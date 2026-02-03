@@ -1,6 +1,6 @@
-//! PCL (Pototo Core Language) Interpreter
+//! CCL (Cambra Core Language) Interpreter
 //!
-//! This module implements the dataflow-based interpreter for PCL.
+//! This module implements the dataflow-based interpreter for CCL.
 //! Execution proceeds via a producer/consumer protocol using guards and extents.
 
 use std::collections::HashMap;
@@ -219,7 +219,7 @@ impl Extent {
     }
 }
 
-/// Base types in PCL
+/// Base types in CCL
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BaseType {
     Int,
@@ -228,7 +228,7 @@ pub enum BaseType {
     Unit,
 }
 
-/// Values in PCL
+/// Values in CCL
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Int(i64),

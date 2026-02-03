@@ -12,7 +12,7 @@ cargo test <name>  # Run a specific test by name
 
 ## Project Overview
 
-Pototo is a programming language implementing a new paradigm that abstracts over memory, threads, and connections. Programs use Python-like syntax with for-comprehensions, which lowers to PCL (Pototo Core Language) for type-checking and interpretation.
+Cambra is a programming language implementing a new paradigm that abstracts over memory, threads, and connections. Programs use Python-like syntax with for-comprehensions, which lowers to CCL (Cambra Core Language) for type-checking and interpretation.
 
 The interpreter uses **dataflow semantics** with a producer/consumer protocol instead of term-wise beta reduction. This enables streaming execution with pipelining, parallelization, and vectorization.
 
@@ -37,7 +37,7 @@ Producer::release(obsolete_guard)  // Consumer retracts interest in a region
 ### Key Files
 
 - `src/lib.rs` - Public API and Python parsing
-- `src/interpreter.rs` - PCL interpreter (operators, producers, consumers, guards, extents)
+- `src/interpreter.rs` - CCL interpreter (operators, producers, consumers, guards, extents)
 
 ### Variable System
 
@@ -57,4 +57,4 @@ See `PLAN.md` for detailed progress. Currently implementing Step 7b (scan chain 
 
 ## Design Reference
 
-See `design.md` for the full specification including syntax, denotational/operational semantics, and detailed PCL operator descriptions.
+See `design.md` for the full specification including syntax, denotational/operational semantics, and detailed CCL operator descriptions.

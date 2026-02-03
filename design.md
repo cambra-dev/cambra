@@ -1,4 +1,4 @@
-Pototo is a programming language that implements a new programming paradigm.
+Cambra is a programming language that implements a new programming paradigm.
 It abstracts over low level concepts like memory, threads, and connections, enabling programmers to focus on the logic of their program, non-functional requirements, and high-level architectural decisions.
 The denotational semantics of the language is a pure, dependently-typed, functional language.
 The operational semantics is very unlike the lambda calculus: rather than operating via term-wise beta reduction, function terms implement a producer/consumer interface which allows the runtime to implement streaming dataflow semantics, with pipelining, parallelization, and vectorization.
@@ -6,20 +6,20 @@ Progress is tracked by sending puntuations through this producer/consumer interf
 
 
 * Python syntax
-    * Programs are written in a Pythonic syntax that uses for-comprehensions for the definition of collection-level logic. This Python syntax is lowered to the Pototo Core Language (PCL), where it is typechecked and interpreted.
+    * Programs are written in a Pythonic syntax that uses for-comprehensions for the definition of collection-level logic. This Python syntax is lowered to the Cambra Core Language (CCL), where it is typechecked and interpreted.
     * Supported: functions, type annotations, assignment, augmented assignment, operators, assignment expressions, attributes, kwargs, ...
     * Likely need some customizations (defer for now):
         * Multi-line generator expressions, so generators don't always have to be wrapped in a def
         * A way to define records. Could reuse Python classes, but they're really imperative and full of boilerplate.
-    * Need to lower to PCL. Will defer until after hashing out the fundamental pieces of PCL and the interpreter.
+    * Need to lower to CCL. Will defer until after hashing out the fundamental pieces of CCL and the interpreter.
         * Retain location info through lowering
         * Big challenge is converting imperative loops into functional expressions. In particular, defining the indexing for these definitions is a big unknown.
         * Converting comprehensions & generators should be easier: just make them lambdas, with some additional indexing for each `yield`
 
-* Pototo Core Language (PCL)
+* Cambra Core Language (CCL)
     * Should be really simple: literals, variables, records, unions, lambdas, let-binding, application, pattern matching, type annotations.
     * Will want a type checker, but can defer implementing it until later, and just make sure terms typecheck when experimenting.
-    * To execute PCL, we convert each term in the AST into a dataflow operator and wire them up to execute.
+    * To execute CCL, we convert each term in the AST into a dataflow operator and wire them up to execute.
         * The interpreter walks the AST, converting AST nodes into dataflow operators, and kicking off computation by subscribing to a dataflow operator when forced.
         * Each operator has an **extent**, the set of values the term can take on, and corresponding exactly to the term's type.
         * Execution proceeds by working in terms of **regions**, which are subsets of the extent: operators can ask for regions, inform about the availability of a region, and revoke their interest in a region.
@@ -38,7 +38,7 @@ Progress is tracked by sending puntuations through this producer/consumer interf
 
     * **Guard Monotonicity Contract**: The contract of `Consumer::notify()` guarantees that yield guards are **monotonically growing**. That is, each call to `notify()` must provide a yield guard that is a superset (or equal to) all previous yield guards for that consumer. This contract allows implementations to store a single yield guard rather than tracking all historical guards, and enables efficient guard management throughout the dataflow graph. 
 
-# PCL operators:
+# CCL operators:
 ## Literals
 Subscribe calls Notify on the consumer immediately. Notify calls Get. Get returns a constant. Release is a no-op.
 
@@ -424,10 +424,10 @@ For deeply nested scans (`\t1. \t2. \t3. ...`):
 - Trade-off between space (storing more indices) and time (recomputing)
 
 
-# PCL Proof of Concept
+# CCL Proof of Concept
     
 
-* PCL interpreter
+* CCL interpreter
     * Convert to dataflow operators and schedule.
     * Follow pull/push/progress protocol.
     * TODO: which cases can't be converted into dataflow?
