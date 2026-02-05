@@ -503,6 +503,10 @@ impl Producer for LiteralProducer {
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// A variable subscription paired with the chain of scanning variables between
+/// the current scope and the found variable, used for alignment composition.
+type VarWithScanChain = (Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>);
+
 /// Variable scope for looking up variables.
 /// Each scope contains exactly one variable (the lambda's bound variable).
 /// Variables are looked up by name, searching up the parent chain if not found.
@@ -537,10 +541,7 @@ impl VarScope {
     /// Look up a variable by name, searching up the parent chain.
     /// Returns (subscription, scan_chain) where scan_chain contains any scanning
     /// variables between the current scope and the found variable (for alignment).
-    pub fn lookup_variable(
-        &self,
-        name: &str,
-    ) -> Option<(Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>)> {
+    pub fn lookup_variable(&self, name: &str) -> Option<VarWithScanChain> {
         self.lookup_with_chain(name, Vec::new())
     }
 
@@ -548,7 +549,7 @@ impl VarScope {
         &self,
         name: &str,
         mut chain: Vec<Rc<RefCell<VarSub>>>,
-    ) -> Option<(Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>)> {
+    ) -> Option<VarWithScanChain> {
         if self.name == name {
             // Found the variable - return it with the chain of inner scans
             Some((self.subscription.clone(), chain))
@@ -794,7 +795,7 @@ impl Operator for VarRef {
         let var_scope = var_scope.expect("VarRef requires a VarScope");
         let (variable_subscription, scan_chain) = var_scope
             .lookup_variable(&self.name)
-            .expect(&format!("Variable '{}' not found in scope", self.name));
+            .unwrap_or_else(|| panic!("Variable '{}' not found in scope", self.name));
 
         // Create VarRefSub with the consumer and scan chain for alignment
         let ref_subscription = Rc::new(RefCell::new(VarRefSub {
@@ -1321,7 +1322,7 @@ mod tests {
         // Check notifications - we should get one when both are ready
         let notifications_borrowed = notifications.borrow();
         assert!(
-            notifications_borrowed.len() >= 1,
+            !notifications_borrowed.is_empty(),
             "Expected at least 1 notification, got {}",
             notifications_borrowed.len()
         );
@@ -1360,7 +1361,7 @@ mod tests {
         // Both variable and body should notify
         let notifications_borrowed = notifications.borrow();
         assert!(
-            notifications_borrowed.len() >= 1,
+            !notifications_borrowed.is_empty(),
             "Expected at least 1 notification, got {}",
             notifications_borrowed.len()
         );
@@ -1438,7 +1439,7 @@ mod tests {
         // Should receive notification
         let notifications_borrowed = notifications.borrow();
         assert!(
-            notifications_borrowed.len() >= 1,
+            !notifications_borrowed.is_empty(),
             "Expected at least 1 notification"
         );
 
@@ -1525,7 +1526,7 @@ mod tests {
         let notifications_borrowed = notifications.borrow();
         // We should get at least one notification when both guards are ready
         assert!(
-            notifications_borrowed.len() >= 1,
+            !notifications_borrowed.is_empty(),
             "Expected notification when both variable and body are ready, got {}",
             notifications_borrowed.len()
         );
