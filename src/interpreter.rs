@@ -798,7 +798,7 @@ impl Operator for VarRef {
 
         // Create VarRefSub with the consumer and scan chain for alignment
         let ref_subscription = Rc::new(RefCell::new(VarRefSub {
-            variable_subscription,
+            variable_subscription: variable_subscription.clone(),
             scan_chain,
             intent_guard,
             consumer,
