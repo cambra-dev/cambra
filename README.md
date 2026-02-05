@@ -22,9 +22,21 @@ See [PLAN.md](PLAN.md) for detailed implementation status and [design.md](design
 cargo build
 ```
 
-## Running Tests
+## CI
+
+CI runs formatting, linting, and tests via GitHub Actions on every push to `main` and on pull requests.
+
+To run the full CI suite locally:
 
 ```bash
-cargo test
+./ci.sh
+```
+
+You can also run individual checks:
+
+```bash
+./ci.sh fmt      # Check formatting
+./ci.sh clippy   # Run lints
+./ci.sh test     # Run tests
 ```
 

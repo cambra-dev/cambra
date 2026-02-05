@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # Skip CI for changes that don't affect code
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+      - 'blog/**'
+      - 'docs/**'
+
+# Group runs by workflow + PR branch (head_ref) so duplicate runs (e.g. from
+# git-spice force-pushing twice) cancel the earlier one. head_ref is empty on
+# pushes to main, so those fall back to run_id and are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable as of 2026-02-05
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Format
+        run: ./ci.sh fmt
+
+      - name: Clippy
+        # Run even if earlier steps failed so we see all errors in one run.
+        # (Steps default to `if: success()`, which skips on prior failure.)
+        if: success() || failure()
+        run: ./ci.sh clippy
+
+      - name: Test
+        # Run even if earlier steps failed so we see all errors in one run.
+        # (Steps default to `if: success()`, which skips on prior failure.)
+        if: success() || failure()
+        run: ./ci.sh test
