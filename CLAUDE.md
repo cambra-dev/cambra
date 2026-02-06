@@ -6,6 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build      # Build the project
+ci.sh            # Runs complete CI suite (tests, lints, etc)
 cargo test       # Run all tests
 cargo test <name>  # Run a specific test by name
 ```
@@ -39,6 +40,10 @@ Producer::release(obsolete_guard)  // Consumer retracts interest in a region
 - `src/lib.rs` - Public API and Python parsing
 - `src/interpreter.rs` - CCL interpreter (operators, producers, consumers, guards, extents)
 
+### Skills
+
+- `/pyast` — Quick reference for `rustpython_parser` AST types (ExprKind, StmtKind, Operator, Constant, etc.)
+
 ### Variable System
 
 Variables have two modes:
@@ -55,6 +60,13 @@ Each `notify()` call provides a yield guard that is a superset of all previous y
 
 See `PLAN.md` for detailed progress. Currently implementing Step 7b (scan chain for multi-level alignment). Core operators (Literal, Var, VarRef, Lambda) and columnar values are complete. Application operator and join execution are next.
 
+Simultaneously we're working on a lowering implementation, transforming the Python AST into CCL operators.
+
 ## Design Reference
 
 See `design.md` for the full specification including syntax, denotational/operational semantics, and detailed CCL operator descriptions.
+
+
+## Compact instructions
+
+When you are using compact, focus on test output and code changes.
