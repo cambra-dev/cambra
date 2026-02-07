@@ -3,13 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
-    # Skip CI for changes that don't affect code
-    paths-ignore:
-      - '**/*.md'
-      - 'LICENSE'
-      - 'blog/**'
-      - 'docs/**'
+  pull_request: # Trigger on all PRs to satisfy branch protection
 
 # Group runs by workflow + PR branch (head_ref) so duplicate runs (e.g. from
 # git-spice force-pushing twice) cancel the earlier one. head_ref is empty on
@@ -21,27 +15,73 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+  # Permissions to see changed files for the paths-filter action below.
+  pull-requests: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable as of 2026-02-05
+
+      # 1. Detect if changes are only in ignored paths
+      # Skip CI for changes that don't affect code
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36
+        id: filter
+        with:
+          filters: |
+            code:
+              - '!**/*.md'
+              - '!LICENSE'
+              - '!blog/**'
+              - '!docs/**'
+              # Catch-all: run for everything else
+              - '**'
+
+      # 2. Setup Toolchain (Only if code changed)
+      - name: Setup Rust
+        if: steps.filter.outputs.code == 'true'
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable as of 2026-02-05
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
+      - name: Cache
+        if: steps.filter.outputs.code == 'true'
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+
+      # 3. Run Checks (Only if code changed)
       - name: Format
+        if: steps.filter.outputs.code == 'true'
         run: ./ci.sh fmt
 
       - name: Clippy
         # Run even if earlier steps failed so we see all errors in one run.
         # (Steps default to `if: success()`, which skips on prior failure.)
-        if: success() || failure()
+        #
+        # An alternative would be to split this into multiple jobs (e.g. check -> execute -> results),
+        # but then we pay a (small) latency overhead for staring up 3 runners.
+        #
+        # Read more about the "hidden ifs" and general inanity here
+        # https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh clippy
 
       - name: Test
         # Run even if earlier steps failed so we see all errors in one run.
         # (Steps default to `if: success()`, which skips on prior failure.)
-        if: success() || failure()
+        #
+        # An alternative would be to split this into multiple jobs (e.g. check -> execute -> results),
+        # but then we pay a (small) latency overhead for staring up 3 runners.
+        #
+        # Read more about the "hidden ifs" and general inanity here
+        # https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh test
+
+        # 4. Success Signal
+      - name: No-op for docs
+        if: steps.filter.outputs.code == 'false'
+        run: echo "Only documentation changed. Skipped CI checks."
