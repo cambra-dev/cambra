@@ -48,9 +48,10 @@ Variables are split into operators and runtime state:
 
 ### Var Operator
 A `Var` operator represents a variable definition. It holds:
-    * The variable's name
-    * The extent of this variable
-    * A predicate guard that restricts the variable's extent (may reference outer variables for correlated scans)
+
+- The variable's name
+- The extent of this variable
+- A predicate guard that restricts the variable's extent (may reference outer variables for correlated scans)
 
 Note: `Var` does **not** hold a static definition. Binding happens dynamically:
 - When the lambda is **applied**, the `Application` operator binds the argument to the variable
@@ -62,19 +63,19 @@ The variable is owned and managed by the operator that defines it (record, lambd
 A `VarSub` is created when `Var::subscribe()` is called. It can operate in two modes:
 
 **Bound Mode** (lambda applied to argument):
-    * Wraps a producer from the binding expression
-    * Forwards values from that producer
+- Wraps a producer from the binding expression
+- Forwards values from that producer
 
 **Scanning Mode** (lambda aggregated):
-    * Iterates over the variable's extent
-    * Applies predicate to filter values
-    * For correlated predicates (referencing outer variables): executes as a join
-    * Produces `parent_indices` relating scan results to outer scans
+- Iterates over the variable's extent
+- Applies predicate to filter values
+- For correlated predicates (referencing outer variables): executes as a join
+- Produces `parent_indices` relating scan results to outer scans
 
 Common to both modes:
-    * Maintains a list of all consumers that have subscribed to this variable
-    * Stores a release guard for use by variable references
-    * Stores `parent_indices` for alignment (scanning mode only)
+- Maintains a list of all consumers that have subscribed to this variable
+- Stores a release guard for use by variable references
+- Stores `parent_indices` for alignment (scanning mode only)
 
 ```rust
 enum VarSource {
@@ -102,14 +103,14 @@ When release is called on a function, its domain release guard is stored in the 
 
 ### VarRef Operator
 A `VarRef` operator represents a reference to a variable. It holds:
-    * The name of the variable being referenced
-    * The extent (cached from the variable when found)
+- The name of the variable being referenced
+- The extent (cached from the variable when found)
 
 ### VarRefSub (Runtime State)
 A `VarRefSub` is created when `VarRef::subscribe()` is called. It implements `Producer`:
-    * Filters data from the `VarSub` based on its intent guard
-    * **Handles alignment**: If referencing an outer variable from within an inner scan, expands values using the inner scan's `parent_indices`
-    * When `release()` is called, returns the stored release guard from the `VarSub` rather than invoking release on the subscription itself (since the lambda would have already invoked it)
+- Filters data from the `VarSub` based on its intent guard
+- **Handles alignment**: If referencing an outer variable from within an inner scan, expands values using the inner scan's `parent_indices`
+- When `release()` is called, returns the stored release guard from the `VarSub` rather than invoking release on the subscription itself (since the lambda would have already invoked it)
 
 ```rust
 struct VarRefSub {
@@ -125,10 +126,10 @@ The `innermost_scan` is set by `VarScope` when the variable is looked up. If the
 
 ### Variable Lookup: VarScope
 Variables are looked up by name using a `VarScope` structure:
-    * `VarScope` is a linked list structure that maps variable names to their `VarSub` objects
-    * Supports parent chaining for nested scopes (e.g., lambdas within lambdas)
-    * When looking up a variable, the scope searches up the parent chain if not found in the current scope
-    * `VarScope` is passed through `subscribe()` calls to enable variable lookup
+- `VarScope` is a linked list structure that maps variable names to their `VarSub` objects
+- Supports parent chaining for nested scopes (e.g., lambdas within lambdas)
+- When looking up a variable, the scope searches up the parent chain if not found in the current scope
+- `VarScope` is passed through `subscribe()` calls to enable variable lookup
 
 ### Variable System Flow
 
