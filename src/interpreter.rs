@@ -525,19 +525,19 @@ pub struct VarScope {
 
 impl VarScope {
     /// Create a new root scope with a single variable.
-    pub fn new(name: String, subscription: Rc<RefCell<VarSub>>) -> Self {
+    pub fn new(name: &str, subscription: Rc<RefCell<VarSub>>) -> Self {
         VarScope {
             parent: None,
-            name,
+            name: name.to_string(),
             subscription,
         }
     }
 
     /// Create a child scope with a parent.
-    pub fn child(parent: VarScope, name: String, subscription: Rc<RefCell<VarSub>>) -> Self {
+    pub fn child(parent: VarScope, name: &str, subscription: Rc<RefCell<VarSub>>) -> Self {
         VarScope {
             parent: Some(Box::new(parent)),
-            name,
+            name: name.to_string(),
             subscription,
         }
     }
@@ -607,9 +607,9 @@ pub struct Var {
 
 impl Var {
     /// Create a new variable operator with the given name and extent.
-    pub fn new(name: String, extent: Extent) -> Self {
+    pub fn new(name: &str, extent: Extent) -> Self {
         Var {
-            name,
+            name: name.to_string(),
             extent,
             predicate: Guard::Universal,
         }
@@ -796,8 +796,11 @@ pub struct VarRef {
 
 impl VarRef {
     /// Create a new variable reference.
-    pub fn new(name: String, extent: Extent) -> Self {
-        VarRef { name, extent }
+    pub fn new(name: &str, extent: Extent) -> Self {
+        VarRef {
+            name: name.to_string(),
+            extent,
+        }
     }
 }
 
@@ -1155,9 +1158,9 @@ impl Lambda {
 
         // Create a new VarScope with this variable
         let new_scope = if let Some(parent) = var_scope {
-            VarScope::child(parent, self.variable.name.clone(), variable_subscription)
+            VarScope::child(parent, &self.variable.name, variable_subscription)
         } else {
-            VarScope::new(self.variable.name.clone(), variable_subscription)
+            VarScope::new(&self.variable.name, variable_subscription)
         };
 
         // Create closure for body notifications: updates body_yield_guard and checks if ready
@@ -1286,8 +1289,8 @@ mod tests {
     #[test]
     fn test_variable_proxy() {
         // Create variable and its reference
-        let variable = Var::new("x".to_string(), Extent::Base(BaseType::Int));
-        let mut var_ref = VarRef::new("x".to_string(), Extent::Base(BaseType::Int));
+        let variable = Var::new("x", Extent::Base(BaseType::Int));
+        let mut var_ref = VarRef::new("x", Extent::Base(BaseType::Int));
 
         assert_eq!(var_ref.extent(), &Extent::Base(BaseType::Int));
 
@@ -1307,7 +1310,7 @@ mod tests {
             .set_source(VarSource::Bound(binding_producer));
 
         // Create a VarScope with the variable
-        let var_scope = VarScope::new("x".to_string(), var_subscription);
+        let var_scope = VarScope::new("x", var_subscription);
 
         // Subscribe and verify it works
         let (consumer, notifications) = TestConsumer::new();
@@ -1332,8 +1335,8 @@ mod tests {
     #[test]
     fn test_lambda_extent() {
         // Create a lambda: λ x . x (identity function)
-        let variable = Var::new("x".to_string(), Extent::Base(BaseType::Int));
-        let body = Box::new(VarRef::new("x".to_string(), Extent::Base(BaseType::Int)));
+        let variable = Var::new("x", Extent::Base(BaseType::Int));
+        let body = Box::new(VarRef::new("x", Extent::Base(BaseType::Int)));
         let lambda = Lambda::new(variable, body);
 
         // Check that extent is a function from Int to Int
@@ -1350,9 +1353,9 @@ mod tests {
     #[test]
     fn test_lambda_simple_identity() {
         // Create a lambda: λ x . x (identity function)
-        let variable = Var::new("x".to_string(), Extent::Base(BaseType::Int));
+        let variable = Var::new("x", Extent::Base(BaseType::Int));
         // Body just returns the variable
-        let body = Box::new(VarRef::new("x".to_string(), Extent::Base(BaseType::Int)));
+        let body = Box::new(VarRef::new("x", Extent::Base(BaseType::Int)));
         let mut lambda = Lambda::new(variable, body);
 
         let mut binding_literal = Literal::new(Value::Int(42));
@@ -1389,7 +1392,7 @@ mod tests {
     #[test]
     fn test_lambda_with_literal_body() {
         // Create a lambda: λ x . 10 (constant function)
-        let variable = Var::new("x".to_string(), Extent::Base(BaseType::Int));
+        let variable = Var::new("x", Extent::Base(BaseType::Int));
         let body = Box::new(Literal::new(Value::Int(10)));
         let mut lambda = Lambda::new(variable, body);
 
@@ -1430,8 +1433,8 @@ mod tests {
     #[test]
     fn test_lambda_release() {
         // Create a lambda: λ x . x
-        let variable = Var::new("x".to_string(), Extent::Base(BaseType::Int));
-        let body = Box::new(VarRef::new("x".to_string(), Extent::Base(BaseType::Int)));
+        let variable = Var::new("x", Extent::Base(BaseType::Int));
+        let body = Box::new(VarRef::new("x", Extent::Base(BaseType::Int)));
         let mut lambda = Lambda::new(variable, body);
 
         let mut binding_literal = Literal::new(Value::Int(42));
@@ -1460,8 +1463,8 @@ mod tests {
     #[test]
     fn test_lambda_with_function_guard() {
         // Create a lambda: λ x . x
-        let variable = Var::new("x".to_string(), Extent::Base(BaseType::Int));
-        let body = Box::new(VarRef::new("x".to_string(), Extent::Base(BaseType::Int)));
+        let variable = Var::new("x", Extent::Base(BaseType::Int));
+        let body = Box::new(VarRef::new("x", Extent::Base(BaseType::Int)));
         let mut lambda = Lambda::new(variable, body);
 
         let mut binding_literal = Literal::new(Value::Int(42));
@@ -1504,12 +1507,12 @@ mod tests {
     fn test_lambda_nested_scope() {
         // Test that lambda creates a new scope for its variable
         // Create: λ x . x where x is defined in the lambda
-        let variable = Var::new("x".to_string(), Extent::Base(BaseType::Int));
-        let body = Box::new(VarRef::new("x".to_string(), Extent::Base(BaseType::Int)));
+        let variable = Var::new("x", Extent::Base(BaseType::Int));
+        let body = Box::new(VarRef::new("x", Extent::Base(BaseType::Int)));
         let mut lambda = Lambda::new(variable, body);
 
         // Create a parent scope with a different variable "x" bound to 200
-        let parent_variable = Var::new("x".to_string(), Extent::Base(BaseType::Int));
+        let parent_variable = Var::new("x", Extent::Base(BaseType::Int));
         // Create parent subscription and wire up binding properly
         let parent_subscription = parent_variable.create_subscription(VarSource::Uninitialized);
         let mut parent_literal = Literal::new(Value::Int(200));
@@ -1519,7 +1522,7 @@ mod tests {
         parent_subscription
             .borrow_mut()
             .set_source(VarSource::Bound(parent_binding));
-        let parent_scope = VarScope::new("x".to_string(), parent_subscription);
+        let parent_scope = VarScope::new("x", parent_subscription);
 
         let mut binding_literal = Literal::new(Value::Int(100));
 
@@ -1553,7 +1556,7 @@ mod tests {
     fn test_lambda_notifications_from_both_sources() {
         // Test that notifications work correctly when both variable and body notify
         // Create a lambda where both variable binding and body are literals (they notify immediately)
-        let variable = Var::new("x".to_string(), Extent::Base(BaseType::Int));
+        let variable = Var::new("x", Extent::Base(BaseType::Int));
         let body = Box::new(Literal::new(Value::Int(2)));
         let mut lambda = Lambda::new(variable, body);
 
@@ -1594,8 +1597,8 @@ mod tests {
         // 1. Creating a lambda with a VarRef body (so VarRefSub is in the consumers list)
         // 2. Verifying a notification is received by the lambda's consumer.
 
-        let variable = Var::new("x".to_string(), Extent::Base(BaseType::Int));
-        let body = Box::new(VarRef::new("x".to_string(), Extent::Base(BaseType::Int)));
+        let variable = Var::new("x", Extent::Base(BaseType::Int));
+        let body = Box::new(VarRef::new("x", Extent::Base(BaseType::Int)));
         let mut lambda = Lambda::new(variable, body);
 
         let mut binding_literal = Literal::new(Value::Int(42));

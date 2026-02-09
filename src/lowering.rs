@@ -64,10 +64,7 @@ fn lower_name(id: &str) -> Result<Box<dyn Operator>, LoweringError> {
     // For now, assume all variables have Int extent.
     // TODO: Implement proper type inference or require type annotations.
     // This is part of phase 3 (Let bindings).
-    Ok(Box::new(VarRef::new(
-        id.to_string(),
-        Extent::Base(BaseType::Int),
-    )))
+    Ok(Box::new(VarRef::new(id, Extent::Base(BaseType::Int))))
 }
 
 /// Lower a binary operation.
