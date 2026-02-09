@@ -81,7 +81,29 @@ jobs:
         if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh test
 
-        # 4. Success Signal
+        # 4. Success Signal for noops
       - name: No-op for docs
         if: steps.filter.outputs.code == 'false'
         run: echo "Only documentation changed. Skipped CI checks."
+
+      - name: Notify Slack on failure
+        # failure() is true if *any* previous step failed, even if later steps
+        # succeeded, so this fires regardless of which check caught the error.
+        #
+        # Only notify on pushes to main, not PRs. The push trigger is scoped
+        # to branches: [main], so event_name == 'push' implies main. PR branch
+        # pushes fire as 'pull_request' events instead.
+        #
+        # Only fire if this is a run with codechanges.
+        if: failure() && github.event_name == 'push' && steps.filter.outputs.code == 'true'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ vars.SLACK_CI_CHANNEL }}
+        run: |
+          curl -sf -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg channel "$SLACK_CHANNEL" \
+              --arg text ":red_circle: CI failed on main — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>" \
+              '{channel: $channel, text: $text}')"
