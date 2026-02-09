@@ -1,0 +1,33 @@
+name: Cache Slack User Map
+
+on:
+  schedule:
+    # Every Monday at 17:00 UTC (10am MST), before the daily reminder
+    - cron: "0 17 * * 1"
+  workflow_dispatch: # Allow manual runs
+
+jobs:
+  build-usermap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Only check out the scripts we need instead of the full repo.
+          # sparse-checkout tells git to only materialise matching paths.
+          # cone-mode (the fast default) matches whole directories rather
+          # than arbitrary gitignore-style patterns.
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Build user map
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: python3 .github/scripts/pr-reminders/build_slack_usermap.py
+
+      - name: Save user map to cache
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: usermap.json
+          key: slack-usermap-${{ github.run_id }}

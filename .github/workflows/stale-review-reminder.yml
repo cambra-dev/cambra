@@ -1,0 +1,39 @@
+name: Stale Review Reminder
+
+on:
+  schedule:
+    # 18:00 UTC = 11:00 AM MST, weekdays only
+    - cron: "0 18 * * 1-5"
+  workflow_dispatch: # Allow manual runs
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Only check out the scripts we need instead of the full repo.
+          # sparse-checkout tells git to only materialise matching paths.
+          # cone-mode (the fast default) matches whole directories rather
+          # than arbitrary gitignore-style patterns.
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: true
+
+      - name: Restore Slack user map
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: usermap.json
+          key: slack-usermap-unused-${{ github.run_id }}
+          restore-keys: |
+            slack-usermap-
+
+      - name: Ensure usermap exists
+        run: test -f usermap.json || echo '{}' > usermap.json
+
+      - name: Find stale PRs and post reminders
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ vars.SLACK_REVIEW_CHANNEL }}
+        run: python3 .github/scripts/pr-reminders/find_stale_prs.py | python3 .github/scripts/pr-reminders/post_slack_reminders.py
