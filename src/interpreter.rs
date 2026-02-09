@@ -4,6 +4,7 @@
 //! Execution proceeds via a producer/consumer protocol using guards and extents.
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 
 /// A Guard represents a region (subset of an extent) via a set of predicates.
 /// Guards are used to:
@@ -356,7 +357,7 @@ where
 /// A Producer provides data and handles release requests.
 /// The producer is created by an operator's `subscribe` method and allows
 /// the consumer to retrieve data and release regions.
-pub trait Producer {
+pub trait Producer: Debug {
     /// Get the data that is ready.
     /// Returns a columnar representation of the values in the ready region.
     /// The structure depends on the operator's type (records have fields,
@@ -387,7 +388,7 @@ impl<P: Producer> Producer for Rc<RefCell<P>> {
 /// The `subscribe` method takes an intent guard (specifying what region the
 /// consumer is interested in) and a consumer, and returns a producer that
 /// allows the consumer to get data and release regions.
-pub trait Operator {
+pub trait Operator: Debug {
     /// Get the extent (type) of this operator.
     fn extent(&self) -> &Extent;
 
@@ -419,6 +420,7 @@ pub trait Operator {
 /// A literal operator represents a constant value.
 /// According to the design: Subscribe calls Notify on the consumer immediately.
 /// Notify calls Get. Get returns a constant. Release is a no-op.
+#[derive(Debug)]
 pub struct Literal {
     value: Value,
     extent: Extent,
@@ -481,6 +483,7 @@ impl Operator for Literal {
     }
 }
 
+#[derive(Debug)]
 struct LiteralProducer {
     value: Value,
 }
@@ -510,6 +513,7 @@ type VarWithScanChain = (Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>);
 /// Variable scope for looking up variables.
 /// Each scope contains exactly one variable (the lambda's bound variable).
 /// Variables are looked up by name, searching up the parent chain if not found.
+#[derive(Debug)]
 pub struct VarScope {
     /// Optional parent scope (for nested scopes)
     parent: Option<Box<VarScope>>,
@@ -570,6 +574,7 @@ impl VarScope {
 
 /// The source of values for a variable subscription.
 /// Determines whether the variable is bound to a producer or scanning its extent.
+#[derive(Debug)]
 pub enum VarSource {
     /// Uninitialized state - used during construction when source will be set later.
     /// VarSub operations will panic if called while in this state.
@@ -589,6 +594,7 @@ pub enum VarSource {
 /// A Var operator represents a variable definition.
 /// It holds the variable's name, extent, and predicate - but NOT a static definition.
 /// Binding happens dynamically via Application (Bound mode) or aggregation (Scanning mode).
+#[derive(Debug)]
 pub struct Var {
     /// The name of the variable
     pub name: String,
@@ -654,6 +660,20 @@ pub struct VarSub {
     consumers: Vec<Box<dyn Consumer>>,
     /// The stored release guard for use by variable references
     stored_release_guard: Guard,
+}
+
+impl std::fmt::Debug for VarSub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VarSub")
+            .field("source", &self.source)
+            .field("yield_guard", &self.yield_guard)
+            .field(
+                "consumers",
+                &format_args!("<{} consumers>", self.consumers.len()),
+            )
+            .field("stored_release_guard", &self.stored_release_guard)
+            .finish()
+    }
 }
 
 impl VarSub {
@@ -766,6 +786,7 @@ impl Consumer for VarSub {
 
 /// A VarRef operator represents a reference to a variable.
 /// It holds the variable name and looks it up in the VarScope when subscribing.
+#[derive(Debug)]
 pub struct VarRef {
     /// The name of the variable being referenced
     name: String,
@@ -830,6 +851,17 @@ struct VarRefSub {
     consumer: Box<dyn Consumer>,
 }
 
+impl std::fmt::Debug for VarRefSub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VarRefSub")
+            .field("variable_subscription", &self.variable_subscription)
+            .field("scan_chain", &self.scan_chain)
+            .field("intent_guard", &self.intent_guard)
+            .field("consumer", &format_args!("<consumer>"))
+            .finish()
+    }
+}
+
 impl Consumer for VarRefSub {
     /// Notify this subscription of a yield guard from the variable.
     fn notify(&mut self, yield_guard: Guard) {
@@ -891,6 +923,7 @@ impl Producer for VarRefSub {
 
 /// A Lambda operator represents a lambda expression.
 /// It has a variable and a body, and manages the variable scope.
+#[derive(Debug)]
 pub struct Lambda {
     variable: Var,
     body: Box<dyn Operator>,
@@ -914,6 +947,19 @@ struct LambdaProducer {
     body_yield_guard: Guard,
     /// The intent guard for this lambda subscription
     intent_guard: Guard,
+}
+
+impl std::fmt::Debug for LambdaProducer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LambdaProducer")
+            .field("variable_subscription", &self.variable_subscription)
+            .field("body_producer", &self.body_producer)
+            .field("downstream_consumer", &format_args!("<consumer>"))
+            .field("variable_yield_guard", &self.variable_yield_guard)
+            .field("body_yield_guard", &self.body_yield_guard)
+            .field("intent_guard", &self.intent_guard)
+            .finish()
+    }
 }
 
 impl LambdaProducer {
