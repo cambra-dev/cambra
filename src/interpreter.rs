@@ -513,10 +513,10 @@ type VarWithScanChain = (Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>);
 /// Variable scope for looking up variables.
 /// Each scope contains exactly one variable (the lambda's bound variable).
 /// Variables are looked up by name, searching up the parent chain if not found.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VarScope {
     /// Optional parent scope (for nested scopes)
-    parent: Option<Box<VarScope>>,
+    parent: Option<Rc<VarScope>>,
     /// The variable name in this scope
     name: String,
     /// The variable subscription in this scope
@@ -534,9 +534,21 @@ impl VarScope {
     }
 
     /// Create a child scope with a parent.
-    pub fn child(parent: VarScope, name: &str, subscription: Rc<RefCell<VarSub>>) -> Self {
+    pub fn child(parent: Rc<VarScope>, name: &str, subscription: Rc<RefCell<VarSub>>) -> Self {
         VarScope {
-            parent: Some(Box::new(parent)),
+            parent: Some(parent),
+            name: name.to_string(),
+            subscription,
+        }
+    }
+
+    pub fn new_with_optional_parent(
+        parent: Option<Rc<VarScope>>,
+        name: &str,
+        subscription: Rc<RefCell<VarSub>>,
+    ) -> Self {
+        VarScope {
+            parent,
             name: name.to_string(),
             subscription,
         }
@@ -1158,7 +1170,7 @@ impl Lambda {
 
         // Create a new VarScope with this variable
         let new_scope = if let Some(parent) = var_scope {
-            VarScope::child(parent, &self.variable.name, variable_subscription)
+            VarScope::child(Rc::new(parent), &self.variable.name, variable_subscription)
         } else {
             VarScope::new(&self.variable.name, variable_subscription)
         };

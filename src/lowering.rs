@@ -3,9 +3,14 @@
 //! This module translates rustpython_parser AST nodes into the dataflow
 //! operators defined in interpreter.rs.
 
+use std::rc::Rc;
+
 use rustpython_parser::ast as pyast;
 
-use crate::interpreter::{BaseType, Extent, FuncBinding, Literal, Operator, Value, VarRef};
+use crate::interpreter::{
+    BaseType, Extent, FuncBinding, Guard, Literal, Operator, Value, Var, VarRef, VarScope,
+    VarSource,
+};
 
 /// Errors that can occur during lowering.
 #[derive(Debug, Clone, PartialEq)]
@@ -149,6 +154,78 @@ fn lower_list_comp(
     ))
 }
 
+/// Lower a series of assignments followed by an expression
+pub fn lower_let_stmt_block(
+    stmts: &[pyast::Stmt],
+) -> Result<(Box<dyn Operator>, Option<VarScope>), LoweringError> {
+    if stmts.is_empty() {
+        return Err(LoweringError::Unsupported("Empty block".into()));
+    }
+    let mut cur_scope: Option<VarScope> = None;
+    for let_stmt in stmts[..stmts.len() - 1].iter() {
+        let (targets, value) = match &let_stmt.node {
+            pyast::StmtKind::Assign { targets, value, .. } => (targets, value),
+            _ => {
+                return Err(LoweringError::Unsupported(format!(
+                    "Only assignment statements are supported in let blocks for now, got {:?}",
+                    let_stmt.node
+                )))
+            }
+        };
+        cur_scope = Some(lower_assign(cur_scope, targets, value)?);
+    }
+    // The last statement is the evaluated expression
+    let result = &stmts[stmts.len() - 1];
+    let result_expr = match &result.node {
+        pyast::StmtKind::Expr { value } => value,
+        _ => {
+            return Err(LoweringError::Unsupported(format!(
+                "The last statement in a let block must be an expression, got {:?}",
+                result.node
+            )))
+        }
+    };
+    Ok((lower_expr(result_expr)?, cur_scope))
+}
+
+fn lower_assign(
+    parent_scope: Option<VarScope>,
+    targets: &[pyast::Expr],
+    value: &pyast::Expr,
+) -> Result<VarScope, LoweringError> {
+    if targets.len() != 1 {
+        return Err(LoweringError::Unsupported(
+            "Only single assignment targets are supported for now".into(),
+        ));
+    }
+    let target = &targets[0];
+    let name = match &target.node {
+        pyast::ExprKind::Name { id, .. } => id,
+        _ => {
+            return Err(LoweringError::Unsupported(format!(
+                "Only simple variable assignment is supported for now, got {:?}",
+                target.node
+            )))
+        }
+    };
+    let mut value_op = lower_expr(value)?;
+    let variable = Var::new(name, value_op.extent().clone());
+    let var_subscription = variable.create_subscription(VarSource::Uninitialized);
+    let binding_producer = value_op.subscribe(
+        Guard::universal(),
+        Box::new(var_subscription.clone()),
+        parent_scope.clone(),
+    );
+    var_subscription
+        .borrow_mut()
+        .set_source(VarSource::Bound(binding_producer));
+    Ok(VarScope::new_with_optional_parent(
+        parent_scope.map(Rc::new),
+        name,
+        var_subscription,
+    ))
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -162,7 +239,7 @@ mod tests {
     use std::rc::Rc;
 
     /// Parse a Python expression and return the AST.
-    fn parse_expr(code: &str) -> pyast::Located<pyast::ExprKind> {
+    fn parse_expr(code: &str) -> pyast::Expr {
         let result = parser::parse(code, parser::Mode::Expression, "<test>")
             .expect("Failed to parse expression");
         match result {
@@ -171,9 +248,19 @@ mod tests {
         }
     }
 
+    /// Parse a Python module (sequence of statements) and return the AST.
+    fn parse_module(code: &str) -> Vec<pyast::Stmt> {
+        let result =
+            parser::parse(code, parser::Mode::Module, "<test>").expect("Failed to parse module");
+        match result {
+            pyast::Mod::Module { body, .. } => body,
+            _ => panic!("Expected module, got {:?}", result),
+        }
+    }
+
     /// Helper to evaluate an operator and get the result value.
     /// Creates a consumer, subscribes, and calls get().
-    fn eval_operator(mut op: Box<dyn Operator>) -> Value {
+    fn eval_operator_with_scope(mut op: Box<dyn Operator>, scope: Option<VarScope>) -> Value {
         // Track notifications
         let notified = Rc::new(RefCell::new(false));
         let notified_clone = notified.clone();
@@ -182,7 +269,7 @@ mod tests {
             *notified_clone.borrow_mut() = true;
         });
 
-        let mut producer = op.subscribe(Guard::universal(), consumer, None);
+        let mut producer = op.subscribe(Guard::universal(), consumer, scope);
 
         // For literals, we should be notified immediately
         assert!(*notified.borrow(), "Expected to be notified");
@@ -190,6 +277,10 @@ mod tests {
         let column = producer.get();
         assert_eq!(column.values.len(), 1, "Expected single value");
         column.values[0].clone()
+    }
+
+    fn eval_operator(op: Box<dyn Operator>) -> Value {
+        eval_operator_with_scope(op, None)
     }
 
     // ========================================================================
@@ -247,14 +338,19 @@ mod tests {
     // ========================================================================
 
     #[test]
-    #[ignore] // TODO: Implement Let operator and statement lowering
     fn test_lower_let_simple() {
-        // x = 2; x
-        // This requires parsing statements, not just expressions.
-        // For now, we'll test the components separately.
-        //
-        // CCL equivalent: Let("x", Literal(2), VarRef("x"))
-        todo!("Implement Let operator and statement lowering")
+        let ast = parse_module("x = 2; x");
+        println!("Statement 0: {:#?}", ast[0]);
+        println!("Statement 1: {:#?}", ast[1]);
+        let (op, scope) = lower_let_stmt_block(&ast).expect("Failed to lower");
+        assert_eq!(eval_operator_with_scope(op, scope), Value::Int(2));
+    }
+
+    #[test]
+    fn test_lower_let_multiple() {
+        let ast = parse_module("x = 2; y = x; y");
+        let (op, scope) = lower_let_stmt_block(&ast).expect("Failed to lower");
+        assert_eq!(eval_operator_with_scope(op, scope), Value::Int(2));
     }
 
     // ========================================================================
@@ -274,7 +370,6 @@ mod tests {
     // ========================================================================
 
     #[test]
-    #[ignore] // TODO: Enable once list lowering is fully working
     fn test_lower_list_literal() {
         let ast = parse_expr("[1, 2, 3]");
         let op = lower_expr(&ast).expect("Failed to lower");
