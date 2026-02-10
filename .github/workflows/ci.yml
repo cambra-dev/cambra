@@ -53,8 +53,12 @@ jobs:
 
 
       # 3. Run Checks (Only if code changed)
-      - name: Format
+      - name: Shellcheck
         if: steps.filter.outputs.code == 'true'
+        run: ./ci.sh shellcheck
+
+      - name: Format
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh fmt
 
       - name: Clippy

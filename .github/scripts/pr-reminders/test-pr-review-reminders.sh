@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Check dependencies
 missing=()
 for cmd in gh python3 git; do
-  command -v "$cmd" &>/dev/null || missing+=("$cmd")
+  command -v "${cmd}" &>/dev/null || missing+=("${cmd}")
 done
 if ((${#missing[@]} > 0)); then
   echo "Error: missing required dependencies: ${missing[*]}" >&2
@@ -19,7 +19,11 @@ if ((${#missing[@]} > 0)); then
 fi
 
 # Defaults
+# shellcheck disable=SC2312
+# Masking is fine, we want the default, not the exit code.
 : "${GH_TOKEN:=$(gh auth token)}"
+# shellcheck disable=SC2312
+# Masking is fine, we want the default, not the exit code.
 : "${GH_REPOSITORY:=$(gh repo view --json nameWithOwner -q .nameWithOwner)}"
 # Defaults to spam-testing instead of "prod" `#code` channel
 : "${SLACK_CHANNEL:=#spam-testing}"
@@ -33,7 +37,7 @@ needs_slack() {
   if [[ -z "${SLACK_BOT_TOKEN:-}" ]]; then
     read -rsp "Enter SLACK_BOT_TOKEN (xoxb-...): " SLACK_BOT_TOKEN
     echo
-    if [[ -z "$SLACK_BOT_TOKEN" ]]; then
+    if [[ -z "${SLACK_BOT_TOKEN}" ]]; then
       echo "Error: SLACK_BOT_TOKEN is required for this command." >&2
       exit 1
     fi
@@ -41,19 +45,19 @@ needs_slack() {
   fi
 }
 
-case "$cmd" in usermap | post | smoke) needs_slack ;; esac
+case "${cmd}" in usermap | post | smoke) needs_slack ;; *) ;; esac
 # check --to-slack also needs Slack credentials
-if [[ "$cmd" == "check" ]] && [[ " $* " == *" --to-slack "* ]]; then
+if [[ "${cmd}" == "check" ]] && [[ " $* " == *" --to-slack "* ]]; then
   needs_slack
 fi
 
 # Ensure usermap.json exists (post needs it for reviewer lookups)
 test -f usermap.json || echo '{}' >usermap.json
 
-case "$cmd" in
+case "${cmd}" in
 usermap)
   echo "==> Building GitHub-to-Slack user map..."
-  python3 "$SCRIPT_DIR/build_slack_usermap.py"
+  python3 "${SCRIPT_DIR}/build_slack_usermap.py"
   echo ""
   echo "==> Result:"
   cat usermap.json
@@ -61,17 +65,17 @@ usermap)
 
 find)
   echo "==> Finding stale PRs (pending review >24h)..."
-  python3 "$SCRIPT_DIR/find_stale_prs.py"
+  python3 "${SCRIPT_DIR}/find_stale_prs.py"
   ;;
 
 post)
   echo "==> Finding stale PRs and posting to Slack..."
-  python3 "$SCRIPT_DIR/find_stale_prs.py" | python3 "$SCRIPT_DIR/post_slack_reminders.py"
+  python3 "${SCRIPT_DIR}/find_stale_prs.py" | python3 "${SCRIPT_DIR}/post_slack_reminders.py"
   ;;
 
 check)
   echo "==> Running staleness logic tests..."
-  python3 "$SCRIPT_DIR/test_pr_review_reminders.py" "$@"
+  python3 "${SCRIPT_DIR}/test_pr_review_reminders.py" "$@"
   ;;
 
 smoke)
@@ -81,7 +85,7 @@ smoke)
   ;;
 
 help | *)
-  echo "Usage: $0 [usermap|find|post|check|smoke]"
+  echo "Usage: ${0} [usermap|find|post|check|smoke]"
   echo ""
   echo "  usermap           Build the GitHub-to-Slack user map (writes usermap.json)"
   echo "  find              Find stale PRs and print JSONL to stdout (no Slack needed)"
