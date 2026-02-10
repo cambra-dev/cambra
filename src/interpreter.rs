@@ -399,9 +399,9 @@ pub trait Operator: Debug {
     /// * `intent_guard` - The region of the operator's extent that the consumer
     ///   is interested in
     /// * `consumer` - The consumer that will receive notifications when data is ready
-    ///
-    /// # Arguments
-    /// * `var_scope` - The variable scope for looking up variables
+    /// * `var_scope` - The variable scope for looking up variables, wrapped in Rc
+    ///   to match the internal parent representation and allow cheap sharing
+    ///   (e.g., Lambda stores the scope for child scope construction).
     ///
     /// # Returns
     /// A producer that provides access to the data and allows releasing regions
@@ -409,7 +409,7 @@ pub trait Operator: Debug {
         &mut self,
         intent_guard: Guard,
         consumer: Box<dyn Consumer>, // TODO: Should we make this a trait bound so we don't assume a Box pointer type?
-        var_scope: Option<VarScope>,
+        var_scope: Option<Rc<VarScope>>,
     ) -> Box<dyn Producer>;
 }
 
@@ -473,7 +473,7 @@ impl Operator for Literal {
         &mut self,
         _intent_guard: Guard,
         mut consumer: Box<dyn Consumer>,
-        _var_scope: Option<VarScope>,
+        _var_scope: Option<Rc<VarScope>>,
     ) -> Box<dyn Producer> {
         consumer.notify(Guard::universal());
 
@@ -513,7 +513,7 @@ type VarWithScanChain = (Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>);
 /// Variable scope for looking up variables.
 /// Each scope contains exactly one variable (the lambda's bound variable).
 /// Variables are looked up by name, searching up the parent chain if not found.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VarScope {
     /// Optional parent scope (for nested scopes)
     parent: Option<Rc<VarScope>>,
@@ -825,7 +825,7 @@ impl Operator for VarRef {
         &mut self,
         intent_guard: Guard,
         consumer: Box<dyn Consumer>,
-        var_scope: Option<VarScope>,
+        var_scope: Option<Rc<VarScope>>,
     ) -> Box<dyn Producer> {
         // Look up the variable in the scope
         let var_scope = var_scope.expect("VarRef requires a VarScope");
@@ -1102,7 +1102,7 @@ impl Lambda {
         &mut self,
         intent_guard: Guard,
         consumer: Box<dyn Consumer>,
-        var_scope: Option<VarScope>,
+        var_scope: Option<Rc<VarScope>>,
         binding: &mut dyn Operator,
     ) -> Box<dyn Producer> {
         self.subscribe_internal(intent_guard, consumer, var_scope, Some(binding))
@@ -1113,7 +1113,7 @@ impl Lambda {
         &mut self,
         intent_guard: Guard,
         consumer: Box<dyn Consumer>,
-        var_scope: Option<VarScope>,
+        var_scope: Option<Rc<VarScope>>,
         binding: Option<&mut dyn Operator>,
     ) -> Box<dyn Producer> {
         // Split intent guard into domain and codomain
@@ -1170,7 +1170,7 @@ impl Lambda {
 
         // Create a new VarScope with this variable
         let new_scope = if let Some(parent) = var_scope {
-            VarScope::child(Rc::new(parent), &self.variable.name, variable_subscription)
+            VarScope::child(parent, &self.variable.name, variable_subscription)
         } else {
             VarScope::new(&self.variable.name, variable_subscription)
         };
@@ -1184,9 +1184,9 @@ impl Lambda {
         });
 
         // Subscribe to the body with the closure as consumer
-        let body_producer = self
-            .body
-            .subscribe(codomain_guard, body_consumer, Some(new_scope));
+        let body_producer =
+            self.body
+                .subscribe(codomain_guard, body_consumer, Some(Rc::new(new_scope)));
 
         // Set the body producer
         lambda_producer
@@ -1207,7 +1207,7 @@ impl Operator for Lambda {
         &mut self,
         intent_guard: Guard,
         consumer: Box<dyn Consumer>,
-        var_scope: Option<VarScope>,
+        var_scope: Option<Rc<VarScope>>,
     ) -> Box<dyn Producer> {
         // When subscribe is called without a binding, the variable is in scanning mode.
         // This happens when the lambda is used by an aggregation operator (e.g., sum).
@@ -1326,8 +1326,11 @@ mod tests {
 
         // Subscribe and verify it works
         let (consumer, notifications) = TestConsumer::new();
-        let mut producer =
-            var_ref.subscribe(Guard::universal(), Box::new(consumer), Some(var_scope));
+        let mut producer = var_ref.subscribe(
+            Guard::universal(),
+            Box::new(consumer),
+            Some(Rc::new(var_scope)),
+        );
 
         // Verify notification was received (flows: Literal → VarSub → VarRefSub → consumer)
         let notifications_borrowed = notifications.borrow();
@@ -1545,7 +1548,7 @@ mod tests {
         let mut producer = lambda.subscribe_with_binding(
             Guard::universal(),
             Box::new(consumer),
-            Some(parent_scope),
+            Some(Rc::new(parent_scope)),
             &mut binding_literal,
         );
 

@@ -155,13 +155,14 @@ fn lower_list_comp(
 }
 
 /// Lower a series of assignments followed by an expression
+#[allow(clippy::type_complexity)]
 pub fn lower_let_stmt_block(
     stmts: &[pyast::Stmt],
-) -> Result<(Box<dyn Operator>, Option<VarScope>), LoweringError> {
+) -> Result<(Box<dyn Operator>, Option<Rc<VarScope>>), LoweringError> {
     if stmts.is_empty() {
         return Err(LoweringError::Unsupported("Empty block".into()));
     }
-    let mut cur_scope: Option<VarScope> = None;
+    let mut cur_scope: Option<Rc<VarScope>> = None;
     for let_stmt in stmts[..stmts.len() - 1].iter() {
         let (targets, value) = match &let_stmt.node {
             pyast::StmtKind::Assign { targets, value, .. } => (targets, value),
@@ -172,7 +173,9 @@ pub fn lower_let_stmt_block(
                 )))
             }
         };
-        cur_scope = Some(lower_assign(cur_scope, targets, value)?);
+        // Wrap each scope in Rc once here; lower_assign and subscribe share it
+        // via cheap Rc clones rather than cloning the struct.
+        cur_scope = Some(Rc::new(lower_assign(cur_scope, targets, value)?));
     }
     // The last statement is the evaluated expression
     let result = &stmts[stmts.len() - 1];
@@ -188,8 +191,11 @@ pub fn lower_let_stmt_block(
     Ok((lower_expr(result_expr)?, cur_scope))
 }
 
+/// Lower a single assignment statement, producing a new VarScope that binds the
+/// target name.  Shares the parent scope via refcount between any `subscribe()`
+/// calls and the new scope.
 fn lower_assign(
-    parent_scope: Option<VarScope>,
+    parent_scope: Option<Rc<VarScope>>,
     targets: &[pyast::Expr],
     value: &pyast::Expr,
 ) -> Result<VarScope, LoweringError> {
@@ -220,7 +226,7 @@ fn lower_assign(
         .borrow_mut()
         .set_source(VarSource::Bound(binding_producer));
     Ok(VarScope::new_with_optional_parent(
-        parent_scope.map(Rc::new),
+        parent_scope,
         name,
         var_subscription,
     ))
@@ -260,7 +266,7 @@ mod tests {
 
     /// Helper to evaluate an operator and get the result value.
     /// Creates a consumer, subscribes, and calls get().
-    fn eval_operator_with_scope(mut op: Box<dyn Operator>, scope: Option<VarScope>) -> Value {
+    fn eval_operator_with_scope(mut op: Box<dyn Operator>, scope: Option<Rc<VarScope>>) -> Value {
         // Track notifications
         let notified = Rc::new(RefCell::new(false));
         let notified_clone = notified.clone();
