@@ -2,7 +2,10 @@
 # Use `set -x` so it's easy to pull out the failing commands.
 set -euxo pipefail
 
-ci_fmt() { cargo fmt --check; }
+ci_fmt() {
+  if (( fix )); then cargo fmt; fi
+  cargo fmt --check
+}
 # --all-targets lints test code too and warms the cache for cargo test
 ci_clippy() { cargo clippy --all-targets -- -D warnings; }
 ci_test() { cargo test; }
@@ -25,5 +28,12 @@ ci_all() {
   exit "${failed}"
 }
 
-cmd="${1:-all}"
+fix=0
+cmd="all"
+for arg in "$@"; do
+  case "${arg}" in
+    --fix) fix=1 ;;
+    *) cmd="${arg}" ;;
+  esac
+done
 "ci_${cmd}"

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 cargo build      # Build the project
-ci.sh            # Runs complete CI suite (tests, lints, etc)
+ci.sh --fix      # Runs complete CI suite, auto-formatting first
 cargo test       # Run all tests
 cargo test <name>  # Run a specific test by name
 ```
