@@ -8,8 +8,8 @@ use std::rc::Rc;
 use rustpython_parser::ast as pyast;
 
 use crate::interpreter::{
-    BaseType, Extent, FuncBinding, Guard, Literal, Operator, Value, Var, VarRef, VarScope,
-    VarSource,
+    BaseType, BinOp, BinOpKind, Extent, FuncBinding, Guard, Literal, Operator, Value, Var, VarRef,
+    VarScope, VarSource,
 };
 
 /// Errors that can occur during lowering.
@@ -74,14 +74,25 @@ fn lower_name(id: &str) -> Result<Box<dyn Operator>, LoweringError> {
 
 /// Lower a binary operation.
 fn lower_binop(
-    _left: &pyast::Located<pyast::ExprKind>,
-    _op: &pyast::Operator,
-    _right: &pyast::Located<pyast::ExprKind>,
+    left: &pyast::Located<pyast::ExprKind>,
+    op: &pyast::Operator,
+    right: &pyast::Located<pyast::ExprKind>,
 ) -> Result<Box<dyn Operator>, LoweringError> {
-    // TODO: Implement BinOp operator in interpreter.rs first
-    Err(LoweringError::Unsupported(
-        "BinOp not yet implemented".into(),
-    ))
+    let left_op = lower_expr(left)?;
+    let right_op = lower_expr(right)?;
+    let kind = match op {
+        pyast::Operator::Add => BinOpKind::Add,
+        pyast::Operator::Sub => BinOpKind::Sub,
+        pyast::Operator::Mult => BinOpKind::Mul,
+        pyast::Operator::FloorDiv => BinOpKind::FloorDiv,
+        _ => {
+            return Err(LoweringError::Unsupported(format!(
+                "Binary operator not yet supported: {:?}",
+                op
+            )))
+        }
+    };
+    Ok(Box::new(BinOp::new(left_op, kind, right_op)))
 }
 
 /// Lower a list literal to a Literal operator with Function value.
@@ -322,7 +333,6 @@ mod tests {
     // ========================================================================
 
     #[test]
-    #[ignore] // TODO: Implement BinOp operator
     fn test_lower_binop_add() {
         let ast = parse_expr("2 + 3");
         let op = lower_expr(&ast).expect("Failed to lower");
@@ -331,12 +341,53 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Implement BinOp operator
     fn test_lower_binop_mul() {
         let ast = parse_expr("4 * 5");
         let op = lower_expr(&ast).expect("Failed to lower");
         let value = eval_operator(op);
         assert_eq!(value, Value::Int(20));
+    }
+
+    #[test]
+    fn test_lower_binop_sub() {
+        let ast = parse_expr("4 - 5");
+        let op = lower_expr(&ast).expect("Failed to lower");
+        let value = eval_operator(op);
+        assert_eq!(value, Value::Int(-1));
+    }
+
+    #[test]
+    fn test_lower_binop_mixed() {
+        let ast = parse_expr("1 + 2 - 3 * 4");
+        let op = lower_expr(&ast).expect("Failed to lower");
+        let value = eval_operator(op);
+        assert_eq!(value, Value::Int(-9));
+    }
+
+    #[test]
+    fn test_lower_binop_op_precedence() {
+        // Op precedence is handled by the parser.
+        let ast = parse_expr("1 + 2 * 3 - 4");
+        let op = lower_expr(&ast).expect("Failed to lower");
+        let value = eval_operator(op);
+        assert_eq!(value, Value::Int(3));
+    }
+
+    #[test]
+    fn test_lower_binop_parens() {
+        // Parens are handled by the parser.
+        let ast = parse_expr("1 + 2 * (3 - 4)");
+        let op = lower_expr(&ast).expect("Failed to lower");
+        let value = eval_operator(op);
+        assert_eq!(value, Value::Int(-1));
+    }
+
+    #[test]
+    fn test_lower_binop_floordiv() {
+        let ast = parse_expr("7 // 2");
+        let op = lower_expr(&ast).expect("Failed to lower");
+        let value = eval_operator(op);
+        assert_eq!(value, Value::Int(3));
     }
 
     // ========================================================================
