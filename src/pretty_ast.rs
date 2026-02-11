@@ -45,7 +45,13 @@ impl AstFormatter for ast::Mod {
 
 impl AstFormatter for ast::Stmt {
     fn format(&self, f: &mut fmt::Formatter<'_>, indent: &str) -> fmt::Result {
-        fmt_stmt(f, self, indent)
+        fmt_stmtkind(f, &self.node, indent)
+    }
+}
+
+impl AstFormatter for StmtKind {
+    fn format(&self, f: &mut fmt::Formatter<'_>, indent: &str) -> fmt::Result {
+        fmt_stmtkind(f, self, indent)
     }
 }
 
@@ -94,17 +100,21 @@ fn fmt_mod(f: &mut fmt::Formatter<'_>, m: &ast::Mod, prefix: &str) -> fmt::Resul
     }
 }
 
+fn fmt_stmt(f: &mut fmt::Formatter<'_>, s: &ast::Stmt, prefix: &str) -> fmt::Result {
+    fmt_stmtkind(f, &s.node, prefix)
+}
+
 /// Format a statement node.  Writes the label (no prefix) then children
 /// indented under `prefix`.
-fn fmt_stmt(f: &mut fmt::Formatter<'_>, s: &ast::Stmt, prefix: &str) -> fmt::Result {
-    match &s.node {
+fn fmt_stmtkind(f: &mut fmt::Formatter<'_>, node: &StmtKind, prefix: &str) -> fmt::Result {
+    match node {
         StmtKind::FunctionDef {
             name, args, body, ..
         }
         | StmtKind::AsyncFunctionDef {
             name, args, body, ..
         } => {
-            let prefix_str = if matches!(s.node, StmtKind::AsyncFunctionDef { .. }) {
+            let prefix_str = if matches!(node, StmtKind::AsyncFunctionDef { .. }) {
                 "AsyncFunctionDef"
             } else {
                 "FunctionDef"
@@ -260,23 +270,21 @@ fn fmt_expr(f: &mut fmt::Formatter<'_>, e: &ast::Expr, prefix: &str) -> fmt::Res
         }
         ExprKind::ListComp { elt, generators } => {
             writeln!(f, "ListComp")?;
-            let total = 1 + generators.len();
-            fmt_child_expr(f, elt, prefix, total == 1)?;
+            fmt_child_expr(f, elt, prefix, generators.is_empty())?;
             for (i, comp) in generators.iter().enumerate() {
-                let is_last = i + 2 == total;
+                let is_last = i + 1 == generators.len();
                 let (connector, child_ext) = if is_last {
                     ("└── ", "    ")
                 } else {
                     ("├── ", "│   ")
                 };
-                let new_prefix = format!("{prefix}{child_ext}");
-                write!(f, "{prefix}{connector}for ")?;
-                fmt_expr_inline(f, &comp.target)?;
-                write!(f, " in ")?;
-                fmt_expr_inline(f, &comp.iter)?;
-                writeln!(f)?;
-                for cond in &comp.ifs {
-                    fmt_child_expr(f, cond, &new_prefix, false)?;
+                let gen_prefix = format!("{prefix}{child_ext}");
+                writeln!(f, "{prefix}{connector}for")?;
+                let has_ifs = !comp.ifs.is_empty();
+                fmt_child_expr(f, &comp.target, &gen_prefix, false)?;
+                fmt_child_expr(f, &comp.iter, &gen_prefix, !has_ifs)?;
+                for (j, cond) in comp.ifs.iter().enumerate() {
+                    fmt_child_expr(f, cond, &gen_prefix, j + 1 == comp.ifs.len())?;
                 }
             }
             Ok(())
@@ -319,31 +327,6 @@ fn fmt_expr(f: &mut fmt::Formatter<'_>, e: &ast::Expr, prefix: &str) -> fmt::Res
             let variant = dbg.split(['{', '(']).next().unwrap_or("?").trim();
             writeln!(f, "{variant}(?)")
         }
-    }
-}
-
-/// Render an expression on a single line (for inline use in comprehension headers).
-fn fmt_expr_inline(f: &mut fmt::Formatter<'_>, e: &ast::Expr) -> fmt::Result {
-    match &e.node {
-        ExprKind::Name { id, .. } => write!(f, "{id}"),
-        ExprKind::Constant { value, .. } => fmt_constant(f, value),
-        ExprKind::BinOp { left, op, right } => {
-            fmt_expr_inline(f, left)?;
-            write!(f, " {} ", operator_symbol(op))?;
-            fmt_expr_inline(f, right)
-        }
-        ExprKind::Call { func, args, .. } => {
-            fmt_expr_inline(f, func)?;
-            write!(f, "(")?;
-            for (i, a) in args.iter().enumerate() {
-                if i > 0 {
-                    write!(f, ", ")?;
-                }
-                fmt_expr_inline(f, a)?;
-            }
-            write!(f, ")")
-        }
-        _ => write!(f, "..."),
     }
 }
 
@@ -688,8 +671,59 @@ Lambda(x, y)
     fn list_comp() {
         let e = parse_expr("[x * 2 for x in items]");
         let output = pretty(&e);
-        assert!(output.starts_with("ListComp\n├── BinOp(*)\n"));
-        assert!(output.contains("for x in items"));
+        assert_eq!(
+            output,
+            "\
+ListComp
+├── BinOp(*)
+│   ├── Name(x)
+│   └── Constant(2)
+└── for
+    ├── Name(x)
+    └── Name(items)
+"
+        );
+    }
+
+    #[test]
+    fn list_comp_with_list_iter() {
+        let e = parse_expr("[1 + i for i in [1, 2, 3, 4]]");
+        let output = pretty(&e);
+        assert_eq!(
+            output,
+            "\
+ListComp
+├── BinOp(+)
+│   ├── Constant(1)
+│   └── Name(i)
+└── for
+    ├── Name(i)
+    └── List[4]
+        ├── Constant(1)
+        ├── Constant(2)
+        ├── Constant(3)
+        └── Constant(4)
+"
+        );
+    }
+
+    #[test]
+    fn list_comp_with_filter() {
+        let e = parse_expr("[x for x in items if x > 0]");
+        let output = pretty(&e);
+        assert_eq!(
+            output,
+            "\
+ListComp
+├── Name(x)
+└── for
+    ├── Name(x)
+    ├── Name(items)
+    └── Compare(>)
+        ├── Name(x)
+        └── Constant(0)
+"
+        );
     }
 
     #[test]
