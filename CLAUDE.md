@@ -2,20 +2,32 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Build Commands
-
-```bash
-cargo build      # Build the project
-ci.sh --fix      # Runs complete CI suite, auto-formatting first
-cargo test       # Run all tests
-cargo test <name>  # Run a specific test by name
-```
-
 ## Project Overview
 
 Cambra is a programming language implementing a new paradigm that abstracts over memory, threads, and connections. Programs use Python-like syntax with for-comprehensions, which lowers to CCL (Cambra Core Language) for type-checking and interpretation.
 
 The interpreter uses **dataflow semantics** with a producer/consumer protocol instead of term-wise beta reduction. This enables streaming execution with pipelining, parallelization, and vectorization.
+
+## Build Commands
+
+```bash
+cargo fmt        # Run formatter
+cargo build      # Build the project
+cargo clippy --all-targets -- -D warnings # Run linter (part of the ci script)
+ci.sh --fix      # Runs complete CI suite, auto-formatting first
+cargo test       # Run all tests
+cargo test <name>  # Run a specific test by name
+```
+
+## General Instructions
+
+When planning or implementing changes, prefer asking a user clarifying questions as necessary rather than making assumptions.
+
+Comment all objects (modules, structures and their fields, functions, etc) thoroughly, but concisely, in accordance with rustdoc best practices. For internal comments (for example, inside functions), strongly prefer commenting the _why_ of things, only commenting _what_ if the code is confusing and cannot be reasonably simplified.
+
+After making changes, run the formatter before running code; prefer running the linter after ensuring the project builds, then progress to CI.
+
+
 
 ## Architecture
 
@@ -74,3 +86,6 @@ When you are using compact, focus on test output and code changes.
 ## Git Conventions
 
 - Do not add "Co-Authored-By" lines attributing credit to AI models to commit messages.
+- When making changes, verify the freshness of the local repo by fetching and comparing the diff. The following commands do this, if there are differences, warn the user and ask the user whether they would like to pull or rebase.
+   1. `git fetch origin`
+   2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
