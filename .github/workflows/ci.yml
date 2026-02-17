@@ -57,6 +57,13 @@ jobs:
         if: steps.filter.outputs.code == 'true'
         run: ./ci.sh shellcheck
 
+      # Workaround: rustpython-parser v0.2.0's build script generates a source
+      # file (python.rs) outside target/. rust-cache restores compiled artifacts
+      # but not that generated file, so clippy/test fail with a missing include.
+      # Cleaning the package forces its build script to re-run every time.
+      - name: Clean rustpython-parser cache
+        run: cargo clean -p rustpython-parser 2>/dev/null || true
+
       - name: Format
         if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh fmt
