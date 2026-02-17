@@ -23,32 +23,28 @@ use std::rc::Rc;
 // Producer/Consumer Protocol
 // ============================================================================
 
-/// A Consumer receives notifications when data is ready.
-/// The consumer is notified by the producer with a yield guard indicating
-/// what region is ready and won't see further data.
+/// A Consumer receives notifications from a producer.
+/// Notifications are either progress updates (yield guards) or data availability signals.
 pub trait Consumer {
-    /// Notify the consumer that data is ready.
-    /// The `yield_guard` specifies a region that is ready and will not see
-    /// any further data.
-    // TODO: should we take Guard by ref?
-    fn notify(&mut self, yield_guard: Guard);
+    /// Notify the consumer of progress or data availability.
+    fn notify(&mut self, notification: Notification);
 }
 
 /// Blanket implementation: Rc<RefCell<C>> implements Consumer when C does.
 impl<C: Consumer> Consumer for Rc<RefCell<C>> {
-    fn notify(&mut self, yield_guard: Guard) {
-        self.borrow_mut().notify(yield_guard)
+    fn notify(&mut self, notification: Notification) {
+        self.borrow_mut().notify(notification)
     }
 }
 
-/// Blanket implementation: FnMut(Guard) implements Consumer.
+/// Blanket implementation: FnMut(Notification) implements Consumer.
 /// This allows closures to be used as consumers.
 impl<F> Consumer for F
 where
-    F: FnMut(Guard),
+    F: FnMut(Notification),
 {
-    fn notify(&mut self, yield_guard: Guard) {
-        self(yield_guard)
+    fn notify(&mut self, notification: Notification) {
+        self(notification)
     }
 }
 
@@ -56,11 +52,9 @@ where
 /// The producer is created by an operator's `subscribe` method and allows
 /// the consumer to retrieve data and release regions.
 pub trait Producer: Debug {
-    /// Get the data that is ready.
-    /// Returns a columnar representation of the values in the ready region.
-    /// The structure depends on the operator's type (records have fields,
-    /// functions are collections, etc.).
-    fn get(&mut self) -> ColumnValue;
+    /// Returns a `GetResult` containing the columnar data and the yield guard,
+    /// guaranteeing they are synchronized.
+    fn get(&mut self) -> GetResult;
 
     /// Release interest in a region.
     /// The `obsolete_guard` specifies a sub-region of the subscription that
@@ -72,7 +66,7 @@ pub trait Producer: Debug {
 
 /// Blanket implementation: Rc<RefCell<P>> implements Producer when P does.
 impl<P: Producer> Producer for Rc<RefCell<P>> {
-    fn get(&mut self) -> ColumnValue {
+    fn get(&mut self) -> GetResult {
         self.borrow_mut().get()
     }
 
@@ -122,14 +116,14 @@ pub(crate) mod test_helpers {
     /// even after the consumer is moved into subscribe.
     /// Uses Rc<RefCell<>> for single-threaded, lock-free shared state.
     pub struct TestConsumer {
-        notifications: Rc<RefCell<Vec<Guard>>>,
+        notifications: Rc<RefCell<Vec<Notification>>>,
     }
 
     impl TestConsumer {
         /// Create a new TestConsumer and return both the consumer and the shared notifications Vec.
         /// The consumer can be moved into subscribe, while the notifications Vec allows
         /// reading notifications from outside.
-        pub fn new() -> (Self, Rc<RefCell<Vec<Guard>>>) {
+        pub fn new() -> (Self, Rc<RefCell<Vec<Notification>>>) {
             let notifications = Rc::new(RefCell::new(Vec::new()));
             (
                 TestConsumer {
@@ -141,9 +135,8 @@ pub(crate) mod test_helpers {
     }
 
     impl Consumer for TestConsumer {
-        fn notify(&mut self, yield_guard: Guard) {
-            // Push the notification to the shared Vec
-            self.notifications.borrow_mut().push(yield_guard);
+        fn notify(&mut self, notification: Notification) {
+            self.notifications.borrow_mut().push(notification);
         }
     }
 }

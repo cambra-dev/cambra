@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{
-    ColumnValue, Consumer, Extent, FuncBinding, Guard, Operator, Producer, Value, Var, VarScope,
-    VarSource, VarSub,
+    ColumnValue, Consumer, Extent, FuncBinding, GetResult, Guard, Notification, Operator, Producer,
+    Value, Var, VarScope, VarSource, VarSub,
 };
 
 /// A Lambda operator represents a lambda expression.
@@ -70,33 +70,17 @@ impl LambdaProducer {
     fn set_body_producer(&mut self, producer: Box<dyn Producer>) {
         self.body_producer = Some(producer);
     }
-
-    /// Check if both variable and body have yielded data, and notify downstream if so.
-    fn check_and_notify(&mut self) {
-        // Both guards must be non-empty for us to have data
-        if !self.variable_yield_guard.is_empty() && !self.body_yield_guard.is_empty() {
-            // Combine the yield guards into a function guard
-            let combined_yield_guard = Guard::from_independent_function_parts(
-                self.variable_yield_guard.clone(),
-                self.body_yield_guard.clone(),
-            );
-
-            let restricted_guard = combined_yield_guard.intersect(self.intent_guard.clone());
-
-            self.downstream_consumer.notify(restricted_guard);
-        }
-    }
 }
 
 impl Producer for LambdaProducer {
     /// Get the function bindings by combining domain values from the variable
     /// and codomain values from the body.
-    fn get(&mut self) -> ColumnValue {
+    fn get(&mut self) -> GetResult {
         // Get domain values from variable
-        let domain_column = self.variable_subscription.borrow_mut().get();
+        let domain_result = self.variable_subscription.borrow_mut().get();
 
         // Get codomain values from body (columnar)
-        let codomain_column = self
+        let codomain_result = self
             .body_producer
             .as_mut()
             .expect("body_producer should be set before get()")
@@ -105,21 +89,30 @@ impl Producer for LambdaProducer {
         // Combine domain and codomain into function bindings
         // The domain and codomain columns should be aligned (same length)
         // Each pair (domain[i], codomain[i]) forms a binding
-        let bindings: Vec<FuncBinding> = domain_column
+        let bindings: Vec<FuncBinding> = domain_result
+            .column_value
             .values
             .iter()
-            .zip(codomain_column.values.iter())
+            .zip(codomain_result.column_value.values.iter())
             .map(|(input, output)| FuncBinding {
                 input: input.clone(),
                 output: output.clone(),
             })
             .collect();
 
-        // Return as a single Function value containing all bindings
-        // The parent_indices from the domain column are preserved for alignment
-        ColumnValue {
-            values: vec![Value::Function(bindings)],
-            parent_indices: domain_column.parent_indices,
+        // Combine domain and codomain yield guards into a function guard
+        let combined_yield_guard = Guard::from_independent_function_parts(
+            domain_result.yield_guard,
+            codomain_result.yield_guard,
+        );
+
+        GetResult {
+            column_value: ColumnValue {
+                values: vec![Value::Function(bindings)],
+                // TODO: calculate correct parent indices when results escape a lambda.
+                parent_indices: domain_result.column_value.parent_indices,
+            },
+            yield_guard: combined_yield_guard.intersect(self.intent_guard.clone()),
         }
     }
 
@@ -227,10 +220,21 @@ impl Lambda {
         // Create the variable consumer closure that captures LambdaProducer
         // This is added to VarSub's consumers so it gets notified when the variable is ready
         let lambda_producer_for_var = lambda_producer.clone();
-        let variable_consumer: Box<dyn Consumer> = Box::new(move |yield_guard: Guard| {
+        let variable_consumer: Box<dyn Consumer> = Box::new(move |notification: Notification| {
             let mut producer = lambda_producer_for_var.borrow_mut();
-            producer.variable_yield_guard = yield_guard;
-            producer.check_and_notify();
+            match notification {
+                Notification::Yield(guard) => {
+                    producer.variable_yield_guard = guard.clone();
+                    let new_guard = Guard::from_independent_function_parts(
+                        guard,
+                        producer.body_yield_guard.clone(),
+                    );
+                    producer
+                        .downstream_consumer
+                        .notify(Notification::Yield(new_guard));
+                }
+                Notification::NewData => producer.downstream_consumer.notify(Notification::NewData),
+            }
         });
 
         // Add the consumer to the variable subscription
@@ -249,10 +253,23 @@ impl Lambda {
 
         // Create closure for body notifications: updates body_yield_guard and checks if ready
         let lambda_producer_for_body = lambda_producer.clone();
-        let body_consumer: Box<dyn Consumer> = Box::new(move |yield_guard: Guard| {
+        let body_consumer: Box<dyn Consumer> = Box::new(move |notification: Notification| {
             let mut producer = lambda_producer_for_body.borrow_mut();
-            producer.body_yield_guard = yield_guard;
-            producer.check_and_notify();
+            match notification {
+                Notification::Yield(guard) => {
+                    producer.body_yield_guard = guard.clone();
+                    let new_guard = Guard::from_independent_function_parts(
+                        producer.variable_yield_guard.clone(),
+                        guard,
+                    );
+                    producer
+                        .downstream_consumer
+                        .notify(Notification::Yield(new_guard));
+                }
+                // Lambda ignores new data on the body side, it only takes action when new data is
+                // available on the variable.
+                Notification::NewData => {} // noop
+            }
         });
 
         // Subscribe to the body with the closure as consumer
@@ -307,7 +324,7 @@ mod tests {
                 assert_eq!(domain.as_ref(), &Extent::Base(BaseType::Int));
                 assert_eq!(codomain.as_ref(), &Extent::Base(BaseType::Int));
             }
-            _ => panic!("Expected function extent, got {:?}", extent),
+            _ => panic!("Expected function extent, got {extent:?}"),
         }
     }
 
@@ -338,15 +355,18 @@ mod tests {
         );
 
         // Get the function bindings (as a single-element column containing a Function value)
-        let column = producer.get();
-        assert_eq!(column.values.len(), 1);
-        match &column.values[0] {
+        let result = producer.get();
+        assert_eq!(result.column_value.values.len(), 1);
+        match &result.column_value.values[0] {
             Value::Function(bindings) => {
                 assert_eq!(bindings.len(), 1);
                 assert_eq!(bindings[0].input, Value::Int(42));
                 assert_eq!(bindings[0].output, Value::Int(42));
             }
-            _ => panic!("Expected Function value, got {:?}", column.values[0]),
+            _ => panic!(
+                "Expected Function value, got {:?}",
+                result.column_value.values[0]
+            ),
         }
     }
 
@@ -377,9 +397,9 @@ mod tests {
         );
 
         // Get the function bindings (as a single-element column containing a Function value)
-        let column = producer.get();
-        assert_eq!(column.values.len(), 1);
-        match &column.values[0] {
+        let result = producer.get();
+        assert_eq!(result.column_value.values.len(), 1);
+        match &result.column_value.values[0] {
             Value::Function(bindings) => {
                 assert_eq!(bindings.len(), 1);
                 // Input is from binding (literal 0)
@@ -387,7 +407,10 @@ mod tests {
                 // Output is from body (literal 10)
                 assert_eq!(bindings[0].output, Value::Int(10));
             }
-            _ => panic!("Expected Function value, got {:?}", column.values[0]),
+            _ => panic!(
+                "Expected Function value, got {:?}",
+                result.column_value.values[0]
+            ),
         }
     }
 
@@ -454,9 +477,9 @@ mod tests {
         );
 
         // Get should work
-        let column = producer.get();
-        assert_eq!(column.values.len(), 1);
-        match &column.values[0] {
+        let result = producer.get();
+        assert_eq!(result.column_value.values.len(), 1);
+        match &result.column_value.values[0] {
             Value::Function(bindings) => {
                 assert!(!bindings.is_empty());
             }
@@ -499,9 +522,9 @@ mod tests {
         );
 
         // Get the value - should use lambda's variable (100), not parent's (200)
-        let column = producer.get();
-        assert_eq!(column.values.len(), 1);
-        match &column.values[0] {
+        let result = producer.get();
+        assert_eq!(result.column_value.values.len(), 1);
+        match &result.column_value.values[0] {
             Value::Function(bindings) => {
                 assert_eq!(bindings.len(), 1);
                 // The input should be from the lambda's variable binding
@@ -541,10 +564,9 @@ mod tests {
             notifications_borrowed.len()
         );
 
-        // The notification should be a function guard (or restricted version)
+        // The notification should be NewData
         let last_notification = notifications_borrowed.last().unwrap();
-        // It should not be empty
-        assert!(!last_notification.is_empty());
+        assert!(matches!(last_notification, Notification::NewData));
     }
 
     #[test]

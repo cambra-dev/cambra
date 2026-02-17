@@ -8,7 +8,7 @@ pub fn parse_python_code(code: &str) -> Result<ast::Mod, String> {
     let parse_result = parser::parse(code, parser::Mode::Module, "<string>");
     match parse_result {
         Ok(module) => Ok(module),
-        Err(err) => Err(format!("Parse error: {}", err)),
+        Err(err) => Err(format!("Parse error: {err}")),
     }
 }
 
@@ -28,19 +28,18 @@ mod tests {
         let result = parse_python_code(code);
         assert!(
             result.is_ok(),
-            "Failed to parse basic Python code: {:?}",
-            result
+            "Failed to parse basic Python code: {result:?}"
         );
 
         let ast = result.unwrap();
-        println!("{:#?}", ast);
+        println!("{ast:#?}");
         match ast {
             ast::Mod::Module { body, .. } => {
                 assert!(!body.is_empty(), "AST should not be empty");
                 // Check that we have the expected number of statements
                 assert_eq!(body.len(), 2, "Expected 2 statements, got {}", body.len());
             }
-            _ => panic!("Expected module, got {:?}", ast),
+            _ => panic!("Expected module, got {ast:?}"),
         }
     }
 
@@ -56,8 +55,7 @@ mod tests {
         let result = parse_python_code(code);
         assert!(
             result.is_ok(),
-            "Failed to parse basic Python code: {:?}",
-            result
+            "Failed to parse basic Python code: {result:?}"
         );
 
         let ast = result.unwrap();
@@ -67,7 +65,7 @@ mod tests {
                 // Check that we have the expected number of statements
                 assert_eq!(body.len(), 4, "Expected 4 statements, got {}", body.len());
             }
-            _ => panic!("Expected module, got {:?}", ast),
+            _ => panic!("Expected module, got {ast:?}"),
         }
     }
 
@@ -83,8 +81,7 @@ mod tests {
         let result = parse_python_code(code);
         assert!(
             result.is_ok(),
-            "Failed to parse function definition: {:?}",
-            result
+            "Failed to parse function definition: {result:?}"
         );
 
         let ast = result.unwrap();
@@ -92,7 +89,7 @@ mod tests {
             ast::Mod::Module { body, .. } => {
                 assert_eq!(body.len(), 2, "Expected 2 statements, got {}", body.len());
             }
-            _ => panic!("Expected module, got {:?}", ast),
+            _ => panic!("Expected module, got {ast:?}"),
         }
     }
 
@@ -110,8 +107,7 @@ mod tests {
         let result = parse_python_code(code);
         assert!(
             result.is_ok(),
-            "Failed to parse conditional statement: {:?}",
-            result
+            "Failed to parse conditional statement: {result:?}"
         );
 
         let ast = result.unwrap();
@@ -119,7 +115,7 @@ mod tests {
             ast::Mod::Module { body, .. } => {
                 assert_eq!(body.len(), 1, "Expected 1 statement, got {}", body.len());
             }
-            _ => panic!("Expected module, got {:?}", ast),
+            _ => panic!("Expected module, got {ast:?}"),
         }
     }
 

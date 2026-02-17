@@ -3,7 +3,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{BaseType, ColumnValue, Consumer, Extent, Guard, Operator, Producer};
+use super::{
+    BaseType, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer,
+};
 
 /// A variable subscription paired with the chain of scanning variables between
 /// the current scope and the found variable, used for alignment composition.
@@ -167,6 +169,8 @@ pub struct VarSub {
     /// The current yield guard (monotonically growing)
     /// The contract of `notify` guarantees that guards are monotonically growing.
     yield_guard: Guard,
+    /// Whether data is available from the source (set on NewData notification)
+    data_available: bool,
     /// All consumers that have subscribed to this variable
     consumers: Vec<Box<dyn Consumer>>,
     /// The stored release guard for use by variable references
@@ -178,6 +182,7 @@ impl std::fmt::Debug for VarSub {
         f.debug_struct("VarSub")
             .field("source", &self.source)
             .field("yield_guard", &self.yield_guard)
+            .field("data_available", &self.data_available)
             .field(
                 "consumers",
                 &format_args!("<{} consumers>", self.consumers.len()),
@@ -193,18 +198,28 @@ impl VarSub {
         VarSub {
             source,
             yield_guard: Guard::Empty,
+            data_available: false,
             consumers: Vec::new(),
             stored_release_guard: Guard::Empty,
         }
     }
 
-    /// Add a consumer to be notified when yield guards arrive.
-    /// If there's already a yield guard (data is ready), notify the new consumer immediately.
+    /// Add a consumer and catch it up to the current state.
     pub fn add_consumer(&mut self, mut consumer: Box<dyn Consumer>) {
-        // If data is already ready, notify the new consumer immediately
-        if !self.yield_guard.is_empty() {
-            consumer.notify(self.yield_guard.clone());
+        // This fires when the binding operator completed synchronously
+        // during subscribe() (e.g., Literal). At subscribe time, no
+        // releases have happened, so data_available is trustworthy.
+        if self.data_available {
+            // Prioritize NewData since get() returns the authoritative
+            // guard, so the consumer gets both data and progress in one call.
+            consumer.notify(Notification::NewData);
+        } else if !self.yield_guard.is_empty() {
+            consumer.notify(Notification::Yield(self.yield_guard.clone()));
         }
+        debug_assert!(
+            self.stored_release_guard.is_empty(),
+            "add_consumer called after releases have occurred"
+        );
         self.consumers.push(consumer);
     }
 
@@ -240,7 +255,7 @@ impl VarSub {
 }
 
 impl Producer for VarSub {
-    fn get(&mut self) -> ColumnValue {
+    fn get(&mut self) -> GetResult {
         match &mut self.source {
             VarSource::Uninitialized => {
                 panic!("VarSub::get() called while source is Uninitialized")
@@ -252,13 +267,17 @@ impl Producer for VarSub {
             } => {
                 // TODO: Implement actual scanning over extent
                 // For now, return a placeholder based on extent type
-                match extent {
+                let data = match extent {
                     Extent::Base(BaseType::Int) => {
                         // Placeholder: return empty column for now
                         // Real implementation would scan the extent
                         ColumnValue::from_values(vec![])
                     }
                     _ => ColumnValue::from_values(vec![]),
+                };
+                GetResult {
+                    column_value: data,
+                    yield_guard: self.yield_guard.clone(),
                 }
             }
         }
@@ -283,14 +302,18 @@ impl Producer for VarSub {
 }
 
 impl Consumer for VarSub {
-    /// Notify this subscription of a yield guard (called by definition).
-    fn notify(&mut self, yield_guard: Guard) {
-        self.yield_guard = yield_guard.clone();
-
+    fn notify(&mut self, notification: Notification) {
+        match &notification {
+            Notification::Yield(guard) => {
+                self.yield_guard = guard.clone();
+            }
+            Notification::NewData => {
+                self.data_available = true;
+            }
+        }
         // Forward to all consumers
-        let yield_guard = self.get_yield_guard();
         for consumer in self.consumers.iter_mut() {
-            consumer.notify(yield_guard.clone());
+            consumer.notify(notification.clone());
         }
     }
 }
@@ -377,10 +400,16 @@ impl std::fmt::Debug for VarRefSub {
 }
 
 impl Consumer for VarRefSub {
-    /// Notify this subscription of a yield guard from the variable.
-    fn notify(&mut self, yield_guard: Guard) {
-        let restricted_guard = yield_guard.intersect(self.intent_guard.clone());
-        self.consumer.notify(restricted_guard);
+    fn notify(&mut self, notification: Notification) {
+        match notification {
+            Notification::Yield(guard) => {
+                let restricted = guard.intersect(self.intent_guard.clone());
+                self.consumer.notify(Notification::Yield(restricted));
+            }
+            Notification::NewData => {
+                self.consumer.notify(Notification::NewData);
+            }
+        }
     }
 }
 
@@ -391,15 +420,15 @@ pub fn compose_indices(outer: &[usize], inner: &[usize]) -> Vec<usize> {
 }
 
 impl Producer for VarRefSub {
-    fn get(&mut self) -> ColumnValue {
+    fn get(&mut self) -> GetResult {
         // Get data from variable subscription
-        let column = self.variable_subscription.borrow_mut().get();
+        let var_result = self.variable_subscription.borrow_mut().get();
 
         // TODO: Filter data based on intent guard
 
         // If no scan chain, no alignment needed
         if self.scan_chain.is_empty() {
-            return column;
+            return var_result;
         }
 
         // Compose parent_indices from innermost scan to outermost
@@ -407,8 +436,8 @@ impl Producer for VarRefSub {
         let mut composed_indices: Option<Vec<usize>> = None;
         for scan in self.scan_chain.iter().rev() {
             // Get this scan's parent_indices
-            let scan_column = scan.borrow_mut().get();
-            if let Some(parent_indices) = scan_column.parent_indices {
+            let scan_result = scan.borrow_mut().get();
+            if let Some(parent_indices) = scan_result.column_value.parent_indices {
                 composed_indices = Some(match composed_indices {
                     None => parent_indices,
                     Some(inner) => compose_indices(&parent_indices, &inner),
@@ -418,8 +447,11 @@ impl Producer for VarRefSub {
 
         // Expand column using composed indices
         match composed_indices {
-            Some(indices) => column.expand(&indices),
-            None => column,
+            Some(indices) => GetResult {
+                column_value: var_result.column_value.expand(&indices),
+                yield_guard: var_result.yield_guard,
+            },
+            None => var_result,
         }
     }
 
@@ -474,12 +506,12 @@ mod tests {
         // Verify notification was received (flows: Literal → VarSub → VarRefSub → consumer)
         let notifications_borrowed = notifications.borrow();
         assert_eq!(notifications_borrowed.len(), 1);
-        assert_eq!(notifications_borrowed[0], Guard::universal());
+        assert!(matches!(notifications_borrowed[0], Notification::NewData));
 
         // Verify get returns the value (as a single-element column)
-        let column = producer.get();
-        assert_eq!(column.values.len(), 1);
-        assert_eq!(column.values[0], Value::Int(42));
+        let result = producer.get();
+        assert_eq!(result.column_value.values.len(), 1);
+        assert_eq!(result.column_value.values[0], Value::Int(42));
 
         // Verify release returns stored release guard (initially empty)
         let released = producer.release(Guard::universal());

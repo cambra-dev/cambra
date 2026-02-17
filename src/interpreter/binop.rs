@@ -3,7 +3,10 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{ColumnValue, Consumer, Extent, Guard, Operator, Producer, Value, VarScope};
+use super::{
+    ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer, Value,
+    VarScope,
+};
 
 /// Kinds of binary arithmetic operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +27,7 @@ pub fn apply_binop(op: BinOpKind, left: &Value, right: &Value) -> Value {
         (BinOpKind::Sub, Value::Int(a), Value::Int(b)) => Value::Int(a - b),
         (BinOpKind::Mul, Value::Int(a), Value::Int(b)) => Value::Int(a * b),
         (BinOpKind::FloorDiv, Value::Int(a), Value::Int(b)) => Value::Int(a / b),
-        _ => panic!("Unsupported binop: {:?} on {:?} and {:?}", op, left, right),
+        _ => panic!("Unsupported binop: {op:?} on {left:?} and {right:?}"),
     }
 }
 
@@ -65,8 +68,7 @@ impl Operator for BinOp {
     ) -> Box<dyn Producer> {
         assert!(
             intent_guard.is_universal(),
-            "BinOp: expected Universal left yield guard, got {:?}",
-            intent_guard
+            "BinOp: expected Universal intent guard, got {intent_guard:?}"
         );
 
         let binop_producer = Rc::new(RefCell::new(BinOpProducer {
@@ -81,18 +83,48 @@ impl Operator for BinOp {
 
         // Create closure consumer for left operand
         let producer_for_left = binop_producer.clone();
-        let left_consumer: Box<dyn Consumer> = Box::new(move |yield_guard: Guard| {
+        let left_consumer: Box<dyn Consumer> = Box::new(move |notification: Notification| {
             let mut producer = producer_for_left.borrow_mut();
-            producer.left_yield_guard = yield_guard;
-            producer.check_and_notify();
+            match notification {
+                Notification::Yield(guard) => {
+                    if guard != producer.left_yield_guard {
+                        producer.left_yield_guard = guard.clone();
+                        if guard.is_universal() && producer.right_yield_guard.is_universal() {
+                            producer
+                                .downstream_consumer
+                                .notify(Notification::Yield(Guard::Universal));
+                        }
+                    }
+                }
+                // Send NewData when either operand has data,
+                // because data-downstream consumers may be able to operate with data from a single side.
+                Notification::NewData => {
+                    producer.downstream_consumer.notify(Notification::NewData);
+                }
+            }
         });
 
         // Create closure consumer for right operand
         let producer_for_right = binop_producer.clone();
-        let right_consumer: Box<dyn Consumer> = Box::new(move |yield_guard: Guard| {
+        let right_consumer: Box<dyn Consumer> = Box::new(move |notification: Notification| {
             let mut producer = producer_for_right.borrow_mut();
-            producer.right_yield_guard = yield_guard;
-            producer.check_and_notify();
+            match notification {
+                Notification::Yield(guard) => {
+                    if guard != producer.right_yield_guard {
+                        producer.right_yield_guard = guard.clone();
+                        if guard.is_universal() && producer.left_yield_guard.is_universal() {
+                            producer
+                                .downstream_consumer
+                                .notify(Notification::Yield(Guard::Universal));
+                        }
+                    }
+                }
+                // Send NewData when either operand has data,
+                // because data-downstream consumers may be able to operate with data from a single side.
+                Notification::NewData => {
+                    producer.downstream_consumer.notify(Notification::NewData);
+                }
+            }
         });
 
         // Subscribe left operand (clone var_scope for left, move original to right)
@@ -140,60 +172,52 @@ impl std::fmt::Debug for BinOpProducer {
     }
 }
 
-impl BinOpProducer {
-    /// When both operands have yielded, notify downstream.
-    fn check_and_notify(&mut self) {
-        if !self.left_yield_guard.is_empty() && !self.right_yield_guard.is_empty() {
-            // For base-type pointwise operations, both operands being ready
-            // means the output is fully determined. Assert guards are Universal
-            // since we only support constant expressions currently.
-            assert!(
-                self.left_yield_guard.is_universal(),
-                "BinOp: expected Universal left yield guard, got {:?}",
-                self.left_yield_guard
-            );
-            assert!(
-                self.right_yield_guard.is_universal(),
-                "BinOp: expected Universal right yield guard, got {:?}",
-                self.right_yield_guard
-            );
-            self.downstream_consumer.notify(self.intent_guard.clone());
-        }
-    }
-}
-
 impl Producer for BinOpProducer {
-    fn get(&mut self) -> ColumnValue {
-        let left_col = self
+    fn get(&mut self) -> GetResult {
+        let left_result = self
             .left_producer
             .as_mut()
             .expect("left_producer should be set before get()")
             .get();
-        let right_col = self
+        let right_result = self
             .right_producer
             .as_mut()
             .expect("right_producer should be set before get()")
             .get();
 
         // Zip and apply binop element-wise
-        let values: Vec<Value> = left_col
+        let values: Vec<Value> = left_result
+            .column_value
             .values
             .iter()
-            .zip(right_col.values.iter())
+            .zip(right_result.column_value.values.iter())
             .map(|(l, r)| apply_binop(self.op, l, r))
             .collect();
 
-        ColumnValue {
-            values,
-            parent_indices: left_col.parent_indices,
+        GetResult {
+            column_value: ColumnValue {
+                values,
+                // TODO: this is wrong, need to figure out the precedence.
+                parent_indices: left_result.column_value.parent_indices,
+            },
+            // BinOp would need to transform sub-producer guards through the
+            // operation to produce a correct output guard. We don't have that
+            // representation yet, so use the same simplification as subscribe():
+            // Universal if both sides are Universal, otherwise Empty.
+            yield_guard: if left_result.yield_guard.is_universal()
+                && right_result.yield_guard.is_universal()
+            {
+                Guard::Universal
+            } else {
+                Guard::Empty
+            },
         }
     }
 
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         assert!(
             obsolete_guard.is_universal(),
-            "BinOp: expected Universal obsolete guard, got {:?}",
-            obsolete_guard
+            "BinOp: expected Universal obsolete guard, got {obsolete_guard:?}"
         );
         let left_expanded = self
             .left_producer
@@ -207,13 +231,11 @@ impl Producer for BinOpProducer {
             .release(obsolete_guard);
         assert!(
             left_expanded.is_universal(),
-            "BinOp: expected Universal left expanded obsolete, got {:?}",
-            left_expanded
+            "BinOp: expected Universal left expanded obsolete, got {left_expanded:?}"
         );
         assert!(
             right_expanded.is_universal(),
-            "BinOp: expected Universal right expanded obsolete, got {:?}",
-            right_expanded
+            "BinOp: expected Universal right expanded obsolete, got {right_expanded:?}"
         );
         Guard::Universal
     }
@@ -236,16 +258,17 @@ mod tests {
         let (consumer, notifications) = TestConsumer::new();
         let mut producer = binop.subscribe(Guard::universal(), Box::new(consumer), None);
 
-        // Should get exactly one notification when both operands are ready
+        // Each literal fires NewData independently, so we get two notifications
         let notifs = notifications.borrow();
-        assert_eq!(notifs.len(), 1);
-        assert!(!notifs[0].is_empty());
+        assert_eq!(notifs.len(), 2);
+        assert!(matches!(notifs[0], Notification::NewData));
+        assert!(matches!(notifs[1], Notification::NewData));
         drop(notifs);
 
-        let column = producer.get();
-        assert_eq!(column.values.len(), 1);
-        assert_eq!(column.values[0], Value::Int(5));
-        assert!(column.parent_indices.is_none());
+        let result = producer.get();
+        assert_eq!(result.column_value.values.len(), 1);
+        assert_eq!(result.column_value.values[0], Value::Int(5));
+        assert!(result.column_value.parent_indices.is_none());
     }
 
     #[test]
@@ -258,9 +281,9 @@ mod tests {
         let (consumer, _notifications) = TestConsumer::new();
         let mut producer = binop.subscribe(Guard::universal(), Box::new(consumer), None);
 
-        let column = producer.get();
-        assert_eq!(column.values.len(), 1);
-        assert_eq!(column.values[0], Value::Int(20));
+        let result = producer.get();
+        assert_eq!(result.column_value.values.len(), 1);
+        assert_eq!(result.column_value.values[0], Value::Int(20));
     }
 
     #[test]
@@ -273,9 +296,9 @@ mod tests {
         let (consumer, _notifications) = TestConsumer::new();
         let mut producer = binop.subscribe(Guard::universal(), Box::new(consumer), None);
 
-        let column = producer.get();
-        assert_eq!(column.values.len(), 1);
-        assert_eq!(column.values[0], Value::Int(7));
+        let result = producer.get();
+        assert_eq!(result.column_value.values.len(), 1);
+        assert_eq!(result.column_value.values[0], Value::Int(7));
     }
 
     #[test]

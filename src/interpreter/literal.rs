@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::{BaseType, ColumnValue, Consumer, Extent, Guard, Operator, Producer, Value, VarScope};
+use super::{
+    BaseType, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer,
+    Value, VarScope,
+};
 
 /// A literal operator represents a constant value.
 /// According to the design: Subscribe calls Notify on the consumer immediately.
@@ -63,7 +66,8 @@ impl Operator for Literal {
         mut consumer: Box<dyn Consumer>,
         _var_scope: Option<Rc<VarScope>>,
     ) -> Box<dyn Producer> {
-        consumer.notify(Guard::universal());
+        // Literal always has data immediately — notify NewData.
+        consumer.notify(Notification::NewData);
 
         Box::new(LiteralProducer {
             value: self.value.clone(),
@@ -77,8 +81,12 @@ struct LiteralProducer {
 }
 
 impl Producer for LiteralProducer {
-    fn get(&mut self) -> ColumnValue {
-        ColumnValue::single(self.value.clone())
+    fn get(&mut self) -> GetResult {
+        // Literal is always fully available, so yield_guard is Universal.
+        GetResult {
+            column_value: ColumnValue::single(self.value.clone()),
+            yield_guard: Guard::universal(),
+        }
     }
 
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
@@ -103,17 +111,17 @@ mod tests {
         let (consumer, notifications) = TestConsumer::new();
         let mut producer = literal.subscribe(Guard::universal(), Box::new(consumer), None);
 
-        // The consumer should have been notified immediately
-        // Now we can check the notification via the shared Vec
+        // The consumer should have been notified immediately with NewData
         let notifications_borrowed = notifications.borrow();
         assert_eq!(notifications_borrowed.len(), 1);
-        assert_eq!(notifications_borrowed[0], Guard::universal());
+        assert!(matches!(notifications_borrowed[0], Notification::NewData));
 
-        // Verify get returns the constant value (as a single-element column)
-        let column = producer.get();
-        assert_eq!(column.values.len(), 1);
-        assert_eq!(column.values[0], Value::Int(42));
-        assert!(column.parent_indices.is_none());
+        // Verify get returns the constant value and Universal yield guard
+        let result = producer.get();
+        assert_eq!(result.column_value.values.len(), 1);
+        assert_eq!(result.column_value.values[0], Value::Int(42));
+        assert!(result.column_value.parent_indices.is_none());
+        assert!(result.yield_guard.is_universal());
 
         // Verify release is a no-op
         let released = producer.release(Guard::universal());
@@ -132,10 +140,13 @@ mod tests {
         // Verify we received the notification
         let notifications_borrowed = notifications.borrow();
         assert_eq!(notifications_borrowed.len(), 1);
-        assert_eq!(notifications_borrowed[0], Guard::universal());
+        assert!(matches!(notifications_borrowed[0], Notification::NewData));
 
-        let column = producer.get();
-        assert_eq!(column.values.len(), 1);
-        assert_eq!(column.values[0], Value::String("hello".to_string()));
+        let result = producer.get();
+        assert_eq!(result.column_value.values.len(), 1);
+        assert_eq!(
+            result.column_value.values[0],
+            Value::String("hello".to_string())
+        );
     }
 }

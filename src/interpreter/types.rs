@@ -245,6 +245,29 @@ pub struct FuncBinding {
     pub output: Value,
 }
 
+/// Notification from a producer to a consumer, indicating the availability of new data,
+/// or progress in the absence of data.
+#[derive(Debug, Clone)]
+pub enum Notification {
+    /// A region has completed with no new data to retrieve.
+    /// The consumer should NOT call get() in response to this.
+    Yield(Guard),
+    /// New data is available. The consumer should call get() to retrieve it.
+    NewData,
+}
+
+/// Result of calling get() on a producer.
+///
+/// Conceptually a snapshot of a producer's current state — data and yield guard
+/// are returned together to guarantee they are synchronized.
+#[derive(Debug)]
+pub struct GetResult {
+    pub column_value: ColumnValue,
+    /// The yield guard covering all data retrieved so far, including the data in this result.
+    /// Monotonically growing across successive get() calls.
+    pub yield_guard: Guard,
+}
+
 /// A columnar value representation for vectorized execution.
 /// Contains a batch of values with optional alignment information.
 #[derive(Debug, Clone, PartialEq, Eq)]

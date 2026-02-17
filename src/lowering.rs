@@ -56,8 +56,7 @@ fn lower_constant(constant: &pyast::Constant) -> Result<Box<dyn Operator>, Lower
         pyast::Constant::None => Value::Unit,
         _ => {
             return Err(LoweringError::Unsupported(format!(
-                "Constant type not yet supported: {:?}",
-                constant
+                "Constant type not yet supported: {constant:?}"
             )))
         }
     };
@@ -87,8 +86,7 @@ fn lower_binop(
         pyast::Operator::FloorDiv => BinOpKind::FloorDiv,
         _ => {
             return Err(LoweringError::Unsupported(format!(
-                "Binary operator not yet supported: {:?}",
-                op
+                "Binary operator not yet supported: {op:?}"
             )))
         }
     };
@@ -137,8 +135,7 @@ fn constant_to_value(constant: &pyast::Constant) -> Result<Value, LoweringError>
         pyast::Constant::Bool(b) => Ok(Value::Bool(*b)),
         pyast::Constant::None => Ok(Value::Unit),
         _ => Err(LoweringError::Unsupported(format!(
-            "Constant type not yet supported: {:?}",
-            constant
+            "Constant type not yet supported: {constant:?}"
         ))),
     }
 }
@@ -250,7 +247,7 @@ fn lower_assign(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::{Consumer, Guard, Operator};
+    use crate::interpreter::{Consumer, Guard, Notification, Operator};
     use rustpython_parser::parser;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -261,7 +258,7 @@ mod tests {
             .expect("Failed to parse expression");
         match result {
             pyast::Mod::Expression { body } => *body,
-            _ => panic!("Expected expression, got {:?}", result),
+            _ => panic!("Expected expression, got {result:?}"),
         }
     }
 
@@ -271,7 +268,7 @@ mod tests {
             parser::parse(code, parser::Mode::Module, "<test>").expect("Failed to parse module");
         match result {
             pyast::Mod::Module { body, .. } => body,
-            _ => panic!("Expected module, got {:?}", result),
+            _ => panic!("Expected module, got {result:?}"),
         }
     }
 
@@ -282,7 +279,7 @@ mod tests {
         let notified = Rc::new(RefCell::new(false));
         let notified_clone = notified.clone();
 
-        let consumer: Box<dyn Consumer> = Box::new(move |_: Guard| {
+        let consumer: Box<dyn Consumer> = Box::new(move |_: Notification| {
             *notified_clone.borrow_mut() = true;
         });
 
@@ -291,9 +288,14 @@ mod tests {
         // For literals, we should be notified immediately
         assert!(*notified.borrow(), "Expected to be notified");
 
-        let column = producer.get();
-        assert_eq!(column.values.len(), 1, "Expected single value");
-        column.values[0].clone()
+        let result = producer.get();
+        assert_eq!(result.column_value.values.len(), 1, "Expected single value");
+        assert!(
+            result.yield_guard.is_universal(),
+            "Expected universal guard. Got: {:?}",
+            result.yield_guard
+        );
+        result.column_value.values[0].clone()
     }
 
     fn eval_operator(op: Box<dyn Operator>) -> Value {
@@ -457,7 +459,7 @@ mod tests {
                     }
                 );
             }
-            _ => panic!("Expected Function value, got {:?}", value),
+            _ => panic!("Expected Function value, got {value:?}"),
         }
     }
 
@@ -526,7 +528,7 @@ mod tests {
                     }
                 );
             }
-            _ => panic!("Expected Function value, got {:?}", value),
+            _ => panic!("Expected Function value, got {value:?}"),
         }
     }
 }
