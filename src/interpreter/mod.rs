@@ -103,6 +103,31 @@ pub trait Operator: Debug {
         consumer: Box<dyn Consumer>, // TODO: Should we make this a trait bound so we don't assume a Box pointer type?
         var_scope: Option<Rc<VarScope>>,
     ) -> Box<dyn Producer>;
+
+    /// Apply this Operator to a second Operator and return the result as a Producer.
+    /// This Operator must logically be a function, and the return producer will produce the output
+    /// of calling it on the input binding
+    ///
+    /// # Arguments
+    /// * `intent_guard` - The region of the operator's extent that the consumer
+    ///   is interested in
+    /// * `consumer` - The consumer that will receive notifications when data is ready
+    /// * `var_scope` - The variable scope for looking up variables, wrapped in Rc
+    ///   to match the internal parent representation and allow cheap sharing
+    ///   (e.g., Lambda stores the scope for child scope construction).
+    /// * `binding` = The argument to the function.
+    ///
+    /// # Returns
+    /// A producer that provides access to the data and allows releasing regions
+    fn subscribe_to_application(
+        &mut self,
+        _intent_guard: Guard,
+        _consumer: Box<dyn Consumer>,
+        _var_scope: Option<Rc<VarScope>>,
+        _binding: &mut dyn Operator,
+    ) -> Box<dyn Producer> {
+        panic!("Not appliable {:?}", self)
+    }
 }
 
 #[cfg(test)]

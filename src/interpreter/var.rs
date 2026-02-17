@@ -3,9 +3,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{
-    BaseType, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer,
-};
+use crate::interpreter::{GetResult, Notification, Value};
+
+use super::{BaseType, ColumnValue, Consumer, Extent, Guard, Operator, Producer};
 
 /// A variable subscription paired with the chain of scanning variables between
 /// the current scope and the found variable, used for alignment composition.
@@ -268,6 +268,9 @@ impl Producer for VarSub {
                 // TODO: Implement actual scanning over extent
                 // For now, return a placeholder based on extent type
                 let data = match extent {
+                    Extent::UIntRange { start, end } => ColumnValue::from_values(
+                        (*start as i64..*end as i64).map(Value::Int).collect(),
+                    ),
                     Extent::Base(BaseType::Int) => {
                         // Placeholder: return empty column for now
                         // Real implementation would scan the extent

@@ -145,7 +145,7 @@ impl Guard {
 
 /// An Extent represents the set of values a term can take on (its type).
 /// Each operator has an extent that corresponds exactly to its type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Extent {
     /// A base type (e.g., integer, string, boolean)
     Base(BaseType),
@@ -158,6 +158,32 @@ pub enum Extent {
     Record(HashMap<String, Extent>),
     /// A union type: one of several possible extents
     Union(Vec<Extent>),
+    // Right-open range of indices: [start, end)
+    UIntRange {
+        start: usize,
+        end: usize,
+    },
+}
+
+impl std::fmt::Debug for Extent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Extent::Base(base) => write!(f, "{:?}", base),
+            Extent::Function { domain, codomain } => write!(f, "({:?} -> {:?})", domain, codomain),
+            Extent::Record(fields) => {
+                let field_strs: Vec<String> = fields
+                    .iter()
+                    .map(|(name, extent)| format!("{}: {:?}", name, extent))
+                    .collect();
+                write!(f, "{{{}}}", field_strs.join(", "))
+            }
+            Extent::Union(extents) => {
+                let extent_strs: Vec<String> = extents.iter().map(|e| format!("{:?}", e)).collect();
+                write!(f, "({})", extent_strs.join(" | "))
+            }
+            Extent::UIntRange { start, end } => write!(f, "[{}, {})", start, end),
+        }
+    }
 }
 
 impl Extent {
@@ -226,7 +252,7 @@ pub enum BaseType {
 }
 
 /// Values in CCL
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Value {
     Int(i64),
     String(String),
@@ -236,6 +262,31 @@ pub enum Value {
     Function(Vec<FuncBinding>),
     /// A record value
     Record(HashMap<String, Value>),
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Int(i) => write!(f, "{}", i),
+            Value::String(s) => write!(f, "\"{}\"", s),
+            Value::Bool(b) => write!(f, "{}", b),
+            Value::Unit => write!(f, "()"),
+            Value::Function(bindings) => {
+                let binding_strs: Vec<String> = bindings
+                    .iter()
+                    .map(|b| format!("{:?} -> {:?}", b.input, b.output))
+                    .collect();
+                write!(f, "Function [ {} ]", binding_strs.join(", "))
+            }
+            Value::Record(fields) => {
+                let field_strs: Vec<String> = fields
+                    .iter()
+                    .map(|(name, val)| format!("{}: {:?}", name, val))
+                    .collect();
+                write!(f, "{{{}}}", field_strs.join(", "))
+            }
+        }
+    }
 }
 
 /// A function binding represents a single input-output pair for a function

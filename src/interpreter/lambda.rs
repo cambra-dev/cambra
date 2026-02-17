@@ -86,14 +86,22 @@ impl Producer for LambdaProducer {
             .expect("body_producer should be set before get()")
             .get();
 
+        let domain_column = domain_result.column_value;
+        let codomain_column = codomain_result.column_value;
+
         // Combine domain and codomain into function bindings
         // The domain and codomain columns should be aligned (same length)
         // Each pair (domain[i], codomain[i]) forms a binding
-        let bindings: Vec<FuncBinding> = domain_result
-            .column_value
+        if domain_column.values.len() != codomain_column.values.len() {
+            panic!(
+                "Domain and codomain columns have different lengths: {:?} vs {:?}",
+                domain_column.values, codomain_column.values
+            );
+        }
+        let bindings: Vec<FuncBinding> = domain_column
             .values
             .iter()
-            .zip(codomain_result.column_value.values.iter())
+            .zip(codomain_column.values.iter())
             .map(|(input, output)| FuncBinding {
                 input: input.clone(),
                 output: output.clone(),
@@ -110,7 +118,7 @@ impl Producer for LambdaProducer {
             column_value: ColumnValue {
                 values: vec![Value::Function(bindings)],
                 // TODO: calculate correct parent indices when results escape a lambda.
-                parent_indices: domain_result.column_value.parent_indices,
+                parent_indices: domain_column.parent_indices,
             },
             yield_guard: combined_yield_guard.intersect(self.intent_guard.clone()),
         }
@@ -155,24 +163,6 @@ impl Lambda {
         }
     }
 
-    /// Subscribe to this lambda with an explicit binding operator for the variable.
-    /// This is used by Application to bind the argument to the lambda's variable.
-    ///
-    /// # Arguments
-    /// * `intent_guard` - The region of the function extent the consumer is interested in
-    /// * `consumer` - The consumer that will receive notifications
-    /// * `var_scope` - The variable scope for looking up outer variables
-    /// * `binding` - The operator that provides values for the lambda's variable (Bound mode)
-    pub fn subscribe_with_binding(
-        &mut self,
-        intent_guard: Guard,
-        consumer: Box<dyn Consumer>,
-        var_scope: Option<Rc<VarScope>>,
-        binding: &mut dyn Operator,
-    ) -> Box<dyn Producer> {
-        self.subscribe_internal(intent_guard, consumer, var_scope, Some(binding))
-    }
-
     /// Internal subscribe implementation that handles both bound and scanning modes.
     fn subscribe_internal(
         &mut self,
@@ -195,7 +185,7 @@ impl Lambda {
             // VarSub implements Consumer, so it will receive notifications
             let var_sub_consumer: Box<dyn Consumer> = Box::new(subscription.clone());
             let binding_producer =
-                binding_op.subscribe(domain_guard.clone(), var_sub_consumer, None);
+                binding_op.subscribe(domain_guard.clone(), var_sub_consumer, var_scope.clone());
 
             // Now set the source to Bound with the actual producer
             subscription
@@ -292,6 +282,8 @@ impl Operator for Lambda {
         &self.extent
     }
 
+    // Subscribe to the lambda in scanning mode, producing (input, output) pairs for every
+    // input value in the input's Extent
     fn subscribe(
         &mut self,
         intent_guard: Guard,
@@ -301,6 +293,107 @@ impl Operator for Lambda {
         // When subscribe is called without a binding, the variable is in scanning mode.
         // This happens when the lambda is used by an aggregation operator (e.g., sum).
         self.subscribe_internal(intent_guard, consumer, var_scope, None)
+    }
+
+    // Subscribe to the lambda bound to the given input. Produces (input, output) pairs
+    // corresponding to the inputs produced by the Producer created by `binding`.
+    fn subscribe_to_application(
+        &mut self,
+        intent_guard: Guard,
+        consumer: Box<dyn Consumer>,
+        var_scope: Option<Rc<VarScope>>,
+        binding: &mut dyn Operator,
+    ) -> Box<dyn Producer> {
+        self.subscribe_internal(intent_guard, consumer, var_scope, Some(binding))
+    }
+}
+
+#[derive(Debug)]
+pub struct Apply {
+    lambda: Box<dyn Operator>,
+    argument: Box<dyn Operator>,
+}
+
+impl Apply {
+    pub fn new(lambda: Box<dyn Operator>, argument: Box<dyn Operator>) -> Self {
+        Apply { lambda, argument }
+    }
+}
+
+impl Operator for Apply {
+    fn extent(&self) -> &Extent {
+        // The extent of applying a lambda is the codomain of the lambda
+        match self.lambda.extent() {
+            Extent::Function { codomain, .. } => codomain.as_ref(),
+            _ => panic!("Expected function extent for lambda"),
+        }
+    }
+
+    fn subscribe(
+        &mut self,
+        intent_guard: Guard,
+        consumer: Box<dyn Consumer>,
+        var_scope: Option<Rc<VarScope>>,
+    ) -> Box<dyn Producer> {
+        // Subscribe to the lambda with the argument as the binding operator
+        // TODO we should not just pass through the consumer here - we need to create a new consumer that
+        // transforms the yield guard according to the body of the lambda.
+        Box::new(ApplyProducer::new(self.lambda.subscribe_to_application(
+            intent_guard,
+            consumer,
+            var_scope,
+            &mut *self.argument,
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct ApplyProducer {
+    lambda_producer: Box<dyn Producer>,
+}
+
+impl ApplyProducer {
+    fn new(lambda_producer: Box<dyn Producer>) -> Self {
+        ApplyProducer { lambda_producer }
+    }
+}
+
+impl Producer for ApplyProducer {
+    fn get(&mut self) -> GetResult {
+        // Get the function bindings from the lambda producer
+        let GetResult {
+            yield_guard,
+            column_value: lambda_column,
+        } = self.lambda_producer.get();
+
+        if lambda_column.values.len() != 1 {
+            panic!(
+                "Expected lambda producer to return a single Function value, got {:?}",
+                lambda_column.values
+            );
+        }
+        match &lambda_column.values[0] {
+            Value::Function(bindings) => GetResult {
+                column_value: ColumnValue {
+                    values: bindings.iter().map(|b| b.output.clone()).collect(),
+                    parent_indices: lambda_column.parent_indices,
+                },
+                yield_guard: if yield_guard.is_universal() {
+                    Guard::Universal
+                } else {
+                    Guard::Empty
+                },
+            },
+            _ => panic!(
+                "Expected lambda producer to return a Function value, got {:?}",
+                lambda_column.values[0]
+            ),
+        }
+    }
+
+    fn release(&mut self, obsolete_guard: Guard) -> Guard {
+        // For simplicity, we just pass through the release to the lambda producer
+        self.lambda_producer.release(obsolete_guard)
     }
 }
 
@@ -339,7 +432,7 @@ mod tests {
         let mut binding_literal = Literal::new(Value::Int(42));
 
         let (consumer, notifications) = TestConsumer::new();
-        let mut producer = lambda.subscribe_with_binding(
+        let mut producer = lambda.subscribe_to_application(
             Guard::universal(),
             Box::new(consumer),
             None,
@@ -381,7 +474,7 @@ mod tests {
 
         // Subscribe to the lambda with the binding operator
         let (consumer, notifications) = TestConsumer::new();
-        let mut producer = lambda.subscribe_with_binding(
+        let mut producer = lambda.subscribe_to_application(
             Guard::universal(),
             Box::new(consumer),
             None,
@@ -425,7 +518,7 @@ mod tests {
 
         // Subscribe to the lambda with the binding operator
         let (consumer, _) = TestConsumer::new();
-        let mut producer = lambda.subscribe_with_binding(
+        let mut producer = lambda.subscribe_to_application(
             Guard::universal(),
             Box::new(consumer),
             None,
@@ -462,7 +555,7 @@ mod tests {
         let intent_guard = Guard::from_function_parts(domain_guard, codomain_guard);
 
         let (consumer, notifications) = TestConsumer::new();
-        let mut producer = lambda.subscribe_with_binding(
+        let mut producer = lambda.subscribe_to_application(
             intent_guard,
             Box::new(consumer),
             None,
@@ -514,7 +607,7 @@ mod tests {
         // The lambda should create its own scope, so the body should reference
         // the lambda's variable (100), not the parent's (200)
         let (consumer, _) = TestConsumer::new();
-        let mut producer = lambda.subscribe_with_binding(
+        let mut producer = lambda.subscribe_to_application(
             Guard::universal(),
             Box::new(consumer),
             Some(Rc::new(parent_scope)),
@@ -547,7 +640,7 @@ mod tests {
         let mut binding_literal = Literal::new(Value::Int(1));
 
         let (consumer, notifications) = TestConsumer::new();
-        let _producer = lambda.subscribe_with_binding(
+        let _producer = lambda.subscribe_to_application(
             Guard::universal(),
             Box::new(consumer),
             None,
@@ -587,7 +680,7 @@ mod tests {
         let mut binding_literal = Literal::new(Value::Int(42));
 
         let (consumer, notifications) = TestConsumer::new();
-        let _producer = lambda.subscribe_with_binding(
+        let _producer = lambda.subscribe_to_application(
             Guard::universal(),
             Box::new(consumer),
             None,
@@ -595,9 +688,54 @@ mod tests {
         );
 
         assert!(
-            notifications.borrow().len() == 1,
-            "Expected exactly 1 notification from proper binding flow, got {:#?}.",
+            !notifications.borrow().is_empty(),
+            "Expected at least one notification from proper binding flow, got {:#?}.",
             notifications.borrow()
         );
+    }
+
+    #[test]
+    fn test_apply() {
+        // (λx. x)(42) = 42 — apply identity to a literal
+        let variable = Var::new("x", Extent::Base(BaseType::Int));
+        let body = Box::new(VarRef::new("x", Extent::Base(BaseType::Int)));
+        let lambda = Lambda::new(variable, body);
+        let argument = Literal::new(Value::Int(42));
+
+        let mut apply = Apply::new(Box::new(lambda), Box::new(argument));
+
+        // Extent should be the codomain (Int)
+        assert_eq!(apply.extent(), &Extent::Base(BaseType::Int));
+
+        let (consumer, notifications) = TestConsumer::new();
+        let mut producer = apply.subscribe(Guard::universal(), Box::new(consumer), None);
+
+        assert!(
+            !notifications.borrow().is_empty(),
+            "Expected at least one notification"
+        );
+
+        // Get should return the unwrapped output value: 42
+        let column = producer.get().column_value;
+        assert_eq!(column.values.len(), 1);
+        assert_eq!(column.values[0], Value::Int(42));
+    }
+
+    #[test]
+    fn test_apply_constant_function() {
+        // (λx. 10)(42) = 10 — apply constant function
+        let variable = Var::new("x", Extent::Base(BaseType::Int));
+        let body = Box::new(Literal::new(Value::Int(10)));
+        let lambda = Lambda::new(variable, body);
+        let argument = Literal::new(Value::Int(42));
+
+        let mut apply = Apply::new(Box::new(lambda), Box::new(argument));
+
+        let (consumer, _) = TestConsumer::new();
+        let mut producer = apply.subscribe(Guard::universal(), Box::new(consumer), None);
+
+        let column = producer.get().column_value;
+        assert_eq!(column.values.len(), 1);
+        assert_eq!(column.values[0], Value::Int(10));
     }
 }

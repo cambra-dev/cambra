@@ -3,10 +3,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::{
-    BaseType, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer,
-    Value, VarScope,
-};
+use crate::interpreter::{FuncBinding, GetResult, Notification};
+
+use super::{BaseType, ColumnValue, Consumer, Extent, Guard, Operator, Producer, Value, VarScope};
 
 /// A literal operator represents a constant value.
 /// According to the design: Subscribe calls Notify on the consumer immediately.
@@ -25,7 +24,7 @@ impl Literal {
     }
 
     /// Determine the extent for a given value.
-    fn extent_for_value(value: &Value) -> Extent {
+    pub fn extent_for_value(value: &Value) -> Extent {
         match value {
             Value::Int(_) => Extent::Base(BaseType::Int),
             Value::String(_) => Extent::Base(BaseType::String),
@@ -95,6 +94,131 @@ impl Producer for LiteralProducer {
     }
 }
 
+/// A List literal that can be subscribed to in scanning mode like a Lambda
+#[derive(Debug)]
+pub struct ListLiteral {
+    values: Vec<Value>,
+    extent: Extent,
+}
+
+impl ListLiteral {
+    pub fn new(values: Vec<Value>) -> Self {
+        let extent = Extent::function(
+            Extent::UIntRange {
+                start: 0,
+                end: values.len(),
+            },
+            if values.is_empty() {
+                Extent::Base(BaseType::Unit)
+            } else {
+                Literal::extent_for_value(&values[0])
+            },
+        );
+        ListLiteral { values, extent }
+    }
+}
+
+impl Operator for ListLiteral {
+    fn extent(&self) -> &Extent {
+        &self.extent
+    }
+
+    /// Subscribe to the literal as single constant value
+    fn subscribe(
+        &mut self,
+        _intent_guard: Guard,
+        mut consumer: Box<dyn Consumer>,
+        _var_scope: Option<Rc<VarScope>>,
+    ) -> Box<dyn Producer> {
+        consumer.notify(Notification::NewData);
+
+        Box::new(LiteralProducer {
+            value: Value::Function(
+                self.values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| FuncBinding {
+                        input: Value::Int(i as i64),
+                        output: v.clone(),
+                    })
+                    .collect(),
+            ),
+        })
+    }
+
+    /// Subscribe to the list, providing a binding that will produce
+    /// the set of list indices for scanning.
+    fn subscribe_to_application(
+        &mut self,
+        intent_guard: Guard,
+        mut consumer: Box<dyn Consumer>,
+        var_scope: Option<Rc<VarScope>>,
+        binding: &mut dyn Operator,
+    ) -> Box<dyn Producer> {
+        consumer.notify(Notification::NewData);
+
+        let index_consumer: Box<dyn Consumer> = Box::new(move |notification| {
+            // Note: we can do something smarter here since we know the set of values.
+            // For now, pass through Univeral guards but treat everything else as Empty.
+            // Only need to improve this if we want to support partial scans of list
+            // literals.
+            consumer.notify(match notification {
+                Notification::NewData => Notification::NewData,
+                Notification::Yield(Guard::Universal) => Notification::Yield(Guard::Universal),
+                Notification::Yield(_) => Notification::Yield(Guard::Empty),
+            });
+        });
+        Box::new(ListLiteralProducer {
+            values: self.values.clone(),
+            index_producer: binding.subscribe(intent_guard, index_consumer, var_scope),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ListLiteralProducer {
+    values: Vec<Value>,
+    index_producer: Box<dyn Producer>,
+}
+
+impl Producer for ListLiteralProducer {
+    fn get(&mut self) -> GetResult {
+        let GetResult {
+            yield_guard,
+            column_value: input_indices,
+        } = self.index_producer.get();
+
+        let bindings: Vec<FuncBinding> = input_indices
+            .values
+            .iter()
+            .map(|i| FuncBinding {
+                input: i.clone(),
+                output: match i {
+                    Value::Int(idx) => {
+                        self.values.get(*idx as usize).cloned().unwrap_or_else(|| {
+                            panic!("Index out of range: {} >= {}", idx, self.values.len())
+                        })
+                    }
+                    _ => panic!("Expected integer index, got {:?}", i),
+                },
+            })
+            .collect();
+
+        GetResult {
+            column_value: ColumnValue {
+                values: vec![Value::Function(bindings)],
+                parent_indices: input_indices.parent_indices,
+            },
+            yield_guard,
+        }
+    }
+
+    fn release(&mut self, obsolete_guard: Guard) -> Guard {
+        // Release is a no-op for literals - just return the obsolete guard unchanged
+        obsolete_guard
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::interpreter::test_helpers::TestConsumer;
@@ -147,6 +271,73 @@ mod tests {
         assert_eq!(
             result.column_value.values[0],
             Value::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_literal_list_scan() {
+        let mut list = ListLiteral::new(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+
+        // Extent should be UIntRange[0,3) -> Int
+        assert_eq!(
+            list.extent(),
+            &Extent::function(
+                Extent::UIntRange { start: 0, end: 3 },
+                Extent::Base(BaseType::Int),
+            )
+        );
+
+        // Subscribe returns the list as a function value
+        let (consumer, _) = TestConsumer::new();
+        let mut producer = list.subscribe(Guard::universal(), Box::new(consumer), None);
+
+        // Get should return a single Function value with index->element bindings
+        let column = producer.get().column_value;
+        assert_eq!(column.values.len(), 1);
+        assert_eq!(
+            column.values[0],
+            Value::Function(vec![
+                FuncBinding {
+                    input: Value::Int(0),
+                    output: Value::Int(10),
+                },
+                FuncBinding {
+                    input: Value::Int(1),
+                    output: Value::Int(20),
+                },
+                FuncBinding {
+                    input: Value::Int(2),
+                    output: Value::Int(30),
+                },
+            ])
+        );
+        assert!(column.parent_indices.is_none());
+    }
+
+    #[test]
+    fn test_literal_list() {
+        let mut list = ListLiteral::new(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
+
+        // Binding produces index 1 — simulates scanning a single index
+        let mut binding = Literal::new(Value::Int(1));
+
+        let (consumer, _) = TestConsumer::new();
+        let mut producer = list.subscribe_to_application(
+            Guard::universal(),
+            Box::new(consumer),
+            None,
+            &mut binding,
+        );
+
+        // Get should return Function with a single binding: 1->20
+        let column = producer.get().column_value;
+        assert_eq!(column.values.len(), 1);
+        assert_eq!(
+            column.values[0],
+            Value::Function(vec![FuncBinding {
+                input: Value::Int(1),
+                output: Value::Int(20),
+            },])
         );
     }
 }
