@@ -70,3 +70,7 @@ See `design.md` for the full specification including syntax, denotational/operat
 ## Compact instructions
 
 When you are using compact, focus on test output and code changes.
+
+## Git Conventions
+
+- Do not add "Co-Authored-By" lines attributing credit to AI models to commit messages.
