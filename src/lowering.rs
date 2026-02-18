@@ -558,7 +558,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO right now when evaluating a literal in a lambda, the domain and codomain sizes don't match up
     fn test_lower_contant_in_list_comp() {
         let ast = parse_expr("[42 for x in [10, 20]]");
         let op = lower_expr(&ast).expect("Failed to lower");
@@ -593,6 +592,26 @@ mod tests {
                 FuncBinding {
                     input: Value::Int(1),
                     output: Value::Int(20)
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn test_lower_binop_in_list_comp() {
+        let ast = parse_expr("[x + 2 for x in [10, 20]]");
+        let op = lower_expr(&ast).expect("Failed to lower");
+        let value = eval(op, None);
+        assert_eq!(
+            value[0],
+            Value::Function(vec![
+                FuncBinding {
+                    input: Value::Int(0),
+                    output: Value::Int(12)
+                },
+                FuncBinding {
+                    input: Value::Int(1),
+                    output: Value::Int(22)
                 }
             ])
         );

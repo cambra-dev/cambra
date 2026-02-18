@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{
-    ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer, Value,
-    VarScope,
+    ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, ParentIndices,
+    Producer, Value, VarScope,
 };
 
 /// Kinds of binary arithmetic operations.
@@ -184,21 +184,63 @@ impl Producer for BinOpProducer {
             .as_mut()
             .expect("right_producer should be set before get()")
             .get();
+        let left_col = left_result.column_value;
+        let right_col = right_result.column_value;
 
         // Zip and apply binop element-wise
-        let values: Vec<Value> = left_result
-            .column_value
-            .values
-            .iter()
-            .zip(right_result.column_value.values.iter())
-            .map(|(l, r)| apply_binop(self.op, l, r))
-            .collect();
+        let left_is_scalar = left_col.parent_indices == ParentIndices::Scalar;
+        let right_is_scalar = right_col.parent_indices == ParentIndices::Scalar;
+        let values: Vec<Value> = if left_is_scalar == right_is_scalar {
+            left_col
+                .values
+                .iter()
+                .zip(right_col.values.iter())
+                .map(|(l, r)| apply_binop(self.op, l, r))
+                .collect()
+        } else if left_is_scalar {
+            right_col
+                .values
+                .iter()
+                .map(|r| {
+                    apply_binop(
+                        self.op,
+                        left_col
+                            .as_single()
+                            .expect("Scalar ColumnValue had multiple values"),
+                        r,
+                    )
+                })
+                .collect()
+        } else {
+            left_col
+                .values
+                .iter()
+                .map(|l| {
+                    apply_binop(
+                        self.op,
+                        l,
+                        right_col
+                            .as_single()
+                            .expect("Scalar ColumnValue had multiple values"),
+                    )
+                })
+                .collect()
+        };
+
+        let result_parent_indices = if left_is_scalar && right_is_scalar {
+            ParentIndices::Scalar
+        } else if left_is_scalar {
+            right_col.parent_indices
+        } else {
+            // TODO: this is wrong.  If neither is scalar, need to appropriately combine
+            // the indices.
+            left_col.parent_indices
+        };
 
         GetResult {
             column_value: ColumnValue {
                 values,
-                // TODO: this is wrong, need to figure out the precedence.
-                parent_indices: left_result.column_value.parent_indices,
+                parent_indices: result_parent_indices,
             },
             // BinOp would need to transform sub-producer guards through the
             // operation to produce a correct output guard. We don't have that
@@ -268,7 +310,7 @@ mod tests {
         let result = producer.get();
         assert_eq!(result.column_value.values.len(), 1);
         assert_eq!(result.column_value.values[0], Value::Int(5));
-        assert!(result.column_value.parent_indices.is_none());
+        assert_eq!(result.column_value.parent_indices, ParentIndices::Scalar);
     }
 
     #[test]

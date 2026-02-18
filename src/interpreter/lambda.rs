@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{
-    ColumnValue, Consumer, Extent, FuncBinding, GetResult, Guard, Notification, Operator, Producer,
-    Value, Var, VarScope, VarSource, VarSub,
+    ColumnValue, Consumer, Extent, FuncBinding, GetResult, Guard, Notification, Operator,
+    ParentIndices, Producer, Value, Var, VarScope, VarSource, VarSub,
 };
 
 /// A Lambda operator represents a lambda expression.
@@ -88,6 +88,31 @@ impl Producer for LambdaProducer {
 
         let domain_column = domain_result.column_value;
         let codomain_column = codomain_result.column_value;
+        // If the body of a lambda is a scalar, expand it out to one copy per element in the domain.
+        if codomain_column.parent_indices == ParentIndices::Scalar {
+            let bindings: Vec<FuncBinding> = domain_column
+                .values
+                .iter()
+                .map(|input| FuncBinding {
+                    input: input.clone(),
+                    output: codomain_column
+                        .as_single()
+                        .expect("Scalar ColumnValue had multiple values")
+                        .clone(),
+                })
+                .collect();
+            return GetResult {
+                column_value: ColumnValue {
+                    values: vec![Value::Function(bindings)],
+                    parent_indices: domain_column.parent_indices,
+                },
+                yield_guard: if domain_result.yield_guard.is_universal() {
+                    Guard::Universal
+                } else {
+                    Guard::Empty
+                },
+            };
+        }
 
         // Combine domain and codomain into function bindings
         // The domain and codomain columns should be aligned (same length)
@@ -365,7 +390,6 @@ impl Producer for ApplyProducer {
             yield_guard,
             column_value: lambda_column,
         } = self.lambda_producer.get();
-
         if lambda_column.values.len() != 1 {
             panic!(
                 "Expected lambda producer to return a single Function value, got {:?}",

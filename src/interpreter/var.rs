@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::interpreter::{GetResult, Notification, Value};
 
-use super::{BaseType, ColumnValue, Consumer, Extent, Guard, Operator, Producer};
+use super::{BaseType, ColumnValue, Consumer, Extent, Guard, Operator, ParentIndices, Producer};
 
 /// A variable subscription paired with the chain of scanning variables between
 /// the current scope and the found variable, used for alignment composition.
@@ -440,7 +440,7 @@ impl Producer for VarRefSub {
         for scan in self.scan_chain.iter().rev() {
             // Get this scan's parent_indices
             let scan_result = scan.borrow_mut().get();
-            if let Some(parent_indices) = scan_result.column_value.parent_indices {
+            if let ParentIndices::Parent(parent_indices) = scan_result.column_value.parent_indices {
                 composed_indices = Some(match composed_indices {
                     None => parent_indices,
                     Some(inner) => compose_indices(&parent_indices, &inner),

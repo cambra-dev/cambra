@@ -244,7 +244,7 @@ mod tests {
         let result = producer.get();
         assert_eq!(result.column_value.values.len(), 1);
         assert_eq!(result.column_value.values[0], Value::Int(42));
-        assert!(result.column_value.parent_indices.is_none());
+        assert_eq!(result.column_value.parent_indices, ParentIndices::Scalar);
         assert!(result.yield_guard.is_universal());
 
         // Verify release is a no-op
@@ -311,7 +311,7 @@ mod tests {
                 },
             ])
         );
-        assert!(column.parent_indices.is_none());
+        assert_eq!(column.parent_indices, ParentIndices::Scalar);
     }
 
     #[test]

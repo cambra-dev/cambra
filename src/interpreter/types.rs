@@ -319,6 +319,13 @@ pub struct GetResult {
     pub yield_guard: Guard,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParentIndices {
+    Parent(Vec<usize>),
+    Scalar,
+    TopLevelVector,
+}
+
 /// A columnar value representation for vectorized execution.
 /// Contains a batch of values with optional alignment information.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,7 +334,7 @@ pub struct ColumnValue {
     pub values: Vec<Value>,
     /// Indices into the parent level's batch for alignment with outer scans.
     /// None if this is the outermost level or independent.
-    pub parent_indices: Option<Vec<usize>>,
+    pub parent_indices: ParentIndices,
 }
 
 impl ColumnValue {
@@ -335,7 +342,7 @@ impl ColumnValue {
     pub fn single(value: Value) -> Self {
         ColumnValue {
             values: vec![value],
-            parent_indices: None,
+            parent_indices: ParentIndices::Scalar,
         }
     }
 
@@ -343,7 +350,7 @@ impl ColumnValue {
     pub fn from_values(values: Vec<Value>) -> Self {
         ColumnValue {
             values,
-            parent_indices: None,
+            parent_indices: ParentIndices::TopLevelVector,
         }
     }
 
@@ -351,7 +358,7 @@ impl ColumnValue {
     pub fn with_parent_indices(values: Vec<Value>, parent_indices: Vec<usize>) -> Self {
         ColumnValue {
             values,
-            parent_indices: Some(parent_indices),
+            parent_indices: ParentIndices::Parent(parent_indices),
         }
     }
 
@@ -386,7 +393,7 @@ impl ColumnValue {
         ColumnValue {
             values: expanded_values,
             // The expanded column inherits the indices as its own parent_indices
-            parent_indices: Some(indices.to_vec()),
+            parent_indices: ParentIndices::Parent(indices.to_vec()),
         }
     }
 }
