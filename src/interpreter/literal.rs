@@ -5,7 +5,9 @@ use std::rc::Rc;
 
 use crate::interpreter::{FuncBinding, GetResult, Notification};
 
-use super::{BaseType, ColumnValue, Consumer, Extent, Guard, Operator, Producer, Value, VarScope};
+use super::{
+    BaseType, ColumnValue, Consumer, Extent, Guard, Operator, Producer, Scheduler, Value, VarScope,
+};
 
 /// A literal operator represents a constant value.
 /// According to the design: Subscribe calls Notify on the consumer immediately.
@@ -27,6 +29,7 @@ impl Literal {
     pub fn extent_for_value(value: &Value) -> Extent {
         match value {
             Value::Int(_) => Extent::Base(BaseType::Int),
+            Value::UInt(_) => Extent::Base(BaseType::UInt),
             Value::String(_) => Extent::Base(BaseType::String),
             Value::Bool(_) => Extent::Base(BaseType::Bool),
             Value::Unit => Extent::Base(BaseType::Unit),
@@ -64,6 +67,7 @@ impl Operator for Literal {
         _intent_guard: Guard,
         mut consumer: Box<dyn Consumer>,
         _var_scope: Option<Rc<VarScope>>,
+        _scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
         // Literal always has data immediately — notify NewData.
         consumer.notify(Notification::NewData);
@@ -129,6 +133,7 @@ impl Operator for ListLiteral {
         _intent_guard: Guard,
         mut consumer: Box<dyn Consumer>,
         _var_scope: Option<Rc<VarScope>>,
+        _scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
         consumer.notify(Notification::NewData);
 
@@ -154,6 +159,7 @@ impl Operator for ListLiteral {
         mut consumer: Box<dyn Consumer>,
         var_scope: Option<Rc<VarScope>>,
         binding: &mut dyn Operator,
+        scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
         consumer.notify(Notification::NewData);
 
@@ -170,7 +176,7 @@ impl Operator for ListLiteral {
         });
         Box::new(ListLiteralProducer {
             values: self.values.clone(),
-            index_producer: binding.subscribe(intent_guard, index_consumer, var_scope),
+            index_producer: binding.subscribe(intent_guard, index_consumer, var_scope, scheduler),
         })
     }
 }
@@ -194,12 +200,8 @@ impl Producer for ListLiteralProducer {
             .map(|i| FuncBinding {
                 input: i.clone(),
                 output: match i {
-                    Value::Int(idx) => {
-                        self.values.get(*idx as usize).cloned().unwrap_or_else(|| {
-                            panic!("Index out of range: {} >= {}", idx, self.values.len())
-                        })
-                    }
-                    _ => panic!("Expected integer index, got {:?}", i),
+                    Value::UInt(idx) => self.values.get(*idx).cloned().unwrap_or(Value::Unit),
+                    _ => panic!("Expected uint index, got {:?}", i),
                 },
             })
             .collect();
@@ -223,6 +225,7 @@ impl Producer for ListLiteralProducer {
 mod tests {
     use crate::interpreter::test_helpers::TestConsumer;
     use crate::interpreter::*;
+    use test_log::test;
 
     #[test]
     fn test_literal_int() {
@@ -233,7 +236,12 @@ mod tests {
 
         // Create consumer with shared notifications Vec - keep the Vec reference
         let (consumer, notifications) = TestConsumer::new();
-        let mut producer = literal.subscribe(Guard::universal(), Box::new(consumer), None);
+        let mut producer = literal.subscribe(
+            Guard::universal(),
+            Box::new(consumer),
+            None,
+            &mut Scheduler::new(),
+        );
 
         // The consumer should have been notified immediately with NewData
         let notifications_borrowed = notifications.borrow();
@@ -259,7 +267,12 @@ mod tests {
         assert_eq!(literal.extent(), &Extent::Base(BaseType::String));
 
         let (consumer, notifications) = TestConsumer::new();
-        let mut producer = literal.subscribe(Guard::universal(), Box::new(consumer), None);
+        let mut producer = literal.subscribe(
+            Guard::universal(),
+            Box::new(consumer),
+            None,
+            &mut Scheduler::new(),
+        );
 
         // Verify we received the notification
         let notifications_borrowed = notifications.borrow();
@@ -289,7 +302,12 @@ mod tests {
 
         // Subscribe returns the list as a function value
         let (consumer, _) = TestConsumer::new();
-        let mut producer = list.subscribe(Guard::universal(), Box::new(consumer), None);
+        let mut producer = list.subscribe(
+            Guard::universal(),
+            Box::new(consumer),
+            None,
+            &mut Scheduler::new(),
+        );
 
         // Get should return a single Function value with index->element bindings
         let column = producer.get().column_value;
@@ -319,7 +337,7 @@ mod tests {
         let mut list = ListLiteral::new(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
 
         // Binding produces index 1 — simulates scanning a single index
-        let mut binding = Literal::new(Value::Int(1));
+        let mut binding = Literal::new(Value::UInt(1));
 
         let (consumer, _) = TestConsumer::new();
         let mut producer = list.subscribe_to_application(
@@ -327,6 +345,7 @@ mod tests {
             Box::new(consumer),
             None,
             &mut binding,
+            &mut Scheduler::new(),
         );
 
         // Get should return Function with a single binding: 1->20
@@ -335,7 +354,7 @@ mod tests {
         assert_eq!(
             column.values[0],
             Value::Function(vec![FuncBinding {
-                input: Value::Int(1),
+                input: Value::UInt(1),
                 output: Value::Int(20),
             },])
         );

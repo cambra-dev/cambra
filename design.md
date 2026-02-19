@@ -26,9 +26,13 @@ Progress is tracked by sending puntuations through this producer/consumer interf
         * A region is represented by a **guard** which is a data structure respresenting a set of predicates, such as equalities, set memberships, and inequalities.
 
     * Dataflow operators implement a producer/consumer protocol:
-        * Subscribe(Guard, Consumer, VarScope): the consumer registers interest with the producer in a region of the producer's extent using an **intent guard**. The `VarScope` parameter provides variable context for operators that reference variables.
-        * Notify(Guard): the producer notifies the consumer that data is ready for it to retrieve, along with a **yield guard** specifying a region that will not see any further data.
-        * Get: the consumer requests the data that is ready from the producer and gets it synchronously. The data structure that represents data is determined by the operator's type: records have multiple fields, unions have multiple cases, and lambdas are collections. These types can be nested, and the data structure explicitly tracks that nesting. 
+        * Subscribe(Guard, Consumer, VarScope, Scheduler): the consumer registers interest with the producer in a region of the producer's extent using an **intent guard**. The `VarScope` parameter provides variable context for operators that reference variables. The `Scheduler` parameter allows producers backed by external data sources to register themselves for polling.
+        * Notify(Notification): the producer notifies the consumer that data is available. `Notification` is an enum:
+            * `NewData` — new data is available; the consumer should call `get()`.
+            * `Yield(Guard)` — progress with no new data; carries a **yield guard** specifying a region that will not see further data.
+        * Get → GetResult: the consumer requests available data synchronously. Returns a `GetResult` containing:
+            * `column_value: ColumnValue` — the batch of values.
+            * `yield_guard: Guard` — the cumulative yield guard covering all data retrieved so far (monotonically growing).
         * Release(Guard): the consumer retracts interest in a sub-region of its subscription with the producer in the form of an **obsolete guard**.
 
     * **Operator vs Runtime State**: There is an important distinction between operators and runtime state:
@@ -41,6 +45,35 @@ Progress is tracked by sending puntuations through this producer/consumer interf
 # CCL operators:
 ## Literals
 Subscribe calls Notify on the consumer immediately. Notify calls Get. Get returns a constant. Release is a no-op.
+
+## Data Sources
+
+A `DataSource` is a special extent variant that wraps an external data source (e.g. stdin, a test fixture, a network stream). It implements the `DataSourceExtentImpl` trait:
+
+```rust
+trait DataSourceExtentImpl {
+    fn get_id(&self) -> String;
+    fn check_for_new_data(&mut self) -> bool;  // poll for new data
+    fn get_yield_guard(&self) -> Guard;
+    fn get_elements(&self) -> Box<dyn Iterator<Item = Value>>;
+    fn release(&mut self, obsolete_guard: Guard) -> Guard;
+}
+```
+
+Unlike operators whose data is computed from other operators, data sources are polled externally. The `Scheduler` manages this polling:
+
+```rust
+struct Scheduler {
+    sources: Vec<Rc<RefCell<VarSub>>>,  // variables backed by data sources
+}
+
+impl Scheduler {
+    fn add_source(&mut self, var_sub: Rc<RefCell<VarSub>>);
+    fn check_for_notifications(&self);  // poll all sources and forward notifications
+}
+```
+
+`subscribe()` on all operators now takes a `&mut Scheduler` so that `Var` operators backed by a `DataSource` extent can register themselves. The main loop calls `scheduler.check_for_notifications()` to drive incremental execution.
 
 ## Variables
 
@@ -178,14 +211,24 @@ A problem arises when there are multiple variables in **scanning mode** in the s
 
 ### Columnar Values and Alignment
 
-To support vectorized execution, `Value` is extended to a columnar representation:
+To support vectorized execution, `Value` is extended to a columnar representation.
+
+`ParentIndices` records how a batch relates to the enclosing scan context:
+
+```rust
+enum ParentIndices {
+    Scalar,              // single value that broadcasts over any batch size
+    TopLevelVector,      // top-level batch — no outer scan
+    Parent(Vec<usize>),  // each element maps to a row in the parent batch
+}
+```
+
+These combine into `ColumnValue`:
 
 ```rust
 struct ColumnValue {
-    values: Vec<ScalarValue>,
-    // Indices into parent level's batch (for alignment with outer scans)
-    // None if this is the outermost level or independent
-    parent_indices: Option<Vec<usize>>,
+    values: Vec<Value>,
+    parent_indices: ParentIndices,
 }
 ```
 
@@ -193,6 +236,7 @@ When evaluating expressions with multiple universally-quantified variables in sc
 - Proper alignment of values from different nesting levels
 - Efficient join execution between nested scans
 - Vectorized operations on aligned batches
+- Scalar broadcasting: a `Scalar` value is valid at any batch size
 
 ### Scans as Joins
 
@@ -212,7 +256,7 @@ Join behavior depends on predicates:
 - **Equality predicate** (`t2.fk = t1.pk`): Hash join or index lookup
 - **Other predicates**: Filter after join, or specialized index structures
 
-The `parent_indices` in a `ColumnValue` are the output of the join algorithm—they indicate which outer row each inner row is paired with.
+The `Parent` variant of `ParentIndices` in a `ColumnValue` is the output of the join algorithm — it indicates which outer row each inner row is paired with.
 
 ### Alignment via VarRefSub
 
@@ -311,7 +355,7 @@ fn get(&mut self) -> ColumnValue {
     // Compose parent_indices from innermost to outermost
     let mut indices: Option<Vec<usize>> = None;
     for scan in self.scan_chain.iter().rev() {  // innermost first
-        if let Some(parent_indices) = scan.borrow_mut().get().parent_indices {
+        if let ParentIndices::Parent(parent_indices) = scan.borrow_mut().get().parent_indices {
             indices = Some(match indices {
                 None => parent_indices,
                 Some(inner) => compose_indices(&parent_indices, &inner),
@@ -360,9 +404,9 @@ A lambda is a (universally quantified) variable and a body, which can be applied
 
 Subscribe splits its intent guard into domain and codomain intent guards, then calls subscribe on its variable and body with these guards. 
 
-Notify comes from the variable, and is handled by the Var. Get returns a collection of function bindings. 
+Notify comes from the variable, and is handled by the Var. Get returns a collection of function bindings. The yield guard returned by `get()` is a `Guard::Domain(domain_yield_guard)` — a domain-only guard — rather than a full function guard. This is because we don't currently derive any completeness information about function bodies.
 
-Release splits the obsolete guard on domain and codomain, and calls release on the Var and the body with the corresponding guard. The Var stores its obsolete guard until the release call on the body returns so that variable references in the body can return expanded obsolete guards as needed.
+Release: if the obsolete guard is a `Guard::Domain`, only the variable (domain) is released. Otherwise, the guard is split into domain and codomain parts and release is propagated to both the variable and the body.
 
 
 ## Memos

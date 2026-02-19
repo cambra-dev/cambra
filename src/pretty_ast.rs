@@ -488,6 +488,7 @@ fn fmt_constant(f: &mut fmt::Formatter<'_>, c: &Constant) -> fmt::Result {
 mod tests {
     use super::*;
     use rustpython_parser::parser;
+    use test_log::test;
 
     fn parse_expr(code: &str) -> ast::Expr {
         let result = parser::parse(code, parser::Mode::Expression, "<test>").unwrap();

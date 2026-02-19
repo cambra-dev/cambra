@@ -15,6 +15,7 @@ pub fn parse_python_code(code: &str) -> Result<ast::Mod, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_log::test;
 
     #[test]
     fn motivating_example() {

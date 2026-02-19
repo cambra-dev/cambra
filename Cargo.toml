@@ -1,5 +1,5 @@
 [package]
-name = "pytoto"
+name = "cambra"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,3 +8,6 @@ edition = "2021"
 [dependencies]
 rustpython-parser = "0.2.0"
 indoc = "1.0"
+log = "0.4.29"
+env_logger = "0.11.9"
+test-log = "0.2.19"

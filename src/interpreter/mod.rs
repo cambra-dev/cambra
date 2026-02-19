@@ -6,12 +6,16 @@
 mod binop;
 mod lambda;
 mod literal;
+mod scheduler;
+mod stdio;
 mod types;
 mod var;
 
 pub use binop::*;
 pub use lambda::*;
 pub use literal::*;
+pub use scheduler::*;
+pub use stdio::*;
 pub use types::*;
 pub use var::*;
 
@@ -102,6 +106,7 @@ pub trait Operator: Debug {
         intent_guard: Guard,
         consumer: Box<dyn Consumer>, // TODO: Should we make this a trait bound so we don't assume a Box pointer type?
         var_scope: Option<Rc<VarScope>>,
+        scheduler: &mut Scheduler,
     ) -> Box<dyn Producer>;
 
     /// Apply this Operator to a second Operator and return the result as a Producer.
@@ -125,6 +130,7 @@ pub trait Operator: Debug {
         _consumer: Box<dyn Consumer>,
         _var_scope: Option<Rc<VarScope>>,
         _binding: &mut dyn Operator,
+        _scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
         panic!("Not appliable {:?}", self)
     }

@@ -4,9 +4,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::interpreter::{GetResult, Notification, Value};
+use log::debug;
 
-use super::{BaseType, ColumnValue, Consumer, Extent, Guard, Operator, ParentIndices, Producer};
-
+use super::{ColumnValue, Consumer, Extent, Guard, Operator, ParentIndices, Producer, Scheduler};
 /// A variable subscription paired with the chain of scanning variables between
 /// the current scope and the found variable, used for alignment composition.
 type VarWithScanChain = (Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>);
@@ -252,6 +252,28 @@ impl VarSub {
         );
         self.source = source;
     }
+
+    pub fn check_for_notification(&mut self) {
+        match &mut self.source {
+            VarSource::Scanning {
+                extent: Extent::DataSourceDomain(extent_impl),
+                ..
+            } => {
+                let notification = if extent_impl.borrow_mut().check_for_new_data() {
+                    Notification::NewData
+                } else {
+                    Notification::Yield(extent_impl.borrow().get_yield_guard())
+                };
+                self.consumers
+                    .iter_mut()
+                    .for_each(|c| c.notify(notification.clone()));
+            }
+            _ => panic!(
+                "Expected VarSub with DataSource input, got {:?}",
+                self.source
+            ),
+        };
+    }
 }
 
 impl Producer for VarSub {
@@ -264,25 +286,25 @@ impl Producer for VarSub {
             VarSource::Scanning {
                 extent,
                 predicate: _,
-            } => {
-                // TODO: Implement actual scanning over extent
-                // For now, return a placeholder based on extent type
-                let data = match extent {
-                    Extent::UIntRange { start, end } => ColumnValue::from_values(
-                        (*start as i64..*end as i64).map(Value::Int).collect(),
+            } => match extent {
+                Extent::UIntRange { start, end } => GetResult {
+                    column_value: ColumnValue::from_values(
+                        (*start..*end).map(Value::UInt).collect(),
                     ),
-                    Extent::Base(BaseType::Int) => {
-                        // Placeholder: return empty column for now
-                        // Real implementation would scan the extent
-                        ColumnValue::from_values(vec![])
-                    }
-                    _ => ColumnValue::from_values(vec![]),
-                };
-                GetResult {
-                    column_value: data,
-                    yield_guard: self.yield_guard.clone(),
+                    yield_guard: Guard::Universal,
+                },
+                Extent::DataSourceDomain(source_impl) => {
+                    let values = source_impl.borrow_mut().get_elements().collect();
+                    let yield_guard = source_impl.borrow().get_yield_guard();
+                    let get_result = GetResult {
+                        column_value: ColumnValue::from_values(values),
+                        yield_guard,
+                    };
+                    debug!("Generating source values {get_result:#?}");
+                    get_result
                 }
-            }
+                _ => panic!("Attempted to iterate on infinite Extent"),
+            },
         }
     }
 
@@ -295,9 +317,12 @@ impl Producer for VarSub {
                 panic!("VarSub::release() called while source is Uninitialized")
             }
             VarSource::Bound(producer) => producer.release(obsolete_guard),
+            VarSource::Scanning {
+                extent: Extent::DataSourceDomain(source_impl),
+                ..
+            } => source_impl.borrow_mut().release(obsolete_guard),
             VarSource::Scanning { .. } => {
-                // For scanning, just return the obsolete guard unchanged
-                // TODO: Once we support scanning over data-defined extents, propagate releases into it.
+                // For scanning over literal sources, nothing to do
                 obsolete_guard
             }
         }
@@ -351,6 +376,7 @@ impl Operator for VarRef {
         intent_guard: Guard,
         consumer: Box<dyn Consumer>,
         var_scope: Option<Rc<VarScope>>,
+        _scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
         // Look up the variable in the scope
         let var_scope = var_scope.expect("VarRef requires a VarScope");
@@ -471,6 +497,7 @@ mod tests {
     use crate::interpreter::test_helpers::TestConsumer;
     use crate::interpreter::*;
     use std::rc::Rc;
+    use test_log::test;
 
     #[test]
     fn test_variable_proxy() {
@@ -487,8 +514,12 @@ mod tests {
         // This ensures VarSub receives notifications
         let mut binding_literal = Literal::new(Value::Int(42));
         let var_sub_consumer: Box<dyn Consumer> = Box::new(var_subscription.clone());
-        let binding_producer =
-            binding_literal.subscribe(Guard::universal(), var_sub_consumer, None);
+        let binding_producer = binding_literal.subscribe(
+            Guard::universal(),
+            var_sub_consumer,
+            None,
+            &mut Scheduler::new(),
+        );
 
         // Now set VarSub's source to Bound with the producer
         var_subscription
@@ -504,6 +535,7 @@ mod tests {
             Guard::universal(),
             Box::new(consumer),
             Some(Rc::new(var_scope)),
+            &mut Scheduler::new(),
         );
 
         // Verify notification was received (flows: Literal → VarSub → VarRefSub → consumer)

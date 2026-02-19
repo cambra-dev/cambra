@@ -3,6 +3,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::interpreter::Scheduler;
+
 use super::{
     ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, ParentIndices,
     Producer, Value, VarScope,
@@ -15,6 +17,7 @@ pub enum BinOpKind {
     Sub,
     Mul,
     FloorDiv,
+    Concat,
     // Other binary operators are either less useful at the
     // momemt moment (e.g. bitwise ops) or require non-Int extents
     // to be implmented first (e.g. float division).
@@ -27,7 +30,10 @@ pub fn apply_binop(op: BinOpKind, left: &Value, right: &Value) -> Value {
         (BinOpKind::Sub, Value::Int(a), Value::Int(b)) => Value::Int(a - b),
         (BinOpKind::Mul, Value::Int(a), Value::Int(b)) => Value::Int(a * b),
         (BinOpKind::FloorDiv, Value::Int(a), Value::Int(b)) => Value::Int(a / b),
-        _ => panic!("Unsupported binop: {op:?} on {left:?} and {right:?}"),
+        (BinOpKind::Concat, Value::String(a), Value::String(b)) => {
+            Value::String(format!("{}{}", a, b))
+        }
+        _ => panic!("Unsupported binop: {:?} on {:?} and {:?}", op, left, right),
     }
 }
 
@@ -65,6 +71,7 @@ impl Operator for BinOp {
         intent_guard: Guard,
         consumer: Box<dyn Consumer>,
         var_scope: Option<Rc<VarScope>>,
+        scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
         assert!(
             intent_guard.is_universal(),
@@ -128,13 +135,16 @@ impl Operator for BinOp {
         });
 
         // Subscribe left operand (clone var_scope for left, move original to right)
-        let left_producer =
-            self.left
-                .subscribe(Guard::universal(), left_consumer, var_scope.clone());
+        let left_producer = self.left.subscribe(
+            Guard::universal(),
+            left_consumer,
+            var_scope.clone(),
+            scheduler,
+        );
 
-        let right_producer = self
-            .right
-            .subscribe(Guard::universal(), right_consumer, var_scope);
+        let right_producer =
+            self.right
+                .subscribe(Guard::universal(), right_consumer, var_scope, scheduler);
 
         // Set both sub-producers
         {
@@ -257,29 +267,17 @@ impl Producer for BinOpProducer {
     }
 
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
-        assert!(
-            obsolete_guard.is_universal(),
-            "BinOp: expected Universal obsolete guard, got {obsolete_guard:?}"
-        );
-        let left_expanded = self
-            .left_producer
-            .as_mut()
-            .expect("left_producer should be set before release()")
-            .release(obsolete_guard.clone());
-        let right_expanded = self
-            .right_producer
-            .as_mut()
-            .expect("right_producer should be set before release()")
-            .release(obsolete_guard);
-        assert!(
-            left_expanded.is_universal(),
-            "BinOp: expected Universal left expanded obsolete, got {left_expanded:?}"
-        );
-        assert!(
-            right_expanded.is_universal(),
-            "BinOp: expected Universal right expanded obsolete, got {right_expanded:?}"
-        );
-        Guard::Universal
+        if obsolete_guard.is_universal() {
+            self.left_producer
+                .as_mut()
+                .expect("left_producer should be set before release()")
+                .release(obsolete_guard.clone());
+            self.right_producer
+                .as_mut()
+                .expect("right_producer should be set before release()")
+                .release(obsolete_guard.clone());
+        }
+        obsolete_guard
     }
 }
 
@@ -287,6 +285,7 @@ impl Producer for BinOpProducer {
 mod tests {
     use crate::interpreter::test_helpers::TestConsumer;
     use crate::interpreter::*;
+    use test_log::test;
 
     #[test]
     fn test_binop_add_literals() {
@@ -298,7 +297,12 @@ mod tests {
         assert_eq!(binop.extent(), &Extent::Base(BaseType::Int));
 
         let (consumer, notifications) = TestConsumer::new();
-        let mut producer = binop.subscribe(Guard::universal(), Box::new(consumer), None);
+        let mut producer = binop.subscribe(
+            Guard::universal(),
+            Box::new(consumer),
+            None,
+            &mut Scheduler::new(),
+        );
 
         // Each literal fires NewData independently, so we get two notifications
         let notifs = notifications.borrow();
@@ -321,7 +325,12 @@ mod tests {
         let mut binop = BinOp::new(left, BinOpKind::Mul, right);
 
         let (consumer, _notifications) = TestConsumer::new();
-        let mut producer = binop.subscribe(Guard::universal(), Box::new(consumer), None);
+        let mut producer = binop.subscribe(
+            Guard::universal(),
+            Box::new(consumer),
+            None,
+            &mut Scheduler::new(),
+        );
 
         let result = producer.get();
         assert_eq!(result.column_value.values.len(), 1);
@@ -336,7 +345,12 @@ mod tests {
         let mut binop = BinOp::new(left, BinOpKind::Sub, right);
 
         let (consumer, _notifications) = TestConsumer::new();
-        let mut producer = binop.subscribe(Guard::universal(), Box::new(consumer), None);
+        let mut producer = binop.subscribe(
+            Guard::universal(),
+            Box::new(consumer),
+            None,
+            &mut Scheduler::new(),
+        );
 
         let result = producer.get();
         assert_eq!(result.column_value.values.len(), 1);
@@ -351,7 +365,12 @@ mod tests {
         let mut binop = BinOp::new(left, BinOpKind::Add, right);
 
         let (consumer, _notifications) = TestConsumer::new();
-        let mut producer = binop.subscribe(Guard::universal(), Box::new(consumer), None);
+        let mut producer = binop.subscribe(
+            Guard::universal(),
+            Box::new(consumer),
+            None,
+            &mut Scheduler::new(),
+        );
 
         let released = producer.release(Guard::universal());
         assert_eq!(released, Guard::Universal);

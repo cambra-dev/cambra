@@ -1,6 +1,6 @@
 //! Core types for the CCL interpreter: Guard, Extent, BaseType, Value, FuncBinding, ColumnValue.
 
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 /// A Guard represents a region (subset of an extent) via a set of predicates.
 /// Guards are used to:
@@ -20,17 +20,22 @@ pub enum Guard {
         variable: String,
         values: Vec<Value>,
     },
-    /// A guard representing inequality: variable != value
-    Inequality { variable: String, value: Value },
+    /// A guard representing disequality: variable != value
+    Disequality(Value),
+    /// A guard representing an upper bound: variable <= value
+    LessThanOrEq(Value),
     /// A conjunction of guards (all must be satisfied)
     And(Vec<Guard>),
     /// A disjunction of guards (at least one must be satisfied)
     Or(Vec<Guard>),
     /// A guard for a function type: combines domain and codomain guards
+    /// Describes the subset of the codomain produced by the domain guard
     Function {
         domain: Box<Guard>,
         codomain: Box<Guard>,
     },
+    /// A guard for a function type that only describes the domain of the function
+    Domain(Box<Guard>),
     /// A guard for a record type: maps field names to their guards
     Record(HashMap<String, Guard>),
 }
@@ -53,14 +58,23 @@ impl Guard {
 
     /// Check if this guard is universal (represents entire extent)
     pub fn is_universal(&self) -> bool {
-        matches!(self, Guard::Universal)
+        match self {
+            Guard::Universal => true,
+            Guard::Domain(domain) => domain.is_universal(),
+            Guard::Or(guards) => guards.iter().any(|g| g.is_universal()),
+            Guard::And(guards) => guards.iter().all(|g| g.is_universal()),
+            _ => false,
+        }
     }
 
     /// Intersect two guards (conjunction)
     pub fn intersect(self, other: Guard) -> Guard {
         match (self, other) {
             (Guard::Empty, _) | (_, Guard::Empty) => Guard::Empty,
+            (g1, g2) if g2.is_empty() || g1.is_empty() => Guard::Empty,
             (Guard::Universal, g) | (g, Guard::Universal) => g,
+            (g1, g2) if g2.is_universal() => g1,
+            (g1, g2) if g1.is_universal() => g2,
             (Guard::And(mut guards), g) => {
                 guards.push(g);
                 Guard::And(guards)
@@ -77,7 +91,10 @@ impl Guard {
     pub fn union(self, other: Guard) -> Guard {
         match (self, other) {
             (Guard::Empty, g) | (g, Guard::Empty) => g,
+            (g1, g2) if g2.is_empty() => g1,
+            (g1, g2) if g1.is_empty() => g2,
             (Guard::Universal, _) | (_, Guard::Universal) => Guard::Universal,
+            (g1, g2) if g2.is_universal() || g1.is_universal() => Guard::Universal,
             (Guard::Or(mut guards), g) => {
                 guards.push(g);
                 Guard::Or(guards)
@@ -97,6 +114,30 @@ impl Guard {
             Guard::Universal => {
                 // Universal function guard means universal domain and codomain
                 Some((Guard::Universal, Guard::Universal))
+            }
+            Guard::Or(guards) => {
+                let mut domain = Guard::Empty;
+                let mut codomain = Guard::Empty;
+                for g in guards.iter() {
+                    let (d, c) = g
+                        .split_function()
+                        .unwrap_or_else(|| panic!("Expected Function guard, got {:?}", g));
+                    domain = domain.union(d);
+                    codomain = codomain.union(c);
+                }
+                Some((domain, codomain))
+            }
+            Guard::And(guards) => {
+                let mut domain = Guard::Empty;
+                let mut codomain = Guard::Empty;
+                for g in guards.iter() {
+                    let (d, c) = g
+                        .split_function()
+                        .unwrap_or_else(|| panic!("Expected Function guard, got {:?}", g));
+                    domain = domain.intersect(d);
+                    codomain = codomain.intersect(c);
+                }
+                Some((domain, codomain))
             }
             _ => None,
         }
@@ -163,7 +204,23 @@ pub enum Extent {
         start: usize,
         end: usize,
     },
+    DataSourceDomain(Rc<RefCell<dyn DataSourceDomainExtentImpl>>),
 }
+
+pub trait DataSourceDomainExtentImpl {
+    fn get_id(&self) -> String;
+    fn check_for_new_data(&mut self) -> bool;
+    fn get_yield_guard(&self) -> Guard;
+    fn get_elements(&self) -> Box<dyn Iterator<Item = Value>>;
+    fn release(&mut self, obsolete_guard: Guard) -> Guard;
+}
+
+impl PartialEq for dyn DataSourceDomainExtentImpl {
+    fn eq(&self, other: &Self) -> bool {
+        self.get_id() == other.get_id()
+    }
+}
+impl Eq for dyn DataSourceDomainExtentImpl {}
 
 impl std::fmt::Debug for Extent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -182,6 +239,7 @@ impl std::fmt::Debug for Extent {
                 write!(f, "({})", extent_strs.join(" | "))
             }
             Extent::UIntRange { start, end } => write!(f, "[{}, {})", start, end),
+            Extent::DataSourceDomain(_) => write!(f, "DataSource"),
         }
     }
 }
@@ -246,6 +304,7 @@ impl Extent {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BaseType {
     Int,
+    UInt,
     String,
     Bool,
     Unit,
@@ -255,6 +314,7 @@ pub enum BaseType {
 #[derive(Clone, PartialEq, Eq)]
 pub enum Value {
     Int(i64),
+    UInt(usize),
     String(String),
     Bool(bool),
     Unit,
@@ -268,6 +328,7 @@ impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Int(i) => write!(f, "{}", i),
+            Value::UInt(i) => write!(f, "u{}", i),
             Value::String(s) => write!(f, "\"{}\"", s),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Unit => write!(f, "()"),
@@ -321,9 +382,9 @@ pub struct GetResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParentIndices {
-    Parent(Vec<usize>),
-    Scalar,
-    TopLevelVector,
+    Scalar,             // single value that broadcasts over any batch size
+    TopLevelVector,     // top-level batch — no outer scan
+    Parent(Vec<usize>), // each element maps to a row in the parent batch
 }
 
 /// A columnar value representation for vectorized execution.

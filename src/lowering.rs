@@ -9,7 +9,7 @@ use rustpython_parser::ast::{self as pyast};
 
 use crate::interpreter::{
     Apply, BaseType, BinOp, BinOpKind, Extent, Guard, Lambda, ListLiteral, Literal, Operator,
-    Value, Var, VarRef, VarScope, VarSource,
+    Scheduler, StdinReader, Value, Var, VarRef, VarScope, VarSource,
 };
 
 /// Errors that can occur during lowering.
@@ -34,6 +34,7 @@ pub fn lower_expr(
         pyast::ExprKind::List { elts, .. } => lower_list(elts),
         pyast::ExprKind::Subscript { value, slice, .. } => lower_subscript(value, slice),
         pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(elt, generators),
+        pyast::ExprKind::Call { func, args, .. } => lower_call(func, args),
         _ => Err(LoweringError::Unsupported(format!(
             "Expression type not yet supported: {:?}",
             expr.node
@@ -84,14 +85,32 @@ fn lower_binop(
 ) -> Result<Box<dyn Operator>, LoweringError> {
     let left_op = lower_expr(left)?;
     let right_op = lower_expr(right)?;
-    let kind = match op {
-        pyast::Operator::Add => BinOpKind::Add,
-        pyast::Operator::Sub => BinOpKind::Sub,
-        pyast::Operator::Mult => BinOpKind::Mul,
-        pyast::Operator::FloorDiv => BinOpKind::FloorDiv,
+    let kind = match left_op.extent() {
+        Extent::Base(BaseType::Int) => match op {
+            pyast::Operator::Add => BinOpKind::Add,
+            pyast::Operator::Sub => BinOpKind::Sub,
+            pyast::Operator::Mult => BinOpKind::Mul,
+            pyast::Operator::FloorDiv => BinOpKind::FloorDiv,
+            _ => {
+                return Err(LoweringError::Unsupported(format!(
+                    "Binary operator not yet supported: {:?}",
+                    op
+                )))
+            }
+        },
+        Extent::Base(BaseType::String) => match op {
+            pyast::Operator::Add => BinOpKind::Concat,
+            _ => {
+                return Err(LoweringError::Unsupported(format!(
+                    "Binary operator not yet supported: {:?}",
+                    op
+                )))
+            }
+        },
         _ => {
             return Err(LoweringError::Unsupported(format!(
-                "Binary operator not yet supported: {op:?}"
+                "Binary operator not yet supported for extent: {:?}",
+                left_op.extent()
             )))
         }
     };
@@ -211,10 +230,30 @@ fn lower_list_comp(
     Ok(Box::new(outer_lambda))
 }
 
+fn lower_call(
+    func: &pyast::Expr,
+    args: &[pyast::Expr],
+) -> Result<Box<dyn Operator>, LoweringError> {
+    match &func.node {
+        pyast::ExprKind::Name { id, .. } if id == "__stdinvalues" => {
+            if !args.is_empty() {
+                return Err(LoweringError::Unsupported(
+                    "stdin() does not take any arguments".into(),
+                ));
+            }
+            Ok(Box::new(StdinReader::new()))
+        }
+        _ => Err(LoweringError::Unsupported(
+            "Only __stdinvalues() function calls are supported for now".into(),
+        )),
+    }
+}
+
 /// Lower a series of assignments followed by an expression
 #[allow(clippy::type_complexity)]
 pub fn lower_let_stmt_block(
     stmts: &[pyast::Stmt],
+    scheduler: &mut Scheduler,
 ) -> Result<(Box<dyn Operator>, Option<Rc<VarScope>>), LoweringError> {
     if stmts.is_empty() {
         return Err(LoweringError::Unsupported("Empty block".into()));
@@ -232,7 +271,7 @@ pub fn lower_let_stmt_block(
         };
         // Wrap each scope in Rc once here; lower_assign and subscribe share it
         // via cheap Rc clones rather than cloning the struct.
-        cur_scope = Some(Rc::new(lower_assign(cur_scope, targets, value)?));
+        cur_scope = Some(Rc::new(lower_assign(cur_scope, targets, value, scheduler)?));
     }
     // The last statement is the evaluated expression
     let result = &stmts[stmts.len() - 1];
@@ -255,6 +294,7 @@ fn lower_assign(
     parent_scope: Option<Rc<VarScope>>,
     targets: &[pyast::Expr],
     value: &pyast::Expr,
+    scheduler: &mut Scheduler,
 ) -> Result<VarScope, LoweringError> {
     if targets.len() != 1 {
         return Err(LoweringError::Unsupported(
@@ -278,6 +318,7 @@ fn lower_assign(
         Guard::universal(),
         Box::new(var_subscription.clone()),
         parent_scope.clone(),
+        scheduler,
     );
     var_subscription
         .borrow_mut()
@@ -296,10 +337,11 @@ fn lower_assign(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::{Consumer, FuncBinding, Guard, Notification, Operator};
+    use crate::interpreter::{Consumer, FuncBinding, Guard, Notification, Operator, Scheduler};
     use rustpython_parser::parser;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use test_log::test;
 
     /// Parse a Python expression and return the AST.
     fn parse_expr(code: &str) -> pyast::Expr {
@@ -342,11 +384,10 @@ mod tests {
             *notified_clone.borrow_mut() = true;
         });
 
-        let mut producer = op.subscribe(Guard::universal(), consumer, scope);
+        let mut producer = op.subscribe(Guard::universal(), consumer, scope, &mut Scheduler::new());
 
         // For literals, we should be notified immediately
-        // TODO fix this assert and make sure notifications flow
-        // assert!(*notified.borrow(), "Expected to be notified");
+        assert!(*notified.borrow(), "Expected to be notified");
 
         let column = producer.get().column_value;
         column.values
@@ -449,14 +490,16 @@ mod tests {
     #[test]
     fn test_lower_let_simple() {
         let ast = parse_module("x = 2; x");
-        let (op, scope) = lower_let_stmt_block(&ast).expect("Failed to lower");
+        let (op, scope) =
+            lower_let_stmt_block(&ast, &mut Scheduler::new()).expect("Failed to lower");
         assert_eq!(eval_scalar_with_scope(op, scope), Value::Int(2));
     }
 
     #[test]
     fn test_lower_let_multiple() {
         let ast = parse_module("x = 2; y = x; y");
-        let (op, scope) = lower_let_stmt_block(&ast).expect("Failed to lower");
+        let (op, scope) =
+            lower_let_stmt_block(&ast, &mut Scheduler::new()).expect("Failed to lower");
         assert_eq!(eval_scalar_with_scope(op, scope), Value::Int(2));
     }
 
@@ -546,11 +589,11 @@ mod tests {
             value[0],
             Value::Function(vec![
                 FuncBinding {
-                    input: Value::Int(0),
+                    input: Value::UInt(0),
                     output: Value::Int(10)
                 },
                 FuncBinding {
-                    input: Value::Int(1),
+                    input: Value::UInt(1),
                     output: Value::Int(20)
                 }
             ])
@@ -566,11 +609,11 @@ mod tests {
             value[0],
             Value::Function(vec![
                 FuncBinding {
-                    input: Value::Int(0),
+                    input: Value::UInt(0),
                     output: Value::Int(42)
                 },
                 FuncBinding {
-                    input: Value::Int(1),
+                    input: Value::UInt(1),
                     output: Value::Int(42)
                 }
             ])
@@ -586,11 +629,11 @@ mod tests {
             value[0],
             Value::Function(vec![
                 FuncBinding {
-                    input: Value::Int(0),
+                    input: Value::UInt(0),
                     output: Value::Int(10)
                 },
                 FuncBinding {
-                    input: Value::Int(1),
+                    input: Value::UInt(1),
                     output: Value::Int(20)
                 }
             ])
@@ -606,11 +649,11 @@ mod tests {
             value[0],
             Value::Function(vec![
                 FuncBinding {
-                    input: Value::Int(0),
+                    input: Value::UInt(0),
                     output: Value::Int(12)
                 },
                 FuncBinding {
-                    input: Value::Int(1),
+                    input: Value::UInt(1),
                     output: Value::Int(22)
                 }
             ])

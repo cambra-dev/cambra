@@ -1,0 +1,2 @@
+# __stdinvalues is a temporary hardcoded value for testing
+["> " + x for x in __stdinvalues()]
