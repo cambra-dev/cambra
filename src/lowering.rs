@@ -25,6 +25,7 @@ pub enum LoweringError {
 #[derive(Default)]
 pub struct LoweringContext {
     injected_sources: HashMap<String, Box<dyn Operator>>,
+    scope: Option<Rc<VarScope>>,
 }
 
 impl LoweringContext {
@@ -86,18 +87,30 @@ fn lower_constant(
 
 /// Lower a Python name reference to a VarRef operator.
 fn lower_name_as_ref(
-    _ctx: &mut LoweringContext,
+    ctx: &mut LoweringContext,
     id: &str,
 ) -> Result<Box<dyn Operator>, LoweringError> {
-    // For now, assume all variables have Int extent.
-    // TODO: Implement proper type inference or require type annotations.
-    // This is part of phase 3 (Let bindings).
-    Ok(Box::new(VarRef::new(id, Extent::Base(BaseType::Int))))
+    match &ctx.scope {
+        None => Result::Err(LoweringError::Unsupported(format!(
+            "Var lookup for {id} in empty scope"
+        ))),
+        Some(scope) => {
+            let extent = match &scope.lookup_variable(id) {
+                None => Extent::Base(BaseType::Int),
+                Some(var) => var.0.borrow().get_extent().clone(),
+            };
+            Ok(Box::new(VarRef::new(id, extent)))
+        }
+    }
 }
 
-fn lower_name_as_var(_ctx: &mut LoweringContext, id: &str) -> Result<Var, LoweringError> {
+fn lower_name_as_var(
+    _ctx: &mut LoweringContext,
+    id: &str,
+    extent: &Extent,
+) -> Result<Var, LoweringError> {
     // For now, assume all variables have Int extent.
-    Ok(Var::new(id, Extent::Base(BaseType::Int)))
+    Ok(Var::new(id, extent.clone()))
 }
 
 /// Lower a binary operation.
@@ -197,6 +210,10 @@ fn lower_subscript(
 }
 
 /// Lower a list comprehension.
+/// This transforms an expression like
+///   [body(x) for x in source]
+/// into the following CCL:
+///   λ outer_var : source::idx_type . (λ inner_var : source::value_type . body(inner_var)) (source(outer_var))
 fn lower_list_comp(
     ctx: &mut LoweringContext,
     elt: &pyast::Located<pyast::ExprKind>,
@@ -219,6 +236,21 @@ fn lower_list_comp(
             "Async comprehensions are not supported for now".into(),
         ));
     }
+
+    let source = lower_expr(ctx, &gen.iter)?;
+    let source_extent = source.extent().clone();
+
+    let outer_var_name = "__list_comp_var";
+    let (outer_var_extent, inner_var_extent) =
+        if let Extent::Function { domain, codomain } = source_extent {
+            (*domain.clone(), *codomain.clone())
+        } else {
+            return Err(LoweringError::TypeError(format!(
+                "Expected function extent for comprehension source, got {:?}",
+                source_extent
+            )));
+        };
+
     let variable = lower_name_as_var(
         ctx,
         match &gen.target.node {
@@ -230,21 +262,20 @@ fn lower_list_comp(
             )))
             }
         },
+        &inner_var_extent,
     )?;
+    ctx.scope = Some(Rc::new(VarScope::new_with_optional_parent(
+        ctx.scope.clone(),
+        variable.name(),
+        variable.create_subscription(VarSource::Uninitialized),
+    )));
     let body = lower_expr(ctx, elt)?;
-    let inner_lambda = Box::new(Lambda::new(variable, body));
-
-    let source = lower_expr(ctx, &gen.iter)?;
-    let source_extent = source.extent().clone();
-
-    let outer_var_name = "__list_comp_var";
-    let outer_var_extent = if let Extent::Function { domain, .. } = source_extent {
-        *domain.clone()
-    } else {
-        return Err(LoweringError::TypeError(format!(
-            "Expected function extent for comprehension source, got {source_extent:?}"
-        )));
+    ctx.scope = match &ctx.scope {
+        Some(s) => s.get_parent(),
+        None => panic!("Empty scope stack"),
     };
+
+    let inner_lambda = Box::new(Lambda::new(variable, body));
 
     let source_apply = Box::new(Apply::new(
         source,
@@ -296,7 +327,6 @@ pub fn lower_let_stmt_block(
     if stmts.is_empty() {
         return Err(LoweringError::Unsupported("Empty block".into()));
     }
-    let mut cur_scope: Option<Rc<VarScope>> = None;
     for let_stmt in stmts[..stmts.len() - 1].iter() {
         let (targets, value) = match &let_stmt.node {
             pyast::StmtKind::Assign { targets, value, .. } => (targets, value),
@@ -309,9 +339,7 @@ pub fn lower_let_stmt_block(
         };
         // Wrap each scope in Rc once here; lower_assign and subscribe share it
         // via cheap Rc clones rather than cloning the struct.
-        cur_scope = Some(Rc::new(lower_assign(
-            ctx, cur_scope, targets, value, scheduler,
-        )?));
+        ctx.scope = Some(Rc::new(lower_assign(ctx, targets, value, scheduler)?));
     }
     // The last statement is the evaluated expression
     let result = &stmts[stmts.len() - 1];
@@ -324,7 +352,7 @@ pub fn lower_let_stmt_block(
             )))
         }
     };
-    Ok((lower_expr(ctx, result_expr)?, cur_scope))
+    Ok((lower_expr(ctx, result_expr)?, ctx.scope.clone()))
 }
 
 /// Lower a single assignment statement, producing a new VarScope that binds the
@@ -332,7 +360,6 @@ pub fn lower_let_stmt_block(
 /// calls and the new scope.
 fn lower_assign(
     ctx: &mut LoweringContext,
-    parent_scope: Option<Rc<VarScope>>,
     targets: &[pyast::Expr],
     value: &pyast::Expr,
     scheduler: &mut Scheduler,
@@ -342,6 +369,7 @@ fn lower_assign(
             "Only single assignment targets are supported for now".into(),
         ));
     }
+    let parent_scope = ctx.scope.clone();
     let target = &targets[0];
     let name = match &target.node {
         pyast::ExprKind::Name { id, .. } => id,
@@ -381,20 +409,10 @@ mod tests {
     use crate::interpreter::{
         ColumnData, Consumer, FuncBinding, Guard, Notification, Operator, Scheduler,
     };
+    use rstest::rstest;
     use rustpython_parser::parser;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use test_log::test;
-
-    /// Parse a Python expression and return the AST.
-    fn parse_expr(code: &str) -> pyast::Expr {
-        let result = parser::parse(code, parser::Mode::Expression, "<test>")
-            .expect("Failed to parse expression");
-        match result {
-            pyast::Mod::Expression { body } => *body,
-            _ => panic!("Expected expression, got {result:?}"),
-        }
-    }
 
     /// Parse a Python module (sequence of statements) and return the AST.
     fn parse_module(code: &str) -> Vec<pyast::Stmt> {
@@ -408,14 +426,10 @@ mod tests {
 
     /// Helper to evaluate an operator and get the result value.
     /// Creates a consumer, subscribes, and calls get().
-    fn eval_scalar_with_scope(op: Box<dyn Operator>, scope: Option<Rc<VarScope>>) -> Value {
+    fn eval_scalar(op: Box<dyn Operator>, scope: Option<Rc<VarScope>>) -> Value {
         let values = eval(op, scope);
         assert_eq!(values.len(), 1, "Expected single value");
         values.as_single().unwrap().clone()
-    }
-
-    fn eval_scalar(op: Box<dyn Operator>) -> Value {
-        eval_scalar_with_scope(op, None)
     }
 
     fn eval(mut op: Box<dyn Operator>, scope: Option<Rc<VarScope>>) -> ColumnData {
@@ -438,257 +452,72 @@ mod tests {
         column.data
     }
 
-    // ========================================================================
-    // Level 0: Literal expressions
-    // ========================================================================
-
-    #[test]
-    fn test_lower_literal_int() {
-        let ast = parse_expr("2");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::Int(2));
-    }
-
-    #[test]
-    fn test_lower_literal_string() {
-        let ast = parse_expr("\"hello\"");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::String("hello".to_string()));
-    }
-
-    #[test]
-    fn test_lower_literal_bool() {
-        let ast = parse_expr("True");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::Bool(true));
-    }
-
-    // ========================================================================
-    // Level 1: Binary operations
-    // ========================================================================
-
-    #[test]
-    fn test_lower_binop_add() {
-        let ast = parse_expr("2 + 3");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::Int(5));
-    }
-
-    #[test]
-    fn test_lower_binop_mul() {
-        let ast = parse_expr("4 * 5");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::Int(20));
-    }
-
-    #[test]
-    fn test_lower_binop_sub() {
-        let ast = parse_expr("4 - 5");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::Int(-1));
-    }
-
-    #[test]
-    fn test_lower_binop_mixed() {
-        let ast = parse_expr("1 + 2 - 3 * 4");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::Int(-9));
-    }
-
-    #[test]
-    fn test_lower_binop_op_precedence() {
-        // Op precedence is handled by the parser.
-        let ast = parse_expr("1 + 2 * 3 - 4");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::Int(3));
-    }
-
-    #[test]
-    fn test_lower_binop_parens() {
-        // Parens are handled by the parser.
-        let ast = parse_expr("1 + 2 * (3 - 4)");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::Int(-1));
-    }
-
-    #[test]
-    fn test_lower_binop_floordiv() {
-        let ast = parse_expr("7 // 2");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::Int(3));
-    }
-
-    // ========================================================================
-    // Level 2: Let bindings (simple variable)
-    // ========================================================================
-
-    #[test]
-    fn test_lower_let_simple() {
-        let ast = parse_module("x = 2; x");
-        let (op, scope) =
-            lower_let_stmt_block(&mut LoweringContext::default(), &ast, &mut Scheduler::new())
-                .expect("Failed to lower");
-        assert_eq!(eval_scalar_with_scope(op, scope), Value::Int(2));
-    }
-
-    #[test]
-    fn test_lower_let_multiple() {
-        let ast = parse_module("x = 2; y = x; y");
-        let (op, scope) =
-            lower_let_stmt_block(&mut LoweringContext::default(), &ast, &mut Scheduler::new())
-                .expect("Failed to lower");
-        assert_eq!(eval_scalar_with_scope(op, scope), Value::Int(2));
-    }
-
-    // ========================================================================
-    // Level 3: Let bindings with binary operations
-    // ========================================================================
-
-    #[test]
-    #[ignore] // TODO: Implement Let + BinOp
-    fn test_lower_let_with_binop() {
-        // x = 2; x + 1
-        // CCL equivalent: Let("x", Literal(2), BinOp(VarRef("x"), Literal(1), Add))
-        todo!("Implement Let + BinOp")
-    }
-
-    // ========================================================================
-    // Level 4: List literals
-    // ========================================================================
-
-    #[test]
-    fn test_lower_list_literal() {
-        let ast = parse_expr("[1, 2, 3]");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-
-        match value {
-            Value::Function(bindings) => {
-                assert_eq!(bindings.len(), 3);
-                assert_eq!(
-                    bindings[0],
-                    FuncBinding {
-                        input: Value::Int(0),
-                        output: Value::Int(1)
-                    }
-                );
-                assert_eq!(
-                    bindings[1],
-                    FuncBinding {
-                        input: Value::Int(1),
-                        output: Value::Int(2)
-                    }
-                );
-                assert_eq!(
-                    bindings[2],
-                    FuncBinding {
-                        input: Value::Int(2),
-                        output: Value::Int(3)
-                    }
-                );
-            }
-            _ => panic!("Expected Function value, got {value:?}"),
+    fn make_int_list(v: &[i64]) -> ColumnData {
+        ColumnData::FunctionBindings {
+            inputs: Box::new(ColumnData::UInts((0..v.len()).collect())),
+            outputs: Box::new(ColumnData::Ints(v.into())),
         }
     }
 
-    // ========================================================================
-    // Level 5: List indexing
-    // ========================================================================
-
-    #[test]
-    #[ignore] // TODO: Implement Apply operator
-    fn test_lower_list_index() {
-        let ast = parse_expr("[1, 2, 3][0]");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::Int(1));
+    #[rstest]
+    // Literals
+    #[case("2", Value::Int(2))]
+    #[case(r#""hello""#, Value::String("hello".to_string()))]
+    #[case("True", Value::Bool(true))]
+    #[case("[]", Value::Function(vec![]))]
+    #[case("[1, 2]", Value::Function(vec![FuncBinding {
+                        input: Value::Int(0),
+                        output: Value::Int(1)
+                    }, FuncBinding {
+                        input: Value::Int(1),
+                        output: Value::Int(2)
+                    }]))]
+    // Arithmetic binary operations
+    #[case("2 + 3", Value::Int(5))]
+    #[case("4 * 5", Value::Int(20))]
+    #[case("4 - 5", Value::Int(-1))]
+    #[case("1 + 2 - 3 * 4", Value::Int(-9))]
+    // Op precedence and parens are handled by the parser
+    #[case("1 + 2 * 3 - 4", Value::Int(3))]
+    #[case("1 + 2 * (3 - 4)", Value::Int(-1))]
+    #[case("7 // 2", Value::Int(3))]
+    // Let bindings (scalar variables)
+    #[case("x = 2; x", Value::Int(2))]
+    #[case("x = 2; y = x; y", Value::Int(2))]
+    #[case("x = 2; y = x; y + x + 1", Value::Int(5))]
+    fn test_lower_scalar(#[case] code: &str, #[case] expected: Value) {
+        let ast = parse_module(code);
+        let (op, scope) =
+            lower_let_stmt_block(&mut LoweringContext::default(), &ast, &mut Scheduler::new())
+                .expect("Failed to lower");
+        assert_eq!(eval_scalar(op, scope), expected);
     }
 
-    #[test]
-    #[ignore] // TODO: Implement Apply operator
-    fn test_lower_list_index_middle() {
-        let ast = parse_expr("[10, 20, 30][1]");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval_scalar(op);
-        assert_eq!(value, Value::Int(20));
+    #[rstest]
+    #[case("[x for x in [10, 20]]", make_int_list(&[10, 20]))]
+    #[case("[42 for x in [10, 20]]", make_int_list(&[42, 42]))]
+    #[case("[y for y in [x for x in [10, 20]]]", make_int_list(&[10, 20]))]
+    #[case("[x + 2 for x in [10, 20]]", make_int_list(&[12, 22]))]
+    #[case("y = 5; [x + y for x in [10, 20]]", make_int_list(&[15, 25]))]
+    fn test_lower(#[case] code: &str, #[case] expected: ColumnData) {
+        let ast = parse_module(code);
+        let (op, scope) =
+            lower_let_stmt_block(&mut LoweringContext::default(), &ast, &mut Scheduler::new())
+                .expect("Failed to lower");
+        assert_eq!(eval(op, scope), expected,);
     }
 
-    // ========================================================================
-    // Level 6: List comprehension (target test case)
-    // ========================================================================
-
-    #[test]
-    fn test_lower_list_comp() {
-        let ast = parse_expr("[x for x in [10, 20]]");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval(op, None);
-        assert_eq!(
-            value,
-            ColumnData::FunctionBindings {
-                inputs: Box::new(ColumnData::UInts(vec![0, 1])),
-                outputs: Box::new(ColumnData::Ints(vec![10, 20]))
-            }
-        );
-    }
-
-    #[test]
-    fn test_lower_contant_in_list_comp() {
-        let ast = parse_expr("[42 for x in [10, 20]]");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval(op, None);
-        assert_eq!(
-            value,
-            ColumnData::FunctionBindings {
-                inputs: Box::new(ColumnData::UInts(vec![0, 1])),
-                outputs: Box::new(ColumnData::Ints(vec![42, 42]))
-            }
-        );
-    }
-
-    #[test]
-    fn test_lower_nested_list_comp() {
-        let ast = parse_expr("[y for y in [x for x in [10, 20]]]");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval(op, None);
-        assert_eq!(
-            value,
-            ColumnData::FunctionBindings {
-                inputs: Box::new(ColumnData::UInts(vec![0, 1])),
-                outputs: Box::new(ColumnData::Ints(vec![10, 20]))
-            }
-        );
-    }
-
-    #[test]
-    fn test_lower_binop_in_list_comp() {
-        let ast = parse_expr("[x + 2 for x in [10, 20]]");
-        let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
-        let value = eval(op, None);
-        assert_eq!(
-            value,
-            ColumnData::FunctionBindings {
-                inputs: Box::new(ColumnData::UInts(vec![0, 1])),
-                outputs: Box::new(ColumnData::Ints(vec![12, 22]))
-            }
-        );
-    }
-
-    #[test]
-    fn test_test_source() {
+    #[rstest]
+    #[case("[x for x in testsource1()]")]
+    #[case("[x + '' for x in testsource1()]")]
+    #[case("['' + x for x in testsource1()]")]
+    #[case("y = ''; [y + x for x in testsource1()]")]
+    fn test_test_source(#[case] code: &str) {
         let mut ctx = LoweringContext::default();
         let data_source = ctx.inject_test_source("testsource1");
-        let ast = parse_expr("[x for x in testsource1()]");
-        let mut op = lower_expr(&mut ctx, &ast).expect("Failed to lower");
+        let ast = parse_module(code);
+        let (mut op, scope) =
+            lower_let_stmt_block(&mut ctx, &ast, &mut Scheduler::new()).expect("Failed to lower");
         data_source.borrow_mut().add_data(&[
             (Value::Int(10), Value::String("foo".to_string())),
             (Value::Int(20), Value::String("bar".to_string())),
@@ -707,7 +536,7 @@ mod tests {
         });
 
         let mut scheduler = Scheduler::new();
-        let mut producer = op.subscribe(Guard::universal(), consumer, None, &mut scheduler);
+        let mut producer = op.subscribe(Guard::universal(), consumer, scope, &mut scheduler);
         scheduler.check_for_notifications();
         assert!(*notified_has_data.borrow());
         assert_eq!(*notified_yield_guard.borrow(), Guard::Empty);

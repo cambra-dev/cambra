@@ -81,6 +81,10 @@ impl VarScope {
             self.parent.as_ref()?.lookup_with_chain(name, chain)
         }
     }
+
+    pub fn get_parent(&self) -> Option<Rc<VarScope>> {
+        self.parent.clone()
+    }
 }
 
 // ============================================================================
@@ -156,7 +160,7 @@ impl Var {
     ///
     /// Consumers can be added later via `VarSub::add_consumer()`.
     pub fn create_subscription(&self, source: VarSource) -> Rc<RefCell<VarSub>> {
-        Rc::new(RefCell::new(VarSub::new(source)))
+        Rc::new(RefCell::new(VarSub::new(source, self.extent())))
     }
 }
 
@@ -167,6 +171,8 @@ impl Var {
 /// VarSub implements both Producer and Consumer.
 /// It stores the yield guard (monotonically growing) and forwards notifications to all consumers.
 pub struct VarSub {
+    /// The Extent of the Var
+    extent: Extent,
     /// The source of values for this variable (Argument or Iteration)
     source: VarSource,
     /// The current yield guard (monotonically growing)
@@ -197,8 +203,9 @@ impl std::fmt::Debug for VarSub {
 
 impl VarSub {
     /// Create a new VarSub with the given source.
-    fn new(source: VarSource) -> Self {
+    fn new(source: VarSource, extent: &Extent) -> Self {
         VarSub {
+            extent: extent.clone(),
             source,
             yield_guard: Guard::Empty,
             data_available: false,
@@ -277,6 +284,10 @@ impl VarSub {
                 self.source
             ),
         };
+    }
+
+    pub fn get_extent(&self) -> &Extent {
+        &self.extent
     }
 }
 
