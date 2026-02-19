@@ -1,0 +1,48 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build)",
+      "Bash(cargo build *)",
+      "Bash(cargo test)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo fmt)",
+      "Bash(cargo fmt *)",
+      "Bash(./ci.sh)",
+      "Bash(./ci.sh *)",
+
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git diff)",
+      "Bash(git diff *)",
+      "Bash(git log)",
+      "Bash(git log *)",
+      "Bash(git status)",
+      "Bash(git status *)",
+      "Bash(git fetch)",
+      "Bash(git fetch *)",
+      "Bash(git pull)",
+      "Bash(git pull *)",
+      "Bash(git push)",
+      "Bash(git push *)",
+      "Bash(git checkout *)",
+      "Bash(git branch)",
+      "Bash(git branch *)",
+      "Bash(git stash)",
+      "Bash(git stash *)",
+      "Bash(git merge *)",
+      "Bash(git rebase *)",
+
+      "Bash(gs)",
+      "Bash(gs *)",
+
+      "Bash(gh pr *)",
+      "Bash(gh issue *)",
+      "Bash(gh run *)",
+      "Bash(gh api *)",
+      "Bash(gh cache *)",
+
+      "WebSearch"
+    ]
+  }
+}

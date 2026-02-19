@@ -21,71 +21,89 @@ cargo test <name>  # Run a specific test by name
 
 ## General Instructions
 
-When planning or implementing changes, prefer asking a user clarifying questions as necessary rather than making assumptions.
+### When in Doubt, Ask
+Stop and ask before proceeding when:
+- A task is ambiguous and you could reasonably interpret it multiple ways
+- Something in the code contradicts what you'd expect from the design docs or CLAUDE.md
+- You're about to make a non-trivial architectural choice that isn't covered by existing patterns
+- A test fails in a way that suggests the premise of the task may be wrong
+- You're unsure whether a change should be made in the interpreter, lowering, or both
 
+Prefer a short clarifying question over a best-guess implementation. Getting it wrong wastes more time than pausing to confirm.
+
+### Skills
+- `/pyast` — Quick reference for `rustpython_parser` AST types (ExprKind, StmtKind, Operator, Constant, etc.)
+
+### Code Comments
 Comment all objects (modules, structures and their fields, functions, etc) thoroughly, but concisely, in accordance with rustdoc best practices. For internal comments (for example, inside functions), strongly prefer commenting the _why_ of things, only commenting _what_ if the code is confusing and cannot be reasonably simplified.
 
+### Workflow
 After making changes, run the formatter before running code; prefer running the linter after ensuring the project builds, then progress to CI.
+
+### Compact instructions
+When you are using compact, focus on test output and code changes.
+
+### Git Conventions
+- Do not add "Co-Authored-By" lines attributing credit to AI models to commit messages.
+- When making changes, verify the freshness of the local repo by fetching and comparing the diff. The following commands do this, if there are differences, warn the user and ask the user whether they would like to pull or rebase.
+   1. `git fetch origin`
+   2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
+
 
 
 
 ## Architecture
 
+### Pipeline
+
+```
+Python source → parse (rustpython_parser) → lower (lowering.rs) → CCL operators → subscribe() → producer/consumer dataflow
+```
+
 ### Core Concepts
 
-- **Operators**: Stateless components corresponding to program syntax (`Literal`, `Var`, `VarRef`, `Lambda`)
-- **Producers/Consumers**: Runtime stateful objects created from operators via `subscribe()`
-- **Guards**: Predicates representing regions (subsets of extents); monotonically growing
-- **Extents**: The set of values a term can take on (equivalent to types)
-- **ColumnValue**: Columnar data with `parent_indices` for alignment across nesting levels
+- **Operators**: Stateless components corresponding to program syntax (`Literal`, `BinOp`, `Var`, `VarRef`, `Lambda`). Each has an `extent` (the set of values it can produce — equivalent to its type) and a `subscribe()` method that creates a producer/consumer pair for execution.
+- **Producers/Consumers**: Runtime stateful objects created from operators via `subscribe()`. Form a dataflow graph where notifications flow downstream and data is pulled upstream.
+- **Guards**: Predicates representing regions (subsets of extents). Three roles: *intent* (consumer registers interest), *yield* (producer announces data ready), and *obsolete* (consumer retracts interest). Yield guards grow monotonically — each notification is a superset of all previous ones.
+- **ColumnValue**: Columnar batch of values with optional `parent_indices` for alignment across nesting levels. Enables vectorized execution; `expand()` composes indices through scan chains for multi-level alignment.
 
 ### Producer/Consumer Protocol
 
 ```rust
-Consumer::notify(yield_guard)      // Producer notifies consumer data is ready
-Producer::get() -> ColumnValue     // Consumer requests data synchronously
-Producer::release(obsolete_guard)  // Consumer retracts interest in a region
+// Operator creates the dataflow link
+Operator::subscribe(intent_guard, consumer, var_scope) -> Producer
+
+// Producer pushes progress notifications to consumer
+Consumer::notify(Notification::NewData)       // Data available — call get()
+Consumer::notify(Notification::Yield(guard))  // Region complete, no new data
+
+// Consumer pulls data and manages lifecycle
+Producer::get() -> GetResult { column_value, yield_guard }
+Producer::release(obsolete_guard) -> Guard
 ```
-
-### Key Files
-
-- `src/lib.rs` - Public API and Python parsing
-- `src/interpreter.rs` - CCL interpreter (operators, producers, consumers, guards, extents)
-
-### Skills
-
-- `/pyast` — Quick reference for `rustpython_parser` AST types (ExprKind, StmtKind, Operator, Constant, etc.)
 
 ### Variable System
 
-Variables have two modes:
-- **Bound**: Lambda applied to argument (`(\x. body) arg`) - VarSub wraps argument's producer
-- **Scanning**: Lambda aggregated (`sum(\x. body)`) - VarSub iterates over extent, executes joins
+- **Var**: Variable definition (name + extent). Not an Operator — cannot be subscribed directly.
+- **VarRef**: Variable reference (implements Operator). Looks up the variable in `VarScope` at subscribe time.
+- **VarSub**: Runtime subscription bridging a variable's source to its consumers. Source is one of:
+  - `Bound` — lambda applied to an argument; wraps the argument's producer
+  - `Scanning` — lambda consumed by an aggregator; iterates over extent with predicate filtering
+- **VarScope**: Linked list for variable lookup with parent chaining. `lookup_variable()` returns both the subscription and the chain of intermediate scanning variables for alignment composition.
 
-`VarScope` is a linked list for variable lookup with parent chaining. For nested scans, `lookup_variable()` returns both the variable and the chain of inner scans for alignment composition.
+### Key Files
 
-### Guard Monotonicity Contract
-
-Each `notify()` call provides a yield guard that is a superset of all previous yield guards. This allows storing a single yield guard rather than tracking history.
-
-## Implementation Status
-
-See `PLAN.md` for detailed progress. Currently implementing Step 7b (scan chain for multi-level alignment). Core operators (Literal, Var, VarRef, Lambda) and columnar values are complete. Application operator and join execution are next.
-
-Simultaneously we're working on a lowering implementation, transforming the Python AST into CCL operators.
+- `src/lib.rs` — Public API; wraps `rustpython_parser` for Python parsing
+- `src/interpreter/` — CCL interpreter module:
+  - `mod.rs` — `Consumer`, `Producer`, `Operator` traits and protocol types
+  - `types.rs` — `Guard`, `Extent`, `Value`, `Notification`, `GetResult`, `ColumnValue`
+  - `var.rs` — `Var`, `VarRef`, `VarSub`, `VarScope`, `VarSource`
+  - `lambda.rs` — `Lambda` operator and `LambdaProducer`
+  - `literal.rs` — `Literal` operator
+  - `binop.rs` — `BinOp` operator (Add, Sub, Mul, FloorDiv)
+- `src/lowering.rs` — Lowers Python AST to CCL operators (constants, binops, let-bindings, list literals)
+- `src/pretty_ast.rs` — Tree-style pretty-printer for rustpython AST (debugging aid)
 
 ## Design Reference
 
 See `design.md` for the full specification including syntax, denotational/operational semantics, and detailed CCL operator descriptions.
-
-
-## Compact instructions
-
-When you are using compact, focus on test output and code changes.
-
-## Git Conventions
-
-- Do not add "Co-Authored-By" lines attributing credit to AI models to commit messages.
-- When making changes, verify the freshness of the local repo by fetching and comparing the diff. The following commands do this, if there are differences, warn the user and ask the user whether they would like to pull or rebase.
-   1. `git fetch origin`
-   2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`

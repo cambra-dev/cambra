@@ -2,3 +2,4 @@
 /Cargo.lock
 /.claude/*
 !/.claude/skills/
+!/.claude/settings.json
