@@ -137,8 +137,8 @@ impl StdinDataSource {
 }
 
 impl DataSourceDomainExtentImpl for StdinDataSource {
-    fn get_id(&self) -> String {
-        "stdin".to_string()
+    fn get_id(&self) -> &str {
+        "stdin"
     }
 
     /// Reads stdin for a newline, blocking until a new line is available or EOF is observed
@@ -266,7 +266,7 @@ impl Producer for StdinProducer {
     fn inspect(&self) -> InspectNode {
         InspectNode {
             type_name: "StdinProducer".to_string(),
-            label: self.data_source.borrow().get_id(),
+            label: self.data_source.borrow().get_id().to_string(),
             yield_guard: guard_summary(
                 &self
                     .data_source

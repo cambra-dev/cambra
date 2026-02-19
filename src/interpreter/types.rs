@@ -1,6 +1,6 @@
 //! Core types for the CCL interpreter: Guard, Extent, BaseType, Value, FuncBinding, ColumnValue.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, cmp::Ordering, collections::HashMap, hash::Hash, rc::Rc};
 
 /// A Guard represents a region (subset of an extent) via a set of predicates.
 /// Guards are used to:
@@ -216,8 +216,9 @@ pub enum Extent {
     DataSourceDomain(Rc<RefCell<dyn DataSourceDomainExtentImpl>>),
 }
 
+/// The Extent of the domain of a Data Source
 pub trait DataSourceDomainExtentImpl {
-    fn get_id(&self) -> String;
+    fn get_id(&self) -> &str;
     fn check_for_new_data(&mut self) -> bool;
     fn get_yield_guard(&self) -> Guard;
     fn get_elements(&self) -> Box<dyn Iterator<Item = Value>>;
@@ -333,6 +334,72 @@ pub enum Value {
     Record(HashMap<String, Value>),
 }
 
+impl Hash for Value {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Value::Int(i) => i.hash(state),
+            Value::UInt(i) => i.hash(state),
+            Value::String(s) => s.hash(state),
+            Value::Bool(b) => b.hash(state),
+            Value::Unit => {}
+            Value::Function(bindings) => bindings.hash(state),
+            Value::Record(fields) => {
+                fields.len().hash(state);
+                let mut entries: Vec<_> = fields.iter().collect();
+                entries.sort_by_key(|(k, _)| *k);
+                for (k, v) in entries {
+                    k.hash(state);
+                    v.hash(state);
+                }
+            }
+        }
+    }
+}
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match self {
+            Value::Int(i) => {
+                if let Value::Int(o) = other {
+                    i.partial_cmp(o)
+                } else {
+                    None
+                }
+            }
+            Value::UInt(i) => {
+                if let Value::UInt(o) = other {
+                    i.partial_cmp(o)
+                } else {
+                    None
+                }
+            }
+            Value::String(s) => {
+                if let Value::String(o) = other {
+                    s.partial_cmp(o)
+                } else {
+                    None
+                }
+            }
+            Value::Bool(b) => {
+                if let Value::Bool(o) = other {
+                    b.partial_cmp(o)
+                } else {
+                    None
+                }
+            }
+            Value::Unit => {
+                if let Value::Unit = other {
+                    Some(Ordering::Equal)
+                } else {
+                    None
+                }
+            }
+            _ => todo!("Ordering not implemented yet"),
+        }
+    }
+}
+
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -360,7 +427,7 @@ impl std::fmt::Debug for Value {
 }
 
 /// A function binding represents a single input-output pair for a function
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FuncBinding {
     pub input: Value,
     pub output: Value,

@@ -2,7 +2,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use cambra::{
     interpreter::{Consumer, GetResult, Guard, Notification, Scheduler, Value},
-    lowering::lower_let_stmt_block,
+    lowering::{lower_let_stmt_block, LoweringContext},
     parse_python_code,
     web_inspector::WebInspector,
 };
@@ -20,7 +20,8 @@ fn run_program(code: &str, inspector: Option<&WebInspector>) {
         _ => panic!("Expected module, got {module:?}"),
     };
     let mut scheduler = Scheduler::new();
-    let (mut op, scope) = lower_let_stmt_block(&stmts, &mut scheduler).unwrap();
+    let (mut op, scope) =
+        lower_let_stmt_block(&mut LoweringContext::default(), &stmts, &mut scheduler).unwrap();
 
     let yield_guard = Rc::new(RefCell::new(Guard::empty()));
     let yield_guard_clone = yield_guard.clone();

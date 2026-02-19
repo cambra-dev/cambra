@@ -9,6 +9,7 @@ mod lambda;
 mod literal;
 mod scheduler;
 mod stdio;
+mod test_source;
 mod types;
 mod var;
 
@@ -18,6 +19,7 @@ pub use lambda::*;
 pub use literal::*;
 pub use scheduler::*;
 pub use stdio::*;
+pub use test_source::*;
 pub use types::*;
 pub use var::*;
 
