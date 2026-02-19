@@ -6,8 +6,8 @@ use std::rc::Rc;
 use crate::interpreter::Scheduler;
 
 use super::{
-    guard_summary, ColumnValue, Consumer, Extent, GetResult, Guard, InspectNode, Notification,
-    Operator, ParentIndices, Producer, Value, VarScope,
+    guard_summary, ColumnData, ColumnValue, Consumer, Extent, GetResult, Guard, InspectNode,
+    Notification, Operator, ParentIndices, Producer, VarScope,
 };
 
 /// Kinds of binary arithmetic operations.
@@ -23,15 +23,28 @@ pub enum BinOpKind {
     // to be implmented first (e.g. float division).
 }
 
-/// Apply a binary operation element-wise.
-pub fn apply_binop(op: BinOpKind, left: &Value, right: &Value) -> Value {
+/// Apply a binary operation element-wise on ColumnData.
+pub fn apply_binop_column(op: BinOpKind, left: &ColumnData, right: &ColumnData) -> ColumnData {
     match (op, left, right) {
-        (BinOpKind::Add, Value::Int(a), Value::Int(b)) => Value::Int(a + b),
-        (BinOpKind::Sub, Value::Int(a), Value::Int(b)) => Value::Int(a - b),
-        (BinOpKind::Mul, Value::Int(a), Value::Int(b)) => Value::Int(a * b),
-        (BinOpKind::FloorDiv, Value::Int(a), Value::Int(b)) => Value::Int(a / b),
-        (BinOpKind::Concat, Value::String(a), Value::String(b)) => Value::String(format!("{a}{b}")),
-        _ => panic!("Unsupported binop: {op:?} on {left:?} and {right:?}"),
+        (BinOpKind::Add, ColumnData::Ints(l), ColumnData::Ints(r)) => {
+            ColumnData::Ints(l.iter().zip(r.iter()).map(|(a, b)| a + b).collect())
+        }
+        (BinOpKind::Sub, ColumnData::Ints(l), ColumnData::Ints(r)) => {
+            ColumnData::Ints(l.iter().zip(r.iter()).map(|(a, b)| a - b).collect())
+        }
+        (BinOpKind::Mul, ColumnData::Ints(l), ColumnData::Ints(r)) => {
+            ColumnData::Ints(l.iter().zip(r.iter()).map(|(a, b)| a * b).collect())
+        }
+        (BinOpKind::FloorDiv, ColumnData::Ints(l), ColumnData::Ints(r)) => {
+            ColumnData::Ints(l.iter().zip(r.iter()).map(|(a, b)| a / b).collect())
+        }
+        (BinOpKind::Concat, ColumnData::Strings(l), ColumnData::Strings(r)) => ColumnData::Strings(
+            l.iter()
+                .zip(r.iter())
+                .map(|(a, b)| format!("{}{}", a, b))
+                .collect(),
+        ),
+        _ => panic!("Unsupported binop: {:?} on {:?} and {:?}", op, left, right),
     }
 }
 
@@ -195,45 +208,21 @@ impl Producer for BinOpProducer {
         let left_col = left_result.column_value;
         let right_col = right_result.column_value;
 
-        // Zip and apply binop element-wise
+        // Zip and apply binop element-wise, broadcasting scalars as needed
+        // TODO figure out a better way to handle repeated values.
+        // Maybe lazily repeat iterators, or use a vectorization library?
         let left_is_scalar = left_col.parent_indices == ParentIndices::Scalar;
         let right_is_scalar = right_col.parent_indices == ParentIndices::Scalar;
-        let values: Vec<Value> = if left_is_scalar == right_is_scalar {
-            left_col
-                .values
-                .iter()
-                .zip(right_col.values.iter())
-                .map(|(l, r)| apply_binop(self.op, l, r))
-                .collect()
-        } else if left_is_scalar {
-            right_col
-                .values
-                .iter()
-                .map(|r| {
-                    apply_binop(
-                        self.op,
-                        left_col
-                            .as_single()
-                            .expect("Scalar ColumnValue had multiple values"),
-                        r,
-                    )
-                })
-                .collect()
+        let (left_data, right_data) = if left_is_scalar && !right_is_scalar {
+            (left_col.data.repeat(right_col.data.len()), right_col.data)
+        } else if right_is_scalar && !left_is_scalar {
+            let len = left_col.data.len();
+            (left_col.data, right_col.data.repeat(len))
         } else {
-            left_col
-                .values
-                .iter()
-                .map(|l| {
-                    apply_binop(
-                        self.op,
-                        l,
-                        right_col
-                            .as_single()
-                            .expect("Scalar ColumnValue had multiple values"),
-                    )
-                })
-                .collect()
+            assert_eq!(left_col.data.len(), right_col.data.len());
+            (left_col.data, right_col.data)
         };
+        let result_data = apply_binop_column(self.op, &left_data, &right_data);
 
         let result_parent_indices = if left_is_scalar && right_is_scalar {
             ParentIndices::Scalar
@@ -250,7 +239,7 @@ impl Producer for BinOpProducer {
 
         GetResult {
             column_value: ColumnValue {
-                values,
+                data: result_data,
                 parent_indices: result_parent_indices,
             },
             // BinOp would need to transform sub-producer guards through the
@@ -334,8 +323,7 @@ mod tests {
         drop(notifs);
 
         let result = producer.get();
-        assert_eq!(result.column_value.values.len(), 1);
-        assert_eq!(result.column_value.values[0], Value::Int(5));
+        assert_eq!(result.column_value.data, ColumnData::Ints(vec![5]));
         assert_eq!(result.column_value.parent_indices, ParentIndices::Scalar);
     }
 
@@ -355,8 +343,7 @@ mod tests {
         );
 
         let result = producer.get();
-        assert_eq!(result.column_value.values.len(), 1);
-        assert_eq!(result.column_value.values[0], Value::Int(20));
+        assert_eq!(result.column_value.data, ColumnData::Ints(vec![20]));
     }
 
     #[test]
@@ -375,8 +362,7 @@ mod tests {
         );
 
         let result = producer.get();
-        assert_eq!(result.column_value.values.len(), 1);
-        assert_eq!(result.column_value.values[0], Value::Int(7));
+        assert_eq!(result.column_value.data, ColumnData::Ints(vec![7]));
     }
 
     #[test]

@@ -211,7 +211,28 @@ A problem arises when there are multiple variables with **iteration** source in 
 
 ### Columnar Values and Alignment
 
-To support vectorized execution, `Value` is extended to a columnar representation.
+To support vectorized execution, values are represented in a typed columnar form.
+
+`ColumnData` stores one batch of values per type, avoiding boxing individual elements:
+
+```rust
+enum ColumnData {
+    Units(usize),                        // n unit values (no storage needed)
+    Ints(Vec<i64>),
+    UInts(Vec<usize>),
+    Strings(Vec<String>),
+    Bools(Vec<bool>),
+    Variants(Vec<Value>),                // heterogeneous fallback
+    FunctionBindings {
+        inputs: Box<ColumnData>,
+        outputs: Box<ColumnData>,
+    },
+    Tuples(Vec<ColumnData>),             // one ColumnData per tuple slot
+    Records(HashMap<String, ColumnData>),
+}
+```
+
+`FunctionBindings` stores all bindings for a lambda batch columnarally — inputs and outputs as parallel typed columns — rather than as a `Vec<FuncBinding>` of boxed pairs.
 
 `ParentIndices` records how a batch relates to the enclosing scan context:
 
@@ -227,7 +248,7 @@ These combine into `ColumnValue`:
 
 ```rust
 struct ColumnValue {
-    values: Vec<Value>,
+    data: ColumnData,
     parent_indices: ParentIndices,
 }
 ```
@@ -236,7 +257,7 @@ When evaluating expressions with multiple universally-quantified variables in sc
 - Proper alignment of values from different nesting levels
 - Efficient join execution between nested iterations
 - Vectorized operations on aligned batches
-- Scalar broadcasting: a `Scalar` value is valid at any batch size
+- Scalar broadcasting: a `Scalar` value expands to match any batch via `ColumnData::repeat()`
 
 ### Scans as Joins
 

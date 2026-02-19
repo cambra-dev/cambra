@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use super::{
     guard_summary, ColumnValue, Consumer, Extent, GetResult, Guard, InspectNode, Notification,
-    Operator, ParentIndices, Producer, Scheduler, Value,
+    Operator, ParentIndices, Producer, Scheduler,
 };
 use log::debug;
 
@@ -294,18 +294,16 @@ impl Producer for VarSub {
                 Extent::UIntRange { start, end } => {
                     self.yield_guard = Guard::Universal;
                     GetResult {
-                        column_value: ColumnValue::from_values(
-                            (*start..*end).map(Value::UInt).collect(),
-                        ),
+                        column_value: ColumnValue::from_uints((*start..*end).collect()),
                         yield_guard: Guard::Universal,
                     }
                 }
                 Extent::DataSourceDomain(source_impl) => {
-                    let values = source_impl.borrow_mut().get_elements().collect();
+                    let values = source_impl.borrow_mut().get_elements();
                     let yield_guard = source_impl.borrow().get_yield_guard();
                     self.yield_guard = yield_guard.clone();
                     let get_result = GetResult {
-                        column_value: ColumnValue::from_values(values),
+                        column_value: ColumnValue::from_column_data(values),
                         yield_guard,
                     };
                     debug!("Generating source values {get_result:#?}");
@@ -586,8 +584,7 @@ mod tests {
 
         // Verify get returns the value (as a single-element column)
         let result = producer.get();
-        assert_eq!(result.column_value.values.len(), 1);
-        assert_eq!(result.column_value.values[0], Value::Int(42));
+        assert_eq!(result.column_value.as_single().unwrap(), Value::Int(42));
 
         // Verify release returns stored release guard (initially empty)
         let released = producer.release(Guard::universal());

@@ -1,7 +1,7 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::interpreter::{
-    ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, FuncBinding, GetResult, Guard,
+    ColumnData, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, GetResult, Guard,
     InspectNode, Operator, ParentIndices, Producer, Scheduler, Value, VarScope,
 };
 
@@ -53,9 +53,8 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         result
     }
 
-    fn get_elements(&self) -> Box<dyn Iterator<Item = Value>> {
-        let keys: Vec<Value> = self.data.keys().cloned().collect();
-        Box::new(keys.into_iter())
+    fn get_elements(&self) -> ColumnData {
+        ColumnData::from_values(self.data.keys().cloned().collect())
     }
 
     fn get_yield_guard(&self) -> Guard {
@@ -166,24 +165,23 @@ impl Producer for TestSourceProducer {
             yield_guard,
         } = self.index_producer.get();
         let source = self.data_source.borrow();
+        let n = indices.data.len();
+        let output_values: Vec<Value> = (0..n)
+            .map(|i| {
+                let key = indices.data.index_at(i);
+                source
+                    .data
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("Key {:?} not found in TestDataSource", key))
+                    .clone()
+            })
+            .collect();
         GetResult {
             column_value: ColumnValue {
-                values: vec![Value::Function(
-                    indices
-                        .values
-                        .iter()
-                        .map(|key| FuncBinding {
-                            input: key.clone(),
-                            output: source
-                                .data
-                                .get(key)
-                                .unwrap_or_else(|| {
-                                    panic!("Key {:?} not found in TestDataSource", key)
-                                })
-                                .clone(),
-                        })
-                        .collect(),
-                )],
+                data: ColumnData::function_bindings(
+                    indices.data,
+                    ColumnData::from_values(output_values),
+                ),
                 parent_indices: ParentIndices::TopLevelVector,
             },
             yield_guard: yield_guard.to_universal_or_empty(),

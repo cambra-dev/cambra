@@ -84,7 +84,7 @@ fn run_program(code: &str, inspector: Option<&WebInspector>) {
         if yield_guard.borrow().is_universal() {
             break;
         }
-        println!("Got value: {:#?}", &column_value.values);
+        println!("Got value: {:#?}", &column_value.data);
     }
     producer.release(Guard::universal());
 }

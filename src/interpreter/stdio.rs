@@ -3,7 +3,7 @@ use std::{cell::RefCell, rc::Rc};
 use log::debug;
 
 use crate::interpreter::{
-    guard_summary, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, FuncBinding,
+    guard_summary, ColumnData, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent,
     GetResult, Guard, InspectNode, Operator, ParentIndices, Producer, Scheduler, Value, VarScope,
 };
 
@@ -183,8 +183,8 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     }
 
     /// Returns the currently readable set of indices
-    fn get_elements(&self) -> Box<dyn Iterator<Item = Value>> {
-        Box::new((self.start_idx..self.ready_size).map(Value::UInt))
+    fn get_elements(&self) -> ColumnData {
+        ColumnData::UInts((self.start_idx..self.ready_size).collect())
     }
 
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
@@ -232,23 +232,16 @@ impl Producer for StdinProducer {
             column_value: indices,
             yield_guard,
         } = self.index_producer.get();
+        let source = self.data_source.borrow();
+        let outputs = match &indices.data {
+            ColumnData::UInts(idx_vec) => {
+                ColumnData::Strings(idx_vec.iter().map(|i| source.get(*i).to_string()).collect())
+            }
+            other => panic!("Expected UInt indices for stdin, got {:?}", other),
+        };
         GetResult {
             column_value: ColumnValue {
-                values: vec![Value::Function(
-                    indices
-                        .values
-                        .iter()
-                        .map(|v| match v {
-                            Value::UInt(i) => FuncBinding {
-                                input: v.clone(),
-                                output: Value::String(
-                                    self.data_source.borrow().get(*i).to_string(),
-                                ),
-                            },
-                            _ => panic!("Non-integer as stdin index"),
-                        })
-                        .collect(),
-                )],
+                data: ColumnData::function_bindings(indices.data, outputs),
                 parent_indices: ParentIndices::TopLevelVector,
             },
             // We don't know anything about the contents of stdin, so the yield guard

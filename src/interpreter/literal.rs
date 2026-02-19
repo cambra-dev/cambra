@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::interpreter::{FuncBinding, GetResult, Notification};
+use crate::interpreter::{ColumnData, GetResult, Notification};
 
 use super::{
-    BaseType, ColumnValue, Consumer, Extent, Guard, InspectNode, Operator, Producer, Scheduler,
-    Value, VarScope,
+    BaseType, ColumnValue, Consumer, Extent, FuncBinding, Guard, InspectNode, Operator, Producer,
+    Scheduler, Value, VarScope,
 };
 
 /// A literal operator represents a constant value.
@@ -206,21 +206,20 @@ impl Producer for ListLiteralProducer {
             column_value: input_indices,
         } = self.index_producer.get();
 
-        let bindings: Vec<FuncBinding> = input_indices
-            .values
-            .iter()
-            .map(|i| FuncBinding {
-                input: i.clone(),
-                output: match i {
-                    Value::UInt(idx) => self.values.get(*idx).cloned().unwrap_or(Value::Unit),
-                    _ => panic!("Expected uint index, got {i:?}"),
-                },
-            })
-            .collect();
+        let outputs = match &input_indices.data {
+            ColumnData::UInts(indices) => {
+                let output_values: Vec<Value> = indices
+                    .iter()
+                    .map(|i| self.values.get(*i).cloned().unwrap_or(Value::Unit))
+                    .collect();
+                ColumnData::from_values(output_values)
+            }
+            other => panic!("Expected UInt indices, got {:?}", other),
+        };
 
         GetResult {
             column_value: ColumnValue {
-                values: vec![Value::Function(bindings)],
+                data: ColumnData::function_bindings(input_indices.data, outputs),
                 parent_indices: input_indices.parent_indices,
             },
             yield_guard,
@@ -273,8 +272,7 @@ mod tests {
 
         // Verify get returns the constant value and Universal yield guard
         let result = producer.get();
-        assert_eq!(result.column_value.values.len(), 1);
-        assert_eq!(result.column_value.values[0], Value::Int(42));
+        assert_eq!(result.column_value.as_single().unwrap(), Value::Int(42));
         assert_eq!(result.column_value.parent_indices, ParentIndices::Scalar);
         assert!(result.yield_guard.is_universal());
 
@@ -303,9 +301,8 @@ mod tests {
         assert!(matches!(notifications_borrowed[0], Notification::NewData));
 
         let result = producer.get();
-        assert_eq!(result.column_value.values.len(), 1);
         assert_eq!(
-            result.column_value.values[0],
+            result.column_value.as_single().unwrap(),
             Value::String("hello".to_string())
         );
     }
@@ -334,9 +331,8 @@ mod tests {
 
         // Get should return a single Function value with index->element bindings
         let column = producer.get().column_value;
-        assert_eq!(column.values.len(), 1);
         assert_eq!(
-            column.values[0],
+            column.as_single().unwrap(),
             Value::Function(vec![
                 FuncBinding {
                     input: Value::Int(0),
@@ -373,9 +369,8 @@ mod tests {
 
         // Get should return Function with a single binding: 1->20
         let column = producer.get().column_value;
-        assert_eq!(column.values.len(), 1);
         assert_eq!(
-            column.values[0],
+            column.as_single().unwrap(),
             Value::Function(vec![FuncBinding {
                 input: Value::UInt(1),
                 output: Value::Int(20),

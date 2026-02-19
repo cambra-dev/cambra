@@ -378,7 +378,9 @@ fn lower_assign(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::{Consumer, FuncBinding, Guard, Notification, Operator, Scheduler};
+    use crate::interpreter::{
+        ColumnData, Consumer, FuncBinding, Guard, Notification, Operator, Scheduler,
+    };
     use rustpython_parser::parser;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -409,14 +411,14 @@ mod tests {
     fn eval_scalar_with_scope(op: Box<dyn Operator>, scope: Option<Rc<VarScope>>) -> Value {
         let values = eval(op, scope);
         assert_eq!(values.len(), 1, "Expected single value");
-        values[0].clone()
+        values.as_single().unwrap().clone()
     }
 
     fn eval_scalar(op: Box<dyn Operator>) -> Value {
         eval_scalar_with_scope(op, None)
     }
 
-    fn eval(mut op: Box<dyn Operator>, scope: Option<Rc<VarScope>>) -> Vec<Value> {
+    fn eval(mut op: Box<dyn Operator>, scope: Option<Rc<VarScope>>) -> ColumnData {
         // Track notifications
         let notified = Rc::new(RefCell::new(false));
         let notified_clone = notified.clone();
@@ -433,17 +435,7 @@ mod tests {
         assert!(*notified.borrow(), "Expected to be notified");
 
         let column = producer.get().column_value;
-        column.values
-    }
-
-    fn sorted_function(function: &Value) -> Value {
-        if let Value::Function(bindings) = function {
-            let mut new_bindings = bindings.clone();
-            new_bindings.sort_by(|l, r| l.input.partial_cmp(&r.input).expect("Failed to sort"));
-            Value::Function(new_bindings)
-        } else {
-            panic!("Not a function: {function:?}");
-        }
+        column.data
     }
 
     // ========================================================================
@@ -641,17 +633,11 @@ mod tests {
         let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
         let value = eval(op, None);
         assert_eq!(
-            value[0],
-            Value::Function(vec![
-                FuncBinding {
-                    input: Value::UInt(0),
-                    output: Value::Int(10)
-                },
-                FuncBinding {
-                    input: Value::UInt(1),
-                    output: Value::Int(20)
-                }
-            ])
+            value,
+            ColumnData::FunctionBindings {
+                inputs: Box::new(ColumnData::UInts(vec![0, 1])),
+                outputs: Box::new(ColumnData::Ints(vec![10, 20]))
+            }
         );
     }
 
@@ -661,17 +647,11 @@ mod tests {
         let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
         let value = eval(op, None);
         assert_eq!(
-            value[0],
-            Value::Function(vec![
-                FuncBinding {
-                    input: Value::UInt(0),
-                    output: Value::Int(42)
-                },
-                FuncBinding {
-                    input: Value::UInt(1),
-                    output: Value::Int(42)
-                }
-            ])
+            value,
+            ColumnData::FunctionBindings {
+                inputs: Box::new(ColumnData::UInts(vec![0, 1])),
+                outputs: Box::new(ColumnData::Ints(vec![42, 42]))
+            }
         );
     }
 
@@ -681,17 +661,11 @@ mod tests {
         let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
         let value = eval(op, None);
         assert_eq!(
-            value[0],
-            Value::Function(vec![
-                FuncBinding {
-                    input: Value::UInt(0),
-                    output: Value::Int(10)
-                },
-                FuncBinding {
-                    input: Value::UInt(1),
-                    output: Value::Int(20)
-                }
-            ])
+            value,
+            ColumnData::FunctionBindings {
+                inputs: Box::new(ColumnData::UInts(vec![0, 1])),
+                outputs: Box::new(ColumnData::Ints(vec![10, 20]))
+            }
         );
     }
 
@@ -701,17 +675,11 @@ mod tests {
         let op = lower_expr(&mut LoweringContext::default(), &ast).expect("Failed to lower");
         let value = eval(op, None);
         assert_eq!(
-            value[0],
-            Value::Function(vec![
-                FuncBinding {
-                    input: Value::UInt(0),
-                    output: Value::Int(12)
-                },
-                FuncBinding {
-                    input: Value::UInt(1),
-                    output: Value::Int(22)
-                }
-            ])
+            value,
+            ColumnData::FunctionBindings {
+                inputs: Box::new(ColumnData::UInts(vec![0, 1])),
+                outputs: Box::new(ColumnData::Ints(vec![12, 22]))
+            }
         );
     }
 
@@ -747,17 +715,14 @@ mod tests {
         let get_result = producer.get();
         *notified_has_data.borrow_mut() = false;
         assert_eq!(
-            sorted_function(&get_result.column_value.values[0]),
-            Value::Function(vec![
-                FuncBinding {
-                    input: Value::Int(10),
-                    output: Value::String("foo".to_string())
-                },
-                FuncBinding {
-                    input: Value::Int(20),
-                    output: Value::String("bar".to_string())
-                },
-            ])
+            get_result.column_value.data.sort_by_inputs(),
+            ColumnData::FunctionBindings {
+                inputs: Box::new(ColumnData::Ints(vec![10, 20])),
+                outputs: Box::new(ColumnData::Strings(vec![
+                    "foo".to_string(),
+                    "bar".to_string()
+                ]))
+            }
         );
 
         data_source.borrow_mut().set_yield_guard(Guard::Universal);
