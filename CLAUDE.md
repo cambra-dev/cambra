@@ -87,9 +87,9 @@ Producer::release(obsolete_guard) -> Guard
 - **Var**: Variable definition (name + extent). Not an Operator — cannot be subscribed directly.
 - **VarRef**: Variable reference (implements Operator). Looks up the variable in `VarScope` at subscribe time.
 - **VarSub**: Runtime subscription bridging a variable's source to its consumers. Source is one of:
-  - `Bound` — lambda applied to an argument; wraps the argument's producer
-  - `Scanning` — lambda consumed by an aggregator; iterates over extent with predicate filtering
-- **VarScope**: Linked list for variable lookup with parent chaining. `lookup_variable()` returns both the subscription and the chain of intermediate scanning variables for alignment composition.
+  - `Argument` — lambda applied to an argument; wraps the argument's producer
+  - `Iteration` — lambda consumed directly (e.g. by aggregation or output); iterates over extent with predicate filtering
+- **VarScope**: Linked list for variable lookup with parent chaining. `lookup_variable()` returns both the subscription and the chain of intermediate iteration variables for alignment composition.
 
 ### Key Files
 

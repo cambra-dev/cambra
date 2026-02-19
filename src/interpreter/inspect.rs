@@ -45,12 +45,12 @@ pub fn guard_summary(guard: &Guard) -> String {
     match guard {
         Guard::Universal => "Universal".to_string(),
         Guard::Empty => "Empty".to_string(),
-        Guard::Equality { value, .. } => format!("== {:?}", value),
+        Guard::Equality { value, .. } => format!("== {value:?}"),
         Guard::Membership { values, .. } => {
             format!("in [{}]", values.len())
         }
-        Guard::Disequality(v) => format!("!= {:?}", v),
-        Guard::LessThanOrEq(v) => format!("<= {:?}", v),
+        Guard::Disequality(v) => format!("!= {v:?}"),
+        Guard::LessThanOrEq(v) => format!("<= {v:?}"),
         Guard::Domain(d) => format!("Domain({})", guard_summary(d)),
         Guard::And(gs) => format!(
             "And({})",

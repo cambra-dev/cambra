@@ -21,9 +21,9 @@ impl WebInspector {
         let snapshot_clone = snapshot.clone();
 
         thread::spawn(move || {
-            let server = tiny_http::Server::http(format!("0.0.0.0:{}", port))
+            let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
                 .expect("Failed to start web inspector server");
-            info!("Web inspector running at http://localhost:{}", port);
+            info!("Web inspector running at http://localhost:{port}");
 
             for request in server.incoming_requests() {
                 let response = match request.url() {

@@ -93,8 +93,7 @@ fn lower_binop(
             pyast::Operator::FloorDiv => BinOpKind::FloorDiv,
             _ => {
                 return Err(LoweringError::Unsupported(format!(
-                    "Binary operator not yet supported: {:?}",
-                    op
+                    "Binary operator not yet supported: {op:?}"
                 )))
             }
         },
@@ -102,8 +101,7 @@ fn lower_binop(
             pyast::Operator::Add => BinOpKind::Concat,
             _ => {
                 return Err(LoweringError::Unsupported(format!(
-                    "Binary operator not yet supported: {:?}",
-                    op
+                    "Binary operator not yet supported: {op:?}"
                 )))
             }
         },
@@ -161,12 +159,12 @@ fn constant_to_value(constant: &pyast::Constant) -> Result<Value, LoweringError>
     }
 }
 
-/// Lower a subscript expression (indexing) to an Application operator.
+/// Lower a subscript expression (indexing) to an Apply operator.
 fn lower_subscript(
     _value: &pyast::Located<pyast::ExprKind>,
     _slice: &pyast::Located<pyast::ExprKind>,
 ) -> Result<Box<dyn Operator>, LoweringError> {
-    // TODO: Implement Application operator in interpreter.rs first
+    // TODO: Implement Apply operator in interpreter.rs first
     Err(LoweringError::Unsupported(
         "Subscript/indexing not yet implemented".into(),
     ))
@@ -214,8 +212,7 @@ fn lower_list_comp(
         *domain.clone()
     } else {
         return Err(LoweringError::TypeError(format!(
-            "Expected function extent for comprehension source, got {:?}",
-            source_extent
+            "Expected function extent for comprehension source, got {source_extent:?}"
         )));
     };
 
@@ -322,7 +319,7 @@ fn lower_assign(
     );
     var_subscription
         .borrow_mut()
-        .set_source(VarSource::Bound(binding_producer));
+        .set_source(VarSource::Argument(binding_producer));
     Ok(VarScope::new_with_optional_parent(
         parent_scope,
         name,
@@ -559,7 +556,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    #[ignore] // TODO: Implement Application operator
+    #[ignore] // TODO: Implement Apply operator
     fn test_lower_list_index() {
         let ast = parse_expr("[1, 2, 3][0]");
         let op = lower_expr(&ast).expect("Failed to lower");
@@ -568,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO: Implement Application operator
+    #[ignore] // TODO: Implement Apply operator
     fn test_lower_list_index_middle() {
         let ast = parse_expr("[10, 20, 30][1]");
         let op = lower_expr(&ast).expect("Failed to lower");

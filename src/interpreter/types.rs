@@ -130,7 +130,7 @@ impl Guard {
                 for g in guards.iter() {
                     let (d, c) = g
                         .split_function()
-                        .unwrap_or_else(|| panic!("Expected Function guard, got {:?}", g));
+                        .unwrap_or_else(|| panic!("Expected Function guard, got {g:?}"));
                     domain = domain.union(d);
                     codomain = codomain.union(c);
                 }
@@ -142,7 +142,7 @@ impl Guard {
                 for g in guards.iter() {
                     let (d, c) = g
                         .split_function()
-                        .unwrap_or_else(|| panic!("Expected Function guard, got {:?}", g));
+                        .unwrap_or_else(|| panic!("Expected Function guard, got {g:?}"));
                     domain = domain.intersect(d);
                     codomain = codomain.intersect(c);
                 }
@@ -234,20 +234,20 @@ impl Eq for dyn DataSourceDomainExtentImpl {}
 impl std::fmt::Debug for Extent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Extent::Base(base) => write!(f, "{:?}", base),
-            Extent::Function { domain, codomain } => write!(f, "({:?} -> {:?})", domain, codomain),
+            Extent::Base(base) => write!(f, "{base:?}"),
+            Extent::Function { domain, codomain } => write!(f, "({domain:?} -> {codomain:?})"),
             Extent::Record(fields) => {
                 let field_strs: Vec<String> = fields
                     .iter()
-                    .map(|(name, extent)| format!("{}: {:?}", name, extent))
+                    .map(|(name, extent)| format!("{name}: {extent:?}"))
                     .collect();
                 write!(f, "{{{}}}", field_strs.join(", "))
             }
             Extent::Union(extents) => {
-                let extent_strs: Vec<String> = extents.iter().map(|e| format!("{:?}", e)).collect();
+                let extent_strs: Vec<String> = extents.iter().map(|e| format!("{e:?}")).collect();
                 write!(f, "({})", extent_strs.join(" | "))
             }
-            Extent::UIntRange { start, end } => write!(f, "[{}, {})", start, end),
+            Extent::UIntRange { start, end } => write!(f, "[{start}, {end})"),
             Extent::DataSourceDomain(_) => write!(f, "DataSource"),
         }
     }
@@ -336,10 +336,10 @@ pub enum Value {
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Value::Int(i) => write!(f, "{}", i),
-            Value::UInt(i) => write!(f, "u{}", i),
-            Value::String(s) => write!(f, "\"{}\"", s),
-            Value::Bool(b) => write!(f, "{}", b),
+            Value::Int(i) => write!(f, "{i}"),
+            Value::UInt(i) => write!(f, "u{i}"),
+            Value::String(s) => write!(f, "\"{s}\""),
+            Value::Bool(b) => write!(f, "{b}"),
             Value::Unit => write!(f, "()"),
             Value::Function(bindings) => {
                 let binding_strs: Vec<String> = bindings
@@ -351,7 +351,7 @@ impl std::fmt::Debug for Value {
             Value::Record(fields) => {
                 let field_strs: Vec<String> = fields
                     .iter()
-                    .map(|(name, val)| format!("{}: {:?}", name, val))
+                    .map(|(name, val)| format!("{name}: {val:?}"))
                     .collect();
                 write!(f, "{{{}}}", field_strs.join(", "))
             }
@@ -402,7 +402,7 @@ pub enum ParentIndices {
 pub struct ColumnValue {
     /// The batch of values
     pub values: Vec<Value>,
-    /// Indices into the parent level's batch for alignment with outer scans.
+    /// Indices into the parent level's batch for alignment with outer iterations.
     /// None if this is the outermost level or independent.
     pub parent_indices: ParentIndices,
 }
@@ -457,7 +457,7 @@ impl ColumnValue {
     }
 
     /// Expand this column's values using the given parent_indices.
-    /// Used when an outer variable needs to be aligned with an inner scan.
+    /// Used when an outer variable needs to be aligned with an inner iteration.
     pub fn expand(&self, indices: &[usize]) -> ColumnValue {
         let expanded_values: Vec<Value> = indices.iter().map(|&i| self.values[i].clone()).collect();
         ColumnValue {

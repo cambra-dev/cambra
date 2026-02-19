@@ -156,7 +156,7 @@ impl Producer for LambdaProducer {
                 .release(*domain_obsolete_guard.clone());
             obsolete_guard
         } else {
-            debug!("Lambda::release with {:?}", obsolete_guard);
+            debug!("Lambda::release with {obsolete_guard:?}");
             // Split obsolete guard into domain and codomain
             let (domain_obsolete, codomain_obsolete) = obsolete_guard
                 .split_function()
@@ -215,7 +215,7 @@ impl Lambda {
         }
     }
 
-    /// Internal subscribe implementation that handles both bound and scanning modes.
+    /// Internal subscribe implementation that handles both argument and iteration sources.
     fn subscribe_internal(
         &mut self,
         intent_guard: Guard,
@@ -229,7 +229,7 @@ impl Lambda {
             .split_function()
             .unwrap_or((Guard::universal(), Guard::universal()));
 
-        // For Bound mode: subscribe to the binding operator with VarSub as consumer
+        // For argument source: subscribe to the binding operator with VarSub as consumer
         // This ensures VarSub receives notifications and can forward to its consumers
         let variable_subscription = if let Some(binding_op) = binding {
             let subscription = self.variable.create_subscription(VarSource::Uninitialized);
@@ -244,14 +244,14 @@ impl Lambda {
                 scheduler,
             );
 
-            // Now set the source to Bound with the actual producer
+            // Now set the source to `Argument` with the actual producer
             subscription
                 .borrow_mut()
-                .set_source(VarSource::Bound(binding_producer));
+                .set_source(VarSource::Argument(binding_producer));
             subscription
         } else {
-            // Scanning mode
-            self.variable.create_subscription(VarSource::Scanning {
+            // Iteration source
+            self.variable.create_subscription(VarSource::Iteration {
                 extent: self.variable.extent().clone(),
                 predicate: domain_guard.clone(),
             })
@@ -293,7 +293,7 @@ impl Lambda {
         });
 
         // Add the consumer to the variable subscription
-        // For Bound mode: VarSub may have already been notified by the binding, and add_consumer
+        // For argument source: VarSub may have already been notified by the binding, and add_consumer
         // will immediately notify this consumer if yield_guard is non-empty
         variable_subscription
             .borrow_mut()
@@ -309,7 +309,7 @@ impl Lambda {
         // Create closure for body notifications: updates body_yield_guard and checks if ready
         let lambda_producer_for_body = lambda_producer.clone();
         let body_consumer: Box<dyn Consumer> = Box::new(move |notification: Notification| {
-            debug!("Lambda body_consumer notified with {:?}", notification);
+            debug!("Lambda body_consumer notified with {notification:?}");
             let mut producer = lambda_producer_for_body.borrow_mut();
             match notification {
                 Notification::Yield(guard) => {
@@ -351,7 +351,7 @@ impl Operator for Lambda {
         &self.extent
     }
 
-    // Subscribe to the lambda in scanning mode, producing (input, output) pairs for every
+    // Subscribe to the lambda with iteration source, producing (input, output) pairs for every
     // input value in the input's Extent
     fn subscribe(
         &mut self,
@@ -360,8 +360,8 @@ impl Operator for Lambda {
         var_scope: Option<Rc<VarScope>>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
-        // When subscribe is called without a binding, the variable is in scanning mode.
-        // This happens when the lambda is used by an aggregation operator (e.g., sum).
+        // When subscribe is called without a binding, the variable has iteration source.
+        // This happens when the lambda is consumed directly (e.g., by aggregation or output).
         self.subscribe_internal(intent_guard, consumer, var_scope, None, scheduler)
     }
 
@@ -416,10 +416,7 @@ impl Operator for Apply {
                 Notification::NewData => Notification::NewData,
                 Notification::Yield(g) => Notification::Yield(g.to_universal_or_empty()),
             };
-            debug!(
-                "Apply notified with {:?}, forwarding {:?}",
-                notification, downstream_notification
-            );
+            debug!("Apply notified with {notification:?}, forwarding {downstream_notification:?}");
             consumer.notify(downstream_notification);
         };
         Box::new(ApplyProducer::new(self.lambda.subscribe_to_application(
@@ -683,7 +680,7 @@ mod tests {
         let body = Box::new(VarRef::new("x", Extent::Base(BaseType::Int)));
         let mut lambda = Lambda::new(variable, body);
 
-        // Create a parent scope with a different variable "x" bound to 200
+        // Create a parent scope with a different variable "x" receiving argument 200
         let parent_variable = Var::new("x", Extent::Base(BaseType::Int));
         // Create parent subscription and wire up binding properly
         let parent_subscription = parent_variable.create_subscription(VarSource::Uninitialized);
@@ -697,7 +694,7 @@ mod tests {
         );
         parent_subscription
             .borrow_mut()
-            .set_source(VarSource::Bound(parent_binding));
+            .set_source(VarSource::Argument(parent_binding));
         let parent_scope = VarScope::new("x", parent_subscription);
 
         let mut binding_literal = Literal::new(Value::Int(100));
@@ -1010,7 +1007,7 @@ mod tests {
         );
         parent_subscription
             .borrow_mut()
-            .set_source(VarSource::Bound(parent_binding));
+            .set_source(VarSource::Argument(parent_binding));
         let parent_scope = Rc::new(VarScope::new("y", parent_subscription));
 
         let variable = Var::new("x", Extent::Base(BaseType::Int));

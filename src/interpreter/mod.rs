@@ -74,7 +74,7 @@ pub trait Producer: Debug {
     fn inspect(&self) -> InspectNode {
         InspectNode {
             type_name: "Unknown".to_string(),
-            label: format!("{:?}", self),
+            label: format!("{self:?}"),
             yield_guard: String::new(),
             data_summary: String::new(),
             children: vec![],
@@ -150,7 +150,7 @@ pub trait Operator: Debug {
         _binding: &mut dyn Operator,
         _scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
-        panic!("Not appliable {:?}", self)
+        panic!("Not appliable {self:?}")
     }
 }
 

@@ -88,32 +88,32 @@ A `Var` operator represents a variable definition. It holds:
 
 Note: `Var` does **not** hold a static definition. Binding happens dynamically:
 - When the lambda is **applied**, the `Application` operator binds the argument to the variable
-- When the lambda is **aggregated** (e.g., by `sum`), the variable remains unbound and scans its extent
+- When the lambda is consumed directly (e.g., by `sum` or `print`), the variable iterates over its extent
 
 The variable is owned and managed by the operator that defines it (record, lambda, let-binding, pattern match).
 
 ### VarSub (Runtime State)
-A `VarSub` is created when `Var::subscribe()` is called. It can operate in two modes:
+A `VarSub` is created when `Var::subscribe()` is called. It has one of two sources:
 
-**Bound Mode** (lambda applied to argument):
+**Argument source** (lambda applied to argument):
 - Wraps a producer from the binding expression
 - Forwards values from that producer
 
-**Scanning Mode** (lambda aggregated):
+**Iteration source** (lambda consumed directly, e.g. by aggregation or output):
 - Iterates over the variable's extent
 - Applies predicate to filter values
 - For correlated predicates (referencing outer variables): executes as a join
-- Produces `parent_indices` relating scan results to outer scans
+- Produces `parent_indices` relating iteration results to outer iterations
 
-Common to both modes:
+Common to both sources:
 - Maintains a list of all consumers that have subscribed to this variable
 - Stores a release guard for use by variable references
-- Stores `parent_indices` for alignment (scanning mode only)
+- Stores `parent_indices` for alignment (iteration source only)
 
 ```rust
 enum VarSource {
-    Bound(Box<dyn Producer>),
-    Scanning {
+    Argument(Box<dyn Producer>),
+    Iteration {
         extent: Extent,
         predicate: Guard,
         correlations: Vec<Correlation>,  // outer variables in predicate
@@ -142,7 +142,7 @@ A `VarRef` operator represents a reference to a variable. It holds:
 ### VarRefSub (Runtime State)
 A `VarRefSub` is created when `VarRef::subscribe()` is called. It implements `Producer`:
 - Filters data from the `VarSub` based on its intent guard
-- **Handles alignment**: If referencing an outer variable from within an inner scan, expands values using the inner scan's `parent_indices`
+- **Handles alignment**: If referencing an outer variable from within an inner iteration, expands values using the inner iteration's `parent_indices`
 - When `release()` is called, returns the stored release guard from the `VarSub` rather than invoking release on the subscription itself (since the lambda would have already invoked it)
 
 ```rust
@@ -150,12 +150,12 @@ struct VarRefSub {
     var_sub: Rc<RefCell<VarSub>>,
     intent_guard: Guard,
     consumer: Box<dyn Consumer>,
-    // The innermost scan in scope (for alignment)
-    innermost_scan: Option<Rc<RefCell<VarSub>>>,
+    // The innermost iteration in scope (for alignment)
+    innermost_iteration: Option<Rc<RefCell<VarSub>>>,
 }
 ```
 
-The `innermost_scan` is set by `VarScope` when the variable is looked up. If the referenced variable is from an outer scope and there's a scanning variable at an inner level, alignment is needed.
+The `innermost_iteration` is set by `VarScope` when the variable is looked up. If the referenced variable is from an outer scope and there's an iteration-source variable at an inner level, alignment is needed.
 
 ### Variable Lookup: VarScope
 Variables are looked up by name using a `VarScope` structure:
@@ -194,20 +194,20 @@ The variable system works as follows:
     * Returns the stored release guard from the `VarSub`
     * Does not propagate release to the definition (the lambda handles that)
 
-### Quantification and Variable Binding Modes
+### Quantification and Variable Sources
 
 Variables are quantified as either existential or universal:
-- **Existential** (let-bindings, records, patterns): Single definition, variable is always **bound**
-- **Universal** (lambda variables): Can be bound or scanned depending on context
+- **Existential** (let-bindings, records, patterns): Single definition, variable always has **argument** source
+- **Universal** (lambda variables): Can be argument or iteration depending on context
 
-Lambda variables have two modes:
+Lambda variables have two sources:
 
-| Mode | When | Behavior |
-|------|------|----------|
-| **Bound** | Lambda is applied (`(\x. body) arg`) | Variable forwards values from argument expression |
-| **Scanning** | Lambda is aggregated (`sum(\x. body)`) | Variable scans over its extent (like a table scan) |
+| Source | When | Behavior |
+|--------|------|----------|
+| **Argument** | Lambda is applied (`(\x. body) arg`) | Variable forwards values from argument expression |
+| **Iteration** | Lambda is consumed directly (`sum(\x. body)`, `print(\x. body)`) | Variable iterates over its extent |
 
-A problem arises when there are multiple variables in **scanning mode** in the same scope (i.e. nested lambdas being aggregated): the different variables need to be aligned with respect to each other so that expressions over both of them evaluate over corresponding values.
+A problem arises when there are multiple variables with **iteration** source in the same scope (i.e. nested lambdas consumed directly): the different variables need to be aligned with respect to each other so that expressions over both of them evaluate over corresponding values.
 
 ### Columnar Values and Alignment
 
@@ -232,15 +232,15 @@ struct ColumnValue {
 }
 ```
 
-When evaluating expressions with multiple universally-quantified variables in scope, `parent_indices` tracks which values correspond to which "rows" of the enclosing scan. This enables:
+When evaluating expressions with multiple universally-quantified variables in scope, `parent_indices` tracks which values correspond to which "rows" of the enclosing iteration. This enables:
 - Proper alignment of values from different nesting levels
-- Efficient join execution between nested scans
+- Efficient join execution between nested iterations
 - Vectorized operations on aligned batches
 - Scalar broadcasting: a `Scalar` value is valid at any batch size
 
 ### Scans as Joins
 
-When there are nested scanning lambdas, the execution is conceptually a join:
+When there are nested iteration-source lambdas, the execution is conceptually a join:
 
 ```
 sum(\t1. sum(\t2. f(t1, t2)))
@@ -260,23 +260,23 @@ The `Parent` variant of `ParentIndices` in a `ColumnValue` is the output of the 
 
 ### Alignment via VarRefSub
 
-When a `VarRef` references an outer variable from within an inner scan, the `VarRefSub` handles alignment:
+When a `VarRef` references an outer variable from within an inner iteration, the `VarRefSub` handles alignment:
 
-1. `VarScope` tracks the **innermost scan** in scope
+1. `VarScope` tracks the **innermost iteration** in scope
 2. When `VarRefSub::get()` is called for an outer variable:
    - Get the outer variable's values
-   - Get `parent_indices` from the innermost scan
+   - Get `parent_indices` from the innermost iteration
    - Expand outer values: `outer_values[parent_indices[i]]` for each `i`
 3. All values at the innermost level are now aligned and can be zipped by operators
 
 
-### Example: Nested Scans
+### Example: Nested Iterations
 
 For `sum(\t1. sum(\t2 where t2.fk = t1.pk. v(t1) + v(t2)))`:
 
-1. **Outer scan (t1)** yields batch: `[A, B, C]`
+1. **Outer iteration (t1)** yields batch: `[A, B, C]`
 
-2. **Inner scan (t2)** sees predicate `t2.fk = t1.pk`:
+2. **Inner iteration (t2)** sees predicate `t2.fk = t1.pk`:
    - Recognizes correlation with `t1`
    - Uses hash join: builds hash table on `t1.pk`, probes with `t2.fk`
    - Yields matching rows with `parent_indices`
@@ -296,8 +296,8 @@ For `sum(\t1. sum(\t2 where t2.fk = t1.pk. v(t1) + v(t2)))`:
 
 ### VarScope: Using Parent Chain for Multi-Level Alignment
 
-Each `VarScope` contains exactly one variable (the lambda's bound variable). The parent scope
-chain serves as the natural scan chain - no separate tracking needed.
+Each `VarScope` contains exactly one variable (the lambda's variable). The parent scope
+chain serves as the natural iteration chain - no separate tracking needed.
 
 **Problem:**
 ```
@@ -319,8 +319,8 @@ pub struct VarScope {
 
 **lookup_variable() walks parent chain:**
 ```rust
-/// Returns (found_subscription, inner_scans) where inner_scans is the chain
-/// of scanning variables between current scope and the found variable.
+/// Returns (found_subscription, inner_iterations) where inner_iterations is the chain
+/// of iteration-source variables between current scope and the found variable.
 pub fn lookup_variable(&self, name: &str) -> Option<(Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>)> {
     self.lookup_with_chain(name, Vec::new())
 }
@@ -330,8 +330,8 @@ fn lookup_with_chain(&self, name: &str, mut chain: Vec<Rc<RefCell<VarSub>>>)
     if self.name == name {
         Some((self.subscription.clone(), chain))
     } else {
-        // If this scope's variable is scanning, add it to the chain
-        if self.subscription.borrow().is_scanning() {
+        // If this scope's variable has iteration source, add it to the chain
+        if self.subscription.borrow().is_iteration() {
             chain.push(self.subscription.clone());
         }
         self.parent.as_ref()?.lookup_with_chain(name, chain)
@@ -348,14 +348,14 @@ fn compose_indices(outer: &[usize], inner: &[usize]) -> Vec<usize> {
 fn get(&mut self) -> ColumnValue {
     let column = self.variable_subscription.borrow_mut().get();
     
-    if self.scan_chain.is_empty() {
+    if self.iteration_chain.is_empty() {
         return column;
     }
     
     // Compose parent_indices from innermost to outermost
     let mut indices: Option<Vec<usize>> = None;
-    for scan in self.scan_chain.iter().rev() {  // innermost first
-        if let ParentIndices::Parent(parent_indices) = scan.borrow_mut().get().parent_indices {
+    for iter_var in self.iteration_chain.iter().rev() {  // innermost first
+        if let ParentIndices::Parent(parent_indices) = iter_var.borrow_mut().get().parent_indices {
             indices = Some(match indices {
                 None => parent_indices,
                 Some(inner) => compose_indices(&parent_indices, &inner),
@@ -463,7 +463,7 @@ Potential approaches:
 - Two-phase evaluation: first pass extracts guard structure, second pass evaluates
 
 ## Multi-Level Nesting Optimization
-For deeply nested scans (`\t1. \t2. \t3. ...`):
+For deeply nested iterations (`\t1. \t2. \t3. ...`):
 - Composing parent_indices through multiple levels may be inefficient
 - May want to precompute transitive indices (t1→t3 directly)
 - Trade-off between space (storing more indices) and time (recomputing)

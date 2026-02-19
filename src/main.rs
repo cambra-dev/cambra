@@ -17,7 +17,7 @@ fn run_program(code: &str, inspector: Option<&WebInspector>) {
     let module: Mod = parse_python_code(code).expect("Failed to parse Python code");
     let stmts = match module {
         Mod::Module { body, .. } => body,
-        _ => panic!("Expected module, got {:?}", module),
+        _ => panic!("Expected module, got {module:?}"),
     };
     let mut scheduler = Scheduler::new();
     let (mut op, scope) = lower_let_stmt_block(&stmts, &mut scheduler).unwrap();
@@ -28,7 +28,7 @@ fn run_program(code: &str, inspector: Option<&WebInspector>) {
     let new_data_clone = new_data.clone();
     let mut obsolete_guard: Guard;
     let consumer: Box<dyn Consumer> = Box::new(move |notification: Notification| {
-        debug!("Main loop received notification: {:?}", notification);
+        debug!("Main loop received notification: {notification:?}");
         match notification {
             Notification::NewData => *new_data_clone.borrow_mut() = true,
             Notification::Yield(yield_guard) => *yield_guard_clone.borrow_mut() = yield_guard,
@@ -41,7 +41,7 @@ fn run_program(code: &str, inspector: Option<&WebInspector>) {
     if let Some(inspector) = inspector {
         inspector.update_snapshot(tick, &*producer, &scheduler);
     }
-    debug!("main producer:\n{:#?}", producer);
+    debug!("main producer:\n{producer:#?}");
 
     loop {
         while !*new_data.borrow() && !yield_guard.borrow().is_universal() {
@@ -72,10 +72,7 @@ fn run_program(code: &str, inspector: Option<&WebInspector>) {
             }
         };
         obsolete_guard = producer.release(new_obsolete_guard.clone());
-        debug!(
-            "Main released with {:?}, got {:?}",
-            new_obsolete_guard, obsolete_guard
-        );
+        debug!("Main released with {new_obsolete_guard:?}, got {obsolete_guard:?}");
         *new_data.borrow_mut() = false;
 
         tick += 1;

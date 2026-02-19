@@ -3,19 +3,18 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::interpreter::{GetResult, Notification, Value};
+use super::{
+    guard_summary, ColumnValue, Consumer, Extent, GetResult, Guard, InspectNode, Notification,
+    Operator, ParentIndices, Producer, Scheduler, Value,
+};
 use log::debug;
 
-use super::{
-    guard_summary, ColumnValue, Consumer, Extent, Guard, InspectNode, Operator, ParentIndices,
-    Producer, Scheduler,
-};
-/// A variable subscription paired with the chain of scanning variables between
+/// A variable subscription paired with the chain of iteration-source variables between
 /// the current scope and the found variable, used for alignment composition.
-type VarWithScanChain = (Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>);
+type VarWithIterationChain = (Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>);
 
 /// Variable scope for looking up variables.
-/// Each scope contains exactly one variable (the lambda's bound variable).
+/// Each scope contains exactly one variable (the lambda's variable).
 /// Variables are looked up by name, searching up the parent chain if not found.
 #[derive(Debug)]
 pub struct VarScope {
@@ -59,9 +58,9 @@ impl VarScope {
     }
 
     /// Look up a variable by name, searching up the parent chain.
-    /// Returns (subscription, scan_chain) where scan_chain contains any scanning
+    /// Returns (subscription, iteration_chain) where iteration_chain contains any iteration-source
     /// variables between the current scope and the found variable (for alignment).
-    pub fn lookup_variable(&self, name: &str) -> Option<VarWithScanChain> {
+    pub fn lookup_variable(&self, name: &str) -> Option<VarWithIterationChain> {
         self.lookup_with_chain(name, Vec::new())
     }
 
@@ -69,13 +68,13 @@ impl VarScope {
         &self,
         name: &str,
         mut chain: Vec<Rc<RefCell<VarSub>>>,
-    ) -> Option<VarWithScanChain> {
+    ) -> Option<VarWithIterationChain> {
         if self.name == name {
-            // Found the variable - return it with the chain of inner scans
+            // Found the variable - return it with the chain of inner iterations
             Some((self.subscription.clone(), chain))
         } else {
-            // If this scope's variable is scanning, add it to the chain
-            if self.subscription.borrow().is_scanning() {
+            // If this scope's variable has iteration source, add it to the chain
+            if self.subscription.borrow().is_iteration() {
                 chain.push(self.subscription.clone());
             }
             // Continue searching in parent
@@ -85,22 +84,22 @@ impl VarScope {
 }
 
 // ============================================================================
-// Variable Source (Bound vs Scanning)
+// Variable Source (Argument vs Iteration)
 // ============================================================================
 
 /// The source of values for a variable subscription.
-/// Determines whether the variable is bound to a producer or scanning its extent.
+/// Determines whether the variable receives from an argument or iterates over its extent.
 #[derive(Debug)]
 pub enum VarSource {
     /// Uninitialized state - used during construction when source will be set later.
     /// VarSub operations will panic if called while in this state.
     Uninitialized,
-    /// Variable is bound to a producer (from Application).
+    /// Variable receives values from an argument producer (via Apply).
     /// The variable forwards values from this producer.
-    Bound(Box<dyn Producer>),
-    /// Variable scans its extent (for aggregation).
-    /// The variable iterates over all values in its extent.
-    Scanning {
+    Argument(Box<dyn Producer>),
+    /// Variable iterates over its extent (for output or aggregation).
+    /// The variable generates values by iterating over all values in its extent.
+    Iteration {
         extent: Extent,
         predicate: Guard,
         // TODO: correlations for join execution
@@ -109,7 +108,8 @@ pub enum VarSource {
 
 /// A Var operator represents a variable definition.
 /// It holds the variable's name, extent, and predicate - but NOT a static definition.
-/// Binding happens dynamically via Application (Bound mode) or aggregation (Scanning mode).
+/// The variable's values are injected at run time either via application (argument source)
+/// or direct iteration (iteration source).
 #[derive(Debug)]
 pub struct Var {
     /// The name of the variable
@@ -150,9 +150,9 @@ impl Var {
 
     /// Create a VarSub for this variable with the given source.
     ///
-    /// The subscription starts with an empty yield guard. For Bound mode, the
-    /// binding operator will notify VarSub when data is ready. For Scanning mode,
-    /// the scan will notify when data is available.
+    /// The subscription starts with an empty yield guard. For `Argument` source, the
+    /// binding operator will notify VarSub when data is ready. For `Iteration` source,
+    /// the scheduler will trigger a check for progress, which notifies when data is available.
     ///
     /// Consumers can be added later via `VarSub::add_consumer()`.
     pub fn create_subscription(&self, source: VarSource) -> Rc<RefCell<VarSub>> {
@@ -162,12 +162,12 @@ impl Var {
 
 // Note: Var does not implement Operator because it cannot be subscribed to directly.
 // Variables are always managed by their enclosing context (Lambda, Let, etc.) which
-// creates the VarSub with the appropriate VarSource (Bound or Scanning).
+// creates the VarSub with the appropriate VarSource (Argument or Iteration).
 
 /// VarSub implements both Producer and Consumer.
 /// It stores the yield guard (monotonically growing) and forwards notifications to all consumers.
 pub struct VarSub {
-    /// The source of values for this variable (Bound or Scanning)
+    /// The source of values for this variable (Argument or Iteration)
     source: VarSource,
     /// The current yield guard (monotonically growing)
     /// The contract of `notify` guarantees that guards are monotonically growing.
@@ -241,13 +241,13 @@ impl VarSub {
         self.stored_release_guard.clone()
     }
 
-    /// Check if this variable is in scanning mode.
-    pub fn is_scanning(&self) -> bool {
-        matches!(self.source, VarSource::Scanning { .. })
+    /// Check if this variable has iteration source.
+    pub fn is_iteration(&self) -> bool {
+        matches!(self.source, VarSource::Iteration { .. })
     }
 
     /// Set the source for this variable subscription.
-    /// Used when the source needs to be updated after creation (e.g., for Bound mode).
+    /// Used when the source needs to be updated after creation (e.g., for `Argument` source).
     pub fn set_source(&mut self, source: VarSource) {
         assert!(
             matches!(self.source, VarSource::Uninitialized),
@@ -258,7 +258,7 @@ impl VarSub {
 
     pub fn check_for_notification(&mut self) {
         match &mut self.source {
-            VarSource::Scanning {
+            VarSource::Iteration {
                 extent: Extent::DataSourceDomain(extent_impl),
                 ..
             } => {
@@ -286,8 +286,8 @@ impl Producer for VarSub {
             VarSource::Uninitialized => {
                 panic!("VarSub::get() called while source is Uninitialized")
             }
-            VarSource::Bound(producer) => producer.get(),
-            VarSource::Scanning {
+            VarSource::Argument(producer) => producer.get(),
+            VarSource::Iteration {
                 extent,
                 predicate: _,
             } => match extent {
@@ -324,13 +324,13 @@ impl Producer for VarSub {
             VarSource::Uninitialized => {
                 panic!("VarSub::release() called while source is Uninitialized")
             }
-            VarSource::Bound(producer) => producer.release(obsolete_guard),
-            VarSource::Scanning {
+            VarSource::Argument(producer) => producer.release(obsolete_guard),
+            VarSource::Iteration {
                 extent: Extent::DataSourceDomain(source_impl),
                 ..
             } => source_impl.borrow_mut().release(obsolete_guard),
-            VarSource::Scanning { .. } => {
-                // For scanning over literal sources, nothing to do
+            VarSource::Iteration { .. } => {
+                // For iteration over literal sources, nothing to do
                 obsolete_guard
             }
         }
@@ -340,11 +340,11 @@ impl Producer for VarSub {
     fn inspect(&self) -> InspectNode {
         let source_label = match &self.source {
             VarSource::Uninitialized => "Uninitialized".to_string(),
-            VarSource::Bound(_) => "Bound".to_string(),
-            VarSource::Scanning { extent, .. } => format!("Scanning({:?})", extent),
+            VarSource::Argument(_) => "Argument".to_string(),
+            VarSource::Iteration { extent, .. } => format!("Iteration({extent:?})"),
         };
         let children = match &self.source {
-            VarSource::Bound(p) => vec![p.inspect()],
+            VarSource::Argument(p) => vec![p.inspect()],
             _ => vec![],
         };
         InspectNode {
@@ -409,14 +409,14 @@ impl Operator for VarRef {
     ) -> Box<dyn Producer> {
         // Look up the variable in the scope
         let var_scope = var_scope.expect("VarRef requires a VarScope");
-        let (variable_subscription, scan_chain) = var_scope
+        let (variable_subscription, iteration_chain) = var_scope
             .lookup_variable(&self.name)
             .unwrap_or_else(|| panic!("Variable '{}' not found in scope", self.name));
 
-        // Create VarRefSub with the consumer and scan chain for alignment
+        // Create VarRefSub with the consumer and iteration chain for alignment
         let ref_subscription = Rc::new(RefCell::new(VarRefSub {
             variable_subscription: variable_subscription.clone(),
-            scan_chain,
+            iteration_chain,
             intent_guard,
             consumer,
         }));
@@ -438,8 +438,8 @@ impl Operator for VarRef {
 struct VarRefSub {
     /// Reference to the VarSub
     variable_subscription: Rc<RefCell<VarSub>>,
-    /// Chain of scanning variables between current scope and referenced variable (for alignment)
-    scan_chain: Vec<Rc<RefCell<VarSub>>>,
+    /// Chain of iteration-source variables between current scope and referenced variable (for alignment)
+    iteration_chain: Vec<Rc<RefCell<VarSub>>>,
     /// The intent guard for this subscription
     intent_guard: Guard,
     /// The consumer of the variable ref that will receive filtered notifications
@@ -450,7 +450,7 @@ impl std::fmt::Debug for VarRefSub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VarRefSub")
             .field("variable_subscription", &self.variable_subscription)
-            .field("scan_chain", &self.scan_chain)
+            .field("iteration_chain", &self.iteration_chain)
             .field("intent_guard", &self.intent_guard)
             .field("consumer", &format_args!("<consumer>"))
             .finish()
@@ -484,18 +484,18 @@ impl Producer for VarRefSub {
 
         // TODO: Filter data based on intent guard
 
-        // If no scan chain, no alignment needed
-        if self.scan_chain.is_empty() {
+        // If no iteration chain, no alignment needed
+        if self.iteration_chain.is_empty() {
             return var_result;
         }
 
-        // Compose parent_indices from innermost scan to outermost
+        // Compose parent_indices from innermost iteration to outermost
         // The chain is ordered from innermost (first after current scope) to outermost (closest to variable)
         let mut composed_indices: Option<Vec<usize>> = None;
-        for scan in self.scan_chain.iter().rev() {
-            // Get this scan's parent_indices
-            let scan_result = scan.borrow_mut().get();
-            if let ParentIndices::Parent(parent_indices) = scan_result.column_value.parent_indices {
+        for iter_var in self.iteration_chain.iter().rev() {
+            // Get this iteration variable's parent_indices
+            let iter_result = iter_var.borrow_mut().get();
+            if let ParentIndices::Parent(parent_indices) = iter_result.column_value.parent_indices {
                 composed_indices = Some(match composed_indices {
                     None => parent_indices,
                     Some(inner) => compose_indices(&parent_indices, &inner),
@@ -562,10 +562,10 @@ mod tests {
             &mut Scheduler::new(),
         );
 
-        // Now set VarSub's source to Bound with the producer
+        // Now set VarSub's source to `Argument` with the producer
         var_subscription
             .borrow_mut()
-            .set_source(VarSource::Bound(binding_producer));
+            .set_source(VarSource::Argument(binding_producer));
 
         // Create a VarScope with the variable
         let var_scope = VarScope::new("x", var_subscription);

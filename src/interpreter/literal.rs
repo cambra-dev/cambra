@@ -110,7 +110,7 @@ impl Producer for LiteralProducer {
     }
 }
 
-/// A List literal that can be subscribed to in scanning mode like a Lambda
+/// A List literal that can be subscribed to in iteration mode like a Lambda
 #[derive(Debug)]
 pub struct ListLiteral {
     values: Vec<Value>,
@@ -164,7 +164,7 @@ impl Operator for ListLiteral {
     }
 
     /// Subscribe to the list, providing a binding that will produce
-    /// the set of list indices for scanning.
+    /// the set of list indices for iteration.
     fn subscribe_to_application(
         &mut self,
         intent_guard: Guard,
@@ -213,7 +213,7 @@ impl Producer for ListLiteralProducer {
                 input: i.clone(),
                 output: match i {
                     Value::UInt(idx) => self.values.get(*idx).cloned().unwrap_or(Value::Unit),
-                    _ => panic!("Expected uint index, got {:?}", i),
+                    _ => panic!("Expected uint index, got {i:?}"),
                 },
             })
             .collect();
@@ -359,7 +359,7 @@ mod tests {
     fn test_literal_list() {
         let mut list = ListLiteral::new(vec![Value::Int(10), Value::Int(20), Value::Int(30)]);
 
-        // Binding produces index 1 — simulates scanning a single index
+        // Binding produces index 1 — simulates iterating over a single index
         let mut binding = Literal::new(Value::UInt(1));
 
         let (consumer, _) = TestConsumer::new();

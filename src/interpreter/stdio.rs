@@ -111,7 +111,7 @@ impl StdinDataSource {
     /// Returns the line at the given index
     fn get(&self, i: usize) -> &str {
         self.get_opt(i)
-            .unwrap_or_else(|| panic!("Invalid StdinDataSource::get({})", i))
+            .unwrap_or_else(|| panic!("Invalid StdinDataSource::get({i})"))
     }
 
     fn add(&mut self, line: String) {
@@ -165,7 +165,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
                 true
             }
             Err(err) => {
-                panic!("Error reading from stdin: {}", err);
+                panic!("Error reading from stdin: {err}");
             }
         }
     }
@@ -178,7 +178,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         } else {
             Guard::LessThanOrEq(Value::UInt(self.start_idx - 1))
         };
-        debug!("StdinDataSource yielding {:?}", yield_guard);
+        debug!("StdinDataSource yielding {yield_guard:?}");
         yield_guard
     }
 
@@ -188,7 +188,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     }
 
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
-        debug!("StdinDataSource::release: {:?}", obsolete_guard);
+        debug!("StdinDataSource::release: {obsolete_guard:?}");
         match &obsolete_guard {
             Guard::LessThanOrEq(Value::UInt(i)) => self.release_index(*i),
             g if g.is_universal() => self.close(),

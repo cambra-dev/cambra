@@ -30,10 +30,8 @@ pub fn apply_binop(op: BinOpKind, left: &Value, right: &Value) -> Value {
         (BinOpKind::Sub, Value::Int(a), Value::Int(b)) => Value::Int(a - b),
         (BinOpKind::Mul, Value::Int(a), Value::Int(b)) => Value::Int(a * b),
         (BinOpKind::FloorDiv, Value::Int(a), Value::Int(b)) => Value::Int(a / b),
-        (BinOpKind::Concat, Value::String(a), Value::String(b)) => {
-            Value::String(format!("{}{}", a, b))
-        }
-        _ => panic!("Unsupported binop: {:?} on {:?} and {:?}", op, left, right),
+        (BinOpKind::Concat, Value::String(a), Value::String(b)) => Value::String(format!("{a}{b}")),
+        _ => panic!("Unsupported binop: {op:?} on {left:?} and {right:?}"),
     }
 }
 
