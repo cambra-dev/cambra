@@ -6,7 +6,10 @@ use std::rc::Rc;
 use crate::interpreter::{GetResult, Notification, Value};
 use log::debug;
 
-use super::{ColumnValue, Consumer, Extent, Guard, Operator, ParentIndices, Producer, Scheduler};
+use super::{
+    guard_summary, ColumnValue, Consumer, Extent, Guard, InspectNode, Operator, ParentIndices,
+    Producer, Scheduler,
+};
 /// A variable subscription paired with the chain of scanning variables between
 /// the current scope and the found variable, used for alignment composition.
 type VarWithScanChain = (Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>);
@@ -262,7 +265,8 @@ impl VarSub {
                 let notification = if extent_impl.borrow_mut().check_for_new_data() {
                     Notification::NewData
                 } else {
-                    Notification::Yield(extent_impl.borrow().get_yield_guard())
+                    self.yield_guard = extent_impl.borrow().get_yield_guard();
+                    Notification::Yield(self.yield_guard.clone())
                 };
                 self.consumers
                     .iter_mut()
@@ -287,15 +291,19 @@ impl Producer for VarSub {
                 extent,
                 predicate: _,
             } => match extent {
-                Extent::UIntRange { start, end } => GetResult {
-                    column_value: ColumnValue::from_values(
-                        (*start..*end).map(Value::UInt).collect(),
-                    ),
-                    yield_guard: Guard::Universal,
-                },
+                Extent::UIntRange { start, end } => {
+                    self.yield_guard = Guard::Universal;
+                    GetResult {
+                        column_value: ColumnValue::from_values(
+                            (*start..*end).map(Value::UInt).collect(),
+                        ),
+                        yield_guard: Guard::Universal,
+                    }
+                }
                 Extent::DataSourceDomain(source_impl) => {
                     let values = source_impl.borrow_mut().get_elements().collect();
                     let yield_guard = source_impl.borrow().get_yield_guard();
+                    self.yield_guard = yield_guard.clone();
                     let get_result = GetResult {
                         column_value: ColumnValue::from_values(values),
                         yield_guard,
@@ -327,12 +335,33 @@ impl Producer for VarSub {
             }
         }
     }
+
+    // TODO: Include ref to corresponding Var so we know what the VarSub is.
+    fn inspect(&self) -> InspectNode {
+        let source_label = match &self.source {
+            VarSource::Uninitialized => "Uninitialized".to_string(),
+            VarSource::Bound(_) => "Bound".to_string(),
+            VarSource::Scanning { extent, .. } => format!("Scanning({:?})", extent),
+        };
+        let children = match &self.source {
+            VarSource::Bound(p) => vec![p.inspect()],
+            _ => vec![],
+        };
+        InspectNode {
+            type_name: "VarSub".to_string(),
+            label: format!("{}, {} consumers", source_label, self.consumers.len()),
+            yield_guard: guard_summary(&self.yield_guard),
+            data_summary: String::new(),
+            children,
+        }
+    }
 }
 
 impl Consumer for VarSub {
     fn notify(&mut self, notification: Notification) {
         match &notification {
             Notification::Yield(guard) => {
+                debug!("Setting VarSub yield guard {guard:?}");
                 self.yield_guard = guard.clone();
             }
             Notification::NewData => {
@@ -489,6 +518,18 @@ impl Producer for VarRefSub {
         self.variable_subscription
             .borrow()
             .get_stored_release_guard()
+    }
+
+    // TODO: Make node collapsed by default so it's not confusing to see the same VarSub
+    // in multiple places in the tree. Maybe draw an arrow to the VarSub, or color coordinate them?
+    fn inspect(&self) -> InspectNode {
+        InspectNode {
+            type_name: "VarRefSub".to_string(),
+            label: format!("intent: {}", guard_summary(&self.intent_guard)),
+            yield_guard: guard_summary(&self.variable_subscription.borrow().yield_guard),
+            data_summary: String::new(),
+            children: vec![self.variable_subscription.borrow().inspect()],
+        }
     }
 }
 

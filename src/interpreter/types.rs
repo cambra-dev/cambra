@@ -67,6 +67,15 @@ impl Guard {
         }
     }
 
+    /// Returns Universal if this guard is universal, or else returns Empty
+    pub fn to_universal_or_empty(&self) -> Guard {
+        if self.is_universal() {
+            Guard::Universal
+        } else {
+            Guard::Empty
+        }
+    }
+
     /// Intersect two guards (conjunction)
     pub fn intersect(self, other: Guard) -> Guard {
         match (self, other) {

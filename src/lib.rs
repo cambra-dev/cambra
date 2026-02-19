@@ -3,6 +3,7 @@ use rustpython_parser::{ast, parser};
 pub mod interpreter;
 pub mod lowering;
 pub mod pretty_ast;
+pub mod web_inspector;
 
 pub fn parse_python_code(code: &str) -> Result<ast::Mod, String> {
     let parse_result = parser::parse(code, parser::Mode::Module, "<string>");

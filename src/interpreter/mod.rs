@@ -4,6 +4,7 @@
 //! Execution proceeds via a producer/consumer protocol using guards and extents.
 
 mod binop;
+mod inspect;
 mod lambda;
 mod literal;
 mod scheduler;
@@ -12,6 +13,7 @@ mod types;
 mod var;
 
 pub use binop::*;
+pub use inspect::*;
 pub use lambda::*;
 pub use literal::*;
 pub use scheduler::*;
@@ -66,6 +68,18 @@ pub trait Producer: Debug {
     /// larger if the producer has additional obsolescence information (e.g.,
     /// from variables with their own obsolete guards).
     fn release(&mut self, obsolete_guard: Guard) -> Guard;
+
+    /// Return a structured inspection node for the web dashboard.
+    /// Default implementation creates a leaf node from the Debug output.
+    fn inspect(&self) -> InspectNode {
+        InspectNode {
+            type_name: "Unknown".to_string(),
+            label: format!("{:?}", self),
+            yield_guard: String::new(),
+            data_summary: String::new(),
+            children: vec![],
+        }
+    }
 }
 
 /// Blanket implementation: Rc<RefCell<P>> implements Producer when P does.
@@ -76,6 +90,10 @@ impl<P: Producer> Producer for Rc<RefCell<P>> {
 
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         self.borrow_mut().release(obsolete_guard)
+    }
+
+    fn inspect(&self) -> InspectNode {
+        self.borrow().inspect()
     }
 }
 

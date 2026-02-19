@@ -3,8 +3,8 @@ use std::{cell::RefCell, rc::Rc};
 use log::debug;
 
 use crate::interpreter::{
-    ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, FuncBinding, GetResult, Guard,
-    Operator, ParentIndices, Producer, Scheduler, Value, VarScope,
+    guard_summary, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, FuncBinding,
+    GetResult, Guard, InspectNode, Operator, ParentIndices, Producer, Scheduler, Value, VarScope,
 };
 
 /// Operator that reads lines from stdin and produces them as output.
@@ -253,11 +253,7 @@ impl Producer for StdinProducer {
             },
             // We don't know anything about the contents of stdin, so the yield guard
             // is Universal if the source is closed and Empty otherwise
-            yield_guard: if yield_guard.is_universal() {
-                Guard::Universal
-            } else {
-                Guard::Empty
-            },
+            yield_guard: yield_guard.to_universal_or_empty(),
         }
     }
 
@@ -265,6 +261,22 @@ impl Producer for StdinProducer {
         // Currently, we only release in sources based on the indices not the values, so
         // nothing to do here.
         guard
+    }
+
+    fn inspect(&self) -> InspectNode {
+        InspectNode {
+            type_name: "StdinProducer".to_string(),
+            label: self.data_source.borrow().get_id(),
+            yield_guard: guard_summary(
+                &self
+                    .data_source
+                    .borrow()
+                    .get_yield_guard()
+                    .to_universal_or_empty(),
+            ),
+            data_summary: format!("{:?}", self.data_source.borrow().buffer),
+            children: vec![self.index_producer.inspect()],
+        }
     }
 }
 

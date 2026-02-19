@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>Cambra Inspector</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
+            font-size: 13px;
+            background: #1e1e2e;
+            color: #cdd6f4;
+            padding: 16px;
+        }
+
+        h1 {
+            font-size: 18px;
+            margin-bottom: 12px;
+            color: #89b4fa;
+        }
+
+        .tick {
+            color: #a6adc8;
+            margin-bottom: 12px;
+        }
+
+        .node {
+            border-left: 2px solid #45475a;
+            margin-left: 12px;
+            padding-left: 10px;
+            margin-top: 4px;
+        }
+
+        .node-header {
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .node-header:hover {
+            background: #313244;
+        }
+
+        .type-name {
+            color: #cba6f7;
+            font-weight: bold;
+        }
+
+        .label {
+            color: #f9e2af;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 11px;
+        }
+
+        .badge-complete {
+            background: #a6e3a1;
+            color: #1e1e2e;
+        }
+
+        .badge-active {
+            background: #f9e2af;
+            color: #1e1e2e;
+        }
+
+        .badge-empty {
+            background: #45475a;
+            color: #bac2de;
+        }
+
+        .guard {
+            color: #94e2d5;
+            font-size: 11px;
+        }
+
+        .data {
+            color: #fab387;
+            font-size: 11px;
+        }
+
+        .collapsed>.children {
+            display: none;
+        }
+
+        .collapsed>.node-header>.toggle {
+            transform: rotate(-90deg);
+        }
+
+        .toggle {
+            width: 16px;
+            text-align: center;
+            color: #6c7086;
+            transition: transform 0.1s;
+        }
+
+        .section {
+            margin-top: 16px;
+        }
+
+        .section-title {
+            color: #89b4fa;
+            font-size: 14px;
+            margin-bottom: 8px;
+            border-bottom: 1px solid #313244;
+            padding-bottom: 4px;
+        }
+
+        #error {
+            color: #f38ba8;
+            margin: 8px 0;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Cambra Runtime Inspector</h1>
+    <button id="refresh" onclick="poll()"
+        style="background:#89b4fa;color:#1e1e2e;border:none;padding:6px 16px;border-radius:4px;font-family:inherit;font-size:13px;cursor:pointer;margin-bottom:12px;">Refresh</button>
+    <div class="tick" id="tick">Tick: --</div>
+    <div id="error"></div>
+    <div class="section">
+        <div class="section-title">Producer Graph</div>
+        <div id="producer"></div>
+    </div>
+    <div class="section">
+        <div class="section-title">Scheduler Sources</div>
+        <div id="sources"></div>
+    </div>
+    <script>
+        function badge(node) {
+            if (node.yield_guard === 'Universal') return '<span class="badge badge-complete">DONE</span>';
+            return '<span class="badge badge-active">RUNNING</span>';
+        }
+        function renderNode(node) {
+            const hasChildren = node.children && node.children.length > 0;
+            const toggle = hasChildren ? '\u25bc' : '\u00a0';
+            let h = '<div class="node">';
+            h += '<div class="node-header" onclick="this.parentElement.classList.toggle(\'collapsed\')">';
+            h += '<span class="toggle">' + toggle + '</span>';
+            h += '<span class="type-name">' + esc(node.type) + '</span>';
+            if (node.label) h += '<span class="label">' + esc(node.label) + '</span>';
+            h += badge(node);
+            if (node.yield_guard) h += '<span class="guard">yield_guard: ' + esc(node.yield_guard) + '</span>';
+            if (node.data_summary) h += '<span class="data">' + esc(node.data_summary) + '</span>';
+            h += '</div>';
+            if (hasChildren) {
+                h += '<div class="children">';
+                for (const child of node.children) h += renderNode(child);
+                h += '</div>';
+            }
+            h += '</div>';
+            return h;
+        }
+        function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+        async function poll() {
+            try {
+                const r = await fetch('/api/snapshot');
+                const data = await r.json();
+                document.getElementById('tick').textContent = 'Tick: ' + data.tick;
+                document.getElementById('producer').innerHTML = data.producer ? renderNode(data.producer) : '<em>none</em>';
+                let srcHtml = '';
+                if (data.sources) for (const s of data.sources) srcHtml += renderNode(s);
+                document.getElementById('sources').innerHTML = srcHtml || '<em>none</em>';
+                document.getElementById('error').textContent = '';
+            } catch (e) {
+                document.getElementById('error').textContent = 'Connection error: ' + e.message;
+            }
+        }
+        poll();
+    </script>
+</body>
+
+</html>

@@ -6,7 +6,8 @@ use std::rc::Rc;
 use crate::interpreter::{FuncBinding, GetResult, Notification};
 
 use super::{
-    BaseType, ColumnValue, Consumer, Extent, Guard, Operator, Producer, Scheduler, Value, VarScope,
+    BaseType, ColumnValue, Consumer, Extent, Guard, InspectNode, Operator, Producer, Scheduler,
+    Value, VarScope,
 };
 
 /// A literal operator represents a constant value.
@@ -95,6 +96,17 @@ impl Producer for LiteralProducer {
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         // Release is a no-op for literals - just return the obsolete guard unchanged
         obsolete_guard
+    }
+
+    fn inspect(&self) -> InspectNode {
+        InspectNode {
+            type_name: "LiteralProducer".to_string(),
+            label: format!("{:?}", self.value),
+            yield_guard: "Universal".to_string(),
+            data_summary: format!("{:?}", self.value),
+
+            children: vec![],
+        }
     }
 }
 
@@ -218,6 +230,17 @@ impl Producer for ListLiteralProducer {
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         // Release is a no-op for literals - just return the obsolete guard unchanged
         obsolete_guard
+    }
+
+    fn inspect(&self) -> InspectNode {
+        InspectNode {
+            type_name: "ListLiteralProducer".to_string(),
+            label: format!("{} elements", self.values.len()),
+            yield_guard: "Universal".to_string(),
+            data_summary: format!("{} elements", self.values.len()),
+
+            children: vec![self.index_producer.inspect()],
+        }
     }
 }
 

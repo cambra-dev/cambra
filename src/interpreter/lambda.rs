@@ -6,8 +6,9 @@ use std::rc::Rc;
 use log::debug;
 
 use super::{
-    ColumnValue, Consumer, Extent, FuncBinding, GetResult, Guard, Notification, Operator,
-    ParentIndices, Producer, Scheduler, Value, Var, VarScope, VarSource, VarSub,
+    guard_summary, ColumnValue, Consumer, Extent, FuncBinding, GetResult, Guard, InspectNode,
+    Notification, Operator, ParentIndices, Producer, Scheduler, Value, Var, VarScope, VarSource,
+    VarSub,
 };
 
 /// A Lambda operator represents a lambda expression.
@@ -88,6 +89,8 @@ impl Producer for LambdaProducer {
             .expect("body_producer should be set before get()")
             .get();
 
+        self.variable_yield_guard = domain_result.yield_guard.clone();
+        self.body_yield_guard = codomain_result.yield_guard.clone();
         let domain_column = domain_result.column_value;
         let codomain_column = codomain_result.column_value;
         // If the body of a lambda is a scalar, expand it out to one copy per element in the domain.
@@ -108,11 +111,7 @@ impl Producer for LambdaProducer {
                     values: vec![Value::Function(bindings)],
                     parent_indices: domain_column.parent_indices,
                 },
-                yield_guard: if domain_result.yield_guard.is_universal() {
-                    Guard::Universal
-                } else {
-                    Guard::Empty
-                },
+                yield_guard: domain_result.yield_guard.to_universal_or_empty(),
             };
         }
 
@@ -181,6 +180,24 @@ impl Producer for LambdaProducer {
                 expanded_domain_obsolete,
                 expanded_codomain_obsolete,
             )
+        }
+    }
+
+    fn inspect(&self) -> InspectNode {
+        let mut children = vec![self.variable_subscription.borrow().inspect()];
+        if let Some(ref bp) = self.body_producer {
+            children.push(bp.inspect());
+        }
+        InspectNode {
+            type_name: "LambdaProducer".to_string(),
+            label: format!(
+                "var_yg={}, body_yg={}",
+                guard_summary(&self.variable_yield_guard),
+                guard_summary(&self.body_yield_guard)
+            ),
+            yield_guard: guard_summary(&Guard::Domain(Box::new(self.variable_yield_guard.clone()))),
+            data_summary: String::new(),
+            children,
         }
     }
 }
@@ -397,8 +414,7 @@ impl Operator for Apply {
         let apply_consumer = move |notification: Notification| {
             let downstream_notification = match &notification {
                 Notification::NewData => Notification::NewData,
-                Notification::Yield(g) if g.is_universal() => Notification::Yield(Guard::Universal),
-                Notification::Yield(_) => Notification::Yield(Guard::Empty),
+                Notification::Yield(g) => Notification::Yield(g.to_universal_or_empty()),
             };
             debug!(
                 "Apply notified with {:?}, forwarding {:?}",
@@ -446,11 +462,7 @@ impl Producer for ApplyProducer {
                     values: bindings.iter().map(|b| b.output.clone()).collect(),
                     parent_indices: lambda_column.parent_indices,
                 },
-                yield_guard: if yield_guard.is_universal() {
-                    Guard::Universal
-                } else {
-                    Guard::Empty
-                },
+                yield_guard: yield_guard.to_universal_or_empty(),
             },
             _ => panic!(
                 "Expected lambda producer to return a Function value, got {:?}",
@@ -462,6 +474,16 @@ impl Producer for ApplyProducer {
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         // For simplicity, we just pass through the release to the lambda producer
         self.lambda_producer.release(obsolete_guard)
+    }
+
+    fn inspect(&self) -> InspectNode {
+        InspectNode {
+            type_name: "ApplyProducer".to_string(),
+            label: String::new(),
+            yield_guard: String::new(),
+            data_summary: String::new(),
+            children: vec![self.lambda_producer.inspect()],
+        }
     }
 }
 

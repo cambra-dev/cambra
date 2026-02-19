@@ -6,8 +6,8 @@ use std::rc::Rc;
 use crate::interpreter::Scheduler;
 
 use super::{
-    ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, ParentIndices,
-    Producer, Value, VarScope,
+    guard_summary, ColumnValue, Consumer, Extent, GetResult, Guard, InspectNode, Notification,
+    Operator, ParentIndices, Producer, Value, VarScope,
 };
 
 /// Kinds of binary arithmetic operations.
@@ -247,6 +247,9 @@ impl Producer for BinOpProducer {
             left_col.parent_indices
         };
 
+        self.left_yield_guard = left_result.yield_guard.clone();
+        self.right_yield_guard = right_result.yield_guard.clone();
+
         GetResult {
             column_value: ColumnValue {
                 values,
@@ -278,6 +281,27 @@ impl Producer for BinOpProducer {
                 .release(obsolete_guard.clone());
         }
         obsolete_guard
+    }
+
+    fn inspect(&self) -> InspectNode {
+        let mut children = vec![];
+        if let Some(ref lp) = self.left_producer {
+            children.push(lp.inspect());
+        }
+        if let Some(ref rp) = self.right_producer {
+            children.push(rp.inspect());
+        }
+        InspectNode {
+            type_name: "BinOpProducer".to_string(),
+            label: format!("{:?}", self.op),
+            yield_guard: format!(
+                "L={}, R={}",
+                guard_summary(&self.left_yield_guard),
+                guard_summary(&self.right_yield_guard)
+            ),
+            data_summary: String::new(),
+            children,
+        }
     }
 }
 

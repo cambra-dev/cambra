@@ -4,6 +4,7 @@ use cambra::{
     interpreter::{Consumer, GetResult, Guard, Notification, Scheduler, Value},
     lowering::lower_let_stmt_block,
     parse_python_code,
+    web_inspector::WebInspector,
 };
 use log::debug;
 use rustpython_parser::ast::Mod;
@@ -12,7 +13,7 @@ use rustpython_parser::ast::Mod;
 /// The program must currently be a series of assignments and a single final expression
 /// Will loop continuously calling get and release on that expression's producer until
 /// it is notified with a Universal obsolete Guard.
-fn run_program(code: &str) {
+fn run_program(code: &str, inspector: Option<&WebInspector>) {
     let module: Mod = parse_python_code(code).expect("Failed to parse Python code");
     let stmts = match module {
         Mod::Module { body, .. } => body,
@@ -36,12 +37,21 @@ fn run_program(code: &str) {
 
     let mut producer = op.subscribe(Guard::universal(), consumer, scope, &mut scheduler);
 
+    let mut tick: u64 = 0;
+    if let Some(inspector) = inspector {
+        inspector.update_snapshot(tick, &*producer, &scheduler);
+    }
     debug!("main producer:\n{:#?}", producer);
 
     loop {
         while !*new_data.borrow() && !yield_guard.borrow().is_universal() {
             debug!("Scheduler checking for notifications");
             scheduler.check_for_notifications();
+            tick += 1;
+
+            if let Some(inspector) = inspector {
+                inspector.update_snapshot(tick, &*producer, &scheduler);
+            }
         }
         let GetResult {
             column_value,
@@ -67,6 +77,12 @@ fn run_program(code: &str) {
             new_obsolete_guard, obsolete_guard
         );
         *new_data.borrow_mut() = false;
+
+        tick += 1;
+        if let Some(inspector) = inspector {
+            inspector.update_snapshot(tick, &*producer, &scheduler);
+        }
+
         if yield_guard.borrow().is_universal() {
             break;
         }
@@ -78,15 +94,30 @@ fn run_program(code: &str) {
 /// Runs a given Cambra file, specified as the first command-line argument.
 fn main() {
     env_logger::init();
-    let args = std::env::args().collect::<Vec<String>>();
-    if args.len() != 2 {
-        debug!("Usage: cambra <input_file>");
-        std::process::exit(1);
-    }
-    let input_file = &args[1];
-    let code = std::fs::read_to_string(input_file).expect("Failed to read input file");
+    let args: Vec<String> = std::env::args().collect();
 
-    run_program(&code);
+    let mut input_file = None;
+    let mut inspect_port: Option<u16> = None;
+
+    for arg in &args[1..] {
+        if arg == "--inspect" {
+            inspect_port = Some(8080);
+        } else if let Some(port_str) = arg.strip_prefix("--inspect=") {
+            inspect_port = Some(port_str.parse().expect("Invalid port for --inspect"));
+        } else {
+            input_file = Some(arg.clone());
+        }
+    }
+
+    let input_file = input_file.unwrap_or_else(|| {
+        eprintln!("Usage: cambra [--inspect[=PORT]] <input_file>");
+        std::process::exit(1);
+    });
+
+    let code = std::fs::read_to_string(&input_file).expect("Failed to read input file");
+
+    let inspector = inspect_port.map(WebInspector::new);
+    run_program(&code, inspector.as_ref());
 }
 
 #[cfg(test)]
@@ -97,6 +128,6 @@ mod tests {
     /// Smoke test that makes sure running a simple program doesn't crash.
     #[test]
     fn test_run_program() {
-        run_program("x = 1; x")
+        run_program("x = 1; x", None)
     }
 }

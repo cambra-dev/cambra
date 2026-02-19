@@ -22,6 +22,14 @@ See [PLAN.md](PLAN.md) for detailed implementation status and [design.md](design
 cargo build
 ```
 
+## Running
+
+To execute a program in a file, optionally providing program inspection at the given port (8080 by default):
+
+```bash
+cargo run -- [--inspect[=<PORT>]] <file>
+```
+
 ## CI
 
 CI runs formatting, linting, and tests via GitHub Actions on every push to `main` and on pull requests.
