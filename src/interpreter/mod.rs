@@ -23,6 +23,8 @@ pub use test_source::*;
 pub use types::*;
 pub use var::*;
 
+use crate::pretty_graph::{InspectNode, VizOptions};
+
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
@@ -71,16 +73,15 @@ pub trait Producer: Debug {
     /// from variables with their own obsolete guards).
     fn release(&mut self, obsolete_guard: Guard) -> Guard;
 
-    /// Return a structured inspection node for the web dashboard.
-    /// Default implementation creates a leaf node from the Debug output.
-    fn inspect(&self) -> InspectNode {
-        InspectNode {
-            type_name: "Unknown".to_string(),
-            label: format!("{self:?}"),
-            yield_guard: String::new(),
-            data_summary: String::new(),
-            children: vec![],
-        }
+    /// Inspect this producer as an [`InspectNode`] for visualization.
+    ///
+    /// The default implementation heuristically extracts the type name from Debug
+    /// output. Override this for proper visualization — the fallback exists only
+    /// so that new Producer types are displayable before a custom impl is added.
+    fn inspect(&self, _opts: &VizOptions) -> InspectNode {
+        let dbg = format!("{:?}", self);
+        let variant = dbg.split(['{', '(']).next().unwrap_or("?").trim();
+        InspectNode::leaf(format!("{variant}(?)"))
     }
 }
 
@@ -94,8 +95,11 @@ impl<P: Producer> Producer for Rc<RefCell<P>> {
         self.borrow_mut().release(obsolete_guard)
     }
 
-    fn inspect(&self) -> InspectNode {
-        self.borrow().inspect()
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        match self.try_borrow() {
+            Ok(p) => p.inspect(opts),
+            Err(_) => InspectNode::leaf("<locked>"),
+        }
     }
 }
 
@@ -153,6 +157,16 @@ pub trait Operator: Debug {
         _scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
         panic!("Not appliable {self:?}")
+    }
+    /// Inspect this operator as an [`InspectNode`] for visualization.
+    ///
+    /// The default implementation heuristically extracts the type name from Debug
+    /// output. Override this for proper visualization — the fallback exists only
+    /// so that new Operator types are displayable before a custom impl is added.
+    fn inspect(&self, _opts: &VizOptions) -> InspectNode {
+        let dbg = format!("{:?}", self);
+        let variant = dbg.split(['{', '(']).next().unwrap_or("?").trim();
+        InspectNode::leaf(format!("{variant}(?)"))
     }
 }
 

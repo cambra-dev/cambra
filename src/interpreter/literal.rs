@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::interpreter::{ColumnData, GetResult, Notification};
+use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
 
 use super::{
-    BaseType, ColumnValue, Consumer, Extent, FuncBinding, Guard, InspectNode, Operator, Producer,
-    Scheduler, Value, VarScope,
+    fmt_value_compact, BaseType, ColumnData, ColumnValue, Consumer, Extent, FuncBinding, GetResult,
+    Guard, Notification, Operator, Producer, Scheduler, Value, VarScope,
 };
 
 /// A literal operator represents a constant value.
@@ -63,6 +63,14 @@ impl Operator for Literal {
         &self.extent
     }
 
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let mut desc = InspectNode::leaf(format!("Literal({})", fmt_value_compact(&self.value)));
+        if opts.show_extents {
+            desc = desc.annotate(format!(": {}", fmt_extent(&self.extent)));
+        }
+        desc
+    }
+
     fn subscribe(
         &mut self,
         _intent_guard: Guard,
@@ -85,6 +93,13 @@ struct LiteralProducer {
 }
 
 impl Producer for LiteralProducer {
+    fn inspect(&self, _opts: &VizOptions) -> InspectNode {
+        InspectNode::leaf(format!(
+            "LiteralProducer({})",
+            fmt_value_compact(&self.value)
+        ))
+    }
+
     fn get(&mut self) -> GetResult {
         // Literal is always fully available, so yield_guard is Universal.
         GetResult {
@@ -96,17 +111,6 @@ impl Producer for LiteralProducer {
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         // Release is a no-op for literals - just return the obsolete guard unchanged
         obsolete_guard
-    }
-
-    fn inspect(&self) -> InspectNode {
-        InspectNode {
-            type_name: "LiteralProducer".to_string(),
-            label: format!("{:?}", self.value),
-            yield_guard: "Universal".to_string(),
-            data_summary: format!("{:?}", self.value),
-
-            children: vec![],
-        }
     }
 }
 
@@ -137,6 +141,23 @@ impl ListLiteral {
 impl Operator for ListLiteral {
     fn extent(&self) -> &Extent {
         &self.extent
+    }
+
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let elem_type = if self.values.is_empty() {
+            "Unit".to_string()
+        } else {
+            fmt_extent(&Literal::extent_for_value(&self.values[0]))
+        };
+        let mut desc = InspectNode::leaf(format!(
+            "ListLiteral({} × {})",
+            self.values.len(),
+            elem_type
+        ));
+        if opts.show_extents {
+            desc = desc.annotate(format!(": {}", fmt_extent(&self.extent)));
+        }
+        desc
     }
 
     /// Subscribe to the literal as single constant value
@@ -200,6 +221,14 @@ struct ListLiteralProducer {
 }
 
 impl Producer for ListLiteralProducer {
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        InspectNode::new(format!(
+            "ListLiteralProducer({} elements)",
+            self.values.len()
+        ))
+        .child("index", self.index_producer.inspect(opts))
+    }
+
     fn get(&mut self) -> GetResult {
         let GetResult {
             yield_guard,
@@ -229,17 +258,6 @@ impl Producer for ListLiteralProducer {
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         // Release is a no-op for literals - just return the obsolete guard unchanged
         obsolete_guard
-    }
-
-    fn inspect(&self) -> InspectNode {
-        InspectNode {
-            type_name: "ListLiteralProducer".to_string(),
-            label: format!("{} elements", self.values.len()),
-            yield_guard: "Universal".to_string(),
-            data_summary: format!("{} elements", self.values.len()),
-
-            children: vec![self.index_producer.inspect()],
-        }
     }
 }
 

@@ -3,12 +3,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
 use log::debug;
 
 use super::{
-    guard_summary, ColumnData, ColumnValue, Consumer, Extent, GetResult, Guard, InspectNode,
-    Notification, Operator, ParentIndices, Producer, Scheduler, Var, VarProducer, VarScope,
-    VarSource,
+    fmt_guard, ColumnData, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator,
+    ParentIndices, Producer, Scheduler, Var, VarProducer, VarScope, VarSource,
 };
 
 /// A Lambda operator represents a lambda expression.
@@ -29,6 +29,8 @@ pub struct Lambda {
 ///
 /// As a [`Producer`]: provides function bindings via `get()` and handles `release()`.
 struct LambdaProducer {
+    /// The variable name (for visualization)
+    var_name: String,
     /// Reference to the variable subscription (for domain values)
     variable_subscription: Rc<RefCell<VarProducer>>,
     /// The body producer (for codomain values). Set after body subscription.
@@ -46,6 +48,7 @@ struct LambdaProducer {
 impl std::fmt::Debug for LambdaProducer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LambdaProducer")
+            .field("var_name", &self.var_name)
             .field("variable_subscription", &self.variable_subscription)
             .field("body_producer", &self.body_producer)
             .field("downstream_consumer", &format_args!("<consumer>"))
@@ -59,11 +62,13 @@ impl std::fmt::Debug for LambdaProducer {
 impl LambdaProducer {
     /// Create a new LambdaProducer. The body_producer should be set via set_body_producer().
     fn new(
+        var_name: String,
         variable_subscription: Rc<RefCell<VarProducer>>,
         downstream_consumer: Box<dyn Consumer>,
         intent_guard: Guard,
     ) -> Self {
         LambdaProducer {
+            var_name,
             variable_subscription,
             body_producer: None,
             downstream_consumer,
@@ -80,6 +85,22 @@ impl LambdaProducer {
 }
 
 impl Producer for LambdaProducer {
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let mut desc = InspectNode::new(format!("LambdaProducer({})", self.var_name));
+        if opts.show_guards {
+            desc = desc.with_intent_guard(fmt_guard(&self.intent_guard));
+        }
+        // Inspect variable subscription (borrows VarProducer then drops before body)
+        let var_desc = self.variable_subscription.inspect(opts);
+        desc = desc.child("var", var_desc);
+        // Inspect body producer
+        match &self.body_producer {
+            Some(p) => desc = desc.child("body", p.inspect(opts)),
+            None => desc = desc.child("body", InspectNode::leaf("<not subscribed>")),
+        }
+        desc
+    }
+
     /// Get the function bindings by combining domain values from the variable
     /// and codomain values from the body.
     fn get(&mut self) -> GetResult {
@@ -160,24 +181,6 @@ impl Producer for LambdaProducer {
                 expanded_domain_obsolete,
                 expanded_codomain_obsolete,
             )
-        }
-    }
-
-    fn inspect(&self) -> InspectNode {
-        let mut children = vec![self.variable_subscription.borrow().inspect()];
-        if let Some(ref bp) = self.body_producer {
-            children.push(bp.inspect());
-        }
-        InspectNode {
-            type_name: "LambdaProducer".to_string(),
-            label: format!(
-                "var_yg={}, body_yg={}",
-                guard_summary(&self.variable_yield_guard),
-                guard_summary(&self.body_yield_guard)
-            ),
-            yield_guard: guard_summary(&Guard::Domain(Box::new(self.variable_yield_guard.clone()))),
-            data_summary: String::new(),
-            children,
         }
     }
 }
@@ -292,6 +295,7 @@ impl Lambda {
 
         // Create LambdaProducer with the variable subscription (body_producer set later)
         let lambda_producer = Rc::new(RefCell::new(LambdaProducer::new(
+            self.variable.name.clone(),
             variable_subscription.clone(),
             consumer,
             intent_guard.clone(),
@@ -334,6 +338,19 @@ impl Lambda {
 impl Operator for Lambda {
     fn extent(&self) -> &Extent {
         &self.extent
+    }
+
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let mut var_desc = InspectNode::leaf(format!("Var({})", self.variable.name));
+        if opts.show_extents {
+            var_desc = var_desc.annotate(format!(": {}", fmt_extent(self.variable.extent())));
+        }
+        let body_desc = self.body.inspect(opts);
+        let mut desc = InspectNode::new(format!("Lambda({})", self.variable.name));
+        if opts.show_extents {
+            desc = desc.annotate(format!(": {}", fmt_extent(&self.extent)));
+        }
+        desc.child("var", var_desc).child("body", body_desc)
     }
 
     // Subscribe to the lambda with iteration source, producing (input, output) pairs for every
@@ -385,6 +402,15 @@ impl Operator for Apply {
         }
     }
 
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let mut desc = InspectNode::new("Apply");
+        if opts.show_extents {
+            desc = desc.annotate(format!(": {}", fmt_extent(self.extent())));
+        }
+        desc.child("lambda", self.lambda.inspect(opts))
+            .child("argument", self.argument.inspect(opts))
+    }
+
     fn subscribe(
         &mut self,
         intent_guard: Guard,
@@ -426,6 +452,10 @@ impl ApplyProducer {
 }
 
 impl Producer for ApplyProducer {
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        InspectNode::new("ApplyProducer").child("lambda", self.lambda_producer.inspect(opts))
+    }
+
     fn get(&mut self) -> GetResult {
         // Get the function bindings from the lambda producer
         let GetResult {
@@ -447,16 +477,6 @@ impl Producer for ApplyProducer {
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         // For simplicity, we just pass through the release to the lambda producer
         self.lambda_producer.release(obsolete_guard)
-    }
-
-    fn inspect(&self) -> InspectNode {
-        InspectNode {
-            type_name: "ApplyProducer".to_string(),
-            label: String::new(),
-            yield_guard: String::new(),
-            data_summary: String::new(),
-            children: vec![self.lambda_producer.inspect()],
-        }
     }
 }
 

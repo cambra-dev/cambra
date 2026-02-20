@@ -6,8 +6,13 @@ use std::thread;
 use log::info;
 
 use crate::interpreter::{Producer, Scheduler};
+use crate::pretty_graph::VizOptions;
 
 /// Web inspector that serves a live HTML dashboard on a background thread.
+///
+/// Pre-rendered static trees (AST and operator graph) are passed at construction
+/// and moved into the HTTP server thread; only the dynamic snapshot is updated
+/// per-tick.
 pub struct WebInspector {
     snapshot: Arc<Mutex<String>>,
 }
@@ -16,9 +21,20 @@ const DASHBOARD_HTML: &str = include_str!("resources/dashboard.html");
 
 impl WebInspector {
     /// Create a new WebInspector and start the HTTP server on the given port.
-    pub fn new(port: u16) -> Self {
+    ///
+    /// `ast_tree` and `operator_tree` are pre-rendered Unicode tree strings
+    /// computed once after parsing/lowering, served as static text endpoints.
+    pub fn new(port: u16, ast_tree: String, operator_tree: String) -> Self {
         let snapshot = Arc::new(Mutex::new("{}".to_string()));
+        let ast_tree = Arc::new(ast_tree);
+        let operator_tree = Arc::new(operator_tree);
+
         let snapshot_clone = snapshot.clone();
+        let ast_clone = ast_tree.clone();
+        let operator_clone = operator_tree.clone();
+
+        let text_plain: tiny_http::Header =
+            "Content-Type: text/plain; charset=utf-8".parse().unwrap();
 
         thread::spawn(move || {
             let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))
@@ -40,13 +56,13 @@ impl WebInspector {
                                 .unwrap(),
                         )
                     }
+                    "/api/ast" => tiny_http::Response::from_string(ast_clone.as_str())
+                        .with_header(text_plain.clone()),
+                    "/api/operators" => tiny_http::Response::from_string(operator_clone.as_str())
+                        .with_header(text_plain.clone()),
                     _ => tiny_http::Response::from_string("Not Found")
                         .with_status_code(404)
-                        .with_header(
-                            "Content-Type: text/plain"
-                                .parse::<tiny_http::Header>()
-                                .unwrap(),
-                        ),
+                        .with_header(text_plain.clone()),
                 };
                 let _ = request.respond(response);
             }
@@ -58,13 +74,16 @@ impl WebInspector {
     /// Update the snapshot with the current state of the producer graph.
     /// Called from the main thread each scheduler tick.
     pub fn update_snapshot(&self, tick: u64, producer: &dyn Producer, scheduler: &Scheduler) {
-        let producer_node = producer.inspect();
-        let sources = scheduler.inspect_sources();
-        let sources_json: Vec<String> = sources.iter().map(|n| n.to_json()).collect();
+        let opts = VizOptions::default();
+        let sources_json: Vec<String> = scheduler
+            .inspect_sources()
+            .iter()
+            .map(|n| n.to_json())
+            .collect();
         let json = format!(
             r#"{{"tick":{},"producer":{},"sources":[{}]}}"#,
             tick,
-            producer_node.to_json(),
+            producer.inspect(&opts).to_json(),
             sources_json.join(","),
         );
         *self.snapshot.lock().unwrap() = json;

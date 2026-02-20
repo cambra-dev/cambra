@@ -3,9 +3,10 @@ use std::{cell::RefCell, rc::Rc};
 use log::debug;
 
 use crate::interpreter::{
-    guard_summary, ColumnData, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent,
-    GetResult, Guard, InspectNode, Operator, ParentIndices, Producer, Scheduler, Value, VarScope,
+    ColumnData, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, GetResult, Guard,
+    Operator, ParentIndices, Producer, Scheduler, Value, VarScope,
 };
+use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
 
 /// Operator that reads lines from stdin and produces them as output.
 /// Indices are produced via StdinDataSource, which also contains a mapping from
@@ -43,6 +44,14 @@ impl std::fmt::Debug for StdinReader {
 impl Operator for StdinReader {
     fn extent(&self) -> &Extent {
         &self.extent
+    }
+
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let mut desc = InspectNode::leaf("StdinReader");
+        if opts.show_extents {
+            desc = desc.annotate(format!(": {}", fmt_extent(&self.extent)));
+        }
+        desc
     }
 
     fn subscribe(
@@ -227,6 +236,13 @@ impl std::fmt::Debug for StdinProducer {
 }
 
 impl Producer for StdinProducer {
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let binding = self.data_source.borrow();
+        let id = binding.get_id();
+        InspectNode::new(format!("StdinProducer({})", id))
+            .child("index", self.index_producer.inspect(opts))
+    }
+
     fn get(&mut self) -> GetResult {
         let GetResult {
             column_value: indices,
@@ -254,22 +270,6 @@ impl Producer for StdinProducer {
         // Currently, we only release in sources based on the indices not the values, so
         // nothing to do here.
         guard
-    }
-
-    fn inspect(&self) -> InspectNode {
-        InspectNode {
-            type_name: "StdinProducer".to_string(),
-            label: self.data_source.borrow().get_id().to_string(),
-            yield_guard: guard_summary(
-                &self
-                    .data_source
-                    .borrow()
-                    .get_yield_guard()
-                    .to_universal_or_empty(),
-            ),
-            data_summary: format!("{:?}", self.data_source.borrow().buffer),
-            children: vec![self.index_producer.inspect()],
-        }
     }
 }
 

@@ -22,13 +22,28 @@ See [PLAN.md](PLAN.md) for detailed implementation status and [design.md](design
 cargo build
 ```
 
-## Running
-
-To execute a program in a file, optionally providing program inspection at the given port (8080 by default):
+## Usage
 
 ```bash
-cargo run -- [--inspect[=<PORT>]] <file>
+cargo run -- <input_file>
 ```
+
+### Web Inspector
+
+Pass `--inspect` to start a live web dashboard that shows the program's Python AST, CCL operator graph, and runtime producer state:
+
+```bash
+cargo run -- --inspect program.cambra
+```
+
+The inspector defaults to port 8080. To use a different port:
+
+```bash
+cargo run -- --inspect=9090 program.cambra
+```
+
+After the program finishes, the process stays alive so you can browse the dashboard at `http://localhost:<port>`. Press Ctrl+C to exit.
+
 
 ## CI
 

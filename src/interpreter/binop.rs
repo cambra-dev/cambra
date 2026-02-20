@@ -4,10 +4,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::interpreter::Scheduler;
+use crate::pretty_graph::{fmt_binop, fmt_extent, InspectNode, VizOptions};
 
 use super::{
-    guard_summary, ColumnData, ColumnValue, Consumer, Extent, GetResult, Guard, InspectNode,
-    Notification, Operator, ParentIndices, Producer, VarScope,
+    fmt_guard, ColumnData, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator,
+    ParentIndices, Producer, VarScope,
 };
 
 /// Kinds of binary arithmetic operations.
@@ -75,6 +76,15 @@ impl BinOp {
 impl Operator for BinOp {
     fn extent(&self) -> &Extent {
         &self.extent
+    }
+
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let mut desc = InspectNode::new(format!("BinOp({})", fmt_binop(&self.op)));
+        if opts.show_extents {
+            desc = desc.annotate(format!(": {}", fmt_extent(&self.extent)));
+        }
+        desc.child("left", self.left.inspect(opts))
+            .child("right", self.right.inspect(opts))
     }
 
     fn subscribe(
@@ -194,6 +204,23 @@ impl std::fmt::Debug for BinOpProducer {
 }
 
 impl Producer for BinOpProducer {
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        // Yield guard is always shown — it is the primary progress signal.
+        let mut desc = InspectNode::new(format!("BinOpProducer({})", fmt_binop(&self.op)))
+            .with_yield_guard(format!(
+                "{} ∧ {}",
+                fmt_guard(&self.left_yield_guard),
+                fmt_guard(&self.right_yield_guard)
+            ));
+        if let Some(ref left) = self.left_producer {
+            desc = desc.child("left", left.inspect(opts));
+        }
+        if let Some(ref right) = self.right_producer {
+            desc = desc.child("right", right.inspect(opts));
+        }
+        desc
+    }
+
     fn get(&mut self) -> GetResult {
         let left_result = self
             .left_producer
@@ -268,27 +295,6 @@ impl Producer for BinOpProducer {
                 .release(obsolete_guard.clone());
         }
         obsolete_guard
-    }
-
-    fn inspect(&self) -> InspectNode {
-        let mut children = vec![];
-        if let Some(ref lp) = self.left_producer {
-            children.push(lp.inspect());
-        }
-        if let Some(ref rp) = self.right_producer {
-            children.push(rp.inspect());
-        }
-        InspectNode {
-            type_name: "BinOpProducer".to_string(),
-            label: format!("{:?}", self.op),
-            yield_guard: format!(
-                "L={}, R={}",
-                guard_summary(&self.left_yield_guard),
-                guard_summary(&self.right_yield_guard)
-            ),
-            data_summary: String::new(),
-            children,
-        }
     }
 }
 

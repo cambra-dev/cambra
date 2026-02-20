@@ -20,93 +20,91 @@ use std::fmt;
 
 use rustpython_parser::ast::{self, Constant, ExprKind, StmtKind};
 
+use crate::pretty_tree::{render, InspectNode};
+
 // ---------------------------------------------------------------------------
 // Generic wrapper & trait
 // ---------------------------------------------------------------------------
+
+/// Wrapper that implements [`fmt::Display`] for any type implementing [`ToInspectNode`].
 pub struct Pretty<'a, T>(pub &'a T);
 
-// Trait used by AST nodes to describe their formatting.
-pub trait AstFormatter {
-    fn format(&self, f: &mut fmt::Formatter<'_>, indent: &str) -> fmt::Result;
+/// Trait for AST nodes that can describe themselves as an [`InspectNode`] tree.
+pub trait ToInspectNode {
+    fn to_inspect_node(&self) -> InspectNode;
 }
 
-// Implement Display for our generic wrapper
-impl<'a, T: AstFormatter> fmt::Display for Pretty<'a, T> {
+impl<'a, T: ToInspectNode> fmt::Display for Pretty<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.format(f, "")
-    }
-}
-// Implement the trait for each specific AST type
-impl AstFormatter for ast::Mod {
-    fn format(&self, f: &mut fmt::Formatter<'_>, indent: &str) -> fmt::Result {
-        fmt_mod(f, self, indent)
+        write!(f, "{}", render(&self.0.to_inspect_node()))
     }
 }
 
-impl AstFormatter for ast::Stmt {
-    fn format(&self, f: &mut fmt::Formatter<'_>, indent: &str) -> fmt::Result {
-        fmt_stmtkind(f, &self.node, indent)
+impl ToInspectNode for ast::Mod {
+    fn to_inspect_node(&self) -> InspectNode {
+        mod_to_node(self)
     }
 }
 
-impl AstFormatter for StmtKind {
-    fn format(&self, f: &mut fmt::Formatter<'_>, indent: &str) -> fmt::Result {
-        fmt_stmtkind(f, self, indent)
+impl ToInspectNode for ast::Stmt {
+    fn to_inspect_node(&self) -> InspectNode {
+        stmt_to_node(self)
     }
 }
 
-impl AstFormatter for ast::Expr {
-    fn format(&self, f: &mut fmt::Formatter<'_>, indent: &str) -> fmt::Result {
-        fmt_expr(f, self, indent)
+impl ToInspectNode for StmtKind {
+    fn to_inspect_node(&self) -> InspectNode {
+        stmtkind_to_node(self)
+    }
+}
+
+impl ToInspectNode for ast::Expr {
+    fn to_inspect_node(&self) -> InspectNode {
+        expr_to_node(self)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Convenience functions
+// Convenience function
 // ---------------------------------------------------------------------------
-// Generic pretty function
-pub fn pretty<T: AstFormatter>(node: &T) -> String {
-    Pretty(node).to_string()
+
+/// Return a compact tree-formatted string for any AST node.
+pub fn pretty<T: ToInspectNode>(node: &T) -> String {
+    render(&node.to_inspect_node())
 }
 
 // ---------------------------------------------------------------------------
-// Internal formatting
-//
-// Convention: fmt_stmt / fmt_expr write the node label (without any leading
-// prefix) followed by a newline, then recurse into children using the
-// `prefix` argument for indentation.  The `prefix` is the column of vertical
-// bars that continues from the parent — it is prepended only to *children*,
-// not to the node's own label line (which is already positioned by the
-// caller's connector).
+// Internal builders
 // ---------------------------------------------------------------------------
 
-fn fmt_mod(f: &mut fmt::Formatter<'_>, m: &ast::Mod, prefix: &str) -> fmt::Result {
+fn mod_to_node(m: &ast::Mod) -> InspectNode {
     match m {
         ast::Mod::Module { body, .. } => {
-            writeln!(f, "Module")?;
-            fmt_children_stmt(f, body, prefix)
+            let mut desc = InspectNode::new("Module");
+            for s in body {
+                desc = desc.child("", stmt_to_node(s));
+            }
+            desc
         }
         ast::Mod::Interactive { body } => {
-            writeln!(f, "Interactive")?;
-            fmt_children_stmt(f, body, prefix)
+            let mut desc = InspectNode::new("Interactive");
+            for s in body {
+                desc = desc.child("", stmt_to_node(s));
+            }
+            desc
         }
         ast::Mod::Expression { body } => {
-            writeln!(f, "Expression")?;
-            fmt_child_expr(f, body, prefix, true)
+            InspectNode::new("Expression").child("", expr_to_node(body))
         }
-        ast::Mod::FunctionType { .. } => {
-            writeln!(f, "FunctionType(?)")
-        }
+        ast::Mod::FunctionType { .. } => InspectNode::leaf("FunctionType(?)"),
     }
 }
 
-fn fmt_stmt(f: &mut fmt::Formatter<'_>, s: &ast::Stmt, prefix: &str) -> fmt::Result {
-    fmt_stmtkind(f, &s.node, prefix)
+fn stmt_to_node(s: &ast::Stmt) -> InspectNode {
+    stmtkind_to_node(&s.node)
 }
 
-/// Format a statement node.  Writes the label (no prefix) then children
-/// indented under `prefix`.
-fn fmt_stmtkind(f: &mut fmt::Formatter<'_>, node: &StmtKind, prefix: &str) -> fmt::Result {
+fn stmtkind_to_node(node: &StmtKind) -> InspectNode {
     match node {
         StmtKind::FunctionDef {
             name, args, body, ..
@@ -119,32 +117,35 @@ fn fmt_stmtkind(f: &mut fmt::Formatter<'_>, node: &StmtKind, prefix: &str) -> fm
             } else {
                 "FunctionDef"
             };
-            write!(f, "{prefix_str}({name}")?;
+            let mut label = format!("{prefix_str}({name}");
             for arg in args.posonlyargs.iter().chain(args.args.iter()) {
-                write!(f, ", {}", arg.node.arg)?;
+                label.push_str(&format!(", {}", arg.node.arg));
             }
-            writeln!(f, ")")?;
-            fmt_children_stmt(f, body, prefix)
+            label.push(')');
+            let mut desc = InspectNode::new(label);
+            for s in body {
+                desc = desc.child("", stmt_to_node(s));
+            }
+            desc
         }
         StmtKind::Return { value } => {
-            writeln!(f, "Return")?;
+            let mut desc = InspectNode::new("Return");
             if let Some(val) = value {
-                fmt_child_expr(f, val, prefix, true)?;
+                desc = desc.child("", expr_to_node(val));
             }
-            Ok(())
+            desc
         }
         StmtKind::Assign { targets, value, .. } => {
-            writeln!(f, "Assign")?;
+            let mut desc = InspectNode::new("Assign");
             for t in targets {
-                // Print the middle values (is_last = false)
-                fmt_child_expr(f, t, prefix, false)?;
+                desc = desc.child("", expr_to_node(t));
             }
-            fmt_child_expr(f, value, prefix, true)
+            desc.child("", expr_to_node(value))
         }
         StmtKind::AugAssign { target, op, value } => {
-            writeln!(f, "AugAssign({}=)", operator_symbol(op))?;
-            fmt_child_expr(f, target, prefix, false)?;
-            fmt_child_expr(f, value, prefix, true)
+            InspectNode::new(format!("AugAssign({}=)", operator_symbol(op)))
+                .child("", expr_to_node(target))
+                .child("", expr_to_node(value))
         }
         StmtKind::For {
             target,
@@ -153,73 +154,64 @@ fn fmt_stmtkind(f: &mut fmt::Formatter<'_>, node: &StmtKind, prefix: &str) -> fm
             orelse,
             ..
         } => {
-            writeln!(f, "For")?;
-            fmt_child_expr(f, target, prefix, false)?;
-            let has_else = !orelse.is_empty();
-            let test_is_last = body.is_empty() && !has_else;
-            fmt_child_expr(f, iter, prefix, test_is_last)?;
-            if has_else {
-                fmt_children_mixed(f, body, &[], prefix, false)?;
-                fmt_children_mixed(f, orelse, &[], prefix, true)?;
-            } else {
-                fmt_children_stmt(f, body, prefix)?;
+            let mut desc = InspectNode::new("For")
+                .child("", expr_to_node(target))
+                .child("", expr_to_node(iter));
+            for s in body {
+                desc = desc.child("", stmt_to_node(s));
             }
-            Ok(())
+            for s in orelse {
+                desc = desc.child("", stmt_to_node(s));
+            }
+            desc
         }
         StmtKind::If { test, body, orelse } => {
-            writeln!(f, "If")?;
-            let has_else = !orelse.is_empty();
-            let test_is_last = body.is_empty() && !has_else;
-            fmt_child_expr(f, test, prefix, test_is_last)?;
-            if has_else {
-                fmt_children_mixed(f, body, &[], prefix, false)?;
-                fmt_children_mixed(f, orelse, &[], prefix, true)?;
-            } else {
-                fmt_children_stmt(f, body, prefix)?;
+            let mut desc = InspectNode::new("If").child("", expr_to_node(test));
+            for s in body {
+                desc = desc.child("", stmt_to_node(s));
             }
-            Ok(())
+            for s in orelse {
+                desc = desc.child("", stmt_to_node(s));
+            }
+            desc
         }
-        StmtKind::Expr { value } => {
-            writeln!(f, "ExprStmt")?;
-            fmt_child_expr(f, value, prefix, true)
-        }
-        StmtKind::Pass => writeln!(f, "Pass"),
-        StmtKind::Break => writeln!(f, "Break"),
-        StmtKind::Continue => writeln!(f, "Continue"),
+        StmtKind::Expr { value } => InspectNode::new("ExprStmt").child("", expr_to_node(value)),
+        StmtKind::Pass => InspectNode::leaf("Pass"),
+        StmtKind::Break => InspectNode::leaf("Break"),
+        StmtKind::Continue => InspectNode::leaf("Continue"),
         other => {
             let dbg = format!("{other:?}");
             let variant = dbg.split(['{', '(']).next().unwrap_or("?").trim();
-            writeln!(f, "{variant}(?)")
+            InspectNode::leaf(format!("{variant}(?)"))
         }
     }
 }
 
-/// Format an expression node.  Writes the label (no prefix) then children
-/// indented under `prefix`.
-fn fmt_expr(f: &mut fmt::Formatter<'_>, e: &ast::Expr, prefix: &str) -> fmt::Result {
+fn expr_to_node(e: &ast::Expr) -> InspectNode {
     match &e.node {
         ExprKind::Constant { value, .. } => {
-            write!(f, "Constant(")?;
-            fmt_constant(f, value)?;
-            writeln!(f, ")")
+            InspectNode::leaf(format!("Constant({})", constant_str(value)))
         }
-        ExprKind::Name { id, .. } => writeln!(f, "Name({id})"),
+        ExprKind::Name { id, .. } => InspectNode::leaf(format!("Name({id})")),
         ExprKind::BinOp { left, op, right } => {
-            writeln!(f, "BinOp({})", operator_symbol(op))?;
-            fmt_child_expr(f, left, prefix, false)?;
-            fmt_child_expr(f, right, prefix, true)
+            InspectNode::new(format!("BinOp({})", operator_symbol(op)))
+                .child("", expr_to_node(left))
+                .child("", expr_to_node(right))
         }
         ExprKind::UnaryOp { op, operand } => {
-            writeln!(f, "UnaryOp({})", unaryop_symbol(op))?;
-            fmt_child_expr(f, operand, prefix, true)
+            InspectNode::new(format!("UnaryOp({})", unaryop_symbol(op)))
+                .child("", expr_to_node(operand))
         }
         ExprKind::BoolOp { op, values } => {
             let sym = match op {
                 ast::Boolop::And => "and",
                 ast::Boolop::Or => "or",
             };
-            writeln!(f, "BoolOp({sym})")?;
-            fmt_children_expr(f, values, prefix)
+            let mut desc = InspectNode::new(format!("BoolOp({sym})"));
+            for v in values {
+                desc = desc.child("", expr_to_node(v));
+            }
+            desc
         }
         ExprKind::Compare {
             left,
@@ -227,74 +219,64 @@ fn fmt_expr(f: &mut fmt::Formatter<'_>, e: &ast::Expr, prefix: &str) -> fmt::Res
             comparators,
         } => {
             let ops_str: Vec<&str> = ops.iter().map(cmpop_symbol).collect();
-            writeln!(f, "Compare({})", ops_str.join(", "))?;
-            fmt_child_expr(f, left, prefix, comparators.is_empty())?;
-            fmt_children_expr(f, comparators, prefix)
+            let mut desc = InspectNode::new(format!("Compare({})", ops_str.join(", ")))
+                .child("", expr_to_node(left));
+            for c in comparators {
+                desc = desc.child("", expr_to_node(c));
+            }
+            desc
         }
         ExprKind::Call {
             func,
             args,
             keywords,
         } => {
-            writeln!(f, "Call")?;
-
-            // Unify all items into an iterator of &ast::Expr
-            let mut all_children = std::iter::once(func.as_ref())
-                .chain(args.iter())
-                .chain(keywords.iter().map(|kw| &kw.node.value))
-                .peekable();
-
-            while let Some(child) = all_children.next() {
-                let is_last = all_children.peek().is_none();
-                fmt_child_expr(f, child, prefix, is_last)?;
+            let mut desc = InspectNode::new("Call").child("", expr_to_node(func));
+            for a in args {
+                desc = desc.child("", expr_to_node(a));
             }
-            Ok(())
+            for kw in keywords {
+                desc = desc.child("", expr_to_node(&kw.node.value));
+            }
+            desc
         }
-
         ExprKind::List { elts, .. } => {
-            writeln!(f, "List[{}]", elts.len())?;
-            fmt_children_expr(f, elts, prefix)
+            let mut desc = InspectNode::new(format!("List[{}]", elts.len()));
+            for e in elts {
+                desc = desc.child("", expr_to_node(e));
+            }
+            desc
         }
         ExprKind::Tuple { elts, .. } => {
-            writeln!(f, "Tuple[{}]", elts.len())?;
-            fmt_children_expr(f, elts, prefix)
+            let mut desc = InspectNode::new(format!("Tuple[{}]", elts.len()));
+            for e in elts {
+                desc = desc.child("", expr_to_node(e));
+            }
+            desc
         }
-        ExprKind::Subscript { value, slice, .. } => {
-            writeln!(f, "Subscript")?;
-            fmt_child_expr(f, value, prefix, false)?;
-            fmt_child_expr(f, slice, prefix, true)
-        }
+        ExprKind::Subscript { value, slice, .. } => InspectNode::new("Subscript")
+            .child("", expr_to_node(value))
+            .child("", expr_to_node(slice)),
         ExprKind::Attribute { value, attr, .. } => {
-            writeln!(f, "Attribute(.{attr})")?;
-            fmt_child_expr(f, value, prefix, true)
+            InspectNode::new(format!("Attribute(.{attr})")).child("", expr_to_node(value))
         }
         ExprKind::ListComp { elt, generators } => {
-            writeln!(f, "ListComp")?;
-            fmt_child_expr(f, elt, prefix, generators.is_empty())?;
-            for (i, comp) in generators.iter().enumerate() {
-                let is_last = i + 1 == generators.len();
-                let (connector, child_ext) = if is_last {
-                    ("└── ", "    ")
-                } else {
-                    ("├── ", "│   ")
-                };
-                let gen_prefix = format!("{prefix}{child_ext}");
-                writeln!(f, "{prefix}{connector}for")?;
-                let has_ifs = !comp.ifs.is_empty();
-                fmt_child_expr(f, &comp.target, &gen_prefix, false)?;
-                fmt_child_expr(f, &comp.iter, &gen_prefix, !has_ifs)?;
-                for (j, cond) in comp.ifs.iter().enumerate() {
-                    fmt_child_expr(f, cond, &gen_prefix, j + 1 == comp.ifs.len())?;
+            let mut desc = InspectNode::new("ListComp").child("", expr_to_node(elt));
+            for comp in generators {
+                let mut for_node = InspectNode::new("for")
+                    .child("", expr_to_node(&comp.target))
+                    .child("", expr_to_node(&comp.iter));
+                for cond in &comp.ifs {
+                    for_node = for_node.child("", expr_to_node(cond));
                 }
+                desc = desc.child("", for_node);
             }
-            Ok(())
+            desc
         }
-        ExprKind::IfExp { test, body, orelse } => {
-            writeln!(f, "IfExp")?;
-            fmt_child_expr(f, test, prefix, false)?;
-            fmt_child_expr(f, body, prefix, false)?;
-            fmt_child_expr(f, orelse, prefix, true)
-        }
+        ExprKind::IfExp { test, body, orelse } => InspectNode::new("IfExp")
+            .child("", expr_to_node(test))
+            .child("", expr_to_node(body))
+            .child("", expr_to_node(orelse)),
         ExprKind::Lambda { args, body } => {
             let all_args: Vec<&str> = args
                 .posonlyargs
@@ -302,113 +284,31 @@ fn fmt_expr(f: &mut fmt::Formatter<'_>, e: &ast::Expr, prefix: &str) -> fmt::Res
                 .chain(args.args.iter())
                 .map(|a| a.node.arg.as_str())
                 .collect();
-            writeln!(f, "Lambda({})", all_args.join(", "))?;
-            fmt_child_expr(f, body, prefix, true)
+            InspectNode::new(format!("Lambda({})", all_args.join(", ")))
+                .child("", expr_to_node(body))
         }
-        ExprKind::NamedExpr { target, value } => {
-            writeln!(f, "NamedExpr")?;
-            fmt_child_expr(f, target, prefix, false)?;
-            fmt_child_expr(f, value, prefix, true)
-        }
+        ExprKind::NamedExpr { target, value } => InspectNode::new("NamedExpr")
+            .child("", expr_to_node(target))
+            .child("", expr_to_node(value)),
         ExprKind::JoinedStr { values } => {
-            writeln!(f, "JoinedStr")?;
-            fmt_children_expr(f, values, prefix)
+            let mut desc = InspectNode::new("JoinedStr");
+            for v in values {
+                desc = desc.child("", expr_to_node(v));
+            }
+            desc
         }
         ExprKind::FormattedValue { value, .. } => {
-            writeln!(f, "FormattedValue")?;
-            fmt_child_expr(f, value, prefix, true)
+            InspectNode::new("FormattedValue").child("", expr_to_node(value))
         }
         ExprKind::Starred { value, .. } => {
-            writeln!(f, "Starred")?;
-            fmt_child_expr(f, value, prefix, true)
+            InspectNode::new("Starred").child("", expr_to_node(value))
         }
         other => {
             let dbg = format!("{other:?}");
             let variant = dbg.split(['{', '(']).next().unwrap_or("?").trim();
-            writeln!(f, "{variant}(?)")
+            InspectNode::leaf(format!("{variant}(?)"))
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Tree connector helpers
-// ---------------------------------------------------------------------------
-
-/// Write one expression child with the appropriate tree connector.
-/// `parent_prefix` is the indentation column inherited from the parent.
-fn fmt_child_expr(
-    f: &mut fmt::Formatter<'_>,
-    expr: &ast::Expr,
-    parent_prefix: &str,
-    is_last: bool,
-) -> fmt::Result {
-    let (connector, child_ext) = if is_last {
-        ("└── ", "    ")
-    } else {
-        ("├── ", "│   ")
-    };
-    let child_prefix = format!("{parent_prefix}{child_ext}");
-    write!(f, "{parent_prefix}{connector}")?;
-    fmt_expr(f, expr, &child_prefix)
-}
-
-/// Write one statement child with the appropriate tree connector.
-fn fmt_child_stmt(
-    f: &mut fmt::Formatter<'_>,
-    stmt: &ast::Stmt,
-    parent_prefix: &str,
-    is_last: bool,
-) -> fmt::Result {
-    let (connector, child_ext) = if is_last {
-        ("└── ", "    ")
-    } else {
-        ("├── ", "│   ")
-    };
-    let child_prefix = format!("{parent_prefix}{child_ext}");
-    write!(f, "{parent_prefix}{connector}")?;
-    fmt_stmt(f, stmt, &child_prefix)
-}
-
-fn fmt_children_expr(
-    f: &mut fmt::Formatter<'_>,
-    exprs: &[ast::Expr],
-    parent_prefix: &str,
-) -> fmt::Result {
-    for (i, e) in exprs.iter().enumerate() {
-        fmt_child_expr(f, e, parent_prefix, i + 1 == exprs.len())?;
-    }
-    Ok(())
-}
-
-fn fmt_children_stmt(
-    f: &mut fmt::Formatter<'_>,
-    stmts: &[ast::Stmt],
-    parent_prefix: &str,
-) -> fmt::Result {
-    for (i, s) in stmts.iter().enumerate() {
-        fmt_child_stmt(f, s, parent_prefix, i + 1 == stmts.len())?;
-    }
-    Ok(())
-}
-
-/// Write stmts then exprs as children of the current node.
-fn fmt_children_mixed(
-    f: &mut fmt::Formatter<'_>,
-    stmts: &[ast::Stmt],
-    exprs: &[ast::Expr],
-    parent_prefix: &str,
-    is_last_group: bool,
-) -> fmt::Result {
-    let total = stmts.len() + exprs.len();
-    for (i, s) in stmts.iter().enumerate() {
-        let is_last = is_last_group && i + 1 == total;
-        fmt_child_stmt(f, s, parent_prefix, is_last)?;
-    }
-    for (i, e) in exprs.iter().enumerate() {
-        let is_last = is_last_group && stmts.len() + i + 1 == total;
-        fmt_child_expr(f, e, parent_prefix, is_last)?;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -457,26 +357,27 @@ fn cmpop_symbol(op: &ast::Cmpop) -> &'static str {
     }
 }
 
-fn fmt_constant(f: &mut fmt::Formatter<'_>, c: &Constant) -> fmt::Result {
+fn constant_str(c: &Constant) -> String {
     match c {
-        Constant::None => write!(f, "None"),
-        Constant::Bool(b) => write!(f, "{}", if *b { "True" } else { "False" }),
-        Constant::Str(s) => write!(f, "\"{}\"", s.escape_default()),
-        Constant::Bytes(b) => write!(f, "b\"{}\"", String::from_utf8_lossy(b)),
-        Constant::Int(i) => write!(f, "{i}"),
-        Constant::Float(v) => write!(f, "{v}"),
-        Constant::Complex { real, imag } => write!(f, "{real}+{imag}j"),
+        Constant::None => "None".to_string(),
+        Constant::Bool(b) => (if *b { "True" } else { "False" }).to_string(),
+        Constant::Str(s) => format!("\"{}\"", s.escape_default()),
+        Constant::Bytes(b) => format!("b\"{}\"", String::from_utf8_lossy(b)),
+        Constant::Int(i) => format!("{i}"),
+        Constant::Float(v) => format!("{v}"),
+        Constant::Complex { real, imag } => format!("{real}+{imag}j"),
         Constant::Tuple(elts) => {
-            write!(f, "(")?;
+            let mut s = "(".to_string();
             for (i, e) in elts.iter().enumerate() {
                 if i > 0 {
-                    write!(f, ", ")?;
+                    s.push_str(", ");
                 }
-                fmt_constant(f, e)?;
+                s.push_str(&constant_str(e));
             }
-            write!(f, ")")
+            s.push(')');
+            s
         }
-        Constant::Ellipsis => write!(f, "..."),
+        Constant::Ellipsis => "...".to_string(),
     }
 }
 

@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::interpreter::{
     ColumnData, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, GetResult, Guard,
-    InspectNode, Operator, ParentIndices, Producer, Scheduler, Value, VarScope,
+    Operator, ParentIndices, Producer, Scheduler, Value, VarScope,
 };
 
 /// Handle for simulating an arbitrary source in a program.
@@ -190,15 +190,5 @@ impl Producer for TestSourceProducer {
 
     fn release(&mut self, guard: Guard) -> Guard {
         guard
-    }
-
-    fn inspect(&self) -> InspectNode {
-        InspectNode {
-            type_name: "TestSourceProducer".to_string(),
-            label: self.data_source.borrow().get_id().to_string(),
-            yield_guard: String::new(),
-            data_summary: format!("{} entries", self.data_source.borrow().data.len()),
-            children: vec![self.index_producer.inspect()],
-        }
     }
 }

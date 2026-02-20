@@ -133,6 +133,18 @@
     <div class="tick" id="tick">Tick: --</div>
     <div id="error"></div>
     <div class="section">
+        <details open>
+            <summary class="section-title" style="cursor:pointer;">Python AST</summary>
+            <pre id="ast" style="margin-top:8px;overflow-x:auto;color:#cdd6f4;">Loading…</pre>
+        </details>
+    </div>
+    <div class="section">
+        <details open>
+            <summary class="section-title" style="cursor:pointer;">CCL Operator Graph</summary>
+            <pre id="operators" style="margin-top:8px;overflow-x:auto;color:#cdd6f4;">Loading…</pre>
+        </details>
+    </div>
+    <div class="section">
         <div class="section-title">Producer Graph</div>
         <div id="producer"></div>
     </div>
@@ -142,24 +154,34 @@
     </div>
     <script>
         function badge(node) {
-            if (node.yield_guard === 'Universal') return '<span class="badge badge-complete">DONE</span>';
+            const yg = node.yield_guard;
+            if (yg === '*') return '<span class="badge badge-complete">DONE</span>';
+            if (!yg || yg === '\u2205') return '<span class="badge badge-empty">IDLE</span>';
             return '<span class="badge badge-active">RUNNING</span>';
         }
-        function renderNode(node) {
+        function renderNode(node, edgeLabel) {
             const hasChildren = node.children && node.children.length > 0;
             const toggle = hasChildren ? '\u25bc' : '\u00a0';
+            const typeName = node.label.split('(')[0];
+            const parenIdx = node.label.indexOf('(');
+            const args = parenIdx >= 0 ? node.label.slice(parenIdx) : '';
             let h = '<div class="node">';
             h += '<div class="node-header" onclick="this.parentElement.classList.toggle(\'collapsed\')">';
             h += '<span class="toggle">' + toggle + '</span>';
-            h += '<span class="type-name">' + esc(node.type) + '</span>';
-            if (node.label) h += '<span class="label">' + esc(node.label) + '</span>';
+            if (edgeLabel) h += '<span style="color:#6c7086">' + esc(edgeLabel) + ': </span>';
+            h += '<span class="type-name">' + esc(typeName) + '</span>';
+            if (args) h += '<span class="label">' + esc(args) + '</span>';
+            if (node.annotations) {
+                for (const ann of node.annotations) {
+                    h += '<span class="guard">' + esc(ann) + '</span>';
+                }
+            }
             h += badge(node);
-            if (node.yield_guard) h += '<span class="guard">yield_guard: ' + esc(node.yield_guard) + '</span>';
-            if (node.data_summary) h += '<span class="data">' + esc(node.data_summary) + '</span>';
+            if (node.yield_guard) h += '<span class="guard">' + esc(node.yield_guard) + '</span>';
             h += '</div>';
             if (hasChildren) {
                 h += '<div class="children">';
-                for (const child of node.children) h += renderNode(child);
+                for (const child of node.children) h += renderNode(child.node, child.edge || '');
                 h += '</div>';
             }
             h += '</div>';
@@ -181,6 +203,8 @@
             }
         }
         poll();
+        fetch('/api/ast').then(r => r.text()).then(t => { document.getElementById('ast').textContent = t; });
+        fetch('/api/operators').then(r => r.text()).then(t => { document.getElementById('operators').textContent = t; });
     </script>
 </body>
 

@@ -1,6 +1,8 @@
 use std::{cell::RefCell, rc::Rc};
 
-use crate::interpreter::{InspectNode, Producer, VarProducer};
+use crate::interpreter::{Producer, VarProducer};
+use crate::pretty_graph::VizOptions;
+use crate::pretty_tree::InspectNode;
 
 // Basic scheduler implementation.
 // For now, this only tracks variables that generate data and need to be
@@ -29,6 +31,10 @@ impl Scheduler {
 
     /// Inspect all registered sources for the web dashboard.
     pub fn inspect_sources(&self) -> Vec<InspectNode> {
-        self.sources.iter().map(|s| s.borrow().inspect()).collect()
+        let opts = VizOptions::default();
+        self.sources
+            .iter()
+            .map(|s| s.borrow().inspect(&opts))
+            .collect()
     }
 }

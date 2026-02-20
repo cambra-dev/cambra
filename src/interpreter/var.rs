@@ -3,13 +3,16 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use super::{
-    guard_summary, ColumnValue, Consumer, Extent, GetResult, Guard, InspectNode, Notification,
-    Operator, ParentIndices, Producer, Scheduler,
-};
 use log::debug;
 
 /// A variable subscription paired with the chain of iteration-source variables between
+use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions, MODE_ARGUMENT, MODE_ITERATION};
+
+use super::{
+    fmt_guard, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator,
+    ParentIndices, Producer, Scheduler,
+};
+/// A variable subscription paired with the chain of scanning variables between
 /// the current scope and the found variable, used for alignment composition.
 type VarWithIterationChain = (Rc<RefCell<VarProducer>>, Vec<Rc<RefCell<VarProducer>>>);
 
@@ -160,7 +163,11 @@ impl Var {
     ///
     /// Consumers can be added later via `VarProducer::add_consumer()`.
     pub fn create_subscription(&self, source: VarSource) -> Rc<RefCell<VarProducer>> {
-        Rc::new(RefCell::new(VarProducer::new(source, self.extent())))
+        Rc::new(RefCell::new(VarProducer::new(
+            self.name.clone(),
+            source,
+            self.extent(),
+        )))
     }
 }
 
@@ -171,6 +178,8 @@ impl Var {
 /// VarProducer implements both Producer and Consumer.
 /// It stores the yield guard (monotonically growing) and forwards notifications to all consumers.
 pub struct VarProducer {
+    /// The variable name (for visualization)
+    name: String,
     /// The Extent of the Var
     extent: Extent,
     /// The source of values for this variable (Argument or Iteration)
@@ -189,6 +198,7 @@ pub struct VarProducer {
 impl std::fmt::Debug for VarProducer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VarProducer")
+            .field("name", &self.name)
             .field("source", &self.source)
             .field("yield_guard", &self.yield_guard)
             .field("data_available", &self.data_available)
@@ -203,10 +213,11 @@ impl std::fmt::Debug for VarProducer {
 
 impl VarProducer {
     /// Create a new VarProducer with the given source.
-    fn new(source: VarSource, extent: &Extent) -> Self {
+    fn new(name: String, source: VarSource, extent: &Extent) -> Self {
         VarProducer {
-            extent: extent.clone(),
+            name,
             source,
+            extent: extent.clone(),
             yield_guard: Guard::Empty,
             data_available: false,
             consumers: Vec::new(),
@@ -289,9 +300,72 @@ impl VarProducer {
     pub fn get_extent(&self) -> &Extent {
         &self.extent
     }
+    /// Non-guard status parts for use in annotations and `summary_line`.
+    fn non_guard_status_parts(&self) -> Vec<String> {
+        let mode = if self.is_iteration() {
+            MODE_ITERATION
+        } else {
+            MODE_ARGUMENT
+        };
+        let mut parts = vec![mode.to_string()];
+        if self.data_available {
+            parts.push("ready".to_string());
+        }
+        parts
+    }
+
+    /// One-line summary for use in VarRefPrducer's compact display.
+    ///
+    /// This is a text-only path; it embeds all status including the yield guard
+    /// inline so the summary reads naturally in a single line.
+    pub fn summary_line(&self, opts: &VizOptions) -> String {
+        let mode = if self.is_iteration() {
+            MODE_ITERATION
+        } else {
+            MODE_ARGUMENT
+        };
+        let mut parts = vec![
+            mode.to_string(),
+            format!("yield: {}", fmt_guard(&self.yield_guard)),
+        ];
+        if opts.show_guards {
+            parts.push(format!(
+                "release: {}",
+                fmt_guard(&self.stored_release_guard)
+            ));
+        }
+        if self.data_available {
+            parts.push("ready".to_string());
+        }
+        parts.push(format!("{} consumers", self.consumers.len()));
+        format!("VarProducer({}) [{}]", self.name, parts.join(", "))
+    }
 }
 
 impl Producer for VarProducer {
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let non_guard_parts = self.non_guard_status_parts();
+        let mut desc = InspectNode::new(format!("VarProducer({})", self.name))
+            .annotate(format!("[{}]", non_guard_parts.join(", ")))
+            .with_yield_guard(fmt_guard(&self.yield_guard));
+        if opts.show_guards {
+            desc = desc.with_obsolete_guard(fmt_guard(&self.stored_release_guard));
+        }
+        match &self.source {
+            VarSource::Argument(producer) => {
+                desc = desc.child("source", producer.inspect(opts));
+            }
+            VarSource::Iteration { predicate, .. } => {
+                if opts.show_guards {
+                    desc = desc.annotate(format!("[predicate: {}]", fmt_guard(predicate)));
+                }
+            }
+            VarSource::Uninitialized => {
+                desc = desc.annotate("[uninitialized]".to_string());
+            }
+        }
+        desc
+    }
     fn get(&mut self) -> GetResult {
         match &mut self.source {
             VarSource::Uninitialized => {
@@ -344,26 +418,6 @@ impl Producer for VarProducer {
             }
         }
     }
-
-    // TODO: Include ref to corresponding Var so we know what the VarProducer is.
-    fn inspect(&self) -> InspectNode {
-        let source_label = match &self.source {
-            VarSource::Uninitialized => "Uninitialized".to_string(),
-            VarSource::Argument(_) => "Argument".to_string(),
-            VarSource::Iteration { extent, .. } => format!("Iteration({extent:?})"),
-        };
-        let children = match &self.source {
-            VarSource::Argument(p) => vec![p.inspect()],
-            _ => vec![],
-        };
-        InspectNode {
-            type_name: "VarProducer".to_string(),
-            label: format!("{}, {} consumers", source_label, self.consumers.len()),
-            yield_guard: guard_summary(&self.yield_guard),
-            data_summary: String::new(),
-            children,
-        }
-    }
 }
 
 impl Consumer for VarProducer {
@@ -409,6 +463,14 @@ impl Operator for VarRef {
         &self.extent
     }
 
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let mut desc = InspectNode::leaf(format!("VarRef({})", self.name));
+        if opts.show_extents {
+            desc = desc.annotate(format!(": {}", fmt_extent(&self.extent)));
+        }
+        desc
+    }
+
     fn subscribe(
         &mut self,
         intent_guard: Guard,
@@ -424,6 +486,7 @@ impl Operator for VarRef {
 
         // Create VarRefProducer with the consumer and iteration chain for alignment
         let ref_subscription = Rc::new(RefCell::new(VarRefProducer {
+            var_name: self.name.clone(),
             variable_subscription: variable_subscription.clone(),
             iteration_chain,
             intent_guard,
@@ -445,6 +508,8 @@ impl Operator for VarRef {
 /// the yield guard with its intent guard, and forwards to the actual consumer.
 /// As a Producer: it provides access to data and handles release requests.
 struct VarRefProducer {
+    /// The variable name (for visualization)
+    var_name: String,
     /// Reference to the VarProducer
     variable_subscription: Rc<RefCell<VarProducer>>,
     /// Chain of iteration-source variables between current scope and referenced variable (for alignment)
@@ -458,6 +523,7 @@ struct VarRefProducer {
 impl std::fmt::Debug for VarRefProducer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VarRefProducer")
+            .field("var_name", &self.var_name)
             .field("variable_subscription", &self.variable_subscription)
             .field("iteration_chain", &self.iteration_chain)
             .field("intent_guard", &self.intent_guard)
@@ -487,6 +553,43 @@ pub fn compose_indices(outer: &[usize], inner: &[usize]) -> Vec<usize> {
 }
 
 impl Producer for VarRefProducer {
+    // TODO: Make node collapsed by default so it's not confusing to see the same VarProducer
+    // in multiple places in the tree. Maybe draw an arrow to the VarProducer, or color coordinate them?
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let mut desc = InspectNode::new(format!("VarRefProducer({})", self.var_name));
+        if opts.show_guards {
+            desc = desc.with_intent_guard(fmt_guard(&self.intent_guard));
+        }
+        if !self.iteration_chain.is_empty() {
+            let names: Vec<String> = self
+                .iteration_chain
+                .iter()
+                .filter_map(|s: &Rc<RefCell<VarProducer>>| {
+                    s.try_borrow().ok().map(|b| b.name.clone())
+                })
+                .collect();
+            desc = desc.annotate(format!(
+                "[iteration_chain({}): {}]",
+                self.iteration_chain.len(),
+                names.join(" → ")
+            ));
+        }
+        // Show a one-line summary reference to the VarProducer rather than recursing
+        // into its full subtree, because VarProducer appears elsewhere in the graph
+        // (e.g., as a child of LambdaProducer). Expanding it here would duplicate
+        // entire subtrees in what is actually a DAG, not a tree.
+        match self.variable_subscription.try_borrow() {
+            Ok(var_sub) => {
+                let summary = var_sub.summary_line(opts);
+                desc = desc.child("", InspectNode::leaf(format!("→ {}", summary)));
+            }
+            Err(_) => {
+                desc = desc.child("", InspectNode::leaf("→ VarProducer(<locked>)".to_string()));
+            }
+        }
+        desc
+    }
+
     fn get(&mut self) -> GetResult {
         // Get data from variable subscription
         let var_result = self.variable_subscription.borrow_mut().get();
@@ -527,18 +630,6 @@ impl Producer for VarRefProducer {
         self.variable_subscription
             .borrow()
             .get_stored_release_guard()
-    }
-
-    // TODO: Make node collapsed by default so it's not confusing to see the same VarProducer
-    // in multiple places in the tree. Maybe draw an arrow to the VarProducer, or color coordinate them?
-    fn inspect(&self) -> InspectNode {
-        InspectNode {
-            type_name: "VarRefProducer".to_string(),
-            label: format!("intent: {}", guard_summary(&self.intent_guard)),
-            yield_guard: guard_summary(&self.variable_subscription.borrow().yield_guard),
-            data_summary: String::new(),
-            children: vec![self.variable_subscription.borrow().inspect()],
-        }
     }
 }
 

@@ -3,6 +3,8 @@ use rustpython_parser::{ast, parser};
 pub mod interpreter;
 pub mod lowering;
 pub mod pretty_ast;
+pub mod pretty_graph;
+pub mod pretty_tree;
 pub mod web_inspector;
 
 pub fn parse_python_code(code: &str) -> Result<ast::Mod, String> {

@@ -3,18 +3,25 @@ use std::{cell::RefCell, rc::Rc};
 use cambra::{
     interpreter::{Consumer, GetResult, Guard, Notification, Scheduler, Value},
     lowering::{lower_let_stmt_block, LoweringContext},
-    parse_python_code,
+    parse_python_code, pretty_ast, pretty_graph,
     web_inspector::WebInspector,
 };
 use log::debug;
 use rustpython_parser::ast::Mod;
 
 /// Runs a Cambra program given as a string of Python code.
-/// The program must currently be a series of assignments and a single final expression
+///
+/// The program must currently be a series of assignments and a single final expression.
 /// Will loop continuously calling get and release on that expression's producer until
 /// it is notified with a Universal obsolete Guard.
-fn run_program(code: &str, inspector: Option<&WebInspector>) {
+///
+/// When `inspect_port` is `Some`, starts a web inspector on that port, computing
+/// static AST and operator graph trees from the parsed/lowered program.
+fn run_program(code: &str, inspect_port: Option<u16>) {
     let module: Mod = parse_python_code(code).expect("Failed to parse Python code");
+
+    let ast_tree = pretty_ast::pretty(&module);
+
     let stmts = match module {
         Mod::Module { body, .. } => body,
         _ => panic!("Expected module, got {module:?}"),
@@ -22,6 +29,10 @@ fn run_program(code: &str, inspector: Option<&WebInspector>) {
     let mut scheduler = Scheduler::new();
     let (mut op, scope) =
         lower_let_stmt_block(&mut LoweringContext::default(), &stmts, &mut scheduler).unwrap();
+
+    let operator_tree = pretty_graph::pretty_operator(op.as_ref());
+
+    let inspector = inspect_port.map(|port| WebInspector::new(port, ast_tree, operator_tree));
 
     let yield_guard = Rc::new(RefCell::new(Guard::empty()));
     let yield_guard_clone = yield_guard.clone();
@@ -39,7 +50,7 @@ fn run_program(code: &str, inspector: Option<&WebInspector>) {
     let mut producer = op.subscribe(Guard::universal(), consumer, scope, &mut scheduler);
 
     let mut tick: u64 = 0;
-    if let Some(inspector) = inspector {
+    if let Some(ref inspector) = inspector {
         inspector.update_snapshot(tick, &*producer, &scheduler);
     }
     debug!("main producer:\n{producer:#?}");
@@ -50,7 +61,7 @@ fn run_program(code: &str, inspector: Option<&WebInspector>) {
             scheduler.check_for_notifications();
             tick += 1;
 
-            if let Some(inspector) = inspector {
+            if let Some(ref inspector) = inspector {
                 inspector.update_snapshot(tick, &*producer, &scheduler);
             }
         }
@@ -77,7 +88,7 @@ fn run_program(code: &str, inspector: Option<&WebInspector>) {
         *new_data.borrow_mut() = false;
 
         tick += 1;
-        if let Some(inspector) = inspector {
+        if let Some(ref inspector) = inspector {
             inspector.update_snapshot(tick, &*producer, &scheduler);
         }
 
@@ -114,8 +125,18 @@ fn main() {
 
     let code = std::fs::read_to_string(&input_file).expect("Failed to read input file");
 
-    let inspector = inspect_port.map(WebInspector::new);
-    run_program(&code, inspector.as_ref());
+    run_program(&code, inspect_port);
+
+    // When inspecting, keep the process alive so the dashboard remains accessible.
+    if let Some(port) = inspect_port {
+        eprintln!(
+            "Program finished. Inspector at http://localhost:{} — press Ctrl+C to exit.",
+            port
+        );
+        loop {
+            std::thread::park();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +147,6 @@ mod tests {
     /// Smoke test that makes sure running a simple program doesn't crash.
     #[test]
     fn test_run_program() {
-        run_program("x = 1; x", None)
+        run_program("x = 1; x", None);
     }
 }
