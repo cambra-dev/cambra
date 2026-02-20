@@ -172,7 +172,7 @@ impl Producer for TestSourceProducer {
                 source
                     .data
                     .get(&key)
-                    .unwrap_or_else(|| panic!("Key {:?} not found in TestDataSource", key))
+                    .unwrap_or_else(|| panic!("Key {key:?} not found in TestDataSource"))
                     .clone()
             })
             .collect();

@@ -41,10 +41,10 @@ pub fn apply_binop_column(op: BinOpKind, left: &ColumnData, right: &ColumnData) 
         (BinOpKind::Concat, ColumnData::Strings(l), ColumnData::Strings(r)) => ColumnData::Strings(
             l.iter()
                 .zip(r.iter())
-                .map(|(a, b)| format!("{}{}", a, b))
+                .map(|(a, b)| format!("{a}{b}"))
                 .collect(),
         ),
-        _ => panic!("Unsupported binop: {:?} on {:?} and {:?}", op, left, right),
+        _ => panic!("Unsupported binop: {op:?} on {left:?} and {right:?}"),
     }
 }
 

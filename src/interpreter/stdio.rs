@@ -237,7 +237,7 @@ impl Producer for StdinProducer {
             ColumnData::UInts(idx_vec) => {
                 ColumnData::Strings(idx_vec.iter().map(|i| source.get(*i).to_string()).collect())
             }
-            other => panic!("Expected UInt indices for stdin, got {:?}", other),
+            other => panic!("Expected UInt indices for stdin, got {other:?}"),
         };
         GetResult {
             column_value: ColumnValue {

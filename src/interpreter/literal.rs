@@ -214,7 +214,7 @@ impl Producer for ListLiteralProducer {
                     .collect();
                 ColumnData::from_values(output_values)
             }
-            other => panic!("Expected UInt indices, got {:?}", other),
+            other => panic!("Expected UInt indices, got {other:?}"),
         };
 
         GetResult {

@@ -246,8 +246,7 @@ fn lower_list_comp(
             (*domain.clone(), *codomain.clone())
         } else {
             return Err(LoweringError::TypeError(format!(
-                "Expected function extent for comprehension source, got {:?}",
-                source_extent
+                "Expected function extent for comprehension source, got {source_extent:?}"
             )));
         };
 

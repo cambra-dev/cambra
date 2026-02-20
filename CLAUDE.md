@@ -49,6 +49,16 @@ When you are using compact, focus on test output and code changes.
    1. `git fetch origin`
    2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
 
+### Stacked PRs with git-spice
+This repo uses [git-spice](https://abhinav.github.io/git-spice/) (`gs`) for stacked PRs. Workflow for creating a new PR in a stack:
+
+1. Create a new git branch with the commit message containing the desired title and body for the PR.
+2. Submit the PR: `gs branch submit --fill --no-draft` (uses commit message for title/body), or explicitly: `gs branch submit --title "..." --body "..." --no-draft`
+3. Post nav comments: `gs stack submit --update-only`
+
+`gs stack submit` discovers existing PRs by branch name and adds a navigation comment linking all PRs in the stack. Use `--update-only` to skip prompts for branches without PRs yet.
+
+To view the current stack: `gs log long`
 
 
 

@@ -205,7 +205,7 @@ struct LambdaBodyConsumer(Rc<RefCell<LambdaProducer>>);
 
 impl Consumer for LambdaBodyConsumer {
     fn notify(&mut self, notification: Notification) {
-        debug!("Lambda body_consumer notified with {:?}", notification);
+        debug!("Lambda body_consumer notified with {notification:?}");
         let mut producer = self.0.borrow_mut();
         match notification {
             Notification::Yield(guard) => {
@@ -440,10 +440,7 @@ impl Producer for ApplyProducer {
                 },
                 yield_guard: yield_guard.to_universal_or_empty(),
             },
-            other => panic!(
-                "Expected FunctionBindings from lambda producer, got {:?}",
-                other
-            ),
+            other => panic!("Expected FunctionBindings from lambda producer, got {other:?}"),
         }
     }
 
@@ -628,7 +625,7 @@ mod tests {
             ColumnData::FunctionBindings { inputs, .. } => {
                 assert!(!inputs.is_empty());
             }
-            other => panic!("Expected FunctionBindings, got {:?}", other),
+            other => panic!("Expected FunctionBindings, got {other:?}"),
         }
     }
 
