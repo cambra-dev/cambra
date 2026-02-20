@@ -1,13 +1,13 @@
 use std::{cell::RefCell, rc::Rc};
 
-use crate::interpreter::{InspectNode, Producer, VarSub};
+use crate::interpreter::{InspectNode, Producer, VarProducer};
 
 // Basic scheduler implementation.
 // For now, this only tracks variables that generate data and need to be
 // checked for notifications.
 #[derive(Default)]
 pub struct Scheduler {
-    sources: Vec<Rc<RefCell<VarSub>>>,
+    sources: Vec<Rc<RefCell<VarProducer>>>,
 }
 
 impl Scheduler {
@@ -17,7 +17,7 @@ impl Scheduler {
         }
     }
 
-    pub fn add_source(&mut self, var_sub: Rc<RefCell<VarSub>>) {
+    pub fn add_source(&mut self, var_sub: Rc<RefCell<VarProducer>>) {
         self.sources.push(var_sub);
     }
 

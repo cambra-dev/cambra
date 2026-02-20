@@ -64,11 +64,11 @@ Unlike operators whose data is computed from other operators, data sources are p
 
 ```rust
 struct Scheduler {
-    sources: Vec<Rc<RefCell<VarSub>>>,  // variables backed by data sources
+    sources: Vec<Rc<RefCell<VarProducer>>>,  // variables backed by data sources
 }
 
 impl Scheduler {
-    fn add_source(&mut self, var_sub: Rc<RefCell<VarSub>>);
+    fn add_source(&mut self, var_sub: Rc<RefCell<VarProducer>>);
     fn check_for_notifications(&self);  // poll all sources and forward notifications
 }
 ```
@@ -92,8 +92,8 @@ Note: `Var` does **not** hold a static definition. Binding happens dynamically:
 
 The variable is owned and managed by the operator that defines it (record, lambda, let-binding, pattern match).
 
-### VarSub (Runtime State)
-A `VarSub` is created when `Var::subscribe()` is called. It has one of two sources:
+### VarProducer (Runtime State)
+A `VarProducer` is created when `Var::subscribe()` is called. It has one of two sources:
 
 **Argument source** (lambda applied to argument):
 - Wraps a producer from the binding expression
@@ -132,26 +132,26 @@ enum JoinStrategy {
 }
 ```
 
-When release is called on a function, its domain release guard is stored in the `VarSub` for use within the function body.
+When release is called on a function, its domain release guard is stored in the `VarProducer` for use within the function body.
 
 ### VarRef Operator
 A `VarRef` operator represents a reference to a variable. It holds:
 - The name of the variable being referenced
 - The extent (cached from the variable when found)
 
-### VarRefSub (Runtime State)
-A `VarRefSub` is created when `VarRef::subscribe()` is called. It implements `Producer`:
-- Filters data from the `VarSub` based on its intent guard
+### VarRefProducer (Runtime State)
+A `VarRefProducer` is created when `VarRef::subscribe()` is called. It implements `Producer`:
+- Filters data from the `VarProducer` based on its intent guard
 - **Handles alignment**: If referencing an outer variable from within an inner iteration, expands values using the inner iteration's `parent_indices`
-- When `release()` is called, returns the stored release guard from the `VarSub` rather than invoking release on the subscription itself (since the lambda would have already invoked it)
+- When `release()` is called, returns the stored release guard from the `VarProducer` rather than invoking release on the subscription itself (since the lambda would have already invoked it)
 
 ```rust
-struct VarRefSub {
-    var_sub: Rc<RefCell<VarSub>>,
+struct VarRefProducer {
+    var_sub: Rc<RefCell<VarProducer>>,
     intent_guard: Guard,
     consumer: Box<dyn Consumer>,
     // The innermost iteration in scope (for alignment)
-    innermost_iteration: Option<Rc<RefCell<VarSub>>>,
+    innermost_iteration: Option<Rc<RefCell<VarProducer>>>,
 }
 ```
 
@@ -159,7 +159,7 @@ The `innermost_iteration` is set by `VarScope` when the variable is looked up. I
 
 ### Variable Lookup: VarScope
 Variables are looked up by name using a `VarScope` structure:
-- `VarScope` is a linked list structure that maps variable names to their `VarSub` objects
+- `VarScope` is a linked list structure that maps variable names to their `VarProducer` objects
 - Supports parent chaining for nested scopes (e.g., lambdas within lambdas)
 - When looking up a variable, the scope searches up the parent chain if not found in the current scope
 - `VarScope` is passed through `subscribe()` calls to enable variable lookup
@@ -169,7 +169,7 @@ Variables are looked up by name using a `VarScope` structure:
 The variable system works as follows:
 
 1. **Variable Definition**: When `Var::subscribe()` is called:
-    * Creates a `VarSub` 
+    * Creates a `VarProducer` 
     * Adds the original consumer (from the subscribe call) to the subscription's consumers list
     * Uses the subscription itself (wrapped in `Rc<RefCell<>>`) as the consumer for the definition operator
     * Subscribes to the definition operator
@@ -177,21 +177,21 @@ The variable system works as follows:
 
 2. **Variable Reference**: When `VarRef::subscribe()` is called:
     * Looks up the variable name in the provided `VarScope` (searching up the parent chain if needed)
-    * Adds itself as a consumer to the found `VarSub`'s consumers list
-    * Creates and returns a `VarRefSub` that filters data based on the intent guard
+    * Adds itself as a consumer to the found `VarProducer`'s consumers list
+    * Creates and returns a `VarRefProducer` that filters data based on the intent guard
 
 3. **Notification Flow**: When the definition operator notifies:
-    * Notification goes to `VarSub::notify()`
+    * Notification goes to `VarProducer::notify()`
     * The yield guard is updated 
-    * All registered consumers (including all `VarRefSub`s) are notified with the updated yield guard
+    * All registered consumers (including all `VarRefProducer`s) are notified with the updated yield guard
 
-4. **Data Access**: When a `VarRefSub` calls `get()`:
-    * It retrieves data from the `VarSub`
+4. **Data Access**: When a `VarRefProducer` calls `get()`:
+    * It retrieves data from the `VarProducer`
     * Filters the data based on its intent guard 
     * Returns the filtered data
 
-5. **Release Flow**: When a `VarRefSub` calls `release()`:
-    * Returns the stored release guard from the `VarSub`
+5. **Release Flow**: When a `VarRefProducer` calls `release()`:
+    * Returns the stored release guard from the `VarProducer`
     * Does not propagate release to the definition (the lambda handles that)
 
 ### Quantification and Variable Sources
@@ -279,12 +279,12 @@ Join behavior depends on predicates:
 
 The `Parent` variant of `ParentIndices` in a `ColumnValue` is the output of the join algorithm — it indicates which outer row each inner row is paired with.
 
-### Alignment via VarRefSub
+### Alignment via VarRefProducer
 
-When a `VarRef` references an outer variable from within an inner iteration, the `VarRefSub` handles alignment:
+When a `VarRef` references an outer variable from within an inner iteration, the `VarRefProducer` handles alignment:
 
 1. `VarScope` tracks the **innermost iteration** in scope
-2. When `VarRefSub::get()` is called for an outer variable:
+2. When `VarRefProducer::get()` is called for an outer variable:
    - Get the outer variable's values
    - Get `parent_indices` from the innermost iteration
    - Expand outer values: `outer_values[parent_indices[i]]` for each `i`
@@ -334,7 +334,7 @@ When referencing `v(t1)` from t3's context:
 pub struct VarScope {
     parent: Option<Box<VarScope>>,
     name: String,                        // Single variable name
-    subscription: Rc<RefCell<VarSub>>,   // Single variable subscription
+    subscription: Rc<RefCell<VarProducer>>,   // Single variable subscription
 }
 ```
 
@@ -342,12 +342,12 @@ pub struct VarScope {
 ```rust
 /// Returns (found_subscription, inner_iterations) where inner_iterations is the chain
 /// of iteration-source variables between current scope and the found variable.
-pub fn lookup_variable(&self, name: &str) -> Option<(Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>)> {
+pub fn lookup_variable(&self, name: &str) -> Option<(Rc<RefCell<VarProducer>>, Vec<Rc<RefCell<VarProducer>>>)> {
     self.lookup_with_chain(name, Vec::new())
 }
 
-fn lookup_with_chain(&self, name: &str, mut chain: Vec<Rc<RefCell<VarSub>>>) 
-    -> Option<(Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>)> {
+fn lookup_with_chain(&self, name: &str, mut chain: Vec<Rc<RefCell<VarProducer>>>) 
+    -> Option<(Rc<RefCell<VarProducer>>, Vec<Rc<RefCell<VarProducer>>>)> {
     if self.name == name {
         Some((self.subscription.clone(), chain))
     } else {
@@ -360,7 +360,7 @@ fn lookup_with_chain(&self, name: &str, mut chain: Vec<Rc<RefCell<VarSub>>>)
 }
 ```
 
-**VarRefSub::get() composes parent_indices:**
+**VarRefProducer::get() composes parent_indices:**
 ```rust
 fn compose_indices(outer: &[usize], inner: &[usize]) -> Vec<usize> {
     inner.iter().map(|&i| outer[i]).collect()

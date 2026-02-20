@@ -86,7 +86,7 @@ Producer::release(obsolete_guard) -> Guard
 
 - **Var**: Variable definition (name + extent). Not an Operator — cannot be subscribed directly.
 - **VarRef**: Variable reference (implements Operator). Looks up the variable in `VarScope` at subscribe time.
-- **VarSub**: Runtime subscription bridging a variable's source to its consumers. Source is one of:
+- **VarProducer**: Runtime subscription bridging a variable's source to its consumers. Source is one of:
   - `Argument` — lambda applied to an argument; wraps the argument's producer
   - `Iteration` — lambda consumed directly (e.g. by aggregation or output); iterates over extent with predicate filtering
 - **VarScope**: Linked list for variable lookup with parent chaining. `lookup_variable()` returns both the subscription and the chain of intermediate iteration variables for alignment composition.
@@ -97,7 +97,7 @@ Producer::release(obsolete_guard) -> Guard
 - `src/interpreter/` — CCL interpreter module:
   - `mod.rs` — `Consumer`, `Producer`, `Operator` traits and protocol types
   - `types.rs` — `Guard`, `Extent`, `Value`, `Notification`, `GetResult`, `ColumnValue`
-  - `var.rs` — `Var`, `VarRef`, `VarSub`, `VarScope`, `VarSource`
+  - `var.rs` — `Var`, `VarRef`, `VarProducer`, `VarScope`, `VarSource`
   - `lambda.rs` — `Lambda` operator and `LambdaProducer`
   - `literal.rs` — `Literal` operator
   - `binop.rs` — `BinOp` operator (Add, Sub, Mul, FloorDiv)

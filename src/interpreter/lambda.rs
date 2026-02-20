@@ -7,7 +7,8 @@ use log::debug;
 
 use super::{
     guard_summary, ColumnData, ColumnValue, Consumer, Extent, GetResult, Guard, InspectNode,
-    Notification, Operator, ParentIndices, Producer, Scheduler, Var, VarScope, VarSource, VarSub,
+    Notification, Operator, ParentIndices, Producer, Scheduler, Var, VarProducer, VarScope,
+    VarSource,
 };
 
 /// A Lambda operator represents a lambda expression.
@@ -19,13 +20,17 @@ pub struct Lambda {
     extent: Extent,
 }
 
-/// LambdaProducer implements both Producer and Consumer.
-/// As a Consumer: receives notifications from variable and body, tracks yield guards,
-/// and notifies downstream when function bindings are ready.
-/// As a Producer: provides function bindings via get(), handles release.
+/// Runtime subscription for a [`Lambda`]: sits at an intermediate node in the dataflow graph,
+/// implementing both sides of the protocol.
+///
+/// As a [`Consumer`]: receives notifications from the variable (domain) subscription and
+/// forwards them downstream, wrapping yield guards in `Guard::Domain`. Body (codomain)
+/// notifications are handled by the companion [`LambdaBodyConsumer`].
+///
+/// As a [`Producer`]: provides function bindings via `get()` and handles `release()`.
 struct LambdaProducer {
     /// Reference to the variable subscription (for domain values)
-    variable_subscription: Rc<RefCell<VarSub>>,
+    variable_subscription: Rc<RefCell<VarProducer>>,
     /// The body producer (for codomain values). Set after body subscription.
     body_producer: Option<Box<dyn Producer>>,
     /// The downstream consumer that will receive notifications
@@ -54,7 +59,7 @@ impl std::fmt::Debug for LambdaProducer {
 impl LambdaProducer {
     /// Create a new LambdaProducer. The body_producer should be set via set_body_producer().
     fn new(
-        variable_subscription: Rc<RefCell<VarSub>>,
+        variable_subscription: Rc<RefCell<VarProducer>>,
         downstream_consumer: Box<dyn Consumer>,
         intent_guard: Guard,
     ) -> Self {
@@ -177,6 +182,48 @@ impl Producer for LambdaProducer {
     }
 }
 
+impl Consumer for LambdaProducer {
+    /// Receives notifications from the variable (domain) subscription and forwards
+    /// them downstream, wrapping yield guards in `Guard::Domain`.
+    fn notify(&mut self, notification: Notification) {
+        match notification {
+            Notification::Yield(guard) => {
+                self.variable_yield_guard = guard.clone();
+                let new_guard = Guard::Domain(Box::new(guard));
+                self.downstream_consumer
+                    .notify(Notification::Yield(new_guard));
+            }
+            Notification::NewData => self.downstream_consumer.notify(Notification::NewData),
+        }
+    }
+}
+
+/// Receives notifications from the body (codomain) subscription and forwards them
+/// to the LambdaProducer, combining the current variable yield guard with the
+/// body yield guard.
+struct LambdaBodyConsumer(Rc<RefCell<LambdaProducer>>);
+
+impl Consumer for LambdaBodyConsumer {
+    fn notify(&mut self, notification: Notification) {
+        debug!("Lambda body_consumer notified with {:?}", notification);
+        let mut producer = self.0.borrow_mut();
+        match notification {
+            Notification::Yield(guard) => {
+                producer.body_yield_guard = guard.clone();
+                let new_guard = Guard::from_independent_function_parts(
+                    producer.variable_yield_guard.clone(),
+                    guard,
+                );
+                producer
+                    .downstream_consumer
+                    .notify(Notification::Yield(new_guard));
+            }
+            // Lambda ignores NewData on the body side; action is taken on variable notification.
+            Notification::NewData => {}
+        }
+    }
+}
+
 impl Lambda {
     pub fn new(variable: Var, body: Box<dyn Operator>) -> Self {
         // Compute the extent: function type from domain (variable) to codomain (body)
@@ -204,13 +251,13 @@ impl Lambda {
             .split_function()
             .unwrap_or((Guard::universal(), Guard::universal()));
 
-        // For argument source: subscribe to the binding operator with VarSub as consumer
-        // This ensures VarSub receives notifications and can forward to its consumers
+        // For argument source: subscribe to the binding operator with VarProducer as consumer
+        // This ensures VarProducer receives notifications and can forward to its consumers
         let variable_subscription = if let Some(binding_op) = binding {
             let subscription = self.variable.create_subscription(VarSource::Uninitialized);
 
-            // Subscribe to binding with VarSub as the consumer
-            // VarSub implements Consumer, so it will receive notifications
+            // Subscribe to binding with VarProducer as the consumer
+            // VarProducer implements Consumer, so it will receive notifications
             let var_sub_consumer: Box<dyn Consumer> = Box::new(subscription.clone());
             let binding_producer = binding_op.subscribe(
                 domain_guard.clone(),
@@ -250,29 +297,12 @@ impl Lambda {
             intent_guard.clone(),
         )));
 
-        // Create the variable consumer closure that captures LambdaProducer
-        // This is added to VarSub's consumers so it gets notified when the variable is ready
-        let lambda_producer_for_var = lambda_producer.clone();
-        let variable_consumer: Box<dyn Consumer> = Box::new(move |notification: Notification| {
-            let mut producer = lambda_producer_for_var.borrow_mut();
-            match notification {
-                Notification::Yield(guard) => {
-                    producer.variable_yield_guard = guard.clone();
-                    let new_guard = Guard::Domain(Box::new(guard));
-                    producer
-                        .downstream_consumer
-                        .notify(Notification::Yield(new_guard));
-                }
-                Notification::NewData => producer.downstream_consumer.notify(Notification::NewData),
-            }
-        });
-
-        // Add the consumer to the variable subscription
-        // For argument source: VarSub may have already been notified by the binding, and add_consumer
-        // will immediately notify this consumer if yield_guard is non-empty
+        // Rc<RefCell<LambdaProducer>> implements Consumer via the blanket impl.
+        // For Bound mode: VarProducer may have already been notified by the binding, and add_consumer
+        // will immediately notify this consumer if yield_guard is non-empty.
         variable_subscription
             .borrow_mut()
-            .add_consumer(variable_consumer);
+            .add_consumer(Box::new(lambda_producer.clone()));
 
         // Create a new VarScope with this variable
         let new_scope = if let Some(parent) = var_scope {
@@ -281,29 +311,9 @@ impl Lambda {
             VarScope::new(&self.variable.name, variable_subscription)
         };
 
-        // Create closure for body notifications: updates body_yield_guard and checks if ready
-        let lambda_producer_for_body = lambda_producer.clone();
-        let body_consumer: Box<dyn Consumer> = Box::new(move |notification: Notification| {
-            debug!("Lambda body_consumer notified with {notification:?}");
-            let mut producer = lambda_producer_for_body.borrow_mut();
-            match notification {
-                Notification::Yield(guard) => {
-                    producer.body_yield_guard = guard.clone();
-                    let new_guard = Guard::from_independent_function_parts(
-                        producer.variable_yield_guard.clone(),
-                        guard,
-                    );
-                    producer
-                        .downstream_consumer
-                        .notify(Notification::Yield(new_guard));
-                }
-                // Lambda ignores new data on the body side, it only takes action when new data is
-                // available on the variable.
-                Notification::NewData => {} // noop
-            }
-        });
+        let body_consumer: Box<dyn Consumer> =
+            Box::new(LambdaBodyConsumer(lambda_producer.clone()));
 
-        // Subscribe to the body with the closure as consumer
         let body_producer = self.body.subscribe(
             codomain_guard,
             body_consumer,
@@ -704,14 +714,14 @@ mod tests {
     }
 
     #[test]
-    fn test_binding_notifications_flow_through_varsub() {
-        // This test verifies that binding notifications flow through VarSub to VarRefSub.
+    fn test_binding_notifications_flow_through_varproducer() {
+        // This test verifies that binding notifications flow through VarProducer to VarRefProducer.
         // Previously, we had a bug where the binding's consumer was a TestConsumer,
-        // so notifications never reached VarSub. VarSub's yield_guard was set manually,
+        // so notifications never reached VarProducer. VarProducer's yield_guard was set manually,
         // which made add_consumer() notify immediately, masking the issue.
         //
         // This test catches the bug by:
-        // 1. Creating a lambda with a VarRef body (so VarRefSub is in the consumers list)
+        // 1. Creating a lambda with a VarRef body (so VarRefProducer is in the consumers list)
         // 2. Verifying a notification is received by the lambda's consumer.
 
         let variable = Var::new("x", Extent::Base(BaseType::Int));

@@ -1,4 +1,4 @@
-//! Variable system: VarScope, VarSource, Var, VarSub, VarRef, VarRefSub, compose_indices.
+//! Variable system: VarScope, VarSource, Var, VarProducer, VarRef, VarRefProducer, compose_indices.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,7 +11,7 @@ use log::debug;
 
 /// A variable subscription paired with the chain of iteration-source variables between
 /// the current scope and the found variable, used for alignment composition.
-type VarWithIterationChain = (Rc<RefCell<VarSub>>, Vec<Rc<RefCell<VarSub>>>);
+type VarWithIterationChain = (Rc<RefCell<VarProducer>>, Vec<Rc<RefCell<VarProducer>>>);
 
 /// Variable scope for looking up variables.
 /// Each scope contains exactly one variable (the lambda's variable).
@@ -23,12 +23,12 @@ pub struct VarScope {
     /// The variable name in this scope
     name: String,
     /// The variable subscription in this scope
-    subscription: Rc<RefCell<VarSub>>,
+    subscription: Rc<RefCell<VarProducer>>,
 }
 
 impl VarScope {
     /// Create a new root scope with a single variable.
-    pub fn new(name: &str, subscription: Rc<RefCell<VarSub>>) -> Self {
+    pub fn new(name: &str, subscription: Rc<RefCell<VarProducer>>) -> Self {
         VarScope {
             parent: None,
             name: name.to_string(),
@@ -37,7 +37,7 @@ impl VarScope {
     }
 
     /// Create a child scope with a parent.
-    pub fn child(parent: Rc<VarScope>, name: &str, subscription: Rc<RefCell<VarSub>>) -> Self {
+    pub fn child(parent: Rc<VarScope>, name: &str, subscription: Rc<RefCell<VarProducer>>) -> Self {
         VarScope {
             parent: Some(parent),
             name: name.to_string(),
@@ -48,7 +48,7 @@ impl VarScope {
     pub fn new_with_optional_parent(
         parent: Option<Rc<VarScope>>,
         name: &str,
-        subscription: Rc<RefCell<VarSub>>,
+        subscription: Rc<RefCell<VarProducer>>,
     ) -> Self {
         VarScope {
             parent,
@@ -67,7 +67,7 @@ impl VarScope {
     fn lookup_with_chain(
         &self,
         name: &str,
-        mut chain: Vec<Rc<RefCell<VarSub>>>,
+        mut chain: Vec<Rc<RefCell<VarProducer>>>,
     ) -> Option<VarWithIterationChain> {
         if self.name == name {
             // Found the variable - return it with the chain of inner iterations
@@ -96,7 +96,7 @@ impl VarScope {
 #[derive(Debug)]
 pub enum VarSource {
     /// Uninitialized state - used during construction when source will be set later.
-    /// VarSub operations will panic if called while in this state.
+    /// VarProducer operations will panic if called while in this state.
     Uninitialized,
     /// Variable receives values from an argument producer (via Apply).
     /// The variable forwards values from this producer.
@@ -152,25 +152,25 @@ impl Var {
         self.predicate = predicate;
     }
 
-    /// Create a VarSub for this variable with the given source.
+    /// Create a VarProducer for this variable with the given source.
     ///
     /// The subscription starts with an empty yield guard. For `Argument` source, the
-    /// binding operator will notify VarSub when data is ready. For `Iteration` source,
+    /// binding operator will notify VarProducer when data is ready. For `Iteration` source,
     /// the scheduler will trigger a check for progress, which notifies when data is available.
     ///
-    /// Consumers can be added later via `VarSub::add_consumer()`.
-    pub fn create_subscription(&self, source: VarSource) -> Rc<RefCell<VarSub>> {
-        Rc::new(RefCell::new(VarSub::new(source, self.extent())))
+    /// Consumers can be added later via `VarProducer::add_consumer()`.
+    pub fn create_subscription(&self, source: VarSource) -> Rc<RefCell<VarProducer>> {
+        Rc::new(RefCell::new(VarProducer::new(source, self.extent())))
     }
 }
 
 // Note: Var does not implement Operator because it cannot be subscribed to directly.
 // Variables are always managed by their enclosing context (Lambda, Let, etc.) which
-// creates the VarSub with the appropriate VarSource (Argument or Iteration).
+// creates the VarProducer with the appropriate VarSource (Argument or Iteration).
 
-/// VarSub implements both Producer and Consumer.
+/// VarProducer implements both Producer and Consumer.
 /// It stores the yield guard (monotonically growing) and forwards notifications to all consumers.
-pub struct VarSub {
+pub struct VarProducer {
     /// The Extent of the Var
     extent: Extent,
     /// The source of values for this variable (Argument or Iteration)
@@ -186,9 +186,9 @@ pub struct VarSub {
     stored_release_guard: Guard,
 }
 
-impl std::fmt::Debug for VarSub {
+impl std::fmt::Debug for VarProducer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VarSub")
+        f.debug_struct("VarProducer")
             .field("source", &self.source)
             .field("yield_guard", &self.yield_guard)
             .field("data_available", &self.data_available)
@@ -201,10 +201,10 @@ impl std::fmt::Debug for VarSub {
     }
 }
 
-impl VarSub {
-    /// Create a new VarSub with the given source.
+impl VarProducer {
+    /// Create a new VarProducer with the given source.
     fn new(source: VarSource, extent: &Extent) -> Self {
-        VarSub {
+        VarProducer {
             extent: extent.clone(),
             source,
             yield_guard: Guard::Empty,
@@ -258,7 +258,7 @@ impl VarSub {
     pub fn set_source(&mut self, source: VarSource) {
         assert!(
             matches!(self.source, VarSource::Uninitialized),
-            "VarSub::set_source() called while source is not Uninitialized"
+            "VarProducer::set_source() called while source is not Uninitialized"
         );
         self.source = source;
     }
@@ -280,7 +280,7 @@ impl VarSub {
                     .for_each(|c| c.notify(notification.clone()));
             }
             _ => panic!(
-                "Expected VarSub with DataSource input, got {:?}",
+                "Expected VarProducer with DataSource input, got {:?}",
                 self.source
             ),
         };
@@ -291,11 +291,11 @@ impl VarSub {
     }
 }
 
-impl Producer for VarSub {
+impl Producer for VarProducer {
     fn get(&mut self) -> GetResult {
         match &mut self.source {
             VarSource::Uninitialized => {
-                panic!("VarSub::get() called while source is Uninitialized")
+                panic!("VarProducer::get() called while source is Uninitialized")
             }
             VarSource::Argument(producer) => producer.get(),
             VarSource::Iteration {
@@ -331,7 +331,7 @@ impl Producer for VarSub {
         // Forward release to source
         match &mut self.source {
             VarSource::Uninitialized => {
-                panic!("VarSub::release() called while source is Uninitialized")
+                panic!("VarProducer::release() called while source is Uninitialized")
             }
             VarSource::Argument(producer) => producer.release(obsolete_guard),
             VarSource::Iteration {
@@ -345,7 +345,7 @@ impl Producer for VarSub {
         }
     }
 
-    // TODO: Include ref to corresponding Var so we know what the VarSub is.
+    // TODO: Include ref to corresponding Var so we know what the VarProducer is.
     fn inspect(&self) -> InspectNode {
         let source_label = match &self.source {
             VarSource::Uninitialized => "Uninitialized".to_string(),
@@ -357,7 +357,7 @@ impl Producer for VarSub {
             _ => vec![],
         };
         InspectNode {
-            type_name: "VarSub".to_string(),
+            type_name: "VarProducer".to_string(),
             label: format!("{}, {} consumers", source_label, self.consumers.len()),
             yield_guard: guard_summary(&self.yield_guard),
             data_summary: String::new(),
@@ -366,11 +366,11 @@ impl Producer for VarSub {
     }
 }
 
-impl Consumer for VarSub {
+impl Consumer for VarProducer {
     fn notify(&mut self, notification: Notification) {
         match &notification {
             Notification::Yield(guard) => {
-                debug!("Setting VarSub yield guard {guard:?}");
+                debug!("Setting VarProducer yield guard {guard:?}");
                 self.yield_guard = guard.clone();
             }
             Notification::NewData => {
@@ -422,15 +422,15 @@ impl Operator for VarRef {
             .lookup_variable(&self.name)
             .unwrap_or_else(|| panic!("Variable '{}' not found in scope", self.name));
 
-        // Create VarRefSub with the consumer and iteration chain for alignment
-        let ref_subscription = Rc::new(RefCell::new(VarRefSub {
+        // Create VarRefProducer with the consumer and iteration chain for alignment
+        let ref_subscription = Rc::new(RefCell::new(VarRefProducer {
             variable_subscription: variable_subscription.clone(),
             iteration_chain,
             intent_guard,
             consumer,
         }));
 
-        // Add the VarRefSub as the consumer of the variable subscription
+        // Add the VarRefProducer as the consumer of the variable subscription
         let ref_subscription_consumer: Box<dyn Consumer> = Box::new(ref_subscription.clone());
         variable_subscription
             .borrow_mut()
@@ -440,24 +440,24 @@ impl Operator for VarRef {
     }
 }
 
-/// VarRefSub implements both Producer and Consumer.
-/// As a Consumer: it receives notifications from VarSub, intersects
+/// VarRefProducer implements both Producer and Consumer.
+/// As a Consumer: it receives notifications from VarProducer, intersects
 /// the yield guard with its intent guard, and forwards to the actual consumer.
 /// As a Producer: it provides access to data and handles release requests.
-struct VarRefSub {
-    /// Reference to the VarSub
-    variable_subscription: Rc<RefCell<VarSub>>,
+struct VarRefProducer {
+    /// Reference to the VarProducer
+    variable_subscription: Rc<RefCell<VarProducer>>,
     /// Chain of iteration-source variables between current scope and referenced variable (for alignment)
-    iteration_chain: Vec<Rc<RefCell<VarSub>>>,
+    iteration_chain: Vec<Rc<RefCell<VarProducer>>>,
     /// The intent guard for this subscription
     intent_guard: Guard,
     /// The consumer of the variable ref that will receive filtered notifications
     consumer: Box<dyn Consumer>,
 }
 
-impl std::fmt::Debug for VarRefSub {
+impl std::fmt::Debug for VarRefProducer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VarRefSub")
+        f.debug_struct("VarRefProducer")
             .field("variable_subscription", &self.variable_subscription)
             .field("iteration_chain", &self.iteration_chain)
             .field("intent_guard", &self.intent_guard)
@@ -466,7 +466,7 @@ impl std::fmt::Debug for VarRefSub {
     }
 }
 
-impl Consumer for VarRefSub {
+impl Consumer for VarRefProducer {
     fn notify(&mut self, notification: Notification) {
         match notification {
             Notification::Yield(guard) => {
@@ -486,7 +486,7 @@ pub fn compose_indices(outer: &[usize], inner: &[usize]) -> Vec<usize> {
     inner.iter().map(|&i| outer[i]).collect()
 }
 
-impl Producer for VarRefSub {
+impl Producer for VarRefProducer {
     fn get(&mut self) -> GetResult {
         // Get data from variable subscription
         let var_result = self.variable_subscription.borrow_mut().get();
@@ -529,11 +529,11 @@ impl Producer for VarRefSub {
             .get_stored_release_guard()
     }
 
-    // TODO: Make node collapsed by default so it's not confusing to see the same VarSub
-    // in multiple places in the tree. Maybe draw an arrow to the VarSub, or color coordinate them?
+    // TODO: Make node collapsed by default so it's not confusing to see the same VarProducer
+    // in multiple places in the tree. Maybe draw an arrow to the VarProducer, or color coordinate them?
     fn inspect(&self) -> InspectNode {
         InspectNode {
-            type_name: "VarRefSub".to_string(),
+            type_name: "VarRefProducer".to_string(),
             label: format!("intent: {}", guard_summary(&self.intent_guard)),
             yield_guard: guard_summary(&self.variable_subscription.borrow().yield_guard),
             data_summary: String::new(),
@@ -557,11 +557,11 @@ mod tests {
 
         assert_eq!(var_ref.extent(), &Extent::Base(BaseType::Int));
 
-        // Create VarSub in Uninitialized state first
+        // Create VarProducer in Uninitialized state first
         let var_subscription = variable.create_subscription(VarSource::Uninitialized);
 
-        // Subscribe to the binding literal with VarSub as the consumer
-        // This ensures VarSub receives notifications
+        // Subscribe to the binding literal with VarProducer as the consumer
+        // This ensures VarProducer receives notifications
         let mut binding_literal = Literal::new(Value::Int(42));
         let var_sub_consumer: Box<dyn Consumer> = Box::new(var_subscription.clone());
         let binding_producer = binding_literal.subscribe(
@@ -571,7 +571,7 @@ mod tests {
             &mut Scheduler::new(),
         );
 
-        // Now set VarSub's source to `Argument` with the producer
+        // Now set VarProducer's source to `Argument` with the producer
         var_subscription
             .borrow_mut()
             .set_source(VarSource::Argument(binding_producer));
@@ -588,7 +588,7 @@ mod tests {
             &mut Scheduler::new(),
         );
 
-        // Verify notification was received (flows: Literal → VarSub → VarRefSub → consumer)
+        // Verify notification was received (flows: Literal → VarProducer → VarRefProducer → consumer)
         let notifications_borrowed = notifications.borrow();
         assert_eq!(notifications_borrowed.len(), 1);
         assert!(matches!(notifications_borrowed[0], Notification::NewData));
