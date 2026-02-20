@@ -7,6 +7,7 @@ Required env: SLACK_BOT_TOKEN, SLACK_CHANNEL
 Optional file: usermap.json (in working directory) for GitHub-to-Slack user resolution
 """
 
+import argparse
 import json
 import os
 import sys
@@ -20,8 +21,18 @@ from prreminder import (
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--failed", action="store_true",
+                        help="Post a workflow-failure notice instead of reminders")
+    args = parser.parse_args()
+
     token = os.environ["SLACK_BOT_TOKEN"]
     channel = os.environ["SLACK_CHANNEL"]
+
+    if args.failed:
+        slack_post_message(token, channel,
+                           "Code Review Reminders!\n:sob: workflow failed! :sob:")
+        return
 
     # Load usermap
     usermap_path = Path("usermap.json")

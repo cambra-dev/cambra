@@ -97,6 +97,6 @@ help | *)
   echo "Required env vars:"
   echo "  GH_REPOSITORY    e.g. your-org/Cambra"
   echo "  SLACK_BOT_TOKEN  xoxb-..."
-  echo "  SLACK_CHANNEL    e.g. #code"
+  echo "  SLACK_CHANNEL    e.g. #spam-testing"
   ;;
 esac

@@ -9,6 +9,8 @@ on:
 jobs:
   remind:
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -31,9 +33,17 @@ jobs:
         run: test -f usermap.json || echo '{}' > usermap.json
 
       - name: Find stale PRs and post reminders
+        id: remind
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPOSITORY: ${{ github.repository }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: ${{ vars.SLACK_REVIEW_CHANNEL }}
         run: python3 .github/scripts/pr-reminders/find_stale_prs.py | python3 .github/scripts/pr-reminders/post_slack_reminders.py
+
+      - name: Post failure notice to Slack
+        if: failure()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ vars.SLACK_REVIEW_CHANNEL }}
+        run: python3 .github/scripts/pr-reminders/post_slack_reminders.py --failed
