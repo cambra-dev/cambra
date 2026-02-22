@@ -28,8 +28,9 @@ pub enum Guard {
     And(Vec<Guard>),
     /// A disjunction of guards (at least one must be satisfied)
     Or(Vec<Guard>),
-    /// A guard for a function type: combines domain and codomain guards
-    /// Describes the subset of the codomain produced by the domain guard
+    /// A guard for a function type, denoting a subset of functions of that type.
+    /// A function is in this guard iff, for all arguments in the domain guard,
+    /// it maps to values in the codomain guard.
     Function {
         domain: Box<Guard>,
         codomain: Box<Guard>,

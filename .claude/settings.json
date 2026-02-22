@@ -10,7 +10,6 @@
       "Bash(cargo fmt *)",
       "Bash(./ci.sh)",
       "Bash(./ci.sh *)",
-
       "Bash(git add *)",
       "Bash(git commit *)",
       "Bash(git diff)",
@@ -32,16 +31,13 @@
       "Bash(git stash *)",
       "Bash(git merge *)",
       "Bash(git rebase *)",
-
       "Bash(gs)",
       "Bash(gs *)",
-
       "Bash(gh pr *)",
       "Bash(gh issue *)",
       "Bash(gh run *)",
       "Bash(gh api *)",
       "Bash(gh cache *)",
-
       "WebSearch"
     ]
   }

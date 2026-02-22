@@ -1,25 +1,20 @@
 # Cambra
 
-Cambra is a programming language that implements a new programming paradigm, abstracting over low-level concepts like memory, threads, and connections. This allows programmers to focus on program logic, non-functional requirements, and high-level architectural decisions.
+Cambra is a programming language that abstracts over low-level concerns like memory, threads, and connections, letting programmers focus on logic and high-level architecture. Programs are written in a Pythonic syntax (Cambra High-level Language, "CHL") that lowers to a small core language (Cambra Core Language, "CCL"), where execution uses streaming dataflow semantics rather than term-wise beta reduction.
 
-## Key Features
+## Docs
 
-- **Python-like Syntax**: Programs are written in a Pythonic syntax that uses for-comprehensions for collection-level logic. This syntax is lowered to the Cambra Core Language (CCL) for type checking and interpretation.
+- [Design](docs/design.md) — language overview, CHL, CCL, execution pipeline
+- [Plan](docs/PLAN.md) — implementation roadmap and status
+- [Developer setup](docs/developer-setup-checklist.md)
 
-- **Dataflow Semantics**: The operational semantics uses a producer/consumer interface that enables streaming dataflow execution with pipelining, parallelization, and vectorization. Progress is tracked through punctuations sent through this interface.
-
-- **Dependently-Typed Functional Core**: The denotational semantics is a pure, dependently-typed, functional language. The core language (CCL) includes literals, variables, records, unions, lambdas, let-bindings, application, and pattern matching.
-
-## Current Status
-
-The project is currently in active development.
-
-See [PLAN.md](PLAN.md) for detailed implementation status and [design.md](design.md) for the full design specification.
-
-## Building
+## Building & CI
 
 ```bash
-cargo build
+cargo build          # build
+cargo test           # run tests
+./ci.sh              # full CI suite (fmt + clippy + tests)
+./ci.sh --fix        # same, with auto-formatting
 ```
 
 ## Usage
@@ -43,23 +38,3 @@ cargo run -- --inspect=9090 program.cambra
 ```
 
 After the program finishes, the process stays alive so you can browse the dashboard at `http://localhost:<port>`. Press Ctrl+C to exit.
-
-
-## CI
-
-CI runs formatting, linting, and tests via GitHub Actions on every push to `main` and on pull requests.
-
-To run the full CI suite locally:
-
-```bash
-./ci.sh
-```
-
-You can also run individual checks:
-
-```bash
-./ci.sh fmt      # Check formatting
-./ci.sh clippy   # Run lints
-./ci.sh test     # Run tests
-```
-
