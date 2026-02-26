@@ -239,7 +239,7 @@ fn lower_list_comp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::pretty;
+    use crate::ccl::symbolic;
     use rstest::rstest;
     use rustpython_parser::parser;
 
@@ -269,29 +269,26 @@ mod tests {
 
     #[rstest]
     // Literals
-    #[case("2", "Lit(2)\n")]
-    #[case(r#""hi""#, "Lit(\"hi\")\n")]
-    #[case("True", "Lit(true)\n")]
-    #[case("None", "Lit(unit)\n")]
+    #[case("2", "2")]
+    #[case(r#""hi""#, r#""hi""#)]
+    #[case("True", "true")]
+    #[case("None", "unit")]
     // Variable
-    #[case("x", "Var(x)\n")]
+    #[case("x", "x")]
     // Arithmetic
-    #[case("2 + 3", "BinOp(+)\n├── left: Lit(2)\n└── right: Lit(3)\n")]
-    #[case("4 * 5", "BinOp(*)\n├── left: Lit(4)\n└── right: Lit(5)\n")]
-    #[case("4 - 5", "BinOp(-)\n├── left: Lit(4)\n└── right: Lit(5)\n")]
-    #[case("7 // 2", "BinOp(//)\n├── left: Lit(7)\n└── right: Lit(2)\n")]
-    // Nested binop (precedence handled by parser)
-    #[case(
-        "1 + 2 * 3",
-        "BinOp(+)\n├── left: Lit(1)\n└── right: BinOp(*)\n    ├── left: Lit(2)\n    └── right: Lit(3)\n"
-    )]
+    #[case("2 + 3", "2 + 3")]
+    #[case("4 * 5", "4 * 5")]
+    #[case("4 - 5", "4 - 5")]
+    #[case("7 // 2", "7 // 2")]
+    // Nested binop: `1 + 2 * 3` parses as `1 + (2 * 3)` — * tighter, no parens needed
+    #[case("1 + 2 * 3", "1 + 2 * 3")]
     // List literals
-    #[case("[]", "List\n")]
-    #[case("[1, 2]", "List\n├── 0: Lit(1)\n└── 1: Lit(2)\n")]
+    #[case("[]", "[]")]
+    #[case("[1, 2]", "[1, 2]")]
     fn test_lower_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr).expect("lowering failed");
-        assert_eq!(pretty::pretty(&ccl), expected);
+        assert_eq!(symbolic::symbolic(&ccl), expected);
     }
 
     // -----------------------------------------------------------------------
@@ -299,121 +296,86 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[rstest]
-    #[case("x = 2\nx", "Let(x)\n├── value: Lit(2)\n└── body: Var(x)\n")]
     #[case(
-        "x = 2\ny = x\ny",
-        "Let(x)\n├── value: Lit(2)\n└── body: Let(y)\n    ├── value: Var(x)\n    └── body: Var(y)\n"
+        "\
+x = 2
+x",
+        "\
+let x = 2
+in x"
+    )]
+    #[case(
+        "\
+x = 2
+y = x
+y",
+        "\
+let x = 2
+in let y = x
+in y"
+    )]
+    #[case(
+        "\
+x = 2 + 3
+y = x * 4
+y",
+        "\
+let x = 2 + 3
+in let y = x * 4
+in y"
+    )]
+    // Note: SSA and ANF disallow this sort of redefinition; our less-normalised
+    // representation allows shadowing the same binding name.
+    #[case(
+        "\
+x = 2 + 3
+x = x * 4
+x",
+        "\
+let x = 2 + 3
+in let x = x * 4
+in x"
     )]
     fn test_lower_stmts(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts).expect("lowering failed");
-        assert_eq!(pretty::pretty(&ccl), expected);
+        assert_eq!(symbolic::symbolic(&ccl), expected);
     }
 
     // -----------------------------------------------------------------------
     // List comprehension tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_list_comp_identity() {
-        let expr = parse_expr("[x for x in [10, 20]]");
-        let ccl = lower_expr(&expr).expect("lowering failed");
-        let expected = "\
-Lambda(__list_comp_var)
-└── body: Apply
-    ├── func: Lambda(x)
-    │   └── body: Var(x)
-    └── arg: Apply
-        ├── func: List
-        │   ├── 0: Lit(10)
-        │   └── 1: Lit(20)
-        └── arg: Var(__list_comp_var)
-";
-        assert_eq!(pretty::pretty(&ccl), expected);
-    }
-
-    #[test]
-    fn test_list_comp_constant_body() {
-        let expr = parse_expr("[42 for x in [10, 20]]");
-        let ccl = lower_expr(&expr).expect("lowering failed");
-        let expected = "\
-Lambda(__list_comp_var)
-└── body: Apply
-    ├── func: Lambda(x)
-    │   └── body: Lit(42)
-    └── arg: Apply
-        ├── func: List
-        │   ├── 0: Lit(10)
-        │   └── 1: Lit(20)
-        └── arg: Var(__list_comp_var)
-";
-        assert_eq!(pretty::pretty(&ccl), expected);
-    }
-
-    #[test]
-    fn test_list_comp_binop_body() {
-        let expr = parse_expr("[x + 2 for x in [10, 20]]");
-        let ccl = lower_expr(&expr).expect("lowering failed");
-        let expected = "\
-Lambda(__list_comp_var)
-└── body: Apply
-    ├── func: Lambda(x)
-    │   └── body: BinOp(+)
-    │       ├── left: Var(x)
-    │       └── right: Lit(2)
-    └── arg: Apply
-        ├── func: List
-        │   ├── 0: Lit(10)
-        │   └── 1: Lit(20)
-        └── arg: Var(__list_comp_var)
-";
-        assert_eq!(pretty::pretty(&ccl), expected);
-    }
-
-    #[test]
-    fn test_list_comp_outer_capture() {
-        // y is captured from an enclosing let binding
-        let stmts = parse_module("y = 5\n[x + y for x in [10, 20]]");
+    #[rstest]
+    // Identity: element passes through unchanged.
+    #[case(
+        "[x for x in [10, 20]]",
+        "λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x)"
+    )]
+    // Constant body: loop variable unused in body.
+    #[case(
+        "[42 for x in [10, 20]]",
+        "λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → 42)"
+    )]
+    // BinOp body: loop variable used in arithmetic.
+    #[case(
+        "[x + 2 for x in [10, 20]]",
+        "λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x + 2)"
+    )]
+    // Outer capture: y is captured from an enclosing let binding.
+    #[case(
+        "\
+y = 5
+[x + y for x in [10, 20]]",
+        "\
+let y = 5
+in λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x + y)"
+    )]
+    // Nested comprehension: inner comp becomes the source of the outer comp.
+    #[case("[y for y in [x for x in [10, 20]]]", "λ __list_comp_var → __list_comp_var ▷ (λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x)) ▷ (λ y → y)")]
+    fn test_lower_list_comp(#[case] code: &str, #[case] expected: &str) {
+        let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts).expect("lowering failed");
-        let expected = "\
-Let(y)
-├── value: Lit(5)
-└── body: Lambda(__list_comp_var)
-    └── body: Apply
-        ├── func: Lambda(x)
-        │   └── body: BinOp(+)
-        │       ├── left: Var(x)
-        │       └── right: Var(y)
-        └── arg: Apply
-            ├── func: List
-            │   ├── 0: Lit(10)
-            │   └── 1: Lit(20)
-            └── arg: Var(__list_comp_var)
-";
-        assert_eq!(pretty::pretty(&ccl), expected);
-    }
-
-    #[test]
-    fn test_list_comp_nested() {
-        let expr = parse_expr("[y for y in [x for x in [10, 20]]]");
-        let ccl = lower_expr(&expr).expect("lowering failed");
-        let expected = "\
-Lambda(__list_comp_var)
-└── body: Apply
-    ├── func: Lambda(y)
-    │   └── body: Var(y)
-    └── arg: Apply
-        ├── func: Lambda(__list_comp_var)
-        │   └── body: Apply
-        │       ├── func: Lambda(x)
-        │       │   └── body: Var(x)
-        │       └── arg: Apply
-        │           ├── func: List
-        │           │   ├── 0: Lit(10)
-        │           │   └── 1: Lit(20)
-        │           └── arg: Var(__list_comp_var)
-        └── arg: Var(__list_comp_var)
-";
-        assert_eq!(pretty::pretty(&ccl), expected);
+        assert_eq!(symbolic::symbolic(&ccl), expected);
     }
 }

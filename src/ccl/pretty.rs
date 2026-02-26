@@ -12,7 +12,7 @@
 //! The formatting is intentionally kept human-readable and stable so that tests
 //! can pin expected tree strings directly.
 
-use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Expr, Lit, LogicKind, UnaryOpKind};
+use crate::ccl::{Expr, Lit, UnaryOpKind};
 use crate::pretty_tree::{render, InspectNode};
 
 // ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             .child("func", expr_to_node(function))
             .child("arg", expr_to_node(argument)),
 
-        Expr::BinOp { left, op, right } => InspectNode::new(format!("BinOp({})", binop_symbol(op)))
+        Expr::BinOp { left, op, right } => InspectNode::new(format!("BinOp({})", op.sym()))
             .child("left", expr_to_node(left))
             .child("right", expr_to_node(right)),
 
@@ -143,28 +143,6 @@ fn lit_label(lit: &Lit) -> String {
     }
 }
 
-fn binop_symbol(op: &BinOpKind) -> &'static str {
-    match op {
-        BinOpKind::Arithmetic(ArithmeticKind::Add) => "+",
-        BinOpKind::Arithmetic(ArithmeticKind::Sub) => "-",
-        BinOpKind::Arithmetic(ArithmeticKind::Mul) => "*",
-        BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => "//",
-        BinOpKind::Concat => "++",
-        BinOpKind::Compare(CompareKind::Less) => "<",
-        BinOpKind::Compare(CompareKind::LessOrEq) => "<=",
-        BinOpKind::Compare(CompareKind::Greater) => ">",
-        BinOpKind::Compare(CompareKind::GreaterOrEq) => ">=",
-        BinOpKind::Compare(CompareKind::Equals) => "==",
-        BinOpKind::Compare(CompareKind::NotEquals) => "!=",
-        BinOpKind::BoolLogic(LogicKind::And) => "and",
-        BinOpKind::BoolLogic(LogicKind::Or) => "or",
-        BinOpKind::BoolLogic(LogicKind::Nand) => "nand",
-        BinOpKind::BoolLogic(LogicKind::Nor) => "nor",
-        BinOpKind::BoolLogic(LogicKind::Xor) => "xor",
-        BinOpKind::BoolLogic(LogicKind::Xnor) => "xnor",
-    }
-}
-
 fn unaryop_symbol(op: &UnaryOpKind) -> &'static str {
     match op {
         UnaryOpKind::Neg => "-",
@@ -200,5 +178,225 @@ fn type_str(ty: &crate::ccl::Type) -> String {
             parts.join(" | ")
         }
         Type::Unknown => "?".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::pretty;
+    use crate::ccl::{ArithmeticKind, BinOpKind, Expr, Lit, Pattern, Type, UnaryOpKind};
+    use crate::interpreter::BaseType;
+    use rstest::rstest;
+
+    #[rstest]
+    // Literals
+    #[case(Expr::Lit(Lit::Int(42)), "Lit(42)\n")]
+    #[case(Expr::Lit(Lit::String("hi".to_string())), "Lit(\"hi\")\n")]
+    #[case(Expr::Lit(Lit::Bool(true)), "Lit(true)\n")]
+    #[case(Expr::Lit(Lit::Unit), "Lit(unit)\n")]
+    // Variable
+    #[case(Expr::Var("x".to_string()), "Var(x)\n")]
+    // BinOp
+    #[case(
+        Expr::BinOp {
+            left: Box::new(Expr::Lit(Lit::Int(1))),
+            op: BinOpKind::Arithmetic(ArithmeticKind::Add),
+            right: Box::new(Expr::Lit(Lit::Int(2))),
+        },
+        "\
+BinOp(+)
+├── left: Lit(1)
+└── right: Lit(2)
+"
+    )]
+    // UnaryOp
+    #[case(
+        Expr::UnaryOp(UnaryOpKind::Neg, Box::new(Expr::Var("x".to_string()))),
+        "\
+UnaryOp(-)
+└── expr: Var(x)
+"
+    )]
+    #[case(
+        Expr::UnaryOp(UnaryOpKind::Not, Box::new(Expr::Var("b".to_string()))),
+        "\
+UnaryOp(not)
+└── expr: Var(b)
+"
+    )]
+    // Apply
+    #[case(
+        Expr::Apply {
+            function: Box::new(Expr::Var("f".to_string())),
+            argument: Box::new(Expr::Var("x".to_string())),
+        },
+        "\
+Apply
+├── func: Var(f)
+└── arg: Var(x)
+"
+    )]
+    // Lambda (unannotated and annotated)
+    #[case(
+        Expr::Lambda {
+            param: "x".to_string(),
+            param_ty: None,
+            body: Box::new(Expr::Var("x".to_string())),
+        },
+        "\
+Lambda(x)
+└── body: Var(x)
+"
+    )]
+    #[case(
+        Expr::Lambda {
+            param: "x".to_string(),
+            param_ty: Some(Type::Base(BaseType::Int)),
+            body: Box::new(Expr::Var("x".to_string())),
+        },
+        "\
+Lambda(x) : Int
+└── body: Var(x)
+"
+    )]
+    // Let (unannotated and annotated)
+    #[case(
+        Expr::Let {
+            name: "x".to_string(),
+            ty: None,
+            value: Box::new(Expr::Lit(Lit::Int(1))),
+            body: Box::new(Expr::Var("x".to_string())),
+        },
+        "\
+Let(x)
+├── value: Lit(1)
+└── body: Var(x)
+"
+    )]
+    #[case(
+        Expr::Let {
+            name: "x".to_string(),
+            ty: Some(Type::Base(BaseType::Bool)),
+            value: Box::new(Expr::Lit(Lit::Bool(true))),
+            body: Box::new(Expr::Var("x".to_string())),
+        },
+        "\
+Let(x) : Bool
+├── value: Lit(true)
+└── body: Var(x)
+"
+    )]
+    // List (empty and non-empty)
+    #[case(Expr::List(vec![]), "List\n")]
+    #[case(
+        Expr::List(vec![Expr::Lit(Lit::Int(1)), Expr::Lit(Lit::Int(2))]),
+        "\
+List
+├── 0: Lit(1)
+└── 1: Lit(2)
+"
+    )]
+    // Tuple
+    #[case(
+        Expr::Tuple(vec![Expr::Lit(Lit::Int(1)), Expr::Lit(Lit::Int(2))]),
+        "\
+Tuple
+├── 0: Lit(1)
+└── 1: Lit(2)
+"
+    )]
+    // Record
+    #[case(
+        Expr::Record(vec![("a".to_string(), Expr::Lit(Lit::Int(1)))]),
+        "\
+Record
+└── a: Lit(1)
+"
+    )]
+    // Case with wildcard branch
+    #[case(
+        Expr::Case {
+            scrutinee: Box::new(Expr::Var("x".to_string())),
+            branches: vec![(Pattern::Wildcard, Expr::Lit(Lit::Int(0)))],
+        },
+        "\
+Case
+├── scrutinee: Var(x)
+└── branch_0: Lit(0)
+"
+    )]
+    // Join + Jump: loop_body (non-last) has a child → triggers │   continuation prefix
+    #[case(
+        Expr::Join {
+            name: "k".to_string(),
+            params: vec![("i".to_string(), None)],
+            loop_body: Box::new(Expr::Jump {
+                target: "k".to_string(),
+                args: vec![Expr::Var("i".to_string())],
+            }),
+            outer_body: Box::new(Expr::Jump {
+                target: "k".to_string(),
+                args: vec![Expr::Lit(Lit::Int(0))],
+            }),
+        },
+        "\
+Join(k)
+├── loop_body: Jump(k)
+│   └── arg_0: Var(i)
+└── outer_body: Jump(k)
+    └── arg_0: Lit(0)
+"
+    )]
+    // Jump with two args
+    #[case(
+        Expr::Jump {
+            target: "k".to_string(),
+            args: vec![Expr::Lit(Lit::Int(1)), Expr::Lit(Lit::Int(2))],
+        },
+        "\
+Jump(k)
+├── arg_0: Lit(1)
+└── arg_1: Lit(2)
+"
+    )]
+    fn test_pretty_expr(#[case] expr: Expr, #[case] expected: &str) {
+        assert_eq!(pretty(&expr), expected);
+    }
+
+    /// Verifies the `│   ` continuation-prefix threading in `pretty_tree`.
+    ///
+    /// The prefix only appears when a *non-last* child itself has children.
+    /// None of the per-variant cases above trigger this; only a tree where a
+    /// non-last child has grandchildren (e.g. `Let` whose `value` is an `Apply`)
+    /// exercises the code path.
+    #[test]
+    fn test_pretty_continuation_prefix() {
+        let expr = Expr::Let {
+            name: "x".to_string(),
+            ty: None,
+            value: Box::new(Expr::Apply {
+                function: Box::new(Expr::Var("f".to_string())),
+                argument: Box::new(Expr::Lit(Lit::Int(1))),
+            }),
+            body: Box::new(Expr::BinOp {
+                left: Box::new(Expr::Var("x".to_string())),
+                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
+                right: Box::new(Expr::Lit(Lit::Int(2))),
+            }),
+        };
+        let expected = "\
+Let(x)
+├── value: Apply
+│   ├── func: Var(f)
+│   └── arg: Lit(1)
+└── body: BinOp(+)
+    ├── left: Var(x)
+    └── right: Lit(2)
+";
+        assert_eq!(pretty(&expr), expected);
     }
 }

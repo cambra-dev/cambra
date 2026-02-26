@@ -8,6 +8,7 @@
 
 pub mod lower;
 pub mod pretty;
+pub mod symbolic;
 
 use crate::interpreter::BaseType;
 
@@ -90,6 +91,35 @@ pub enum BinOpKind {
     Concat,
     /// A comparison that produces a boolean result.
     Compare(CompareKind),
+}
+
+impl BinOpKind {
+    /// Returns the canonical infix symbol for this operator (e.g. `"+"`, `"and"`, `"<="`).
+    ///
+    /// Used by formatters such as the symbolic printer and the pretty-tree
+    /// printer so that the mapping lives once on the type rather than being
+    /// duplicated in each formatter.
+    pub fn sym(&self) -> &'static str {
+        match self {
+            Self::Arithmetic(ArithmeticKind::Add) => "+",
+            Self::Arithmetic(ArithmeticKind::Sub) => "-",
+            Self::Arithmetic(ArithmeticKind::Mul) => "*",
+            Self::Arithmetic(ArithmeticKind::FloorDiv) => "//",
+            Self::Concat => "++",
+            Self::Compare(CompareKind::Less) => "<",
+            Self::Compare(CompareKind::LessOrEq) => "<=",
+            Self::Compare(CompareKind::Greater) => ">",
+            Self::Compare(CompareKind::GreaterOrEq) => ">=",
+            Self::Compare(CompareKind::Equals) => "==",
+            Self::Compare(CompareKind::NotEquals) => "!=",
+            Self::BoolLogic(LogicKind::And) => "and",
+            Self::BoolLogic(LogicKind::Nand) => "nand",
+            Self::BoolLogic(LogicKind::Or) => "or",
+            Self::BoolLogic(LogicKind::Nor) => "nor",
+            Self::BoolLogic(LogicKind::Xor) => "xor",
+            Self::BoolLogic(LogicKind::Xnor) => "xnor",
+        }
+    }
 }
 
 /// Unary operation kinds.
