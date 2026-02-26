@@ -2,6 +2,8 @@
 
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap, hash::Hash, rc::Rc};
 
+use bit_vec::BitVec;
+
 /// A Guard represents a region (subset of an extent) via a set of predicates.
 /// Guards are used to:
 /// - Specify intent (what region a consumer is interested in)
@@ -500,7 +502,7 @@ pub enum ColumnData {
     Ints(Vec<i64>),
     UInts(Vec<usize>),
     Strings(Vec<String>),
-    Bools(Vec<bool>),
+    Bools(BitVec),
     Variants(Vec<Value>),
     FunctionBindings {
         inputs: Box<ColumnData>,
@@ -545,7 +547,7 @@ impl ColumnData {
         assert_eq!(self.len(), 1, "repeat requires single-element ColumnData");
         match self {
             ColumnData::Units(_) => ColumnData::Units(n),
-            ColumnData::Bools(v) => ColumnData::Bools(vec![v[0]; n]),
+            ColumnData::Bools(v) => ColumnData::Bools(BitVec::from_elem(n, v[0])),
             ColumnData::Ints(v) => ColumnData::Ints(vec![v[0]; n]),
             ColumnData::UInts(v) => ColumnData::UInts(vec![v[0]; n]),
             ColumnData::Strings(v) => ColumnData::Strings(vec![v[0].clone(); n]),
@@ -691,7 +693,7 @@ impl ColumnValue {
     pub fn single(value: Value) -> Self {
         ColumnValue {
             data: match value {
-                Value::Bool(b) => ColumnData::Bools(vec![b]),
+                Value::Bool(b) => ColumnData::Bools(BitVec::from_elem(1, b)),
                 Value::Int(i) => ColumnData::Ints(vec![i]),
                 Value::UInt(i) => ColumnData::UInts(vec![i]),
                 Value::String(s) => ColumnData::Strings(vec![s]),

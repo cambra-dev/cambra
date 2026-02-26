@@ -10,7 +10,9 @@
 //! └── right: VarRef(x) : Int
 //! ```
 
-use crate::interpreter::{BaseType, BinOpKind, Extent, Operator, Producer};
+use crate::interpreter::{
+    ArithmeticKind, BaseType, BinOpKind, CompareKind, Extent, LogicKind, Operator, Producer,
+};
 pub use crate::pretty_tree::{render, render_with_max_depth, InspectNode};
 
 /// Mode labels for variable subscription display.
@@ -111,10 +113,22 @@ pub fn fmt_extent(extent: &Extent) -> String {
 /// Format a BinOpKind as its operator symbol.
 pub fn fmt_binop(op: &BinOpKind) -> &'static str {
     match op {
-        BinOpKind::Add => "+",
-        BinOpKind::Sub => "-",
-        BinOpKind::Mul => "*",
-        BinOpKind::FloorDiv => "//",
+        BinOpKind::Arithmetic(ArithmeticKind::Add) => "+",
+        BinOpKind::Arithmetic(ArithmeticKind::Sub) => "-",
+        BinOpKind::Arithmetic(ArithmeticKind::Mul) => "*",
+        BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => "//",
+        BinOpKind::BoolLogic(LogicKind::And) => "and",
+        BinOpKind::BoolLogic(LogicKind::Nand) => "nand",
+        BinOpKind::BoolLogic(LogicKind::Or) => "or",
+        BinOpKind::BoolLogic(LogicKind::Nor) => "nor",
+        BinOpKind::BoolLogic(LogicKind::Xor) => "xor",
+        BinOpKind::BoolLogic(LogicKind::Xnor) => "xnor",
+        BinOpKind::Compare(CompareKind::Equals) => "==",
+        BinOpKind::Compare(CompareKind::NotEquals) => "≠",
+        BinOpKind::Compare(CompareKind::Less) => "<",
+        BinOpKind::Compare(CompareKind::LessOrEq) => "≤",
+        BinOpKind::Compare(CompareKind::Greater) => ">",
+        BinOpKind::Compare(CompareKind::GreaterOrEq) => "≥",
         BinOpKind::Concat => "++",
     }
 }
@@ -301,7 +315,7 @@ Parent
     fn binop_operator() {
         let left = Box::new(Literal::new(Value::Int(1)));
         let right = Box::new(VarRef::new("x", Extent::Base(BaseType::Int)));
-        let binop = BinOp::new(left, BinOpKind::Add, right);
+        let binop = BinOp::new(left, BinOpKind::Arithmetic(ArithmeticKind::Add), right);
         let output = pretty_operator(&binop);
         assert_eq!(
             output,
@@ -335,7 +349,7 @@ Lambda(x) : Int \u{2192} Int
         let variable = Var::new("x", Extent::Base(BaseType::Int));
         let body = Box::new(BinOp::new(
             Box::new(VarRef::new("x", Extent::Base(BaseType::Int))),
-            BinOpKind::Add,
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
             Box::new(Literal::new(Value::Int(1))),
         ));
         let lambda = Lambda::new(variable, body);
@@ -372,7 +386,7 @@ Lambda(x) : Int \u{2192} Int
     fn binop_dataflow() {
         let left = Box::new(Literal::new(Value::Int(2)));
         let right = Box::new(Literal::new(Value::Int(3)));
-        let mut binop = BinOp::new(left, BinOpKind::Add, right);
+        let mut binop = BinOp::new(left, BinOpKind::Arithmetic(ArithmeticKind::Add), right);
 
         let (consumer, _) = TestConsumer::new();
         let producer = binop.subscribe(
@@ -398,7 +412,7 @@ BinOpProducer(+) [yield: ∅ ∧ ∅]
         let variable = Var::new("x", Extent::Base(BaseType::Int));
         let body = Box::new(BinOp::new(
             Box::new(VarRef::new("x", Extent::Base(BaseType::Int))),
-            BinOpKind::Add,
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
             Box::new(Literal::new(Value::Int(1))),
         ));
         let lambda = Lambda::new(variable, body);
@@ -434,7 +448,7 @@ ApplyProducer
     fn binop_dataflow_with_guards() {
         let left = Box::new(Literal::new(Value::Int(2)));
         let right = Box::new(Literal::new(Value::Int(3)));
-        let mut binop = BinOp::new(left, BinOpKind::Add, right);
+        let mut binop = BinOp::new(left, BinOpKind::Arithmetic(ArithmeticKind::Add), right);
 
         let (consumer, _) = TestConsumer::new();
         let producer = binop.subscribe(
@@ -638,7 +652,7 @@ ApplyProducer
         let inner_var = Var::new("y", Extent::Base(BaseType::Int));
         let inner_body = Box::new(BinOp::new(
             Box::new(VarRef::new("x", Extent::Base(BaseType::Int))),
-            BinOpKind::Add,
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
             Box::new(VarRef::new("y", Extent::Base(BaseType::Int))),
         ));
         let inner_lambda = Lambda::new(inner_var, inner_body);

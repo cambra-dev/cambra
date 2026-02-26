@@ -917,7 +917,11 @@ mod tests {
         let variable = Var::new("x", Extent::Base(BaseType::Int));
         let var_ref = Box::new(VarRef::new("x", Extent::Base(BaseType::Int)));
         let one = Box::new(Literal::new(Value::Int(1)));
-        let body = Box::new(BinOp::new(var_ref, BinOpKind::Add, one));
+        let body = Box::new(BinOp::new(
+            var_ref,
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            one,
+        ));
         let lambda = Lambda::new(variable, body);
         let argument = Literal::new(Value::Int(42));
 

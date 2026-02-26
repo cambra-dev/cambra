@@ -8,9 +8,9 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use rustpython_parser::ast::{self as pyast};
 
 use crate::interpreter::{
-    Apply, BaseType, BinOp, BinOpKind, Extent, Guard, Lambda, ListLiteral, Literal, Operator,
-    Scheduler, StdinReader, TestDataSource, TestSourceReader, Value, Var, VarRef, VarScope,
-    VarSource,
+    Apply, ArithmeticKind, BaseType, BinOp, BinOpKind, CompareKind, Extent, Guard, Lambda,
+    ListLiteral, Literal, Operator, Scheduler, StdinReader, TestDataSource, TestSourceReader,
+    Value, Var, VarRef, VarScope, VarSource,
 };
 
 /// Errors that can occur during lowering.
@@ -49,6 +49,11 @@ pub fn lower_expr(
         pyast::ExprKind::Constant { value, .. } => lower_constant(ctx, value),
         pyast::ExprKind::Name { id, .. } => lower_name_as_ref(ctx, id),
         pyast::ExprKind::BinOp { left, op, right } => lower_binop(ctx, left, op, right),
+        pyast::ExprKind::Compare {
+            left,
+            ops,
+            comparators,
+        } => lower_compare(ctx, left, ops, comparators),
         pyast::ExprKind::List { elts, .. } => lower_list(ctx, elts),
         pyast::ExprKind::Subscript { value, slice, .. } => lower_subscript(ctx, value, slice),
         pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(ctx, elt, generators),
@@ -123,11 +128,11 @@ fn lower_binop(
     let left_op = lower_expr(ctx, left)?;
     let right_op = lower_expr(ctx, right)?;
     let kind = match left_op.extent() {
-        Extent::Base(BaseType::Int) => match op {
-            pyast::Operator::Add => BinOpKind::Add,
-            pyast::Operator::Sub => BinOpKind::Sub,
-            pyast::Operator::Mult => BinOpKind::Mul,
-            pyast::Operator::FloorDiv => BinOpKind::FloorDiv,
+        Extent::Base(BaseType::Int) | Extent::Base(BaseType::UInt) => match op {
+            pyast::Operator::Add => BinOpKind::Arithmetic(ArithmeticKind::Add),
+            pyast::Operator::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
+            pyast::Operator::Mult => BinOpKind::Arithmetic(ArithmeticKind::Mul),
+            pyast::Operator::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
             _ => {
                 return Err(LoweringError::Unsupported(format!(
                     "Binary operator not yet supported: {op:?}"
@@ -142,6 +147,16 @@ fn lower_binop(
                 )))
             }
         },
+        Extent::Base(BaseType::Bool) => match op {
+            pyast::Operator::BitAnd => BinOpKind::BoolLogic(crate::interpreter::LogicKind::And),
+            pyast::Operator::BitOr => BinOpKind::BoolLogic(crate::interpreter::LogicKind::Or),
+            pyast::Operator::BitXor => BinOpKind::BoolLogic(crate::interpreter::LogicKind::Xor),
+            _ => {
+                return Err(LoweringError::Unsupported(format!(
+                    "Binary operator not yet supported: {op:?}"
+                )))
+            }
+        },
         _ => {
             return Err(LoweringError::Unsupported(format!(
                 "Binary operator not yet supported for extent: {:?}",
@@ -150,6 +165,41 @@ fn lower_binop(
         }
     };
     Ok(Box::new(BinOp::new(left_op, kind, right_op)))
+}
+
+fn lower_compare(
+    ctx: &mut LoweringContext,
+    left: &pyast::Expr,
+    ops: &[pyast::Cmpop],
+    right: &[pyast::Expr],
+) -> Result<Box<dyn Operator>, LoweringError> {
+    let left_op = lower_expr(ctx, left)?;
+    if ops.len() != 1 || right.len() != 1 {
+        Err(LoweringError::Unsupported(format!(
+            "Compare operator not yet supported {:?}, {:?}",
+            ops, right
+        )))
+    } else {
+        let right_op = lower_expr(ctx, &right[0])?;
+        Ok(Box::new(BinOp::new(
+            left_op,
+            match ops[0] {
+                pyast::Cmpop::Eq => BinOpKind::Compare(CompareKind::Equals),
+                pyast::Cmpop::NotEq => BinOpKind::Compare(CompareKind::NotEquals),
+                pyast::Cmpop::Lt => BinOpKind::Compare(CompareKind::Less),
+                pyast::Cmpop::LtE => BinOpKind::Compare(CompareKind::LessOrEq),
+                pyast::Cmpop::Gt => BinOpKind::Compare(CompareKind::Greater),
+                pyast::Cmpop::GtE => BinOpKind::Compare(CompareKind::GreaterOrEq),
+                _ => {
+                    return Err(LoweringError::Unsupported(format!(
+                        "Comparison operator not yet supported: {:?}",
+                        ops[0]
+                    )))
+                }
+            },
+            right_op,
+        )))
+    }
 }
 
 /// Lower a list literal to a Literal operator with Function value.
@@ -476,6 +526,17 @@ mod tests {
     #[case("4 * 5", Value::Int(20))]
     #[case("4 - 5", Value::Int(-1))]
     #[case("1 + 2 - 3 * 4", Value::Int(-9))]
+    #[case("1 == 1", Value::Bool(true))]
+    #[case("'a' == 'b'", Value::Bool(false))]
+    #[case("1 != 1", Value::Bool(false))]
+    #[case("'a' != 'b'", Value::Bool(true))]
+    #[case("2 > 1", Value::Bool(true))]
+    #[case("'a' < 'b'", Value::Bool(true))]
+    #[case("True != False", Value::Bool(true))]
+    #[case("True == True", Value::Bool(true))]
+    #[case("True & True", Value::Bool(true))]
+    #[case("True | False", Value::Bool(true))]
+    #[case("True ^ True", Value::Bool(false))]
     // Op precedence and parens are handled by the parser
     #[case("1 + 2 * 3 - 4", Value::Int(3))]
     #[case("1 + 2 * (3 - 4)", Value::Int(-1))]
