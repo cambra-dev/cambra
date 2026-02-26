@@ -36,7 +36,7 @@ Comment all objects (modules, structures and their fields, functions, etc) thoro
 ### Workflow
 After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds, then progress to CI.
 
-Before creating a PR, update the appropriate docs to reflect the changes. This includes `docs/design.md`, `docs/plan.md`, and other `*/design-*.md` files close to source files that were changed.
+When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md`, `docs/plan.md`, and other `*/design-*.md` files close to source files that were changed.
 
 ### Compact instructions
 When you are using compact, focus on test output and code changes.
