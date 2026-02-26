@@ -151,6 +151,7 @@ enum Expr {
         value: Box<Expr>,
         body: Box<Expr>,
     },
+    List(Vec<Expr>),                     // list literal [e0, e1, ...]; elements may be arbitrary exprs
     Case {
         scrutinee: Box<Expr>,
         branches: Vec<(Pattern, Expr)>,
@@ -195,6 +196,6 @@ enum Type {
 
 ## Planned implementation order
 
-1. Define the node types above in a new `src/ccl/` module.
-2. Add tests lowering basic Python constructs to CCL (covering all constructs currently handled in `src/lowering.rs`).
+1. Define the node types above in a new `src/ccl/` module. ✓
+2. Add pretty printer (`src/ccl/pretty.rs`) and Python → CCL lowering (`src/ccl/lower.rs`) with snapshot tests. ✓
 3. Iteratively replace the current Python → operator direct lowering with Python → CCL → operator.

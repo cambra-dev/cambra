@@ -6,6 +6,9 @@
 //!
 //! See `docs/design-ccl-ast.md` for the full design rationale.
 
+pub mod lower;
+pub mod pretty;
+
 use crate::interpreter::BaseType;
 
 /// A literal constant value.
@@ -177,6 +180,15 @@ pub enum Expr {
         /// The expression in which `name` is in scope.
         body: Box<Expr>,
     },
+
+    /// A list literal: `[e0, e1, ...]`.
+    ///
+    /// Represents Python list syntax directly in the CCL tree. Elements may be
+    /// arbitrary expressions (not restricted to [`Lit`]).
+    ///
+    /// Distinct from [`Expr::Tuple`] (unnamed product type) and from the
+    /// function-encoding of lists used at the operator-graph level.
+    List(Vec<Expr>),
 
     /// Multi-way pattern matching.
     ///
