@@ -151,7 +151,7 @@ enum Expr {
         value: Box<Expr>,
         body: Box<Expr>,
     },
-    List(Vec<Expr>),                     // list literal [e0, e1, ...]; elements may be arbitrary exprs
+    List(Vec<Expr>),                     // list literal [e0, e1, ...]; elements may be arbitrary exprs of the same type
     Case {
         scrutinee: Box<Expr>,
         branches: Vec<(Pattern, Expr)>,

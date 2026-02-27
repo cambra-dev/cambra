@@ -8,9 +8,9 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use rustpython_parser::ast::{self as pyast};
 
 use crate::interpreter::{
-    Apply, ArithmeticKind, BaseType, BinOp, BinOpKind, CompareKind, Extent, Guard, Lambda,
-    ListLiteral, Literal, Operator, Scheduler, StdinReader, TestDataSource, TestSourceReader,
-    Value, Var, VarRef, VarScope, VarSource,
+    Apply, ArithmeticKind, BaseType, BinOp, BinOpKind, CompareKind, ConstructRecord, Extent, Guard,
+    Lambda, ListLiteral, Literal, Operator, RecordAttribute, Scheduler, StdinReader,
+    TestDataSource, TestSourceReader, Value, Var, VarRef, VarScope, VarSource,
 };
 
 /// Errors that can occur during lowering.
@@ -58,6 +58,8 @@ pub fn lower_expr(
         pyast::ExprKind::Subscript { value, slice, .. } => lower_subscript(ctx, value, slice),
         pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(ctx, elt, generators),
         pyast::ExprKind::Call { func, args, .. } => lower_call(ctx, func, args),
+        pyast::ExprKind::Tuple { elts, .. } => lower_tuple(ctx, elts),
+        pyast::ExprKind::Attribute { value, attr, .. } => lower_attribute(ctx, value, attr),
         _ => Err(LoweringError::Unsupported(format!(
             "Expression type not yet supported: {:?}",
             expr.node
@@ -207,9 +209,13 @@ fn lower_compare(
 /// Lists are represented as functions from indices (natural numbers) to values:
 /// `[1, 2, 3]` becomes `Function([{0, 1}, {1, 2}, {2, 3}])`
 fn lower_list(
-    _ctx: &mut LoweringContext,
+    ctx: &mut LoweringContext,
     elts: &[pyast::Located<pyast::ExprKind>],
 ) -> Result<Box<dyn Operator>, LoweringError> {
+    if !elts.is_empty() && matches!(elts[0].node, pyast::ExprKind::Tuple { .. }) {
+        return lower_tuple_list(ctx, elts);
+    }
+
     // For now, only support lists of constants
     let mut bindings = Vec::with_capacity(elts.len());
 
@@ -227,6 +233,67 @@ fn lower_list(
     }
 
     Ok(Box::new(ListLiteral::new(bindings)))
+}
+
+/// Lowers a list of literal tuples.
+/// Tuples all must only contain constants and have identical schemas.
+fn lower_tuple_list(
+    _ctx: &mut LoweringContext,
+    elts: &[pyast::Located<pyast::ExprKind>],
+) -> Result<Box<dyn Operator>, LoweringError> {
+    // For now, only support lists of same-schema tuples of constants
+    let mut bindings = Vec::with_capacity(elts.len());
+
+    // TODO validate schema constraints
+
+    for elt in elts.iter() {
+        let value = match &elt.node {
+            pyast::ExprKind::Tuple { elts, .. } => {
+                let mut attributes = HashMap::new();
+                for (i, elt) in elts.iter().enumerate() {
+                    if let pyast::ExprKind::Constant { value, .. } = &elt.node {
+                        attributes.insert(format!("_{i}"), constant_to_value(value)?);
+                    } else {
+                        return Err(LoweringError::Unsupported(
+                            "List elements must be constants (for now)".into(),
+                        ));
+                    }
+                }
+                Value::Record(attributes)
+            }
+            _ => {
+                return Err(LoweringError::Unsupported(
+                    "List elements must be constants (for now)".into(),
+                ))
+            }
+        };
+
+        bindings.push(value);
+    }
+
+    Ok(Box::new(ListLiteral::new(bindings)))
+}
+
+fn lower_tuple(
+    ctx: &mut LoweringContext,
+    elts: &[pyast::Expr],
+) -> Result<Box<dyn Operator>, LoweringError> {
+    let mut attributes = HashMap::new();
+    for (i, elt) in elts.iter().enumerate() {
+        attributes.insert(format!("_{i}"), lower_expr(ctx, elt)?);
+    }
+    Ok(Box::new(ConstructRecord::new(attributes)))
+}
+
+fn lower_attribute(
+    ctx: &mut LoweringContext,
+    record: &pyast::Expr,
+    attribute: &str,
+) -> Result<Box<dyn Operator>, LoweringError> {
+    Ok(Box::new(RecordAttribute::new(
+        lower_expr(ctx, record)?,
+        attribute,
+    )))
 }
 
 /// Convert a Python constant to a CCL Value.
@@ -508,6 +575,14 @@ mod tests {
         }
     }
 
+    fn make_tuple(v: &[Value]) -> Value {
+        let mut map = HashMap::new();
+        for (i, elem) in v.iter().enumerate() {
+            map.insert(format!("_{i}"), elem.clone());
+        }
+        Value::Record(map)
+    }
+
     #[rstest]
     // Literals
     #[case("2", Value::Int(2))]
@@ -545,6 +620,10 @@ mod tests {
     #[case("x = 2; x", Value::Int(2))]
     #[case("x = 2; y = x; y", Value::Int(2))]
     #[case("x = 2; y = x; y + x + 1", Value::Int(5))]
+    // Tuples
+    #[case("('a', 1)", make_tuple(&[Value::String("a".to_string()), Value::Int(1)]))]
+    #[case("('a', 1)._0", Value::String("a".to_string()))]
+    #[case("x = ('a', 1); x._0", Value::String("a".to_string()))]
     fn test_lower_scalar(#[case] code: &str, #[case] expected: Value) {
         let ast = parse_module(code);
         let (op, scope) =
@@ -559,6 +638,12 @@ mod tests {
     #[case("[y for y in [x for x in [10, 20]]]", make_int_list(&[10, 20]))]
     #[case("[x + 2 for x in [10, 20]]", make_int_list(&[12, 22]))]
     #[case("y = 5; [x + y for x in [10, 20]]", make_int_list(&[15, 25]))]
+    #[case("[(y, y)._1 for y in [10, 20]]", make_int_list(&[10, 20]))]
+    #[case("[y._0 for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
+    #[case("[(y, 100) for y in [(10, 'a'), (20, 'b')]]", ColumnData::FunctionBindings {
+            inputs: Box::new(ColumnData::UInts(vec![0, 1])),
+            outputs: Box::new(ColumnData::Records(HashMap::from([(String::from("_0"), ColumnData::Records(HashMap::from([(String::from("_0"), ColumnData::Ints(vec![10, 20])), (String::from("_1"), ColumnData::Strings(vec![String::from("a"), String::from("b")]))]))), (String::from("_1"), ColumnData::Ints(vec![100, 100]))]))),
+        })]
     fn test_lower(#[case] code: &str, #[case] expected: ColumnData) {
         let ast = parse_module(code);
         let (op, scope) =
@@ -572,6 +657,7 @@ mod tests {
     #[case("[x + '' for x in testsource1()]")]
     #[case("['' + x for x in testsource1()]")]
     #[case("y = ''; [y + x for x in testsource1()]")]
+    #[case("[(x, 0)._0 for x in testsource1()]")]
     fn test_test_source(#[case] code: &str) {
         let mut ctx = LoweringContext::default();
         let data_source = ctx.inject_test_source("testsource1");

@@ -64,8 +64,9 @@ impl Guard {
         match self {
             Guard::Universal => true,
             Guard::Domain(domain) => domain.is_universal(),
-            Guard::Or(guards) => guards.iter().any(|g| g.is_universal()),
-            Guard::And(guards) => guards.iter().all(|g| g.is_universal()),
+            Guard::Or(guards) => guards.iter().any(Guard::is_universal),
+            Guard::And(guards) => guards.iter().all(Guard::is_universal),
+            Guard::Record(guards) => guards.values().all(Guard::is_universal),
             _ => false,
         }
     }
@@ -508,7 +509,6 @@ pub enum ColumnData {
         inputs: Box<ColumnData>,
         outputs: Box<ColumnData>,
     },
-    Tuples(Vec<ColumnData>),
     Records(HashMap<String, ColumnData>),
 }
 
@@ -529,7 +529,6 @@ impl ColumnData {
             ColumnData::UInts(v) => Value::UInt(v[i]),
             ColumnData::Strings(v) => Value::String(v[i].clone()),
             ColumnData::Variants(v) => v[i].clone(),
-            ColumnData::Tuples(_) => todo!("No tuple value yet"),
             ColumnData::FunctionBindings { inputs, outputs } => {
                 Value::Function(vec![FuncBinding {
                     input: inputs.index_at(i),
@@ -570,6 +569,24 @@ impl ColumnData {
             Value::UInt(..) => ColumnData::UInts(values.iter().map(Value::as_uint).collect()),
             Value::String(..) => {
                 ColumnData::Strings(values.iter().map(|v| v.as_string().to_string()).collect())
+            }
+            Value::Record(m) => {
+                // Pivot the list of Records into a Record of ColumnDatas
+                let keys: Vec<String> = m.keys().cloned().collect();
+                let fields = keys
+                    .into_iter()
+                    .map(|key| {
+                        let field_values = values
+                            .iter()
+                            .map(|v| match v {
+                                Value::Record(r) => r[&key].clone(),
+                                _ => panic!("Expected Record in from_values, got {v:?}"),
+                            })
+                            .collect();
+                        (key, ColumnData::from_values(field_values))
+                    })
+                    .collect();
+                ColumnData::Records(fields)
             }
             _ => ColumnData::Variants(values),
         }
@@ -613,9 +630,6 @@ impl ColumnData {
                 inputs.select_indices(indices),
                 outputs.select_indices(indices),
             ),
-            ColumnData::Tuples(t) => {
-                ColumnData::Tuples(t.iter().map(|c| c.select_indices(indices)).collect())
-            }
             ColumnData::Records(r) => ColumnData::Records(
                 r.iter()
                     .map(|(k, v)| (k.clone(), v.select_indices(indices)))
@@ -632,7 +646,6 @@ impl ColumnData {
             ColumnData::UInts(v) => v.len(),
             ColumnData::Strings(v) => v.len(),
             ColumnData::Variants(v) => v.len(),
-            ColumnData::Tuples(t) => t[0].len(),
             ColumnData::Records(m) => m.values().next().expect("Empty Record").len(),
             ColumnData::FunctionBindings { inputs, .. } => inputs.len(),
         }
@@ -658,7 +671,6 @@ impl ColumnData {
                 ColumnData::UInts(v) => Some(Value::UInt(v[0])),
                 ColumnData::Strings(v) => Some(Value::String(v[0].clone())),
                 ColumnData::Variants(v) => Some(v[0].clone()),
-                ColumnData::Tuples(_t) => todo!("No tuple value yet"),
                 ColumnData::FunctionBindings { inputs, outputs } => {
                     Some(Value::Function(vec![FuncBinding {
                         input: inputs.as_single().expect("Not single").clone(),
