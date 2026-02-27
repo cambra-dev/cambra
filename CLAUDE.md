@@ -50,10 +50,23 @@ When you are using compact, focus on test output and code changes.
 ### Stacked PRs with git-spice
 This repo uses [git-spice](https://abhinav.github.io/git-spice/) (`gs`) for stacked PRs. Workflow for creating a new PR in a stack:
 
-1. Create a new git branch with the commit message containing the desired title and body for the PR.
-2. Submit the PR: `gs branch submit --fill --no-draft` (uses commit message for title/body), or explicitly: `gs branch submit --title "..." --body "..." --no-draft`
-3. Post nav comments: `gs stack submit --update-only`
+**Option A — git-spice branch creation** (stage changes first, then):
+```bash
+gs branch create -m "commit message"   # creates branch + commit in one step
+gs branch submit --fill --no-draft     # submit to GitHub
+gs stack submit --update-only          # add nav comments to all PRs in stack
+```
 
-`gs stack submit` discovers existing PRs by branch name and adds a navigation comment linking all PRs in the stack. Use `--update-only` to skip prompts for branches without PRs yet.
+**Option B — plain git then track** (more control over commit flow):
+```bash
+git checkout -b <branch-name>
+git add <files> && git commit -m "..."
+gs branch track --base <parent-branch>   # register with git-spice
+gs branch submit --fill --no-draft
+gs stack submit --update-only
+```
 
-To view the current stack: `gs log long`
+Notes:
+- For a PR stacked on `main`, `--base main` is implicit; for stacked PRs use `--base <parent-branch>`.
+- `gs stack submit` discovers existing PRs by branch name and adds navigation comments. Use `--update-only` to skip prompts for branches without PRs yet.
+- To view the current stack: `gs log long`
