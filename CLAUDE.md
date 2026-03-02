@@ -67,6 +67,7 @@ gs stack submit --update-only
 ```
 
 Notes:
+- Prefer `gs branch create` over `git checkout -b` for branch creation — if `spice.branchCreate.prefix` is configured, git-spice will apply it automatically, avoiding manual prefix guessing.
 - For a PR stacked on `main`, `--base main` is implicit; for stacked PRs use `--base <parent-branch>`.
 - `gs stack submit` discovers existing PRs by branch name and adds navigation comments. Use `--update-only` to skip prompts for branches without PRs yet.
 - To view the current stack: `gs log long`
