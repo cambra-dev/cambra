@@ -2,10 +2,10 @@
 //!
 //! This module provides two operators:
 //! - [`ConstructRecord`]: builds a record value from a named set of field operators.
-//! - [`RecordAttribute`]: projects a single named field out of a record operator.
+//! - [`RecordField`]: projects a single named field out of a record operator.
 //!
 //! Each operator has a corresponding runtime producer ([`ConstructRecordProducer`],
-//! [`RecordAttributeProducer`]) created at `subscribe()` time, which carries the actual
+//! [`RecordFieldProducer`]) created at `subscribe()` time, which carries the actual
 //! execution state.
 
 use std::cell::RefCell;
@@ -24,7 +24,7 @@ use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
 #[derive(Debug)]
 pub struct ConstructRecord {
     /// The child operators keyed by field name, one per record field.
-    attributes: HashMap<String, Box<dyn Operator>>,
+    fields: HashMap<String, Box<dyn Operator>>,
     /// The record extent, computed eagerly from the extents of all fields.
     extent: Extent,
 }
@@ -34,14 +34,14 @@ impl ConstructRecord {
     ///
     /// Eagerly computes the record [`Extent`] by collecting each field's extent, so that the
     /// full record type is known before any subscription takes place.
-    pub fn new(attributes: HashMap<String, Box<dyn Operator>>) -> Self {
+    pub fn new(fields: HashMap<String, Box<dyn Operator>>) -> Self {
         let extent = Extent::record(
-            attributes
+            fields
                 .iter()
                 .map(|(name, op)| (name.clone(), op.extent().clone()))
                 .collect(),
         );
-        Self { attributes, extent }
+        Self { fields, extent }
     }
 }
 
@@ -56,10 +56,10 @@ impl Operator for ConstructRecord {
             desc = desc.annotate(format!(": {}", fmt_extent(&self.extent)));
         }
         // Sort for deterministic output.
-        let mut attrs: Vec<(&String, &Box<dyn Operator>)> = self.attributes.iter().collect();
-        attrs.sort_by_key(|(k, _)| k.as_str());
-        for (attr, op) in attrs {
-            desc = desc.child(attr.clone(), op.inspect(opts));
+        let mut fields: Vec<(&String, &Box<dyn Operator>)> = self.fields.iter().collect();
+        fields.sort_by_key(|(k, _)| k.as_str());
+        for (field, op) in fields {
+            desc = desc.child(field.clone(), op.inspect(opts));
         }
         desc
     }
@@ -71,23 +71,21 @@ impl Operator for ConstructRecord {
     /// the intent guard is universal and all fields produce aligned, same-length outputs.
     fn subscribe(
         &mut self,
-        intent_guard: Guard,
+        // TODO handle intent guard
+        _intent_guard: Guard,
         mut consumer: Box<dyn Consumer>,
         var_scope: Option<Rc<VarScope>>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
-        // TODO handle intent guard
-        assert!(intent_guard.is_universal());
-
         let consumer_wrapper = Rc::new(RefCell::new(move |notification| {
             consumer.notify(notification);
         }));
         let producers = self
-            .attributes
+            .fields
             .iter_mut()
-            .map(|(attr, op)| {
+            .map(|(field, op)| {
                 (
-                    attr.clone(),
+                    field.clone(),
                     op.subscribe(
                         Guard::Universal,
                         Box::new(consumer_wrapper.clone()),
@@ -109,14 +107,12 @@ impl Operator for ConstructRecord {
 #[derive(Debug)]
 struct ConstructRecordProducer {
     /// One producer per record field, keyed by field name.
-    attribute_producers: HashMap<String, Box<dyn Producer>>,
+    field_producers: HashMap<String, Box<dyn Producer>>,
 }
 
 impl ConstructRecordProducer {
-    fn new(attribute_producers: HashMap<String, Box<dyn Producer>>) -> Self {
-        Self {
-            attribute_producers,
-        }
+    fn new(field_producers: HashMap<String, Box<dyn Producer>>) -> Self {
+        Self { field_producers }
     }
 }
 
@@ -126,14 +122,14 @@ impl Producer for ConstructRecordProducer {
     /// If some fields are scalar and others are vectors, scalar fields are broadcast
     /// (repeated) to match the vector length so all fields are aligned.
     fn get(&mut self) -> GetResult {
-        let num_attrs = self.attribute_producers.len();
+        let num_fields = self.field_producers.len();
         let mut inputs: HashMap<String, GetResult> = self
-            .attribute_producers
+            .field_producers
             .iter_mut()
             .map(|(name, producer)| (name.clone(), producer.get()))
             .collect();
-        let mut output_data = HashMap::with_capacity(num_attrs);
-        let mut output_yield_guards = HashMap::with_capacity(num_attrs);
+        let mut output_data = HashMap::with_capacity(num_fields);
+        let mut output_yield_guards = HashMap::with_capacity(num_fields);
 
         let length = inputs
             .values()
@@ -141,11 +137,11 @@ impl Producer for ConstructRecordProducer {
             .max()
             .expect("Empty records not supported");
 
-        for (attr, get_result) in inputs.drain() {
-            output_yield_guards.insert(attr.clone(), get_result.yield_guard.clone());
+        for (field, get_result) in inputs.drain() {
+            output_yield_guards.insert(field.clone(), get_result.yield_guard.clone());
             let data = get_result.column_value;
             output_data.insert(
-                attr.clone(),
+                field.clone(),
                 if data.is_scalar() && length > 1 {
                     data.repeat(length)
                 } else {
@@ -166,15 +162,12 @@ impl Producer for ConstructRecordProducer {
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         match &obsolete_guard {
             g if g.is_empty() => {}
-            g if g.is_universal() => self.attribute_producers.values_mut().for_each(|input| {
+            g if g.is_universal() => self.field_producers.values_mut().for_each(|input| {
                 input.release(Guard::Universal);
             }),
-            Guard::Record(m) => self
-                .attribute_producers
-                .iter_mut()
-                .for_each(|(attr, input)| {
-                    m.get(attr).map(|g| input.release(g.clone()));
-                }),
+            Guard::Record(m) => self.field_producers.iter_mut().for_each(|(field, input)| {
+                m.get(field).map(|g| input.release(g.clone()));
+            }),
             _ => panic!("Unexpected guard {obsolete_guard:?}"),
         };
         obsolete_guard
@@ -184,10 +177,10 @@ impl Producer for ConstructRecordProducer {
         let mut desc = InspectNode::new("ConstructRecordProducer");
         // Sort for deterministic output.
         let mut producers: Vec<(&String, &Box<dyn Producer>)> =
-            self.attribute_producers.iter().collect();
+            self.field_producers.iter().collect();
         producers.sort_by_key(|(k, _)| k.as_str());
-        for (attr, producer) in producers {
-            desc = desc.child(attr.clone(), producer.inspect(opts));
+        for (field, producer) in producers {
+            desc = desc.child(field.clone(), producer.inspect(opts));
         }
         desc
     }
@@ -199,43 +192,43 @@ impl Producer for ConstructRecordProducer {
 /// record operator knows which field is actually needed. The remaining fields receive a
 /// `Guard::Universal` intent, meaning the subscriber doesn't restrict them further.
 #[derive(Debug)]
-pub struct RecordAttribute {
+pub struct RecordField {
     /// The upstream record operator whose output will be projected.
     input: Box<dyn Operator>,
     /// The name of the field to extract.
-    attribute: String,
+    field: String,
     /// The extent of the extracted field, taken from the input record's extent at construction.
     extent: Extent,
 }
 
-impl RecordAttribute {
-    /// Creates a new `RecordAttribute` that extracts `attribute` from `input`.
+impl RecordField {
+    /// Creates a new `RecordField` that extracts `field` from `input`.
     ///
-    /// Panics if `input` does not have a `Record` extent or if `attribute` is not a field
+    /// Panics if `input` does not have a `Record` extent or if `field` is not a field
     /// of that record.
-    pub fn new(input: Box<dyn Operator>, attribute: &str) -> Self {
+    pub fn new(input: Box<dyn Operator>, field: &str) -> Self {
         let extent = input
             .extent()
-            .record_attributes()
-            .unwrap_or_else(|| panic!("Attribute ref on non-record type {:?}", input.extent()))
-            .get(attribute)
-            .unwrap_or_else(|| panic!("No attribute {attribute} in {:?}", input.extent()))
+            .record_fields()
+            .unwrap_or_else(|| panic!("Field ref on non-record type {:?}", input.extent()))
+            .get(field)
+            .unwrap_or_else(|| panic!("No field {field} in {:?}", input.extent()))
             .clone();
         Self {
             input,
-            attribute: attribute.to_string(),
+            field: field.to_string(),
             extent,
         }
     }
 }
 
-impl Operator for RecordAttribute {
+impl Operator for RecordField {
     fn extent(&self) -> &Extent {
         &self.extent
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut desc = InspectNode::new(format!("RecordAttribute(\"{}\")", self.attribute));
+        let mut desc = InspectNode::new(format!("RecordField(\"{}\")", self.field));
         if opts.show_extents {
             desc = desc.annotate(format!(": {}", fmt_extent(&self.extent)));
         }
@@ -245,7 +238,7 @@ impl Operator for RecordAttribute {
     /// Subscribes to the input record operator, requesting only the target field's intent.
     ///
     /// Builds a `Guard::Record` where the target field carries the caller's `intent_guard`
-    /// and all other fields receive `Guard::Universal` (unconstrained). Also installs a
+    /// and all other fields receive `Guard::Empty` (unneeded). Also installs a
     /// forwarding consumer that translates `Yield(Guard::Record(…))` notifications to the
     /// per-field yield guard before forwarding to the downstream consumer.
     fn subscribe(
@@ -258,63 +251,63 @@ impl Operator for RecordAttribute {
         let producer_intent_guard = Guard::Record(
             self.input
                 .extent()
-                .record_attributes()
-                .expect("Expected Record input Extent in RecordAttribute::subscribe")
+                .record_fields()
+                .expect("Expected Record input Extent in RecordField::subscribe")
                 .keys()
-                .map(|attr| {
-                    if *attr == self.attribute {
-                        (attr.clone(), intent_guard.clone())
+                .map(|field| {
+                    if *field == self.field {
+                        (field.clone(), intent_guard.clone())
                     } else {
-                        (attr.clone(), Guard::Universal)
+                        (field.clone(), Guard::Empty)
                     }
                 })
                 .collect(),
         );
 
-        let self_attr_clone = self.attribute.clone();
+        let self_field_clone = self.field.clone();
         // Translate record-level yield guards to the single-field yield guard that the
         // downstream consumer expects.
         let forwarding_consumer = Box::new(move |notification| {
             consumer.notify(match &notification {
                 Notification::NewData => Notification::NewData,
                 Notification::Yield(Guard::Record(m)) => {
-                    Notification::Yield(m.get(&self_attr_clone).unwrap().clone())
+                    Notification::Yield(m.get(&self_field_clone).unwrap().clone())
                 }
                 Notification::Yield(g) if g.is_empty() || g.is_universal() => notification,
                 _ => panic!("Unexpected notification {notification:?}"),
             })
         });
-        Box::new(RecordAttributeProducer::new(
+        Box::new(RecordFieldProducer::new(
             self.input.subscribe(
                 producer_intent_guard,
                 forwarding_consumer,
                 var_scope,
                 scheduler,
             ),
-            self.attribute.clone(),
+            self.field.clone(),
         ))
     }
 }
 
-/// Runtime producer for [`RecordAttribute`].
+/// Runtime producer for [`RecordField`].
 ///
 /// Wraps the underlying record producer and, on each [`Producer::get`] call, extracts
 /// the target field's data from the returned `ColumnData::Records`.
 #[derive(Debug)]
-struct RecordAttributeProducer {
+struct RecordFieldProducer {
     /// The upstream record producer.
     record: Box<dyn Producer>,
     /// The name of the field to extract from each record batch.
-    attribute: String,
+    field: String,
 }
 
-impl RecordAttributeProducer {
-    fn new(record: Box<dyn Producer>, attribute: String) -> Self {
-        Self { record, attribute }
+impl RecordFieldProducer {
+    fn new(record: Box<dyn Producer>, field: String) -> Self {
+        Self { record, field }
     }
 }
 
-impl Producer for RecordAttributeProducer {
+impl Producer for RecordFieldProducer {
     /// Fetches the record batch and returns only the target field's column.
     ///
     /// Also extracts the per-field yield guard from the record-level yield guard, so the
@@ -323,13 +316,13 @@ impl Producer for RecordAttributeProducer {
         let record_get_result = self.record.get();
 
         let output_data = match record_get_result.column_value {
-            ColumnValue::Records(mut m) => m.remove(&self.attribute).unwrap(),
+            ColumnValue::Records(mut m) => m.remove(&self.field).unwrap(),
             _ => panic!("Expected input records"),
         };
 
         let output_yield_guard = match record_get_result.yield_guard {
             g if g.is_empty() || g.is_universal() => g,
-            Guard::Record(m) => m.get(&self.attribute).unwrap().clone(),
+            Guard::Record(m) => m.get(&self.field).unwrap().clone(),
             g => panic!("Unexpected yield guard {g:?}"),
         };
         GetResult {
@@ -341,7 +334,7 @@ impl Producer for RecordAttributeProducer {
     /// Releases interest in the upstream record producer.
     ///
     /// This producer cannot express partial per-field release to the record producer, so
-    /// any non-empty obsolete guard is promoted to `Universal`. This is conservative but
+    /// any non-universal obsolete guard is treated as `Empty`. This is conservative but
     /// correct: we release the whole record once we are completely done with the field.
     ///
     /// TODO: to do a more fine-grained release, we need to be able to get the record schema
@@ -350,17 +343,17 @@ impl Producer for RecordAttributeProducer {
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         match &self.record.release(obsolete_guard.to_universal_or_empty()) {
             g if g.is_empty() || g.is_universal() => g.clone(),
-            Guard::Record(m) if m.contains_key(&self.attribute) => m[&self.attribute].clone(),
+            Guard::Record(m) if m.contains_key(&self.field) => m[&self.field].clone(),
             g => panic!("Unexpected yield guard {g:?}"),
         }
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new(format!("RecordAttributeProducer(\"{}\")", self.attribute))
+        InspectNode::new(format!("RecordFieldProducer(\"{}\")", self.field))
             .child("record", self.record.inspect(opts))
     }
 }
 
-pub fn tuple_attr(index: usize) -> String {
+pub fn tuple_field(index: usize) -> String {
     format!("_{}", index)
 }

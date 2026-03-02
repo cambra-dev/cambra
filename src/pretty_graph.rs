@@ -93,8 +93,8 @@ pub fn fmt_extent(extent: &Extent) -> String {
                 format!("{d} → {c}")
             }
         }
-        Extent::Record(attributes) => {
-            let mut parts: Vec<String> = attributes
+        Extent::Record(fields) => {
+            let mut parts: Vec<String> = fields
                 .iter()
                 .map(|(name, ext)| format!("{}: {}", name, fmt_extent(ext)))
                 .collect();

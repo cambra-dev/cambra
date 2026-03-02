@@ -10,9 +10,9 @@ use rustpython_parser::ast::{self as pyast};
 
 use crate::{
     interpreter::{
-        tuple_attr, Apply, ArithmeticKind, BaseType, BinOp, BinOpKind, CompareKind,
+        tuple_field, Apply, ArithmeticKind, BaseType, BinOp, BinOpKind, CompareKind,
         ComputeRestriction, ConstructRecord, Extent, Guard, Lambda, ListLiteral, Literal, Operator,
-        RecordAttribute, Scheduler, StdinDataSource, StdinReader, TestDataSource, TestSourceReader,
+        RecordField, Scheduler, StdinDataSource, StdinReader, TestDataSource, TestSourceReader,
         Value, Var, VarRef, VarScope, VarSource,
     },
     pretty_graph::pretty_operator,
@@ -304,17 +304,17 @@ fn lower_tuple_list(
     for elt in elts.iter() {
         let value = match &elt.node {
             pyast::ExprKind::Tuple { elts, .. } => {
-                let mut attributes = HashMap::new();
+                let mut fields = HashMap::new();
                 for (i, elt) in elts.iter().enumerate() {
                     if let pyast::ExprKind::Constant { value, .. } = &elt.node {
-                        attributes.insert(tuple_attr(i), constant_to_value(value)?);
+                        fields.insert(tuple_field(i), constant_to_value(value)?);
                     } else {
                         return Err(LoweringError::Unsupported(
                             "List elements must be constants (for now)".into(),
                         ));
                     }
                 }
-                Value::Record(attributes)
+                Value::Record(fields)
             }
             _ => {
                 return Err(LoweringError::Unsupported(
@@ -333,11 +333,11 @@ fn lower_tuple(
     ctx: &mut LoweringContext,
     elts: &[pyast::Expr],
 ) -> Result<Box<dyn Operator>, LoweringError> {
-    let mut attributes = HashMap::new();
+    let mut fields = HashMap::new();
     for (i, elt) in elts.iter().enumerate() {
-        attributes.insert(tuple_attr(i), lower_expr(ctx, elt)?);
+        fields.insert(tuple_field(i), lower_expr(ctx, elt)?);
     }
-    Ok(Box::new(ConstructRecord::new(attributes)))
+    Ok(Box::new(ConstructRecord::new(fields)))
 }
 
 fn lower_attribute(
@@ -345,7 +345,7 @@ fn lower_attribute(
     record: &pyast::Expr,
     attribute: &str,
 ) -> Result<Box<dyn Operator>, LoweringError> {
-    Ok(Box::new(RecordAttribute::new(
+    Ok(Box::new(RecordField::new(
         lower_expr(ctx, record)?,
         attribute,
     )))
@@ -483,7 +483,7 @@ fn lower_list_comp(
     // ---- Phase 4: Build the outer iteration variable ------------------------------
     // Single generator: iterate directly over that source's index extent.
     // Multiple generators: pack all index extents into a Record so the body can
-    // address each one via RecordAttribute and the runtime produces the cartesian
+    // address each one via RecordField and the runtime produces the cartesian
     // product.
     // With a predicate: wrap in Restricted so the runtime filters via a correlation
     // vector computed from the predicate (see Phase 6).
@@ -495,7 +495,7 @@ fn lower_list_comp(
             gen_idx_extents
                 .iter()
                 .enumerate()
-                .map(|(i, ext)| (tuple_attr(i), ext.clone()))
+                .map(|(i, ext)| (tuple_field(i), ext.clone()))
                 .collect(),
         )
     };
@@ -511,13 +511,13 @@ fn lower_list_comp(
 
     // Helper: build the index argument for generator `i`.
     // Single-gen: a bare VarRef to the outer variable.
-    // Multi-gen: a RecordAttribute projection of the i-th field from the outer record.
+    // Multi-gen: a RecordField projection of the i-th field from the outer record.
     let make_idx_arg = |var: &Var, i: usize| -> Box<dyn Operator> {
         let vref = Box::new(VarRef::new(var.name(), var.extent().clone()));
         if single_gen {
             vref
         } else {
-            Box::new(RecordAttribute::new(vref, &tuple_attr(i)))
+            Box::new(RecordField::new(vref, &tuple_field(i)))
         }
     };
 
@@ -748,7 +748,7 @@ mod tests {
     fn make_tuple(v: &[Value]) -> Value {
         let mut map = HashMap::new();
         for (i, elem) in v.iter().enumerate() {
-            map.insert(tuple_attr(i), elem.clone());
+            map.insert(tuple_field(i), elem.clone());
         }
         Value::Record(map)
     }

@@ -300,9 +300,9 @@ impl VarProducer {
                     .iter_mut()
                     .for_each(|c| c.notify(notification.clone()));
             }
-            Extent::Record(attributes) => {
-                for attr_extent in attributes.values() {
-                    self.check_for_notifications_by_extent(attr_extent);
+            Extent::Record(fields) => {
+                for field_extent in fields.values() {
+                    self.check_for_notifications_by_extent(field_extent);
                 }
             }
             Extent::Restricted { base, .. } => {
@@ -428,7 +428,7 @@ fn iterate_extent(extent: &Extent, outer_filter: &Option<BitSet>) -> GetResult {
         Extent::DataSourceDomain(source_impl) => {
             iterate_data_source_domain(source_impl, outer_filter)
         }
-        Extent::Record(attributes) => iterate_record(attributes, outer_filter),
+        Extent::Record(fields) => iterate_record(fields, outer_filter),
         Extent::Restricted { base, restriction } => {
             iterate_restricted_extent(base.as_ref(), restriction, outer_filter)
         }
@@ -480,23 +480,20 @@ fn iterate_data_source_domain(
     }
 }
 
-fn iterate_record(
-    attributes: &HashMap<String, Extent>,
-    outer_filter: &Option<BitSet>,
-) -> GetResult {
-    let mut output_data: HashMap<String, GetResult> = attributes
+fn iterate_record(fields: &HashMap<String, Extent>, outer_filter: &Option<BitSet>) -> GetResult {
+    let mut output_data: HashMap<String, GetResult> = fields
         .iter()
-        .map(|(attr, attr_extent)| (attr.clone(), iterate_extent(attr_extent, &None)))
+        .map(|(field, field_extent)| (field.clone(), iterate_extent(field_extent, &None)))
         .collect();
     let yield_guard = Guard::Record(
         output_data
             .iter()
-            .map(|(attr, get_result)| (attr.clone(), get_result.yield_guard.clone()))
+            .map(|(field, get_result)| (field.clone(), get_result.yield_guard.clone()))
             .collect(),
     );
     let data = output_data
         .drain()
-        .map(|(attr, get_result)| (attr.clone(), get_result.column_value))
+        .map(|(field, get_result)| (field.clone(), get_result.column_value))
         .collect();
     GetResult {
         column_value: ColumnValue::cartesian_product_with_correlation(data, outer_filter),
@@ -519,12 +516,12 @@ fn iterate_restricted_extent(
 fn release_for_extent(extent: &mut Extent, obsolete_guard: Guard) -> Guard {
     match extent {
         Extent::DataSourceDomain(source_impl) => source_impl.borrow_mut().release(obsolete_guard),
-        Extent::Record(attributes) => {
-            for (attr, attr_extent) in attributes.iter_mut() {
+        Extent::Record(fields) => {
+            for (field, field_extent) in fields.iter_mut() {
                 release_for_extent(
-                    attr_extent,
+                    field_extent,
                     obsolete_guard
-                        .get_record_attribute(attr)
+                        .get_record_field(field)
                         .unwrap_or_else(|| panic!("Not Record Guard: {obsolete_guard:?}")),
                 );
             }

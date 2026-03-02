@@ -177,9 +177,9 @@ impl Guard {
         }
     }
 
-    pub fn get_record_attribute(&self, attr: &str) -> Option<Guard> {
+    pub fn get_record_field(&self, field: &str) -> Option<Guard> {
         match self {
-            Guard::Record(fields) => fields.get(attr).cloned(),
+            Guard::Record(fields) => fields.get(field).cloned(),
             g if g.is_universal() => Some(Guard::Universal),
             g if g.is_empty() => Some(Guard::Empty),
             _ => None,
@@ -304,9 +304,9 @@ impl Extent {
                 notify: true,
                 subscribe: false,
             },
-            // Record extents are immediately ready if all attributes are ready,
+            // Record extents are immediately ready if all fields are ready,
             // otherwise we register with the scheduler.
-            Extent::Record(attributes) => attributes
+            Extent::Record(fields) => fields
                 .values()
                 .map(|extent| extent.subscribe_to_iteration_action())
                 .fold(
@@ -452,8 +452,8 @@ impl std::fmt::Debug for Extent {
         match self {
             Extent::Base(base) => write!(f, "{base:?}"),
             Extent::Function { domain, codomain } => write!(f, "({domain:?} -> {codomain:?})"),
-            Extent::Record(attributes) => {
-                let field_strs: Vec<String> = attributes
+            Extent::Record(fields) => {
+                let field_strs: Vec<String> = fields
                     .iter()
                     .map(|(name, extent)| format!("{name}: {extent:?}"))
                     .collect();
@@ -479,14 +479,14 @@ impl Extent {
         }
     }
 
-    /// Create a record extent from attribute extents
-    pub fn record(attributes: HashMap<String, Extent>) -> Self {
-        Extent::Record(attributes)
+    /// Create a record extent from field extents
+    pub fn record(fields: HashMap<String, Extent>) -> Self {
+        Extent::Record(fields)
     }
 
     /// Create a restricted record extent: a [`Restricted`] wrapping a [`Record`].
-    pub fn restricted_record(attributes: HashMap<String, Extent>) -> Self {
-        Extent::restricted(Extent::Record(attributes))
+    pub fn restricted_record(fields: HashMap<String, Extent>) -> Self {
+        Extent::restricted(Extent::Record(fields))
     }
 
     /// Wrap any extent in a [`Restricted`] with a fresh [`Restriction`].
@@ -505,11 +505,11 @@ impl Extent {
         }
     }
 
-    /// Return the attribute map if this extent is a [`Record`], or a [`Restricted`] wrapping one.
-    pub fn record_attributes(&self) -> Option<&HashMap<String, Extent>> {
+    /// Return the field map if this extent is a [`Record`], or a [`Restricted`] wrapping one.
+    pub fn record_fields(&self) -> Option<&HashMap<String, Extent>> {
         match self {
-            Extent::Record(attributes) => Some(attributes),
-            Extent::Restricted { base, .. } => base.record_attributes(),
+            Extent::Record(fields) => Some(fields),
+            Extent::Restricted { base, .. } => base.record_fields(),
             _ => None,
         }
     }
@@ -634,15 +634,15 @@ impl PartialOrd for Value {
                 }
             }
             // Order records lexicographically if they have the same schema.
-            Value::Record(attrs) => {
-                if let Value::Record(o_attrs) = other {
-                    if attrs.keys().collect::<std::collections::HashSet<_>>()
-                        != o_attrs.keys().collect::<std::collections::HashSet<_>>()
+            Value::Record(fields) => {
+                if let Value::Record(o_fields) = other {
+                    if fields.keys().collect::<std::collections::HashSet<_>>()
+                        != o_fields.keys().collect::<std::collections::HashSet<_>>()
                     {
                         return None; // Records with different keys are not comparable
                     }
-                    let mut entries: Vec<_> = attrs.iter().collect();
-                    let mut o_entries: Vec<_> = o_attrs.iter().collect();
+                    let mut entries: Vec<_> = fields.iter().collect();
+                    let mut o_entries: Vec<_> = o_fields.iter().collect();
                     entries.sort_by_key(|(k, _)| *k);
                     o_entries.sort_by_key(|(k, _)| *k);
                     entries.partial_cmp(&o_entries)
@@ -839,10 +839,10 @@ impl ColumnValue {
                             ColumnValue::from_values(
                                 field_values,
                                 extent
-                                    .record_attributes()
-                                    .and_then(|attrs| attrs.get(&key))
+                                    .record_fields()
+                                    .and_then(|fields| fields.get(&key))
                                     .unwrap_or_else(|| {
-                                        panic!("Record extent missing attribute '{key}'")
+                                        panic!("Record extent missing field '{key}'")
                                     }),
                             ),
                         )
