@@ -3,12 +3,12 @@
 set -euxo pipefail
 
 ci_fmt() {
-  if (( fix )); then cargo fmt; fi
+  if ((fix)); then cargo fmt; fi
   cargo fmt --check
 }
 # --all-targets lints test code too and warms the cache for cargo test
 ci_clippy() { cargo clippy --all-targets -- -D warnings; }
-ci_test() { cargo test; }
+ci_test() { cargo test -q; }
 ci_shellcheck() { find . -name '*.sh' -not -path './.git/*' -exec shellcheck -a -o all {} +; }
 
 ci_all() {
@@ -32,8 +32,8 @@ fix=0
 cmd="all"
 for arg in "$@"; do
   case "${arg}" in
-    --fix) fix=1 ;;
-    *) cmd="${arg}" ;;
+  --fix) fix=1 ;;
+  *) cmd="${arg}" ;;
   esac
 done
 "ci_${cmd}"
