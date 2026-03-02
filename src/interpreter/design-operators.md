@@ -37,6 +37,9 @@ trait DataSourceDomainExtentImpl {
 The `Scheduler` holds references to all `VarProducer` objects backed by data sources and calls
 `check_for_notifications()` in the main loop to drive incremental execution.
 
+During compilation, the underlying `DataSourceDomainExtentImpl` objects will exist in a scoped registry
+so that multiple references to the same source can share their internal state.
+
 ---
 
 ## Variables
@@ -48,9 +51,9 @@ Variables are split into **operators** (stateless, syntax-level) and **runtime p
 
 A variable definition — not an `Operator` and cannot be subscribed directly. Holds:
 - The variable's name
-- The variable's extent (its type)
-- An optional predicate guard restricting the extent (may reference outer variables for correlated
-  scans)
+- The variable's extent (its type), which may be `Extent::Restricted` when an `if` predicate is present
+- The `owns_restriction` flag: set when this variable is responsible for setting up its `Restriction`'s
+  compute producer at subscription time (see `Extent::Restricted` below)
 
 `Var` does **not** hold a binding. Binding happens dynamically: the `Apply` operator binds
 an argument to the variable; operators that consume the lambda directly cause it to iterate.
@@ -106,21 +109,25 @@ A parent-chain lookup structure for variable scopes. Each scope holds exactly on
 
 ### Scans as Joins
 
-When multiple lambdas with iteration source are in nested scopes, execution is conceptually a join:
+When multiple lambdas with iteration source are in nested scopes, execution is conceptually a join.
+In the lowered representation, a list comprehension `[body for x in src1 for y in src2 if pred]`
+is lowered to a single outer lambda over a packed index extent:
 
-```
-sum(\c1. \c2. f(c1, c2))
-```
-
-is equivalent to `SELECT sum(f(c1, c2)) FROM T1, T2 [WHERE predicate]`.
-
-Join strategy is determined by the predicate on the inner variable:
-- **No predicate**: Cartesian product (cross join)
-- **Equality predicate** (`t2.fk = t1.pk`): Hash join — build on outer, probe with inner
-- **Other predicates**: Cartesian product plus filter (or specialized index)
+- **Single generator, no predicate**: the outer extent is the source's index extent directly.
+- **Multiple generators**: the outer extent is `Extent::Record` packing all index extents under
+  tuple-attribute keys (`_0`, `_1`, …); the runtime computes the cartesian product via
+  `ColumnData::cartesian_product_with_correlation`.
+- **`if` predicate present**: the outer extent is `Extent::Restricted` wrapping the base extent
+  (see below). A `ComputeRestriction` operator is attached to evaluate the predicate.  During
+  iteration, the computed restriction is used to limit the iteration to only the matching
+  values.
 
 The `parent_indices` field in `ColumnValue` is the output of the join: each inner row maps to the
 outer row it is paired with.
+
+Current join strategy is always a loop join (cartesian product with a restriction filter).
+In the future, we will not treat predicates as opaque and convert specific predicates to 
+more efficient joins (such as equality predicates to hash joins)
 
 ---
 
@@ -216,6 +223,38 @@ Open question: when some fields are ready but others are not, should `get()` ret
 record or wait for all fields? Current position: wait for all subscribed fields.
 
 `release()` splits the obsolete guard into per-field sub-guards and propagates them.
+
+---
+
+## Restricted Extents and ComputeRestriction
+
+### `Extent::Restricted`
+
+`Extent::Restricted { base, restriction }` wraps any extent with a `Restriction` handle. The
+`Restriction` holds a `ComputeRestriction` operator and, once subscribed, a producer that evaluates
+the predicate and materialises a `BitVec` boolean correlation vector. At iteration time the runtime
+calls `get_correlation_vector()` on the `Restriction`, converts the result to a `BitSet`, and passes
+it as an `outer_filter` to `iterate_extent`, which uses it to skip rows that did not pass the
+predicate.
+
+In the future, we will change the `BitVec` to a more compact representation.
+
+A `Var` whose extent is `Restricted` and whose `owns_restriction` flag is set is responsible for
+calling `set_up_producer` on the `Restriction` during subscription; this wires the
+`ComputeRestriction` operator into the live producer graph.
+
+### `ComputeRestriction` (Operator)
+
+Wraps a predicate operator (typically a lambda that returns `Bool` over the outer index extent).
+
+`subscribe()` subscribes to the wrapped predicate using an **isolated** `Scheduler` so the
+predicate's dataflow does not participate in the main notification loop. `ComputeRestriction` always runs
+in the context of iterating over a restricted extent, so the notifications will flow through the
+outer iterating variable, whose extent has all the same sources and will be notified through them.
+
+`get()` (via `ComputeRestrictionProducer`) delegates directly to the predicate producer and returns
+`ColumnData::FunctionBindings { outputs: ColumnData::Bools(_), … }`. The caller extracts the
+`Bools` `BitVec` as the correlation vector.
 
 ---
 

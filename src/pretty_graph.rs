@@ -93,8 +93,8 @@ pub fn fmt_extent(extent: &Extent) -> String {
                 format!("{d} → {c}")
             }
         }
-        Extent::Record(fields) => {
-            let mut parts: Vec<String> = fields
+        Extent::Record(attributes) => {
+            let mut parts: Vec<String> = attributes
                 .iter()
                 .map(|(name, ext)| format!("{}: {}", name, fmt_extent(ext)))
                 .collect();
@@ -107,6 +107,7 @@ pub fn fmt_extent(extent: &Extent) -> String {
             let parts: Vec<String> = variants.iter().map(fmt_extent).collect();
             parts.join(" | ")
         }
+        Extent::Restricted { base, .. } => format!("Restricted({})", fmt_extent(base)),
     }
 }
 
@@ -166,6 +167,7 @@ mod tests {
     use super::*;
     use crate::interpreter::test_helpers::TestConsumer;
     use crate::interpreter::*;
+    use std::cell::RefCell;
     use std::rc::Rc;
 
     #[test]
@@ -710,7 +712,7 @@ ApplyProducer
 
     #[test]
     fn stdin_reader_operator() {
-        let reader = StdinReader::new();
+        let reader = StdinReader::new(Rc::new(RefCell::new(StdinDataSource::new())));
         let output = pretty_operator(&reader);
         assert_eq!(output, "StdinReader : DataSource → String\n");
     }
@@ -719,7 +721,7 @@ ApplyProducer
     fn stdin_dataflow() {
         // Safe because inspect() doesn't read stdin — only get() and
         // check_for_new_data() do.
-        let reader = StdinReader::new();
+        let reader = StdinReader::new(Rc::new(RefCell::new(StdinDataSource::new())));
         let binding = Literal::new(Value::UInt(0));
         let mut apply = Apply::new(Box::new(reader), Box::new(binding));
         let (consumer, _) = TestConsumer::new();

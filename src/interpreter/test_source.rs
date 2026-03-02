@@ -10,6 +10,10 @@ use crate::interpreter::{
 /// as well as reading the obsolete guards pushed back to it.
 pub struct TestDataSource {
     name: String,
+    output_extent: Extent,
+    /// The extent of each domain key (element type).
+    /// Defaults to [`Extent::Base(BaseType::UInt)`]; call [`set_element_extent`] to override.
+    element_extent: Extent,
     yield_guard: Guard,
     has_data: bool,
     data: HashMap<Value, Value>,
@@ -17,14 +21,23 @@ pub struct TestDataSource {
 }
 
 impl TestDataSource {
-    fn new(name: &str) -> Self {
+    pub fn new(name: &str, output_extent: Extent) -> Self {
+        use crate::interpreter::BaseType;
         Self {
             name: name.to_string(),
+            output_extent,
+            element_extent: Extent::Base(BaseType::UInt),
             yield_guard: Guard::Empty,
             has_data: false,
             data: HashMap::new(),
             obsolete_guard: Guard::Empty,
         }
+    }
+
+    /// Override the element extent (type of domain keys).
+    /// Needed only when the domain may be empty; non-empty domains infer the type from the first key.
+    pub fn set_element_extent(&mut self, extent: Extent) {
+        self.element_extent = extent;
     }
 
     pub fn set_yield_guard(&mut self, yield_guard: Guard) {
@@ -40,6 +53,10 @@ impl TestDataSource {
             self.data.insert(k.clone(), v.clone());
         }
     }
+
+    pub fn output_extent(&self) -> Extent {
+        self.output_extent.clone()
+    }
 }
 
 impl DataSourceDomainExtentImpl for TestDataSource {
@@ -54,7 +71,11 @@ impl DataSourceDomainExtentImpl for TestDataSource {
     }
 
     fn get_elements(&self) -> ColumnData {
-        ColumnData::from_values(self.data.keys().cloned().collect())
+        ColumnData::from_values(self.data.keys().cloned().collect(), &self.element_extent)
+    }
+
+    fn element_extent(&self) -> Extent {
+        self.element_extent.clone()
     }
 
     fn get_yield_guard(&self) -> Guard {
@@ -63,7 +84,11 @@ impl DataSourceDomainExtentImpl for TestDataSource {
 
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         self.obsolete_guard = obsolete_guard.clone();
-        // TODO remove elements from self.data that match the obsolete guard
+        match &obsolete_guard {
+            Guard::Universal => self.data.clear(),
+            Guard::LessThanOrEq(value) => self.data.retain(|k, _| k > value),
+            _ => {}
+        }
         obsolete_guard
     }
 }
@@ -74,12 +99,20 @@ pub struct TestSourceReader {
 }
 
 impl TestSourceReader {
-    pub fn new(name: &str) -> Self {
-        let data_source = Rc::new(RefCell::new(TestDataSource::new(name)));
+    pub fn new(name: &str, output_extent: Extent) -> Self {
+        let data_source = Rc::new(RefCell::new(TestDataSource::new(name, output_extent)));
+        Self::from_shared(data_source)
+    }
+
+    /// Create a new reader attached to an existing shared [`TestDataSource`].
+    /// Used to create additional readers when the same source is lowered more than once
+    /// (e.g. when a predicate also needs to reference the source).
+    pub fn from_shared(data_source: Rc<RefCell<TestDataSource>>) -> Self {
+        let output_extent = data_source.borrow().output_extent();
         Self {
             extent: Extent::Function {
                 domain: Box::new(Extent::DataSourceDomain(data_source.clone())),
-                codomain: Box::new(Extent::Base(super::BaseType::String)),
+                codomain: Box::new(output_extent),
             },
             data_source,
         }
@@ -180,7 +213,7 @@ impl Producer for TestSourceProducer {
             column_value: ColumnValue {
                 data: ColumnData::function_bindings(
                     indices.data,
-                    ColumnData::from_values(output_values),
+                    ColumnData::from_values(output_values, &source.output_extent()),
                 ),
                 parent_indices: ParentIndices::TopLevelVector,
             },

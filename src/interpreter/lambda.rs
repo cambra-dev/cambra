@@ -3,8 +3,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
-use log::debug;
+use crate::{
+    interpreter::NotifyOrSubscribeResult,
+    pretty_graph::{fmt_extent, InspectNode, VizOptions},
+};
+use log::{debug, trace};
 
 use super::{
     fmt_guard, ColumnData, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator,
@@ -282,15 +285,37 @@ impl Lambda {
             })
         };
 
-        // Set up notifications as needed based on the type of the Extent of the variable
-        match self.variable.extent() {
-            // DataSource extents need to be registered so that the scheduling loop can
-            // poll them for notifications
-            Extent::DataSourceDomain(..) => scheduler.add_source(variable_subscription.clone()),
-            // Literal range extents are fully ready immediately
-            Extent::UIntRange { .. } => consumer.notify(Notification::NewData),
-            // Other Extents cannot be iterated, so nothing to do
-            _ => {}
+        // Set up notifications based on the variable's source and extent.
+        // For Argument sources, the binding producer notifies VarProducer directly via the
+        // Consumer impl, which then propagates to LambdaProducer via add_consumer — no
+        // scheduler registration or direct consumer notification needed here.
+        // For Iteration sources, we either register with the scheduler (for data sources that
+        // need polling) or notify the consumer immediately (for literal ranges).
+        if variable_subscription.borrow().is_iteration() {
+            // Register the outer variable with the scheduler first so it gets polled before any
+            // restriction producer.  If the outer source is a data source, this ensures the
+            // outer VarProducer consumes the `check_for_new_data` flag before the restriction's
+            // inner variable does (the restriction's data is fetched on-demand, not via the flag).
+            let NotifyOrSubscribeResult { notify, subscribe } =
+                self.variable.extent().subscribe_to_iteration_action();
+            if notify {
+                consumer.notify(Notification::NewData);
+            }
+            if subscribe {
+                scheduler.add_source(variable_subscription.clone());
+            }
+        }
+
+        let name = self.variable.name.clone();
+        if self.variable.owns_restriction() {
+            if let Extent::Restricted { restriction, .. } = self.variable.extent_mut() {
+                debug!("Setting up producer for restriction of variable {name} in lambda with scope {var_scope:?}");
+                restriction.borrow_mut().set_up_producer(
+                    intent_guard.clone(),
+                    var_scope.clone(),
+                    scheduler,
+                );
+            }
         }
 
         // Create LambdaProducer with the variable subscription (body_producer set later)
@@ -341,7 +366,15 @@ impl Operator for Lambda {
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut var_desc = InspectNode::leaf(format!("Var({})", self.variable.name));
+        let mut var_desc = InspectNode::leaf(format!(
+            "Var({}{})",
+            self.variable.name,
+            if self.variable.owns_restriction() {
+                " (owns restriction)"
+            } else {
+                ""
+            }
+        ));
         if opts.show_extents {
             var_desc = var_desc.annotate(format!(": {}", fmt_extent(self.variable.extent())));
         }
@@ -463,13 +496,16 @@ impl Producer for ApplyProducer {
             column_value: lambda_column,
         } = self.lambda_producer.get();
         match lambda_column.data {
-            ColumnData::FunctionBindings { outputs, .. } => GetResult {
-                column_value: ColumnValue {
-                    data: *outputs,
-                    parent_indices: lambda_column.parent_indices,
-                },
-                yield_guard: yield_guard.to_universal_or_empty(),
-            },
+            ColumnData::FunctionBindings { outputs, .. } => {
+                trace!("ApplyProducer producing {:?}", *outputs);
+                GetResult {
+                    column_value: ColumnValue {
+                        data: *outputs,
+                        parent_indices: lambda_column.parent_indices,
+                    },
+                    yield_guard: yield_guard.to_universal_or_empty(),
+                }
+            }
             other => panic!("Expected FunctionBindings from lambda producer, got {other:?}"),
         }
     }

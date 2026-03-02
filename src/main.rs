@@ -1,9 +1,10 @@
 use std::{cell::RefCell, rc::Rc};
 
 use cambra::{
-    interpreter::{Consumer, GetResult, Guard, Notification, Scheduler, Value},
+    interpreter::{Consumer, GetResult, Guard, Notification, Scheduler},
     lowering::{lower_let_stmt_block, LoweringContext},
-    parse_python_code, pretty_ast, pretty_graph,
+    parse_python_code, pretty_ast,
+    pretty_graph::{self, pretty_dataflow},
     web_inspector::WebInspector,
 };
 use log::debug;
@@ -53,7 +54,7 @@ fn run_program(code: &str, inspect_port: Option<u16>) {
     if let Some(ref inspector) = inspector {
         inspector.update_snapshot(tick, &*producer, &scheduler);
     }
-    debug!("main producer:\n{producer:#?}");
+    debug!("main producer:\n{}", pretty_dataflow(producer.as_ref()));
 
     loop {
         while !*new_data.borrow() && !yield_guard.borrow().is_universal() {
@@ -70,21 +71,9 @@ fn run_program(code: &str, inspect_port: Option<u16>) {
             yield_guard: new_yield_guard,
         } = producer.get();
         *yield_guard.borrow_mut() = new_yield_guard;
-
-        let new_obsolete_guard: Guard = match column_value.as_single() {
-            Some(Value::Function(bindings)) => Guard::Domain(Box::new(
-                bindings
-                    .last()
-                    .map(|b| b.input.clone())
-                    .map_or(Guard::Empty, Guard::LessThanOrEq),
-            )),
-            _ => {
-                debug!("Main received constant, releasing Universal");
-                Guard::Universal
-            }
-        };
-        obsolete_guard = producer.release(new_obsolete_guard.clone());
-        debug!("Main released with {new_obsolete_guard:?}, got {obsolete_guard:?}");
+        debug!("Main got yield_guard: {yield_guard:?}, releasing");
+        obsolete_guard = producer.release(yield_guard.borrow().clone());
+        debug!("Main release got {obsolete_guard:?}");
         *new_data.borrow_mut() = false;
 
         tick += 1;

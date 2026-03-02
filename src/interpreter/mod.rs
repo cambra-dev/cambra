@@ -5,6 +5,7 @@
 
 mod binop;
 mod inspect;
+mod join;
 mod lambda;
 mod literal;
 mod record;
@@ -16,6 +17,7 @@ mod var;
 
 pub use binop::*;
 pub use inspect::*;
+pub use join::*;
 pub use lambda::*;
 pub use literal::*;
 pub use record::*;

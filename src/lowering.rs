@@ -5,12 +5,17 @@
 
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
+use log::debug;
 use rustpython_parser::ast::{self as pyast};
 
-use crate::interpreter::{
-    Apply, ArithmeticKind, BaseType, BinOp, BinOpKind, CompareKind, ConstructRecord, Extent, Guard,
-    Lambda, ListLiteral, Literal, Operator, RecordAttribute, Scheduler, StdinReader,
-    TestDataSource, TestSourceReader, Value, Var, VarRef, VarScope, VarSource,
+use crate::{
+    interpreter::{
+        tuple_attr, Apply, ArithmeticKind, BaseType, BinOp, BinOpKind, CompareKind,
+        ComputeRestriction, ConstructRecord, Extent, Guard, Lambda, ListLiteral, Literal, Operator,
+        RecordAttribute, Scheduler, StdinDataSource, StdinReader, TestDataSource, TestSourceReader,
+        Value, Var, VarRef, VarScope, VarSource,
+    },
+    pretty_graph::pretty_operator,
 };
 
 /// Errors that can occur during lowering.
@@ -22,19 +27,46 @@ pub enum LoweringError {
     TypeError(String),
 }
 
-#[derive(Default)]
 pub struct LoweringContext {
-    injected_sources: HashMap<String, Box<dyn Operator>>,
+    // TODO: sources should be handled in some scoped way, but for now we
+    // only have a handful of hardcoded ones so they can live here.
+    injected_test_sources: HashMap<String, Rc<RefCell<TestDataSource>>>,
+    stdin_data_source: Rc<RefCell<StdinDataSource>>,
     scope: Option<Rc<VarScope>>,
 }
 
 impl LoweringContext {
-    pub fn inject_test_source(&mut self, name: &str) -> Rc<RefCell<TestDataSource>> {
-        let reader = TestSourceReader::new(name);
-        let data_source = reader.get_data_source();
-        self.injected_sources
-            .insert(name.to_string(), Box::new(reader));
+    pub fn inject_test_source(
+        &mut self,
+        name: &str,
+        output_extent: Extent,
+    ) -> Rc<RefCell<TestDataSource>> {
+        let data_source = Rc::new(RefCell::new(TestDataSource::new(
+            name,
+            output_extent.clone(),
+        )));
+        self.injected_test_sources
+            .insert(name.to_string(), data_source.clone());
         data_source
+    }
+
+    pub fn get_test_source(&self, name: &str) -> Option<Box<dyn Operator>> {
+        self.injected_test_sources
+            .get(name)
+            .cloned()
+            .map(|data_source| {
+                Box::new(TestSourceReader::from_shared(data_source)) as Box<dyn Operator>
+            })
+    }
+}
+
+impl Default for LoweringContext {
+    fn default() -> Self {
+        Self {
+            injected_test_sources: HashMap::new(),
+            stdin_data_source: Rc::new(RefCell::new(StdinDataSource::new())),
+            scope: None,
+        }
     }
 }
 
@@ -54,6 +86,7 @@ pub fn lower_expr(
             ops,
             comparators,
         } => lower_compare(ctx, left, ops, comparators),
+        pyast::ExprKind::BoolOp { op, values } => lower_bool_op(ctx, op, values),
         pyast::ExprKind::List { elts, .. } => lower_list(ctx, elts),
         pyast::ExprKind::Subscript { value, slice, .. } => lower_subscript(ctx, value, slice),
         pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(ctx, elt, generators),
@@ -204,6 +237,28 @@ fn lower_compare(
     }
 }
 
+fn lower_bool_op(
+    ctx: &mut LoweringContext,
+    op: &pyast::Boolop,
+    values: &[pyast::Located<pyast::ExprKind>],
+) -> Result<Box<dyn Operator>, LoweringError> {
+    if values.len() < 2 {
+        return Err(LoweringError::Unsupported(
+            "Boolean operator must have at least two values".into(),
+        ));
+    }
+    let mut result = lower_expr(ctx, &values[0])?;
+    let kind = match op {
+        pyast::Boolop::And => crate::interpreter::LogicKind::And,
+        pyast::Boolop::Or => crate::interpreter::LogicKind::Or,
+    };
+    for value in &values[1..] {
+        let next_op = lower_expr(ctx, value)?;
+        result = Box::new(BinOp::new(result, BinOpKind::BoolLogic(kind), next_op));
+    }
+    Ok(result)
+}
+
 /// Lower a list literal to a Literal operator with Function value.
 ///
 /// Lists are represented as functions from indices (natural numbers) to values:
@@ -252,7 +307,7 @@ fn lower_tuple_list(
                 let mut attributes = HashMap::new();
                 for (i, elt) in elts.iter().enumerate() {
                     if let pyast::ExprKind::Constant { value, .. } = &elt.node {
-                        attributes.insert(format!("_{i}"), constant_to_value(value)?);
+                        attributes.insert(tuple_attr(i), constant_to_value(value)?);
                     } else {
                         return Err(LoweringError::Unsupported(
                             "List elements must be constants (for now)".into(),
@@ -280,7 +335,7 @@ fn lower_tuple(
 ) -> Result<Box<dyn Operator>, LoweringError> {
     let mut attributes = HashMap::new();
     for (i, elt) in elts.iter().enumerate() {
-        attributes.insert(format!("_{i}"), lower_expr(ctx, elt)?);
+        attributes.insert(tuple_attr(i), lower_expr(ctx, elt)?);
     }
     Ok(Box::new(ConstructRecord::new(attributes)))
 }
@@ -326,82 +381,195 @@ fn lower_subscript(
     ))
 }
 
-/// Lower a list comprehension.
-/// This transforms an expression like
-///   [body(x) for x in source]
-/// into the following CCL:
-///   λ outer_var : source::idx_type . (λ inner_var : source::value_type . body(inner_var)) (source(outer_var))
+// Lowers a list comprehension, e.g.:
+//   [body(x, y) for x in source1() for y in source2() if pred(x, y)]
+//
+// Each source is a function `I -> T`, so iterating it means ranging over its index
+// domain `I` and applying the function to obtain the value `T`.  The result is a
+// lambda over a single "outer" index variable that packs all generator indices:
+//
+//   λ outer . Apply(Lambda(x, Apply(Lambda(y, body), Apply(src2, outer._1))),
+//                   Apply(src1, outer._0))
+//
+// When a predicate is present, the outer variable's extent is `Restricted` and a ComputeRestriction
+// operator is attached to the iterating variable to evaluate the predicate and find the actual set
+// values that need to be iterated over.
+// Currently, only loop joins are supported, and the evaluation looks like
+//
+//   λ r . Apply(Lambda(x, Apply(Lambda(y, pred), Apply(src2, r._1))),
+//                   Apply(src1, r._0))
 fn lower_list_comp(
     ctx: &mut LoweringContext,
     elt: &pyast::Located<pyast::ExprKind>,
     generators: &[pyast::Comprehension],
 ) -> Result<Box<dyn Operator>, LoweringError> {
-    if generators.len() != 1 {
-        return Err(LoweringError::Unsupported(
-            "Only single generator comprehensions are supported for now".into(),
-        ));
-    }
+    // ---- Phase 1: Lower each generator's source and register its loop variable ----
+    // We keep the source operators and index extents for later use when building the
+    // Apply/Lambda chains.  Each loop variable is pushed onto the lowering scope so
+    // that body and predicate expressions can reference it.
+    let mut gen_sources: Vec<Box<dyn Operator>> = Vec::new();
+    let mut gen_iter_vars: Vec<Var> = Vec::new();
+    let mut gen_idx_extents: Vec<Extent> = Vec::new();
 
-    let gen = &generators[0];
-    if !gen.ifs.is_empty() {
-        return Err(LoweringError::Unsupported(
-            "Comprehensions with if conditions are not supported for now".into(),
-        ));
-    }
-    if gen.is_async > 0 {
-        return Err(LoweringError::Unsupported(
-            "Async comprehensions are not supported for now".into(),
-        ));
-    }
-
-    let source = lower_expr(ctx, &gen.iter)?;
-    let source_extent = source.extent().clone();
-
-    let outer_var_name = "__list_comp_var";
-    let (outer_var_extent, inner_var_extent) =
-        if let Extent::Function { domain, codomain } = source_extent {
-            (*domain.clone(), *codomain.clone())
-        } else {
-            return Err(LoweringError::TypeError(format!(
-                "Expected function extent for comprehension source, got {source_extent:?}"
-            )));
+    for gen in generators.iter() {
+        let source = lower_expr(ctx, &gen.iter)?;
+        let (idx_extent, value_extent) = match source.extent() {
+            Extent::Function { domain, codomain } => (*domain.clone(), *codomain.clone()),
+            other => {
+                return Err(LoweringError::TypeError(format!(
+                    "Expected function extent for comprehension source, got {other:?}"
+                )));
+            }
         };
-
-    let variable = lower_name_as_var(
-        ctx,
-        match &gen.target.node {
+        let var_name = match &gen.target.node {
             pyast::ExprKind::Name { id, .. } => id,
             _ => {
                 return Err(LoweringError::Unsupported(format!(
-                "Only simple variable targets are supported in comprehensions for now, got {:?}",
-                gen.target.node
-            )))
+                    "Only simple variable targets are supported in comprehensions, got {:?}",
+                    gen.target.node
+                )));
             }
-        },
-        &inner_var_extent,
-    )?;
-    ctx.scope = Some(Rc::new(VarScope::new_with_optional_parent(
-        ctx.scope.clone(),
-        variable.name(),
-        variable.create_subscription(VarSource::Uninitialized),
-    )));
+        };
+        let iter_var = lower_name_as_var(ctx, var_name, &value_extent)?;
+        // TODO: support lowering-time scopes that don't need a VarSub
+        ctx.scope = Some(Rc::new(VarScope::new_with_optional_parent(
+            ctx.scope.clone(),
+            iter_var.name(),
+            iter_var.create_subscription(VarSource::Uninitialized),
+        )));
+        gen_iter_vars.push(iter_var);
+        gen_idx_extents.push(idx_extent);
+        gen_sources.push(source);
+    }
+
+    // ---- Phase 2: Lower body and predicates while loop variables are in scope ----
     let body = lower_expr(ctx, elt)?;
-    ctx.scope = match &ctx.scope {
-        Some(s) => s.get_parent(),
-        None => panic!("Empty scope stack"),
+
+    // Combine all `if` guards across all generators into a single predicate with `and`.
+    // TODO: lift equality predicates out of this and pass them to the ComputeRestriction
+    // operator so it can use them to do hash joins instead of loop joins.
+    let mut pred_op: Option<Box<dyn Operator>> = None;
+    for pred in generators.iter().flat_map(|gen| gen.ifs.iter()) {
+        let lowered = lower_expr(ctx, pred)?;
+        pred_op = Some(match pred_op {
+            Some(lhs) => Box::new(BinOp::new(
+                lhs,
+                BinOpKind::BoolLogic(crate::interpreter::LogicKind::And),
+                lowered,
+            )),
+            None => lowered,
+        });
+    }
+
+    let mut pred_sources: Vec<Box<dyn Operator>> = Vec::new();
+    if pred_op.is_some() {
+        // If there is a predicate, we need to collect all the sources that are involved in the predicate.
+        // TODO: once we have support for function-typed variables, we should share the source between
+        // here and the body.
+        for gen in generators {
+            pred_sources.push(lower_expr(ctx, &gen.iter)?);
+        }
+    }
+
+    // ---- Phase 3: Pop loop variable scopes ----------------------------------------
+    for _ in 0..gen_iter_vars.len() {
+        ctx.scope = ctx
+            .scope
+            .as_ref()
+            .expect("scope stack should not be empty while popping generator scopes")
+            .get_parent();
+    }
+
+    // ---- Phase 4: Build the outer iteration variable ------------------------------
+    // Single generator: iterate directly over that source's index extent.
+    // Multiple generators: pack all index extents into a Record so the body can
+    // address each one via RecordAttribute and the runtime produces the cartesian
+    // product.
+    // With a predicate: wrap in Restricted so the runtime filters via a correlation
+    // vector computed from the predicate (see Phase 6).
+    let single_gen = generators.len() == 1;
+    let base_extent: Extent = if single_gen {
+        gen_idx_extents[0].clone()
+    } else {
+        Extent::record(
+            gen_idx_extents
+                .iter()
+                .enumerate()
+                .map(|(i, ext)| (tuple_attr(i), ext.clone()))
+                .collect(),
+        )
+    };
+    let mut outer_extent = if pred_op.is_some() {
+        Extent::restricted(base_extent.clone())
+    } else {
+        base_extent.clone()
+    };
+    let mut outer_var = Var::new("__iter_record", outer_extent.clone());
+    if pred_op.is_some() {
+        outer_var.set_owns_restriction(true);
+    }
+
+    // Helper: build the index argument for generator `i`.
+    // Single-gen: a bare VarRef to the outer variable.
+    // Multi-gen: a RecordAttribute projection of the i-th field from the outer record.
+    let make_idx_arg = |var: &Var, i: usize| -> Box<dyn Operator> {
+        let vref = Box::new(VarRef::new(var.name(), var.extent().clone()));
+        if single_gen {
+            vref
+        } else {
+            Box::new(RecordAttribute::new(vref, &tuple_attr(i)))
+        }
     };
 
-    let inner_lambda = Box::new(Lambda::new(variable, body));
+    // ---- Phase 5: Build the body as a nested Apply/Lambda chain ------------------
+    // Working innermost-first (reverse order) we wrap the accumulated expression:
+    //   body = Apply(Lambda(iter_var_i, body), Apply(source_i, idx_arg_i))
+    let mut body_expr: Box<dyn Operator> = body;
+    for (i, (iter_var, source)) in gen_iter_vars
+        .iter()
+        .zip(gen_sources.drain(..))
+        .enumerate()
+        .rev()
+    {
+        body_expr = Box::new(Apply::new(
+            Box::new(Lambda::new(iter_var.clone(), body_expr)),
+            Box::new(Apply::new(source, make_idx_arg(&outer_var, i))),
+        ));
+    }
 
-    let source_apply = Box::new(Apply::new(
-        source,
-        Box::new(VarRef::new(outer_var_name, outer_var_extent.clone())),
-    ));
+    // ---- Phase 6: Attach the predicate as a ComputeRestriction -------------------
+    // The restriction lambda mirrors the body structure but uses an independent
+    // "__iter_record_restr" variable (with the base, non-restricted extent) so it
+    // can be evaluated without recursively depending on a correlation vector.
+    if let Some(pred_op) = pred_op {
+        let restriction = outer_extent
+            .restriction()
+            .expect("outer_extent is Restricted because pred_op is Some");
+        let restr_outer_var = Var::new("__iter_record_restr", base_extent);
+        let mut pred_expr: Box<dyn Operator> = pred_op;
+        for (i, (iter_var, pred_source)) in gen_iter_vars
+            .iter()
+            .zip(pred_sources.drain(..))
+            .enumerate()
+            .rev()
+        {
+            pred_expr = Box::new(Apply::new(
+                Box::new(Lambda::new(iter_var.clone(), pred_expr)),
+                Box::new(Apply::new(pred_source, make_idx_arg(&restr_outer_var, i))),
+            ));
+        }
+        let compute_restriction = Box::new(ComputeRestriction::new(Box::new(Lambda::new(
+            restr_outer_var,
+            pred_expr,
+        ))));
+        debug!(
+            "Restriction op:\n{}",
+            pretty_operator(compute_restriction.as_ref())
+        );
+        restriction.borrow_mut().set_compute_op(compute_restriction);
+    }
 
-    let outer_var = Var::new(outer_var_name, outer_var_extent.clone());
-    let outer_lambda = Lambda::new(outer_var, Box::new(Apply::new(inner_lambda, source_apply)));
-
-    Ok(Box::new(outer_lambda))
+    Ok(Box::new(Lambda::new(outer_var, body_expr)))
 }
 
 fn lower_call(
@@ -422,11 +590,11 @@ fn lower_call(
             "{id}() does not take any arguments"
         )));
     }
-    if let Some(source) = ctx.injected_sources.remove(id.as_str()) {
+    if let Some(source) = ctx.get_test_source(id.as_str()) {
         return Ok(source);
     }
     if id == "__stdinvalues" {
-        return Ok(Box::new(StdinReader::new()));
+        return Ok(Box::new(StdinReader::new(ctx.stdin_data_source.clone())));
     }
     Err(LoweringError::Unsupported(format!(
         "Unknown function call: {id}"
@@ -525,7 +693,10 @@ mod tests {
     use crate::interpreter::{
         ColumnData, Consumer, FuncBinding, Guard, Notification, Operator, Scheduler,
     };
-    use rstest::rstest;
+    use crate::pretty_ast;
+    use crate::pretty_graph::pretty_operator;
+    use log::debug;
+    use rstest_log::rstest;
     use rustpython_parser::parser;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -569,16 +740,16 @@ mod tests {
     }
 
     fn make_int_list(v: &[i64]) -> ColumnData {
-        ColumnData::FunctionBindings {
-            inputs: Box::new(ColumnData::UInts((0..v.len()).collect())),
-            outputs: Box::new(ColumnData::Ints(v.into())),
-        }
+        ColumnData::function_bindings(
+            ColumnData::UInts((0..v.len()).collect()),
+            ColumnData::Ints(v.into()),
+        )
     }
 
     fn make_tuple(v: &[Value]) -> Value {
         let mut map = HashMap::new();
         for (i, elem) in v.iter().enumerate() {
-            map.insert(format!("_{i}"), elem.clone());
+            map.insert(tuple_attr(i), elem.clone());
         }
         Value::Record(map)
     }
@@ -644,12 +815,64 @@ mod tests {
             inputs: Box::new(ColumnData::UInts(vec![0, 1])),
             outputs: Box::new(ColumnData::Records(HashMap::from([(String::from("_0"), ColumnData::Records(HashMap::from([(String::from("_0"), ColumnData::Ints(vec![10, 20])), (String::from("_1"), ColumnData::Strings(vec![String::from("a"), String::from("b")]))]))), (String::from("_1"), ColumnData::Ints(vec![100, 100]))]))),
         })]
+    #[case("[x for x in [1,2,3] if x < 0]", make_int_list(&[]))]
+    // Filter edge cases: all-pass and all-fail reuse make_int_list;
+    // partial matches require explicit FunctionBindings because the filtered
+    // indices are not contiguous from 0.
+    #[case("[x for x in [1,2,3] if x > 0]", make_int_list(&[1, 2, 3]))]
+    #[case("[x for x in [1,2,3] if x > 10]", make_int_list(&[]))]
+    #[case("[x for x in [1,2,3] if x == 2]", ColumnData::FunctionBindings {
+        inputs: Box::new(ColumnData::UInts(vec![1])),
+        outputs: Box::new(ColumnData::Ints(vec![2])),
+    })]
+    #[case("[x for x in [1,2,3,4,5] if x > 1 if x < 5]", ColumnData::FunctionBindings {
+        inputs: Box::new(ColumnData::UInts(vec![1, 2, 3])),
+        outputs: Box::new(ColumnData::Ints(vec![2, 3, 4])),
+    })]
     fn test_lower(#[case] code: &str, #[case] expected: ColumnData) {
         let ast = parse_module(code);
         let (op, scope) =
             lower_let_stmt_block(&mut LoweringContext::default(), &ast, &mut Scheduler::new())
                 .expect("Failed to lower");
+        debug!("Operator:\n{}", pretty_operator(op.as_ref()));
         assert_eq!(eval(op, scope), expected,);
+    }
+
+    #[rstest]
+    #[case("[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]", ColumnData::strings(&["ac", "ad", "ae", "bc", "bd", "be"]))]
+    #[case("[x + '_' for x in ['a', 'b'] for y in [True, False]]", ColumnData::strings(&["a_", "a_", "b_", "b_"]))]
+    #[case("[x + z + y for x in ['a', 'b'] for y in ['c', 'd'] for z in ['e', 'f']]", ColumnData::strings(&["aec", "afc", "aed", "afd", "bec", "bfc", "bed", "bfd"]))]
+    #[case("[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'e'] if x == y]", ColumnData::strings(&["bb", "cc"]))]
+    #[case("[x for x in [y for y in ['a', 'b', 'c'] if y != 'b'] if x < 'b']", ColumnData::strings(&["a"]))]
+    // Inequality join predicate
+    #[case("[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'd'] if x < y]", ColumnData::strings(&["ab", "ac", "ad", "bc", "bd", "cd"]))]
+    // Join where predicate matches nothing
+    #[case("[x + y for x in ['a', 'b'] for y in ['c', 'd'] if x == y]", ColumnData::strings(&[]))]
+    // Three-way join with two-clause predicate
+    #[case("[x + y + z for x in ['a', 'b'] for y in ['b', 'c'] for z in ['b', 'c'] if x != y if y == z]", ColumnData::strings(&["abb", "acc", "bcc"]))]
+    // Two-clause predicate on a two-generator join
+    #[case("[x + y for x in ['a', 'b', 'c'] for y in ['a', 'b', 'c'] if x == y if x < 'c']", ColumnData::strings(&["aa", "bb"]))]
+    // Captured outer let-binding used in join predicate
+    #[case("y = 'b'; [x for x in ['a', 'b', 'c'] for z in ['b', 'c'] if x == y]", ColumnData::strings(&["b", "b"]))]
+    #[case("\
+    [a + b
+        for a in [c + d for c in ['a'] for d in ['b', 'c'] if c < d]
+        for b in [e + f for e in ['d', 'e'] for f in ['f'] if e < f]
+    if a != b]
+    ", ColumnData::strings(&["abdf", "abef", "acdf", "acef"]))]
+    fn test_lower_join(#[case] code: &str, #[case] expected: ColumnData) {
+        let ast = parse_module(code);
+        debug!("Ast:\n{}", pretty_ast::pretty(&ast[0]));
+        let (op, scope) =
+            lower_let_stmt_block(&mut LoweringContext::default(), &ast, &mut Scheduler::new())
+                .expect("Failed to lower");
+        debug!("Operator:\n{}", pretty_operator(op.as_ref()));
+        match eval(op, scope) {
+            ColumnData::FunctionBindings { outputs, .. } => {
+                assert_eq!(*outputs, expected);
+            }
+            other => panic!("Expected Record -> Value output, got: {:?}", other),
+        }
     }
 
     #[rstest]
@@ -658,15 +881,16 @@ mod tests {
     #[case("['' + x for x in testsource1()]")]
     #[case("y = ''; [y + x for x in testsource1()]")]
     #[case("[(x, 0)._0 for x in testsource1()]")]
+    #[case("[(x, 0)._0 for x in testsource1() if True]")]
     fn test_test_source(#[case] code: &str) {
         let mut ctx = LoweringContext::default();
-        let data_source = ctx.inject_test_source("testsource1");
+        let data_source = ctx.inject_test_source("testsource1", Extent::Base(BaseType::String));
         let ast = parse_module(code);
         let (mut op, scope) =
             lower_let_stmt_block(&mut ctx, &ast, &mut Scheduler::new()).expect("Failed to lower");
         data_source.borrow_mut().add_data(&[
-            (Value::Int(10), Value::String("foo".to_string())),
-            (Value::Int(20), Value::String("bar".to_string())),
+            (Value::UInt(10), Value::String("foo".to_string())),
+            (Value::UInt(20), Value::String("bar".to_string())),
         ]);
         data_source.borrow_mut().set_has_data(true);
 
@@ -692,7 +916,7 @@ mod tests {
         assert_eq!(
             get_result.column_value.data.sort_by_inputs(),
             ColumnData::FunctionBindings {
-                inputs: Box::new(ColumnData::Ints(vec![10, 20])),
+                inputs: Box::new(ColumnData::UInts(vec![10, 20])),
                 outputs: Box::new(ColumnData::Strings(vec![
                     "foo".to_string(),
                     "bar".to_string()
@@ -706,6 +930,161 @@ mod tests {
         assert_eq!(
             *notified_yield_guard.borrow(),
             Guard::Domain(Box::new(Guard::Universal))
+        );
+    }
+
+    // Test a join between two data sources, including incrementally adding new data and releasing
+    // old regions.
+    #[test_log::test]
+    fn test_inner_join() {
+        let mut ctx = LoweringContext::default();
+        let code =
+            "[(x._0, x._1, y._1) for x in testsource1() for y in testsource2() if x._0 == y._0]";
+        let record_extent = Extent::record(HashMap::from([
+            (String::from("_0"), Extent::Base(BaseType::Int)),
+            (String::from("_1"), Extent::Base(BaseType::String)),
+        ]));
+        let data_source1 = ctx.inject_test_source("testsource1", record_extent.clone());
+        let data_source2 = ctx.inject_test_source("testsource2", record_extent);
+        let ast = parse_module(code);
+
+        let (mut op, scope) =
+            lower_let_stmt_block(&mut ctx, &ast, &mut Scheduler::new()).expect("Failed to lower");
+
+        data_source1.borrow_mut().add_data(&[(
+            Value::UInt(10),
+            Value::Record(HashMap::from([
+                (String::from("_0"), Value::Int(100)),
+                (String::from("_1"), Value::String("a1".to_string())),
+            ])),
+        )]);
+        data_source1.borrow_mut().set_has_data(true);
+
+        data_source2.borrow_mut().add_data(&[(
+            Value::UInt(10),
+            Value::Record(HashMap::from([
+                (String::from("_0"), Value::Int(100)),
+                (String::from("_1"), Value::String("b1".to_string())),
+            ])),
+        )]);
+        data_source2.borrow_mut().set_has_data(true);
+
+        let notified_has_data = Rc::new(RefCell::new(false));
+        let has_data_clone = notified_has_data.clone();
+        let consumer: Box<dyn Consumer> = Box::new(move |n: Notification| {
+            if let Notification::NewData = n {
+                *has_data_clone.borrow_mut() = true
+            }
+        });
+
+        let mut scheduler = Scheduler::new();
+        let mut producer = op.subscribe(Guard::universal(), consumer, scope, &mut scheduler);
+        scheduler.check_for_notifications();
+        assert!(*notified_has_data.borrow());
+
+        let get_result = producer.get();
+        *notified_has_data.borrow_mut() = false;
+        assert_eq!(
+            get_result.column_value.data.sort_by_inputs(),
+            ColumnData::FunctionBindings {
+                inputs: Box::new(ColumnData::Records(HashMap::from([
+                    ("_0".to_string(), ColumnData::UInts(vec![10])),
+                    ("_1".to_string(), ColumnData::UInts(vec![10]))
+                ]))),
+                outputs: Box::new(ColumnData::Records(HashMap::from([
+                    ("_0".to_string(), ColumnData::Ints(vec![100])),
+                    (
+                        "_1".to_string(),
+                        ColumnData::Strings(vec!["a1".to_string()])
+                    ),
+                    (
+                        "_2".to_string(),
+                        ColumnData::Strings(vec!["b1".to_string()])
+                    )
+                ])))
+            }
+        );
+
+        data_source1.borrow_mut().add_data(&[(
+            Value::UInt(20),
+            Value::Record(HashMap::from([
+                (String::from("_0"), Value::Int(200)),
+                (String::from("_1"), Value::String("a2".to_string())),
+            ])),
+        )]);
+        data_source1.borrow_mut().set_has_data(true);
+
+        data_source2.borrow_mut().add_data(&[(
+            Value::UInt(20),
+            Value::Record(HashMap::from([
+                (String::from("_0"), Value::Int(100)),
+                (String::from("_1"), Value::String("b2".to_string())),
+            ])),
+        )]);
+        data_source2.borrow_mut().set_has_data(true);
+
+        scheduler.check_for_notifications();
+        assert!(*notified_has_data.borrow());
+        let get_result = producer.get();
+        *notified_has_data.borrow_mut() = false;
+        assert_eq!(
+            get_result.column_value.data.sort_by_inputs(),
+            ColumnData::FunctionBindings {
+                inputs: Box::new(ColumnData::Records(HashMap::from([
+                    ("_0".to_string(), ColumnData::UInts(vec![10, 10])),
+                    ("_1".to_string(), ColumnData::UInts(vec![10, 20]))
+                ]))),
+                outputs: Box::new(ColumnData::Records(HashMap::from([
+                    ("_0".to_string(), ColumnData::Ints(vec![100, 100])),
+                    (
+                        "_1".to_string(),
+                        ColumnData::Strings(vec!["a1".to_string(), "a1".to_string()])
+                    ),
+                    (
+                        "_2".to_string(),
+                        ColumnData::Strings(vec!["b1".to_string(), "b2".to_string()])
+                    )
+                ])))
+            }
+        );
+
+        producer.release(Guard::Domain(Box::new(Guard::Record(HashMap::from([
+            ("_0".to_string(), Guard::LessThanOrEq(Value::UInt(10))),
+            ("_1".to_string(), Guard::LessThanOrEq(Value::UInt(10))),
+        ])))));
+
+        data_source1.borrow_mut().add_data(&[(
+            Value::UInt(30),
+            Value::Record(HashMap::from([
+                (String::from("_0"), Value::Int(100)),
+                (String::from("_1"), Value::String("a3".to_string())),
+            ])),
+        )]);
+        data_source1.borrow_mut().set_has_data(true);
+
+        scheduler.check_for_notifications();
+        assert!(*notified_has_data.borrow());
+        let get_result = producer.get();
+        *notified_has_data.borrow_mut() = false;
+        assert_eq!(
+            get_result.column_value.data.sort_by_inputs(),
+            ColumnData::FunctionBindings {
+                inputs: Box::new(ColumnData::Records(HashMap::from([
+                    ("_0".to_string(), ColumnData::UInts(vec![30])),
+                    ("_1".to_string(), ColumnData::UInts(vec![20]))
+                ]))),
+                outputs: Box::new(ColumnData::Records(HashMap::from([
+                    ("_0".to_string(), ColumnData::Ints(vec![100])),
+                    (
+                        "_1".to_string(),
+                        ColumnData::Strings(vec!["a3".to_string()])
+                    ),
+                    (
+                        "_2".to_string(),
+                        ColumnData::Strings(vec!["b2".to_string()])
+                    )
+                ])))
+            }
         );
     }
 }

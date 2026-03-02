@@ -35,7 +35,7 @@ impl ConstructRecord {
     /// Eagerly computes the record [`Extent`] by collecting each field's extent, so that the
     /// full record type is known before any subscription takes place.
     pub fn new(attributes: HashMap<String, Box<dyn Operator>>) -> Self {
-        let extent = Extent::Record(
+        let extent = Extent::record(
             attributes
                 .iter()
                 .map(|(name, op)| (name.clone(), op.extent().clone()))
@@ -230,13 +230,13 @@ impl RecordAttribute {
     /// Panics if `input` does not have a `Record` extent or if `attribute` is not a field
     /// of that record.
     pub fn new(input: Box<dyn Operator>, attribute: &str) -> Self {
-        let extent = match &input.extent() {
-            Extent::Record(attributes) => attributes
-                .get(attribute)
-                .unwrap_or_else(|| panic!("No attribute {attribute} in {:?}", &input.extent())),
-            _ => panic!("Attribute ref on non-record type {:?}", input.extent()),
-        }
-        .clone();
+        let extent = input
+            .extent()
+            .record_attributes()
+            .unwrap_or_else(|| panic!("Attribute ref on non-record type {:?}", input.extent()))
+            .get(attribute)
+            .unwrap_or_else(|| panic!("No attribute {attribute} in {:?}", input.extent()))
+            .clone();
         Self {
             input,
             attribute: attribute.to_string(),
@@ -271,21 +271,21 @@ impl Operator for RecordAttribute {
         var_scope: Option<std::rc::Rc<VarScope>>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
-        let producer_intent_guard = match self.input.extent() {
-            Extent::Record(m) => Guard::Record(
-                m.keys()
-                    .map(|attr| {
-                        if *attr == self.attribute {
-                            (attr.clone(), intent_guard.clone())
-                        } else {
-                            // Other fields are not constrained by this subscriber.
-                            (attr.clone(), Guard::Universal)
-                        }
-                    })
-                    .collect(),
-            ),
-            _ => panic!("Expected Record input Extent"),
-        };
+        let producer_intent_guard = Guard::Record(
+            self.input
+                .extent()
+                .record_attributes()
+                .expect("Expected Record input Extent in RecordAttribute::subscribe")
+                .keys()
+                .map(|attr| {
+                    if *attr == self.attribute {
+                        (attr.clone(), intent_guard.clone())
+                    } else {
+                        (attr.clone(), Guard::Universal)
+                    }
+                })
+                .collect(),
+        );
 
         let self_attr_clone = self.attribute.clone();
         // Translate record-level yield guards to the single-field yield guard that the
@@ -379,4 +379,8 @@ impl Producer for RecordAttributeProducer {
         InspectNode::new(format!("RecordAttributeProducer(\"{}\")", self.attribute))
             .child("record", self.record.inspect(opts))
     }
+}
+
+pub fn tuple_attr(index: usize) -> String {
+    format!("_{}", index)
 }

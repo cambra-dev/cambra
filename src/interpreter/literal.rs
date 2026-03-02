@@ -1,6 +1,5 @@
 //! Literal operator: represents a constant value in the dataflow graph.
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
@@ -22,39 +21,8 @@ pub struct Literal {
 impl Literal {
     /// Create a new literal operator from a value.
     pub fn new(value: Value) -> Self {
-        let extent = Self::extent_for_value(&value);
+        let extent = Extent::for_value(&value);
         Literal { value, extent }
-    }
-
-    /// Determine the extent for a given value.
-    pub fn extent_for_value(value: &Value) -> Extent {
-        match value {
-            Value::Int(_) => Extent::Base(BaseType::Int),
-            Value::UInt(_) => Extent::Base(BaseType::UInt),
-            Value::String(_) => Extent::Base(BaseType::String),
-            Value::Bool(_) => Extent::Base(BaseType::Bool),
-            Value::Unit => Extent::Base(BaseType::Unit),
-            Value::Function(bindings) => {
-                // For a function literal, we need to infer the domain and codomain
-                // from the bindings. For now, we'll use a simplified approach.
-                // TODO: Properly infer function types from bindings
-                if bindings.is_empty() {
-                    Extent::function(Extent::Base(BaseType::Unit), Extent::Base(BaseType::Unit))
-                } else {
-                    // Infer from first binding as a placeholder
-                    let domain = Self::extent_for_value(&bindings[0].input);
-                    let codomain = Self::extent_for_value(&bindings[0].output);
-                    Extent::function(domain, codomain)
-                }
-            }
-            Value::Record(fields) => {
-                let field_extents: HashMap<String, Extent> = fields
-                    .iter()
-                    .map(|(name, val)| (name.clone(), Self::extent_for_value(val)))
-                    .collect();
-                Extent::record(field_extents)
-            }
-        }
     }
 }
 
@@ -131,7 +99,7 @@ impl ListLiteral {
             if values.is_empty() {
                 Extent::Base(BaseType::Unit)
             } else {
-                Literal::extent_for_value(&values[0])
+                Extent::for_value(&values[0])
             },
         );
         ListLiteral { values, extent }
@@ -147,7 +115,7 @@ impl Operator for ListLiteral {
         let elem_type = if self.values.is_empty() {
             "Unit".to_string()
         } else {
-            fmt_extent(&Literal::extent_for_value(&self.values[0]))
+            fmt_extent(&Extent::for_value(&self.values[0]))
         };
         let mut desc = InspectNode::leaf(format!(
             "ListLiteral({} × {})",
@@ -207,8 +175,14 @@ impl Operator for ListLiteral {
                 Notification::Yield(_) => Notification::Yield(Guard::Empty),
             });
         });
+        let value_extent = if self.values.is_empty() {
+            Extent::Base(BaseType::Unit)
+        } else {
+            Extent::for_value(&self.values[0])
+        };
         Box::new(ListLiteralProducer {
             values: self.values.clone(),
+            value_extent,
             index_producer: binding.subscribe(intent_guard, index_consumer, var_scope, scheduler),
         })
     }
@@ -217,6 +191,8 @@ impl Operator for ListLiteral {
 #[derive(Debug)]
 struct ListLiteralProducer {
     values: Vec<Value>,
+    /// The extent (type) of each element value, used to produce a typed empty column when needed.
+    value_extent: Extent,
     index_producer: Box<dyn Producer>,
 }
 
@@ -241,7 +217,7 @@ impl Producer for ListLiteralProducer {
                     .iter()
                     .map(|i| self.values.get(*i).cloned().unwrap_or(Value::Unit))
                     .collect();
-                ColumnData::from_values(output_values)
+                ColumnData::from_values(output_values, &self.value_extent)
             }
             other => panic!("Expected UInt indices, got {other:?}"),
         };

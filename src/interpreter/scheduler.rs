@@ -19,6 +19,13 @@ impl Scheduler {
         }
     }
 
+    /// Use when the scheduler will be intentionally unused.
+    pub fn noop() -> Self {
+        Scheduler {
+            sources: Vec::new(),
+        }
+    }
+
     pub fn add_source(&mut self, var_sub: Rc<RefCell<VarProducer>>) {
         self.sources.push(var_sub);
     }

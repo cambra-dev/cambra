@@ -2,7 +2,11 @@
 
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap, hash::Hash, rc::Rc};
 
+use bit_set::BitSet;
 use bit_vec::BitVec;
+use log::trace;
+
+use crate::interpreter::{ComputeRestriction, Operator, Producer, Scheduler, VarScope};
 
 /// A Guard represents a region (subset of an extent) via a set of predicates.
 /// Guards are used to:
@@ -169,6 +173,15 @@ impl Guard {
         }
     }
 
+    pub fn get_record_attribute(&self, attr: &str) -> Option<Guard> {
+        match self {
+            Guard::Record(fields) => fields.get(attr).cloned(),
+            g if g.is_universal() => Some(Guard::Universal),
+            g if g.is_empty() => Some(Guard::Empty),
+            _ => None,
+        }
+    }
+
     /// Create a function guard from domain and codomain guards
     pub fn from_function_parts(domain: Guard, codomain: Guard) -> Self {
         Guard::Function {
@@ -199,7 +212,7 @@ impl Guard {
 
 /// An Extent represents the set of values a term can take on (its type).
 /// Each operator has an extent that corresponds exactly to its type.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub enum Extent {
     /// A base type (e.g., integer, string, boolean)
     Base(BaseType),
@@ -218,6 +231,185 @@ pub enum Extent {
         end: usize,
     },
     DataSourceDomain(Rc<RefCell<dyn DataSourceDomainExtentImpl>>),
+    /// A restricted extent: wraps another extent with a restriction predicate.
+    Restricted {
+        base: Box<Extent>,
+        restriction: Rc<RefCell<Restriction>>,
+    },
+}
+
+impl PartialEq for Extent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Extent::Base(t1), Extent::Base(t2)) => t1 == t2,
+            (
+                Extent::Function {
+                    domain: d1,
+                    codomain: c1,
+                },
+                Extent::Function {
+                    domain: d2,
+                    codomain: c2,
+                },
+            ) => d1 == d2 && c1 == c2,
+            (Extent::Record(a1), Extent::Record(a2)) => a1 == a2,
+            (
+                Extent::Restricted {
+                    base: b1,
+                    restriction: r1,
+                },
+                Extent::Restricted {
+                    base: b2,
+                    restriction: r2,
+                },
+            ) => b1 == b2 && Rc::ptr_eq(r1, r2),
+            // Union equality is order-sensitive (structural).
+            (Extent::Union(u1), Extent::Union(u2)) => u1 == u2,
+            (
+                Extent::UIntRange { start: s1, end: e1 },
+                Extent::UIntRange { start: s2, end: e2 },
+            ) => s1 == s2 && e1 == e2,
+            (Extent::DataSourceDomain(d1), Extent::DataSourceDomain(d2)) => {
+                d1.borrow().get_id() == d2.borrow().get_id()
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Extent {}
+
+pub struct NotifyOrSubscribeResult {
+    pub notify: bool,
+    pub subscribe: bool,
+}
+
+impl Extent {
+    /// When subscribing to this extent as an iteration, returns whether to immediately
+    /// notify true and whether to add the iterating variable to the scheduler.
+    pub fn subscribe_to_iteration_action(&self) -> NotifyOrSubscribeResult {
+        match self {
+            // DataSource extents need to be registered so that the scheduling loop can
+            // poll them for notifications
+            Extent::DataSourceDomain(..) => NotifyOrSubscribeResult {
+                notify: false,
+                subscribe: true,
+            },
+            // Literal range extents are fully ready immediately
+            Extent::UIntRange { .. } => NotifyOrSubscribeResult {
+                notify: true,
+                subscribe: false,
+            },
+            // Record extents are immediately ready if all attributes are ready,
+            // otherwise we register with the scheduler.
+            Extent::Record(attributes) => attributes
+                .values()
+                .map(|extent| extent.subscribe_to_iteration_action())
+                .fold(
+                    NotifyOrSubscribeResult {
+                        notify: true,
+                        subscribe: false,
+                    },
+                    |acc, value| NotifyOrSubscribeResult {
+                        notify: acc.notify && value.notify,
+                        subscribe: acc.subscribe || value.subscribe,
+                    },
+                ),
+            // Restricted extents behave like their base record, but also set up the
+            // restriction producer so it can compute correlation vectors at runtime.
+            Extent::Restricted { base, .. } => base.subscribe_to_iteration_action(),
+            // Other Extents cannot be iterated, so nothing to do
+            _ => NotifyOrSubscribeResult {
+                notify: false,
+                subscribe: false,
+            },
+        }
+    }
+
+    /// Determine the extent for a given value.
+    pub fn for_value(value: &Value) -> Extent {
+        match value {
+            Value::Int(_) => Extent::Base(BaseType::Int),
+            Value::UInt(_) => Extent::Base(BaseType::UInt),
+            Value::String(_) => Extent::Base(BaseType::String),
+            Value::Bool(_) => Extent::Base(BaseType::Bool),
+            Value::Unit => Extent::Base(BaseType::Unit),
+            Value::Function(bindings) => {
+                // For a function literal, we need to infer the domain and codomain
+                // from the bindings. For now, we'll use a simplified approach.
+                // TODO: Properly infer function types from bindings
+                if bindings.is_empty() {
+                    Extent::function(Extent::Base(BaseType::Unit), Extent::Base(BaseType::Unit))
+                } else {
+                    // Infer from first binding as a placeholder
+                    let domain = Self::for_value(&bindings[0].input);
+                    let codomain = Self::for_value(&bindings[0].output);
+                    Extent::function(domain, codomain)
+                }
+            }
+            Value::Record(fields) => {
+                let field_extents: HashMap<String, Extent> = fields
+                    .iter()
+                    .map(|(name, val)| (name.clone(), Self::for_value(val)))
+                    .collect();
+                Extent::record(field_extents)
+            }
+        }
+    }
+}
+
+pub struct Restriction {
+    compute_op: Option<Box<ComputeRestriction>>,
+    compute_producer: Option<Box<dyn Producer>>,
+}
+
+impl Default for Restriction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Restriction {
+    pub fn new() -> Self {
+        Self {
+            compute_op: None,
+            compute_producer: None,
+        }
+    }
+
+    pub fn set_compute_op(&mut self, compute_op: Box<ComputeRestriction>) {
+        self.compute_op = Some(compute_op);
+    }
+
+    pub fn set_up_producer(
+        &mut self,
+        intent_guard: Guard,
+        var_scope: Option<Rc<VarScope>>,
+        scheduler: &mut Scheduler,
+    ) {
+        if self.compute_producer.is_none() {
+            if let Some(op) = &mut self.compute_op {
+                self.compute_producer =
+                    Some(op.subscribe(intent_guard, Box::new(|_| {}), var_scope, scheduler));
+            } else {
+                panic!("Missing compute_op in Restriction");
+            }
+        }
+    }
+
+    pub fn get_correlation_vector(&mut self) -> BitVec {
+        let data = self.compute_producer.as_mut().unwrap().get();
+        match data.column_value.data {
+            ColumnData::FunctionBindings { outputs, .. } => match *outputs {
+                ColumnData::Bools(bools) => {
+                    trace!("Got restriction vector {}", bools);
+                    bools
+                }
+                _ => panic!("Expected Bools from compute_producer outputs"),
+            },
+            _ => panic!("Expected FunctionBindings from compute_producer"),
+        }
+    }
 }
 
 /// The Extent of the domain of a Data Source
@@ -226,6 +418,9 @@ pub trait DataSourceDomainExtentImpl {
     fn check_for_new_data(&mut self) -> bool;
     fn get_yield_guard(&self) -> Guard;
     fn get_elements(&self) -> ColumnData;
+    /// Returns the [`Extent`] of each individual domain element.
+    /// Used to construct a typed empty [`ColumnData`] when the domain is empty.
+    fn element_extent(&self) -> Extent;
     fn release(&mut self, obsolete_guard: Guard) -> Guard;
 }
 
@@ -241,8 +436,8 @@ impl std::fmt::Debug for Extent {
         match self {
             Extent::Base(base) => write!(f, "{base:?}"),
             Extent::Function { domain, codomain } => write!(f, "({domain:?} -> {codomain:?})"),
-            Extent::Record(fields) => {
-                let field_strs: Vec<String> = fields
+            Extent::Record(attributes) => {
+                let field_strs: Vec<String> = attributes
                     .iter()
                     .map(|(name, extent)| format!("{name}: {extent:?}"))
                     .collect();
@@ -254,6 +449,7 @@ impl std::fmt::Debug for Extent {
             }
             Extent::UIntRange { start, end } => write!(f, "[{start}, {end})"),
             Extent::DataSourceDomain(_) => write!(f, "DataSource"),
+            Extent::Restricted { base, .. } => write!(f, "Restricted({base:?})"),
         }
     }
 }
@@ -267,23 +463,45 @@ impl Extent {
         }
     }
 
-    /// Create a record extent from field extents
-    pub fn record(fields: HashMap<String, Extent>) -> Self {
-        Extent::Record(fields)
+    /// Create a record extent from attribute extents
+    pub fn record(attributes: HashMap<String, Extent>) -> Self {
+        Extent::Record(attributes)
+    }
+
+    /// Create a restricted record extent: a [`Restricted`] wrapping a [`Record`].
+    pub fn restricted_record(attributes: HashMap<String, Extent>) -> Self {
+        Extent::restricted(Extent::Record(attributes))
+    }
+
+    /// Wrap any extent in a [`Restricted`] with a fresh [`Restriction`].
+    pub fn restricted(base: Extent) -> Self {
+        Extent::Restricted {
+            base: Box::new(base),
+            restriction: Rc::new(RefCell::new(Restriction::new())),
+        }
+    }
+
+    /// Return the restriction handle if this is a [`Restricted`] extent.
+    pub fn restriction(&mut self) -> Option<Rc<RefCell<Restriction>>> {
+        match self {
+            Extent::Restricted { restriction, .. } => Some(restriction.clone()),
+            _ => None,
+        }
+    }
+
+    /// Return the attribute map if this extent is a [`Record`], or a [`Restricted`] wrapping one.
+    pub fn record_attributes(&self) -> Option<&HashMap<String, Extent>> {
+        match self {
+            Extent::Record(attributes) => Some(attributes),
+            Extent::Restricted { base, .. } => base.record_attributes(),
+            _ => None,
+        }
     }
 
     /// Split a function extent into domain and codomain
     pub fn split_function(&self) -> Option<(&Extent, &Extent)> {
         match self {
             Extent::Function { domain, codomain } => Some((domain, codomain)),
-            _ => None,
-        }
-    }
-
-    /// Split a record extent into field extents
-    pub fn split_record(&self) -> Option<&HashMap<String, Extent>> {
-        match self {
-            Extent::Record(fields) => Some(fields),
             _ => None,
         }
     }
@@ -298,7 +516,7 @@ impl Extent {
                     Guard::Universal
                 }
             }
-            Extent::Record(_) => {
+            Extent::Record(..) => {
                 // For records, parts should be a map of field names to guards
                 // This is a simplified version - in practice we'd need proper mapping
                 Guard::Universal
@@ -399,7 +617,24 @@ impl PartialOrd for Value {
                     None
                 }
             }
-            _ => todo!("Ordering not implemented yet"),
+            // Order records lexicographically if they have the same schema.
+            Value::Record(attrs) => {
+                if let Value::Record(o_attrs) = other {
+                    if attrs.keys().collect::<std::collections::HashSet<_>>()
+                        != o_attrs.keys().collect::<std::collections::HashSet<_>>()
+                    {
+                        return None; // Records with different keys are not comparable
+                    }
+                    let mut entries: Vec<_> = attrs.iter().collect();
+                    let mut o_entries: Vec<_> = o_attrs.iter().collect();
+                    entries.sort_by_key(|(k, _)| *k);
+                    o_entries.sort_by_key(|(k, _)| *k);
+                    entries.partial_cmp(&o_entries)
+                } else {
+                    None
+                }
+            }
+            _ => todo!("Ordering not implemented yet: {self:?}"),
         }
     }
 }
@@ -556,21 +791,22 @@ impl ColumnData {
     }
 
     /// Convert a Vec<Value> into typed ColumnData.
-    pub fn from_values(values: Vec<Value>) -> ColumnData {
-        let exemplar = if values.is_empty() {
-            &Value::Unit
-        } else {
-            &values[0]
-        };
-        match exemplar {
-            Value::Unit => ColumnData::Units(values.len()),
-            Value::Bool(..) => ColumnData::Bools(values.iter().map(Value::as_bool).collect()),
-            Value::Int(..) => ColumnData::Ints(values.iter().map(Value::as_int).collect()),
-            Value::UInt(..) => ColumnData::UInts(values.iter().map(Value::as_uint).collect()),
-            Value::String(..) => {
+    pub fn from_values(values: Vec<Value>, extent: &Extent) -> ColumnData {
+        match extent {
+            Extent::Base(BaseType::Unit) => ColumnData::Units(values.len()),
+            Extent::Base(BaseType::Bool) => {
+                ColumnData::Bools(values.iter().map(Value::as_bool).collect())
+            }
+            Extent::Base(BaseType::Int) => {
+                ColumnData::Ints(values.iter().map(Value::as_int).collect())
+            }
+            Extent::Base(BaseType::UInt) => {
+                ColumnData::UInts(values.iter().map(Value::as_uint).collect())
+            }
+            Extent::Base(BaseType::String) => {
                 ColumnData::Strings(values.iter().map(|v| v.as_string().to_string()).collect())
             }
-            Value::Record(m) => {
+            Extent::Record(m) => {
                 // Pivot the list of Records into a Record of ColumnDatas
                 let keys: Vec<String> = m.keys().cloned().collect();
                 let fields = keys
@@ -583,7 +819,18 @@ impl ColumnData {
                                 _ => panic!("Expected Record in from_values, got {v:?}"),
                             })
                             .collect();
-                        (key, ColumnData::from_values(field_values))
+                        (
+                            key.clone(),
+                            ColumnData::from_values(
+                                field_values,
+                                extent
+                                    .record_attributes()
+                                    .and_then(|attrs| attrs.get(&key))
+                                    .unwrap_or_else(|| {
+                                        panic!("Record extent missing attribute '{key}'")
+                                    }),
+                            ),
+                        )
                     })
                     .collect();
                 ColumnData::Records(fields)
@@ -687,6 +934,165 @@ impl ColumnData {
             None
         }
     }
+
+    /// Compute the cartesian product of a map of named column datas.
+    ///
+    /// Returns a [`ColumnData::Records`] where each field is expanded so that the fields
+    /// together enumerate every combination of rows across all input columns. The total
+    /// row count is the product of all input column lengths.
+    ///
+    /// # Example
+    /// Given `{"a": [1, 2], "b": [3, 4]}`, returns
+    /// `Records {"a": [1, 1, 2, 2], "b": [3, 4, 3, 4]}`.
+    pub fn cartesian_product_with_correlation(
+        data: HashMap<String, ColumnData>,
+        correlations: &Option<BitSet>,
+    ) -> ColumnData {
+        if data.is_empty() {
+            return ColumnData::Records(HashMap::new());
+        }
+        // Sort keys for a deterministic column order when computing strides.
+        let mut keys: Vec<String> = data.keys().cloned().collect();
+        keys.sort();
+        let lengths: Vec<usize> = keys.iter().map(|k| data[k].len()).collect();
+        let total: usize = lengths.iter().product();
+        let expanded = keys
+            .iter()
+            .enumerate()
+            .map(|(j, key)| {
+                // stride: how many output rows share the same index into this column
+                // before it advances — the product of all subsequent column lengths.
+                let stride: usize = lengths[j + 1..].iter().product();
+                let indices: Vec<usize> = if let Some(corr) = correlations {
+                    // If correlations are provided, filter the range to only include rows that are correlated.
+                    (0..total)
+                        .filter(|i| corr.contains(*i))
+                        .map(|i| (i / stride) % lengths[j])
+                        .collect()
+                } else {
+                    (0..total).map(|i| (i / stride) % lengths[j]).collect()
+                };
+                (key.clone(), data[key].select_indices(&indices))
+            })
+            .collect();
+        ColumnData::Records(expanded)
+    }
+
+    /// Construct a ColumnData containing the given string values.
+    pub fn strings(values: &[&str]) -> ColumnData {
+        ColumnData::Strings(values.iter().map(|s| s.to_string()).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bit_set::BitSet;
+    use std::collections::HashMap;
+
+    /// Helper to make a full BitSet covering [0, n).
+    fn full_bitset(n: usize) -> BitSet {
+        let mut bs = BitSet::new();
+        for i in 0..n {
+            bs.insert(i);
+        }
+        bs
+    }
+
+    #[test]
+    fn test_cartesian_product_no_filter() {
+        // {"a": [1,2], "b": [3,4]}, no filter → full 2×2 product.
+        // Keys sorted: ["a","b"].  Strides: a=2, b=1.
+        // Row 0: a[0]=1, b[0]=3 | Row 1: a[0]=1, b[1]=4
+        // Row 2: a[1]=2, b[0]=3 | Row 3: a[1]=2, b[1]=4
+        let data = HashMap::from([
+            ("a".to_string(), ColumnData::Ints(vec![1, 2])),
+            ("b".to_string(), ColumnData::Ints(vec![3, 4])),
+        ]);
+        let result = ColumnData::cartesian_product_with_correlation(data, &None);
+        assert_eq!(
+            result,
+            ColumnData::Records(HashMap::from([
+                ("a".to_string(), ColumnData::Ints(vec![1, 1, 2, 2])),
+                ("b".to_string(), ColumnData::Ints(vec![3, 4, 3, 4])),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_cartesian_product_empty_bitset() {
+        // Empty correlation set → no rows selected → empty columns.
+        let data = HashMap::from([
+            ("a".to_string(), ColumnData::Ints(vec![1, 2])),
+            ("b".to_string(), ColumnData::Ints(vec![3, 4])),
+        ]);
+        let result = ColumnData::cartesian_product_with_correlation(data, &Some(BitSet::new()));
+        assert_eq!(
+            result,
+            ColumnData::Records(HashMap::from([
+                ("a".to_string(), ColumnData::Ints(vec![])),
+                ("b".to_string(), ColumnData::Ints(vec![])),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_cartesian_product_full_bitset() {
+        // Full BitSet covering all 4 rows → same output as no filter.
+        let data = HashMap::from([
+            ("a".to_string(), ColumnData::Ints(vec![1, 2])),
+            ("b".to_string(), ColumnData::Ints(vec![3, 4])),
+        ]);
+        let result = ColumnData::cartesian_product_with_correlation(data, &Some(full_bitset(4)));
+        assert_eq!(
+            result,
+            ColumnData::Records(HashMap::from([
+                ("a".to_string(), ColumnData::Ints(vec![1, 1, 2, 2])),
+                ("b".to_string(), ColumnData::Ints(vec![3, 4, 3, 4])),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_cartesian_product_sparse_bitset() {
+        // BitSet {0, 3} → rows 0 and 3 of the 2×2 product (diagonal).
+        // Row 0: a[0]=1, b[0]=3 | Row 3: a[1]=2, b[1]=4
+        let data = HashMap::from([
+            ("a".to_string(), ColumnData::Ints(vec![1, 2])),
+            ("b".to_string(), ColumnData::Ints(vec![3, 4])),
+        ]);
+        let mut filter = BitSet::new();
+        filter.insert(0);
+        filter.insert(3);
+        let result = ColumnData::cartesian_product_with_correlation(data, &Some(filter));
+        assert_eq!(
+            result,
+            ColumnData::Records(HashMap::from([
+                ("a".to_string(), ColumnData::Ints(vec![1, 2])),
+                ("b".to_string(), ColumnData::Ints(vec![3, 4])),
+            ]))
+        );
+    }
+
+    #[test]
+    fn test_cartesian_product_empty_map() {
+        let result = ColumnData::cartesian_product_with_correlation(HashMap::new(), &None);
+        assert_eq!(result, ColumnData::Records(HashMap::new()));
+    }
+
+    #[test]
+    fn test_cartesian_product_single_column() {
+        // Single column with a full filter → identity.
+        let data = HashMap::from([("a".to_string(), ColumnData::Ints(vec![10, 20, 30]))]);
+        let result = ColumnData::cartesian_product_with_correlation(data, &Some(full_bitset(3)));
+        assert_eq!(
+            result,
+            ColumnData::Records(HashMap::from([(
+                "a".to_string(),
+                ColumnData::Ints(vec![10, 20, 30]),
+            )]))
+        );
+    }
 }
 
 /// A columnar value representation for vectorized execution.
@@ -715,9 +1121,9 @@ impl ColumnValue {
         }
     }
 
-    pub fn from_values(values: Vec<Value>) -> ColumnValue {
+    pub fn from_values(values: Vec<Value>, extent: &Extent) -> ColumnValue {
         ColumnValue {
-            data: ColumnData::from_values(values),
+            data: ColumnData::from_values(values, extent),
             parent_indices: ParentIndices::TopLevelVector,
         }
     }

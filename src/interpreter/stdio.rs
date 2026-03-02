@@ -1,6 +1,6 @@
 use std::{cell::RefCell, rc::Rc};
 
-use log::debug;
+use log::{debug, trace};
 
 use crate::interpreter::{
     ColumnData, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, GetResult, Guard,
@@ -17,8 +17,7 @@ pub struct StdinReader {
 }
 
 impl StdinReader {
-    pub fn new() -> StdinReader {
-        let data_source = Rc::new(RefCell::new(StdinDataSource::new()));
+    pub fn new(data_source: Rc<RefCell<StdinDataSource>>) -> StdinReader {
         StdinReader {
             extent: Extent::Function {
                 domain: Box::new(Extent::DataSourceDomain(data_source.clone())),
@@ -26,12 +25,6 @@ impl StdinReader {
             },
             data_source,
         }
-    }
-}
-
-impl Default for StdinReader {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -81,7 +74,8 @@ impl Operator for StdinReader {
 }
 
 /// Buffers and tracks lines available on stdin
-struct StdinDataSource {
+#[derive(Default)]
+pub struct StdinDataSource {
     /// Currently available data
     buffer: Vec<String>,
 
@@ -99,7 +93,7 @@ struct StdinDataSource {
 }
 
 impl StdinDataSource {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             buffer: Vec::new(),
             start_idx: 0,
@@ -152,6 +146,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
 
     /// Reads stdin for a newline, blocking until a new line is available or EOF is observed
     fn check_for_new_data(&mut self) -> bool {
+        trace!("Checking for new data on stdin");
         let input = std::io::stdin();
         let mut line = String::new();
         match input.read_line(&mut line) {
@@ -182,10 +177,10 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     fn get_yield_guard(&self) -> Guard {
         let yield_guard = if self.eof_reached {
             Guard::Universal
-        } else if self.start_idx == 0 {
+        } else if self.ready_size == 0 {
             Guard::Empty
         } else {
-            Guard::LessThanOrEq(Value::UInt(self.start_idx - 1))
+            Guard::LessThanOrEq(Value::UInt(self.ready_size - 1))
         };
         debug!("StdinDataSource yielding {yield_guard:?}");
         yield_guard
@@ -194,6 +189,10 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     /// Returns the currently readable set of indices
     fn get_elements(&self) -> ColumnData {
         ColumnData::UInts((self.start_idx..self.ready_size).collect())
+    }
+
+    fn element_extent(&self) -> Extent {
+        Extent::Base(crate::interpreter::BaseType::UInt)
     }
 
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
@@ -250,6 +249,7 @@ impl Producer for StdinProducer {
         } = self.index_producer.get();
         let source = self.data_source.borrow();
         let outputs = match &indices.data {
+            d if d.is_empty() => ColumnData::Strings(Vec::new()),
             ColumnData::UInts(idx_vec) => {
                 ColumnData::Strings(idx_vec.iter().map(|i| source.get(*i).to_string()).collect())
             }
@@ -287,10 +287,13 @@ mod tests {
         assert_eq!("a", source.get(0));
         assert_eq!("b", source.get(1));
         assert_eq!(None, source.get_opt(2));
-        assert_eq!(Guard::Empty, source.get_yield_guard());
+        assert_eq!(
+            Guard::LessThanOrEq(crate::interpreter::Value::UInt(1)),
+            source.get_yield_guard()
+        );
         source.release_index(0);
         assert_eq!(
-            Guard::LessThanOrEq(crate::interpreter::Value::UInt(0)),
+            Guard::LessThanOrEq(crate::interpreter::Value::UInt(1)),
             source.get_yield_guard()
         );
         assert_eq!(None, source.get_opt(0));
@@ -300,19 +303,19 @@ mod tests {
         assert_eq!("b", source.get(1));
         assert_eq!("c", source.get(2));
         assert_eq!(
-            Guard::LessThanOrEq(crate::interpreter::Value::UInt(0)),
+            Guard::LessThanOrEq(crate::interpreter::Value::UInt(2)),
             source.get_yield_guard()
         );
         source.release_index(1);
         assert_eq!(
-            Guard::LessThanOrEq(crate::interpreter::Value::UInt(1)),
+            Guard::LessThanOrEq(crate::interpreter::Value::UInt(2)),
             source.get_yield_guard()
         );
         assert_eq!(None, source.get_opt(0));
         assert_eq!(None, source.get_opt(1));
         assert_eq!("c", source.get(2));
         assert_eq!(
-            Guard::LessThanOrEq(crate::interpreter::Value::UInt(1)),
+            Guard::LessThanOrEq(crate::interpreter::Value::UInt(2)),
             source.get_yield_guard()
         );
         source.eof_reached = true;

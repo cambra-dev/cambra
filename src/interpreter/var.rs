@@ -1,12 +1,17 @@
 //! Variable system: VarScope, VarSource, Var, VarProducer, VarRef, VarRefProducer, compose_indices.
 
-use std::cell::RefCell;
 use std::rc::Rc;
+use std::{cell::RefCell, collections::HashMap};
 
-use log::debug;
+use bit_set::BitSet;
+use log::{debug, trace};
 
+use crate::interpreter::Restriction;
 /// A variable subscription paired with the chain of iteration-source variables between
-use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions, MODE_ARGUMENT, MODE_ITERATION};
+use crate::{
+    interpreter::{ColumnData, DataSourceDomainExtentImpl},
+    pretty_graph::{fmt_extent, InspectNode, VizOptions, MODE_ARGUMENT, MODE_ITERATION},
+};
 
 use super::{
     fmt_guard, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator,
@@ -117,7 +122,7 @@ pub enum VarSource {
 /// It holds the variable's name, extent, and predicate - but NOT a static definition.
 /// The variable's values are injected at run time either via application (argument source)
 /// or direct iteration (iteration source).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Var {
     /// The name of the variable
     pub name: String,
@@ -126,6 +131,10 @@ pub struct Var {
     /// Predicate that restricts this variable's extent
     /// Applied to guards before propagating to the operator
     predicate: Guard,
+    /// Whether this variable is responsible for setting up the producer for its restriction (if any)
+    /// The producer needs to be set up in the narrowest scope that contains the restriction, which
+    /// is information that is only available in the compiler. Thus, we record that info here.
+    owns_restriction: bool,
 }
 
 impl Var {
@@ -135,6 +144,7 @@ impl Var {
             name: name.to_string(),
             extent,
             predicate: Guard::Universal,
+            owns_restriction: false,
         }
     }
 
@@ -146,6 +156,11 @@ impl Var {
     /// Get the extent (type) of this variable.
     pub fn extent(&self) -> &Extent {
         &self.extent
+    }
+
+    /// Get the extent of this variable as a mutable ref.
+    pub fn extent_mut(&mut self) -> &mut Extent {
+        &mut self.extent
     }
 
     /// Set a predicate that restricts this variable's extent.
@@ -168,6 +183,14 @@ impl Var {
             source,
             self.extent(),
         )))
+    }
+
+    pub fn owns_restriction(&self) -> bool {
+        self.owns_restriction
+    }
+
+    pub fn set_owns_restriction(&mut self, owns_restriction: bool) {
+        self.owns_restriction = owns_restriction;
     }
 }
 
@@ -274,12 +297,9 @@ impl VarProducer {
         self.source = source;
     }
 
-    pub fn check_for_notification(&mut self) {
-        match &mut self.source {
-            VarSource::Iteration {
-                extent: Extent::DataSourceDomain(extent_impl),
-                ..
-            } => {
+    fn check_for_notifications_by_extent(&mut self, extent: &Extent) {
+        match extent {
+            Extent::DataSourceDomain(extent_impl, ..) => {
                 let notification = if extent_impl.borrow_mut().check_for_new_data() {
                     Notification::NewData
                 } else {
@@ -290,11 +310,29 @@ impl VarProducer {
                     .iter_mut()
                     .for_each(|c| c.notify(notification.clone()));
             }
+            Extent::Record(attributes) => {
+                for attr_extent in attributes.values() {
+                    self.check_for_notifications_by_extent(attr_extent);
+                }
+            }
+            Extent::Restricted { base, .. } => {
+                self.check_for_notifications_by_extent(base);
+            }
+            // Nothing to do for other extents since they all complete from the start of the program
+            _ => {}
+        }
+    }
+
+    pub fn check_for_notification(&mut self) {
+        let extent = match &self.source {
+            VarSource::Iteration { extent, .. } => extent,
             _ => panic!(
                 "Expected VarProducer with DataSource input, got {:?}",
                 self.source
             ),
-        };
+        }
+        .clone();
+        self.check_for_notifications_by_extent(&extent);
     }
 
     pub fn get_extent(&self) -> &Extent {
@@ -375,27 +413,7 @@ impl Producer for VarProducer {
             VarSource::Iteration {
                 extent,
                 predicate: _,
-            } => match extent {
-                Extent::UIntRange { start, end } => {
-                    self.yield_guard = Guard::Universal;
-                    GetResult {
-                        column_value: ColumnValue::from_uints((*start..*end).collect()),
-                        yield_guard: Guard::Universal,
-                    }
-                }
-                Extent::DataSourceDomain(source_impl) => {
-                    let values = source_impl.borrow_mut().get_elements();
-                    let yield_guard = source_impl.borrow().get_yield_guard();
-                    self.yield_guard = yield_guard.clone();
-                    let get_result = GetResult {
-                        column_value: ColumnValue::from_column_data(values),
-                        yield_guard,
-                    };
-                    debug!("Generating source values {get_result:#?}");
-                    get_result
-                }
-                _ => panic!("Attempted to iterate on infinite Extent"),
-            },
+            } => iterate_extent(extent, &None),
         }
     }
 
@@ -408,15 +426,126 @@ impl Producer for VarProducer {
                 panic!("VarProducer::release() called while source is Uninitialized")
             }
             VarSource::Argument(producer) => producer.release(obsolete_guard),
-            VarSource::Iteration {
-                extent: Extent::DataSourceDomain(source_impl),
-                ..
-            } => source_impl.borrow_mut().release(obsolete_guard),
-            VarSource::Iteration { .. } => {
-                // For iteration over literal sources, nothing to do
-                obsolete_guard
+            VarSource::Iteration { extent, .. } => release_for_extent(extent, obsolete_guard),
+        }
+    }
+}
+
+/// Produce all values for the given extent, applying the outer filter if provided.
+/// For now the filters are simple BitSets, but in the future they will be some more compressed structure.
+fn iterate_extent(extent: &Extent, outer_filter: &Option<BitSet>) -> GetResult {
+    match extent {
+        Extent::UIntRange { start, end, .. } => iterate_uint_range(*start, *end, outer_filter),
+        Extent::DataSourceDomain(source_impl) => {
+            iterate_data_source_domain(source_impl, outer_filter)
+        }
+        Extent::Record(attributes) => iterate_record(attributes, outer_filter),
+        Extent::Restricted { base, restriction } => {
+            iterate_restricted_extent(base.as_ref(), restriction, outer_filter)
+        }
+        _ => panic!("Attempted to iterate on infinite Extent"),
+    }
+}
+
+fn iterate_uint_range(start: usize, end: usize, outer_filter: &Option<BitSet>) -> GetResult {
+    match outer_filter {
+        Some(restriction) => {
+            let filtered: Vec<usize> = (start..end)
+                .enumerate()
+                .filter(|(i, _)| restriction.contains(*i))
+                .map(|(_, v)| v)
+                .collect();
+            GetResult {
+                column_value: ColumnValue::from_uints(filtered),
+                yield_guard: Guard::Universal,
             }
         }
+        None => GetResult {
+            column_value: ColumnValue::from_uints((start..end).collect()),
+            yield_guard: Guard::Universal,
+        },
+    }
+}
+
+fn iterate_data_source_domain(
+    source_impl: &Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+    outer_filter: &Option<BitSet>,
+) -> GetResult {
+    let values = source_impl.borrow_mut().get_elements();
+    let yield_guard = source_impl.borrow().get_yield_guard();
+    let n = values.len();
+    let output = if let Some(outer_filter) = outer_filter {
+        ColumnValue::from_values(
+            (0..n)
+                .filter(|i| outer_filter.contains(*i))
+                .map(|i| values.index_at(i))
+                .collect(),
+            &source_impl.borrow().element_extent(),
+        )
+    } else {
+        ColumnValue::from_column_data(values)
+    };
+    GetResult {
+        column_value: output,
+        yield_guard,
+    }
+}
+
+fn iterate_record(
+    attributes: &HashMap<String, Extent>,
+    outer_filter: &Option<BitSet>,
+) -> GetResult {
+    let mut output_data: HashMap<String, GetResult> = attributes
+        .iter()
+        .map(|(attr, attr_extent)| (attr.clone(), iterate_extent(attr_extent, &None)))
+        .collect();
+    let yield_guard = Guard::Record(
+        output_data
+            .iter()
+            .map(|(attr, get_result)| (attr.clone(), get_result.yield_guard.clone()))
+            .collect(),
+    );
+    let data = output_data
+        .drain()
+        .map(|(attr, get_result)| (attr.clone(), get_result.column_value.data))
+        .collect();
+    GetResult {
+        column_value: ColumnValue {
+            data: ColumnData::cartesian_product_with_correlation(data, outer_filter),
+            parent_indices: ParentIndices::TopLevelVector,
+        },
+        yield_guard,
+    }
+}
+
+fn iterate_restricted_extent(
+    base: &Extent,
+    restriction: &Rc<RefCell<Restriction>>,
+    outer_filter: &Option<BitSet>,
+) -> GetResult {
+    let mut filter = BitSet::from_bit_vec(restriction.borrow_mut().get_correlation_vector());
+    if let Some(outer_filter) = outer_filter {
+        filter.intersect_with(outer_filter);
+    }
+    iterate_extent(base, &Some(filter))
+}
+
+fn release_for_extent(extent: &mut Extent, obsolete_guard: Guard) -> Guard {
+    match extent {
+        Extent::DataSourceDomain(source_impl) => source_impl.borrow_mut().release(obsolete_guard),
+        Extent::Record(attributes) => {
+            for (attr, attr_extent) in attributes.iter_mut() {
+                release_for_extent(
+                    attr_extent,
+                    obsolete_guard
+                        .get_record_attribute(attr)
+                        .unwrap_or_else(|| panic!("Not Record Guard: {obsolete_guard:?}")),
+                );
+            }
+            obsolete_guard
+        }
+        Extent::Restricted { base, .. } => release_for_extent(base.as_mut(), obsolete_guard),
+        _ => obsolete_guard,
     }
 }
 
@@ -598,6 +727,11 @@ impl Producer for VarRefProducer {
 
         // If no iteration chain, no alignment needed
         if self.iteration_chain.is_empty() {
+            trace!(
+                "VarRefProducer for '{}' has no iteration chain, returning data directly: {:?}",
+                self.var_name,
+                var_result.column_value.data
+            );
             return var_result;
         }
 
