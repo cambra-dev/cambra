@@ -383,7 +383,11 @@ impl Producer for VarProducer {
             VarSource::Argument(producer) => {
                 desc = desc.child("source", producer.inspect(opts));
             }
-            VarSource::Iteration { .. } => {}
+            VarSource::Iteration { .. } => {
+                if let Extent::Restricted { restriction, .. } = &self.extent {
+                    desc = desc.child("restriction", restriction.borrow().inspect(opts));
+                }
+            }
             VarSource::Uninitialized => {
                 desc = desc.annotate("[uninitialized]".to_string());
             }
@@ -391,13 +395,15 @@ impl Producer for VarProducer {
         desc
     }
     fn get(&mut self) -> GetResult {
-        match &mut self.source {
+        let result = match &mut self.source {
             VarSource::Uninitialized => {
                 panic!("VarProducer::get() called while source is Uninitialized")
             }
             VarSource::Argument(producer) => producer.get(),
             VarSource::Iteration { extent } => iterate_extent(extent, &None),
-        }
+        };
+        self.yield_guard = result.yield_guard.clone();
+        result
     }
 
     fn release(&mut self, obsolete_guard: Guard) -> Guard {

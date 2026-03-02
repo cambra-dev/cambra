@@ -356,17 +356,14 @@ impl Operator for Lambda {
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut var_desc = InspectNode::leaf(format!(
-            "Var({}{})",
-            self.variable.name,
-            if self.variable.owns_restriction() {
-                " (owns restriction)"
-            } else {
-                ""
-            }
-        ));
+        let mut var_desc = InspectNode::new(format!("Var({})", self.variable.name));
         if opts.show_extents {
             var_desc = var_desc.annotate(format!(": {}", fmt_extent(self.variable.extent())));
+        }
+        if self.variable.owns_restriction() {
+            if let Extent::Restricted { restriction, .. } = self.variable.extent() {
+                var_desc = var_desc.child("restriction", restriction.borrow().inspect(opts));
+            }
         }
         let body_desc = self.body.inspect(opts);
         let mut desc = InspectNode::new(format!("Lambda({})", self.variable.name));

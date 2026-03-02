@@ -7,6 +7,7 @@ use bit_vec::BitVec;
 use log::trace;
 
 use crate::interpreter::{ComputeRestriction, Operator, Producer, Scheduler, VarScope};
+use crate::pretty_graph::{InspectNode, VizOptions};
 
 /// A Guard represents a region (subset of an extent) via a set of predicates.
 /// Guards are used to:
@@ -397,6 +398,18 @@ impl Restriction {
             } else {
                 panic!("Missing compute_op in Restriction");
             }
+        }
+    }
+
+    /// Inspect this restriction for visualization.
+    /// Shows the producer if one has been set up (post-subscribe), otherwise the operator.
+    pub fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        if let Some(producer) = &self.compute_producer {
+            producer.inspect(opts)
+        } else if let Some(op) = &self.compute_op {
+            op.inspect(opts)
+        } else {
+            InspectNode::leaf("Restriction (unset)")
         }
     }
 
@@ -912,6 +925,10 @@ impl ColumnValue {
     }
 
     /// Return `true` if this column is a single scalar value that can broadcast.
+    /// Note: it's a bit unsafe that we are just using length for this, as it
+    /// could mask bugs where a vector column of length 1 could be treated as a
+    /// scalar.
+    /// TODO: consider adding an explicit Scalar variant to ColumnValue to avoid this ambiguity.
     pub fn is_scalar(&self) -> bool {
         self.len() == 1
     }
