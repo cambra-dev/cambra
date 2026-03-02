@@ -1,8 +1,8 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::interpreter::{
-    ColumnData, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, GetResult, Guard,
-    Operator, ParentIndices, Producer, Scheduler, Value, VarScope,
+    ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, GetResult, Guard, Operator,
+    Producer, Scheduler, Value, VarScope,
 };
 
 /// Handle for simulating an arbitrary source in a program.
@@ -70,8 +70,8 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         result
     }
 
-    fn get_elements(&self) -> ColumnData {
-        ColumnData::from_values(self.data.keys().cloned().collect(), &self.element_extent)
+    fn get_elements(&self) -> ColumnValue {
+        ColumnValue::from_values(self.data.keys().cloned().collect(), &self.element_extent)
     }
 
     fn element_extent(&self) -> Extent {
@@ -198,10 +198,10 @@ impl Producer for TestSourceProducer {
             yield_guard,
         } = self.index_producer.get();
         let source = self.data_source.borrow();
-        let n = indices.data.len();
+        let n = indices.len();
         let output_values: Vec<Value> = (0..n)
             .map(|i| {
-                let key = indices.data.index_at(i);
+                let key = indices.index_at(i);
                 source
                     .data
                     .get(&key)
@@ -210,13 +210,10 @@ impl Producer for TestSourceProducer {
             })
             .collect();
         GetResult {
-            column_value: ColumnValue {
-                data: ColumnData::function_bindings(
-                    indices.data,
-                    ColumnData::from_values(output_values, &source.output_extent()),
-                ),
-                parent_indices: ParentIndices::TopLevelVector,
-            },
+            column_value: ColumnValue::function_bindings(
+                indices,
+                ColumnValue::from_values(output_values, &source.output_extent()),
+            ),
             yield_guard: yield_guard.to_universal_or_empty(),
         }
     }

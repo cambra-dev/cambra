@@ -79,7 +79,7 @@ impl Producer for ComputeRestrictionProducer {
 mod tests {
     use super::*;
     use crate::interpreter::{
-        Apply, ColumnData, Lambda, ListLiteral, Literal, Notification, Value, Var, VarRef,
+        Apply, ColumnValue, Lambda, ListLiteral, Literal, Notification, Value, Var, VarRef,
     };
     use bit_vec::BitVec;
     use std::cell::RefCell;
@@ -106,9 +106,9 @@ mod tests {
             "Expected synchronous notification from static extent"
         );
         let result = producer.get();
-        match result.column_value.data {
-            ColumnData::FunctionBindings { outputs, .. } => match *outputs {
-                ColumnData::Bools(bools) => bools,
+        match result.column_value {
+            ColumnValue::FunctionBindings { outputs, .. } => match *outputs {
+                ColumnValue::Bools(bools) => bools,
                 other => panic!("Expected Bools in ComputeRestriction outputs, got {other:?}"),
             },
             other => panic!("Expected FunctionBindings from ComputeRestriction, got {other:?}"),

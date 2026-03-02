@@ -691,7 +691,7 @@ fn lower_assign(
 mod tests {
     use super::*;
     use crate::interpreter::{
-        ColumnData, Consumer, FuncBinding, Guard, Notification, Operator, Scheduler,
+        ColumnValue, Consumer, FuncBinding, Guard, Notification, Operator, Scheduler,
     };
     use crate::pretty_ast;
     use crate::pretty_graph::pretty_operator;
@@ -719,7 +719,7 @@ mod tests {
         values.as_single().unwrap().clone()
     }
 
-    fn eval(mut op: Box<dyn Operator>, scope: Option<Rc<VarScope>>) -> ColumnData {
+    fn eval(mut op: Box<dyn Operator>, scope: Option<Rc<VarScope>>) -> ColumnValue {
         // Track notifications
         let notified = Rc::new(RefCell::new(false));
         let notified_clone = notified.clone();
@@ -735,14 +735,13 @@ mod tests {
         // For literals, we should be notified immediately
         assert!(*notified.borrow(), "Expected to be notified");
 
-        let column = producer.get().column_value;
-        column.data
+        producer.get().column_value
     }
 
-    fn make_int_list(v: &[i64]) -> ColumnData {
-        ColumnData::function_bindings(
-            ColumnData::UInts((0..v.len()).collect()),
-            ColumnData::Ints(v.into()),
+    fn make_int_list(v: &[i64]) -> ColumnValue {
+        ColumnValue::function_bindings(
+            ColumnValue::UInts((0..v.len()).collect()),
+            ColumnValue::Ints(v.into()),
         )
     }
 
@@ -811,9 +810,9 @@ mod tests {
     #[case("y = 5; [x + y for x in [10, 20]]", make_int_list(&[15, 25]))]
     #[case("[(y, y)._1 for y in [10, 20]]", make_int_list(&[10, 20]))]
     #[case("[y._0 for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
-    #[case("[(y, 100) for y in [(10, 'a'), (20, 'b')]]", ColumnData::FunctionBindings {
-            inputs: Box::new(ColumnData::UInts(vec![0, 1])),
-            outputs: Box::new(ColumnData::Records(HashMap::from([(String::from("_0"), ColumnData::Records(HashMap::from([(String::from("_0"), ColumnData::Ints(vec![10, 20])), (String::from("_1"), ColumnData::Strings(vec![String::from("a"), String::from("b")]))]))), (String::from("_1"), ColumnData::Ints(vec![100, 100]))]))),
+    #[case("[(y, 100) for y in [(10, 'a'), (20, 'b')]]", ColumnValue::FunctionBindings {
+            inputs: Box::new(ColumnValue::UInts(vec![0, 1])),
+            outputs: Box::new(ColumnValue::Records(HashMap::from([(String::from("_0"), ColumnValue::Records(HashMap::from([(String::from("_0"), ColumnValue::Ints(vec![10, 20])), (String::from("_1"), ColumnValue::Strings(vec![String::from("a"), String::from("b")]))]))), (String::from("_1"), ColumnValue::Ints(vec![100, 100]))]))),
         })]
     #[case("[x for x in [1,2,3] if x < 0]", make_int_list(&[]))]
     // Filter edge cases: all-pass and all-fail reuse make_int_list;
@@ -821,15 +820,15 @@ mod tests {
     // indices are not contiguous from 0.
     #[case("[x for x in [1,2,3] if x > 0]", make_int_list(&[1, 2, 3]))]
     #[case("[x for x in [1,2,3] if x > 10]", make_int_list(&[]))]
-    #[case("[x for x in [1,2,3] if x == 2]", ColumnData::FunctionBindings {
-        inputs: Box::new(ColumnData::UInts(vec![1])),
-        outputs: Box::new(ColumnData::Ints(vec![2])),
+    #[case("[x for x in [1,2,3] if x == 2]", ColumnValue::FunctionBindings {
+        inputs: Box::new(ColumnValue::UInts(vec![1])),
+        outputs: Box::new(ColumnValue::Ints(vec![2])),
     })]
-    #[case("[x for x in [1,2,3,4,5] if x > 1 if x < 5]", ColumnData::FunctionBindings {
-        inputs: Box::new(ColumnData::UInts(vec![1, 2, 3])),
-        outputs: Box::new(ColumnData::Ints(vec![2, 3, 4])),
+    #[case("[x for x in [1,2,3,4,5] if x > 1 if x < 5]", ColumnValue::FunctionBindings {
+        inputs: Box::new(ColumnValue::UInts(vec![1, 2, 3])),
+        outputs: Box::new(ColumnValue::Ints(vec![2, 3, 4])),
     })]
-    fn test_lower(#[case] code: &str, #[case] expected: ColumnData) {
+    fn test_lower(#[case] code: &str, #[case] expected: ColumnValue) {
         let ast = parse_module(code);
         let (op, scope) =
             lower_let_stmt_block(&mut LoweringContext::default(), &ast, &mut Scheduler::new())
@@ -839,28 +838,28 @@ mod tests {
     }
 
     #[rstest]
-    #[case("[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]", ColumnData::strings(&["ac", "ad", "ae", "bc", "bd", "be"]))]
-    #[case("[x + '_' for x in ['a', 'b'] for y in [True, False]]", ColumnData::strings(&["a_", "a_", "b_", "b_"]))]
-    #[case("[x + z + y for x in ['a', 'b'] for y in ['c', 'd'] for z in ['e', 'f']]", ColumnData::strings(&["aec", "afc", "aed", "afd", "bec", "bfc", "bed", "bfd"]))]
-    #[case("[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'e'] if x == y]", ColumnData::strings(&["bb", "cc"]))]
-    #[case("[x for x in [y for y in ['a', 'b', 'c'] if y != 'b'] if x < 'b']", ColumnData::strings(&["a"]))]
+    #[case("[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]", ColumnValue::strings(&["ac", "ad", "ae", "bc", "bd", "be"]))]
+    #[case("[x + '_' for x in ['a', 'b'] for y in [True, False]]", ColumnValue::strings(&["a_", "a_", "b_", "b_"]))]
+    #[case("[x + z + y for x in ['a', 'b'] for y in ['c', 'd'] for z in ['e', 'f']]", ColumnValue::strings(&["aec", "afc", "aed", "afd", "bec", "bfc", "bed", "bfd"]))]
+    #[case("[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'e'] if x == y]", ColumnValue::strings(&["bb", "cc"]))]
+    #[case("[x for x in [y for y in ['a', 'b', 'c'] if y != 'b'] if x < 'b']", ColumnValue::strings(&["a"]))]
     // Inequality join predicate
-    #[case("[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'd'] if x < y]", ColumnData::strings(&["ab", "ac", "ad", "bc", "bd", "cd"]))]
+    #[case("[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'd'] if x < y]", ColumnValue::strings(&["ab", "ac", "ad", "bc", "bd", "cd"]))]
     // Join where predicate matches nothing
-    #[case("[x + y for x in ['a', 'b'] for y in ['c', 'd'] if x == y]", ColumnData::strings(&[]))]
+    #[case("[x + y for x in ['a', 'b'] for y in ['c', 'd'] if x == y]", ColumnValue::strings(&[]))]
     // Three-way join with two-clause predicate
-    #[case("[x + y + z for x in ['a', 'b'] for y in ['b', 'c'] for z in ['b', 'c'] if x != y if y == z]", ColumnData::strings(&["abb", "acc", "bcc"]))]
+    #[case("[x + y + z for x in ['a', 'b'] for y in ['b', 'c'] for z in ['b', 'c'] if x != y if y == z]", ColumnValue::strings(&["abb", "acc", "bcc"]))]
     // Two-clause predicate on a two-generator join
-    #[case("[x + y for x in ['a', 'b', 'c'] for y in ['a', 'b', 'c'] if x == y if x < 'c']", ColumnData::strings(&["aa", "bb"]))]
+    #[case("[x + y for x in ['a', 'b', 'c'] for y in ['a', 'b', 'c'] if x == y if x < 'c']", ColumnValue::strings(&["aa", "bb"]))]
     // Captured outer let-binding used in join predicate
-    #[case("y = 'b'; [x for x in ['a', 'b', 'c'] for z in ['b', 'c'] if x == y]", ColumnData::strings(&["b", "b"]))]
+    #[case("y = 'b'; [x for x in ['a', 'b', 'c'] for z in ['b', 'c'] if x == y]", ColumnValue::strings(&["b", "b"]))]
     #[case("\
     [a + b
         for a in [c + d for c in ['a'] for d in ['b', 'c'] if c < d]
         for b in [e + f for e in ['d', 'e'] for f in ['f'] if e < f]
     if a != b]
-    ", ColumnData::strings(&["abdf", "abef", "acdf", "acef"]))]
-    fn test_lower_join(#[case] code: &str, #[case] expected: ColumnData) {
+    ", ColumnValue::strings(&["abdf", "abef", "acdf", "acef"]))]
+    fn test_lower_join(#[case] code: &str, #[case] expected: ColumnValue) {
         let ast = parse_module(code);
         debug!("Ast:\n{}", pretty_ast::pretty(&ast[0]));
         let (op, scope) =
@@ -868,7 +867,7 @@ mod tests {
                 .expect("Failed to lower");
         debug!("Operator:\n{}", pretty_operator(op.as_ref()));
         match eval(op, scope) {
-            ColumnData::FunctionBindings { outputs, .. } => {
+            ColumnValue::FunctionBindings { outputs, .. } => {
                 assert_eq!(*outputs, expected);
             }
             other => panic!("Expected Record -> Value output, got: {:?}", other),
@@ -914,10 +913,10 @@ mod tests {
         let get_result = producer.get();
         *notified_has_data.borrow_mut() = false;
         assert_eq!(
-            get_result.column_value.data.sort_by_inputs(),
-            ColumnData::FunctionBindings {
-                inputs: Box::new(ColumnData::UInts(vec![10, 20])),
-                outputs: Box::new(ColumnData::Strings(vec![
+            get_result.column_value.sort_by_inputs(),
+            ColumnValue::FunctionBindings {
+                inputs: Box::new(ColumnValue::UInts(vec![10, 20])),
+                outputs: Box::new(ColumnValue::Strings(vec![
                     "foo".to_string(),
                     "bar".to_string()
                 ]))
@@ -985,21 +984,21 @@ mod tests {
         let get_result = producer.get();
         *notified_has_data.borrow_mut() = false;
         assert_eq!(
-            get_result.column_value.data.sort_by_inputs(),
-            ColumnData::FunctionBindings {
-                inputs: Box::new(ColumnData::Records(HashMap::from([
-                    ("_0".to_string(), ColumnData::UInts(vec![10])),
-                    ("_1".to_string(), ColumnData::UInts(vec![10]))
+            get_result.column_value.sort_by_inputs(),
+            ColumnValue::FunctionBindings {
+                inputs: Box::new(ColumnValue::Records(HashMap::from([
+                    ("_0".to_string(), ColumnValue::UInts(vec![10])),
+                    ("_1".to_string(), ColumnValue::UInts(vec![10]))
                 ]))),
-                outputs: Box::new(ColumnData::Records(HashMap::from([
-                    ("_0".to_string(), ColumnData::Ints(vec![100])),
+                outputs: Box::new(ColumnValue::Records(HashMap::from([
+                    ("_0".to_string(), ColumnValue::Ints(vec![100])),
                     (
                         "_1".to_string(),
-                        ColumnData::Strings(vec!["a1".to_string()])
+                        ColumnValue::Strings(vec!["a1".to_string()])
                     ),
                     (
                         "_2".to_string(),
-                        ColumnData::Strings(vec!["b1".to_string()])
+                        ColumnValue::Strings(vec!["b1".to_string()])
                     )
                 ])))
             }
@@ -1028,21 +1027,21 @@ mod tests {
         let get_result = producer.get();
         *notified_has_data.borrow_mut() = false;
         assert_eq!(
-            get_result.column_value.data.sort_by_inputs(),
-            ColumnData::FunctionBindings {
-                inputs: Box::new(ColumnData::Records(HashMap::from([
-                    ("_0".to_string(), ColumnData::UInts(vec![10, 10])),
-                    ("_1".to_string(), ColumnData::UInts(vec![10, 20]))
+            get_result.column_value.sort_by_inputs(),
+            ColumnValue::FunctionBindings {
+                inputs: Box::new(ColumnValue::Records(HashMap::from([
+                    ("_0".to_string(), ColumnValue::UInts(vec![10, 10])),
+                    ("_1".to_string(), ColumnValue::UInts(vec![10, 20]))
                 ]))),
-                outputs: Box::new(ColumnData::Records(HashMap::from([
-                    ("_0".to_string(), ColumnData::Ints(vec![100, 100])),
+                outputs: Box::new(ColumnValue::Records(HashMap::from([
+                    ("_0".to_string(), ColumnValue::Ints(vec![100, 100])),
                     (
                         "_1".to_string(),
-                        ColumnData::Strings(vec!["a1".to_string(), "a1".to_string()])
+                        ColumnValue::Strings(vec!["a1".to_string(), "a1".to_string()])
                     ),
                     (
                         "_2".to_string(),
-                        ColumnData::Strings(vec!["b1".to_string(), "b2".to_string()])
+                        ColumnValue::Strings(vec!["b1".to_string(), "b2".to_string()])
                     )
                 ])))
             }
@@ -1067,21 +1066,21 @@ mod tests {
         let get_result = producer.get();
         *notified_has_data.borrow_mut() = false;
         assert_eq!(
-            get_result.column_value.data.sort_by_inputs(),
-            ColumnData::FunctionBindings {
-                inputs: Box::new(ColumnData::Records(HashMap::from([
-                    ("_0".to_string(), ColumnData::UInts(vec![30])),
-                    ("_1".to_string(), ColumnData::UInts(vec![20]))
+            get_result.column_value.sort_by_inputs(),
+            ColumnValue::FunctionBindings {
+                inputs: Box::new(ColumnValue::Records(HashMap::from([
+                    ("_0".to_string(), ColumnValue::UInts(vec![30])),
+                    ("_1".to_string(), ColumnValue::UInts(vec![20]))
                 ]))),
-                outputs: Box::new(ColumnData::Records(HashMap::from([
-                    ("_0".to_string(), ColumnData::Ints(vec![100])),
+                outputs: Box::new(ColumnValue::Records(HashMap::from([
+                    ("_0".to_string(), ColumnValue::Ints(vec![100])),
                     (
                         "_1".to_string(),
-                        ColumnData::Strings(vec!["a3".to_string()])
+                        ColumnValue::Strings(vec!["a3".to_string()])
                     ),
                     (
                         "_2".to_string(),
-                        ColumnData::Strings(vec!["b2".to_string()])
+                        ColumnValue::Strings(vec!["b2".to_string()])
                     )
                 ])))
             }

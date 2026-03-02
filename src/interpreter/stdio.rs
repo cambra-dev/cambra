@@ -3,8 +3,8 @@ use std::{cell::RefCell, rc::Rc};
 use log::{debug, trace};
 
 use crate::interpreter::{
-    ColumnData, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, GetResult, Guard,
-    Operator, ParentIndices, Producer, Scheduler, Value, VarScope,
+    ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, GetResult, Guard, Operator,
+    Producer, Scheduler, Value, VarScope,
 };
 use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
 
@@ -187,8 +187,8 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     }
 
     /// Returns the currently readable set of indices
-    fn get_elements(&self) -> ColumnData {
-        ColumnData::UInts((self.start_idx..self.ready_size).collect())
+    fn get_elements(&self) -> ColumnValue {
+        ColumnValue::UInts((self.start_idx..self.ready_size).collect())
     }
 
     fn element_extent(&self) -> Extent {
@@ -248,18 +248,15 @@ impl Producer for StdinProducer {
             yield_guard,
         } = self.index_producer.get();
         let source = self.data_source.borrow();
-        let outputs = match &indices.data {
-            d if d.is_empty() => ColumnData::Strings(Vec::new()),
-            ColumnData::UInts(idx_vec) => {
-                ColumnData::Strings(idx_vec.iter().map(|i| source.get(*i).to_string()).collect())
+        let outputs = match &indices {
+            d if d.is_empty() => ColumnValue::Strings(Vec::new()),
+            ColumnValue::UInts(idx_vec) => {
+                ColumnValue::Strings(idx_vec.iter().map(|i| source.get(*i).to_string()).collect())
             }
             other => panic!("Expected UInt indices for stdin, got {other:?}"),
         };
         GetResult {
-            column_value: ColumnValue {
-                data: ColumnData::function_bindings(indices.data, outputs),
-                parent_indices: ParentIndices::TopLevelVector,
-            },
+            column_value: ColumnValue::function_bindings(indices, outputs),
             // We don't know anything about the contents of stdin, so the yield guard
             // is Universal if the source is closed and Empty otherwise
             yield_guard: yield_guard.to_universal_or_empty(),

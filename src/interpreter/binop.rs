@@ -10,8 +10,8 @@ use crate::interpreter::Scheduler;
 use crate::pretty_graph::{fmt_binop, fmt_extent, InspectNode, VizOptions};
 
 use super::{
-    fmt_guard, ColumnData, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator,
-    ParentIndices, Producer, VarScope,
+    fmt_guard, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer,
+    VarScope,
 };
 
 /// Kinds of binary operations.
@@ -140,32 +140,32 @@ fn zip_bool_logic(op: LogicKind, mut l: BitVec, r: &BitVec) -> BitVec {
     l
 }
 
-/// Apply a binary operation element-wise on ColumnData.
-pub fn apply_binop_column(op: BinOpKind, left: ColumnData, right: &ColumnData) -> ColumnData {
+/// Apply a binary operation element-wise on two `ColumnValue`s.
+pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue) -> ColumnValue {
     match (op, left, right) {
-        (BinOpKind::Arithmetic(op), ColumnData::Ints(l), ColumnData::Ints(r)) => {
-            ColumnData::Ints(zip_arithmetic(op, l, r))
+        (BinOpKind::Arithmetic(op), ColumnValue::Ints(l), ColumnValue::Ints(r)) => {
+            ColumnValue::Ints(zip_arithmetic(op, l, r))
         }
-        (BinOpKind::Arithmetic(op), ColumnData::UInts(l), ColumnData::UInts(r)) => {
-            ColumnData::UInts(zip_arithmetic(op, l, r))
+        (BinOpKind::Arithmetic(op), ColumnValue::UInts(l), ColumnValue::UInts(r)) => {
+            ColumnValue::UInts(zip_arithmetic(op, l, r))
         }
-        (BinOpKind::BoolLogic(op), ColumnData::Bools(l), ColumnData::Bools(r)) => {
-            ColumnData::Bools(zip_bool_logic(op, l, r))
+        (BinOpKind::BoolLogic(op), ColumnValue::Bools(l), ColumnValue::Bools(r)) => {
+            ColumnValue::Bools(zip_bool_logic(op, l, r))
         }
-        (BinOpKind::Concat, ColumnData::Strings(l), ColumnData::Strings(r)) => {
-            ColumnData::Strings(zip_concat(l, r))
+        (BinOpKind::Concat, ColumnValue::Strings(l), ColumnValue::Strings(r)) => {
+            ColumnValue::Strings(zip_concat(l, r))
         }
-        (BinOpKind::Compare(op), ColumnData::Strings(l), ColumnData::Strings(r)) => {
-            ColumnData::Bools(zip_compare(op, l, r))
+        (BinOpKind::Compare(op), ColumnValue::Strings(l), ColumnValue::Strings(r)) => {
+            ColumnValue::Bools(zip_compare(op, l, r))
         }
-        (BinOpKind::Compare(op), ColumnData::Ints(l), ColumnData::Ints(r)) => {
-            ColumnData::Bools(zip_compare(op, l, r))
+        (BinOpKind::Compare(op), ColumnValue::Ints(l), ColumnValue::Ints(r)) => {
+            ColumnValue::Bools(zip_compare(op, l, r))
         }
-        (BinOpKind::Compare(op), ColumnData::UInts(l), ColumnData::UInts(r)) => {
-            ColumnData::Bools(zip_compare(op, l, r))
+        (BinOpKind::Compare(op), ColumnValue::UInts(l), ColumnValue::UInts(r)) => {
+            ColumnValue::Bools(zip_compare(op, l, r))
         }
-        (BinOpKind::Compare(op), ColumnData::Bools(l), ColumnData::Bools(r)) => {
-            ColumnData::Bools(zip_bool_compare(op, l, r))
+        (BinOpKind::Compare(op), ColumnValue::Bools(l), ColumnValue::Bools(r)) => {
+            ColumnValue::Bools(zip_bool_compare(op, l, r))
         }
         _ => panic!("Unsupported binop: {:?}", op),
     }
@@ -356,40 +356,27 @@ impl Producer for BinOpProducer {
         let left_col = left_result.column_value;
         let right_col = right_result.column_value;
 
-        // Zip and apply binop element-wise, broadcasting scalars as needed
+        // Zip and apply binop element-wise, broadcasting scalars (single-element columns) as needed.
         // TODO figure out a better way to handle repeated values.
         // Maybe lazily repeat iterators, or use a vectorization library?
-        let left_is_scalar = left_col.parent_indices == ParentIndices::Scalar;
-        let right_is_scalar = right_col.parent_indices == ParentIndices::Scalar;
+        let left_is_scalar = left_col.len() == 1;
+        let right_is_scalar = right_col.len() == 1;
         let (left_data, right_data) = if left_is_scalar && !right_is_scalar {
-            (left_col.data.repeat(right_col.data.len()), right_col.data)
+            (left_col.repeat(right_col.len()), right_col)
         } else if right_is_scalar && !left_is_scalar {
-            let len = left_col.data.len();
-            (left_col.data, right_col.data.repeat(len))
+            let len = left_col.len();
+            (left_col, right_col.repeat(len))
         } else {
-            assert_eq!(left_col.data.len(), right_col.data.len());
-            (left_col.data, right_col.data)
+            assert_eq!(left_col.len(), right_col.len());
+            (left_col, right_col)
         };
         let result_data = apply_binop_column(self.op, left_data, &right_data);
-
-        let result_parent_indices = if left_is_scalar && right_is_scalar {
-            ParentIndices::Scalar
-        } else if left_is_scalar {
-            right_col.parent_indices
-        } else {
-            // TODO: this is wrong.  If neither is scalar, need to appropriately combine
-            // the indices.
-            left_col.parent_indices
-        };
 
         self.left_yield_guard = left_result.yield_guard.clone();
         self.right_yield_guard = right_result.yield_guard.clone();
 
         GetResult {
-            column_value: ColumnValue {
-                data: result_data,
-                parent_indices: result_parent_indices,
-            },
+            column_value: result_data,
             // BinOp would need to transform sub-producer guards through the
             // operation to produce a correct output guard. We don't have that
             // representation yet, so use the same simplification as subscribe():
@@ -437,11 +424,11 @@ mod tests {
         let cmp = |op: CompareKind, l: bool, r: bool| -> bool {
             let result = apply_binop_column(
                 BinOpKind::Compare(op),
-                ColumnData::Bools(BitVec::from_elem(1, l)),
-                &ColumnData::Bools(BitVec::from_elem(1, r)),
+                ColumnValue::Bools(BitVec::from_elem(1, l)),
+                &ColumnValue::Bools(BitVec::from_elem(1, r)),
             );
             match result {
-                ColumnData::Bools(v) => v[0],
+                ColumnValue::Bools(v) => v[0],
                 other => panic!("expected Bools, got {other:?}"),
             }
         };
@@ -499,8 +486,7 @@ mod tests {
         drop(notifs);
 
         let result = producer.get();
-        assert_eq!(result.column_value.data, ColumnData::Ints(vec![5]));
-        assert_eq!(result.column_value.parent_indices, ParentIndices::Scalar);
+        assert_eq!(result.column_value, ColumnValue::Ints(vec![5]));
     }
 
     #[test]
@@ -519,7 +505,7 @@ mod tests {
         );
 
         let result = producer.get();
-        assert_eq!(result.column_value.data, ColumnData::Ints(vec![20]));
+        assert_eq!(result.column_value, ColumnValue::Ints(vec![20]));
     }
 
     #[test]
@@ -538,7 +524,7 @@ mod tests {
         );
 
         let result = producer.get();
-        assert_eq!(result.column_value.data, ColumnData::Ints(vec![7]));
+        assert_eq!(result.column_value, ColumnValue::Ints(vec![7]));
     }
 
     #[test]
@@ -566,8 +552,8 @@ mod tests {
         let len: usize = 1000000;
         let lv: Vec<i64> = (0..(len as i64)).collect();
         let rv: Vec<i64> = (0..(len as i64)).collect();
-        let l = ColumnData::Ints(lv.clone());
-        let r = ColumnData::Ints(rv.clone());
+        let l = ColumnValue::Ints(lv.clone());
+        let r = ColumnValue::Ints(rv.clone());
 
         let options = microbench::Options::default().time(Duration::new(1, 0));
         microbench::bench(&options, "native_iter", || {

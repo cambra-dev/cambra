@@ -1,4 +1,4 @@
-//! Core types for the CCL interpreter: Guard, Extent, BaseType, Value, FuncBinding, ColumnValue.
+//! Core types for the CCL interpreter: Guard, Extent, BaseType, Value, FuncBinding, ColumnValue, GetResult.
 
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap, hash::Hash, rc::Rc};
 
@@ -71,6 +71,9 @@ impl Guard {
             Guard::Or(guards) => guards.iter().any(Guard::is_universal),
             Guard::And(guards) => guards.iter().all(Guard::is_universal),
             Guard::Record(guards) => guards.values().all(Guard::is_universal),
+            Guard::Function { domain, codomain } => {
+                domain.is_universal() && codomain.is_universal()
+            }
             _ => false,
         }
     }
@@ -399,9 +402,9 @@ impl Restriction {
 
     pub fn get_correlation_vector(&mut self) -> BitVec {
         let data = self.compute_producer.as_mut().unwrap().get();
-        match data.column_value.data {
-            ColumnData::FunctionBindings { outputs, .. } => match *outputs {
-                ColumnData::Bools(bools) => {
+        match data.column_value {
+            ColumnValue::FunctionBindings { outputs, .. } => match *outputs {
+                ColumnValue::Bools(bools) => {
                     trace!("Got restriction vector {}", bools);
                     bools
                 }
@@ -417,9 +420,9 @@ pub trait DataSourceDomainExtentImpl {
     fn get_id(&self) -> &str;
     fn check_for_new_data(&mut self) -> bool;
     fn get_yield_guard(&self) -> Guard;
-    fn get_elements(&self) -> ColumnData;
+    fn get_elements(&self) -> ColumnValue;
     /// Returns the [`Extent`] of each individual domain element.
-    /// Used to construct a typed empty [`ColumnData`] when the domain is empty.
+    /// Used to construct a typed empty [`ColumnValue`] when the domain is empty.
     fn element_extent(&self) -> Extent;
     fn release(&mut self, obsolete_guard: Guard) -> Guard;
 }
@@ -725,15 +728,10 @@ pub struct GetResult {
     pub yield_guard: Guard,
 }
 
+/// Columnar data for vectorized execution.
+/// Each variant holds a typed batch of values produced during interpretation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParentIndices {
-    Scalar,             // single value that broadcasts over any batch size
-    TopLevelVector,     // top-level batch — no outer scan
-    Parent(Vec<usize>), // each element maps to a row in the parent batch
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ColumnData {
+pub enum ColumnValue {
     Units(usize),
     Ints(Vec<i64>),
     UInts(Vec<usize>),
@@ -741,14 +739,15 @@ pub enum ColumnData {
     Bools(BitVec),
     Variants(Vec<Value>),
     FunctionBindings {
-        inputs: Box<ColumnData>,
-        outputs: Box<ColumnData>,
+        inputs: Box<ColumnValue>,
+        outputs: Box<ColumnValue>,
     },
-    Records(HashMap<String, ColumnData>),
+    Records(HashMap<String, ColumnValue>),
 }
 
-impl ColumnData {
-    pub fn function_bindings(inputs: ColumnData, outputs: ColumnData) -> ColumnData {
+impl ColumnValue {
+    /// Construct a `FunctionBindings` variant from inputs and outputs.
+    pub fn function_bindings(inputs: ColumnValue, outputs: ColumnValue) -> ColumnValue {
         Self::FunctionBindings {
             inputs: Box::new(inputs),
             outputs: Box::new(outputs),
@@ -758,56 +757,59 @@ impl ColumnData {
     /// Get a value at a specific index.
     pub fn index_at(&self, i: usize) -> Value {
         match self {
-            ColumnData::Units(_) => Value::Unit,
-            ColumnData::Bools(v) => Value::Bool(v[i]),
-            ColumnData::Ints(v) => Value::Int(v[i]),
-            ColumnData::UInts(v) => Value::UInt(v[i]),
-            ColumnData::Strings(v) => Value::String(v[i].clone()),
-            ColumnData::Variants(v) => v[i].clone(),
-            ColumnData::FunctionBindings { inputs, outputs } => {
+            ColumnValue::Units(_) => Value::Unit,
+            ColumnValue::Bools(v) => Value::Bool(v[i]),
+            ColumnValue::Ints(v) => Value::Int(v[i]),
+            ColumnValue::UInts(v) => Value::UInt(v[i]),
+            ColumnValue::Strings(v) => Value::String(v[i].clone()),
+            ColumnValue::Variants(v) => v[i].clone(),
+            ColumnValue::FunctionBindings { inputs, outputs } => {
                 Value::Function(vec![FuncBinding {
                     input: inputs.index_at(i),
                     output: outputs.index_at(i),
                 }])
             }
-            ColumnData::Records(r) => {
+            ColumnValue::Records(r) => {
                 Value::Record(r.iter().map(|(k, v)| (k.clone(), v.index_at(i))).collect())
             }
         }
     }
 
-    /// Repeat a single-element ColumnData to the given length.
-    pub fn repeat(&self, n: usize) -> ColumnData {
-        assert_eq!(self.len(), 1, "repeat requires single-element ColumnData");
+    /// Repeat a single-element `ColumnValue` to the given length.
+    pub fn repeat(&self, n: usize) -> ColumnValue {
+        assert_eq!(self.len(), 1, "repeat requires single-element ColumnValue");
         match self {
-            ColumnData::Units(_) => ColumnData::Units(n),
-            ColumnData::Bools(v) => ColumnData::Bools(BitVec::from_elem(n, v[0])),
-            ColumnData::Ints(v) => ColumnData::Ints(vec![v[0]; n]),
-            ColumnData::UInts(v) => ColumnData::UInts(vec![v[0]; n]),
-            ColumnData::Strings(v) => ColumnData::Strings(vec![v[0].clone(); n]),
-            ColumnData::Variants(v) => ColumnData::Variants(vec![v[0].clone(); n]),
-            _ => panic!("Cannot repeat composite ColumnData"),
+            ColumnValue::Units(_) => ColumnValue::Units(n),
+            ColumnValue::Bools(v) => ColumnValue::Bools(BitVec::from_elem(n, v[0])),
+            ColumnValue::Ints(v) => ColumnValue::Ints(vec![v[0]; n]),
+            ColumnValue::UInts(v) => ColumnValue::UInts(vec![v[0]; n]),
+            ColumnValue::Strings(v) => ColumnValue::Strings(vec![v[0].clone(); n]),
+            ColumnValue::Variants(v) => ColumnValue::Variants(vec![v[0].clone(); n]),
+            ColumnValue::Records(r) => {
+                ColumnValue::Records(r.iter().map(|(k, v)| (k.clone(), v.repeat(n))).collect())
+            }
+            _ => panic!("Cannot repeat composite ColumnValue"),
         }
     }
 
-    /// Convert a Vec<Value> into typed ColumnData.
-    pub fn from_values(values: Vec<Value>, extent: &Extent) -> ColumnData {
+    /// Convert a Vec<Value> into typed ColumnValue.
+    pub fn from_values(values: Vec<Value>, extent: &Extent) -> ColumnValue {
         match extent {
-            Extent::Base(BaseType::Unit) => ColumnData::Units(values.len()),
+            Extent::Base(BaseType::Unit) => ColumnValue::Units(values.len()),
             Extent::Base(BaseType::Bool) => {
-                ColumnData::Bools(values.iter().map(Value::as_bool).collect())
+                ColumnValue::Bools(values.iter().map(Value::as_bool).collect())
             }
             Extent::Base(BaseType::Int) => {
-                ColumnData::Ints(values.iter().map(Value::as_int).collect())
+                ColumnValue::Ints(values.iter().map(Value::as_int).collect())
             }
             Extent::Base(BaseType::UInt) => {
-                ColumnData::UInts(values.iter().map(Value::as_uint).collect())
+                ColumnValue::UInts(values.iter().map(Value::as_uint).collect())
             }
             Extent::Base(BaseType::String) => {
-                ColumnData::Strings(values.iter().map(|v| v.as_string().to_string()).collect())
+                ColumnValue::Strings(values.iter().map(|v| v.as_string().to_string()).collect())
             }
             Extent::Record(m) => {
-                // Pivot the list of Records into a Record of ColumnDatas
+                // Pivot the list of Records into a Record of ColumnValues
                 let keys: Vec<String> = m.keys().cloned().collect();
                 let fields = keys
                     .into_iter()
@@ -821,7 +823,7 @@ impl ColumnData {
                             .collect();
                         (
                             key.clone(),
-                            ColumnData::from_values(
+                            ColumnValue::from_values(
                                 field_values,
                                 extent
                                     .record_attributes()
@@ -833,16 +835,16 @@ impl ColumnData {
                         )
                     })
                     .collect();
-                ColumnData::Records(fields)
+                ColumnValue::Records(fields)
             }
-            _ => ColumnData::Variants(values),
+            _ => ColumnValue::Variants(values),
         }
     }
 
-    /// Sort FunctionBindings by their input values.
-    pub fn sort_by_inputs(&self) -> ColumnData {
+    /// Sort `FunctionBindings` by their input values.
+    pub fn sort_by_inputs(&self) -> ColumnValue {
         match self {
-            ColumnData::FunctionBindings { inputs, outputs } => {
+            ColumnValue::FunctionBindings { inputs, outputs } => {
                 let n = inputs.len();
                 let mut indices: Vec<usize> = (0..n).collect();
                 indices.sort_by(|&a, &b| {
@@ -851,7 +853,7 @@ impl ColumnData {
                         .partial_cmp(&inputs.index_at(b))
                         .expect("Cannot compare inputs")
                 });
-                ColumnData::function_bindings(
+                ColumnValue::function_bindings(
                     inputs.select_indices(&indices),
                     outputs.select_indices(&indices),
                 )
@@ -861,23 +863,23 @@ impl ColumnData {
     }
 
     /// Select elements at the given indices.
-    pub fn select_indices(&self, indices: &[usize]) -> ColumnData {
+    pub fn select_indices(&self, indices: &[usize]) -> ColumnValue {
         match self {
-            ColumnData::Units(_) => ColumnData::Units(indices.len()),
-            ColumnData::Bools(v) => ColumnData::Bools(indices.iter().map(|&i| v[i]).collect()),
-            ColumnData::Ints(v) => ColumnData::Ints(indices.iter().map(|&i| v[i]).collect()),
-            ColumnData::UInts(v) => ColumnData::UInts(indices.iter().map(|&i| v[i]).collect()),
-            ColumnData::Strings(v) => {
-                ColumnData::Strings(indices.iter().map(|&i| v[i].clone()).collect())
+            ColumnValue::Units(_) => ColumnValue::Units(indices.len()),
+            ColumnValue::Bools(v) => ColumnValue::Bools(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Ints(v) => ColumnValue::Ints(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::UInts(v) => ColumnValue::UInts(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Strings(v) => {
+                ColumnValue::Strings(indices.iter().map(|&i| v[i].clone()).collect())
             }
-            ColumnData::Variants(v) => {
-                ColumnData::Variants(indices.iter().map(|&i| v[i].clone()).collect())
+            ColumnValue::Variants(v) => {
+                ColumnValue::Variants(indices.iter().map(|&i| v[i].clone()).collect())
             }
-            ColumnData::FunctionBindings { inputs, outputs } => ColumnData::function_bindings(
+            ColumnValue::FunctionBindings { inputs, outputs } => ColumnValue::function_bindings(
                 inputs.select_indices(indices),
                 outputs.select_indices(indices),
             ),
-            ColumnData::Records(r) => ColumnData::Records(
+            ColumnValue::Records(r) => ColumnValue::Records(
                 r.iter()
                     .map(|(k, v)| (k.clone(), v.select_indices(indices)))
                     .collect(),
@@ -885,46 +887,58 @@ impl ColumnData {
         }
     }
 
+    /// Return the number of elements in this column.
     pub fn len(&self) -> usize {
         match &self {
-            ColumnData::Units(len) => *len,
-            ColumnData::Bools(v) => v.len(),
-            ColumnData::Ints(v) => v.len(),
-            ColumnData::UInts(v) => v.len(),
-            ColumnData::Strings(v) => v.len(),
-            ColumnData::Variants(v) => v.len(),
-            ColumnData::Records(m) => m.values().next().expect("Empty Record").len(),
-            ColumnData::FunctionBindings { inputs, .. } => inputs.len(),
+            ColumnValue::Units(len) => *len,
+            ColumnValue::Bools(v) => v.len(),
+            ColumnValue::Ints(v) => v.len(),
+            ColumnValue::UInts(v) => v.len(),
+            ColumnValue::Strings(v) => v.len(),
+            ColumnValue::Variants(v) => v.len(),
+            ColumnValue::Records(m) => m.values().next().expect("Empty Record").len(),
+            ColumnValue::FunctionBindings { inputs, .. } => inputs.len(),
         }
     }
 
+    /// Return `true` if this column contains no elements.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Get the single value if this column contains exactly one value.
+    /// Return `true` if this column contains exactly one element.
+    pub fn is_single(&self) -> bool {
+        self.len() == 1
+    }
+
+    /// Return `true` if this column is a single scalar value that can broadcast.
+    pub fn is_scalar(&self) -> bool {
+        self.len() == 1
+    }
+
+    /// Get the single value if this column contains exactly one element.
     pub fn as_single(&self) -> Option<Value> {
         if self.len() == 1 {
             match self {
-                ColumnData::Units(len) => {
+                ColumnValue::Units(len) => {
                     if *len == 1 {
                         Some(Value::Unit)
                     } else {
                         None
                     }
                 }
-                ColumnData::Bools(v) => Some(Value::Bool(v[0])),
-                ColumnData::Ints(v) => Some(Value::Int(v[0])),
-                ColumnData::UInts(v) => Some(Value::UInt(v[0])),
-                ColumnData::Strings(v) => Some(Value::String(v[0].clone())),
-                ColumnData::Variants(v) => Some(v[0].clone()),
-                ColumnData::FunctionBindings { inputs, outputs } => {
+                ColumnValue::Bools(v) => Some(Value::Bool(v[0])),
+                ColumnValue::Ints(v) => Some(Value::Int(v[0])),
+                ColumnValue::UInts(v) => Some(Value::UInt(v[0])),
+                ColumnValue::Strings(v) => Some(Value::String(v[0].clone())),
+                ColumnValue::Variants(v) => Some(v[0].clone()),
+                ColumnValue::FunctionBindings { inputs, outputs } => {
                     Some(Value::Function(vec![FuncBinding {
                         input: inputs.as_single().expect("Not single").clone(),
                         output: outputs.as_single().expect("Not single").clone(),
                     }]))
                 }
-                ColumnData::Records(r) => Some(Value::Record(
+                ColumnValue::Records(r) => Some(Value::Record(
                     r.iter()
                         .map(|e| (e.0.clone(), e.1.as_single().expect("Not single").clone()))
                         .collect(),
@@ -935,9 +949,30 @@ impl ColumnData {
         }
     }
 
-    /// Compute the cartesian product of a map of named column datas.
+    /// Create a `ColumnValue` from a single `Value`, wrapping it in a 1-element column.
+    pub fn single(value: Value) -> Self {
+        match value {
+            Value::Bool(b) => ColumnValue::Bools(BitVec::from_elem(1, b)),
+            Value::Int(i) => ColumnValue::Ints(vec![i]),
+            Value::UInt(i) => ColumnValue::UInts(vec![i]),
+            Value::String(s) => ColumnValue::Strings(vec![s]),
+            _ => ColumnValue::Variants(vec![value]),
+        }
+    }
+
+    /// Create a `ColumnValue` from a `Vec<i64>`.
+    pub fn from_ints(values: Vec<i64>) -> Self {
+        ColumnValue::Ints(values)
+    }
+
+    /// Create a `ColumnValue` from a `Vec<usize>`.
+    pub fn from_uints(values: Vec<usize>) -> Self {
+        ColumnValue::UInts(values)
+    }
+
+    /// Compute the cartesian product of a map of named column values.
     ///
-    /// Returns a [`ColumnData::Records`] where each field is expanded so that the fields
+    /// Returns a [`ColumnValue::Records`] where each field is expanded so that the fields
     /// together enumerate every combination of rows across all input columns. The total
     /// row count is the product of all input column lengths.
     ///
@@ -945,11 +980,11 @@ impl ColumnData {
     /// Given `{"a": [1, 2], "b": [3, 4]}`, returns
     /// `Records {"a": [1, 1, 2, 2], "b": [3, 4, 3, 4]}`.
     pub fn cartesian_product_with_correlation(
-        data: HashMap<String, ColumnData>,
+        data: HashMap<String, ColumnValue>,
         correlations: &Option<BitSet>,
-    ) -> ColumnData {
+    ) -> ColumnValue {
         if data.is_empty() {
-            return ColumnData::Records(HashMap::new());
+            return ColumnValue::Records(HashMap::new());
         }
         // Sort keys for a deterministic column order when computing strides.
         let mut keys: Vec<String> = data.keys().cloned().collect();
@@ -975,12 +1010,12 @@ impl ColumnData {
                 (key.clone(), data[key].select_indices(&indices))
             })
             .collect();
-        ColumnData::Records(expanded)
+        ColumnValue::Records(expanded)
     }
 
-    /// Construct a ColumnData containing the given string values.
-    pub fn strings(values: &[&str]) -> ColumnData {
-        ColumnData::Strings(values.iter().map(|s| s.to_string()).collect())
+    /// Construct a `ColumnValue` containing the given string values.
+    pub fn strings(values: &[&str]) -> ColumnValue {
+        ColumnValue::Strings(values.iter().map(|s| s.to_string()).collect())
     }
 }
 
@@ -1006,15 +1041,15 @@ mod tests {
         // Row 0: a[0]=1, b[0]=3 | Row 1: a[0]=1, b[1]=4
         // Row 2: a[1]=2, b[0]=3 | Row 3: a[1]=2, b[1]=4
         let data = HashMap::from([
-            ("a".to_string(), ColumnData::Ints(vec![1, 2])),
-            ("b".to_string(), ColumnData::Ints(vec![3, 4])),
+            ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
+            ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
         ]);
-        let result = ColumnData::cartesian_product_with_correlation(data, &None);
+        let result = ColumnValue::cartesian_product_with_correlation(data, &None);
         assert_eq!(
             result,
-            ColumnData::Records(HashMap::from([
-                ("a".to_string(), ColumnData::Ints(vec![1, 1, 2, 2])),
-                ("b".to_string(), ColumnData::Ints(vec![3, 4, 3, 4])),
+            ColumnValue::Records(HashMap::from([
+                ("a".to_string(), ColumnValue::Ints(vec![1, 1, 2, 2])),
+                ("b".to_string(), ColumnValue::Ints(vec![3, 4, 3, 4])),
             ]))
         );
     }
@@ -1023,15 +1058,15 @@ mod tests {
     fn test_cartesian_product_empty_bitset() {
         // Empty correlation set → no rows selected → empty columns.
         let data = HashMap::from([
-            ("a".to_string(), ColumnData::Ints(vec![1, 2])),
-            ("b".to_string(), ColumnData::Ints(vec![3, 4])),
+            ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
+            ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
         ]);
-        let result = ColumnData::cartesian_product_with_correlation(data, &Some(BitSet::new()));
+        let result = ColumnValue::cartesian_product_with_correlation(data, &Some(BitSet::new()));
         assert_eq!(
             result,
-            ColumnData::Records(HashMap::from([
-                ("a".to_string(), ColumnData::Ints(vec![])),
-                ("b".to_string(), ColumnData::Ints(vec![])),
+            ColumnValue::Records(HashMap::from([
+                ("a".to_string(), ColumnValue::Ints(vec![])),
+                ("b".to_string(), ColumnValue::Ints(vec![])),
             ]))
         );
     }
@@ -1040,15 +1075,15 @@ mod tests {
     fn test_cartesian_product_full_bitset() {
         // Full BitSet covering all 4 rows → same output as no filter.
         let data = HashMap::from([
-            ("a".to_string(), ColumnData::Ints(vec![1, 2])),
-            ("b".to_string(), ColumnData::Ints(vec![3, 4])),
+            ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
+            ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
         ]);
-        let result = ColumnData::cartesian_product_with_correlation(data, &Some(full_bitset(4)));
+        let result = ColumnValue::cartesian_product_with_correlation(data, &Some(full_bitset(4)));
         assert_eq!(
             result,
-            ColumnData::Records(HashMap::from([
-                ("a".to_string(), ColumnData::Ints(vec![1, 1, 2, 2])),
-                ("b".to_string(), ColumnData::Ints(vec![3, 4, 3, 4])),
+            ColumnValue::Records(HashMap::from([
+                ("a".to_string(), ColumnValue::Ints(vec![1, 1, 2, 2])),
+                ("b".to_string(), ColumnValue::Ints(vec![3, 4, 3, 4])),
             ]))
         );
     }
@@ -1058,133 +1093,39 @@ mod tests {
         // BitSet {0, 3} → rows 0 and 3 of the 2×2 product (diagonal).
         // Row 0: a[0]=1, b[0]=3 | Row 3: a[1]=2, b[1]=4
         let data = HashMap::from([
-            ("a".to_string(), ColumnData::Ints(vec![1, 2])),
-            ("b".to_string(), ColumnData::Ints(vec![3, 4])),
+            ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
+            ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
         ]);
         let mut filter = BitSet::new();
         filter.insert(0);
         filter.insert(3);
-        let result = ColumnData::cartesian_product_with_correlation(data, &Some(filter));
+        let result = ColumnValue::cartesian_product_with_correlation(data, &Some(filter));
         assert_eq!(
             result,
-            ColumnData::Records(HashMap::from([
-                ("a".to_string(), ColumnData::Ints(vec![1, 2])),
-                ("b".to_string(), ColumnData::Ints(vec![3, 4])),
+            ColumnValue::Records(HashMap::from([
+                ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
+                ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
             ]))
         );
     }
 
     #[test]
     fn test_cartesian_product_empty_map() {
-        let result = ColumnData::cartesian_product_with_correlation(HashMap::new(), &None);
-        assert_eq!(result, ColumnData::Records(HashMap::new()));
+        let result = ColumnValue::cartesian_product_with_correlation(HashMap::new(), &None);
+        assert_eq!(result, ColumnValue::Records(HashMap::new()));
     }
 
     #[test]
     fn test_cartesian_product_single_column() {
         // Single column with a full filter → identity.
-        let data = HashMap::from([("a".to_string(), ColumnData::Ints(vec![10, 20, 30]))]);
-        let result = ColumnData::cartesian_product_with_correlation(data, &Some(full_bitset(3)));
+        let data = HashMap::from([("a".to_string(), ColumnValue::Ints(vec![10, 20, 30]))]);
+        let result = ColumnValue::cartesian_product_with_correlation(data, &Some(full_bitset(3)));
         assert_eq!(
             result,
-            ColumnData::Records(HashMap::from([(
+            ColumnValue::Records(HashMap::from([(
                 "a".to_string(),
-                ColumnData::Ints(vec![10, 20, 30]),
+                ColumnValue::Ints(vec![10, 20, 30]),
             )]))
         );
-    }
-}
-
-/// A columnar value representation for vectorized execution.
-/// Contains a batch of values with optional alignment information.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ColumnValue {
-    /// The batch of values
-    pub data: ColumnData,
-    /// Indices into the parent level's batch for alignment with outer iterations.
-    /// None if this is the outermost level or independent.
-    pub parent_indices: ParentIndices,
-}
-
-impl ColumnValue {
-    /// Create a new ColumnValue with a single value (no parent alignment).
-    pub fn single(value: Value) -> Self {
-        ColumnValue {
-            data: match value {
-                Value::Bool(b) => ColumnData::Bools(BitVec::from_elem(1, b)),
-                Value::Int(i) => ColumnData::Ints(vec![i]),
-                Value::UInt(i) => ColumnData::UInts(vec![i]),
-                Value::String(s) => ColumnData::Strings(vec![s]),
-                _ => ColumnData::Variants(vec![value]),
-            },
-            parent_indices: ParentIndices::Scalar,
-        }
-    }
-
-    pub fn from_values(values: Vec<Value>, extent: &Extent) -> ColumnValue {
-        ColumnValue {
-            data: ColumnData::from_values(values, extent),
-            parent_indices: ParentIndices::TopLevelVector,
-        }
-    }
-
-    /// Create a new ColumnValue from a vector of values (no parent alignment).
-    pub fn from_ints(values: Vec<i64>) -> Self {
-        ColumnValue {
-            data: ColumnData::Ints(values),
-            parent_indices: ParentIndices::TopLevelVector,
-        }
-    }
-
-    pub fn from_uints(values: Vec<usize>) -> Self {
-        ColumnValue {
-            data: ColumnData::UInts(values),
-            parent_indices: ParentIndices::TopLevelVector,
-        }
-    }
-
-    pub fn from_column_data(data: ColumnData) -> Self {
-        ColumnValue {
-            data,
-            parent_indices: ParentIndices::TopLevelVector,
-        }
-    }
-
-    /// Create a new ColumnValue with parent alignment indices.
-    pub fn with_parent_indices(data: ColumnData, parent_indices: Vec<usize>) -> Self {
-        ColumnValue {
-            data,
-            parent_indices: ParentIndices::Parent(parent_indices),
-        }
-    }
-
-    /// Check if this column contains a single value.
-    pub fn is_single(&self) -> bool {
-        self.len() == 1
-    }
-
-    /// Get the single value if this column contains exactly one value.
-    pub fn as_single(&self) -> Option<Value> {
-        self.data.as_single()
-    }
-
-    /// Get the number of values in this column.
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Check if this column is empty.
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    /// Expand this column's values using the given parent_indices.
-    /// Used when an outer variable needs to be aligned with an inner iteration.
-    pub fn expand(&self, indices: &[usize]) -> ColumnValue {
-        ColumnValue {
-            data: self.data.select_indices(indices),
-            // The expanded column inherits the indices as its own parent_indices
-            parent_indices: ParentIndices::Parent(indices.to_vec()),
-        }
     }
 }

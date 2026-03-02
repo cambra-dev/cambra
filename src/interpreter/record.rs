@@ -12,8 +12,8 @@ use std::cell::RefCell;
 use std::{collections::HashMap, rc::Rc};
 
 use crate::interpreter::{
-    ColumnData, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator,
-    ParentIndices, Producer, Scheduler, VarScope,
+    ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer, Scheduler,
+    VarScope,
 };
 use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
 
@@ -135,9 +135,6 @@ impl Producer for ConstructRecordProducer {
         let mut output_data = HashMap::with_capacity(num_attrs);
         let mut output_yield_guards = HashMap::with_capacity(num_attrs);
 
-        let is_scalar = inputs
-            .values()
-            .all(|r| matches!(r.column_value.parent_indices, ParentIndices::Scalar));
         let length = inputs
             .values()
             .map(|r| r.column_value.len())
@@ -146,31 +143,18 @@ impl Producer for ConstructRecordProducer {
 
         for (attr, get_result) in inputs.drain() {
             output_yield_guards.insert(attr.clone(), get_result.yield_guard.clone());
-            let data = get_result.column_value.data;
+            let data = get_result.column_value;
             output_data.insert(
                 attr.clone(),
-                // Broadcast scalar fields to the vector length so all fields are aligned.
-                if matches!(
-                    get_result.column_value.parent_indices,
-                    ParentIndices::Scalar
-                ) && !is_scalar
-                {
+                if data.is_scalar() && length > 1 {
                     data.repeat(length)
                 } else {
                     data
                 },
             );
         }
-        // TODO handle parent_indices
         GetResult {
-            column_value: ColumnValue {
-                data: super::ColumnData::Records(output_data),
-                parent_indices: if is_scalar {
-                    ParentIndices::Scalar
-                } else {
-                    ParentIndices::TopLevelVector
-                },
-            },
+            column_value: ColumnValue::Records(output_data),
             yield_guard: Guard::Record(output_yield_guards),
         }
     }
@@ -337,10 +321,9 @@ impl Producer for RecordAttributeProducer {
     /// caller sees a plain (non-record) guard appropriate to the field's type.
     fn get(&mut self) -> GetResult {
         let record_get_result = self.record.get();
-        let record_data = record_get_result.column_value.data;
 
-        let output_data = match record_data {
-            ColumnData::Records(mut m) => m.remove(&self.attribute).unwrap(),
+        let output_data = match record_get_result.column_value {
+            ColumnValue::Records(mut m) => m.remove(&self.attribute).unwrap(),
             _ => panic!("Expected input records"),
         };
 
@@ -350,10 +333,7 @@ impl Producer for RecordAttributeProducer {
             g => panic!("Unexpected yield guard {g:?}"),
         };
         GetResult {
-            column_value: ColumnValue {
-                data: output_data,
-                parent_indices: record_get_result.column_value.parent_indices,
-            },
+            column_value: output_data,
             yield_guard: output_yield_guard,
         }
     }

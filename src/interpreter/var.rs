@@ -1,4 +1,4 @@
-//! Variable system: VarScope, VarSource, Var, VarProducer, VarRef, VarRefProducer, compose_indices.
+//! Variable system: VarScope, VarSource, Var, VarProducer, VarRef, VarRefProducer.
 
 use std::rc::Rc;
 use std::{cell::RefCell, collections::HashMap};
@@ -9,13 +9,13 @@ use log::{debug, trace};
 use crate::interpreter::Restriction;
 /// A variable subscription paired with the chain of iteration-source variables between
 use crate::{
-    interpreter::{ColumnData, DataSourceDomainExtentImpl},
+    interpreter::DataSourceDomainExtentImpl,
     pretty_graph::{fmt_extent, InspectNode, VizOptions, MODE_ARGUMENT, MODE_ITERATION},
 };
 
 use super::{
-    fmt_guard, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator,
-    ParentIndices, Producer, Scheduler,
+    fmt_guard, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer,
+    Scheduler,
 };
 /// A variable subscription paired with the chain of scanning variables between
 /// the current scope and the found variable, used for alignment composition.
@@ -111,15 +111,16 @@ pub enum VarSource {
     Argument(Box<dyn Producer>),
     /// Variable iterates over its extent (for output or aggregation).
     /// The variable generates values by iterating over all values in its extent.
+    /// Variable iterates over its extent (for output or aggregation).
+    /// The variable generates values by iterating over all values in its extent.
     Iteration {
         extent: Extent,
-        predicate: Guard,
         // TODO: correlations for join execution
     },
 }
 
 /// A Var operator represents a variable definition.
-/// It holds the variable's name, extent, and predicate - but NOT a static definition.
+/// It holds the variable's name and extent, but NOT a static definition.
 /// The variable's values are injected at run time either via application (argument source)
 /// or direct iteration (iteration source).
 #[derive(Debug, Clone)]
@@ -128,9 +129,6 @@ pub struct Var {
     pub name: String,
     /// The extent of this variable (may be restricted by predicates)
     extent: Extent,
-    /// Predicate that restricts this variable's extent
-    /// Applied to guards before propagating to the operator
-    predicate: Guard,
     /// Whether this variable is responsible for setting up the producer for its restriction (if any)
     /// The producer needs to be set up in the narrowest scope that contains the restriction, which
     /// is information that is only available in the compiler. Thus, we record that info here.
@@ -143,7 +141,6 @@ impl Var {
         Var {
             name: name.to_string(),
             extent,
-            predicate: Guard::Universal,
             owns_restriction: false,
         }
     }
@@ -161,13 +158,6 @@ impl Var {
     /// Get the extent of this variable as a mutable ref.
     pub fn extent_mut(&mut self) -> &mut Extent {
         &mut self.extent
-    }
-
-    /// Set a predicate that restricts this variable's extent.
-    /// The predicate is applied to guards before propagating to the operator.
-    /// Use `Guard::Universal` to remove the predicate (no restriction).
-    pub fn set_predicate(&mut self, predicate: Guard) {
-        self.predicate = predicate;
     }
 
     /// Create a VarProducer for this variable with the given source.
@@ -393,11 +383,7 @@ impl Producer for VarProducer {
             VarSource::Argument(producer) => {
                 desc = desc.child("source", producer.inspect(opts));
             }
-            VarSource::Iteration { predicate, .. } => {
-                if opts.show_guards {
-                    desc = desc.annotate(format!("[predicate: {}]", fmt_guard(predicate)));
-                }
-            }
+            VarSource::Iteration { .. } => {}
             VarSource::Uninitialized => {
                 desc = desc.annotate("[uninitialized]".to_string());
             }
@@ -410,10 +396,7 @@ impl Producer for VarProducer {
                 panic!("VarProducer::get() called while source is Uninitialized")
             }
             VarSource::Argument(producer) => producer.get(),
-            VarSource::Iteration {
-                extent,
-                predicate: _,
-            } => iterate_extent(extent, &None),
+            VarSource::Iteration { extent } => iterate_extent(extent, &None),
         }
     }
 
@@ -483,7 +466,7 @@ fn iterate_data_source_domain(
             &source_impl.borrow().element_extent(),
         )
     } else {
-        ColumnValue::from_column_data(values)
+        values
     };
     GetResult {
         column_value: output,
@@ -507,13 +490,10 @@ fn iterate_record(
     );
     let data = output_data
         .drain()
-        .map(|(attr, get_result)| (attr.clone(), get_result.column_value.data))
+        .map(|(attr, get_result)| (attr.clone(), get_result.column_value))
         .collect();
     GetResult {
-        column_value: ColumnValue {
-            data: ColumnData::cartesian_product_with_correlation(data, outer_filter),
-            parent_indices: ParentIndices::TopLevelVector,
-        },
+        column_value: ColumnValue::cartesian_product_with_correlation(data, outer_filter),
         yield_guard,
     }
 }
@@ -675,12 +655,6 @@ impl Consumer for VarRefProducer {
     }
 }
 
-/// Compose parent indices: maps inner indices through outer indices.
-/// For inner[i], result[i] = outer[inner[i]]
-pub fn compose_indices(outer: &[usize], inner: &[usize]) -> Vec<usize> {
-    inner.iter().map(|&i| outer[i]).collect()
-}
-
 impl Producer for VarRefProducer {
     // TODO: Make node collapsed by default so it's not confusing to see the same VarProducer
     // in multiple places in the tree. Maybe draw an arrow to the VarProducer, or color coordinate them?
@@ -725,38 +699,13 @@ impl Producer for VarRefProducer {
 
         // TODO: Filter data based on intent guard
 
-        // If no iteration chain, no alignment needed
-        if self.iteration_chain.is_empty() {
-            trace!(
-                "VarRefProducer for '{}' has no iteration chain, returning data directly: {:?}",
-                self.var_name,
-                var_result.column_value.data
-            );
-            return var_result;
-        }
+        trace!(
+            "VarRefProducer for '{}' returning: {:?}",
+            self.var_name,
+            var_result.column_value
+        );
 
-        // Compose parent_indices from innermost iteration to outermost
-        // The chain is ordered from innermost (first after current scope) to outermost (closest to variable)
-        let mut composed_indices: Option<Vec<usize>> = None;
-        for iter_var in self.iteration_chain.iter().rev() {
-            // Get this iteration variable's parent_indices
-            let iter_result = iter_var.borrow_mut().get();
-            if let ParentIndices::Parent(parent_indices) = iter_result.column_value.parent_indices {
-                composed_indices = Some(match composed_indices {
-                    None => parent_indices,
-                    Some(inner) => compose_indices(&parent_indices, &inner),
-                });
-            }
-        }
-
-        // Expand column using composed indices
-        match composed_indices {
-            Some(indices) => GetResult {
-                column_value: var_result.column_value.expand(&indices),
-                yield_guard: var_result.yield_guard,
-            },
-            None => var_result,
-        }
+        var_result
     }
 
     fn release(&mut self, _obsolete_guard: Guard) -> Guard {

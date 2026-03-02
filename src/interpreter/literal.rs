@@ -5,8 +5,8 @@ use std::rc::Rc;
 use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
 
 use super::{
-    fmt_value_compact, BaseType, ColumnData, ColumnValue, Consumer, Extent, FuncBinding, GetResult,
-    Guard, Notification, Operator, Producer, Scheduler, Value, VarScope,
+    fmt_value_compact, BaseType, ColumnValue, Consumer, Extent, FuncBinding, GetResult, Guard,
+    Notification, Operator, Producer, Scheduler, Value, VarScope,
 };
 
 /// A literal operator represents a constant value.
@@ -211,22 +211,19 @@ impl Producer for ListLiteralProducer {
             column_value: input_indices,
         } = self.index_producer.get();
 
-        let outputs = match &input_indices.data {
-            ColumnData::UInts(indices) => {
+        let outputs = match &input_indices {
+            ColumnValue::UInts(indices) => {
                 let output_values: Vec<Value> = indices
                     .iter()
                     .map(|i| self.values.get(*i).cloned().unwrap_or(Value::Unit))
                     .collect();
-                ColumnData::from_values(output_values, &self.value_extent)
+                ColumnValue::from_values(output_values, &self.value_extent)
             }
             other => panic!("Expected UInt indices, got {other:?}"),
         };
 
         GetResult {
-            column_value: ColumnValue {
-                data: ColumnData::function_bindings(input_indices.data, outputs),
-                parent_indices: input_indices.parent_indices,
-            },
+            column_value: ColumnValue::function_bindings(input_indices, outputs),
             yield_guard,
         }
     }
@@ -267,7 +264,6 @@ mod tests {
         // Verify get returns the constant value and Universal yield guard
         let result = producer.get();
         assert_eq!(result.column_value.as_single().unwrap(), Value::Int(42));
-        assert_eq!(result.column_value.parent_indices, ParentIndices::Scalar);
         assert!(result.yield_guard.is_universal());
 
         // Verify release is a no-op
@@ -342,7 +338,6 @@ mod tests {
                 },
             ])
         );
-        assert_eq!(column.parent_indices, ParentIndices::Scalar);
     }
 
     #[test]

@@ -10,8 +10,8 @@ use crate::{
 use log::{debug, trace};
 
 use super::{
-    fmt_guard, ColumnData, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator,
-    ParentIndices, Producer, Scheduler, Var, VarProducer, VarScope, VarSource,
+    fmt_guard, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer,
+    Scheduler, Var, VarProducer, VarScope, VarSource,
 };
 
 /// A Lambda operator represents a lambda expression.
@@ -121,33 +121,24 @@ impl Producer for LambdaProducer {
         self.body_yield_guard = codomain_result.yield_guard.clone();
         let domain_column = domain_result.column_value;
         let codomain_column = codomain_result.column_value;
+        let codomain_is_scalar = codomain_column.is_scalar();
 
-        // If the body of a lambda is a scalar, expand it out to one copy per element in the domain.
-        let codomain_data = if codomain_column.parent_indices == ParentIndices::Scalar {
-            codomain_column.data.repeat(domain_column.data.len())
+        // If the body of a lambda is a scalar (single-element), expand it out to one copy per element in the domain.
+        let codomain_data = if codomain_is_scalar {
+            codomain_column.repeat(domain_column.len())
         } else {
             assert_eq!(
-                domain_column.data.len(),
-                codomain_column.data.len(),
+                domain_column.len(),
+                codomain_column.len(),
                 "Domain and codomain columns have different lengths"
             );
-            codomain_column.data
-        };
-
-        let yield_guard = if codomain_column.parent_indices == ParentIndices::Scalar {
-            domain_result.yield_guard.to_universal_or_empty()
-        } else {
-            let domain_guard = Guard::Domain(Box::new(domain_result.yield_guard));
-            domain_guard.intersect(self.intent_guard.clone())
+            codomain_column
         };
 
         GetResult {
-            column_value: ColumnValue {
-                data: ColumnData::function_bindings(domain_column.data, codomain_data),
-                // TODO: calculate correct parent indices when results escape a lambda.
-                parent_indices: domain_column.parent_indices,
-            },
-            yield_guard,
+            column_value: ColumnValue::function_bindings(domain_column, codomain_data),
+            yield_guard: Guard::Domain(Box::new(domain_result.yield_guard))
+                .intersect(self.intent_guard.clone()),
         }
     }
 
@@ -281,7 +272,6 @@ impl Lambda {
             // Iteration source
             self.variable.create_subscription(VarSource::Iteration {
                 extent: self.variable.extent().clone(),
-                predicate: domain_guard.clone(),
             })
         };
 
@@ -495,14 +485,11 @@ impl Producer for ApplyProducer {
             yield_guard,
             column_value: lambda_column,
         } = self.lambda_producer.get();
-        match lambda_column.data {
-            ColumnData::FunctionBindings { outputs, .. } => {
+        match lambda_column {
+            ColumnValue::FunctionBindings { outputs, .. } => {
                 trace!("ApplyProducer producing {:?}", *outputs);
                 GetResult {
-                    column_value: ColumnValue {
-                        data: *outputs,
-                        parent_indices: lambda_column.parent_indices,
-                    },
+                    column_value: *outputs,
                     yield_guard: yield_guard.to_universal_or_empty(),
                 }
             }
@@ -571,8 +558,11 @@ mod tests {
         // Get the function bindings
         let result = producer.get();
         assert_eq!(
-            result.column_value.data,
-            ColumnData::function_bindings(ColumnData::Ints(vec![42]), ColumnData::Ints(vec![42])),
+            result.column_value,
+            ColumnValue::function_bindings(
+                ColumnValue::Ints(vec![42]),
+                ColumnValue::Ints(vec![42])
+            ),
         );
     }
 
@@ -606,8 +596,8 @@ mod tests {
         // Get the function bindings
         let result = producer.get();
         assert_eq!(
-            result.column_value.data,
-            ColumnData::function_bindings(ColumnData::Ints(vec![0]), ColumnData::Ints(vec![10]))
+            result.column_value,
+            ColumnValue::function_bindings(ColumnValue::Ints(vec![0]), ColumnValue::Ints(vec![10]))
         );
     }
 
@@ -677,8 +667,8 @@ mod tests {
 
         // Get should work
         let result = producer.get();
-        match &result.column_value.data {
-            ColumnData::FunctionBindings { inputs, .. } => {
+        match &result.column_value {
+            ColumnValue::FunctionBindings { inputs, .. } => {
                 assert!(!inputs.is_empty());
             }
             other => panic!("Expected FunctionBindings, got {other:?}"),
@@ -727,8 +717,11 @@ mod tests {
         // Get the value - should use lambda's variable (100), not parent's (200)
         let result = producer.get();
         assert_eq!(
-            result.column_value.data,
-            ColumnData::function_bindings(ColumnData::Ints(vec![100]), ColumnData::Ints(vec![100]))
+            result.column_value,
+            ColumnValue::function_bindings(
+                ColumnValue::Ints(vec![100]),
+                ColumnValue::Ints(vec![100])
+            )
         );
     }
 
@@ -827,7 +820,7 @@ mod tests {
 
         // Get should return the unwrapped output value: 42
         let column = producer.get().column_value;
-        assert_eq!(column.data, ColumnData::Ints(vec![42]));
+        assert_eq!(column, ColumnValue::Ints(vec![42]));
     }
 
     #[test]
@@ -849,7 +842,7 @@ mod tests {
         );
 
         let column = producer.get().column_value;
-        assert_eq!(column.data, ColumnData::Ints(vec![10]));
+        assert_eq!(column, ColumnValue::Ints(vec![10]));
     }
 
     #[test]
@@ -972,7 +965,7 @@ mod tests {
         );
 
         let column = producer.get().column_value;
-        assert_eq!(column.data, ColumnData::Ints(vec![43]));
+        assert_eq!(column, ColumnValue::Ints(vec![43]));
     }
 
     #[test]
@@ -994,7 +987,7 @@ mod tests {
         );
 
         let column = producer.get().column_value;
-        assert_eq!(column.data, ColumnData::Strings(vec!["hello".to_string()]));
+        assert_eq!(column, ColumnValue::Strings(vec!["hello".to_string()]));
     }
 
     #[test]
@@ -1032,7 +1025,7 @@ mod tests {
         );
 
         let column = producer.get().column_value;
-        assert_eq!(column.data, ColumnData::Ints(vec![100]));
+        assert_eq!(column, ColumnValue::Ints(vec![100]));
     }
 
     #[test]
@@ -1060,6 +1053,6 @@ mod tests {
         );
 
         let column = producer.get().column_value;
-        assert_eq!(column.data, ColumnData::Ints(vec![42]));
+        assert_eq!(column, ColumnValue::Ints(vec![42]));
     }
 }

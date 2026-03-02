@@ -84,7 +84,7 @@ fn run_program(code: &str, inspect_port: Option<u16>) {
         if yield_guard.borrow().is_universal() {
             break;
         }
-        println!("Got value: {:#?}", &column_value.data);
+        println!("Got value: {:#?}", &column_value);
     }
     producer.release(Guard::universal());
 }
