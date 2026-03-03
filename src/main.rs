@@ -1,7 +1,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use cambra::{
-    interpreter::{Consumer, GetResult, Guard, Notification, Scheduler},
+    interpreter::{Consumer, GetResult, Guard, Scheduler},
     lowering::{lower_let_stmt_block, LoweringContext},
     parse_python_code, pretty_ast,
     pretty_graph::{self, pretty_dataflow},
@@ -35,17 +35,12 @@ fn run_program(code: &str, inspect_port: Option<u16>) {
 
     let inspector = inspect_port.map(|port| WebInspector::new(port, ast_tree, operator_tree));
 
-    let yield_guard = Rc::new(RefCell::new(Guard::empty()));
-    let yield_guard_clone = yield_guard.clone();
     let new_data = Rc::new(RefCell::new(false));
     let new_data_clone = new_data.clone();
     let mut obsolete_guard: Guard;
-    let consumer: Box<dyn Consumer> = Box::new(move |notification: Notification| {
-        debug!("Main loop received notification: {notification:?}");
-        match notification {
-            Notification::NewData => *new_data_clone.borrow_mut() = true,
-            Notification::Yield(yield_guard) => *yield_guard_clone.borrow_mut() = yield_guard,
-        };
+    let consumer: Box<dyn Consumer> = Box::new(move || {
+        debug!("Main loop received notification");
+        *new_data_clone.borrow_mut() = true;
     });
 
     let mut producer = op.subscribe(Guard::universal(), consumer, scope, &mut scheduler);
@@ -57,7 +52,7 @@ fn run_program(code: &str, inspect_port: Option<u16>) {
     debug!("main producer:\n{}", pretty_dataflow(producer.as_ref()));
 
     loop {
-        while !*new_data.borrow() && !yield_guard.borrow().is_universal() {
+        while !*new_data.borrow() {
             debug!("Scheduler checking for notifications");
             scheduler.check_for_notifications();
             tick += 1;
@@ -68,23 +63,21 @@ fn run_program(code: &str, inspect_port: Option<u16>) {
         }
         let GetResult {
             column_value,
-            yield_guard: new_yield_guard,
+            yield_guard,
         } = producer.get();
-        *yield_guard.borrow_mut() = new_yield_guard;
         debug!("Main got yield_guard: {yield_guard:?}, releasing");
-        obsolete_guard = producer.release(yield_guard.borrow().clone());
+        obsolete_guard = producer.release(yield_guard.clone());
         debug!("Main release got {obsolete_guard:?}");
         *new_data.borrow_mut() = false;
-
+        println!("Got value: {:#?}", &column_value);
         tick += 1;
         if let Some(ref inspector) = inspector {
             inspector.update_snapshot(tick, &*producer, &scheduler);
         }
 
-        if yield_guard.borrow().is_universal() {
+        if yield_guard.is_universal() {
             break;
         }
-        println!("Got value: {:#?}", &column_value);
     }
     producer.release(Guard::universal());
 }

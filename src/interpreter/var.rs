@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::{cell::RefCell, collections::HashMap};
 
 use bit_set::BitSet;
-use log::{debug, trace};
+use log::trace;
 
 use crate::interpreter::Restriction;
 /// A variable subscription paired with the chain of iteration-source variables between
@@ -14,8 +14,7 @@ use crate::{
 };
 
 use super::{
-    fmt_guard, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer,
-    Scheduler,
+    fmt_guard, ColumnValue, Consumer, Extent, GetResult, Guard, Operator, Producer, Scheduler,
 };
 /// A variable subscription paired with the chain of scanning variables between
 /// the current scope and the found variable, used for alignment composition.
@@ -213,7 +212,6 @@ impl std::fmt::Debug for VarProducer {
         f.debug_struct("VarProducer")
             .field("name", &self.name)
             .field("source", &self.source)
-            .field("yield_guard", &self.yield_guard)
             .field("data_available", &self.data_available)
             .field(
                 "consumers",
@@ -244,22 +242,13 @@ impl VarProducer {
         // during subscribe() (e.g., Literal). At subscribe time, no
         // releases have happened, so data_available is trustworthy.
         if self.data_available {
-            // Prioritize NewData since get() returns the authoritative
-            // guard, so the consumer gets both data and progress in one call.
-            consumer.notify(Notification::NewData);
-        } else if !self.yield_guard.is_empty() {
-            consumer.notify(Notification::Yield(self.yield_guard.clone()));
+            consumer.notify();
         }
         debug_assert!(
             self.stored_release_guard.is_empty(),
             "add_consumer called after releases have occurred"
         );
         self.consumers.push(consumer);
-    }
-
-    /// Get the current yield guard.
-    pub fn get_yield_guard(&self) -> Guard {
-        self.yield_guard.clone()
     }
 
     /// Store a release guard.
@@ -290,15 +279,9 @@ impl VarProducer {
     fn check_for_notifications_by_extent(&mut self, extent: &Extent) {
         match extent {
             Extent::DataSourceDomain(extent_impl, ..) => {
-                let notification = if extent_impl.borrow_mut().check_for_new_data() {
-                    Notification::NewData
-                } else {
-                    self.yield_guard = extent_impl.borrow().get_yield_guard();
-                    Notification::Yield(self.yield_guard.clone())
-                };
-                self.consumers
-                    .iter_mut()
-                    .for_each(|c| c.notify(notification.clone()));
+                if extent_impl.borrow_mut().check_for_new_data() {
+                    self.consumers.iter_mut().for_each(|c| c.notify());
+                }
             }
             Extent::Record(fields) => {
                 for field_extent in fields.values() {
@@ -352,10 +335,7 @@ impl VarProducer {
         } else {
             MODE_ARGUMENT
         };
-        let mut parts = vec![
-            mode.to_string(),
-            format!("yield: {}", fmt_guard(&self.yield_guard)),
-        ];
+        let mut parts = vec![mode.to_string()];
         if opts.show_guards {
             parts.push(format!(
                 "release: {}",
@@ -533,19 +513,11 @@ fn release_for_extent(extent: &mut Extent, obsolete_guard: Guard) -> Guard {
 }
 
 impl Consumer for VarProducer {
-    fn notify(&mut self, notification: Notification) {
-        match &notification {
-            Notification::Yield(guard) => {
-                debug!("Setting VarProducer yield guard {guard:?}");
-                self.yield_guard = guard.clone();
-            }
-            Notification::NewData => {
-                self.data_available = true;
-            }
-        }
+    fn notify(&mut self) {
+        self.data_available = true;
         // Forward to all consumers
         for consumer in self.consumers.iter_mut() {
-            consumer.notify(notification.clone());
+            consumer.notify();
         }
     }
 }
@@ -645,16 +617,8 @@ impl std::fmt::Debug for VarRefProducer {
 }
 
 impl Consumer for VarRefProducer {
-    fn notify(&mut self, notification: Notification) {
-        match notification {
-            Notification::Yield(guard) => {
-                let restricted = guard.intersect(self.intent_guard.clone());
-                self.consumer.notify(Notification::Yield(restricted));
-            }
-            Notification::NewData => {
-                self.consumer.notify(Notification::NewData);
-            }
-        }
+    fn notify(&mut self) {
+        self.consumer.notify();
     }
 }
 
@@ -766,9 +730,7 @@ mod tests {
         );
 
         // Verify notification was received (flows: Literal → VarProducer → VarRefProducer → consumer)
-        let notifications_borrowed = notifications.borrow();
-        assert_eq!(notifications_borrowed.len(), 1);
-        assert!(matches!(notifications_borrowed[0], Notification::NewData));
+        assert_eq!(*notifications.borrow(), 1);
 
         // Verify get returns the value (as a single-element column)
         let result = producer.get();

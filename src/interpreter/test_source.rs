@@ -156,7 +156,7 @@ impl Operator for TestSourceReader {
     ) -> Box<dyn Producer> {
         Box::new(TestSourceProducer::new(
             intent_guard.clone(),
-            binding.subscribe(intent_guard, Box::new(|_| {}), var_scope, scheduler),
+            binding.subscribe(intent_guard, Box::new(|| {}), var_scope, scheduler),
             self.data_source.clone(),
         ))
     }

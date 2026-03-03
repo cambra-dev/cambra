@@ -12,7 +12,7 @@ operator creates a runtime **producer/consumer** pair that manages actual execut
 
 A `Literal` operator holds a constant value.
 
-`subscribe()` immediately calls `notify(NewData)` on the consumer. `get()` returns the constant
+`subscribe()` immediately calls `notify()` on the consumer. `get()` returns the constant
 as a single-element `ColumnValue` with a full yield guard. `release()` is a no-op.
 
 ---

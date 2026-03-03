@@ -394,7 +394,7 @@ impl Restriction {
         if self.compute_producer.is_none() {
             if let Some(op) = &mut self.compute_op {
                 self.compute_producer =
-                    Some(op.subscribe(intent_guard, Box::new(|_| {}), var_scope, scheduler));
+                    Some(op.subscribe(intent_guard, Box::new(|| {}), var_scope, scheduler));
             } else {
                 panic!("Missing compute_op in Restriction");
             }
@@ -716,17 +716,6 @@ impl Value {
 pub struct FuncBinding {
     pub input: Value,
     pub output: Value,
-}
-
-/// Notification from a producer to a consumer, indicating the availability of new data,
-/// or progress in the absence of data.
-#[derive(Debug, Clone)]
-pub enum Notification {
-    /// A region has completed with no new data to retrieve.
-    /// The consumer should NOT call get() in response to this.
-    Yield(Guard),
-    /// New data is available. The consumer should call get() to retrieve it.
-    NewData,
 }
 
 /// Result of calling get() on a producer.

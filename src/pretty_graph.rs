@@ -401,7 +401,7 @@ Lambda(x) : Int \u{2192} Int
         assert_eq!(
             output,
             "\
-BinOpProducer(+) [yield: ∅ ∧ ∅]
+BinOpProducer(+)
 ├── left: LiteralProducer(2)
 └── right: LiteralProducer(3)
 "
@@ -429,8 +429,6 @@ BinOpProducer(+) [yield: ∅ ∧ ∅]
             &mut Scheduler::new(),
         );
         let output = pretty_dataflow(producer.as_ref());
-        // VarProducer yield guard is ∅ because Literal sends NewData (not Yield),
-        // which sets data_available=true but doesn't update yield_guard.
         assert_eq!(
             output,
             "\
@@ -438,9 +436,9 @@ ApplyProducer
 └── lambda: LambdaProducer(x)
     ├── var: VarProducer(x) [argument, ready] [yield: ∅]
     │   └── source: LiteralProducer(42)
-    └── body: BinOpProducer(+) [yield: ∅ ∧ ∅]
+    └── body: BinOpProducer(+)
         ├── left: VarRefProducer(x)
-        │   └── → VarProducer(x) [argument, yield: ∅, ready, 2 consumers]
+        │   └── → VarProducer(x) [argument, ready, 2 consumers]
         └── right: LiteralProducer(1)
 "
         );
@@ -460,13 +458,10 @@ ApplyProducer
             &mut Scheduler::new(),
         );
         let output = pretty_dataflow_with(producer.as_ref(), &VizOptions::verbose());
-        // Yield guards are ∅ because Literals send NewData, not Yield.
-        // Output is identical to default mode for BinOpProducer since yield
-        // guards are always shown; verbose only adds non-yield guards.
         assert_eq!(
             output,
             "\
-BinOpProducer(+) [yield: ∅ ∧ ∅]
+BinOpProducer(+)
 ├── left: LiteralProducer(2)
 └── right: LiteralProducer(3)
 "
@@ -639,7 +634,7 @@ ApplyProducer
     ├── var: VarProducer(x) [argument, ready] [yield: ∅]
     │   └── source: LiteralProducer(42)
     └── body: VarRefProducer(x)
-        └── → VarProducer(x) [argument, yield: ∅, ready, 2 consumers]
+        └── → VarProducer(x) [argument, ready, 2 consumers]
 "
         );
     }
@@ -699,11 +694,11 @@ ApplyProducer
         └── lambda: LambdaProducer(y)
             ├── var: VarProducer(y) [argument, ready] [yield: ∅]
             │   └── source: LiteralProducer(2)
-            └── body: BinOpProducer(+) [yield: ∅ ∧ ∅]
+            └── body: BinOpProducer(+)
                 ├── left: VarRefProducer(x)
-                │   └── → VarProducer(x) [argument, yield: ∅, ready, 2 consumers]
+                │   └── → VarProducer(x) [argument, ready, 2 consumers]
                 └── right: VarRefProducer(y)
-                    └── → VarProducer(y) [argument, yield: ∅, ready, 2 consumers]
+                    └── → VarProducer(y) [argument, ready, 2 consumers]
 "
         );
     }

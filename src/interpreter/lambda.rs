@@ -10,8 +10,8 @@ use crate::{
 use log::{debug, trace};
 
 use super::{
-    fmt_guard, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer,
-    Scheduler, Var, VarProducer, VarScope, VarSource,
+    fmt_guard, ColumnValue, Consumer, Extent, GetResult, Guard, Operator, Producer, Scheduler, Var,
+    VarProducer, VarScope, VarSource,
 };
 
 /// A Lambda operator represents a lambda expression.
@@ -40,10 +40,6 @@ struct LambdaProducer {
     body_producer: Option<Box<dyn Producer>>,
     /// The downstream consumer that will receive notifications
     downstream_consumer: Box<dyn Consumer>,
-    /// Yield guard from the variable (domain)
-    variable_yield_guard: Guard,
-    /// Yield guard from the body (codomain)
-    body_yield_guard: Guard,
     /// The intent guard for this lambda subscription
     intent_guard: Guard,
 }
@@ -55,8 +51,6 @@ impl std::fmt::Debug for LambdaProducer {
             .field("variable_subscription", &self.variable_subscription)
             .field("body_producer", &self.body_producer)
             .field("downstream_consumer", &format_args!("<consumer>"))
-            .field("variable_yield_guard", &self.variable_yield_guard)
-            .field("body_yield_guard", &self.body_yield_guard)
             .field("intent_guard", &self.intent_guard)
             .finish()
     }
@@ -75,8 +69,6 @@ impl LambdaProducer {
             variable_subscription,
             body_producer: None,
             downstream_consumer,
-            variable_yield_guard: Guard::Empty,
-            body_yield_guard: Guard::Empty,
             intent_guard,
         }
     }
@@ -117,8 +109,6 @@ impl Producer for LambdaProducer {
             .expect("body_producer should be set before get()")
             .get();
 
-        self.variable_yield_guard = domain_result.yield_guard.clone();
-        self.body_yield_guard = codomain_result.yield_guard.clone();
         let domain_column = domain_result.column_value;
         let codomain_column = codomain_result.column_value;
         let codomain_is_scalar = codomain_column.is_scalar();
@@ -180,44 +170,9 @@ impl Producer for LambdaProducer {
 }
 
 impl Consumer for LambdaProducer {
-    /// Receives notifications from the variable (domain) subscription and forwards
-    /// them downstream, wrapping yield guards in `Guard::Domain`.
-    fn notify(&mut self, notification: Notification) {
-        match notification {
-            Notification::Yield(guard) => {
-                self.variable_yield_guard = guard.clone();
-                let new_guard = Guard::Domain(Box::new(guard));
-                self.downstream_consumer
-                    .notify(Notification::Yield(new_guard));
-            }
-            Notification::NewData => self.downstream_consumer.notify(Notification::NewData),
-        }
-    }
-}
-
-/// Receives notifications from the body (codomain) subscription and forwards them
-/// to the LambdaProducer, combining the current variable yield guard with the
-/// body yield guard.
-struct LambdaBodyConsumer(Rc<RefCell<LambdaProducer>>);
-
-impl Consumer for LambdaBodyConsumer {
-    fn notify(&mut self, notification: Notification) {
-        debug!("Lambda body_consumer notified with {notification:?}");
-        let mut producer = self.0.borrow_mut();
-        match notification {
-            Notification::Yield(guard) => {
-                producer.body_yield_guard = guard.clone();
-                let new_guard = Guard::from_independent_function_parts(
-                    producer.variable_yield_guard.clone(),
-                    guard,
-                );
-                producer
-                    .downstream_consumer
-                    .notify(Notification::Yield(new_guard));
-            }
-            // Lambda ignores NewData on the body side; action is taken on variable notification.
-            Notification::NewData => {}
-        }
+    /// Receives notifications from the variable (domain) subscription and forwards downstream.
+    fn notify(&mut self) {
+        self.downstream_consumer.notify();
     }
 }
 
@@ -289,7 +244,7 @@ impl Lambda {
             let NotifyOrSubscribeResult { notify, subscribe } =
                 self.variable.extent().subscribe_to_iteration_action();
             if notify {
-                consumer.notify(Notification::NewData);
+                consumer.notify();
             }
             if subscribe {
                 scheduler.add_source(variable_subscription.clone());
@@ -330,8 +285,8 @@ impl Lambda {
             VarScope::new(&self.variable.name, variable_subscription)
         };
 
-        let body_consumer: Box<dyn Consumer> =
-            Box::new(LambdaBodyConsumer(lambda_producer.clone()));
+        // Lambda ignores body notifications; action is taken on variable notification.
+        let body_consumer: Box<dyn Consumer> = Box::new(|| {});
 
         let body_producer = self.body.subscribe(
             codomain_guard,
@@ -442,13 +397,9 @@ impl Operator for Apply {
         // Note: this should ideally transform the output yield guard according to the body
         // of the lambda. For now, we treat the body as a black box and just forward Universal
         // or Empty.
-        let apply_consumer = move |notification: Notification| {
-            let downstream_notification = match &notification {
-                Notification::NewData => Notification::NewData,
-                Notification::Yield(g) => Notification::Yield(g.to_universal_or_empty()),
-            };
-            debug!("Apply notified with {notification:?}, forwarding {downstream_notification:?}");
-            consumer.notify(downstream_notification);
+        let apply_consumer = move || {
+            debug!("Apply notified");
+            consumer.notify();
         };
         Box::new(ApplyProducer::new(self.lambda.subscribe_to_application(
             intent_guard,
@@ -545,11 +496,10 @@ mod tests {
         );
 
         // Check notifications - we should get one when both are ready
-        let notifications_borrowed = notifications.borrow();
         assert!(
-            !notifications_borrowed.is_empty(),
+            *notifications.borrow() >= 1,
             "Expected at least 1 notification, got {}",
-            notifications_borrowed.len()
+            *notifications.borrow()
         );
 
         // Get the function bindings
@@ -583,11 +533,10 @@ mod tests {
         );
 
         // Both variable and body should notify
-        let notifications_borrowed = notifications.borrow();
         assert!(
-            !notifications_borrowed.is_empty(),
+            *notifications.borrow() > 0,
             "Expected at least 1 notification, got {}",
-            notifications_borrowed.len()
+            *notifications.borrow()
         );
 
         // Get the function bindings
@@ -656,9 +605,8 @@ mod tests {
         );
 
         // Should receive notification
-        let notifications_borrowed = notifications.borrow();
         assert!(
-            !notifications_borrowed.is_empty(),
+            *notifications.borrow() > 0,
             "Expected at least 1 notification"
         );
 
@@ -743,17 +691,14 @@ mod tests {
 
         // Both variable binding and body should notify, and LambdaProducer should
         // notify downstream when both are ready
-        let notifications_borrowed = notifications.borrow();
         // We should get at least one notification when both guards are ready
         assert!(
-            !notifications_borrowed.is_empty(),
+            *notifications.borrow() > 0,
             "Expected notification when both variable and body are ready, got {}",
-            notifications_borrowed.len()
+            *notifications.borrow()
         );
 
-        // The notification should be NewData
-        let last_notification = notifications_borrowed.last().unwrap();
-        assert!(matches!(last_notification, Notification::NewData));
+        // All notifications signal new data
     }
 
     #[test]
@@ -783,9 +728,9 @@ mod tests {
         );
 
         assert!(
-            !notifications.borrow().is_empty(),
-            "Expected at least one notification from proper binding flow, got {:#?}.",
-            notifications.borrow()
+            *notifications.borrow() > 0,
+            "Expected at least one notification from proper binding flow, got {}.",
+            *notifications.borrow()
         );
     }
 
@@ -811,7 +756,7 @@ mod tests {
         );
 
         assert!(
-            !notifications.borrow().is_empty(),
+            *notifications.borrow() > 0,
             "Expected at least one notification"
         );
 
@@ -900,13 +845,9 @@ mod tests {
         );
 
         let notifs = notifications.borrow();
-        let new_data_count = notifs
-            .iter()
-            .filter(|n| matches!(n, Notification::NewData))
-            .count();
         assert!(
-            new_data_count > 0,
-            "Expected at least one NewData notification, got: {:?}",
+            *notifs > 0,
+            "Expected at least one notification, got: {}",
             *notifs
         );
     }

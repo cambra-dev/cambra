@@ -67,7 +67,7 @@ impl Operator for StdinReader {
     ) -> Box<dyn Producer> {
         Box::new(StdinProducer::new(
             intent_guard.clone(),
-            binding.subscribe(intent_guard, Box::new(|_| {}), var_scope, scheduler),
+            binding.subscribe(intent_guard, Box::new(|| {}), var_scope, scheduler),
             self.data_source.clone(),
         ))
     }
@@ -154,7 +154,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
                 debug!("EOF reached on stdin");
                 // EOF reached
                 self.eof_reached = true;
-                false
+                true
             }
             Ok(_) => {
                 if line.ends_with('\n') {

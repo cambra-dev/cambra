@@ -6,7 +6,7 @@ use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
 
 use super::{
     fmt_value_compact, BaseType, ColumnValue, Consumer, Extent, FuncBinding, GetResult, Guard,
-    Notification, Operator, Producer, Scheduler, Value, VarScope,
+    Operator, Producer, Scheduler, Value, VarScope,
 };
 
 /// A literal operator represents a constant value.
@@ -47,7 +47,7 @@ impl Operator for Literal {
         _scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
         // Literal always has data immediately — notify NewData.
-        consumer.notify(Notification::NewData);
+        consumer.notify();
 
         Box::new(LiteralProducer {
             value: self.value.clone(),
@@ -136,7 +136,7 @@ impl Operator for ListLiteral {
         _var_scope: Option<Rc<VarScope>>,
         _scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
-        consumer.notify(Notification::NewData);
+        consumer.notify();
 
         Box::new(LiteralProducer {
             value: Value::Function(
@@ -162,18 +162,10 @@ impl Operator for ListLiteral {
         binding: &mut dyn Operator,
         scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
-        consumer.notify(Notification::NewData);
+        consumer.notify();
 
-        let index_consumer: Box<dyn Consumer> = Box::new(move |notification| {
-            // Note: we can do something smarter here since we know the set of values.
-            // For now, pass through Univeral guards but treat everything else as Empty.
-            // Only need to improve this if we want to support partial scans of list
-            // literals.
-            consumer.notify(match notification {
-                Notification::NewData => Notification::NewData,
-                Notification::Yield(Guard::Universal) => Notification::Yield(Guard::Universal),
-                Notification::Yield(_) => Notification::Yield(Guard::Empty),
-            });
+        let index_consumer: Box<dyn Consumer> = Box::new(move || {
+            consumer.notify();
         });
         let value_extent = if self.values.is_empty() {
             Extent::Base(BaseType::Unit)
@@ -256,10 +248,8 @@ mod tests {
             &mut Scheduler::new(),
         );
 
-        // The consumer should have been notified immediately with NewData
-        let notifications_borrowed = notifications.borrow();
-        assert_eq!(notifications_borrowed.len(), 1);
-        assert!(matches!(notifications_borrowed[0], Notification::NewData));
+        // The consumer should have been notified immediately
+        assert_eq!(*notifications.borrow(), 1);
 
         // Verify get returns the constant value and Universal yield guard
         let result = producer.get();
@@ -286,9 +276,7 @@ mod tests {
         );
 
         // Verify we received the notification
-        let notifications_borrowed = notifications.borrow();
-        assert_eq!(notifications_borrowed.len(), 1);
-        assert!(matches!(notifications_borrowed[0], Notification::NewData));
+        assert_eq!(*notifications.borrow(), 1);
 
         let result = producer.get();
         assert_eq!(

@@ -12,8 +12,7 @@ use std::cell::RefCell;
 use std::{collections::HashMap, rc::Rc};
 
 use crate::interpreter::{
-    ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer, Scheduler,
-    VarScope,
+    ColumnValue, Consumer, Extent, GetResult, Guard, Operator, Producer, Scheduler, VarScope,
 };
 use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
 
@@ -77,8 +76,8 @@ impl Operator for ConstructRecord {
         var_scope: Option<Rc<VarScope>>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
-        let consumer_wrapper = Rc::new(RefCell::new(move |notification| {
-            consumer.notify(notification);
+        let consumer_wrapper = Rc::new(RefCell::new(move || {
+            consumer.notify();
         }));
         let producers = self
             .fields
@@ -244,7 +243,7 @@ impl Operator for RecordField {
     fn subscribe(
         &mut self,
         intent_guard: Guard,
-        mut consumer: Box<dyn Consumer>,
+        consumer: Box<dyn Consumer>,
         var_scope: Option<std::rc::Rc<VarScope>>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
@@ -264,26 +263,9 @@ impl Operator for RecordField {
                 .collect(),
         );
 
-        let self_field_clone = self.field.clone();
-        // Translate record-level yield guards to the single-field yield guard that the
-        // downstream consumer expects.
-        let forwarding_consumer = Box::new(move |notification| {
-            consumer.notify(match &notification {
-                Notification::NewData => Notification::NewData,
-                Notification::Yield(Guard::Record(m)) => {
-                    Notification::Yield(m.get(&self_field_clone).unwrap().clone())
-                }
-                Notification::Yield(g) if g.is_empty() || g.is_universal() => notification,
-                _ => panic!("Unexpected notification {notification:?}"),
-            })
-        });
         Box::new(RecordFieldProducer::new(
-            self.input.subscribe(
-                producer_intent_guard,
-                forwarding_consumer,
-                var_scope,
-                scheduler,
-            ),
+            self.input
+                .subscribe(producer_intent_guard, consumer, var_scope, scheduler),
             self.field.clone(),
         ))
     }

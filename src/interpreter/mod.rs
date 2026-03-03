@@ -38,27 +38,27 @@ use std::rc::Rc;
 // ============================================================================
 
 /// A Consumer receives notifications from a producer.
-/// Notifications are either progress updates (yield guards) or data availability signals.
+/// A notification always means new data is available; the consumer should call `get()`.
 pub trait Consumer {
-    /// Notify the consumer of progress or data availability.
-    fn notify(&mut self, notification: Notification);
+    /// Notify the consumer that new data is available.
+    fn notify(&mut self);
 }
 
 /// Blanket implementation: Rc<RefCell<C>> implements Consumer when C does.
 impl<C: Consumer> Consumer for Rc<RefCell<C>> {
-    fn notify(&mut self, notification: Notification) {
-        self.borrow_mut().notify(notification)
+    fn notify(&mut self) {
+        self.borrow_mut().notify()
     }
 }
 
-/// Blanket implementation: FnMut(Notification) implements Consumer.
+/// Blanket implementation: FnMut() implements Consumer.
 /// This allows closures to be used as consumers.
 impl<F> Consumer for F
 where
-    F: FnMut(Notification),
+    F: FnMut(),
 {
-    fn notify(&mut self, notification: Notification) {
-        self(notification)
+    fn notify(&mut self) {
+        self()
     }
 }
 
@@ -180,32 +180,32 @@ pub(crate) mod test_helpers {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    /// A test consumer that stores notifications in shared state.
-    /// The notifications Vec is kept by the test, allowing access to notifications
+    /// A test consumer that counts notifications in shared state.
+    /// The count is kept by the test, allowing access to the notification count
     /// even after the consumer is moved into subscribe.
     /// Uses Rc<RefCell<>> for single-threaded, lock-free shared state.
     pub struct TestConsumer {
-        notifications: Rc<RefCell<Vec<Notification>>>,
+        count: Rc<RefCell<usize>>,
     }
 
     impl TestConsumer {
-        /// Create a new TestConsumer and return both the consumer and the shared notifications Vec.
-        /// The consumer can be moved into subscribe, while the notifications Vec allows
-        /// reading notifications from outside.
-        pub fn new() -> (Self, Rc<RefCell<Vec<Notification>>>) {
-            let notifications = Rc::new(RefCell::new(Vec::new()));
+        /// Create a new TestConsumer and return both the consumer and the shared notification count.
+        /// The consumer can be moved into subscribe, while the count allows
+        /// reading from outside.
+        pub fn new() -> (Self, Rc<RefCell<usize>>) {
+            let count = Rc::new(RefCell::new(0usize));
             (
                 TestConsumer {
-                    notifications: notifications.clone(),
+                    count: count.clone(),
                 },
-                notifications,
+                count,
             )
         }
     }
 
     impl Consumer for TestConsumer {
-        fn notify(&mut self, notification: Notification) {
-            self.notifications.borrow_mut().push(notification);
+        fn notify(&mut self) {
+            *self.count.borrow_mut() += 1;
         }
     }
 }

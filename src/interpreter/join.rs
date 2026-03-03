@@ -79,7 +79,7 @@ impl Producer for ComputeRestrictionProducer {
 mod tests {
     use super::*;
     use crate::interpreter::{
-        Apply, ColumnValue, Lambda, ListLiteral, Literal, Notification, Value, Var, VarRef,
+        Apply, ColumnValue, Lambda, ListLiteral, Literal, Value, Var, VarRef,
     };
     use bit_vec::BitVec;
     use std::cell::RefCell;
@@ -93,10 +93,8 @@ mod tests {
     fn eval_correlation(cr: &mut ComputeRestriction) -> BitVec {
         let notified = Rc::new(RefCell::new(false));
         let notified_clone = notified.clone();
-        let consumer: Box<dyn Consumer> = Box::new(move |n: Notification| {
-            if matches!(n, Notification::NewData) {
-                *notified_clone.borrow_mut() = true;
-            }
+        let consumer: Box<dyn Consumer> = Box::new(move || {
+            *notified_clone.borrow_mut() = true;
         });
         let mut scheduler = Scheduler::new();
         let mut producer = cr.subscribe(Guard::universal(), consumer, None, &mut scheduler);

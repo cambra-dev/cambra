@@ -9,10 +9,7 @@ use bit_vec::BitVec;
 use crate::interpreter::Scheduler;
 use crate::pretty_graph::{fmt_binop, fmt_extent, InspectNode, VizOptions};
 
-use super::{
-    fmt_guard, ColumnValue, Consumer, Extent, GetResult, Guard, Notification, Operator, Producer,
-    VarScope,
-};
+use super::{ColumnValue, Consumer, Extent, GetResult, Guard, Operator, Producer, VarScope};
 
 /// Kinds of binary operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,56 +221,20 @@ impl Operator for BinOp {
             left_producer: None,
             right_producer: None,
             downstream_consumer: consumer,
-            left_yield_guard: Guard::Empty,
-            right_yield_guard: Guard::Empty,
             intent_guard,
             op: self.op,
         }));
 
-        // Create closure consumer for left operand
+        // Create closure consumer for left operand — forward notify when either side has data.
         let producer_for_left = binop_producer.clone();
-        let left_consumer: Box<dyn Consumer> = Box::new(move |notification: Notification| {
-            let mut producer = producer_for_left.borrow_mut();
-            match notification {
-                Notification::Yield(guard) => {
-                    if guard != producer.left_yield_guard {
-                        producer.left_yield_guard = guard.clone();
-                        if guard.is_universal() && producer.right_yield_guard.is_universal() {
-                            producer
-                                .downstream_consumer
-                                .notify(Notification::Yield(Guard::Universal));
-                        }
-                    }
-                }
-                // Send NewData when either operand has data,
-                // because data-downstream consumers may be able to operate with data from a single side.
-                Notification::NewData => {
-                    producer.downstream_consumer.notify(Notification::NewData);
-                }
-            }
+        let left_consumer: Box<dyn Consumer> = Box::new(move || {
+            producer_for_left.borrow_mut().downstream_consumer.notify();
         });
 
-        // Create closure consumer for right operand
+        // Create closure consumer for right operand.
         let producer_for_right = binop_producer.clone();
-        let right_consumer: Box<dyn Consumer> = Box::new(move |notification: Notification| {
-            let mut producer = producer_for_right.borrow_mut();
-            match notification {
-                Notification::Yield(guard) => {
-                    if guard != producer.right_yield_guard {
-                        producer.right_yield_guard = guard.clone();
-                        if guard.is_universal() && producer.left_yield_guard.is_universal() {
-                            producer
-                                .downstream_consumer
-                                .notify(Notification::Yield(Guard::Universal));
-                        }
-                    }
-                }
-                // Send NewData when either operand has data,
-                // because data-downstream consumers may be able to operate with data from a single side.
-                Notification::NewData => {
-                    producer.downstream_consumer.notify(Notification::NewData);
-                }
-            }
+        let right_consumer: Box<dyn Consumer> = Box::new(move || {
+            producer_for_right.borrow_mut().downstream_consumer.notify();
         });
 
         // Subscribe left operand (clone var_scope for left, move original to right)
@@ -299,13 +260,11 @@ impl Operator for BinOp {
     }
 }
 
-/// Producer for BinOp: tracks yield guards from both operands and combines results.
+/// Producer for BinOp: combines results from both operands.
 struct BinOpProducer {
     left_producer: Option<Box<dyn Producer>>,
     right_producer: Option<Box<dyn Producer>>,
     downstream_consumer: Box<dyn Consumer>,
-    left_yield_guard: Guard,
-    right_yield_guard: Guard,
     intent_guard: Guard,
     op: BinOpKind,
 }
@@ -315,8 +274,6 @@ impl std::fmt::Debug for BinOpProducer {
         f.debug_struct("BinOpProducer")
             .field("left_producer", &self.left_producer)
             .field("right_producer", &self.right_producer)
-            .field("left_yield_guard", &self.left_yield_guard)
-            .field("right_yield_guard", &self.right_yield_guard)
             .field("intent_guard", &self.intent_guard)
             .field("op", &self.op)
             // Does not include Consumer.
@@ -326,13 +283,7 @@ impl std::fmt::Debug for BinOpProducer {
 
 impl Producer for BinOpProducer {
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        // Yield guard is always shown — it is the primary progress signal.
-        let mut desc = InspectNode::new(format!("BinOpProducer({})", fmt_binop(&self.op)))
-            .with_yield_guard(format!(
-                "{} ∧ {}",
-                fmt_guard(&self.left_yield_guard),
-                fmt_guard(&self.right_yield_guard)
-            ));
+        let mut desc = InspectNode::new(format!("BinOpProducer({})", fmt_binop(&self.op)));
         if let Some(ref left) = self.left_producer {
             desc = desc.child("left", left.inspect(opts));
         }
@@ -359,8 +310,8 @@ impl Producer for BinOpProducer {
         // Zip and apply binop element-wise, broadcasting scalars (single-element columns) as needed.
         // TODO figure out a better way to handle repeated values.
         // Maybe lazily repeat iterators, or use a vectorization library?
-        let left_is_scalar = left_col.len() == 1;
-        let right_is_scalar = right_col.len() == 1;
+        let left_is_scalar = left_col.is_scalar();
+        let right_is_scalar = right_col.is_scalar();
         let (left_data, right_data) = if left_is_scalar && !right_is_scalar {
             (left_col.repeat(right_col.len()), right_col)
         } else if right_is_scalar && !left_is_scalar {
@@ -371,9 +322,6 @@ impl Producer for BinOpProducer {
             (left_col, right_col)
         };
         let result_data = apply_binop_column(self.op, left_data, &right_data);
-
-        self.left_yield_guard = left_result.yield_guard.clone();
-        self.right_yield_guard = right_result.yield_guard.clone();
 
         GetResult {
             column_value: result_data,
@@ -478,12 +426,8 @@ mod tests {
             &mut Scheduler::new(),
         );
 
-        // Each literal fires NewData independently, so we get two notifications
-        let notifs = notifications.borrow();
-        assert_eq!(notifs.len(), 2);
-        assert!(matches!(notifs[0], Notification::NewData));
-        assert!(matches!(notifs[1], Notification::NewData));
-        drop(notifs);
+        // Each literal fires independently, so we get two notifications
+        assert_eq!(*notifications.borrow(), 2);
 
         let result = producer.get();
         assert_eq!(result.column_value, ColumnValue::Ints(vec![5]));

@@ -690,9 +690,7 @@ fn lower_assign(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::interpreter::{
-        ColumnValue, Consumer, FuncBinding, Guard, Notification, Operator, Scheduler,
-    };
+    use crate::interpreter::{ColumnValue, Consumer, FuncBinding, Guard, Operator, Scheduler};
     use crate::pretty_ast;
     use crate::pretty_graph::pretty_operator;
     use log::debug;
@@ -724,7 +722,7 @@ mod tests {
         let notified = Rc::new(RefCell::new(false));
         let notified_clone = notified.clone();
 
-        let consumer: Box<dyn Consumer> = Box::new(move |_: Notification| {
+        let consumer: Box<dyn Consumer> = Box::new(move || {
             *notified_clone.borrow_mut() = true;
         });
 
@@ -893,22 +891,16 @@ mod tests {
         ]);
         data_source.borrow_mut().set_has_data(true);
 
-        let notified_yield_guard = Rc::new(RefCell::new(Guard::Empty));
         let notified_has_data = Rc::new(RefCell::new(false));
-        let yield_clone = notified_yield_guard.clone();
         let has_data_clone = notified_has_data.clone();
-        let consumer: Box<dyn Consumer> = Box::new(move |n: Notification| {
-            match n {
-                Notification::NewData => *has_data_clone.borrow_mut() = true,
-                Notification::Yield(g) => *yield_clone.borrow_mut() = g,
-            };
+        let consumer: Box<dyn Consumer> = Box::new(move || {
+            *has_data_clone.borrow_mut() = true;
         });
 
         let mut scheduler = Scheduler::new();
         let mut producer = op.subscribe(Guard::universal(), consumer, scope, &mut scheduler);
         scheduler.check_for_notifications();
         assert!(*notified_has_data.borrow());
-        assert_eq!(*notified_yield_guard.borrow(), Guard::Empty);
 
         let get_result = producer.get();
         *notified_has_data.borrow_mut() = false;
@@ -926,10 +918,6 @@ mod tests {
         data_source.borrow_mut().set_yield_guard(Guard::Universal);
         scheduler.check_for_notifications();
         assert!(!*notified_has_data.borrow());
-        assert_eq!(
-            *notified_yield_guard.borrow(),
-            Guard::Domain(Box::new(Guard::Universal))
-        );
     }
 
     // Test a join between two data sources, including incrementally adding new data and releasing
@@ -970,10 +958,8 @@ mod tests {
 
         let notified_has_data = Rc::new(RefCell::new(false));
         let has_data_clone = notified_has_data.clone();
-        let consumer: Box<dyn Consumer> = Box::new(move |n: Notification| {
-            if let Notification::NewData = n {
-                *has_data_clone.borrow_mut() = true
-            }
+        let consumer: Box<dyn Consumer> = Box::new(move || {
+            *has_data_clone.borrow_mut() = true;
         });
 
         let mut scheduler = Scheduler::new();
