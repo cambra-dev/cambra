@@ -131,7 +131,7 @@ fn lower_name_as_ref(
     id: &str,
 ) -> Result<Box<dyn Operator>, LoweringError> {
     match &ctx.scope {
-        None => Result::Err(LoweringError::Unsupported(format!(
+        None => Err(LoweringError::Unsupported(format!(
             "Var lookup for {id} in empty scope"
         ))),
         Some(scope) => {

@@ -244,7 +244,7 @@ impl Operator for RecordField {
         &mut self,
         intent_guard: Guard,
         consumer: Box<dyn Consumer>,
-        var_scope: Option<std::rc::Rc<VarScope>>,
+        var_scope: Option<Rc<VarScope>>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn Producer> {
         let producer_intent_guard = Guard::Record(

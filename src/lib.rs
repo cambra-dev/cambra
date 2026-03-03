@@ -1,3 +1,5 @@
+#![warn(unused_qualifications)]
+
 use rustpython_parser::{ast, parser};
 
 pub mod ccl;

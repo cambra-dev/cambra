@@ -596,7 +596,7 @@ impl Hash for Value {
 }
 
 impl PartialOrd for Value {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         match self {
             Value::Int(i) => {
                 if let Value::Int(o) = other {
