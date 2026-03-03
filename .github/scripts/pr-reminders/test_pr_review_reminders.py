@@ -48,6 +48,13 @@ PRS = [
             {"login": "charlie", "__typename": "User"},
         ],
     },
+    {
+        "number": 105, "title": "Draft PR being ignored",
+        "url": "https://github.com/test/repo/pull/105",
+        "author": {"login": "alice"},
+        "isDraft": True,
+        "reviewRequests": [{"login": "bob", "__typename": "User"}],
+    },
 ]
 
 TIMELINES: dict[int, dict[str, str]] = {
@@ -59,6 +66,8 @@ TIMELINES: dict[int, dict[str, str]] = {
     103: {},
     # Two reviewers: bob requested 50h ago (stale), charlie requested 30min ago (fresh)
     104: {"bob": "2026-02-03T10:00:00Z", "charlie": "2026-02-05T11:30:00Z"},
+    # Stale but draft
+    105: {"bob": "2026-02-03T10:00:00Z"},
 }
 
 
@@ -109,6 +118,11 @@ def main() -> None:
         ("charlie", 104) not in stale_keys,
         "PR #104 correctly excludes charlie (requested <24h ago)",
         "PR #104 should not list charlie (requested <24h ago)",
+    )
+    check(
+        not any(pr == 105 for _, pr in stale_keys),
+        "PR #105 correctly excluded (is draft)",
+        "PR #105 should not appear (is draft)",
     )
 
     # --- JSONL round-trip test ---

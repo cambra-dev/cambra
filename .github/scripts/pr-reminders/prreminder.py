@@ -80,7 +80,7 @@ def gh_lines(*args: str) -> list[str]:
 
 
 def list_open_prs_with_reviewers(repo: str) -> list[dict]:
-    """List open PRs that have at least one review request (individual user)."""
+    """List open, non-draft PRs that have at least one review request (individual user)."""
     lines = gh_lines(
         "pr",
         "list",
@@ -89,9 +89,9 @@ def list_open_prs_with_reviewers(repo: str) -> list[dict]:
         "--state",
         "open",
         "--json",
-        "number,title,url,author,reviewRequests",
+        "number,title,url,author,reviewRequests,isDraft",
         "--jq",
-        ".[] | select(.reviewRequests | length > 0)",
+        ".[] | select(.isDraft == false and (.reviewRequests | length > 0))",
     )
     return [json.loads(line) for line in lines]
 
@@ -122,16 +122,67 @@ def get_review_request_dates(repo: str, pr_number: int) -> dict[str, str]:
 
 def list_collaborators(repo: str) -> list[str]:
     """List collaborator logins for a repo."""
-    lines = gh_lines(
-        "api", f"repos/{repo}/collaborators", "--paginate", "--jq", ".[].login"
-    )
-    return sorted(set(lines))
+    print(f"Fetching collaborators for {repo}...")
+    try:
+        lines = gh_lines(
+            "api", f"repos/{repo}/collaborators", "--paginate", "--jq", ".[].login"
+        )
+        collaborators = sorted(set(lines))
+        print(f"Found {len(collaborators)} collaborators: {', '.join(collaborators)}")
+        return collaborators
+    except Exception as e:
+        print(f"::warning::Failed to list collaborators: {e}")
+        return []
 
 
-def get_user_email(username: str) -> Optional[str]:
-    """Get the public email for a GitHub user, or None."""
+def list_recent_users(repo: str) -> list[str]:
+    """List users who recently interacted with PRs as a fallback."""
+    print(f"Fetching users from recent PR activity for {repo}...")
+    try:
+        # Get authors and reviewers from last 50 PRs (any state)
+        lines = gh_lines(
+            "pr", "list",
+            "--repo", repo,
+            "--state", "all",
+            "--limit", "50",
+            "--json", "author,reviewRequests",
+            "--jq", ".[] | .author.login, (.reviewRequests[].login // empty)"
+        )
+        users = sorted(set(lines))
+        print(f"Found {len(users)} recent users: {', '.join(users)}")
+        return users
+    except Exception as e:
+        print(f"::warning::Failed to list recent users: {e}")
+        return []
+
+
+def get_user_email(username: str, repo: Optional[str] = None) -> Optional[str]:
+    """Get the email for a GitHub user.
+
+    Checks the public profile first. If that's missing and a repo is provided,
+    checks recent commits by that user in the repo.
+    """
+    # 1. Try public profile
     data = gh_json("api", f"users/{username}")
-    return data.get("email") or None
+    email = data.get("email")
+    if email:
+        return email
+
+    # 2. Try recent commits in the repo
+    if repo:
+        try:
+            commits = gh_json(
+                "api",
+                f"repos/{repo}/commits",
+                "-q",
+                f'[.[] | select(.author.login == "{username}") | .commit.author.email] | first',
+            )
+            if commits and isinstance(commits, str) and "@" in commits and "noreply.github.com" not in commits:
+                return commits
+        except Exception:
+            pass
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +257,10 @@ def find_stale_reviews(
     results: list[StaleReview] = []
 
     for pr in prs:
+        # Skip draft PRs
+        if pr.get("isDraft"):
+            continue
+
         # Extract individual reviewers (skip teams)
         reviewers = [rr["login"] for rr in pr["reviewRequests"] if rr.get("login")]
         if not reviewers:
