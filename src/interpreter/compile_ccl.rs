@@ -20,6 +20,8 @@
 //! annotated [`crate::ccl::Type`] to the corresponding interpreter
 //! [`Extent`] (e.g. `Type::UIntRange(n)` → `Extent::UIntRange { start: 0, end: n }`).
 
+use std::collections::HashMap;
+
 use rustpython_parser::{ast as pyast, parser};
 
 use crate::ccl::infer::{infer, InferError, TypeInferenceContext};
@@ -29,8 +31,9 @@ use crate::ccl::{
     LogicKind as CclLogic, Type,
 };
 use crate::interpreter::{
-    Apply, ArithmeticKind, BinOp, BinOpKind, CompareKind, Extent, Lambda, Let, ListLiteral,
-    Literal, LogicKind, Operator, Scheduler, Value, Var, VarRef,
+    tuple_field, Apply, ArithmeticKind, BinOp, BinOpKind, CompareKind, ConstructRecord, Extent,
+    Lambda, Let, ListLiteral, Literal, LogicKind, Operator, RecordField, Scheduler, Value, Var,
+    VarRef,
 };
 use crate::util::ScopeStack;
 
@@ -117,6 +120,17 @@ pub fn compile(
         } => Err(CompileError::TypeError(format!(
             "Let binding '{name}' has no type annotation; ccl::infer must run before compile"
         ))),
+        Expr::Tuple(elts) => {
+            let mut fields = HashMap::new();
+            for (i, elt) in elts.iter().enumerate() {
+                fields.insert(tuple_field(i), compile(elt, ctx, scheduler)?);
+            }
+            Ok(Box::new(ConstructRecord::new(fields)))
+        }
+        Expr::TupleIndex(tuple, idx) => Ok(Box::new(RecordField::new(
+            compile(tuple, ctx, scheduler)?,
+            &tuple_field(*idx),
+        ))),
         other => Err(CompileError::Unsupported(format!(
             "CCL node not yet supported by compile_ccl: {other:?}"
         ))),
@@ -183,29 +197,40 @@ fn compile_var(ctx: &CompileContext, name: &str) -> Result<Box<dyn Operator>, Co
     Ok(Box::new(VarRef::new(name, extent)))
 }
 
+/// Convert a constant CCL expression to a [`Value`].
+///
+/// Handles [`Expr::Lit`] and [`Expr::Tuple`] (whose elements must also be
+/// constant). Returns [`CompileError::Unsupported`] for any non-constant node.
+fn expr_to_value(expr: &Expr) -> Result<Value, CompileError> {
+    match expr {
+        Expr::Lit(lit) => Ok(match lit {
+            Lit::Int(n) => Value::Int(*n),
+            Lit::String(s) => Value::String(s.clone()),
+            Lit::Bool(b) => Value::Bool(*b),
+            Lit::Unit => Value::Unit,
+        }),
+        Expr::Tuple(elts) => {
+            let fields: Result<HashMap<String, Value>, _> = elts
+                .iter()
+                .enumerate()
+                .map(|(i, e)| Ok((tuple_field(i), expr_to_value(e)?)))
+                .collect();
+            Ok(Value::Record(fields?))
+        }
+        other => Err(CompileError::Unsupported(format!(
+            "Only literals and constant-indexed tuples are supported, got: {other:?}"
+        ))),
+    }
+}
+
 /// Compile a list literal to a [`ListLiteral`] operator.
 ///
-/// All elements must be [`Lit`] nodes; non-literal elements return
-/// [`CompileError::Unsupported`].
+/// Elements may be [`Lit`] nodes or constant [`Expr::Tuple`] nodes.
+/// Non-constant elements return [`CompileError::Unsupported`].
 fn compile_list(elts: &[Expr]) -> Result<Box<dyn Operator>, CompileError> {
     let mut values = Vec::with_capacity(elts.len());
     for elt in elts {
-        match elt {
-            Expr::Lit(lit) => {
-                let v = match lit {
-                    Lit::Int(n) => Value::Int(*n),
-                    Lit::String(s) => Value::String(s.clone()),
-                    Lit::Bool(b) => Value::Bool(*b),
-                    Lit::Unit => Value::Unit,
-                };
-                values.push(v);
-            }
-            other => {
-                return Err(CompileError::Unsupported(format!(
-                    "List elements must be literals; got: {other:?}"
-                )))
-            }
-        }
+        values.push(expr_to_value(elt)?);
     }
     Ok(Box::new(ListLiteral::new(values)))
 }
@@ -269,6 +294,14 @@ fn extent_of(ty: &Type) -> Result<Extent, CompileError> {
             domain: Box::new(extent_of(a)?),
             codomain: Box::new(extent_of(b)?),
         }),
+        Type::Tuple(ts) => {
+            let fields: Result<HashMap<String, Extent>, _> = ts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| Ok((tuple_field(i), extent_of(t)?)))
+                .collect();
+            Ok(Extent::record(fields?))
+        }
         other => Err(CompileError::TypeError(format!(
             "Cannot convert CCL type {other:?} to an interpreter extent"
         ))),

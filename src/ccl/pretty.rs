@@ -88,6 +88,10 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             node
         }
 
+        Expr::TupleIndex(tuple, idx) => {
+            InspectNode::new(format!("TupleIndex({idx})")).child("tuple", expr_to_node(tuple))
+        }
+
         Expr::Record(fields) => {
             let mut node = InspectNode::new("Record");
             for (field, e) in fields {

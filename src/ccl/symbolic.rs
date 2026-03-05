@@ -47,6 +47,8 @@ enum Precedence {
     Apply,
     /// Prefix `-` — tightest binary-expression level; `-a * b` means `(-a) * b`.
     Unary,
+    /// Subscripts and indexed access.
+    Subscript,
     /// Variables and literals — never parenthesised.
     Atom,
 }
@@ -67,7 +69,8 @@ impl Precedence {
             Self::Add => Self::Mul,
             Self::Mul => Self::Apply,
             Self::Apply => Self::Unary,
-            Self::Unary => Self::Atom,
+            Self::Unary => Self::Subscript,
+            Self::Subscript => Self::Atom,
             Self::Atom => Self::Atom,
         }
     }
@@ -175,6 +178,11 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
         Expr::Tuple(elts) => {
             let items: Vec<_> = elts.iter().map(|e| fmt(e, Precedence::Lowest)).collect();
             (Precedence::Atom, format!("({})", items.join(", ")))
+        }
+
+        Expr::TupleIndex(tuple, idx) => {
+            let t = fmt(tuple, Precedence::Atom);
+            (Precedence::Subscript, format!("{t}[{idx}]"))
         }
 
         Expr::Record(fields) => {

@@ -287,8 +287,16 @@ pub enum Expr {
         args: Vec<Expr>,
     },
 
-    /// A tuple constructor. Lowering from Python syntax is not yet implemented.
+    /// A tuple constructor: `(e0, e1, ...)`.
+    ///
+    /// Compiles to a [`crate::interpreter::ConstructRecord`] with fields
+    /// named `_0`, `_1`, … (via [`crate::interpreter::tuple_field`]).
     Tuple(Vec<Expr>),
+
+    /// Integer-index access into a tuple: `t[n]`.
+    ///
+    /// Compiles to a [`crate::interpreter::RecordField`] with field name `_n`.
+    TupleIndex(Box<Expr>, usize),
 
     /// A record constructor. Lowering from Python syntax is not yet implemented.
     Record(Vec<(String, Expr)>),

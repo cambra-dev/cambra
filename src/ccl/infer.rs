@@ -249,12 +249,31 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
             Ok(Type::Unknown)
         }
 
-        // ----- Join / Jump / Tuple / Record -----
+        // ----- Tuple constructor -----
+        //
+        // Infer each element in order and return their types as a Tuple type.
+        Expr::Tuple(elts) => {
+            let types: Result<Vec<Type>, InferError> =
+                elts.iter_mut().map(|e| infer(e, ctx)).collect();
+            Ok(Type::Tuple(types?))
+        }
+
+        // ----- Tuple index -----
+        //
+        // Infer the tuple expression, then return the element type at the given index.
+        // Returns Unknown if the expression is not a known Tuple type or the index is out of bounds.
+        Expr::TupleIndex(tuple, idx) => {
+            let ty = infer(tuple, ctx)?;
+            Ok(match ty {
+                Type::Tuple(types) => types.into_iter().nth(*idx).unwrap_or(Type::Unknown),
+                _ => Type::Unknown,
+            })
+        }
+
+        // ----- Join / Jump / Record -----
         //
         // Not yet handled by this pass; sub-expressions are not visited.
-        Expr::Join { .. } | Expr::Jump { .. } | Expr::Tuple(_) | Expr::Record(_) => {
-            Ok(Type::Unknown)
-        }
+        Expr::Join { .. } | Expr::Jump { .. } | Expr::Record(_) => Ok(Type::Unknown),
     }
 }
 
@@ -378,6 +397,15 @@ fn collect_constraints_into(
         Expr::UnaryOp(_, inner) => collect_constraints_into(param, inner, ctx, out),
 
         Expr::TypeAnnotation(inner, _) => collect_constraints_into(param, inner, ctx, out),
+
+        Expr::Tuple(elts) => {
+            for elt in elts {
+                collect_constraints_into(param, elt, ctx, out);
+            }
+        }
+
+        // idx is a usize constant, not an expression; nothing to search.
+        Expr::TupleIndex(tuple, _) => collect_constraints_into(param, tuple, ctx, out),
 
         _ => {}
     }

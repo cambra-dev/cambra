@@ -61,6 +61,24 @@ pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, Loweri
             Ok(Expr::List(items?))
         }
         pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(elt, generators),
+        pyast::ExprKind::Tuple { elts, .. } => {
+            let items: Result<Vec<_>, _> = elts.iter().map(lower_expr).collect();
+            Ok(Expr::Tuple(items?))
+        }
+        pyast::ExprKind::Subscript { value, slice, .. } => match &slice.node {
+            pyast::ExprKind::Constant {
+                value: pyast::Constant::Int(n),
+                ..
+            } => {
+                let idx: usize = n.try_into().map_err(|_| {
+                    LoweringError::Unsupported("Tuple index must be non-negative".into())
+                })?;
+                Ok(Expr::TupleIndex(Box::new(lower_expr(value)?), idx))
+            }
+            _ => Err(LoweringError::Unsupported(
+                "Only integer subscripts are supported".into(),
+            )),
+        },
         _ => Err(LoweringError::Unsupported(format!(
             "Expression type not supported: {:?}",
             expr.node

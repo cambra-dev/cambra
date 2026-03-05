@@ -267,17 +267,15 @@ fn test_let_nonscalar(#[case] code: &str, #[case] expected: ColumnValue) {
 // ---------------------------------------------------------------------------
 // Tuples / record fields
 // ---------------------------------------------------------------------------
-//
-// TODO: Support Tuple/RecordField in `compile_ccl` so these can be `Both`.
 #[rstest]
 #[case(
     "('a', 1)",
     make_tuple(&[Value::String("a".to_string()), Value::Int(1)])
 )]
-#[case("('a', 1)._0", Value::String("a".to_string()))]
-#[case("x = ('a', 1); x._0", Value::String("a".to_string()))]
+#[case("('a', 1)[0]", Value::String("a".to_string()))]
+#[case("x = ('a', 1); x[0]", Value::String("a".to_string()))]
 fn test_tuples(#[case] code: &str, #[case] expected: Value) {
-    parity_scalar(code, expected, DirectOnly);
+    parity_scalar(code, expected, Both);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,12 +304,10 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: ColumnV
 // ---------------------------------------------------------------------------
 // Comprehensions with tuple body
 // ---------------------------------------------------------------------------
-//
-// TODO: Requires Tuple/RecordField support in `compile_ccl`.
 
 #[rstest]
-#[case("[(y, y)._1 for y in [10, 20]]", make_int_list(&[10, 20]))]
-#[case("[y._0 for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
+#[case("[(y, y)[1] for y in [10, 20]]", make_int_list(&[10, 20]))]
+#[case("[y[0] for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
 #[case(
     "[(y, 100) for y in [(10, 'a'), (20, 'b')]]",
     ColumnValue::FunctionBindings {
@@ -335,7 +331,7 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: ColumnV
     }
 )]
 fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: ColumnValue) {
-    parity(code, expected, DirectOnly);
+    parity(code, expected, Both);
 }
 
 // ---------------------------------------------------------------------------
@@ -453,8 +449,8 @@ fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
 #[case("[x + '' for x in testsource1()]")]
 #[case("['' + x for x in testsource1()]")]
 #[case("y = ''; [y + x for x in testsource1()]")]
-#[case("[(x, 0)._0 for x in testsource1()]")]
-#[case("[(x, 0)._0 for x in testsource1() if True]")]
+#[case("[(x, 0)[0] for x in testsource1()]")]
+#[case("[(x, 0)[0] for x in testsource1() if True]")]
 fn test_test_source(#[case] code: &str) {
     let mut ctx = LoweringContext::default();
     let data_source = ctx.inject_test_source("testsource1", Extent::Base(BaseType::String));
@@ -507,7 +503,7 @@ fn test_test_source(#[case] code: &str) {
 #[test_log::test]
 fn test_inner_join() {
     let mut ctx = LoweringContext::default();
-    let code = "[(x._0, x._1, y._1) for x in testsource1() for y in testsource2() if x._0 == y._0]";
+    let code = "[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] == y[0]]";
     let record_extent = Extent::record(HashMap::from([
         (String::from("_0"), Extent::Base(BaseType::Int)),
         (String::from("_1"), Extent::Base(BaseType::String)),

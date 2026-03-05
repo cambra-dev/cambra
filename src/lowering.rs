@@ -373,14 +373,27 @@ fn constant_to_value(constant: &pyast::Constant) -> Result<Value, LoweringError>
 
 /// Lower a subscript expression (indexing) to an Apply operator.
 fn lower_subscript(
-    _ctx: &mut LoweringContext,
-    _value: &pyast::Located<pyast::ExprKind>,
-    _slice: &pyast::Located<pyast::ExprKind>,
+    ctx: &mut LoweringContext,
+    value: &pyast::Located<pyast::ExprKind>,
+    slice: &pyast::Located<pyast::ExprKind>,
 ) -> Result<Box<dyn Operator>, LoweringError> {
-    // TODO: Implement Apply operator in interpreter.rs first
-    Err(LoweringError::Unsupported(
-        "Subscript/indexing not yet implemented".into(),
-    ))
+    match &slice.node {
+        pyast::ExprKind::Constant {
+            value: pyast::Constant::Int(n),
+            ..
+        } => {
+            let idx: usize = n.try_into().map_err(|_| {
+                LoweringError::Unsupported("Tuple index must be non-negative".into())
+            })?;
+            Ok(Box::new(RecordField::new(
+                lower_expr(ctx, value)?,
+                &tuple_field(idx),
+            )))
+        }
+        _ => Err(LoweringError::Unsupported(
+            "non-int subscripts not supported".to_string(),
+        )),
+    }
 }
 
 // ============================================================================
