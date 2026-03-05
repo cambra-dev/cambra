@@ -23,7 +23,7 @@ To execute CCL, the interpreter walks the AST, converting each node into a **dat
 
 A **scheduler** orchestrates the execution, triggering source operators and coordinating the work among different operators.
 
-See [design-operational-semantics.md](design-operational-semantics.md) for a description of CCL's operational semantics: progress algebras, the model, guards, yield guards and embedded closure, the two-layer picture, protocol rules, terminology.
+See [docs/operational-semantics/summary.md](operational-semantics/summary.md) for a description of CCL's operational semantics. Detailed formal definitions are in [semantics.md](operational-semantics/semantics.md).
 
 ## Program Execution Pipeline
 

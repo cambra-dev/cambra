@@ -1,7 +1,7 @@
 # CCL Operator Specifications
 
 Specifications for each CCL (Cambra Core Language) operator. For the underlying protocol and
-progress algebra formalism, see [docs/design-operational-semantics.md](/docs/design-operational-semantics.md).
+progress algebra formalism, see [docs/operational-semantics/semantics.md](/docs/operational-semantics/semantics.md).
 
 Each operator is **stateless** and corresponds to program syntax. Calling `subscribe()` on an
 operator creates a runtime **producer/consumer** pair that manages actual execution state.

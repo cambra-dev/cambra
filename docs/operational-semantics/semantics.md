@@ -1,33 +1,13 @@
-# Operational Semantics: Progress through Tilings
+# Operational Semantics: Formal Details
 
-
-This document describes the operational semantics of CCL (Cambra Core Language). See also:
+See also:
+- [summary.md](summary.md) — high-level overview of the model
 - [src/interpreter/design-operators.md](/src/interpreter/design-operators.md) — per-operator specifications
-- [brainstorm/guards-and-separation-algebras.md](brainstorm/guards-and-separation-algebras.md) — historical brainstorm that originated
-  many of the ideas here
+- [brainstorm/guards-and-separation-algebras.md](brainstorm/guards-and-separation-algebras.md) — historical brainstorm
 
 ---
 
-## 1. The Model
-
-Every term in a Cambra program has a Type. Each type has a corresponding **Extent**, which is the set
-of the values of the type (e.g. "the set of integers" for the type `Int`).
-To compute the actual value of a term, Cambra chooses a **tiling** for elements of that extent,
-which represents the steps it can take along the way to computing that value.
-Each element of the tiling is called a **tile**.
-
-The state of a Cambra program contains a tile for each term in the program.
-The initial tile for every term is `⊥` (bottom) — zero information.
-As execution proceeds (the program makes progress), the tile associated with each term is 
-**extended** by combining it with other tiles.
-When some portion of a term's state is no longer needed, its operator may **compact** that
-portion — summarizing it and reclaiming the underlying resources (see Section 4).
-A program terminates when none of its tiles can be extended further,
-i.e. when they cannot be combined with any tiles other than `⊥`.
-
----
-
-## 2. Tilings
+## 1. Tilings
 
 Each type has a **tiling** — an algebraic structure describing all possible operational states
 during computation of a value of that type. Each state is called a **tile**. Tiles can be
@@ -80,7 +60,7 @@ of the domain. Partial function tiles are terminal when they are total.
 **Aggregate terms** (e.g. `sum(f)`, `max(f)`, where `f: I ⇒ T`):
 An aggregate operator takes a function tiling (`I ⇀ T`) as input and produces tiles in a
 tiling specific to the aggregation. For `sum`, the tiling is `Count × Sum`; for `max`,
-`Count × Max` (see Section 3, Unsplittable Tilings). Each increment of the input function
+`Count × Max` (see Section 2, Unsplittable Tilings). Each increment of the input function
 tiling is translated into a tile of the aggregate tiling, and the aggregate's running state
 is their `⊕`-combination. These aggregate tilings are typically unsplittable — they support
 only the trivial guard algebra. This means projection guards cannot request a portion of the running
@@ -88,7 +68,7 @@ aggregate, and obsolete guards can only release the entirety of the aggregate.
 
 ---
 
-## 3. Guards
+## 2. Guards
 
 A **guard** is a predicate that identifies a **subtiling**—that is, a subset of tiles that is
 both **downward-closed** and **⊕-closed**. Concretely:
@@ -117,8 +97,8 @@ necessarily a subtiling: if `a ∈ G₁` and `b ∈ G₂` with
 
 ### The `split` Operation
 
-Guards enable an operation that splits a tile into one piece that's inside the guard's subtiling, 
-and another outside. 
+Guards enable an operation that splits a tile into one piece that's inside the guard's subtiling,
+and another outside.
 
 Formally, given `tiling : Tiling` and `guardAlg: GuardAlgebra(tiling)`:
 
@@ -212,7 +192,7 @@ both.
 ### Unsplittable Tilings
 
 Tilings which are only split determinate over the trivial guard algebra can still be interesting.
-Being "unsplittable" just means that part of the information can't be thrown out without affecting 
+Being "unsplittable" just means that part of the information can't be thrown out without affecting
 the overall computation.
 
 
@@ -260,7 +240,7 @@ function tilings, union does work (`Domain(D₁) ∪ Domain(D₂) = Domain(D₁ 
 
 **Obsolete guard**: declares that a subtiling is no longer needed. Once all consumers have
 released a subtiling, the producer may **compact** the portion of its tile inside of the
-subtiling (see Section 4, Compaction) and reclaim resources. The obsolete guard must be a guard (not merely
+subtiling (see Section 3, Compaction) and reclaim resources. The obsolete guard must be a guard (not merely
 a set of tiles) because `split` is required to separate the obsolete portion from the
 still-relevant portion. For example, a consumer may release a subset of a function's domain
 after processing the corresponding mappings and checkpointing the result. Another example:
@@ -282,24 +262,24 @@ These are fundamentally different operations.
 
 ---
 
-## 4. Operators
+## 3. Operators
 
-Sections 2–3 define the operational structures: tilings give types their progress algebra,
+Sections 1–2 define the operational structures: tilings give types their progress algebra,
 and guards give tilings their decomposition structure. This section connects these operational
 structures to the denotational world of CCL. Types, terms, and functions each have an
 operational counterpart — and the bridge between them is the **operator**.
 
 ### Denotational–Operational Correspondence
 
-Each CCL type `T` has a corresponding tiling `Tiling(T)`, chosen by the compiler. Each term of 
-type `T` is computed as a tile in `Tiling(T)` — starting at `⊥` and growing monotonically until 
+Each CCL type `T` has a corresponding tiling `Tiling(T)`, chosen by the compiler. Each term of
+type `T` is computed as a tile in `Tiling(T)` — starting at `⊥` and growing monotonically until
 it reaches a terminal tile.
 
 Type constructors compose tilings in the expected way: a function type `T ⇒ U` uses the
-partial-function tiling `T ⇀ U` over the extent of `T` and the tiling for `U`; a record type 
+partial-function tiling `T ⇀ U` over the extent of `T` and the tiling for `U`; a record type
 would use a product-like tiling over its fields.
 
-A CCL function `f : T ⇒ U` corresponds to a function between tiles, 
+A CCL function `f : T ⇒ U` corresponds to a function between tiles,
 `op : Tiling(T).Tile → Tiling(U).Tile`, called an **operator**. Operators are the operational
 counterpart of denotational functions — they describe how to compute output tiles from input
 tiles.
@@ -348,15 +328,15 @@ until the output becomes terminal.
 Consider `sum(f) < 100` for `f : I ⇒ ℕ` and `|I|` bounded:
 
 - `sum` is a tiling homomorphism from `I ⇀ ℕ` to `Count_N × Sum_ℕ`: each new mapping
-  increments the count and adds to the running sum, up to `N` elements. Because `sum` is a 
-  homomorphism, it can stream — each new partial-function tile from `f` is independently 
+  increments the count and adds to the running sum, up to `N` elements. Because `sum` is a
+  homomorphism, it can stream — each new partial-function tile from `f` is independently
   transformed into a `Count_N × Sum_ℕ` tile and combined into the running aggregate.
 - `< 100` is a monotone operator from `Count_N × Sum_ℕ` to `{⊥, true, false}`, but it is
   **not** a homomorphism — we cannot stream partial results into it. Instead, each time
   `sum` produces a new intermediate tile (enabled by `sum`'s homomorphism property), `< 100`
   is **re-applied** to the updated `Count_N × Sum_ℕ` state. Because partial sums of
-  non-negative integers are non-decreasing, a fact that is encoded into the `Count_N × Sum_ℕ` 
-  tiling and is therefore usable by the `_<_` operator, once the running sum reaches 100 the 
+  non-negative integers are non-decreasing, a fact that is encoded into the `Count_N × Sum_ℕ`
+  tiling and is therefore usable by the `_<_` operator, once the running sum reaches 100 the
   `_<_` operator produces terminal `false` — without waiting for `f` to complete.
 - The benefit comes from the combination: `sum`'s streaming feeds incremental updates to
   `< 100`'s repeated application, giving `< 100` the opportunity to terminate early at each
@@ -364,7 +344,7 @@ Consider `sum(f) < 100` for `f : I ⇒ ℕ` and `|I|` bounded:
 
 ### Extent Predicates as Operators
 
-Extent predicates — predicates on the final values of tiles (see Section 3, "Why Extent
+Extent predicates — predicates on the final values of tiles (see Section 2, "Why Extent
 Predicates Are Not Guards") — are expressed as **operators** in the CCL program, not as
 guards. A predicate operator has the scalar tiling `{⊥, true, false}`.
 The predicate only filters values when used as a refinement of the domain of a function.
@@ -394,7 +374,7 @@ future outputs — must retain a summary. This summarize-and-reclaim operation i
 
 The operator's current tile decomposes as `obsolete ⊕ relevant`, where `obsolete` is in the
 released subtiling and `relevant` is in the still-active subtiling. Split-determinism of the
-guard algebra (Section 3) guarantees this decomposition is unique. The operator replaces the
+guard algebra (Section 2) guarantees this decomposition is unique. The operator replaces the
 full tile with `(compact(obsolete), relevant)`, where `compact` maps tiles of the source
 tiling into tiles of a simpler **summary tiling**. The summary tiling is a progress algebra
 in its own right, but is typically simpler: it may lack cancellativity or sub-tile meet, and
@@ -447,7 +427,7 @@ implied.
 
 Compaction operates at the granularity of the guard algebra: the `split` operation can only
 separate tiles along boundaries the guard algebra can express. If a tiling only supports the
-trivial guard algebra (Section 3), the only possible splits are `(⊥, tile)` and `(tile, ⊥)` —
+trivial guard algebra (Section 2), the only possible splits are `(⊥, tile)` and `(tile, ⊥)` —
 all or nothing. Operators over unsplittable tilings cannot partially compact, and that is fine:
 their tiles are inherently atomic and must be retained in full until no consumer needs them.
 
@@ -481,155 +461,3 @@ would use a different, less aggressive compaction strategy.
 
 This is exactly what database vacuum does: old row versions are reclaimed once no active
 transaction can read them, i.e., once all consumers have released their interest.
-
-### Extent Predicates as Operators
-
-Extent predicates — predicates on the final values of tiles (see Section 3, "Why Extent
-Predicates Are Not Guards") — are expressed as **operators** in the CCL program, not as
-guards. A predicate operator has the scalar tiling `{⊥, true, false}`.
-The predicate only filters values when used as a refinement of the domain of a function.
-
-Extent predicates compose with the guard system through two mechanisms:
-
-1. **Standard domain guards propagating the consequence.** A terminal result from a predicate
-   operator feeds into domain restrictions on enclosing function tilings via `Domain` guards.
-   The function guard algebra suffices to do this filtering.
-2. **Operators producing terminal results from non-terminal inputs.** The `< 100` operator
-   on a non-decreasing sum can determine its output before its input is complete. This is a
-   semantic property of the specific operator, not an algebraic property of the guard system.
-
----
-
-## 5. End to End Example
-
-**TODO(Dan): Flesh out a method for stepping through these operational semantics so AI can generate them in the future.**
-
----
-
-## 6. Deprecating Yield Guards
-
-This section explains the transition from the previous operational semantics to the one
-described above.
-
-### The Problem with Separate Yield Guards
-
-The original protocol included an additional guard role:
-
-**Yield guard**: a producer's assertion that a region of its tiling is final — no further
-tiles will cover that region.
-
-For scalar terms, this was coherent: a yield guard narrows the set of possible output values by
-ruling out a region.
-
-For function terms, it was problematic. A `Domain(D)` yield guard says "all mappings for inputs
-in D are final" — but this is a statement about *progress*, not a predicate on the function's
-*value*. Trying to interpret such a statement for a value, rather than the steps along the way
-to computing the value, makes the guard vacuous.
-
-Because of this confusing, the code currently conflates extents and tilings. The new model
-distinguishes them more clearly.
-
-### The Direction: Tilings for Sparse Functions 
-
-The resolution is to define the notion of progress as part of the tiling. Nontrivial yield
-guards are only needed when computing a function with a dynamically-defined domain (e.g. stdin,
-timeseries): `f: (t: T | P(t)) ⇒ U`, where `P` is a predicate that must be computed at runtime.
-
-An intutive approach is to lift `P` out of the type and define an intermediate function:
-
-```
-f_opt : T ⇒ Option(U) 
-  = λ t →  if P(t) then Some(t) else None
-
-f = λ t | f_opt(t) != None → case f_opt(t)
-    Some(u) → u
-    None → unreachable
-```
-
-We can then use the standard partial-function tiling over `T ⇒ Option(U)` to describe its semantics.
-However, if the domain `T` is unbounded, the `None` mappings of `f_opt` can grow to be arbitrarily large.
-So, we can represent it at runtime as a set of mappings and a predicate defining the region mapped to `None`.
-```
-SparseFn(T, U) = {somes: T ⇀ U, nones: Predicate(T)}
-sparse_apply : { SparseFn(T, U), T } ⇒ functionTiling(T, Option(U)).Tile
-  = λ (somes, nones), t → 
-      if t ∈ somes      then Some(somes(t))
-      else if t ∈ nones then None
-      else ⊥
-```
-
-`SparseFn` implements the partial function tiling for `T ⇒ Option(U)`, but with a more compact 
-representation than mapping every element of the domain.
-This tiling has universal split-determinism, as all partial-function tilings do.
-
-This representation allows consumers to split on the function's domain and receive a compact
-sub-tile in response. It also replaces yield guards, which formerly provided an out-of-band version
-of the `nones` predicate. Consumers lose the ability to only request the `nones` predicate, but
-that's not a problem because they retain the ability to restrict the requested domain. That is,
-they'll receive all data within a region of the domain, whether mapped to `Some` or `None`, which
-is what they needed anyway. 
-
-NOTE: If there are a large number of `some` mappings _outside_ of the `nones` predicate, calls to 
-`get(¬nones)` may end up repeatedly returning large amounts of data. This is a special case of 
-an unsolved problem: how and whether to provide a "get everything since my last call to get"
-concept. Any homomorphic operator can stream like this, so it could make sense to provide first-class
-support for it in the protocol. However, we are deferring solving this problem until we find a
-compelling need. 
-
-NOTE: An alternative approach to incremental gets specific to this case is to come up with a
-tiling that allows splitting the `somes` mappings from the `nones` predicate. The approach
-above does not permit this because it doesn't distinguish between "defining a mapping" and
-"sealing part of the domain". If we wanted to make that distinction, we could probably do so by
-adding epoch numbers to the mappings and sealing predicates. That would let us talk about
-"the subtiling of tiles that had sealed a certain predicate by a certain time", which would permit
-projection guards to split the mappings and the sealing predicate into separate tiles. Then,
-consumers could use this "sealed by" guard to project out progress information with no data.
-
-### New Protocol
-
-The producer/consumer protocol, stated in terms of tiles and guards:
-
-```
-// Operator creates the dataflow link
-Operator::subscribe(intent: Guard, consumer: Consumer, var_scope: VarScope) -> Producer
-
-// Producer pushes notifications to consumer
-Consumer::notify()
-    // New tile available — consumer should call get()
-
-// Consumer pulls data and manages lifecycle
-Producer::get(projection: Guard) -> GetResult { compact_obsolete, relevant }
-    // Returns the producer's current state, projected by the consumer's projection guards:
-    //   compact_obsolete: compacted summary of tiles the consumer has released
-    //   relevant: the non-released tile within the consumer's intent subtiling
-Producer::release(obsolete: Guard) -> Guard
-    // Consumer retracts interest; producer may compact and reclaim resources
-```
-
-**Invariants**:
-- `get()` returns the producer's current decomposed state, projected by the consumer's
-  projection guards. Progress monotonicity is structural: `compact_obsolete` accumulates via `⊕`, and
-  `relevant` reflects all non-released tiles received so far.
-
----
-
-## 7. Terminology
-
-Three terms to keep distinct:
-
-**Extent**: the base values of a type — the set of possible final values a term can take on.
-`Int` has extent ℤ. For a function type `T ⇒ U`, the extent is the set of all total functions
-from `T` to `U`. The extent is a plain set with no algebraic structure.
-
-**Tiling**: the *progress algebra* for a type — the algebraic structure of possible operational
-states during computation. `Int` has tiling `{⊥} ∪ ℤ`; `T ⇒ U` has tiling `T ⇀ U` (partial
-functions, composable by disjoint-domain union). The tiling has `⊕`, `⊥`, and the progress preorder.
-
-**Tile**: an *element* of a tiling — the actual runtime state of a term at a given moment. A tile
-starts at `⊥` (nothing known) and grows monotonically. When computation is complete, the final
-tile maps to a value of the extent.
-
-**Guards** operate on tilings (structural decomposition), not on extents (value predicates).
-Value predicates are expressed as operators in the program and interact with guards indirectly,
-through terminal results feeding into domain restrictions on enclosing function tilings
-(see Section 4).
