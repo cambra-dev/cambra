@@ -23,7 +23,7 @@
 use rustpython_parser::{ast as pyast, parser};
 
 use crate::ccl::infer::{infer, InferError, TypeInferenceContext};
-use crate::ccl::lower::{lower_expr, LowerError};
+use crate::ccl::lower::{lower_expr, LoweringError};
 use crate::ccl::{
     ArithmeticKind as CclArith, BinOpKind as CclBinOp, CompareKind as CclCmp, Expr, Lit,
     LogicKind as CclLogic, Type,
@@ -53,7 +53,7 @@ pub enum PipelineError {
     /// The Python source could not be parsed.
     Parse(String),
     /// The Python AST could not be lowered to CCL.
-    Lower(LowerError),
+    Lower(LoweringError),
     /// Type inference failed.
     Infer(InferError),
     /// CCL compilation to operators failed.

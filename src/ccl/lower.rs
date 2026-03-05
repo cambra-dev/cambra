@@ -16,7 +16,7 @@
 //! | Single-generator list comprehensions (no `if`) | `Lambda`/`Apply` encoding |
 //! | Assignment + expression blocks | nested [`Expr::Let`] |
 //!
-//! Everything else returns [`LowerError::Unsupported`].
+//! Everything else returns [`LoweringError::Unsupported`].
 //!
 //! # Name uniqueness
 //!
@@ -41,7 +41,7 @@ use crate::ccl::{ArithmeticKind, BinOpKind, Expr, Lit};
 
 /// Errors that can occur during Python → CCL lowering.
 #[derive(Debug, Clone, PartialEq)]
-pub enum LowerError {
+pub enum LoweringError {
     /// The AST node or construct is not yet supported by this lowering pass.
     Unsupported(String),
 }
@@ -51,7 +51,7 @@ pub enum LowerError {
 // ---------------------------------------------------------------------------
 
 /// Lower a single Python expression to a CCL expression.
-pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, LowerError> {
+pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, LoweringError> {
     match &expr.node {
         pyast::ExprKind::Constant { value, .. } => lower_constant(value),
         pyast::ExprKind::Name { id, .. } => Ok(Expr::Var(id.clone())),
@@ -61,7 +61,7 @@ pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, LowerE
             Ok(Expr::List(items?))
         }
         pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(elt, generators),
-        _ => Err(LowerError::Unsupported(format!(
+        _ => Err(LoweringError::Unsupported(format!(
             "Expression type not supported: {:?}",
             expr.node
         ))),
@@ -73,9 +73,9 @@ pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, LowerE
 /// All statements except the last must be simple name assignments
 /// (`x = expr`); each becomes an [`Expr::Let`] binding wrapping the rest.
 /// The last statement must be a bare expression (`StmtKind::Expr`).
-pub fn lower_stmts(stmts: &[pyast::Stmt]) -> Result<Expr, LowerError> {
+pub fn lower_stmts(stmts: &[pyast::Stmt]) -> Result<Expr, LoweringError> {
     if stmts.is_empty() {
-        return Err(LowerError::Unsupported("Empty statement block".into()));
+        return Err(LoweringError::Unsupported("Empty statement block".into()));
     }
 
     let (last, rest) = stmts.split_last().unwrap();
@@ -84,7 +84,7 @@ pub fn lower_stmts(stmts: &[pyast::Stmt]) -> Result<Expr, LowerError> {
     let final_expr = match &last.node {
         pyast::StmtKind::Expr { value } => lower_expr(value)?,
         _ => {
-            return Err(LowerError::Unsupported(
+            return Err(LoweringError::Unsupported(
                 "Last statement must be a bare expression".into(),
             ))
         }
@@ -96,14 +96,14 @@ pub fn lower_stmts(stmts: &[pyast::Stmt]) -> Result<Expr, LowerError> {
         .try_fold(final_expr, |body, stmt| match &stmt.node {
             pyast::StmtKind::Assign { targets, value, .. } => {
                 if targets.len() != 1 {
-                    return Err(LowerError::Unsupported(
+                    return Err(LoweringError::Unsupported(
                         "Multiple assignment targets not supported".into(),
                     ));
                 }
                 let name = match &targets[0].node {
                     pyast::ExprKind::Name { id, .. } => id.clone(),
                     _ => {
-                        return Err(LowerError::Unsupported(
+                        return Err(LoweringError::Unsupported(
                             "Destructuring assignment not supported".into(),
                         ))
                     }
@@ -116,7 +116,7 @@ pub fn lower_stmts(stmts: &[pyast::Stmt]) -> Result<Expr, LowerError> {
                     body: Box::new(body),
                 })
             }
-            _ => Err(LowerError::Unsupported(
+            _ => Err(LoweringError::Unsupported(
                 "Only assignment statements are supported before the final expression".into(),
             )),
         })
@@ -126,19 +126,19 @@ pub fn lower_stmts(stmts: &[pyast::Stmt]) -> Result<Expr, LowerError> {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn lower_constant(constant: &pyast::Constant) -> Result<Expr, LowerError> {
+fn lower_constant(constant: &pyast::Constant) -> Result<Expr, LoweringError> {
     let lit = match constant {
         pyast::Constant::Int(n) => {
             let n_i64: i64 = n
                 .try_into()
-                .map_err(|_| LowerError::Unsupported("Integer too large for i64".into()))?;
+                .map_err(|_| LoweringError::Unsupported("Integer too large for i64".into()))?;
             Lit::Int(n_i64)
         }
         pyast::Constant::Str(s) => Lit::String(s.clone()),
         pyast::Constant::Bool(b) => Lit::Bool(*b),
         pyast::Constant::None => Lit::Unit,
         _ => {
-            return Err(LowerError::Unsupported(format!(
+            return Err(LoweringError::Unsupported(format!(
                 "Constant type not supported: {constant:?}"
             )))
         }
@@ -150,7 +150,7 @@ fn lower_binop(
     left: &pyast::Located<pyast::ExprKind>,
     op: &pyast::Operator,
     right: &pyast::Located<pyast::ExprKind>,
-) -> Result<Expr, LowerError> {
+) -> Result<Expr, LoweringError> {
     let left_expr = lower_expr(left)?;
     let right_expr = lower_expr(right)?;
     let kind = match op {
@@ -159,7 +159,7 @@ fn lower_binop(
         pyast::Operator::Mult => BinOpKind::Arithmetic(ArithmeticKind::Mul),
         pyast::Operator::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
         _ => {
-            return Err(LowerError::Unsupported(format!(
+            return Err(LoweringError::Unsupported(format!(
                 "Binary operator not supported: {op:?}"
             )))
         }
@@ -187,20 +187,20 @@ fn lower_binop(
 fn lower_list_comp(
     elt: &pyast::Located<pyast::ExprKind>,
     generators: &[pyast::Comprehension],
-) -> Result<Expr, LowerError> {
+) -> Result<Expr, LoweringError> {
     if generators.len() != 1 {
-        return Err(LowerError::Unsupported(
+        return Err(LoweringError::Unsupported(
             "Only single-generator comprehensions are supported".into(),
         ));
     }
     let gen = &generators[0];
     if !gen.ifs.is_empty() {
-        return Err(LowerError::Unsupported(
+        return Err(LoweringError::Unsupported(
             "Comprehensions with if conditions are not supported".into(),
         ));
     }
     if gen.is_async > 0 {
-        return Err(LowerError::Unsupported(
+        return Err(LoweringError::Unsupported(
             "Async comprehensions are not supported".into(),
         ));
     }
@@ -209,7 +209,7 @@ fn lower_list_comp(
     let var_name = match &gen.target.node {
         pyast::ExprKind::Name { id, .. } => id.clone(),
         _ => {
-            return Err(LowerError::Unsupported(
+            return Err(LoweringError::Unsupported(
                 "Destructuring comprehension targets are not supported".into(),
             ))
         }
