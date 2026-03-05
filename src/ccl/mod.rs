@@ -6,10 +6,17 @@
 //!
 //! See `docs/design-ccl-ast.md` for the full design rationale.
 
+pub mod infer;
 pub mod lower;
 pub mod pretty;
 pub mod symbolic;
 
+use std::fmt;
+
+// TODO: `BaseType` belongs here (or in a shared module), not in the interpreter.
+// Move it to `ccl` and have the interpreter import from `ccl`; this removes the
+// upward dependency from `ccl` into `crate::interpreter`. See also `ccl::infer`
+// which has the same non-test import.
 use crate::interpreter::BaseType;
 
 /// A literal constant value.
@@ -78,9 +85,7 @@ pub enum LogicKind {
     Xnor,
 }
 
-/// Binary operation kinds, using the same nested structure as
-/// `crate::interpreter::BinOpKind`. Future unification into a shared module
-/// will be a pure relocation with no rename or restructure work.
+/// Binary operation kinds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BinOpKind {
     /// An arithmetic operation (add, sub, mul, floor-div).
@@ -190,7 +195,12 @@ pub enum Expr {
     Lambda {
         /// The bound parameter name.
         param: String,
-        /// Optional type annotation for the parameter.
+        /// The parameter's type, if known.
+        ///
+        /// `None` on unannotated lambdas from lowering; filled in by
+        /// [`infer::infer`] before compilation. User-written ascriptions on
+        /// arbitrary expressions use [`Expr::TypeAnnotation`] instead.
+        /// See the `TypedExpr` TODO in [`infer`](crate::ccl::infer).
         param_ty: Option<Type>,
         /// The lambda body.
         body: Box<Expr>,
@@ -203,10 +213,14 @@ pub enum Expr {
     Let {
         /// The name being bound.
         name: String,
-        /// Optional type annotation for the bound value.
-        ty: Option<Type>,
+        /// The type of the bound value, if known.
+        ///
+        /// `None` when unannotated; filled in by [`infer::infer`] before
+        /// compilation. User-written ascriptions on arbitrary expressions use
+        /// [`Expr::TypeAnnotation`] instead. See the `TypedExpr` TODO in [`infer`].
+        bound_ty: Option<Type>,
         /// The expression being bound.
-        value: Box<Expr>,
+        bound_expr: Box<Expr>,
         /// The expression in which `name` is in scope.
         body: Box<Expr>,
     },
@@ -309,6 +323,12 @@ pub enum Pattern {
 pub enum Type {
     /// A primitive base type.
     Base(BaseType),
+    /// A finite index range `[0, n)`, used as the domain of list types.
+    ///
+    /// Emitted by `lower_list_comp` to annotate the outer lambda's parameter
+    /// with the exact length of the source list. `compile_ccl::extent_of` maps
+    /// it directly to `Extent::UIntRange { start: 0, end: n }`.
+    UIntRange(usize),
     /// A non-dependent function type: `T ⇒ U`.
     Fun(Box<Type>, Box<Type>),
     /// An ordered product type with unnamed fields (tuple).
@@ -322,4 +342,37 @@ pub enum Type {
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
     // Refinement { base: Box<Type>, predicate: Box<Expr> }
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Type::Base(b) => write!(
+                f,
+                "{}",
+                match b {
+                    BaseType::Int => "Int",
+                    BaseType::UInt => "UInt",
+                    BaseType::String => "String",
+                    BaseType::Bool => "Bool",
+                    BaseType::Unit => "Unit",
+                }
+            ),
+            Type::UIntRange(n) => write!(f, "[0, {n})"),
+            Type::Fun(a, b) => write!(f, "{a} ⇒ {b}"),
+            Type::Tuple(ts) => {
+                let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
+                write!(f, "({})", parts.join(", "))
+            }
+            Type::Record(fields) => {
+                let parts: Vec<_> = fields.iter().map(|(n, t)| format!("{n}: {t}")).collect();
+                write!(f, "{{{}}}", parts.join(", "))
+            }
+            Type::Union(ts) => {
+                let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
+                write!(f, "{}", parts.join(" | "))
+            }
+            Type::Unknown => write!(f, "_"),
+        }
+    }
 }

@@ -4,6 +4,7 @@
 //! Execution proceeds via a producer/consumer protocol using guards and extents.
 
 mod binop;
+pub mod compile_ccl;
 mod inspect;
 mod join;
 mod lambda;

@@ -111,8 +111,8 @@ pub fn lower_stmts(stmts: &[pyast::Stmt]) -> Result<Expr, LowerError> {
                 let val = lower_expr(value)?;
                 Ok(Expr::Let {
                     name,
-                    ty: None,
-                    value: Box::new(val),
+                    bound_ty: None,
+                    bound_expr: Box::new(val),
                     body: Box::new(body),
                 })
             }
@@ -175,10 +175,13 @@ fn lower_binop(
 ///
 /// The encoding is:
 /// ```text
-/// λ __list_comp_var .
-///   Apply(λ var . lower(body),
+/// λ __list_comp_var →
+///   Apply(λ var → lower(body),
 ///         Apply(lower(source), Var(__list_comp_var)))
 /// ```
+///
+/// Both lambdas are produced with `param_ty: None`; the type inference pass
+/// (`ccl::infer`) fills in the annotations before compilation.
 ///
 /// Multi-generator and filtered comprehensions are not yet supported.
 fn lower_list_comp(
@@ -347,7 +350,7 @@ in x"
     // -----------------------------------------------------------------------
 
     #[rstest]
-    // Identity: element passes through unchanged.
+    // Identity: element passes through unchanged; lambdas are unannotated (infer fills them in).
     #[case(
         "[x for x in [10, 20]]",
         "λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x)"
@@ -371,11 +374,68 @@ y = 5
 let y = 5
 in λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x + y)"
     )]
-    // Nested comprehension: inner comp becomes the source of the outer comp.
-    #[case("[y for y in [x for x in [10, 20]]]", "λ __list_comp_var → __list_comp_var ▷ (λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x)) ▷ (λ y → y)")]
+    // Nested comprehension: all lambdas unannotated; infer annotates them in a
+    // subsequent pass.
+    #[case(
+        "[y for y in [x for x in [10, 20]]]",
+        "λ __list_comp_var → __list_comp_var ▷ (λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x)) ▷ (λ y → y)"
+    )]
     fn test_lower_list_comp(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts).expect("lowering failed");
         assert_eq!(symbolic::symbolic(&ccl), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Future construct tests — ignored until lowering is implemented.
+    //
+    // These are CHL expressions that will produce Expr::Let nodes in value
+    // position once supported. They must be promoted to end-to-end pipeline
+    // tests (CHL → CCL → Operators) at that point, as compile_case and any
+    // other new compile_* function must save/restore ctx.scope to uphold the
+    // invariant described in compile_ccl::compile_let.
+    // -----------------------------------------------------------------------
+
+    /// `if/else` with branch-local variables lowers to
+    /// `let result = case cond of { True → let tmp = … in … | False → let tmp = … in … } in result`.
+    /// The Case branches each contain a Let, so compile_case must save/restore
+    /// ctx.scope for each branch or value_op.subscribe() will panic on the
+    /// inner tmp VarRef.
+    #[test]
+    #[ignore = "if/else statement lowering not yet implemented (StmtKind::If unsupported)"]
+    fn test_lower_if_else_branch_locals() {
+        let code = "\
+if cond:
+    tmp = 1
+    result = tmp + 1
+else:
+    tmp = 2
+    result = tmp + 2
+result";
+        let stmts = parse_module(code);
+        let ccl = lower_stmts(&stmts).expect("lowering failed");
+        // Fill in the expected string when StmtKind::If lowering is added.
+        // Structure: let result = case cond of { True → let tmp = 1 in tmp + 1 | False → let tmp = 2 in tmp + 2 } in result
+        assert_eq!(symbolic::symbolic(&ccl), "");
+    }
+
+    /// Walrus operator `(y := expr)` lowers to `Expr::Let` in expression position,
+    /// placing a Let directly in the value field of an outer Let:
+    /// `let x = (let y = 5 in y) + 1 in x`.
+    /// This is the only planned CHL construct that puts a Let directly in
+    /// Let.value (not inside a Case branch). compile_let must be fixed to pass
+    /// the post-value scope (not parent_scope) to value_op.subscribe() before
+    /// this can run end-to-end.
+    #[test]
+    #[ignore = "walrus operator (:=) not yet implemented (ExprKind::NamedExpr unsupported)"]
+    fn test_lower_walrus_let_in_value_position() {
+        let code = "\
+x = (y := 5) + 1
+x";
+        let stmts = parse_module(code);
+        let ccl = lower_stmts(&stmts).expect("lowering failed");
+        // Fill in the expected string when ExprKind::NamedExpr lowering is added.
+        // Structure: let x = (let y = 5 in y) + 1 in x
+        assert_eq!(symbolic::symbolic(&ccl), "");
     }
 }

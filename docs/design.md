@@ -29,9 +29,10 @@ See [docs/operational-semantics/summary.md](operational-semantics/summary.md) fo
 
 ```
 Python source
-  → parse (rustpython_parser)
-  → lower (lowering.rs)
-  → CCL operators
+  → parse   (rustpython_parser)
+  → lower   (ccl/lower.rs: Python AST → CCL Expr)
+  → infer   (ccl/infer.rs: limited type inference)
+  → compile (interpreter/compile_ccl.rs: CCL Expr → dataflow operators)
   → subscribe()
   → producer/consumer dataflow
 ```

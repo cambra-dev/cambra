@@ -6,15 +6,16 @@ Design decisions for the Cambra Core Language (CCL) abstract syntax tree — the
 
 ## Overview
 
-CCL is a λ-calculus–based IR. Python source is lowered into CCL, where it is type-checked and optimized, then compiled to the operator graph for execution.
+CCL is a λ-calculus–based IR. Python source is lowered into CCL, where it is type-inferred and optimized, then compiled to the operator graph for execution.
 
 ```
 Python source
   → parse          (rustpython_parser)
-  → lower          (Python AST → CCL AST)
+  → lower          (ccl/lower.rs: Python AST → CCL AST, structural only)
+  → infer          (ccl/infer.rs: limited type inference, fills param_ty / Let.ty)
   → type-check     (bidirectional, fills in Type::Unknown annotations)
   → optimize       (tree rewrites on CCL AST)
-  → compile        (CCL AST → dataflow operators)
+  → compile        (interpreter/compile_ccl.rs: CCL AST → dataflow operators)
   → subscribe()
   → producer/consumer dataflow
 ```
@@ -43,11 +44,11 @@ in x
 
 The semantics are correct for sequential code — each `Let` evaluates its value expression in the enclosing scope before the new binding takes effect — but the same name may appear at multiple binding sites in the tree.
 
-Rationale: renaming every assignment to a fresh variable would over-normalize the tree for the same reasons strict ANF does, destroying structural information useful for optimization passes. 
+Rationale: renaming every assignment to a fresh variable would over-normalize the tree for the same reasons strict ANF does, destroying structural information useful for optimization passes.
 
 ### Curried application
 
-Function application is curried: `Apply(Box<Expr>, Box<Expr>)`. 
+Function application is curried: `Apply(Box<Expr>, Box<Expr>)`.
 There are no first-class n-ary functions: the Python syntax `f(x, y)` may be written as `f(x)(y)` in CCL but is typically represented as chained applications using `▷`.
 Multi-argument calls are represented as nested `Apply` nodes: `f(x)(y)` → `Apply(Apply(f, x), y)`.
 
@@ -70,7 +71,6 @@ The same distinction applies in CCL:
 | Standalone `Lambda` (not inside `Apply`) | `subscribe()` (if execution is forced)| `VarSource::Iteration` |
 | `Apply(lambda, collection)` | `subscribe_to_application(collection)` | `VarSource::Argument` |
 | `Apply(Var("sum"), xs)` | resolved to built-in aggregate | aggregate operator |
-
 
 ### `Case` only — no `IfThenElse`
 
@@ -181,6 +181,7 @@ enum Pattern {
 
 enum Type {
     Base(BaseType),
+    UIntRange(usize),                    // finite index range [0, n); domain of list types
     Fun(Box<Type>, Box<Type>),           // T ⇒ U
     Tuple(Vec<Type>),
     Record(Vec<(String, Type)>),
@@ -194,8 +195,58 @@ enum Type {
 
 ---
 
+## Type inference
+
+`ccl::infer` currently implements a "limited" type inference pass that sits between
+lowering and the full bidirectional type checker. It handles enough to make
+the existing list-comprehension pipeline work end-to-end, while deferring
+heavier machinery (BinOp rules, constraint unification) to later phases.
+
+### `collect_param_constraint`
+
+Used for standalone lambdas (not in `Apply(lambda, arg)` position). Walks the
+entire lambda body collecting every `Apply(func, Var(param))` pattern and records
+the domain of `func`'s inferred `Fun` type as a constraint. All constraints must
+agree; conflicting constraints produce a `TypeMismatch` error.
+
+### Comparison with bidirectional type checking and Hindley-Milner
+
+| | Our limited pass | Bidirectional | Full HM |
+|---|---|---|---|
+| `Apply(Λ x. b, arg)` | special-case Apply rule | elegant check-mode push-down | same |
+| Standalone `Λ x. b` | `collect_param_constraint` heuristic | fails in synth mode; needs annotation | type variable + unify |
+| Multi-use params | first constraint only | same limitation | unification solves all |
+| Needs unification | No | No | Yes |
+| Type error reporting | limited | at check sites | at unification failure |
+
+**Delta from our pass to bidirectional**: add a `check(expr, expected, ctx)`
+function alongside `infer`; rewrite the Apply rule to check the argument against
+the domain. `collect_param_constraint` is still needed for standalone lambdas.
+Gains type-mismatch error detection at Apply sites.
+
+**Delta from bidirectional to HM**: add type variables (`Type::Var(u32)`), a
+union-find unification table, and an occurs check. Removes the need for
+`collect_param_constraint` since type variables unify across all use sites.
+
+### TODOs
+
+- BinOp/UnaryOp type rules (arithmetic, comparison, boolean).
+- `Case` arm scope: push pattern variable bindings into ctx.
+
+---
+
 ## Planned implementation order
 
 1. Define the node types above in a new `src/ccl/` module. ✓
 2. Add pretty printer (`src/ccl/pretty.rs`) and Python → CCL lowering (`src/ccl/lower.rs`) with snapshot tests. ✓
-3. Iteratively replace the current Python → operator direct lowering with Python → CCL → operator.
+3. Insert CCL as the IR between Python and operators (in progress):
+   - `ccl/lower.rs`:  `lower_list_comp` produces unannotated lambdas
+     (`param_ty: None`) — type annotation moved to
+     the inference pass. ✓
+   - `interpreter/compile_ccl.rs`: CCL → operator compilation step created;
+     `CompileContext`, `CompileError`, `compile()`, and unit tests. ✓
+   - `ccl/infer.rs`: limited type inference pass; `TypeInferenceContext`, `InferError`,
+     `infer()`, `collect_param_constraint()`; unit and pipeline tests. ✓
+   - `interpreter/compile_ccl.rs` add support for compiling Let nodes to operators (Design work pending).
+   - `lowering_via_ccl.rs`: sandboxed end-to-end pipeline tests.
+   - `lowering.rs` direct path removed after parity confirmed.

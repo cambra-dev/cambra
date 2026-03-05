@@ -10,8 +10,7 @@
 //!
 //! The public entry point is [`symbolic`].
 
-use crate::ccl::{ArithmeticKind, BinOpKind, Expr, Lit, LogicKind, Pattern, Type, UnaryOpKind};
-use crate::interpreter::BaseType;
+use crate::ccl::{ArithmeticKind, BinOpKind, Expr, Lit, LogicKind, Pattern, UnaryOpKind};
 
 // ---------------------------------------------------------------------------
 // Precedence
@@ -144,7 +143,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
         } => {
             let header = match param_ty {
                 None => format!("λ {param}"),
-                Some(ty) => format!("λ ({param}: {})", fmt_type(ty)),
+                Some(ty) => format!("λ {param} : {ty}"),
             };
             let body_str = fmt(body, Precedence::Lowest);
             (Precedence::Lowest, format!("{header} → {body_str}"))
@@ -152,13 +151,13 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
 
         Expr::Let {
             name,
-            ty,
-            value,
+            bound_ty: ty,
+            bound_expr: value,
             body,
         } => {
             let annotation = match ty {
                 None => String::new(),
-                Some(t) => format!(": {}", fmt_type(t)),
+                Some(t) => format!(": {t}"),
             };
             let val_str = fmt(value, Precedence::Lowest);
             let body_str = fmt(body, Precedence::Lowest);
@@ -214,7 +213,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
                 .iter()
                 .map(|(p, ty)| match ty {
                     None => p.clone(),
-                    Some(t) => format!("{p}: {}", fmt_type(t)),
+                    Some(t) => format!("{p}: {t}"),
                 })
                 .collect();
             let body_str = fmt(loop_body, Precedence::Lowest);
@@ -230,7 +229,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
 
         Expr::TypeAnnotation(expr, ty) => {
             let inner = fmt(expr, Precedence::Lowest);
-            (Precedence::Atom, format!("({inner} : {})", fmt_type(ty)))
+            (Precedence::Atom, format!("({inner} : {ty})"))
         }
 
         Expr::Jump { target, args } => {
@@ -258,36 +257,6 @@ fn fmt_apply_func(func: &Expr) -> String {
     match func {
         Expr::Apply { .. } | Expr::Lambda { .. } => format!("({})", fmt(func, Precedence::Lowest)),
         _ => fmt(func, Precedence::Lowest),
-    }
-}
-
-/// Render a CCL type as a symbolic string.
-fn fmt_type(ty: &Type) -> String {
-    match ty {
-        Type::Base(b) => match b {
-            BaseType::Int => "Int".to_string(),
-            BaseType::UInt => "UInt".to_string(),
-            BaseType::String => "String".to_string(),
-            BaseType::Bool => "Bool".to_string(),
-            BaseType::Unit => "Unit".to_string(),
-        },
-        Type::Fun(a, b) => format!("{} ⇒ {}", fmt_type(a), fmt_type(b)),
-        Type::Tuple(ts) => {
-            let parts: Vec<_> = ts.iter().map(fmt_type).collect();
-            format!("({})", parts.join(", "))
-        }
-        Type::Record(fields) => {
-            let parts: Vec<_> = fields
-                .iter()
-                .map(|(k, t)| format!("{k}: {}", fmt_type(t)))
-                .collect();
-            format!("{{{}}}", parts.join(", "))
-        }
-        Type::Union(ts) => {
-            let parts: Vec<_> = ts.iter().map(fmt_type).collect();
-            parts.join(" | ")
-        }
-        Type::Unknown => "?".to_string(),
     }
 }
 
@@ -505,7 +474,7 @@ mod tests {
             param_ty: Some(Type::Base(BaseType::Int)),
             body: Box::new(Expr::Var("x".to_string())),
         },
-        "λ (x: Int) → x"
+        "λ x : Int → x"
     )]
     // Lambda with function type annotation
     #[case(
@@ -517,14 +486,14 @@ mod tests {
             )),
             body: Box::new(Expr::Var("x".to_string())),
         },
-        "λ (x: Int ⇒ Bool) → x"
+        "λ x : Int ⇒ Bool → x"
     )]
     // Let (unannotated)
     #[case(
         Expr::Let {
             name: "x".to_string(),
-            ty: None,
-            value: Box::new(Expr::Lit(Lit::Int(1))),
+            bound_ty: None,
+            bound_expr: Box::new(Expr::Lit(Lit::Int(1))),
             body: Box::new(Expr::Var("x".to_string())),
         },
         "\
@@ -535,8 +504,8 @@ in x"
     #[case(
         Expr::Let {
             name: "x".to_string(),
-            ty: Some(Type::Base(BaseType::Bool)),
-            value: Box::new(Expr::Lit(Lit::Bool(true))),
+            bound_ty: Some(Type::Base(BaseType::Bool)),
+            bound_expr: Box::new(Expr::Lit(Lit::Bool(true))),
             body: Box::new(Expr::Var("x".to_string())),
         },
         "\
@@ -622,8 +591,8 @@ in k(0)"
         // in x ▷ (λ y → y + 1 * 2)
         let expr = Expr::Let {
             name: "x".to_string(),
-            ty: None,
-            value: Box::new(Expr::BinOp {
+            bound_ty: None,
+            bound_expr: Box::new(Expr::BinOp {
                 left: Box::new(Expr::UnaryOp(
                     UnaryOpKind::Not,
                     Box::new(Expr::Var("a".to_string())),

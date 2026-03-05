@@ -52,21 +52,21 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
         } => {
             let mut node = InspectNode::new(format!("Lambda({param})"));
             if let Some(ty) = param_ty {
-                node = node.annotate(format!(": {}", type_str(ty)));
+                node = node.annotate(format!(": {ty}"));
             }
             node.child("body", expr_to_node(body))
         }
 
         Expr::Let {
             name,
-            ty,
-            value,
+            bound_ty: ty,
+            bound_expr: value,
             body,
             ..
         } => {
             let mut node = InspectNode::new(format!("Let({name})"));
             if let Some(t) = ty {
-                node = node.annotate(format!(": {}", type_str(t)));
+                node = node.annotate(format!(": {t}"));
             }
             node.child("value", expr_to_node(value))
                 .child("body", expr_to_node(body))
@@ -117,7 +117,7 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             .child("outer_body", expr_to_node(outer_body)),
 
         Expr::TypeAnnotation(expr, ty) => InspectNode::new("TypeAnnotation")
-            .annotate(format!(": {}", type_str(ty)))
+            .annotate(format!(": {ty}"))
             .child("expr", expr_to_node(expr)),
 
         Expr::Jump { target, args } => {
@@ -147,37 +147,6 @@ fn unaryop_symbol(op: &UnaryOpKind) -> &'static str {
     match op {
         UnaryOpKind::Neg => "-",
         UnaryOpKind::Not => "not",
-    }
-}
-
-fn type_str(ty: &crate::ccl::Type) -> String {
-    use crate::ccl::Type;
-    use crate::interpreter::BaseType;
-    match ty {
-        Type::Base(b) => match b {
-            BaseType::Int => "Int".to_string(),
-            BaseType::UInt => "UInt".to_string(),
-            BaseType::String => "String".to_string(),
-            BaseType::Bool => "Bool".to_string(),
-            BaseType::Unit => "Unit".to_string(),
-        },
-        Type::Fun(a, b) => format!("{} → {}", type_str(a), type_str(b)),
-        Type::Tuple(ts) => {
-            let parts: Vec<_> = ts.iter().map(type_str).collect();
-            format!("({})", parts.join(", "))
-        }
-        Type::Record(fields) => {
-            let parts: Vec<_> = fields
-                .iter()
-                .map(|(n, t)| format!("{n}: {}", type_str(t)))
-                .collect();
-            format!("{{{}}}", parts.join(", "))
-        }
-        Type::Union(ts) => {
-            let parts: Vec<_> = ts.iter().map(type_str).collect();
-            parts.join(" | ")
-        }
-        Type::Unknown => "?".to_string(),
     }
 }
 
@@ -267,8 +236,8 @@ Lambda(x) : Int
     #[case(
         Expr::Let {
             name: "x".to_string(),
-            ty: None,
-            value: Box::new(Expr::Lit(Lit::Int(1))),
+            bound_ty: None,
+            bound_expr: Box::new(Expr::Lit(Lit::Int(1))),
             body: Box::new(Expr::Var("x".to_string())),
         },
         "\
@@ -280,8 +249,8 @@ Let(x)
     #[case(
         Expr::Let {
             name: "x".to_string(),
-            ty: Some(Type::Base(BaseType::Bool)),
-            value: Box::new(Expr::Lit(Lit::Bool(true))),
+            bound_ty: Some(Type::Base(BaseType::Bool)),
+            bound_expr: Box::new(Expr::Lit(Lit::Bool(true))),
             body: Box::new(Expr::Var("x".to_string())),
         },
         "\
@@ -377,8 +346,8 @@ Jump(k)
     fn test_pretty_continuation_prefix() {
         let expr = Expr::Let {
             name: "x".to_string(),
-            ty: None,
-            value: Box::new(Expr::Apply {
+            bound_ty: None,
+            bound_expr: Box::new(Expr::Apply {
                 function: Box::new(Expr::Var("f".to_string())),
                 argument: Box::new(Expr::Lit(Lit::Int(1))),
             }),
