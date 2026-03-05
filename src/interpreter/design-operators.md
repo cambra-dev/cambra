@@ -125,9 +125,8 @@ is lowered to a single outer lambda over a packed index extent:
 The `parent_indices` field in `ColumnValue` is the output of the join: each inner row maps to the
 outer row it is paired with.
 
-Current join strategy is always a loop join (cartesian product with a restriction filter).
-In the future, we will not treat predicates as opaque and convert specific predicates to 
-more efficient joins (such as equality predicates to hash joins)
+The join strategy can either be a loop join for arbitrary predicates, or a hash join for equality
+predicates between exactly two sources.
 
 ---
 
@@ -232,12 +231,8 @@ record or wait for all fields? Current position: wait for all subscribed fields.
 
 `Extent::Restricted { base, restriction }` wraps any extent with a `Restriction` handle. The
 `Restriction` holds a `ComputeRestriction` operator and, once subscribed, a producer that evaluates
-the predicate and materialises a `BitVec` boolean correlation vector. At iteration time the runtime
-calls `get_correlation_vector()` on the `Restriction`, converts the result to a `BitSet`, and passes
-it as an `outer_filter` to `iterate_extent`, which uses it to skip rows that did not pass the
-predicate.
-
-In the future, we will change the `BitVec` to a more compact representation.
+the predicate. At iteration time the runtime calls `get_correlations()` on the `Restriction` and
+uses the result to limit iteration to matching rows only.
 
 A `Var` whose extent is `Restricted` and whose `owns_restriction` flag is set is responsible for
 calling `set_up_producer` on the `Restriction` during subscription; this wires the
@@ -245,16 +240,60 @@ calling `set_up_producer` on the `Restriction` during subscription; this wires t
 
 ### `ComputeRestriction` (Operator)
 
-Wraps a predicate operator (typically a lambda that returns `Bool` over the outer index extent).
+Wraps a predicate operator and tags it with a `RestrictionType` that tells the caller how to
+interpret the output:
+
+- **`FilteredProduct`** (loop-join fallback): the wrapped operator is a lambda over the full
+  cartesian-product index extent that returns `Bool` for each row. `get()` returns
+  `FunctionBindings { outputs: Bools }`. `Restriction::get_correlations` converts this to a
+  `Correlations::Positional(BitSet)` used to skip non-matching rows during iteration.
+
+- **`HashJoin`**: the wrapped operator encodes an equality join using the `Converse` operator
+  (see below). `get()` returns `FunctionBindings { inputs: probe_elements, outputs: Functions }`,
+  where each output function lists the build elements whose key matches the corresponding probe
+  element. `Restriction::get_correlations` decodes this into `Correlations::Tuples`, a flat list
+  of `[probe_idx, build_idx]` pairs covering exactly the matching rows.
 
 `subscribe()` subscribes to the wrapped predicate using an **isolated** `Scheduler` so the
-predicate's dataflow does not participate in the main notification loop. `ComputeRestriction` always runs
-in the context of iterating over a restricted extent, so the notifications will flow through the
-outer iterating variable, whose extent has all the same sources and will be notified through them.
+predicate's dataflow does not participate in the main notification loop. Notifications flow through
+the outer iterating variable instead, which shares the same sources.
 
-`get()` (via `ComputeRestrictionProducer`) delegates directly to the predicate producer and returns
-`ColumnData::FunctionBindings { outputs: ColumnData::Bools(_), … }`. The caller extracts the
-`Bools` `BitVec` as the correlation vector.
+### Hash Join Lowering
+
+The lowerer (`lower_list_comp`) detects hash-join opportunities in `[body for x in A for y in B if x.k == y.k]`:
+a two-generator comprehension with a single equality predicate where each side references exactly
+one distinct generator. The equality predicate is detected by `try_extract_equality_join`, which
+normalises so the lower-indexed generator is always the build side.
+
+The join is expressed entirely in terms of existing interpreter primitives via the `Converse` operator:
+
+```
+join_op = Lambda(probe_var,
+            Apply(
+              Converse(Lambda(build_var, build_key(build_var))),
+              probe_key(probe_var)
+            ))
+```
+
+`Converse(Lambda(build_var, build_key))` inverts the build-side key function into a
+`LookupTable` (`key_value → [build_indices]`) at evaluation time. Applying it to
+`probe_key(probe_var)` looks up each probe key in the table, yielding the list of matching build
+indices. The resulting `ComputeRestriction::new_join(join_op)` is attached to the outer extent's
+`Restriction`.
+
+### `Converse` (Operator)
+
+`Converse` inverts a function `A → B` into a lookup table `B → List(A)`. Given an input with
+extent `A → B`, it produces an operator with extent `B → (UInt → A)`, where each output value
+maps to the indexed list of input values that produced it.
+
+`subscribe()` wraps the input producer in a `ConverseProducer` that calls
+`ColumnValue::function_converse` on the raw `FunctionBindings` result, converting it into a
+`LookupTable`.
+
+`subscribe_to_application()` further composes a `ConverseApplicationProducer` that applies the
+`LookupTable` to a column of argument values, producing `FunctionBindings` pairing each argument
+with its pre-image list as a `Value::Function`.
 
 ---
 

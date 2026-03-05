@@ -6,7 +6,7 @@ use std::{cell::RefCell, collections::HashMap};
 use bit_set::BitSet;
 use log::trace;
 
-use crate::interpreter::Restriction;
+use crate::interpreter::{Correlations, Restriction};
 /// A variable subscription paired with the chain of iteration-source variables between
 use crate::{
     interpreter::DataSourceDomainExtentImpl,
@@ -380,7 +380,7 @@ impl Producer for VarProducer {
                 panic!("VarProducer::get() called while source is Uninitialized")
             }
             VarSource::Argument(producer) => producer.get(),
-            VarSource::Iteration { extent } => iterate_extent(extent, &None),
+            VarSource::Iteration { extent } => iterate_extent(extent, None),
         };
         self.yield_guard = result.yield_guard.clone();
         result
@@ -402,7 +402,7 @@ impl Producer for VarProducer {
 
 /// Produce all values for the given extent, applying the outer filter if provided.
 /// For now the filters are simple BitSets, but in the future they will be some more compressed structure.
-fn iterate_extent(extent: &Extent, outer_filter: &Option<BitSet>) -> GetResult {
+fn iterate_extent(extent: &Extent, outer_filter: Option<&Correlations>) -> GetResult {
     match extent {
         Extent::UIntRange { start, end, .. } => iterate_uint_range(*start, *end, outer_filter),
         Extent::DataSourceDomain(source_impl) => {
@@ -416,9 +416,9 @@ fn iterate_extent(extent: &Extent, outer_filter: &Option<BitSet>) -> GetResult {
     }
 }
 
-fn iterate_uint_range(start: usize, end: usize, outer_filter: &Option<BitSet>) -> GetResult {
+fn iterate_uint_range(start: usize, end: usize, outer_filter: Option<&Correlations>) -> GetResult {
     match outer_filter {
-        Some(restriction) => {
+        Some(Correlations::Positional(restriction)) => {
             let filtered: Vec<usize> = (start..end)
                 .enumerate()
                 .filter(|(i, _)| restriction.contains(*i))
@@ -429,6 +429,7 @@ fn iterate_uint_range(start: usize, end: usize, outer_filter: &Option<BitSet>) -
                 yield_guard: Guard::Universal,
             }
         }
+        Some(Correlations::Tuples(..)) => panic!("Unexpected correlations"),
         None => GetResult {
             column_value: ColumnValue::from_uints((start..end).collect()),
             yield_guard: Guard::Universal,
@@ -438,12 +439,12 @@ fn iterate_uint_range(start: usize, end: usize, outer_filter: &Option<BitSet>) -
 
 fn iterate_data_source_domain(
     source_impl: &Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-    outer_filter: &Option<BitSet>,
+    outer_filter: Option<&Correlations>,
 ) -> GetResult {
     let values = source_impl.borrow_mut().get_elements();
     let yield_guard = source_impl.borrow().get_yield_guard();
     let n = values.len();
-    let output = if let Some(outer_filter) = outer_filter {
+    let output = if let Some(Correlations::Positional(outer_filter)) = outer_filter {
         ColumnValue::from_values(
             (0..n)
                 .filter(|i| outer_filter.contains(*i))
@@ -460,10 +461,13 @@ fn iterate_data_source_domain(
     }
 }
 
-fn iterate_record(fields: &HashMap<String, Extent>, outer_filter: &Option<BitSet>) -> GetResult {
+fn iterate_record_positions(
+    fields: &HashMap<String, Extent>,
+    outer_filter: Option<&BitSet>,
+) -> GetResult {
     let mut output_data: HashMap<String, GetResult> = fields
         .iter()
-        .map(|(field, field_extent)| (field.clone(), iterate_extent(field_extent, &None)))
+        .map(|(field, field_extent)| (field.clone(), iterate_extent(field_extent, None)))
         .collect();
     let yield_guard = Guard::Record(
         output_data
@@ -481,16 +485,49 @@ fn iterate_record(fields: &HashMap<String, Extent>, outer_filter: &Option<BitSet
     }
 }
 
+fn iterate_record(
+    fields: &HashMap<String, Extent>,
+    outer_filter: Option<&Correlations>,
+) -> GetResult {
+    match outer_filter {
+        Some(Correlations::Positional(outer_filter_positions)) => {
+            iterate_record_positions(fields, Some(outer_filter_positions))
+        }
+        Some(Correlations::Tuples(elements)) => {
+            let mut v0 = Vec::new();
+            let mut v1 = Vec::new();
+            for e in elements.iter() {
+                v0.push(e[1].clone());
+                v1.push(e[0].clone());
+            }
+            GetResult {
+                column_value: ColumnValue::Records(HashMap::from([
+                    (
+                        "_0".to_string(),
+                        ColumnValue::from_values(v0, &fields["_0"]),
+                    ),
+                    (
+                        "_1".to_string(),
+                        ColumnValue::from_values(v1, &fields["_1"]),
+                    ),
+                ])),
+                yield_guard: Guard::Empty,
+            }
+        }
+        None => iterate_record_positions(fields, None),
+    }
+}
+
 fn iterate_restricted_extent(
     base: &Extent,
     restriction: &Rc<RefCell<Restriction>>,
-    outer_filter: &Option<BitSet>,
+    outer_filter: Option<&Correlations>,
 ) -> GetResult {
-    let mut filter = BitSet::from_bit_vec(restriction.borrow_mut().get_correlation_vector());
+    let mut filter = restriction.borrow_mut().get_correlations();
     if let Some(outer_filter) = outer_filter {
         filter.intersect_with(outer_filter);
     }
-    iterate_extent(base, &Some(filter))
+    iterate_extent(base, Some(&filter))
 }
 
 fn release_for_extent(extent: &mut Extent, obsolete_guard: Guard) -> Guard {
@@ -539,6 +576,11 @@ impl VarRef {
             name: name.to_string(),
             extent,
         }
+    }
+
+    /// Create a new variable reference to the given Var.
+    pub fn from_var(var: &Var) -> Self {
+        Self::new(var.name(), var.extent().clone())
     }
 }
 

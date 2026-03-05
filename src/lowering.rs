@@ -5,15 +5,17 @@
 
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use log::debug;
+use log::{debug, trace};
 use rustpython_parser::ast::{self as pyast};
+
+use bit_set::BitSet;
 
 use crate::{
     interpreter::{
         tuple_field, Apply, ArithmeticKind, BaseType, BinOp, BinOpKind, CompareKind,
-        ComputeRestriction, ConstructRecord, Extent, Guard, Lambda, ListLiteral, Literal, Operator,
-        RecordField, Scheduler, StdinDataSource, StdinReader, TestDataSource, TestSourceReader,
-        Value, Var, VarRef, VarScope, VarSource,
+        ComputeRestriction, ConstructRecord, Converse, Extent, Guard, Lambda, ListLiteral, Literal,
+        Operator, RecordField, Scheduler, StdinDataSource, StdinReader, TestDataSource,
+        TestSourceReader, Value, Var, VarRef, VarScope, VarSource,
     },
     pretty_graph::pretty_operator,
 };
@@ -381,6 +383,97 @@ fn lower_subscript(
     ))
 }
 
+// ============================================================================
+// Join planning helpers
+// ============================================================================
+
+/// Compute the set of generator-variable indices referenced by `expr`.
+///
+/// Returns a `BitSet` where bit `i` is set when `expr` (or any sub-expression) contains
+/// a `Name` node whose identifier matches `gen_var_names[i]`.
+fn gen_vars_referenced(expr: &pyast::Expr, gen_var_names: &[&str]) -> BitSet {
+    let mut result = BitSet::new();
+    gen_vars_referenced_inner(expr, gen_var_names, &mut result);
+    result
+}
+
+fn gen_vars_referenced_inner(expr: &pyast::Expr, gen_var_names: &[&str], result: &mut BitSet) {
+    match &expr.node {
+        pyast::ExprKind::Name { id, .. } => {
+            if let Some(i) = gen_var_names.iter().position(|n| *n == id.as_str()) {
+                result.insert(i);
+            }
+        }
+        pyast::ExprKind::BinOp { left, right, .. } => {
+            gen_vars_referenced_inner(left, gen_var_names, result);
+            gen_vars_referenced_inner(right, gen_var_names, result);
+        }
+        pyast::ExprKind::Compare {
+            left, comparators, ..
+        } => {
+            gen_vars_referenced_inner(left, gen_var_names, result);
+            for c in comparators {
+                gen_vars_referenced_inner(c, gen_var_names, result);
+            }
+        }
+        pyast::ExprKind::BoolOp { values, .. } => {
+            for v in values {
+                gen_vars_referenced_inner(v, gen_var_names, result);
+            }
+        }
+        pyast::ExprKind::Attribute { value, .. } => {
+            gen_vars_referenced_inner(value, gen_var_names, result);
+        }
+        pyast::ExprKind::Call { func, args, .. } => {
+            gen_vars_referenced_inner(func, gen_var_names, result);
+            for a in args {
+                gen_vars_referenced_inner(a, gen_var_names, result);
+            }
+        }
+        pyast::ExprKind::Subscript { value, slice, .. } => {
+            gen_vars_referenced_inner(value, gen_var_names, result);
+            gen_vars_referenced_inner(slice, gen_var_names, result);
+        }
+        _ => {}
+    }
+}
+
+/// If `pred` is a two-generator equality predicate (`lhs == rhs` where `lhs` references
+/// exactly one generator and `rhs` references a different single generator), return
+/// `(gen_left, lhs, gen_right, rhs)` normalised so that `gen_left < gen_right`.
+///
+/// Returns `None` for any other predicate shape.
+fn try_extract_equality_join<'a>(
+    pred: &'a pyast::Expr,
+    gen_var_names: &[&str],
+) -> Option<(usize, &'a pyast::Expr, usize, &'a pyast::Expr)> {
+    if let pyast::ExprKind::Compare {
+        left,
+        ops,
+        comparators,
+    } = &pred.node
+    {
+        if ops.len() == 1 && matches!(ops[0], pyast::Cmpop::Eq) && comparators.len() == 1 {
+            let rhs = &comparators[0];
+            let refs_lhs = gen_vars_referenced(left, gen_var_names);
+            let refs_rhs = gen_vars_referenced(rhs, gen_var_names);
+            if refs_lhs.len() == 1 && refs_rhs.len() == 1 {
+                let gen_l = refs_lhs.iter().next().unwrap();
+                let gen_r = refs_rhs.iter().next().unwrap();
+                if gen_l != gen_r {
+                    // Normalise: smaller generator index = "left" (build side).
+                    return if gen_l < gen_r {
+                        Some((gen_l, left, gen_r, rhs))
+                    } else {
+                        Some((gen_r, rhs, gen_l, left))
+                    };
+                }
+            }
+        }
+    }
+    None
+}
+
 // Lowers a list comprehension, e.g.:
 //   [body(x, y) for x in source1() for y in source2() if pred(x, y)]
 //
@@ -445,29 +538,73 @@ fn lower_list_comp(
     // ---- Phase 2: Lower body and predicates while loop variables are in scope ----
     let body = lower_expr(ctx, elt)?;
 
-    // Combine all `if` guards across all generators into a single predicate with `and`.
-    // TODO: lift equality predicates out of this and pass them to the ComputeRestriction
-    // operator so it can use them to do hash joins instead of loop joins.
-    let mut pred_op: Option<Box<dyn Operator>> = None;
-    for pred in generators.iter().flat_map(|gen| gen.ifs.iter()) {
-        let lowered = lower_expr(ctx, pred)?;
-        pred_op = Some(match pred_op {
-            Some(lhs) => Box::new(BinOp::new(
-                lhs,
-                BinOpKind::BoolLogic(crate::interpreter::LogicKind::And),
-                lowered,
-            )),
-            None => lowered,
-        });
-    }
+    // Collect all `if` predicates across all generators.
+    let all_preds: Vec<&pyast::Expr> = generators
+        .iter()
+        .flat_map(|gen| gen.ifs.iter().map(|e| e as &pyast::Expr))
+        .collect();
+    let gen_var_names: Vec<&str> = gen_iter_vars.iter().map(|v| v.name()).collect();
 
+    // Try hash join: applicable when there are exactly 2 generators and exactly 1 predicate
+    // and that predicate is a two-generator equality (e.g. `x.k == y.k`).
+    // We lower the key expressions now while the generator vars are still in scope.
+    #[derive(Debug)]
+    struct HashJoinPlan {
+        gen_build: usize,
+        gen_probe: usize,
+        /// Lowered key expression for the build (left) side.
+        build_side_key: Box<dyn Operator>,
+        /// Lowered key expression for the probe (right) side.
+        probe_side_key: Box<dyn Operator>,
+        /// Source copy used inside the build key extractor lambda.
+        build_source: Box<dyn Operator>,
+        /// Source copy used inside the probe key extractor lambda.
+        probe_source: Box<dyn Operator>,
+    }
+    let hash_join_plan: Option<HashJoinPlan> = if generators.len() == 2 && all_preds.len() == 1 {
+        if let Some((gen_left, key_left_expr, gen_right, key_right_expr)) =
+            try_extract_equality_join(all_preds[0], &gen_var_names)
+        {
+            let key_left_op = lower_expr(ctx, key_left_expr)?;
+            let key_right_op = lower_expr(ctx, key_right_expr)?;
+            Some(HashJoinPlan {
+                gen_build: gen_left,
+                gen_probe: gen_right,
+                build_side_key: key_left_op,
+                probe_side_key: key_right_op,
+                build_source: lower_expr(ctx, &generators[gen_left].iter)?,
+                probe_source: lower_expr(ctx, &generators[gen_right].iter)?,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    trace!("HashJoinPlan {hash_join_plan:#?}");
+
+    // For the ComputeRestriction fallback: lower all predicates into a single combined predicate.
+    let mut pred_op: Option<Box<dyn Operator>> = None;
     let mut pred_sources: Vec<Box<dyn Operator>> = Vec::new();
-    if pred_op.is_some() {
-        // If there is a predicate, we need to collect all the sources that are involved in the predicate.
-        // TODO: once we have support for function-typed variables, we should share the source between
-        // here and the body.
-        for gen in generators {
-            pred_sources.push(lower_expr(ctx, &gen.iter)?);
+    if hash_join_plan.is_none() {
+        for pred in all_preds.iter() {
+            let lowered = lower_expr(ctx, pred)?;
+            pred_op = Some(match pred_op {
+                Some(lhs) => Box::new(BinOp::new(
+                    lhs,
+                    BinOpKind::BoolLogic(crate::interpreter::LogicKind::And),
+                    lowered,
+                )),
+                None => lowered,
+            });
+        }
+        if pred_op.is_some() {
+            // If there is a predicate, we need to collect all the sources that are involved in the predicate.
+            // TODO: once we have support for function-typed variables, we should share the source between
+            // here and the body.
+            for gen in generators {
+                pred_sources.push(lower_expr(ctx, &gen.iter)?);
+            }
         }
     }
 
@@ -499,13 +636,14 @@ fn lower_list_comp(
                 .collect(),
         )
     };
-    let mut outer_extent = if pred_op.is_some() {
+    let needs_restriction = pred_op.is_some() || hash_join_plan.is_some();
+    let mut outer_extent = if needs_restriction {
         Extent::restricted(base_extent.clone())
     } else {
         base_extent.clone()
     };
     let mut outer_var = Var::new("__iter_record", outer_extent.clone());
-    if pred_op.is_some() {
+    if needs_restriction {
         outer_var.set_owns_restriction(true);
     }
 
@@ -537,11 +675,74 @@ fn lower_list_comp(
         ));
     }
 
-    // ---- Phase 6: Attach the predicate as a ComputeRestriction -------------------
-    // The restriction lambda mirrors the body structure but uses an independent
-    // "__iter_record_restr" variable (with the base, non-restricted extent) so it
-    // can be evaluated without recursively depending on a correlation vector.
-    if let Some(pred_op) = pred_op {
+    // ---- Phase 6: Attach the restriction operator --------------------------------
+    if let Some(plan) = hash_join_plan {
+        // Hash join plan: for each probe-side index, find all build-side indices whose
+        // key matches. This is expressed using `Converse`:
+        //
+        //   join_op = Lambda(probe_var,
+        //               Apply(
+        //                 Converse(Lambda(build_var, build_key(build_var))),
+        //                 probe_key(probe_var)
+        //               )
+        //             )
+        //
+        // `Converse(Lambda(build_var, build_key(build_var)))` inverts the build-side key
+        // function into a lookup table `key_value → [build_indices]`.
+        // Applying it to `probe_key(probe_var)` looks up the probe key in that table,
+        // yielding the list of build indices that share the same key — exactly the
+        // matching pairs for the join.
+        let probe_var = Var::new(
+            "__hash_join_probe_var",
+            gen_idx_extents[plan.gen_probe].clone(),
+        );
+        let build_var = Var::new(
+            "__hash_join_build_var",
+            gen_idx_extents[plan.gen_build].clone(),
+        );
+        let probe_term = Box::new(Apply::new(
+            Box::new(Lambda::new(
+                gen_iter_vars[plan.gen_probe].clone(),
+                plan.probe_side_key,
+            )),
+            Box::new(Apply::new(
+                plan.probe_source,
+                Box::new(VarRef::from_var(&probe_var)),
+            )),
+        ));
+        let build_term = Box::new(Apply::new(
+            Box::new(Lambda::new(
+                gen_iter_vars[plan.gen_build].clone(),
+                plan.build_side_key,
+            )),
+            Box::new(Apply::new(
+                plan.build_source,
+                Box::new(VarRef::from_var(&build_var)),
+            )),
+        ));
+        let join_op = Box::new(Lambda::new(
+            probe_var.clone(),
+            Box::new(Apply::new(
+                Box::new(Converse::new(Box::new(Lambda::new(
+                    build_var.clone(),
+                    build_term,
+                )))),
+                probe_term,
+            )),
+        ));
+        let restriction = outer_extent
+            .restriction()
+            .expect("outer_extent is Restricted because hash_join_plan is Some");
+        debug!("Restriction op:\n{}", pretty_operator(join_op.as_ref()));
+        restriction
+            .borrow_mut()
+            .set_compute_op(ComputeRestriction::new_join(join_op));
+    } else if let Some(pred_op) = pred_op {
+        // Loop-join fallback: attach a ComputeRestriction.
+        //
+        // The restriction lambda mirrors the body structure but uses an independent
+        // "__iter_record_restr" variable (with the base, non-restricted extent) so it
+        // can be evaluated without recursively depending on a correlation vector.
         let restriction = outer_extent
             .restriction()
             .expect("outer_extent is Restricted because pred_op is Some");
@@ -558,13 +759,11 @@ fn lower_list_comp(
                 Box::new(Apply::new(pred_source, make_idx_arg(&restr_outer_var, i))),
             ));
         }
-        let compute_restriction = Box::new(ComputeRestriction::new(Box::new(Lambda::new(
-            restr_outer_var,
-            pred_expr,
-        ))));
+        let compute_restriction =
+            ComputeRestriction::new_predicate(Box::new(Lambda::new(restr_outer_var, pred_expr)));
         debug!(
-            "Restriction op:\n{}",
-            pretty_operator(compute_restriction.as_ref())
+            "ComputeRestriction op:\n{}",
+            pretty_operator(&compute_restriction)
         );
         restriction.borrow_mut().set_compute_op(compute_restriction);
     }
@@ -839,7 +1038,8 @@ mod tests {
     #[case("[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]", ColumnValue::strings(&["ac", "ad", "ae", "bc", "bd", "be"]))]
     #[case("[x + '_' for x in ['a', 'b'] for y in [True, False]]", ColumnValue::strings(&["a_", "a_", "b_", "b_"]))]
     #[case("[x + z + y for x in ['a', 'b'] for y in ['c', 'd'] for z in ['e', 'f']]", ColumnValue::strings(&["aec", "afc", "aed", "afd", "bec", "bfc", "bed", "bfd"]))]
-    #[case("[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'e'] if x == y]", ColumnValue::strings(&["bb", "cc"]))]
+    #[case("[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'e', 'f'] if x == y]", ColumnValue::strings(&["bb", "cc"]))]
+    #[case("[x + y for x in [1, 1] for y in [2, 2, 3] if x + 1 == y]", ColumnValue::Ints(vec![3, 3, 3, 3]))]
     #[case("[x for x in [y for y in ['a', 'b', 'c'] if y != 'b'] if x < 'b']", ColumnValue::strings(&["a"]))]
     // Inequality join predicate
     #[case("[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'd'] if x < y]", ColumnValue::strings(&["ab", "ac", "ad", "bc", "bd", "cd"]))]
@@ -922,11 +1122,11 @@ mod tests {
 
     // Test a join between two data sources, including incrementally adding new data and releasing
     // old regions.
-    #[test_log::test]
-    fn test_inner_join() {
+    #[rstest]
+    #[case("[(x._0, x._1, y._1) for x in testsource1() for y in testsource2() if x._0 == y._0]")]
+    #[case("[(x._0, x._1, y._1) for x in testsource1() for y in testsource2() if x._0 == y._0 and True]")]
+    fn test_inner_join(#[case] code: &str) {
         let mut ctx = LoweringContext::default();
-        let code =
-            "[(x._0, x._1, y._1) for x in testsource1() for y in testsource2() if x._0 == y._0]";
         let record_extent = Extent::record(HashMap::from([
             (String::from("_0"), Extent::Base(BaseType::Int)),
             (String::from("_1"), Extent::Base(BaseType::String)),

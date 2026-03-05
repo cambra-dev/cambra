@@ -1,12 +1,15 @@
 //! Core types for the CCL interpreter: Guard, Extent, BaseType, Value, FuncBinding, ColumnValue, GetResult.
 
+use std::iter;
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap, hash::Hash, rc::Rc};
 
 use bit_set::BitSet;
 use bit_vec::BitVec;
 use log::trace;
 
-use crate::interpreter::{ComputeRestriction, Operator, Producer, Scheduler, VarScope};
+use crate::interpreter::{
+    ComputeRestriction, Operator, Producer, RestrictionType, Scheduler, VarScope,
+};
 use crate::pretty_graph::{InspectNode, VizOptions};
 
 /// A Guard represents a region (subset of an extent) via a set of predicates.
@@ -362,8 +365,9 @@ impl Extent {
     }
 }
 
+/// Holds the restriction operator and its cached producer for a [`Extent::Restricted`] extent.
 pub struct Restriction {
-    compute_op: Option<Box<ComputeRestriction>>,
+    compute_op: Option<ComputeRestriction>,
     compute_producer: Option<Box<dyn Producer>>,
 }
 
@@ -381,7 +385,8 @@ impl Restriction {
         }
     }
 
-    pub fn set_compute_op(&mut self, compute_op: Box<ComputeRestriction>) {
+    /// Attach a restriction operator (either `ComputeRestriction` or `HashJoinRestriction`).
+    pub fn set_compute_op(&mut self, compute_op: ComputeRestriction) {
         self.compute_op = Some(compute_op);
     }
 
@@ -413,17 +418,60 @@ impl Restriction {
         }
     }
 
-    pub fn get_correlation_vector(&mut self) -> BitVec {
+    pub fn get_correlations(&mut self) -> Correlations {
         let data = self.compute_producer.as_mut().unwrap().get();
-        match data.column_value {
-            ColumnValue::FunctionBindings { outputs, .. } => match *outputs {
-                ColumnValue::Bools(bools) => {
-                    trace!("Got restriction vector {}", bools);
-                    bools
+        match (
+            self.compute_op.as_ref().unwrap().restriction_type(),
+            data.column_value,
+        ) {
+            (RestrictionType::FilteredProduct, ColumnValue::FunctionBindings { outputs, .. }) => {
+                match *outputs {
+                    ColumnValue::Bools(bools) => {
+                        trace!("Got restriction vector {}", bools);
+                        Correlations::Positional(BitSet::from_bit_vec(bools))
+                    }
+                    other => panic!(
+                        "Expected Bools from compute_producer outputs, got {:?}",
+                        other
+                    ),
                 }
-                _ => panic!("Expected Bools from compute_producer outputs"),
-            },
-            _ => panic!("Expected FunctionBindings from compute_producer"),
+            }
+            (
+                RestrictionType::HashJoin,
+                ColumnValue::FunctionBindings {
+                    mut inputs,
+                    mut outputs,
+                },
+            ) => Correlations::Tuples(
+                inputs
+                    .drain_to_value_iter()
+                    .zip(outputs.drain_to_value_iter())
+                    .flat_map(|(i, o)| {
+                        if let Value::Function(f) = o {
+                            f.into_iter().map(move |b| vec![i.clone(), b.output])
+                        } else {
+                            panic!("Expected Function value from HashJoin outputs, got {o:?}")
+                        }
+                    })
+                    .collect(),
+            ),
+            _ => panic!("Unexpected correlation data"),
+        }
+    }
+}
+
+pub enum Correlations {
+    Positional(BitSet),
+    Tuples(Vec<Vec<Value>>),
+}
+
+impl Correlations {
+    pub fn intersect_with(&mut self, other: &Correlations) {
+        match (self, other) {
+            (Correlations::Positional(s), Correlations::Positional(o)) => {
+                s.intersect_with(o);
+            }
+            _ => todo!(),
         }
     }
 }
@@ -745,6 +793,10 @@ pub enum ColumnValue {
         outputs: Box<ColumnValue>,
     },
     Records(HashMap<String, ColumnValue>),
+    /// TODO: consider a more efficient representation here.
+    ///   Using Value massively simplifies the code but probably has a
+    ///   nontrivial perf cost
+    LookupTable(HashMap<Value, Vec<Value>>),
 }
 
 impl ColumnValue {
@@ -774,6 +826,7 @@ impl ColumnValue {
             ColumnValue::Records(r) => {
                 Value::Record(r.iter().map(|(k, v)| (k.clone(), v.index_at(i))).collect())
             }
+            ColumnValue::LookupTable(..) => panic!("Cannot index LookupTable"),
         }
     }
 
@@ -804,7 +857,7 @@ impl ColumnValue {
             Extent::Base(BaseType::Int) => {
                 ColumnValue::Ints(values.iter().map(Value::as_int).collect())
             }
-            Extent::Base(BaseType::UInt) => {
+            Extent::Base(BaseType::UInt) | Extent::UIntRange { .. } => {
                 ColumnValue::UInts(values.iter().map(Value::as_uint).collect())
             }
             Extent::Base(BaseType::String) => {
@@ -838,6 +891,9 @@ impl ColumnValue {
                     })
                     .collect();
                 ColumnValue::Records(fields)
+            }
+            Extent::DataSourceDomain(d) => {
+                ColumnValue::from_values(values, &d.borrow().element_extent())
             }
             _ => ColumnValue::Variants(values),
         }
@@ -886,6 +942,7 @@ impl ColumnValue {
                     .map(|(k, v)| (k.clone(), v.select_indices(indices)))
                     .collect(),
             ),
+            ColumnValue::LookupTable(..) => panic!("Cannot select_indices on LookupTable"),
         }
     }
 
@@ -900,6 +957,7 @@ impl ColumnValue {
             ColumnValue::Variants(v) => v.len(),
             ColumnValue::Records(m) => m.values().next().expect("Empty Record").len(),
             ColumnValue::FunctionBindings { inputs, .. } => inputs.len(),
+            ColumnValue::LookupTable(m) => m.len(),
         }
     }
 
@@ -949,6 +1007,7 @@ impl ColumnValue {
                         .map(|e| (e.0.clone(), e.1.as_single().expect("Not single").clone()))
                         .collect(),
                 )),
+                ColumnValue::LookupTable(..) => panic!("Cannot cast LookupTable to single element"),
             }
         } else {
             None
@@ -964,6 +1023,80 @@ impl ColumnValue {
             Value::String(s) => ColumnValue::Strings(vec![s]),
             _ => ColumnValue::Variants(vec![value]),
         }
+    }
+
+    /// Drain this column into an owned iterator of [`Value`]s, one per row.
+    ///
+    /// After the call, `self` is left in a valid but empty state.
+    pub fn drain_to_value_iter(&mut self) -> Box<dyn Iterator<Item = Value>> {
+        match self {
+            ColumnValue::Units(n) => {
+                let count = *n;
+                *n = 0;
+                Box::new(iter::repeat_n(Value::Unit, count))
+            }
+            ColumnValue::Bools(v) => {
+                // BitVec::take gives us ownership so we can return a 'static iterator.
+                let v = std::mem::take(v);
+                Box::new(v.into_iter().map(Value::Bool))
+            }
+            ColumnValue::Ints(v) => {
+                let v = std::mem::take(v);
+                Box::new(v.into_iter().map(Value::Int))
+            }
+            ColumnValue::UInts(v) => {
+                let v = std::mem::take(v);
+                Box::new(v.into_iter().map(Value::UInt))
+            }
+            ColumnValue::Strings(v) => {
+                let v = std::mem::take(v);
+                Box::new(v.into_iter().map(Value::String))
+            }
+            ColumnValue::Variants(v) => {
+                let v = std::mem::take(v);
+                Box::new(v.into_iter())
+            }
+            ColumnValue::FunctionBindings { inputs, outputs } => Box::new(
+                inputs
+                    .drain_to_value_iter()
+                    .zip(outputs.drain_to_value_iter())
+                    .map(|(input, output)| Value::Function(vec![FuncBinding { input, output }])),
+            ),
+            ColumnValue::Records(m) => {
+                let m = std::mem::take(m);
+                let n = m.values().next().map(|v| v.len()).unwrap_or(0);
+                Box::new((0..n).map(move |i| {
+                    Value::Record(m.iter().map(|(k, v)| (k.clone(), v.index_at(i))).collect())
+                }))
+            }
+            // Convert the table to a list of key-value pairs, flattening out the vectors of values
+            ColumnValue::LookupTable(m) => {
+                let m = std::mem::take(m);
+                Box::new(m.into_iter().flat_map(|(key, values)| {
+                    values.into_iter().map(move |v| {
+                        Value::Function(vec![FuncBinding {
+                            input: key.clone(),
+                            output: v,
+                        }])
+                    })
+                }))
+            }
+        }
+    }
+
+    pub fn function_converse(data: ColumnValue) -> ColumnValue {
+        let (mut inputs, mut outputs) = match data {
+            ColumnValue::FunctionBindings { inputs, outputs } => (*inputs, *outputs),
+            _ => panic!("Not a function"),
+        };
+        let mut map: HashMap<Value, Vec<Value>> = HashMap::new();
+        for (i, o) in inputs
+            .drain_to_value_iter()
+            .zip(outputs.drain_to_value_iter())
+        {
+            map.entry(o).or_default().push(i);
+        }
+        ColumnValue::LookupTable(map)
     }
 
     /// Create a `ColumnValue` from a `Vec<i64>`.
@@ -987,7 +1120,7 @@ impl ColumnValue {
     /// `Records {"a": [1, 1, 2, 2], "b": [3, 4, 3, 4]}`.
     pub fn cartesian_product_with_correlation(
         data: HashMap<String, ColumnValue>,
-        correlations: &Option<BitSet>,
+        correlations: Option<&BitSet>,
     ) -> ColumnValue {
         if data.is_empty() {
             return ColumnValue::Records(HashMap::new());
@@ -1050,7 +1183,7 @@ mod tests {
             ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
             ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
         ]);
-        let result = ColumnValue::cartesian_product_with_correlation(data, &None);
+        let result = ColumnValue::cartesian_product_with_correlation(data, None);
         assert_eq!(
             result,
             ColumnValue::Records(HashMap::from([
@@ -1067,7 +1200,7 @@ mod tests {
             ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
             ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
         ]);
-        let result = ColumnValue::cartesian_product_with_correlation(data, &Some(BitSet::new()));
+        let result = ColumnValue::cartesian_product_with_correlation(data, Some(&BitSet::new()));
         assert_eq!(
             result,
             ColumnValue::Records(HashMap::from([
@@ -1084,7 +1217,7 @@ mod tests {
             ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
             ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
         ]);
-        let result = ColumnValue::cartesian_product_with_correlation(data, &Some(full_bitset(4)));
+        let result = ColumnValue::cartesian_product_with_correlation(data, Some(&full_bitset(4)));
         assert_eq!(
             result,
             ColumnValue::Records(HashMap::from([
@@ -1105,7 +1238,7 @@ mod tests {
         let mut filter = BitSet::new();
         filter.insert(0);
         filter.insert(3);
-        let result = ColumnValue::cartesian_product_with_correlation(data, &Some(filter));
+        let result = ColumnValue::cartesian_product_with_correlation(data, Some(&filter));
         assert_eq!(
             result,
             ColumnValue::Records(HashMap::from([
@@ -1117,7 +1250,7 @@ mod tests {
 
     #[test]
     fn test_cartesian_product_empty_map() {
-        let result = ColumnValue::cartesian_product_with_correlation(HashMap::new(), &None);
+        let result = ColumnValue::cartesian_product_with_correlation(HashMap::new(), None);
         assert_eq!(result, ColumnValue::Records(HashMap::new()));
     }
 
@@ -1125,13 +1258,36 @@ mod tests {
     fn test_cartesian_product_single_column() {
         // Single column with a full filter → identity.
         let data = HashMap::from([("a".to_string(), ColumnValue::Ints(vec![10, 20, 30]))]);
-        let result = ColumnValue::cartesian_product_with_correlation(data, &Some(full_bitset(3)));
+        let result = ColumnValue::cartesian_product_with_correlation(data, Some(&full_bitset(3)));
         assert_eq!(
             result,
             ColumnValue::Records(HashMap::from([(
                 "a".to_string(),
                 ColumnValue::Ints(vec![10, 20, 30]),
             )]))
+        );
+    }
+
+    #[test]
+    fn test_function_converse() {
+        let data = ColumnValue::FunctionBindings {
+            inputs: Box::new(ColumnValue::UInts(vec![0, 1, 2])),
+            outputs: Box::new(ColumnValue::Strings(vec![
+                "a".to_string(),
+                "b".to_string(),
+                "b".to_string(),
+            ])),
+        };
+        let result = ColumnValue::function_converse(data);
+        assert_eq!(
+            result,
+            ColumnValue::LookupTable(HashMap::from([
+                (Value::String("a".to_string()), vec![Value::UInt(0)]),
+                (
+                    Value::String("b".to_string()),
+                    vec![Value::UInt(1), Value::UInt(2)]
+                )
+            ]))
         );
     }
 }
