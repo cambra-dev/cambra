@@ -29,8 +29,8 @@ use crate::ccl::{
     LogicKind as CclLogic, Type,
 };
 use crate::interpreter::{
-    Apply, ArithmeticKind, BinOp, BinOpKind, CompareKind, Extent, Lambda, ListLiteral, Literal,
-    LogicKind, Operator, Scheduler, Value, Var, VarRef,
+    Apply, ArithmeticKind, BinOp, BinOpKind, CompareKind, Extent, Lambda, Let, ListLiteral,
+    Literal, LogicKind, Operator, Scheduler, Value, Var, VarRef,
 };
 use crate::util::ScopeStack;
 
@@ -104,6 +104,19 @@ pub fn compile(
             let arg = compile(argument, ctx, scheduler)?;
             Ok(Box::new(Apply::new(func, arg)))
         }
+        Expr::Let {
+            name,
+            bound_ty: Some(bound_ty),
+            bound_expr,
+            body,
+        } => compile_let(name, bound_ty, bound_expr, body, ctx, scheduler),
+        Expr::Let {
+            name,
+            bound_ty: None,
+            ..
+        } => Err(CompileError::TypeError(format!(
+            "Let binding '{name}' has no type annotation; ccl::infer must run before compile"
+        ))),
         other => Err(CompileError::Unsupported(format!(
             "CCL node not yet supported by compile_ccl: {other:?}"
         ))),
@@ -217,6 +230,33 @@ fn compile_lambda(
     })?;
 
     Ok(Box::new(Lambda::new(variable, body_op)))
+}
+
+/// Compile a `Let` binding to a [`Let`] operator.
+///
+/// Scope invariant: `value` is compiled in the caller's scope (before pushing
+/// `name`); `body` is compiled inside a fresh scope where `name` is bound.
+///
+/// `ty` must be `Some` — the type inference pass (`ccl::infer`) must annotate
+/// all `Let` nodes before compilation reaches this function.
+fn compile_let(
+    name: &str,
+    bound_ty: &Type,
+    bound_expr: &Expr,
+    body: &Expr,
+    ctx: &mut CompileContext,
+    scheduler: &mut Scheduler,
+) -> Result<Box<dyn Operator>, CompileError> {
+    // Value is evaluated in the enclosing scope.
+    let value_op = compile(bound_expr, ctx, scheduler)?;
+    // Body is compiled inside a scope that adds `name`.
+    let var_extent = extent_of(bound_ty)?;
+    let body_op = ctx.with_scope(|ctx| {
+        ctx.bind(name, var_extent.clone());
+        compile(body, ctx, scheduler)
+    })?;
+    let var = Var::new(name, var_extent);
+    Ok(Box::new(Let::new(var, value_op, body_op)))
 }
 
 /// Convert a CCL [`Type`] to an interpreter [`Extent`].
@@ -479,5 +519,71 @@ mod tests {
         );
         // The scope stack must be empty: "x" should not be visible.
         assert_eq!(ctx.lookup("x"), None);
+    }
+    // test_compile_let — Let bindings via the dedicated Let operator
+    // -----------------------------------------------------------------------
+
+    // TODO these are compiling CCL _then_ evaluating the operator tree,
+    // we need a way of comparing operators (Eq) for optimization and structural testing.
+    #[rstest]
+    // let x = 5 in x
+    #[case(
+        Expr::Let {
+            name: "x".to_string(),
+            bound_ty: Some(Type::Base(BaseType::Int)),
+            bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
+            body: Box::new(Expr::Var("x".to_string())),
+        },
+        Value::Int(5)
+    )]
+    // let x = 5 in x + 1
+    #[case(
+        Expr::Let {
+            name: "x".to_string(),
+            bound_ty: Some(Type::Base(BaseType::Int)),
+            bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
+            body: Box::new(Expr::BinOp {
+                left: Box::new(Expr::Var("x".to_string())),
+                op: CclBinOp::Arithmetic(CclArith::Add),
+                right: Box::new(Expr::Lit(Lit::Int(1))),
+            }),
+        },
+        Value::Int(6)
+    )]
+    // let x = 5 in x + x  (multiple references — value subscribed once)
+    #[case(
+        Expr::Let {
+            name: "x".to_string(),
+            bound_ty: Some(Type::Base(BaseType::Int)),
+            bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
+            body: Box::new(Expr::BinOp {
+                left: Box::new(Expr::Var("x".to_string())),
+                op: CclBinOp::Arithmetic(CclArith::Add),
+                right: Box::new(Expr::Var("x".to_string())),
+            }),
+        },
+        Value::Int(10)
+    )]
+    // let x = 5 in let y = 2 in x + y  (chained bindings)
+    #[case(
+        Expr::Let {
+            name: "x".to_string(),
+            bound_ty: Some(Type::Base(BaseType::Int)),
+            bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
+            body: Box::new(Expr::Let {
+                name: "y".to_string(),
+                bound_ty: Some(Type::Base(BaseType::Int)),
+                bound_expr: Box::new(Expr::Lit(Lit::Int(2))),
+                body: Box::new(Expr::BinOp {
+                    left: Box::new(Expr::Var("x".to_string())),
+                    op: CclBinOp::Arithmetic(CclArith::Add),
+                    right: Box::new(Expr::Var("y".to_string())),
+                }),
+            }),
+        },
+        Value::Int(7)
+    )]
+    fn test_compile_let(#[case] expr: Expr, #[case] expected: Value) {
+        assert_eq!(compile_and_eval_scalar(&expr), expected);
     }
 }

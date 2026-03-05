@@ -246,14 +246,22 @@ fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
 // Let bindings
 // ---------------------------------------------------------------------------
 //
-// TODO: Support `Expr::Let` in `compile_ccl` so these can be `Both`.
-
 #[rstest]
 #[case("x = 2; x", Value::Int(2))]
 #[case("x = 2; y = x; y", Value::Int(2))]
 #[case("x = 2; y = x; y + x + 1", Value::Int(5))]
 fn test_let_bindings(#[case] code: &str, #[case] expected: Value) {
-    parity_scalar(code, expected, DirectOnly);
+    parity_scalar(code, expected, Both);
+}
+
+// ---------------------------------------------------------------------------
+// More Let bindings
+// ---------------------------------------------------------------------------
+#[rstest]
+#[case("x = [x for x in [1,2,3]]; [y for y in x]", make_int_list(&[1,2,3]))]
+#[ignore = "need first class functions for this let"]
+fn test_let_nonscalar(#[case] code: &str, #[case] expected: ColumnValue) {
+    parity(code, expected, Both);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +269,6 @@ fn test_let_bindings(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 //
 // TODO: Support Tuple/RecordField in `compile_ccl` so these can be `Both`.
-
 #[rstest]
 #[case(
     "('a', 1)",
@@ -290,12 +297,10 @@ fn test_comprehensions(#[case] code: &str, #[case] expected: ColumnValue) {
 // Comprehensions with let capture
 // ---------------------------------------------------------------------------
 //
-// TODO: Requires `Expr::Let` support in `compile_ccl`.
-
 #[rstest]
 #[case("y = 5; [x + y for x in [10, 20]]", make_int_list(&[15, 25]))]
 fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: ColumnValue) {
-    parity(code, expected, DirectOnly);
+    parity(code, expected, Both);
 }
 
 // ---------------------------------------------------------------------------

@@ -147,8 +147,8 @@ enum Expr {
     },
     Let {
         name: String,
-        ty: Option<Type>,
-        value: Box<Expr>,
+        bound_ty: Option<Type>,
+        bound_expr: Box<Expr>,
         body: Box<Expr>,
     },
     List(Vec<Expr>),                     // list literal [e0, e1, ...]; elements may be arbitrary exprs of the same type
@@ -232,6 +232,32 @@ union-find unification table, and an occurs check. Removes the need for
 
 - BinOp/UnaryOp type rules (arithmetic, comparison, boolean).
 - `Case` arm scope: push pattern variable bindings into ctx.
+- Infer `Let.ty` from the type of `value` (required before `Let` nodes can be compiled; see §Compilation).
+
+---
+
+## Compilation
+
+The `compile_ccl` pass (`interpreter/compile_ccl.rs`) transforms a fully-type-inferred CCL AST
+into the dataflow operator graph (`interpreter/let_op.rs`).
+
+### `Let` nodes compile to a dedicated `Let` operator
+
+`Let` is compiled to a first-class `Let` operator rather than desugared to `Apply(Lambda, value)`.
+
+The desugaring identity `let x = e1 in e2 ≡ (λx. e2)(e1)` is operationally correct, but
+compiling through it loses binding provenance in the graph and introduces unnecessary indirection:
+data flows `apply.argument → lambda.var → lambda.body → lambda_producer → apply_producer`,
+and `Lambda` must support both `VarSource::Iteration` and `VarSource::Argument` modes even
+though a let-binding is always `Argument`.
+
+The `Let` operator stores `(variable: Var, definition: Operator, body: Operator, extent: Extent)`.
+`LetProducer::get()` returns the body's output directly — no `FunctionBindings` wrapping.
+The bound variable is subscribed to `definition` exactly once via a `VarProducer`, so multiple
+`VarRef(name)` nodes in the body all resolve to the same producer and the value is computed once.
+
+**Prerequisite**: `Let.bound_ty` must be `Some(T)` before compilation — the type inference pass
+fills this in from the type of `bound_expr`.
 
 ---
 
@@ -247,6 +273,7 @@ union-find unification table, and an occurs check. Removes the need for
      `CompileContext`, `CompileError`, `compile()`, and unit tests. ✓
    - `ccl/infer.rs`: limited type inference pass; `TypeInferenceContext`, `InferError`,
      `infer()`, `collect_param_constraint()`; unit and pipeline tests. ✓
-   - `interpreter/compile_ccl.rs` add support for compiling Let nodes to operators (Design work pending).
+   - `interpreter/compile_ccl.rs` add support for compiling Let nodes to operators (see §Compilation above). ✓
+   - `interpreter/let_op.rs`: dedicated `Let` operator and `LetProducer` replacing the Let-as-Apply-Lambda desugaring. ✓
    - `lowering_via_ccl.rs`: sandboxed end-to-end pipeline tests.
    - `lowering.rs` direct path removed after parity confirmed.
