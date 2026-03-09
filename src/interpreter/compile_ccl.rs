@@ -66,7 +66,7 @@ pub enum PipelineError {
 /// Scope-stack mapping variable names to interpreter [`Extent`]s for the compilation pass.
 ///
 /// Each binding construct (lambda, `let`, etc) compiles its body inside a fresh scope
-/// via [`with_scope`](CompileContext::with_scope), handling nested and shadowed names.
+/// via [`enter_scope`](CompileContext::enter_scope), handling nested and shadowed names.
 /// [`compile_var`] resolves a name at compile time by walking the stack from innermost
 /// to outermost scope.
 pub type CompileContext = ScopeStack<Extent>;
@@ -249,10 +249,9 @@ fn compile_lambda(
     let extent = extent_of(param_ty)?;
     let variable = Var::new(param, extent.clone());
 
-    let body_op = ctx.with_scope(|ctx| {
-        ctx.bind(param, extent);
-        compile(body, ctx, scheduler)
-    })?;
+    let mut ctx = ctx.enter_scope();
+    ctx.bind(param, extent);
+    let body_op = compile(body, &mut ctx, scheduler)?;
 
     Ok(Box::new(Lambda::new(variable, body_op)))
 }
@@ -275,12 +274,11 @@ fn compile_let(
     // Value is evaluated in the enclosing scope.
     let value_op = compile(bound_expr, ctx, scheduler)?;
     // Body is compiled inside a scope that adds `name`.
-    let var_extent = extent_of(bound_ty)?;
-    let body_op = ctx.with_scope(|ctx| {
-        ctx.bind(name, var_extent.clone());
-        compile(body, ctx, scheduler)
-    })?;
-    let var = Var::new(name, var_extent);
+    let bound_extent = extent_of(bound_ty)?;
+    let mut ctx = ctx.enter_scope();
+    ctx.bind(name, bound_extent.clone());
+    let body_op = compile(body, &mut ctx, scheduler)?;
+    let var = Var::new(name, bound_extent);
     Ok(Box::new(Let::new(var, value_op, body_op)))
 }
 

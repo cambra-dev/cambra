@@ -39,7 +39,7 @@ use crate::util::ScopeStack;
 /// Supports shadowing: inner scopes can bind the same name as outer scopes,
 /// and [`lookup`](TypeInferenceContext::lookup) returns the innermost binding.
 ///
-/// Scopes are entered and exited exclusively via [`with_scope`](TypeInferenceContext::with_scope);
+/// Scopes are entered and exited exclusively via [`enter_scope`](TypeInferenceContext::enter_scope);
 /// each lambda body and let binding gets its own scope.
 pub type TypeInferenceContext = ScopeStack<Type>;
 
@@ -138,10 +138,9 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
             // param_ty is now Some; infer the body in a scope with param bound.
             let p = param_ty.as_ref().unwrap().clone();
             let param_name = param.clone();
-            let body_ty = ctx.with_scope(|ctx| {
-                ctx.bind(&param_name, p.clone());
-                infer(body, ctx)
-            })?;
+            let mut ctx = ctx.enter_scope();
+            ctx.bind(&param_name, p.clone());
+            let body_ty = infer(body, &mut ctx)?;
             Ok(Type::Fun(Box::new(p), Box::new(body_ty)))
         }
 
@@ -226,10 +225,9 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
                 *ty = Some(bound_ty.clone());
             }
             let name_owned = name.clone();
-            let body_ty = ctx.with_scope(|ctx| {
-                ctx.bind(&name_owned, bound_ty);
-                infer(body, ctx)
-            })?;
+            let mut ctx = ctx.enter_scope();
+            ctx.bind(&name_owned, bound_ty);
+            let body_ty = infer(body, &mut ctx)?;
             Ok(body_ty)
         }
 
