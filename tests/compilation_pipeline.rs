@@ -247,8 +247,9 @@ fn test_compare(#[case] code: &str, #[case] expected: Value) {
 #[case("True | False", Value::Bool(true))]
 #[case("True ^ True", Value::Bool(false))]
 #[case("True and False", Value::Bool(false))]
+#[case("True or False", Value::Bool(true))]
 fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
-    parity_scalar(code, expected, DirectOnly);
+    parity_scalar(code, expected, Both);
 }
 
 // ---------------------------------------------------------------------------

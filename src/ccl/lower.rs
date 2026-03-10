@@ -14,6 +14,7 @@
 //! | Binary arithmetic (`+`, `-`, `*`, `//`) | [`Expr::BinOp`] |
 //! | Comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) | [`Expr::BinOp`] |
 //! | Chained comparisons (`a < b < c`) | nested [`Expr::BinOp`] with `and` |
+//! | Boolean operators (`and`, `or`) | left-folded [`Expr::BinOp`] chain |
 //! | List literals `[e0, e1, ...]` | [`Expr::List`] |
 //! | Single-generator list comprehensions (no `if`) | `Lambda`/`Apply` encoding |
 //! | 2-gen equality-join comprehensions (`if x.k == y.k`) | hash-join [`crate::ccl::RefinementKind::HashJoin`] |
@@ -68,6 +69,7 @@ pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, Loweri
             ops,
             comparators,
         } => lower_compare(left, ops, comparators),
+        pyast::ExprKind::BoolOp { op, values } => lower_boolop(op, values),
         pyast::ExprKind::List { elts, .. } => {
             let items: Result<Vec<_>, _> = elts.iter().map(lower_expr).collect();
             Ok(Expr::List(items?))
@@ -188,6 +190,9 @@ fn lower_binop(
         pyast::Operator::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
         pyast::Operator::Mult => BinOpKind::Arithmetic(ArithmeticKind::Mul),
         pyast::Operator::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
+        pyast::Operator::BitAnd => BinOpKind::BoolLogic(LogicKind::And),
+        pyast::Operator::BitOr => BinOpKind::BoolLogic(LogicKind::Or),
+        pyast::Operator::BitXor => BinOpKind::BoolLogic(LogicKind::Xor),
         _ => {
             return Err(LoweringError::Unsupported(format!(
                 "Binary operator not supported: {op:?}"
@@ -256,6 +261,36 @@ fn lower_compare(
             right: Box::new(cmp),
         })
         .expect("ops is non-empty"))
+}
+
+/// Lower a Python boolean operator expression to a left-folded [`Expr::BinOp`] chain.
+///
+/// Python `BoolOp` carries a list of two or more operands sharing a single
+/// operator (`and` / `or`). For example, `a and b and c` becomes
+/// `(a and b) and c` — two nested [`BinOpKind::BoolLogic`] nodes.
+fn lower_boolop(
+    op: &pyast::Boolop,
+    values: &[pyast::Located<pyast::ExprKind>],
+) -> Result<Expr, LoweringError> {
+    if values.len() < 2 {
+        return Err(LoweringError::Unsupported(
+            "Boolean operator must have at least two operands".into(),
+        ));
+    }
+    let kind = match op {
+        pyast::Boolop::And => BinOpKind::BoolLogic(LogicKind::And),
+        pyast::Boolop::Or => BinOpKind::BoolLogic(LogicKind::Or),
+    };
+    // Fold left-to-right: `a and b and c` → `(a and b) and c`.
+    let mut acc = lower_expr(&values[0])?;
+    for value in &values[1..] {
+        acc = Expr::BinOp {
+            left: Box::new(acc),
+            op: kind.clone(),
+            right: Box::new(lower_expr(value)?),
+        };
+    }
+    Ok(acc)
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +687,14 @@ mod tests {
     #[case("x >= 1", "x >= 1")]
     // Chained comparison: `1 < x < 10` → `(1 < x) and (x < 10)`
     #[case("1 < x < 10", "1 < x and x < 10")]
+    // Boolean operators
+    #[case("x and y", "x and y")]
+    #[case("x or y", "x or y")]
+    // Three operands fold left: `a and b and c` → `(a and b) and c`
+    #[case("a and b and c", "a and b and c")]
+    #[case("a or b or c", "a or b or c")]
+    // Mixed: `x == 1 and y == 2`
+    #[case("x == 1 and y == 2", "x == 1 and y == 2")]
     fn test_lower_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr).expect("lowering failed");
