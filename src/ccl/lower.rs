@@ -12,8 +12,12 @@
 //! | Integer / string / bool / None literals | [`Expr::Lit`] |
 //! | Variable references | [`Expr::Var`] |
 //! | Binary arithmetic (`+`, `-`, `*`, `//`) | [`Expr::BinOp`] |
+//! | Comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) | [`Expr::BinOp`] |
+//! | Chained comparisons (`a < b < c`) | nested [`Expr::BinOp`] with `and` |
 //! | List literals `[e0, e1, ...]` | [`Expr::List`] |
 //! | Single-generator list comprehensions (no `if`) | `Lambda`/`Apply` encoding |
+//! | 2-gen equality-join comprehensions (`if x.k == y.k`) | hash-join [`crate::ccl::RefinementKind::HashJoin`] |
+//! | Multi-gen filtered comprehensions (non-equality or 3+ generators) | loop-join [`crate::ccl::RefinementKind::Predicate`] |
 //! | Assignment + expression blocks | nested [`Expr::Let`] |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
@@ -31,9 +35,12 @@
 //! This is intentional: the less-normalized representation preserves structure
 //! needed for optimization passes.
 
+use std::rc::Rc;
+
+use bit_set::BitSet;
 use rustpython_parser::ast as pyast;
 
-use crate::ccl::{ArithmeticKind, BinOpKind, Expr, Lit};
+use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Expr, HashJoinSpec, Lit, LogicKind};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -56,6 +63,11 @@ pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, Loweri
         pyast::ExprKind::Constant { value, .. } => lower_constant(value),
         pyast::ExprKind::Name { id, .. } => Ok(Expr::Var(id.clone())),
         pyast::ExprKind::BinOp { left, op, right } => lower_binop(left, op, right),
+        pyast::ExprKind::Compare {
+            left,
+            ops,
+            comparators,
+        } => lower_compare(left, ops, comparators),
         pyast::ExprKind::List { elts, .. } => {
             let items: Result<Vec<_>, _> = elts.iter().map(lower_expr).collect();
             Ok(Expr::List(items?))
@@ -189,68 +201,393 @@ fn lower_binop(
     })
 }
 
-/// Lower `[body for var in source]` to the Lambda/Apply comprehension encoding.
+/// Lower a Python comparison expression to a CCL [`Expr::BinOp`] chain.
 ///
-/// The encoding is:
+/// Python comparison expressions may chain multiple operators, e.g. `a < b < c`
+/// desugars to `a < b and b < c`. Each consecutive pair of operands is compared
+/// with its corresponding operator and the results are combined with logical AND.
+///
+/// Unsupported operators (`is`, `is not`, `in`, `not in`) return
+/// [`LoweringError::Unsupported`].
+fn lower_compare(
+    left: &pyast::Located<pyast::ExprKind>,
+    ops: &[pyast::Cmpop],
+    comparators: &[pyast::Located<pyast::ExprKind>],
+) -> Result<Expr, LoweringError> {
+    // Lower all operands up-front. For a chain of n ops there are n+1 operands:
+    // left, comparators[0], comparators[1], …
+    let mut operands: Vec<Expr> = Vec::with_capacity(comparators.len() + 1);
+    operands.push(lower_expr(left)?);
+    for comp in comparators {
+        operands.push(lower_expr(comp)?);
+    }
+
+    // Build one BinOp per (op, adjacent-operand-pair).
+    let mut comparisons: Vec<Expr> = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        let kind = match op {
+            pyast::Cmpop::Eq => CompareKind::Equals,
+            pyast::Cmpop::NotEq => CompareKind::NotEquals,
+            pyast::Cmpop::Lt => CompareKind::Less,
+            pyast::Cmpop::LtE => CompareKind::LessOrEq,
+            pyast::Cmpop::Gt => CompareKind::Greater,
+            pyast::Cmpop::GtE => CompareKind::GreaterOrEq,
+            _ => {
+                return Err(LoweringError::Unsupported(format!(
+                    "Comparison operator not supported: {op:?}"
+                )))
+            }
+        };
+        // Clone the shared middle operand so both adjacent pairs can own it.
+        comparisons.push(Expr::BinOp {
+            left: Box::new(operands[i].clone()),
+            op: BinOpKind::Compare(kind),
+            right: Box::new(operands[i + 1].clone()),
+        });
+    }
+
+    // Single comparison: return it directly.
+    // Chained comparisons: fold with logical AND (mirrors Python semantics).
+    Ok(comparisons
+        .into_iter()
+        .reduce(|acc, cmp| Expr::BinOp {
+            left: Box::new(acc),
+            op: BinOpKind::BoolLogic(LogicKind::And),
+            right: Box::new(cmp),
+        })
+        .expect("ops is non-empty"))
+}
+
+// ---------------------------------------------------------------------------
+// Join-detection helpers (operate on the lowered CCL AST)
+// ---------------------------------------------------------------------------
+
+/// Compute the set of generator-variable indices referenced anywhere in a CCL [`Expr`].
+///
+/// Returns a [`BitSet`] where bit `i` is set when `expr` contains a [`Expr::Var`]
+/// whose name matches `gen_var_names[i]`.
+fn ccl_gen_vars_referenced(expr: &Expr, gen_var_names: &[&str]) -> BitSet {
+    let mut result = BitSet::new();
+    let mut shadowed = BitSet::new();
+    ccl_gen_vars_referenced_inner(expr, gen_var_names, &mut result, &mut shadowed);
+    result
+}
+
+fn ccl_gen_vars_referenced_inner(
+    expr: &Expr,
+    gen_var_names: &[&str],
+    result: &mut BitSet,
+    shadowed: &mut BitSet,
+) {
+    match expr {
+        Expr::Var(name) => {
+            if let Some(i) = gen_var_names.iter().position(|n| *n == name.as_str()) {
+                // TODO once we support lambda expressions in CHL, test that the shadowing here
+                // actually works.
+                if !shadowed.contains(i) {
+                    result.insert(i);
+                }
+            }
+        }
+        Expr::BinOp { left, right, .. } => {
+            ccl_gen_vars_referenced_inner(left, gen_var_names, result, shadowed);
+            ccl_gen_vars_referenced_inner(right, gen_var_names, result, shadowed);
+        }
+        Expr::UnaryOp(_, operand) => {
+            ccl_gen_vars_referenced_inner(operand, gen_var_names, result, shadowed);
+        }
+        Expr::Apply { function, argument } => {
+            ccl_gen_vars_referenced_inner(function, gen_var_names, result, shadowed);
+            ccl_gen_vars_referenced_inner(argument, gen_var_names, result, shadowed);
+        }
+        Expr::Lambda { body, param, .. } => {
+            // Generator variables are free in the predicate; descend into body.
+            let outer_shadowed = shadowed.clone();
+            if let Some(i) = gen_var_names.iter().position(|n| *n == param) {
+                shadowed.insert(i);
+            }
+            ccl_gen_vars_referenced_inner(body, gen_var_names, result, shadowed);
+            *shadowed = outer_shadowed;
+        }
+        Expr::Let {
+            bound_expr,
+            body,
+            name,
+            ..
+        } => {
+            ccl_gen_vars_referenced_inner(bound_expr, gen_var_names, result, shadowed);
+            let outer_shadowed = shadowed.clone();
+            if let Some(i) = gen_var_names.iter().position(|n| *n == name) {
+                shadowed.insert(i);
+            }
+            ccl_gen_vars_referenced_inner(body, gen_var_names, result, shadowed);
+            *shadowed = outer_shadowed;
+        }
+        Expr::List(items) | Expr::Tuple(items) => {
+            for item in items {
+                ccl_gen_vars_referenced_inner(item, gen_var_names, result, shadowed);
+            }
+        }
+        Expr::TupleIndex(expr, _) => {
+            ccl_gen_vars_referenced_inner(expr, gen_var_names, result, shadowed);
+        }
+        Expr::TypeAnnotation(expr, _) => {
+            ccl_gen_vars_referenced_inner(expr, gen_var_names, result, shadowed);
+        }
+        Expr::Lit(_) => {}
+        _ => {}
+    }
+}
+
+/// If `pred` is a CCL equality between expressions each referencing a distinct
+/// single generator variable, return `(build_gen, build_key, probe_gen, probe_key)`
+/// normalised so that `build_gen < probe_gen`.
+///
+/// Returns `None` for any other predicate shape.
+fn try_extract_ccl_equality_join<'a>(
+    pred: &'a Expr,
+    gen_var_names: &[&str],
+) -> Option<(usize, &'a Expr, usize, &'a Expr)> {
+    if let Expr::BinOp {
+        left,
+        op: BinOpKind::Compare(CompareKind::Equals),
+        right,
+    } = pred
+    {
+        let refs_lhs = ccl_gen_vars_referenced(left, gen_var_names);
+        let refs_rhs = ccl_gen_vars_referenced(right, gen_var_names);
+        if refs_lhs.len() == 1 && refs_rhs.len() == 1 {
+            let gen_l = refs_lhs.iter().next().unwrap();
+            let gen_r = refs_rhs.iter().next().unwrap();
+            if gen_l != gen_r {
+                // Normalise: smaller generator index = build side.
+                return if gen_l < gen_r {
+                    Some((gen_l, left, gen_r, right))
+                } else {
+                    Some((gen_r, right, gen_l, left))
+                };
+            }
+        }
+    }
+    None
+}
+
+/// Lower a Python list comprehension to the CCL Lambda/Apply encoding.
+///
+/// Handles three cases based on the number of generators and predicates:
+///
+/// **Single generator, no predicate** — identity encoding:
 /// ```text
-/// λ __list_comp_var →
-///   Apply(λ var → lower(body),
-///         Apply(lower(source), Var(__list_comp_var)))
+/// λ __iter_record → __iter_record ▷ lower(source) ▷ (λ var → lower(body))
 /// ```
 ///
-/// Both lambdas are produced with `param_ty: None`; the type inference pass
-/// (`ccl::infer`) fills in the annotations before compilation.
+/// **Multiple generators / non-equality predicates** — loop-join encoding.
+/// The outer lambda carries a [`RefinementKind::Predicate`] with the combined
+/// guard expression; the runtime filters via a correlation vector:
+/// ```text
+/// λ __iter_record : {T | Refined(pred)} →
+///   __iter_record[0] ▷ lower(source0) ▷ (λ var0 →
+///     __iter_record[1] ▷ lower(source1) ▷ (λ var1 → lower(body)))
+/// ```
 ///
-/// Multi-generator and filtered comprehensions are not yet supported.
+/// **Two generators, single equality predicate** — hash-join encoding.
+/// Detected by [`try_extract_ccl_equality_join`] on the lowered predicate.
+/// The outer lambda carries a [`RefinementKind::HashJoin`]; `compile_ccl`
+/// translates it to an O(N+M) hash-join-based restriction:
+/// ```text
+/// λ __iter_record : {T | Refined(build_var == probe_var)} →
+///   __iter_record[0] ▷ lower(source0) ▷ (λ var0 →
+///     __iter_record[1] ▷ lower(source1) ▷ (λ var1 → lower(body)))
+/// ```
+///
+/// All lambdas are produced with `param_ty: None`; [`crate::ccl::infer`]
+/// fills in the type annotations before compilation.
+///
+/// TODO this currently has an assumption that all generator variables have distinct names.
+/// This might be a reasonable assumption that we should enforce, or we should fix scoping to
+/// handle that case.
 fn lower_list_comp(
     elt: &pyast::Located<pyast::ExprKind>,
     generators: &[pyast::Comprehension],
 ) -> Result<Expr, LoweringError> {
-    if generators.len() != 1 {
-        return Err(LoweringError::Unsupported(
-            "Only single-generator comprehensions are supported".into(),
-        ));
-    }
-    let gen = &generators[0];
-    if !gen.ifs.is_empty() {
-        return Err(LoweringError::Unsupported(
-            "Comprehensions with if conditions are not supported".into(),
-        ));
-    }
-    if gen.is_async > 0 {
-        return Err(LoweringError::Unsupported(
-            "Async comprehensions are not supported".into(),
-        ));
+    // ---- Phase 1: Lower each generator's source and register its loop variable ----
+    // We keep the source operators and index extents for later use when building the
+    // Apply/Lambda chains.  Each loop variable is pushed onto the lowering scope so
+    // that body and predicate expressions can reference it.
+    let mut gen_sources: Vec<Expr> = Vec::new();
+    let mut gen_iter_vars: Vec<String> = Vec::new();
+
+    for gen in generators.iter() {
+        if gen.is_async > 0 {
+            return Err(LoweringError::Unsupported(
+                "Async comprehensions are not supported".into(),
+            ));
+        }
+        let source = lower_expr(&gen.iter)?;
+        let var_name = match &gen.target.node {
+            pyast::ExprKind::Name { id, .. } => id,
+            _ => {
+                return Err(LoweringError::Unsupported(format!(
+                    "Only simple variable targets are supported in comprehensions, got {:?}",
+                    gen.target.node
+                )));
+            }
+        };
+        let iter_var = var_name;
+        gen_iter_vars.push(iter_var.to_string());
+        gen_sources.push(source);
     }
 
-    // Extract the loop variable name (must be a simple Name).
-    let var_name = match &gen.target.node {
-        pyast::ExprKind::Name { id, .. } => id.clone(),
-        _ => {
-            return Err(LoweringError::Unsupported(
-                "Destructuring comprehension targets are not supported".into(),
-            ))
+    // ---- Phase 2: Lower body and all predicates to CCL -------------------------
+    let body = lower_expr(elt)?;
+
+    // Lower every `if` guard from each generator to CCL.  We hold on to the
+    // original pyast nodes only to build human-readable description strings;
+    // all detection logic operates on the lowered CCL expressions.
+    let pyast_preds: Vec<&pyast::Expr> = generators
+        .iter()
+        .flat_map(|g| g.ifs.iter().map(|e| e as &pyast::Expr))
+        .collect();
+    let lowered_preds: Vec<Expr> = pyast_preds
+        .iter()
+        .map(|e| lower_expr(e))
+        .collect::<Result<_, _>>()?;
+
+    let gen_var_refs: Vec<&str> = gen_iter_vars.iter().map(String::as_str).collect();
+
+    // Detect a 2-generator equality join on the CCL AST: exactly 2 generators,
+    // 1 predicate, and the predicate is `lhs == rhs` where each side references
+    // a distinct generator variable.  Emit a hash-join refinement instead of a
+    // loop-join predicate.  Sources are cloned from the already-lowered
+    // `gen_sources`; key expressions are taken directly from the lowered predicate.
+    // TODO move this to a later phase of compilation.
+    let hash_join_spec: Option<HashJoinSpec> = if generators.len() == 2 && lowered_preds.len() == 1
+    {
+        if let Some((build_gen, build_key, probe_gen, probe_key)) =
+            try_extract_ccl_equality_join(&lowered_preds[0], &gen_var_refs)
+        {
+            Some(HashJoinSpec {
+                build_gen_position: build_gen,
+                probe_gen_position: probe_gen,
+                build_var_name: gen_iter_vars[build_gen].clone(),
+                probe_var_name: gen_iter_vars[probe_gen].clone(),
+                build_key: Rc::new(build_key.clone()),
+                probe_key: Rc::new(probe_key.clone()),
+                build_source: Rc::new(gen_sources[build_gen].clone()),
+                probe_source: Rc::new(gen_sources[probe_gen].clone()),
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Combine all `if` guards into a single loop-join predicate (used when hash
+    // join is not applicable — non-equality, 3+ generators, or multiple predicates).
+    // Description strings are built from the original pyast Display output.
+    let mut pred_op: Option<Expr> = None;
+    let mut pred_desc = String::new();
+    if hash_join_spec.is_none() {
+        for (pyast_pred, lowered) in pyast_preds.iter().zip(lowered_preds) {
+            pred_op = Some(match pred_op {
+                Some(lhs) => {
+                    pred_desc.push_str(&format!(" and {pyast_pred}"));
+                    Expr::BinOp {
+                        left: Box::new(lhs),
+                        op: BinOpKind::BoolLogic(LogicKind::And),
+                        right: Box::new(lowered),
+                    }
+                }
+                None => {
+                    pred_desc = format!("{pyast_pred}");
+                    lowered
+                }
+            });
+        }
+    }
+
+    // Sources for the loop-join restriction lambda are cloned from the
+    // already-lowered gen_sources (Phase 5 drains it, so clone here).
+    let mut pred_sources: Vec<Expr> = if pred_op.is_some() {
+        gen_sources.clone()
+    } else {
+        Vec::new()
+    };
+
+    // ---- Phase 4: Build the outer iteration variable ------------------------------
+    // Single generator: iterate directly over that source's index extent.
+    // Multiple generators: pack all index extents into a Record so the body can
+    // address each one via RecordField and the runtime produces the cartesian
+    // product.
+    // With a predicate: wrap in Restricted so the runtime filters via a correlation
+    // vector computed from the predicate (see Phase 6).
+    let single_gen = generators.len() == 1;
+    let outer_var = "__iter_record";
+
+    // Helper: build the index argument for generator `i`.
+    // Single-gen: a bare VarRef to the outer variable.
+    // Multi-gen: a RecordField projection of the i-th field from the outer record.
+    let make_idx_arg = |var: &str, i: usize| -> Expr {
+        let vref = Expr::Var(var.to_string());
+        if single_gen {
+            vref
+        } else {
+            Expr::TupleIndex(Box::new(vref), i)
         }
     };
 
-    let source = lower_expr(&gen.iter)?;
-    let body = lower_expr(elt)?;
+    // ---- Phase 5: Build the body as a nested Apply/Lambda chain ------------------
+    // Working innermost-first (reverse order) we wrap the accumulated expression:
+    //   body = Apply(Lambda(iter_var_i, body), Apply(source_i, idx_arg_i))
+    let mut body_expr: Expr = body;
+    for (i, (iter_var, source)) in gen_iter_vars
+        .iter()
+        .zip(gen_sources.drain(..))
+        .enumerate()
+        .rev()
+    {
+        body_expr = Expr::apply(
+            Expr::apply(make_idx_arg(outer_var, i), source),
+            Expr::lambda(iter_var, None, body_expr),
+        );
+    }
 
-    Ok(Expr::Lambda {
-        param: "__list_comp_var".to_string(),
-        param_ty: None,
-        body: Box::new(Expr::Apply {
-            function: Box::new(Expr::Lambda {
-                param: var_name,
-                param_ty: None,
-                body: Box::new(body),
-            }),
-            argument: Box::new(Expr::Apply {
-                function: Box::new(source),
-                argument: Box::new(Expr::Var("__list_comp_var".to_string())),
-            }),
-        }),
-    })
+    // ---- Phase 6: Attach restriction (hash join or loop-join predicate) ----------
+    if let Some(spec) = hash_join_spec {
+        // Equality join between two generators: emit a hash-join refinement.
+        // compile_ccl will construct the Converse/Lambda/Apply operator structure.
+        let desc = format!("{} == {}", spec.build_var_name, spec.probe_var_name);
+        Ok(Expr::lambda_with_hash_join(
+            outer_var, None, body_expr, spec, &desc,
+        ))
+    } else if let Some(pred_op) = pred_op {
+        // Non-equality or multi-predicate: loop-join restriction lambda.
+        // Uses an independent "__iter_record_restr" variable so it does not
+        // recursively depend on a correlation vector.
+        let restr_outer_var = "__iter_record_restr";
+        let mut pred_expr: Expr = pred_op;
+        for (i, (iter_var, pred_source)) in gen_iter_vars
+            .iter()
+            .zip(pred_sources.drain(..))
+            .enumerate()
+            .rev()
+        {
+            pred_expr = Expr::apply(
+                Expr::apply(make_idx_arg(restr_outer_var, i), pred_source),
+                Expr::lambda(iter_var, None, pred_expr),
+            );
+        }
+        Ok(Expr::lambda_with_refinement(
+            outer_var,
+            None,
+            body_expr,
+            Expr::lambda(restr_outer_var, None, pred_expr),
+            &pred_desc,
+        ))
+    } else {
+        Ok(Expr::lambda(outer_var, None, body_expr))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +597,7 @@ fn lower_list_comp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::symbolic;
+    use crate::ccl::{symbolic::symbolic, RefinementKind};
     use rstest::rstest;
     use rustpython_parser::parser;
 
@@ -306,10 +643,19 @@ mod tests {
     // List literals
     #[case("[]", "[]")]
     #[case("[1, 2]", "[1, 2]")]
+    // Comparisons
+    #[case("x == 1", "x == 1")]
+    #[case("x != 1", "x != 1")]
+    #[case("x < 1", "x < 1")]
+    #[case("x <= 1", "x <= 1")]
+    #[case("x > 1", "x > 1")]
+    #[case("x >= 1", "x >= 1")]
+    // Chained comparison: `1 < x < 10` → `(1 < x) and (x < 10)`
+    #[case("1 < x < 10", "1 < x and x < 10")]
     fn test_lower_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr).expect("lowering failed");
-        assert_eq!(symbolic::symbolic(&ccl), expected);
+        assert_eq!(symbolic(&ccl), expected);
     }
 
     // -----------------------------------------------------------------------
@@ -360,7 +706,7 @@ in x"
     fn test_lower_stmts(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts).expect("lowering failed");
-        assert_eq!(symbolic::symbolic(&ccl), expected);
+        assert_eq!(symbolic(&ccl), expected);
     }
 
     // -----------------------------------------------------------------------
@@ -371,17 +717,17 @@ in x"
     // Identity: element passes through unchanged; lambdas are unannotated (infer fills them in).
     #[case(
         "[x for x in [10, 20]]",
-        "λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x)"
+        "λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x)"
     )]
     // Constant body: loop variable unused in body.
     #[case(
         "[42 for x in [10, 20]]",
-        "λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → 42)"
+        "λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → 42)"
     )]
     // BinOp body: loop variable used in arithmetic.
     #[case(
         "[x + 2 for x in [10, 20]]",
-        "λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x + 2)"
+        "λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + 2)"
     )]
     // Outer capture: y is captured from an enclosing let binding.
     #[case(
@@ -390,18 +736,69 @@ y = 5
 [x + y for x in [10, 20]]",
         "\
 let y = 5
-in λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x + y)"
+in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     )]
     // Nested comprehension: all lambdas unannotated; infer annotates them in a
     // subsequent pass.
     #[case(
         "[y for y in [x for x in [10, 20]]]",
-        "λ __list_comp_var → __list_comp_var ▷ (λ __list_comp_var → __list_comp_var ▷ [10, 20] ▷ (λ x → x)) ▷ (λ y → y)"
+        "λ __iter_record → __iter_record ▷ (λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x)) ▷ (λ y → y)"
     )]
     fn test_lower_list_comp(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts).expect("lowering failed");
-        assert_eq!(symbolic::symbolic(&ccl), expected);
+        assert_eq!(symbolic(&ccl), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Hash join detection tests
+    // -----------------------------------------------------------------------
+
+    /// Verify that a 2-generator equality join produces a `RefinementKind::HashJoin`
+    /// and a non-equality predicate produces `RefinementKind::Predicate`.
+    #[test]
+    fn test_hash_join_kind_detection() {
+        // Equality join: `x == y` should give HashJoin
+        let eq_join = parse_module("[x for x in [1, 2] for y in [3, 4] if x == y]");
+        let eq_ccl = lower_stmts(&eq_join).expect("lowering failed");
+        if let Expr::Lambda { refinement, .. } = &eq_ccl {
+            let r = refinement
+                .as_ref()
+                .expect("expected refinement for equality join");
+            assert!(
+                matches!(r.kind, RefinementKind::HashJoin(_)),
+                "expected HashJoin refinement for `x == y`, got Predicate"
+            );
+        } else {
+            panic!("expected Lambda at top level, got {eq_ccl:?}");
+        }
+
+        // Non-equality predicate: `x < y` should give Predicate (loop join)
+        let non_eq = parse_module("[x for x in [1, 2] for y in [3, 4] if x < y]");
+        let non_eq_ccl = lower_stmts(&non_eq).expect("lowering failed");
+        if let Expr::Lambda { refinement, .. } = &non_eq_ccl {
+            let r = refinement
+                .as_ref()
+                .expect("expected refinement for loop join");
+            assert!(
+                matches!(r.kind, RefinementKind::Predicate(_)),
+                "expected Predicate refinement for `x < y`, got HashJoin"
+            );
+        } else {
+            panic!("expected Lambda at top level, got {non_eq_ccl:?}");
+        }
+    }
+
+    /// Symbolic output for a 2-gen equality join includes `Refined(x == y)` in the header.
+    #[test]
+    fn test_hash_join_symbolic() {
+        let stmts = parse_module("[x for x in [1, 2] for y in [3, 4] if x == y]");
+        let ccl = lower_stmts(&stmts).expect("lowering failed");
+        let sym = symbolic(&ccl);
+        assert!(
+            sym.contains("Refined(x == y)"),
+            "expected 'Refined(x == y)' in symbolic output, got: {sym}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -434,7 +831,7 @@ result";
         let ccl = lower_stmts(&stmts).expect("lowering failed");
         // Fill in the expected string when StmtKind::If lowering is added.
         // Structure: let result = case cond of { True → let tmp = 1 in tmp + 1 | False → let tmp = 2 in tmp + 2 } in result
-        assert_eq!(symbolic::symbolic(&ccl), "");
+        assert_eq!(symbolic(&ccl), "");
     }
 
     /// Walrus operator `(y := expr)` lowers to `Expr::Let` in expression position,
@@ -454,6 +851,6 @@ x";
         let ccl = lower_stmts(&stmts).expect("lowering failed");
         // Fill in the expected string when ExprKind::NamedExpr lowering is added.
         // Structure: let x = (let y = 5 in y) + 1 in x
-        assert_eq!(symbolic::symbolic(&ccl), "");
+        assert_eq!(symbolic(&ccl), "");
     }
 }

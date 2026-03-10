@@ -144,6 +144,9 @@ enum Expr {
         param: String,
         param_ty: Option<Type>,
         body: Box<Expr>,
+        /// Optional restriction on the outer iteration variable.
+        /// `None` for unrestricted lambdas; `Some(r)` for filtered or joined comprehensions.
+        refinement: Option<Refinement>,
     },
     Let {
         name: String,
@@ -187,9 +190,41 @@ enum Type {
     Record(Vec<(String, Type)>),
     Union(Vec<Type>),
     Unknown,                             // pre-type-checking placeholder
+    Refinement(Box<Type>, Refinement),   // refined base type; `Refinement.kind` carries join strategy
     // Future:
     // Pi { param, param_ty, body_ty }  — dependent function type
-    // Refinement { base, predicate }   — refinement type
+}
+
+/// Carries the join strategy for a restricted Lambda (i.e. a filtered/joined comprehension).
+struct Refinement {
+    /// Human-readable description shown by the symbolic printer (e.g. `"x < 10"`, `"x == y"`).
+    description: String,
+    /// Whether this is a loop join (arbitrary predicate) or hash join (equality between generators).
+    kind: RefinementKind,
+}
+
+enum RefinementKind {
+    /// Arbitrary boolean predicate; compiled to a `ComputeRestriction::new_predicate` loop join.
+    /// The `Rc` holds the predicate expression and doubles as the cache key in `CompileContext`.
+    Predicate(Rc<RefCell<Expr>>),
+    /// Equality key join between two generators; compiled to a `ComputeRestriction::new_join`
+    /// hash join using a `Converse` operator.
+    HashJoin(Box<HashJoinSpec>),
+}
+
+/// Specifies the two sides of a hash join.
+///
+/// Detection criteria: exactly 2 generators, exactly 1 `if` guard, the guard is
+/// `lhs == rhs` where each side references a distinct generator variable.
+struct HashJoinSpec {
+    build_gen: usize,           // generator index (0-based) for the build side
+    probe_gen: usize,           // generator index for the probe side
+    build_var_name: String,     // iteration variable name for the build side
+    probe_var_name: String,     // iteration variable name for the probe side
+    build_key: Rc<RefCell<Expr>>,   // key expression referencing build_var_name
+    probe_key: Rc<RefCell<Expr>>,   // key expression referencing probe_var_name
+    build_source: Rc<RefCell<Expr>>, // source list for the build side
+    probe_source: Rc<RefCell<Expr>>, // source list for the probe side
 }
 ```
 
@@ -275,5 +310,7 @@ fills this in from the type of `bound_expr`.
      `infer()`, `collect_param_constraint()`; unit and pipeline tests. ✓
    - `interpreter/compile_ccl.rs` add support for compiling Let nodes to operators (see §Compilation above). ✓
    - `interpreter/let_op.rs`: dedicated `Let` operator and `LetProducer` replacing the Let-as-Apply-Lambda desugaring. ✓
+   - `ccl/mod.rs` + `ccl/lower.rs` + `interpreter/compile_ccl.rs`: hash join detection and compilation
+     (`RefinementKind::HashJoin`, `HashJoinSpec`, `compile_hash_join_restriction`). ✓
    - `lowering_via_ccl.rs`: sandboxed end-to-end pipeline tests.
    - `lowering.rs` direct path removed after parity confirmed.

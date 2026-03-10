@@ -143,10 +143,13 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             param,
             param_ty,
             body,
+            refinement,
         } => {
-            let header = match param_ty {
-                None => format!("λ {param}"),
-                Some(ty) => format!("λ {param} : {ty}"),
+            let header = match (param_ty, refinement) {
+                (None, None) => format!("λ {param}"),
+                (Some(ty), None) => format!("λ {param} : {ty}"),
+                (None, Some(r)) => format!("λ {param} : {{??? | Refined({})}}", r.description),
+                (Some(ty), Some(r)) => format!("λ {param} : {{{ty} | Refined({})}}", r.description),
             };
             let body_str = fmt(body, Precedence::Lowest);
             (Precedence::Lowest, format!("{header} → {body_str}"))
@@ -320,9 +323,12 @@ fn binop_prec(op: &BinOpKind) -> Precedence {
 #[cfg(test)]
 mod tests {
     use super::symbolic;
-    use crate::ccl::{ArithmeticKind, BinOpKind, Expr, Lit, LogicKind, Pattern, Type, UnaryOpKind};
+    use crate::ccl::{
+        ArithmeticKind, BinOpKind, Expr, HashJoinSpec, Lit, LogicKind, Pattern, Type, UnaryOpKind,
+    };
     use crate::interpreter::BaseType;
     use rstest::rstest;
+    use std::rc::Rc;
 
     // -----------------------------------------------------------------------
     // Per-variant direct-construction tests
@@ -426,74 +432,61 @@ mod tests {
     )]
     // Apply: basic pipe notation
     #[case(
-        Expr::Apply {
-            function: Box::new(Expr::Var("f".to_string())),
-            argument: Box::new(Expr::Var("x".to_string())),
-        },
+        Expr::apply(Expr::Var("x".to_string()), Expr::Var("f".to_string())),
         "x ▷ f"
     )]
     // Apply: inner Apply in arg position — left-assoc, no extra parens
     #[case(
-        Expr::Apply {
-            function: Box::new(Expr::Var("g".to_string())),
-            argument: Box::new(Expr::Apply {
-                function: Box::new(Expr::Var("f".to_string())),
-                argument: Box::new(Expr::Var("x".to_string())),
-            }),
-        },
+        Expr::apply(
+            Expr::apply(Expr::Var("x".to_string()), Expr::Var("f".to_string())),
+            Expr::Var("g".to_string()),
+        ),
         "x ▷ f ▷ g"
     )]
     // Apply: inner Apply in func position — gets parens to disambiguate
     #[case(
-        Expr::Apply {
-            function: Box::new(Expr::Apply {
-                function: Box::new(Expr::Var("f".to_string())),
-                argument: Box::new(Expr::Var("x".to_string())),
-            }),
-            argument: Box::new(Expr::Var("y".to_string())),
-        },
+        Expr::apply(
+            Expr::Var("y".to_string()),
+            Expr::apply(Expr::Var("x".to_string()), Expr::Var("f".to_string())),
+        ),
         "y ▷ (x ▷ f)"
     )]
     // Apply: Lambda in func position gets parens
     #[case(
-        Expr::Apply {
-            function: Box::new(Expr::Lambda {
-                param: "x".to_string(),
-                param_ty: None,
-                body: Box::new(Expr::Var("x".to_string())),
-            }),
-            argument: Box::new(Expr::Var("v".to_string())),
-        },
+        Expr::apply(
+            Expr::Var("v".to_string()),
+            Expr::lambda("x", None, Expr::Var("x".to_string())),
+        ),
         "v ▷ (λ x → x)"
     )]
     // Lambda (unannotated)
     #[case(
-        Expr::Lambda {
-            param: "x".to_string(),
-            param_ty: None,
-            body: Box::new(Expr::Var("x".to_string())),
-        },
+        Expr::lambda(
+                "x",
+                None,
+                Expr::Var("x".to_string()),
+            ),
         "λ x → x"
     )]
     // Lambda (annotated)
     #[case(
-        Expr::Lambda {
-            param: "x".to_string(),
-            param_ty: Some(Type::Base(BaseType::Int)),
-            body: Box::new(Expr::Var("x".to_string())),
-        },
+        Expr::lambda(
+                "x",
+                Some(Type::Base(BaseType::Int)),
+                Expr::Var("x".to_string()),
+            ),
         "λ x : Int → x"
     )]
     // Lambda with function type annotation
     #[case(
-        Expr::Lambda {
-            param: "x".to_string(),
-            param_ty: Some(Type::Fun(
+        Expr::lambda(
+            "x",
+            Some(Type::Fun(
                 Box::new(Type::Base(BaseType::Int)),
                 Box::new(Type::Base(BaseType::Bool)),
             )),
-            body: Box::new(Expr::Var("x".to_string())),
-        },
+            Expr::Var("x".to_string()),
+        ),
         "λ x : Int ⇒ Bool → x"
     )]
     // Let (unannotated)
@@ -561,6 +554,28 @@ in x"
         },
         "case x of { (a, b) → a }"
     )]
+    // Lambda with predicate refinement, no type annotation
+    #[case(
+        Expr::lambda_with_refinement(
+            "x",
+            None,
+            Expr::Var("x".to_string()),
+            Expr::Lit(Lit::Bool(true)),
+            "x > 0",
+        ),
+        "λ x : {??? | Refined(x > 0)} → x"
+    )]
+    // Lambda with predicate refinement and type annotation
+    #[case(
+        Expr::lambda_with_refinement(
+            "x",
+            Some(Type::Base(BaseType::Int)),
+            Expr::Var("x".to_string()),
+            Expr::Lit(Lit::Bool(true)),
+            "x > 0",
+        ),
+        "λ x : {Int | Refined(x > 0)} → x"
+    )]
     // Join + Jump
     #[case(
         Expr::Join {
@@ -581,6 +596,50 @@ in k(0)"
     )]
     fn test_symbolic_expr(#[case] expr: Expr, #[case] expected: &str) {
         assert_eq!(symbolic(&expr), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Refinement formatting tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_symbolic_lambda_hash_join_refinement_no_ty() {
+        // (None, Some(HashJoin)) → "λ x : {??? | Refined(x == y)} → body"
+        let spec = HashJoinSpec {
+            build_gen_position: 0,
+            probe_gen_position: 1,
+            build_var_name: "x".to_string(),
+            probe_var_name: "y".to_string(),
+            build_key: Rc::new(Expr::Var("x".to_string())),
+            probe_key: Rc::new(Expr::Var("y".to_string())),
+            build_source: Rc::new(Expr::Lit(Lit::Int(0))),
+            probe_source: Rc::new(Expr::Lit(Lit::Int(0))),
+        };
+        let expr = Expr::lambda_with_hash_join("p", None, Expr::Lit(Lit::Unit), spec, "x == y");
+        assert_eq!(symbolic(&expr), "λ p : {??? | Refined(x == y)} → unit");
+    }
+
+    #[test]
+    fn test_symbolic_lambda_hash_join_refinement_with_ty() {
+        // (Some(ty), Some(HashJoin)) → "λ p : {Int | Refined(x == y)} → unit"
+        let spec = HashJoinSpec {
+            build_gen_position: 0,
+            probe_gen_position: 1,
+            build_var_name: "x".to_string(),
+            probe_var_name: "y".to_string(),
+            build_key: Rc::new(Expr::Var("x".to_string())),
+            probe_key: Rc::new(Expr::Var("y".to_string())),
+            build_source: Rc::new(Expr::Lit(Lit::Int(0))),
+            probe_source: Rc::new(Expr::Lit(Lit::Int(0))),
+        };
+        let expr = Expr::lambda_with_hash_join(
+            "p",
+            Some(Type::Base(BaseType::Int)),
+            Expr::Lit(Lit::Unit),
+            spec,
+            "x == y",
+        );
+        assert_eq!(symbolic(&expr), "λ p : {Int | Refined(x == y)} → unit");
     }
 
     // -----------------------------------------------------------------------
@@ -608,11 +667,12 @@ in k(0)"
                 op: BinOpKind::BoolLogic(LogicKind::Or),
                 right: Box::new(Expr::Var("b".to_string())),
             }),
-            body: Box::new(Expr::Apply {
-                function: Box::new(Expr::Lambda {
-                    param: "y".to_string(),
-                    param_ty: None,
-                    body: Box::new(Expr::BinOp {
+            body: Box::new(Expr::apply(
+                Expr::Var("x".to_string()),
+                Expr::lambda(
+                    "y",
+                    None,
+                    Expr::BinOp {
                         left: Box::new(Expr::Var("y".to_string())),
                         op: BinOpKind::Arithmetic(ArithmeticKind::Add),
                         right: Box::new(Expr::BinOp {
@@ -620,10 +680,9 @@ in k(0)"
                             op: BinOpKind::Arithmetic(ArithmeticKind::Mul),
                             right: Box::new(Expr::Lit(Lit::Int(2))),
                         }),
-                    }),
-                }),
-                argument: Box::new(Expr::Var("x".to_string())),
-            }),
+                    },
+                ),
+            )),
         };
         let expected = "\
 let x = not a or b

@@ -12,6 +12,7 @@ rstest-log = "0.2.0"
 test-log = "0.2.19"
 
 [dependencies]
+rustpython-ast = { version = "0.2.0", features = ["unparse"] }
 rustpython-parser = "0.2.0"
 indoc = "1.0"
 log = "0.4.29"

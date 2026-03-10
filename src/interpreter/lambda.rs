@@ -398,7 +398,6 @@ impl Operator for Apply {
         // of the lambda. For now, we treat the body as a black box and just forward Universal
         // or Empty.
         let apply_consumer = move || {
-            debug!("Apply notified");
             consumer.notify();
         };
         Box::new(ApplyProducer::new(self.lambda.subscribe_to_application(

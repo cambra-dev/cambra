@@ -30,12 +30,15 @@ use std::rc::Rc;
 
 use cambra::ccl::infer::{infer, TypeInferenceContext};
 use cambra::ccl::lower::{lower_expr, lower_stmts};
+use cambra::ccl::symbolic::symbolic;
 use cambra::interpreter::compile_ccl::{compile, CompileContext};
 use cambra::interpreter::{
     tuple_field, BaseType, ColumnValue, Consumer, Extent, FuncBinding, Guard, Scheduler, Value,
 };
 use cambra::lowering::{lower_let_stmt_block, LoweringContext};
-use rstest::rstest;
+use cambra::pretty_graph::pretty_operator;
+use log::debug;
+use rstest_log::rstest;
 use rustpython_parser::{ast as pyast, parser};
 
 // ---------------------------------------------------------------------------
@@ -106,12 +109,18 @@ fn run_pipeline(code: &str) -> ColumnValue {
         lower_expr(&ast_expr).expect("ccl lowering failed")
     };
 
+    debug!("Lowered:\n{}", symbolic(&expr));
+
     let mut env = TypeInferenceContext::new();
     infer(&mut expr, &mut env).expect("type inference failed");
 
-    let mut ctx = CompileContext::new();
+    debug!("Inferred:\n{}", symbolic(&expr));
+
     let mut scheduler = Scheduler::new();
-    let mut op = compile(&expr, &mut ctx, &mut scheduler).expect("compile failed");
+    let mut op =
+        compile(&expr, &mut CompileContext::new(), &mut scheduler).expect("compile failed");
+
+    debug!("Operators:\n{}", pretty_operator(op.as_ref()));
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -395,7 +404,7 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: ColumnValu
     ColumnValue::Ints(vec![3, 3, 3, 3])
 )]
 #[case(
-    "[x for x in [y for y in ['a', 'b', 'c'] if y != 'b'] if x < 'b']",
+    "[x for x in [y for y in ['a', 'b', 'c', 'd'] if y != 'b'] if x < 'c']",
     ColumnValue::strings(&["a"])
 )]
 #[case(
@@ -426,12 +435,14 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: ColumnValu
     ColumnValue::strings(&["abdf", "abef", "acdf", "acef"])
 )]
 fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
-    let result = run_direct(code);
-    match result {
-        ColumnValue::FunctionBindings { outputs, .. } => {
-            assert_eq!(*outputs, expected);
+    let results = &[run_direct(code), run_pipeline(code)];
+    for result in results.iter() {
+        match result {
+            ColumnValue::FunctionBindings { outputs, .. } => {
+                assert_eq!(**outputs, expected);
+            }
+            other => panic!("expected FunctionBindings, got: {other:?}"),
         }
-        other => panic!("expected FunctionBindings, got: {other:?}"),
     }
 }
 
@@ -500,10 +511,13 @@ fn test_test_source(#[case] code: &str) {
 
 /// Test a join between two data sources, including incremental data addition
 /// and region release.
-#[test_log::test]
-fn test_inner_join() {
+#[rstest]
+#[case("[(x._0, x._1, y._1) for x in testsource1() for y in testsource2() if x._0 == y._0]")]
+#[case(
+    "[(x._0, x._1, y._1) for x in testsource1() for y in testsource2() if x._0 == y._0 and True]"
+)]
+fn test_inner_join(#[case] code: &str) {
     let mut ctx = LoweringContext::default();
-    let code = "[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] == y[0]]";
     let record_extent = Extent::record(HashMap::from([
         (String::from("_0"), Extent::Base(BaseType::Int)),
         (String::from("_1"), Extent::Base(BaseType::String)),

@@ -12,7 +12,7 @@
 //! The formatting is intentionally kept human-readable and stable so that tests
 //! can pin expected tree strings directly.
 
-use crate::ccl::{Expr, Lit, UnaryOpKind};
+use crate::ccl::{Expr, Lit, RefinementKind, UnaryOpKind};
 use crate::pretty_tree::{render, InspectNode};
 
 // ---------------------------------------------------------------------------
@@ -49,10 +49,25 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             param,
             param_ty,
             body,
+            refinement,
         } => {
             let mut node = InspectNode::new(format!("Lambda({param})"));
             if let Some(ty) = param_ty {
                 node = node.annotate(format!(": {ty}"));
+            }
+            if let Some(r) = refinement {
+                node = match &r.kind {
+                    RefinementKind::Predicate(def) => {
+                        node.child("refinement", expr_to_node(&def.borrow()))
+                    }
+                    RefinementKind::HashJoin(spec) => node.child(
+                        "refinement",
+                        InspectNode::leaf(format!(
+                            "HashJoin({} == {})",
+                            spec.build_var_name, spec.probe_var_name
+                        )),
+                    ),
+                };
             }
             node.child("body", expr_to_node(body))
         }
@@ -203,10 +218,7 @@ UnaryOp(not)
     )]
     // Apply
     #[case(
-        Expr::Apply {
-            function: Box::new(Expr::Var("f".to_string())),
-            argument: Box::new(Expr::Var("x".to_string())),
-        },
+        Expr::apply(Expr::Var("x".to_string()), Expr::Var("f".to_string())),
         "\
 Apply
 ├── func: Var(f)
@@ -215,22 +227,14 @@ Apply
     )]
     // Lambda (unannotated and annotated)
     #[case(
-        Expr::Lambda {
-            param: "x".to_string(),
-            param_ty: None,
-            body: Box::new(Expr::Var("x".to_string())),
-        },
+        Expr::lambda("x", None, Expr::Var("x".to_string())),
         "\
 Lambda(x)
 └── body: Var(x)
 "
     )]
     #[case(
-        Expr::Lambda {
-            param: "x".to_string(),
-            param_ty: Some(Type::Base(BaseType::Int)),
-            body: Box::new(Expr::Var("x".to_string())),
-        },
+        Expr::lambda("x", Some(Type::Base(BaseType::Int)), Expr::Var("x".to_string())),
         "\
 Lambda(x) : Int
 └── body: Var(x)
@@ -336,7 +340,51 @@ Jump(k)
 └── arg_1: Lit(2)
 "
     )]
+    // Lambda with predicate refinement
+    #[case(
+        Expr::lambda_with_refinement(
+            "x",
+            Some(Type::Base(BaseType::Int)),
+            Expr::Var("x".to_string()),
+            Expr::Lit(Lit::Bool(true)),
+            "test pred",
+        ),
+        "\
+Lambda(x) : Int
+├── refinement: Lit(true)
+└── body: Var(x)
+"
+    )]
     fn test_pretty_expr(#[case] expr: Expr, #[case] expected: &str) {
+        assert_eq!(pretty(&expr), expected);
+    }
+
+    #[test]
+    fn test_pretty_lambda_hash_join_refinement() {
+        use crate::ccl::{HashJoinSpec, Lit};
+        use std::rc::Rc;
+        let spec = HashJoinSpec {
+            build_gen_position: 0,
+            probe_gen_position: 1,
+            build_var_name: "x".to_string(),
+            probe_var_name: "y".to_string(),
+            build_key: Rc::new(Expr::Var("x".to_string())),
+            probe_key: Rc::new(Expr::Var("y".to_string())),
+            build_source: Rc::new(Expr::Lit(Lit::Int(0))),
+            probe_source: Rc::new(Expr::Lit(Lit::Int(0))),
+        };
+        let expr = Expr::lambda_with_hash_join(
+            "p",
+            Some(Type::Base(BaseType::Int)),
+            Expr::Lit(Lit::Unit),
+            spec,
+            "x == y",
+        );
+        let expected = "\
+Lambda(p) : Int
+├── refinement: HashJoin(x == y)
+└── body: Lit(unit)
+";
         assert_eq!(pretty(&expr), expected);
     }
 
@@ -351,10 +399,10 @@ Jump(k)
         let expr = Expr::Let {
             name: "x".to_string(),
             bound_ty: None,
-            bound_expr: Box::new(Expr::Apply {
-                function: Box::new(Expr::Var("f".to_string())),
-                argument: Box::new(Expr::Lit(Lit::Int(1))),
-            }),
+            bound_expr: Box::new(Expr::apply(
+                Expr::Lit(Lit::Int(1)),
+                Expr::Var("f".to_string()),
+            )),
             body: Box::new(Expr::BinOp {
                 left: Box::new(Expr::Var("x".to_string())),
                 op: BinOpKind::Arithmetic(ArithmeticKind::Add),

@@ -47,6 +47,9 @@ pub struct ScopeStack<V> {
 /// This struct is created by the [`enter_scope`](ScopeStack::enter_scope) method
 /// on [`ScopeStack`]. See its documentation for usage examples.
 ///
+/// `&mut ScopeGuard<'_, V>` deref-coerces to `&mut ScopeStack<V>`, so a guard can
+/// be passed wherever a mutable reference to the underlying stack is expected.
+///
 /// # Warning
 ///
 /// Must be bound to a variable; if dropped immediately (e.g. used as a
@@ -75,14 +78,7 @@ impl<'a, V> Drop for ScopeGuard<'a, V> {
         // Invariant: `enter_scope` always pushes before handing out this guard,
         // and `scopes` is private, so underflow is impossible in correct code.
         // Avoid double-panic during unwinding for the same reason as `ScopeStack::drop`.
-        if !std::thread::panicking() {
-            self.stack
-                .scopes
-                .pop()
-                .expect("ScopeStack: scope underflow in ScopeGuard::drop");
-        } else {
-            self.stack.scopes.pop();
-        }
+        self.stack.pop_scope();
     }
 }
 
@@ -95,10 +91,34 @@ impl<V> ScopeStack<V> {
     /// Enter a fresh scope, returning a guard that pops it on drop.
     ///
     /// The scope is pushed immediately and popped when the returned [`ScopeGuard`]
-    /// goes out of scope.
+    /// goes out of scope. `&mut guard` deref-coerces to `&mut ScopeStack<V>`, so
+    /// the guard can be passed directly to functions expecting `&mut ScopeStack<V>`.
     pub fn enter_scope(&mut self) -> ScopeGuard<'_, V> {
-        self.scopes.push(HashMap::new());
+        self.push_scope();
         ScopeGuard { stack: self }
+    }
+
+    /// Push a fresh scope without returning a guard.
+    ///
+    /// Prefer [`enter_scope`](Self::enter_scope) when possible; this is a lower-level
+    /// escape hatch for wrapper types (e.g. [`CompileContext`](crate::interpreter::compile_ccl::CompileContext))
+    /// that need to manage scopes on a field while the wrapper itself is borrowed.
+    pub(crate) fn push_scope(&mut self) {
+        self.scopes.push(HashMap::new());
+    }
+
+    /// Pop the innermost scope.
+    ///
+    /// Panics on underflow (unless already panicking).  Prefer the drop of a
+    /// [`ScopeGuard`] over calling this directly.
+    pub(crate) fn pop_scope(&mut self) {
+        if !std::thread::panicking() {
+            self.scopes
+                .pop()
+                .expect("ScopeStack: scope underflow in pop_scope");
+        } else {
+            self.scopes.pop();
+        }
     }
 
     /// Bind `name` to `value` in the innermost scope.

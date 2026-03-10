@@ -366,6 +366,7 @@ impl Extent {
 }
 
 /// Holds the restriction operator and its cached producer for a [`Extent::Restricted`] extent.
+#[derive(Debug)]
 pub struct Restriction {
     compute_op: Option<ComputeRestriction>,
     compute_producer: Option<Box<dyn Producer>>,

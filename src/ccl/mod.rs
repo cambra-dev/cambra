@@ -11,7 +11,21 @@ pub mod lower;
 pub mod pretty;
 pub mod symbolic;
 
-use std::fmt;
+use std::{
+    cell::RefCell,
+    fmt,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+/// Global counter for assigning unique IDs to [`Refinement`] instances.
+static REFINEMENT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub type RefinementId = u64;
+
+fn next_refinement_id() -> RefinementId {
+    REFINEMENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 // TODO: `BaseType` belongs here (or in a shared module), not in the interpreter.
 // Move it to `ccl` and have the interpreter import from `ccl`; this removes the
@@ -204,6 +218,11 @@ pub enum Expr {
         param_ty: Option<Type>,
         /// The lambda body.
         body: Box<Expr>,
+        /// Refinement on the param type computed by this lambda.
+        /// This is a separate field from param_ty because it can be set before the
+        /// type is known, and the presence of this field indicates that the refinement
+        /// should be interpreted in the scope of this lambda.
+        refinement: Option<Refinement>,
     },
 
     /// A let binding: `let name [: ty] = value in body`.
@@ -302,6 +321,63 @@ pub enum Expr {
     Record(Vec<(String, Expr)>),
 }
 
+impl Expr {
+    pub fn apply(argument: Expr, function: Expr) -> Self {
+        Expr::Apply {
+            argument: Box::new(argument),
+            function: Box::new(function),
+        }
+    }
+
+    pub fn lambda(param: &str, param_ty: Option<Type>, body: Expr) -> Self {
+        Expr::Lambda {
+            param: param.to_string(),
+            param_ty,
+            body: Box::new(body),
+            refinement: None,
+        }
+    }
+
+    pub fn lambda_with_refinement(
+        param: &str,
+        param_ty: Option<Type>,
+        body: Expr,
+        refinement: Expr,
+        refinement_desc: &str,
+    ) -> Self {
+        Expr::Lambda {
+            param: param.to_string(),
+            param_ty,
+            body: Box::new(body),
+            refinement: Some(Refinement {
+                id: next_refinement_id(),
+                description: refinement_desc.to_string(),
+                kind: RefinementKind::Predicate(Rc::new(RefCell::new(refinement))),
+            }),
+        }
+    }
+
+    /// Build a [`Expr::Lambda`] with a hash-join [`Refinement`].
+    pub fn lambda_with_hash_join(
+        param: &str,
+        param_ty: Option<Type>,
+        body: Expr,
+        spec: HashJoinSpec,
+        desc: &str,
+    ) -> Self {
+        Expr::Lambda {
+            param: param.to_string(),
+            param_ty,
+            body: Box::new(body),
+            refinement: Some(Refinement {
+                id: next_refinement_id(),
+                description: desc.to_string(),
+                kind: RefinementKind::HashJoin(Box::new(spec)),
+            }),
+        }
+    }
+}
+
 /// A pattern in a [`Expr::Case`] branch.
 ///
 /// Patterns are tested against the scrutinee. The first branch whose pattern
@@ -327,7 +403,7 @@ pub enum Pattern {
 /// type inference. [`Type::Unknown`] is the placeholder used before
 /// type-checking; it has no runtime equivalent and must be fully resolved
 /// before operator-graph compilation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     /// A primitive base type.
     Base(BaseType),
@@ -345,6 +421,8 @@ pub enum Type {
     Record(Vec<(String, Type)>),
     /// A sum type.
     Union(Vec<Type>),
+    /// A refinement of another type
+    Refinement(Box<Type>, Refinement),
     /// Pre-type-checking placeholder; filled in by the type checker.
     Unknown,
     // Planned:
@@ -380,7 +458,75 @@ impl fmt::Display for Type {
                 let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
                 write!(f, "{}", parts.join(" | "))
             }
+            Type::Refinement(t, r) => write!(f, "{{{t} | Refined({})}}", r.description),
             Type::Unknown => write!(f, "_"),
         }
+    }
+}
+
+/// Represents a type refinement carried by a [`Expr::Lambda`] parameter.
+#[derive(Debug, Clone)]
+pub struct Refinement {
+    /// Unique ID assigned at construction time.
+    ///
+    /// Used by [`crate::interpreter::compile_ccl::CompileContext`] as a cache key
+    /// so that the same restriction [`crate::interpreter::Extent`] is shared across
+    /// all uses of the same refinement.
+    pub id: RefinementId,
+    /// Human-readable description of the predicate or join condition.
+    pub description: String,
+    /// Whether this refinement is a loop-join predicate or a hash join.
+    pub kind: RefinementKind,
+}
+
+impl PartialEq for Refinement {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Refinement {}
+
+/// Distinguishes loop-join (predicate) refinements from hash-join refinements and carries join strategy metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RefinementKind {
+    /// Arbitrary boolean predicate; compiled as an element-wise loop join.
+    Predicate(Rc<RefCell<Expr>>),
+    /// Equality join between two generator key expressions; compiled as a hash join.
+    HashJoin(Box<HashJoinSpec>),
+}
+
+/// All data needed by [`crate::interpreter::compile_ccl`] to build a hash-join
+/// [`crate::interpreter::ComputeRestriction`].
+#[derive(Debug, Clone)]
+pub struct HashJoinSpec {
+    /// Position of the generator for the build side in the original list comp (always the earlier generator for now).
+    pub build_gen_position: usize,
+    /// Position of the generator for the build side in the original list com
+    pub probe_gen_position: usize,
+    /// Name of the build-side iterator variable (e.g. `"x"`).
+    pub build_var_name: String,
+    /// Name of the probe-side iterator variable (e.g. `"y"`).
+    pub probe_var_name: String,
+    /// CCL expression for the build-side join key; references `build_var_name` as a free variable.
+    pub build_key: Rc<Expr>,
+    /// CCL expression for the probe-side join key; references `probe_var_name` as a free variable.
+    pub probe_key: Rc<Expr>,
+    /// CCL expression for the build-side source list (no free generator variables).
+    pub build_source: Rc<Expr>,
+    /// CCL expression for the probe-side source list (no free generator variables).
+    pub probe_source: Rc<Expr>,
+}
+
+impl PartialEq for HashJoinSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.build_gen_position == other.build_gen_position
+            && self.probe_gen_position == other.probe_gen_position
+            && self.build_var_name == other.build_var_name
+            && self.probe_var_name == other.probe_var_name
+            && Rc::ptr_eq(&self.build_key, &other.build_key)
+            && Rc::ptr_eq(&self.probe_key, &other.probe_key)
+            && Rc::ptr_eq(&self.build_source, &other.build_source)
+            && Rc::ptr_eq(&self.probe_source, &other.probe_source)
     }
 }
