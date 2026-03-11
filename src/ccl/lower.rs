@@ -20,6 +20,7 @@
 //! | 2-gen equality-join comprehensions (`if x.k == y.k`) | hash-join [`crate::ccl::RefinementKind::HashJoin`] |
 //! | Multi-gen filtered comprehensions (non-equality or 3+ generators) | loop-join [`crate::ccl::RefinementKind::Predicate`] |
 //! | Assignment + expression blocks | nested [`Expr::Let`] |
+//! | `sum(expr)` / `max(expr)` calls | [`Expr::Aggregate`] |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
 //!
@@ -41,7 +42,9 @@ use std::rc::Rc;
 use bit_set::BitSet;
 use rustpython_parser::ast as pyast;
 
-use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Expr, HashJoinSpec, Lit, LogicKind};
+use crate::ccl::{
+    AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, HashJoinSpec, Lit, LogicKind,
+};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -75,6 +78,11 @@ pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, Loweri
             Ok(Expr::List(items?))
         }
         pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(elt, generators),
+        pyast::ExprKind::Call {
+            func,
+            args,
+            keywords,
+        } => lower_call(func, args, keywords),
         pyast::ExprKind::Tuple { elts, .. } => {
             let items: Result<Vec<_>, _> = elts.iter().map(lower_expr).collect();
             Ok(Expr::Tuple(items?))
@@ -176,6 +184,48 @@ fn lower_constant(constant: &pyast::Constant) -> Result<Expr, LoweringError> {
         }
     };
     Ok(Expr::Lit(lit))
+}
+
+/// Lower a Python function call to an [`Expr::Aggregate`].
+///
+/// Only the built-in aggregation functions `sum` and `max` are supported,
+/// each taking exactly one positional argument and no keyword arguments.
+fn lower_call(
+    func: &pyast::Expr,
+    args: &[pyast::Expr],
+    keywords: &[pyast::Keyword],
+) -> Result<Expr, LoweringError> {
+    if !keywords.is_empty() {
+        return Err(LoweringError::Unsupported(
+            "Keyword arguments not supported in function calls".into(),
+        ));
+    }
+    if args.len() != 1 {
+        return Err(LoweringError::Unsupported(
+            "Aggregate functions require exactly one argument".into(),
+        ));
+    }
+    let kind = match &func.node {
+        pyast::ExprKind::Name { id, .. } => match id.as_str() {
+            "sum" => AggregateKind::Sum,
+            "max" => AggregateKind::Max,
+            _ => {
+                return Err(LoweringError::Unsupported(format!(
+                    "Unknown function: {id}"
+                )))
+            }
+        },
+        _ => {
+            return Err(LoweringError::Unsupported(
+                "Only named function calls are supported".into(),
+            ))
+        }
+    };
+    let input = lower_expr(&args[0])?;
+    Ok(Expr::Aggregate {
+        input: Box::new(input),
+        kind,
+    })
 }
 
 fn lower_binop(
@@ -841,6 +891,46 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
         assert!(
             sym.contains("Refined(x == y)"),
             "expected 'Refined(x == y)' in symbolic output, got: {sym}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Aggregate expression tests
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    // sum over a list literal
+    #[case("sum([1, 2, 3])", "Sum([1, 2, 3])")]
+    // max over a list literal
+    #[case("max([1, 2])", "Max([1, 2])")]
+    // sum over a variable (the input expression is itself a CCL expression)
+    #[case("sum(xs)", "Sum(xs)")]
+    // max over a variable
+    #[case("max(xs)", "Max(xs)")]
+    // sum over a list comprehension — input becomes a lambda
+    #[case(
+        "sum([x for x in [10, 20]])",
+        "Sum(λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x))"
+    )]
+    // max over a list comprehension with a body expression
+    #[case(
+        "max([x + 1 for x in [10, 20]])",
+        "Max(λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + 1))"
+    )]
+    fn test_lower_aggregate(#[case] code: &str, #[case] expected: &str) {
+        let expr = parse_expr(code);
+        let ccl = lower_expr(&expr).expect("lowering failed");
+        assert_eq!(symbolic(&ccl), expected);
+    }
+
+    /// Unsupported call targets produce a `LoweringError::Unsupported`.
+    #[test]
+    fn test_lower_unknown_function() {
+        let expr = parse_expr("foo(x)");
+        let err = lower_expr(&expr).expect_err("expected lowering error");
+        assert!(
+            matches!(err, LoweringError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
         );
     }
 

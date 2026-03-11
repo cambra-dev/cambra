@@ -70,7 +70,16 @@ The same distinction applies in CCL:
 |----------|-----------------|---------------|
 | Standalone `Lambda` (not inside `Apply`) | `subscribe()` (if execution is forced)| `VarSource::Iteration` |
 | `Apply(lambda, collection)` | `subscribe_to_application(collection)` | `VarSource::Argument` |
-| `Apply(Var("sum"), xs)` | resolved to built-in aggregate | aggregate operator |
+| `Aggregate { input: xs, kind: Sum }` | `compile_aggregate` | aggregate operator |
+
+### `Aggregate` — first-class aggregation node
+
+Python aggregate calls (`sum(xs)`, `max(xs)`) are lowered directly to `Expr::Aggregate` rather than kept as `Apply(Var("sum"), xs)`. This makes aggregate operations structurally distinct from ordinary function calls, which simplifies:
+
+- Type inference: `infer` can derive the output type from `AggregateKind::output_type(input_element_type)` without needing built-in name resolution.
+- Compilation: the compiler dispatches on `Expr::Aggregate` and emits the appropriate aggregate operator without scanning call-site variable names.
+
+`AggregateKind` enumerates the supported operations; each variant carries its own typing rule in `output_type`.
 
 ### `Case` only — no `IfThenElse`
 
@@ -124,6 +133,11 @@ enum UnaryOpKind {
     Not,  // boolean not
 }
 
+enum AggregateKind {
+    Sum,  // sum of elements (Int input → Int output)
+    Max,  // maximum element (any base type input → same base type output)
+}
+
 // --- CCL AST ---
 
 enum Expr {
@@ -155,6 +169,10 @@ enum Expr {
         body: Box<Expr>,
     },
     List(Vec<Expr>),                     // list literal [e0, e1, ...]; elements may be arbitrary exprs of the same type
+    Aggregate {
+        input: Box<Expr>,                // expression being aggregated (must be of type Fun)
+        kind: AggregateKind,             // the aggregation operation (Sum, Max, …)
+    },
     Case {
         scrutinee: Box<Expr>,
         branches: Vec<(Pattern, Expr)>,
@@ -171,6 +189,7 @@ enum Expr {
     },
     // Construction — lowering stubbed, deferred
     Tuple(Vec<Expr>),
+    TupleIndex(Box<Expr>, usize),        // integer-index access into a tuple: t[n]
     Record(Vec<(String, Expr)>),
 }
 
@@ -312,5 +331,7 @@ fills this in from the type of `bound_expr`.
    - `interpreter/let_op.rs`: dedicated `Let` operator and `LetProducer` replacing the Let-as-Apply-Lambda desugaring. ✓
    - `ccl/mod.rs` + `ccl/lower.rs` + `interpreter/compile_ccl.rs`: hash join detection and compilation
      (`RefinementKind::HashJoin`, `HashJoinSpec`, `compile_hash_join_restriction`). ✓
+   - `ccl/mod.rs` + `ccl/lower.rs` + `ccl/infer.rs`: first-class `Aggregate` node (`AggregateKind`,
+     `Expr::Aggregate`); lowering from `sum`/`max` call sites; type inference via `AggregateKind::output_type`. ✓
    - `lowering_via_ccl.rs`: sandboxed end-to-end pipeline tests.
    - `lowering.rs` direct path removed after parity confirmed.

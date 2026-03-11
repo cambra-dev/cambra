@@ -160,6 +160,19 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
             Ok(Type::Fun(Box::new(p), Box::new(body_ty)))
         }
 
+        Expr::Aggregate { input, kind } => {
+            let input_type = infer(input, ctx)?;
+            let input_codomain = input_type
+                .codomain()
+                .ok_or_else(|| InferError::TypeMismatch {
+                    expected: Type::Fun(Box::new(Type::Unknown), Box::new(Type::Unknown)),
+                    found: input_type,
+                })?;
+            kind.output_type(&input_codomain).ok_or_else(|| {
+                InferError::Unsupported(format!("Cannot apply {kind:?} to {input_codomain}"))
+            })
+        }
+
         // ----- Function application -----
         //
         // Two cases:
@@ -518,7 +531,9 @@ fn reconcile_constraints(constraints: Vec<TypeConstraint>) -> Result<Option<Type
 mod tests {
     use super::*;
     use crate::ccl::symbolic::symbolic;
-    use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Expr, Lit, LogicKind, Type};
+    use crate::ccl::{
+        AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, Lit, LogicKind, Type,
+    };
     use crate::interpreter::BaseType;
 
     // -----------------------------------------------------------------------
@@ -1018,6 +1033,120 @@ mod tests {
         );
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(result, Err(InferError::UnboundVariable("x".into())));
+    }
+
+    // -----------------------------------------------------------------------
+    // Aggregate type inference tests
+    // -----------------------------------------------------------------------
+
+    /// `Sum` over a list of ints: `sum([1, 2, 3])` → `Int`.
+    ///
+    /// The input list infers as `Fun(UIntRange(3), Int)`; the codomain is `Int`;
+    /// `Sum.output_type(Int)` → `Int`.
+    #[test]
+    fn test_infer_aggregate_sum_int_list() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::Aggregate {
+            input: Box::new(Expr::List(vec![
+                Expr::Lit(Lit::Int(1)),
+                Expr::Lit(Lit::Int(2)),
+                Expr::Lit(Lit::Int(3)),
+            ])),
+            kind: AggregateKind::Sum,
+        };
+        assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
+    }
+
+    /// `Max` over a list of ints: `max([10, 20])` → `Int`.
+    ///
+    /// `Max.output_type` accepts any base type, returning it unchanged.
+    #[test]
+    fn test_infer_aggregate_max_int_list() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::Aggregate {
+            input: Box::new(Expr::List(vec![
+                Expr::Lit(Lit::Int(10)),
+                Expr::Lit(Lit::Int(20)),
+            ])),
+            kind: AggregateKind::Max,
+        };
+        assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
+    }
+
+    /// `Max` over a list of strings: `max(["a", "b"])` → `String`.
+    ///
+    /// `Max` is defined for any base type; codomain of the list is `String`.
+    #[test]
+    fn test_infer_aggregate_max_string_list() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::Aggregate {
+            input: Box::new(Expr::List(vec![
+                Expr::Lit(Lit::String("a".into())),
+                Expr::Lit(Lit::String("b".into())),
+            ])),
+            kind: AggregateKind::Max,
+        };
+        assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::String)));
+    }
+
+    /// `Sum` over a list of strings → `Unsupported`.
+    ///
+    /// `Sum.output_type(String)` returns `None`; the aggregate arm converts
+    /// that to `InferError::Unsupported`.
+    #[test]
+    fn test_infer_aggregate_sum_string_unsupported() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::Aggregate {
+            input: Box::new(Expr::List(vec![
+                Expr::Lit(Lit::String("x".into())),
+                Expr::Lit(Lit::String("y".into())),
+            ])),
+            kind: AggregateKind::Sum,
+        };
+        assert!(
+            matches!(infer(&mut expr, &mut ctx), Err(InferError::Unsupported(_))),
+            "Sum over String should be Unsupported"
+        );
+    }
+
+    /// `Sum` with a non-function input → `TypeMismatch`.
+    ///
+    /// The input infers as `Int` (a bare literal), which has no codomain.
+    /// The aggregate arm expects a `Fun(_, _)`.
+    #[test]
+    fn test_infer_aggregate_non_function_input_mismatch() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::Aggregate {
+            input: Box::new(Expr::Lit(Lit::Int(42))),
+            kind: AggregateKind::Sum,
+        };
+        assert!(
+            matches!(
+                infer(&mut expr, &mut ctx),
+                Err(InferError::TypeMismatch { .. })
+            ),
+            "Aggregate with non-function input should be TypeMismatch"
+        );
+    }
+
+    /// `Sum` wrapping a list-comprehension lambda: `sum([x for x in [1, 2]])`.
+    ///
+    /// The unannotated lambda is fully annotated by inference; its type is
+    /// `Fun(UIntRange(2), Int)` and the aggregate returns `Int`.
+    #[test]
+    fn test_infer_aggregate_sum_over_list_comp() {
+        let mut ctx = TypeInferenceContext::new();
+        // The list-comp CCL: λ __list_comp_var → __list_comp_var ▷ [1, 2] ▷ (λ x → x)
+        let comp = list_comp_unannotated(
+            Expr::List(vec![Expr::Lit(Lit::Int(1)), Expr::Lit(Lit::Int(2))]),
+            "x",
+            Expr::Var("x".into()),
+        );
+        let mut expr = Expr::Aggregate {
+            input: Box::new(comp),
+            kind: AggregateKind::Sum,
+        };
+        assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
     }
 
     // -----------------------------------------------------------------------

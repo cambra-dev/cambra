@@ -155,6 +155,11 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             (Precedence::Lowest, format!("{header} → {body_str}"))
         }
 
+        Expr::Aggregate { input, kind } => {
+            let input_str = fmt(input, Precedence::Lowest);
+            (Precedence::Lowest, format!("{kind:?}({input_str})"))
+        }
+
         Expr::Let {
             name,
             bound_ty: ty,
@@ -324,7 +329,8 @@ fn binop_prec(op: &BinOpKind) -> Precedence {
 mod tests {
     use super::symbolic;
     use crate::ccl::{
-        ArithmeticKind, BinOpKind, Expr, HashJoinSpec, Lit, LogicKind, Pattern, Type, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BinOpKind, Expr, HashJoinSpec, Lit, LogicKind, Pattern,
+        Type, UnaryOpKind,
     };
     use crate::interpreter::BaseType;
     use rstest::rstest;
@@ -575,6 +581,11 @@ in x"
             "x > 0",
         ),
         "λ x : {Int | Refined(x > 0)} → x"
+    )]
+    // Aggregate
+    #[case(
+        Expr::Aggregate { input: Box::new(Expr::Var("xs".to_string())), kind: AggregateKind::Max },
+        "Max(xs)"
     )]
     // Join + Jump
     #[case(

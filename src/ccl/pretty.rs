@@ -72,6 +72,10 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             node.child("body", expr_to_node(body))
         }
 
+        Expr::Aggregate { input, kind } => {
+            InspectNode::new(format!("Aggregate({kind:?})")).child("input", expr_to_node(input))
+        }
+
         Expr::Let {
             name,
             bound_ty: ty,
@@ -176,7 +180,9 @@ fn unaryop_symbol(op: &UnaryOpKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::pretty;
-    use crate::ccl::{ArithmeticKind, BinOpKind, Expr, Lit, Pattern, Type, UnaryOpKind};
+    use crate::ccl::{
+        AggregateKind, ArithmeticKind, BinOpKind, Expr, Lit, Pattern, Type, UnaryOpKind,
+    };
     use crate::interpreter::BaseType;
     use rstest::rstest;
 
@@ -338,6 +344,17 @@ Join(k)
 Jump(k)
 ├── arg_0: Lit(1)
 └── arg_1: Lit(2)
+"
+    )]
+    // Aggregate
+    #[case(
+        Expr::Aggregate {
+            input: Box::new(Expr::Var("xs".to_string())),
+            kind: AggregateKind::Sum,
+        },
+        "\
+Aggregate(Sum)
+└── input: Var(xs)
 "
     )]
     // Lambda with predicate refinement

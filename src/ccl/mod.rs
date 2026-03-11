@@ -33,6 +33,12 @@ fn next_refinement_id() -> RefinementId {
 // which has the same non-test import.
 use crate::interpreter::BaseType;
 
+/// Errors about types that can be used by any phase of compilation
+pub enum TypeError {
+    /// Generic type error
+    Unsupported(String),
+}
+
 /// A literal constant value.
 ///
 /// Covers the subset of [`crate::interpreter::Value`] that can appear as
@@ -150,6 +156,25 @@ pub enum UnaryOpKind {
     Not,
 }
 
+/// Types of aggregations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateKind {
+    Sum,
+    Max,
+}
+
+impl AggregateKind {
+    /// Returns the output type of this aggregation given a specific input type.
+    /// If `input_type` is not a valid input type for this aggregation, returns None.
+    pub fn output_type(&self, input_type: &Type) -> Option<Type> {
+        match (self, input_type) {
+            (AggregateKind::Sum, Type::Base(BaseType::Int)) => Some(Type::Base(BaseType::Int)),
+            (AggregateKind::Max, Type::Base(b)) => Some(Type::Base(b.clone())),
+            _ => None,
+        }
+    }
+}
+
 /// A CCL expression.
 ///
 /// The central type of the CCL AST. Every program is an `Expr`.
@@ -223,6 +248,16 @@ pub enum Expr {
         /// type is known, and the presence of this field indicates that the refinement
         /// should be interpreted in the scope of this lambda.
         refinement: Option<Refinement>,
+    },
+
+    /// An aggregation over a function (including, and usually being, a collection)
+    /// Computes the aggregate over the codomain of the function, which in the case of
+    /// a collection is the elements of the collection.
+    Aggregate {
+        /// Expression being aggregated over.  Must be of type `Fun`
+        input: Box<Expr>,
+        /// The type of aggregation to do (e.g. sum, max)
+        kind: AggregateKind,
     },
 
     /// A let binding: `let name [: ty] = value in body`.
@@ -460,6 +495,17 @@ impl fmt::Display for Type {
             }
             Type::Refinement(t, r) => write!(f, "{{{t} | Refined({})}}", r.description),
             Type::Unknown => write!(f, "_"),
+        }
+    }
+}
+
+impl Type {
+    /// If this is a function type, return the codomain type, otherwise None
+    pub fn codomain(&self) -> Option<Type> {
+        if let Type::Fun(_, codomain) = &self {
+            Some(codomain.as_ref().clone())
+        } else {
+            None
         }
     }
 }
