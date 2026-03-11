@@ -1,0 +1,207 @@
+// Render: dot -Tsvg example.dot -o example.svg
+digraph AST {
+    ordering = out;
+    rankdir = TB;
+    nodesep = 0.5;
+    ranksep = 0.5;
+    bgcolor = "#1e1e2e";
+    node [fontname = "Arial"; fontsize = 10; style = filled; fillcolor = "#313244"; fontcolor = "#cdd6f4"; color = "#585b70";];
+    edge [fontname = "Arial"; fontsize = 9; color = "#6c7086"; fontcolor = "#9399b2";];
+
+    // ── External inputs (ellipse shape) ──────────────────
+    node [shape = ellipse; fillcolor = "#181825"; color = "#45475a";];
+    ext_key [label = <key: I ⇒ Key<br/><font face="Courier New">I ⇀ Key</font>>; fillcolor = "#3d1c00"; color = "#e8913a"; fontcolor = "#fab387";];
+    ext_val [label = <val: I ⇒ V<br/><font face="Courier New">I ⇀ V</font>>; fillcolor = "#3d1c00"; color = "#e8913a"; fontcolor = "#fab387";];
+    ext_cnt [label = <cnt: Key ⇒ Nat<br/><font face="Courier New">Key ⇀ Nat</font>>; fillcolor = "#3d1c00"; color = "#e8913a"; fontcolor = "#fab387";];
+    ext_sum [label = <sum: (I ⇒ V) ⇒ V>; shape = box; style = filled; fillcolor = "#313244"; color = "#585b70"; fontcolor = "#cdd6f4";];
+
+    // ── Top-level ────────────────────────────────────────
+    node [shape = box; fillcolor = "#313244"; style = filled; color = "#585b70";];
+    stdout_node [label = <stdout<br/><font face="Courier New">output</font>>;];
+    let_node [label = "let stats, small_avgs";];
+
+    // ── stats assign ────────────────────────────────────
+    stats_eq [label = "=";];
+    node [shape = box; style = filled; fillcolor = "#313244"; color = "#585b70";];
+    memo [label = <memo<br/><font face="Courier New">Key ⇒ V<br/>Key ⇀ (Count×Sum)</font>>;];
+    node [shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0";];
+    stats_var [label = <stats<br/><font face="Courier New">Key ⇒ V<br/>Key ⇀ (Count×Sum)</font>>;];
+    node [shape = box; style = filled; fillcolor = "#313244"; color = "#585b70";];
+    stats_lam [label = <λ k : Key<br/><font face="Courier New">Key ⇒ V<br/>Key ⇀ (Count×Sum)</font>>;];
+    node [shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0";];
+    k_stats [label = <k: Key<br/><font face="Courier New">Scalar(Key)</font>>;];
+
+    // ── inner let and group assign ──────────────────────
+    node [shape = box; style = filled; fillcolor = "#313244"; color = "#585b70";];
+    inner_let [label = <let group in …<br/><font face="Courier New">V<br/>Count×Sum</font>>;];
+    group_eq [label = "=";];
+    group_lam [label = <λ i<br/><font face="Courier New">(I|i▸key==k) ⇒ V<br/>SparseFn(I, V)</font>>;];
+    node [shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0";];
+    group_var [label = <group<br/><font face="Courier New">(I|…) ⇒ V<br/>SparseFn(I, V)</font>>;];
+    i_var [label = <i: I<br/><font face="Courier New">Scalar(I)</font>>;];
+
+    // ── group lambda internals ───────────────────────────
+    node [shape = box; style = filled; fillcolor = "#313244"; color = "#585b70";];
+    eq [label = <==<br/><font face="Courier New">Bool<br/>Scalar(Bool)</font>>;];
+    app_i_key [label = <i▸key<br/><font face="Courier New">Key<br/>Scalar(Key)</font>>;];
+    node [shape = ellipse; fillcolor = "#181825"; color = "#45475a";];
+    app_i_key_i [label = <i: I<br/><font face="Courier New">Scalar(I)</font>>; shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0"; fontcolor = "#cdd6f4";];
+    eq_k [label = <k: K<br/><font face="Courier New">Scalar(V)</font>>; shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0"; fontcolor = "#cdd6f4";];
+    node [shape = box; fillcolor = "#313244"; style = filled; color = "#585b70";];
+    app_i_val [label = <i▸val<br/><font face="Courier New">V<br/>Scalar(V)</font>>;];
+    node [shape = ellipse; fillcolor = "#181825"; color = "#45475a";];
+    app_i_val_i [label = <i: I<br/><font face="Courier New">Scalar(I)</font>>; shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0"; fontcolor = "#cdd6f4";];
+    node [shape = box; fillcolor = "#313244"; style = filled; color = "#585b70";];
+    app_sum [label = <sum(group)<br/><font face="Courier New">V<br/>Count×Sum</font>>;];
+    node [shape = ellipse; fillcolor = "#181825"; color = "#45475a";];
+    app_sum_group [label = <group<br/><font face="Courier New">(I|…) ⇒ V<br/>SparseFn(I, V)</font>>; shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0"; fontcolor = "#cdd6f4";];
+
+    // ── small_avgs assign ───────────────────────────────
+    node [shape = box; fillcolor = "#313244"; style = filled; color = "#585b70";];
+    avgs_eq [label = "=";];
+    avgs_lam [label = <λ k<br/><font face="Courier New">(Key|…) ⇒ V<br/>SparseFn(Key, V)</font>>;];
+    node [shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0";];
+    avgs_var [label = <small_avgs<br/><font face="Courier New">(Key|…) ⇒ V<br/>SparseFn(Key, V)</font>>;];
+    k_avgs [label = <k: Key<br/><font face="Courier New">Scalar(Key)</font>>;];
+
+    // ── small_avgs lambda internals ──────────────────────
+    node [shape = box; style = filled; fillcolor = "#313244"; color = "#585b70";];
+    lt_100 [label = <&lt;<br/><font face="Courier New">Bool<br/>Scalar(Bool)</font>>;];
+    app_k_stats_ref [label = <k▸stats<br/><font face="Courier New">V<br/>Count×Sum</font>>;];
+    node [shape = ellipse; fillcolor = "#181825"; color = "#45475a";];
+    app_k_stats_k [label = <k: Key<br/><font face="Courier New">Scalar(Key)</font>>; shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0"; fontcolor = "#cdd6f4";];
+    app_k_stats_stats [label = <stats<br/><font face="Courier New">Key ⇒ V<br/>Key ⇀ (Count×Sum)</font>>; shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0"; fontcolor = "#cdd6f4";];
+    node [shape = box; fillcolor = "#313244"; style = filled; color = "#585b70";];
+    lit_100 [label = <100<br/><font face="Courier New">Nat<br/>Scalar(Nat)</font>>;];
+    div [label = </<br/><font face="Courier New">V<br/>Scalar(V)</font>>;];
+    app_k_stats_body [label = <k▸stats: V<br/><font face="Courier New">Count×Sum</font>>;];
+    app_k_cnt [label = <k▸cnt: Nat<br/><font face="Courier New">Scalar(Nat)</font>>;];
+    node [shape = ellipse; fillcolor = "#181825"; color = "#45475a";];
+    app_k_stats_body_k [label = <k: Key<br/><font face="Courier New">Count×Sum</font>>; shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0"; fontcolor = "#cdd6f4";];
+    app_k_stats_body_stats [label = <stats: Key ⇒ V<br/><font face="Courier New">Key ⇀ (Count×Sum)</font>>; shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0"; fontcolor = "#cdd6f4";];
+    app_k_cnt_k [label = <k: Key<br/><font face="Courier New">Scalar(Nat)</font>>; shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0"; fontcolor = "#cdd6f4";];
+
+    // ── outer let in-body (use-site reference to small_avgs) ──
+    node [shape = ellipse; fillcolor = "#181825"; color = "#45475a";];
+    let_in_result [label = <small_avgs<br/><font face="Courier New">(Key|…) ⇒ V<br/>SparseFn(Key, V)</font>>; shape = rect; style = "filled,rounded"; fillcolor = "#2a2040"; color = "#7c71b0"; fontcolor = "#cdd6f4";];
+
+    // ── AST edges (solid, no arrowheads) ─────────────────
+    edge [dir = none; color = "#6c7086"; fontcolor = "#9399b2";];
+    stdout_node -> let_node [label = "=";];
+    let_node -> stats_eq [label = "assign";];
+    let_node -> avgs_eq [label = "assign";];
+    let_node -> let_in_result [label = "in";];
+
+    // Definitions (left) and Variables (right)
+    stats_eq -> memo [label = "def";];
+    stats_eq -> stats_var [label = "var";];
+    memo -> stats_lam;
+    stats_lam -> k_stats [label = "param";];
+    stats_lam -> inner_let [label = "body";];
+
+    inner_let -> group_eq [label = "assign";];
+    inner_let -> app_sum [label = "in";];
+    group_eq -> group_lam [label = "def";];
+    group_eq -> group_var [label = "var";];
+
+    group_lam -> i_var [label = "param";];
+    i_var -> eq [label = "refinement";];
+    group_lam -> app_i_val [label = "body";];
+    eq -> app_i_key [label = "left";];
+    app_i_key -> app_i_key_i [label = "arg";];
+    app_i_key -> ext_key [label = "fn";];
+    eq -> eq_k [label = "right";];
+    app_i_val -> app_i_val_i [label = "arg";];
+    app_i_val -> ext_val [label = "fn";];
+    app_sum -> app_sum_group [label = "arg";];
+    app_sum -> ext_sum [label = "fn";];
+
+    avgs_eq -> avgs_lam [label = "def";];
+    avgs_eq -> avgs_var [label = "var";];
+    avgs_lam -> k_avgs [label = "param";];
+    k_avgs -> lt_100 [label = "refinement";];
+    avgs_lam -> div [label = "body";];
+    lt_100 -> app_k_stats_ref [label = "left";];
+    app_k_stats_ref -> app_k_stats_k [label = "arg";];
+    app_k_stats_ref -> app_k_stats_stats [label = "fn";];
+    lt_100 -> lit_100 [label = "right";];
+    div -> app_k_stats_body [label = "left";];
+    app_k_stats_body -> app_k_stats_body_k [label = "arg";];
+    app_k_stats_body -> app_k_stats_body_stats [label = "fn";];
+    div -> app_k_cnt [label = "right";];
+    app_k_cnt -> app_k_cnt_k [label = "arg";];
+    app_k_cnt -> ext_cnt [label = "fn";];
+
+    // ── Dataflow edges (dotted, non-constraining) ────────
+    edge [style = dashed; dir = fwd; constraint = false; color = "#89b4fa";];
+    edge [tailport = e; headport = nw;];
+
+    // stats_var references
+    stats_var -> app_k_stats_stats;
+    stats_var -> app_k_stats_body_stats;
+
+    // k_stats references
+    k_stats -> eq_k;
+
+    // group_var references
+    group_var -> app_sum_group;
+
+    // i_var references
+    i_var -> app_i_key_i;
+    i_var -> app_i_val_i;
+
+    // k_avgs references
+    k_avgs -> app_k_stats_k;
+    k_avgs -> app_k_stats_body_k;
+    k_avgs -> app_k_cnt_k;
+
+    // ── Application nodes: fn → arg ──────────────
+    edge [style = solid; constraint = false; color = "#89b4fa";];
+    edge [tailport = e; headport = w;];
+    // i▸key
+    app_i_key_i -> ext_key [headport = w;];
+    // i▸val
+    app_i_val_i -> ext_val [headport = w;];
+    // sum(group)
+    app_sum_group -> ext_sum;
+    // k▸stats (in refinement)
+    app_k_stats_k -> app_k_stats_stats;
+    // k▸stats (in body)
+    app_k_stats_body_k -> app_k_stats_body_stats;
+    // k▸cnt
+    app_k_cnt_k -> ext_cnt;
+    // ── Application nodes: arg → result ──────────────
+    edge [tailport = ne; headport = e;];
+    ext_key -> app_i_key;
+    ext_val -> app_i_val;
+    ext_sum -> app_sum;
+    app_k_stats_stats -> app_k_stats_ref;
+    app_k_stats_body_stats -> app_k_stats_body;
+    ext_cnt -> app_k_cnt;
+
+    // ── Assignment nodes: def → var ───────────────────────
+    edge [style = solid; tailport = e; headport = w;];
+    memo -> stats_var;
+    group_lam -> group_var;
+    avgs_lam -> avgs_var;
+
+    // ── Binary operators: children → operator ─────────────
+    edge [style = solid; tailport = ne; headport = se;];
+    // ==
+    app_i_key -> eq;
+    eq_k -> eq;
+    // <
+    app_k_stats_ref -> lt_100;
+    lit_100 -> lt_100;
+    // /
+    app_k_stats_body -> div;
+    app_k_cnt -> div;
+
+    // ── Let in-body: body result → let node ───────────────
+    edge [style = solid; tailport = ne; headport = se;];
+    // inner let: `let group = … in sum(group)`
+    app_sum -> inner_let;
+    // outer let: `let stats, small_avgs in small_avgs`
+    avgs_var -> let_in_result;
+    let_in_result -> let_node;
+}

@@ -1,0 +1,4 @@
+{
+    "graphviz-interactive-preview.codeCompletion.enable": false,
+    "graphviz-interactive-preview.debouncingInterval": 1000
+}
