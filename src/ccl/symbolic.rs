@@ -255,6 +255,15 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
                 format!("{target}({})", arg_strs.join(", ")),
             )
         }
+
+        Expr::GroupBy { collection, key } => {
+            let coll_str = fmt(collection, Precedence::Lowest);
+            let key_str = fmt(key, Precedence::Lowest);
+            (
+                Precedence::Lowest,
+                format!("GroupBy({coll_str}, {key_str})"),
+            )
+        }
     }
 }
 

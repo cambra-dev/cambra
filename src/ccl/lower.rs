@@ -21,6 +21,8 @@
 //! | Multi-gen filtered comprehensions (non-equality or 3+ generators) | loop-join [`crate::ccl::RefinementKind::Predicate`] |
 //! | Assignment + expression blocks | nested [`Expr::Let`] |
 //! | `sum(expr)` / `max(expr)` calls | [`Expr::Aggregate`] |
+//! | Lambda expressions `lambda x: body` | curried [`Expr::Lambda`] chain |
+//! | `groupby(collection, key)` calls | [`Expr::GroupBy`] |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
 //!
@@ -101,6 +103,7 @@ pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, Loweri
                 "Only integer subscripts are supported".into(),
             )),
         },
+        pyast::ExprKind::Lambda { args, body } => lower_lambda(args, body),
         _ => Err(LoweringError::Unsupported(format!(
             "Expression type not supported: {:?}",
             expr.node
@@ -186,10 +189,18 @@ fn lower_constant(constant: &pyast::Constant) -> Result<Expr, LoweringError> {
     Ok(Expr::Lit(lit))
 }
 
-/// Lower a Python function call to an [`Expr::Aggregate`].
+/// Lower a Python function call to a CCL built-in expression.
 ///
-/// Only the built-in aggregation functions `sum` and `max` are supported,
-/// each taking exactly one positional argument and no keyword arguments.
+/// Supported built-ins:
+///
+/// | Python call | CCL node | Arity |
+/// |---|---|---|
+/// | `sum(expr)` | [`Expr::Aggregate`] (`Sum`) | 1 |
+/// | `max(expr)` | [`Expr::Aggregate`] (`Max`) | 1 |
+/// | `groupby(collection, key)` | [`Expr::GroupBy`] | 2 |
+///
+/// Keyword arguments and unknown function names return
+/// [`LoweringError::Unsupported`].
 fn lower_call(
     func: &pyast::Expr,
     args: &[pyast::Expr],
@@ -200,32 +211,49 @@ fn lower_call(
             "Keyword arguments not supported in function calls".into(),
         ));
     }
-    if args.len() != 1 {
-        return Err(LoweringError::Unsupported(
-            "Aggregate functions require exactly one argument".into(),
-        ));
-    }
-    let kind = match &func.node {
-        pyast::ExprKind::Name { id, .. } => match id.as_str() {
-            "sum" => AggregateKind::Sum,
-            "max" => AggregateKind::Max,
-            _ => {
-                return Err(LoweringError::Unsupported(format!(
-                    "Unknown function: {id}"
-                )))
-            }
-        },
+    let name = match &func.node {
+        pyast::ExprKind::Name { id, .. } => id.as_str(),
         _ => {
             return Err(LoweringError::Unsupported(
                 "Only named function calls are supported".into(),
             ))
         }
     };
-    let input = lower_expr(&args[0])?;
-    Ok(Expr::Aggregate {
-        input: Box::new(input),
-        kind,
-    })
+    match name {
+        "groupby" => {
+            if args.len() != 2 {
+                return Err(LoweringError::Unsupported(
+                    "groupby requires exactly two arguments".into(),
+                ));
+            }
+            let collection = lower_expr(&args[0])?;
+            let key = lower_expr(&args[1])?;
+            Ok(Expr::GroupBy {
+                collection: Box::new(collection),
+                key: Box::new(key),
+            })
+        }
+        "sum" | "max" => {
+            if args.len() != 1 {
+                return Err(LoweringError::Unsupported(
+                    "Aggregate functions require exactly one argument".into(),
+                ));
+            }
+            let kind = match name {
+                "sum" => AggregateKind::Sum,
+                "max" => AggregateKind::Max,
+                _ => unreachable!(),
+            };
+            let input = lower_expr(&args[0])?;
+            Ok(Expr::Aggregate {
+                input: Box::new(input),
+                kind,
+            })
+        }
+        _ => Err(LoweringError::Unsupported(format!(
+            "Unknown function: {name}"
+        ))),
+    }
 }
 
 fn lower_binop(
@@ -419,6 +447,10 @@ fn ccl_gen_vars_referenced_inner(
         Expr::TypeAnnotation(expr, _) => {
             ccl_gen_vars_referenced_inner(expr, gen_var_names, result, shadowed);
         }
+        Expr::GroupBy { collection, key } => {
+            ccl_gen_vars_referenced_inner(collection, gen_var_names, result, shadowed);
+            ccl_gen_vars_referenced_inner(key, gen_var_names, result, shadowed);
+        }
         Expr::Lit(_) => {}
         _ => {}
     }
@@ -455,6 +487,55 @@ fn try_extract_ccl_equality_join<'a>(
         }
     }
     None
+}
+
+/// Lower a Python lambda expression to a curried [`Expr::Lambda`] chain.
+///
+/// Each positional parameter becomes one lambda layer, outermost-first, so
+/// `lambda x, y: x + y` lowers to `λ x → λ y → x + y`.
+///
+/// Unsupported features (`*args`, `**kwargs`, default values, keyword-only
+/// arguments) return [`LoweringError::Unsupported`].
+fn lower_lambda(
+    args: &pyast::Arguments,
+    body: &pyast::Located<pyast::ExprKind>,
+) -> Result<Expr, LoweringError> {
+    if args.vararg.is_some() {
+        return Err(LoweringError::Unsupported(
+            "Lambda *args not supported".into(),
+        ));
+    }
+    if args.kwarg.is_some() {
+        return Err(LoweringError::Unsupported(
+            "Lambda **kwargs not supported".into(),
+        ));
+    }
+    if !args.kwonlyargs.is_empty() {
+        return Err(LoweringError::Unsupported(
+            "Lambda keyword-only arguments not supported".into(),
+        ));
+    }
+    if !args.defaults.is_empty() {
+        return Err(LoweringError::Unsupported(
+            "Lambda default arguments not supported".into(),
+        ));
+    }
+    if args.args.is_empty() {
+        // TODO do we need to support 0-arg lambdas?
+        return Err(LoweringError::Unsupported(
+            "Lambda with no parameters not supported".into(),
+        ));
+    }
+
+    // Lower the body once; then wrap it in one lambda per parameter,
+    // innermost-first (reverse order) to produce the curried chain.
+    let body_expr = lower_expr(body)?;
+    let result = args
+        .args
+        .iter()
+        .rev()
+        .fold(body_expr, |acc, arg| Expr::lambda(&arg.node.arg, None, acc));
+    Ok(result)
 }
 
 /// Lower a Python list comprehension to the CCL Lambda/Apply encoding.
@@ -745,6 +826,9 @@ mod tests {
     #[case("a or b or c", "a or b or c")]
     // Mixed: `x == 1 and y == 2`
     #[case("x == 1 and y == 2", "x == 1 and y == 2")]
+    // Lambdas
+    #[case("lambda x: x + 1", "λ x → x + 1")]
+    #[case("lambda x, y: x + y", "λ x → λ y → x + y")]
     fn test_lower_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr).expect("lowering failed");
@@ -921,6 +1005,46 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // GroupBy tests
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    // Variable collection and inline key lambda
+    #[case("groupby(xs, lambda x: x)", "GroupBy(xs, λ x → x)")]
+    // List literal collection with a more complex key
+    #[case(
+        "groupby([1, 2, 3], lambda x: x // 2)",
+        "GroupBy([1, 2, 3], λ x → x // 2)"
+    )]
+    // Key is a variable reference (pre-defined function)
+    #[case("groupby(xs, key_fn)", "GroupBy(xs, key_fn)")]
+    // Keyed aggregation
+    #[case(
+        "[sum(x) for x in groupby(xs, key_fn)]",
+        "λ __iter_record → __iter_record ▷ GroupBy(xs, key_fn) ▷ (λ x → Sum(x))"
+    )]
+    fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
+        let expr = parse_expr(code);
+        let ccl = lower_expr(&expr).expect("lowering failed");
+        assert_eq!(symbolic(&ccl), expected);
+    }
+
+    /// `groupby` with the wrong number of arguments returns `LoweringError::Unsupported`.
+    #[test]
+    fn test_lower_groupby_wrong_arity() {
+        let one_arg = parse_expr("groupby(xs)");
+        assert!(matches!(
+            lower_expr(&one_arg),
+            Err(LoweringError::Unsupported(_))
+        ));
+        let three_args = parse_expr("groupby(xs, f, extra)");
+        assert!(matches!(
+            lower_expr(&three_args),
+            Err(LoweringError::Unsupported(_))
+        ));
     }
 
     /// Unsupported call targets produce a `LoweringError::Unsupported`.

@@ -91,10 +91,14 @@ pub enum InferError {
 ///   find a usage-site type constraint for the parameter
 /// - Lists — derives `Fun(UIntRange(n), elem_ty)` from the first element
 /// - Let bindings — infers value type, fills the optional type annotation, binds name in scope
+/// - `GroupBy` — infers the collection type; uses its codomain to annotate the
+///   key lambda's parameter (mirrors how `Apply` annotates its lambda argument);
+///   returns `Fun(KeyType, Fun(UInt, ValueType))`
 ///
 /// Returns [`Type::Unknown`] for unhandled cases ([`Expr::BinOp`],
-/// [`Expr::UnaryOp`]). BinOp type rules and full constraint solving are
-/// deferred; see the TODOs throughout this module.
+/// [`Expr::UnaryOp`]) or when component types cannot be determined. BinOp type
+/// rules and full constraint solving are deferred; see the TODOs throughout this
+/// module.
 ///
 /// Errors propagate from sub-expressions: an [`InferError::UnboundVariable`]
 /// anywhere in the tree aborts inference and returns the error.
@@ -310,6 +314,41 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
                 Type::Tuple(types) => types.into_iter().nth(*idx).unwrap_or(Type::Unknown),
                 _ => Type::Unknown,
             })
+        }
+
+        // ----- GroupBy -----
+        //
+        // Infer the collection type; its codomain is the element type fed into
+        // the key function.  If the key is an unannotated lambda, write the
+        // element type onto param_ty before inferring the key body — the same
+        // pattern used by Apply to annotate its lambda argument.
+        //
+        // Result type: Fun(KeyType, Fun(UInt, ValueType))
+        //   - KeyType  = codomain of the key function type
+        //   - UInt     = unbounded unsigned index into each group
+        //   - ValueType = element type of the collection
+        // Falls back to Unknown for any component that cannot be inferred.
+        Expr::GroupBy { collection, key } => {
+            let coll_ty = infer(collection, ctx)?;
+            let elem_ty = coll_ty.codomain();
+            if let Some(ref et) = elem_ty {
+                if let Expr::Lambda {
+                    param_ty: param_ty @ None,
+                    ..
+                } = key.as_mut()
+                {
+                    *param_ty = Some(et.clone());
+                }
+            }
+            let key_fn_ty = infer(key, ctx)?;
+            let key_output_ty = key_fn_ty.codomain();
+            match (key_output_ty, elem_ty) {
+                (Some(k), Some(v)) => Ok(Type::Fun(
+                    Box::new(k),
+                    Box::new(Type::Fun(Box::new(Type::Base(BaseType::UInt)), Box::new(v))),
+                )),
+                _ => Ok(Type::Unknown),
+            }
         }
 
         // ----- Join / Jump / Record -----
@@ -1147,6 +1186,110 @@ mod tests {
             kind: AggregateKind::Sum,
         };
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
+    }
+
+    // -----------------------------------------------------------------------
+    // GroupBy type inference tests
+    // -----------------------------------------------------------------------
+
+    /// `groupby` with a list collection: the key lambda's param_ty is annotated
+    /// and the result type is `Fun(KeyType, Fun(UInt, ValueType))`.
+    #[test]
+    fn test_infer_groupby() {
+        let mut ctx = TypeInferenceContext::new();
+        // groupby([1, 2, 3], lambda x: x)
+        // Collection: [1, 2, 3] has type Fun(UIntRange(3), Int).
+        // Key lambda (identity): Fun(Int, Int) after annotation.
+        // Expected return: Fun(Int, Fun(UInt, Int))
+        let mut expr = Expr::GroupBy {
+            collection: Box::new(Expr::List(vec![
+                Expr::Lit(Lit::Int(1)),
+                Expr::Lit(Lit::Int(2)),
+                Expr::Lit(Lit::Int(3)),
+            ])),
+            key: Box::new(Expr::lambda("x", None, Expr::Var("x".into()))),
+        };
+        let result_ty = infer(&mut expr, &mut ctx).unwrap();
+        // Verify param_ty annotation on the key lambda
+        if let Expr::GroupBy { key, .. } = &expr {
+            if let Expr::Lambda { param_ty, .. } = key.as_ref() {
+                assert_eq!(*param_ty, Some(Type::Base(BaseType::Int)));
+            } else {
+                panic!("expected Lambda for key");
+            }
+        }
+        // Verify return type: Fun(Int, Fun(UInt, Int))
+        assert_eq!(
+            result_ty,
+            Type::Fun(
+                Box::new(Type::Base(BaseType::Int)),
+                Box::new(Type::Fun(
+                    Box::new(Type::Base(BaseType::UInt)),
+                    Box::new(Type::Base(BaseType::Int)),
+                )),
+            )
+        );
+    }
+
+    /// `[sum(group) for group in groupby([1, 2, 3], lambda x: x)]`
+    ///
+    /// The list-comp encoding:
+    /// ```text
+    /// λ __list_comp_var →
+    ///   Apply(λ group → sum(group),
+    ///         Apply(GroupBy([1,2,3], λ x → x), __list_comp_var))
+    /// ```
+    ///
+    /// - `GroupBy(...)` : `Fun(Int, Fun(UInt, Int))`
+    /// - `Apply(groupby, __list_comp_var)` constrains `__list_comp_var : Int`, returns `Fun(UInt, Int)`
+    /// - `sum(group)` where `group : Fun(UInt, Int)` → `Int`
+    /// - Full result: `Fun(Int, Int)`
+    #[test]
+    fn test_infer_groupby_aggregate() {
+        let mut ctx = TypeInferenceContext::new();
+        let groupby_expr = Expr::GroupBy {
+            collection: Box::new(Expr::List(vec![
+                Expr::Lit(Lit::Int(1)),
+                Expr::Lit(Lit::Int(2)),
+                Expr::Lit(Lit::Int(3)),
+            ])),
+            key: Box::new(Expr::lambda("x", None, Expr::Var("x".into()))),
+        };
+        let mut expr = list_comp_unannotated(
+            groupby_expr,
+            "group",
+            Expr::Aggregate {
+                input: Box::new(Expr::Var("group".into())),
+                kind: AggregateKind::Sum,
+            },
+        );
+        let result_ty = infer(&mut expr, &mut ctx).unwrap();
+        // __list_comp_var iterates over the groupby result's domain (Int);
+        // each group is Fun(UInt, Int); sum of that is Int.
+        assert_eq!(
+            result_ty,
+            Type::Fun(
+                Box::new(Type::Base(BaseType::Int)),
+                Box::new(Type::Base(BaseType::Int)),
+            )
+        );
+    }
+
+    /// When the collection inference fails, the error propagates and the key is
+    /// not visited — `UnboundVariable` from the collection short-circuits inference.
+    #[test]
+    fn test_infer_groupby_collection_error_propagates() {
+        let mut ctx = TypeInferenceContext::new();
+        // groupby(xs, lambda x: x) — xs is unbound; collection inference returns
+        // UnboundVariable, which propagates before the key is touched.
+        let mut expr = Expr::GroupBy {
+            collection: Box::new(Expr::Var("xs".into())),
+            key: Box::new(Expr::lambda("x", None, Expr::Var("x".into()))),
+        };
+        assert_eq!(
+            infer(&mut expr, &mut ctx),
+            Err(InferError::UnboundVariable("xs".into()))
+        );
     }
 
     // -----------------------------------------------------------------------

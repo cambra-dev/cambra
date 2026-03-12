@@ -354,6 +354,27 @@ pub enum Expr {
 
     /// A record constructor. Lowering from Python syntax is not yet implemented.
     Record(Vec<(String, Expr)>),
+
+    /// A grouping operation over a collection by a key extraction function.
+    ///
+    /// TODO this is temporary.  We should instead be representing grouping
+    /// purely with refinements and letting the optimizer insert Converse operations
+    /// as needed to efficiently compute those refinements.
+    ///
+    /// `groupby(collection, key)` partitions `collection` into groups, where
+    /// each element is assigned to the group identified by applying `key` to it.
+    ///
+    /// - `collection` is the data source (a function from index to element, i.e.
+    ///   the standard CCL list-as-function encoding).
+    /// - `key` is a function that extracts the grouping key from each element.
+    ///
+    /// The result type is `Fun(key_output_ty, Fun(Base(UInt), elem_ty))`
+    GroupBy {
+        /// The collection (function) whose elements are to be grouped.
+        collection: Box<Expr>,
+        /// A function that computes the grouping key for each element.
+        key: Box<Expr>,
+    },
 }
 
 impl Expr {

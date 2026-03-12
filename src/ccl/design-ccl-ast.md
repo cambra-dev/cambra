@@ -81,6 +81,21 @@ Python aggregate calls (`sum(xs)`, `max(xs)`) are lowered directly to `Expr::Agg
 
 `AggregateKind` enumerates the supported operations; each variant carries its own typing rule in `output_type`.
 
+### Python `lambda` expressions — curried `Expr::Lambda` chain
+
+Python `lambda` expressions are lowered to a curried chain of `Expr::Lambda` nodes. A multi-parameter `lambda x, y: body` becomes `λ x → λ y → body`. Single-parameter lambdas lower to a single `Expr::Lambda`. `param_ty` is left `None` at lowering time and filled in by the inference pass where the call site provides type information.
+
+Restrictions not yet supported (lowering raises `LoweringError::Unsupported`): `*args`, `**kwargs`, keyword-only arguments, and default values.
+
+### `GroupBy` — first-class grouping node
+
+`groupby(collection, key)` calls are lowered directly to `Expr::GroupBy` rather than kept as a nested `Apply`. This makes the grouping operation structurally distinct from ordinary calls, which simplifies:
+
+- **Type inference**: `infer` can propagate the collection's element type onto the key lambda's `param_ty` without needing built-in name resolution.
+- **Compilation**: the compiler can dispatch on `Expr::GroupBy` and emit the appropriate group operator without inspecting call-site variable names.
+
+The result type is `Fun(K, Fun(UInt, V))` where `K` is the key type and `V` is the element type. The outer function maps a key to a group; the inner function maps an unsigned index to an element within that group — the same encoding used for lists (`Fun(UIntRange(n), V)`), but with an unbounded `UInt` domain since group sizes are not known statically.
+
 ### `Case` only — no `IfThenElse`
 
 Python `if/else` and `if/elif/.../else` chains are lowered to `Case` during Python → CCL lowering. There is no `IfThenElse` node in the CCL AST. `Case` subsumes all multi-way branching.
@@ -187,6 +202,10 @@ enum Expr {
         target: String,                  // must name an enclosing Join
         args: Vec<Expr>,
     },
+    GroupBy {
+        collection: Box<Expr>,           // the collection (function) whose elements are grouped
+        key: Box<Expr>,                  // key extraction function: element → key
+    },
     // Construction — lowering stubbed, deferred
     Tuple(Vec<Expr>),
     TupleIndex(Box<Expr>, usize),        // integer-index access into a tuple: t[n]
@@ -282,12 +301,20 @@ Gains type-mismatch error detection at Apply sites.
 union-find unification table, and an occurs check. Removes the need for
 `collect_param_constraint` since type variables unify across all use sites.
 
+### `GroupBy` inference
+
+When inferring `Expr::GroupBy { collection, key }`:
+
+1. Infer the type of `collection`.
+2. If the collection type has a codomain (i.e. it is a `Fun(_, elem_ty)`), write `elem_ty` into the key lambda's `param_ty` when `param_ty` is still `None`. This mirrors the `Apply` rule where the argument type is pushed onto the lambda parameter.
+3. Infer the type of `key` (now annotated); take its codomain as `key_output_ty`.
+4. Return `Fun(key_output_ty, Fun(Base(UInt), elem_ty))`. Falls back to `Unknown` if either codomain cannot be determined.
+
 ### TODOs
 
 - BinOp/UnaryOp type rules (arithmetic, comparison, boolean).
 - `Case` arm scope: push pattern variable bindings into ctx.
 - Infer `Let.ty` from the type of `value` (required before `Let` nodes can be compiled; see §Compilation).
-
 ---
 
 ## Compilation
@@ -333,5 +360,9 @@ fills this in from the type of `bound_expr`.
      (`RefinementKind::HashJoin`, `HashJoinSpec`, `compile_hash_join_restriction`). ✓
    - `ccl/mod.rs` + `ccl/lower.rs` + `ccl/infer.rs`: first-class `Aggregate` node (`AggregateKind`,
      `Expr::Aggregate`); lowering from `sum`/`max` call sites; type inference via `AggregateKind::output_type`. ✓
+   - `ccl/lower.rs`: Python `lambda` expression lowering to curried `Expr::Lambda` chain. ✓
+   - `ccl/mod.rs` + `ccl/lower.rs` + `ccl/infer.rs`: first-class `GroupBy` node (`Expr::GroupBy`);
+     lowering from `groupby(collection, key)` call sites; type inference propagates collection
+     element type onto key lambda `param_ty`. ✓
    - `lowering_via_ccl.rs`: sandboxed end-to-end pipeline tests.
    - `lowering.rs` direct path removed after parity confirmed.
