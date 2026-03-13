@@ -2,6 +2,35 @@
 
 use std::collections::HashMap;
 
+use crate::interpreter::tuple_field;
+
+/// Format a map of named fields as either a positional tuple or a named record.
+///
+/// If every key is a dense `_0`…`_n` sequence, emits `{v0, v1, …}`; otherwise
+/// emits `{name: value, …}` with fields sorted alphabetically.
+pub fn fmt_record<V: std::fmt::Display>(
+    f: &mut std::fmt::Formatter<'_>,
+    fields: &HashMap<String, V>,
+) -> std::fmt::Result {
+    let is_tuple = (0..fields.len()).all(|i| fields.contains_key(&tuple_field(i)));
+    if is_tuple {
+        let mut ordered: Vec<(usize, &V)> = fields
+            .iter()
+            .map(|(k, v)| (k[1..].parse::<usize>().unwrap(), v))
+            .collect();
+        ordered.sort_by_key(|(i, _)| *i);
+        let strs: Vec<String> = ordered.iter().map(|(_, v)| format!("{v}")).collect();
+        write!(f, "{{{}}}", strs.join(", "))
+    } else {
+        let mut field_strs: Vec<String> = fields
+            .iter()
+            .map(|(name, v)| format!("{name}: {v}"))
+            .collect();
+        field_strs.sort();
+        write!(f, "{{{}}}", field_strs.join(", "))
+    }
+}
+
 /// A stack of named-binding scopes supporting lexical shadowing.
 ///
 /// Scopes are entered and exited exclusively through [`enter_scope`](Self::enter_scope),

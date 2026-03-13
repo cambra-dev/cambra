@@ -11,6 +11,7 @@ use crate::interpreter::{
     ComputeRestriction, Operator, Producer, RestrictionType, Scheduler, VarScope,
 };
 use crate::pretty_graph::{InspectNode, VizOptions};
+use crate::util::fmt_record;
 
 /// A Guard represents a region (subset of an extent) via a set of predicates.
 /// Guards are used to:
@@ -496,26 +497,38 @@ impl PartialEq for dyn DataSourceDomainExtentImpl {
 }
 impl Eq for dyn DataSourceDomainExtentImpl {}
 
-impl std::fmt::Debug for Extent {
+impl std::fmt::Display for BaseType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Extent::Base(base) => write!(f, "{base:?}"),
-            Extent::Function { domain, codomain } => write!(f, "({domain:?} -> {codomain:?})"),
-            Extent::Record(fields) => {
-                let field_strs: Vec<String> = fields
-                    .iter()
-                    .map(|(name, extent)| format!("{name}: {extent:?}"))
-                    .collect();
-                write!(f, "{{{}}}", field_strs.join(", "))
-            }
+            BaseType::Int => write!(f, "Int"),
+            BaseType::UInt => write!(f, "UInt"),
+            BaseType::String => write!(f, "String"),
+            BaseType::Bool => write!(f, "Bool"),
+            BaseType::Unit => write!(f, "Unit"),
+        }
+    }
+}
+
+impl std::fmt::Display for Extent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Extent::Base(base) => write!(f, "{base}"),
+            Extent::Function { domain, codomain } => write!(f, "({domain} -> {codomain})"),
+            Extent::Record(fields) => fmt_record(f, fields),
             Extent::Union(extents) => {
-                let extent_strs: Vec<String> = extents.iter().map(|e| format!("{e:?}")).collect();
+                let extent_strs: Vec<String> = extents.iter().map(|e| format!("{e}")).collect();
                 write!(f, "({})", extent_strs.join(" | "))
             }
             Extent::UIntRange { start, end } => write!(f, "[{start}, {end})"),
             Extent::DataSourceDomain(_) => write!(f, "DataSource"),
-            Extent::Restricted { base, .. } => write!(f, "Restricted({base:?})"),
+            Extent::Restricted { base, .. } => write!(f, "Restricted({base})"),
         }
+    }
+}
+
+impl std::fmt::Debug for Extent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
     }
 }
 
@@ -704,7 +717,7 @@ impl PartialOrd for Value {
     }
 }
 
-impl std::fmt::Debug for Value {
+impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Int(i) => write!(f, "{i}"),
@@ -713,20 +726,31 @@ impl std::fmt::Debug for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Unit => write!(f, "()"),
             Value::Function(bindings) => {
+                // If inputs are exactly u0..uN, omit them for readability.
+                let positional = bindings
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| b.input == Value::UInt(i));
                 let binding_strs: Vec<String> = bindings
                     .iter()
-                    .map(|b| format!("{:?} -> {:?}", b.input, b.output))
+                    .map(|b| {
+                        if positional {
+                            format!("{}", b.output)
+                        } else {
+                            format!("{} -> {}", b.input, b.output)
+                        }
+                    })
                     .collect();
                 write!(f, "Function [ {} ]", binding_strs.join(", "))
             }
-            Value::Record(fields) => {
-                let field_strs: Vec<String> = fields
-                    .iter()
-                    .map(|(name, val)| format!("{name}: {val:?}"))
-                    .collect();
-                write!(f, "{{{}}}", field_strs.join(", "))
-            }
+            Value::Record(fields) => fmt_record(f, fields),
         }
+    }
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
     }
 }
 
@@ -1290,5 +1314,112 @@ mod tests {
                 )
             ]))
         );
+    }
+
+    // --- Display tests ---
+
+    #[test]
+    fn test_value_display_primitives() {
+        assert_eq!(Value::Int(42).to_string(), "42");
+        assert_eq!(Value::Int(-7).to_string(), "-7");
+        assert_eq!(Value::UInt(3).to_string(), "u3");
+        assert_eq!(Value::String("hello".to_string()).to_string(), "\"hello\"");
+        assert_eq!(Value::Bool(true).to_string(), "true");
+        assert_eq!(Value::Bool(false).to_string(), "false");
+        assert_eq!(Value::Unit.to_string(), "()");
+    }
+
+    #[test]
+    fn test_value_display_function_positional() {
+        // Inputs are u0, u1, u2 — should be omitted.
+        let f = Value::Function(vec![
+            FuncBinding {
+                input: Value::UInt(0),
+                output: Value::String("a".to_string()),
+            },
+            FuncBinding {
+                input: Value::UInt(1),
+                output: Value::String("b".to_string()),
+            },
+        ]);
+        assert_eq!(f.to_string(), r#"Function [ "a", "b" ]"#);
+    }
+
+    #[test]
+    fn test_value_display_function_non_positional() {
+        // Inputs are not u0..uN — should be shown explicitly.
+        let f = Value::Function(vec![
+            FuncBinding {
+                input: Value::String("x".to_string()),
+                output: Value::Int(1),
+            },
+            FuncBinding {
+                input: Value::String("y".to_string()),
+                output: Value::Int(2),
+            },
+        ]);
+        assert_eq!(f.to_string(), r#"Function [ "x" -> 1, "y" -> 2 ]"#);
+    }
+
+    #[test]
+    fn test_value_display_function_gap_in_indices() {
+        // u0, u2 — not contiguous, so inputs should be shown.
+        let f = Value::Function(vec![
+            FuncBinding {
+                input: Value::UInt(0),
+                output: Value::Int(10),
+            },
+            FuncBinding {
+                input: Value::UInt(2),
+                output: Value::Int(20),
+            },
+        ]);
+        assert_eq!(f.to_string(), "Function [ u0 -> 10, u2 -> 20 ]");
+    }
+
+    #[test]
+    fn test_value_display_record() {
+        let mut fields = HashMap::new();
+        fields.insert("x".to_string(), Value::Int(1));
+        let r = Value::Record(fields);
+        assert_eq!(r.to_string(), "{x: 1}");
+    }
+
+    #[test]
+    fn test_extent_display_base() {
+        assert_eq!(Extent::Base(BaseType::Int).to_string(), "Int");
+        assert_eq!(Extent::Base(BaseType::UInt).to_string(), "UInt");
+        assert_eq!(Extent::Base(BaseType::String).to_string(), "String");
+        assert_eq!(Extent::Base(BaseType::Bool).to_string(), "Bool");
+        assert_eq!(Extent::Base(BaseType::Unit).to_string(), "Unit");
+    }
+
+    #[test]
+    fn test_extent_display_function() {
+        let e = Extent::function(Extent::Base(BaseType::Int), Extent::Base(BaseType::String));
+        assert_eq!(e.to_string(), "(Int -> String)");
+    }
+
+    #[test]
+    fn test_extent_display_union() {
+        let e = Extent::Union(vec![
+            Extent::Base(BaseType::Int),
+            Extent::Base(BaseType::Bool),
+        ]);
+        assert_eq!(e.to_string(), "(Int | Bool)");
+    }
+
+    #[test]
+    fn test_extent_display_uint_range() {
+        let e = Extent::UIntRange { start: 2, end: 5 };
+        assert_eq!(e.to_string(), "[2, 5)");
+    }
+
+    #[test]
+    fn test_extent_display_nested_function() {
+        // (Int -> (Bool -> String))
+        let inner = Extent::function(Extent::Base(BaseType::Bool), Extent::Base(BaseType::String));
+        let outer = Extent::function(Extent::Base(BaseType::Int), inner);
+        assert_eq!(outer.to_string(), "(Int -> (Bool -> String))");
     }
 }
