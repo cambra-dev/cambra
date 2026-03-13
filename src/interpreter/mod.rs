@@ -14,6 +14,7 @@ mod record;
 mod scheduler;
 mod stdio;
 mod test_source;
+mod tiling;
 mod types;
 mod var;
 
@@ -27,6 +28,7 @@ pub use record::*;
 pub use scheduler::*;
 pub use stdio::*;
 pub use test_source::*;
+pub use tiling::*;
 pub use types::*;
 pub use var::*;
 

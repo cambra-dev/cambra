@@ -315,6 +315,94 @@ destructured fields.
 
 ---
 
+## Tilings and Tiles
+
+Tilings and Tiles are the data model used by `TileOperator` and `TileProducer`. A `Tiling`
+describes the *shape* of data a producer will emit — analogous to a type. A `Tile` is the
+materialized data itself, shaped according to its `Tiling`.
+
+### Tiling
+
+Each `TileOperator` declares a `Tiling` that tells consumers what structure to expect:
+
+| Variant | Meaning |
+|---------|---------|
+| `Scalar(Extent)` | A single value, possibly still unknown (represented as an empty `ColumnValue`). |
+| `Record(fields)` | A named collection of sub-tilings, one per field. The tiles are records with fields that are the tiles of the sub-tilings |
+| `SealedFunction { domain, codomain }` | A function mapping with structured codomain. Domain values accumulate incrementally; a `domain_predicate` on the tile signals when all have arrived. |
+| `LookupFunction { domain, codomain }` | Logically, this tiling is equivalent to `SealedFunction(domain, SealedFunction(UInt, codomain))`. It has a custom layout for efficiency, detailed in the `Tile` table below. |
+| `Aggregation { accumulator }` | An ongoing aggregate with scalar accumulator type. |
+
+`Tiling::extent()` converts a `Tiling` to the corresponding `Extent` (the type-level view).
+
+`Tiling::empty_tile()` constructs the starting state for a tile — empty `ColumnValue`s and
+`Predicate::False` domain predicates everywhere.
+
+### Tile
+
+A `Tile` holds the actual data. Its shape mirrors its `Tiling`:
+
+| Variant | Contents |
+|---------|----------|
+| `Scalar(ColumnValue)` |  The two tiles in this tiling are `⊥` and the specific scalar of the tiling. `⊥` is represented as an empty `ColumnValue` and the scalar is represented as a `ColumnValue` of length 1 |
+| `Record(fields)` | A Record of other `Tiles` |
+| `SealedFunction { domain, codomain, domain_predicate }` | Each `Tile` is the set of known mappings of the function.  The `domain` is a `ColumnValue` of the domain elements, and the `codomain` is another `Tile`, which must be implicitly vectorized.  For example, a `Scalar` tiling is stored as a `ColumnValue` instead of a single element. |
+| `LookupFunction { map, domain_predicate }` | Each tile represents the known mappings of a curried function. In the implementation, this is realized as a map from the domain to lists of codomain elements. (This is also likely to change in the near future to be more efficient) |
+| `Aggregation { accumulator, terminal }` | Logically, this tiling knows the final number of inputs `N` that will be aggregated and the tiles are of form `(count, accumulator)`.  However, for making this feasible to compute, we instead store a terminal flag indicating `count == N`. |
+
+`Tile::is_terminal()` returns true when a tile carries complete, final data. No larger tiles will ever be returned, although
+equivalent tiles with some data released may.
+
+### TileGuard
+
+A `TileGuard` specifies a sub-tiling (a downward-closed, ⊕-closed subset of tiles) of interest. It drives
+demand-directed computation and incremental release, mirroring the intent/yield guard system of
+the previous version of the interpreter.
+
+| Variant | Meaning |
+|---------|---------|
+| `Scalar(bool)` | `true` = interested, `false` = not interested. |
+| `LookupFunction(bool)` | All-or-nothing interest in the lookup table. |
+| `Aggregation(bool)` | All-or-nothing interest in the aggregate result. |
+| `Record(fields)` | Per-field `TileGuard`s, allowing fine-grained field demand. |
+| `SealedFunction(SealedFunctionGuard)` | Structured interest in a function tile (see below). |
+
+`TileGuard::intersect()` computes the overlap between two guards (conjunction of interest
+regions). `is_universal()` and `is_empty()` test the extremes.
+
+TileGuards are also used to extract portions of a tile that a consumer is interested. This will be implemented
+as a `split(guard: &TileGuard)` method on `Tile` in the future.
+
+### SealedFunctionGuard
+
+Refines interest in a `SealedFunction` tiling:
+
+| Variant | Meaning |
+|---------|---------|
+| `Universal` | Interested in everything — domain and codomain. |
+| `Empty` | Not interested in anything. Annihilator under `intersect`. |
+| `Domain(Predicate)` | Interested only in domain elements matching the predicate. |
+| `Codomain(TileGuard)` | Interested only in codomain elements that are part of the subtiling specified by the guard. |
+
+### Predicate
+
+A `Predicate` describes a subset of values within an extent. Used as a domain-completeness
+signal in tiles and as a region specifier in guards.
+
+| Variant | Meaning |
+|---------|---------|
+| `True` | All values. Universal predicate; identity under `intersect`. |
+| `False` | No values. Empty predicate; annihilator under `intersect`. |
+| `LessThanEq(Value)` | All values ≤ the given value (upper-bound streaming signal). |
+| `Intervals(IntervalSet<Value>)` | Arbitrary union of intervals. |
+| `Record(fields)` | Per-field predicates for record-typed extents. |
+
+`Predicate::intersect()` computes the conjunction of two predicates.
+`Predicate::as_bool()` short-circuits to `Some(true/false)` when the predicate is trivially
+`True` or `False` (including uniform record predicates).
+
+---
+
 ## Open Challenges
 
 ### Streaming Joins

@@ -5,6 +5,8 @@ use std::{cell::RefCell, cmp::Ordering, collections::HashMap, hash::Hash, rc::Rc
 
 use bit_set::BitSet;
 use bit_vec::BitVec;
+use intervalsets::numeric::Domain;
+use intervalsets::Side;
 use log::trace;
 
 use crate::interpreter::{
@@ -751,6 +753,12 @@ impl std::fmt::Display for Value {
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{self}")
+    }
+}
+
+impl Domain for Value {
+    fn try_adjacent(&self, _side: Side) -> Option<Self> {
+        None
     }
 }
 
