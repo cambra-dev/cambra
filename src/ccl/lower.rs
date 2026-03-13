@@ -46,6 +46,7 @@ use rustpython_parser::ast as pyast;
 
 use crate::ccl::{
     AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, HashJoinSpec, Lit, LogicKind,
+    Type, TypedBinding,
 };
 
 // ---------------------------------------------------------------------------
@@ -153,8 +154,7 @@ pub fn lower_stmts(stmts: &[pyast::Stmt]) -> Result<Expr, LoweringError> {
                 };
                 let val = lower_expr(value)?;
                 Ok(Expr::Let {
-                    name,
-                    bound_ty: None,
+                    binding: TypedBinding::new_unannotated(&name),
                     bound_expr: Box::new(val),
                     body: Box::new(body),
                 })
@@ -416,21 +416,20 @@ fn ccl_gen_vars_referenced_inner(
         Expr::Lambda { body, param, .. } => {
             // Generator variables are free in the predicate; descend into body.
             let outer_shadowed = shadowed.clone();
-            if let Some(i) = gen_var_names.iter().position(|n| *n == param) {
+            if let Some(i) = gen_var_names.iter().position(|n| *n == param.name) {
                 shadowed.insert(i);
             }
             ccl_gen_vars_referenced_inner(body, gen_var_names, result, shadowed);
             *shadowed = outer_shadowed;
         }
         Expr::Let {
+            binding,
             bound_expr,
             body,
-            name,
-            ..
         } => {
             ccl_gen_vars_referenced_inner(bound_expr, gen_var_names, result, shadowed);
             let outer_shadowed = shadowed.clone();
-            if let Some(i) = gen_var_names.iter().position(|n| *n == name) {
+            if let Some(i) = gen_var_names.iter().position(|n| *n == binding.name) {
                 shadowed.insert(i);
             }
             ccl_gen_vars_referenced_inner(body, gen_var_names, result, shadowed);
@@ -530,11 +529,9 @@ fn lower_lambda(
     // Lower the body once; then wrap it in one lambda per parameter,
     // innermost-first (reverse order) to produce the curried chain.
     let body_expr = lower_expr(body)?;
-    let result = args
-        .args
-        .iter()
-        .rev()
-        .fold(body_expr, |acc, arg| Expr::lambda(&arg.node.arg, None, acc));
+    let result = args.args.iter().rev().fold(body_expr, |acc, arg| {
+        Expr::lambda(&arg.node.arg, Type::Unknown, acc)
+    });
     Ok(result)
 }
 
@@ -566,7 +563,7 @@ fn lower_lambda(
 ///     __iter_record[1] ▷ lower(source1) ▷ (λ var1 → lower(body)))
 /// ```
 ///
-/// All lambdas are produced with `param_ty: None`; [`crate::ccl::infer`]
+/// All lambdas are produced with `param.ty = Type::Unknown`; [`crate::ccl::infer`]
 /// fills in the type annotations before compilation.
 ///
 /// TODO this currently has an assumption that all generator variables have distinct names.
@@ -715,7 +712,7 @@ fn lower_list_comp(
     {
         body_expr = Expr::apply(
             Expr::apply(make_idx_arg(outer_var, i), source),
-            Expr::lambda(iter_var, None, body_expr),
+            Expr::lambda(iter_var, Type::Unknown, body_expr),
         );
     }
 
@@ -725,7 +722,11 @@ fn lower_list_comp(
         // compile_ccl will construct the Converse/Lambda/Apply operator structure.
         let desc = format!("{} == {}", spec.build_var_name, spec.probe_var_name);
         Ok(Expr::lambda_with_hash_join(
-            outer_var, None, body_expr, spec, &desc,
+            outer_var,
+            Type::Unknown,
+            body_expr,
+            spec,
+            &desc,
         ))
     } else if let Some(pred_op) = pred_op {
         // Non-equality or multi-predicate: loop-join restriction lambda.
@@ -741,18 +742,18 @@ fn lower_list_comp(
         {
             pred_expr = Expr::apply(
                 Expr::apply(make_idx_arg(restr_outer_var, i), pred_source),
-                Expr::lambda(iter_var, None, pred_expr),
+                Expr::lambda(iter_var, Type::Unknown, pred_expr),
             );
         }
         Ok(Expr::lambda_with_refinement(
             outer_var,
-            None,
+            Type::Unknown,
             body_expr,
-            Expr::lambda(restr_outer_var, None, pred_expr),
+            Expr::lambda(restr_outer_var, Type::Unknown, pred_expr),
             &pred_desc,
         ))
     } else {
-        Ok(Expr::lambda(outer_var, None, body_expr))
+        Ok(Expr::lambda(outer_var, Type::Unknown, body_expr))
     }
 }
 

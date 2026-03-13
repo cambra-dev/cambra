@@ -7,7 +7,7 @@
 //! ```text
 //! Python source
 //!   → ccl::lower    (Python AST → CCL Expr)
-//!   → ccl::infer    (type inference; annotates Lambda param_ty)
+//!   → ccl::infer    (type inference; annotates binding.ty on Lambda/Join/Let)
 //!   → compile_ccl   (CCL Expr → dataflow operators)   ← this module
 //!   → subscribe()
 //!   → producer/consumer dataflow
@@ -15,8 +15,9 @@
 //!
 //! # Lambda extent inference
 //!
-//! [`Expr::Lambda`] nodes must have their `param_ty` fields annotated by
-//! `ccl::infer` before reaching this module. [`extent_of`] maps each
+//! All binding sites ([`Expr::Lambda`], [`Expr::Join`], [`Expr::Let`]) must have
+//! their [`crate::ccl::TypedBinding::ty`] fields filled in by `ccl::infer` before
+//! reaching this module. [`extent_of`] maps each
 //! annotated [`crate::ccl::Type`] to the corresponding interpreter
 //! [`Extent`] (e.g. `Type::UIntRange(n)` → `Extent::UIntRange { start: 0, end: n }`).
 
@@ -211,16 +212,14 @@ pub fn compile(
         Expr::List(elts) => compile_list(elts),
         Expr::Lambda {
             param,
-            param_ty: Some(ty),
             body,
             refinement,
-        } => compile_lambda(param, ty, body, refinement, ctx, scheduler),
-        Expr::Lambda {
-            param_ty: None,
-            param,
-            ..
-        } => Err(CompileError::Unsupported(format!(
-            "Lambda '{param}' has no type annotation; ccl::infer must run before compile"
+        } if param.ty != Type::Unknown => {
+            compile_lambda(&param.name, &param.ty, body, refinement, ctx, scheduler)
+        }
+        Expr::Lambda { param, .. } => Err(CompileError::Unsupported(format!(
+            "Lambda '{}' has no type annotation; ccl::infer must run before compile",
+            param.name
         ))),
         Expr::Apply { function, argument } => {
             let func = compile(function, ctx, scheduler)?;
@@ -228,17 +227,15 @@ pub fn compile(
             Ok(Box::new(Apply::new(func, arg)))
         }
         Expr::Let {
-            name,
-            bound_ty: Some(bound_ty),
+            binding,
             bound_expr,
             body,
-        } => compile_let(name, bound_ty, bound_expr, body, ctx, scheduler),
-        Expr::Let {
-            name,
-            bound_ty: None,
-            ..
-        } => Err(CompileError::TypeError(format!(
-            "Let binding '{name}' has no type annotation; ccl::infer must run before compile"
+        } if binding.ty != Type::Unknown => {
+            compile_let(&binding.name, &binding.ty, bound_expr, body, ctx, scheduler)
+        }
+        Expr::Let { binding, .. } => Err(CompileError::TypeError(format!(
+            "Let binding '{}' has no type annotation; ccl::infer must run before compile",
+            binding.name
         ))),
         Expr::Tuple(elts) => {
             let mut fields = HashMap::new();
@@ -569,7 +566,7 @@ mod tests {
     use super::*;
     use crate::ccl::{
         ArithmeticKind as CclArith, BinOpKind as CclBinOp, Expr, HashJoinSpec, Lit, Refinement,
-        RefinementKind, Type,
+        RefinementKind, Type, TypedBinding,
     };
     use crate::interpreter::{
         BaseType, ColumnValue, Consumer, Extent, FuncBinding, Guard, Scheduler, Value,
@@ -697,10 +694,10 @@ mod tests {
         let source = Expr::List(elts.into_iter().map(Expr::Lit).collect());
         Expr::lambda(
             "__list_comp_var",
-            Some(Type::UIntRange(n)),
+            Type::UIntRange(n),
             Expr::apply(
                 Expr::apply(Expr::Var("__list_comp_var".to_string()), source),
-                Expr::lambda(var, Some(elem_ty), body),
+                Expr::lambda(var, elem_ty, body),
             ),
         )
     }
@@ -755,7 +752,7 @@ mod tests {
         let mut scheduler = Scheduler::new();
         let expr = Expr::lambda(
             "x",
-            Some(Type::Base(BaseType::Int)),
+            Type::Base(BaseType::Int),
             Expr::Var("unbound_var".into()),
         );
         let mut ctx = CompileContext::new();
@@ -776,8 +773,7 @@ mod tests {
     // let x = 5 in x
     #[case(
         Expr::Let {
-            name: "x".to_string(),
-            bound_ty: Some(Type::Base(BaseType::Int)),
+            binding: TypedBinding { name: "x".to_string(), ty: Type::Base(BaseType::Int), user_annotation: None },
             bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
             body: Box::new(Expr::Var("x".to_string())),
         },
@@ -786,8 +782,7 @@ mod tests {
     // let x = 5 in x + 1
     #[case(
         Expr::Let {
-            name: "x".to_string(),
-            bound_ty: Some(Type::Base(BaseType::Int)),
+            binding: TypedBinding { name: "x".to_string(), ty: Type::Base(BaseType::Int), user_annotation: None },
             bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
             body: Box::new(Expr::BinOp {
                 left: Box::new(Expr::Var("x".to_string())),
@@ -800,8 +795,7 @@ mod tests {
     // let x = 5 in x + x  (multiple references — value subscribed once)
     #[case(
         Expr::Let {
-            name: "x".to_string(),
-            bound_ty: Some(Type::Base(BaseType::Int)),
+            binding: TypedBinding { name: "x".to_string(), ty: Type::Base(BaseType::Int), user_annotation: None },
             bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
             body: Box::new(Expr::BinOp {
                 left: Box::new(Expr::Var("x".to_string())),
@@ -814,12 +808,10 @@ mod tests {
     // let x = 5 in let y = 2 in x + y  (chained bindings)
     #[case(
         Expr::Let {
-            name: "x".to_string(),
-            bound_ty: Some(Type::Base(BaseType::Int)),
+            binding: TypedBinding { name: "x".to_string(), ty: Type::Base(BaseType::Int), user_annotation: None },
             bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
             body: Box::new(Expr::Let {
-                name: "y".to_string(),
-                bound_ty: Some(Type::Base(BaseType::Int)),
+                binding: TypedBinding { name: "y".to_string(), ty: Type::Base(BaseType::Int), user_annotation: None },
                 bound_expr: Box::new(Expr::Lit(Lit::Int(2))),
                 body: Box::new(Expr::BinOp {
                     left: Box::new(Expr::Var("x".to_string())),
@@ -893,7 +885,7 @@ mod tests {
 
         let expr = Expr::lambda_with_hash_join(
             "p",
-            Some(Type::Base(BaseType::Int)), // not a Tuple — must trigger TypeError
+            Type::Base(BaseType::Int), // not a Tuple — must trigger TypeError
             Expr::Lit(Lit::Unit),
             spec,
             "test join",

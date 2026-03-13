@@ -175,6 +175,44 @@ impl AggregateKind {
     }
 }
 
+/// A typed binding site: a named variable together with its type.
+///
+/// Used in [`Expr::Lambda`], [`Expr::Join`], and [`Expr::Let`] to carry both
+/// the inferred type and any user-written annotation at each binding site,
+///
+/// `ty` starts as [`Type::Unknown`] and is filled in by [`infer::infer`].
+/// `user_annotation` is set at construction time by lowering when the source
+/// Python carries an explicit type cast; the inference pass checks that the
+/// inferred type is compatible with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedBinding {
+    /// The bound variable name.
+    pub name: String,
+    /// The variable's type, filled in by type inference.
+    ///
+    /// Starts as [`Type::Unknown`]; written by [`infer::infer`] before compilation.
+    pub ty: Type,
+    /// User-written type annotation, if any.
+    ///
+    /// `None` for all bindings produced by the current lowering pass.
+    /// Reserved for future use when Python type annotations are propagated.
+    pub user_annotation: Option<Type>,
+}
+
+impl TypedBinding {
+    /// Create an unannotated binding with type [`Type::Unknown`].
+    ///
+    /// Equivalent to `TypedBinding { name: name.to_string(), ty: Type::Unknown, user_annotation: None }`.
+    /// Use this at lowering time when no type is yet known.
+    pub fn new_unannotated(name: &str) -> Self {
+        TypedBinding {
+            name: name.to_string(),
+            ty: Type::Unknown,
+            user_annotation: None,
+        }
+    }
+}
+
 /// A CCL expression.
 ///
 /// The central type of the CCL AST. Every program is an `Expr`.
@@ -226,27 +264,21 @@ pub enum Expr {
 
     /// A lambda abstraction.
     ///
-    /// `param_ty` may be `None` when unannotated; the type checker fills it
-    /// in. Wrapping a lambda in [`Expr::Let`] gives it a name and a natural
-    /// annotation site for bidirectional type checking.
+    /// The bound parameter and its type are carried by a [`TypedBinding`].
+    /// `param.ty` starts as [`Type::Unknown`] on unannotated lambdas from
+    /// lowering; [`infer::infer`] fills it in before compilation.
     ///
     /// Note: `crate::interpreter::Lambda` is an unrelated operator struct.
     Lambda {
-        /// The bound parameter name.
-        param: String,
-        /// The parameter's type, if known.
-        ///
-        /// `None` on unannotated lambdas from lowering; filled in by
-        /// [`infer::infer`] before compilation. User-written ascriptions on
-        /// arbitrary expressions use [`Expr::TypeAnnotation`] instead.
-        /// See the `TypedExpr` TODO in [`infer`](crate::ccl::infer).
-        param_ty: Option<Type>,
+        /// The bound parameter, with its name and inferred/annotated type.
+        param: TypedBinding,
         /// The lambda body.
         body: Box<Expr>,
         /// Refinement on the param type computed by this lambda.
-        /// This is a separate field from param_ty because it can be set before the
-        /// type is known, and the presence of this field indicates that the refinement
-        /// should be interpreted in the scope of this lambda.
+        ///
+        /// This is a separate field from `param.ty` because it can be set
+        /// before the type is known, and its presence indicates that the
+        /// refinement should be interpreted in the scope of this lambda.
         refinement: Option<Refinement>,
     },
 
@@ -265,14 +297,11 @@ pub enum Expr {
     /// Binds `name` to `value` within `body`. Unlike strict ANF, `value`
     /// may be any `Expr`, not only an atomic term.
     Let {
-        /// The name being bound.
-        name: String,
-        /// The type of the bound value, if known.
+        /// The bound name and its type.
         ///
-        /// `None` when unannotated; filled in by [`infer::infer`] before
-        /// compilation. User-written ascriptions on arbitrary expressions use
-        /// [`Expr::TypeAnnotation`] instead. See the `TypedExpr` TODO in [`infer`].
-        bound_ty: Option<Type>,
+        /// `binding.ty` starts as [`Type::Unknown`] at lowering time and is
+        /// filled in by [`infer::infer`] before compilation.
+        binding: TypedBinding,
         /// The expression being bound.
         bound_expr: Box<Expr>,
         /// The expression in which `name` is in scope.
@@ -319,8 +348,8 @@ pub enum Expr {
     Join {
         /// The join point's label, referenced by [`Expr::Jump`].
         name: String,
-        /// The loop variables with optional type annotations.
-        params: Vec<(String, Option<Type>)>,
+        /// The loop variables with their names and inferred/annotated types.
+        params: Vec<TypedBinding>,
         /// The loop body; evaluated on each iteration. May contain a
         /// [`Expr::Jump`] back to this join point.
         loop_body: Box<Expr>,
@@ -385,25 +414,38 @@ impl Expr {
         }
     }
 
-    pub fn lambda(param: &str, param_ty: Option<Type>, body: Expr) -> Self {
+    /// Build an unannotated or pre-annotated [`Expr::Lambda`].
+    ///
+    /// Pass [`Type::Unknown`] for `param_ty` when the parameter type is not yet
+    /// known (lowering phase); pass the concrete type when it is already known.
+    /// Callers that previously passed `None` should pass `Type::Unknown`;
+    /// callers that passed `Some(ty)` should pass `ty` directly.
+    pub fn lambda(param: &str, param_ty: Type, body: Expr) -> Self {
         Expr::Lambda {
-            param: param.to_string(),
-            param_ty,
+            param: TypedBinding {
+                name: param.to_string(),
+                ty: param_ty,
+                user_annotation: None,
+            },
             body: Box::new(body),
             refinement: None,
         }
     }
 
+    /// Build an [`Expr::Lambda`] with a predicate [`Refinement`].
     pub fn lambda_with_refinement(
         param: &str,
-        param_ty: Option<Type>,
+        param_ty: Type,
         body: Expr,
         refinement: Expr,
         refinement_desc: &str,
     ) -> Self {
         Expr::Lambda {
-            param: param.to_string(),
-            param_ty,
+            param: TypedBinding {
+                name: param.to_string(),
+                ty: param_ty,
+                user_annotation: None,
+            },
             body: Box::new(body),
             refinement: Some(Refinement {
                 id: next_refinement_id(),
@@ -416,14 +458,17 @@ impl Expr {
     /// Build a [`Expr::Lambda`] with a hash-join [`Refinement`].
     pub fn lambda_with_hash_join(
         param: &str,
-        param_ty: Option<Type>,
+        param_ty: Type,
         body: Expr,
         spec: HashJoinSpec,
         desc: &str,
     ) -> Self {
         Expr::Lambda {
-            param: param.to_string(),
-            param_ty,
+            param: TypedBinding {
+                name: param.to_string(),
+                ty: param_ty,
+                user_annotation: None,
+            },
             body: Box::new(body),
             refinement: Some(Refinement {
                 id: next_refinement_id(),

@@ -83,7 +83,7 @@ Python aggregate calls (`sum(xs)`, `max(xs)`) are lowered directly to `Expr::Agg
 
 ### Python `lambda` expressions — curried `Expr::Lambda` chain
 
-Python `lambda` expressions are lowered to a curried chain of `Expr::Lambda` nodes. A multi-parameter `lambda x, y: body` becomes `λ x → λ y → body`. Single-parameter lambdas lower to a single `Expr::Lambda`. `param_ty` is left `None` at lowering time and filled in by the inference pass where the call site provides type information.
+Python `lambda` expressions are lowered to a curried chain of `Expr::Lambda` nodes. A multi-parameter `lambda x, y: body` becomes `λ x → λ y → body`. Single-parameter lambdas lower to a single `Expr::Lambda`. `param.ty` is left `Type::Unknown` at lowering time and filled in by the inference pass where the call site provides type information.
 
 Restrictions not yet supported (lowering raises `LoweringError::Unsupported`): `*args`, `**kwargs`, keyword-only arguments, and default values.
 
@@ -112,9 +112,14 @@ Rationale: encoding loops as recursive lambdas requires detecting recursive bind
 
 `Literal` and `BinOpKind` are defined in a shared module, not in the interpreter. The CCL IR must not depend on interpreter internals.
 
-### Optional type annotations
+### Typed binding sites — `TypedBinding`
 
-`Lambda.param_ty` and `Let.ty` are `Option<Type>`. Unannotated terms are valid in the CCL; the type checker fills in `Type::Unknown` annotations. `Type::Unknown` has no runtime equivalent — all types must be resolved before operator-graph compilation.
+All binding sites — `Lambda`, `Join`, and `Let` — use `TypedBinding { name, ty, user_annotation }` rather than separate `name: String` / type fields.
+
+- `ty` starts as `Type::Unknown` (lowering phase) and is filled in by inference before compilation.
+- `user_annotation` carries an optional user-written type annotation (e.g. from a Python `cast` expression). Inference validates the inferred type against it; if the body provides no usable constraint the annotation is used directly as the param type.
+
+`Let.ty` remains `Option<Type>`. `Type::Unknown` has no runtime equivalent — all types must be resolved before operator-graph compilation.
 
 ---
 
@@ -170,16 +175,14 @@ enum Expr {
     UnaryOp(UnaryOpKind, Box<Expr>),
     TypeAnnotation(Box<Expr>, Type),
     Lambda {
-        param: String,
-        param_ty: Option<Type>,
+        param: TypedBinding,    // name + ty (Unknown until inferred) + user_annotation
         body: Box<Expr>,
         /// Optional restriction on the outer iteration variable.
         /// `None` for unrestricted lambdas; `Some(r)` for filtered or joined comprehensions.
         refinement: Option<Refinement>,
     },
     Let {
-        name: String,
-        bound_ty: Option<Type>,
+        binding: TypedBinding,  // name + ty (Unknown until inferred)
         bound_expr: Box<Expr>,
         body: Box<Expr>,
     },
@@ -193,8 +196,8 @@ enum Expr {
         branches: Vec<(Pattern, Expr)>,
     },
     Join {
-        name: String,
-        params: Vec<(String, Option<Type>)>,
+        name: String,       // join-point label
+        params: Vec<TypedBinding>,
         loop_body: Box<Expr>,                 // loop body; may contain Jump back to this Join
         outer_body: Box<Expr>,                // evaluated first; contains the initial Jump
     },
@@ -306,7 +309,7 @@ union-find unification table, and an occurs check. Removes the need for
 When inferring `Expr::GroupBy { collection, key }`:
 
 1. Infer the type of `collection`.
-2. If the collection type has a codomain (i.e. it is a `Fun(_, elem_ty)`), write `elem_ty` into the key lambda's `param_ty` when `param_ty` is still `None`. This mirrors the `Apply` rule where the argument type is pushed onto the lambda parameter.
+2. If the collection type has a codomain (i.e. it is a `Fun(_, elem_ty)`), write `elem_ty` into the key lambda's `param.ty` when `param.ty` is still `Type::Unknown`. This mirrors the `Apply` rule where the argument type is pushed onto the lambda parameter.
 3. Infer the type of `key` (now annotated); take its codomain as `key_output_ty`.
 4. Return `Fun(key_output_ty, Fun(Base(UInt), elem_ty))`. Falls back to `Unknown` if either codomain cannot be determined.
 

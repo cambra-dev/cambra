@@ -12,7 +12,7 @@
 //! The formatting is intentionally kept human-readable and stable so that tests
 //! can pin expected tree strings directly.
 
-use crate::ccl::{Expr, Lit, RefinementKind, UnaryOpKind};
+use crate::ccl::{Expr, Lit, RefinementKind, Type, UnaryOpKind};
 use crate::pretty_tree::{render, InspectNode};
 
 // ---------------------------------------------------------------------------
@@ -47,13 +47,12 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
 
         Expr::Lambda {
             param,
-            param_ty,
             body,
             refinement,
         } => {
-            let mut node = InspectNode::new(format!("Lambda({param})"));
-            if let Some(ty) = param_ty {
-                node = node.annotate(format!(": {ty}"));
+            let mut node = InspectNode::new(format!("Lambda({})", param.name));
+            if param.ty != Type::Unknown {
+                node = node.annotate(format!(": {}", param.ty));
             }
             if let Some(r) = refinement {
                 node = match &r.kind {
@@ -77,15 +76,13 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
         }
 
         Expr::Let {
-            name,
-            bound_ty: ty,
+            binding,
             bound_expr: value,
             body,
-            ..
         } => {
-            let mut node = InspectNode::new(format!("Let({name})"));
-            if let Some(t) = ty {
-                node = node.annotate(format!(": {t}"));
+            let mut node = InspectNode::new(format!("Let({})", binding.name));
+            if binding.ty != Type::Unknown {
+                node = node.annotate(format!(": {}", binding.ty));
             }
             node.child("value", expr_to_node(value))
                 .child("body", expr_to_node(body))
@@ -185,7 +182,8 @@ fn unaryop_symbol(op: &UnaryOpKind) -> &'static str {
 mod tests {
     use super::pretty;
     use crate::ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, Expr, Lit, Pattern, Type, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BinOpKind, Expr, Lit, Pattern, Type, TypedBinding,
+        UnaryOpKind,
     };
     use crate::interpreter::BaseType;
     use rstest::rstest;
@@ -237,14 +235,14 @@ Apply
     )]
     // Lambda (unannotated and annotated)
     #[case(
-        Expr::lambda("x", None, Expr::Var("x".to_string())),
+        Expr::lambda("x", Type::Unknown, Expr::Var("x".to_string())),
         "\
 Lambda(x)
 └── body: Var(x)
 "
     )]
     #[case(
-        Expr::lambda("x", Some(Type::Base(BaseType::Int)), Expr::Var("x".to_string())),
+        Expr::lambda("x", Type::Base(BaseType::Int), Expr::Var("x".to_string())),
         "\
 Lambda(x) : Int
 └── body: Var(x)
@@ -253,8 +251,7 @@ Lambda(x) : Int
     // Let (unannotated and annotated)
     #[case(
         Expr::Let {
-            name: "x".to_string(),
-            bound_ty: None,
+            binding: TypedBinding::new_unannotated("x"),
             bound_expr: Box::new(Expr::Lit(Lit::Int(1))),
             body: Box::new(Expr::Var("x".to_string())),
         },
@@ -266,8 +263,7 @@ Let(x)
     )]
     #[case(
         Expr::Let {
-            name: "x".to_string(),
-            bound_ty: Some(Type::Base(BaseType::Bool)),
+            binding: TypedBinding { name: "x".to_string(), ty: Type::Base(BaseType::Bool), user_annotation: None },
             bound_expr: Box::new(Expr::Lit(Lit::Bool(true))),
             body: Box::new(Expr::Var("x".to_string())),
         },
@@ -320,7 +316,7 @@ Case
     #[case(
         Expr::Join {
             name: "k".to_string(),
-            params: vec![("i".to_string(), None)],
+            params: vec![TypedBinding::new_unannotated("i")],
             loop_body: Box::new(Expr::Jump {
                 target: "k".to_string(),
                 args: vec![Expr::Var("i".to_string())],
@@ -365,7 +361,7 @@ Aggregate(Sum)
     #[case(
         Expr::lambda_with_refinement(
             "x",
-            Some(Type::Base(BaseType::Int)),
+            Type::Base(BaseType::Int),
             Expr::Var("x".to_string()),
             Expr::Lit(Lit::Bool(true)),
             "test pred",
@@ -396,7 +392,7 @@ Lambda(x) : Int
         };
         let expr = Expr::lambda_with_hash_join(
             "p",
-            Some(Type::Base(BaseType::Int)),
+            Type::Base(BaseType::Int),
             Expr::Lit(Lit::Unit),
             spec,
             "x == y",
@@ -418,8 +414,7 @@ Lambda(p) : Int
     #[test]
     fn test_pretty_continuation_prefix() {
         let expr = Expr::Let {
-            name: "x".to_string(),
-            bound_ty: None,
+            binding: TypedBinding::new_unannotated("x"),
             bound_expr: Box::new(Expr::apply(
                 Expr::Lit(Lit::Int(1)),
                 Expr::Var("f".to_string()),
