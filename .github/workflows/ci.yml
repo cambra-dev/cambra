@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request: # Trigger on all PRs to satisfy branch protection
+    types: [opened, synchronize, reopened]
 
 # Group runs by workflow + PR branch (head_ref) so duplicate runs (e.g. from
 # git-spice force-pushing twice) cancel the earlier one. head_ref is empty on
