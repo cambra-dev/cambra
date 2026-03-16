@@ -26,6 +26,7 @@
 //! from inference-filled slots. Deferred until the inference pass matures.
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 
 use log::trace;
 
@@ -38,14 +39,92 @@ use crate::util::ScopeStack;
 // TypeInferenceContext
 // ---------------------------------------------------------------------------
 
-/// Scope-stack mapping variable names to CCL [`Type`]s for the type-inference pass.
+/// Context for the CCL type-inference pass.
 ///
-/// Supports shadowing: inner scopes can bind the same name as outer scopes,
-/// and [`lookup`](TypeInferenceContext::lookup) returns the innermost binding.
+/// Combines a lexical scope stack (for lambda parameters and let bindings)
+/// with a registry of externally-registered data-source types.
+/// Source types are consulted when [`infer`] encounters an [`Expr::Source`] node.
 ///
 /// Scopes are entered and exited exclusively via [`enter_scope`](TypeInferenceContext::enter_scope);
 /// each lambda body and let binding gets its own scope.
-pub type TypeInferenceContext = ScopeStack<Type>;
+#[derive(Default)]
+pub struct TypeInferenceContext {
+    /// Lexical scopes
+    scopes: ScopeStack<Type>,
+
+    /// Types of known sources
+    source_types: HashMap<String, Type>,
+}
+
+/// RAII guard returned by [`TypeInferenceContext::enter_scope`].
+///
+/// Pops the innermost lexical scope when dropped, ensuring every
+/// `enter_scope` call is paired with a scope exit regardless of how
+/// control leaves the enclosing block.
+pub struct TypeInferenceContextGuard<'a> {
+    ctx: &'a mut TypeInferenceContext,
+}
+
+impl<'a> Deref for TypeInferenceContextGuard<'a> {
+    type Target = TypeInferenceContext;
+    fn deref(&self) -> &TypeInferenceContext {
+        self.ctx
+    }
+}
+
+impl<'a> DerefMut for TypeInferenceContextGuard<'a> {
+    fn deref_mut(&mut self) -> &mut TypeInferenceContext {
+        self.ctx
+    }
+}
+
+impl<'a> Drop for TypeInferenceContextGuard<'a> {
+    fn drop(&mut self) {
+        self.ctx.scopes.pop_scope();
+    }
+}
+
+impl TypeInferenceContext {
+    /// Create a new, empty context with no scopes and no registered sources.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Push a fresh lexical scope and return a guard that pops it on drop.
+    ///
+    /// Use this for every lambda body and let binding to ensure shadowing
+    /// is correctly scoped.
+    pub fn enter_scope(&mut self) -> TypeInferenceContextGuard<'_> {
+        self.scopes.push_scope();
+        TypeInferenceContextGuard { ctx: self }
+    }
+
+    /// Register the CCL type for an externally-managed data source.
+    ///
+    /// Typically called by [`crate::ccl::context::GlobalContext`] when a source
+    /// is registered; the type is a `Fun(DataSource(name), output_type)`.
+    pub fn register_source_type(&mut self, name: &str, ty: Type) {
+        self.source_types.insert(name.to_string(), ty);
+    }
+
+    /// Look up the CCL type for a registered source by name.
+    pub fn source_type(&self, name: &str) -> Option<Type> {
+        self.source_types.get(name).cloned()
+    }
+}
+
+impl Deref for TypeInferenceContext {
+    type Target = ScopeStack<Type>;
+    fn deref(&self) -> &Self::Target {
+        &self.scopes
+    }
+}
+
+impl DerefMut for TypeInferenceContext {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.scopes
+    }
+}
 
 // ---------------------------------------------------------------------------
 // InferError
@@ -387,6 +466,15 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         //
         // Not yet handled by this pass; sub-expressions are not visited.
         Expr::Join { .. } | Expr::Jump { .. } | Expr::Record(_) => Ok(Type::Unknown),
+
+        // ----- External data source reference -----
+        //
+        // Look up the source's function type in the source registry.
+        // Returns `InferError::UnboundVariable` if the source was not registered
+        // before inference was run.
+        Expr::Source(name) => ctx
+            .source_type(name)
+            .ok_or_else(|| InferError::UnboundVariable(name.clone())),
     }
 }
 
@@ -538,6 +626,9 @@ fn collect_constraints_into(
 
         // idx is a usize constant, not an expression; nothing to search.
         Expr::TupleIndex(tuple, _) => collect_constraints_into(param, tuple, ctx, out),
+
+        // Leaf nodes with no sub-expressions to search.
+        Expr::Source(_) | Expr::Lit(_) | Expr::Var(_) => {}
 
         _ => {}
     }
@@ -1481,5 +1572,55 @@ mod tests {
         if let Expr::Lambda { param, .. } = &expr {
             assert_eq!(param.ty, Type::Base(BaseType::Int));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Source inference tests
+    // -----------------------------------------------------------------------
+
+    /// A registered `Expr::Source` infers to the type it was registered with.
+    #[test]
+    fn test_infer_source_returns_registered_type() {
+        let mut ctx = TypeInferenceContext::new();
+        let source_ty = Type::Fun(
+            Box::new(Type::DataSource("mystream".into())),
+            Box::new(Type::Base(BaseType::String)),
+        );
+        ctx.register_source_type("mystream", source_ty.clone());
+        let mut expr = Expr::Source("mystream".into());
+        assert_eq!(infer(&mut expr, &mut ctx), Ok(source_ty));
+    }
+
+    /// An `Expr::Source` whose name was never registered produces `UnboundVariable`.
+    #[test]
+    fn test_infer_source_unregistered_is_unbound() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::Source("ghost".into());
+        assert_eq!(
+            infer(&mut expr, &mut ctx),
+            Err(InferError::UnboundVariable("ghost".into()))
+        );
+    }
+
+    /// Multiple distinct sources can coexist in the registry and each resolves
+    /// to its own type independently.
+    #[test]
+    fn test_infer_multiple_sources_resolve_independently() {
+        let mut ctx = TypeInferenceContext::new();
+        let int_ty = Type::Fun(
+            Box::new(Type::DataSource("ints".into())),
+            Box::new(Type::Base(BaseType::Int)),
+        );
+        let str_ty = Type::Fun(
+            Box::new(Type::DataSource("strs".into())),
+            Box::new(Type::Base(BaseType::String)),
+        );
+        ctx.register_source_type("ints", int_ty.clone());
+        ctx.register_source_type("strs", str_ty.clone());
+
+        let mut e1 = Expr::Source("ints".into());
+        let mut e2 = Expr::Source("strs".into());
+        assert_eq!(infer(&mut e1, &mut ctx), Ok(int_ty));
+        assert_eq!(infer(&mut e2, &mut ctx), Ok(str_ty));
     }
 }

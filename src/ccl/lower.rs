@@ -39,7 +39,7 @@
 //! This is intentional: the less-normalized representation preserves structure
 //! needed for optimization passes.
 
-use std::rc::Rc;
+use std::{collections::HashSet, rc::Rc};
 
 use bit_set::BitSet;
 use rustpython_parser::ast as pyast;
@@ -61,33 +61,61 @@ pub enum LoweringError {
 }
 
 // ---------------------------------------------------------------------------
+// Lowering context
+// ---------------------------------------------------------------------------
+
+/// Context for Python → CCL lowering that carries externally-registered source names.
+///
+/// Zero-argument function calls whose name is registered here are lowered to
+/// [`crate::ccl::Expr::Source`] nodes instead of failing with an
+/// [`LoweringError::Unsupported`] error. The caller is responsible for
+/// registering the matching type in [`crate::ccl::infer::TypeInferenceContext`]
+/// and operator factory in [`crate::interpreter::compile_ccl::CompileContext`]
+/// before running those passes.
+#[derive(Default)]
+pub struct LoweringContext {
+    known_sources: HashSet<String>,
+}
+
+impl LoweringContext {
+    /// Register `name` as a known data-source call (e.g. `"testsource1"`,
+    /// `"__stdinvalues"`).
+    pub fn register_source(&mut self, name: &str) {
+        self.known_sources.insert(name.to_string());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Lower a single Python expression to a CCL expression.
-pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, LoweringError> {
+pub fn lower_expr(
+    expr: &pyast::Located<pyast::ExprKind>,
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
     match &expr.node {
         pyast::ExprKind::Constant { value, .. } => lower_constant(value),
         pyast::ExprKind::Name { id, .. } => Ok(Expr::Var(id.clone())),
-        pyast::ExprKind::BinOp { left, op, right } => lower_binop(left, op, right),
+        pyast::ExprKind::BinOp { left, op, right } => lower_binop(left, op, right, ctx),
         pyast::ExprKind::Compare {
             left,
             ops,
             comparators,
-        } => lower_compare(left, ops, comparators),
-        pyast::ExprKind::BoolOp { op, values } => lower_boolop(op, values),
+        } => lower_compare(left, ops, comparators, ctx),
+        pyast::ExprKind::BoolOp { op, values } => lower_boolop(op, values, ctx),
         pyast::ExprKind::List { elts, .. } => {
-            let items: Result<Vec<_>, _> = elts.iter().map(lower_expr).collect();
+            let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
             Ok(Expr::List(items?))
         }
-        pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(elt, generators),
+        pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(elt, generators, ctx),
         pyast::ExprKind::Call {
             func,
             args,
             keywords,
-        } => lower_call(func, args, keywords),
+        } => lower_call(func, args, keywords, ctx),
         pyast::ExprKind::Tuple { elts, .. } => {
-            let items: Result<Vec<_>, _> = elts.iter().map(lower_expr).collect();
+            let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
             Ok(Expr::Tuple(items?))
         }
         pyast::ExprKind::Subscript { value, slice, .. } => match &slice.node {
@@ -98,13 +126,13 @@ pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, Loweri
                 let idx: usize = n.try_into().map_err(|_| {
                     LoweringError::Unsupported("Tuple index must be non-negative".into())
                 })?;
-                Ok(Expr::TupleIndex(Box::new(lower_expr(value)?), idx))
+                Ok(Expr::TupleIndex(Box::new(lower_expr(value, ctx)?), idx))
             }
             _ => Err(LoweringError::Unsupported(
                 "Only integer subscripts are supported".into(),
             )),
         },
-        pyast::ExprKind::Lambda { args, body } => lower_lambda(args, body),
+        pyast::ExprKind::Lambda { args, body } => lower_lambda(args, body, ctx),
         _ => Err(LoweringError::Unsupported(format!(
             "Expression type not supported: {:?}",
             expr.node
@@ -117,7 +145,7 @@ pub fn lower_expr(expr: &pyast::Located<pyast::ExprKind>) -> Result<Expr, Loweri
 /// All statements except the last must be simple name assignments
 /// (`x = expr`); each becomes an [`Expr::Let`] binding wrapping the rest.
 /// The last statement must be a bare expression (`StmtKind::Expr`).
-pub fn lower_stmts(stmts: &[pyast::Stmt]) -> Result<Expr, LoweringError> {
+pub fn lower_stmts(stmts: &[pyast::Stmt], ctx: &LoweringContext) -> Result<Expr, LoweringError> {
     if stmts.is_empty() {
         return Err(LoweringError::Unsupported("Empty statement block".into()));
     }
@@ -126,7 +154,7 @@ pub fn lower_stmts(stmts: &[pyast::Stmt]) -> Result<Expr, LoweringError> {
 
     // The final statement must be a bare expression.
     let final_expr = match &last.node {
-        pyast::StmtKind::Expr { value } => lower_expr(value)?,
+        pyast::StmtKind::Expr { value } => lower_expr(value, ctx)?,
         _ => {
             return Err(LoweringError::Unsupported(
                 "Last statement must be a bare expression".into(),
@@ -152,7 +180,7 @@ pub fn lower_stmts(stmts: &[pyast::Stmt]) -> Result<Expr, LoweringError> {
                         ))
                     }
                 };
-                let val = lower_expr(value)?;
+                let val = lower_expr(value, ctx)?;
                 Ok(Expr::Let {
                     binding: TypedBinding::new_unannotated(&name),
                     bound_expr: Box::new(val),
@@ -205,6 +233,7 @@ fn lower_call(
     func: &pyast::Expr,
     args: &[pyast::Expr],
     keywords: &[pyast::Keyword],
+    ctx: &LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if !keywords.is_empty() {
         return Err(LoweringError::Unsupported(
@@ -219,6 +248,7 @@ fn lower_call(
             ))
         }
     };
+
     match name {
         "groupby" => {
             if args.len() != 2 {
@@ -226,8 +256,8 @@ fn lower_call(
                     "groupby requires exactly two arguments".into(),
                 ));
             }
-            let collection = lower_expr(&args[0])?;
-            let key = lower_expr(&args[1])?;
+            let collection = lower_expr(&args[0], ctx)?;
+            let key = lower_expr(&args[1], ctx)?;
             Ok(Expr::GroupBy {
                 collection: Box::new(collection),
                 key: Box::new(key),
@@ -244,12 +274,13 @@ fn lower_call(
                 "max" => AggregateKind::Max,
                 _ => unreachable!(),
             };
-            let input = lower_expr(&args[0])?;
+            let input = lower_expr(&args[0], ctx)?;
             Ok(Expr::Aggregate {
                 input: Box::new(input),
                 kind,
             })
         }
+        name if ctx.known_sources.contains(name) => Ok(Expr::Source(name.to_string())),
         _ => Err(LoweringError::Unsupported(format!(
             "Unknown function: {name}"
         ))),
@@ -260,9 +291,10 @@ fn lower_binop(
     left: &pyast::Located<pyast::ExprKind>,
     op: &pyast::Operator,
     right: &pyast::Located<pyast::ExprKind>,
+    ctx: &LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let left_expr = lower_expr(left)?;
-    let right_expr = lower_expr(right)?;
+    let left_expr = lower_expr(left, ctx)?;
+    let right_expr = lower_expr(right, ctx)?;
     let kind = match op {
         pyast::Operator::Add => BinOpKind::Arithmetic(ArithmeticKind::Add),
         pyast::Operator::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
@@ -296,13 +328,14 @@ fn lower_compare(
     left: &pyast::Located<pyast::ExprKind>,
     ops: &[pyast::Cmpop],
     comparators: &[pyast::Located<pyast::ExprKind>],
+    ctx: &LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // Lower all operands up-front. For a chain of n ops there are n+1 operands:
     // left, comparators[0], comparators[1], …
     let mut operands: Vec<Expr> = Vec::with_capacity(comparators.len() + 1);
-    operands.push(lower_expr(left)?);
+    operands.push(lower_expr(left, ctx)?);
     for comp in comparators {
-        operands.push(lower_expr(comp)?);
+        operands.push(lower_expr(comp, ctx)?);
     }
 
     // Build one BinOp per (op, adjacent-operand-pair).
@@ -349,6 +382,7 @@ fn lower_compare(
 fn lower_boolop(
     op: &pyast::Boolop,
     values: &[pyast::Located<pyast::ExprKind>],
+    ctx: &LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if values.len() < 2 {
         return Err(LoweringError::Unsupported(
@@ -360,12 +394,12 @@ fn lower_boolop(
         pyast::Boolop::Or => BinOpKind::BoolLogic(LogicKind::Or),
     };
     // Fold left-to-right: `a and b and c` → `(a and b) and c`.
-    let mut acc = lower_expr(&values[0])?;
+    let mut acc = lower_expr(&values[0], ctx)?;
     for value in &values[1..] {
         acc = Expr::BinOp {
             left: Box::new(acc),
             op: kind.clone(),
-            right: Box::new(lower_expr(value)?),
+            right: Box::new(lower_expr(value, ctx)?),
         };
     }
     Ok(acc)
@@ -498,6 +532,7 @@ fn try_extract_ccl_equality_join<'a>(
 fn lower_lambda(
     args: &pyast::Arguments,
     body: &pyast::Located<pyast::ExprKind>,
+    ctx: &LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if args.vararg.is_some() {
         return Err(LoweringError::Unsupported(
@@ -528,7 +563,7 @@ fn lower_lambda(
 
     // Lower the body once; then wrap it in one lambda per parameter,
     // innermost-first (reverse order) to produce the curried chain.
-    let body_expr = lower_expr(body)?;
+    let body_expr = lower_expr(body, ctx)?;
     let result = args.args.iter().rev().fold(body_expr, |acc, arg| {
         Expr::lambda(&arg.node.arg, Type::Unknown, acc)
     });
@@ -572,6 +607,7 @@ fn lower_lambda(
 fn lower_list_comp(
     elt: &pyast::Located<pyast::ExprKind>,
     generators: &[pyast::Comprehension],
+    ctx: &LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // ---- Phase 1: Lower each generator's source and register its loop variable ----
     // We keep the source operators and index extents for later use when building the
@@ -586,7 +622,7 @@ fn lower_list_comp(
                 "Async comprehensions are not supported".into(),
             ));
         }
-        let source = lower_expr(&gen.iter)?;
+        let source = lower_expr(&gen.iter, ctx)?;
         let var_name = match &gen.target.node {
             pyast::ExprKind::Name { id, .. } => id,
             _ => {
@@ -602,7 +638,7 @@ fn lower_list_comp(
     }
 
     // ---- Phase 2: Lower body and all predicates to CCL -------------------------
-    let body = lower_expr(elt)?;
+    let body = lower_expr(elt, ctx)?;
 
     // Lower every `if` guard from each generator to CCL.  We hold on to the
     // original pyast nodes only to build human-readable description strings;
@@ -613,7 +649,7 @@ fn lower_list_comp(
         .collect();
     let lowered_preds: Vec<Expr> = pyast_preds
         .iter()
-        .map(|e| lower_expr(e))
+        .map(|e| lower_expr(e, ctx))
         .collect::<Result<_, _>>()?;
 
     let gen_var_refs: Vec<&str> = gen_iter_vars.iter().map(String::as_str).collect();
@@ -832,7 +868,7 @@ mod tests {
     #[case("lambda x, y: x + y", "λ x → λ y → x + y")]
     fn test_lower_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr).expect("lowering failed");
+        let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -883,7 +919,7 @@ in x"
     )]
     fn test_lower_stmts(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -924,7 +960,7 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     )]
     fn test_lower_list_comp(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -938,7 +974,7 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     fn test_hash_join_kind_detection() {
         // Equality join: `x == y` should give HashJoin
         let eq_join = parse_module("[x for x in [1, 2] for y in [3, 4] if x == y]");
-        let eq_ccl = lower_stmts(&eq_join).expect("lowering failed");
+        let eq_ccl = lower_stmts(&eq_join, &LoweringContext::default()).expect("lowering failed");
         if let Expr::Lambda { refinement, .. } = &eq_ccl {
             let r = refinement
                 .as_ref()
@@ -953,7 +989,8 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
 
         // Non-equality predicate: `x < y` should give Predicate (loop join)
         let non_eq = parse_module("[x for x in [1, 2] for y in [3, 4] if x < y]");
-        let non_eq_ccl = lower_stmts(&non_eq).expect("lowering failed");
+        let non_eq_ccl =
+            lower_stmts(&non_eq, &LoweringContext::default()).expect("lowering failed");
         if let Expr::Lambda { refinement, .. } = &non_eq_ccl {
             let r = refinement
                 .as_ref()
@@ -971,7 +1008,7 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     #[test]
     fn test_hash_join_symbolic() {
         let stmts = parse_module("[x for x in [1, 2] for y in [3, 4] if x == y]");
-        let ccl = lower_stmts(&stmts).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
         let sym = symbolic(&ccl);
         assert!(
             sym.contains("Refined(x == y)"),
@@ -1004,7 +1041,7 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     )]
     fn test_lower_aggregate(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr).expect("lowering failed");
+        let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -1029,7 +1066,7 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr).expect("lowering failed");
+        let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -1038,12 +1075,12 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     fn test_lower_groupby_wrong_arity() {
         let one_arg = parse_expr("groupby(xs)");
         assert!(matches!(
-            lower_expr(&one_arg),
+            lower_expr(&one_arg, &LoweringContext::default()),
             Err(LoweringError::Unsupported(_))
         ));
         let three_args = parse_expr("groupby(xs, f, extra)");
         assert!(matches!(
-            lower_expr(&three_args),
+            lower_expr(&three_args, &LoweringContext::default()),
             Err(LoweringError::Unsupported(_))
         ));
     }
@@ -1052,10 +1089,60 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     #[test]
     fn test_lower_unknown_function() {
         let expr = parse_expr("foo(x)");
-        let err = lower_expr(&expr).expect_err("expected lowering error");
+        let err =
+            lower_expr(&expr, &LoweringContext::default()).expect_err("expected lowering error");
         assert!(
             matches!(err, LoweringError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Source lowering tests
+    // -----------------------------------------------------------------------
+
+    /// A zero-argument call whose name is registered lowers to `Expr::Source`.
+    #[test]
+    fn test_lower_registered_source_becomes_source_node() {
+        let mut ctx = LoweringContext::default();
+        ctx.register_source("mystream");
+        let expr = parse_expr("mystream()");
+        let ccl = lower_expr(&expr, &ctx).expect("lowering failed");
+        assert_eq!(symbolic(&ccl), "source(mystream)");
+    }
+
+    /// A zero-argument call whose name is NOT registered still fails.
+    #[test]
+    fn test_lower_unregistered_zero_arg_call_fails() {
+        let expr = parse_expr("unknown_source()");
+        let err =
+            lower_expr(&expr, &LoweringContext::default()).expect_err("expected lowering error");
+        assert!(matches!(err, LoweringError::Unsupported(_)));
+    }
+
+    /// A registered source name used as a non-call expression (plain variable)
+    /// lowers to `Expr::Var`, not `Expr::Source` — the call syntax is required.
+    #[test]
+    fn test_lower_source_name_without_call_is_var() {
+        let mut ctx = LoweringContext::default();
+        ctx.register_source("mystream");
+        let expr = parse_expr("mystream");
+        let ccl = lower_expr(&expr, &ctx).expect("lowering failed");
+        assert_eq!(symbolic(&ccl), "mystream");
+    }
+
+    /// A source call nested inside a larger expression lowers correctly.
+    #[test]
+    fn test_lower_source_in_list_comp() {
+        let mut ctx = LoweringContext::default();
+        ctx.register_source("src");
+        let stmts = parse_module("[x for x in src()]");
+        let ccl = lower_stmts(&stmts, &ctx).expect("lowering failed");
+        // The source node should appear in the symbolic output.
+        assert!(
+            symbolic(&ccl).contains("source(src)"),
+            "expected source(src) in output, got: {}",
+            symbolic(&ccl)
         );
     }
 
@@ -1086,7 +1173,7 @@ else:
     result = tmp + 2
 result";
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
         // Fill in the expected string when StmtKind::If lowering is added.
         // Structure: let result = case cond of { True → let tmp = 1 in tmp + 1 | False → let tmp = 2 in tmp + 2 } in result
         assert_eq!(symbolic(&ccl), "");
@@ -1106,7 +1193,7 @@ result";
 x = (y := 5) + 1
 x";
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
         // Fill in the expected string when ExprKind::NamedExpr lowering is added.
         // Structure: let x = (let y = 5 in y) + 1 in x
         assert_eq!(symbolic(&ccl), "");

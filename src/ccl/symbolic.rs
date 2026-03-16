@@ -270,6 +270,8 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
                 format!("GroupBy({coll_str}, {key_str})"),
             )
         }
+
+        Expr::Source(name) => (Precedence::Atom, format!("source({name})")),
     }
 }
 

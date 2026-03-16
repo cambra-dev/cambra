@@ -280,7 +280,7 @@ pub fn compile_chl_expr(
             )))
         }
     };
-    let mut expr = lower_expr(&ast_expr).map_err(PipelineError::Lower)?;
+    let mut expr = lower_expr(&ast_expr, &Default::default()).map_err(PipelineError::Lower)?;
     let mut type_scopes = TypeInferenceContext::new();
     infer(&mut expr, &mut type_scopes).map_err(PipelineError::Infer)?;
     compile(&expr, &mut CompileContext::new(), scheduler).map_err(PipelineError::Compile)

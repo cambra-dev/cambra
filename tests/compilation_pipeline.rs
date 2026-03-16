@@ -28,7 +28,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use cambra::ccl::infer::{infer, TypeInferenceContext};
+use cambra::ccl::context::GlobalContext;
+use cambra::ccl::infer::infer;
 use cambra::ccl::lower::{lower_expr, lower_stmts};
 use cambra::ccl::symbolic::symbolic;
 use cambra::interpreter::compile_ccl::{compile, CompileContext};
@@ -91,6 +92,7 @@ fn run_direct(code: &str) -> ColumnValue {
 /// Lower `code` through the CCL pipeline (parse → `ccl::lower` → `ccl::infer`
 /// → `compile_ccl` → subscribe → get) and return the resulting [`ColumnValue`].
 fn run_pipeline(code: &str) -> ColumnValue {
+    let mut ctx = GlobalContext::default();
     let mut expr = if code.contains(';') || code.contains('=') {
         let result = parser::parse(code, parser::Mode::Module, "<test>")
             .expect("Failed to parse Python module");
@@ -98,7 +100,7 @@ fn run_pipeline(code: &str) -> ColumnValue {
             pyast::Mod::Module { body, .. } => body,
             other => panic!("expected Module, got {other:?}"),
         };
-        lower_stmts(&stmts).expect("ccl lowering failed")
+        lower_stmts(&stmts, ctx.lowering_ctx()).expect("ccl lowering failed")
     } else {
         let result = parser::parse(code, parser::Mode::Expression, "<test>")
             .expect("Failed to parse Python expression");
@@ -106,13 +108,12 @@ fn run_pipeline(code: &str) -> ColumnValue {
             pyast::Mod::Expression { body } => *body,
             other => panic!("expected Expression, got {other:?}"),
         };
-        lower_expr(&ast_expr).expect("ccl lowering failed")
+        lower_expr(&ast_expr, ctx.lowering_ctx()).expect("ccl lowering failed")
     };
 
     debug!("Lowered:\n{}", symbolic(&expr));
 
-    let mut env = TypeInferenceContext::new();
-    infer(&mut expr, &mut env).expect("type inference failed");
+    infer(&mut expr, ctx.inference_ctx()).expect("type inference failed");
 
     debug!("Inferred:\n{}", symbolic(&expr));
 

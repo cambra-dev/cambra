@@ -151,6 +151,8 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
         Expr::GroupBy { collection, key } => InspectNode::new("GroupBy")
             .child("collection", expr_to_node(collection))
             .child("key", expr_to_node(key)),
+
+        Expr::Source(name) => InspectNode::leaf(format!("Source({name})")),
     }
 }
 

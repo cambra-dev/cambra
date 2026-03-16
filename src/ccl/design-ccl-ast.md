@@ -213,6 +213,8 @@ enum Expr {
     Tuple(Vec<Expr>),
     TupleIndex(Box<Expr>, usize),        // integer-index access into a tuple: t[n]
     Record(Vec<(String, Expr)>),
+    // Built-in data source
+    Source(String),
 }
 
 enum Pattern {
@@ -232,6 +234,7 @@ enum Type {
     Union(Vec<Type>),
     Unknown,                             // pre-type-checking placeholder
     Refinement(Box<Type>, Refinement),   // refined base type; `Refinement.kind` carries join strategy
+    DataSource(String),                  // opaque domain type of a source
     // Future:
     // Pi { param, param_ty, body_ty }  — dependent function type
 }
@@ -270,6 +273,14 @@ struct HashJoinSpec {
 ```
 
 ---
+
+## Source injection
+
+Sources need to be available to all stages of compilation, so they are tracked in a `GlobalContext` struct
+which produces references to the other types of contexts.
+
+Each phase of compilation needs different information about the sources: lowering needs just the names, inference needs the types, and compilation needs to track the materialized extents so that they are shared across references to the
+same source.
 
 ## Type inference
 
@@ -367,5 +378,8 @@ fills this in from the type of `bound_expr`.
    - `ccl/mod.rs` + `ccl/lower.rs` + `ccl/infer.rs`: first-class `GroupBy` node (`Expr::GroupBy`);
      lowering from `groupby(collection, key)` call sites; type inference propagates collection
      element type onto key lambda `param_ty`. ✓
+   - Source injection across all three CCL pipeline stages: `Expr::Source`, `Type::DataSource`,
+     `CclLoweringContext`, `TypeInferenceContext` source registry, `CompileContext` source registries,
+     `CclPipelineSources` convenience bundle. CCL pipeline variants of source/join tests added. ✓
    - `lowering_via_ccl.rs`: sandboxed end-to-end pipeline tests.
    - `lowering.rs` direct path removed after parity confirmed.

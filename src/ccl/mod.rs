@@ -6,6 +6,7 @@
 //!
 //! See `docs/design-ccl-ast.md` for the full design rationale.
 
+pub mod context;
 pub mod infer;
 pub mod lower;
 pub mod pretty;
@@ -404,6 +405,15 @@ pub enum Expr {
         /// A function that computes the grouping key for each element.
         key: Box<Expr>,
     },
+
+    /// A reference to an externally-registered data source, identified by name.
+    ///
+    /// Emitted by [`crate::ccl::lower`] when a zero-argument call is recognised
+    /// as a registered source (e.g. `testsource1()` or `__stdinvalues()`).
+    /// [`crate::ccl::infer`] resolves it to a `Fun(DataSource(name), output_type)`
+    /// via the source registry; [`crate::interpreter::compile_ccl`] compiles it to
+    /// the appropriate reader operator.
+    Source(String),
 }
 
 impl Expr {
@@ -526,6 +536,13 @@ pub enum Type {
     Refinement(Box<Type>, Refinement),
     /// Pre-type-checking placeholder; filled in by the type checker.
     Unknown,
+    /// The opaque domain type of an externally-registered data source.
+    ///
+    /// Used as the domain in `Fun(DataSource(name), output_type)` types emitted
+    /// by the source registry.  [`crate::interpreter::compile_ccl::CompileContext`]
+    /// resolves this to a concrete `Extent::DataSourceDomain(rc)` at compilation time
+    /// by looking the name up in its source-domain-extent registry.
+    DataSource(String),
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
     // Refinement { base: Box<Type>, predicate: Box<Expr> }
@@ -561,6 +578,7 @@ impl fmt::Display for Type {
             }
             Type::Refinement(t, r) => write!(f, "{{{t} | Refined({})}}", r.description),
             Type::Unknown => write!(f, "_"),
+            Type::DataSource(name) => write!(f, "source({name})"),
         }
     }
 }

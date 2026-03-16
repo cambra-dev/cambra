@@ -11,6 +11,7 @@ use rustpython_parser::ast::{self as pyast};
 use bit_set::BitSet;
 
 use crate::{
+    ccl::Type,
     interpreter::{
         tuple_field, Apply, ArithmeticKind, BaseType, BinOp, BinOpKind, CompareKind,
         ComputeRestriction, ConstructRecord, Converse, Extent, Guard, Lambda, ListLiteral, Literal,
@@ -45,6 +46,7 @@ impl LoweringContext {
     ) -> Rc<RefCell<TestDataSource>> {
         let data_source = Rc::new(RefCell::new(TestDataSource::new(
             name,
+            Type::Unknown,
             output_extent.clone(),
         )));
         self.injected_test_sources

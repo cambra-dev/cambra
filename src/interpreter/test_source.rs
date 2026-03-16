@@ -1,8 +1,11 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use crate::interpreter::{
-    ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, GetResult, Guard, Operator,
-    Producer, Scheduler, Value, VarScope,
+use crate::{
+    ccl::Type,
+    interpreter::{
+        ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, GetResult, Guard, Operator,
+        Producer, Scheduler, Value, VarScope,
+    },
 };
 
 /// Handle for simulating an arbitrary source in a program.
@@ -10,6 +13,7 @@ use crate::interpreter::{
 /// as well as reading the obsolete guards pushed back to it.
 pub struct TestDataSource {
     name: String,
+    output_type: Type,
     output_extent: Extent,
     /// The extent of each domain key (element type).
     /// Defaults to [`Extent::Base(BaseType::UInt)`]; call [`set_element_extent`] to override.
@@ -21,10 +25,11 @@ pub struct TestDataSource {
 }
 
 impl TestDataSource {
-    pub fn new(name: &str, output_extent: Extent) -> Self {
+    pub fn new(name: &str, output_type: Type, output_extent: Extent) -> Self {
         use crate::interpreter::BaseType;
         Self {
             name: name.to_string(),
+            output_type,
             output_extent,
             element_extent: Extent::Base(BaseType::UInt),
             yield_guard: Guard::Empty,
@@ -56,6 +61,10 @@ impl TestDataSource {
 
     pub fn output_extent(&self) -> Extent {
         self.output_extent.clone()
+    }
+
+    pub fn output_type(&self) -> Type {
+        self.output_type.clone()
     }
 }
 
@@ -99,11 +108,6 @@ pub struct TestSourceReader {
 }
 
 impl TestSourceReader {
-    pub fn new(name: &str, output_extent: Extent) -> Self {
-        let data_source = Rc::new(RefCell::new(TestDataSource::new(name, output_extent)));
-        Self::from_shared(data_source)
-    }
-
     /// Create a new reader attached to an existing shared [`TestDataSource`].
     /// Used to create additional readers when the same source is lowered more than once
     /// (e.g. when a predicate also needs to reference the source).
