@@ -5,9 +5,22 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use log::debug;
+use rustpython_parser::{ast as pyast, parser};
+
 use crate::{
-    ccl::{infer::TypeInferenceContext, lower::LoweringContext, Type},
-    interpreter::{BaseType, DataSourceDomainExtentImpl, TestDataSource},
+    ccl::{
+        infer::{infer, TypeInferenceContext},
+        lower::{lower_stmts, LoweringContext},
+        symbolic::symbolic,
+        Type,
+    },
+    interpreter::{
+        compile_tile_operators::{compile_tile, TileCompileContext},
+        tile_operators::TileProducer,
+        BaseType, Consumer, DataSourceDomainExtentImpl, Scheduler, TestDataSource,
+    },
+    pretty_graph::{pretty_tile_operator, pretty_tile_producer},
 };
 
 /// Bundles the per-stage registries needed to thread externally-managed data
@@ -21,6 +34,10 @@ pub struct GlobalContext {
     lowering: LoweringContext,
     /// Inference-stage registry: supplies the CCL function type for each source.
     inference: TypeInferenceContext,
+    /// Compilation context.
+    compile: TileCompileContext,
+    /// Scheduler for triggering notifications.
+    scheduler: Scheduler,
 }
 
 impl GlobalContext {
@@ -29,9 +46,39 @@ impl GlobalContext {
         let mut result = Self {
             lowering: LoweringContext::default(),
             inference: TypeInferenceContext::new(),
+            compile: TileCompileContext::new(),
+            scheduler: Scheduler::new(),
         };
         result.register_stdin_source();
         result
+    }
+
+    pub fn compile_program(
+        &mut self,
+        code: &str,
+        consumer: Box<dyn Consumer>,
+    ) -> Box<dyn TileProducer> {
+        let result = parser::parse(code, parser::Mode::Module, "<test>")
+            .expect("Failed to parse Python module");
+        let stmts = match result {
+            pyast::Mod::Module { body, .. } => body,
+            other => panic!("expected Module, got {other:?}"),
+        };
+        let mut expr = lower_stmts(&stmts, self.lowering_ctx()).expect("ccl lowering failed");
+
+        infer(&mut expr, self.inference_ctx()).expect("type inference failed");
+
+        debug!("CCL:\n{}", symbolic(&expr));
+
+        let mut op = compile_tile(&expr, self.compile()).expect("compile failed");
+
+        debug!("Operators:\n{}", pretty_tile_operator(op.as_ref()));
+
+        let producer = op.subscribe(op.tiling().universal_guard(), consumer, self.scheduler());
+
+        debug!("Producers:\n{}", pretty_tile_producer(producer.as_ref()));
+
+        producer
     }
 
     /// Returns the context for lowering
@@ -42,6 +89,15 @@ impl GlobalContext {
     /// Returns the context for type inference
     pub fn inference_ctx(&mut self) -> &mut TypeInferenceContext {
         &mut self.inference
+    }
+
+    /// Returns the context for type inference
+    pub fn compile(&mut self) -> &mut TileCompileContext {
+        &mut self.compile
+    }
+
+    pub fn scheduler(&mut self) -> &mut Scheduler {
+        &mut self.scheduler
     }
 
     /// Register a [`TestDataSource`] under `name`.
@@ -59,6 +115,7 @@ impl GlobalContext {
                 Box::new(output_type),
             ),
         );
+        self.compile.register_source(name, ds);
     }
 
     /// Register a [`StdinDataSource`] under `name`.

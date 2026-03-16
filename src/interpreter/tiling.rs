@@ -285,12 +285,7 @@ impl TileGuard {
             | TileGuard::LookupFunction(universal)
             | TileGuard::Aggregation(universal) => *universal,
             TileGuard::Record(m) => m.values().all(TileGuard::is_universal),
-            TileGuard::SealedFunction(SealedFunctionGuard::Universal) => true,
-            TileGuard::SealedFunction(SealedFunctionGuard::Domain(p)) if p.as_bool().is_some() => {
-                p.as_bool().unwrap()
-            }
-            TileGuard::SealedFunction(SealedFunctionGuard::Codomain(g)) => g.is_universal(),
-            TileGuard::SealedFunction(..) => false,
+            TileGuard::SealedFunction(g) => g.is_univeral(),
         }
     }
 
@@ -300,13 +295,7 @@ impl TileGuard {
             | TileGuard::LookupFunction(universal)
             | TileGuard::Aggregation(universal) => !*universal,
             TileGuard::Record(m) => m.values().all(TileGuard::is_empty),
-            TileGuard::SealedFunction(SealedFunctionGuard::Universal) => false,
-            TileGuard::SealedFunction(SealedFunctionGuard::Empty) => true,
-            TileGuard::SealedFunction(SealedFunctionGuard::Domain(p)) if p.as_bool().is_some() => {
-                !p.as_bool().unwrap()
-            }
-            TileGuard::SealedFunction(SealedFunctionGuard::Codomain(g)) => g.is_empty(),
-            TileGuard::SealedFunction(..) => false,
+            TileGuard::SealedFunction(g) => g.is_empty(),
         }
     }
 }
@@ -337,6 +326,26 @@ impl SealedFunctionGuard {
             _ => todo!("Handle Domain + Codomain guards together"),
         }
     }
+
+    pub fn is_univeral(&self) -> bool {
+        match self {
+            SealedFunctionGuard::Universal => true,
+            SealedFunctionGuard::Empty => false,
+            SealedFunctionGuard::Domain(p) if p.as_bool().is_some() => p.as_bool().unwrap(),
+            SealedFunctionGuard::Domain(..) => false,
+            SealedFunctionGuard::Codomain(g) => g.is_universal(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            SealedFunctionGuard::Universal => false,
+            SealedFunctionGuard::Empty => true,
+            SealedFunctionGuard::Domain(p) if p.as_bool().is_some() => !p.as_bool().unwrap(),
+            SealedFunctionGuard::Domain(..) => false,
+            SealedFunctionGuard::Codomain(g) => g.is_empty(),
+        }
+    }
 }
 
 /// A predicate that describes a subset of values in an extent.
@@ -364,7 +373,7 @@ impl Predicate {
         }
     }
 
-    pub fn split_record<V>(&self, fields: HashMap<String, V>) -> HashMap<String, Predicate> {
+    pub fn split_record<V>(&self, fields: &HashMap<String, V>) -> HashMap<String, Predicate> {
         match self {
             p if p.as_bool().is_some() => fields
                 .keys()
@@ -958,7 +967,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), *v))
             .collect();
-        let result = Predicate::True.split_record(fields);
+        let result = Predicate::True.split_record(&fields);
         assert_eq!(result["x"], Predicate::True);
         assert_eq!(result["y"], Predicate::True);
     }
@@ -969,7 +978,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), *v))
             .collect();
-        let result = Predicate::False.split_record(fields);
+        let result = Predicate::False.split_record(&fields);
         assert_eq!(result["a"], Predicate::False);
     }
 
@@ -980,7 +989,7 @@ mod tests {
             .map(|(k, v)| (k.to_string(), *v))
             .collect();
         let p = record_pred(&[("a", Predicate::True), ("b", Predicate::False)]);
-        let result = p.split_record(fields);
+        let result = p.split_record(&fields);
         assert_eq!(result["a"], Predicate::True);
         assert_eq!(result["b"], Predicate::False);
     }

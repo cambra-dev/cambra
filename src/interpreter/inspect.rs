@@ -65,6 +65,7 @@ pub fn fmt_value_compact(value: &Value) -> String {
             parts.sort();
             format!("{{{}}}", parts.join(", "))
         }
+        Value::ComputableFunction(fun) => format!("{fun:?}"),
     }
 }
 

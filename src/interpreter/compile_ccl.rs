@@ -535,7 +535,7 @@ fn compile_let(
 /// Merging them would require either moving extent logic into the shared CCL
 /// crate or adding a cross-crate trait, both of which are awkward given that
 /// CCL and the interpreter are headed toward separate crates.
-fn map_binop(op: &CclBinOp) -> BinOpKind {
+pub(crate) fn map_binop(op: &CclBinOp) -> BinOpKind {
     match op {
         CclBinOp::Arithmetic(CclArith::Add) => BinOpKind::Arithmetic(ArithmeticKind::Add),
         CclBinOp::Arithmetic(CclArith::Sub) => BinOpKind::Arithmetic(ArithmeticKind::Sub),

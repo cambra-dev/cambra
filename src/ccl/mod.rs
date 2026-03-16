@@ -32,7 +32,7 @@ fn next_refinement_id() -> RefinementId {
 // Move it to `ccl` and have the interpreter import from `ccl`; this removes the
 // upward dependency from `ccl` into `crate::interpreter`. See also `ccl::infer`
 // which has the same non-test import.
-use crate::interpreter::BaseType;
+use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
 
 /// Errors about types that can be used by any phase of compilation
 pub enum TypeError {
@@ -172,6 +172,71 @@ impl AggregateKind {
             (AggregateKind::Sum, Type::Base(BaseType::Int)) => Some(Type::Base(BaseType::Int)),
             (AggregateKind::Max, Type::Base(b)) => Some(Type::Base(b.clone())),
             _ => None,
+        }
+    }
+
+    pub fn output_extent(&self, input_extent: &Extent) -> Option<Extent> {
+        match (self, input_extent) {
+            (AggregateKind::Sum, Extent::Base(BaseType::Int)) => Some(Extent::Base(BaseType::Int)),
+            (AggregateKind::Max, Extent::Base(b)) => Some(Extent::Base(b.clone())),
+            _ => None,
+        }
+    }
+
+    /// Returns the identity element for this aggregation over the given accumulator extent.
+    ///
+    /// Used to seed the [`Tile::Aggregation`](crate::interpreter::tiling::Tile::Aggregation)
+    /// accumulator before the first batch of values arrives.
+    pub fn initial_accumulator(&self, accumulator_extent: &Extent) -> ColumnValue {
+        match (self, accumulator_extent) {
+            (AggregateKind::Sum, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![0]),
+            (AggregateKind::Max, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![i64::MIN]),
+            (AggregateKind::Max, Extent::Base(BaseType::UInt)) => ColumnValue::UInts(vec![0]),
+            (AggregateKind::Max, Extent::Base(BaseType::String)) => {
+                ColumnValue::Strings(vec![String::new()])
+            }
+            _ => panic!("No identity for {self:?} over {accumulator_extent:?}"),
+        }
+    }
+
+    /// Fold `values` into `accumulator` in place.
+    ///
+    /// `accumulator` holds the running state (a single-element `ColumnValue`);
+    /// `values` contains the new batch of elements to incorporate.
+    pub fn accumulate(&self, accumulator: &mut ColumnValue, values: &ColumnValue) {
+        match (self, accumulator, values) {
+            (AggregateKind::Sum, ColumnValue::Ints(ref mut acc), ColumnValue::Ints(vs)) => {
+                acc[0] += vs.iter().sum::<i64>()
+            }
+            (AggregateKind::Max, ColumnValue::Ints(ref mut acc), ColumnValue::Ints(vs)) => {
+                accumulate_max(acc, vs);
+            }
+            (AggregateKind::Max, ColumnValue::UInts(ref mut acc), ColumnValue::UInts(vs)) => {
+                accumulate_max(acc, vs);
+            }
+            (AggregateKind::Max, ColumnValue::Strings(ref mut acc), ColumnValue::Strings(vs)) => {
+                accumulate_max(acc, vs);
+            }
+            _ => panic!("Invalid accumulate"),
+        };
+    }
+
+    pub fn extract(&self, accumulator: &ColumnValue) -> Value {
+        match (self, accumulator) {
+            (AggregateKind::Sum, ColumnValue::Ints(ref acc)) => Value::Int(acc[0]),
+            (AggregateKind::Max, ColumnValue::Ints(ref acc)) => Value::Int(acc[0]),
+            (AggregateKind::Max, ColumnValue::UInts(ref acc)) => Value::UInt(acc[0]),
+            (AggregateKind::Max, ColumnValue::Strings(ref acc)) => Value::String(acc[0].clone()),
+            _ => panic!("Invalid accumulate"),
+        }
+    }
+}
+
+fn accumulate_max<T: Ord + Clone>(acc: &mut [T], values: &[T]) {
+    let max = values.iter().max().cloned();
+    if let Some(max) = max {
+        if max > acc[0] {
+            acc[0] = max;
         }
     }
 }

@@ -5,6 +5,7 @@
 
 mod binop;
 pub mod compile_ccl;
+pub mod compile_tile_operators;
 mod inspect;
 mod join;
 mod lambda;
@@ -14,7 +15,8 @@ mod record;
 mod scheduler;
 mod stdio;
 mod test_source;
-mod tiling;
+pub mod tile_operators;
+pub mod tiling;
 mod types;
 mod var;
 

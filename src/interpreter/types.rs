@@ -10,7 +10,8 @@ use intervalsets::Side;
 use log::trace;
 
 use crate::interpreter::{
-    ComputeRestriction, Operator, Producer, RestrictionType, Scheduler, VarScope,
+    apply_binop_column, tuple_field, BinOpKind, ComputeRestriction, Operator, Producer,
+    RestrictionType, Scheduler, VarScope,
 };
 use crate::pretty_graph::{InspectNode, VizOptions};
 use crate::util::fmt_record;
@@ -364,6 +365,81 @@ impl Extent {
                     .collect();
                 Extent::record(field_extents)
             }
+            Value::ComputableFunction(_) => todo!(),
+        }
+    }
+
+    /// Whether this extent includes all of `other` (i.e. `self` is a supertype of `other`,
+    /// or equivalently every value in `other` is also a value in `self`).
+    pub fn includes(&self, other: &Extent) -> bool {
+        match (self, other) {
+            // Base types include only the same base type.
+            (Extent::Base(t1), Extent::Base(t2)) => t1 == t2,
+
+            // Function types: self.domain must include other.domain, and the codomains must be equal.
+            (
+                Extent::Function {
+                    domain: d1,
+                    codomain: c1,
+                },
+                Extent::Function {
+                    domain: d2,
+                    codomain: c2,
+                },
+            ) => d1.includes(d2) && c1 == c2,
+
+            // Records: same set of field names, each field covariant.
+            (Extent::Record(m1), Extent::Record(m2)) => {
+                m1.len() == m2.len()
+                    && m1
+                        .iter()
+                        .all(|(k, e1)| m2.get(k).is_some_and(|e2| e1.includes(e2)))
+            }
+
+            // Union self vs union other: every variant of `other` must be covered by
+            // some variant of `self`.
+            (Extent::Union(vs), Extent::Union(ws)) => {
+                ws.iter().all(|w| vs.iter().any(|v| v.includes(w)))
+            }
+            // Union self vs scalar other: `other` must be covered by at least one variant.
+            (Extent::Union(variants), _) => variants.iter().any(|v| v.includes(other)),
+            // Scalar self vs union other: `self` must include every variant.
+            (_, Extent::Union(variants)) => variants.iter().all(|v| self.includes(v)),
+
+            (Extent::Base(BaseType::UInt), Extent::UIntRange { .. }) => true,
+
+            // UIntRange: [s1, e1) includes [s2, e2) iff s1 ≤ s2 and e2 ≤ e1.
+            (
+                Extent::UIntRange { start: s1, end: e1 },
+                Extent::UIntRange { start: s2, end: e2 },
+            ) => s1 <= s2 && e2 <= e1,
+
+            // DataSourceDomain: identity check
+            (Extent::DataSourceDomain(d1), Extent::DataSourceDomain(d2)) => d1 == d2,
+
+            // If self is not a DataSourceDomain, then check if it is larger than the inner extent
+            // of other.
+            (_, Extent::DataSourceDomain(d2)) => self.includes(&d2.borrow().element_extent()),
+
+            // Two restricted extents sharing the same restriction object are subsets
+            // of the same predicate; inclusion then reduces to base inclusion.
+            (
+                Extent::Restricted {
+                    base: b1,
+                    restriction: r1,
+                },
+                Extent::Restricted {
+                    base: b2,
+                    restriction: r2,
+                },
+            ) => Rc::ptr_eq(r1, r2) && b1.includes(b2),
+
+            // An unrestricted extent includes a restricted one iff it includes the
+            // base, because the restricted set is always a subset of the base.
+            (_, Extent::Restricted { base, .. }) => self.includes(base),
+
+            // All other combinations are incompatible.
+            _ => false,
         }
     }
 }
@@ -489,6 +565,15 @@ pub trait DataSourceDomainExtentImpl {
     /// Returns the [`Extent`] of each individual domain element.
     /// Used to construct a typed empty [`ColumnValue`] when the domain is empty.
     fn element_extent(&self) -> Extent;
+    /// Returns the output value for a given domain key.
+    ///
+    /// Used by [`crate::interpreter::tile_operators::MapSource`] to map each domain
+    /// element to its corresponding output value when building a
+    /// `SealedFunction { domain, codomain: Scalar(output_values) }` tile.
+    fn get(&self, key: &Value) -> Value;
+    /// Returns the [`Extent`] of each output value produced by this source.
+    /// Used to type the codomain of [`crate::interpreter::tile_operators::MapSource`].
+    fn output_value_extent(&self) -> Extent;
     fn release(&mut self, obsolete_guard: Guard) -> Guard;
 }
 
@@ -622,6 +707,28 @@ pub enum BaseType {
     Unit,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FunctionDef {
+    BinOp(BinOpKind),
+    RecordField(String),
+}
+
+impl FunctionDef {
+    pub fn apply(&self, input: ColumnValue) -> ColumnValue {
+        match (self, input) {
+            (FunctionDef::BinOp(op), ColumnValue::Records(mut fields)) => apply_binop_column(
+                *op,
+                fields.remove(&tuple_field(0)).expect("Not a tuple"),
+                &fields[&tuple_field(1)],
+            ),
+            (FunctionDef::RecordField(f), ColumnValue::Records(mut fields)) => fields
+                .remove(f)
+                .unwrap_or_else(|| panic!("Missing field {f}")),
+            _ => panic!("Invalid function application"),
+        }
+    }
+}
+
 /// Values in CCL
 #[derive(Clone, PartialEq, Eq)]
 pub enum Value {
@@ -634,6 +741,7 @@ pub enum Value {
     Function(Vec<FuncBinding>),
     /// A record value
     Record(HashMap<String, Value>),
+    ComputableFunction(FunctionDef),
 }
 
 impl Hash for Value {
@@ -655,6 +763,7 @@ impl Hash for Value {
                     v.hash(state);
                 }
             }
+            Value::ComputableFunction(f) => f.hash(state),
         }
     }
 }
@@ -746,6 +855,7 @@ impl std::fmt::Display for Value {
                 write!(f, "Function [ {} ]", binding_strs.join(", "))
             }
             Value::Record(fields) => fmt_record(f, fields),
+            Value::ComputableFunction(fun) => write!(f, "{fun:?}"),
         }
     }
 }
@@ -788,6 +898,13 @@ impl Value {
         match self {
             Value::String(s) => s,
             _ => panic!("Not string: {self:?}"),
+        }
+    }
+
+    pub fn as_function(&self) -> &Vec<FuncBinding> {
+        match self {
+            Value::Function(v) => v,
+            _ => panic!("Not function: {self:?}"),
         }
     }
 }
@@ -1054,6 +1171,12 @@ impl ColumnValue {
             Value::Int(i) => ColumnValue::Ints(vec![i]),
             Value::UInt(i) => ColumnValue::UInts(vec![i]),
             Value::String(s) => ColumnValue::Strings(vec![s]),
+            Value::Record(fields) => ColumnValue::Records(
+                fields
+                    .into_iter()
+                    .map(|(k, v)| (k, ColumnValue::single(v)))
+                    .collect(),
+            ),
             _ => ColumnValue::Variants(vec![value]),
         }
     }
@@ -1429,5 +1552,109 @@ mod tests {
         let inner = Extent::function(Extent::Base(BaseType::Bool), Extent::Base(BaseType::String));
         let outer = Extent::function(Extent::Base(BaseType::Int), inner);
         assert_eq!(outer.to_string(), "(Int -> (Bool -> String))");
+    }
+
+    // -----------------------------------------------------------------------
+    // Extent::includes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_includes_base_same() {
+        assert!(Extent::Base(BaseType::Int).includes(&Extent::Base(BaseType::Int)));
+        assert!(Extent::Base(BaseType::Bool).includes(&Extent::Base(BaseType::Bool)));
+    }
+
+    #[test]
+    fn test_includes_base_different() {
+        assert!(!Extent::Base(BaseType::Int).includes(&Extent::Base(BaseType::Bool)));
+        assert!(!Extent::Base(BaseType::String).includes(&Extent::Base(BaseType::Int)));
+    }
+
+    #[test]
+    fn test_includes_uint_range_subset() {
+        let wide = Extent::UIntRange { start: 0, end: 10 };
+        let narrow = Extent::UIntRange { start: 2, end: 7 };
+        assert!(wide.includes(&narrow));
+        assert!(!narrow.includes(&wide));
+    }
+
+    #[test]
+    fn test_includes_uint_range_equal() {
+        let r = Extent::UIntRange { start: 3, end: 6 };
+        assert!(r.includes(&r));
+    }
+
+    #[test]
+    fn test_includes_record_same() {
+        let r = Extent::Record(HashMap::from([
+            ("a".to_string(), Extent::Base(BaseType::Int)),
+            ("b".to_string(), Extent::Base(BaseType::Bool)),
+        ]));
+        assert!(r.includes(&r));
+    }
+
+    #[test]
+    fn test_includes_record_covariant_field() {
+        // Wide has field "a" = Int; narrow has field "a" = Int and "b" = Bool (different size).
+        let wide = Extent::Record(HashMap::from([(
+            "a".to_string(),
+            Extent::UIntRange { start: 0, end: 10 },
+        )]));
+        let narrow = Extent::Record(HashMap::from([(
+            "a".to_string(),
+            Extent::UIntRange { start: 2, end: 5 },
+        )]));
+        assert!(wide.includes(&narrow));
+        assert!(!narrow.includes(&wide));
+    }
+
+    #[test]
+    fn test_includes_union_self_includes_member() {
+        let u = Extent::Union(vec![
+            Extent::Base(BaseType::Int),
+            Extent::Base(BaseType::Bool),
+        ]);
+        assert!(u.includes(&Extent::Base(BaseType::Int)));
+        assert!(u.includes(&Extent::Base(BaseType::Bool)));
+        assert!(!u.includes(&Extent::Base(BaseType::String)));
+    }
+
+    #[test]
+    fn test_includes_union_vs_union() {
+        let u = Extent::Union(vec![
+            Extent::Base(BaseType::Int),
+            Extent::Base(BaseType::Bool),
+        ]);
+        assert!(u.includes(&u));
+        let subset = Extent::Union(vec![Extent::Base(BaseType::Int)]);
+        assert!(u.includes(&subset));
+        assert!(!subset.includes(&u));
+    }
+
+    #[test]
+    fn test_includes_restricted_subset_of_base() {
+        let base = Extent::Base(BaseType::Int);
+        let restricted = Extent::restricted(base.clone());
+        // The base type includes its restriction (restriction is a subset of base).
+        assert!(base.includes(&restricted));
+        // A restriction cannot include an unrestricted base of the same kind.
+        assert!(!restricted.includes(&base));
+    }
+
+    #[test]
+    fn test_includes_function_codomain_covariant() {
+        let codomain = Extent::Base(BaseType::Int);
+        let narrow_domain = Extent::UIntRange { start: 0, end: 5 };
+        let wide_domain = Extent::UIntRange { start: 0, end: 10 };
+        let wide_fn = Extent::Function {
+            domain: Box::new(wide_domain),
+            codomain: Box::new(codomain.clone()),
+        };
+        let narrow_fn = Extent::Function {
+            domain: Box::new(narrow_domain),
+            codomain: Box::new(codomain),
+        };
+        assert!(wide_fn.includes(&narrow_fn));
+        assert!(!narrow_fn.includes(&wide_fn));
     }
 }

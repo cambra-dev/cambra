@@ -12,7 +12,7 @@ use crate::pretty_graph::{fmt_binop, fmt_extent, InspectNode, VizOptions};
 use super::{ColumnValue, Consumer, Extent, GetResult, Guard, Operator, Producer, VarScope};
 
 /// Kinds of binary operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOpKind {
     Arithmetic(ArithmeticKind),
     BoolLogic(LogicKind),
@@ -23,7 +23,7 @@ pub enum BinOpKind {
     // to be implmented first (e.g. float division).
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArithmeticKind {
     Add,
     Sub,
@@ -31,7 +31,7 @@ pub enum ArithmeticKind {
     FloorDiv,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompareKind {
     Equals,
     NotEquals,
@@ -41,7 +41,7 @@ pub enum CompareKind {
     GreaterOrEq,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LogicKind {
     And,
     Nand,
@@ -164,7 +164,7 @@ pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue)
         (BinOpKind::Compare(op), ColumnValue::Bools(l), ColumnValue::Bools(r)) => {
             ColumnValue::Bools(zip_bool_compare(op, l, r))
         }
-        _ => panic!("Unsupported binop: {:?}", op),
+        (op, left, right) => panic!("Unsupported binop: {:?} on {:?}, {:?}", op, left, &right),
     }
 }
 

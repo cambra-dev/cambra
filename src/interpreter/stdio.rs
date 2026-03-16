@@ -195,6 +195,17 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         Extent::Base(crate::interpreter::BaseType::UInt)
     }
 
+    fn get(&self, key: &Value) -> Value {
+        match key {
+            Value::UInt(i) => Value::String(self.get(*i).to_string()),
+            other => panic!("StdinDataSource::get expected UInt key, got {other:?}"),
+        }
+    }
+
+    fn output_value_extent(&self) -> Extent {
+        Extent::Base(crate::interpreter::BaseType::String)
+    }
+
     fn release(&mut self, obsolete_guard: Guard) -> Guard {
         debug!("StdinDataSource::release: {obsolete_guard:?}");
         match &obsolete_guard {

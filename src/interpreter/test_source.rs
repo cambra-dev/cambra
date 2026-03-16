@@ -57,6 +57,8 @@ impl TestDataSource {
         for (k, v) in data.iter() {
             self.data.insert(k.clone(), v.clone());
         }
+        // Mark that new data is available so check_for_new_data() returns true.
+        self.has_data = true;
     }
 
     pub fn output_extent(&self) -> Extent {
@@ -85,6 +87,17 @@ impl DataSourceDomainExtentImpl for TestDataSource {
 
     fn element_extent(&self) -> Extent {
         self.element_extent.clone()
+    }
+
+    fn get(&self, key: &Value) -> Value {
+        self.data
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| panic!("Key {key:?} not found in TestDataSource"))
+    }
+
+    fn output_value_extent(&self) -> Extent {
+        self.output_extent.clone()
     }
 
     fn get_yield_guard(&self) -> Guard {

@@ -403,6 +403,34 @@ signal in tiles and as a region specifier in guards.
 
 ---
 
+## Tile Operators
+
+Note: These will soon replace the old operators and be renamed to just `Operator`
+
+Each `TileOperator` is a static (compile-time) node in the dataflow graph. It knows its output
+[`Tiling`] and can instantiate a live `TileProducer` via `subscribe`. Operators are constructed
+during compilation; producers are created on demand at runtime.
+
+| Operator | Input Tiling(s) | Output Tiling | Description |
+|---|---|---|---|
+| `Constant` | None | `Scalar` | Produces a fixed scalar `Value`. |
+| `IterateExtent` | None | `SealedFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping sealed function (domain = codomain = extent) |
+| `MapSource` | `SealedFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `SealedFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a sealed function from keys to their output values. |
+| `Zip` | `N` inputs of `SealedFunction(shared_extent → *)` tilings |  `SealedFunction(shared_domain → Record(_0, … _N))` | Merges N sealed-function operators that share a domain into one sealed function whose codomain is a Record Tiling of all their codomains. |
+| `ScalarTuple` | `N` inputs with `Scalar` tilings | `Record(_0, … _N)` | Packs N scalar inputs into a single `Record` tiling where each field is a `Scalar` tiling . The scalar analogue of `Zip`. |
+| `MapApply` | Function: any tiling of type `A → B`<br>Data: `SealedFunction(extent → Scalar(A))` | `SealedFunction(extent → Scalar(B))` | Applies a function element-wise over a sealed-function input, transforming each codomain value. The function input can have many different tilings; currently supports `Scalar(ComputableFunction)`, `Scalar(Function)`, `LookupFunction`, and `SealedFunction` tilings. |
+| `MapToConst` | `SealedFunction(extent → *)` | `SealedFunction(extent → Scalar)` | Replaces every codomain value of a sealed-function input with the same constant, preserving the domain. |
+| `ToScalar` | Constant: `Scalar`<br>Data: `SealedFunction(Unit → Scalar)` | `Scalar` | Unwraps a `SealedFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |
+| `Converse` | `SealedFunction(domain -> Scalar(codomain))` | `LookupFunction(codomain → domain)` | Inverts a sealed-function operator: each codomain value maps to the list of domain values that produced it. |
+| `MapCompose` | Function: Function: any tiling of type `A → B`<br>Data: `LookupFunction(extent → A)` | `LookupFunction(extent → B)` | Applies a function to every value in each codomain list of a `LookupFunction`, producing a new `LookupFunction` with the same domain but transformed values. |
+| `Filter` | Predicate: any tiling of type `A → bool` <br>Data: `SealedFunction(extent → Scalar(A))` | Same as input | Filters a sealed-function tile by a boolean predicate: keeps only domain elements where the predicate on the value evaluates to `true`. <br>TODO can probably remove this in favor of Restrict |
+| `Restrict` | Predicate: any tiling of type `A → bool` <br>Data: `SealedFunction(A → *)` | Same as input | Filters a sealed-function tile by a boolean predicate: keeps only domain elements whose predicate evaluates to `true`. |
+| `Aggregate` | `SealedFunction(* → Scalar)` | `Aggregation` | Reduces all codomain values of a `SealedFunction` input into a single running accumulator via an `AggregateKind` (e.g. Sum, Max). Currently, the aggregation is hardcoded in the graph, but we could add support for aggregate-kinds-as-data |
+| `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts the final value from an `Aggregation` tile, emitting it only when the aggregation is marked terminal. |
+| `MapAggregate` | `LookupFunction(domain → codomain)` | `SealedFunction(domain → Aggregation)` | Performs a per-key aggregation |
+| `MapExtractAggregate` | `SealedFunction(extent → Aggregation)` | `SealedFunction(extent → Scalar)` | Extracts terminal per-key aggregation results from a `SealedFunction(D, Aggregation)`, producing `SealedFunction(D, Scalar)`. |
+| `Split` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Forwards `get` requests and tracks the intersection of release guards. <br>TODO this should probably turn into the Memo operator |
+
 ## Open Challenges
 
 ### Streaming Joins

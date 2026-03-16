@@ -11,6 +11,7 @@
 //! ```
 
 use crate::interpreter::{
+    tile_operators::{TileOperator, TileProducer},
     ArithmeticKind, BaseType, BinOpKind, CompareKind, Extent, LogicKind, Operator, Producer,
 };
 pub use crate::pretty_tree::{render, render_with_max_depth, InspectNode};
@@ -146,6 +147,26 @@ pub fn pretty_operator(op: &dyn Operator) -> String {
 /// Pretty-print an operator tree with custom options.
 pub fn pretty_operator_with(op: &dyn Operator, opts: &VizOptions) -> String {
     render_with_max_depth(&op.inspect(opts), opts.max_depth)
+}
+
+/// Pretty-print an operator tree with default options.
+pub fn pretty_tile_operator(op: &dyn TileOperator) -> String {
+    pretty_tile_operator_with(op, &VizOptions::default())
+}
+
+/// Pretty-print an operator tree with custom options.
+pub fn pretty_tile_operator_with(op: &dyn TileOperator, opts: &VizOptions) -> String {
+    render_with_max_depth(&op.inspect(opts), opts.max_depth)
+}
+
+/// Pretty-print a tile producer tree with default options.
+pub fn pretty_tile_producer(producer: &dyn TileProducer) -> String {
+    pretty_tile_producer_with(producer, &VizOptions::default())
+}
+
+/// Pretty-print a tile producer tree with custom options.
+pub fn pretty_tile_producer_with(producer: &dyn TileProducer, opts: &VizOptions) -> String {
+    render_with_max_depth(&producer.inspect(opts), opts.max_depth)
 }
 
 /// Pretty-print a dataflow (producer) tree with default options.

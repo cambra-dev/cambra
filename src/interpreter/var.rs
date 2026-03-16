@@ -6,7 +6,7 @@ use std::{cell::RefCell, collections::HashMap};
 use bit_set::BitSet;
 use log::trace;
 
-use crate::interpreter::{Correlations, Restriction};
+use crate::interpreter::{BaseType, Correlations, Restriction};
 /// A variable subscription paired with the chain of iteration-source variables between
 use crate::{
     interpreter::DataSourceDomainExtentImpl,
@@ -402,8 +402,12 @@ impl Producer for VarProducer {
 
 /// Produce all values for the given extent, applying the outer filter if provided.
 /// For now the filters are simple BitSets, but in the future they will be some more compressed structure.
-fn iterate_extent(extent: &Extent, outer_filter: Option<&Correlations>) -> GetResult {
+pub fn iterate_extent(extent: &Extent, outer_filter: Option<&Correlations>) -> GetResult {
     match extent {
+        Extent::Base(BaseType::Unit) => GetResult {
+            column_value: ColumnValue::Units(1),
+            yield_guard: Guard::Universal,
+        },
         Extent::UIntRange { start, end, .. } => iterate_uint_range(*start, *end, outer_filter),
         Extent::DataSourceDomain(source_impl) => {
             iterate_data_source_domain(source_impl, outer_filter)
