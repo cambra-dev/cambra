@@ -33,7 +33,7 @@ use crate::ccl::lower::{lower_expr, LoweringError};
 
 use crate::ccl::{
     ArithmeticKind as CclArith, BinOpKind as CclBinOp, CompareKind as CclCmp, Expr, HashJoinSpec,
-    Lit, LogicKind as CclLogic, Refinement, RefinementId, RefinementKind, Type,
+    Lit, LogicKind as CclLogic, Refinement, RefinementId, RefinementKind, Type, TypedExprNode,
 };
 use crate::interpreter::{
     tuple_field, Apply, ArithmeticKind, BinOp, BinOpKind, CompareKind, ComputeRestriction,
@@ -201,50 +201,52 @@ pub fn compile(
     ctx: &mut CompileContext,
     scheduler: &mut Scheduler,
 ) -> Result<Box<dyn Operator>, CompileError> {
-    match expr {
-        Expr::Lit(lit) => compile_lit(lit),
-        Expr::Var(name) => compile_var(ctx, name),
-        Expr::BinOp { left, op, right } => {
+    match &expr.node {
+        TypedExprNode::Lit(lit) => compile_lit(lit),
+        TypedExprNode::Var(name) => compile_var(ctx, name),
+        TypedExprNode::BinOp { left, op, right } => {
             let l = compile(left, ctx, scheduler)?;
             let r = compile(right, ctx, scheduler)?;
             Ok(Box::new(BinOp::new(l, map_binop(op), r)))
         }
-        Expr::List(elts) => compile_list(elts),
-        Expr::Lambda {
+        TypedExprNode::List(elts) => compile_list(elts),
+        TypedExprNode::Lambda {
             param,
             body,
             refinement,
         } if param.ty != Type::Unknown => {
             compile_lambda(&param.name, &param.ty, body, refinement, ctx, scheduler)
         }
-        Expr::Lambda { param, .. } => Err(CompileError::Unsupported(format!(
+        TypedExprNode::Lambda { param, .. } => Err(CompileError::Unsupported(format!(
             "Lambda '{}' has no type annotation; ccl::infer must run before compile",
             param.name
         ))),
-        Expr::Apply { function, argument } => {
+        TypedExprNode::Apply { function, argument } => {
             let func = compile(function, ctx, scheduler)?;
             let arg = compile(argument, ctx, scheduler)?;
             Ok(Box::new(Apply::new(func, arg)))
         }
-        Expr::Let {
+        TypedExprNode::Let {
             binding,
             bound_expr,
             body,
-        } if binding.ty != Type::Unknown => {
+        } => {
+            if binding.ty == Type::Unknown {
+                return Err(CompileError::TypeError(format!(
+                    "Let binding '{}' has no type annotation",
+                    binding.name
+                )));
+            }
             compile_let(&binding.name, &binding.ty, bound_expr, body, ctx, scheduler)
         }
-        Expr::Let { binding, .. } => Err(CompileError::TypeError(format!(
-            "Let binding '{}' has no type annotation; ccl::infer must run before compile",
-            binding.name
-        ))),
-        Expr::Tuple(elts) => {
+        TypedExprNode::Tuple(elts) => {
             let mut fields = HashMap::new();
             for (i, elt) in elts.iter().enumerate() {
                 fields.insert(tuple_field(i), compile(elt, ctx, scheduler)?);
             }
             Ok(Box::new(ConstructRecord::new(fields)))
         }
-        Expr::TupleIndex(tuple, idx) => Ok(Box::new(RecordField::new(
+        TypedExprNode::TupleIndex(tuple, idx) => Ok(Box::new(RecordField::new(
             compile(tuple, ctx, scheduler)?,
             &tuple_field(*idx),
         ))),
@@ -319,14 +321,14 @@ fn compile_var(ctx: &CompileContext, name: &str) -> Result<Box<dyn Operator>, Co
 /// Handles [`Expr::Lit`] and [`Expr::Tuple`] (whose elements must also be
 /// constant). Returns [`CompileError::Unsupported`] for any non-constant node.
 fn expr_to_value(expr: &Expr) -> Result<Value, CompileError> {
-    match expr {
-        Expr::Lit(lit) => Ok(match lit {
+    match &expr.node {
+        TypedExprNode::Lit(lit) => Ok(match lit {
             Lit::Int(n) => Value::Int(*n),
             Lit::String(s) => Value::String(s.clone()),
             Lit::Bool(b) => Value::Bool(*b),
             Lit::Unit => Value::Unit,
         }),
-        Expr::Tuple(elts) => {
+        TypedExprNode::Tuple(elts) => {
             let fields: Result<HashMap<String, Value>, _> = elts
                 .iter()
                 .enumerate()
@@ -566,7 +568,7 @@ mod tests {
     use super::*;
     use crate::ccl::{
         ArithmeticKind as CclArith, BinOpKind as CclBinOp, Expr, HashJoinSpec, Lit, Refinement,
-        RefinementKind, Type, TypedBinding,
+        RefinementKind, Type,
     };
     use crate::interpreter::{
         BaseType, ColumnValue, Consumer, Extent, FuncBinding, Guard, Scheduler, Value,
@@ -625,14 +627,14 @@ mod tests {
 
     #[rstest]
     // Literals
-    #[case(Expr::Lit(Lit::Int(2)), Value::Int(2))]
-    #[case(Expr::Lit(Lit::String("hello".to_string())), Value::String("hello".to_string()))]
-    #[case(Expr::Lit(Lit::Bool(true)), Value::Bool(true))]
+    #[case(Expr::lit(Lit::Int(2)), Value::Int(2))]
+    #[case(Expr::lit(Lit::String("hello".to_string())), Value::String("hello".to_string()))]
+    #[case(Expr::lit(Lit::Bool(true)), Value::Bool(true))]
     // Empty list (subscribe returns a Function value)
-    #[case(Expr::List(vec![]), Value::Function(vec![]))]
+    #[case(Expr::list(vec![]), Value::Function(vec![]))]
     // Non-empty list
     #[case(
-        Expr::List(vec![Expr::Lit(Lit::Int(1)), Expr::Lit(Lit::Int(2))]),
+        Expr::list(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]),
         Value::Function(vec![
             FuncBinding { input: Value::Int(0), output: Value::Int(1) },
             FuncBinding { input: Value::Int(1), output: Value::Int(2) },
@@ -640,35 +642,28 @@ mod tests {
     )]
     // Arithmetic binary operations
     #[case(
-        Expr::BinOp {
-            left: Box::new(Expr::Lit(Lit::Int(2))),
-            op: CclBinOp::Arithmetic(CclArith::Add),
-            right: Box::new(Expr::Lit(Lit::Int(3))),
-        },
+        Expr::binop(
+            Expr::lit(Lit::Int(2)),
+            CclBinOp::Arithmetic(CclArith::Add),
+            Expr::lit(Lit::Int(3))
+        ),
         Value::Int(5)
     )]
     #[case(
-        Expr::BinOp {
-            left: Box::new(Expr::Lit(Lit::Int(4))),
-            op: CclBinOp::Arithmetic(CclArith::Mul),
-            right: Box::new(Expr::Lit(Lit::Int(5))),
-        },
+        Expr::binop(
+            Expr::lit(Lit::Int(4)),
+            CclBinOp::Arithmetic(CclArith::Mul),
+            Expr::lit(Lit::Int(5))
+        ),
         Value::Int(20)
     )]
+    #[case(Expr::binop(Expr::lit(Lit::Int(4)), CclBinOp::Arithmetic(CclArith::Sub), Expr::lit(Lit::Int(5))), Value::Int(-1))]
     #[case(
-        Expr::BinOp {
-            left: Box::new(Expr::Lit(Lit::Int(4))),
-            op: CclBinOp::Arithmetic(CclArith::Sub),
-            right: Box::new(Expr::Lit(Lit::Int(5))),
-        },
-        Value::Int(-1)
-    )]
-    #[case(
-        Expr::BinOp {
-            left: Box::new(Expr::Lit(Lit::Int(7))),
-            op: CclBinOp::Arithmetic(CclArith::FloorDiv),
-            right: Box::new(Expr::Lit(Lit::Int(2))),
-        },
+        Expr::binop(
+            Expr::lit(Lit::Int(7)),
+            CclBinOp::Arithmetic(CclArith::FloorDiv),
+            Expr::lit(Lit::Int(2))
+        ),
         Value::Int(3)
     )]
     fn test_compile_scalar(#[case] expr: Expr, #[case] expected: Value) {
@@ -691,12 +686,12 @@ mod tests {
             _ => Type::Base(BaseType::Unit),
         };
         let n = elts.len();
-        let source = Expr::List(elts.into_iter().map(Expr::Lit).collect());
+        let source = Expr::list(elts.into_iter().map(Expr::lit).collect());
         Expr::lambda(
             "__list_comp_var",
             Type::UIntRange(n),
             Expr::apply(
-                Expr::apply(Expr::Var("__list_comp_var".to_string()), source),
+                Expr::apply(Expr::var("__list_comp_var"), source),
                 Expr::lambda(var, elem_ty, body),
             ),
         )
@@ -708,7 +703,7 @@ mod tests {
         list_comp_expr(
             vec![Lit::Int(10), Lit::Int(20)],
             "x",
-            Expr::Var("x".to_string()),
+            Expr::var("x"),
         ),
         make_int_list(&[10, 20])
     )]
@@ -717,7 +712,7 @@ mod tests {
         list_comp_expr(
             vec![Lit::Int(10), Lit::Int(20)],
             "x",
-            Expr::Lit(Lit::Int(42)),
+            Expr::lit(Lit::Int(42)),
         ),
         make_int_list(&[42, 42])
     )]
@@ -726,11 +721,7 @@ mod tests {
         list_comp_expr(
             vec![Lit::Int(10), Lit::Int(20)],
             "x",
-            Expr::BinOp {
-                left: Box::new(Expr::Var("x".to_string())),
-                op: CclBinOp::Arithmetic(CclArith::Add),
-                right: Box::new(Expr::Lit(Lit::Int(2))),
-            },
+            Expr::binop(Expr::var("x"), CclBinOp::Arithmetic(CclArith::Add), Expr::lit(Lit::Int(2))),
         ),
         make_int_list(&[12, 22])
     )]
@@ -750,11 +741,7 @@ mod tests {
         // The scope pushed for "x" must be popped even on error; otherwise "x"
         // remains visible in `scopes` after the call returns.
         let mut scheduler = Scheduler::new();
-        let expr = Expr::lambda(
-            "x",
-            Type::Base(BaseType::Int),
-            Expr::Var("unbound_var".into()),
-        );
+        let expr = Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("unbound_var"));
         let mut ctx = CompileContext::new();
         let err = compile(&expr, &mut ctx, &mut scheduler).unwrap_err();
         assert_eq!(
@@ -772,54 +759,42 @@ mod tests {
     #[rstest]
     // let x = 5 in x
     #[case(
-        Expr::Let {
-            binding: TypedBinding { name: "x".to_string(), ty: Type::Base(BaseType::Int), user_annotation: None },
-            bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
-            body: Box::new(Expr::Var("x".to_string())),
-        },
+        Expr::let_bind(
+            "x",
+            Expr::lit(Lit::Int(5)).with_ty(Type::Base(BaseType::Int)),
+            Expr::var("x"),
+        ),
         Value::Int(5)
     )]
     // let x = 5 in x + 1
     #[case(
-        Expr::Let {
-            binding: TypedBinding { name: "x".to_string(), ty: Type::Base(BaseType::Int), user_annotation: None },
-            bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
-            body: Box::new(Expr::BinOp {
-                left: Box::new(Expr::Var("x".to_string())),
-                op: CclBinOp::Arithmetic(CclArith::Add),
-                right: Box::new(Expr::Lit(Lit::Int(1))),
-            }),
-        },
+        Expr::let_bind(
+            "x",
+            Expr::lit(Lit::Int(5)).with_ty(Type::Base(BaseType::Int)),
+            Expr::binop(Expr::var("x"), CclBinOp::Arithmetic(CclArith::Add), Expr::lit(Lit::Int(1))),
+        ),
         Value::Int(6)
     )]
     // let x = 5 in x + x  (multiple references — value subscribed once)
     #[case(
-        Expr::Let {
-            binding: TypedBinding { name: "x".to_string(), ty: Type::Base(BaseType::Int), user_annotation: None },
-            bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
-            body: Box::new(Expr::BinOp {
-                left: Box::new(Expr::Var("x".to_string())),
-                op: CclBinOp::Arithmetic(CclArith::Add),
-                right: Box::new(Expr::Var("x".to_string())),
-            }),
-        },
+        Expr::let_bind(
+            "x",
+            Expr::lit(Lit::Int(5)).with_ty(Type::Base(BaseType::Int)),
+            Expr::binop(Expr::var("x"), CclBinOp::Arithmetic(CclArith::Add), Expr::var("x")),
+        ),
         Value::Int(10)
     )]
     // let x = 5 in let y = 2 in x + y  (chained bindings)
     #[case(
-        Expr::Let {
-            binding: TypedBinding { name: "x".to_string(), ty: Type::Base(BaseType::Int), user_annotation: None },
-            bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
-            body: Box::new(Expr::Let {
-                binding: TypedBinding { name: "y".to_string(), ty: Type::Base(BaseType::Int), user_annotation: None },
-                bound_expr: Box::new(Expr::Lit(Lit::Int(2))),
-                body: Box::new(Expr::BinOp {
-                    left: Box::new(Expr::Var("x".to_string())),
-                    op: CclBinOp::Arithmetic(CclArith::Add),
-                    right: Box::new(Expr::Var("y".to_string())),
-                }),
-            }),
-        },
+        Expr::let_bind(
+            "x",
+            Expr::lit(Lit::Int(5)).with_ty(Type::Base(BaseType::Int)),
+            Expr::let_bind(
+                "y",
+                Expr::lit(Lit::Int(2)).with_ty(Type::Base(BaseType::Int)),
+                Expr::binop(Expr::var("x"), CclBinOp::Arithmetic(CclArith::Add), Expr::var("y")),
+            ),
+        ),
         Value::Int(7)
     )]
     fn test_compile_let(#[case] expr: Expr, #[case] expected: Value) {
@@ -839,7 +814,7 @@ mod tests {
         let refinement = Refinement {
             id: 99_999,
             description: "test".to_string(),
-            kind: RefinementKind::Predicate(Rc::new(RefCell::new(Expr::Lit(Lit::Bool(true))))),
+            kind: RefinementKind::Predicate(Rc::new(RefCell::new(Expr::lit(Lit::Bool(true))))),
         };
         let ty = Type::Refinement(Box::new(Type::Base(BaseType::Int)), refinement);
 
@@ -877,16 +852,16 @@ mod tests {
             probe_gen_position: 1,
             build_var_name: "x".to_string(),
             probe_var_name: "y".to_string(),
-            build_key: Rc::new(Expr::Var("x".to_string())),
-            probe_key: Rc::new(Expr::Var("y".to_string())),
-            build_source: Rc::new(Expr::Lit(Lit::Int(0))),
-            probe_source: Rc::new(Expr::Lit(Lit::Int(0))),
+            build_key: Rc::new(Expr::var("x")),
+            probe_key: Rc::new(Expr::var("y")),
+            build_source: Rc::new(Expr::lit(Lit::Int(0))),
+            probe_source: Rc::new(Expr::lit(Lit::Int(0))),
         };
 
         let expr = Expr::lambda_with_hash_join(
             "p",
             Type::Base(BaseType::Int), // not a Tuple — must trigger TypeError
-            Expr::Lit(Lit::Unit),
+            Expr::lit(Lit::Unit),
             spec,
             "test join",
         );

@@ -243,8 +243,8 @@ fn accumulate_max<T: Ord + Clone>(acc: &mut [T], values: &[T]) {
 
 /// A typed binding site: a named variable together with its type.
 ///
-/// Used in [`Expr::Lambda`], [`Expr::Join`], and [`Expr::Let`] to carry both
-/// the inferred type and any user-written annotation at each binding site,
+/// Used in [`TypedExprNode::Lambda`], [`TypedExprNode::Join`], and [`TypedExprNode::Let`] to carry
+/// both the inferred type and any user-written annotation at each binding site.
 ///
 /// `ty` starts as [`Type::Unknown`] and is filled in by [`infer::infer`].
 /// `user_annotation` is set at construction time by lowering when the source
@@ -279,15 +279,16 @@ impl TypedBinding {
     }
 }
 
-/// A CCL expression.
+/// The expression kind enum for CCL expressions.
 ///
-/// The central type of the CCL AST. Every program is an `Expr`.
+/// This is the central type of the CCL AST node hierarchy. Every program is a [`TypedExpr`]
+/// whose `node` field holds one of these variants.
 ///
 /// Application is curried: `f(x, y)` is `Apply(Apply(f, x), y)`. Compound
-/// expressions may appear inline as arguments — [`Expr::Let`] bindings are
+/// expressions may appear inline as arguments — [`TypedExprNode::Let`] bindings are
 /// optional (unlike strict ANF).
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub enum TypedExprNode {
     /// A literal constant.
     Lit(Lit),
 
@@ -302,31 +303,23 @@ pub enum Expr {
     /// Note: `crate::interpreter::Apply` is an unrelated operator struct.
     Apply {
         /// The function being applied.
-        function: Box<Expr>,
+        function: Box<TypedExpr>,
         /// The argument passed to the function.
-        argument: Box<Expr>,
+        argument: Box<TypedExpr>,
     },
 
     /// A binary operation.
     BinOp {
         /// The left-hand operand.
-        left: Box<Expr>,
+        left: Box<TypedExpr>,
         /// The operation kind.
         op: BinOpKind,
         /// The right-hand operand.
-        right: Box<Expr>,
+        right: Box<TypedExpr>,
     },
 
     /// A unary operation.
-    UnaryOp(UnaryOpKind, Box<Expr>),
-
-    /// An explicit type ascription: `(expr : ty)`.
-    ///
-    /// Only emitted when a concrete type is known at the annotation site (e.g.
-    /// a Python `cast(T, expr)` or an annotated expression outside a binder).
-    /// Annotations on binders are carried directly by [`Expr::Let`] and
-    /// [`Expr::Lambda`] instead.
-    TypeAnnotation(Box<Expr>, Type),
+    UnaryOp(UnaryOpKind, Box<TypedExpr>),
 
     /// A lambda abstraction.
     ///
@@ -339,7 +332,7 @@ pub enum Expr {
         /// The bound parameter, with its name and inferred/annotated type.
         param: TypedBinding,
         /// The lambda body.
-        body: Box<Expr>,
+        body: Box<TypedExpr>,
         /// Refinement on the param type computed by this lambda.
         ///
         /// This is a separate field from `param.ty` because it can be set
@@ -353,25 +346,27 @@ pub enum Expr {
     /// a collection is the elements of the collection.
     Aggregate {
         /// Expression being aggregated over.  Must be of type `Fun`
-        input: Box<Expr>,
+        input: Box<TypedExpr>,
         /// The type of aggregation to do (e.g. sum, max)
         kind: AggregateKind,
     },
 
-    /// A let binding: `let name [: ty] = value in body`.
+    /// A let binding: `let name = value in body`.
     ///
     /// Binds `name` to `value` within `body`. Unlike strict ANF, `value`
-    /// may be any `Expr`, not only an atomic term.
+    /// may be any `TypedExpr`, not only an atomic term.
     Let {
         /// The bound name and its type.
         ///
-        /// `binding.ty` starts as [`Type::Unknown`] at lowering time and is
-        /// filled in by [`infer::infer`] before compilation.
+        /// `binding.ty` mirrors `bound_expr.ty` after inference and is filled
+        /// in by [`infer::infer`]. `binding.user_annotation` carries any
+        /// user-written type annotation on the binding site (e.g. `x: Int = expr`),
+        /// which inference checks for compatibility with the inferred expression type.
         binding: TypedBinding,
         /// The expression being bound.
-        bound_expr: Box<Expr>,
-        /// The expression in which `name` is in scope.
-        body: Box<Expr>,
+        bound_expr: Box<TypedExpr>,
+        /// The expression in which `binding.name` is in scope.
+        body: Box<TypedExpr>,
     },
 
     /// A list literal: `[e0, e1, ...]`.
@@ -379,9 +374,9 @@ pub enum Expr {
     /// Represents Python list syntax directly in the CCL tree. Elements may be
     /// arbitrary expressions (not restricted to [`Lit`]).
     ///
-    /// Distinct from [`Expr::Tuple`] (unnamed product type) and from the
+    /// Distinct from [`TypedExprNode::Tuple`] (unnamed product type) and from the
     /// function-encoding of lists used at the operator-graph level.
-    List(Vec<Expr>),
+    List(Vec<TypedExpr>),
 
     /// Multi-way pattern matching.
     ///
@@ -392,18 +387,18 @@ pub enum Expr {
     /// Python → CCL lowering; there is no separate `IfThenElse` node.
     Case {
         /// The expression being matched.
-        scrutinee: Box<Expr>,
+        scrutinee: Box<TypedExpr>,
         /// Ordered list of pattern–arm pairs. Evaluated top-to-bottom; the
         /// first matching pattern wins.
-        branches: Vec<(Pattern, Expr)>,
+        branches: Vec<(Pattern, TypedExpr)>,
     },
 
     /// A loop join point.
     ///
     /// Defines a named, parameterized loop header. `outer_body` is evaluated
-    /// first and must contain the initial [`Expr::Jump`] that enters the loop.
+    /// first and must contain the initial [`TypedExprNode::Jump`] that enters the loop.
     /// The loop body (`loop_body`) runs on each iteration; it may
-    /// [`Expr::Jump`] back to this point with updated parameter values, or
+    /// [`TypedExprNode::Jump`] back to this point with updated parameter values, or
     /// fall through to produce the loop's final value.
     ///
     /// Join points are non-escaping: they cannot be stored in variables or
@@ -412,43 +407,43 @@ pub enum Expr {
     ///
     /// Compiles to iterate/feedback operators in the dataflow graph.
     Join {
-        /// The join point's label, referenced by [`Expr::Jump`].
+        /// The join point's label, referenced by [`TypedExprNode::Jump`].
         name: String,
         /// The loop variables with their names and inferred/annotated types.
         params: Vec<TypedBinding>,
         /// The loop body; evaluated on each iteration. May contain a
-        /// [`Expr::Jump`] back to this join point.
-        loop_body: Box<Expr>,
-        /// Evaluated first; must contain the initial [`Expr::Jump`] into this
+        /// [`TypedExprNode::Jump`] back to this join point.
+        loop_body: Box<TypedExpr>,
+        /// Evaluated first; must contain the initial [`TypedExprNode::Jump`] into this
         /// join point.
-        outer_body: Box<Expr>,
+        outer_body: Box<TypedExpr>,
     },
 
-    /// A tail call to a [`Expr::Join`] point.
+    /// A tail call to a [`TypedExprNode::Join`] point.
     ///
     /// Transfers control to the named join point, passing `args` as updated
     /// values for its parameters (in declaration order). Must appear in tail
-    /// position within the enclosing [`Expr::Join`] body.
+    /// position within the enclosing [`TypedExprNode::Join`] body.
     Jump {
-        /// Name of the target [`Expr::Join`].
+        /// Name of the target [`TypedExprNode::Join`].
         target: String,
         /// Updated values for the join point's parameters, in order.
-        args: Vec<Expr>,
+        args: Vec<TypedExpr>,
     },
 
     /// A tuple constructor: `(e0, e1, ...)`.
     ///
     /// Compiles to a [`crate::interpreter::ConstructRecord`] with fields
     /// named `_0`, `_1`, … (via [`crate::interpreter::tuple_field`]).
-    Tuple(Vec<Expr>),
+    Tuple(Vec<TypedExpr>),
 
     /// Integer-index access into a tuple: `t[n]`.
     ///
     /// Compiles to a [`crate::interpreter::RecordField`] with field name `_n`.
-    TupleIndex(Box<Expr>, usize),
+    TupleIndex(Box<TypedExpr>, usize),
 
     /// A record constructor. Lowering from Python syntax is not yet implemented.
-    Record(Vec<(String, Expr)>),
+    Record(Vec<(String, TypedExpr)>),
 
     /// A grouping operation over a collection by a key extraction function.
     ///
@@ -466,9 +461,9 @@ pub enum Expr {
     /// The result type is `Fun(key_output_ty, Fun(Base(UInt), elem_ty))`
     GroupBy {
         /// The collection (function) whose elements are to be grouped.
-        collection: Box<Expr>,
+        collection: Box<TypedExpr>,
         /// A function that computes the grouping key for each element.
-        key: Box<Expr>,
+        key: Box<TypedExpr>,
     },
 
     /// A reference to an externally-registered data source, identified by name.
@@ -481,22 +476,153 @@ pub enum Expr {
     Source(String),
 }
 
-impl Expr {
-    pub fn apply(argument: Expr, function: Expr) -> Self {
-        Expr::Apply {
-            argument: Box::new(argument),
-            function: Box::new(function),
+/// A CCL expression with a type slot on every node.
+///
+/// Every node starts with `ty: Type::Unknown`; the inference pass
+/// ([`infer::infer`]) fills it before compilation.
+///
+/// `user_annotation` carries an explicit type annotation written by the user
+/// (e.g. from a Python `cast(T, expr)` or an annotated binding site). The
+/// inference pass checks that the inferred type is compatible with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedExpr {
+    /// The expression kind.
+    pub node: TypedExprNode,
+    /// The inferred type of this expression.
+    ///
+    /// Starts as [`Type::Unknown`]; written by [`infer::infer`] before compilation.
+    pub ty: Type,
+    /// User-written type annotation, if any.
+    ///
+    /// Checked against the inferred type by [`infer::infer`]; `None` for all
+    /// nodes produced by the current lowering pass.
+    pub user_annotation: Option<Type>,
+}
+
+/// Type alias for backward compatibility. `Expr` is now [`TypedExpr`].
+pub type Expr = TypedExpr;
+
+impl TypedExpr {
+    /// Construct a new [`TypedExpr`] with `ty: Type::Unknown` and no user annotation.
+    pub fn new(node: TypedExprNode) -> Self {
+        TypedExpr {
+            node,
+            ty: Type::Unknown,
+            user_annotation: None,
         }
     }
 
-    /// Build an unannotated or pre-annotated [`Expr::Lambda`].
+    /// Set the inferred type on this expression, consuming and returning it.
+    ///
+    /// Used to pre-fill the type in tests or when the type is known at construction time.
+    pub fn with_ty(self, ty: Type) -> Self {
+        TypedExpr { ty, ..self }
+    }
+
+    /// Set the user annotation on this expression, consuming and returning it.
+    ///
+    /// Used to attach a user-written type annotation in tests.
+    pub fn with_user_annotation(self, annotation: Type) -> Self {
+        TypedExpr {
+            user_annotation: Some(annotation),
+            ..self
+        }
+    }
+
+    /// Construct a literal expression.
+    pub fn lit(l: Lit) -> Self {
+        Self::new(TypedExprNode::Lit(l))
+    }
+
+    /// Construct a variable reference expression.
+    pub fn var(name: impl Into<String>) -> Self {
+        Self::new(TypedExprNode::Var(name.into()))
+    }
+
+    /// Construct a list literal expression.
+    pub fn list(elts: Vec<Self>) -> Self {
+        Self::new(TypedExprNode::List(elts))
+    }
+
+    /// Construct an aggregate expression.
+    pub fn aggregate(input: Self, kind: AggregateKind) -> Self {
+        Self::new(TypedExprNode::Aggregate {
+            input: Box::new(input),
+            kind,
+        })
+    }
+
+    /// Construct a groupby expression.
+    pub fn groupby(collection: Self, key: Self) -> Self {
+        Self::new(TypedExprNode::GroupBy {
+            collection: Box::new(collection),
+            key: Box::new(key),
+        })
+    }
+
+    /// Construct a let binding expression.
+    ///
+    /// `binding.ty` mirrors `bound_expr.ty` at construction time so that callers
+    /// who pre-set the expression type via [`TypedExpr::with_ty`] (e.g. tests that
+    /// bypass inference) do not need to set the binding type separately. After
+    /// inference both fields hold the same type; [`compile_ccl::compile`] reads
+    /// `binding.ty` as the authoritative slot. In normal lowering both start as
+    /// [`Type::Unknown`] and inference fills them together.
+    pub fn let_bind(name: impl Into<String>, bound_expr: Self, body: Self) -> Self {
+        let ty = bound_expr.ty.clone();
+        Self::new(TypedExprNode::Let {
+            binding: TypedBinding {
+                name: name.into(),
+                ty,
+                user_annotation: None,
+            },
+            bound_expr: Box::new(bound_expr),
+            body: Box::new(body),
+        })
+    }
+
+    /// Construct a tuple expression.
+    pub fn tuple(elts: Vec<Self>) -> Self {
+        Self::new(TypedExprNode::Tuple(elts))
+    }
+
+    /// Construct a tuple index expression.
+    pub fn tuple_index(t: Self, idx: usize) -> Self {
+        Self::new(TypedExprNode::TupleIndex(Box::new(t), idx))
+    }
+
+    /// Construct a unary operation expression.
+    pub fn unary(op: UnaryOpKind, operand: Self) -> Self {
+        Self::new(TypedExprNode::UnaryOp(op, Box::new(operand)))
+    }
+
+    /// Construct a binary operation expression.
+    pub fn binop(left: Self, op: BinOpKind, right: Self) -> Self {
+        Self::new(TypedExprNode::BinOp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        })
+    }
+
+    /// Construct a curried function application.
+    ///
+    /// `argument` is first, `function` is second, mirroring the pipeline style.
+    pub fn apply(argument: TypedExpr, function: TypedExpr) -> Self {
+        Self::new(TypedExprNode::Apply {
+            argument: Box::new(argument),
+            function: Box::new(function),
+        })
+    }
+
+    /// Build an unannotated or pre-annotated [`TypedExprNode::Lambda`].
     ///
     /// Pass [`Type::Unknown`] for `param_ty` when the parameter type is not yet
     /// known (lowering phase); pass the concrete type when it is already known.
     /// Callers that previously passed `None` should pass `Type::Unknown`;
     /// callers that passed `Some(ty)` should pass `ty` directly.
-    pub fn lambda(param: &str, param_ty: Type, body: Expr) -> Self {
-        Expr::Lambda {
+    pub fn lambda(param: &str, param_ty: Type, body: TypedExpr) -> Self {
+        Self::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 name: param.to_string(),
                 ty: param_ty,
@@ -504,18 +630,18 @@ impl Expr {
             },
             body: Box::new(body),
             refinement: None,
-        }
+        })
     }
 
-    /// Build an [`Expr::Lambda`] with a predicate [`Refinement`].
+    /// Build a [`TypedExprNode::Lambda`] with a predicate [`Refinement`].
     pub fn lambda_with_refinement(
         param: &str,
         param_ty: Type,
-        body: Expr,
-        refinement: Expr,
+        body: TypedExpr,
+        refinement: TypedExpr,
         refinement_desc: &str,
     ) -> Self {
-        Expr::Lambda {
+        Self::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 name: param.to_string(),
                 ty: param_ty,
@@ -527,18 +653,18 @@ impl Expr {
                 description: refinement_desc.to_string(),
                 kind: RefinementKind::Predicate(Rc::new(RefCell::new(refinement))),
             }),
-        }
+        })
     }
 
-    /// Build a [`Expr::Lambda`] with a hash-join [`Refinement`].
+    /// Build a [`TypedExprNode::Lambda`] with a hash-join [`Refinement`].
     pub fn lambda_with_hash_join(
         param: &str,
         param_ty: Type,
-        body: Expr,
+        body: TypedExpr,
         spec: HashJoinSpec,
         desc: &str,
     ) -> Self {
-        Expr::Lambda {
+        Self::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 name: param.to_string(),
                 ty: param_ty,
@@ -550,11 +676,11 @@ impl Expr {
                 description: desc.to_string(),
                 kind: RefinementKind::HashJoin(Box::new(spec)),
             }),
-        }
+        })
     }
 }
 
-/// A pattern in a [`Expr::Case`] branch.
+/// A pattern in a [`TypedExprNode::Case`] branch.
 ///
 /// Patterns are tested against the scrutinee. The first branch whose pattern
 /// matches wins, and any [`Pattern::Var`] sub-patterns in it are bound in
@@ -575,10 +701,9 @@ pub enum Pattern {
 
 /// A CCL type annotation.
 ///
-/// Appears on [`Expr::Let`] and [`Expr::Lambda`] nodes and as the output of
-/// type inference. [`Type::Unknown`] is the placeholder used before
-/// type-checking; it has no runtime equivalent and must be fully resolved
-/// before operator-graph compilation.
+/// Appears on [`TypedExpr`] nodes and as the output of type inference.
+/// [`Type::Unknown`] is the placeholder used before type-checking; it has no
+/// runtime equivalent and must be fully resolved before operator-graph compilation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     /// A primitive base type.
@@ -659,7 +784,7 @@ impl Type {
     }
 }
 
-/// Represents a type refinement carried by a [`Expr::Lambda`] parameter.
+/// Represents a type refinement carried by a [`TypedExprNode::Lambda`] parameter.
 #[derive(Debug, Clone)]
 pub struct Refinement {
     /// Unique ID assigned at construction time.
@@ -686,7 +811,7 @@ impl Eq for Refinement {}
 #[derive(Debug, Clone, PartialEq)]
 pub enum RefinementKind {
     /// Arbitrary boolean predicate; compiled as an element-wise loop join.
-    Predicate(Rc<RefCell<Expr>>),
+    Predicate(Rc<RefCell<TypedExpr>>),
     /// Equality join between two generator key expressions; compiled as a hash join.
     HashJoin(Box<HashJoinSpec>),
 }
@@ -704,13 +829,13 @@ pub struct HashJoinSpec {
     /// Name of the probe-side iterator variable (e.g. `"y"`).
     pub probe_var_name: String,
     /// CCL expression for the build-side join key; references `build_var_name` as a free variable.
-    pub build_key: Rc<Expr>,
+    pub build_key: Rc<TypedExpr>,
     /// CCL expression for the probe-side join key; references `probe_var_name` as a free variable.
-    pub probe_key: Rc<Expr>,
+    pub probe_key: Rc<TypedExpr>,
     /// CCL expression for the build-side source list (no free generator variables).
-    pub build_source: Rc<Expr>,
+    pub build_source: Rc<TypedExpr>,
     /// CCL expression for the probe-side source list (no free generator variables).
-    pub probe_source: Rc<Expr>,
+    pub probe_source: Rc<TypedExpr>,
 }
 
 impl PartialEq for HashJoinSpec {

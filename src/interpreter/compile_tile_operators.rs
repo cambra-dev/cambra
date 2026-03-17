@@ -26,7 +26,10 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::{
-    ccl::{AggregateKind, BinOpKind as CclBinOp, Expr, Lit, Refinement, RefinementKind, Type},
+    ccl::{
+        AggregateKind, BinOpKind as CclBinOp, Expr, Lit, Refinement, RefinementKind, Type,
+        TypedExprNode,
+    },
     interpreter::{
         compile_ccl::{map_binop, CompileContext, CompileError},
         tile_operators::{
@@ -176,41 +179,40 @@ fn compile_tile_inner(
     expr: &Expr,
     ctx: &mut TileCompileContext,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
-    match expr {
-        Expr::Lit(lit) => compile_lit(lit),
-        Expr::Var(name) => compile_var(name, ctx),
-        Expr::BinOp { left, op, right } => compile_binop(left, op, right, ctx),
+    match &expr.node {
+        TypedExprNode::Lit(lit) => compile_lit(lit),
+        TypedExprNode::Var(name) => compile_var(name, ctx),
+        TypedExprNode::BinOp { left, op, right } => compile_binop(left, op, right, ctx),
         // β-reduce immediately-applied lambdas to avoid iterating infinite types.
-        Expr::Apply { function, argument } => compile_apply(function, argument, ctx),
-        Expr::Lambda {
+        TypedExprNode::Apply { function, argument } => compile_apply(function, argument, ctx),
+        TypedExprNode::Lambda {
             param,
             body,
             refinement,
         } if param.ty != Type::Unknown => {
             compile_lambda(&param.name, &param.ty, body, refinement, ctx)
         }
-        Expr::Lambda { param, .. } => Err(CompileError::Unsupported(format!(
+        TypedExprNode::Lambda { param, .. } => Err(CompileError::Unsupported(format!(
             "Lambda '{param:?}' has no type annotation; ccl::infer must run before compile_tile"
         ))),
-        Expr::Let {
+        TypedExprNode::Let {
             binding,
             bound_expr,
             body,
-        } if binding.ty != Type::Unknown => compile_let(&binding.name, &binding.ty, bound_expr, body, ctx),
-        Expr::Let {
-            binding,
-            ..
-        } => Err(CompileError::TypeError(format!(
+        } if binding.ty != Type::Unknown => {
+            compile_let(&binding.name, &binding.ty, bound_expr, body, ctx)
+        }
+        TypedExprNode::Let { binding, .. } => Err(CompileError::TypeError(format!(
             "Let binding '{binding:?}' has no type annotation; ccl::infer must run before compile_tile"
         ))),
-        Expr::Tuple(elts) => compile_tuple(elts, ctx),
-        Expr::TupleIndex(tuple, idx) => compile_tuple_index(tuple, *idx, ctx),
-        Expr::List(elts) => compile_list(elts),
-        Expr::Aggregate { input, kind } => compile_aggregate(input, kind, ctx),
-        Expr::GroupBy { collection, key } => compile_groupby(collection, key, ctx),
-        Expr::Source(name) => compile_source(name, ctx),
-        other => Err(CompileError::Unsupported(format!(
-            "CCL node not yet supported by compile_tile: {other:?}"
+        TypedExprNode::Tuple(elts) => compile_tuple(elts, ctx),
+        TypedExprNode::TupleIndex(tuple, idx) => compile_tuple_index(tuple, *idx, ctx),
+        TypedExprNode::List(elts) => compile_list(elts),
+        TypedExprNode::Aggregate { input, kind } => compile_aggregate(input, kind, ctx),
+        TypedExprNode::GroupBy { collection, key } => compile_groupby(collection, key, ctx),
+        TypedExprNode::Source(name) => compile_source(name, ctx),
+        _ => Err(CompileError::Unsupported(format!(
+            "CCL node not yet supported by compile_tile: {expr:?}"
         ))),
     }
 }
@@ -432,8 +434,8 @@ fn compile_apply(
     argument: &Expr,
     ctx: &mut TileCompileContext,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
-    match function {
-        Expr::Lambda {
+    match &function.node {
+        TypedExprNode::Lambda {
             param,
             body,
             refinement,
@@ -466,13 +468,13 @@ fn compile_apply(
                 }
             }
         }
-        Expr::Lambda {
+        TypedExprNode::Lambda {
             param,
             ..
         } => Err(CompileError::Unsupported(format!(
             "Lambda '{param:?}' has no type annotation in Apply; ccl::infer must run before compile_tile"
         ))),
-        Expr::Source(name) => {
+        TypedExprNode::Source(name) => {
             // Applying a source to a domain argument: MapSource already maps
             // the full source domain to output values, so the domain argument
             // is implicit. Using MapApply(arg, MapSource) would be wrong
@@ -641,16 +643,16 @@ fn compile_list(elts: &[Expr]) -> Result<Box<dyn TileOperator>, CompileError> {
 
 /// Evaluate a constant CCL expression to a [`Value`].
 ///
-/// Supports [`Expr::Lit`] and [`Expr::Tuple`] with constant elements.
+/// Supports [`TypedExprNode::Lit`] and [`TypedExprNode::Tuple`] with constant elements.
 fn expr_to_value(expr: &Expr) -> Result<Value, CompileError> {
-    match expr {
-        Expr::Lit(lit) => Ok(match lit {
+    match &expr.node {
+        TypedExprNode::Lit(lit) => Ok(match lit {
             Lit::Int(n) => Value::Int(*n),
             Lit::String(s) => Value::String(s.clone()),
             Lit::Bool(b) => Value::Bool(*b),
             Lit::Unit => Value::Unit,
         }),
-        Expr::Tuple(elts) => {
+        TypedExprNode::Tuple(elts) => {
             let fields: Result<HashMap<String, Value>, _> = elts
                 .iter()
                 .enumerate()
@@ -658,8 +660,8 @@ fn expr_to_value(expr: &Expr) -> Result<Value, CompileError> {
                 .collect();
             Ok(Value::Record(fields?))
         }
-        other => Err(CompileError::Unsupported(format!(
-            "compile_tile: only literals and constant tuples supported in list elements, got: {other:?}"
+        _ => Err(CompileError::Unsupported(format!(
+            "compile_tile: only literals and constant tuples supported in list elements, got: {expr:?}"
         ))),
     }
 }
@@ -670,7 +672,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, CompileError> {
 /// recurses into `inner`.  Returns the first expression that is not a variable
 /// resolving to a `Let` binding.
 fn resolve_to_expr<'a>(expr: &'a Expr, ctx: &'a TileCompileContext) -> &'a Expr {
-    if let Expr::Var(name) = expr {
+    if let TypedExprNode::Var(name) = &expr.node {
         if let Some(TileVarBinding::Let(inner)) = ctx.lookup(name) {
             return resolve_to_expr(inner, ctx);
         }
@@ -708,10 +710,7 @@ fn build_materialization_expr(
     Ok(Expr::lambda(
         "_groupby_idx",
         domain_type,
-        Expr::apply(
-            Expr::Var("_groupby_idx".to_string()),
-            collection_expr.clone(),
-        ),
+        Expr::apply(Expr::var("_groupby_idx"), collection_expr.clone()),
     ))
 }
 
@@ -787,8 +786,8 @@ fn compile_aggregate(
     // so that compile_groupby can borrow ctx mutably.
     let groupby_spec: Option<(Expr, Expr)> = {
         let resolved = resolve_to_expr(input, ctx);
-        if let Expr::Apply { function, .. } = resolved {
-            if let Expr::GroupBy { collection, key } = function.as_ref() {
+        if let TypedExprNode::Apply { function, .. } = &resolved.node {
+            if let TypedExprNode::GroupBy { collection, key } = &function.node {
                 Some((*collection.clone(), *key.clone()))
             } else {
                 None
@@ -847,7 +846,7 @@ mod tests {
 
     #[test]
     fn test_literal_int() {
-        let tile = eval_tile_expr(&Expr::Lit(Lit::Int(5)));
+        let tile = eval_tile_expr(&Expr::lit(Lit::Int(5)));
         match tile {
             Tile::Scalar(cv) => assert_eq!(cv.as_single(), Some(Value::Int(5))),
             other => panic!("expected Scalar(Int(5)), got {other:?}"),
@@ -856,7 +855,7 @@ mod tests {
 
     #[test]
     fn test_literal_bool() {
-        let tile = eval_tile_expr(&Expr::Lit(Lit::Bool(false)));
+        let tile = eval_tile_expr(&Expr::lit(Lit::Bool(false)));
         match tile {
             Tile::Scalar(cv) => assert_eq!(cv.as_single(), Some(Value::Bool(false))),
             other => panic!("expected Scalar(Bool(false)), got {other:?}"),
@@ -865,11 +864,11 @@ mod tests {
 
     #[test]
     fn test_binop_add() {
-        let expr = Expr::BinOp {
-            left: Box::new(Expr::Lit(Lit::Int(3))),
-            op: CclBinOp::Arithmetic(CclArith::Add),
-            right: Box::new(Expr::Lit(Lit::Int(4))),
-        };
+        let expr = Expr::binop(
+            Expr::lit(Lit::Int(3)),
+            CclBinOp::Arithmetic(CclArith::Add),
+            Expr::lit(Lit::Int(4)),
+        );
         let tile = eval_tile_expr(&expr);
         match tile {
             Tile::Scalar(cv) => assert_eq!(cv.as_single(), Some(Value::Int(7))),
@@ -879,11 +878,11 @@ mod tests {
 
     #[test]
     fn test_binop_mul() {
-        let expr = Expr::BinOp {
-            left: Box::new(Expr::Lit(Lit::Int(5))),
-            op: CclBinOp::Arithmetic(CclArith::Mul),
-            right: Box::new(Expr::Lit(Lit::Int(6))),
-        };
+        let expr = Expr::binop(
+            Expr::lit(Lit::Int(5)),
+            CclBinOp::Arithmetic(CclArith::Mul),
+            Expr::lit(Lit::Int(6)),
+        );
         let tile = eval_tile_expr(&expr);
         match tile {
             Tile::Scalar(cv) => assert_eq!(cv.as_single(), Some(Value::Int(30))),
@@ -900,8 +899,8 @@ mod tests {
     #[test]
     fn test_apply_lambda_identity() {
         let expr = Expr::apply(
-            Expr::Lit(Lit::Int(3)),
-            Expr::lambda("x", Type::Base(BaseType::Int), Expr::Var("x".to_string())),
+            Expr::lit(Lit::Int(3)),
+            Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("x")),
         );
         let tile = eval_tile_expr(&expr);
         match tile {
@@ -914,8 +913,8 @@ mod tests {
     #[test]
     fn test_apply_lambda_const() {
         let expr = Expr::apply(
-            Expr::Lit(Lit::Int(99)),
-            Expr::lambda("x", Type::Base(BaseType::Int), Expr::Lit(Lit::Int(42))),
+            Expr::lit(Lit::Int(99)),
+            Expr::lambda("x", Type::Base(BaseType::Int), Expr::lit(Lit::Int(42))),
         );
         let tile = eval_tile_expr(&expr);
         match tile {
@@ -928,15 +927,15 @@ mod tests {
     #[test]
     fn test_apply_lambda_binop() {
         let expr = Expr::apply(
-            Expr::Lit(Lit::Int(5)),
+            Expr::lit(Lit::Int(5)),
             Expr::lambda(
                 "x",
                 Type::Base(BaseType::Int),
-                Expr::BinOp {
-                    left: Box::new(Expr::Var("x".to_string())),
-                    op: CclBinOp::Arithmetic(CclArith::Add),
-                    right: Box::new(Expr::Lit(Lit::Int(2))),
-                },
+                Expr::binop(
+                    Expr::var("x"),
+                    CclBinOp::Arithmetic(CclArith::Add),
+                    Expr::lit(Lit::Int(2)),
+                ),
             ),
         );
         let tile = eval_tile_expr(&expr);
@@ -953,19 +952,20 @@ mod tests {
     /// `let x:Int = 5 in x + 1` → Scalar(Int(6)).
     #[test]
     fn test_let_binding() {
-        let expr = Expr::Let {
+        use crate::ccl::TypedExpr;
+        let expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: "x".to_string(),
                 ty: Type::Base(BaseType::Int),
                 user_annotation: None,
             },
-            bound_expr: Box::new(Expr::Lit(Lit::Int(5))),
-            body: Box::new(Expr::BinOp {
-                left: Box::new(Expr::Var("x".to_string())),
-                op: CclBinOp::Arithmetic(CclArith::Add),
-                right: Box::new(Expr::Lit(Lit::Int(1))),
-            }),
-        };
+            bound_expr: Box::new(Expr::lit(Lit::Int(5))),
+            body: Box::new(Expr::binop(
+                Expr::var("x"),
+                CclBinOp::Arithmetic(CclArith::Add),
+                Expr::lit(Lit::Int(1)),
+            )),
+        });
         let tile = eval_tile_expr(&expr);
         match tile {
             Tile::Scalar(cv) => assert_eq!(cv.as_single(), Some(Value::Int(6))),
@@ -985,16 +985,12 @@ mod tests {
     #[test]
     fn test_lambda_list_lookup() {
         // λi:[0,3). [10,20,30][i]
-        let list = Expr::List(vec![
-            Expr::Lit(Lit::Int(10)),
-            Expr::Lit(Lit::Int(20)),
-            Expr::Lit(Lit::Int(30)),
+        let list = Expr::list(vec![
+            Expr::lit(Lit::Int(10)),
+            Expr::lit(Lit::Int(20)),
+            Expr::lit(Lit::Int(30)),
         ]);
-        let expr = Expr::lambda(
-            "i",
-            Type::UIntRange(3),
-            Expr::apply(Expr::Var("i".to_string()), list),
-        );
+        let expr = Expr::lambda("i", Type::UIntRange(3), Expr::apply(Expr::var("i"), list));
         let tile = eval_tile_expr(&expr);
         // Expect SealedFunction with 3 domain elements: UInt(0), UInt(1), UInt(2).
         match tile {
@@ -1012,7 +1008,7 @@ mod tests {
     /// `(3, 4)` → Scalar(Record{_0: Int(3), _1: Int(4)}).
     #[test]
     fn test_tuple() {
-        let expr = Expr::Tuple(vec![Expr::Lit(Lit::Int(3)), Expr::Lit(Lit::Int(4))]);
+        let expr = Expr::tuple(vec![Expr::lit(Lit::Int(3)), Expr::lit(Lit::Int(4))]);
         let tile = eval_tile_expr(&expr);
         match tile {
             Tile::Scalar(ColumnValue::Records(fields)) => {
@@ -1078,18 +1074,13 @@ mod tests {
             probe_gen_position: 1,
             build_var_name: "x".to_string(),
             probe_var_name: "y".to_string(),
-            build_key: Rc::new(Expr::Var("x".to_string())),
-            probe_key: Rc::new(Expr::Var("y".to_string())),
-            build_source: Rc::new(Expr::List(vec![])),
-            probe_source: Rc::new(Expr::List(vec![])),
+            build_key: Rc::new(Expr::var("x")),
+            probe_key: Rc::new(Expr::var("y")),
+            build_source: Rc::new(Expr::list(vec![])),
+            probe_source: Rc::new(Expr::list(vec![])),
         };
-        let expr = Expr::lambda_with_hash_join(
-            "x",
-            Type::UIntRange(2),
-            Expr::Var("x".to_string()),
-            spec,
-            "x == y",
-        );
+        let expr =
+            Expr::lambda_with_hash_join("x", Type::UIntRange(2), Expr::var("x"), spec, "x == y");
         let mut ctx = TileCompileContext::new();
         let result = compile_tile(&expr, &mut ctx);
         assert!(

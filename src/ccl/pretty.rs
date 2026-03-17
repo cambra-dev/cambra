@@ -12,7 +12,7 @@
 //! The formatting is intentionally kept human-readable and stable so that tests
 //! can pin expected tree strings directly.
 
-use crate::ccl::{Expr, Lit, RefinementKind, Type, UnaryOpKind};
+use crate::ccl::{Expr, Lit, RefinementKind, Type, TypedExprNode, UnaryOpKind};
 use crate::pretty_tree::{render, InspectNode};
 
 // ---------------------------------------------------------------------------
@@ -29,23 +29,27 @@ pub fn pretty(expr: &Expr) -> String {
 // ---------------------------------------------------------------------------
 
 fn expr_to_node(expr: &Expr) -> InspectNode {
-    match expr {
-        Expr::Lit(lit) => InspectNode::leaf(lit_label(lit)),
+    match &expr.node {
+        TypedExprNode::Lit(lit) => InspectNode::leaf(lit_label(lit)),
 
-        Expr::Var(name) => InspectNode::leaf(format!("Var({name})")),
+        TypedExprNode::Var(name) => InspectNode::leaf(format!("Var({name})")),
 
-        Expr::Apply { function, argument } => InspectNode::new("Apply")
+        TypedExprNode::Apply { function, argument } => InspectNode::new("Apply")
             .child("func", expr_to_node(function))
             .child("arg", expr_to_node(argument)),
 
-        Expr::BinOp { left, op, right } => InspectNode::new(format!("BinOp({})", op.sym()))
-            .child("left", expr_to_node(left))
-            .child("right", expr_to_node(right)),
+        TypedExprNode::BinOp { left, op, right } => {
+            InspectNode::new(format!("BinOp({})", op.sym()))
+                .child("left", expr_to_node(left))
+                .child("right", expr_to_node(right))
+        }
 
-        Expr::UnaryOp(op, operand) => InspectNode::new(format!("UnaryOp({})", unaryop_symbol(op)))
-            .child("expr", expr_to_node(operand)),
+        TypedExprNode::UnaryOp(op, operand) => {
+            InspectNode::new(format!("UnaryOp({})", unaryop_symbol(op)))
+                .child("expr", expr_to_node(operand))
+        }
 
-        Expr::Lambda {
+        TypedExprNode::Lambda {
             param,
             body,
             refinement,
@@ -71,11 +75,11 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             node.child("body", expr_to_node(body))
         }
 
-        Expr::Aggregate { input, kind } => {
+        TypedExprNode::Aggregate { input, kind } => {
             InspectNode::new(format!("Aggregate({kind:?})")).child("input", expr_to_node(input))
         }
 
-        Expr::Let {
+        TypedExprNode::Let {
             binding,
             bound_expr: value,
             body,
@@ -88,7 +92,7 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
                 .child("body", expr_to_node(body))
         }
 
-        Expr::List(elts) => {
+        TypedExprNode::List(elts) => {
             let mut node = InspectNode::new("List");
             for (i, e) in elts.iter().enumerate() {
                 node = node.child(i.to_string(), expr_to_node(e));
@@ -96,7 +100,7 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             node
         }
 
-        Expr::Tuple(elts) => {
+        TypedExprNode::Tuple(elts) => {
             let mut node = InspectNode::new("Tuple");
             for (i, e) in elts.iter().enumerate() {
                 node = node.child(i.to_string(), expr_to_node(e));
@@ -104,11 +108,11 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             node
         }
 
-        Expr::TupleIndex(tuple, idx) => {
+        TypedExprNode::TupleIndex(tuple, idx) => {
             InspectNode::new(format!("TupleIndex({idx})")).child("tuple", expr_to_node(tuple))
         }
 
-        Expr::Record(fields) => {
+        TypedExprNode::Record(fields) => {
             let mut node = InspectNode::new("Record");
             for (field, e) in fields {
                 node = node.child(field.as_str(), expr_to_node(e));
@@ -116,7 +120,7 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             node
         }
 
-        Expr::Case {
+        TypedExprNode::Case {
             scrutinee,
             branches,
         } => {
@@ -127,7 +131,7 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             node
         }
 
-        Expr::Join {
+        TypedExprNode::Join {
             name,
             loop_body,
             outer_body,
@@ -136,11 +140,7 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             .child("loop_body", expr_to_node(loop_body))
             .child("outer_body", expr_to_node(outer_body)),
 
-        Expr::TypeAnnotation(expr, ty) => InspectNode::new("TypeAnnotation")
-            .annotate(format!(": {ty}"))
-            .child("expr", expr_to_node(expr)),
-
-        Expr::Jump { target, args } => {
+        TypedExprNode::Jump { target, args } => {
             let mut node = InspectNode::new(format!("Jump({target})"));
             for (i, arg) in args.iter().enumerate() {
                 node = node.child(format!("arg_{i}"), expr_to_node(arg));
@@ -148,11 +148,11 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             node
         }
 
-        Expr::GroupBy { collection, key } => InspectNode::new("GroupBy")
+        TypedExprNode::GroupBy { collection, key } => InspectNode::new("GroupBy")
             .child("collection", expr_to_node(collection))
             .child("key", expr_to_node(key)),
 
-        Expr::Source(name) => InspectNode::leaf(format!("Source({name})")),
+        TypedExprNode::Source(name) => InspectNode::leaf(format!("Source({name})")),
     }
 }
 
@@ -185,26 +185,26 @@ mod tests {
     use super::pretty;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, Expr, Lit, Pattern, Type, TypedBinding,
-        UnaryOpKind,
+        TypedExpr, TypedExprNode, UnaryOpKind,
     };
     use crate::interpreter::BaseType;
     use rstest::rstest;
 
     #[rstest]
     // Literals
-    #[case(Expr::Lit(Lit::Int(42)), "Lit(42)\n")]
-    #[case(Expr::Lit(Lit::String("hi".to_string())), "Lit(\"hi\")\n")]
-    #[case(Expr::Lit(Lit::Bool(true)), "Lit(true)\n")]
-    #[case(Expr::Lit(Lit::Unit), "Lit(unit)\n")]
+    #[case(Expr::lit(Lit::Int(42)), "Lit(42)\n")]
+    #[case(Expr::lit(Lit::String("hi".to_string())), "Lit(\"hi\")\n")]
+    #[case(Expr::lit(Lit::Bool(true)), "Lit(true)\n")]
+    #[case(Expr::lit(Lit::Unit), "Lit(unit)\n")]
     // Variable
-    #[case(Expr::Var("x".to_string()), "Var(x)\n")]
+    #[case(Expr::var("x"), "Var(x)\n")]
     // BinOp
     #[case(
-        Expr::BinOp {
-            left: Box::new(Expr::Lit(Lit::Int(1))),
-            op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-            right: Box::new(Expr::Lit(Lit::Int(2))),
-        },
+        Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::lit(Lit::Int(2))
+        ),
         "\
 BinOp(+)
 ├── left: Lit(1)
@@ -213,14 +213,14 @@ BinOp(+)
     )]
     // UnaryOp
     #[case(
-        Expr::UnaryOp(UnaryOpKind::Neg, Box::new(Expr::Var("x".to_string()))),
+        Expr::unary(UnaryOpKind::Neg, Expr::var("x")),
         "\
 UnaryOp(-)
 └── expr: Var(x)
 "
     )]
     #[case(
-        Expr::UnaryOp(UnaryOpKind::Not, Box::new(Expr::Var("b".to_string()))),
+        Expr::unary(UnaryOpKind::Not, Expr::var("b")),
         "\
 UnaryOp(not)
 └── expr: Var(b)
@@ -228,7 +228,7 @@ UnaryOp(not)
     )]
     // Apply
     #[case(
-        Expr::apply(Expr::Var("x".to_string()), Expr::Var("f".to_string())),
+        Expr::apply(Expr::var("x"), Expr::var("f")),
         "\
 Apply
 ├── func: Var(f)
@@ -237,38 +237,31 @@ Apply
     )]
     // Lambda (unannotated and annotated)
     #[case(
-        Expr::lambda("x", Type::Unknown, Expr::Var("x".to_string())),
+        Expr::lambda("x", Type::Unknown, Expr::var("x")),
         "\
 Lambda(x)
 └── body: Var(x)
 "
     )]
     #[case(
-        Expr::lambda("x", Type::Base(BaseType::Int), Expr::Var("x".to_string())),
+        Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("x")),
         "\
 Lambda(x) : Int
 └── body: Var(x)
 "
     )]
-    // Let (unannotated and annotated)
+    // Let (unannotated — bound_expr.ty Unknown → no annotation)
     #[case(
-        Expr::Let {
-            binding: TypedBinding::new_unannotated("x"),
-            bound_expr: Box::new(Expr::Lit(Lit::Int(1))),
-            body: Box::new(Expr::Var("x".to_string())),
-        },
+        Expr::let_bind("x", Expr::lit(Lit::Int(1)), Expr::var("x")),
         "\
 Let(x)
 ├── value: Lit(1)
 └── body: Var(x)
 "
     )]
+    // Let (annotated — set bound_expr.ty to Bool so annotation is printed)
     #[case(
-        Expr::Let {
-            binding: TypedBinding { name: "x".to_string(), ty: Type::Base(BaseType::Bool), user_annotation: None },
-            bound_expr: Box::new(Expr::Lit(Lit::Bool(true))),
-            body: Box::new(Expr::Var("x".to_string())),
-        },
+        Expr::let_bind("x", Expr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool)), Expr::var("x")),
         "\
 Let(x) : Bool
 ├── value: Lit(true)
@@ -276,9 +269,9 @@ Let(x) : Bool
 "
     )]
     // List (empty and non-empty)
-    #[case(Expr::List(vec![]), "List\n")]
+    #[case(Expr::list(vec![]), "List\n")]
     #[case(
-        Expr::List(vec![Expr::Lit(Lit::Int(1)), Expr::Lit(Lit::Int(2))]),
+        Expr::list(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]),
         "\
 List
 ├── 0: Lit(1)
@@ -287,7 +280,7 @@ List
     )]
     // Tuple
     #[case(
-        Expr::Tuple(vec![Expr::Lit(Lit::Int(1)), Expr::Lit(Lit::Int(2))]),
+        Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]),
         "\
 Tuple
 ├── 0: Lit(1)
@@ -296,7 +289,7 @@ Tuple
     )]
     // Record
     #[case(
-        Expr::Record(vec![("a".to_string(), Expr::Lit(Lit::Int(1)))]),
+        TypedExpr::new(TypedExprNode::Record(vec![("a".to_string(), Expr::lit(Lit::Int(1)))])),
         "\
 Record
 └── a: Lit(1)
@@ -304,10 +297,10 @@ Record
     )]
     // Case with wildcard branch
     #[case(
-        Expr::Case {
-            scrutinee: Box::new(Expr::Var("x".to_string())),
-            branches: vec![(Pattern::Wildcard, Expr::Lit(Lit::Int(0)))],
-        },
+        TypedExpr::new(TypedExprNode::Case {
+            scrutinee: Box::new(Expr::var("x")),
+            branches: vec![(Pattern::Wildcard, Expr::lit(Lit::Int(0)))],
+        }),
         "\
 Case
 ├── scrutinee: Var(x)
@@ -316,18 +309,18 @@ Case
     )]
     // Join + Jump: loop_body (non-last) has a child → triggers │   continuation prefix
     #[case(
-        Expr::Join {
+        TypedExpr::new(TypedExprNode::Join {
             name: "k".to_string(),
             params: vec![TypedBinding::new_unannotated("i")],
-            loop_body: Box::new(Expr::Jump {
+            loop_body: Box::new(TypedExpr::new(TypedExprNode::Jump {
                 target: "k".to_string(),
-                args: vec![Expr::Var("i".to_string())],
-            }),
-            outer_body: Box::new(Expr::Jump {
+                args: vec![Expr::var("i")],
+            })),
+            outer_body: Box::new(TypedExpr::new(TypedExprNode::Jump {
                 target: "k".to_string(),
-                args: vec![Expr::Lit(Lit::Int(0))],
-            }),
-        },
+                args: vec![Expr::lit(Lit::Int(0))],
+            })),
+        }),
         "\
 Join(k)
 ├── loop_body: Jump(k)
@@ -338,10 +331,10 @@ Join(k)
     )]
     // Jump with two args
     #[case(
-        Expr::Jump {
+        TypedExpr::new(TypedExprNode::Jump {
             target: "k".to_string(),
-            args: vec![Expr::Lit(Lit::Int(1)), Expr::Lit(Lit::Int(2))],
-        },
+            args: vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))],
+        }),
         "\
 Jump(k)
 ├── arg_0: Lit(1)
@@ -350,10 +343,7 @@ Jump(k)
     )]
     // Aggregate
     #[case(
-        Expr::Aggregate {
-            input: Box::new(Expr::Var("xs".to_string())),
-            kind: AggregateKind::Sum,
-        },
+        Expr::aggregate(Expr::var("xs"), AggregateKind::Sum),
         "\
 Aggregate(Sum)
 └── input: Var(xs)
@@ -364,8 +354,8 @@ Aggregate(Sum)
         Expr::lambda_with_refinement(
             "x",
             Type::Base(BaseType::Int),
-            Expr::Var("x".to_string()),
-            Expr::Lit(Lit::Bool(true)),
+            Expr::var("x"),
+            Expr::lit(Lit::Bool(true)),
             "test pred",
         ),
         "\
@@ -387,15 +377,15 @@ Lambda(x) : Int
             probe_gen_position: 1,
             build_var_name: "x".to_string(),
             probe_var_name: "y".to_string(),
-            build_key: Rc::new(Expr::Var("x".to_string())),
-            probe_key: Rc::new(Expr::Var("y".to_string())),
-            build_source: Rc::new(Expr::Lit(Lit::Int(0))),
-            probe_source: Rc::new(Expr::Lit(Lit::Int(0))),
+            build_key: Rc::new(Expr::var("x")),
+            probe_key: Rc::new(Expr::var("y")),
+            build_source: Rc::new(Expr::lit(Lit::Int(0))),
+            probe_source: Rc::new(Expr::lit(Lit::Int(0))),
         };
         let expr = Expr::lambda_with_hash_join(
             "p",
             Type::Base(BaseType::Int),
-            Expr::Lit(Lit::Unit),
+            Expr::lit(Lit::Unit),
             spec,
             "x == y",
         );
@@ -415,18 +405,15 @@ Lambda(p) : Int
     /// exercises the code path.
     #[test]
     fn test_pretty_continuation_prefix() {
-        let expr = Expr::Let {
-            binding: TypedBinding::new_unannotated("x"),
-            bound_expr: Box::new(Expr::apply(
-                Expr::Lit(Lit::Int(1)),
-                Expr::Var("f".to_string()),
-            )),
-            body: Box::new(Expr::BinOp {
-                left: Box::new(Expr::Var("x".to_string())),
-                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-                right: Box::new(Expr::Lit(Lit::Int(2))),
-            }),
-        };
+        let expr = Expr::let_bind(
+            "x",
+            Expr::apply(Expr::lit(Lit::Int(1)), Expr::var("f")),
+            Expr::binop(
+                Expr::var("x"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                Expr::lit(Lit::Int(2)),
+            ),
+        );
         let expected = "\
 Let(x)
 ├── value: Apply

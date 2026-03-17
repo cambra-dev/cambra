@@ -10,7 +10,9 @@
 //!
 //! The public entry point is [`symbolic`].
 
-use crate::ccl::{ArithmeticKind, BinOpKind, Expr, Lit, LogicKind, Pattern, Type, UnaryOpKind};
+use crate::ccl::{
+    ArithmeticKind, BinOpKind, Expr, Lit, LogicKind, Pattern, Type, TypedExprNode, UnaryOpKind,
+};
 
 // ---------------------------------------------------------------------------
 // Precedence
@@ -101,12 +103,12 @@ fn fmt(expr: &Expr, min_prec: Precedence) -> String {
 
 /// Returns `(self_prec, rendered_text)` without outer parentheses.
 fn fmt_inner(expr: &Expr) -> (Precedence, String) {
-    match expr {
-        Expr::Lit(lit) => (Precedence::Atom, fmt_lit(lit)),
+    match &expr.node {
+        TypedExprNode::Lit(lit) => (Precedence::Atom, fmt_lit(lit)),
 
-        Expr::Var(name) => (Precedence::Atom, name.clone()),
+        TypedExprNode::Var(name) => (Precedence::Atom, name.clone()),
 
-        Expr::BinOp { left, op, right } => {
+        TypedExprNode::BinOp { left, op, right } => {
             let op_prec = binop_prec(op);
             let sym = op.sym();
             // Left at same prec is fine (left-associative).
@@ -116,7 +118,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             (op_prec, format!("{l} {sym} {r}"))
         }
 
-        Expr::UnaryOp(op, operand) => match op {
+        TypedExprNode::UnaryOp(op, operand) => match op {
             UnaryOpKind::Neg => {
                 let s = format!("-{}", fmt(operand, Precedence::Unary));
                 (Precedence::Unary, s)
@@ -127,7 +129,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             }
         },
 
-        Expr::Apply { function, argument } => {
+        TypedExprNode::Apply { function, argument } => {
             // Apply is left-associative: `x ▷ f ▷ g` means `(x ▷ f) ▷ g`.
             // Render arg at Apply so a nested Apply is not parenthesised
             // (left-assoc), but Lambda / BinOp / etc. are.
@@ -139,7 +141,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             )
         }
 
-        Expr::Lambda {
+        TypedExprNode::Lambda {
             param,
             body,
             refinement,
@@ -158,18 +160,18 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             (Precedence::Lowest, format!("{header} → {body_str}"))
         }
 
-        Expr::Aggregate { input, kind } => {
+        TypedExprNode::Aggregate { input, kind } => {
             let input_str = fmt(input, Precedence::Lowest);
             (Precedence::Lowest, format!("{kind:?}({input_str})"))
         }
 
-        Expr::Let {
+        TypedExprNode::Let {
             binding,
             bound_expr: value,
             body,
         } => {
-            let annotation = if binding.ty != Type::Unknown {
-                format!(": {}", binding.ty)
+            let ty_str = if binding.ty != Type::Unknown {
+                format!(" : {}", binding.ty)
             } else {
                 String::new()
             };
@@ -177,29 +179,26 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             let body_str = fmt(body, Precedence::Lowest);
             (
                 Precedence::Lowest,
-                format!(
-                    "let {}{annotation} = {val_str}\nin {body_str}",
-                    binding.name
-                ),
+                format!("let {}{ty_str} = {val_str}\nin {body_str}", binding.name),
             )
         }
 
-        Expr::List(elts) => {
+        TypedExprNode::List(elts) => {
             let items: Vec<_> = elts.iter().map(|e| fmt(e, Precedence::Lowest)).collect();
             (Precedence::Atom, format!("[{}]", items.join(", ")))
         }
 
-        Expr::Tuple(elts) => {
+        TypedExprNode::Tuple(elts) => {
             let items: Vec<_> = elts.iter().map(|e| fmt(e, Precedence::Lowest)).collect();
             (Precedence::Atom, format!("({})", items.join(", ")))
         }
 
-        Expr::TupleIndex(tuple, idx) => {
+        TypedExprNode::TupleIndex(tuple, idx) => {
             let t = fmt(tuple, Precedence::Atom);
             (Precedence::Subscript, format!("{t}[{idx}]"))
         }
 
-        Expr::Record(fields) => {
+        TypedExprNode::Record(fields) => {
             let items: Vec<_> = fields
                 .iter()
                 .map(|(k, e)| format!("{k}: {}", fmt(e, Precedence::Lowest)))
@@ -207,7 +206,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             (Precedence::Atom, format!("({})", items.join(", ")))
         }
 
-        Expr::Case {
+        TypedExprNode::Case {
             scrutinee,
             branches,
         } => {
@@ -224,7 +223,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             )
         }
 
-        Expr::Join {
+        TypedExprNode::Join {
             name,
             params,
             loop_body,
@@ -249,12 +248,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             )
         }
 
-        Expr::TypeAnnotation(expr, ty) => {
-            let inner = fmt(expr, Precedence::Lowest);
-            (Precedence::Atom, format!("({inner} : {ty})"))
-        }
-
-        Expr::Jump { target, args } => {
+        TypedExprNode::Jump { target, args } => {
             let arg_strs: Vec<_> = args.iter().map(|a| fmt(a, Precedence::Lowest)).collect();
             (
                 Precedence::Atom,
@@ -262,7 +256,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             )
         }
 
-        Expr::GroupBy { collection, key } => {
+        TypedExprNode::GroupBy { collection, key } => {
             let coll_str = fmt(collection, Precedence::Lowest);
             let key_str = fmt(key, Precedence::Lowest);
             (
@@ -271,7 +265,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             )
         }
 
-        Expr::Source(name) => (Precedence::Atom, format!("source({name})")),
+        TypedExprNode::Source(name) => (Precedence::Atom, format!("source({name})")),
     }
 }
 
@@ -287,8 +281,10 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
 ///   does not absorb the rest of the chain without parens.
 /// - Anything else: render at [`Precedence::Lowest`] (no extra wrapping needed).
 fn fmt_apply_func(func: &Expr) -> String {
-    match func {
-        Expr::Apply { .. } | Expr::Lambda { .. } => format!("({})", fmt(func, Precedence::Lowest)),
+    match &func.node {
+        TypedExprNode::Apply { .. } | TypedExprNode::Lambda { .. } => {
+            format!("({})", fmt(func, Precedence::Lowest))
+        }
         _ => fmt(func, Precedence::Lowest),
     }
 }
@@ -347,7 +343,7 @@ mod tests {
     use super::symbolic;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, Expr, HashJoinSpec, Lit, LogicKind, Pattern,
-        Type, TypedBinding, UnaryOpKind,
+        Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
     };
     use crate::interpreter::BaseType;
     use rstest::rstest;
@@ -359,145 +355,111 @@ mod tests {
 
     #[rstest]
     // Literals
-    #[case(Expr::Lit(Lit::Int(42)), "42")]
-    #[case(Expr::Lit(Lit::String("hi".to_string())), r#""hi""#)]
-    #[case(Expr::Lit(Lit::Bool(true)), "true")]
-    #[case(Expr::Lit(Lit::Unit), "unit")]
+    #[case(Expr::lit(Lit::Int(42)), "42")]
+    #[case(Expr::lit(Lit::String("hi".to_string())), r#""hi""#)]
+    #[case(Expr::lit(Lit::Bool(true)), "true")]
+    #[case(Expr::lit(Lit::Unit), "unit")]
     // Variable
-    #[case(Expr::Var("x".to_string()), "x")]
+    #[case(Expr::var("x"), "x")]
     // BinOp: left-assoc, no parens on left child at same prec
     #[case(
-        Expr::BinOp {
-            left: Box::new(Expr::BinOp {
-                left: Box::new(Expr::Var("a".to_string())),
-                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-                right: Box::new(Expr::Var("b".to_string())),
-            }),
-            op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-            right: Box::new(Expr::Var("c".to_string())),
-        },
+        Expr::binop(
+            Expr::binop(
+                Expr::var("a"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                Expr::var("b")
+            ),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::var("c"),
+        ),
         "a + b + c"
     )]
     // BinOp: right child at same prec needs parens (left-assoc)
     #[case(
-        Expr::BinOp {
-            left: Box::new(Expr::Var("a".to_string())),
-            op: BinOpKind::Arithmetic(ArithmeticKind::Sub),
-            right: Box::new(Expr::BinOp {
-                left: Box::new(Expr::Var("b".to_string())),
-                op: BinOpKind::Arithmetic(ArithmeticKind::Sub),
-                right: Box::new(Expr::Var("c".to_string())),
-            }),
-        },
+        Expr::binop(
+            Expr::var("a"),
+            BinOpKind::Arithmetic(ArithmeticKind::Sub),
+            Expr::binop(
+                Expr::var("b"),
+                BinOpKind::Arithmetic(ArithmeticKind::Sub),
+                Expr::var("c")
+            ),
+        ),
         "a - (b - c)"
     )]
     // BinOp: lower-prec left child needs parens inside higher-prec op
     #[case(
-        Expr::BinOp {
-            left: Box::new(Expr::BinOp {
-                left: Box::new(Expr::Var("a".to_string())),
-                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-                right: Box::new(Expr::Var("b".to_string())),
-            }),
-            op: BinOpKind::Arithmetic(ArithmeticKind::Mul),
-            right: Box::new(Expr::Var("c".to_string())),
-        },
+        Expr::binop(
+            Expr::binop(
+                Expr::var("a"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                Expr::var("b")
+            ),
+            BinOpKind::Arithmetic(ArithmeticKind::Mul),
+            Expr::var("c"),
+        ),
         "(a + b) * c"
     )]
     // BinOp: tighter right child never needs parens
     #[case(
-        Expr::BinOp {
-            left: Box::new(Expr::Var("a".to_string())),
-            op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-            right: Box::new(Expr::BinOp {
-                left: Box::new(Expr::Var("b".to_string())),
-                op: BinOpKind::Arithmetic(ArithmeticKind::Mul),
-                right: Box::new(Expr::Var("c".to_string())),
-            }),
-        },
+        Expr::binop(
+            Expr::var("a"),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::binop(
+                Expr::var("b"),
+                BinOpKind::Arithmetic(ArithmeticKind::Mul),
+                Expr::var("c")
+            ),
+        ),
         "a + b * c"
     )]
     // UnaryOp(Neg) inside Mul: Unary > Mul, so -a needs no parens as left child
     #[case(
-        Expr::BinOp {
-            left: Box::new(Expr::UnaryOp(
-                UnaryOpKind::Neg,
-                Box::new(Expr::Var("a".to_string())),
-            )),
-            op: BinOpKind::Arithmetic(ArithmeticKind::Mul),
-            right: Box::new(Expr::Var("b".to_string())),
-        },
+        Expr::binop(
+            Expr::unary(UnaryOpKind::Neg, Expr::var("a")),
+            BinOpKind::Arithmetic(ArithmeticKind::Mul),
+            Expr::var("b"),
+        ),
         "-a * b"
     )]
     // UnaryOp(Not): And sub-expr needs parens (Not > And)
     #[case(
-        Expr::UnaryOp(
+        Expr::unary(
             UnaryOpKind::Not,
-            Box::new(Expr::BinOp {
-                left: Box::new(Expr::Var("a".to_string())),
-                op: BinOpKind::BoolLogic(LogicKind::And),
-                right: Box::new(Expr::Var("b".to_string())),
-            }),
+            Expr::binop(Expr::var("a"), BinOpKind::BoolLogic(LogicKind::And), Expr::var("b")),
         ),
         "not (a and b)"
     )]
     // UnaryOp(Not): Or sub-expr needs parens (Not > Or)
     #[case(
-        Expr::UnaryOp(
+        Expr::unary(
             UnaryOpKind::Not,
-            Box::new(Expr::BinOp {
-                left: Box::new(Expr::Var("a".to_string())),
-                op: BinOpKind::BoolLogic(LogicKind::Or),
-                right: Box::new(Expr::Var("b".to_string())),
-            }),
+            Expr::binop(Expr::var("a"), BinOpKind::BoolLogic(LogicKind::Or), Expr::var("b")),
         ),
         "not (a or b)"
     )]
     // Apply: basic pipe notation
-    #[case(
-        Expr::apply(Expr::Var("x".to_string()), Expr::Var("f".to_string())),
-        "x ▷ f"
-    )]
+    #[case(Expr::apply(Expr::var("x"), Expr::var("f")), "x ▷ f")]
     // Apply: inner Apply in arg position — left-assoc, no extra parens
     #[case(
-        Expr::apply(
-            Expr::apply(Expr::Var("x".to_string()), Expr::Var("f".to_string())),
-            Expr::Var("g".to_string()),
-        ),
+        Expr::apply(Expr::apply(Expr::var("x"), Expr::var("f")), Expr::var("g"),),
         "x ▷ f ▷ g"
     )]
     // Apply: inner Apply in func position — gets parens to disambiguate
     #[case(
-        Expr::apply(
-            Expr::Var("y".to_string()),
-            Expr::apply(Expr::Var("x".to_string()), Expr::Var("f".to_string())),
-        ),
+        Expr::apply(Expr::var("y"), Expr::apply(Expr::var("x"), Expr::var("f")),),
         "y ▷ (x ▷ f)"
     )]
     // Apply: Lambda in func position gets parens
     #[case(
-        Expr::apply(
-            Expr::Var("v".to_string()),
-            Expr::lambda("x", Type::Unknown, Expr::Var("x".to_string())),
-        ),
+        Expr::apply(Expr::var("v"), Expr::lambda("x", Type::Unknown, Expr::var("x")),),
         "v ▷ (λ x → x)"
     )]
     // Lambda (unannotated)
-    #[case(
-        Expr::lambda(
-                "x",
-                Type::Unknown,
-                Expr::Var("x".to_string()),
-            ),
-        "λ x → x"
-    )]
+    #[case(Expr::lambda("x", Type::Unknown, Expr::var("x")), "λ x → x")]
     // Lambda (annotated)
     #[case(
-        Expr::lambda(
-                "x",
-                Type::Base(BaseType::Int),
-                Expr::Var("x".to_string()),
-            ),
+        Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("x")),
         "λ x : Int → x"
     )]
     // Lambda with function type annotation
@@ -508,71 +470,63 @@ mod tests {
                 Box::new(Type::Base(BaseType::Int)),
                 Box::new(Type::Base(BaseType::Bool)),
             ),
-            Expr::Var("x".to_string()),
+            Expr::var("x"),
         ),
         "λ x : Int ⇒ Bool → x"
     )]
-    // Let (unannotated)
+    // Let (unannotated — bound_expr.ty is Unknown so no annotation printed)
     #[case(
-        Expr::Let {
-            binding: TypedBinding::new_unannotated("x"),
-            bound_expr: Box::new(Expr::Lit(Lit::Int(1))),
-            body: Box::new(Expr::Var("x".to_string())),
-        },
+        Expr::let_bind("x", Expr::lit(Lit::Int(1)), Expr::var("x")),
         "\
 let x = 1
 in x"
     )]
-    // Let (annotated)
+    // Let (annotated — set bound_expr.ty to Bool so annotation is printed)
     #[case(
-        Expr::Let {
-            binding: TypedBinding { name: "x".to_string(), ty: Type::Base(BaseType::Bool), user_annotation: None },
-            bound_expr: Box::new(Expr::Lit(Lit::Bool(true))),
-            body: Box::new(Expr::Var("x".to_string())),
-        },
+        Expr::let_bind("x", Expr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool)), Expr::var("x")),
         "\
-let x: Bool = true
+let x : Bool = true
 in x"
     )]
     // List (empty and non-empty)
-    #[case(Expr::List(vec![]), "[]")]
+    #[case(Expr::list(vec![]), "[]")]
     #[case(
-        Expr::List(vec![Expr::Lit(Lit::Int(1)), Expr::Lit(Lit::Int(2))]),
+        Expr::list(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]),
         "[1, 2]"
     )]
     // Tuple
     #[case(
-        Expr::Tuple(vec![Expr::Lit(Lit::Int(1)), Expr::Lit(Lit::Int(2))]),
+        Expr::tuple(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]),
         "(1, 2)"
     )]
     // Record
     #[case(
-        Expr::Record(vec![
-            ("a".to_string(), Expr::Lit(Lit::Int(1))),
-            ("b".to_string(), Expr::Lit(Lit::Int(2))),
-        ]),
+        TypedExpr::new(TypedExprNode::Record(vec![
+            ("a".to_string(), Expr::lit(Lit::Int(1))),
+            ("b".to_string(), Expr::lit(Lit::Int(2))),
+        ])),
         "(a: 1, b: 2)"
     )]
     // Case with wildcard
     #[case(
-        Expr::Case {
-            scrutinee: Box::new(Expr::Var("x".to_string())),
-            branches: vec![(Pattern::Wildcard, Expr::Lit(Lit::Int(0)))],
-        },
+        TypedExpr::new(TypedExprNode::Case {
+            scrutinee: Box::new(Expr::var("x")),
+            branches: vec![(Pattern::Wildcard, Expr::lit(Lit::Int(0)))],
+        }),
         "case x of { _ → 0 }"
     )]
     // Case with tuple pattern
     #[case(
-        Expr::Case {
-            scrutinee: Box::new(Expr::Var("x".to_string())),
+        TypedExpr::new(TypedExprNode::Case {
+            scrutinee: Box::new(Expr::var("x")),
             branches: vec![(
                 Pattern::Tuple(vec![
                     Pattern::Var("a".to_string()),
                     Pattern::Var("b".to_string()),
                 ]),
-                Expr::Var("a".to_string()),
+                Expr::var("a"),
             )],
-        },
+        }),
         "case x of { (a, b) → a }"
     )]
     // Lambda with predicate refinement, no type annotation
@@ -580,8 +534,8 @@ in x"
         Expr::lambda_with_refinement(
             "x",
             Type::Unknown,
-            Expr::Var("x".to_string()),
-            Expr::Lit(Lit::Bool(true)),
+            Expr::var("x"),
+            Expr::lit(Lit::Bool(true)),
             "x > 0",
         ),
         "λ x : {??? | Refined(x > 0)} → x"
@@ -591,31 +545,28 @@ in x"
         Expr::lambda_with_refinement(
             "x",
             Type::Base(BaseType::Int),
-            Expr::Var("x".to_string()),
-            Expr::Lit(Lit::Bool(true)),
+            Expr::var("x"),
+            Expr::lit(Lit::Bool(true)),
             "x > 0",
         ),
         "λ x : {Int | Refined(x > 0)} → x"
     )]
     // Aggregate
-    #[case(
-        Expr::Aggregate { input: Box::new(Expr::Var("xs".to_string())), kind: AggregateKind::Max },
-        "Max(xs)"
-    )]
+    #[case(Expr::aggregate(Expr::var("xs"), AggregateKind::Max), "Max(xs)")]
     // Join + Jump
     #[case(
-        Expr::Join {
+        TypedExpr::new(TypedExprNode::Join {
             name: "k".to_string(),
             params: vec![TypedBinding::new_unannotated("i")],
-            loop_body: Box::new(Expr::Jump {
+            loop_body: Box::new(TypedExpr::new(TypedExprNode::Jump {
                 target: "k".to_string(),
-                args: vec![Expr::Var("i".to_string())],
-            }),
-            outer_body: Box::new(Expr::Jump {
+                args: vec![Expr::var("i")],
+            })),
+            outer_body: Box::new(TypedExpr::new(TypedExprNode::Jump {
                 target: "k".to_string(),
-                args: vec![Expr::Lit(Lit::Int(0))],
-            }),
-        },
+                args: vec![Expr::lit(Lit::Int(0))],
+            })),
+        }),
         "\
 let rec k(i) = k(i)
 in k(0)"
@@ -636,13 +587,13 @@ in k(0)"
             probe_gen_position: 1,
             build_var_name: "x".to_string(),
             probe_var_name: "y".to_string(),
-            build_key: Rc::new(Expr::Var("x".to_string())),
-            probe_key: Rc::new(Expr::Var("y".to_string())),
-            build_source: Rc::new(Expr::Lit(Lit::Int(0))),
-            probe_source: Rc::new(Expr::Lit(Lit::Int(0))),
+            build_key: Rc::new(Expr::var("x")),
+            probe_key: Rc::new(Expr::var("y")),
+            build_source: Rc::new(Expr::lit(Lit::Int(0))),
+            probe_source: Rc::new(Expr::lit(Lit::Int(0))),
         };
         let expr =
-            Expr::lambda_with_hash_join("p", Type::Unknown, Expr::Lit(Lit::Unit), spec, "x == y");
+            Expr::lambda_with_hash_join("p", Type::Unknown, Expr::lit(Lit::Unit), spec, "x == y");
         assert_eq!(symbolic(&expr), "λ p : {??? | Refined(x == y)} → unit");
     }
 
@@ -654,15 +605,15 @@ in k(0)"
             probe_gen_position: 1,
             build_var_name: "x".to_string(),
             probe_var_name: "y".to_string(),
-            build_key: Rc::new(Expr::Var("x".to_string())),
-            probe_key: Rc::new(Expr::Var("y".to_string())),
-            build_source: Rc::new(Expr::Lit(Lit::Int(0))),
-            probe_source: Rc::new(Expr::Lit(Lit::Int(0))),
+            build_key: Rc::new(Expr::var("x")),
+            probe_key: Rc::new(Expr::var("y")),
+            build_source: Rc::new(Expr::lit(Lit::Int(0))),
+            probe_source: Rc::new(Expr::lit(Lit::Int(0))),
         };
         let expr = Expr::lambda_with_hash_join(
             "p",
             Type::Base(BaseType::Int),
-            Expr::Lit(Lit::Unit),
+            Expr::lit(Lit::Unit),
             spec,
             "x == y",
         );
@@ -683,33 +634,30 @@ in k(0)"
     fn test_symbolic_complex() {
         // let x = not a or b
         // in x ▷ (λ y → y + 1 * 2)
-        let expr = Expr::Let {
-            binding: TypedBinding::new_unannotated("x"),
-            bound_expr: Box::new(Expr::BinOp {
-                left: Box::new(Expr::UnaryOp(
-                    UnaryOpKind::Not,
-                    Box::new(Expr::Var("a".to_string())),
-                )),
-                op: BinOpKind::BoolLogic(LogicKind::Or),
-                right: Box::new(Expr::Var("b".to_string())),
-            }),
-            body: Box::new(Expr::apply(
-                Expr::Var("x".to_string()),
+        let expr = Expr::let_bind(
+            "x",
+            Expr::binop(
+                Expr::unary(UnaryOpKind::Not, Expr::var("a")),
+                BinOpKind::BoolLogic(LogicKind::Or),
+                Expr::var("b"),
+            ),
+            Expr::apply(
+                Expr::var("x"),
                 Expr::lambda(
                     "y",
                     Type::Unknown,
-                    Expr::BinOp {
-                        left: Box::new(Expr::Var("y".to_string())),
-                        op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-                        right: Box::new(Expr::BinOp {
-                            left: Box::new(Expr::Lit(Lit::Int(1))),
-                            op: BinOpKind::Arithmetic(ArithmeticKind::Mul),
-                            right: Box::new(Expr::Lit(Lit::Int(2))),
-                        }),
-                    },
+                    Expr::binop(
+                        Expr::var("y"),
+                        BinOpKind::Arithmetic(ArithmeticKind::Add),
+                        Expr::binop(
+                            Expr::lit(Lit::Int(1)),
+                            BinOpKind::Arithmetic(ArithmeticKind::Mul),
+                            Expr::lit(Lit::Int(2)),
+                        ),
+                    ),
                 ),
-            )),
-        };
+            ),
+        );
         let expected = "\
 let x = not a or b
 in x ▷ (λ y → y + 1 * 2)";

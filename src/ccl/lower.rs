@@ -46,7 +46,7 @@ use rustpython_parser::ast as pyast;
 
 use crate::ccl::{
     AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, HashJoinSpec, Lit, LogicKind,
-    Type, TypedBinding,
+    Type, TypedExprNode,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ pub fn lower_expr(
 ) -> Result<Expr, LoweringError> {
     match &expr.node {
         pyast::ExprKind::Constant { value, .. } => lower_constant(value),
-        pyast::ExprKind::Name { id, .. } => Ok(Expr::Var(id.clone())),
+        pyast::ExprKind::Name { id, .. } => Ok(Expr::var(id.clone())),
         pyast::ExprKind::BinOp { left, op, right } => lower_binop(left, op, right, ctx),
         pyast::ExprKind::Compare {
             left,
@@ -106,7 +106,7 @@ pub fn lower_expr(
         pyast::ExprKind::BoolOp { op, values } => lower_boolop(op, values, ctx),
         pyast::ExprKind::List { elts, .. } => {
             let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
-            Ok(Expr::List(items?))
+            Ok(Expr::list(items?))
         }
         pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(elt, generators, ctx),
         pyast::ExprKind::Call {
@@ -116,7 +116,7 @@ pub fn lower_expr(
         } => lower_call(func, args, keywords, ctx),
         pyast::ExprKind::Tuple { elts, .. } => {
             let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
-            Ok(Expr::Tuple(items?))
+            Ok(Expr::tuple(items?))
         }
         pyast::ExprKind::Subscript { value, slice, .. } => match &slice.node {
             pyast::ExprKind::Constant {
@@ -126,7 +126,7 @@ pub fn lower_expr(
                 let idx: usize = n.try_into().map_err(|_| {
                     LoweringError::Unsupported("Tuple index must be non-negative".into())
                 })?;
-                Ok(Expr::TupleIndex(Box::new(lower_expr(value, ctx)?), idx))
+                Ok(Expr::tuple_index(lower_expr(value, ctx)?, idx))
             }
             _ => Err(LoweringError::Unsupported(
                 "Only integer subscripts are supported".into(),
@@ -181,11 +181,7 @@ pub fn lower_stmts(stmts: &[pyast::Stmt], ctx: &LoweringContext) -> Result<Expr,
                     }
                 };
                 let val = lower_expr(value, ctx)?;
-                Ok(Expr::Let {
-                    binding: TypedBinding::new_unannotated(&name),
-                    bound_expr: Box::new(val),
-                    body: Box::new(body),
-                })
+                Ok(Expr::let_bind(name, val, body))
             }
             _ => Err(LoweringError::Unsupported(
                 "Only assignment statements are supported before the final expression".into(),
@@ -214,7 +210,7 @@ fn lower_constant(constant: &pyast::Constant) -> Result<Expr, LoweringError> {
             )))
         }
     };
-    Ok(Expr::Lit(lit))
+    Ok(Expr::lit(lit))
 }
 
 /// Lower a Python function call to a CCL built-in expression.
@@ -258,10 +254,7 @@ fn lower_call(
             }
             let collection = lower_expr(&args[0], ctx)?;
             let key = lower_expr(&args[1], ctx)?;
-            Ok(Expr::GroupBy {
-                collection: Box::new(collection),
-                key: Box::new(key),
-            })
+            Ok(Expr::groupby(collection, key))
         }
         "sum" | "max" => {
             if args.len() != 1 {
@@ -275,12 +268,11 @@ fn lower_call(
                 _ => unreachable!(),
             };
             let input = lower_expr(&args[0], ctx)?;
-            Ok(Expr::Aggregate {
-                input: Box::new(input),
-                kind,
-            })
+            Ok(Expr::aggregate(input, kind))
         }
-        name if ctx.known_sources.contains(name) => Ok(Expr::Source(name.to_string())),
+        name if ctx.known_sources.contains(name) => {
+            Ok(Expr::new(TypedExprNode::Source(name.to_string())))
+        }
         _ => Err(LoweringError::Unsupported(format!(
             "Unknown function: {name}"
         ))),
@@ -309,11 +301,7 @@ fn lower_binop(
             )))
         }
     };
-    Ok(Expr::BinOp {
-        left: Box::new(left_expr),
-        op: kind,
-        right: Box::new(right_expr),
-    })
+    Ok(Expr::binop(left_expr, kind, right_expr))
 }
 
 /// Lower a Python comparison expression to a CCL [`Expr::BinOp`] chain.
@@ -355,22 +343,18 @@ fn lower_compare(
             }
         };
         // Clone the shared middle operand so both adjacent pairs can own it.
-        comparisons.push(Expr::BinOp {
-            left: Box::new(operands[i].clone()),
-            op: BinOpKind::Compare(kind),
-            right: Box::new(operands[i + 1].clone()),
-        });
+        comparisons.push(Expr::binop(
+            operands[i].clone(),
+            BinOpKind::Compare(kind),
+            operands[i + 1].clone(),
+        ));
     }
 
     // Single comparison: return it directly.
     // Chained comparisons: fold with logical AND (mirrors Python semantics).
     Ok(comparisons
         .into_iter()
-        .reduce(|acc, cmp| Expr::BinOp {
-            left: Box::new(acc),
-            op: BinOpKind::BoolLogic(LogicKind::And),
-            right: Box::new(cmp),
-        })
+        .reduce(|acc, cmp| Expr::binop(acc, BinOpKind::BoolLogic(LogicKind::And), cmp))
         .expect("ops is non-empty"))
 }
 
@@ -396,11 +380,7 @@ fn lower_boolop(
     // Fold left-to-right: `a and b and c` → `(a and b) and c`.
     let mut acc = lower_expr(&values[0], ctx)?;
     for value in &values[1..] {
-        acc = Expr::BinOp {
-            left: Box::new(acc),
-            op: kind.clone(),
-            right: Box::new(lower_expr(value, ctx)?),
-        };
+        acc = Expr::binop(acc, kind.clone(), lower_expr(value, ctx)?);
     }
     Ok(acc)
 }
@@ -426,8 +406,8 @@ fn ccl_gen_vars_referenced_inner(
     result: &mut BitSet,
     shadowed: &mut BitSet,
 ) {
-    match expr {
-        Expr::Var(name) => {
+    match &expr.node {
+        TypedExprNode::Var(name) => {
             if let Some(i) = gen_var_names.iter().position(|n| *n == name.as_str()) {
                 // TODO once we support lambda expressions in CHL, test that the shadowing here
                 // actually works.
@@ -436,18 +416,18 @@ fn ccl_gen_vars_referenced_inner(
                 }
             }
         }
-        Expr::BinOp { left, right, .. } => {
+        TypedExprNode::BinOp { left, right, .. } => {
             ccl_gen_vars_referenced_inner(left, gen_var_names, result, shadowed);
             ccl_gen_vars_referenced_inner(right, gen_var_names, result, shadowed);
         }
-        Expr::UnaryOp(_, operand) => {
+        TypedExprNode::UnaryOp(_, operand) => {
             ccl_gen_vars_referenced_inner(operand, gen_var_names, result, shadowed);
         }
-        Expr::Apply { function, argument } => {
+        TypedExprNode::Apply { function, argument } => {
             ccl_gen_vars_referenced_inner(function, gen_var_names, result, shadowed);
             ccl_gen_vars_referenced_inner(argument, gen_var_names, result, shadowed);
         }
-        Expr::Lambda { body, param, .. } => {
+        TypedExprNode::Lambda { body, param, .. } => {
             // Generator variables are free in the predicate; descend into body.
             let outer_shadowed = shadowed.clone();
             if let Some(i) = gen_var_names.iter().position(|n| *n == param.name) {
@@ -456,7 +436,7 @@ fn ccl_gen_vars_referenced_inner(
             ccl_gen_vars_referenced_inner(body, gen_var_names, result, shadowed);
             *shadowed = outer_shadowed;
         }
-        Expr::Let {
+        TypedExprNode::Let {
             binding,
             bound_expr,
             body,
@@ -469,22 +449,19 @@ fn ccl_gen_vars_referenced_inner(
             ccl_gen_vars_referenced_inner(body, gen_var_names, result, shadowed);
             *shadowed = outer_shadowed;
         }
-        Expr::List(items) | Expr::Tuple(items) => {
+        TypedExprNode::List(items) | TypedExprNode::Tuple(items) => {
             for item in items {
                 ccl_gen_vars_referenced_inner(item, gen_var_names, result, shadowed);
             }
         }
-        Expr::TupleIndex(expr, _) => {
+        TypedExprNode::TupleIndex(expr, _) => {
             ccl_gen_vars_referenced_inner(expr, gen_var_names, result, shadowed);
         }
-        Expr::TypeAnnotation(expr, _) => {
-            ccl_gen_vars_referenced_inner(expr, gen_var_names, result, shadowed);
-        }
-        Expr::GroupBy { collection, key } => {
+        TypedExprNode::GroupBy { collection, key } => {
             ccl_gen_vars_referenced_inner(collection, gen_var_names, result, shadowed);
             ccl_gen_vars_referenced_inner(key, gen_var_names, result, shadowed);
         }
-        Expr::Lit(_) => {}
+        TypedExprNode::Lit(_) => {}
         _ => {}
     }
 }
@@ -498,11 +475,11 @@ fn try_extract_ccl_equality_join<'a>(
     pred: &'a Expr,
     gen_var_names: &[&str],
 ) -> Option<(usize, &'a Expr, usize, &'a Expr)> {
-    if let Expr::BinOp {
+    if let TypedExprNode::BinOp {
         left,
         op: BinOpKind::Compare(CompareKind::Equals),
         right,
-    } = pred
+    } = &pred.node
     {
         let refs_lhs = ccl_gen_vars_referenced(left, gen_var_names);
         let refs_rhs = ccl_gen_vars_referenced(right, gen_var_names);
@@ -692,11 +669,7 @@ fn lower_list_comp(
             pred_op = Some(match pred_op {
                 Some(lhs) => {
                     pred_desc.push_str(&format!(" and {pyast_pred}"));
-                    Expr::BinOp {
-                        left: Box::new(lhs),
-                        op: BinOpKind::BoolLogic(LogicKind::And),
-                        right: Box::new(lowered),
-                    }
+                    Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), lowered)
                 }
                 None => {
                     pred_desc = format!("{pyast_pred}");
@@ -728,11 +701,11 @@ fn lower_list_comp(
     // Single-gen: a bare VarRef to the outer variable.
     // Multi-gen: a RecordField projection of the i-th field from the outer record.
     let make_idx_arg = |var: &str, i: usize| -> Expr {
-        let vref = Expr::Var(var.to_string());
+        let vref = Expr::var(var.to_string());
         if single_gen {
             vref
         } else {
-            Expr::TupleIndex(Box::new(vref), i)
+            Expr::tuple_index(vref, i)
         }
     };
 
@@ -975,7 +948,7 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
         // Equality join: `x == y` should give HashJoin
         let eq_join = parse_module("[x for x in [1, 2] for y in [3, 4] if x == y]");
         let eq_ccl = lower_stmts(&eq_join, &LoweringContext::default()).expect("lowering failed");
-        if let Expr::Lambda { refinement, .. } = &eq_ccl {
+        if let TypedExprNode::Lambda { refinement, .. } = &eq_ccl.node {
             let r = refinement
                 .as_ref()
                 .expect("expected refinement for equality join");
@@ -991,7 +964,7 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
         let non_eq = parse_module("[x for x in [1, 2] for y in [3, 4] if x < y]");
         let non_eq_ccl =
             lower_stmts(&non_eq, &LoweringContext::default()).expect("lowering failed");
-        if let Expr::Lambda { refinement, .. } = &non_eq_ccl {
+        if let TypedExprNode::Lambda { refinement, .. } = &non_eq_ccl.node {
             let r = refinement
                 .as_ref()
                 .expect("expected refinement for loop join");

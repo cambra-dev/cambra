@@ -12,7 +12,7 @@ CCL is a λ-calculus–based IR. Python source is lowered into CCL, where it is 
 Python source
   → parse          (rustpython_parser)
   → lower          (ccl/lower.rs: Python AST → CCL AST, structural only)
-  → infer          (ccl/infer.rs: limited type inference, fills param_ty / Let.ty)
+  → infer          (ccl/infer.rs: type inference, fills ty on every TypedExpr node)
   → type-check     (bidirectional, fills in Type::Unknown annotations)
   → optimize       (tree rewrites on CCL AST)
   → compile        (interpreter/compile_ccl.rs: CCL AST → dataflow operators)
@@ -119,7 +119,17 @@ All binding sites — `Lambda`, `Join`, and `Let` — use `TypedBinding { name, 
 - `ty` starts as `Type::Unknown` (lowering phase) and is filled in by inference before compilation.
 - `user_annotation` carries an optional user-written type annotation (e.g. from a Python `cast` expression). Inference validates the inferred type against it; if the body provides no usable constraint the annotation is used directly as the param type.
 
-`Let.ty` remains `Option<Type>`. `Type::Unknown` has no runtime equivalent — all types must be resolved before operator-graph compilation.
+`Type::Unknown` has no runtime equivalent — all types must be resolved before operator-graph compilation.
+
+### `TypedExpr` — type slot on every node
+
+Every CCL expression is wrapped in `TypedExpr { node: TypedExprNode, ty: Type, user_annotation: Option<Type> }`.
+
+- `node` holds the expression kind (`TypedExprNode` enum, formerly `Expr`).
+- `ty` starts as `Type::Unknown` and is written by `infer::infer` before compilation.
+- `user_annotation` carries an explicit annotation from the source (e.g. a `cast` call). Inference checks it for compatibility with the inferred type and uses it as the final type if present.
+
+`TypeAnnotation` no longer exists as a node variant; annotations are carried uniformly by `TypedExpr.user_annotation` instead.
 
 ---
 
@@ -160,59 +170,69 @@ enum AggregateKind {
 
 // --- CCL AST ---
 
-enum Expr {
+/// Every program is a TypedExpr. `node` holds the expression kind; `ty` is
+/// filled in by infer::infer; `user_annotation` carries an explicit cast/annotation.
+struct TypedExpr {
+    node: TypedExprNode,
+    ty: Type,                        // Unknown until inference fills it
+    user_annotation: Option<Type>,   // checked against ty by infer; None for lowered nodes
+}
+
+/// Type alias for call-site convenience: `Expr` == `TypedExpr`.
+type Expr = TypedExpr;
+
+enum TypedExprNode {
     Lit(Literal),
     Var(String),
     Apply{
-      function: Box<Expr>, 
-      argument: Box<Expr>
+      function: Box<TypedExpr>,
+      argument: Box<TypedExpr>
     },         // unary application: f(x) == x ▷ f
     BinOp{
-      left: Box<Expr>, 
-      op: BinOpKind, 
-      right: Box<Expr>,
+      left: Box<TypedExpr>,
+      op: BinOpKind,
+      right: Box<TypedExpr>,
     },
-    UnaryOp(UnaryOpKind, Box<Expr>),
-    TypeAnnotation(Box<Expr>, Type),
+    UnaryOp(UnaryOpKind, Box<TypedExpr>),
     Lambda {
         param: TypedBinding,    // name + ty (Unknown until inferred) + user_annotation
-        body: Box<Expr>,
+        body: Box<TypedExpr>,
         /// Optional restriction on the outer iteration variable.
         /// `None` for unrestricted lambdas; `Some(r)` for filtered or joined comprehensions.
         refinement: Option<Refinement>,
     },
     Let {
-        binding: TypedBinding,  // name + ty (Unknown until inferred)
-        bound_expr: Box<Expr>,
-        body: Box<Expr>,
+        binding: TypedBinding,  // name + ty mirrors bound_expr.ty after inference
+        bound_expr: Box<TypedExpr>,
+        body: Box<TypedExpr>,
     },
-    List(Vec<Expr>),                     // list literal [e0, e1, ...]; elements may be arbitrary exprs of the same type
+    List(Vec<TypedExpr>),                     // list literal [e0, e1, ...]; elements may be arbitrary exprs of the same type
     Aggregate {
-        input: Box<Expr>,                // expression being aggregated (must be of type Fun)
-        kind: AggregateKind,             // the aggregation operation (Sum, Max, …)
+        input: Box<TypedExpr>,                // expression being aggregated (must be of type Fun)
+        kind: AggregateKind,                  // the aggregation operation (Sum, Max, …)
     },
     Case {
-        scrutinee: Box<Expr>,
-        branches: Vec<(Pattern, Expr)>,
+        scrutinee: Box<TypedExpr>,
+        branches: Vec<(Pattern, TypedExpr)>,
     },
     Join {
         name: String,       // join-point label
         params: Vec<TypedBinding>,
-        loop_body: Box<Expr>,                 // loop body; may contain Jump back to this Join
-        outer_body: Box<Expr>,                // evaluated first; contains the initial Jump
+        loop_body: Box<TypedExpr>,            // loop body; may contain Jump back to this Join
+        outer_body: Box<TypedExpr>,           // evaluated first; contains the initial Jump
     },
     Jump {
-        target: String,                  // must name an enclosing Join
-        args: Vec<Expr>,
+        target: String,                       // must name an enclosing Join
+        args: Vec<TypedExpr>,
     },
     GroupBy {
-        collection: Box<Expr>,           // the collection (function) whose elements are grouped
-        key: Box<Expr>,                  // key extraction function: element → key
+        collection: Box<TypedExpr>,           // the collection (function) whose elements are grouped
+        key: Box<TypedExpr>,                  // key extraction function: element → key
     },
     // Construction — lowering stubbed, deferred
-    Tuple(Vec<Expr>),
-    TupleIndex(Box<Expr>, usize),        // integer-index access into a tuple: t[n]
-    Record(Vec<(String, Expr)>),
+    Tuple(Vec<TypedExpr>),
+    TupleIndex(Box<TypedExpr>, usize),        // integer-index access into a tuple: t[n]
+    Record(Vec<(String, TypedExpr)>),
     // Built-in data source
     Source(String),
 }
@@ -249,8 +269,8 @@ struct Refinement {
 
 enum RefinementKind {
     /// Arbitrary boolean predicate; compiled to a `ComputeRestriction::new_predicate` loop join.
-    /// The `Rc` holds the predicate expression and doubles as the cache key in `CompileContext`.
-    Predicate(Rc<RefCell<Expr>>),
+    /// The `Rc<RefCell<>>` holds the predicate expression and doubles as the cache key in `CompileContext`.
+    Predicate(Rc<RefCell<TypedExpr>>),
     /// Equality key join between two generators; compiled to a `ComputeRestriction::new_join`
     /// hash join using a `Converse` operator.
     HashJoin(Box<HashJoinSpec>),
@@ -261,14 +281,14 @@ enum RefinementKind {
 /// Detection criteria: exactly 2 generators, exactly 1 `if` guard, the guard is
 /// `lhs == rhs` where each side references a distinct generator variable.
 struct HashJoinSpec {
-    build_gen: usize,           // generator index (0-based) for the build side
-    probe_gen: usize,           // generator index for the probe side
-    build_var_name: String,     // iteration variable name for the build side
-    probe_var_name: String,     // iteration variable name for the probe side
-    build_key: Rc<RefCell<Expr>>,   // key expression referencing build_var_name
-    probe_key: Rc<RefCell<Expr>>,   // key expression referencing probe_var_name
-    build_source: Rc<RefCell<Expr>>, // source list for the build side
-    probe_source: Rc<RefCell<Expr>>, // source list for the probe side
+    build_gen: usize,              // generator index (0-based) for the build side
+    probe_gen: usize,              // generator index for the probe side
+    build_var_name: String,        // iteration variable name for the build side
+    probe_var_name: String,        // iteration variable name for the probe side
+    build_key: Rc<TypedExpr>,      // key expression referencing build_var_name
+    probe_key: Rc<TypedExpr>,      // key expression referencing probe_var_name
+    build_source: Rc<TypedExpr>,   // source list for the build side
+    probe_source: Rc<TypedExpr>,   // source list for the probe side
 }
 ```
 
@@ -381,5 +401,9 @@ fills this in from the type of `bound_expr`.
    - Source injection across all three CCL pipeline stages: `Expr::Source`, `Type::DataSource`,
      `CclLoweringContext`, `TypeInferenceContext` source registry, `CompileContext` source registries,
      `CclPipelineSources` convenience bundle. CCL pipeline variants of source/join tests added. ✓
+   - `ccl/mod.rs` + all call sites: introduce `TypedExpr { node: TypedExprNode, ty, user_annotation }`
+     as the primary expression type; rename `Expr` enum to `TypedExprNode`; keep `pub type Expr =
+     TypedExpr` alias; remove `TypeAnnotation` variant; remove `Let.bound_ty` field; fill `ty` on
+     every node in the inference pass. ✓
    - `lowering_via_ccl.rs`: sandboxed end-to-end pipeline tests.
    - `lowering.rs` direct path removed after parity confirmed.

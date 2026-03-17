@@ -5,7 +5,7 @@
 //! ```text
 //! Python source
 //!   → lower (ccl/lower.rs)     — structural, no type reasoning
-//!   → infer  (ccl/infer.rs)    — limited type inference, fills param.ty / binding.ty
+//!   → infer  (ccl/infer.rs)    — type inference, fills ty on every TypedExpr node
 //!   → compile (interpreter/compile_ccl.rs)  — CCL → dataflow operators
 //! ```
 //!
@@ -16,21 +16,16 @@
 //! list-comprehension pipeline end-to-end. See [`infer`] for what is currently
 //! supported and what is deferred.
 //!
-//! # TODO: TypedExpr
-//!
-//! The current pass mutates `Expr` in place, writing inferred types into
-//! [`TypedBinding::ty`] on [`Expr::Lambda`], [`Expr::Join`], and [`Expr::Let`] nodes. The long-term
-//! direction is a `TypedExpr { expr: Expr, ty: Option<Type> }` wrapper that
-//! carries a type slot on every node, cleanly separating structure from typing
-//! and distinguishing user-written annotations ([`crate::ccl::Expr::TypeAnnotation`])
-//! from inference-filled slots. Deferred until the inference pass matures.
+//! The pass fills in [`TypedExpr::ty`] on every node it visits. User-written
+//! annotations are carried in [`TypedExpr::user_annotation`]; they are checked for
+//! compatibility with the inferred type at the end of each [`infer`] call.
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
 use log::trace;
 
-use crate::ccl::{BinOpKind, Expr, Lit, RefinementKind, Type};
+use crate::ccl::{BinOpKind, Expr, Lit, RefinementKind, Type, TypedExprNode};
 // TODO: once `BaseType` moves to `ccl`, this import goes away.
 use crate::interpreter::BaseType;
 use crate::util::ScopeStack;
@@ -166,28 +161,28 @@ pub enum InferError {
 // ---------------------------------------------------------------------------
 
 /// Run limited type inference on `expr`, mutating the tree in place to fill
-/// in `param_ty` on [`Expr::Lambda`] nodes and `bound_ty` on [`Expr::Let`] nodes.
-///
-/// See the `TypedExpr` TODO in the [module documentation](self).
+/// in `ty` on every [`TypedExpr`](crate::ccl::TypedExpr) node.
 ///
 /// Currently handled:
 ///
 /// - Literals — type always known from the literal tag
 /// - Variables — looked up in the scope stack ([`TypeInferenceContext`])
 /// - Annotated lambdas — param type known; recurse into body
-/// - `Apply(Lambda(x, None), arg)` — infers arg type, writes it onto `param_ty`
+/// - `Apply(Lambda(x, Unknown), arg)` — infers arg type, writes it onto `param.ty`
 /// - Standalone unannotated lambdas — calls [`collect_param_constraint`] to
 ///   find a usage-site type constraint for the parameter
 /// - Lists — derives `Fun(UIntRange(n), elem_ty)` from the first element
-/// - Let bindings — infers value type, fills the optional type annotation, binds name in scope
+/// - Let bindings — infers value type, stores it in `bound_expr.ty`, binds name in scope
 /// - `GroupBy` — infers the collection type; uses its codomain to annotate the
 ///   key lambda's parameter (mirrors how `Apply` annotates its lambda argument);
 ///   returns `Fun(KeyType, Fun(UInt, ValueType))`
 ///
-/// Returns [`Type::Unknown`] for unhandled cases ([`Expr::BinOp`],
-/// [`Expr::UnaryOp`]) or when component types cannot be determined. BinOp type
-/// rules and full constraint solving are deferred; see the TODOs throughout this
-/// module.
+/// Returns [`Type::Unknown`] for unhandled cases or when component types cannot
+/// be determined. BinOp type rules and full constraint solving are deferred;
+/// see the TODOs throughout this module.
+///
+/// After computing the result type, checks `expr.user_annotation` compatibility
+/// and stores the final type in `expr.ty`.
 ///
 /// Errors propagate from sub-expressions: an [`InferError::UnboundVariable`]
 /// anywhere in the tree aborts inference and returns the error.
@@ -195,31 +190,21 @@ pub enum InferError {
 /// The `ctx` scope stack is left at the same depth on return as on entry,
 /// even if an error is returned midway.
 pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
-    match expr {
+    let result_ty = match &mut expr.node {
         // ----- Literals -----
-        Expr::Lit(lit) => Ok(lit_type(lit)),
+        TypedExprNode::Lit(lit) => Ok(lit_type(lit)),
 
         // ----- Variable reference -----
-        Expr::Var(name) => ctx
+        TypedExprNode::Var(name) => ctx
             .lookup(name)
             .cloned()
             .ok_or_else(|| InferError::UnboundVariable(name.clone())),
-
-        // ----- Explicit type annotation -----
-        //
-        // Recurse into the inner expression for mutation side-effects,
-        // then return the explicit annotation as the expression's type.
-        Expr::TypeAnnotation(inner, ty) => {
-            let inferred_ty = infer(inner, ctx)?;
-            check_type_compatibility(ty, &inferred_ty)?;
-            Ok(ty.clone())
-        }
 
         // ----- Lambda abstraction -----
         //
         // If param.ty is Unknown, use collect_param_constraint to find a
         // usage-site type constraint before proceeding.
-        Expr::Lambda {
+        TypedExprNode::Lambda {
             param,
             body,
             refinement,
@@ -270,7 +255,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
             Ok(Type::Fun(Box::new(p), Box::new(body_ty)))
         }
 
-        Expr::Aggregate { input, kind } => {
+        TypedExprNode::Aggregate { input, kind } => {
             let input_type = infer(input, ctx)?;
             let input_codomain = input_type
                 .codomain()
@@ -290,9 +275,9 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         //     type and write it onto the lambda's param_ty before continuing.
         //   Lookup: function is any other expression (Var, Apply, List,
         //     or an already-annotated Lambda) — typed by reading without mutation.
-        Expr::Apply { function, argument } => {
+        TypedExprNode::Apply { function, argument } => {
             let arg_ty = infer(argument, ctx)?;
-            if let Expr::Lambda { param, .. } = function.as_mut() {
+            if let TypedExprNode::Lambda { param, .. } = &mut function.node {
                 if param.ty == Type::Unknown {
                     // If the function is a lambda with unknown type, infer it from the argument.
                     // If a user annotation is present, verify it matches before accepting arg_ty.
@@ -323,7 +308,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         // Type is Fun(UIntRange(n), elem_ty) where elem_ty is inferred from
         // the first element. Returns Unknown for empty lists or when the first
         // element's type is Unknown.
-        Expr::List(elts) => {
+        TypedExprNode::List(elts) => {
             let Some(first) = elts.first_mut() else {
                 return Ok(Type::Unknown);
             };
@@ -338,7 +323,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         // ----- Binary operation -----
         //
         // Recurse into both operands for mutation side-effects.
-        Expr::BinOp { left, right, op } => {
+        TypedExprNode::BinOp { left, right, op } => {
             let left_ty = infer(left, ctx)?;
             let right_ty = infer(right, ctx)?;
 
@@ -362,30 +347,38 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         //
         // Recurse into the operand for mutation side-effects.
         // TODO: add unary type rules.
-        Expr::UnaryOp(_, inner) => {
+        TypedExprNode::UnaryOp(_, inner) => {
             infer(inner, ctx)?;
             Ok(Type::Unknown)
         }
 
         // ----- Let binding -----
         //
-        // Infer the value type, fill binding.ty if Unknown, bind the name in a
-        // new scope, infer the body, return the body type.
-        Expr::Let {
+        // Infer the value type, check any user annotation on the binding site,
+        // fill binding.ty, bind the name in a new scope, infer the body, return
+        // the body type.
+        TypedExprNode::Let {
             binding,
             bound_expr,
             body,
         } => {
             let bound_ty = infer(bound_expr, ctx)?;
-            if binding.ty != Type::Unknown {
-                check_type_compatibility(&binding.ty, &bound_ty)?;
-            } else {
+            // Check user annotation on the binding site (e.g. `x: Int = expr`)
+            // against the inferred expression type.
+            if let Some(ref annotation) = binding.user_annotation {
+                if *annotation != bound_ty {
+                    return Err(InferError::AnnotationMismatch {
+                        annotation: annotation.clone(),
+                        inferred: bound_ty,
+                    });
+                }
+            }
+            if binding.ty == Type::Unknown {
                 binding.ty = bound_ty.clone();
             }
-            let name_owned = binding.name.clone();
             let body_ty = {
                 let mut scoped = ctx.enter_scope();
-                scoped.bind(&name_owned, bound_ty);
+                scoped.bind(&binding.name, bound_ty);
                 infer(body, &mut scoped)?
             };
             Ok(body_ty)
@@ -396,7 +389,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         // Recurse into the scrutinee and arms for mutation side-effects.
         // Pattern variable bindings are not pushed into scope; arms with
         // unbound variables silently produce Unknown rather than aborting.
-        Expr::Case {
+        TypedExprNode::Case {
             scrutinee,
             branches,
         } => {
@@ -410,7 +403,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         // ----- Tuple constructor -----
         //
         // Infer each element in order and return their types as a Tuple type.
-        Expr::Tuple(elts) => {
+        TypedExprNode::Tuple(elts) => {
             let types: Result<Vec<Type>, InferError> =
                 elts.iter_mut().map(|e| infer(e, ctx)).collect();
             Ok(Type::Tuple(types?))
@@ -420,10 +413,11 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         //
         // Infer the tuple expression, then return the element type at the given index.
         // Returns Unknown if the expression is not a known Tuple type or the index is out of bounds.
-        Expr::TupleIndex(tuple, idx) => {
+        TypedExprNode::TupleIndex(tuple, idx) => {
             let ty = infer(tuple, ctx)?;
+            let idx = *idx;
             Ok(match ty {
-                Type::Tuple(types) => types.into_iter().nth(*idx).unwrap_or(Type::Unknown),
+                Type::Tuple(types) => types.into_iter().nth(idx).unwrap_or(Type::Unknown),
                 _ => Type::Unknown,
             })
         }
@@ -440,11 +434,11 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         //   - UInt     = unbounded unsigned index into each group
         //   - ValueType = element type of the collection
         // Falls back to Unknown for any component that cannot be inferred.
-        Expr::GroupBy { collection, key } => {
+        TypedExprNode::GroupBy { collection, key } => {
             let coll_ty = infer(collection, ctx)?;
             let elem_ty = coll_ty.codomain();
             if let Some(ref et) = elem_ty {
-                if let Expr::Lambda { param, .. } = key.as_mut() {
+                if let TypedExprNode::Lambda { param, .. } = &mut key.node {
                     // If the key lambda's param type is unknown, infer it from the collection element type.
                     if param.ty == Type::Unknown {
                         param.ty = et.clone();
@@ -465,17 +459,34 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         // ----- Join / Jump / Record -----
         //
         // Not yet handled by this pass; sub-expressions are not visited.
-        Expr::Join { .. } | Expr::Jump { .. } | Expr::Record(_) => Ok(Type::Unknown),
+        TypedExprNode::Join { .. } | TypedExprNode::Jump { .. } | TypedExprNode::Record(_) => {
+            Ok(Type::Unknown)
+        }
 
         // ----- External data source reference -----
         //
         // Look up the source's function type in the source registry.
         // Returns `InferError::UnboundVariable` if the source was not registered
         // before inference was run.
-        Expr::Source(name) => ctx
+        TypedExprNode::Source(name) => ctx
             .source_type(name)
             .ok_or_else(|| InferError::UnboundVariable(name.clone())),
+    }?;
+
+    // Check user_annotation compatibility. If the user provided an explicit annotation,
+    // verify it is compatible with the inferred type and use it as the final type.
+    //
+    // Note: we always infer the full subtree before checking user_annotation.
+    // Skipping recursion when an annotation is present would leave sub-node `ty`
+    // fields as Unknown and miss lambda-param mutations at Apply/GroupBy sites.
+    if let Some(ref annotation) = expr.user_annotation {
+        check_type_compatibility(annotation, &result_ty)?;
+        expr.ty = annotation.clone();
+        return Ok(annotation.clone());
     }
+
+    expr.ty = result_ty.clone();
+    Ok(result_ty)
 }
 
 // ---------------------------------------------------------------------------
@@ -556,11 +567,11 @@ fn collect_constraints_into(
     ctx: &mut TypeInferenceContext,
     out: &mut Vec<TypeConstraint>,
 ) {
-    match body {
-        Expr::Apply { function, argument } => {
+    match &mut body.node {
+        TypedExprNode::Apply { function, argument } => {
             // If argument is Var(param), the domain of function's type is the constraint.
-            match argument.as_ref() {
-                Expr::Var(v) if v == param => {
+            match &argument.node {
+                TypedExprNode::Var(v) if v == param => {
                     if let Ok(Type::Fun(domain, _)) = infer(function, ctx) {
                         out.push(TypeConstraint::Type(*domain));
                         // Don't recurse: function was already inferred (possibly mutated),
@@ -568,10 +579,11 @@ fn collect_constraints_into(
                         return;
                     }
                 }
-                Expr::TupleIndex(tuple, idx) => {
-                    if matches!(tuple.as_ref(), Expr::Var(v) if v == param) {
+                TypedExprNode::TupleIndex(tuple, idx) => {
+                    let idx = *idx;
+                    if matches!(&tuple.node, TypedExprNode::Var(v) if v == param) {
                         if let Ok(Type::Fun(domain, _)) = infer(function, ctx) {
-                            out.push(TypeConstraint::TupleField(*idx, *domain));
+                            out.push(TypeConstraint::TupleField(idx, *domain));
                             return;
                         }
                     }
@@ -579,25 +591,30 @@ fn collect_constraints_into(
                 // infer failed or returned a non-Fun type; fall through to recursive search.
                 _ => {}
             }
+            // Need to split borrows — collect separately on each child.
+            // We can't hold `&mut body.node` while calling collect_constraints_into on parts.
+            // So we reborrow here by calling the function with the child nodes directly.
+            // The match already extracted function and argument as mutable refs.
             collect_constraints_into(param, function, ctx, out);
             collect_constraints_into(param, argument, ctx, out);
         }
 
         // Don't recurse into a lambda that shadows param.
-        Expr::Lambda {
+        TypedExprNode::Lambda {
             param: lam_param,
-            body,
+            body: lam_body,
             ..
         } => {
             if lam_param.name != param {
-                collect_constraints_into(param, body, ctx, out);
+                collect_constraints_into(param, lam_body, ctx, out);
             }
         }
 
-        Expr::Let {
+        TypedExprNode::Let {
             binding,
             bound_expr: value,
-            body,
+            body: let_body,
+            ..
         } => {
             // Always search the value: it is evaluated in the outer scope, so
             // `param` is still in play even if `binding.name == param`.
@@ -605,30 +622,28 @@ fn collect_constraints_into(
             // Don't recurse into `body` when `binding.name == param`: the let-binding
             // shadows `param` there, mirroring the Lambda shadowing guard above.
             if binding.name != param {
-                collect_constraints_into(param, body, ctx, out);
+                collect_constraints_into(param, let_body, ctx, out);
             }
         }
 
-        Expr::BinOp { left, right, .. } => {
+        TypedExprNode::BinOp { left, right, .. } => {
             collect_constraints_into(param, left, ctx, out);
             collect_constraints_into(param, right, ctx, out);
         }
 
-        Expr::UnaryOp(_, inner) => collect_constraints_into(param, inner, ctx, out),
+        TypedExprNode::UnaryOp(_, inner) => collect_constraints_into(param, inner, ctx, out),
 
-        Expr::TypeAnnotation(inner, _) => collect_constraints_into(param, inner, ctx, out),
-
-        Expr::Tuple(elts) => {
+        TypedExprNode::Tuple(elts) => {
             for elt in elts {
                 collect_constraints_into(param, elt, ctx, out);
             }
         }
 
         // idx is a usize constant, not an expression; nothing to search.
-        Expr::TupleIndex(tuple, _) => collect_constraints_into(param, tuple, ctx, out),
+        TypedExprNode::TupleIndex(tuple, _) => collect_constraints_into(param, tuple, ctx, out),
 
         // Leaf nodes with no sub-expressions to search.
-        Expr::Source(_) | Expr::Lit(_) | Expr::Var(_) => {}
+        TypedExprNode::Source(_) | TypedExprNode::Lit(_) | TypedExprNode::Var(_) => {}
 
         _ => {}
     }
@@ -694,7 +709,7 @@ mod tests {
     use crate::ccl::symbolic::symbolic;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, Lit, LogicKind, Type,
-        TypedBinding,
+        TypedBinding, TypedExpr, TypedExprNode,
     };
     use crate::interpreter::BaseType;
 
@@ -706,19 +721,19 @@ mod tests {
     fn test_infer_literals() {
         let mut ctx = TypeInferenceContext::new();
         assert_eq!(
-            infer(&mut Expr::Lit(Lit::Int(42)), &mut ctx),
+            infer(&mut Expr::lit(Lit::Int(42)), &mut ctx),
             Ok(Type::Base(BaseType::Int))
         );
         assert_eq!(
-            infer(&mut Expr::Lit(Lit::String("hello".into())), &mut ctx),
+            infer(&mut Expr::lit(Lit::String("hello".into())), &mut ctx),
             Ok(Type::Base(BaseType::String))
         );
         assert_eq!(
-            infer(&mut Expr::Lit(Lit::Bool(true)), &mut ctx),
+            infer(&mut Expr::lit(Lit::Bool(true)), &mut ctx),
             Ok(Type::Base(BaseType::Bool))
         );
         assert_eq!(
-            infer(&mut Expr::Lit(Lit::Unit), &mut ctx),
+            infer(&mut Expr::lit(Lit::Unit), &mut ctx),
             Ok(Type::Base(BaseType::Unit))
         );
     }
@@ -727,7 +742,7 @@ mod tests {
     fn test_infer_annotated_lambda() {
         let mut ctx = TypeInferenceContext::new();
         // λ x : Int → x  =>  Fun(Int, Int)
-        let mut expr = Expr::lambda("x", Type::Base(BaseType::Int), Expr::Var("x".into()));
+        let mut expr = Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("x"));
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
             ty,
@@ -743,14 +758,14 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         // Apply(λ x → x, 42) should annotate x : Int and return Int.
         let mut expr = Expr::apply(
-            Expr::Lit(Lit::Int(42)),
-            Expr::lambda("x", Type::Unknown, Expr::Var("x".into())),
+            Expr::lit(Lit::Int(42)),
+            Expr::lambda("x", Type::Unknown, Expr::var("x")),
         );
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::Int));
         // Verify the lambda was annotated in place.
-        if let Expr::Apply { function, .. } = &expr {
-            if let Expr::Lambda { param, .. } = function.as_ref() {
+        if let TypedExprNode::Apply { function, .. } = &expr.node {
+            if let TypedExprNode::Lambda { param, .. } = &function.node {
                 assert_eq!(param.ty, Type::Base(BaseType::Int));
             } else {
                 panic!("expected Lambda in function position");
@@ -762,7 +777,7 @@ mod tests {
     fn test_infer_list() {
         let mut ctx = TypeInferenceContext::new();
         // [10, 20]  =>  Fun(UIntRange(2), Int)
-        let mut expr = Expr::List(vec![Expr::Lit(Lit::Int(10)), Expr::Lit(Lit::Int(20))]);
+        let mut expr = Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]);
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
             ty,
@@ -776,7 +791,7 @@ mod tests {
     #[test]
     fn test_infer_list_empty() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::List(vec![]);
+        let mut expr = Expr::list(vec![]);
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Unknown);
     }
@@ -784,7 +799,7 @@ mod tests {
     #[test]
     fn test_infer_unbound_var() {
         let mut ctx = TypeInferenceContext::new();
-        let result = infer(&mut Expr::Var("y".into()), &mut ctx);
+        let result = infer(&mut Expr::var("y"), &mut ctx);
         assert_eq!(result, Err(InferError::UnboundVariable("y".into())));
     }
 
@@ -792,7 +807,7 @@ mod tests {
     fn test_infer_cannot_infer_param() {
         let mut ctx = TypeInferenceContext::new();
         // λ x → x  — standalone; x is referenced but never used as an Apply argument.
-        let mut expr = Expr::lambda("x", Type::Unknown, Expr::Var("x".into()));
+        let mut expr = Expr::lambda("x", Type::Unknown, Expr::var("x"));
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(result, Err(InferError::CannotInferParam("x".into())));
     }
@@ -810,7 +825,7 @@ mod tests {
             "__list_comp_var",
             Type::Unknown,
             Expr::apply(
-                Expr::apply(Expr::Var("__list_comp_var".into()), source),
+                Expr::apply(Expr::var("__list_comp_var"), source),
                 Expr::lambda(var, Type::Unknown, elt),
             ),
         )
@@ -820,9 +835,9 @@ mod tests {
     fn test_infer_outer_lambda_constraint() {
         // [x for x in [10, 20]] — unannotated; infer should annotate both lambdas.
         let mut expr = list_comp_unannotated(
-            Expr::List(vec![Expr::Lit(Lit::Int(10)), Expr::Lit(Lit::Int(20))]),
+            Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]),
             "x",
-            Expr::Var("x".into()),
+            Expr::var("x"),
         );
         let mut ctx = TypeInferenceContext::new();
         infer(&mut expr, &mut ctx).unwrap();
@@ -837,9 +852,9 @@ mod tests {
     fn test_infer_const_body_comp() {
         // [42 for x in [10, 20]]
         let mut expr = list_comp_unannotated(
-            Expr::List(vec![Expr::Lit(Lit::Int(10)), Expr::Lit(Lit::Int(20))]),
+            Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]),
             "x",
-            Expr::Lit(Lit::Int(42)),
+            Expr::lit(Lit::Int(42)),
         );
         let mut ctx = TypeInferenceContext::new();
         infer(&mut expr, &mut ctx).unwrap();
@@ -853,13 +868,13 @@ mod tests {
     #[test]
     fn test_infer_binop_body_comp() {
         // [x + 2 for x in [10, 20]]
-        let body = Expr::BinOp {
-            left: Box::new(Expr::Var("x".into())),
-            op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-            right: Box::new(Expr::Lit(Lit::Int(2))),
-        };
+        let body = Expr::binop(
+            Expr::var("x"),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::lit(Lit::Int(2)),
+        );
         let mut expr = list_comp_unannotated(
-            Expr::List(vec![Expr::Lit(Lit::Int(10)), Expr::Lit(Lit::Int(20))]),
+            Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]),
             "x",
             body,
         );
@@ -877,11 +892,11 @@ mod tests {
         // [y for y in [x for x in [10, 20]]]
         // Both outer and inner comp lambdas start unannotated.
         let inner_comp = list_comp_unannotated(
-            Expr::List(vec![Expr::Lit(Lit::Int(10)), Expr::Lit(Lit::Int(20))]),
+            Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]),
             "x",
-            Expr::Var("x".into()),
+            Expr::var("x"),
         );
-        let mut outer_comp = list_comp_unannotated(inner_comp, "y", Expr::Var("y".into()));
+        let mut outer_comp = list_comp_unannotated(inner_comp, "y", Expr::var("y"));
         let mut ctx = TypeInferenceContext::new();
         infer(&mut outer_comp, &mut ctx).unwrap();
 
@@ -900,16 +915,16 @@ mod tests {
     /// Builds `λ x → BinOp(Apply(f, Var(x)), op, Apply(g, Var(x)))` where `f`
     /// and `g` are annotated lambdas with the given param types.
     fn double_apply_lambda(f_param_ty: Type, g_param_ty: Type) -> Expr {
-        let f = Expr::lambda("a", f_param_ty, Expr::Var("a".into()));
-        let g = Expr::lambda("b", g_param_ty, Expr::Var("b".into()));
+        let f = Expr::lambda("a", f_param_ty, Expr::var("a"));
+        let g = Expr::lambda("b", g_param_ty, Expr::var("b"));
         Expr::lambda(
             "x",
             Type::Unknown,
-            Expr::BinOp {
-                left: Box::new(Expr::apply(Expr::Var("x".into()), f)),
-                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-                right: Box::new(Expr::apply(Expr::Var("x".into()), g)),
-            },
+            Expr::binop(
+                Expr::apply(Expr::var("x"), f),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                Expr::apply(Expr::var("x"), g),
+            ),
         )
     }
 
@@ -928,7 +943,7 @@ mod tests {
             )
         );
         // The param.ty was filled in as Int.
-        if let Expr::Lambda { param, .. } = &expr {
+        if let TypedExprNode::Lambda { param, .. } = &expr.node {
             assert_eq!(param.ty, Type::Base(BaseType::Int));
         } else {
             panic!("expected Lambda");
@@ -939,10 +954,7 @@ mod tests {
     fn test_infer_type_annotation_mismatch() {
         let mut ctx = TypeInferenceContext::new();
         // (42 : String)  =>  TypeMismatch { expected: String, found: Int }
-        let mut expr = Expr::TypeAnnotation(
-            Box::new(Expr::Lit(Lit::Int(42))),
-            Type::Base(BaseType::String),
-        );
+        let mut expr = Expr::lit(Lit::Int(42)).with_user_annotation(Type::Base(BaseType::String));
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(
             result,
@@ -957,8 +969,7 @@ mod tests {
     fn test_infer_type_annotation_ok() {
         let mut ctx = TypeInferenceContext::new();
         // (42 : Int)  =>  Int
-        let mut expr =
-            Expr::TypeAnnotation(Box::new(Expr::Lit(Lit::Int(42))), Type::Base(BaseType::Int));
+        let mut expr = Expr::lit(Lit::Int(42)).with_user_annotation(Type::Base(BaseType::Int));
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::Int));
     }
@@ -967,14 +978,12 @@ mod tests {
     fn test_infer_type_annotation_unknown_ignored() {
         let mut ctx = TypeInferenceContext::new();
         // (BinOp : Int)  =>  Int (since BinOp returns Unknown currently)
-        let mut expr = Expr::TypeAnnotation(
-            Box::new(Expr::BinOp {
-                left: Box::new(Expr::Lit(Lit::Int(1))),
-                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-                right: Box::new(Expr::Lit(Lit::Int(2))),
-            }),
-            Type::Base(BaseType::Int),
-        );
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::lit(Lit::Int(2)),
+        )
+        .with_user_annotation(Type::Base(BaseType::Int));
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::Int));
     }
@@ -982,22 +991,22 @@ mod tests {
     #[test]
     fn test_infer_let_mismatch() {
         let mut ctx = TypeInferenceContext::new();
-        // let x : String = 42 in x  =>  TypeMismatch
-        let mut expr = Expr::Let {
+        // let x : String = 42 in x  =>  AnnotationMismatch
+        let mut expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: "x".into(),
-                ty: Type::Base(BaseType::String),
-                user_annotation: None,
+                ty: Type::Unknown,
+                user_annotation: Some(Type::Base(BaseType::String)),
             },
-            bound_expr: Box::new(Expr::Lit(Lit::Int(42))),
-            body: Box::new(Expr::Var("x".into())),
-        };
-        let result = infer(&mut expr, &mut ctx);
-        // This currently passes or ignores the mismatch in the current code;
-        // we want this to eventually fail.
-        assert!(
-            result.is_err(),
-            "Let should catch type mismatch between annotation and value"
+            bound_expr: Box::new(Expr::lit(Lit::Int(42))),
+            body: Box::new(Expr::var("x")),
+        });
+        assert_eq!(
+            infer(&mut expr, &mut ctx),
+            Err(InferError::AnnotationMismatch {
+                annotation: Type::Base(BaseType::String),
+                inferred: Type::Base(BaseType::Int),
+            })
         );
     }
 
@@ -1005,14 +1014,14 @@ mod tests {
     fn test_infer_apply_mismatch() {
         let mut ctx = TypeInferenceContext::new();
         // (λ x : String → x)(42)  =>  TypeMismatch
-        let mut expr = Expr::Apply {
+        let mut expr = TypedExpr::new(TypedExprNode::Apply {
             function: Box::new(Expr::lambda(
                 "x",
                 Type::Base(BaseType::String),
-                Expr::Var("x".into()),
+                Expr::var("x"),
             )),
-            argument: Box::new(Expr::Lit(Lit::Int(42))),
-        };
+            argument: Box::new(Expr::lit(Lit::Int(42))),
+        });
         let result = infer(&mut expr, &mut ctx);
         assert!(
             result.is_err(),
@@ -1028,11 +1037,7 @@ mod tests {
         // the lambda parameter must be popped even on error; otherwise "x"
         // remains visible in `ctx` after the call returns.
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::lambda(
-            "x",
-            Type::Base(BaseType::Int),
-            Expr::Var("unbound_var".into()),
-        );
+        let mut expr = Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("unbound_var"));
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(
             result,
@@ -1051,18 +1056,18 @@ mod tests {
         // The body is skipped (shadowed), so Apply(f_string, Var(x)) — which refers
         // to the *let-bound* x, not the outer param — does not create a false
         // String constraint. Result: CannotInferParam("x").
-        let f_string = Expr::lambda("b", Type::Base(BaseType::String), Expr::Var("b".into()));
+        let f_string = Expr::lambda("b", Type::Base(BaseType::String), Expr::var("b"));
         let mut expr = Expr::lambda(
             "x",
             Type::Unknown,
-            Expr::Let {
-                binding: TypedBinding::new_unannotated("x"),
-                bound_expr: Box::new(Expr::Lit(Lit::Int(42))),
-                body: Box::new(Expr::Apply {
+            Expr::let_bind(
+                "x",
+                Expr::lit(Lit::Int(42)),
+                TypedExpr::new(TypedExprNode::Apply {
                     function: Box::new(f_string),
-                    argument: Box::new(Expr::Var("x".into())),
+                    argument: Box::new(Expr::var("x")),
                 }),
-            },
+            ),
         );
         let mut ctx = TypeInferenceContext::new();
         assert_eq!(
@@ -1095,11 +1100,11 @@ mod tests {
     fn test_infer_binop_compare_returns_bool() {
         let mut ctx = TypeInferenceContext::new();
         // 1 < 2  =>  Bool
-        let mut expr = Expr::BinOp {
-            left: Box::new(Expr::Lit(Lit::Int(1))),
-            op: BinOpKind::Compare(CompareKind::Less),
-            right: Box::new(Expr::Lit(Lit::Int(2))),
-        };
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Compare(CompareKind::Less),
+            Expr::lit(Lit::Int(2)),
+        );
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Bool)));
     }
 
@@ -1107,11 +1112,11 @@ mod tests {
     fn test_infer_binop_bool_logic_returns_bool() {
         let mut ctx = TypeInferenceContext::new();
         // True and False  =>  Bool
-        let mut expr = Expr::BinOp {
-            left: Box::new(Expr::Lit(Lit::Bool(true))),
-            op: BinOpKind::BoolLogic(LogicKind::And),
-            right: Box::new(Expr::Lit(Lit::Bool(false))),
-        };
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Bool(true)),
+            BinOpKind::BoolLogic(LogicKind::And),
+            Expr::lit(Lit::Bool(false)),
+        );
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Bool)));
     }
 
@@ -1119,15 +1124,15 @@ mod tests {
     fn test_infer_string_add_mutates_to_concat() {
         let mut ctx = TypeInferenceContext::new();
         // "hello" + "world"  =>  String; op mutated to Concat in place
-        let mut expr = Expr::BinOp {
-            left: Box::new(Expr::Lit(Lit::String("hello".into()))),
-            op: BinOpKind::Arithmetic(ArithmeticKind::Add),
-            right: Box::new(Expr::Lit(Lit::String("world".into()))),
-        };
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::String("hello".into())),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::lit(Lit::String("world".into())),
+        );
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::String));
         // The op must have been rewritten from Add to Concat.
-        if let Expr::BinOp { op, .. } = &expr {
+        if let TypedExprNode::BinOp { op, .. } = &expr.node {
             assert_eq!(
                 *op,
                 BinOpKind::Concat,
@@ -1148,11 +1153,11 @@ mod tests {
         // The predicate is a standalone annotated lambda; no outer vars needed.
         // Return type must be Fun(Refinement(Int, r), Int).
         let mut ctx = TypeInferenceContext::new();
-        let predicate = Expr::lambda("_", Type::Base(BaseType::Int), Expr::Lit(Lit::Bool(true)));
+        let predicate = Expr::lambda("_", Type::Base(BaseType::Int), Expr::lit(Lit::Bool(true)));
         let mut expr = Expr::lambda_with_refinement(
             "x",
             Type::Base(BaseType::Int),
-            Expr::Var("x".into()),
+            Expr::var("x"),
             predicate,
             "test predicate",
         );
@@ -1179,11 +1184,11 @@ mod tests {
         // there, so inference fails with UnboundVariable rather than succeeding
         // by accidentally seeing the body's scope.
         let mut ctx = TypeInferenceContext::new();
-        let predicate = Expr::Var("x".into());
+        let predicate = Expr::var("x");
         let mut expr = Expr::lambda_with_refinement(
             "x",
             Type::Base(BaseType::Int),
-            Expr::Var("x".into()),
+            Expr::var("x"),
             predicate,
             "outer scope test",
         );
@@ -1202,14 +1207,14 @@ mod tests {
     #[test]
     fn test_infer_aggregate_sum_int_list() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::Aggregate {
-            input: Box::new(Expr::List(vec![
-                Expr::Lit(Lit::Int(1)),
-                Expr::Lit(Lit::Int(2)),
-                Expr::Lit(Lit::Int(3)),
-            ])),
-            kind: AggregateKind::Sum,
-        };
+        let mut expr = Expr::aggregate(
+            Expr::list(vec![
+                Expr::lit(Lit::Int(1)),
+                Expr::lit(Lit::Int(2)),
+                Expr::lit(Lit::Int(3)),
+            ]),
+            AggregateKind::Sum,
+        );
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
     }
 
@@ -1219,13 +1224,10 @@ mod tests {
     #[test]
     fn test_infer_aggregate_max_int_list() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::Aggregate {
-            input: Box::new(Expr::List(vec![
-                Expr::Lit(Lit::Int(10)),
-                Expr::Lit(Lit::Int(20)),
-            ])),
-            kind: AggregateKind::Max,
-        };
+        let mut expr = Expr::aggregate(
+            Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]),
+            AggregateKind::Max,
+        );
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
     }
 
@@ -1235,13 +1237,13 @@ mod tests {
     #[test]
     fn test_infer_aggregate_max_string_list() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::Aggregate {
-            input: Box::new(Expr::List(vec![
-                Expr::Lit(Lit::String("a".into())),
-                Expr::Lit(Lit::String("b".into())),
-            ])),
-            kind: AggregateKind::Max,
-        };
+        let mut expr = Expr::aggregate(
+            Expr::list(vec![
+                Expr::lit(Lit::String("a".into())),
+                Expr::lit(Lit::String("b".into())),
+            ]),
+            AggregateKind::Max,
+        );
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::String)));
     }
 
@@ -1252,13 +1254,13 @@ mod tests {
     #[test]
     fn test_infer_aggregate_sum_string_unsupported() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::Aggregate {
-            input: Box::new(Expr::List(vec![
-                Expr::Lit(Lit::String("x".into())),
-                Expr::Lit(Lit::String("y".into())),
-            ])),
-            kind: AggregateKind::Sum,
-        };
+        let mut expr = Expr::aggregate(
+            Expr::list(vec![
+                Expr::lit(Lit::String("x".into())),
+                Expr::lit(Lit::String("y".into())),
+            ]),
+            AggregateKind::Sum,
+        );
         assert!(
             matches!(infer(&mut expr, &mut ctx), Err(InferError::Unsupported(_))),
             "Sum over String should be Unsupported"
@@ -1272,10 +1274,7 @@ mod tests {
     #[test]
     fn test_infer_aggregate_non_function_input_mismatch() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::Aggregate {
-            input: Box::new(Expr::Lit(Lit::Int(42))),
-            kind: AggregateKind::Sum,
-        };
+        let mut expr = Expr::aggregate(Expr::lit(Lit::Int(42)), AggregateKind::Sum);
         assert!(
             matches!(
                 infer(&mut expr, &mut ctx),
@@ -1294,14 +1293,11 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         // The list-comp CCL: λ __list_comp_var → __list_comp_var ▷ [1, 2] ▷ (λ x → x)
         let comp = list_comp_unannotated(
-            Expr::List(vec![Expr::Lit(Lit::Int(1)), Expr::Lit(Lit::Int(2))]),
+            Expr::list(vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))]),
             "x",
-            Expr::Var("x".into()),
+            Expr::var("x"),
         );
-        let mut expr = Expr::Aggregate {
-            input: Box::new(comp),
-            kind: AggregateKind::Sum,
-        };
+        let mut expr = Expr::aggregate(comp, AggregateKind::Sum);
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
     }
 
@@ -1318,18 +1314,18 @@ mod tests {
         // Collection: [1, 2, 3] has type Fun(UIntRange(3), Int).
         // Key lambda (identity): Fun(Int, Int) after annotation.
         // Expected return: Fun(Int, Fun(UInt, Int))
-        let mut expr = Expr::GroupBy {
-            collection: Box::new(Expr::List(vec![
-                Expr::Lit(Lit::Int(1)),
-                Expr::Lit(Lit::Int(2)),
-                Expr::Lit(Lit::Int(3)),
-            ])),
-            key: Box::new(Expr::lambda("x", Type::Unknown, Expr::Var("x".into()))),
-        };
+        let mut expr = Expr::groupby(
+            Expr::list(vec![
+                Expr::lit(Lit::Int(1)),
+                Expr::lit(Lit::Int(2)),
+                Expr::lit(Lit::Int(3)),
+            ]),
+            Expr::lambda("x", Type::Unknown, Expr::var("x")),
+        );
         let result_ty = infer(&mut expr, &mut ctx).unwrap();
         // Verify param.ty annotation on the key lambda
-        if let Expr::GroupBy { key, .. } = &expr {
-            if let Expr::Lambda { param, .. } = key.as_ref() {
+        if let TypedExprNode::GroupBy { key, .. } = &expr.node {
+            if let TypedExprNode::Lambda { param, .. } = &key.node {
                 assert_eq!(param.ty, Type::Base(BaseType::Int));
             } else {
                 panic!("expected Lambda for key");
@@ -1364,21 +1360,18 @@ mod tests {
     #[test]
     fn test_infer_groupby_aggregate() {
         let mut ctx = TypeInferenceContext::new();
-        let groupby_expr = Expr::GroupBy {
-            collection: Box::new(Expr::List(vec![
-                Expr::Lit(Lit::Int(1)),
-                Expr::Lit(Lit::Int(2)),
-                Expr::Lit(Lit::Int(3)),
-            ])),
-            key: Box::new(Expr::lambda("x", Type::Unknown, Expr::Var("x".into()))),
-        };
+        let groupby_expr = Expr::groupby(
+            Expr::list(vec![
+                Expr::lit(Lit::Int(1)),
+                Expr::lit(Lit::Int(2)),
+                Expr::lit(Lit::Int(3)),
+            ]),
+            Expr::lambda("x", Type::Unknown, Expr::var("x")),
+        );
         let mut expr = list_comp_unannotated(
             groupby_expr,
             "group",
-            Expr::Aggregate {
-                input: Box::new(Expr::Var("group".into())),
-                kind: AggregateKind::Sum,
-            },
+            Expr::aggregate(Expr::var("group"), AggregateKind::Sum),
         );
         let result_ty = infer(&mut expr, &mut ctx).unwrap();
         // __list_comp_var iterates over the groupby result's domain (Int);
@@ -1399,10 +1392,10 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         // groupby(xs, lambda x: x) — xs is unbound; collection inference returns
         // UnboundVariable, which propagates before the key is touched.
-        let mut expr = Expr::GroupBy {
-            collection: Box::new(Expr::Var("xs".into())),
-            key: Box::new(Expr::lambda("x", Type::Unknown, Expr::Var("x".into()))),
-        };
+        let mut expr = Expr::groupby(
+            Expr::var("xs"),
+            Expr::lambda("x", Type::Unknown, Expr::var("x")),
+        );
         assert_eq!(
             infer(&mut expr, &mut ctx),
             Err(InferError::UnboundVariable("xs".into()))
@@ -1419,22 +1412,16 @@ mod tests {
         // TupleField constraints at indices 0 and 2 — index 1 is missing.
         // reconcile_constraints detects the gap (max 2 != len-1 = 1) → Ok(None)
         // → collect_param_constraint returns None → CannotInferParam("p").
-        let f = Expr::lambda("a", Type::Base(BaseType::Int), Expr::Var("a".into()));
-        let g = Expr::lambda("b", Type::Base(BaseType::Bool), Expr::Var("b".into()));
+        let f = Expr::lambda("a", Type::Base(BaseType::Int), Expr::var("a"));
+        let g = Expr::lambda("b", Type::Base(BaseType::Bool), Expr::var("b"));
         let mut expr = Expr::lambda(
             "p",
             Type::Unknown,
-            Expr::BinOp {
-                left: Box::new(Expr::Apply {
-                    function: Box::new(f),
-                    argument: Box::new(Expr::TupleIndex(Box::new(Expr::Var("p".into())), 0)),
-                }),
-                op: BinOpKind::BoolLogic(LogicKind::And),
-                right: Box::new(Expr::Apply {
-                    function: Box::new(g),
-                    argument: Box::new(Expr::TupleIndex(Box::new(Expr::Var("p".into())), 2)),
-                }),
-            },
+            Expr::binop(
+                Expr::apply(Expr::tuple_index(Expr::var("p"), 0), f),
+                BinOpKind::BoolLogic(LogicKind::And),
+                Expr::apply(Expr::tuple_index(Expr::var("p"), 2), g),
+            ),
         );
         let mut ctx = TypeInferenceContext::new();
         assert_eq!(
@@ -1449,22 +1436,16 @@ mod tests {
         // where f : Int → Int and g : String → String.
         // TupleField constraints at the same index 0 with conflicting types →
         // reconcile_constraints returns TypeMismatch.
-        let f = Expr::lambda("a", Type::Base(BaseType::Int), Expr::Var("a".into()));
-        let g = Expr::lambda("b", Type::Base(BaseType::String), Expr::Var("b".into()));
+        let f = Expr::lambda("a", Type::Base(BaseType::Int), Expr::var("a"));
+        let g = Expr::lambda("b", Type::Base(BaseType::String), Expr::var("b"));
         let mut expr = Expr::lambda(
             "p",
             Type::Unknown,
-            Expr::BinOp {
-                left: Box::new(Expr::Apply {
-                    function: Box::new(f),
-                    argument: Box::new(Expr::TupleIndex(Box::new(Expr::Var("p".into())), 0)),
-                }),
-                op: BinOpKind::BoolLogic(LogicKind::And),
-                right: Box::new(Expr::Apply {
-                    function: Box::new(g),
-                    argument: Box::new(Expr::TupleIndex(Box::new(Expr::Var("p".into())), 0)),
-                }),
-            },
+            Expr::binop(
+                Expr::apply(Expr::tuple_index(Expr::var("p"), 0), f),
+                BinOpKind::BoolLogic(LogicKind::And),
+                Expr::apply(Expr::tuple_index(Expr::var("p"), 0), g),
+            ),
         );
         let mut ctx = TypeInferenceContext::new();
         assert_eq!(
@@ -1491,16 +1472,16 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         // λ [x : annotated Int] → Apply(λ s : String → s, x)
         // Constraint from Apply: x must be String, but annotation says Int.
-        let inner = Expr::lambda("s", Type::Base(BaseType::String), Expr::Var("s".into()));
-        let mut expr = Expr::Lambda {
+        let inner = Expr::lambda("s", Type::Base(BaseType::String), Expr::var("s"));
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 name: "x".to_string(),
                 ty: Type::Unknown,
                 user_annotation: Some(Type::Base(BaseType::Int)),
             },
-            body: Box::new(Expr::apply(Expr::Var("x".into()), inner)),
+            body: Box::new(Expr::apply(Expr::var("x"), inner)),
             refinement: None,
-        };
+        });
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(
             result,
@@ -1520,18 +1501,18 @@ mod tests {
     #[test]
     fn test_infer_apply_annotation_mismatch() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::Apply {
-            function: Box::new(Expr::Lambda {
+        let mut expr = TypedExpr::new(TypedExprNode::Apply {
+            function: Box::new(TypedExpr::new(TypedExprNode::Lambda {
                 param: TypedBinding {
                     name: "x".to_string(),
                     ty: Type::Unknown,
                     user_annotation: Some(Type::Base(BaseType::String)),
                 },
-                body: Box::new(Expr::Var("x".into())),
+                body: Box::new(Expr::var("x")),
                 refinement: None,
-            }),
-            argument: Box::new(Expr::Lit(Lit::Int(42))),
-        };
+            })),
+            argument: Box::new(Expr::lit(Lit::Int(42))),
+        });
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(
             result,
@@ -1552,15 +1533,15 @@ mod tests {
     #[test]
     fn test_infer_annotation_used_when_no_body_constraint() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::Lambda {
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 name: "x".to_string(),
                 ty: Type::Unknown,
                 user_annotation: Some(Type::Base(BaseType::Int)),
             },
-            body: Box::new(Expr::Lit(Lit::Unit)),
+            body: Box::new(Expr::lit(Lit::Unit)),
             refinement: None,
-        };
+        });
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
             ty,
@@ -1569,7 +1550,7 @@ mod tests {
                 Box::new(Type::Base(BaseType::Unit))
             )
         );
-        if let Expr::Lambda { param, .. } = &expr {
+        if let TypedExprNode::Lambda { param, .. } = &expr.node {
             assert_eq!(param.ty, Type::Base(BaseType::Int));
         }
     }
@@ -1587,7 +1568,7 @@ mod tests {
             Box::new(Type::Base(BaseType::String)),
         );
         ctx.register_source_type("mystream", source_ty.clone());
-        let mut expr = Expr::Source("mystream".into());
+        let mut expr = Expr::new(TypedExprNode::Source("mystream".into()));
         assert_eq!(infer(&mut expr, &mut ctx), Ok(source_ty));
     }
 
@@ -1595,7 +1576,7 @@ mod tests {
     #[test]
     fn test_infer_source_unregistered_is_unbound() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::Source("ghost".into());
+        let mut expr = Expr::new(TypedExprNode::Source("ghost".into()));
         assert_eq!(
             infer(&mut expr, &mut ctx),
             Err(InferError::UnboundVariable("ghost".into()))
@@ -1618,8 +1599,8 @@ mod tests {
         ctx.register_source_type("ints", int_ty.clone());
         ctx.register_source_type("strs", str_ty.clone());
 
-        let mut e1 = Expr::Source("ints".into());
-        let mut e2 = Expr::Source("strs".into());
+        let mut e1 = Expr::new(TypedExprNode::Source("ints".into()));
+        let mut e2 = Expr::new(TypedExprNode::Source("strs".into()));
         assert_eq!(infer(&mut e1, &mut ctx), Ok(int_ty));
         assert_eq!(infer(&mut e2, &mut ctx), Ok(str_ty));
     }
