@@ -1005,23 +1005,35 @@ mod tests {
     // Tuples
     // -----------------------------------------------------------------------
 
-    /// `(3, 4)` → Scalar(Record{_0: Int(3), _1: Int(4)}).
-    #[test]
+    /// `(3, 4)` → `Record{_0: Scalar(Int(3)), _1: Scalar(Int(4))}`.
+    #[test_log::test]
     fn test_tuple() {
         let expr = Expr::tuple(vec![Expr::lit(Lit::Int(3)), Expr::lit(Lit::Int(4))]);
         let tile = eval_tile_expr(&expr);
         match tile {
-            Tile::Scalar(ColumnValue::Records(fields)) => {
+            Tile::Record(fields) => {
                 assert_eq!(
-                    fields.get("_0").and_then(|cv| cv.as_single()),
+                    fields.get("_0").and_then(|t| {
+                        if let Tile::Scalar(cv) = t {
+                            cv.as_single()
+                        } else {
+                            None
+                        }
+                    }),
                     Some(Value::Int(3))
                 );
                 assert_eq!(
-                    fields.get("_1").and_then(|cv| cv.as_single()),
+                    fields.get("_1").and_then(|t| {
+                        if let Tile::Scalar(cv) = t {
+                            cv.as_single()
+                        } else {
+                            None
+                        }
+                    }),
                     Some(Value::Int(4))
                 );
             }
-            other => panic!("expected Scalar(Records), got {other:?}"),
+            other => panic!("expected Record, got {other:?}"),
         }
     }
 

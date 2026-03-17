@@ -1121,6 +1121,40 @@ impl ColumnValue {
         self.len() == 1
     }
 
+    /// Return `true` if this column's element type is consistent with `extent`.
+    ///
+    /// This is a structural check — it verifies that the `ColumnValue` variant
+    /// matches what `from_values(..., extent)` would have produced for the same
+    /// data. `DataSourceDomain` extents are resolved to their element extent
+    /// before comparison.
+    pub fn is_compatible_with_extent(&self, extent: &Extent) -> bool {
+        let extent = match extent {
+            Extent::DataSourceDomain(source) => source.borrow().element_extent(),
+            Extent::Restricted { base, .. } => *base.clone(),
+            other => other.clone(),
+        };
+        match (self, extent) {
+            (ColumnValue::Units(_), Extent::Base(BaseType::Unit)) => true,
+            (ColumnValue::Bools(_), Extent::Base(BaseType::Bool)) => true,
+            (ColumnValue::Ints(_), Extent::Base(BaseType::Int)) => true,
+            (ColumnValue::UInts(_), Extent::Base(BaseType::UInt)) => true,
+            (ColumnValue::UInts(_), Extent::UIntRange { .. }) => true,
+            (ColumnValue::Strings(_), Extent::Base(BaseType::String)) => true,
+            (ColumnValue::Records(fields), Extent::Record(ext_fields)) => {
+                fields.len() == ext_fields.len()
+                    && fields.iter().all(|(k, cv)| {
+                        ext_fields
+                            .get(k)
+                            .is_some_and(|e| cv.is_compatible_with_extent(e))
+                    })
+            }
+            (ColumnValue::FunctionBindings { .. }, Extent::Function { .. }) => true,
+            // Variants is the fallback used for Union, unknown, etc.
+            (ColumnValue::Variants(_), _) => true,
+            _ => false,
+        }
+    }
+
     /// Return `true` if this column is a single scalar value that can broadcast.
     /// Note: it's a bit unsafe that we are just using length for this, as it
     /// could mask bugs where a vector column of length 1 could be treated as a

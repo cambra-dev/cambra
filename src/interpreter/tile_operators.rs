@@ -11,7 +11,7 @@
 use std::{cell::RefCell, collections::HashMap, hash::Hash, rc::Rc};
 
 use bit_vec::BitVec;
-use log::debug;
+use log::{debug, trace};
 
 pub use crate::interpreter::tiling::{Predicate, SealedFunctionGuard, Tile, TileGuard, Tiling};
 use crate::{
@@ -75,8 +75,28 @@ pub trait TileProducer {
     /// from inputs to the output.
     fn tiling(&self) -> &Tiling;
 
+    /// Return the name of the concrete producer type.
+    fn name(&self) -> &'static str;
+
     /// Fetch the current tile value.
-    fn get(&mut self, projection_guard: TileGuard) -> Tile;
+    fn get(&mut self, projection_guard: TileGuard) -> Tile {
+        let result = self.get_impl(projection_guard);
+        trace!(
+            "{} produced {:?} for tiling {}",
+            self.name(),
+            result,
+            self.tiling()
+        );
+        assert!(
+            result.check_from(self.tiling()),
+            "{result:?} vs {:?}",
+            self.tiling()
+        );
+        result
+    }
+
+    /// Fetch the current tile value.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile;
 
     /// Release interest in a region.
     /// The `obsolete_guard` specifies a sub-region of the subscription that
@@ -93,13 +113,59 @@ pub trait TileProducer {
     fn inspect(&self, _opts: &VizOptions) -> InspectNode;
 }
 
-fn scalar_tile_to_column_value(tile: Tile) -> ColumnValue {
+/// Repeat a scalar or record-of-scalars tile `len` times along the domain axis.
+///
+/// Used by [`MapToConstProducer`] to broadcast a constant value across all
+/// domain elements: `Tile::Scalar(cv)` → `Tile::Scalar(cv.repeat(len))`;
+/// `Tile::Record(m)` → `Tile::Record(m.map(t → repeat_tile(t, len)))`.
+fn repeat_tile(tile: Tile, len: usize) -> Tile {
+    match tile {
+        Tile::Scalar(cv) => Tile::Scalar(cv.repeat(len)),
+        Tile::Record(m) => Tile::Record(
+            m.into_iter()
+                .map(|(k, t)| (k, repeat_tile(t, len)))
+                .collect(),
+        ),
+        other => panic!("repeat_tile: unsupported tile shape {other:?}"),
+    }
+}
+
+/// Converts a Scalar tile or Record of Scalars to its underlying [`ColumnValue`].
+pub fn scalar_tile_to_column_value(tile: Tile) -> ColumnValue {
     match tile {
         Tile::Scalar(cv) => cv,
         Tile::Record(m) => {
             ColumnValue::Records(extract_hashmap_values(m, scalar_tile_to_column_value))
         }
         _ => panic!("Not scalar"),
+    }
+}
+
+/// Inverse of [`scalar_tile_to_column_value`]: reconstructs a [`Tile`] from a
+/// [`ColumnValue`] using the given [`Tiling`] to determine the output shape.
+///
+/// - `Tiling::Scalar` → `Tile::Scalar(cv)`
+/// - `Tiling::Record` → `Tile::Record(fields)` where each field is rebuilt recursively
+fn column_value_to_tile(cv: ColumnValue, tiling: &Tiling) -> Tile {
+    match tiling {
+        Tiling::Scalar(_) => Tile::Scalar(cv),
+        Tiling::Record(fields) => {
+            let ColumnValue::Records(mut cv_fields) = cv else {
+                panic!("column_value_to_tile: expected Records ColumnValue for Record tiling, got {cv:?}");
+            };
+            Tile::Record(
+                fields
+                    .iter()
+                    .map(|(k, t)| {
+                        let field_cv = cv_fields
+                            .remove(k)
+                            .unwrap_or_else(|| panic!("column_value_to_tile: missing field {k}"));
+                        (k.clone(), column_value_to_tile(field_cv, t))
+                    })
+                    .collect(),
+            )
+        }
+        other => panic!("column_value_to_tile: unsupported tiling {other:?}"),
     }
 }
 
@@ -218,6 +284,10 @@ impl MapApplyProducer {
 }
 
 impl TileProducer for MapApplyProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -229,12 +299,13 @@ impl TileProducer for MapApplyProducer {
             .child("input", self.input.inspect(opts))
     }
 
-    fn get(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let f_tiling = self.function.tiling();
         assert!(
             f_tiling.is_function(),
             "MapApply expected function tiling, Got {f_tiling:?}"
         );
+        let f_codomain_extent = f_tiling.extent().split_function().unwrap().1.clone();
         let i_tiling = self.input.tiling();
         let input_guard = match projection_guard {
             TileGuard::SealedFunction(SealedFunctionGuard::Domain(p)) => {
@@ -269,13 +340,7 @@ impl TileProducer for MapApplyProducer {
                         .drain_to_value_iter()
                         .map(|v| map[&v].clone())
                         .collect();
-                    match output_values.first() {
-                        None => Tile::Scalar(ColumnValue::Units(0)),
-                        Some(first) => {
-                            let extent = Extent::for_value(first);
-                            Tile::Scalar(ColumnValue::from_values(output_values, &extent))
-                        }
-                    }
+                    Tile::Scalar(ColumnValue::from_values(output_values, &f_codomain_extent))
                 }
                 _ => panic!("Not single function"),
             },
@@ -314,13 +379,7 @@ impl TileProducer for MapApplyProducer {
                     .drain_to_value_iter()
                     .map(|v| table[&v].clone())
                     .collect();
-                match output_values.first() {
-                    None => Tile::Scalar(ColumnValue::Units(0)),
-                    Some(first) => {
-                        let extent = Extent::for_value(first);
-                        Tile::Scalar(ColumnValue::from_values(output_values, &extent))
-                    }
-                }
+                Tile::Scalar(ColumnValue::from_values(output_values, &f_codomain_extent))
             }
             _ => panic!("Got non-appliable function {s}"),
         };
@@ -444,6 +503,10 @@ impl MapToConstProducer {
 }
 
 impl TileProducer for MapToConstProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -455,7 +518,7 @@ impl TileProducer for MapToConstProducer {
             .child("constant", self.constant.inspect(opts))
     }
 
-    fn get(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let c_tiling = self.constant.tiling();
         assert!(
             c_tiling.is_scalar(),
@@ -481,11 +544,10 @@ impl TileProducer for MapToConstProducer {
 
         let len = i_domain.len();
         let constant_result = self.constant.get(c_tiling.universal_guard());
-        let constant = scalar_tile_to_column_value(constant_result);
 
         Tile::SealedFunction {
             domain: i_domain,
-            codomain: Box::new(Tile::Scalar(constant.repeat(len))),
+            codomain: Box::new(repeat_tile(constant_result, len)),
             domain_predicate: i_domain_predicate,
         }
     }
@@ -670,11 +732,15 @@ fn release_extent(extent: &mut Extent, obsolete_guard: &SealedFunctionGuard) {
 }
 
 impl TileProducer for IterateExtentProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn inspect(&self, _opts: &VizOptions) -> InspectNode {
         InspectNode::leaf("IterateExtent").annotate(format!("{:?}", self.extent))
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let values = iterate_extent(&self.extent, None).column_value;
         let domain_predicate = get_iterate_extent_predicate(&self.extent);
         Tile::SealedFunction {
@@ -788,6 +854,10 @@ impl MapSourceProducer {
 }
 
 impl TileProducer for MapSourceProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -798,7 +868,7 @@ impl TileProducer for MapSourceProducer {
             .child("input", self.input.inspect(opts))
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_result = self.input.get(self.input.tiling().universal_guard());
         let Tile::SealedFunction {
             codomain: i_codomain,
@@ -930,6 +1000,10 @@ impl ZipProducer {
 }
 
 impl TileProducer for ZipProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -942,7 +1016,7 @@ impl TileProducer for ZipProducer {
         node
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let tiles: Vec<Tile> = self
             .inputs
             .iter_mut()
@@ -1086,6 +1160,10 @@ impl ScalarTupleProducer {
 }
 
 impl TileProducer for ScalarTupleProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1098,21 +1176,17 @@ impl TileProducer for ScalarTupleProducer {
         node
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
-        let fields: HashMap<String, ColumnValue> = self
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let fields: HashMap<String, Tile> = self
             .inputs
             .iter_mut()
             .enumerate()
             .map(|(i, input)| {
                 let tile = input.get(input.tiling().universal_guard());
-                let cv = match tile {
-                    Tile::Scalar(cv) => cv,
-                    other => panic!("ScalarTuple input {i} produced non-scalar: {other:?}"),
-                };
-                (tuple_field(i), cv)
+                (tuple_field(i), tile)
             })
             .collect();
-        Tile::Scalar(ColumnValue::Records(fields))
+        Tile::Record(fields)
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
@@ -1188,6 +1262,10 @@ impl ConverseProducer {
 }
 
 impl TileProducer for ConverseProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1198,7 +1276,7 @@ impl TileProducer for ConverseProducer {
             .child("input", self.input.inspect(opts))
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
         match input_tile {
             Tile::SealedFunction {
@@ -1340,6 +1418,10 @@ struct MapComposeProducer {
 }
 
 impl TileProducer for MapComposeProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1351,7 +1433,7 @@ impl TileProducer for MapComposeProducer {
             .child("input", self.input.inspect(opts))
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_value_extent = match self.input.tiling() {
             Tiling::LookupFunction { codomain, .. } => codomain.clone(),
             t => panic!("MapCompose requires LookupFunction input, got {t:?}"),
@@ -1538,6 +1620,10 @@ impl FilterProducer {
 }
 
 impl TileProducer for FilterProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1549,13 +1635,16 @@ impl TileProducer for FilterProducer {
             .child("predicate", self.predicate.inspect(opts))
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let pred_guard = self.predicate.tiling().universal_guard();
         let i_guard = self.input.tiling().universal_guard();
-        let (domain_extent, codomain_extent) = match self.tiling() {
-            Tiling::SealedFunction { domain, codomain } => (domain.clone(), codomain.extent()),
+        let (domain_extent, codomain_tiling) = match self.tiling() {
+            Tiling::SealedFunction { domain, codomain } => {
+                (domain.clone(), codomain.as_ref().clone())
+            }
             _ => panic!("Filter tiling must be SealedFunction"),
         };
+        let codomain_extent = codomain_tiling.extent();
         let predicate_result = self.predicate.get(pred_guard);
         let input_result = self.input.get(i_guard);
 
@@ -1584,10 +1673,10 @@ impl TileProducer for FilterProducer {
                             .unzip();
                         Tile::SealedFunction {
                             domain: ColumnValue::from_values(kept_domain, &domain_extent),
-                            codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
-                                kept_codomain,
-                                &codomain_extent,
-                            ))),
+                            codomain: Box::new(column_value_to_tile(
+                                ColumnValue::from_values(kept_codomain, &codomain_extent),
+                                &codomain_tiling,
+                            )),
                             domain_predicate,
                         }
                     }
@@ -1602,10 +1691,10 @@ impl TileProducer for FilterProducer {
                             .unzip();
                         Tile::SealedFunction {
                             domain: ColumnValue::from_values(kept_domain, &domain_extent),
-                            codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
-                                kept_codomain,
-                                &codomain_extent,
-                            ))),
+                            codomain: Box::new(column_value_to_tile(
+                                ColumnValue::from_values(kept_codomain, &codomain_extent),
+                                &codomain_tiling,
+                            )),
                             domain_predicate,
                         }
                     }
@@ -1640,11 +1729,10 @@ impl TileProducer for FilterProducer {
                     .unzip();
                 Tile::SealedFunction {
                     domain: ColumnValue::from_values(kept_domain, &domain_extent),
-                    codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
-                        kept_codomain,
-                        &codomain_extent,
-                    ))),
-
+                    codomain: Box::new(column_value_to_tile(
+                        ColumnValue::from_values(kept_codomain, &codomain_extent),
+                        &codomain_tiling,
+                    )),
                     domain_predicate,
                 }
             }
@@ -1757,6 +1845,10 @@ impl AggregateProducer {
 }
 
 impl TileProducer for AggregateProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1768,7 +1860,7 @@ impl TileProducer for AggregateProducer {
             .child("input", self.input.inspect(opts))
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let i_tiling = self.input.tiling().clone();
         let input_result = self.input.get(i_tiling.universal_guard());
         let is_terminal = input_result.is_terminal();
@@ -1881,6 +1973,10 @@ impl ExtractAggregateProducer {
 }
 
 impl TileProducer for ExtractAggregateProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1889,7 +1985,7 @@ impl TileProducer for ExtractAggregateProducer {
         InspectNode::new("ExtractAggregate").child("input", self.input.inspect(opts))
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_result = self.input.get(self.input.tiling().universal_guard());
         let Tile::Aggregation {
             accumulator,
@@ -2002,6 +2098,10 @@ struct MapExtractAggregateProducer {
 }
 
 impl TileProducer for MapExtractAggregateProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -2013,7 +2113,7 @@ impl TileProducer for MapExtractAggregateProducer {
             .child("input", self.input.inspect(opts))
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_result = self.input.get(self.input.tiling().universal_guard());
         let Tile::SealedFunction {
             mut domain,
@@ -2155,6 +2255,10 @@ struct MapAggregateProducer {
 }
 
 impl TileProducer for MapAggregateProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -2166,7 +2270,7 @@ impl TileProducer for MapAggregateProducer {
             .child("input", self.input.inspect(opts))
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
         let Tile::LookupFunction {
             map,
@@ -2346,6 +2450,10 @@ struct SplitProducer {
 }
 
 impl TileProducer for SplitProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -2369,7 +2477,7 @@ impl TileProducer for SplitProducer {
         }
     }
 
-    fn get(&mut self, projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         self.shared
             .borrow_mut()
             .producer
@@ -2452,6 +2560,10 @@ struct ConstantProducer {
 }
 
 impl TileProducer for ConstantProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -2460,7 +2572,7 @@ impl TileProducer for ConstantProducer {
         InspectNode::leaf("Constant").annotate(format!("{}: {:?}", self.tiling, self.value))
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         // sanity check we don't call get after a universal release
         assert!(!self.released);
         Tile::Scalar(ColumnValue::single(self.value.clone()))
@@ -2536,6 +2648,10 @@ struct ToScalarProducer {
 }
 
 impl TileProducer for ToScalarProducer {
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -2546,7 +2662,7 @@ impl TileProducer for ToScalarProducer {
             .child("input", self.input.inspect(opts))
     }
 
-    fn get(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_result = self.input.get(self.input.tiling().universal_guard());
         let Tile::SealedFunction {
             domain,

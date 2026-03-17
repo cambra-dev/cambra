@@ -222,6 +222,36 @@ impl Tile {
         self.len() == 0
     }
 
+    /// Check whether this tile could have been produced by `tiling`.
+    pub fn check_from(&self, tiling: &Tiling) -> bool {
+        match (self, tiling) {
+            (Tile::Scalar(cv), Tiling::Scalar(extent)) => cv.is_compatible_with_extent(extent),
+            (Tile::Record(tile_fields), Tiling::Record(tiling_fields)) => {
+                tile_fields.len() == tiling_fields.len()
+                    && tile_fields
+                        .iter()
+                        .all(|(k, t)| tiling_fields.get(k).is_some_and(|s| t.check_from(s)))
+            }
+            (
+                Tile::SealedFunction {
+                    domain,
+                    codomain: codomain_tile,
+                    ..
+                },
+                Tiling::SealedFunction {
+                    domain: domain_extent,
+                    codomain: codomain_tiling,
+                },
+            ) => {
+                domain.is_compatible_with_extent(domain_extent)
+                    && codomain_tile.check_from(codomain_tiling)
+            }
+            (Tile::LookupFunction { .. }, Tiling::LookupFunction { .. }) => true,
+            (Tile::Aggregation { .. }, Tiling::Aggregation { .. }) => true,
+            _ => false,
+        }
+    }
+
     pub fn is_terminal(&self) -> bool {
         match self {
             Tile::Scalar(cv) => !cv.is_empty(),

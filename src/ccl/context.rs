@@ -18,7 +18,7 @@ use crate::{
     interpreter::{
         compile_tile_operators::{compile_tile, TileCompileContext},
         tile_operators::TileProducer,
-        BaseType, Consumer, DataSourceDomainExtentImpl, Scheduler, TestDataSource,
+        BaseType, Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource, TestDataSource,
     },
     pretty_graph::{pretty_tile_operator, pretty_tile_producer},
 };
@@ -132,6 +132,8 @@ impl GlobalContext {
                 Box::new(Type::Base(BaseType::String)),
             ),
         );
+        let ds = Rc::new(RefCell::new(StdinDataSource::new()));
+        self.compile.register_source(name, ds);
     }
 }
 
