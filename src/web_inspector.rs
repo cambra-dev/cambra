@@ -5,7 +5,7 @@ use std::thread;
 
 use log::info;
 
-use crate::interpreter::{Producer, Scheduler};
+use crate::interpreter::tile_operators::TileProducer;
 use crate::pretty_graph::VizOptions;
 
 /// Web inspector that serves a live HTML dashboard on a background thread.
@@ -73,18 +73,12 @@ impl WebInspector {
 
     /// Update the snapshot with the current state of the producer graph.
     /// Called from the main thread each scheduler tick.
-    pub fn update_snapshot(&self, tick: u64, producer: &dyn Producer, scheduler: &Scheduler) {
+    pub fn update_snapshot(&self, tick: u64, producer: &dyn TileProducer) {
         let opts = VizOptions::default();
-        let sources_json: Vec<String> = scheduler
-            .inspect_sources()
-            .iter()
-            .map(|n| n.to_json())
-            .collect();
         let json = format!(
-            r#"{{"tick":{},"producer":{},"sources":[{}]}}"#,
+            r#"{{"tick":{},"producer":{}}}"#,
             tick,
             producer.inspect(&opts).to_json(),
-            sources_json.join(","),
         );
         *self.snapshot.lock().unwrap() = json;
     }

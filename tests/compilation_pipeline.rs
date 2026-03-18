@@ -20,7 +20,7 @@ use std::rc::Rc;
 use cambra::ccl::{context::GlobalContext, Type};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
-    tuple_field, BaseType, ColumnValue, Consumer, Extent, FuncBinding, Guard, Predicate,
+    tuple_field, BaseType, ColumnValue, Consumer, Extent, FuncBinding, Predicate,
     SealedFunctionGuard, TestDataSource, Tile, TileGuard, Value,
 };
 use rstest_log::rstest;
@@ -418,7 +418,9 @@ fn test_test_source(#[case] code: &str) {
     );
 
     // Changing the yield guard without adding new data must not notify.
-    data_source.borrow_mut().set_yield_guard(Guard::Universal);
+    data_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
     assert!(!*notified.borrow());
 }
@@ -481,8 +483,8 @@ fn test_inner_join(#[case] code: &str) {
     *notified.borrow_mut() = false;
 
     // Extract rows from a SealedFunction tile where:
-    //   domain  = Records { _0: UInts (src1 key), _1: UInts (src2 key) }
-    //   codomain = Scalar(Records { _0: Ints, _1: Strings, _2: Strings })
+    //   domain   = Records { _0: UInts (src1 key), _1: UInts (src2 key) }
+    //   codomain = Record { _0: Scalar(Ints), _1: Scalar(Strings), _2: Scalar(Strings) }
     // Returns pairs sorted by (domain._0, domain._1) for deterministic comparison.
     type DomainKey = (usize, usize);
     type JoinOutput = (i64, String, String);
@@ -491,7 +493,7 @@ fn test_inner_join(#[case] code: &str) {
             domain, codomain, ..
         } = tile
         else {
-            panic!("expected SealedFunction tile");
+            panic!("expected SealedFunction tile, got {tile:?}");
         };
         // domain  = Records { _0: UInts (src1 key), _1: UInts (src2 key) }
         // codomain = Record { _0: Scalar(Ints), _1: Scalar(Strings), _2: Scalar(Strings) }
@@ -582,11 +584,16 @@ fn test_inner_join(#[case] code: &str) {
         ]
     );
 
-    // Release domain where _0 ≤ 10 AND _1 ≤ 10 — removes the (10,10) entry.
+    producer.release(TileGuard::SealedFunction(SealedFunctionGuard::Domain(
+        Predicate::Record(HashMap::from([
+            (tuple_field(0), Predicate::True),
+            (tuple_field(1), Predicate::LessThanEq(Value::UInt(10))),
+        ])),
+    )));
     producer.release(TileGuard::SealedFunction(SealedFunctionGuard::Domain(
         Predicate::Record(HashMap::from([
             (tuple_field(0), Predicate::LessThanEq(Value::UInt(10))),
-            (tuple_field(1), Predicate::LessThanEq(Value::UInt(10))),
+            (tuple_field(1), Predicate::True),
         ])),
     )));
 

@@ -1,18 +1,20 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use crate::interpreter::tile_operators::IterateExtentHandle;
-use crate::interpreter::{Producer, VarProducer};
-use crate::pretty_graph::VizOptions;
-use crate::pretty_tree::InspectNode;
+use crate::interpreter::{Consumer, DataSourceDomainExtentImpl};
 
-// Basic scheduler implementation.
-// For now, this only tracks variables that generate data and need to be
-// checked for notifications.
+/// Basic scheduler implementation.
+///
+/// Tracks [`IterateExtentHandle`]s that generate data from external sources (e.g.
+/// data sources) and need to be polled for new data each tick.
 #[derive(Default)]
 pub struct Scheduler {
-    sources: Vec<Rc<RefCell<VarProducer>>>,
-    source_handles: Vec<IterateExtentHandle>,
+    source_handles: HashMap<String, SourceHandle>,
 }
+
+type SourceHandle = (
+    Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+    Vec<Box<dyn Consumer>>,
+);
 
 impl Scheduler {
     pub fn new() -> Self {
@@ -24,29 +26,27 @@ impl Scheduler {
         Self::default()
     }
 
-    pub fn add_source(&mut self, var_sub: Rc<RefCell<VarProducer>>) {
-        self.sources.push(var_sub);
-    }
-
-    pub fn add_iterate_handle(&mut self, handle: IterateExtentHandle) {
-        self.source_handles.push(handle);
+    pub fn add_source_handle(
+        &mut self,
+        handle: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        consumer: Box<dyn Consumer>,
+    ) {
+        let id = handle.borrow().get_id().to_string();
+        if let Some(entry) = self.source_handles.get_mut(&id) {
+            assert!(Rc::ptr_eq(&handle, &entry.0));
+            entry.1.push(consumer);
+        } else {
+            self.source_handles.insert(id, (handle, vec![consumer]));
+        }
     }
 
     pub fn check_for_notifications(&mut self) {
-        self.sources
-            .iter()
-            .for_each(|s| s.borrow_mut().check_for_notification());
         self.source_handles
-            .iter_mut()
-            .for_each(|s| s.check_for_notification());
-    }
-
-    /// Inspect all registered sources for the web dashboard.
-    pub fn inspect_sources(&self) -> Vec<InspectNode> {
-        let opts = VizOptions::default();
-        self.sources
-            .iter()
-            .map(|s| s.borrow().inspect(&opts))
-            .collect()
+            .values_mut()
+            .for_each(|(source, consumers)| {
+                if source.borrow_mut().check_for_new_data() {
+                    consumers.iter_mut().for_each(|c| c.notify());
+                }
+            });
     }
 }

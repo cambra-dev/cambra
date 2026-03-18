@@ -1,77 +1,8 @@
-use std::{cell::RefCell, rc::Rc};
-
 use log::{debug, trace};
 
 use crate::interpreter::{
-    ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, GetResult, Guard, Operator,
-    Producer, Scheduler, Value, VarScope,
+    tiling::Predicate, ColumnValue, DataSourceDomainExtentImpl, Extent, Value,
 };
-use crate::pretty_graph::{fmt_extent, InspectNode, VizOptions};
-
-/// Operator that reads lines from stdin and produces them as output.
-/// Indices are produced via StdinDataSource, which also contains a mapping from
-/// index to line at that index.
-pub struct StdinReader {
-    extent: Extent,
-    data_source: Rc<RefCell<StdinDataSource>>,
-}
-
-impl StdinReader {
-    pub fn new(data_source: Rc<RefCell<StdinDataSource>>) -> StdinReader {
-        StdinReader {
-            extent: Extent::Function {
-                domain: Box::new(Extent::DataSourceDomain(data_source.clone())),
-                codomain: Box::new(Extent::Base(super::BaseType::String)),
-            },
-            data_source,
-        }
-    }
-}
-
-impl std::fmt::Debug for StdinReader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StdinReader").finish()
-    }
-}
-
-impl Operator for StdinReader {
-    fn extent(&self) -> &Extent {
-        &self.extent
-    }
-
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut desc = InspectNode::leaf("StdinReader");
-        if opts.show_extents {
-            desc = desc.annotate(format!(": {}", fmt_extent(&self.extent)));
-        }
-        desc
-    }
-
-    fn subscribe(
-        &mut self,
-        _intent_guard: Guard,
-        _consumer: Box<dyn Consumer>,
-        _var_scope: Option<Rc<VarScope>>,
-        _scheduler: &mut Scheduler,
-    ) -> Box<dyn Producer> {
-        panic!("Cannot subscribe to stdin directly");
-    }
-
-    fn subscribe_to_application(
-        &mut self,
-        intent_guard: Guard,
-        _consumer: Box<dyn Consumer>,
-        var_scope: Option<Rc<VarScope>>,
-        binding: &mut dyn Operator,
-        scheduler: &mut Scheduler,
-    ) -> Box<dyn Producer> {
-        Box::new(StdinProducer::new(
-            intent_guard.clone(),
-            binding.subscribe(intent_guard, Box::new(|| {}), var_scope, scheduler),
-            self.data_source.clone(),
-        ))
-    }
-}
 
 /// Buffers and tracks lines available on stdin
 #[derive(Default)]
@@ -124,7 +55,11 @@ impl StdinDataSource {
 
     /// Releases all lines up to and including the given index
     fn release_index(&mut self, i: usize) {
-        if i >= self.ready_size || i < self.start_idx {
+        if i < self.start_idx {
+            // Already released, do nothing
+            return;
+        }
+        if i >= self.ready_size {
             panic!(
                 "Invalid StdinDataSource::release, {} vs {}, {}",
                 i, self.ready_size, self.start_idx
@@ -174,16 +109,16 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         }
     }
 
-    fn get_yield_guard(&self) -> Guard {
-        let yield_guard = if self.eof_reached {
-            Guard::Universal
+    fn get_yield_predicate(&self) -> Predicate {
+        let predicate = if self.eof_reached {
+            Predicate::True
         } else if self.ready_size == 0 {
-            Guard::Empty
+            Predicate::False
         } else {
-            Guard::LessThanOrEq(Value::UInt(self.ready_size - 1))
+            Predicate::LessThanEq(Value::UInt(self.ready_size - 1))
         };
-        debug!("StdinDataSource yielding {yield_guard:?}");
-        yield_guard
+        debug!("StdinDataSource yielding {predicate:?}");
+        predicate
     }
 
     /// Returns the currently readable set of indices
@@ -206,103 +141,40 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         Extent::Base(crate::interpreter::BaseType::String)
     }
 
-    fn release(&mut self, obsolete_guard: Guard) -> Guard {
-        debug!("StdinDataSource::release: {obsolete_guard:?}");
-        match &obsolete_guard {
-            Guard::LessThanOrEq(Value::UInt(i)) => self.release_index(*i),
-            g if g.is_universal() => self.close(),
+    fn release(&mut self, obsolete: Predicate) {
+        debug!("StdinDataSource::release: {obsolete:?}");
+        match &obsolete {
+            Predicate::LessThanEq(Value::UInt(i)) => self.release_index(*i),
+            Predicate::True => self.close(),
             _ => {}
-        };
-        obsolete_guard
-    }
-}
-
-struct StdinProducer {
-    intent_guard: Guard,
-    index_producer: Box<dyn Producer>,
-    data_source: Rc<RefCell<StdinDataSource>>,
-}
-
-impl StdinProducer {
-    fn new(
-        intent_guard: Guard,
-        index_producer: Box<dyn Producer>,
-        data_source: Rc<RefCell<StdinDataSource>>,
-    ) -> Self {
-        Self {
-            intent_guard,
-            index_producer,
-            data_source,
         }
-    }
-}
-
-impl std::fmt::Debug for StdinProducer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StdinProducer")
-            .field("intent_guard", &self.intent_guard)
-            .finish()
-    }
-}
-
-impl Producer for StdinProducer {
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let binding = self.data_source.borrow();
-        let id = binding.get_id();
-        InspectNode::new(format!("StdinProducer({})", id))
-            .child("index", self.index_producer.inspect(opts))
-    }
-
-    fn get(&mut self) -> GetResult {
-        let GetResult {
-            column_value: indices,
-            yield_guard,
-        } = self.index_producer.get();
-        let source = self.data_source.borrow();
-        let outputs = match &indices {
-            d if d.is_empty() => ColumnValue::Strings(Vec::new()),
-            ColumnValue::UInts(idx_vec) => {
-                ColumnValue::Strings(idx_vec.iter().map(|i| source.get(*i).to_string()).collect())
-            }
-            other => panic!("Expected UInt indices for stdin, got {other:?}"),
-        };
-        GetResult {
-            column_value: ColumnValue::function_bindings(indices, outputs),
-            // We don't know anything about the contents of stdin, so the yield guard
-            // is Universal if the source is closed and Empty otherwise
-            yield_guard: yield_guard.to_universal_or_empty(),
-        }
-    }
-
-    fn release(&mut self, guard: Guard) -> Guard {
-        // Currently, we only release in sources based on the indices not the values, so
-        // nothing to do here.
-        guard
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::interpreter::{stdio::StdinDataSource, DataSourceDomainExtentImpl, Guard};
+    use crate::interpreter::{
+        stdio::StdinDataSource, tiling::Predicate, DataSourceDomainExtentImpl, Value,
+    };
     use test_log::test;
 
     #[test]
     fn test_stdin_datasource() {
         let mut source = StdinDataSource::new();
-        assert_eq!(Guard::Empty, source.get_yield_guard());
+        assert_eq!(Predicate::False, source.get_yield_predicate());
         source.add("a".to_string());
         source.add("b".to_string());
         assert_eq!("a", source.get(0));
         assert_eq!("b", source.get(1));
         assert_eq!(None, source.get_opt(2));
         assert_eq!(
-            Guard::LessThanOrEq(crate::interpreter::Value::UInt(1)),
-            source.get_yield_guard()
+            Predicate::LessThanEq(Value::UInt(1)),
+            source.get_yield_predicate()
         );
         source.release_index(0);
         assert_eq!(
-            Guard::LessThanOrEq(crate::interpreter::Value::UInt(1)),
-            source.get_yield_guard()
+            Predicate::LessThanEq(Value::UInt(1)),
+            source.get_yield_predicate()
         );
         assert_eq!(None, source.get_opt(0));
         assert_eq!("b", source.get(1));
@@ -311,26 +183,26 @@ mod tests {
         assert_eq!("b", source.get(1));
         assert_eq!("c", source.get(2));
         assert_eq!(
-            Guard::LessThanOrEq(crate::interpreter::Value::UInt(2)),
-            source.get_yield_guard()
+            Predicate::LessThanEq(Value::UInt(2)),
+            source.get_yield_predicate()
         );
         source.release_index(1);
         assert_eq!(
-            Guard::LessThanOrEq(crate::interpreter::Value::UInt(2)),
-            source.get_yield_guard()
+            Predicate::LessThanEq(Value::UInt(2)),
+            source.get_yield_predicate()
         );
         assert_eq!(None, source.get_opt(0));
         assert_eq!(None, source.get_opt(1));
         assert_eq!("c", source.get(2));
         assert_eq!(
-            Guard::LessThanOrEq(crate::interpreter::Value::UInt(2)),
-            source.get_yield_guard()
+            Predicate::LessThanEq(Value::UInt(2)),
+            source.get_yield_predicate()
         );
         source.eof_reached = true;
         source.close();
         assert_eq!(None, source.get_opt(0));
         assert_eq!(None, source.get_opt(1));
         assert_eq!(None, source.get_opt(2));
-        assert_eq!(Guard::Universal, source.get_yield_guard());
+        assert_eq!(Predicate::True, source.get_yield_predicate());
     }
 }

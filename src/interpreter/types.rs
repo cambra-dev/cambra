@@ -1,4 +1,4 @@
-//! Core types for the CCL interpreter: Guard, Extent, BaseType, Value, FuncBinding, ColumnValue, GetResult.
+//! Core types for the CCL interpreter: Guard, Extent, BaseType, Value, FuncBinding, ColumnValue.
 
 use std::iter;
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap, hash::Hash, rc::Rc};
@@ -7,219 +7,9 @@ use bit_set::BitSet;
 use bit_vec::BitVec;
 use intervalsets::numeric::Domain;
 use intervalsets::Side;
-use log::trace;
 
-use crate::interpreter::{
-    apply_binop_column, tuple_field, BinOpKind, ComputeRestriction, Operator, Producer,
-    RestrictionType, Scheduler, VarScope,
-};
-use crate::pretty_graph::{InspectNode, VizOptions};
+use crate::interpreter::{apply_binop_column, tuple_field, BinOpKind};
 use crate::util::fmt_record;
-
-/// A Guard represents a region (subset of an extent) via a set of predicates.
-/// Guards are used to:
-/// - Specify intent (what region a consumer is interested in)
-/// - Track yield (what region is ready and won't see further data)
-/// - Track obsolescence (what region is no longer needed)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Guard {
-    /// The universal guard representing the entire extent
-    Universal,
-    /// An empty guard representing no region
-    Empty,
-    /// A guard representing equality: variable == value
-    Equality { variable: String, value: Value },
-    /// A guard representing set membership: variable ∈ set
-    Membership {
-        variable: String,
-        values: Vec<Value>,
-    },
-    /// A guard representing disequality: variable != value
-    Disequality(Value),
-    /// A guard representing an upper bound: variable <= value
-    LessThanOrEq(Value),
-    /// A conjunction of guards (all must be satisfied)
-    And(Vec<Guard>),
-    /// A disjunction of guards (at least one must be satisfied)
-    Or(Vec<Guard>),
-    /// A guard for a function type, denoting a subset of functions of that type.
-    /// A function is in this guard iff, for all arguments in the domain guard,
-    /// it maps to values in the codomain guard.
-    Function {
-        domain: Box<Guard>,
-        codomain: Box<Guard>,
-    },
-    /// A guard for a function type that only describes the domain of the function
-    Domain(Box<Guard>),
-    /// A guard for a record type: maps field names to their guards
-    Record(HashMap<String, Guard>),
-}
-
-impl Guard {
-    /// Create an empty guard
-    pub fn empty() -> Self {
-        Guard::Empty
-    }
-
-    /// Create a universal guard
-    pub fn universal() -> Self {
-        Guard::Universal
-    }
-
-    /// Check if this guard is empty (represents no region)
-    pub fn is_empty(&self) -> bool {
-        matches!(self, Guard::Empty)
-    }
-
-    /// Check if this guard is universal (represents entire extent)
-    pub fn is_universal(&self) -> bool {
-        match self {
-            Guard::Universal => true,
-            Guard::Domain(domain) => domain.is_universal(),
-            Guard::Or(guards) => guards.iter().any(Guard::is_universal),
-            Guard::And(guards) => guards.iter().all(Guard::is_universal),
-            Guard::Record(guards) => guards.values().all(Guard::is_universal),
-            Guard::Function { domain, codomain } => {
-                domain.is_universal() && codomain.is_universal()
-            }
-            _ => false,
-        }
-    }
-
-    /// Returns Universal if this guard is universal, or else returns Empty
-    pub fn to_universal_or_empty(&self) -> Guard {
-        if self.is_universal() {
-            Guard::Universal
-        } else {
-            Guard::Empty
-        }
-    }
-
-    /// Intersect two guards (conjunction)
-    pub fn intersect(self, other: Guard) -> Guard {
-        match (self, other) {
-            (Guard::Empty, _) | (_, Guard::Empty) => Guard::Empty,
-            (g1, g2) if g2.is_empty() || g1.is_empty() => Guard::Empty,
-            (Guard::Universal, g) | (g, Guard::Universal) => g,
-            (g1, g2) if g2.is_universal() => g1,
-            (g1, g2) if g1.is_universal() => g2,
-            (Guard::And(mut guards), g) => {
-                guards.push(g);
-                Guard::And(guards)
-            }
-            (g, Guard::And(mut guards)) => {
-                guards.insert(0, g);
-                Guard::And(guards)
-            }
-            (g1, g2) => Guard::And(vec![g1, g2]),
-        }
-    }
-
-    /// Union two guards (disjunction)
-    pub fn union(self, other: Guard) -> Guard {
-        match (self, other) {
-            (Guard::Empty, g) | (g, Guard::Empty) => g,
-            (g1, g2) if g2.is_empty() => g1,
-            (g1, g2) if g1.is_empty() => g2,
-            (Guard::Universal, _) | (_, Guard::Universal) => Guard::Universal,
-            (g1, g2) if g2.is_universal() || g1.is_universal() => Guard::Universal,
-            (Guard::Or(mut guards), g) => {
-                guards.push(g);
-                Guard::Or(guards)
-            }
-            (g, Guard::Or(mut guards)) => {
-                guards.insert(0, g);
-                Guard::Or(guards)
-            }
-            (g1, g2) => Guard::Or(vec![g1, g2]),
-        }
-    }
-
-    /// Split a function guard into domain and codomain guards
-    pub fn split_function(&self) -> Option<(Guard, Guard)> {
-        match self {
-            Guard::Function { domain, codomain } => Some((*domain.clone(), *codomain.clone())),
-            Guard::Universal => {
-                // Universal function guard means universal domain and codomain
-                Some((Guard::Universal, Guard::Universal))
-            }
-            Guard::Or(guards) => {
-                let mut domain = Guard::Empty;
-                let mut codomain = Guard::Empty;
-                for g in guards.iter() {
-                    let (d, c) = g
-                        .split_function()
-                        .unwrap_or_else(|| panic!("Expected Function guard, got {g:?}"));
-                    domain = domain.union(d);
-                    codomain = codomain.union(c);
-                }
-                Some((domain, codomain))
-            }
-            Guard::And(guards) => {
-                let mut domain = Guard::Empty;
-                let mut codomain = Guard::Empty;
-                for g in guards.iter() {
-                    let (d, c) = g
-                        .split_function()
-                        .unwrap_or_else(|| panic!("Expected Function guard, got {g:?}"));
-                    domain = domain.intersect(d);
-                    codomain = codomain.intersect(c);
-                }
-                Some((domain, codomain))
-            }
-            _ => None,
-        }
-    }
-
-    /// Split a record guard into field guards
-    pub fn split_record(&self) -> Option<HashMap<String, Guard>> {
-        match self {
-            Guard::Record(fields) => Some(fields.clone()),
-            Guard::Universal => {
-                // Universal record guard means universal for all fields
-                // This is a placeholder - in practice we'd need the record schema
-                Some(HashMap::new())
-            }
-            _ => None,
-        }
-    }
-
-    pub fn get_record_field(&self, field: &str) -> Option<Guard> {
-        match self {
-            Guard::Record(fields) => fields.get(field).cloned(),
-            g if g.is_universal() => Some(Guard::Universal),
-            g if g.is_empty() => Some(Guard::Empty),
-            _ => None,
-        }
-    }
-
-    /// Create a function guard from domain and codomain guards
-    pub fn from_function_parts(domain: Guard, codomain: Guard) -> Self {
-        Guard::Function {
-            domain: Box::new(domain),
-            codomain: Box::new(codomain),
-        }
-    }
-
-    /// Create a function guard from independent domain and codomain guards
-    pub fn from_independent_function_parts(domain: Guard, codomain: Guard) -> Self {
-        Guard::union(
-            Guard::Function {
-                domain: Box::new(domain),
-                codomain: Box::new(Guard::Universal),
-            },
-            Guard::Function {
-                domain: Box::new(Guard::Universal),
-                codomain: Box::new(codomain),
-            },
-        )
-    }
-
-    /// Create a record guard from field guards
-    pub fn from_record_parts(fields: HashMap<String, Guard>) -> Self {
-        Guard::Record(fields)
-    }
-}
 
 /// An Extent represents the set of values a term can take on (its type).
 /// Each operator has an extent that corresponds exactly to its type.
@@ -444,115 +234,18 @@ impl Extent {
     }
 }
 
-/// Holds the restriction operator and its cached producer for a [`Extent::Restricted`] extent.
-#[derive(Debug)]
-pub struct Restriction {
-    compute_op: Option<ComputeRestriction>,
-    compute_producer: Option<Box<dyn Producer>>,
-}
-
-impl Default for Restriction {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Placeholder restriction handle for [`Extent::Restricted`].
+///
+/// Restriction computation is handled by [`Filter`] operators in the tile path.
+/// This struct exists only to satisfy the [`Extent::Restricted`] variant's type requirement
+/// and will panic if any computation method is called.
+#[derive(Debug, Default)]
+pub struct Restriction;
 
 impl Restriction {
+    /// Create a new empty restriction.
     pub fn new() -> Self {
-        Self {
-            compute_op: None,
-            compute_producer: None,
-        }
-    }
-
-    /// Attach a restriction operator (either `ComputeRestriction` or `HashJoinRestriction`).
-    pub fn set_compute_op(&mut self, compute_op: ComputeRestriction) {
-        self.compute_op = Some(compute_op);
-    }
-
-    pub fn set_up_producer(
-        &mut self,
-        intent_guard: Guard,
-        var_scope: Option<Rc<VarScope>>,
-        scheduler: &mut Scheduler,
-    ) {
-        if self.compute_producer.is_none() {
-            if let Some(op) = &mut self.compute_op {
-                self.compute_producer =
-                    Some(op.subscribe(intent_guard, Box::new(|| {}), var_scope, scheduler));
-            } else {
-                panic!("Missing compute_op in Restriction");
-            }
-        }
-    }
-
-    /// Inspect this restriction for visualization.
-    /// Shows the producer if one has been set up (post-subscribe), otherwise the operator.
-    pub fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        if let Some(producer) = &self.compute_producer {
-            producer.inspect(opts)
-        } else if let Some(op) = &self.compute_op {
-            op.inspect(opts)
-        } else {
-            InspectNode::leaf("Restriction (unset)")
-        }
-    }
-
-    pub fn get_correlations(&mut self) -> Correlations {
-        let data = self.compute_producer.as_mut().unwrap().get();
-        match (
-            self.compute_op.as_ref().unwrap().restriction_type(),
-            data.column_value,
-        ) {
-            (RestrictionType::FilteredProduct, ColumnValue::FunctionBindings { outputs, .. }) => {
-                match *outputs {
-                    ColumnValue::Bools(bools) => {
-                        trace!("Got restriction vector {}", bools);
-                        Correlations::Positional(BitSet::from_bit_vec(bools))
-                    }
-                    other => panic!(
-                        "Expected Bools from compute_producer outputs, got {:?}",
-                        other
-                    ),
-                }
-            }
-            (
-                RestrictionType::HashJoin,
-                ColumnValue::FunctionBindings {
-                    mut inputs,
-                    mut outputs,
-                },
-            ) => Correlations::Tuples(
-                inputs
-                    .drain_to_value_iter()
-                    .zip(outputs.drain_to_value_iter())
-                    .flat_map(|(i, o)| {
-                        if let Value::Function(f) = o {
-                            f.into_iter().map(move |b| vec![i.clone(), b.output])
-                        } else {
-                            panic!("Expected Function value from HashJoin outputs, got {o:?}")
-                        }
-                    })
-                    .collect(),
-            ),
-            _ => panic!("Unexpected correlation data"),
-        }
-    }
-}
-
-pub enum Correlations {
-    Positional(BitSet),
-    Tuples(Vec<Vec<Value>>),
-}
-
-impl Correlations {
-    pub fn intersect_with(&mut self, other: &Correlations) {
-        match (self, other) {
-            (Correlations::Positional(s), Correlations::Positional(o)) => {
-                s.intersect_with(o);
-            }
-            _ => todo!(),
-        }
+        Self
     }
 }
 
@@ -560,7 +253,9 @@ impl Correlations {
 pub trait DataSourceDomainExtentImpl {
     fn get_id(&self) -> &str;
     fn check_for_new_data(&mut self) -> bool;
-    fn get_yield_guard(&self) -> Guard;
+    /// Returns the current yield predicate: the region of domain values
+    /// available to consume.
+    fn get_yield_predicate(&self) -> crate::interpreter::tiling::Predicate;
     fn get_elements(&self) -> ColumnValue;
     /// Returns the [`Extent`] of each individual domain element.
     /// Used to construct a typed empty [`ColumnValue`] when the domain is empty.
@@ -574,7 +269,9 @@ pub trait DataSourceDomainExtentImpl {
     /// Returns the [`Extent`] of each output value produced by this source.
     /// Used to type the codomain of [`crate::interpreter::tile_operators::MapSource`].
     fn output_value_extent(&self) -> Extent;
-    fn release(&mut self, obsolete_guard: Guard) -> Guard;
+    /// Release the region described by `obsolete` — those domain values no longer
+    /// need to be retained by the source.
+    fn release(&mut self, obsolete: crate::interpreter::tiling::Predicate);
 }
 
 impl PartialEq for dyn DataSourceDomainExtentImpl {
@@ -668,31 +365,6 @@ impl Extent {
         match self {
             Extent::Function { domain, codomain } => Some((domain, codomain)),
             _ => None,
-        }
-    }
-
-    /// Create a guard from parts (for function types: domain + codomain guards)
-    pub fn create_guard_from_parts(&self, parts: Vec<Guard>) -> Guard {
-        match self {
-            Extent::Function { .. } => {
-                if parts.len() == 2 {
-                    Guard::from_function_parts(parts[0].clone(), parts[1].clone())
-                } else {
-                    Guard::Universal
-                }
-            }
-            Extent::Record(..) => {
-                // For records, parts should be a map of field names to guards
-                // This is a simplified version - in practice we'd need proper mapping
-                Guard::Universal
-            }
-            _ => {
-                if parts.len() == 1 {
-                    parts[0].clone()
-                } else {
-                    Guard::Universal
-                }
-            }
         }
     }
 }
@@ -914,18 +586,6 @@ impl Value {
 pub struct FuncBinding {
     pub input: Value,
     pub output: Value,
-}
-
-/// Result of calling get() on a producer.
-///
-/// Conceptually a snapshot of a producer's current state — data and yield guard
-/// are returned together to guarantee they are synchronized.
-#[derive(Debug)]
-pub struct GetResult {
-    pub column_value: ColumnValue,
-    /// The yield guard covering all data retrieved so far, including the data in this result.
-    /// Monotonically growing across successive get() calls.
-    pub yield_guard: Guard,
 }
 
 /// Columnar data for vectorized execution.

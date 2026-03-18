@@ -17,9 +17,8 @@ pub use crate::interpreter::tiling::{Predicate, SealedFunctionGuard, Tile, TileG
 use crate::{
     ccl::AggregateKind,
     interpreter::{
-        iterate_extent, transform_hashmap_values, tuple_field, ColumnValue, Consumer,
-        DataSourceDomainExtentImpl, Extent, FuncBinding, Guard, NotifyOrSubscribeResult, Scheduler,
-        Value,
+        transform_hashmap_values, tuple_field, BaseType, ColumnValue, Consumer,
+        DataSourceDomainExtentImpl, Extent, FuncBinding, NotifyOrSubscribeResult, Scheduler, Value,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -584,6 +583,32 @@ impl IterateExtent {
         };
         Self { tiling, extent }
     }
+
+    fn add_all_source_handles(
+        extent: &Extent,
+        consumer: Rc<RefCell<dyn Consumer>>,
+        scheduler: &mut Scheduler,
+    ) {
+        match extent {
+            Extent::DataSourceDomain(extent_impl, ..) => {
+                let c = consumer.clone();
+                scheduler.add_source_handle(
+                    extent_impl.clone(),
+                    Box::new(move || c.borrow_mut().notify()),
+                );
+            }
+            Extent::Record(fields) => {
+                for field_extent in fields.values() {
+                    Self::add_all_source_handles(field_extent, consumer.clone(), scheduler);
+                }
+            }
+            Extent::Restricted { base, .. } => {
+                Self::add_all_source_handles(base, consumer, scheduler);
+            }
+            // Nothing to do for other extents since they all complete from the start of the program
+            _ => {}
+        }
+    }
 }
 
 impl TileOperator for IterateExtent {
@@ -607,48 +632,16 @@ impl TileOperator for IterateExtent {
             consumer.notify();
         }
         if subscribe {
-            scheduler.add_iterate_handle(IterateExtentHandle::new(self.extent.clone(), consumer));
+            let consumer_wrapper = Rc::new(RefCell::new(move || {
+                consumer.notify();
+            }));
+            Self::add_all_source_handles(&self.extent, consumer_wrapper, scheduler);
         }
 
         Box::new(IterateExtentProducer::new(
             self.extent.clone(),
             self.tiling.clone(),
         ))
-    }
-}
-
-pub struct IterateExtentHandle {
-    extent: Extent,
-    consumer: Box<dyn Consumer>,
-}
-
-impl IterateExtentHandle {
-    pub fn new(extent: Extent, consumer: Box<dyn Consumer>) -> Self {
-        Self { extent, consumer }
-    }
-
-    pub fn check_for_notification(&mut self) {
-        Self::check_for_notifications_by_extent(&self.extent, &mut self.consumer);
-    }
-
-    fn check_for_notifications_by_extent(extent: &Extent, consumer: &mut Box<dyn Consumer>) {
-        match extent {
-            Extent::DataSourceDomain(extent_impl, ..) => {
-                if extent_impl.borrow_mut().check_for_new_data() {
-                    consumer.notify();
-                }
-            }
-            Extent::Record(fields) => {
-                for field_extent in fields.values() {
-                    Self::check_for_notifications_by_extent(field_extent, consumer);
-                }
-            }
-            Extent::Restricted { base, .. } => {
-                Self::check_for_notifications_by_extent(base, consumer);
-            }
-            // Nothing to do for other extents since they all complete from the start of the program
-            _ => {}
-        }
     }
 }
 
@@ -669,33 +662,12 @@ impl IterateExtentProducer {
 
 fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
     match extent {
-        Extent::DataSourceDomain(source) => {
-            yield_guard_to_predicate(&source.borrow().get_yield_guard())
-        }
+        Extent::DataSourceDomain(source) => source.borrow().get_yield_predicate(),
         Extent::Record(fields) => Predicate::Record(transform_hashmap_values(
             fields,
             get_iterate_extent_predicate,
         )),
         _ => Predicate::True,
-    }
-}
-
-// TODO clean this up and make sources produce Predicates directly
-fn yield_guard_to_predicate(yield_guard: &Guard) -> Predicate {
-    match yield_guard {
-        Guard::Universal => Predicate::True,
-        Guard::Empty => Predicate::False,
-        Guard::LessThanOrEq(v) => Predicate::LessThanEq(v.clone()),
-        _ => todo!(),
-    }
-}
-
-fn predicate_to_yield_guard(pred: &Predicate) -> Guard {
-    match pred {
-        Predicate::True => Guard::Universal,
-        Predicate::False => Guard::Empty,
-        Predicate::LessThanEq(v) => Guard::LessThanOrEq(v.clone()),
-        _ => todo!(),
     }
 }
 
@@ -705,18 +677,32 @@ fn release_extent(extent: &mut Extent, obsolete_guard: &SealedFunctionGuard) {
             g if g.is_univeral() => fields.values_mut().for_each(|e| release_extent(e, g)),
             g if g.is_empty() => {}
             SealedFunctionGuard::Domain(p) => {
+                // A Record predicate is a conjunction: {f0: p0, f1: p1} means
+                // "release pairs where p0(f0) AND p1(f1)".  We can only safely
+                // advance a dimension's extent when all other dimensions are
+                // unconstrained (Predicate::True), because the AND means the
+                // full cross-product sub-space is released along that axis.
                 let field_preds = p.split_record(fields);
-                fields.iter_mut().for_each(|(f, e)| {
-                    release_extent(e, &SealedFunctionGuard::Domain(field_preds[f].clone()))
-                });
+                for (f, e) in fields.iter_mut() {
+                    let others_all_true = field_preds
+                        .iter()
+                        .all(|(k, p)| k == f || *p == Predicate::True);
+                    if others_all_true {
+                        release_extent(e, &SealedFunctionGuard::Domain(field_preds[f].clone()));
+                    } else {
+                        // TODO: handle the case where multiple fields have
+                        // non-trivial predicates; requires releasing the
+                        // intersection of projected ranges per dimension.
+                    }
+                }
             }
             _ => panic!("Unexected guard {obsolete_guard:?}"),
         },
         Extent::DataSourceDomain(source) => {
             source.borrow_mut().release(match obsolete_guard {
-                SealedFunctionGuard::Universal => Guard::Universal,
-                SealedFunctionGuard::Domain(p) => predicate_to_yield_guard(p),
-                _ => Guard::Empty,
+                SealedFunctionGuard::Universal => Predicate::True,
+                SealedFunctionGuard::Domain(p) => p.clone(),
+                _ => Predicate::False,
             });
         }
         Extent::UIntRange { start, end } => match obsolete_guard {
@@ -731,6 +717,28 @@ fn release_extent(extent: &mut Extent, obsolete_guard: &SealedFunctionGuard) {
     }
 }
 
+/// Produce all values for the given extent.
+fn iterate_extent(extent: &Extent) -> ColumnValue {
+    match extent {
+        Extent::Base(BaseType::Unit) => ColumnValue::Units(1),
+        Extent::UIntRange { start, end, .. } => ColumnValue::from_uints((*start..*end).collect()),
+        Extent::DataSourceDomain(source_impl) => source_impl.borrow_mut().get_elements(),
+        Extent::Record(fields) => iterate_record(fields),
+        Extent::Restricted { .. } => {
+            panic!("Iterating over restricted extents not supported; use Filter operators instead")
+        }
+        _ => panic!("Attempted to iterate on infinite Extent"),
+    }
+}
+
+fn iterate_record(fields: &HashMap<String, Extent>) -> ColumnValue {
+    let data: HashMap<String, ColumnValue> = fields
+        .iter()
+        .map(|(field, field_extent)| (field.clone(), iterate_extent(field_extent)))
+        .collect();
+    ColumnValue::cartesian_product_with_correlation(data, None)
+}
+
 impl TileProducer for IterateExtentProducer {
     fn name(&self) -> &'static str {
         std::any::type_name::<Self>()
@@ -741,7 +749,7 @@ impl TileProducer for IterateExtentProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let values = iterate_extent(&self.extent, None).column_value;
+        let values = iterate_extent(&self.extent);
         let domain_predicate = get_iterate_extent_predicate(&self.extent);
         Tile::SealedFunction {
             domain: values.clone(),

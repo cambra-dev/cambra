@@ -32,14 +32,13 @@ use crate::{
     },
     interpreter::{
         ccl_compile_util::{validate_type, CompileError},
-        compile_ccl::{map_binop, CompileContext},
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, Filter, IterateExtent, MapAggregate,
             MapApply, MapCompose, MapExtractAggregate, MapSource, MapToConst, ScalarTuple, Split,
             TileOperator, Tiling, ToScalar, Zip,
         },
-        transform_hashmap_values, tuple_field, BaseType, DataSourceDomainExtentImpl, Extent,
-        FuncBinding, FunctionDef, Value,
+        transform_hashmap_values, tuple_field, ArithmeticKind, BaseType, BinOpKind, CompareKind,
+        DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, Value,
     },
     util::ScopeStack,
 };
@@ -179,8 +178,12 @@ impl TileCompileContext {
                 domain: Box::new(self.extent_of(a)?),
                 codomain: Box::new(self.extent_of(b)?),
             }),
-            // Leaf types — no refinements possible, delegate to CompileContext.
-            _ => CompileContext::new().extent_of(ty),
+            // Leaf types — no refinements possible, handle inline.
+            Type::Base(b) => Ok(Extent::Base(b.clone())),
+            Type::UIntRange(n) => Ok(Extent::UIntRange { start: 0, end: *n }),
+            other => Err(CompileError::TypeError(format!(
+                "Cannot convert CCL type {other:?} to an interpreter extent"
+            ))),
         }
     }
 }
@@ -901,6 +904,34 @@ fn compile_aggregate(
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Map a CCL [`ccl::BinOpKind`] to the interpreter [`BinOpKind`].
+fn map_binop(op: &CclBinOp) -> BinOpKind {
+    use crate::ccl::{ArithmeticKind as CclArith, CompareKind as CclCmp, LogicKind as CclLogic};
+    match op {
+        CclBinOp::Arithmetic(CclArith::Add) => BinOpKind::Arithmetic(ArithmeticKind::Add),
+        CclBinOp::Arithmetic(CclArith::Sub) => BinOpKind::Arithmetic(ArithmeticKind::Sub),
+        CclBinOp::Arithmetic(CclArith::Mul) => BinOpKind::Arithmetic(ArithmeticKind::Mul),
+        CclBinOp::Arithmetic(CclArith::FloorDiv) => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
+        CclBinOp::BoolLogic(CclLogic::And) => BinOpKind::BoolLogic(LogicKind::And),
+        CclBinOp::BoolLogic(CclLogic::Nand) => BinOpKind::BoolLogic(LogicKind::Nand),
+        CclBinOp::BoolLogic(CclLogic::Or) => BinOpKind::BoolLogic(LogicKind::Or),
+        CclBinOp::BoolLogic(CclLogic::Nor) => BinOpKind::BoolLogic(LogicKind::Nor),
+        CclBinOp::BoolLogic(CclLogic::Xor) => BinOpKind::BoolLogic(LogicKind::Xor),
+        CclBinOp::BoolLogic(CclLogic::Xnor) => BinOpKind::BoolLogic(LogicKind::Xnor),
+        CclBinOp::Concat => BinOpKind::Concat,
+        CclBinOp::Compare(CclCmp::Equals) => BinOpKind::Compare(CompareKind::Equals),
+        CclBinOp::Compare(CclCmp::NotEquals) => BinOpKind::Compare(CompareKind::NotEquals),
+        CclBinOp::Compare(CclCmp::Less) => BinOpKind::Compare(CompareKind::Less),
+        CclBinOp::Compare(CclCmp::LessOrEq) => BinOpKind::Compare(CompareKind::LessOrEq),
+        CclBinOp::Compare(CclCmp::Greater) => BinOpKind::Compare(CompareKind::Greater),
+        CclBinOp::Compare(CclCmp::GreaterOrEq) => BinOpKind::Compare(CompareKind::GreaterOrEq),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1416,7 +1447,7 @@ mod tests {
 
         test_source
             .borrow_mut()
-            .set_yield_guard(crate::interpreter::Guard::Universal);
+            .set_yield_predicate(Predicate::True);
 
         let result = producer.get(producer.tiling().universal_guard());
         // TODO this is currently wrong because aggregation doesn't properly release upstream,

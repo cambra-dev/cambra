@@ -53,11 +53,13 @@ impl GlobalContext {
         result
     }
 
-    pub fn compile_program(
+    /// Compile `code` and return the producer together with pre-rendered tree
+    /// strings for the web inspector: `(producer, ccl_repr, operator_tree)`.
+    pub fn compile_program_with_trees(
         &mut self,
         code: &str,
         consumer: Box<dyn Consumer>,
-    ) -> Box<dyn TileProducer> {
+    ) -> (Box<dyn TileProducer>, String, String) {
         let result = parser::parse(code, parser::Mode::Module, "<test>")
             .expect("Failed to parse Python module");
         let stmts = match result {
@@ -69,17 +71,28 @@ impl GlobalContext {
         let ctx = self.inference_ctx();
         infer(&mut expr, ctx).expect("type inference failed");
 
-        debug!("CCL:\n{}", symbolic(&expr));
+        let ccl_repr = symbolic(&expr);
+        debug!("CCL:\n{}", ccl_repr);
 
         let mut op = compile_tile(&expr, self.compile()).expect("compile failed");
 
-        debug!("Operators:\n{}", pretty_tile_operator(op.as_ref()));
+        let operator_tree = pretty_tile_operator(op.as_ref());
+        debug!("Operators:\n{}", operator_tree);
 
         let producer = op.subscribe(op.tiling().universal_guard(), consumer, self.scheduler());
 
         debug!("Producers:\n{}", pretty_tile_producer(producer.as_ref()));
 
-        producer
+        (producer, ccl_repr, operator_tree)
+    }
+
+    /// Compile `code` and return the producer.
+    pub fn compile_program(
+        &mut self,
+        code: &str,
+        consumer: Box<dyn Consumer>,
+    ) -> Box<dyn TileProducer> {
+        self.compile_program_with_trees(code, consumer).0
     }
 
     /// Returns the context for lowering

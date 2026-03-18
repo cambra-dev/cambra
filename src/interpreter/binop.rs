@@ -1,15 +1,10 @@
 //! BinOp operator: binary arithmetic operations on dataflow values.
 
-use std::cell::RefCell;
 use std::ops::{AddAssign, DivAssign, MulAssign, SubAssign};
-use std::rc::Rc;
 
 use bit_vec::BitVec;
 
-use crate::interpreter::Scheduler;
-use crate::pretty_graph::{fmt_binop, fmt_extent, InspectNode, VizOptions};
-
-use super::{ColumnValue, Consumer, Extent, GetResult, Guard, Operator, Producer, VarScope};
+use super::ColumnValue;
 
 /// Kinds of binary operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,17 +44,6 @@ pub enum LogicKind {
     Nor,
     Xor,
     Xnor,
-}
-
-impl BinOpKind {
-    pub fn output_extent(&self, left: &Extent, right: &Extent) -> Extent {
-        // For now, we only support binops on matching types
-        assert_eq!(left, right);
-        match self {
-            BinOpKind::Compare(_) => Extent::Base(crate::interpreter::BaseType::Bool),
-            _ => left.clone(),
-        }
-    }
 }
 
 // Performance note: trying to factor this futher to avoid repeating the zip/iter logic
@@ -168,198 +152,11 @@ pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue)
     }
 }
 
-/// A binary operation operator (e.g., addition, subtraction, multiplication).
-/// Subscribes to left and right sub-operators and combines their results.
-#[derive(Debug)]
-pub struct BinOp {
-    left: Box<dyn Operator>,
-    right: Box<dyn Operator>,
-    op: BinOpKind,
-    extent: Extent,
-}
-
-impl BinOp {
-    /// Create a new BinOp operator.
-    pub fn new(left: Box<dyn Operator>, op: BinOpKind, right: Box<dyn Operator>) -> Self {
-        let extent = op.output_extent(left.extent(), right.extent());
-        BinOp {
-            left,
-            right,
-            op,
-            extent,
-        }
-    }
-}
-
-impl Operator for BinOp {
-    fn extent(&self) -> &Extent {
-        &self.extent
-    }
-
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut desc = InspectNode::new(format!("BinOp({})", fmt_binop(&self.op)));
-        if opts.show_extents {
-            desc = desc.annotate(format!(": {}", fmt_extent(&self.extent)));
-        }
-        desc.child("left", self.left.inspect(opts))
-            .child("right", self.right.inspect(opts))
-    }
-
-    fn subscribe(
-        &mut self,
-        intent_guard: Guard,
-        consumer: Box<dyn Consumer>,
-        var_scope: Option<Rc<VarScope>>,
-        scheduler: &mut Scheduler,
-    ) -> Box<dyn Producer> {
-        assert!(
-            intent_guard.is_universal(),
-            "BinOp: expected Universal intent guard, got {intent_guard:?}"
-        );
-
-        let binop_producer = Rc::new(RefCell::new(BinOpProducer {
-            left_producer: None,
-            right_producer: None,
-            downstream_consumer: consumer,
-            intent_guard,
-            op: self.op,
-        }));
-
-        // Create closure consumer for left operand — forward notify when either side has data.
-        let producer_for_left = binop_producer.clone();
-        let left_consumer: Box<dyn Consumer> = Box::new(move || {
-            producer_for_left.borrow_mut().downstream_consumer.notify();
-        });
-
-        // Create closure consumer for right operand.
-        let producer_for_right = binop_producer.clone();
-        let right_consumer: Box<dyn Consumer> = Box::new(move || {
-            producer_for_right.borrow_mut().downstream_consumer.notify();
-        });
-
-        // Subscribe left operand (clone var_scope for left, move original to right)
-        let left_producer = self.left.subscribe(
-            Guard::universal(),
-            left_consumer,
-            var_scope.clone(),
-            scheduler,
-        );
-
-        let right_producer =
-            self.right
-                .subscribe(Guard::universal(), right_consumer, var_scope, scheduler);
-
-        // Set both sub-producers
-        {
-            let mut bp = binop_producer.borrow_mut();
-            bp.left_producer = Some(left_producer);
-            bp.right_producer = Some(right_producer);
-        }
-
-        Box::new(binop_producer)
-    }
-}
-
-/// Producer for BinOp: combines results from both operands.
-struct BinOpProducer {
-    left_producer: Option<Box<dyn Producer>>,
-    right_producer: Option<Box<dyn Producer>>,
-    downstream_consumer: Box<dyn Consumer>,
-    intent_guard: Guard,
-    op: BinOpKind,
-}
-
-impl std::fmt::Debug for BinOpProducer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BinOpProducer")
-            .field("left_producer", &self.left_producer)
-            .field("right_producer", &self.right_producer)
-            .field("intent_guard", &self.intent_guard)
-            .field("op", &self.op)
-            // Does not include Consumer.
-            .finish_non_exhaustive()
-    }
-}
-
-impl Producer for BinOpProducer {
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut desc = InspectNode::new(format!("BinOpProducer({})", fmt_binop(&self.op)));
-        if let Some(ref left) = self.left_producer {
-            desc = desc.child("left", left.inspect(opts));
-        }
-        if let Some(ref right) = self.right_producer {
-            desc = desc.child("right", right.inspect(opts));
-        }
-        desc
-    }
-
-    fn get(&mut self) -> GetResult {
-        let left_result = self
-            .left_producer
-            .as_mut()
-            .expect("left_producer should be set before get()")
-            .get();
-        let right_result = self
-            .right_producer
-            .as_mut()
-            .expect("right_producer should be set before get()")
-            .get();
-        let left_col = left_result.column_value;
-        let right_col = right_result.column_value;
-
-        // Zip and apply binop element-wise, broadcasting scalars (single-element columns) as needed.
-        // TODO figure out a better way to handle repeated values.
-        // Maybe lazily repeat iterators, or use a vectorization library?
-        let left_is_scalar = left_col.is_scalar();
-        let right_is_scalar = right_col.is_scalar();
-        let (left_data, right_data) = if left_is_scalar && !right_is_scalar {
-            (left_col.repeat(right_col.len()), right_col)
-        } else if right_is_scalar && !left_is_scalar {
-            let len = left_col.len();
-            (left_col, right_col.repeat(len))
-        } else {
-            assert_eq!(left_col.len(), right_col.len());
-            (left_col, right_col)
-        };
-        let result_data = apply_binop_column(self.op, left_data, &right_data);
-
-        GetResult {
-            column_value: result_data,
-            // BinOp would need to transform sub-producer guards through the
-            // operation to produce a correct output guard. We don't have that
-            // representation yet, so use the same simplification as subscribe():
-            // Universal if both sides are Universal, otherwise Empty.
-            yield_guard: if left_result.yield_guard.is_universal()
-                && right_result.yield_guard.is_universal()
-            {
-                Guard::Universal
-            } else {
-                Guard::Empty
-            },
-        }
-    }
-
-    fn release(&mut self, obsolete_guard: Guard) -> Guard {
-        if obsolete_guard.is_universal() {
-            self.left_producer
-                .as_mut()
-                .expect("left_producer should be set before release()")
-                .release(obsolete_guard.clone());
-            self.right_producer
-                .as_mut()
-                .expect("right_producer should be set before release()")
-                .release(obsolete_guard.clone());
-        }
-        obsolete_guard
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::hint::black_box;
     use std::time::Duration;
 
-    use crate::interpreter::test_helpers::TestConsumer;
     use crate::interpreter::*;
     use test_log::test;
 
@@ -407,87 +204,6 @@ mod tests {
         assert!(!cmp(CompareKind::Equals, false, true));
         assert!(!cmp(CompareKind::NotEquals, true, true));
         assert!(cmp(CompareKind::NotEquals, false, true));
-    }
-
-    #[test]
-    fn test_binop_add_literals() {
-        // 2 + 3 = 5
-        let left = Box::new(Literal::new(Value::Int(2)));
-        let right = Box::new(Literal::new(Value::Int(3)));
-        let mut binop = BinOp::new(left, BinOpKind::Arithmetic(ArithmeticKind::Add), right);
-
-        assert_eq!(binop.extent(), &Extent::Base(BaseType::Int));
-
-        let (consumer, notifications) = TestConsumer::new();
-        let mut producer = binop.subscribe(
-            Guard::universal(),
-            Box::new(consumer),
-            None,
-            &mut Scheduler::new(),
-        );
-
-        // Each literal fires independently, so we get two notifications
-        assert_eq!(*notifications.borrow(), 2);
-
-        let result = producer.get();
-        assert_eq!(result.column_value, ColumnValue::Ints(vec![5]));
-    }
-
-    #[test]
-    fn test_binop_mul_literals() {
-        // 4 * 5 = 20
-        let left = Box::new(Literal::new(Value::Int(4)));
-        let right = Box::new(Literal::new(Value::Int(5)));
-        let mut binop = BinOp::new(left, BinOpKind::Arithmetic(ArithmeticKind::Mul), right);
-
-        let (consumer, _notifications) = TestConsumer::new();
-        let mut producer = binop.subscribe(
-            Guard::universal(),
-            Box::new(consumer),
-            None,
-            &mut Scheduler::new(),
-        );
-
-        let result = producer.get();
-        assert_eq!(result.column_value, ColumnValue::Ints(vec![20]));
-    }
-
-    #[test]
-    fn test_binop_sub_literals() {
-        // 10 - 3 = 7
-        let left = Box::new(Literal::new(Value::Int(10)));
-        let right = Box::new(Literal::new(Value::Int(3)));
-        let mut binop = BinOp::new(left, BinOpKind::Arithmetic(ArithmeticKind::Sub), right);
-
-        let (consumer, _notifications) = TestConsumer::new();
-        let mut producer = binop.subscribe(
-            Guard::universal(),
-            Box::new(consumer),
-            None,
-            &mut Scheduler::new(),
-        );
-
-        let result = producer.get();
-        assert_eq!(result.column_value, ColumnValue::Ints(vec![7]));
-    }
-
-    #[test]
-    fn test_binop_release() {
-        // Release propagation should return Universal (both sub-producers are literals)
-        let left = Box::new(Literal::new(Value::Int(1)));
-        let right = Box::new(Literal::new(Value::Int(2)));
-        let mut binop = BinOp::new(left, BinOpKind::Arithmetic(ArithmeticKind::Add), right);
-
-        let (consumer, _notifications) = TestConsumer::new();
-        let mut producer = binop.subscribe(
-            Guard::universal(),
-            Box::new(consumer),
-            None,
-            &mut Scheduler::new(),
-        );
-
-        let released = producer.release(Guard::universal());
-        assert_eq!(released, Guard::Universal);
     }
 
     #[test]

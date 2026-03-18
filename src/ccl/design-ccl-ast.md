@@ -15,7 +15,7 @@ Python source
   → infer          (ccl/infer.rs: type inference, converts Hole→Infer and fills ty on every node)
   → resolve        (ccl/unify.rs: substitutes solved Infer vars with concrete types)
   → optimize       (tree rewrites on CCL AST)
-  → compile        (interpreter/compile_ccl.rs: CCL AST → dataflow operators)
+  → compile        (interpreter/compile_tile_operators.rs: CCL AST → tile operators)
   → subscribe()
   → producer/consumer dataflow
 ```

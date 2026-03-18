@@ -148,10 +148,6 @@
         <div class="section-title">Producer Graph</div>
         <div id="producer"></div>
     </div>
-    <div class="section">
-        <div class="section-title">Scheduler Sources</div>
-        <div id="sources"></div>
-    </div>
     <script>
         function badge(node) {
             const yg = node.yield_guard;
@@ -194,9 +190,6 @@
                 const data = await r.json();
                 document.getElementById('tick').textContent = 'Tick: ' + data.tick;
                 document.getElementById('producer').innerHTML = data.producer ? renderNode(data.producer) : '<em>none</em>';
-                let srcHtml = '';
-                if (data.sources) for (const s of data.sources) srcHtml += renderNode(s);
-                document.getElementById('sources').innerHTML = srcHtml || '<em>none</em>';
                 document.getElementById('error').textContent = '';
             } catch (e) {
                 document.getElementById('error').textContent = 'Connection error: ' + e.message;

@@ -43,7 +43,7 @@ pub fn fmt_record<V: std::fmt::Display>(
 /// | Type alias | `V` |
 /// |---|---|
 /// | [`TypeInferenceContext`](crate::ccl::infer::TypeInferenceContext) | [`Type`](crate::ccl::Type) |
-/// | [`CompileContext`](crate::interpreter::compile_ccl::CompileContext) | [`Extent`](crate::interpreter::Extent) |
+/// | [`TileCompileContext`](crate::interpreter::compile_tile_operators::TileCompileContext) | `TileVarBinding` |
 ///
 /// # Examples
 ///

@@ -1,48 +1,30 @@
 //! CCL (Cambra Core Language) Interpreter
 //!
-//! This module implements the dataflow-based interpreter for CCL.
-//! Execution proceeds via a producer/consumer protocol using guards and extents.
+//! This module implements the tile-operator-based interpreter for CCL.
+//! Execution proceeds via the tile producer/consumer protocol using guards and tilings.
 
 mod binop;
 pub mod ccl_compile_util;
-pub mod compile_ccl;
 pub mod compile_tile_operators;
-mod inspect;
-mod join;
-mod lambda;
-mod let_op;
-mod literal;
-mod record;
 mod scheduler;
 mod stdio;
 mod test_source;
 pub mod tile_operators;
 pub mod tiling;
 mod types;
-mod var;
 
 pub use binop::*;
-pub use inspect::*;
-pub use join::*;
-pub use lambda::*;
-pub use let_op::*;
-pub use literal::*;
-pub use record::*;
 pub use scheduler::*;
 pub use stdio::*;
 pub use test_source::*;
 pub use tiling::*;
 pub use types::*;
-pub use var::*;
-
-use crate::pretty_graph::{InspectNode, VizOptions};
 
 use std::cell::RefCell;
-use std::fmt::Debug;
 use std::rc::Rc;
 
 // ============================================================================
-// Producer/Consumer Protocol
+// Consumer Protocol
 // ============================================================================
 
 /// A Consumer receives notifications from a producer.
@@ -70,150 +52,10 @@ where
     }
 }
 
-/// A Producer provides data and handles release requests.
-/// The producer is created by an operator's `subscribe` method and allows
-/// the consumer to retrieve data and release regions.
-pub trait Producer: Debug {
-    /// Returns a `GetResult` containing the columnar data and the yield guard,
-    /// guaranteeing they are synchronized.
-    fn get(&mut self) -> GetResult;
-
-    /// Release interest in a region.
-    /// The `obsolete_guard` specifies a sub-region of the subscription that
-    /// is no longer needed. Returns an expanded obsolete guard that may be
-    /// larger if the producer has additional obsolescence information (e.g.,
-    /// from variables with their own obsolete guards).
-    fn release(&mut self, obsolete_guard: Guard) -> Guard;
-
-    /// Inspect this producer as an [`InspectNode`] for visualization.
-    ///
-    /// The default implementation heuristically extracts the type name from Debug
-    /// output. Override this for proper visualization — the fallback exists only
-    /// so that new Producer types are displayable before a custom impl is added.
-    fn inspect(&self, _opts: &VizOptions) -> InspectNode {
-        let dbg = format!("{:?}", self);
-        let variant = dbg.split(['{', '(']).next().unwrap_or("?").trim();
-        InspectNode::leaf(format!("{variant}(?)"))
-    }
-}
-
-/// Blanket implementation: Rc<RefCell<P>> implements Producer when P does.
-impl<P: Producer> Producer for Rc<RefCell<P>> {
-    fn get(&mut self) -> GetResult {
-        self.borrow_mut().get()
-    }
-
-    fn release(&mut self, obsolete_guard: Guard) -> Guard {
-        self.borrow_mut().release(obsolete_guard)
-    }
-
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        match self.try_borrow() {
-            Ok(p) => p.inspect(opts),
-            Err(_) => InspectNode::leaf("<locked>"),
-        }
-    }
-}
-
-/// A dataflow operator that can be subscribed to.
-/// Operators implement this trait to provide a subscription interface.
-/// The `subscribe` method takes an intent guard (specifying what region the
-/// consumer is interested in) and a consumer, and returns a producer that
-/// allows the consumer to get data and release regions.
-pub trait Operator: Debug {
-    /// Get the extent (type) of this operator.
-    fn extent(&self) -> &Extent;
-
-    /// Subscribe to this operator with an intent guard and consumer.
-    /// Returns a producer that allows the consumer to get data and release regions.
-    ///
-    /// # Arguments
-    /// * `intent_guard` - The region of the operator's extent that the consumer
-    ///   is interested in
-    /// * `consumer` - The consumer that will receive notifications when data is ready
-    /// * `var_scope` - The variable scope for looking up variables, wrapped in Rc
-    ///   to match the internal parent representation and allow cheap sharing
-    ///   (e.g., Lambda stores the scope for child scope construction).
-    ///
-    /// # Returns
-    /// A producer that provides access to the data and allows releasing regions
-    fn subscribe(
-        &mut self,
-        intent_guard: Guard,
-        consumer: Box<dyn Consumer>, // TODO: Should we make this a trait bound so we don't assume a Box pointer type?
-        var_scope: Option<Rc<VarScope>>,
-        scheduler: &mut Scheduler,
-    ) -> Box<dyn Producer>;
-
-    /// Apply this Operator to a second Operator and return the result as a Producer.
-    /// This Operator must logically be a function, and the return producer will produce the output
-    /// of calling it on the input binding
-    ///
-    /// # Arguments
-    /// * `intent_guard` - The region of the operator's extent that the consumer
-    ///   is interested in
-    /// * `consumer` - The consumer that will receive notifications when data is ready
-    /// * `var_scope` - The variable scope for looking up variables, wrapped in Rc
-    ///   to match the internal parent representation and allow cheap sharing
-    ///   (e.g., Lambda stores the scope for child scope construction).
-    /// * `binding` = The argument to the function.
-    ///
-    /// # Returns
-    /// A producer that provides access to the data and allows releasing regions
-    fn subscribe_to_application(
-        &mut self,
-        _intent_guard: Guard,
-        _consumer: Box<dyn Consumer>,
-        _var_scope: Option<Rc<VarScope>>,
-        _binding: &mut dyn Operator,
-        _scheduler: &mut Scheduler,
-    ) -> Box<dyn Producer> {
-        panic!("Not appliable {self:?}")
-    }
-    /// Inspect this operator as an [`InspectNode`] for visualization.
-    ///
-    /// The default implementation heuristically extracts the type name from Debug
-    /// output. Override this for proper visualization — the fallback exists only
-    /// so that new Operator types are displayable before a custom impl is added.
-    fn inspect(&self, _opts: &VizOptions) -> InspectNode {
-        let dbg = format!("{:?}", self);
-        let variant = dbg.split(['{', '(']).next().unwrap_or("?").trim();
-        InspectNode::leaf(format!("{variant}(?)"))
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod test_helpers {
-    use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    /// A test consumer that counts notifications in shared state.
-    /// The count is kept by the test, allowing access to the notification count
-    /// even after the consumer is moved into subscribe.
-    /// Uses Rc<RefCell<>> for single-threaded, lock-free shared state.
-    pub struct TestConsumer {
-        count: Rc<RefCell<usize>>,
-    }
-
-    impl TestConsumer {
-        /// Create a new TestConsumer and return both the consumer and the shared notification count.
-        /// The consumer can be moved into subscribe, while the count allows
-        /// reading from outside.
-        pub fn new() -> (Self, Rc<RefCell<usize>>) {
-            let count = Rc::new(RefCell::new(0usize));
-            (
-                TestConsumer {
-                    count: count.clone(),
-                },
-                count,
-            )
-        }
-    }
-
-    impl Consumer for TestConsumer {
-        fn notify(&mut self) {
-            *self.count.borrow_mut() += 1;
-        }
-    }
+/// Generate a tuple field name for the given index.
+///
+/// Returns `"_0"`, `"_1"`, etc., used throughout the interpreter to represent
+/// positional tuple fields as named record fields.
+pub fn tuple_field(i: usize) -> String {
+    format!("_{i}")
 }

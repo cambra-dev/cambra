@@ -32,9 +32,9 @@ Python source
   → parse   (rustpython_parser)
   → lower   (ccl/lower.rs: Python AST → CCL Expr)
   → infer   (ccl/infer.rs: limited type inference)
-  → compile (interpreter/compile_ccl.rs: CCL Expr → dataflow operators)
+  → compile (interpreter/compile_tile_operators.rs: CCL Expr → tile operators)
   → subscribe()
-  → producer/consumer dataflow
+  → tile producer/consumer dataflow
 ```
 
 For source layout and design doc locations, see [src/design.md](/src/design.md).
