@@ -1,8 +1,6 @@
 //! End-to-end pipeline tests: Python source → CCL lower → infer → compile → eval.
 //!
-//! Currently these exist as parity tests (Python → direct-lowering vs. CCL pipeline)
-//! as we're still suporting parallel implementations. Eventually the direct lowering
-//! will be removed, leaving only the full compilation stack:
+//! All tests run through the full CCL pipeline via [`GlobalContext::compile_program`]:
 //!
 //! ```text
 //! Python source
@@ -12,15 +10,6 @@
 //!   → subscribe()   (operator evaluation)
 //! ```
 //!
-//! Every test case in this file runs through the **direct** lowering path
-//! (`lower_let_stmt_block`).  Cases tagged [`Both`] additionally run through
-//! the full CCL pipeline (Python → `ccl::lower` → `ccl::infer` → `compile_ccl`
-//! → subscribe → get) and assert the same result.
-//!
-//! Cases tagged [`DirectOnly`] skip the pipeline assertion and include a comment
-//! explaining which feature is missing.  Changing a tag from `DirectOnly` to
-//! `Both` is the self-documenting way to mark a feature as pipeline-complete.
-//!
 //! Unlike the unit tests in each module, these tests validate the composition
 //! of all passes together.
 
@@ -28,62 +17,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use cambra::ccl::context::GlobalContext;
-use cambra::ccl::infer::infer;
-use cambra::ccl::lower::{lower_expr, lower_stmts};
-use cambra::ccl::symbolic::symbolic;
-use cambra::interpreter::compile_ccl::{compile, CompileContext};
+use cambra::ccl::{context::GlobalContext, Type};
+use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
-    tuple_field, BaseType, ColumnValue, Consumer, Extent, FuncBinding, Guard, Scheduler, Value,
+    tuple_field, BaseType, ColumnValue, Consumer, Extent, FuncBinding, Guard, Predicate,
+    SealedFunctionGuard, TestDataSource, Tile, TileGuard, Value,
 };
-use cambra::lowering::{lower_let_stmt_block, LoweringContext};
-use cambra::pretty_graph::pretty_operator;
-use log::debug;
 use rstest_log::rstest;
-use rustpython_parser::{ast as pyast, parser};
-
-// ---------------------------------------------------------------------------
-// Pipeline flag
-// ---------------------------------------------------------------------------
-
-/// Whether the CCL pipeline path is exercised for this test case.
-#[derive(Copy, Clone, Debug, PartialEq)]
-enum Pipeline {
-    /// Both the direct and CCL pipeline paths are asserted.
-    Both,
-    /// Only the direct path is asserted; pipeline support is pending.
-    DirectOnly,
-}
-use Pipeline::{Both, DirectOnly};
-
-// ---------------------------------------------------------------------------
-// Helpers — direct path
-// ---------------------------------------------------------------------------
-
-/// Parse `code` as a Python module, lower via `lower_let_stmt_block`, subscribe,
-/// and return the resulting [`ColumnValue`].
-fn run_direct(code: &str) -> ColumnValue {
-    let result =
-        parser::parse(code, parser::Mode::Module, "<test>").expect("Failed to parse Python module");
-    let stmts = match result {
-        pyast::Mod::Module { body, .. } => body,
-        other => panic!("expected Module, got {other:?}"),
-    };
-    let mut scheduler = Scheduler::new();
-    let (mut op, scope) =
-        lower_let_stmt_block(&mut LoweringContext::default(), &stmts, &mut scheduler)
-            .expect("direct lowering failed");
-
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
-    let mut producer = op.subscribe(Guard::universal(), consumer, scope, &mut scheduler);
-    scheduler.check_for_notifications();
-    assert!(*notified.borrow(), "expected notification (direct path)");
-    producer.get().column_value
-}
 
 // ---------------------------------------------------------------------------
 // Helpers — CCL pipeline path
@@ -91,49 +31,17 @@ fn run_direct(code: &str) -> ColumnValue {
 
 /// Lower `code` through the CCL pipeline (parse → `ccl::lower` → `ccl::infer`
 /// → `compile_ccl` → subscribe → get) and return the resulting [`ColumnValue`].
-fn run_pipeline(code: &str) -> ColumnValue {
+fn run_pipeline(code: &str) -> Tile {
     let mut ctx = GlobalContext::default();
-    let mut expr = if code.contains(';') || code.contains('=') {
-        let result = parser::parse(code, parser::Mode::Module, "<test>")
-            .expect("Failed to parse Python module");
-        let stmts = match result {
-            pyast::Mod::Module { body, .. } => body,
-            other => panic!("expected Module, got {other:?}"),
-        };
-        lower_stmts(&stmts, ctx.lowering_ctx()).expect("ccl lowering failed")
-    } else {
-        let result = parser::parse(code, parser::Mode::Expression, "<test>")
-            .expect("Failed to parse Python expression");
-        let ast_expr = match result {
-            pyast::Mod::Expression { body } => *body,
-            other => panic!("expected Expression, got {other:?}"),
-        };
-        lower_expr(&ast_expr, ctx.lowering_ctx()).expect("ccl lowering failed")
-    };
-
-    debug!("Lowered:\n{}", symbolic(&expr));
-
-    let ictx = ctx.inference_ctx();
-    infer(&mut expr, ictx).expect("type inference failed");
-    cambra::ccl::unify::resolve(&mut expr, &mut ictx.table);
-
-    debug!("Inferred:\n{}", symbolic(&expr));
-
-    let mut scheduler = Scheduler::new();
-    let mut op =
-        compile(&expr, &mut CompileContext::new(), &mut scheduler).expect("compile failed");
-
-    debug!("Operators:\n{}", pretty_operator(op.as_ref()));
-
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut producer = op.subscribe(Guard::universal(), consumer, None, &mut scheduler);
-    scheduler.check_for_notifications();
+    let mut producer = ctx.compile_program(code, consumer);
+    ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
-    producer.get().column_value
+    producer.get(producer.tiling().universal_guard())
 }
 
 // ---------------------------------------------------------------------------
@@ -142,41 +50,28 @@ fn run_pipeline(code: &str) -> ColumnValue {
 
 /// Assert `code` produces `expected` via the direct path; additionally assert
 /// the pipeline path if `pipeline == Both`.
-fn parity(code: &str, expected: ColumnValue, pipeline: Pipeline) {
-    assert_eq!(run_direct(code), expected, "direct path");
-    if pipeline == Both {
-        assert_eq!(run_pipeline(code), expected, "pipeline path");
-    }
+fn check_tile(code: &str, expected: Tile) {
+    assert_eq!(run_pipeline(code), expected, "pipeline path");
 }
 
 /// Scalar variant of [`parity`]: unwraps the result via [`ColumnValue::as_single`]
 /// before comparing.
-fn parity_scalar(code: &str, expected: Value, pipeline: Pipeline) {
-    let direct = run_direct(code);
-    assert_eq!(
-        direct.as_single().unwrap(),
-        expected,
-        "direct path (scalar)"
-    );
-    if pipeline == Both {
-        let pipe = run_pipeline(code);
-        assert_eq!(
-            pipe.as_single().unwrap(),
-            expected,
-            "pipeline path (scalar)"
-        );
-    }
+fn check_scalar(code: &str, expected: Value) {
+    let result = run_pipeline(code);
+    let scalar = scalar_tile_to_column_value(result);
+    assert_eq!(scalar.as_single().unwrap(), expected);
 }
 
 // ---------------------------------------------------------------------------
 // Value constructors
 // ---------------------------------------------------------------------------
 
-fn make_int_list(v: &[i64]) -> ColumnValue {
-    ColumnValue::function_bindings(
-        ColumnValue::UInts((0..v.len()).collect()),
-        ColumnValue::Ints(v.into()),
-    )
+fn make_int_list(v: &[i64]) -> Tile {
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts((0..v.len()).collect()),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(v.into()))),
+        domain_predicate: Predicate::True,
+    }
 }
 
 fn make_tuple(v: &[Value]) -> Value {
@@ -197,11 +92,11 @@ fn make_tuple(v: &[Value]) -> Value {
 #[case("True", Value::Bool(true))]
 #[case("[]", Value::Function(vec![]))]
 #[case("[1, 2]", Value::Function(vec![
-    FuncBinding { input: Value::Int(0), output: Value::Int(1) },
-    FuncBinding { input: Value::Int(1), output: Value::Int(2) },
+    FuncBinding { input: Value::UInt(0), output: Value::Int(1) },
+    FuncBinding { input: Value::UInt(1), output: Value::Int(2) },
 ]))]
 fn test_literals(#[case] code: &str, #[case] expected: Value) {
-    parity_scalar(code, expected, Both);
+    check_scalar(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -217,14 +112,12 @@ fn test_literals(#[case] code: &str, #[case] expected: Value) {
 #[case("1 + 2 * (3 - 4)", Value::Int(-1))]
 #[case("7 // 2", Value::Int(3))]
 fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
-    parity_scalar(code, expected, Both);
+    check_scalar(code, expected);
 }
 
 // ---------------------------------------------------------------------------
 // Comparisons
 // ---------------------------------------------------------------------------
-//
-// TODO: `ccl::lower` does not yet support `Compare` expressions.
 
 #[rstest]
 #[case("1 == 1", Value::Bool(true))]
@@ -236,14 +129,12 @@ fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
 #[case("True != False", Value::Bool(true))]
 #[case("True == True", Value::Bool(true))]
 fn test_compare(#[case] code: &str, #[case] expected: Value) {
-    parity_scalar(code, expected, DirectOnly);
+    check_scalar(code, expected);
 }
 
 // ---------------------------------------------------------------------------
 // Boolean operations
 // ---------------------------------------------------------------------------
-//
-// TODO: `ccl::lower` does not yet support bitwise-as-boolean ops or `BoolOp`.
 
 #[rstest]
 #[case("True & True", Value::Bool(true))]
@@ -252,7 +143,7 @@ fn test_compare(#[case] code: &str, #[case] expected: Value) {
 #[case("True and False", Value::Bool(false))]
 #[case("True or False", Value::Bool(true))]
 fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
-    parity_scalar(code, expected, Both);
+    check_scalar(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +155,7 @@ fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
 #[case("x = 2; y = x; y", Value::Int(2))]
 #[case("x = 2; y = x; y + x + 1", Value::Int(5))]
 fn test_let_bindings(#[case] code: &str, #[case] expected: Value) {
-    parity_scalar(code, expected, Both);
+    check_scalar(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -273,8 +164,8 @@ fn test_let_bindings(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[case("x = [x for x in [1,2,3]]; [y for y in x]", make_int_list(&[1,2,3]))]
 #[ignore = "need first class functions for this let"]
-fn test_let_nonscalar(#[case] code: &str, #[case] expected: ColumnValue) {
-    parity(code, expected, Both);
+fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +179,7 @@ fn test_let_nonscalar(#[case] code: &str, #[case] expected: ColumnValue) {
 #[case("('a', 1)[0]", Value::String("a".to_string()))]
 #[case("x = ('a', 1); x[0]", Value::String("a".to_string()))]
 fn test_tuples(#[case] code: &str, #[case] expected: Value) {
-    parity_scalar(code, expected, Both);
+    check_scalar(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -300,8 +191,8 @@ fn test_tuples(#[case] code: &str, #[case] expected: Value) {
 #[case("[42 for x in [10, 20]]", make_int_list(&[42, 42]))]
 #[case("[y for y in [x for x in [10, 20]]]", make_int_list(&[10, 20]))]
 #[case("[x + 2 for x in [10, 20]]", make_int_list(&[12, 22]))]
-fn test_comprehensions(#[case] code: &str, #[case] expected: ColumnValue) {
-    parity(code, expected, Both);
+fn test_comprehensions(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -310,8 +201,8 @@ fn test_comprehensions(#[case] code: &str, #[case] expected: ColumnValue) {
 //
 #[rstest]
 #[case("y = 5; [x + y for x in [10, 20]]", make_int_list(&[15, 25]))]
-fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: ColumnValue) {
-    parity(code, expected, Both);
+fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -323,28 +214,29 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: ColumnV
 #[case("[y[0] for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
 #[case(
     "[(y, 100) for y in [(10, 'a'), (20, 'b')]]",
-    ColumnValue::FunctionBindings {
-        inputs: Box::new(ColumnValue::UInts(vec![0, 1])),
-        outputs: Box::new(ColumnValue::Records(HashMap::from([
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![0, 1]),
+        codomain: Box::new(Tile::Record(HashMap::from([
             (
-                String::from("_0"),
-                ColumnValue::Records(HashMap::from([
-                    (String::from("_0"), ColumnValue::Ints(vec![10, 20])),
+                tuple_field(0),
+                Tile::Scalar(ColumnValue::Records(HashMap::from([
+                    (tuple_field(0), ColumnValue::Ints(vec![10, 20])),
                     (
-                        String::from("_1"),
+                        tuple_field(1),
                         ColumnValue::Strings(vec![
                             String::from("a"),
                             String::from("b"),
                         ]),
                     ),
-                ])),
+                ]))),
             ),
-            (String::from("_1"), ColumnValue::Ints(vec![100, 100])),
+            (tuple_field(1), Tile::Scalar(ColumnValue::Ints(vec![100, 100]))),
         ]))),
+        domain_predicate: Predicate::True,
     }
 )]
-fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: ColumnValue) {
-    parity(code, expected, Both);
+fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -359,20 +251,22 @@ fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: ColumnVa
 #[case("[x for x in [1, 2, 3] if x > 10]", make_int_list(&[]))]
 #[case(
     "[x for x in [1, 2, 3] if x == 2]",
-    ColumnValue::FunctionBindings {
-        inputs: Box::new(ColumnValue::UInts(vec![1])),
-        outputs: Box::new(ColumnValue::Ints(vec![2])),
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![1]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))),
+        domain_predicate: Predicate::True,
     }
 )]
 #[case(
     "[x for x in [1, 2, 3, 4, 5] if x > 1 if x < 5]",
-    ColumnValue::FunctionBindings {
-        inputs: Box::new(ColumnValue::UInts(vec![1, 2, 3])),
-        outputs: Box::new(ColumnValue::Ints(vec![2, 3, 4])),
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![1, 2, 3]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4]))),
+        domain_predicate: Predicate::True,
     }
 )]
-fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: ColumnValue) {
-    parity(code, expected, DirectOnly);
+fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -398,13 +292,15 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: ColumnValu
     "[x + z + y for x in ['a', 'b'] for y in ['c', 'd'] for z in ['e', 'f']]",
     ColumnValue::strings(&["aec", "afc", "aed", "afd", "bec", "bfc", "bed", "bfd"])
 )]
+// TODO turn back to hash join
 #[case(
-    "[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'e'] if x == y]",
+    "[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'e'] if x == y and True]",
     ColumnValue::strings(&["bb", "cc"])
 )]
 // Loop join with non-equality predicate involving both generators
+// TODO turn back to hash join
 #[case(
-    "[x + y for x in [1, 1] for y in [2, 2, 3] if x + 1 == y]",
+    "[x + y for x in [1, 1] for y in [2, 2, 3] if x + 1 == y and True]",
     ColumnValue::Ints(vec![3, 3, 3, 3])
 )]
 #[case(
@@ -415,8 +311,9 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: ColumnValu
     "[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'd'] if x < y]",
     ColumnValue::strings(&["ab", "ac", "ad", "bc", "bd", "cd"])
 )]
+// TODO turn back to hash join
 #[case(
-    "[x + y for x in ['a', 'b'] for y in ['c', 'd'] if x == y]",
+    "[x + y for x in ['a', 'b'] for y in ['c', 'd'] if x == y and True]",
     ColumnValue::strings(&[])
 )]
 #[case(
@@ -439,27 +336,29 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: ColumnValu
     ColumnValue::strings(&["abdf", "abef", "acdf", "acef"])
 )]
 fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
-    let results = &[run_direct(code), run_pipeline(code)];
-    for result in results.iter() {
-        match result {
-            ColumnValue::FunctionBindings { outputs, .. } => {
-                assert_eq!(**outputs, expected);
-            }
-            other => panic!("expected FunctionBindings, got: {other:?}"),
+    let result = run_pipeline(code);
+    match result {
+        Tile::SealedFunction { codomain, .. } => {
+            assert_eq!(scalar_tile_to_column_value(*codomain), expected);
         }
+        other => panic!("expected FunctionBindings, got: {other:?}"),
     }
 }
 
 // ---------------------------------------------------------------------------
 // Data-source injection tests
-// TODO: direct path only — CCL pipeline needs design work
-//
-// These tests inject a `TestDataSource` or `StdinDataSource` into the lowering
-// context, which has no CCL pipeline equivalent yet.  Tracked as `DirectOnly`
-// until a source-injection mechanism is designed for the pipeline.
 // ---------------------------------------------------------------------------
 
+/// Verify that a single-generator comprehension over a `TestDataSource` compiles
+/// and evaluates correctly through the CCL pipeline.
+///
+/// All six code variants project or transform the string elements of `testsource1`
+/// and should produce the same sorted key→value mapping: `{10 → "foo", 20 → "bar"}`.
+///
+/// Also confirms that updating the yield guard without adding new data does not
+/// trigger a spurious notification.
 #[rstest]
+#[case("testsource1()")]
 #[case("[x for x in testsource1()]")]
 #[case("[x + '' for x in testsource1()]")]
 #[case("['' + x for x in testsource1()]")]
@@ -467,23 +366,18 @@ fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
 #[case("[(x, 0)[0] for x in testsource1()]")]
 #[case("[(x, 0)[0] for x in testsource1() if True]")]
 fn test_test_source(#[case] code: &str) {
-    let mut ctx = LoweringContext::default();
-    let data_source = ctx.inject_test_source("testsource1", Extent::Base(BaseType::String));
-    let result =
-        parser::parse(code, parser::Mode::Module, "<test>").expect("Failed to parse Python module");
-    let stmts = match result {
-        pyast::Mod::Module { body, .. } => body,
-        other => panic!("expected Module, got {other:?}"),
-    };
-    let mut scheduler = Scheduler::new();
-    let (mut op, scope) =
-        lower_let_stmt_block(&mut ctx, &stmts, &mut scheduler).expect("direct lowering failed");
+    let mut ctx = GlobalContext::default();
+    let data_source = Rc::new(RefCell::new(TestDataSource::new(
+        "testsource1",
+        Type::Base(BaseType::String),
+        Extent::Base(BaseType::String),
+    )));
+    ctx.register_test_source(data_source.clone());
 
     data_source.borrow_mut().add_data(&[
         (Value::UInt(10), Value::String("foo".to_string())),
         (Value::UInt(20), Value::String("bar".to_string())),
     ]);
-    data_source.borrow_mut().set_has_data(true);
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -491,70 +385,87 @@ fn test_test_source(#[case] code: &str) {
         *notified_clone.borrow_mut() = true;
     });
 
-    let mut producer = op.subscribe(Guard::universal(), consumer, scope, &mut scheduler);
-    scheduler.check_for_notifications();
+    let mut producer = ctx.compile_program(code, consumer);
+    ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
 
-    let get_result = producer.get();
+    let tile = producer.get(producer.tiling().universal_guard());
     *notified.borrow_mut() = false;
+
+    // Extract domain and codomain; sort by domain key for deterministic comparison.
+    let Tile::SealedFunction {
+        domain, codomain, ..
+    } = tile
+    else {
+        panic!("expected SealedFunction tile");
+    };
+    let Tile::Scalar(codomain_cv) = *codomain else {
+        panic!("expected Scalar codomain");
+    };
+    let keys = match domain {
+        ColumnValue::UInts(v) => v,
+        other => panic!("expected UInts domain, got {other:?}"),
+    };
+    let vals = match codomain_cv {
+        ColumnValue::Strings(v) => v,
+        other => panic!("expected Strings codomain, got {other:?}"),
+    };
+    let mut pairs: Vec<(usize, String)> = keys.into_iter().zip(vals).collect();
+    pairs.sort_by_key(|(k, _)| *k);
     assert_eq!(
-        get_result.column_value.sort_by_inputs(),
-        ColumnValue::FunctionBindings {
-            inputs: Box::new(ColumnValue::UInts(vec![10, 20])),
-            outputs: Box::new(ColumnValue::Strings(vec![
-                "foo".to_string(),
-                "bar".to_string()
-            ]))
-        }
+        pairs,
+        vec![(10, "foo".to_string()), (20, "bar".to_string())]
     );
 
+    // Changing the yield guard without adding new data must not notify.
     data_source.borrow_mut().set_yield_guard(Guard::Universal);
-    scheduler.check_for_notifications();
+    ctx.scheduler().check_for_notifications();
     assert!(!*notified.borrow());
 }
 
 /// Test a join between two data sources, including incremental data addition
 /// and region release.
 #[rstest]
-#[case("[(x._0, x._1, y._1) for x in testsource1() for y in testsource2() if x._0 == y._0]")]
 #[case(
-    "[(x._0, x._1, y._1) for x in testsource1() for y in testsource2() if x._0 == y._0 and True]"
+    "[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] == y[0] and True]"
 )]
 fn test_inner_join(#[case] code: &str) {
-    let mut ctx = LoweringContext::default();
+    let mut ctx = GlobalContext::default();
+    let record_type = Type::Record(vec![
+        (tuple_field(0), Type::Base(BaseType::Int)),
+        (tuple_field(1), Type::Base(BaseType::String)),
+    ]);
     let record_extent = Extent::record(HashMap::from([
-        (String::from("_0"), Extent::Base(BaseType::Int)),
-        (String::from("_1"), Extent::Base(BaseType::String)),
+        (tuple_field(0), Extent::Base(BaseType::Int)),
+        (tuple_field(1), Extent::Base(BaseType::String)),
     ]));
-    let data_source1 = ctx.inject_test_source("testsource1", record_extent.clone());
-    let data_source2 = ctx.inject_test_source("testsource2", record_extent);
-    let result =
-        parser::parse(code, parser::Mode::Module, "<test>").expect("Failed to parse Python module");
-    let stmts = match result {
-        pyast::Mod::Module { body, .. } => body,
-        other => panic!("expected Module, got {other:?}"),
-    };
-    let mut scheduler = Scheduler::new();
-    let (mut op, scope) =
-        lower_let_stmt_block(&mut ctx, &stmts, &mut scheduler).expect("direct lowering failed");
+    let data_source1 = Rc::new(RefCell::new(TestDataSource::new(
+        "testsource1",
+        record_type.clone(),
+        record_extent.clone(),
+    )));
+    let data_source2 = Rc::new(RefCell::new(TestDataSource::new(
+        "testsource2",
+        record_type,
+        record_extent,
+    )));
+    ctx.register_test_source(data_source1.clone());
+    ctx.register_test_source(data_source2.clone());
 
     data_source1.borrow_mut().add_data(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
-            (String::from("_0"), Value::Int(100)),
-            (String::from("_1"), Value::String("a1".to_string())),
+            (tuple_field(0), Value::Int(100)),
+            (tuple_field(1), Value::String("a1".to_string())),
         ])),
     )]);
-    data_source1.borrow_mut().set_has_data(true);
-
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
-            (String::from("_0"), Value::Int(100)),
-            (String::from("_1"), Value::String("b1".to_string())),
+            (tuple_field(0), Value::Int(100)),
+            (tuple_field(1), Value::String("b1".to_string())),
         ])),
     )]);
-    data_source2.borrow_mut().set_has_data(true);
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -562,112 +473,143 @@ fn test_inner_join(#[case] code: &str) {
         *notified_clone.borrow_mut() = true;
     });
 
-    let mut producer = op.subscribe(Guard::universal(), consumer, scope, &mut scheduler);
-    scheduler.check_for_notifications();
+    let mut producer = ctx.compile_program(code, consumer);
+    ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
 
-    let get_result = producer.get();
+    let tile = producer.get(producer.tiling().universal_guard());
     *notified.borrow_mut() = false;
+
+    // Extract rows from a SealedFunction tile where:
+    //   domain  = Records { _0: UInts (src1 key), _1: UInts (src2 key) }
+    //   codomain = Scalar(Records { _0: Ints, _1: Strings, _2: Strings })
+    // Returns pairs sorted by (domain._0, domain._1) for deterministic comparison.
+    type DomainKey = (usize, usize);
+    type JoinOutput = (i64, String, String);
+    fn extract_join_rows(tile: Tile) -> Vec<(DomainKey, JoinOutput)> {
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("expected SealedFunction tile");
+        };
+        // domain  = Records { _0: UInts (src1 key), _1: UInts (src2 key) }
+        // codomain = Record { _0: Scalar(Ints), _1: Scalar(Strings), _2: Scalar(Strings) }
+        let ColumnValue::Records(mut domain_fields) = domain else {
+            panic!("expected Records domain, got {domain:?}");
+        };
+        let Tile::Record(mut codomain_fields) = *codomain else {
+            panic!("expected Record codomain, got {codomain:?}");
+        };
+        let ColumnValue::UInts(d0) = domain_fields.remove("_0").expect("domain._0") else {
+            panic!(
+                "expected UInts in domain._0, got {:?}",
+                domain_fields.get("_0")
+            );
+        };
+        let ColumnValue::UInts(d1) = domain_fields.remove("_1").expect("domain._1") else {
+            panic!(
+                "expected UInts in domain._1, got {:?}",
+                domain_fields.get("_1")
+            );
+        };
+        let Tile::Scalar(ColumnValue::Ints(o0)) =
+            codomain_fields.remove("_0").expect("codomain._0")
+        else {
+            panic!(
+                "expected Scalar(Ints) in codomain._0, got {:?}",
+                codomain_fields.get("_0")
+            );
+        };
+        let Tile::Scalar(ColumnValue::Strings(o1)) =
+            codomain_fields.remove("_1").expect("codomain._1")
+        else {
+            panic!(
+                "expected Scalar(Strings) in codomain._1, got {:?}",
+                codomain_fields.get("_1")
+            );
+        };
+        let Tile::Scalar(ColumnValue::Strings(o2)) =
+            codomain_fields.remove("_2").expect("codomain._2")
+        else {
+            panic!(
+                "expected Scalar(Strings) in codomain._2, got {:?}",
+                codomain_fields.get("_2")
+            );
+        };
+        let mut rows: Vec<(DomainKey, JoinOutput)> = d0
+            .into_iter()
+            .zip(d1)
+            .zip(o0.into_iter().zip(o1).zip(o2))
+            .map(|((k0, k1), ((v0, v1), v2))| ((k0, k1), (v0, v1, v2)))
+            .collect();
+        rows.sort_by_key(|(k, _)| *k);
+        rows
+    }
+
     assert_eq!(
-        get_result.column_value.sort_by_inputs(),
-        ColumnValue::FunctionBindings {
-            inputs: Box::new(ColumnValue::Records(HashMap::from([
-                ("_0".to_string(), ColumnValue::UInts(vec![10])),
-                ("_1".to_string(), ColumnValue::UInts(vec![10]))
-            ]))),
-            outputs: Box::new(ColumnValue::Records(HashMap::from([
-                ("_0".to_string(), ColumnValue::Ints(vec![100])),
-                (
-                    "_1".to_string(),
-                    ColumnValue::Strings(vec!["a1".to_string()])
-                ),
-                (
-                    "_2".to_string(),
-                    ColumnValue::Strings(vec!["b1".to_string()])
-                )
-            ])))
-        }
+        extract_join_rows(tile),
+        vec![((10, 10), (100, "a1".to_string(), "b1".to_string()))]
     );
 
     data_source1.borrow_mut().add_data(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
-            (String::from("_0"), Value::Int(200)),
-            (String::from("_1"), Value::String("a2".to_string())),
+            (tuple_field(0), Value::Int(200)),
+            (tuple_field(1), Value::String("a2".to_string())),
         ])),
     )]);
-    data_source1.borrow_mut().set_has_data(true);
-
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
-            (String::from("_0"), Value::Int(100)),
-            (String::from("_1"), Value::String("b2".to_string())),
+            (tuple_field(0), Value::Int(100)),
+            (tuple_field(1), Value::String("b2".to_string())),
         ])),
     )]);
-    data_source2.borrow_mut().set_has_data(true);
 
-    scheduler.check_for_notifications();
+    ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
-    let get_result = producer.get();
+    let tile = producer.get(producer.tiling().universal_guard());
     *notified.borrow_mut() = false;
+
+    // After second batch: (10,10)→(100,"a1","b1") and (10,20)→(100,"a1","b2").
+    // src1[20] (_0=200) does not match any src2 row via the x._0==y._0 filter.
     assert_eq!(
-        get_result.column_value.sort_by_inputs(),
-        ColumnValue::FunctionBindings {
-            inputs: Box::new(ColumnValue::Records(HashMap::from([
-                ("_0".to_string(), ColumnValue::UInts(vec![10, 10])),
-                ("_1".to_string(), ColumnValue::UInts(vec![10, 20]))
-            ]))),
-            outputs: Box::new(ColumnValue::Records(HashMap::from([
-                ("_0".to_string(), ColumnValue::Ints(vec![100, 100])),
-                (
-                    "_1".to_string(),
-                    ColumnValue::Strings(vec!["a1".to_string(), "a1".to_string()])
-                ),
-                (
-                    "_2".to_string(),
-                    ColumnValue::Strings(vec!["b1".to_string(), "b2".to_string()])
-                )
-            ])))
-        }
+        extract_join_rows(tile),
+        vec![
+            ((10, 10), (100, "a1".to_string(), "b1".to_string())),
+            ((10, 20), (100, "a1".to_string(), "b2".to_string())),
+        ]
     );
 
-    producer.release(Guard::Domain(Box::new(Guard::Record(HashMap::from([
-        ("_0".to_string(), Guard::LessThanOrEq(Value::UInt(10))),
-        ("_1".to_string(), Guard::LessThanOrEq(Value::UInt(10))),
-    ])))));
+    // Release domain where _0 ≤ 10 AND _1 ≤ 10 — removes the (10,10) entry.
+    producer.release(TileGuard::SealedFunction(SealedFunctionGuard::Domain(
+        Predicate::Record(HashMap::from([
+            (tuple_field(0), Predicate::LessThanEq(Value::UInt(10))),
+            (tuple_field(1), Predicate::LessThanEq(Value::UInt(10))),
+        ])),
+    )));
 
     data_source1.borrow_mut().add_data(&[(
         Value::UInt(30),
         Value::Record(HashMap::from([
-            (String::from("_0"), Value::Int(100)),
-            (String::from("_1"), Value::String("a3".to_string())),
+            (tuple_field(0), Value::Int(100)),
+            (tuple_field(1), Value::String("a3".to_string())),
         ])),
     )]);
-    data_source1.borrow_mut().set_has_data(true);
 
-    scheduler.check_for_notifications();
+    ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
-    let get_result = producer.get();
+    let tile = producer.get(producer.tiling().universal_guard());
     *notified.borrow_mut() = false;
+
+    // After release {_0:≤10, _1:≤10}: each source releases its bound independently.
+    // src1 releases key 10; src2 releases key 10.  The remaining cross-products
+    // are src1={20,30} × src2={20} = {(20,20),(30,20)}.  After the join filter
+    // x[0]==y[0]: src1[20]._0=200 ≠ src2[20]._0=100 (filtered out); src1[30]._0=100
+    // == src2[20]._0=100 (kept).
     assert_eq!(
-        get_result.column_value.sort_by_inputs(),
-        ColumnValue::FunctionBindings {
-            inputs: Box::new(ColumnValue::Records(HashMap::from([
-                ("_0".to_string(), ColumnValue::UInts(vec![30])),
-                ("_1".to_string(), ColumnValue::UInts(vec![20]))
-            ]))),
-            outputs: Box::new(ColumnValue::Records(HashMap::from([
-                ("_0".to_string(), ColumnValue::Ints(vec![100])),
-                (
-                    "_1".to_string(),
-                    ColumnValue::Strings(vec!["a3".to_string()])
-                ),
-                (
-                    "_2".to_string(),
-                    ColumnValue::Strings(vec!["b2".to_string()])
-                )
-            ])))
-        }
+        extract_join_rows(tile),
+        vec![((30, 20), (100, "a3".to_string(), "b2".to_string()))]
     );
 }

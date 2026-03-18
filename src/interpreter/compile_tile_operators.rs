@@ -38,7 +38,8 @@ use crate::{
             MapApply, MapCompose, MapExtractAggregate, MapSource, MapToConst, ScalarTuple, Split,
             TileOperator, Tiling, ToScalar, Zip,
         },
-        tuple_field, BaseType, DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, Value,
+        transform_hashmap_values, tuple_field, BaseType, DataSourceDomainExtentImpl, Extent,
+        FuncBinding, FunctionDef, Value,
     },
     util::ScopeStack,
 };
@@ -54,7 +55,12 @@ enum TileVarBinding {
     Param(Extent),
     /// Let-bound (or β-reduced lambda arg) — each reference re-compiles the
     /// bound expression. Sharing via `Split` is future work.
-    Let(Box<Expr>),
+    ///
+    /// The second field captures the binding that was active for this name
+    /// *before* this `Let` was introduced (if any). This allows [`compile_var`]
+    /// to evaluate the bound expression in its correct outer scope without
+    /// reaching back through the scope stack.
+    Let(Box<Expr>, Option<Box<TileVarBinding>>),
 }
 
 /// Compilation context for tile compilation.
@@ -137,13 +143,15 @@ impl TileCompileContext {
 
     /// Convert a CCL [`Type`] to an interpreter [`Extent`].
     ///
-    /// Handles [`Type::DataSource`] by looking the name up in the source
-    /// registry. Strips [`Type::Refinement`] wrappers (refinements are enforced
-    /// at runtime by [`Filter`] operators, not in the extent). All other types
-    /// are delegated to [`CompileContext::extent_of`].
+    /// Refinements are enforced at runtime by [`Filter`] operators and are
+    /// never materialised as [`Extent::Restricted`] in the tile-operator path.
+    /// Every [`Type::Refinement`] wrapper — at any nesting depth — is stripped
+    /// so that compound types such as `Tuple([Refinement(...), Refinement(...)])`
+    /// never produce empty, unsubscribed [`Restriction`] objects that would
+    /// panic when iterated.
     pub fn extent_of(&self, ty: &Type) -> Result<Extent, CompileError> {
         match ty {
-            // Refinements are enforced by Filter operators; strip and resolve inner.
+            // Strip refinements at every level — Filter handles them instead.
             Type::Refinement(inner, _) => self.extent_of(inner),
             // Look up the runtime impl and wrap it in DataSourceDomain.
             Type::DataSource(name) => self
@@ -151,6 +159,27 @@ impl TileCompileContext {
                 .get(name.as_str())
                 .map(|rc| Extent::DataSourceDomain(rc.clone()))
                 .ok_or_else(|| CompileError::TypeError(format!("Unknown data source: {name}"))),
+            // Recurse through compound types so nested refinements are stripped.
+            Type::Tuple(ts) => {
+                let fields: Result<HashMap<String, Extent>, _> = ts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| Ok((tuple_field(i), self.extent_of(t)?)))
+                    .collect();
+                Ok(Extent::record(fields?))
+            }
+            Type::Record(named) => {
+                let fields: Result<HashMap<String, Extent>, _> = named
+                    .iter()
+                    .map(|(name, t)| Ok((name.clone(), self.extent_of(t)?)))
+                    .collect();
+                Ok(Extent::record(fields?))
+            }
+            Type::Fun(a, b) => Ok(Extent::Function {
+                domain: Box::new(self.extent_of(a)?),
+                codomain: Box::new(self.extent_of(b)?),
+            }),
+            // Leaf types — no refinements possible, delegate to CompileContext.
             _ => CompileContext::new().extent_of(ty),
         }
     }
@@ -261,6 +290,7 @@ fn value_extent(tiling: &Tiling) -> Extent {
     match tiling {
         Tiling::Scalar(e) => e.clone(),
         Tiling::SealedFunction { codomain, .. } => codomain.extent(),
+        Tiling::Record(fields) => Extent::Record(transform_hashmap_values(fields, value_extent)),
         t => panic!("unexpected tiling in value_extent: {t:?}"),
     }
 }
@@ -371,10 +401,28 @@ fn compile_var(
 ) -> Result<Box<dyn TileOperator>, CompileError> {
     match ctx.lookup(name).cloned() {
         Some(TileVarBinding::Param(extent)) => Ok(Box::new(IterateExtent::new(extent))),
-        Some(TileVarBinding::Let(expr)) => {
+        Some(TileVarBinding::Let(expr, shadowed)) => {
             // Let-bound: re-compile the binding expression each time (sharing via
             // Split is future work).
-            compile_tile_inner(&expr, ctx)
+            //
+            // The bound expression belongs to the scope *before* this Let was
+            // introduced.  If it references `name`, evaluating it in the current
+            // scope would find this same Let binding and recurse forever.  This
+            // happens, for example, when β-reducing `(λ __iter_record → body)`
+            // applied to `Var("__iter_record")` — the new scope gets
+            // `__iter_record → Let(Var("__iter_record"), Some(Param(...)))`, so
+            // looking up `__iter_record` inside the expression would loop.
+            //
+            // Fix: if a shadowed binding was captured at bind time, restore it
+            // in a fresh scope so the expression resolves `name` correctly.
+            match shadowed {
+                Some(outer_binding) => {
+                    let mut scope = ctx.enter_scope();
+                    scope.bind(name, *outer_binding);
+                    compile_tile_inner(&expr, &mut scope)
+                }
+                None => compile_tile_inner(&expr, ctx),
+            }
         }
         None => Err(CompileError::TypeError(format!("Unbound variable: {name}"))),
     }
@@ -440,21 +488,15 @@ fn compile_apply(
             // β-reduce: compile body with param bound to argument expression.
             // Validate the type annotation is well-formed (required by infer pass).
             ctx.extent_of(&param.ty)?;
-            {
+            let body_op = {
                 let mut scope = ctx.enter_scope();
-                scope.bind(&param.name, TileVarBinding::Let(Box::new(argument.clone())));
+                let shadowed = scope.lookup(&param.name).cloned().map(Box::new);
+                scope.bind(
+                    &param.name,
+                    TileVarBinding::Let(Box::new(argument.clone()), shadowed),
+                );
                 let body_op = compile_tile_inner(body, &mut scope)?;
-                // If the lambda carries a predicate refinement and the result maps over a
-                // domain (is a SealedFunction), we must still apply the filter.  Scalar
-                // results have no domain to filter, so we skip the refinement there.
                 match refinement {
-                    Some(Refinement {
-                        kind: RefinementKind::Predicate(def),
-                        ..
-                    }) if !body_op.tiling().is_scalar() => {
-                        let pred_op = compile_tile_inner(&def.borrow(), &mut scope)?;
-                        Ok(Box::new(Filter::new(body_op, pred_op)))
-                    }
                     Some(Refinement {
                         kind: RefinementKind::HashJoin(_),
                         ..
@@ -463,7 +505,42 @@ fn compile_apply(
                     )),
                     _ => Ok(body_op),
                 }
+            }?;
+            // Predicate refinement: apply the predicate lambda to the same `argument`
+            // as the main lambda (β-reducing it here, outside the param scope).
+            // This ensures the predicate's domain matches the body's domain exactly —
+            // both are SealedFunctions over `argument`'s domain.
+            //
+            // Compiling the predicate as a standalone lambda inside the scope would
+            // instead produce a SealedFunction over the predicate lambda's own base
+            // domain (ignoring `argument`), so the Filter's HashMap lookup would find
+            // no matching domain values and discard everything.
+            let body_op = if let Some(Refinement {
+                kind: RefinementKind::Predicate(def),
+                ..
+            }) = refinement
+            {
+                if !body_op.tiling().is_scalar() {
+                    let pred_op = compile_apply(&def.borrow(), argument, ctx)?;
+                    Box::new(Filter::new(body_op, pred_op)) as Box<dyn TileOperator>
+                } else {
+                    body_op
+                }
+            } else {
+                body_op
+            };
+            // If the body is constant w.r.t. the parameter — compiled to a
+            // Scalar even though the argument has a domain — we must still
+            // iterate over that domain.  Example: `[42 for x in [1, 2]]`
+            // should yield [42, 42], not just 42.  Compile the argument here
+            // (scope already dropped) and wrap with MapToConst.
+            if body_op.tiling().is_scalar() {
+                let arg_op = compile_tile_inner(argument, ctx)?;
+                if !arg_op.tiling().is_scalar() {
+                    return Ok(Box::new(MapToConst::new(arg_op, body_op)));
+                }
             }
+            Ok(body_op)
         }
         TypedExprNode::Lambda {
             param,
@@ -472,11 +549,22 @@ fn compile_apply(
             "Lambda '{param:?}' has no type annotation in Apply; ccl::infer must run before compile_tile"
         ))),
         TypedExprNode::Source(name) => {
-            // Applying a source to a domain argument: MapSource already maps
-            // the full source domain to output values, so the domain argument
-            // is implicit. Using MapApply(arg, MapSource) would be wrong
-            // because MapApply expects a scalar function, not a SealedFunction.
-            compile_source(name, ctx)
+            // Apply the source as a point-lookup table via MapApply.
+            //
+            // `compile_source` returns `MapSource(IterateExtent(DataSourceDomain), src)`,
+            // a `SealedFunction(DataSourceDomain, element)`.  The `argument` provides
+            // the keys to look up — for single-generator comprehensions it is
+            // `Var("__iter_record")` with type `DataSource(name)`, so it compiles to
+            // `IterateExtent(DataSourceDomain)` and `MapApply` is equivalent to
+            // `MapSource` directly.  For multi-generator comprehensions the argument
+            // is `TupleIndex(Var("__iter_record"), i)`, which has tiling
+            // `SealedFunction(cross_product_record_extent, DataSourceDomain(src_i))`.
+            // Using `MapApply` in both cases ensures the output tile carries the
+            // correct outer domain (the cross-product extent), threading it through
+            // the source lookup.
+            let source_op = compile_source(name, ctx)?;
+            let arg_op = compile_tile_inner(argument, ctx)?;
+            Ok(map_apply(arg_op, source_op))
         }
         _ => {
             // Non-lambda function: use Map(input=arg, function=f).
@@ -536,7 +624,11 @@ fn compile_let(
     ctx.extent_of(bound_ty)?;
     {
         let mut scope = ctx.enter_scope();
-        scope.bind(name, TileVarBinding::Let(Box::new(bound_expr.clone())));
+        let shadowed = scope.lookup(name).cloned().map(Box::new);
+        scope.bind(
+            name,
+            TileVarBinding::Let(Box::new(bound_expr.clone()), shadowed),
+        );
         compile_tile_inner(body, &mut scope)
     }
 }
@@ -583,6 +675,19 @@ fn compile_tuple(
     }
 }
 
+fn get_field_extent(record_extent: &Extent, field_name: &str) -> Result<Extent, CompileError> {
+    match &record_extent {
+        Extent::Record(fields) => fields
+            .get(field_name)
+            .cloned()
+            .ok_or_else(|| CompileError::TypeError(format!("Tuple has no field {field_name}"))),
+        Extent::Restricted { base, .. } => get_field_extent(base, field_name),
+        other => Err(CompileError::TypeError(format!(
+            "TupleIndex applied to non-record extent {other:?}"
+        ))),
+    }
+}
+
 /// Compile `tuple[idx]` as `Map(compile(tuple), Constant(RecordField(_idx)))`.
 fn compile_tuple_index(
     tuple: &Expr,
@@ -592,17 +697,7 @@ fn compile_tuple_index(
     let tuple_op = compile_tile_inner(tuple, ctx)?;
     let record_extent = value_extent(tuple_op.tiling());
     let field_name = tuple_field(idx);
-    let field_extent = match &record_extent {
-        Extent::Record(fields) => fields
-            .get(&field_name)
-            .cloned()
-            .ok_or_else(|| CompileError::TypeError(format!("Tuple has no field {field_name}")))?,
-        other => {
-            return Err(CompileError::TypeError(format!(
-                "TupleIndex applied to non-record extent {other:?}"
-            )))
-        }
-    };
+    let field_extent = get_field_extent(&record_extent, &field_name)?;
     let fn_value = Value::ComputableFunction(FunctionDef::RecordField(field_name));
     let fn_extent = Extent::Function {
         domain: Box::new(record_extent),
@@ -670,7 +765,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, CompileError> {
 /// resolving to a `Let` binding.
 fn resolve_to_expr<'a>(expr: &'a Expr, ctx: &'a TileCompileContext) -> &'a Expr {
     if let TypedExprNode::Var(name) = &expr.node {
-        if let Some(TileVarBinding::Let(inner)) = ctx.lookup(name) {
+        if let Some(TileVarBinding::Let(inner, _)) = ctx.lookup(name) {
             return resolve_to_expr(inner, ctx);
         }
     }

@@ -159,6 +159,13 @@ impl CompileContext {
                     .collect();
                 Ok(Extent::record(fields?))
             }
+            Type::Record(fields) => Ok(Extent::Record({
+                let mut m = HashMap::new();
+                for (f, ty) in fields.iter() {
+                    m.insert(f.clone(), self.extent_of(ty)?);
+                }
+                m
+            })),
             Type::Refinement(ty, refinement) => {
                 if let Some(cached) = self.compiled_refined_types.get(&refinement.id) {
                     return Ok(cached.clone());
