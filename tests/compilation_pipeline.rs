@@ -113,7 +113,9 @@ fn run_pipeline(code: &str) -> ColumnValue {
 
     debug!("Lowered:\n{}", symbolic(&expr));
 
-    infer(&mut expr, ctx.inference_ctx()).expect("type inference failed");
+    let ictx = ctx.inference_ctx();
+    infer(&mut expr, ictx).expect("type inference failed");
+    cambra::ccl::unify::resolve(&mut expr, &mut ictx.table);
 
     debug!("Inferred:\n{}", symbolic(&expr));
 

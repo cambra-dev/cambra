@@ -25,7 +25,10 @@ use std::ops::{Deref, DerefMut};
 
 use log::trace;
 
-use crate::ccl::{BinOpKind, Expr, Lit, RefinementKind, Type, TypedExprNode};
+use crate::ccl::{
+    fresh_infer_var_id, unify::UnificationTable, BinOpKind, Expr, InferVarId, Lit, RefinementKind,
+    Type, TypedExprNode,
+};
 // TODO: once `BaseType` moves to `ccl`, this import goes away.
 use crate::interpreter::BaseType;
 use crate::util::ScopeStack;
@@ -36,19 +39,26 @@ use crate::util::ScopeStack;
 
 /// Context for the CCL type-inference pass.
 ///
-/// Combines a lexical scope stack (for lambda parameters and let bindings)
-/// with a registry of externally-registered data-source types.
-/// Source types are consulted when [`infer`] encounters an [`Expr::Source`] node.
+/// Combines a lexical scope stack (for lambda parameters and let bindings),
+/// a registry of externally-registered data-source types, and a
+/// [`UnificationTable`] that tracks solved and unified inference variables.
 ///
 /// Scopes are entered and exited exclusively via [`enter_scope`](TypeInferenceContext::enter_scope);
 /// each lambda body and let binding gets its own scope.
 #[derive(Default)]
 pub struct TypeInferenceContext {
-    /// Lexical scopes
+    /// Lexical scopes mapping variable names to their types.
     scopes: ScopeStack<Type>,
 
-    /// Types of known sources
+    /// Types of known externally-registered data sources.
     source_types: HashMap<String, Type>,
+
+    /// Union-Find table tracking solved and unified inference variables.
+    ///
+    /// Every inference variable allocated via [`fresh_infer_var`](Self::fresh_infer_var) is
+    /// registered here. The post-inference [`resolve`](crate::ccl::unify::resolve)
+    /// pass uses it to replace `Infer(id)` placeholders with concrete types.
+    pub table: UnificationTable,
 }
 
 /// RAII guard returned by [`TypeInferenceContext::enter_scope`].
@@ -92,6 +102,18 @@ impl TypeInferenceContext {
     pub fn enter_scope(&mut self) -> TypeInferenceContextGuard<'_> {
         self.scopes.push_scope();
         TypeInferenceContextGuard { ctx: self }
+    }
+
+    /// Allocate a fresh inference variable, register it in the [`UnificationTable`],
+    /// and return its ID.
+    ///
+    /// Use this instead of calling [`fresh_infer_var_id`] directly whenever you need
+    /// a new variable during inference — the table entry is required for the
+    /// post-inference resolution pass.
+    pub fn fresh_infer_var(&mut self) -> InferVarId {
+        let id = fresh_infer_var_id();
+        self.table.register(id);
+        id
     }
 
     /// Register the CCL type for an externally-managed data source.
@@ -160,8 +182,21 @@ pub enum InferError {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Run limited type inference on `expr`, mutating the tree in place to fill
-/// in `ty` on every [`TypedExpr`](crate::ccl::TypedExpr) node.
+/// Run type inference on `expr`, then resolve all inference variables.
+///
+/// Public entry point for the CCL type-inference pass. Calls [`infer_expr`]
+/// to annotate every node, then calls [`crate::ccl::unify::resolve`] to
+/// substitute solved inference-variable placeholders with their concrete types.
+///
+/// After this call returns `Ok`, the tree is fully annotated and contains no
+/// `Type::Hole` or (ideally) `Type::Infer` placeholders.
+pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
+    let ty = infer_expr(expr, ctx)?;
+    crate::ccl::unify::resolve(expr, &mut ctx.table);
+    Ok(ty)
+}
+
+/// Walk `expr` and fill in `ty` on every node. Does not call `resolve`.
 ///
 /// Currently handled:
 ///
@@ -177,19 +212,21 @@ pub enum InferError {
 ///   key lambda's parameter (mirrors how `Apply` annotates its lambda argument);
 ///   returns `Fun(KeyType, Fun(UInt, ValueType))`
 ///
-/// Returns [`Type::Unknown`] for unhandled cases or when component types cannot
-/// be determined. BinOp type rules and full constraint solving are deferred;
-/// see the TODOs throughout this module.
-///
-/// After computing the result type, checks `expr.user_annotation` compatibility
-/// and stores the final type in `expr.ty`.
+/// Returns a fresh [`Type::Infer`] variable for unhandled cases or when component
+/// types cannot be determined. BinOp type rules and full constraint solving are
+/// deferred; see the TODOs throughout this module.
 ///
 /// Errors propagate from sub-expressions: an [`InferError::UnboundVariable`]
 /// anywhere in the tree aborts inference and returns the error.
-///
-/// The `ctx` scope stack is left at the same depth on return as on entry,
-/// even if an error is returned midway.
-pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
+fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
+    // Register a fresh inference variable now so the table entry exists for the
+    // solution recording step at the bottom of this function. If we skipped
+    // this, the table would have no id to record the solution against and
+    // resolve() would be unable to substitute the type back into the tree.
+    if matches!(expr.ty, Type::Hole) {
+        expr.ty = Type::Infer(ctx.fresh_infer_var());
+    }
+
     let result_ty = match &mut expr.node {
         // ----- Literals -----
         TypedExprNode::Lit(lit) => Ok(lit_type(lit)),
@@ -201,66 +238,22 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
             .ok_or_else(|| InferError::UnboundVariable(name.clone())),
 
         // ----- Lambda abstraction -----
-        //
-        // If param.ty is Unknown, use collect_param_constraint to find a
-        // usage-site type constraint before proceeding.
         TypedExprNode::Lambda {
             param,
             body,
             refinement,
-        } => {
-            if param.ty == Type::Unknown {
-                let constraint = collect_param_constraint(&param.name, body, ctx)?;
-                match constraint {
-                    Some(inferred) => {
-                        // If a user annotation is present, verify it matches.
-                        if let Some(ref annotation) = param.user_annotation {
-                            if *annotation != inferred {
-                                return Err(InferError::AnnotationMismatch {
-                                    annotation: annotation.clone(),
-                                    inferred,
-                                });
-                            }
-                        }
-                        param.ty = inferred;
-                    }
-                    None => {
-                        // Body provides no usable constraint. If the user wrote an annotation,
-                        // trust it — the annotation *is* the type (no inference needed to
-                        // confirm it). Without an annotation there is no information at all.
-                        match param.user_annotation.clone() {
-                            Some(annotation) => param.ty = annotation,
-                            None => return Err(InferError::CannotInferParam(param.name.clone())),
-                        }
-                    }
-                }
-            }
-            // param.ty is now known; infer the body in a scope with param bound.
-            let mut p = param.ty.clone();
-            let param_name = param.name.clone();
-            let body_ty = {
-                let mut scoped = ctx.enter_scope();
-                scoped.bind(&param_name, p.clone());
-                infer(body, &mut scoped)?
-            };
-            // Predicate is inferred in the outer scope (param not in scope).
-            // This reflects that the refinement predicate is a constraint on the
-            // *call site*, not an expression in the lambda body.
-            if let Some(refinement) = refinement {
-                if let RefinementKind::Predicate(def) = &refinement.kind {
-                    infer(&mut def.borrow_mut(), ctx)?;
-                }
-                p = Type::Refinement(Box::new(p), refinement.clone())
-            }
-            Ok(Type::Fun(Box::new(p), Box::new(body_ty)))
-        }
+        } => infer_lambda(param, body, refinement, ctx),
 
+        // ----- Aggregation -----
         TypedExprNode::Aggregate { input, kind } => {
-            let input_type = infer(input, ctx)?;
+            let input_type = infer_expr(input, ctx)?;
             let input_codomain = input_type
                 .codomain()
                 .ok_or_else(|| InferError::TypeMismatch {
-                    expected: Type::Fun(Box::new(Type::Unknown), Box::new(Type::Unknown)),
+                    expected: Type::Fun(
+                        Box::new(Type::Infer(ctx.fresh_infer_var())),
+                        Box::new(Type::Infer(ctx.fresh_infer_var())),
+                    ),
                     found: input_type,
                 })?;
             kind.output_type(&input_codomain).ok_or_else(|| {
@@ -269,135 +262,44 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         }
 
         // ----- Function application -----
-        //
-        // Two cases:
-        //   Annotate: function is an unannotated Lambda — infer the argument
-        //     type and write it onto the lambda's param_ty before continuing.
-        //   Lookup: function is any other expression (Var, Apply, List,
-        //     or an already-annotated Lambda) — typed by reading without mutation.
-        TypedExprNode::Apply { function, argument } => {
-            let arg_ty = infer(argument, ctx)?;
-            if let TypedExprNode::Lambda { param, .. } = &mut function.node {
-                if param.ty == Type::Unknown {
-                    // If the function is a lambda with unknown type, infer it from the argument.
-                    // If a user annotation is present, verify it matches before accepting arg_ty.
-                    if let Some(ref annotation) = param.user_annotation {
-                        if *annotation != arg_ty {
-                            return Err(InferError::AnnotationMismatch {
-                                annotation: annotation.clone(),
-                                inferred: arg_ty,
-                            });
-                        }
-                    }
-                    param.ty = arg_ty.clone();
-                }
-            }
-
-            // Infer function type and return its codomain.
-            match infer(function, ctx)? {
-                Type::Fun(domain, codomain) => {
-                    check_type_compatibility(&domain, &arg_ty)?;
-                    Ok(*codomain)
-                }
-                _ => Ok(Type::Unknown),
-            }
-        }
+        TypedExprNode::Apply { function, argument } => infer_apply(function, argument, ctx),
 
         // ----- List literal -----
-        //
-        // Type is Fun(UIntRange(n), elem_ty) where elem_ty is inferred from
-        // the first element. Returns Unknown for empty lists or when the first
-        // element's type is Unknown.
-        TypedExprNode::List(elts) => {
-            let Some(first) = elts.first_mut() else {
-                return Ok(Type::Unknown);
-            };
-            let elem_ty = match infer(first, ctx)? {
-                Type::Unknown => return Ok(Type::Unknown),
-                ty => ty,
-            };
-            let n = elts.len();
-            Ok(Type::Fun(Box::new(Type::UIntRange(n)), Box::new(elem_ty)))
-        }
+        TypedExprNode::List(elts) => infer_list(elts, ctx),
 
         // ----- Binary operation -----
-        //
-        // Recurse into both operands for mutation side-effects.
-        TypedExprNode::BinOp { left, right, op } => {
-            let left_ty = infer(left, ctx)?;
-            let right_ty = infer(right, ctx)?;
-
-            // TODO this is the wrong place to do this.  Once we are consistently
-            // doing type annotations everywhere, this should be in the compile step.
-            if *op == BinOpKind::Arithmetic(super::ArithmeticKind::Add)
-                && left_ty == Type::Base(BaseType::String)
-                && right_ty == Type::Base(BaseType::String)
-            {
-                *op = BinOpKind::Concat;
-            }
-
-            Ok(match op {
-                BinOpKind::Arithmetic(..) => left_ty,
-                BinOpKind::Concat => Type::Base(BaseType::String),
-                BinOpKind::BoolLogic(..) | BinOpKind::Compare(..) => Type::Base(BaseType::Bool),
-            })
-        }
+        TypedExprNode::BinOp { left, right, op } => infer_binop(left, op, right, ctx),
 
         // ----- Unary operation -----
         //
         // Recurse into the operand for mutation side-effects.
         // TODO: add unary type rules.
         TypedExprNode::UnaryOp(_, inner) => {
-            infer(inner, ctx)?;
-            Ok(Type::Unknown)
+            infer_expr(inner, ctx)?;
+            Ok(Type::Infer(ctx.fresh_infer_var()))
         }
 
         // ----- Let binding -----
-        //
-        // Infer the value type, check any user annotation on the binding site,
-        // fill binding.ty, bind the name in a new scope, infer the body, return
-        // the body type.
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
-        } => {
-            let bound_ty = infer(bound_expr, ctx)?;
-            // Check user annotation on the binding site (e.g. `x: Int = expr`)
-            // against the inferred expression type.
-            if let Some(ref annotation) = binding.user_annotation {
-                if *annotation != bound_ty {
-                    return Err(InferError::AnnotationMismatch {
-                        annotation: annotation.clone(),
-                        inferred: bound_ty,
-                    });
-                }
-            }
-            if binding.ty == Type::Unknown {
-                binding.ty = bound_ty.clone();
-            }
-            let body_ty = {
-                let mut scoped = ctx.enter_scope();
-                scoped.bind(&binding.name, bound_ty);
-                infer(body, &mut scoped)?
-            };
-            Ok(body_ty)
-        }
+        } => infer_let(binding, bound_expr, body, ctx),
 
         // ----- Case -----
         //
         // Recurse into the scrutinee and arms for mutation side-effects.
         // Pattern variable bindings are not pushed into scope; arms with
-        // unbound variables silently produce Unknown rather than aborting.
+        // unbound variables silently produce Infer rather than aborting.
         TypedExprNode::Case {
             scrutinee,
             branches,
         } => {
-            infer(scrutinee, ctx)?;
+            infer_expr(scrutinee, ctx)?;
             for (_, arm) in branches.iter_mut() {
-                let _ = infer(arm, ctx);
+                let _ = infer_expr(arm, ctx);
             }
-            Ok(Type::Unknown)
+            Ok(Type::Infer(ctx.fresh_infer_var()))
         }
 
         // ----- Tuple constructor -----
@@ -405,7 +307,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         // Infer each element in order and return their types as a Tuple type.
         TypedExprNode::Tuple(elts) => {
             let types: Result<Vec<Type>, InferError> =
-                elts.iter_mut().map(|e| infer(e, ctx)).collect();
+                elts.iter_mut().map(|e| infer_expr(e, ctx)).collect();
             Ok(Type::Tuple(types?))
         }
 
@@ -414,53 +316,25 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
         // Infer the tuple expression, then return the element type at the given index.
         // Returns Unknown if the expression is not a known Tuple type or the index is out of bounds.
         TypedExprNode::TupleIndex(tuple, idx) => {
-            let ty = infer(tuple, ctx)?;
+            let ty = infer_expr(tuple, ctx)?;
             let idx = *idx;
             Ok(match ty {
-                Type::Tuple(types) => types.into_iter().nth(idx).unwrap_or(Type::Unknown),
-                _ => Type::Unknown,
+                Type::Tuple(types) => types
+                    .into_iter()
+                    .nth(idx)
+                    .unwrap_or_else(|| Type::Infer(ctx.fresh_infer_var())),
+                _ => Type::Infer(ctx.fresh_infer_var()),
             })
         }
 
         // ----- GroupBy -----
-        //
-        // Infer the collection type; its codomain is the element type fed into
-        // the key function.  If the key is an unannotated lambda, write the
-        // element type onto param_ty before inferring the key body — the same
-        // pattern used by Apply to annotate its lambda argument.
-        //
-        // Result type: Fun(KeyType, Fun(UInt, ValueType))
-        //   - KeyType  = codomain of the key function type
-        //   - UInt     = unbounded unsigned index into each group
-        //   - ValueType = element type of the collection
-        // Falls back to Unknown for any component that cannot be inferred.
-        TypedExprNode::GroupBy { collection, key } => {
-            let coll_ty = infer(collection, ctx)?;
-            let elem_ty = coll_ty.codomain();
-            if let Some(ref et) = elem_ty {
-                if let TypedExprNode::Lambda { param, .. } = &mut key.node {
-                    // If the key lambda's param type is unknown, infer it from the collection element type.
-                    if param.ty == Type::Unknown {
-                        param.ty = et.clone();
-                    }
-                }
-            }
-            let key_fn_ty = infer(key, ctx)?;
-            let key_output_ty = key_fn_ty.codomain();
-            match (key_output_ty, elem_ty) {
-                (Some(k), Some(v)) => Ok(Type::Fun(
-                    Box::new(k),
-                    Box::new(Type::Fun(Box::new(Type::Base(BaseType::UInt)), Box::new(v))),
-                )),
-                _ => Ok(Type::Unknown),
-            }
-        }
+        TypedExprNode::GroupBy { collection, key } => infer_groupby(collection, key, ctx),
 
         // ----- Join / Jump / Record -----
         //
         // Not yet handled by this pass; sub-expressions are not visited.
         TypedExprNode::Join { .. } | TypedExprNode::Jump { .. } | TypedExprNode::Record(_) => {
-            Ok(Type::Unknown)
+            Ok(Type::Infer(ctx.fresh_infer_var()))
         }
 
         // ----- External data source reference -----
@@ -478,15 +352,258 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
     //
     // Note: we always infer the full subtree before checking user_annotation.
     // Skipping recursion when an annotation is present would leave sub-node `ty`
-    // fields as Unknown and miss lambda-param mutations at Apply/GroupBy sites.
+    // fields as Infer and miss lambda-param mutations at Apply/GroupBy sites.
     if let Some(ref annotation) = expr.user_annotation {
         check_type_compatibility(annotation, &result_ty)?;
+        // Record the solution in the table if this node started with an Infer var.
+        if let Type::Infer(id) = expr.ty {
+            ctx.table.set(id, annotation.clone());
+        }
         expr.ty = annotation.clone();
         return Ok(annotation.clone());
     }
 
+    // Record the solved type in the unification table so the post-inference
+    // resolution pass can substitute Infer placeholders in the tree.
+    if let Type::Infer(id) = expr.ty {
+        if !matches!(result_ty, Type::Infer(_)) {
+            ctx.table.set(id, result_ty.clone());
+        }
+    }
+
     expr.ty = result_ty.clone();
     Ok(result_ty)
+}
+
+// ---------------------------------------------------------------------------
+// Non-trivial match-arm helpers
+// ---------------------------------------------------------------------------
+
+/// Infer the type of a [`TypedExprNode::Lambda`] node.
+///
+/// Resolves the parameter type (either from a user annotation, a call-site
+/// constraint collected by [`collect_param_constraint`], or a `Hole → Infer`
+/// conversion), then infers the body type inside a fresh scope.
+fn infer_lambda(
+    param: &mut crate::ccl::TypedBinding,
+    body: &mut Expr,
+    refinement: &mut Option<crate::ccl::Refinement>,
+    ctx: &mut TypeInferenceContext,
+) -> Result<Type, InferError> {
+    // Normalize Hole → fresh registered Infer before existing param-type logic.
+    if matches!(param.ty, Type::Hole) {
+        param.ty = Type::Infer(ctx.fresh_infer_var());
+    }
+    if matches!(param.ty, Type::Infer(_)) {
+        let constraint = collect_param_constraint(&param.name, body, ctx)?;
+        match constraint {
+            Some(inferred) => {
+                // If a user annotation is present, verify it matches.
+                if let Some(ref annotation) = param.user_annotation {
+                    if *annotation != inferred {
+                        return Err(InferError::AnnotationMismatch {
+                            annotation: annotation.clone(),
+                            inferred,
+                        });
+                    }
+                }
+                param.ty = inferred;
+            }
+            None => {
+                // Body provides no usable constraint. If the user wrote an annotation,
+                // trust it — the annotation *is* the type (no inference needed to
+                // confirm it). Without an annotation there is no information at all.
+                match &param.user_annotation {
+                    Some(annotation) => param.ty = annotation.clone(),
+                    None => return Err(InferError::CannotInferParam(param.name.clone())),
+                }
+            }
+        }
+    }
+    // param.ty is now known; infer the body in a scope with param bound.
+    let mut p = param.ty.clone();
+    let param_name = param.name.clone();
+    let body_ty = {
+        let mut scoped = ctx.enter_scope();
+        scoped.bind(&param_name, p.clone());
+        infer_expr(body, &mut scoped)?
+    };
+    // Predicate is inferred in the outer scope (param not in scope).
+    // This reflects that the refinement predicate is a constraint on the
+    // *call site*, not an expression in the lambda body.
+    if let Some(refinement) = refinement {
+        if let RefinementKind::Predicate(def) = &refinement.kind {
+            infer_expr(&mut def.borrow_mut(), ctx)?;
+        }
+        p = Type::Refinement(Box::new(p), refinement.clone())
+    }
+    Ok(Type::Fun(Box::new(p), Box::new(body_ty)))
+}
+
+/// Infer the type of a [`TypedExprNode::Apply`] node.
+///
+/// If the function is an unannotated lambda, annotates its parameter type from
+/// the argument, then infers the function type and returns its codomain.
+fn infer_apply(
+    function: &mut Expr,
+    argument: &mut Expr,
+    ctx: &mut TypeInferenceContext,
+) -> Result<Type, InferError> {
+    let arg_ty = infer_expr(argument, ctx)?;
+    if let TypedExprNode::Lambda { param, .. } = &mut function.node {
+        // Normalize Hole → fresh registered Infer before existing param-type logic.
+        if matches!(param.ty, Type::Hole) {
+            param.ty = Type::Infer(ctx.fresh_infer_var());
+        }
+        if matches!(param.ty, Type::Infer(_)) {
+            // If the function is a lambda with unresolved type, infer it from the argument.
+            // If a user annotation is present, verify it matches before accepting arg_ty.
+            if let Some(ref annotation) = param.user_annotation {
+                if *annotation != arg_ty {
+                    return Err(InferError::AnnotationMismatch {
+                        annotation: annotation.clone(),
+                        inferred: arg_ty,
+                    });
+                }
+            }
+            param.ty = arg_ty.clone();
+        }
+    }
+    // Infer function type and return its codomain.
+    match infer_expr(function, ctx)? {
+        Type::Fun(domain, codomain) => {
+            check_type_compatibility(&domain, &arg_ty)?;
+            Ok(*codomain)
+        }
+        _ => Ok(Type::Infer(ctx.fresh_infer_var())),
+    }
+}
+
+/// Infer the type of a [`TypedExprNode::Let`] node.
+///
+/// Infers the bound expression type, checks any user annotation on the binding
+/// site, fills `binding.ty`, then infers the body in a fresh scope.
+fn infer_let(
+    binding: &mut crate::ccl::TypedBinding,
+    bound_expr: &mut Expr,
+    body: &mut Expr,
+    ctx: &mut TypeInferenceContext,
+) -> Result<Type, InferError> {
+    let bound_ty = infer_expr(bound_expr, ctx)?;
+    // Check user annotation on the binding site (e.g. `x: Int = expr`)
+    // against the inferred expression type.
+    if let Some(ref annotation) = binding.user_annotation {
+        if *annotation != bound_ty {
+            return Err(InferError::AnnotationMismatch {
+                annotation: annotation.clone(),
+                inferred: bound_ty,
+            });
+        }
+    }
+    // Normalize Hole → fresh registered Infer before existing binding-type logic.
+    if matches!(binding.ty, Type::Hole) {
+        binding.ty = Type::Infer(ctx.fresh_infer_var());
+    }
+    // Move bound_ty into binding.ty when unresolved, avoiding a clone.
+    // The scope bind then clones from binding.ty instead of from bound_ty.
+    if matches!(binding.ty, Type::Infer(_)) {
+        binding.ty = bound_ty;
+    }
+    let body_ty = {
+        let mut scoped = ctx.enter_scope();
+        scoped.bind(&binding.name, binding.ty.clone());
+        infer_expr(body, &mut scoped)?
+    };
+    Ok(body_ty)
+}
+
+/// Infer the type of a [`TypedExprNode::List`] node.
+///
+/// Returns `Fun(UIntRange(n), elem_ty)` where `elem_ty` is derived from the
+/// first element. Returns a fresh inference variable for empty lists or when
+/// the first element's type is itself an unresolved inference variable.
+fn infer_list(elts: &mut [Expr], ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
+    let Some(first) = elts.first_mut() else {
+        return Ok(Type::Infer(ctx.fresh_infer_var()));
+    };
+    let elem_ty = match infer_expr(first, ctx)? {
+        Type::Infer(_) => return Ok(Type::Infer(ctx.fresh_infer_var())),
+        ty => ty,
+    };
+    // Visit remaining elements to eliminate Type::Hole placeholders and
+    // propagate type information through sub-expressions. The list element
+    // type is still derived from the first element only (all elements are
+    // assumed homogeneous); errors from remaining elements are silently
+    // dropped because the type has already been determined.
+    for rest in elts.iter_mut().skip(1) {
+        let _ = infer_expr(rest, ctx);
+    }
+    let n = elts.len();
+    Ok(Type::Fun(Box::new(Type::UIntRange(n)), Box::new(elem_ty)))
+}
+
+/// Infer the type of a [`TypedExprNode::BinOp`] node.
+///
+/// Recurses into both operands, rewriting `Add` to `Concat` when both sides
+/// are `String`, then returns the result type based on the operator kind.
+fn infer_binop(
+    left: &mut Expr,
+    op: &mut BinOpKind,
+    right: &mut Expr,
+    ctx: &mut TypeInferenceContext,
+) -> Result<Type, InferError> {
+    let left_ty = infer_expr(left, ctx)?;
+    let right_ty = infer_expr(right, ctx)?;
+
+    // TODO this is the wrong place to do this.  Once we are consistently
+    // doing type annotations everywhere, this should be in the compile step.
+    if *op == BinOpKind::Arithmetic(super::ArithmeticKind::Add)
+        && left_ty == Type::Base(BaseType::String)
+        && right_ty == Type::Base(BaseType::String)
+    {
+        *op = BinOpKind::Concat;
+    }
+
+    Ok(match op {
+        BinOpKind::Arithmetic(..) => left_ty,
+        BinOpKind::Concat => Type::Base(BaseType::String),
+        BinOpKind::BoolLogic(..) | BinOpKind::Compare(..) => Type::Base(BaseType::Bool),
+    })
+}
+
+/// Infer the type of a [`TypedExprNode::GroupBy`] node.
+///
+/// Infers the collection type, propagates the element type onto the key
+/// lambda's parameter (mirroring the `Apply` rule), then returns
+/// `Fun(KeyType, Fun(UInt, ValueType))`.
+fn infer_groupby(
+    collection: &mut Expr,
+    key: &mut Expr,
+    ctx: &mut TypeInferenceContext,
+) -> Result<Type, InferError> {
+    let coll_ty = infer_expr(collection, ctx)?;
+    let elem_ty = coll_ty.codomain();
+    if let Some(ref et) = elem_ty {
+        if let TypedExprNode::Lambda { param, .. } = &mut key.node {
+            // Normalize Hole → fresh registered Infer before existing param-type logic.
+            if matches!(param.ty, Type::Hole) {
+                param.ty = Type::Infer(ctx.fresh_infer_var());
+            }
+            // If the key lambda's param type is unresolved, infer it from the collection element type.
+            if matches!(param.ty, Type::Infer(_)) {
+                param.ty = et.clone();
+            }
+        }
+    }
+    let key_fn_ty = infer_expr(key, ctx)?;
+    let key_output_ty = key_fn_ty.codomain();
+    match (key_output_ty, elem_ty) {
+        (Some(k), Some(v)) => Ok(Type::Fun(
+            Box::new(k),
+            Box::new(Type::Fun(Box::new(Type::Base(BaseType::UInt)), Box::new(v))),
+        )),
+        _ => Ok(Type::Infer(ctx.fresh_infer_var())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -497,11 +614,15 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
 ///
 /// Returns `Ok(())` if:
 /// - types are equal
-/// - either type is `Type::Unknown` (deferred)
+/// - either type is [`Type::Infer`] (deferred — the variable will be resolved later)
+/// - either type is [`Type::Hole`] (lowering placeholder — not yet assigned)
 ///
 /// Otherwise returns `Err(InferError::TypeMismatch)`.
 fn check_type_compatibility(expected: &Type, found: &Type) -> Result<(), InferError> {
-    if expected == found || expected == &Type::Unknown || found == &Type::Unknown {
+    if expected == found
+        || matches!(expected, Type::Hole | Type::Infer(_))
+        || matches!(found, Type::Hole | Type::Infer(_))
+    {
         Ok(())
     } else {
         Err(InferError::TypeMismatch {
@@ -549,16 +670,18 @@ fn collect_param_constraint(
 ) -> Result<Option<Type>, InferError> {
     let mut constraints = Vec::new();
     collect_constraints_into(param, body, ctx, &mut constraints);
-    let result = reconcile_constraints(constraints.clone());
-    trace!("Collected constraints for {param}: {constraints:?}, got {result:?}");
+    // Log before consuming constraints so we avoid cloning the Vec for the trace.
+    trace!("Collected constraints for {param}: {constraints:?}");
+    let result = reconcile_constraints(constraints);
+    trace!("Reconciled to {result:?}");
     result
 }
 
 /// Accumulate every type constraint for `param` found in `body` into `out`.
 ///
-/// For each `Apply(func, Var(param))` encountered, calls [`infer`] on `func`
-/// and, if the result is a `Fun` type, pushes its domain onto `out`. Does not
-/// short-circuit: all matching sites in the entire subtree are visited.
+/// For each `Apply(func, Var(param))` encountered, calls [`infer_expr`] on
+/// `func` and, if the result is a `Fun` type, pushes its domain onto `out`.
+/// Does not short-circuit: all matching sites in the entire subtree are visited.
 ///
 /// Does not recurse into `Lambda` nodes that shadow `param`.
 fn collect_constraints_into(
@@ -572,7 +695,7 @@ fn collect_constraints_into(
             // If argument is Var(param), the domain of function's type is the constraint.
             match &argument.node {
                 TypedExprNode::Var(v) if v == param => {
-                    if let Ok(Type::Fun(domain, _)) = infer(function, ctx) {
+                    if let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx) {
                         out.push(TypeConstraint::Type(*domain));
                         // Don't recurse: function was already inferred (possibly mutated),
                         // and argument = Var(param) has no sub-patterns to search.
@@ -582,7 +705,7 @@ fn collect_constraints_into(
                 TypedExprNode::TupleIndex(tuple, idx) => {
                     let idx = *idx;
                     if matches!(&tuple.node, TypedExprNode::Var(v) if v == param) {
-                        if let Ok(Type::Fun(domain, _)) = infer(function, ctx) {
+                        if let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx) {
                             out.push(TypeConstraint::TupleField(idx, *domain));
                             return;
                         }
@@ -674,7 +797,7 @@ fn reconcile_constraints(constraints: Vec<TypeConstraint>) -> Result<Option<Type
             }
             TypeConstraint::TupleField(idx, ty) => {
                 let prev = tuple_type.insert(idx, ty.clone());
-                if prev.clone().map(|p| p != ty).unwrap_or(false) {
+                if prev.as_ref().is_some_and(|p| p != &ty) {
                     return Err(InferError::TypeMismatch {
                         expected: prev.unwrap(),
                         found: ty,
@@ -759,7 +882,7 @@ mod tests {
         // Apply(λ x → x, 42) should annotate x : Int and return Int.
         let mut expr = Expr::apply(
             Expr::lit(Lit::Int(42)),
-            Expr::lambda("x", Type::Unknown, Expr::var("x")),
+            Expr::lambda("x", Type::infer(), Expr::var("x")),
         );
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::Int));
@@ -793,7 +916,10 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::list(vec![]);
         let ty = infer(&mut expr, &mut ctx).unwrap();
-        assert_eq!(ty, Type::Unknown);
+        assert!(
+            matches!(ty, Type::Infer(_)),
+            "empty list should return an inference variable"
+        );
     }
 
     #[test]
@@ -807,7 +933,7 @@ mod tests {
     fn test_infer_cannot_infer_param() {
         let mut ctx = TypeInferenceContext::new();
         // λ x → x  — standalone; x is referenced but never used as an Apply argument.
-        let mut expr = Expr::lambda("x", Type::Unknown, Expr::var("x"));
+        let mut expr = Expr::lambda("x", Type::infer(), Expr::var("x"));
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(result, Err(InferError::CannotInferParam("x".into())));
     }
@@ -816,17 +942,17 @@ mod tests {
     ///
     /// Produces:
     /// ```text
-    /// λ __list_comp_var (Unknown) →
-    ///   Apply(λ var (Unknown) → elt,
+    /// λ __list_comp_var (?N) →
+    ///   Apply(λ var (?M) → elt,
     ///         Apply(source, Var(__list_comp_var)))
     /// ```
     fn list_comp_unannotated(source: Expr, var: &str, elt: Expr) -> Expr {
         Expr::lambda(
             "__list_comp_var",
-            Type::Unknown,
+            Type::infer(),
             Expr::apply(
                 Expr::apply(Expr::var("__list_comp_var"), source),
-                Expr::lambda(var, Type::Unknown, elt),
+                Expr::lambda(var, Type::infer(), elt),
             ),
         )
     }
@@ -919,7 +1045,7 @@ mod tests {
         let g = Expr::lambda("b", g_param_ty, Expr::var("b"));
         Expr::lambda(
             "x",
-            Type::Unknown,
+            Type::infer(),
             Expr::binop(
                 Expr::apply(Expr::var("x"), f),
                 BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -995,7 +1121,7 @@ mod tests {
         let mut expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: "x".into(),
-                ty: Type::Unknown,
+                ty: Type::infer(),
                 user_annotation: Some(Type::Base(BaseType::String)),
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(42))),
@@ -1059,7 +1185,7 @@ mod tests {
         let f_string = Expr::lambda("b", Type::Base(BaseType::String), Expr::var("b"));
         let mut expr = Expr::lambda(
             "x",
-            Type::Unknown,
+            Type::infer(),
             Expr::let_bind(
                 "x",
                 Expr::lit(Lit::Int(42)),
@@ -1320,7 +1446,7 @@ mod tests {
                 Expr::lit(Lit::Int(2)),
                 Expr::lit(Lit::Int(3)),
             ]),
-            Expr::lambda("x", Type::Unknown, Expr::var("x")),
+            Expr::lambda("x", Type::infer(), Expr::var("x")),
         );
         let result_ty = infer(&mut expr, &mut ctx).unwrap();
         // Verify param.ty annotation on the key lambda
@@ -1366,7 +1492,7 @@ mod tests {
                 Expr::lit(Lit::Int(2)),
                 Expr::lit(Lit::Int(3)),
             ]),
-            Expr::lambda("x", Type::Unknown, Expr::var("x")),
+            Expr::lambda("x", Type::infer(), Expr::var("x")),
         );
         let mut expr = list_comp_unannotated(
             groupby_expr,
@@ -1394,7 +1520,7 @@ mod tests {
         // UnboundVariable, which propagates before the key is touched.
         let mut expr = Expr::groupby(
             Expr::var("xs"),
-            Expr::lambda("x", Type::Unknown, Expr::var("x")),
+            Expr::lambda("x", Type::infer(), Expr::var("x")),
         );
         assert_eq!(
             infer(&mut expr, &mut ctx),
@@ -1416,7 +1542,7 @@ mod tests {
         let g = Expr::lambda("b", Type::Base(BaseType::Bool), Expr::var("b"));
         let mut expr = Expr::lambda(
             "p",
-            Type::Unknown,
+            Type::infer(),
             Expr::binop(
                 Expr::apply(Expr::tuple_index(Expr::var("p"), 0), f),
                 BinOpKind::BoolLogic(LogicKind::And),
@@ -1440,7 +1566,7 @@ mod tests {
         let g = Expr::lambda("b", Type::Base(BaseType::String), Expr::var("b"));
         let mut expr = Expr::lambda(
             "p",
-            Type::Unknown,
+            Type::infer(),
             Expr::binop(
                 Expr::apply(Expr::tuple_index(Expr::var("p"), 0), f),
                 BinOpKind::BoolLogic(LogicKind::And),
@@ -1476,7 +1602,7 @@ mod tests {
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 name: "x".to_string(),
-                ty: Type::Unknown,
+                ty: Type::infer(),
                 user_annotation: Some(Type::Base(BaseType::Int)),
             },
             body: Box::new(Expr::apply(Expr::var("x"), inner)),
@@ -1505,7 +1631,7 @@ mod tests {
             function: Box::new(TypedExpr::new(TypedExprNode::Lambda {
                 param: TypedBinding {
                     name: "x".to_string(),
-                    ty: Type::Unknown,
+                    ty: Type::infer(),
                     user_annotation: Some(Type::Base(BaseType::String)),
                 },
                 body: Box::new(Expr::var("x")),
@@ -1536,7 +1662,7 @@ mod tests {
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 name: "x".to_string(),
-                ty: Type::Unknown,
+                ty: Type::infer(),
                 user_annotation: Some(Type::Base(BaseType::Int)),
             },
             body: Box::new(Expr::lit(Lit::Unit)),

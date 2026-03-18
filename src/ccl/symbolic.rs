@@ -147,9 +147,9 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             refinement,
         } => {
             let header = match (&param.ty, refinement) {
-                (Type::Unknown, None) => format!("λ {}", param.name),
+                (Type::Hole | Type::Infer(_), None) => format!("λ {}", param.name),
                 (ty, None) => format!("λ {} : {ty}", param.name),
-                (Type::Unknown, Some(r)) => {
+                (Type::Hole | Type::Infer(_), Some(r)) => {
                     format!("λ {} : {{??? | Refined({})}}", param.name, r.description)
                 }
                 (ty, Some(r)) => {
@@ -170,7 +170,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             bound_expr: value,
             body,
         } => {
-            let ty_str = if binding.ty != Type::Unknown {
+            let ty_str = if !matches!(binding.ty, Type::Hole | Type::Infer(_)) {
                 format!(" : {}", binding.ty)
             } else {
                 String::new()
@@ -233,7 +233,7 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             let param_strs: Vec<_> = params
                 .iter()
                 .map(|p| match &p.ty {
-                    Type::Unknown => p.name.clone(),
+                    Type::Hole | Type::Infer(_) => p.name.clone(),
                     t => format!("{}: {t}", p.name),
                 })
                 .collect();
@@ -452,11 +452,11 @@ mod tests {
     )]
     // Apply: Lambda in func position gets parens
     #[case(
-        Expr::apply(Expr::var("v"), Expr::lambda("x", Type::Unknown, Expr::var("x")),),
+        Expr::apply(Expr::var("v"), Expr::lambda("x", Type::infer(), Expr::var("x")),),
         "v ▷ (λ x → x)"
     )]
     // Lambda (unannotated)
-    #[case(Expr::lambda("x", Type::Unknown, Expr::var("x")), "λ x → x")]
+    #[case(Expr::lambda("x", Type::infer(), Expr::var("x")), "λ x → x")]
     // Lambda (annotated)
     #[case(
         Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("x")),
@@ -533,7 +533,7 @@ in x"
     #[case(
         Expr::lambda_with_refinement(
             "x",
-            Type::Unknown,
+            Type::infer(),
             Expr::var("x"),
             Expr::lit(Lit::Bool(true)),
             "x > 0",
@@ -593,7 +593,7 @@ in k(0)"
             probe_source: Rc::new(Expr::lit(Lit::Int(0))),
         };
         let expr =
-            Expr::lambda_with_hash_join("p", Type::Unknown, Expr::lit(Lit::Unit), spec, "x == y");
+            Expr::lambda_with_hash_join("p", Type::infer(), Expr::lit(Lit::Unit), spec, "x == y");
         assert_eq!(symbolic(&expr), "λ p : {??? | Refined(x == y)} → unit");
     }
 
@@ -645,7 +645,7 @@ in k(0)"
                 Expr::var("x"),
                 Expr::lambda(
                     "y",
-                    Type::Unknown,
+                    Type::infer(),
                     Expr::binop(
                         Expr::var("y"),
                         BinOpKind::Arithmetic(ArithmeticKind::Add),

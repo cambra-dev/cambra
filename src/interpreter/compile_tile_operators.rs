@@ -31,7 +31,8 @@ use crate::{
         TypedExprNode,
     },
     interpreter::{
-        compile_ccl::{map_binop, CompileContext, CompileError},
+        ccl_compile_util::{validate_type, CompileError},
+        compile_ccl::{map_binop, CompileContext},
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, Filter, IterateExtent, MapAggregate,
             MapApply, MapCompose, MapExtractAggregate, MapSource, MapToConst, ScalarTuple, Split,
@@ -189,22 +190,18 @@ fn compile_tile_inner(
             param,
             body,
             refinement,
-        } if param.ty != Type::Unknown => {
+        } => {
+            validate_type(&param.ty, &format!("Lambda parameter '{}'", param.name))?;
             compile_lambda(&param.name, &param.ty, body, refinement, ctx)
         }
-        TypedExprNode::Lambda { param, .. } => Err(CompileError::Unsupported(format!(
-            "Lambda '{param:?}' has no type annotation; ccl::infer must run before compile_tile"
-        ))),
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
-        } if binding.ty != Type::Unknown => {
+        } => {
+            validate_type(&binding.ty, &format!("Let binding '{}'", binding.name))?;
             compile_let(&binding.name, &binding.ty, bound_expr, body, ctx)
         }
-        TypedExprNode::Let { binding, .. } => Err(CompileError::TypeError(format!(
-            "Let binding '{binding:?}' has no type annotation; ccl::infer must run before compile_tile"
-        ))),
         TypedExprNode::Tuple(elts) => compile_tuple(elts, ctx),
         TypedExprNode::TupleIndex(tuple, idx) => compile_tuple_index(tuple, *idx, ctx),
         TypedExprNode::List(elts) => compile_list(elts),
@@ -439,7 +436,7 @@ fn compile_apply(
             param,
             body,
             refinement,
-        } if param.ty != Type::Unknown => {
+        } if !matches!(param.ty, Type::Infer(_) | Type::Hole) => {
             // β-reduce: compile body with param bound to argument expression.
             // Validate the type annotation is well-formed (required by infer pass).
             ctx.extent_of(&param.ty)?;

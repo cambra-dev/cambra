@@ -66,7 +66,8 @@ impl GlobalContext {
         };
         let mut expr = lower_stmts(&stmts, self.lowering_ctx()).expect("ccl lowering failed");
 
-        infer(&mut expr, self.inference_ctx()).expect("type inference failed");
+        let ctx = self.inference_ctx();
+        infer(&mut expr, ctx).expect("type inference failed");
 
         debug!("CCL:\n{}", symbolic(&expr));
 

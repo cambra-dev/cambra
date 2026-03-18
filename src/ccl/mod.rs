@@ -11,12 +11,13 @@ pub mod infer;
 pub mod lower;
 pub mod pretty;
 pub mod symbolic;
+pub mod unify;
 
 use std::{
     cell::RefCell,
     fmt,
     rc::Rc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 /// Global counter for assigning unique IDs to [`Refinement`] instances.
@@ -26,6 +27,47 @@ pub type RefinementId = u64;
 
 fn next_refinement_id() -> RefinementId {
     REFINEMENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A unique identifier for an inference type variable.
+///
+/// Every [`Type::Infer`] carries one of these, assigned monotonically by
+/// [`fresh_infer_var_id`]. Uniqueness is global across the process so that
+/// variables created in different parts of the tree never alias.
+///
+/// The inner `u32` is `pub(crate)` to prevent external code from constructing
+/// arbitrary `InferVarId` values. Use [`Type::infer`] or
+/// [`crate::ccl::infer::TypeInferenceContext::fresh_infer_var`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InferVarId(pub(crate) u32);
+
+impl fmt::Display for InferVarId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Global counter for [`InferVarId`] allocation.
+static INFER_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate a fresh, globally-unique [`InferVarId`].
+///
+/// Called only by [`Type::infer`] (test helper) and
+/// [`crate::ccl::infer::TypeInferenceContext::fresh_infer_var`]
+/// (which also registers the variable in the
+/// [`crate::ccl::unify::UnificationTable`]).
+fn fresh_infer_var_id() -> InferVarId {
+    InferVarId(INFER_VAR_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Reset the inference variable counter to zero.
+///
+/// For use in tests that need predictable `InferVarId` values in output.
+/// Not safe to call concurrently — run such tests with `--test-threads=1`
+/// or use `serial_test` if order matters.
+#[cfg(test)]
+pub fn reset_infer_var_counter() {
+    INFER_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
 
 // TODO: `BaseType` belongs here (or in a shared module), not in the interpreter.
@@ -246,7 +288,9 @@ fn accumulate_max<T: Ord + Clone>(acc: &mut [T], values: &[T]) {
 /// Used in [`TypedExprNode::Lambda`], [`TypedExprNode::Join`], and [`TypedExprNode::Let`] to carry
 /// both the inferred type and any user-written annotation at each binding site.
 ///
-/// `ty` starts as [`Type::Unknown`] and is filled in by [`infer::infer`].
+/// `ty` starts as [`Type::Hole`] (lowering placeholder) and is converted to a
+/// registered [`Type::Infer`] variable at inference entry, then filled in with
+/// the concrete type by [`infer::infer`].
 /// `user_annotation` is set at construction time by lowering when the source
 /// Python carries an explicit type cast; the inference pass checks that the
 /// inferred type is compatible with it.
@@ -256,7 +300,8 @@ pub struct TypedBinding {
     pub name: String,
     /// The variable's type, filled in by type inference.
     ///
-    /// Starts as [`Type::Unknown`]; written by [`infer::infer`] before compilation.
+    /// Starts as [`Type::Hole`] (lowering placeholder); converted to [`Type::Infer`]
+    /// at inference entry and written to a concrete type by [`infer::infer`].
     pub ty: Type,
     /// User-written type annotation, if any.
     ///
@@ -266,14 +311,14 @@ pub struct TypedBinding {
 }
 
 impl TypedBinding {
-    /// Create an unannotated binding with type [`Type::Unknown`].
+    /// Create an unannotated binding with a [`Type::Hole`] placeholder.
     ///
-    /// Equivalent to `TypedBinding { name: name.to_string(), ty: Type::Unknown, user_annotation: None }`.
-    /// Use this at lowering time when no type is yet known.
+    /// Use this at lowering time when no type is yet known. The inference pass
+    /// converts the `Hole` to a registered inference variable before type-checking.
     pub fn new_unannotated(name: &str) -> Self {
         TypedBinding {
             name: name.to_string(),
-            ty: Type::Unknown,
+            ty: Type::Hole,
             user_annotation: None,
         }
     }
@@ -324,8 +369,9 @@ pub enum TypedExprNode {
     /// A lambda abstraction.
     ///
     /// The bound parameter and its type are carried by a [`TypedBinding`].
-    /// `param.ty` starts as [`Type::Unknown`] on unannotated lambdas from
-    /// lowering; [`infer::infer`] fills it in before compilation.
+    /// `param.ty` starts as [`Type::Hole`] on unannotated lambdas from
+    /// lowering; [`infer::infer`] converts each `Hole` to a registered
+    /// [`Type::Infer`] variable and resolves it before compilation.
     ///
     /// Note: `crate::interpreter::Lambda` is an unrelated operator struct.
     Lambda {
@@ -478,8 +524,9 @@ pub enum TypedExprNode {
 
 /// A CCL expression with a type slot on every node.
 ///
-/// Every node starts with `ty: Type::Unknown`; the inference pass
-/// ([`infer::infer`]) fills it before compilation.
+/// Every node starts with `ty: Type::Hole`; the inference pass
+/// ([`infer::infer`]) converts it to a registered [`Type::Infer`] variable,
+/// then fills it with the concrete type before compilation.
 ///
 /// `user_annotation` carries an explicit type annotation written by the user
 /// (e.g. from a Python `cast(T, expr)` or an annotated binding site). The
@@ -490,7 +537,8 @@ pub struct TypedExpr {
     pub node: TypedExprNode,
     /// The inferred type of this expression.
     ///
-    /// Starts as [`Type::Unknown`]; written by [`infer::infer`] before compilation.
+    /// Starts as [`Type::Hole`] (lowering placeholder); converted to [`Type::Infer`]
+    /// at inference entry and written to a concrete type by [`infer::infer`].
     pub ty: Type,
     /// User-written type annotation, if any.
     ///
@@ -503,11 +551,14 @@ pub struct TypedExpr {
 pub type Expr = TypedExpr;
 
 impl TypedExpr {
-    /// Construct a new [`TypedExpr`] with `ty: Type::Unknown` and no user annotation.
+    /// Construct a new [`TypedExpr`] with a [`Type::Hole`] placeholder and no user annotation.
+    ///
+    /// `Hole` is the lowering-phase placeholder. The inference pass converts it to a
+    /// registered [`Type::Infer`] variable before type-checking begins.
     pub fn new(node: TypedExprNode) -> Self {
         TypedExpr {
             node,
-            ty: Type::Unknown,
+            ty: Type::Hole,
             user_annotation: None,
         }
     }
@@ -567,7 +618,7 @@ impl TypedExpr {
     /// bypass inference) do not need to set the binding type separately. After
     /// inference both fields hold the same type; [`compile_ccl::compile`] reads
     /// `binding.ty` as the authoritative slot. In normal lowering both start as
-    /// [`Type::Unknown`] and inference fills them together.
+    /// [`Type::Infer`] and inference fills them together.
     pub fn let_bind(name: impl Into<String>, bound_expr: Self, body: Self) -> Self {
         let ty = bound_expr.ty.clone();
         Self::new(TypedExprNode::Let {
@@ -617,10 +668,10 @@ impl TypedExpr {
 
     /// Build an unannotated or pre-annotated [`TypedExprNode::Lambda`].
     ///
-    /// Pass [`Type::Unknown`] for `param_ty` when the parameter type is not yet
+    /// Pass [`Type::Hole`] for `param_ty` when the parameter type is not yet
     /// known (lowering phase); pass the concrete type when it is already known.
-    /// Callers that previously passed `None` should pass `Type::Unknown`;
-    /// callers that passed `Some(ty)` should pass `ty` directly.
+    /// Do not pass `Type::Infer(fresh_infer_var())` from lowering — `Hole` is
+    /// the correct lowering placeholder.
     pub fn lambda(param: &str, param_ty: Type, body: TypedExpr) -> Self {
         Self::new(TypedExprNode::Lambda {
             param: TypedBinding {
@@ -702,8 +753,13 @@ pub enum Pattern {
 /// A CCL type annotation.
 ///
 /// Appears on [`TypedExpr`] nodes and as the output of type inference.
-/// [`Type::Unknown`] is the placeholder used before type-checking; it has no
-/// runtime equivalent and must be fully resolved before operator-graph compilation.
+///
+/// The two pre-/post-inference variants divide ownership cleanly:
+///
+/// | Variant | Owner | Meaning | Must be eliminated by |
+/// |---|---|---|---|
+/// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (hard error if survives) |
+/// | `Infer(id)` | Type checker only | "Inference variable N, tracked in table" | End of `resolve()` (ambiguous type if survives) |
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     /// A primitive base type.
@@ -724,8 +780,18 @@ pub enum Type {
     Union(Vec<Type>),
     /// A refinement of another type
     Refinement(Box<Type>, Refinement),
-    /// Pre-type-checking placeholder; filled in by the type checker.
-    Unknown,
+    /// Pre-inference placeholder stamped by lowering on every new node.
+    ///
+    /// Created exclusively by [`TypedExpr::new`] and [`TypedBinding::new_unannotated`].
+    /// The inference pass converts each `Hole` to a registered [`Type::Infer`] variable
+    /// before type-checking begins. A `Hole` surviving past inference is a compiler bug.
+    Hole,
+    /// Unresolved type variable, identified by a unique [`InferVarId`].
+    ///
+    /// Created exclusively by [`crate::ccl::infer::TypeInferenceContext::fresh_infer_var`]
+    /// during inference. Variables are registered in the [`crate::ccl::unify::UnificationTable`]
+    /// and resolved by the post-inference [`crate::ccl::unify::resolve`] pass.
+    Infer(InferVarId),
     /// The opaque domain type of an externally-registered data source.
     ///
     /// Used as the domain in `Fun(DataSource(name), output_type)` types emitted
@@ -767,7 +833,8 @@ impl fmt::Display for Type {
                 write!(f, "{}", parts.join(" | "))
             }
             Type::Refinement(t, r) => write!(f, "{{{t} | Refined({})}}", r.description),
-            Type::Unknown => write!(f, "_"),
+            Type::Hole => write!(f, "_"),
+            Type::Infer(id) => write!(f, "?{}", id.0),
             Type::DataSource(name) => write!(f, "source({name})"),
         }
     }
@@ -781,6 +848,19 @@ impl Type {
         } else {
             None
         }
+    }
+
+    /// Create a fresh, unregistered [`Type::Infer`] variable for use in tests.
+    ///
+    /// The created variable is **not** registered in any
+    /// [`crate::ccl::unify::UnificationTable`], so it cannot be solved by the
+    /// resolution pass. Use this only when constructing expressions in tests
+    /// that will not be run through inference (e.g. to exercise pretty-printing
+    /// or symbolic output). Production inference code must call
+    /// [`crate::ccl::infer::TypeInferenceContext::fresh_infer_var`] instead.
+    #[cfg(test)]
+    pub fn infer() -> Self {
+        Type::Infer(fresh_infer_var_id())
     }
 }
 

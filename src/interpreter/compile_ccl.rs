@@ -30,6 +30,7 @@ use rustpython_parser::{ast as pyast, parser};
 
 use crate::ccl::infer::{infer, InferError, TypeInferenceContext};
 use crate::ccl::lower::{lower_expr, LoweringError};
+use crate::interpreter::ccl_compile_util::{validate_type, CompileError};
 
 use crate::ccl::{
     ArithmeticKind as CclArith, BinOpKind as CclBinOp, CompareKind as CclCmp, Expr, HashJoinSpec,
@@ -45,15 +46,6 @@ use crate::util::ScopeStack;
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
-
-/// Errors that can occur during CCL → operator-graph compilation.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CompileError {
-    /// The CCL node or construct is not yet supported by this compilation pass.
-    Unsupported(String),
-    /// A type-level inconsistency was detected.
-    TypeError(String),
-}
 
 /// Errors from the full Python → operator pipeline.
 #[derive(Debug)]
@@ -214,13 +206,10 @@ pub fn compile(
             param,
             body,
             refinement,
-        } if param.ty != Type::Unknown => {
+        } => {
+            validate_type(&param.ty, &format!("Lambda parameter '{}'", param.name))?;
             compile_lambda(&param.name, &param.ty, body, refinement, ctx, scheduler)
         }
-        TypedExprNode::Lambda { param, .. } => Err(CompileError::Unsupported(format!(
-            "Lambda '{}' has no type annotation; ccl::infer must run before compile",
-            param.name
-        ))),
         TypedExprNode::Apply { function, argument } => {
             let func = compile(function, ctx, scheduler)?;
             let arg = compile(argument, ctx, scheduler)?;
@@ -231,12 +220,7 @@ pub fn compile(
             bound_expr,
             body,
         } => {
-            if binding.ty == Type::Unknown {
-                return Err(CompileError::TypeError(format!(
-                    "Let binding '{}' has no type annotation",
-                    binding.name
-                )));
-            }
+            validate_type(&binding.ty, &format!("Let binding '{}'", binding.name))?;
             compile_let(&binding.name, &binding.ty, bound_expr, body, ctx, scheduler)
         }
         TypedExprNode::Tuple(elts) => {

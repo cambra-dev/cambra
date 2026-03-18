@@ -55,7 +55,7 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             refinement,
         } => {
             let mut node = InspectNode::new(format!("Lambda({})", param.name));
-            if param.ty != Type::Unknown {
+            if !matches!(param.ty, Type::Hole | Type::Infer(_)) {
                 node = node.annotate(format!(": {}", param.ty));
             }
             if let Some(r) = refinement {
@@ -85,7 +85,7 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             body,
         } => {
             let mut node = InspectNode::new(format!("Let({})", binding.name));
-            if binding.ty != Type::Unknown {
+            if !matches!(binding.ty, Type::Hole | Type::Infer(_)) {
                 node = node.annotate(format!(": {}", binding.ty));
             }
             node.child("value", expr_to_node(value))
@@ -237,7 +237,7 @@ Apply
     )]
     // Lambda (unannotated and annotated)
     #[case(
-        Expr::lambda("x", Type::Unknown, Expr::var("x")),
+        Expr::lambda("x", Type::infer(), Expr::var("x")),
         "\
 Lambda(x)
 └── body: Var(x)

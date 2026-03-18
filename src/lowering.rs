@@ -46,7 +46,7 @@ impl LoweringContext {
     ) -> Rc<RefCell<TestDataSource>> {
         let data_source = Rc::new(RefCell::new(TestDataSource::new(
             name,
-            Type::Unknown,
+            Type::Hole,
             output_extent.clone(),
         )));
         self.injected_test_sources

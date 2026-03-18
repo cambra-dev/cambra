@@ -542,7 +542,7 @@ fn lower_lambda(
     // innermost-first (reverse order) to produce the curried chain.
     let body_expr = lower_expr(body, ctx)?;
     let result = args.args.iter().rev().fold(body_expr, |acc, arg| {
-        Expr::lambda(&arg.node.arg, Type::Unknown, acc)
+        Expr::lambda(&arg.node.arg, Type::Hole, acc)
     });
     Ok(result)
 }
@@ -575,8 +575,9 @@ fn lower_lambda(
 ///     __iter_record[1] ▷ lower(source1) ▷ (λ var1 → lower(body)))
 /// ```
 ///
-/// All lambdas are produced with `param.ty = Type::Unknown`; [`crate::ccl::infer`]
-/// fills in the type annotations before compilation.
+/// All lambdas are produced with `param.ty = Type::Hole`; [`crate::ccl::infer`]
+/// converts the placeholder to a registered inference variable and fills in the
+/// type annotations before compilation.
 ///
 /// TODO this currently has an assumption that all generator variables have distinct names.
 /// This might be a reasonable assumption that we should enforce, or we should fix scoping to
@@ -721,7 +722,7 @@ fn lower_list_comp(
     {
         body_expr = Expr::apply(
             Expr::apply(make_idx_arg(outer_var, i), source),
-            Expr::lambda(iter_var, Type::Unknown, body_expr),
+            Expr::lambda(iter_var, Type::Hole, body_expr),
         );
     }
 
@@ -732,7 +733,7 @@ fn lower_list_comp(
         let desc = format!("{} == {}", spec.build_var_name, spec.probe_var_name);
         Ok(Expr::lambda_with_hash_join(
             outer_var,
-            Type::Unknown,
+            Type::Hole,
             body_expr,
             spec,
             &desc,
@@ -751,18 +752,18 @@ fn lower_list_comp(
         {
             pred_expr = Expr::apply(
                 Expr::apply(make_idx_arg(restr_outer_var, i), pred_source),
-                Expr::lambda(iter_var, Type::Unknown, pred_expr),
+                Expr::lambda(iter_var, Type::Hole, pred_expr),
             );
         }
         Ok(Expr::lambda_with_refinement(
             outer_var,
-            Type::Unknown,
+            Type::Hole,
             body_expr,
-            Expr::lambda(restr_outer_var, Type::Unknown, pred_expr),
+            Expr::lambda(restr_outer_var, Type::Hole, pred_expr),
             &pred_desc,
         ))
     } else {
-        Ok(Expr::lambda(outer_var, Type::Unknown, body_expr))
+        Ok(Expr::lambda(outer_var, Type::Hole, body_expr))
     }
 }
 

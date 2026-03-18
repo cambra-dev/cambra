@@ -12,8 +12,8 @@ CCL is a λ-calculus–based IR. Python source is lowered into CCL, where it is 
 Python source
   → parse          (rustpython_parser)
   → lower          (ccl/lower.rs: Python AST → CCL AST, structural only)
-  → infer          (ccl/infer.rs: type inference, fills ty on every TypedExpr node)
-  → type-check     (bidirectional, fills in Type::Unknown annotations)
+  → infer          (ccl/infer.rs: type inference, converts Hole→Infer and fills ty on every node)
+  → resolve        (ccl/unify.rs: substitutes solved Infer vars with concrete types)
   → optimize       (tree rewrites on CCL AST)
   → compile        (interpreter/compile_ccl.rs: CCL AST → dataflow operators)
   → subscribe()
@@ -83,7 +83,7 @@ Python aggregate calls (`sum(xs)`, `max(xs)`) are lowered directly to `Expr::Agg
 
 ### Python `lambda` expressions — curried `Expr::Lambda` chain
 
-Python `lambda` expressions are lowered to a curried chain of `Expr::Lambda` nodes. A multi-parameter `lambda x, y: body` becomes `λ x → λ y → body`. Single-parameter lambdas lower to a single `Expr::Lambda`. `param.ty` is left `Type::Unknown` at lowering time and filled in by the inference pass where the call site provides type information.
+Python `lambda` expressions are lowered to a curried chain of `Expr::Lambda` nodes. A multi-parameter `lambda x, y: body` becomes `λ x → λ y → body`. Single-parameter lambdas lower to a single `Expr::Lambda`. `param.ty` is left `Type::Hole` at lowering time; the inference pass converts it to a registered `Type::Infer` variable and fills in the concrete type where the call site provides type information.
 
 Restrictions not yet supported (lowering raises `LoweringError::Unsupported`): `*args`, `**kwargs`, keyword-only arguments, and default values.
 
@@ -116,20 +116,46 @@ Rationale: encoding loops as recursive lambdas requires detecting recursive bind
 
 All binding sites — `Lambda`, `Join`, and `Let` — use `TypedBinding { name, ty, user_annotation }` rather than separate `name: String` / type fields.
 
-- `ty` starts as `Type::Unknown` (lowering phase) and is filled in by inference before compilation.
+- `ty` starts as `Type::Hole` (lowering placeholder); the inference pass converts it to a registered `Type::Infer` variable at inference entry and fills in the concrete type before compilation.
 - `user_annotation` carries an optional user-written type annotation (e.g. from a Python `cast` expression). Inference validates the inferred type against it; if the body provides no usable constraint the annotation is used directly as the param type.
 
-`Type::Unknown` has no runtime equivalent — all types must be resolved before operator-graph compilation.
+`Type::Hole` and `Type::Infer(_)` have no runtime equivalents — all types must be resolved to concrete types before operator-graph compilation.
 
 ### `TypedExpr` — type slot on every node
 
 Every CCL expression is wrapped in `TypedExpr { node: TypedExprNode, ty: Type, user_annotation: Option<Type> }`.
 
 - `node` holds the expression kind (`TypedExprNode` enum, formerly `Expr`).
-- `ty` starts as `Type::Unknown` and is written by `infer::infer` before compilation.
+- `ty` starts as `Type::Hole` (stamped by `TypedExpr::new()`); the inference pass converts it to a registered `Type::Infer` variable then fills it with the concrete type before compilation.
 - `user_annotation` carries an explicit annotation from the source (e.g. a `cast` call). Inference checks it for compatibility with the inferred type and uses it as the final type if present.
 
 `TypeAnnotation` no longer exists as a node variant; annotations are carried uniformly by `TypedExpr.user_annotation` instead.
+
+### `Type::Hole` and `Type::Infer` — the two-way split
+
+The type system uses two distinct pre-/post-inference placeholders with strict ownership:
+
+| Variant | Owner | Meaning | Must be eliminated by |
+|---|---|---|---|
+| `Type::Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (debug assertion if survives) |
+| `Type::Infer(id)` | Type checker only | "Inference variable N, tracked in table" | End of `resolve()` (ambiguous type if survives) |
+
+**`Type::Hole`** is stamped by `TypedExpr::new()` and `TypedBinding::new_unannotated()`. It is a structural placeholder that carries no identity — it is not registered in the `UnificationTable`. The inference pass (`infer::infer`) converts every `Hole` to a registered `Type::Infer` variable at the top of the `infer()` function (before the main dispatch). `fresh_infer_var_id()` must not be called from lowering code; use `Type::Hole` instead.
+
+**`Type::Infer(id)`** is created exclusively by `TypeInferenceContext::fresh_infer_var()`. Each variable is registered in the `UnificationTable` immediately, giving it an identity that can participate in unification and be resolved by `unify::resolve`. This strict ownership means every `Infer(id)` that reaches `resolve()` is a known, tracked variable — never an accidentally-unregistered orphan.
+
+This separation makes test expression construction straightforward: tests that build expressions without running inference use `Type::Hole` (via `TypedExpr::new()`) and never need to synthesize `InferVarId` values.
+
+**Path to full HM**: the current inference pass still mutates `param.ty` and `binding.ty` directly (two sources of truth alongside the `UnificationTable`). The intended follow-up is to move inference toward writing only to the table and having `resolve()` be the single materialization pass — eliminating the two-sources-of-truth problem. Once BinOp/UnaryOp unification rules are added, `collect_param_constraint` can also be removed.
+
+### Union-find unification table (`ccl::unify`)
+
+`ccl::unify::UnificationTable` is a sparse union-find structure over `InferVarId`s, stored in `TypeInferenceContext`. It tracks solved inference variables across the typed-expression tree.
+
+- Each fresh variable is `register`ed when created by `TypeInferenceContext::fresh_infer_var()`.
+- `set(id, ty)` records a concrete solution; `probe(id)` retrieves it (with path compression via `find`).
+- `unify(a, b)` merges two variables into the same equivalence class, preferring a solved root when one exists.
+- After the main inference walk, `unify::resolve(expr, table)` replaces remaining `Type::Infer(id)` placeholders with their solved types. Any `Infer` left after resolution represents an ambiguous type. `resolve` is now called automatically inside the public `infer()` wrapper, so callers no longer need to invoke it explicitly.
 
 ---
 
@@ -174,7 +200,7 @@ enum AggregateKind {
 /// filled in by infer::infer; `user_annotation` carries an explicit cast/annotation.
 struct TypedExpr {
     node: TypedExprNode,
-    ty: Type,                        // Unknown until inference fills it
+    ty: Type,                        // Infer(id) until inference fills it; Error on inference failure
     user_annotation: Option<Type>,   // checked against ty by infer; None for lowered nodes
 }
 
@@ -252,7 +278,9 @@ enum Type {
     Tuple(Vec<Type>),
     Record(Vec<(String, Type)>),
     Union(Vec<Type>),
-    Unknown,                             // pre-type-checking placeholder
+    Hole,                                // lowering placeholder; converted to Infer at inference entry
+    Infer(InferVarId),                   // type-checker variable; registered in UnificationTable
+    Error,                               // inference already failed here; suppresses cascades
     Refinement(Box<Type>, Refinement),   // refined base type; `Refinement.kind` carries join strategy
     DataSource(String),                  // opaque domain type of a source
     // Future:
@@ -306,8 +334,10 @@ same source.
 
 `ccl::infer` currently implements a "limited" type inference pass that sits between
 lowering and the full bidirectional type checker. It handles enough to make
-the existing list-comprehension pipeline work end-to-end, while deferring
-heavier machinery (BinOp rules, constraint unification) to later phases.
+the existing list-comprehension pipeline work end-to-end. The pass now includes
+a full union-find unification table (`UnificationTable` in `ccl::unify`) and records
+solved types into it as inference proceeds; a post-inference `resolve` pass replaces
+remaining `Infer(id)` placeholders with their solved types.
 
 ### `collect_param_constraint`
 
@@ -323,7 +353,7 @@ agree; conflicting constraints produce a `TypeMismatch` error.
 | `Apply(Λ x. b, arg)` | special-case Apply rule | elegant check-mode push-down | same |
 | Standalone `Λ x. b` | `collect_param_constraint` heuristic | fails in synth mode; needs annotation | type variable + unify |
 | Multi-use params | first constraint only | same limitation | unification solves all |
-| Needs unification | No | No | Yes |
+| Needs unification | `UnificationTable` (union-find) present, BinOp rules deferred | full | Yes |
 | Type error reporting | limited | at check sites | at unification failure |
 
 **Delta from our pass to bidirectional**: add a `check(expr, expected, ctx)`
@@ -331,18 +361,19 @@ function alongside `infer`; rewrite the Apply rule to check the argument against
 the domain. `collect_param_constraint` is still needed for standalone lambdas.
 Gains type-mismatch error detection at Apply sites.
 
-**Delta from bidirectional to HM**: add type variables (`Type::Var(u32)`), a
-union-find unification table, and an occurs check. Removes the need for
-`collect_param_constraint` since type variables unify across all use sites.
+**Delta from bidirectional to HM**: `Type::Infer(InferVarId)` already acts as type
+variables, and `UnificationTable` is already in place. Remaining steps: add BinOp/UnaryOp
+unification rules (unify left/right operands, return result type) and an occurs check.
+`collect_param_constraint` can be removed once type variables unify across all use sites.
 
 ### `GroupBy` inference
 
 When inferring `Expr::GroupBy { collection, key }`:
 
 1. Infer the type of `collection`.
-2. If the collection type has a codomain (i.e. it is a `Fun(_, elem_ty)`), write `elem_ty` into the key lambda's `param.ty` when `param.ty` is still `Type::Unknown`. This mirrors the `Apply` rule where the argument type is pushed onto the lambda parameter.
+2. If the collection type has a codomain (i.e. it is a `Fun(_, elem_ty)`), write `elem_ty` into the key lambda's `param.ty` when `param.ty` is still `Type::Hole` or `Type::Infer(_)`. This mirrors the `Apply` rule where the argument type is pushed onto the lambda parameter.
 3. Infer the type of `key` (now annotated); take its codomain as `key_output_ty`.
-4. Return `Fun(key_output_ty, Fun(Base(UInt), elem_ty))`. Falls back to `Unknown` if either codomain cannot be determined.
+4. Return `Fun(key_output_ty, Fun(Base(UInt), elem_ty))`. Falls back to `Infer(fresh_var)` if either codomain cannot be determined.
 
 ### TODOs
 
@@ -405,5 +436,13 @@ fills this in from the type of `bound_expr`.
      as the primary expression type; rename `Expr` enum to `TypedExprNode`; keep `pub type Expr =
      TypedExpr` alias; remove `TypeAnnotation` variant; remove `Let.bound_ty` field; fill `ty` on
      every node in the inference pass. ✓
+   - `ccl/mod.rs` + `ccl/infer.rs` + `ccl/unify.rs` + all call sites: replace `Type::Unknown`
+     with `Type::Infer(InferVarId)` (unique per node via `AtomicU32` counter); add `UnificationTable`
+     (union-find over `InferVarId`) to `TypeInferenceContext`; add post-inference `resolve` pass in
+     `ccl::unify`. ✓
+   - `ccl/mod.rs` + `ccl/infer.rs` + `ccl/lower.rs`: introduce `Type::Hole` as the lowering
+     placeholder, separating lowering ownership from type-checker ownership. `TypedExpr::new()` and
+     `TypedBinding::new_unannotated()` now stamp `Hole`; `infer()` converts `Hole → Infer(ctx.fresh_infer_var())`
+     at entry; `fresh_infer_var_id()` is no longer called from lowering code. ✓
    - `lowering_via_ccl.rs`: sandboxed end-to-end pipeline tests.
    - `lowering.rs` direct path removed after parity confirmed.
