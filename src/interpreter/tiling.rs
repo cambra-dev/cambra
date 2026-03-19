@@ -3,7 +3,11 @@
 //! These types describe the shape, data, and region-tracking for the tile-based
 //! dataflow evaluation model.
 
-use std::{collections::HashMap, fmt, hash::Hash};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    hash::Hash,
+};
 
 use bit_vec::BitVec;
 use intervalsets::{ops::Intersection, Interval, IntervalSet, MaybeEmpty};
@@ -27,8 +31,12 @@ pub enum Tiling {
         domain: Extent,
         codomain: Box<Tiling>,
     },
-    /// A lookup-table function: domain values map to lists of codomain values.
-    LookupFunction { domain: Extent, codomain: Extent },
+    /// A function of type A -> B -> C
+    CurriedFunction {
+        domain1: Extent,
+        domain2: Extent,
+        codomain: Extent,
+    },
     /// Result of an aggregation
     Aggregation { accumulator: Extent },
 }
@@ -42,9 +50,16 @@ impl Tiling {
                 domain: Box::new(domain.clone()),
                 codomain: Box::new(codomain.extent()),
             },
-            Tiling::LookupFunction { domain, codomain } => Extent::Function {
-                domain: Box::new(domain.clone()),
-                codomain: Box::new(codomain.clone()),
+            Tiling::CurriedFunction {
+                domain1,
+                domain2,
+                codomain,
+            } => Extent::Function {
+                domain: Box::new(domain1.clone()),
+                codomain: Box::new(Extent::Function {
+                    domain: Box::new(domain2.clone()),
+                    codomain: Box::new(codomain.clone()),
+                }),
             },
             Tiling::Aggregation { accumulator } => accumulator.clone(),
         }
@@ -59,7 +74,7 @@ impl Tiling {
             Tiling::SealedFunction { .. } => {
                 TileGuard::SealedFunction(SealedFunctionGuard::Universal)
             }
-            Tiling::LookupFunction { .. } => TileGuard::LookupFunction(true),
+            Tiling::CurriedFunction { .. } => TileGuard::CurriedFunction(true),
             Tiling::Aggregation { .. } => TileGuard::Aggregation(true),
         }
     }
@@ -71,7 +86,7 @@ impl Tiling {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.empty_guard()))
             }
             Tiling::SealedFunction { .. } => TileGuard::SealedFunction(SealedFunctionGuard::Empty),
-            Tiling::LookupFunction { .. } => TileGuard::LookupFunction(false),
+            Tiling::CurriedFunction { .. } => TileGuard::CurriedFunction(false),
             Tiling::Aggregation { .. } => TileGuard::Aggregation(false),
         }
     }
@@ -87,12 +102,12 @@ impl Tiling {
     }
 
     /// Return the domain extent if the the tiling represents a function.  This returns Some
-    /// for Scalar(Function), SealedFunction, and LookupFunction
+    /// for Scalar(Function), SealedFunction, and CurriedFunction
     pub fn domain_extent(&self) -> Option<Extent> {
         match self {
             Tiling::Scalar(Extent::Function { domain, .. }) => Some(*domain.clone()),
             Tiling::SealedFunction { domain, .. } => Some(domain.clone()),
-            Tiling::LookupFunction { domain, .. } => Some(domain.clone()),
+            Tiling::CurriedFunction { domain1, .. } => Some(domain1.clone()),
             _ => None,
         }
     }
@@ -119,10 +134,17 @@ impl Tiling {
                 codomain: Box::new(codomain.empty_tile()),
                 domain_predicate: Predicate::False,
             },
-            Tiling::LookupFunction { .. } => Tile::LookupFunction {
-                map: HashMap::new(),
-                domain_predicate: Predicate::False,
-            },
+            Tiling::CurriedFunction {
+                domain1: domain1_extent,
+                domain2: domain2_extent,
+                codomain: codomain_extent,
+            } => Tile::curried_function(
+                ColumnValue::from_values(Vec::new(), domain1_extent),
+                ColumnValue::UInts(Vec::new()),
+                ColumnValue::from_values(Vec::new(), domain2_extent),
+                ColumnValue::from_values(Vec::new(), codomain_extent),
+                Predicate::False,
+            ),
             Tiling::Aggregation { accumulator } => Tile::Aggregation {
                 terminal: ColumnValue::Bools(BitVec::new()),
                 accumulator: ColumnValue::from_values(Vec::new(), accumulator),
@@ -164,9 +186,13 @@ impl fmt::Display for Tiling {
         match self {
             Tiling::Scalar(e) => write!(f, "{e:?}"),
             Tiling::Record(fields) => fmt_record(f, fields),
-            Tiling::SealedFunction { domain, codomain } => write!(f, "{domain:?} → {codomain}"),
-            Tiling::LookupFunction { domain, codomain } => {
-                write!(f, "{domain:?} → [{codomain:?}]")
+            Tiling::SealedFunction { domain, codomain } => write!(f, "SF({domain:?} → {codomain})"),
+            Tiling::CurriedFunction {
+                domain1,
+                domain2,
+                codomain,
+            } => {
+                write!(f, "CF({domain1:?} → {domain2:?} → {codomain:?}])")
             }
             Tiling::Aggregation { accumulator } => write!(f, "agg({accumulator:?})"),
         }
@@ -189,12 +215,24 @@ pub enum Tile {
         codomain: Box<Tile>,
         domain_predicate: Predicate,
     },
-    /// A function mapping values to bags of values.
-    LookupFunction {
-        /// The per-key value lists.
-        /// TODO: change this representation so that the values can be operated on
-        /// with vectorized code
-        map: HashMap<Value, Vec<Value>>,
+    /// A two-level curried function.
+    ///
+    /// Stored in a Compressed Sparse Row (CSR)-like layout: `domain1` is sorted so lookups can be done
+    /// in O(log n) via binary search, `offsets[i]` is the start index in
+    /// `codomain` and `domain2` for `domain1[i]`, and `codomain` is the flattened sequence of
+    /// all codomain values across all groups.  Group `i` occupies
+    /// `codomain[offsets[i]..offsets[i+1]]` (or `codomain[offsets[i]..]` for
+    /// the last group).  Because `codomain` is a single `ColumnValue`,
+    /// vectorized transformations over the full codomain are straightforward.
+    CurriedFunction {
+        /// Sorted domain keys, enabling O(log n) lookup by binary search.
+        domain1: ColumnValue,
+        /// Start offsets into `domain2` and `codomain`, one per value in `domain1`.
+        offsets: ColumnValue,
+        /// Flattened domain2 values
+        domain2: ColumnValue,
+        /// Flattened codomain values; supports vectorized transformations.
+        codomain: ColumnValue,
         /// Whether all domain keys and their value lists have been fully received.
         domain_predicate: Predicate,
     },
@@ -213,7 +251,7 @@ impl Tile {
             Tile::Scalar(cv) => cv.len(),
             Tile::Record(m) => m.values().map(Tile::len).max().unwrap_or(0),
             Tile::SealedFunction { domain, .. } => domain.len(),
-            Tile::LookupFunction { map, .. } => map.len(),
+            Tile::CurriedFunction { domain1, .. } => domain1.len(),
             Tile::Aggregation { accumulator, .. } => accumulator.len(),
         }
     }
@@ -246,7 +284,7 @@ impl Tile {
                 domain.is_compatible_with_extent(domain_extent)
                     && codomain_tile.check_from(codomain_tiling)
             }
-            (Tile::LookupFunction { .. }, Tiling::LookupFunction { .. }) => true,
+            (Tile::CurriedFunction { .. }, Tiling::CurriedFunction { .. }) => true,
             (Tile::Aggregation { .. }, Tiling::Aggregation { .. }) => true,
             _ => false,
         }
@@ -259,7 +297,7 @@ impl Tile {
             Tile::SealedFunction {
                 domain_predicate, ..
             } => domain_predicate.as_bool().unwrap_or(false),
-            Tile::LookupFunction {
+            Tile::CurriedFunction {
                 domain_predicate, ..
             } => domain_predicate.as_bool().unwrap_or(false),
             Tile::Aggregation { terminal, .. } => {
@@ -267,6 +305,57 @@ impl Tile {
             }
         }
     }
+
+    /// Creates a Tile::CurriedFunction and does dev-build-only validation for correct structure.
+    pub fn curried_function(
+        domain1: ColumnValue,
+        offsets: ColumnValue,
+        domain2: ColumnValue,
+        codomain: ColumnValue,
+        domain_predicate: Predicate,
+    ) -> Tile {
+        let result = Tile::CurriedFunction {
+            domain1,
+            offsets,
+            domain2,
+            codomain,
+            domain_predicate,
+        };
+        debug_assert!(
+            validate_curried_function_tile(&result),
+            "Invalid curried function: {result:?}"
+        );
+        result
+    }
+}
+
+fn validate_curried_function_tile(tile: &Tile) -> bool {
+    let Tile::CurriedFunction {
+        domain1,
+        offsets,
+        domain2,
+        codomain,
+        domain_predicate: _,
+    } = tile
+    else {
+        return false;
+    };
+    let ColumnValue::UInts(offsets) = offsets else {
+        return false;
+    };
+    let domain2_values: Vec<_> = domain2.clone().drain_to_value_iter().collect();
+    if domain2.len() != codomain.len()
+        || HashSet::<Value>::from_iter(domain1.clone().drain_to_value_iter()).len() != domain1.len()
+        || !offsets.windows(2).all(|w| w[0] < w[1])
+        || !offsets.windows(2).all(|w| {
+            w[1] - w[0]
+                == HashSet::<Value>::from_iter(domain2_values[w[0]..w[1]].iter().cloned()).len()
+        })
+        || offsets.last().is_some_and(|o| *o >= domain2.len())
+    {
+        return false;
+    }
+    true
 }
 
 /// Specifies a sub-region of interest within a [`Tile`], used for demand-driven
@@ -276,7 +365,7 @@ pub enum TileGuard {
     Scalar(bool),
     Record(HashMap<String, TileGuard>),
     SealedFunction(SealedFunctionGuard),
-    LookupFunction(bool),
+    CurriedFunction(bool),
     Aggregation(bool),
 }
 
@@ -284,8 +373,8 @@ impl TileGuard {
     pub fn intersect(&self, other: &TileGuard) -> TileGuard {
         match (self, other) {
             (TileGuard::Scalar(u1), TileGuard::Scalar(u2)) => TileGuard::Scalar(*u1 && *u2),
-            (TileGuard::LookupFunction(u1), TileGuard::LookupFunction(u2)) => {
-                TileGuard::LookupFunction(*u1 && *u2)
+            (TileGuard::CurriedFunction(u1), TileGuard::CurriedFunction(u2)) => {
+                TileGuard::CurriedFunction(*u1 && *u2)
             }
             (TileGuard::Aggregation(u1), TileGuard::Aggregation(u2)) => {
                 TileGuard::Aggregation(*u1 && *u2)
@@ -312,7 +401,7 @@ impl TileGuard {
     pub fn is_universal(&self) -> bool {
         match self {
             TileGuard::Scalar(universal)
-            | TileGuard::LookupFunction(universal)
+            | TileGuard::CurriedFunction(universal)
             | TileGuard::Aggregation(universal) => *universal,
             TileGuard::Record(m) => m.values().all(TileGuard::is_universal),
             TileGuard::SealedFunction(g) => g.is_univeral(),
@@ -322,7 +411,7 @@ impl TileGuard {
     pub fn is_empty(&self) -> bool {
         match self {
             TileGuard::Scalar(universal)
-            | TileGuard::LookupFunction(universal)
+            | TileGuard::CurriedFunction(universal)
             | TileGuard::Aggregation(universal) => !*universal,
             TileGuard::Record(m) => m.values().all(TileGuard::is_empty),
             TileGuard::SealedFunction(g) => g.is_empty(),
@@ -517,8 +606,12 @@ mod tests {
         }
     }
 
-    fn lookup(domain: Extent, codomain: Extent) -> Tiling {
-        Tiling::LookupFunction { domain, codomain }
+    fn curried(domain1: Extent, domain2: Extent, codomain: Extent) -> Tiling {
+        Tiling::CurriedFunction {
+            domain1,
+            domain2,
+            codomain,
+        }
     }
 
     fn record_tiling(fields: &[(&str, Tiling)]) -> Tiling {
@@ -560,12 +653,15 @@ mod tests {
 
     #[test]
     fn tiling_extent_lookup_function() {
-        let t = lookup(range(4), int());
+        let t = curried(range(4), int(), int());
         assert_eq!(
             t.extent(),
             Extent::Function {
                 domain: Box::new(range(4)),
-                codomain: Box::new(int()),
+                codomain: Box::new(Extent::Function {
+                    domain: Box::new(int()),
+                    codomain: Box::new(int()),
+                }),
             }
         );
     }
@@ -590,12 +686,14 @@ mod tests {
 
     #[test]
     fn universal_guard_lookup_function() {
-        assert!(lookup(int(), int()).universal_guard().is_universal());
+        assert!(curried(int(), int(), bool_ext())
+            .universal_guard()
+            .is_universal());
     }
 
     #[test]
     fn empty_guard_lookup_function() {
-        assert!(lookup(int(), int()).empty_guard().is_empty());
+        assert!(curried(int(), int(), bool_ext()).empty_guard().is_empty());
     }
 
     #[test]
@@ -654,8 +752,8 @@ mod tests {
 
     #[test]
     fn codomain_lookup_function_is_none() {
-        // LookupFunction has no structured codomain tiling.
-        assert_eq!(lookup(int(), bool_ext()).codomain(), None);
+        // CurriedFunction has no structured codomain tiling.
+        assert_eq!(curried(int(), bool_ext(), int()).codomain(), None);
     }
 
     // ── Tiling::domain_extent ─────────────────────────────────────────────────
@@ -667,7 +765,10 @@ mod tests {
 
     #[test]
     fn domain_extent_lookup_function() {
-        assert_eq!(lookup(range(4), int()).domain_extent(), Some(range(4)));
+        assert_eq!(
+            curried(range(4), int(), bool_ext()).domain_extent(),
+            Some(range(4))
+        );
     }
 
     #[test]
@@ -706,7 +807,10 @@ mod tests {
     #[test]
     fn split_function_extent_non_function_is_none() {
         assert_eq!(Tiling::Scalar(int()).split_function_extent(), None);
-        assert_eq!(lookup(int(), bool_ext()).split_function_extent(), None);
+        assert_eq!(
+            curried(int(), bool_ext(), int()).split_function_extent(),
+            None
+        );
     }
 
     // ── Tiling::is_scalar / is_function ──────────────────────────────────────
@@ -743,7 +847,7 @@ mod tests {
 
     #[test]
     fn is_function_lookup() {
-        assert!(lookup(int(), bool_ext()).is_function());
+        assert!(curried(int(), bool_ext(), int()).is_function());
     }
 
     #[test]
@@ -790,7 +894,7 @@ mod tests {
 
     #[test]
     fn empty_tile_lookup_function_is_empty() {
-        let tile = lookup(int(), bool_ext()).empty_tile();
+        let tile = curried(int(), bool_ext(), int()).empty_tile();
         assert!(tile.is_empty());
         assert!(!tile.is_terminal());
     }
@@ -810,7 +914,7 @@ mod tests {
 
     #[test]
     fn display_lookup_function() {
-        let s = lookup(range(4), int()).to_string();
+        let s = curried(range(4), int(), bool_ext()).to_string();
         assert!(
             s.contains("→") && s.contains('['),
             "expected '→ [' in '{s}'"
@@ -839,7 +943,7 @@ mod tests {
 
     #[test]
     fn guard_intersect_lookup_function() {
-        let g = TileGuard::LookupFunction(true).intersect(&TileGuard::LookupFunction(false));
+        let g = TileGuard::CurriedFunction(true).intersect(&TileGuard::CurriedFunction(false));
         assert!(g.is_empty());
     }
 
@@ -1054,8 +1158,11 @@ mod tests {
 
     #[test]
     fn tile_lookup_function_true_predicate_is_terminal() {
-        let tile = Tile::LookupFunction {
-            map: HashMap::new(),
+        let tile = Tile::CurriedFunction {
+            domain1: ColumnValue::UInts(vec![]),
+            offsets: ColumnValue::UInts(vec![]),
+            domain2: ColumnValue::UInts(vec![]),
+            codomain: ColumnValue::UInts(vec![]),
             domain_predicate: Predicate::True,
         };
         assert!(tile.is_terminal());

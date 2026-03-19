@@ -18,7 +18,7 @@ use crate::{
     ccl::AggregateKind,
     interpreter::{
         transform_hashmap_values, tuple_field, BaseType, ColumnValue, Consumer,
-        DataSourceDomainExtentImpl, Extent, FuncBinding, NotifyOrSubscribeResult, Scheduler, Value,
+        DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult, Scheduler, Value,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -137,6 +137,61 @@ pub fn scalar_tile_to_column_value(tile: Tile) -> ColumnValue {
             ColumnValue::Records(extract_hashmap_values(m, scalar_tile_to_column_value))
         }
         _ => panic!("Not scalar"),
+    }
+}
+
+/// Apply a function tile over a column of input values, producing a column of outputs.
+///
+/// Handles all four function tile representations:
+/// - [`Tile::Scalar`] wrapping a [`Value::ComputableFunction`]: calls `f.apply` directly.
+/// - [`Tile::Scalar`] wrapping a [`Value::Function`] (bindings table): maps each element
+///   through the table.
+/// - [`Tile::SealedFunction`]: treated as a point-lookup table keyed by domain value.
+/// - [`Tile::CurriedFunction`]: each input value maps to a [`Value::Function`] bag of the
+///   matching codomain group.
+///
+/// `output_extent` types the output column for the bindings-table and `SealedFunction`
+/// cases; it is unused for `ComputableFunction` (which determines its own output type)
+/// and `CurriedFunction` (which always produces [`ColumnValue::Variants`]).
+fn apply_function_tile(
+    function_tile: Tile,
+    mut input: ColumnValue,
+    output_extent: &Extent,
+) -> ColumnValue {
+    match function_tile {
+        Tile::Scalar(func) => match func.as_single() {
+            Some(Value::ComputableFunction(f)) => f.apply(input),
+            Some(Value::Function(bindings)) => {
+                let table: HashMap<Value, Value> =
+                    bindings.into_iter().map(|b| (b.input, b.output)).collect();
+                let output_values: Vec<Value> = input
+                    .drain_to_value_iter()
+                    .map(|v| table[&v].clone())
+                    .collect();
+                ColumnValue::from_values(output_values, output_extent)
+            }
+            None => ColumnValue::from_values(Vec::new(), output_extent),
+            _ => panic!("apply_function_tile: Scalar tile is not a function value"),
+        },
+        Tile::SealedFunction {
+            mut domain,
+            codomain,
+            ..
+        } => {
+            let Tile::Scalar(mut codomain_col) = *codomain else {
+                panic!("apply_function_tile: SealedFunction must have a Scalar codomain")
+            };
+            let table: HashMap<Value, Value> = domain
+                .drain_to_value_iter()
+                .zip(codomain_col.drain_to_value_iter())
+                .collect();
+            let output_values: Vec<Value> = input
+                .drain_to_value_iter()
+                .map(|v| table[&v].clone())
+                .collect();
+            ColumnValue::from_values(output_values, output_extent)
+        }
+        tile => panic!("apply_function_tile: not a function tile: {tile:?}"),
     }
 }
 
@@ -324,67 +379,11 @@ impl TileProducer for MapApplyProducer {
         };
 
         let function_result = self.function.get(f_tiling.universal_guard());
-        let mut input = scalar_tile_to_column_value(*i_codomain);
-
-        let s = format!("{function_result:?}");
-        let result = match function_result {
-            Tile::Scalar(func) => match func.as_single() {
-                Some(Value::ComputableFunction(f)) => Tile::Scalar(f.apply(input)),
-                Some(Value::Function(bindings)) => {
-                    // List-literal lookup: map each input value through the bindings table.
-                    let map: HashMap<Value, Value> =
-                        bindings.into_iter().map(|b| (b.input, b.output)).collect();
-                    let mut input = input;
-                    let output_values: Vec<Value> = input
-                        .drain_to_value_iter()
-                        .map(|v| map[&v].clone())
-                        .collect();
-                    Tile::Scalar(ColumnValue::from_values(output_values, &f_codomain_extent))
-                }
-                _ => panic!("Not single function"),
-            },
-            Tile::LookupFunction { map: lookup, .. } => Tile::Scalar(ColumnValue::Variants(
-                input
-                    .drain_to_value_iter()
-                    .map(|v| {
-                        Value::Function(
-                            lookup[&v]
-                                .iter()
-                                .enumerate()
-                                .map(|(i, e)| FuncBinding {
-                                    input: Value::UInt(i),
-                                    output: e.clone(),
-                                })
-                                .collect(),
-                        )
-                    })
-                    .collect(),
-            )),
-            Tile::SealedFunction {
-                mut domain,
-                codomain,
-                ..
-            } => {
-                // Treat the sealed function as a point-lookup table: build a HashMap
-                // from domain values to codomain values, then look up each input.
-                let Tile::Scalar(mut codomain_col) = *codomain else {
-                    panic!("MapApply: SealedFunction function must have a Scalar codomain")
-                };
-                let table: HashMap<Value, Value> = domain
-                    .drain_to_value_iter()
-                    .zip(codomain_col.drain_to_value_iter())
-                    .collect();
-                let output_values: Vec<Value> = input
-                    .drain_to_value_iter()
-                    .map(|v| table[&v].clone())
-                    .collect();
-                Tile::Scalar(ColumnValue::from_values(output_values, &f_codomain_extent))
-            }
-            _ => panic!("Got non-appliable function {s}"),
-        };
+        let input = scalar_tile_to_column_value(*i_codomain);
+        let output = apply_function_tile(function_result, input, &f_codomain_extent);
         Tile::SealedFunction {
             domain: i_domain,
-            codomain: Box::new(result),
+            codomain: Box::new(Tile::Scalar(output)),
             domain_predicate: i_domain_predicate,
         }
     }
@@ -1205,10 +1204,10 @@ impl TileProducer for ScalarTupleProducer {
 /// Inverts a sealed-function operator, producing a lookup-function from codomain to domain.
 ///
 /// For an input `domain → codomain`, `Converse` produces a
-/// `LookupFunction { domain: codomain, codomain: domain }`.  Each codomain
+/// `CurriedFunction { domain: codomain, codomain: domain }`.  Each codomain
 /// value maps to the list of domain values that produce it.
 pub struct Converse {
-    /// Output tiling: `LookupFunction { domain: input.codomain, codomain: input.domain }`.
+    /// Output tiling: `CurriedFunction { domain: input.codomain, codomain: input.domain }`.
     tiling: Tiling,
     /// The sealed-function input to invert.
     input: Box<dyn TileOperator>,
@@ -1221,8 +1220,9 @@ impl Converse {
             .tiling()
             .split_function_extent()
             .unwrap_or_else(|| panic!("Converse expected function, got {:?}", input.tiling()));
-        let tiling = Tiling::LookupFunction {
-            domain: codomain,
+        let tiling = Tiling::CurriedFunction {
+            domain1: codomain,
+            domain2: domain.clone(),
             codomain: domain,
         };
         Self { tiling, input }
@@ -1293,21 +1293,47 @@ impl TileProducer for ConverseProducer {
                 domain_predicate,
             } => match *codomain {
                 Tile::Scalar(mut codomain) => {
-                    let mut map: HashMap<Value, Vec<Value>> = HashMap::new();
+                    // Invert the function: group domain values by their output value.
+                    let mut grouped: HashMap<Value, Vec<Value>> = HashMap::new();
                     for (i, o) in domain
                         .drain_to_value_iter()
                         .zip(codomain.drain_to_value_iter())
                     {
-                        map.entry(o).or_default().push(i);
+                        grouped.entry(o).or_default().push(i);
                     }
-                    Tile::LookupFunction {
-                        map,
-                        domain_predicate: if domain_predicate.as_bool().unwrap_or(false) {
+                    // Sort by key so downstream consumers can do O(log n) binary-search lookups.
+                    let mut sorted: Vec<(Value, Vec<Value>)> = grouped.into_iter().collect();
+                    sorted.sort_by(|(a, _), (b, _)| {
+                        a.partial_cmp(b)
+                            .expect("CurriedFunction domain values must be comparable")
+                    });
+                    let (out_domain_extent, out_codomain_extent) = match &self.tiling {
+                        Tiling::CurriedFunction {
+                            domain1, codomain, ..
+                        } => (domain1.clone(), codomain.clone()),
+                        _ => unreachable!(),
+                    };
+                    let mut domain_vals: Vec<Value> = Vec::with_capacity(sorted.len());
+                    let mut offset_vals: Vec<usize> = Vec::with_capacity(sorted.len());
+                    let mut codomain_vals: Vec<Value> = Vec::new();
+                    for (key, values) in sorted {
+                        domain_vals.push(key);
+                        offset_vals.push(codomain_vals.len());
+                        codomain_vals.extend(values);
+                    }
+                    let output_codomain =
+                        ColumnValue::from_values(codomain_vals, &out_codomain_extent);
+                    Tile::curried_function(
+                        ColumnValue::from_values(domain_vals, &out_domain_extent),
+                        ColumnValue::UInts(offset_vals),
+                        output_codomain.clone(),
+                        output_codomain,
+                        if domain_predicate.as_bool().unwrap_or(false) {
                             Predicate::True
                         } else {
                             Predicate::False
                         },
-                    }
+                    )
                 }
                 _ => panic!("Can only converse functions with scalar codomains"),
             },
@@ -1325,13 +1351,13 @@ impl TileProducer for ConverseProducer {
     }
 }
 
-/// Applies a function to every value in a [`Tile::LookupFunction`], producing a new
-/// `LookupFunction` with the same domain but mapped codomain values.
+/// Applies a function to every value in a [`Tile::CurriedFunction`], producing a new
+/// `CurriedFunction` with the same domain but mapped codomain values.
 ///
 /// For a input `D → [C]` and a function `C → E`, `MapCompose` produces `D → [E]`
 /// by applying the function independently to every element in each codomain list.
 pub struct MapCompose {
-    /// Output tiling: `LookupFunction { domain: input.domain, codomain: function.output_extent }`.
+    /// Output tiling: `CurriedFunction { domain: input.domain, codomain: function.output_extent }`.
     tiling: Tiling,
     /// The lookup-function input whose values are transformed.
     input: Box<dyn TileOperator>,
@@ -1342,13 +1368,17 @@ pub struct MapCompose {
 impl MapCompose {
     /// Create a new `MapCompose` operator.
     ///
-    /// `input` must have a `LookupFunction` tiling; `function` must have a function
+    /// `input` must have a `CurriedFunction` tiling; `function` must have a function
     /// tiling whose domain includes the input's codomain extent.  The output tiling is
-    /// `LookupFunction { domain: input.domain, codomain: function.output_extent }`.
+    /// `CurriedFunction { domain: input.domain, codomain: function.output_extent }`.
     pub fn new(input: Box<dyn TileOperator>, function: Box<dyn TileOperator>) -> Self {
-        let (domain, input_codomain) = match input.tiling() {
-            Tiling::LookupFunction { domain, codomain } => (domain.clone(), codomain.clone()),
-            t => panic!("MapCompose requires LookupFunction input, got {t:?}"),
+        let (domain1, domain2, input_codomain) = match input.tiling() {
+            Tiling::CurriedFunction {
+                domain1,
+                domain2,
+                codomain,
+            } => (domain1.clone(), domain2.clone(), codomain.clone()),
+            t => panic!("MapCompose requires CurriedFunction input, got {t:?}"),
         };
         let output_tiling = function.tiling().codomain().unwrap_or_else(|| {
             panic!(
@@ -1364,8 +1394,9 @@ impl MapCompose {
                 .includes(&input_codomain),
             "MapCompose function domain must include input codomain"
         );
-        let tiling = Tiling::LookupFunction {
-            domain,
+        let tiling = Tiling::CurriedFunction {
+            domain1,
+            domain2,
             codomain: output_tiling.extent(),
         };
         Self {
@@ -1442,9 +1473,9 @@ impl TileProducer for MapComposeProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_value_extent = match self.input.tiling() {
-            Tiling::LookupFunction { codomain, .. } => codomain.clone(),
-            t => panic!("MapCompose requires LookupFunction input, got {t:?}"),
+        let out_codomain_extent = match &self.tiling {
+            Tiling::CurriedFunction { codomain, .. } => codomain.clone(),
+            t => panic!("MapCompose output tiling is not CurriedFunction: {t:?}"),
         };
         let f_tiling = self.function.tiling();
         assert!(
@@ -1452,81 +1483,21 @@ impl TileProducer for MapComposeProducer {
             "MapCompose expected function tiling, got {f_tiling:?}"
         );
         let input_tile = self.input.get(self.input.tiling().universal_guard());
-        let Tile::LookupFunction {
-            map,
+        let Tile::CurriedFunction {
+            domain1,
+            offsets,
+            domain2,
+            codomain,
             domain_predicate,
         } = input_tile
         else {
-            panic!("MapCompose requires a LookupFunction tile")
+            panic!("MapCompose requires a CurriedFunction tile")
         };
         let function_tile = self.function.get(f_tiling.universal_guard());
-        // Handle SealedFunction as a point-lookup table (domain → codomain).
-        if let Tile::SealedFunction {
-            mut domain,
-            codomain,
-            ..
-        } = function_tile
-        {
-            let Tile::Scalar(mut codomain_col) = *codomain else {
-                panic!("MapCompose: SealedFunction function must have a Scalar codomain")
-            };
-            let table: HashMap<Value, Value> = domain
-                .drain_to_value_iter()
-                .zip(codomain_col.drain_to_value_iter())
-                .collect();
-            let new_map = map
-                .into_iter()
-                .map(|(key, values)| {
-                    let new_values = values.into_iter().map(|v| table[&v].clone()).collect();
-                    (key, new_values)
-                })
-                .collect();
-            return Tile::LookupFunction {
-                map: new_map,
-                domain_predicate,
-            };
-        }
-        let Tile::Scalar(func) = function_tile else {
-            panic!("MapCompose function tile must be Scalar or SealedFunction")
-        };
-        match func.as_single() {
-            Some(Value::ComputableFunction(f)) => {
-                // Apply f to each codomain list, converting each list through ColumnValue.
-                let new_map = map
-                    .into_iter()
-                    .map(|(key, values)| {
-                        let input = ColumnValue::from_values(values, &input_value_extent);
-                        let mut output = f.apply(input);
-                        let new_values: Vec<Value> = output.drain_to_value_iter().collect();
-                        (key, new_values)
-                    })
-                    .collect();
-                Tile::LookupFunction {
-                    map: new_map,
-                    domain_predicate: domain_predicate.clone(),
-                }
-            }
-            Some(Value::Function(bindings)) => {
-                // Map each value through the bindings lookup table.
-                let input_table: HashMap<Value, Value> =
-                    bindings.into_iter().map(|b| (b.input, b.output)).collect();
-                let new_map = map
-                    .into_iter()
-                    .map(|(key, values)| {
-                        let new_values = values
-                            .into_iter()
-                            .map(|v| input_table[&v].clone())
-                            .collect();
-                        (key, new_values)
-                    })
-                    .collect();
-                Tile::LookupFunction {
-                    map: new_map,
-                    domain_predicate,
-                }
-            }
-            _ => panic!("MapCompose: function is not a ComputableFunction or Function"),
-        }
+        // All function representations map each codomain element 1-to-1, so domain
+        // and offsets carry over unchanged; only the codomain values are remapped.
+        let new_codomain = apply_function_tile(function_tile, codomain, &out_codomain_extent);
+        Tile::curried_function(domain1, offsets, domain2, new_codomain, domain_predicate)
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
@@ -1893,7 +1864,7 @@ impl TileProducer for AggregateProducer {
         else {
             panic!("Accumulator must be Aggregation tile")
         };
-        self.kind.accumulate(accumulator, &values);
+        self.kind.accumulate(accumulator, &values, 0, values.len());
         terminal.set(0, is_terminal);
         if is_terminal {
             // TODO fine-grained release
@@ -2176,7 +2147,7 @@ impl TileProducer for MapExtractAggregateProducer {
     }
 }
 
-/// Performs a per-key aggregation over a [`Tile::LookupFunction`], producing a
+/// Performs a per-key aggregation over a [`Tile::CurriedFunction`], producing a
 /// `SealedFunction` that maps each domain key to an in-progress aggregation.
 ///
 /// For a lookup `D → [C]` and an [`AggregateKind`], `MapAggregate` produces a
@@ -2195,13 +2166,15 @@ pub struct MapAggregate {
 impl MapAggregate {
     /// Create a new `MapAggregate` operator.
     ///
-    /// `input` must have a `LookupFunction` tiling; `kind` must support the
+    /// `input` must have a `CurriedFunction` tiling; `kind` must support the
     /// lookup's codomain element type.  The output tiling is
     /// `SealedFunction { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
     pub fn new(input: Box<dyn TileOperator>, kind: AggregateKind) -> Self {
         let (domain, input_codomain) = match input.tiling() {
-            Tiling::LookupFunction { domain, codomain } => (domain.clone(), codomain.clone()),
-            t => panic!("MapAggregate requires LookupFunction input, got {t:?}"),
+            Tiling::CurriedFunction {
+                domain1, codomain, ..
+            } => (domain1.clone(), codomain.clone()),
+            t => panic!("MapAggregate requires CurriedFunction input, got {t:?}"),
         };
         let output_extent = kind.output_extent(&input_codomain).unwrap_or_else(|| {
             panic!("Cannot apply {kind:?} to codomain extent {input_codomain:?}")
@@ -2280,16 +2253,15 @@ impl TileProducer for MapAggregateProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
-        let Tile::LookupFunction {
-            map,
+        let Tile::CurriedFunction {
+            domain1,
+            offsets,
+            domain2: _,
+            codomain,
             domain_predicate,
         } = input_tile
         else {
-            panic!("MapAggregate requires a LookupFunction tile")
-        };
-        let input_codomain = match self.input.tiling() {
-            Tiling::LookupFunction { codomain, .. } => codomain.clone(),
-            t => panic!("MapAggregate input tiling is not LookupFunction: {t:?}"),
+            panic!("MapAggregate requires a CurriedFunction tile")
         };
         // output_extent is the accumulator extent from the Aggregation codomain tiling.
         let output_extent = self.tiling.codomain().unwrap().extent();
@@ -2297,12 +2269,19 @@ impl TileProducer for MapAggregateProducer {
         // Merge newly arrived values into per-key accumulators.
         let kind = &self.kind;
         let accumulators = &mut self.accumulators;
-        for (key, values) in map {
-            let col = ColumnValue::from_values(values, &input_codomain);
+        let n = domain1.len();
+        for i in 0..n {
+            let key = domain1.index_at(i);
+            let start = offsets.index_at(i).as_uint();
+            let end = if i + 1 < n {
+                offsets.index_at(i + 1).as_uint()
+            } else {
+                codomain.len()
+            };
             let acc = accumulators
                 .entry(key)
                 .or_insert_with(|| kind.initial_accumulator(&output_extent));
-            kind.accumulate(acc, &col);
+            kind.accumulate(acc, &codomain, start, end);
         }
         // Build the output tile from all known per-key accumulators.
         let is_terminal = domain_predicate.as_bool().unwrap_or(false);

@@ -23,7 +23,7 @@ Each `TileOperator` declares a `Tiling` that tells consumers what structure to e
 | `Scalar(Extent)` | A single value, possibly still unknown (represented as an empty `ColumnValue`). |
 | `Record(fields)` | A named collection of sub-tilings, one per field. The tiles are records with fields that are the tiles of the sub-tilings |
 | `SealedFunction { domain, codomain }` | A function mapping with structured codomain. Domain values accumulate incrementally; a `domain_predicate` on the tile signals when all have arrived. |
-| `LookupFunction { domain, codomain }` | Logically, this tiling is equivalent to `SealedFunction(domain, SealedFunction(UInt, codomain))`. It has a custom layout for efficiency, detailed in the `Tile` table below. |
+| `CurriedFunction { domain1, domain2, codomain }` | Logically, this tiling is equivalent to `SealedFunction(domain1, SealedFunction(domain2, codomain))`. It has a custom layout for efficiency, detailed in the `Tile` table below. |
 | `Aggregation { accumulator }` | An ongoing aggregate with scalar accumulator type. |
 
 `Tiling::extent()` converts a `Tiling` to the corresponding `Extent` (the type-level view).
@@ -40,7 +40,7 @@ A `Tile` holds the actual data. Its shape mirrors its `Tiling`:
 | `Scalar(ColumnValue)` |  The two tiles in this tiling are `⊥` and the specific scalar of the tiling. `⊥` is represented as an empty `ColumnValue` and the scalar is represented as a `ColumnValue` of length 1 |
 | `Record(fields)` | A Record of other `Tiles` |
 | `SealedFunction { domain, codomain, domain_predicate }` | Each `Tile` is the set of known mappings of the function.  The `domain` is a `ColumnValue` of the domain elements, and the `codomain` is another `Tile`, which must be implicitly vectorized.  For example, a `Scalar` tiling is stored as a `ColumnValue` instead of a single element. |
-| `LookupFunction { map, domain_predicate }` | Each tile represents the known mappings of a curried function. In the implementation, this is realized as a map from the domain to lists of codomain elements. (This is also likely to change in the near future to be more efficient) |
+| `CurriedFunction { domain1, offsets, domain2, codomain, domain_predicate }` | Each tile represents the known mappings of a curried function of type `domain1 → domain2 → codomain`. In the implementation, this is realized as sorted and aligned `ColumnValue`s of domain1 elements and offsets, where the offsets index into the codomain and domain2 `ColumnValue`. |
 | `Aggregation { accumulator, terminal }` | Logically, this tiling knows the final number of inputs `N` that will be aggregated and the tiles are of form `(count, accumulator)`.  However, for making this feasible to compute, we instead store a terminal flag indicating `count == N`. |
 
 `Tile::is_terminal()` returns true when a tile carries complete, final data. No larger tiles will ever be returned, although
@@ -55,7 +55,7 @@ the previous version of the interpreter.
 | Variant | Meaning |
 |---------|---------|
 | `Scalar(bool)` | `true` = interested, `false` = not interested. |
-| `LookupFunction(bool)` | All-or-nothing interest in the lookup table. |
+| `CurriedFunction(bool)` | All-or-nothing interest in the lookup table. |
 | `Aggregation(bool)` | All-or-nothing interest in the aggregate result. |
 | `Record(fields)` | Per-field `TileGuard`s, allowing fine-grained field demand. |
 | `SealedFunction(SealedFunctionGuard)` | Structured interest in a function tile (see below). |
@@ -109,18 +109,23 @@ during compilation; producers are created on demand at runtime.
 | `MapSource` | `SealedFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `SealedFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a sealed function from keys to their output values. |
 | `Zip` | `N` inputs of `SealedFunction(shared_extent → *)` tilings |  `SealedFunction(shared_domain → Record(_0, … _N))` | Merges N sealed-function operators that share a domain into one sealed function whose codomain is a Record Tiling of all their codomains. |
 | `ScalarTuple` | `N` inputs with `Scalar` tilings | `Record(_0, … _N)` | Packs N scalar inputs into a single `Record` tiling where each field is a `Scalar` tiling . The scalar analogue of `Zip`. |
-| `MapApply` | Function: any tiling of type `A → B`<br>Data: `SealedFunction(extent → Scalar(A))` | `SealedFunction(extent → Scalar(B))` | Applies a function element-wise over a sealed-function input, transforming each codomain value. The function input can have many different tilings; currently supports `Scalar(ComputableFunction)`, `Scalar(Function)`, `LookupFunction`, and `SealedFunction` tilings. |
+| `MapApply` | Function: any tiling of type `A → B`<br>Data: `SealedFunction(extent → Scalar(A))` | `SealedFunction(extent → Scalar(B))` | Applies a function element-wise over a sealed-function input, transforming each codomain value. The function input can have many different tilings; currently supports `Scalar(ComputableFunction)`, `Scalar(Function)`, `CurriedFunction`, and `SealedFunction` tilings. |
 | `MapToConst` | `SealedFunction(extent → *)` | `SealedFunction(extent → Scalar)` | Replaces every codomain value of a sealed-function input with the same constant, preserving the domain. |
 | `ToScalar` | Constant: `Scalar`<br>Data: `SealedFunction(Unit → Scalar)` | `Scalar` | Unwraps a `SealedFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |
-| `Converse` | `SealedFunction(domain -> Scalar(codomain))` | `LookupFunction(codomain → domain)` | Inverts a sealed-function operator: each codomain value maps to the list of domain values that produced it. |
-| `MapCompose` | Function: Function: any tiling of type `A → B`<br>Data: `LookupFunction(extent → A)` | `LookupFunction(extent → B)` | Applies a function to every value in each codomain list of a `LookupFunction`, producing a new `LookupFunction` with the same domain but transformed values. |
+| `Converse` | `SealedFunction(domain -> Scalar(codomain))` | `CurriedFunction(codomain → domain)` | Inverts a sealed-function operator: each codomain value maps to the list of domain values that produced it. |
+| `MapCompose` | Function: Function: any tiling of type `A → B`<br>Data: `CurriedFunction(extent → A)` | `CurriedFunction(extent → B)` | Applies a function to every value in each codomain list of a `CurriedFunction`, producing a new `CurriedFunction` with the same domain but transformed values. |
 | `Filter` | Predicate: any tiling of type `A → bool` <br>Data: `SealedFunction(extent → Scalar(A))` | Same as input | Filters a sealed-function tile by a boolean predicate: keeps only domain elements where the predicate on the value evaluates to `true`. <br>TODO can probably remove this in favor of Restrict |
 | `Restrict` | Predicate: any tiling of type `A → bool` <br>Data: `SealedFunction(A → *)` | Same as input | Filters a sealed-function tile by a boolean predicate: keeps only domain elements whose predicate evaluates to `true`. |
 | `Aggregate` | `SealedFunction(* → Scalar)` | `Aggregation` | Reduces all codomain values of a `SealedFunction` input into a single running accumulator via an `AggregateKind` (e.g. Sum, Max). Currently, the aggregation is hardcoded in the graph, but we could add support for aggregate-kinds-as-data |
 | `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts the final value from an `Aggregation` tile, emitting it only when the aggregation is marked terminal. |
-| `MapAggregate` | `LookupFunction(domain → codomain)` | `SealedFunction(domain → Aggregation)` | Performs a per-key aggregation |
+| `MapAggregate` | `CurriedFunction(domain → codomain)` | `SealedFunction(domain → Aggregation)` | Performs a per-key aggregation |
 | `MapExtractAggregate` | `SealedFunction(extent → Aggregation)` | `SealedFunction(extent → Scalar)` | Extracts terminal per-key aggregation results from a `SealedFunction(D, Aggregation)`, producing `SealedFunction(D, Scalar)`. |
 | `Split` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Forwards `get` requests and tracks the intersection of release guards. <br>TODO this should probably turn into the Memo operator |
+
+TODOs for implementing hash joins:
+
+- Add an uncurry that converts `CurriedFunction(A → UInt → B)` to `SealedFunction(Record(A, Uint) → B)`
+- Add support for MapApply to take a `CurriedFunction(A → UInt → B)` as the function argument, which will then convert `SealedFunction(C → A)` to `CurriedFunction(C → UInt → B)`
 
 ## Open Challenges
 

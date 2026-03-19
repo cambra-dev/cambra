@@ -241,23 +241,30 @@ impl AggregateKind {
         }
     }
 
-    /// Fold `values` into `accumulator` in place.
+    /// Fold `values[start..end]` into `accumulator` in place.
     ///
     /// `accumulator` holds the running state (a single-element `ColumnValue`);
-    /// `values` contains the new batch of elements to incorporate.
-    pub fn accumulate(&self, accumulator: &mut ColumnValue, values: &ColumnValue) {
+    /// `values` is the source column and `start..end` is the slice of elements
+    /// to incorporate.  Passing `0..values.len()` incorporates the whole column.
+    pub fn accumulate(
+        &self,
+        accumulator: &mut ColumnValue,
+        values: &ColumnValue,
+        start: usize,
+        end: usize,
+    ) {
         match (self, accumulator, values) {
             (AggregateKind::Sum, ColumnValue::Ints(ref mut acc), ColumnValue::Ints(vs)) => {
-                acc[0] += vs.iter().sum::<i64>()
+                acc[0] += vs[start..end].iter().sum::<i64>()
             }
             (AggregateKind::Max, ColumnValue::Ints(ref mut acc), ColumnValue::Ints(vs)) => {
-                accumulate_max(acc, vs);
+                accumulate_max(acc, &vs[start..end]);
             }
             (AggregateKind::Max, ColumnValue::UInts(ref mut acc), ColumnValue::UInts(vs)) => {
-                accumulate_max(acc, vs);
+                accumulate_max(acc, &vs[start..end]);
             }
             (AggregateKind::Max, ColumnValue::Strings(ref mut acc), ColumnValue::Strings(vs)) => {
-                accumulate_max(acc, vs);
+                accumulate_max(acc, &vs[start..end]);
             }
             _ => panic!("Invalid accumulate"),
         };

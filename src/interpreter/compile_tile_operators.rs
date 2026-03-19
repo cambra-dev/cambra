@@ -809,7 +809,7 @@ fn build_materialization_expr(
     ))
 }
 
-/// Compile a `groupby(collection, key)` expression to a [`LookupFunction`] tile.
+/// Compile a `groupby(collection, key)` expression to a [`CurriedFunction`] tile.
 ///
 /// The output maps each key value `K` to the list of collection elements `V`
 /// that produce that key.  The pipeline is:
@@ -820,9 +820,9 @@ fn build_materialization_expr(
 /// 3. Apply the key to each element: `Apply(key, mat_expr)`.  For lambda keys
 ///    this β-reduces so that element-wise operations (e.g. `x // 2`) work over
 ///    the materialized SealedFunction.  Result: `SealedFunction(D, K)`.
-/// 4. [`Converse`] inverts `D → K` to `LookupFunction(K, D)`.
+/// 4. [`Converse`] inverts `D → K` to `CurriedFunction(K, D)`.
 /// 5. [`MapCompose`] applies the collection again to each domain index, turning
-///    `LookupFunction(K, D)` into `LookupFunction(K, V)`.
+///    `CurriedFunction(K, D)` into `CurriedFunction(K, V)`.
 fn compile_groupby(
     collection_expr: &Expr,
     key_expr: &Expr,
@@ -849,10 +849,10 @@ fn compile_groupby(
     let keyed_op = compile_tile_inner(&keyed_expr, ctx)?;
     // keyed_op tiling: SealedFunction(D, K)
 
-    // 4. Invert D → K into LookupFunction(K, D).
+    // 4. Invert D → K into CurriedFunction(K, D).
     let converse_op: Box<dyn TileOperator> = Box::new(Converse::new(keyed_op));
 
-    // 5. Replace domain indices with collection elements: LookupFunction(K, V).
+    // 5. Replace domain indices with collection elements: CurriedFunction(K, V).
     //    Recompile collection because TileOperator is not Clone.
     let collection_op_2 = compile_tile_inner(collection_expr, ctx)?;
     let grouped_op: Box<dyn TileOperator> = Box::new(MapCompose::new(converse_op, collection_op_2));
