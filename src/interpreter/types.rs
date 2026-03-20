@@ -3,7 +3,6 @@
 use std::iter;
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap, hash::Hash, rc::Rc};
 
-use bit_set::BitSet;
 use bit_vec::BitVec;
 use intervalsets::numeric::Domain;
 use intervalsets::ops::Difference;
@@ -562,14 +561,11 @@ impl std::fmt::Display for Value {
             Value::Unit => write!(f, "()"),
             Value::Function(bindings) => {
                 // If inputs are exactly u0..uN, omit them for readability.
-                let positional = bindings
-                    .iter()
-                    .enumerate()
-                    .all(|(i, b)| b.input == Value::UInt(i));
+                let is_list = bindings_are_list(bindings);
                 let binding_strs: Vec<String> = bindings
                     .iter()
                     .map(|b| {
-                        if positional {
+                        if is_list {
                             format!("{}", b.output)
                         } else {
                             format!("{} -> {}", b.input, b.output)
@@ -667,6 +663,14 @@ impl Value {
             _ => panic!("Not function: {self:?}"),
         }
     }
+}
+
+/// Returns whether the given FuncBindings represent a logical list.
+pub fn bindings_are_list(bindings: &[FuncBinding]) -> bool {
+    bindings
+        .iter()
+        .enumerate()
+        .all(|(i, b)| b.input == Value::UInt(i))
 }
 
 /// A function binding represents a single input-output pair for a function
@@ -810,8 +814,8 @@ impl ColumnValue {
                         .expect("Cannot compare inputs")
                 });
                 ColumnValue::function_bindings(
-                    inputs.select_indices(&indices),
-                    outputs.select_indices(&indices),
+                    inputs.select_indices(indices.iter().cloned(), indices.len()),
+                    outputs.select_indices(indices.iter().cloned(), indices.len()),
                 )
             }
             other => other.clone(),
@@ -819,27 +823,37 @@ impl ColumnValue {
     }
 
     /// Select elements at the given indices.
-    pub fn select_indices(&self, indices: &[usize]) -> ColumnValue {
+    pub fn select_indices(
+        &self,
+        indices: impl Iterator<Item = usize>,
+        indices_len: usize,
+    ) -> ColumnValue {
         match self {
-            ColumnValue::Units(_) => ColumnValue::Units(indices.len()),
-            ColumnValue::Bools(v) => ColumnValue::Bools(indices.iter().map(|&i| v[i]).collect()),
-            ColumnValue::Ints(v) => ColumnValue::Ints(indices.iter().map(|&i| v[i]).collect()),
-            ColumnValue::UInts(v) => ColumnValue::UInts(indices.iter().map(|&i| v[i]).collect()),
+            ColumnValue::Units(_) => ColumnValue::Units(indices_len),
+            ColumnValue::Bools(v) => ColumnValue::Bools(indices.map(|i| v[i]).collect()),
+            ColumnValue::Ints(v) => ColumnValue::Ints(indices.map(|i| v[i]).collect()),
+            ColumnValue::UInts(v) => ColumnValue::UInts(indices.map(|i| v[i]).collect()),
             ColumnValue::Strings(v) => {
-                ColumnValue::Strings(indices.iter().map(|&i| v[i].clone()).collect())
+                ColumnValue::Strings(indices.map(|i| v[i].clone()).collect())
             }
             ColumnValue::Variants(v) => {
-                ColumnValue::Variants(indices.iter().map(|&i| v[i].clone()).collect())
+                ColumnValue::Variants(indices.map(|i| v[i].clone()).collect())
             }
-            ColumnValue::FunctionBindings { inputs, outputs } => ColumnValue::function_bindings(
-                inputs.select_indices(indices),
-                outputs.select_indices(indices),
-            ),
-            ColumnValue::Records(r) => ColumnValue::Records(
-                r.iter()
-                    .map(|(k, v)| (k.clone(), v.select_indices(indices)))
-                    .collect(),
-            ),
+            ColumnValue::FunctionBindings { inputs, outputs } => {
+                let i: Vec<_> = indices.collect();
+                ColumnValue::function_bindings(
+                    inputs.select_indices(i.iter().cloned(), i.len()),
+                    outputs.select_indices(i.iter().cloned(), i.len()),
+                )
+            }
+            ColumnValue::Records(r) => {
+                let i: Vec<_> = indices.collect();
+                ColumnValue::Records(
+                    r.iter()
+                        .map(|(k, v)| (k.clone(), v.select_indices(i.iter().cloned(), indices_len)))
+                        .collect(),
+                )
+            }
             ColumnValue::LookupTable(..) => panic!("Cannot select_indices on LookupTable"),
         }
     }
@@ -1056,10 +1070,7 @@ impl ColumnValue {
     /// # Example
     /// Given `{"a": [1, 2], "b": [3, 4]}`, returns
     /// `Records {"a": [1, 1, 2, 2], "b": [3, 4, 3, 4]}`.
-    pub fn cartesian_product_with_correlation(
-        data: HashMap<String, ColumnValue>,
-        correlations: Option<&BitSet>,
-    ) -> ColumnValue {
+    pub fn cartesian_product(data: HashMap<String, ColumnValue>) -> ColumnValue {
         if data.is_empty() {
             return ColumnValue::Records(HashMap::new());
         }
@@ -1075,16 +1086,8 @@ impl ColumnValue {
                 // stride: how many output rows share the same index into this column
                 // before it advances — the product of all subsequent column lengths.
                 let stride: usize = lengths[j + 1..].iter().product();
-                let indices: Vec<usize> = if let Some(corr) = correlations {
-                    // If correlations are provided, filter the range to only include rows that are correlated.
-                    (0..total)
-                        .filter(|i| corr.contains(*i))
-                        .map(|i| (i / stride) % lengths[j])
-                        .collect()
-                } else {
-                    (0..total).map(|i| (i / stride) % lengths[j]).collect()
-                };
-                (key.clone(), data[key].select_indices(&indices))
+                let indices = (0..total).map(|i| (i / stride) % lengths[j]);
+                (key.clone(), data[key].select_indices(indices, total))
             })
             .collect();
         ColumnValue::Records(expanded)
@@ -1099,17 +1102,7 @@ impl ColumnValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bit_set::BitSet;
     use std::collections::HashMap;
-
-    /// Helper to make a full BitSet covering [0, n).
-    fn full_bitset(n: usize) -> BitSet {
-        let mut bs = BitSet::new();
-        for i in 0..n {
-            bs.insert(i);
-        }
-        bs
-    }
 
     #[test]
     fn test_cartesian_product_no_filter() {
@@ -1121,89 +1114,20 @@ mod tests {
             ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
             ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
         ]);
-        let result = ColumnValue::cartesian_product_with_correlation(data, None);
+        let result = ColumnValue::cartesian_product(data);
         assert_eq!(
             result,
             ColumnValue::Records(HashMap::from([
                 ("a".to_string(), ColumnValue::Ints(vec![1, 1, 2, 2])),
                 ("b".to_string(), ColumnValue::Ints(vec![3, 4, 3, 4])),
-            ]))
-        );
-    }
-
-    #[test]
-    fn test_cartesian_product_empty_bitset() {
-        // Empty correlation set → no rows selected → empty columns.
-        let data = HashMap::from([
-            ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
-            ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
-        ]);
-        let result = ColumnValue::cartesian_product_with_correlation(data, Some(&BitSet::new()));
-        assert_eq!(
-            result,
-            ColumnValue::Records(HashMap::from([
-                ("a".to_string(), ColumnValue::Ints(vec![])),
-                ("b".to_string(), ColumnValue::Ints(vec![])),
-            ]))
-        );
-    }
-
-    #[test]
-    fn test_cartesian_product_full_bitset() {
-        // Full BitSet covering all 4 rows → same output as no filter.
-        let data = HashMap::from([
-            ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
-            ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
-        ]);
-        let result = ColumnValue::cartesian_product_with_correlation(data, Some(&full_bitset(4)));
-        assert_eq!(
-            result,
-            ColumnValue::Records(HashMap::from([
-                ("a".to_string(), ColumnValue::Ints(vec![1, 1, 2, 2])),
-                ("b".to_string(), ColumnValue::Ints(vec![3, 4, 3, 4])),
-            ]))
-        );
-    }
-
-    #[test]
-    fn test_cartesian_product_sparse_bitset() {
-        // BitSet {0, 3} → rows 0 and 3 of the 2×2 product (diagonal).
-        // Row 0: a[0]=1, b[0]=3 | Row 3: a[1]=2, b[1]=4
-        let data = HashMap::from([
-            ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
-            ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
-        ]);
-        let mut filter = BitSet::new();
-        filter.insert(0);
-        filter.insert(3);
-        let result = ColumnValue::cartesian_product_with_correlation(data, Some(&filter));
-        assert_eq!(
-            result,
-            ColumnValue::Records(HashMap::from([
-                ("a".to_string(), ColumnValue::Ints(vec![1, 2])),
-                ("b".to_string(), ColumnValue::Ints(vec![3, 4])),
             ]))
         );
     }
 
     #[test]
     fn test_cartesian_product_empty_map() {
-        let result = ColumnValue::cartesian_product_with_correlation(HashMap::new(), None);
+        let result = ColumnValue::cartesian_product(HashMap::new());
         assert_eq!(result, ColumnValue::Records(HashMap::new()));
-    }
-
-    #[test]
-    fn test_cartesian_product_single_column() {
-        // Single column with a full filter → identity.
-        let data = HashMap::from([("a".to_string(), ColumnValue::Ints(vec![10, 20, 30]))]);
-        let result = ColumnValue::cartesian_product_with_correlation(data, Some(&full_bitset(3)));
-        assert_eq!(
-            result,
-            ColumnValue::Records(HashMap::from([(
-                "a".to_string(),
-                ColumnValue::Ints(vec![10, 20, 30]),
-            )]))
-        );
     }
 
     #[test]

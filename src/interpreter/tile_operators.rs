@@ -18,7 +18,7 @@ pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, 
 use crate::{
     ccl::AggregateKind,
     interpreter::{
-        transform_hashmap_values, tuple_field, BaseType, ColumnValue, Consumer,
+        bindings_are_list, transform_hashmap_values, tuple_field, BaseType, ColumnValue, Consumer,
         DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult, Scheduler, Value,
     },
     pretty_graph::VizOptions,
@@ -165,12 +165,20 @@ fn apply_function_tile(
         Tile::Scalar(func) => match func.as_single() {
             Some(Value::ComputableFunction(f)) => f.apply(input),
             Some(Value::Function(bindings)) => {
-                let table: HashMap<Value, Value> =
-                    bindings.into_iter().map(|b| (b.input, b.output)).collect();
-                let output_values: Vec<Value> = input
-                    .drain_to_value_iter()
-                    .map(|v| table[&v].clone())
-                    .collect();
+                let output_values: Vec<Value> = if bindings_are_list(&bindings) {
+                    let table: Vec<Value> = bindings.into_iter().map(|b| b.output).collect();
+                    input
+                        .drain_to_value_iter()
+                        .map(|v| table[v.as_uint()].clone())
+                        .collect()
+                } else {
+                    let table: HashMap<Value, Value> =
+                        bindings.into_iter().map(|b| (b.input, b.output)).collect();
+                    input
+                        .drain_to_value_iter()
+                        .map(|v| table[&v].clone())
+                        .collect()
+                };
                 ColumnValue::from_values(output_values, output_extent)
             }
             None => ColumnValue::from_values(Vec::new(), output_extent),
@@ -287,7 +295,7 @@ impl TileOperator for MapApply {
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("Map")
+        InspectNode::new("MapApply")
             .with_tiling(self.tiling.to_string())
             .child("fn", self.function.inspect(opts))
             .child("input", self.input.inspect(opts))
@@ -346,7 +354,7 @@ impl TileProducer for MapApplyProducer {
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("Map")
+        InspectNode::new("MapApply")
             .with_tiling(self.tiling.to_string())
             .child("fn", self.function.inspect(opts))
             .child("input", self.input.inspect(opts))
@@ -785,7 +793,7 @@ fn iterate_record(fields: &HashMap<String, Extent>) -> ColumnValue {
         .iter()
         .map(|(field, field_extent)| (field.clone(), iterate_extent(field_extent)))
         .collect();
-    ColumnValue::cartesian_product_with_correlation(data, None)
+    ColumnValue::cartesian_product(data)
 }
 
 impl TileProducer for IterateExtentProducer {
@@ -1878,7 +1886,6 @@ impl TileProducer for AggregateProducer {
         let i_tiling = self.input.tiling().clone();
         let input_result = self.input.get(i_tiling.universal_guard());
         let is_terminal = input_result.is_terminal();
-        let s = format!("{input_result:?}");
         let values = match input_result {
             Tile::SealedFunction {
                 domain,
@@ -1900,7 +1907,7 @@ impl TileProducer for AggregateProducer {
                     &i_tiling.codomain().unwrap().extent(),
                 )
             }
-            _ => panic!("Aggregate expected function tiling {s}"),
+            t => panic!("Aggregate expected function tiling, got {t:?}"),
         };
         let Tile::Aggregation {
             ref mut accumulator,
