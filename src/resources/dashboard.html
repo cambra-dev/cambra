@@ -30,83 +30,6 @@
             margin-bottom: 12px;
         }
 
-        .node {
-            border-left: 2px solid #45475a;
-            margin-left: 12px;
-            padding-left: 10px;
-            margin-top: 4px;
-        }
-
-        .node-header {
-            cursor: pointer;
-            padding: 4px 8px;
-            border-radius: 4px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            flex-wrap: wrap;
-        }
-
-        .node-header:hover {
-            background: #313244;
-        }
-
-        .type-name {
-            color: #cba6f7;
-            font-weight: bold;
-        }
-
-        .label {
-            color: #f9e2af;
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 1px 6px;
-            border-radius: 3px;
-            font-size: 11px;
-        }
-
-        .badge-complete {
-            background: #a6e3a1;
-            color: #1e1e2e;
-        }
-
-        .badge-active {
-            background: #f9e2af;
-            color: #1e1e2e;
-        }
-
-        .badge-empty {
-            background: #45475a;
-            color: #bac2de;
-        }
-
-        .guard {
-            color: #94e2d5;
-            font-size: 11px;
-        }
-
-        .data {
-            color: #fab387;
-            font-size: 11px;
-        }
-
-        .collapsed>.children {
-            display: none;
-        }
-
-        .collapsed>.node-header>.toggle {
-            transform: rotate(-90deg);
-        }
-
-        .toggle {
-            width: 16px;
-            text-align: center;
-            color: #6c7086;
-            transition: transform 0.1s;
-        }
-
         .section {
             margin-top: 16px;
         }
@@ -122,6 +45,12 @@
         #error {
             color: #f38ba8;
             margin: 8px 0;
+        }
+
+        #producer-container {
+            overflow: auto;
+            border: 1px solid #313244;
+            border-radius: 4px;
         }
     </style>
 </head>
@@ -146,55 +75,283 @@
     </div>
     <div class="section">
         <div class="section-title">Producer Graph</div>
-        <div id="producer"></div>
+        <div id="producer-container">
+            <div id="producer" style="line-height:0;"></div>
+        </div>
     </div>
     <script>
-        function badge(node) {
-            const yg = node.yield_guard;
-            if (yg === '*') return '<span class="badge badge-complete">DONE</span>';
-            if (!yg || yg === '\u2205') return '<span class="badge badge-empty">IDLE</span>';
-            return '<span class="badge badge-active">RUNNING</span>';
+        // ── XML escaping for SVG text content ────────────────────────────────
+        function esc(s) {
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;');
         }
-        function renderNode(node, edgeLabel) {
-            const hasChildren = node.children && node.children.length > 0;
-            const toggle = hasChildren ? '\u25bc' : '\u00a0';
-            const typeName = node.label.split('(')[0];
-            const parenIdx = node.label.indexOf('(');
-            const args = parenIdx >= 0 ? node.label.slice(parenIdx) : '';
-            let h = '<div class="node">';
-            h += '<div class="node-header" onclick="this.parentElement.classList.toggle(\'collapsed\')">';
-            h += '<span class="toggle">' + toggle + '</span>';
-            if (edgeLabel) h += '<span style="color:#6c7086">' + esc(edgeLabel) + ': </span>';
-            h += '<span class="type-name">' + esc(typeName) + '</span>';
-            if (args) h += '<span class="label">' + esc(args) + '</span>';
-            if (node.annotations) {
-                for (const ann of node.annotations) {
-                    h += '<span class="guard">' + esc(ann) + '</span>';
+
+        // ── Helpers for identifying back-reference split nodes ────────────────
+        // Primary split nodes have labels like   "Split#<hex>"
+        // Back-references have labels like       "→ Split#<hex>"
+        function isSplitRef(label) { return label.startsWith('\u2192 Split#'); }
+        function splitId(label) {
+            // Works for both "Split#<id>" and "→ Split#<id>"
+            const idx = label.indexOf('Split#');
+            return idx >= 0 ? label.slice(idx + 6) : null;
+        }
+
+        // ── Layout constants ─────────────────────────────────────────────────
+        const NODE_W    = 188;  // node box width
+        const TILING_LW = 24;   // approximate chars that fit on one tiling line
+        const H_GAP     = 24;   // minimum horizontal gap between sibling subtrees
+        const V_GAP     = 56;   // vertical gap between levels
+        const PAD       = 20;   // canvas padding
+
+        // ── Per-node height based on how many lines the tiling wraps to ───────
+        // Title always occupies the first 26px; each additional tiling line
+        // adds 13px with 8px of bottom padding.
+        function nodeHeight(node) {
+            const n = tilingLines(node.tiling || '').length;
+            return n === 0 ? 34 : 26 + n * 13 + 8;
+        }
+
+        // ── Wrap a tiling string into lines at natural break points ───────────
+        // Breaks preferentially after '→' or at spaces; falls back to a hard
+        // break when no whitespace is found within the limit.
+        function tilingLines(text) {
+            if (!text) return [];
+            const lines = [];
+            let rem = text;
+            while (rem.length > TILING_LW) {
+                // Prefer breaking just after '→' (inclusive, so the arrow stays on its line)
+                const arrowIdx = rem.lastIndexOf('\u2192', TILING_LW);
+                let bp = arrowIdx > 0 ? arrowIdx + 1 : rem.lastIndexOf(' ', TILING_LW);
+                if (bp <= 0) bp = TILING_LW;  // hard break
+                lines.push(rem.slice(0, bp).trimEnd());
+                rem = rem.slice(bp).trimStart();
+            }
+            if (rem) lines.push(rem);
+            return lines;
+        }
+
+        // ── Bottom-up: measure the minimum width each subtree needs ───────────
+        // Back-reference split nodes are collapsed into cross-edges, so they
+        // don't contribute width to their parent's subtree.
+        function subtreeWidth(node) {
+            const realChildren = (node.children || []).filter(c => !isSplitRef(c.node.label));
+            if (realChildren.length === 0) return NODE_W;
+            const childTotal = realChildren.reduce((sum, c) => sum + subtreeWidth(c.node), 0);
+            const gaps = H_GAP * (realChildren.length - 1);
+            return Math.max(NODE_W, childTotal + gaps);
+        }
+
+        // ── Depth assignment (phase 1): DFS, ignoring split back-references ─────
+        function assignDepths(node, depth) {
+            node._depth = Math.max(node._depth ?? 0, depth);
+            const realChildren = (node.children || []).filter(c => !isSplitRef(c.node.label));
+            for (const c of realChildren) assignDepths(c.node, depth + 1);
+        }
+
+        // ── Depth constraint (phase 2): push any consumer below its split ────
+        // A node that references Split#X must sit strictly deeper than Split#X,
+        // otherwise the cross-edge would have to travel sideways or upward.
+        function pushDown(node, delta) {
+            node._depth += delta;
+            const realChildren = (node.children || []).filter(c => !isSplitRef(c.node.label));
+            for (const c of realChildren) pushDown(c.node, delta);
+        }
+
+        function enforceDepthConstraints(node, splitMap) {
+            for (const c of (node.children || [])) {
+                if (isSplitRef(c.node.label)) {
+                    const split = splitMap.get(splitId(c.node.label));
+                    if (split && split._depth <= node._depth)
+                        pushDown(split, node._depth - split._depth + 1);
                 }
             }
-            h += badge(node);
-            if (node.yield_guard) h += '<span class="guard">' + esc(node.yield_guard) + '</span>';
-            h += '</div>';
-            if (hasChildren) {
-                h += '<div class="children">';
-                for (const child of node.children) h += renderNode(child.node, child.edge || '');
-                h += '</div>';
-            }
-            h += '</div>';
-            return h;
+            const realChildren = (node.children || []).filter(c => !isSplitRef(c.node.label));
+            for (const c of realChildren) enforceDepthConstraints(c.node, splitMap);
         }
-        function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+        // ── Y assignment (phase 3): compute row tops from actual node heights ──
+        // Each depth level's y-offset equals the sum of all preceding rows'
+        // heights (max per level) plus inter-level gaps.
+        function computeYPositions(nodes) {
+            const rowH = new Map();
+            for (const n of nodes)
+                rowH.set(n._depth, Math.max(rowH.get(n._depth) ?? 0, nodeHeight(n)));
+            const maxDepth = Math.max(...nodes.map(n => n._depth));
+            const rowY = [0];
+            for (let d = 0; d < maxDepth; d++)
+                rowY.push(rowY[d] + (rowH.get(d) ?? 34) + V_GAP);
+            for (const n of nodes)
+                n._y = rowY[n._depth];
+        }
+
+        // ── X assignment (phase 4): centre each node over its real children ──
+        function assignX(node, cx) {
+            node._cx = cx;
+            const realChildren = (node.children || []).filter(c => !isSplitRef(c.node.label));
+            if (realChildren.length === 0) return;
+
+            const widths = realChildren.map(c => subtreeWidth(c.node));
+            const total  = widths.reduce((a, b) => a + b, 0) + H_GAP * (widths.length - 1);
+            let x = cx - total / 2;
+            for (let i = 0; i < realChildren.length; i++) {
+                assignX(realChildren[i].node, x + widths[i] / 2);
+                x += widths[i] + H_GAP;
+            }
+        }
+
+        // ── Flatten the tree into node and edge arrays ────────────────────────
+        // Back-reference children are recorded as unresolved cross-edges;
+        // the to-node is filled in after all real nodes have been laid out.
+        function collectAll(node, nodes, edges) {
+            nodes.push(node);
+            if (!node.children) return;
+            for (const c of node.children) {
+                if (isSplitRef(c.node.label)) {
+                    // Deferred cross-edge: target resolved after layout via split map
+                    edges.push({
+                        from: node,
+                        to: null,
+                        splitRefId: splitId(c.node.label),
+                        label: c.edge || '',
+                    });
+                } else {
+                    edges.push({ from: node, to: c.node, label: c.edge || '' });
+                    collectAll(c.node, nodes, edges);
+                }
+            }
+        }
+
+
+        // ── Build the SVG string for a producer tree ──────────────────────────
+        function buildSvgGraph(root) {
+            // 1. Assign initial tree depths
+            assignDepths(root, 0);
+
+            // 2. Collect nodes so we can build the split map before layout
+            const nodes = [], edges = [];
+            collectAll(root, nodes, edges);
+
+            // 3. Build split map and enforce depth constraints so every consumer
+            //    sits strictly below the split node it references
+            const splitMap = new Map();
+            for (const n of nodes) {
+                const id = splitId(n.label);
+                if (id && !isSplitRef(n.label)) splitMap.set(id, n);
+            }
+            enforceDepthConstraints(root, splitMap);
+
+            // 4. Assign x positions and compute y from actual node heights
+            const totalW = subtreeWidth(root);
+            assignX(root, totalW / 2);
+            computeYPositions(nodes);
+
+            // 5. Resolve deferred cross-edges
+            for (const e of edges) {
+                if (e.splitRefId) e.to = splitMap.get(e.splitRefId) ?? null;
+            }
+
+            // 6. Compute canvas bounds
+            const minX = Math.min(...nodes.map(n => n._cx)) - NODE_W / 2;
+            const maxX = Math.max(...nodes.map(n => n._cx)) + NODE_W / 2;
+            const maxY = Math.max(...nodes.map(n => n._y + nodeHeight(n)));
+            const svgW = maxX - minX + 2 * PAD;
+            const svgH = maxY + 2 * PAD;
+            const ox   = PAD - minX;   // layout → SVG x offset
+            const oy   = PAD;          // layout → SVG y offset
+
+            // 5. Generate SVG
+            let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgW}" height="${svgH}" `
+                  + `style="font-family:'SF Mono',Menlo,Monaco,monospace;display:block;">`;
+
+            s += `<rect width="${svgW}" height="${svgH}" fill="#1e1e2e"/>`;
+
+            // ── Edges (drawn first so they sit behind nodes) ──────────────────
+            for (const e of edges) {
+                if (!e.to) continue;   // unresolvable cross-edge (shouldn't happen)
+
+                // Normal edges: bottom of parent → top of child.
+                // Split cross-edges: top of split node → bottom of consumer.
+                // (e.from = consumer, e.to = split for cross-edges)
+                const x1 = e.splitRefId ? e.to._cx   + ox : e.from._cx + ox;
+                const y1 = e.splitRefId ? e.to._y    + oy : e.from._y  + oy + nodeHeight(e.from);
+                const x2 = e.splitRefId ? e.from._cx + ox : e.to._cx   + ox;
+                const y2 = e.splitRefId ? e.from._y  + oy + nodeHeight(e.from) : e.to._y + oy;
+
+                {
+                    // Solid gray bezier with symmetric control points.
+                    // Midpoint of this curve is exactly ((x1+x2)/2, (y1+y2)/2).
+                    const cm = (y1 + y2) / 2;
+                    s += `<path d="M${x1},${y1} C${x1},${cm} ${x2},${cm} ${x2},${y2}" `
+                       + `fill="none" stroke="#45475a" stroke-width="1.5"/>`;
+                    if (e.label) {
+                        const lx  = (x1 + x2) / 2;
+                        const ly  = (y1 + y2) / 2;
+                        const fw  = e.label.length * 6.5 + 6;
+                        s += `<rect x="${lx-fw/2}" y="${ly-8}" width="${fw}" height="13" rx="2" fill="#1e1e2e"/>`;
+                        s += `<text x="${lx}" y="${ly+3}" text-anchor="middle" `
+                           + `fill="#6c7086" font-size="10">${esc(e.label)}</text>`;
+                    }
+                }
+            }
+
+            // ── Nodes ─────────────────────────────────────────────────────────
+            for (const n of nodes) {
+                const nx = n._cx + ox - NODE_W / 2;
+                const ny = n._y  + oy;
+                const cx = n._cx + ox;
+                // Border highlights active nodes (yield guard present and not complete)
+                const yg = n.yield_guard;
+                const borderColor = (yg && yg !== '\u2205' && yg !== '*') ? '#f9e2af' : '#45475a';
+                s += `<rect x="${nx}" y="${ny}" width="${NODE_W}" height="${nodeHeight(n)}" rx="5" `
+                   + `fill="#313244" stroke="${borderColor}" stroke-width="1"/>`;
+
+                // Line 1: type name (before first '('), bold purple
+                const parenIdx   = n.label.indexOf('(');
+                // Line 1 title: type name + inline annotations (e.g. "(Sum)")
+                const typeName = parenIdx >= 0 ? n.label.slice(0, parenIdx) : n.label;
+                const args     = parenIdx >= 0 ? n.label.slice(parenIdx) : '';
+                const annInline = (n.annotations && n.annotations.length > 0)
+                    ? ' ' + n.annotations.join(' ')
+                    : '';
+                const titleText = typeName + (args || '') + annInline;
+                s += `<text x="${cx}" y="${ny + 18}" text-anchor="middle" font-size="12">`
+                   + `<tspan fill="#cba6f7" font-weight="bold">${esc(typeName + (args || ''))}</tspan>`;
+                if (annInline)
+                    s += `<tspan fill="#a6adc8" font-size="11">${esc(annInline)}</tspan>`;
+                s += `</text>`;
+
+                // Line 2+: tiling, wrapped, teal
+                const tlines = tilingLines(n.tiling || '');
+                for (let i = 0; i < tlines.length; i++) {
+                    s += `<text x="${cx}" y="${ny + 35 + i * 13}" text-anchor="middle" `
+                       + `fill="#94e2d5" font-size="11">${esc(tlines[i])}</text>`;
+                }
+
+            }
+
+            s += '</svg>';
+            return s;
+        }
+
+        // ── Polling ───────────────────────────────────────────────────────────
         async function poll() {
             try {
-                const r = await fetch('/api/snapshot');
+                const r    = await fetch('/api/snapshot');
                 const data = await r.json();
                 document.getElementById('tick').textContent = 'Tick: ' + data.tick;
-                document.getElementById('producer').innerHTML = data.producer ? renderNode(data.producer) : '<em>none</em>';
+                document.getElementById('producer').innerHTML =
+                    data.producer
+                        ? buildSvgGraph(data.producer)
+                        : '<em style="padding:8px;color:#a6adc8;">none</em>';
                 document.getElementById('error').textContent = '';
             } catch (e) {
                 document.getElementById('error').textContent = 'Connection error: ' + e.message;
             }
         }
+
         poll();
         fetch('/api/ast').then(r => r.text()).then(t => { document.getElementById('ast').textContent = t; });
         fetch('/api/operators').then(r => r.text()).then(t => { document.getElementById('operators').textContent = t; });

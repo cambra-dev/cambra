@@ -12,6 +12,7 @@ use intervalsets::{Bounding, Interval, IntervalSet, MaybeEmpty, Side};
 use crate::interpreter::{
     apply_binop_column, apply_unaryop_column, tuple_field, BinOpKind, UnaryOpKind,
 };
+use crate::pretty_graph::fmt_binop;
 use crate::util::fmt_record;
 
 /// An Extent represents the set of values a term can take on (its type).
@@ -301,7 +302,7 @@ impl std::fmt::Display for Extent {
                 write!(f, "({})", extent_strs.join(" | "))
             }
             Extent::UIntRange(set) => write!(f, "{set}"),
-            Extent::DataSourceDomain(_) => write!(f, "DataSource"),
+            Extent::DataSourceDomain(source) => write!(f, "Source({})", source.borrow().get_id()),
             Extent::Restricted { base, .. } => write!(f, "Restricted({base})"),
         }
     }
@@ -442,6 +443,16 @@ impl FunctionDef {
     }
 }
 
+impl std::fmt::Display for FunctionDef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FunctionDef::UnaryOp(op) => write!(f, "UnaryOp({:?})", op),
+            FunctionDef::BinOp(op) => write!(f, "BinOp({})", fmt_binop(op)),
+            FunctionDef::RecordField(field) => write!(f, ".{field}"),
+        }
+    }
+}
+
 /// Values in CCL
 #[derive(Clone, PartialEq, Eq)]
 pub enum Value {
@@ -568,7 +579,7 @@ impl std::fmt::Display for Value {
                 write!(f, "Function [ {} ]", binding_strs.join(", "))
             }
             Value::Record(fields) => fmt_record(f, fields),
-            Value::ComputableFunction(fun) => write!(f, "{fun:?}"),
+            Value::ComputableFunction(fun) => write!(f, "{fun}"),
         }
     }
 }

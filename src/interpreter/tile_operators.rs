@@ -288,7 +288,7 @@ impl TileOperator for MapApply {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("Map")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("fn", self.function.inspect(opts))
             .child("input", self.input.inspect(opts))
     }
@@ -347,7 +347,7 @@ impl TileProducer for MapApplyProducer {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("Map")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("fn", self.function.inspect(opts))
             .child("input", self.input.inspect(opts))
     }
@@ -447,7 +447,7 @@ impl TileOperator for MapToConst {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("Map")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
             .child("constant", self.constant.inspect(opts))
     }
@@ -506,7 +506,7 @@ impl TileProducer for MapToConstProducer {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("Map")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
             .child("constant", self.constant.inspect(opts))
     }
@@ -611,7 +611,7 @@ impl TileOperator for IterateExtent {
     }
 
     fn inspect(&self, _opts: &VizOptions) -> InspectNode {
-        InspectNode::leaf("IterateExtent").annotate(format!("{:?}", self.extent))
+        InspectNode::leaf("IterateExtent").with_tiling(self.tiling().to_string())
     }
 
     fn subscribe(
@@ -790,7 +790,7 @@ fn iterate_record(fields: &HashMap<String, Extent>) -> ColumnValue {
 
 impl TileProducer for IterateExtentProducer {
     fn inspect(&self, _opts: &VizOptions) -> InspectNode {
-        InspectNode::leaf("IterateExtent").annotate(format!("{:?}", self.extent))
+        InspectNode::leaf("IterateExtent").with_tiling(self.tiling().to_string())
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -865,6 +865,7 @@ impl TileOperator for MapSource {
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("MapSource")
             .annotate(self.source.borrow().get_id().to_string())
+            .with_tiling(self.tiling().to_string())
             .child("input", self.input.inspect(opts))
     }
 
@@ -914,6 +915,7 @@ impl TileProducer for MapSourceProducer {
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("MapSource")
             .annotate(self.source.borrow().get_id().to_string())
+            .with_tiling(self.tiling().to_string())
             .child("input", self.input.inspect(opts))
     }
 
@@ -1001,7 +1003,7 @@ impl TileOperator for Zip {
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut node = InspectNode::new("Zip").annotate(self.tiling.to_string());
+        let mut node = InspectNode::new("Zip").with_tiling(self.tiling.to_string());
         for (i, input) in self.inputs.iter().enumerate() {
             node = node.child(format!("{i}"), input.inspect(opts));
         }
@@ -1054,7 +1056,7 @@ impl TileProducer for ZipProducer {
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut node = InspectNode::new("Zip").annotate(self.tiling.to_string());
+        let mut node = InspectNode::new("Zip").with_tiling(self.tiling.to_string());
         for (i, input) in self.inputs.iter().enumerate() {
             node = node.child(format!("_{i}"), input.inspect(opts));
         }
@@ -1158,7 +1160,7 @@ impl TileOperator for ScalarTuple {
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut node = InspectNode::new("ScalarTuple").annotate(self.tiling.to_string());
+        let mut node = InspectNode::new("ScalarTuple").with_tiling(self.tiling.to_string());
         for (i, input) in self.inputs.iter().enumerate() {
             node = node.child(format!("{i}"), input.inspect(opts));
         }
@@ -1210,7 +1212,7 @@ impl TileProducer for ScalarTupleProducer {
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut node = InspectNode::new("ScalarTuple").annotate(self.tiling.to_string());
+        let mut node = InspectNode::new("ScalarTuple").with_tiling(self.tiling.to_string());
         for (i, input) in self.inputs.iter().enumerate() {
             node = node.child(format!("{i}"), input.inspect(opts));
         }
@@ -1270,7 +1272,7 @@ impl TileOperator for Converse {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("Converse")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
     }
 
@@ -1310,7 +1312,7 @@ impl TileProducer for ConverseProducer {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("Converse")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
     }
 
@@ -1449,7 +1451,7 @@ impl TileOperator for MapCompose {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("MapCompose")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("fn", self.function.inspect(opts))
             .child("input", self.input.inspect(opts))
     }
@@ -1498,7 +1500,7 @@ impl TileProducer for MapComposeProducer {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("MapCompose")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("fn", self.function.inspect(opts))
             .child("input", self.input.inspect(opts))
     }
@@ -1587,7 +1589,7 @@ impl TileOperator for Filter {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("Filter")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
             .child("predicate", self.predicate.inspect(opts))
     }
@@ -1646,7 +1648,7 @@ impl TileProducer for FilterProducer {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("Filter")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
             .child("predicate", self.predicate.inspect(opts))
     }
@@ -1807,7 +1809,7 @@ impl TileOperator for Aggregate {
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("Aggregate")
             .annotate(format!("({:?})", self.kind))
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
     }
 
@@ -1868,7 +1870,7 @@ impl TileProducer for AggregateProducer {
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("Aggregate")
             .annotate(format!("({:?})", self.kind))
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
     }
 
@@ -2080,7 +2082,7 @@ impl TileOperator for MapExtractAggregate {
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("MapExtractAggregate")
             .annotate(format!("({:?})", self.kind))
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
     }
 
@@ -2119,7 +2121,7 @@ impl TileProducer for MapExtractAggregateProducer {
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("MapExtractAggregate")
             .annotate(format!("({:?})", self.kind))
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
     }
 
@@ -2232,7 +2234,7 @@ impl TileOperator for MapAggregate {
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("MapAggregate")
             .annotate(format!("({:?})", self.kind))
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
     }
 
@@ -2274,7 +2276,7 @@ impl TileProducer for MapAggregateProducer {
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("MapAggregate")
             .annotate(format!("({:?})", self.kind))
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
     }
 
@@ -2415,7 +2417,7 @@ impl TileOperator for Split {
         let id = Rc::as_ptr(&self.shared) as usize;
         if self.primary {
             InspectNode::new(format!("Split#{id:x}"))
-                .annotate(self.tiling().to_string())
+                .with_tiling(self.tiling().to_string())
                 .child("input", self.input.borrow().inspect(opts))
         } else {
             InspectNode::leaf(format!("→ Split#{id:x}"))
@@ -2482,7 +2484,7 @@ impl TileProducer for SplitProducer {
         let id = Rc::as_ptr(&self.shared) as usize;
         if self.index == 0 {
             InspectNode::new(format!("Split#{id:x}"))
-                .annotate(self.tiling.to_string())
+                .with_tiling(self.tiling.to_string())
                 .child(
                     "input",
                     self.shared
@@ -2555,7 +2557,9 @@ impl TileOperator for Constant {
     }
 
     fn inspect(&self, _opts: &VizOptions) -> InspectNode {
-        InspectNode::leaf("Constant").annotate(format!("{}: {:?}", self.tiling, self.value))
+        InspectNode::leaf("Constant")
+            .with_tiling(self.tiling.to_string())
+            .annotate(format!("{}", self.value))
     }
 
     fn subscribe(
@@ -2585,7 +2589,9 @@ impl TileProducer for ConstantProducer {
     }
 
     fn inspect(&self, _opts: &VizOptions) -> InspectNode {
-        InspectNode::leaf("Constant").annotate(format!("{}: {:?}", self.tiling, self.value))
+        InspectNode::leaf("Constant")
+            .with_tiling(self.tiling.to_string())
+            .annotate(format!("{}", self.value))
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -2636,7 +2642,7 @@ impl TileOperator for ToScalar {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("ToScalar")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
     }
 
@@ -2670,7 +2676,7 @@ impl TileProducer for ToScalarProducer {
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new("ToScalar")
-            .annotate(self.tiling.to_string())
+            .with_tiling(self.tiling.to_string())
             .child("input", self.input.inspect(opts))
     }
 

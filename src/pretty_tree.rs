@@ -29,6 +29,10 @@ pub struct InspectNode {
     pub label: String,
     /// Generic display annotations shown after the label, e.g. ": Int → Int"
     pub annotations: Vec<String>,
+    /// The tiling / output shape of this node, e.g. "[f32; 100]".
+    /// Stored separately from `annotations` so renderers can display it
+    /// with dedicated styling (e.g. as a subtitle in the web inspector).
+    pub tiling: Option<String>,
     /// Formatted yield guard; always displayed when present.
     pub yield_guard: Option<String>,
     /// Formatted obsolete/release guard; shown in verbose mode.
@@ -45,6 +49,7 @@ impl InspectNode {
         InspectNode {
             label: label.into(),
             annotations: Vec::new(),
+            tiling: None,
             yield_guard: None,
             obsolete_guard: None,
             intent_guard: None,
@@ -60,6 +65,12 @@ impl InspectNode {
     /// Add an annotation (shown after label on same line).
     pub fn annotate(mut self, annotation: impl Into<String>) -> Self {
         self.annotations.push(annotation.into());
+        self
+    }
+
+    /// Set the tiling / output shape (shown as a subtitle in graphical renderers).
+    pub fn with_tiling(mut self, tiling: impl Into<String>) -> Self {
+        self.tiling = Some(tiling.into());
         self
     }
 
@@ -112,6 +123,9 @@ impl InspectNode {
 
         let mut json = format!("{{\"label\":\"{}\"", escape_json(&self.label));
         json.push_str(&format!(",\"annotations\":[{}]", ann_strs.join(",")));
+        if let Some(ref t) = self.tiling {
+            json.push_str(&format!(",\"tiling\":\"{}\"", escape_json(t)));
+        }
         if let Some(ref g) = self.yield_guard {
             json.push_str(&format!(",\"yield_guard\":\"{}\"", escape_json(g)));
         }
@@ -177,11 +191,15 @@ fn render_node(
     depth: usize,
     max_depth: Option<usize>,
 ) {
-    // Write label + annotations on one line.
+    // Write label + annotations + tiling on one line.
     out.push_str(&node.label);
     for ann in &node.annotations {
         out.push(' ');
         out.push_str(ann);
+    }
+    if let Some(ref t) = node.tiling {
+        out.push(' ');
+        out.push_str(t);
     }
     // Append structured guard fields after annotations.
     if let Some(ref g) = node.yield_guard {
