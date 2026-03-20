@@ -128,6 +128,34 @@ impl TypeInferenceContext {
     pub fn source_type(&self, name: &str) -> Option<Type> {
         self.source_types.get(name).cloned()
     }
+
+    /// Constrain two types to be equal, recording the solution in the [`UnificationTable`].
+    ///
+    /// - Both `Infer`: union the two variables.
+    /// - One `Infer`, one concrete: set the variable to the concrete type.
+    /// - Both concrete and equal: no-op.
+    /// - Both concrete and different: returns [`InferError::TypeMismatch`].
+    fn constrain_equal(&mut self, a: &Type, b: &Type) -> Result<(), InferError> {
+        match (a, b) {
+            (Type::Infer(a_id), Type::Infer(b_id)) => {
+                self.table
+                    .unify(*a_id, *b_id)
+                    .map_err(|(type_a, type_b)| InferError::TypeMismatch { type_a, type_b })?;
+                Ok(())
+            }
+            (Type::Infer(id), concrete) | (concrete, Type::Infer(id)) => {
+                // Ensure this is a actually a concrete type: guards against case reordering.
+                debug_assert!(!matches!(concrete, Type::Infer(_)));
+                self.table.set(*id, concrete.clone());
+                Ok(())
+            }
+            (a, b) if a == b => Ok(()),
+            (type_a, type_b) => Err(InferError::TypeMismatch {
+                type_a: type_a.clone(),
+                type_b: type_b.clone(),
+            }),
+        }
+    }
 }
 
 impl Deref for TypeInferenceContext {
@@ -155,13 +183,8 @@ pub enum InferError {
     /// A standalone lambda's parameter type cannot be inferred — it is never
     /// used as the argument of a typed function in the lambda body.
     CannotInferParam(String),
-    /// A type mismatch was detected between an expected and found type.
-    TypeMismatch {
-        /// The type that was expected.
-        expected: Type,
-        /// The type that was found.
-        found: Type,
-    },
+    /// A type mismatch was detected between two solved types.
+    TypeMismatch { type_a: Type, type_b: Type },
     /// A user-written annotation on a binding site conflicts with the inferred type.
     ///
     /// Distinct from [`TypeMismatch`] so error messages can say
@@ -191,9 +214,12 @@ pub enum InferError {
 /// After this call returns `Ok`, the tree is fully annotated and contains no
 /// `Type::Hole` or (ideally) `Type::Infer` placeholders.
 pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
-    let ty = infer_expr(expr, ctx)?;
+    infer_expr(expr, ctx)?;
     crate::ccl::unify::resolve(expr, &mut ctx.table);
-    Ok(ty)
+    // Return the type from expr.ty (post-resolve) rather than the pre-resolve return value
+    // from infer_expr: the two can differ when infer_expr returns an Infer var that
+    // constrain_equal subsequently solved (e.g. the left operand of a BinOp).
+    Ok(expr.ty.clone())
 }
 
 /// Walk `expr` and fill in `ty` on every node. Does not call `resolve`.
@@ -203,7 +229,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
 /// - Literals — type always known from the literal tag
 /// - Variables — looked up in the scope stack ([`TypeInferenceContext`])
 /// - Annotated lambdas — param type known; recurse into body
-/// - `Apply(Lambda(x, Unknown), arg)` — infers arg type, writes it onto `param.ty`
+/// - `Apply(Lambda(x, Infer), arg)` — infers arg type, writes it onto `param.ty`
 /// - Standalone unannotated lambdas — calls [`collect_param_constraint`] to
 ///   find a usage-site type constraint for the parameter
 /// - Lists — derives `Fun(UIntRange(n), elem_ty)` from the first element
@@ -250,11 +276,11 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
             let input_codomain = input_type
                 .codomain()
                 .ok_or_else(|| InferError::TypeMismatch {
-                    expected: Type::Fun(
+                    type_a: Type::Fun(
                         Box::new(Type::Infer(ctx.fresh_infer_var())),
                         Box::new(Type::Infer(ctx.fresh_infer_var())),
                     ),
-                    found: input_type,
+                    type_b: input_type,
                 })?;
             kind.output_type(&input_codomain).ok_or_else(|| {
                 InferError::Unsupported(format!("Cannot apply {kind:?} to {input_codomain}"))
@@ -354,7 +380,7 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
     // Skipping recursion when an annotation is present would leave sub-node `ty`
     // fields as Infer and miss lambda-param mutations at Apply/GroupBy sites.
     if let Some(ref annotation) = expr.user_annotation {
-        check_type_compatibility(annotation, &result_ty)?;
+        ctx.constrain_equal(annotation, &result_ty)?;
         // Record the solution in the table if this node started with an Infer var.
         if let Type::Infer(id) = expr.ty {
             ctx.table.set(id, annotation.clone());
@@ -472,7 +498,7 @@ fn infer_apply(
     // Infer function type and return its codomain.
     match infer_expr(function, ctx)? {
         Type::Fun(domain, codomain) => {
-            check_type_compatibility(&domain, &arg_ty)?;
+            ctx.constrain_equal(&domain, &arg_ty)?;
             Ok(*codomain)
         }
         _ => Ok(Type::Infer(ctx.fresh_infer_var())),
@@ -543,9 +569,9 @@ fn infer_list(elts: &mut [Expr], ctx: &mut TypeInferenceContext) -> Result<Type,
 }
 
 /// Infer the type of a [`TypedExprNode::BinOp`] node.
-///
-/// Recurses into both operands, rewriting `Add` to `Concat` when both sides
-/// are `String`, then returns the result type based on the operator kind.
+/// Infer both operands then apply the operation's type rules via the
+/// UnificationTable.  String + String → Concat rewriting is deferred to
+/// compile time; this pass only propagates the type constraint.
 fn infer_binop(
     left: &mut Expr,
     op: &mut BinOpKind,
@@ -554,21 +580,30 @@ fn infer_binop(
 ) -> Result<Type, InferError> {
     let left_ty = infer_expr(left, ctx)?;
     let right_ty = infer_expr(right, ctx)?;
-
-    // TODO this is the wrong place to do this.  Once we are consistently
-    // doing type annotations everywhere, this should be in the compile step.
-    if *op == BinOpKind::Arithmetic(super::ArithmeticKind::Add)
-        && left_ty == Type::Base(BaseType::String)
-        && right_ty == Type::Base(BaseType::String)
-    {
-        *op = BinOpKind::Concat;
+    match op {
+        BinOpKind::Arithmetic(_) => {
+            // Both operands must have the same type; the result is that type.
+            ctx.constrain_equal(&left_ty, &right_ty)?;
+            Ok(left_ty)
+        }
+        BinOpKind::Concat => {
+            // Explicit concat: both sides must be String.
+            ctx.constrain_equal(&left_ty, &Type::Base(BaseType::String))?;
+            ctx.constrain_equal(&right_ty, &Type::Base(BaseType::String))?;
+            Ok(Type::Base(BaseType::String))
+        }
+        BinOpKind::Compare(_) => {
+            // Operands must agree; result is Bool.
+            ctx.constrain_equal(&left_ty, &right_ty)?;
+            Ok(Type::Base(BaseType::Bool))
+        }
+        BinOpKind::BoolLogic(_) => {
+            // Both operands must be Bool; result is Bool.
+            ctx.constrain_equal(&left_ty, &Type::Base(BaseType::Bool))?;
+            ctx.constrain_equal(&right_ty, &Type::Base(BaseType::Bool))?;
+            Ok(Type::Base(BaseType::Bool))
+        }
     }
-
-    Ok(match op {
-        BinOpKind::Arithmetic(..) => left_ty,
-        BinOpKind::Concat => Type::Base(BaseType::String),
-        BinOpKind::BoolLogic(..) | BinOpKind::Compare(..) => Type::Base(BaseType::Bool),
-    })
 }
 
 /// Infer the type of a [`TypedExprNode::GroupBy`] node.
@@ -609,28 +644,6 @@ fn infer_groupby(
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
-
-/// Check if `found` is compatible with `expected`.
-///
-/// Returns `Ok(())` if:
-/// - types are equal
-/// - either type is [`Type::Infer`] (deferred — the variable will be resolved later)
-/// - either type is [`Type::Hole`] (lowering placeholder — not yet assigned)
-///
-/// Otherwise returns `Err(InferError::TypeMismatch)`.
-fn check_type_compatibility(expected: &Type, found: &Type) -> Result<(), InferError> {
-    if expected == found
-        || matches!(expected, Type::Hole | Type::Infer(_))
-        || matches!(found, Type::Hole | Type::Infer(_))
-    {
-        Ok(())
-    } else {
-        Err(InferError::TypeMismatch {
-            expected: expected.clone(),
-            found: found.clone(),
-        })
-    }
-}
 
 /// Return the base [`Type`] of a [`Lit`] value.
 fn lit_type(lit: &Lit) -> Type {
@@ -776,7 +789,7 @@ fn collect_constraints_into(
 ///
 /// - Empty list → `Ok(None)` (no constraint found)
 /// - All equal → `Ok(Some(ty))` (unique constraint)
-/// - Any differ → `Err(TypeMismatch { expected: first, found: other })`
+/// - Any differ → `Err(TypeMismatch { type_a: first, type_b: other })`
 fn reconcile_constraints(constraints: Vec<TypeConstraint>) -> Result<Option<Type>, InferError> {
     let iter = constraints.into_iter();
     let mut base_type: Option<Type> = None;
@@ -787,8 +800,8 @@ fn reconcile_constraints(constraints: Vec<TypeConstraint>) -> Result<Option<Type
                 if let Some(base) = &base_type {
                     if *base != ty {
                         return Err(InferError::TypeMismatch {
-                            expected: base.clone(),
-                            found: ty,
+                            type_a: base.clone(),
+                            type_b: ty,
                         });
                     }
                 } else {
@@ -799,8 +812,8 @@ fn reconcile_constraints(constraints: Vec<TypeConstraint>) -> Result<Option<Type
                 let prev = tuple_type.insert(idx, ty.clone());
                 if prev.as_ref().is_some_and(|p| p != &ty) {
                     return Err(InferError::TypeMismatch {
-                        expected: prev.unwrap(),
-                        found: ty,
+                        type_a: prev.unwrap(),
+                        type_b: ty,
                     });
                 }
             }
@@ -1079,14 +1092,14 @@ mod tests {
     #[test]
     fn test_infer_type_annotation_mismatch() {
         let mut ctx = TypeInferenceContext::new();
-        // (42 : String)  =>  TypeMismatch { expected: String, found: Int }
+        // (42 : String)  =>  TypeMismatch { type_a: String, type_b: Int }
         let mut expr = Expr::lit(Lit::Int(42)).with_user_annotation(Type::Base(BaseType::String));
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(
             result,
             Err(InferError::TypeMismatch {
-                expected: Type::Base(BaseType::String),
-                found: Type::Base(BaseType::Int),
+                type_a: Type::Base(BaseType::String),
+                type_b: Type::Base(BaseType::Int),
             })
         );
     }
@@ -1101,9 +1114,9 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_type_annotation_unknown_ignored() {
+    fn test_infer_type_annotation_overrides_inferred() {
         let mut ctx = TypeInferenceContext::new();
-        // (BinOp : Int)  =>  Int (since BinOp returns Unknown currently)
+        // (1 + 2 : Int)  =>  Int; annotation matches inferred type, accepted as-is.
         let mut expr = Expr::binop(
             Expr::lit(Lit::Int(1)),
             BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -1212,8 +1225,8 @@ mod tests {
         assert_eq!(
             result,
             Err(InferError::TypeMismatch {
-                expected: Type::Base(BaseType::Int),
-                found: Type::Base(BaseType::String),
+                type_a: Type::Base(BaseType::Int),
+                type_b: Type::Base(BaseType::String),
             })
         );
     }
@@ -1247,9 +1260,10 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_string_add_mutates_to_concat() {
+    fn test_infer_string_add_infers_string() {
         let mut ctx = TypeInferenceContext::new();
-        // "hello" + "world"  =>  String; op mutated to Concat in place
+        // "hello" + "world"  =>  String; Add is left as-is (Concat rewriting
+        // happens at compile time, not inference time).
         let mut expr = Expr::binop(
             Expr::lit(Lit::String("hello".into())),
             BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -1257,16 +1271,131 @@ mod tests {
         );
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::String));
-        // The op must have been rewritten from Add to Concat.
+        // The op is NOT rewritten at inference time.
         if let TypedExprNode::BinOp { op, .. } = &expr.node {
-            assert_eq!(
-                *op,
-                BinOpKind::Concat,
-                "expected Add to be rewritten to Concat"
-            );
+            assert_eq!(*op, BinOpKind::Arithmetic(ArithmeticKind::Add));
         } else {
             panic!("expected BinOp");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // BinOp constraint propagation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_binop_int_add() {
+        let mut ctx = TypeInferenceContext::new();
+        // Int + Int → Int, left and right constrained equal.
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::lit(Lit::Int(2)),
+        );
+        assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
+    }
+
+    #[test]
+    fn test_binop_type_mismatch() {
+        let mut ctx = TypeInferenceContext::new();
+        // Int + Bool → TypeMismatch.
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::lit(Lit::Bool(true)),
+        );
+        assert_eq!(
+            infer(&mut expr, &mut ctx),
+            Err(InferError::TypeMismatch {
+                type_a: Type::Base(BaseType::Int),
+                type_b: Type::Base(BaseType::Bool),
+            })
+        );
+    }
+
+    #[test]
+    fn test_binop_constraint_propagation() {
+        let mut ctx = TypeInferenceContext::new();
+        // constrain_equal(Infer(id), Int) should solve the variable in the table.
+        let fresh_id = ctx.fresh_infer_var();
+        ctx.constrain_equal(&Type::Infer(fresh_id), &Type::Base(BaseType::Int))
+            .unwrap();
+        assert_eq!(ctx.table.probe(fresh_id), Some(Type::Base(BaseType::Int)));
+    }
+
+    #[test]
+    fn test_binop_compare_bool_result() {
+        let mut ctx = TypeInferenceContext::new();
+        // 1 < 2 → Bool.
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Compare(CompareKind::Less),
+            Expr::lit(Lit::Int(2)),
+        );
+        assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Bool)));
+    }
+
+    /// Verify that `infer_binop` propagates type constraints to `Infer`-typed operands
+    /// via [`TypeInferenceContext::constrain_equal`].
+    ///
+    /// A variable bound to a fresh `Infer` var in scope should be solved to `Int` after
+    /// being used as the left operand of `x + 1`. This would fail if `infer_binop` never
+    /// called `constrain_equal` — for example, if it was reverted to the pre-BinOp-rules
+    /// stub. It also verifies that `infer()` returns the post-`resolve()` type from
+    /// `expr.ty` rather than the pre-resolve return value of `infer_expr` (which would
+    /// be `Infer(A)` since `constrain_equal` solves the variable in the table without
+    /// updating the local binding).
+    #[test]
+    fn test_binop_constrains_infer_operand() {
+        let mut ctx = TypeInferenceContext::new();
+        let infer_id = ctx.fresh_infer_var();
+        // Enter a scope so we can bind "x" to a fresh Infer type.
+        let result_ty = {
+            let mut scoped = ctx.enter_scope();
+            scoped.bind("x", Type::Infer(infer_id));
+            let mut expr = Expr::binop(
+                Expr::var("x"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                Expr::lit(Lit::Int(1)),
+            );
+            infer(&mut expr, &mut scoped).unwrap()
+        };
+        // infer() must return the resolved type (Int), not the pre-resolve Infer var.
+        assert_eq!(result_ty, Type::Base(BaseType::Int));
+        // constrain_equal must have recorded Int as the solution for the Infer var.
+        assert_eq!(ctx.table.probe(infer_id), Some(Type::Base(BaseType::Int)));
+    }
+
+    /// Verify that type information propagates inward through nested `BinOp` nodes.
+    ///
+    /// `(x + y) + (1 : Int)` — the outer `+` constrains its result to `Int`,
+    /// which flows inward: `constrain_equal(Infer(id_x), Int)` solves `id_x`,
+    /// and because the inner `+` had already unified `id_x` with `id_y` via
+    /// `constrain_equal(Infer(id_x), Infer(id_y))`, `id_y` is also solved.
+    #[test]
+    fn test_binop_downward_propagation() {
+        let mut ctx = TypeInferenceContext::new();
+        let id_x = ctx.fresh_infer_var();
+        let id_y = ctx.fresh_infer_var();
+        let result_ty = {
+            let mut scoped = ctx.enter_scope();
+            scoped.bind("x", Type::Infer(id_x));
+            scoped.bind("y", Type::Infer(id_y));
+            let inner = Expr::binop(
+                Expr::var("x"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                Expr::var("y"),
+            );
+            let mut outer = Expr::binop(
+                inner,
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                Expr::lit(Lit::Int(1)),
+            );
+            infer(&mut outer, &mut scoped).unwrap()
+        };
+        assert_eq!(result_ty, Type::Base(BaseType::Int));
+        assert_eq!(ctx.table.probe(id_x), Some(Type::Base(BaseType::Int)));
+        assert_eq!(ctx.table.probe(id_y), Some(Type::Base(BaseType::Int)));
     }
 
     // -----------------------------------------------------------------------
@@ -1577,8 +1706,8 @@ mod tests {
         assert_eq!(
             infer(&mut expr, &mut ctx),
             Err(InferError::TypeMismatch {
-                expected: Type::Base(BaseType::Int),
-                found: Type::Base(BaseType::String),
+                type_a: Type::Base(BaseType::Int),
+                type_b: Type::Base(BaseType::String),
             })
         );
     }

@@ -384,6 +384,21 @@ mod tests {
     }
 
     #[test]
+    fn test_unify_then_solve_propagates() {
+        // Complement of test_unify_propagates_solution: union first, then solve.
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let b = table.fresh_var();
+        table.unify(a, b).unwrap();
+        // Neither solved yet.
+        assert_eq!(table.probe(a), None);
+        assert_eq!(table.probe(b), None);
+        // Solve a; b should see the solution via the union.
+        table.set(a, Type::Base(BaseType::Int));
+        assert_eq!(table.probe(b), Some(Type::Base(BaseType::Int)));
+    }
+
+    #[test]
     fn test_unify_prefers_solved_root() {
         let mut table = UnificationTable::new();
         let a = table.fresh_var();

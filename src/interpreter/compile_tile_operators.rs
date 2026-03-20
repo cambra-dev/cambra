@@ -27,8 +27,8 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::{
     ccl::{
-        AggregateKind, BinOpKind as CclBinOp, Expr, Lit, Refinement, RefinementKind, Type,
-        TypedExprNode,
+        AggregateKind, ArithmeticKind as CclArith, BinOpKind as CclBinOp, Expr, Lit, Refinement,
+        RefinementKind, Type, TypedExprNode,
     },
     interpreter::{
         ccl_compile_util::{validate_type, CompileError},
@@ -353,13 +353,16 @@ fn make_constant(value: Value, value_extent: Extent) -> Box<dyn TileOperator> {
     Box::new(Constant::new(value, value_extent))
 }
 
-/// Infer the output [`Extent`] of a CCL binary operation.
-fn binop_output_extent(op: &CclBinOp) -> Extent {
+/// Output [`Extent`] for an already-mapped interpreter [`BinOpKind`].
+///
+/// Mirrors [`binop_output_extent`] but operates on the post-rewrite interpreter
+/// op, so `Concat` (which may have been rewritten from `Arithmetic(Add)` at
+/// compile time) correctly returns `String`.
+fn binop_output_extent_for_interp(op: &BinOpKind) -> Extent {
     match op {
-        CclBinOp::Arithmetic(_) => Extent::Base(BaseType::Int),
-        CclBinOp::Compare(_) => Extent::Base(BaseType::Bool),
-        CclBinOp::BoolLogic(_) => Extent::Base(BaseType::Bool),
-        CclBinOp::Concat => Extent::Base(BaseType::String),
+        BinOpKind::Arithmetic(_) => Extent::Base(BaseType::Int),
+        BinOpKind::Compare(_) | BinOpKind::BoolLogic(_) => Extent::Base(BaseType::Bool),
+        BinOpKind::Concat => Extent::Base(BaseType::String),
     }
 }
 
@@ -446,7 +449,6 @@ fn compile_binop(
 
     let l_extent = value_extent(l_op.tiling());
     let r_extent = value_extent(r_op.tiling());
-    let out_extent = binop_output_extent(op);
 
     // Combine the two operands into a record tile, choosing the right combinator.
     let record_ext = zip_record_extent([l_extent, r_extent].into_iter());
@@ -458,7 +460,16 @@ fn compile_binop(
     };
 
     // Apply the binary operation via a scalar ComputableFunction constant.
-    let fn_value = Value::ComputableFunction(FunctionDef::BinOp(map_binop(op)));
+    // String + String uses Concat instead of arithmetic Add; out_extent is
+    // derived from mapped_op so that Concat correctly yields String, not Int.
+    let mapped_op =
+        if *op == CclBinOp::Arithmetic(CclArith::Add) && left.ty == Type::Base(BaseType::String) {
+            BinOpKind::Concat
+        } else {
+            map_binop(op)
+        };
+    let out_extent = binop_output_extent_for_interp(&mapped_op);
+    let fn_value = Value::ComputableFunction(FunctionDef::BinOp(mapped_op));
     let fn_extent = Extent::Function {
         domain: Box::new(record_ext),
         codomain: Box::new(out_extent.clone()),
