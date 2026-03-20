@@ -8,7 +8,9 @@ use bit_vec::BitVec;
 use intervalsets::numeric::Domain;
 use intervalsets::Side;
 
-use crate::interpreter::{apply_binop_column, tuple_field, BinOpKind};
+use crate::interpreter::{
+    apply_binop_column, apply_unaryop_column, tuple_field, BinOpKind, UnaryOpKind,
+};
 use crate::util::fmt_record;
 
 /// An Extent represents the set of values a term can take on (its type).
@@ -382,6 +384,8 @@ pub enum BaseType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FunctionDef {
     BinOp(BinOpKind),
+    /// Unary arithmetic or boolean operation applied element-wise to a single column.
+    UnaryOp(UnaryOpKind),
     RecordField(String),
 }
 
@@ -393,6 +397,7 @@ impl FunctionDef {
                 fields.remove(&tuple_field(0)).expect("Not a tuple"),
                 &fields[&tuple_field(1)],
             ),
+            (FunctionDef::UnaryOp(op), cv) => apply_unaryop_column(*op, cv),
             (FunctionDef::RecordField(f), ColumnValue::Records(mut fields)) => fields
                 .remove(f)
                 .unwrap_or_else(|| panic!("Missing field {f}")),

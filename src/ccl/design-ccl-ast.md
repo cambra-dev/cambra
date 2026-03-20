@@ -353,7 +353,7 @@ agree; conflicting constraints produce a `TypeMismatch` error.
 | `Apply(Λ x. b, arg)` | special-case Apply rule | elegant check-mode push-down | same |
 | Standalone `Λ x. b` | `collect_param_constraint` heuristic | fails in synth mode; needs annotation | type variable + unify |
 | Multi-use params | first constraint only | same limitation | unification solves all |
-| Needs unification | `UnificationTable` (union-find) present, BinOp rules deferred | full | Yes |
+| Needs unification | `UnificationTable` (union-find) present; BinOp/UnaryOp rules implemented via `constrain_equal` | full | Yes |
 | Type error reporting | limited | at check sites | at unification failure |
 
 **Delta from our pass to bidirectional**: add a `check(expr, expected, ctx)`
@@ -362,9 +362,9 @@ the domain. `collect_param_constraint` is still needed for standalone lambdas.
 Gains type-mismatch error detection at Apply sites.
 
 **Delta from bidirectional to HM**: `Type::Infer(InferVarId)` already acts as type
-variables, and `UnificationTable` is already in place. Remaining steps: add BinOp/UnaryOp
-unification rules (unify left/right operands, return result type) and an occurs check.
-`collect_param_constraint` can be removed once type variables unify across all use sites.
+variables, and `UnificationTable` is already in place. BinOp and UnaryOp unification rules
+are implemented via `constrain_equal`. Remaining steps: an occurs check and removing
+`collect_param_constraint` once type variables unify across all use sites.
 
 ### `GroupBy` inference
 
@@ -375,17 +375,51 @@ When inferring `Expr::GroupBy { collection, key }`:
 3. Infer the type of `key` (now annotated); take its codomain as `key_output_ty`.
 4. Return `Fun(key_output_ty, Fun(Base(UInt), elem_ty))`. Falls back to `Infer(fresh_var)` if either codomain cannot be determined.
 
+### `constrain_equal` — constraint propagation via the UnificationTable
+
+`TypeInferenceContext::constrain_equal(a, b)` unifies two types through the `UnificationTable`:
+
+- Both `Infer`: union the two variables.
+- One `Infer`, one concrete: set the variable to the concrete type.
+- Either `Error`: no-op (suppress cascades).
+- Both concrete and equal: no-op.
+- Both concrete and different: `InferError::TypeMismatch`.
+
+This is used by the BinOp and UnaryOp inference rules to propagate constraints across
+operands without requiring explicit type annotations.
+
+### BinOp type rules
+
+| Op kind | Operand constraint | Result type |
+|---|---|---|
+| `Arithmetic` | both operands constrained equal | operand type |
+| `Concat` | both operands constrained to `String` | `String` |
+| `Compare` | both operands constrained equal | `Bool` |
+| `BoolLogic` | both operands constrained to `Bool` | `Bool` |
+
+**Note**: String + String → `Concat` rewriting is performed at **compile time**
+(`compile_ccl.rs` and `compile_tile_operators.rs`), not at inference time. The inference
+pass only constrains both operands to `String` and returns `String` as the result type.
+
+### UnaryOp type rules
+
+| Op kind | Operand constraint | Result type |
+|---|---|---|
+| `Neg` | operand constrained to `Int` | `Int` |
+| `Not` | operand constrained to `Bool` | `Bool` |
+
 ### TODOs
 
-- BinOp/UnaryOp type rules (arithmetic, comparison, boolean).
 - `Case` arm scope: push pattern variable bindings into ctx.
 - Infer `Let.ty` from the type of `value` (required before `Let` nodes can be compiled; see §Compilation).
+
 ---
 
 ## Compilation
 
-The `compile_ccl` pass (`interpreter/compile_ccl.rs`) transforms a fully-type-inferred CCL AST
-into the dataflow operator graph (`interpreter/let_op.rs`).
+The compilation pass (`interpreter/compile_tile_operators.rs`) transforms a fully-type-inferred
+CCL AST into the tile-dataflow operator representation. End-to-end pipeline tests live in
+`tests/compilation_pipeline.rs`.
 
 ### `Let` nodes compile to a dedicated `Let` operator
 
@@ -444,5 +478,9 @@ fills this in from the type of `bound_expr`.
      placeholder, separating lowering ownership from type-checker ownership. `TypedExpr::new()` and
      `TypedBinding::new_unannotated()` now stamp `Hole`; `infer()` converts `Hole → Infer(ctx.fresh_infer_var())`
      at entry; `fresh_infer_var_id()` is no longer called from lowering code. ✓
-   - `lowering_via_ccl.rs`: sandboxed end-to-end pipeline tests.
-   - `lowering.rs` direct path removed after parity confirmed.
+   - `ccl/infer.rs`: BinOp and UnaryOp inference rules via `constrain_equal`; String+String→Concat
+     detection moved to compile time; `lower.rs` UnaryOp lowering; `interpreter/unary_op.rs`
+     `UnaryOpKind` enum + `apply_unaryop_column`; `FunctionDef::UnaryOp` in types;
+     `compile_tile_operators.rs` UnaryOp compilation case. ✓
+   - `tests/compilation_pipeline.rs`: end-to-end pipeline tests (Python → CCL lower → infer → compile → eval). ✓
+   - `lowering.rs` direct path removed after parity confirmed. ✓

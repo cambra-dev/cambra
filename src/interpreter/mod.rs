@@ -12,6 +12,7 @@ mod test_source;
 pub mod tile_operators;
 pub mod tiling;
 mod types;
+mod unary_op;
 
 pub use binop::*;
 pub use scheduler::*;
@@ -19,6 +20,7 @@ pub use stdio::*;
 pub use test_source::*;
 pub use tiling::*;
 pub use types::*;
+pub use unary_op::*;
 
 use std::cell::RefCell;
 use std::rc::Rc;

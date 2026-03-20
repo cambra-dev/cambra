@@ -28,7 +28,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use crate::{
     ccl::{
         AggregateKind, ArithmeticKind as CclArith, BinOpKind as CclBinOp, Expr, Lit, Refinement,
-        RefinementKind, Type, TypedExprNode,
+        RefinementKind, Type, TypedExprNode, UnaryOpKind as CclUnaryOp,
     },
     interpreter::{
         ccl_compile_util::{validate_type, CompileError},
@@ -38,7 +38,8 @@ use crate::{
             TileOperator, Tiling, ToScalar, Zip,
         },
         transform_hashmap_values, tuple_field, ArithmeticKind, BaseType, BinOpKind, CompareKind,
-        DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, Value,
+        DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
+        Value,
     },
     util::ScopeStack,
 };
@@ -240,6 +241,7 @@ fn compile_tile_inner(
         TypedExprNode::Aggregate { input, kind } => compile_aggregate(input, kind, ctx),
         TypedExprNode::GroupBy { collection, key } => compile_groupby(collection, key, ctx),
         TypedExprNode::Source(name) => compile_source(name, ctx),
+        TypedExprNode::UnaryOp(op, operand) => compile_unaryop(op, operand, ctx),
         _ => Err(CompileError::Unsupported(format!(
             "CCL node not yet supported by compile_tile: {expr:?}"
         ))),
@@ -477,6 +479,43 @@ fn compile_binop(
     let fn_op: Box<dyn TileOperator> = Box::new(Constant::new(fn_value, fn_extent));
 
     Ok(map_apply(zip_op, fn_op))
+}
+
+/// Infer the output [`Extent`] of a CCL unary operation.
+fn unaryop_output_extent(op: &CclUnaryOp) -> Extent {
+    match op {
+        CclUnaryOp::Neg => Extent::Base(BaseType::Int),
+        CclUnaryOp::Not => Extent::Base(BaseType::Bool),
+    }
+}
+
+/// Map a CCL [`CclUnaryOp`] to the interpreter [`UnaryOpKind`].
+fn map_unaryop(op: &CclUnaryOp) -> UnaryOpKind {
+    match op {
+        CclUnaryOp::Neg => UnaryOpKind::Neg,
+        CclUnaryOp::Not => UnaryOpKind::Not,
+    }
+}
+
+/// Compile a unary operation as `Map(operand, Constant(UnaryOp_fn))`.
+fn compile_unaryop(
+    op: &CclUnaryOp,
+    operand: &Expr,
+    ctx: &mut TileCompileContext,
+) -> Result<Box<dyn TileOperator>, CompileError> {
+    let inner_op = compile_tile_inner(operand, ctx)?;
+
+    let inner_extent = value_extent(inner_op.tiling());
+    let out_extent = unaryop_output_extent(op);
+
+    let fn_value = Value::ComputableFunction(FunctionDef::UnaryOp(map_unaryop(op)));
+    let fn_extent = Extent::Function {
+        domain: Box::new(inner_extent),
+        codomain: Box::new(out_extent),
+    };
+    let fn_op: Box<dyn TileOperator> = Box::new(Constant::new(fn_value, fn_extent));
+
+    Ok(map_apply(inner_op, fn_op))
 }
 
 /// Compile a function application.

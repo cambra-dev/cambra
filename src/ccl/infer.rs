@@ -27,7 +27,7 @@ use log::trace;
 
 use crate::ccl::{
     fresh_infer_var_id, unify::UnificationTable, BinOpKind, Expr, InferVarId, Lit, RefinementKind,
-    Type, TypedExprNode,
+    Type, TypedExprNode, UnaryOpKind,
 };
 // TODO: once `BaseType` moves to `ccl`, this import goes away.
 use crate::interpreter::BaseType;
@@ -297,12 +297,20 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
         TypedExprNode::BinOp { left, right, op } => infer_binop(left, op, right, ctx),
 
         // ----- Unary operation -----
-        //
-        // Recurse into the operand for mutation side-effects.
-        // TODO: add unary type rules.
-        TypedExprNode::UnaryOp(_, inner) => {
-            infer_expr(inner, ctx)?;
-            Ok(Type::Infer(ctx.fresh_infer_var()))
+        TypedExprNode::UnaryOp(op, inner) => {
+            let inner_ty = infer_expr(inner, ctx)?;
+            match op {
+                UnaryOpKind::Neg => {
+                    // Operand must be Int; result is Int.
+                    ctx.constrain_equal(&inner_ty, &Type::Base(BaseType::Int))?;
+                    Ok(Type::Base(BaseType::Int))
+                }
+                UnaryOpKind::Not => {
+                    // Operand must be Bool; result is Bool.
+                    ctx.constrain_equal(&inner_ty, &Type::Base(BaseType::Bool))?;
+                    Ok(Type::Base(BaseType::Bool))
+                }
+            }
         }
 
         // ----- Let binding -----
@@ -1858,5 +1866,41 @@ mod tests {
         let mut e2 = Expr::new(TypedExprNode::Source("strs".into()));
         assert_eq!(infer(&mut e1, &mut ctx), Ok(int_ty));
         assert_eq!(infer(&mut e2, &mut ctx), Ok(str_ty));
+    }
+
+    // -----------------------------------------------------------------------
+    // UnaryOp type rule tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unary_neg_int() {
+        let mut ctx = TypeInferenceContext::new();
+        use crate::ccl::UnaryOpKind;
+        let mut expr = Expr::unary(UnaryOpKind::Neg, Expr::lit(Lit::Int(5)));
+        assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
+    }
+
+    #[test]
+    fn test_unary_not_bool() {
+        let mut ctx = TypeInferenceContext::new();
+        use crate::ccl::UnaryOpKind;
+        let mut expr = Expr::unary(UnaryOpKind::Not, Expr::lit(Lit::Bool(true)));
+        assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Bool)));
+    }
+
+    #[test]
+    fn test_unary_neg_wrong_type() {
+        let mut ctx = TypeInferenceContext::new();
+        use crate::ccl::UnaryOpKind;
+        // -true → TypeMismatch: constrain_equal(Bool, Int) errors with
+        // expected=Bool (first arg / inner_ty), found=Int (second arg / constraint).
+        let mut expr = Expr::unary(UnaryOpKind::Neg, Expr::lit(Lit::Bool(true)));
+        assert_eq!(
+            infer(&mut expr, &mut ctx),
+            Err(InferError::TypeMismatch {
+                type_a: Type::Base(BaseType::Bool),
+                type_b: Type::Base(BaseType::Int),
+            })
+        );
     }
 }

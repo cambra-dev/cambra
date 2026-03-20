@@ -23,6 +23,9 @@
 //! | `sum(expr)` / `max(expr)` calls | [`Expr::Aggregate`] |
 //! | Lambda expressions `lambda x: body` | curried [`Expr::Lambda`] chain |
 //! | `groupby(collection, key)` calls | [`Expr::GroupBy`] |
+//! | Unary negation (`-x`) | [`Expr::UnaryOp`] with [`crate::ccl::UnaryOpKind::Neg`] |
+//! | Boolean negation (`not x`) | [`Expr::UnaryOp`] with [`crate::ccl::UnaryOpKind::Not`] |
+//! | Unary plus (`+x`) | identity — lowered to `x` directly |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
 //!
@@ -46,7 +49,7 @@ use rustpython_parser::ast as pyast;
 
 use crate::ccl::{
     AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, HashJoinSpec, Lit, LogicKind,
-    Type, TypedExprNode,
+    Type, TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -133,6 +136,7 @@ pub fn lower_expr(
             )),
         },
         pyast::ExprKind::Lambda { args, body } => lower_lambda(args, body, ctx),
+        pyast::ExprKind::UnaryOp { op, operand } => lower_unaryop(op, operand, ctx),
         _ => Err(LoweringError::Unsupported(format!(
             "Expression type not supported: {:?}",
             expr.node
@@ -302,6 +306,36 @@ fn lower_binop(
         }
     };
     Ok(Expr::binop(left_expr, kind, right_expr))
+}
+
+/// Lower a Python unary expression to a CCL [`Expr::UnaryOp`].
+///
+/// - `USub` (`-x`) lowers to [`UnaryOpKind::Neg`].
+/// - `Not` (`not x`) lowers to [`UnaryOpKind::Not`].
+/// - `UAdd` (`+x`) is a no-op identity and unsuppored; returns [`LoweringError::Unsupported`].
+/// - `Invert` (`~x`) is unsupported and returns [`LoweringError::Unsupported`].
+fn lower_unaryop(
+    op: &pyast::Unaryop,
+    operand: &pyast::Located<pyast::ExprKind>,
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let inner = lower_expr(operand, ctx)?;
+    let kind = match op {
+        pyast::Unaryop::USub => UnaryOpKind::Neg,
+        pyast::Unaryop::Not => UnaryOpKind::Not,
+        // Unary plus is a no-op identity in Python; we don't support it.
+        pyast::Unaryop::UAdd => {
+            return Err(LoweringError::Unsupported(
+                "Unary Add (+) is not supported".into(),
+            ))
+        }
+        pyast::Unaryop::Invert => {
+            return Err(LoweringError::Unsupported(
+                "Bitwise invert (~) is not supported".into(),
+            ))
+        }
+    };
+    Ok(Expr::unary(kind, inner))
 }
 
 /// Lower a Python comparison expression to a CCL [`Expr::BinOp`] chain.
