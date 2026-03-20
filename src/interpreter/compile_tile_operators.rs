@@ -181,7 +181,7 @@ impl TileCompileContext {
             }),
             // Leaf types — no refinements possible, handle inline.
             Type::Base(b) => Ok(Extent::Base(b.clone())),
-            Type::UIntRange(n) => Ok(Extent::UIntRange { start: 0, end: *n }),
+            Type::UIntRange(n) => Ok(Extent::uint_range(*n)),
             other => Err(CompileError::TypeError(format!(
                 "Cannot convert CCL type {other:?} to an interpreter extent"
             ))),
@@ -777,10 +777,7 @@ fn compile_list(elts: &[Expr]) -> Result<Box<dyn TileOperator>, CompileError> {
     }
     let fn_value = Value::Function(bindings);
     let fn_extent = Extent::Function {
-        domain: Box::new(Extent::UIntRange {
-            start: 0,
-            end: elts.len(),
-        }),
+        domain: Box::new(Extent::uint_range(elts.len())),
         codomain: Box::new(elt_extent),
     };
     Ok(make_constant(fn_value, fn_extent))
@@ -832,11 +829,18 @@ fn resolve_to_expr<'a>(expr: &'a Expr, ctx: &'a TileCompileContext) -> &'a Expr 
 /// are supported; others return [`CompileError::TypeError`].
 fn extent_to_type(extent: &Extent) -> Result<Type, CompileError> {
     match extent {
-        Extent::UIntRange { start: 0, end } => Ok(Type::UIntRange(*end)),
+        Extent::UIntRange(_) => {
+            let n = extent.as_uint_range_size().ok_or_else(|| {
+                CompileError::TypeError(
+                    "Cannot convert fragmented UIntRange extent to CCL type".to_string(),
+                )
+            })?;
+            Ok(Type::UIntRange(n))
+        }
         Extent::Base(bt) => Ok(Type::Base(bt.clone())),
         Extent::DataSourceDomain(imp) => Ok(Type::DataSource(imp.borrow().get_id().to_string())),
         other => Err(CompileError::TypeError(format!(
-            "GroupBy: cannot convert extent to CCL type: {other:?}"
+            "Cannot convert extent to CCL type: {other:?}"
         ))),
     }
 }
@@ -997,8 +1001,8 @@ mod tests {
             HashJoinSpec, Lit, Type, TypedBinding,
         },
         interpreter::{
-            tile_operators::Tile, tiling::Predicate, BaseType, ColumnValue, Consumer, Scheduler,
-            TestDataSource, Value,
+            sort_sealed_function_by_domain, tile_operators::Tile, tiling::Predicate, BaseType,
+            ColumnValue, Consumer, Scheduler, TestDataSource, Value,
         },
     };
 
@@ -1301,52 +1305,6 @@ mod tests {
         result
     }
 
-    /// Sort a `Tile::SealedFunction` by its domain values for deterministic comparison.
-    ///
-    /// Handles `Ints` and `UInts` domains paired with `Scalar(Ints)` codomains; all
-    /// other tile forms are returned unchanged.  This is needed wherever key order
-    /// depends on [`HashMap`] iteration order (e.g. GroupBy, MapSource).
-    fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
-        /// Sort parallel `domain` and `cod_ints` vectors together by `domain` key,
-        /// then rebuild the tile.
-        fn sort_and_rebuild<K: Ord + Clone>(
-            domain_vals: Vec<K>,
-            cod_ints: Vec<i64>,
-            domain_predicate: Predicate,
-            mk_domain: impl Fn(Vec<K>) -> ColumnValue,
-        ) -> Tile {
-            let mut pairs: Vec<(K, i64)> = domain_vals.into_iter().zip(cod_ints).collect();
-            pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
-            let (sorted_d, sorted_c): (Vec<K>, Vec<i64>) = pairs.into_iter().unzip();
-            Tile::SealedFunction {
-                domain: mk_domain(sorted_d),
-                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(sorted_c))),
-                domain_predicate,
-            }
-        }
-
-        match tile {
-            Tile::SealedFunction {
-                domain,
-                codomain,
-                domain_predicate,
-            } => match (*codomain, domain) {
-                (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Ints(dom)) => {
-                    sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::Ints)
-                }
-                (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::UInts(dom)) => {
-                    sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::UInts)
-                }
-                (other_codomain, domain) => Tile::SealedFunction {
-                    domain,
-                    codomain: Box::new(other_codomain),
-                    domain_predicate,
-                },
-            },
-            other => other,
-        }
-    }
-
     #[rstest]
     #[case(
         "[x + 1 for x in [1,2,3]]",
@@ -1440,75 +1398,6 @@ mod tests {
         assert_eq!(
             sort_sealed_function_by_domain(tile),
             sort_sealed_function_by_domain(expected),
-        );
-    }
-
-    #[test_log::test]
-    fn test_incremental_aggregates() {
-        let code = "[sum(x) for x in groupby(source1(), lambda x: x // 10)]";
-        let mut ctx = GlobalContext::default();
-
-        let test_source = Rc::new(RefCell::new(TestDataSource::new(
-            "source1",
-            Type::Base(BaseType::Int),
-            Extent::Base(BaseType::Int),
-        )));
-        ctx.register_test_source(test_source.clone());
-
-        let notified = Rc::new(RefCell::new(false));
-        let notified_clone = notified.clone();
-        let consumer: Box<dyn Consumer> = Box::new(move || {
-            *notified_clone.borrow_mut() = true;
-        });
-        let mut producer = ctx.compile_program(code, consumer);
-
-        ctx.scheduler().check_for_notifications();
-        assert!(*notified.borrow(), "expected notification (pipeline path)");
-        *notified.borrow_mut() = false;
-
-        test_source.borrow_mut().add_data(&[
-            (Value::UInt(0), Value::Int(10)),
-            (Value::UInt(1), Value::Int(20)),
-        ]);
-
-        let result = producer.get(producer.tiling().universal_guard());
-        assert_eq!(
-            result,
-            Tile::SealedFunction {
-                domain: ColumnValue::Ints(vec![]),
-                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
-                domain_predicate: Predicate::False
-            }
-        );
-
-        test_source.borrow_mut().add_data(&[
-            (Value::UInt(2), Value::Int(10)),
-            (Value::UInt(3), Value::Int(30)),
-        ]);
-        let result = producer.get(producer.tiling().universal_guard());
-        assert_eq!(
-            result,
-            Tile::SealedFunction {
-                domain: ColumnValue::Ints(vec![]),
-                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
-                domain_predicate: Predicate::False
-            }
-        );
-
-        test_source
-            .borrow_mut()
-            .set_yield_predicate(Predicate::True);
-
-        let result = producer.get(producer.tiling().universal_guard());
-        // TODO this is currently wrong because aggregation doesn't properly release upstream,
-        // so it receives duplicate data.
-        assert_eq!(
-            sort_sealed_function_by_domain(result),
-            sort_sealed_function_by_domain(Tile::SealedFunction {
-                domain: ColumnValue::Ints(vec![1, 2, 3]),
-                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![50, 60, 60]))),
-                domain_predicate: Predicate::True
-            })
         );
     }
 }

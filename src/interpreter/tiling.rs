@@ -10,7 +10,11 @@ use std::{
 };
 
 use bit_vec::BitVec;
-use intervalsets::{ops::Intersection, Interval, IntervalSet, MaybeEmpty};
+use intervalsets::{
+    numeric::Domain,
+    ops::{Intersection, Union},
+    Interval, IntervalSet, MaybeEmpty, Side,
+};
 
 use crate::{
     interpreter::{ColumnValue, Extent, Value},
@@ -71,10 +75,9 @@ impl Tiling {
             Tiling::Record(m) => {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.universal_guard()))
             }
-            Tiling::SealedFunction { .. } => {
-                TileGuard::SealedFunction(SealedFunctionGuard::Universal)
+            Tiling::SealedFunction { .. } | Tiling::CurriedFunction { .. } => {
+                TileGuard::Function(FunctionGuard::Universal)
             }
-            Tiling::CurriedFunction { .. } => TileGuard::CurriedFunction(true),
             Tiling::Aggregation { .. } => TileGuard::Aggregation(true),
         }
     }
@@ -85,8 +88,9 @@ impl Tiling {
             Tiling::Record(m) => {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.empty_guard()))
             }
-            Tiling::SealedFunction { .. } => TileGuard::SealedFunction(SealedFunctionGuard::Empty),
-            Tiling::CurriedFunction { .. } => TileGuard::CurriedFunction(false),
+            Tiling::SealedFunction { .. } | Tiling::CurriedFunction { .. } => {
+                TileGuard::Function(FunctionGuard::Empty)
+            }
             Tiling::Aggregation { .. } => TileGuard::Aggregation(false),
         }
     }
@@ -364,8 +368,7 @@ fn validate_curried_function_tile(tile: &Tile) -> bool {
 pub enum TileGuard {
     Scalar(bool),
     Record(HashMap<String, TileGuard>),
-    SealedFunction(SealedFunctionGuard),
-    CurriedFunction(bool),
+    Function(FunctionGuard),
     Aggregation(bool),
 }
 
@@ -373,14 +376,11 @@ impl TileGuard {
     pub fn intersect(&self, other: &TileGuard) -> TileGuard {
         match (self, other) {
             (TileGuard::Scalar(u1), TileGuard::Scalar(u2)) => TileGuard::Scalar(*u1 && *u2),
-            (TileGuard::CurriedFunction(u1), TileGuard::CurriedFunction(u2)) => {
-                TileGuard::CurriedFunction(*u1 && *u2)
-            }
             (TileGuard::Aggregation(u1), TileGuard::Aggregation(u2)) => {
                 TileGuard::Aggregation(*u1 && *u2)
             }
-            (TileGuard::SealedFunction(f1), TileGuard::SealedFunction(f2)) => {
-                TileGuard::SealedFunction(f1.intersect(f2))
+            (TileGuard::Function(f1), TileGuard::Function(f2)) => {
+                TileGuard::Function(f1.intersect(f2))
             }
             (TileGuard::Record(m1), TileGuard::Record(m2)) => {
                 assert_eq!(
@@ -400,47 +400,41 @@ impl TileGuard {
 
     pub fn is_universal(&self) -> bool {
         match self {
-            TileGuard::Scalar(universal)
-            | TileGuard::CurriedFunction(universal)
-            | TileGuard::Aggregation(universal) => *universal,
+            TileGuard::Scalar(universal) | TileGuard::Aggregation(universal) => *universal,
             TileGuard::Record(m) => m.values().all(TileGuard::is_universal),
-            TileGuard::SealedFunction(g) => g.is_univeral(),
+            TileGuard::Function(g) => g.is_univeral(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
-            TileGuard::Scalar(universal)
-            | TileGuard::CurriedFunction(universal)
-            | TileGuard::Aggregation(universal) => !*universal,
+            TileGuard::Scalar(universal) | TileGuard::Aggregation(universal) => !*universal,
             TileGuard::Record(m) => m.values().all(TileGuard::is_empty),
-            TileGuard::SealedFunction(g) => g.is_empty(),
+            TileGuard::Function(g) => g.is_empty(),
         }
     }
 }
 
-/// A guard on a [`SealedFunction`](Tile::SealedFunction) tile, specifying
+/// A guard on a [Tile::SealedFunction] or [Tile::CurriedFunction], specifying
 /// which part of the function is of interest.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SealedFunctionGuard {
+pub enum FunctionGuard {
     Universal,
     Empty,
     Domain(Predicate),
     Codomain(Box<TileGuard>),
 }
 
-impl SealedFunctionGuard {
-    pub fn intersect(&self, other: &SealedFunctionGuard) -> SealedFunctionGuard {
+impl FunctionGuard {
+    pub fn intersect(&self, other: &FunctionGuard) -> FunctionGuard {
         match (self, other) {
-            (_, SealedFunctionGuard::Empty) | (SealedFunctionGuard::Empty, _) => {
-                SealedFunctionGuard::Empty
+            (_, FunctionGuard::Empty) | (FunctionGuard::Empty, _) => FunctionGuard::Empty,
+            (g, FunctionGuard::Universal) | (FunctionGuard::Universal, g) => g.clone(),
+            (FunctionGuard::Domain(p1), FunctionGuard::Domain(p2)) => {
+                FunctionGuard::Domain(p1.intersect(p2))
             }
-            (g, SealedFunctionGuard::Universal) | (SealedFunctionGuard::Universal, g) => g.clone(),
-            (SealedFunctionGuard::Domain(p1), SealedFunctionGuard::Domain(p2)) => {
-                SealedFunctionGuard::Domain(p1.intersect(p2))
-            }
-            (SealedFunctionGuard::Codomain(p1), SealedFunctionGuard::Codomain(p2)) => {
-                SealedFunctionGuard::Codomain(Box::new(p1.intersect(p2)))
+            (FunctionGuard::Codomain(p1), FunctionGuard::Codomain(p2)) => {
+                FunctionGuard::Codomain(Box::new(p1.intersect(p2)))
             }
             _ => todo!("Handle Domain + Codomain guards together"),
         }
@@ -448,21 +442,21 @@ impl SealedFunctionGuard {
 
     pub fn is_univeral(&self) -> bool {
         match self {
-            SealedFunctionGuard::Universal => true,
-            SealedFunctionGuard::Empty => false,
-            SealedFunctionGuard::Domain(p) if p.as_bool().is_some() => p.as_bool().unwrap(),
-            SealedFunctionGuard::Domain(..) => false,
-            SealedFunctionGuard::Codomain(g) => g.is_universal(),
+            FunctionGuard::Universal => true,
+            FunctionGuard::Empty => false,
+            FunctionGuard::Domain(p) if p.as_bool().is_some() => p.as_bool().unwrap(),
+            FunctionGuard::Domain(..) => false,
+            FunctionGuard::Codomain(g) => g.is_universal(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
-            SealedFunctionGuard::Universal => false,
-            SealedFunctionGuard::Empty => true,
-            SealedFunctionGuard::Domain(p) if p.as_bool().is_some() => !p.as_bool().unwrap(),
-            SealedFunctionGuard::Domain(..) => false,
-            SealedFunctionGuard::Codomain(g) => g.is_empty(),
+            FunctionGuard::Universal => false,
+            FunctionGuard::Empty => true,
+            FunctionGuard::Domain(p) if p.as_bool().is_some() => !p.as_bool().unwrap(),
+            FunctionGuard::Domain(..) => false,
+            FunctionGuard::Codomain(g) => g.is_empty(),
         }
     }
 }
@@ -570,6 +564,125 @@ impl Predicate {
             _ => panic!("Cannot intersect incompatible predicates: {self:?} and {other:?}"),
         }
     }
+
+    /// Returns the predicate that admits exactly the values accepted by either `self` or `other`.
+    pub fn union(&self, other: &Predicate) -> Predicate {
+        match (self, other) {
+            // True is the universal predicate: annihilator under union.
+            (Predicate::True, _) | (_, Predicate::True) => Predicate::True,
+            // False is the empty predicate: identity under union.
+            (Predicate::False, p) | (p, Predicate::False) => p.clone(),
+            // Two upper bounds: keep the looser (larger) one.
+            (Predicate::LessThanEq(a), Predicate::LessThanEq(b)) => match a.partial_cmp(b) {
+                Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
+                    Predicate::LessThanEq(a.clone())
+                }
+                Some(std::cmp::Ordering::Less) => Predicate::LessThanEq(b.clone()),
+                None => panic!("Cannot compare values in LessThanEq predicates: {a:?} and {b:?}"),
+            },
+            // Upper bound unioned with an interval set: merge (-∞, v] into the set.
+            (Predicate::LessThanEq(v), Predicate::Intervals(s))
+            | (Predicate::Intervals(s), Predicate::LessThanEq(v)) => {
+                let upper = IntervalSet::new(vec![Interval::unbound_closed(v.clone())]);
+                Predicate::Intervals(s.union(&upper))
+            }
+            // Two interval sets: standard set union.
+            (Predicate::Intervals(a), Predicate::Intervals(b)) => Predicate::Intervals(a.union(b)),
+            // Records: union field-by-field.
+            (Predicate::Record(m1), Predicate::Record(m2)) => {
+                assert_eq!(
+                    m1.len(),
+                    m2.len(),
+                    "Cannot union Record predicates with different schemas"
+                );
+                Predicate::Record(
+                    m1.iter()
+                        .map(|(k, p1)| (k.clone(), p1.union(&m2[k])))
+                        .collect(),
+                )
+            }
+            _ => panic!("Cannot union incompatible predicates: {self:?} and {other:?}"),
+        }
+    }
+
+    /// Converts a batch of concrete domain values into the predicate admitting exactly those values.
+    ///
+    /// Each scalar value becomes a point interval; records are split field-by-field.
+    pub(super) fn from_column_value(cv: &ColumnValue) -> Predicate {
+        match cv {
+            // Unit is a single-value type; any Unit value satisfies the predicate.
+            ColumnValue::Units(len) => {
+                if *len > 0 {
+                    Predicate::True
+                } else {
+                    Predicate::False
+                }
+            }
+            ColumnValue::Ints(v) => vec_to_predicate(v),
+            ColumnValue::UInts(v) => vec_to_predicate(v),
+            ColumnValue::Bools(v) => {
+                let mut vec = Vec::new();
+                if v.count_ones() > 0 {
+                    vec.push(true)
+                }
+                if v.count_zeros() > 0 {
+                    vec.push(false)
+                }
+                vec_to_predicate(&vec)
+            }
+            ColumnValue::Strings(v) => vec_to_predicate(v),
+            ColumnValue::Variants(v) => vec_to_predicate(v),
+            ColumnValue::Records(_) => todo!(),
+            ColumnValue::FunctionBindings { .. } => {
+                panic!("Cannot build predicate from FunctionBindings")
+            }
+            ColumnValue::LookupTable(_) => {
+                panic!("Cannot build predicate from LookupTable ColumnValue")
+            }
+        }
+    }
+}
+
+/// Converts a slice of values into a `Predicate::Intervals` with adjacent discrete values merged
+/// into contiguous ranges.
+///
+/// `IntervalSet::new` has a fast-path that skips `merge_sorted` when intervals are already sorted
+/// and non-overlapping — which point intervals always are. By sorting the values ourselves and
+/// explicitly extending runs of adjacent discrete values, we produce a minimal interval set.
+fn vec_to_predicate<T: Clone>(data: &[T]) -> Predicate
+where
+    Value: From<T>,
+{
+    if data.is_empty() {
+        return Predicate::False;
+    }
+
+    // Sort and deduplicate so we can do a single linear scan for adjacent runs.
+    let mut vals: Vec<Value> = data.iter().map(|x| Value::from(x.clone())).collect();
+    vals.sort_by(|a, b| {
+        a.partial_cmp(b)
+            .expect("values in a ColumnValue column must be mutually comparable")
+    });
+    vals.dedup();
+
+    // Walk the sorted values, extending the current interval whenever the next value
+    // is the immediate successor of the current end.
+    let mut intervals: Vec<Interval<Value>> = Vec::new();
+    let mut start = vals[0].clone();
+    let mut end = vals[0].clone();
+    for v in &vals[1..] {
+        if end.try_adjacent(Side::Right).as_ref() == Some(v) {
+            end = v.clone();
+        } else {
+            intervals.push(Interval::closed(start, end));
+            start = v.clone();
+            end = v.clone();
+        }
+    }
+    intervals.push(Interval::closed(start, end));
+
+    // Intervals are already sorted and merged, so skip the invariant check.
+    Predicate::Intervals(IntervalSet::new_unchecked(intervals))
 }
 
 /// Apply `f` to every value in a `HashMap`, producing a new map with the same keys.
@@ -580,8 +693,56 @@ pub(super) fn transform_hashmap_values<K: Clone + Eq + Hash, InputV, V, F: Fn(&I
     source.iter().map(|(k, v)| (k.clone(), f(v))).collect()
 }
 
+/// Sort a `Tile::SealedFunction` by its domain values for deterministic comparison.
+///
+/// Handles `Ints` and `UInts` domains paired with `Scalar(Ints)` codomains; all
+/// other tile forms are returned unchanged.  This is needed wherever key order
+/// depends on [`HashMap`] iteration order (e.g. GroupBy, MapSource).
+pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
+    /// Sort parallel `domain` and `cod_ints` vectors together by `domain` key,
+    /// then rebuild the tile.
+    fn sort_and_rebuild<K: Ord + Clone>(
+        domain_vals: Vec<K>,
+        cod_ints: Vec<i64>,
+        domain_predicate: Predicate,
+        mk_domain: impl Fn(Vec<K>) -> ColumnValue,
+    ) -> Tile {
+        let mut pairs: Vec<(K, i64)> = domain_vals.into_iter().zip(cod_ints).collect();
+        pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let (sorted_d, sorted_c): (Vec<K>, Vec<i64>) = pairs.into_iter().unzip();
+        Tile::SealedFunction {
+            domain: mk_domain(sorted_d),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(sorted_c))),
+            domain_predicate,
+        }
+    }
+
+    match tile {
+        Tile::SealedFunction {
+            domain,
+            codomain,
+            domain_predicate,
+        } => match (*codomain, domain) {
+            (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Ints(dom)) => {
+                sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::Ints)
+            }
+            (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::UInts(dom)) => {
+                sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::UInts)
+            }
+            (other_codomain, domain) => Tile::SealedFunction {
+                domain,
+                codomain: Box::new(other_codomain),
+                domain_predicate,
+            },
+        },
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use intervalsets::ops::Contains;
+
     use super::*;
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
 
@@ -596,7 +757,7 @@ mod tests {
     }
 
     fn range(end: usize) -> Extent {
-        Extent::UIntRange { start: 0, end }
+        Extent::uint_range(end)
     }
 
     fn sealed(domain: Extent, codomain: Extent) -> Tiling {
@@ -942,12 +1103,6 @@ mod tests {
     }
 
     #[test]
-    fn guard_intersect_lookup_function() {
-        let g = TileGuard::CurriedFunction(true).intersect(&TileGuard::CurriedFunction(false));
-        assert!(g.is_empty());
-    }
-
-    #[test]
     fn guard_intersect_aggregation() {
         let g = TileGuard::Aggregation(true).intersect(&TileGuard::Aggregation(true));
         assert!(g.is_universal());
@@ -955,15 +1110,15 @@ mod tests {
 
     #[test]
     fn guard_intersect_sealed_function_universal_universal() {
-        let g = TileGuard::SealedFunction(SealedFunctionGuard::Universal)
-            .intersect(&TileGuard::SealedFunction(SealedFunctionGuard::Universal));
+        let g = TileGuard::Function(FunctionGuard::Universal)
+            .intersect(&TileGuard::Function(FunctionGuard::Universal));
         assert!(g.is_universal());
     }
 
     #[test]
     fn guard_intersect_sealed_function_empty_dominates() {
-        let g = TileGuard::SealedFunction(SealedFunctionGuard::Universal)
-            .intersect(&TileGuard::SealedFunction(SealedFunctionGuard::Empty));
+        let g = TileGuard::Function(FunctionGuard::Universal)
+            .intersect(&TileGuard::Function(FunctionGuard::Empty));
         assert!(g.is_empty());
     }
 
@@ -971,38 +1126,30 @@ mod tests {
 
     #[test]
     fn sfg_intersect_empty_dominates() {
-        let result = SealedFunctionGuard::Universal.intersect(&SealedFunctionGuard::Empty);
-        assert!(matches!(result, SealedFunctionGuard::Empty));
+        let result = FunctionGuard::Universal.intersect(&FunctionGuard::Empty);
+        assert!(matches!(result, FunctionGuard::Empty));
     }
 
     #[test]
     fn sfg_intersect_universal_is_identity() {
-        let result =
-            SealedFunctionGuard::Domain(Predicate::True).intersect(&SealedFunctionGuard::Universal);
-        assert!(matches!(
-            result,
-            SealedFunctionGuard::Domain(Predicate::True)
-        ));
+        let result = FunctionGuard::Domain(Predicate::True).intersect(&FunctionGuard::Universal);
+        assert!(matches!(result, FunctionGuard::Domain(Predicate::True)));
     }
 
     #[test]
     fn sfg_intersect_domain_domain() {
-        let result = SealedFunctionGuard::Domain(Predicate::True)
-            .intersect(&SealedFunctionGuard::Domain(Predicate::False));
-        assert!(matches!(
-            result,
-            SealedFunctionGuard::Domain(Predicate::False)
-        ));
+        let result = FunctionGuard::Domain(Predicate::True)
+            .intersect(&FunctionGuard::Domain(Predicate::False));
+        assert!(matches!(result, FunctionGuard::Domain(Predicate::False)));
     }
 
     #[test]
     fn sfg_intersect_codomain_codomain() {
-        let result = SealedFunctionGuard::Codomain(Box::new(TileGuard::Scalar(true))).intersect(
-            &SealedFunctionGuard::Codomain(Box::new(TileGuard::Scalar(false))),
-        );
+        let result = FunctionGuard::Codomain(Box::new(TileGuard::Scalar(true)))
+            .intersect(&FunctionGuard::Codomain(Box::new(TileGuard::Scalar(false))));
         assert_eq!(
             result,
-            SealedFunctionGuard::Codomain(Box::new(TileGuard::Scalar(false)))
+            FunctionGuard::Codomain(Box::new(TileGuard::Scalar(false)))
         );
     }
 
@@ -1093,6 +1240,117 @@ mod tests {
         assert_eq!(m["b"], Predicate::False);
     }
 
+    // ── Predicate::from_column_value ─────────────────────────────────────────
+
+    #[test]
+    fn from_column_value_empty_ints_is_false() {
+        assert_eq!(
+            Predicate::from_column_value(&ColumnValue::Ints(vec![])),
+            Predicate::False
+        );
+    }
+
+    #[test]
+    fn from_column_value_single_int() {
+        let p = Predicate::from_column_value(&ColumnValue::Ints(vec![7]));
+        let Predicate::Intervals(s) = p else {
+            panic!("expected Intervals");
+        };
+        // The single point [7, 7] should contain 7 but not 6 or 8.
+        assert!(s.contains(&Value::Int(7)));
+        assert!(!s.contains(&Value::Int(6)));
+        assert!(!s.contains(&Value::Int(8)));
+    }
+
+    #[test]
+    fn from_column_value_multiple_ints_contains_all() {
+        let p = Predicate::from_column_value(&ColumnValue::Ints(vec![1, 3, 5]));
+        let Predicate::Intervals(s) = p else {
+            panic!("expected Intervals");
+        };
+        assert!(s.contains(&Value::Int(1)));
+        assert!(s.contains(&Value::Int(3)));
+        assert!(s.contains(&Value::Int(5)));
+        assert!(!s.contains(&Value::Int(2)));
+        assert!(!s.contains(&Value::Int(4)));
+    }
+
+    #[test]
+    fn from_column_value_uints() {
+        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 2]));
+        let Predicate::Intervals(s) = p else {
+            panic!("expected Intervals");
+        };
+        assert!(s.contains(&Value::UInt(0)));
+        assert!(s.contains(&Value::UInt(2)));
+        assert!(!s.contains(&Value::UInt(1)));
+    }
+
+    #[test]
+    fn from_column_value_compact() {
+        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1, 2, 5, 6, 7]));
+        let Predicate::Intervals(s) = p else {
+            panic!("expected Intervals");
+        };
+        assert_eq!(s.intervals().len(), 2, "{s:?}");
+    }
+
+    #[test]
+    fn from_column_value_empty_uints_is_false() {
+        assert_eq!(
+            Predicate::from_column_value(&ColumnValue::UInts(vec![])),
+            Predicate::False
+        );
+    }
+
+    #[test]
+    fn from_column_value_bools_both_values() {
+        let mut bv = BitVec::from_elem(2, false);
+        bv.set(0, true);
+        bv.set(1, false);
+        let p = Predicate::from_column_value(&ColumnValue::Bools(bv));
+        let Predicate::Intervals(s) = p else {
+            panic!("expected Intervals");
+        };
+        assert!(s.contains(&Value::Bool(true)));
+        assert!(s.contains(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn from_column_value_bools_only_true() {
+        let bv = BitVec::from_elem(3, true);
+        let p = Predicate::from_column_value(&ColumnValue::Bools(bv));
+        let Predicate::Intervals(s) = p else {
+            panic!("expected Intervals");
+        };
+        assert!(s.contains(&Value::Bool(true)));
+        assert!(!s.contains(&Value::Bool(false)));
+    }
+
+    #[test]
+    fn from_column_value_empty_bools_is_false() {
+        assert_eq!(
+            Predicate::from_column_value(&ColumnValue::Bools(BitVec::new())),
+            Predicate::False
+        );
+    }
+
+    #[test]
+    fn from_column_value_units_nonempty_is_true() {
+        assert_eq!(
+            Predicate::from_column_value(&ColumnValue::Units(3)),
+            Predicate::True
+        );
+    }
+
+    #[test]
+    fn from_column_value_units_empty_is_false() {
+        assert_eq!(
+            Predicate::from_column_value(&ColumnValue::Units(0)),
+            Predicate::False
+        );
+    }
+
     // ── Predicate::split_record ───────────────────────────────────────────────
 
     #[test]
@@ -1154,6 +1412,159 @@ mod tests {
             domain_predicate: Predicate::False,
         };
         assert!(!tile.is_terminal());
+    }
+
+    // ── Predicate::union ──────────────────────────────────────────────────────
+
+    /// Helper: assert that a `Predicate::Intervals` contains / does not contain a value.
+    fn intervals_contains(p: &Predicate, v: Value) -> bool {
+        let Predicate::Intervals(s) = p else {
+            panic!("expected Predicate::Intervals, got {p:?}");
+        };
+        s.contains(&v)
+    }
+
+    // True is the annihilator: True ∪ x = True and x ∪ True = True.
+    #[test]
+    fn union_true_annihilates_lhs() {
+        assert_eq!(
+            Predicate::True.union(&Predicate::LessThanEq(Value::UInt(5))),
+            Predicate::True
+        );
+    }
+
+    #[test]
+    fn union_true_annihilates_rhs() {
+        assert_eq!(
+            Predicate::LessThanEq(Value::UInt(5)).union(&Predicate::True),
+            Predicate::True
+        );
+    }
+
+    // False is the identity: False ∪ x = x and x ∪ False = x.
+    #[test]
+    fn union_false_identity_lhs() {
+        let p = Predicate::LessThanEq(Value::UInt(3));
+        assert_eq!(Predicate::False.union(&p), p);
+    }
+
+    #[test]
+    fn union_false_identity_rhs() {
+        let p = Predicate::LessThanEq(Value::UInt(3));
+        assert_eq!(p.union(&Predicate::False), p);
+    }
+
+    // LessThanEq ∪ LessThanEq: keep the looser (larger) bound.
+    #[test]
+    fn union_less_than_eq_keeps_larger() {
+        assert_eq!(
+            Predicate::LessThanEq(Value::UInt(7)).union(&Predicate::LessThanEq(Value::UInt(3))),
+            Predicate::LessThanEq(Value::UInt(7))
+        );
+        assert_eq!(
+            Predicate::LessThanEq(Value::UInt(3)).union(&Predicate::LessThanEq(Value::UInt(7))),
+            Predicate::LessThanEq(Value::UInt(7))
+        );
+    }
+
+    #[test]
+    fn union_less_than_eq_equal_bounds() {
+        assert_eq!(
+            Predicate::LessThanEq(Value::UInt(5)).union(&Predicate::LessThanEq(Value::UInt(5))),
+            Predicate::LessThanEq(Value::UInt(5))
+        );
+    }
+
+    // LessThanEq ∪ Intervals: result is Intervals containing a left-unbounded interval.
+    #[test]
+    fn union_less_than_eq_with_intervals_lhs() {
+        // (-∞, 3] ∪ {7} → Intervals containing both 0, 3, and 7; but not 4 or 6.
+        let intervals = Predicate::from_column_value(&ColumnValue::UInts(vec![7]));
+        let result = Predicate::LessThanEq(Value::UInt(3)).union(&intervals);
+        assert!(intervals_contains(&result, Value::UInt(0)), "0 in (-inf,3]");
+        assert!(intervals_contains(&result, Value::UInt(3)), "3 in (-inf,3]");
+        assert!(
+            !intervals_contains(&result, Value::UInt(4)),
+            "4 not in result"
+        );
+        assert!(
+            intervals_contains(&result, Value::UInt(7)),
+            "7 in point set"
+        );
+    }
+
+    #[test]
+    fn union_less_than_eq_with_intervals_rhs() {
+        // {7} ∪ (-∞, 3] — commutative, same outcome.
+        let intervals = Predicate::from_column_value(&ColumnValue::UInts(vec![7]));
+        let result = intervals.union(&Predicate::LessThanEq(Value::UInt(3)));
+        assert!(intervals_contains(&result, Value::UInt(3)));
+        assert!(!intervals_contains(&result, Value::UInt(4)));
+        assert!(intervals_contains(&result, Value::UInt(7)));
+    }
+
+    // Intervals ∪ Intervals: standard set union.
+    #[test]
+    fn union_disjoint_interval_sets() {
+        // {1, 2} ∪ {5, 6} → values 1, 2, 5, 6 present; 3, 4 absent.
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2]));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![5, 6]));
+        let result = a.union(&b);
+        for v in [1usize, 2, 5, 6] {
+            assert!(
+                intervals_contains(&result, Value::UInt(v)),
+                "{v} should be in union"
+            );
+        }
+        for v in [3usize, 4] {
+            assert!(
+                !intervals_contains(&result, Value::UInt(v)),
+                "{v} should not be in union"
+            );
+        }
+    }
+
+    #[test]
+    fn union_overlapping_interval_sets_merges() {
+        // {2, 3, 4} ∪ {3, 4, 5} → {2, 3, 4, 5}, all present.
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3, 4]));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 4, 5]));
+        let result = a.union(&b);
+        for v in [2usize, 3, 4, 5] {
+            assert!(intervals_contains(&result, Value::UInt(v)));
+        }
+    }
+
+    // Record ∪ Record: each field is unioned independently.
+    #[test]
+    fn union_record_predicates_field_by_field() {
+        let r1 = record_pred(&[
+            ("x", Predicate::LessThanEq(Value::UInt(3))),
+            ("y", Predicate::False),
+        ]);
+        let r2 = record_pred(&[
+            ("x", Predicate::LessThanEq(Value::UInt(7))),
+            ("y", Predicate::True),
+        ]);
+        let result = r1.union(&r2);
+        let Predicate::Record(m) = result else {
+            panic!("expected Record");
+        };
+        assert_eq!(m["x"], Predicate::LessThanEq(Value::UInt(7)));
+        assert_eq!(m["y"], Predicate::True);
+    }
+
+    #[test]
+    fn union_record_false_fields_stay_false() {
+        // False ∪ False = False for each field.
+        let r1 = record_pred(&[("a", Predicate::False), ("b", Predicate::False)]);
+        let r2 = record_pred(&[("a", Predicate::False), ("b", Predicate::False)]);
+        let result = r1.union(&r2);
+        let Predicate::Record(m) = result else {
+            panic!("expected Record");
+        };
+        assert_eq!(m["a"], Predicate::False);
+        assert_eq!(m["b"], Predicate::False);
     }
 
     #[test]

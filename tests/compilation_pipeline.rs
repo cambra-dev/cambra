@@ -20,8 +20,8 @@ use std::rc::Rc;
 use cambra::ccl::{context::GlobalContext, Type};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
-    tuple_field, BaseType, ColumnValue, Consumer, Extent, FuncBinding, Predicate,
-    SealedFunctionGuard, TestDataSource, Tile, TileGuard, Value,
+    sort_sealed_function_by_domain, tuple_field, BaseType, ColumnValue, Consumer, Extent,
+    FuncBinding, FunctionGuard, Predicate, TestDataSource, Tile, TileGuard, Value,
 };
 use rstest_log::rstest;
 
@@ -584,13 +584,13 @@ fn test_inner_join(#[case] code: &str) {
         ]
     );
 
-    producer.release(TileGuard::SealedFunction(SealedFunctionGuard::Domain(
+    producer.release(TileGuard::Function(FunctionGuard::Domain(
         Predicate::Record(HashMap::from([
             (tuple_field(0), Predicate::True),
             (tuple_field(1), Predicate::LessThanEq(Value::UInt(10))),
         ])),
     )));
-    producer.release(TileGuard::SealedFunction(SealedFunctionGuard::Domain(
+    producer.release(TileGuard::Function(FunctionGuard::Domain(
         Predicate::Record(HashMap::from([
             (tuple_field(0), Predicate::LessThanEq(Value::UInt(10))),
             (tuple_field(1), Predicate::True),
@@ -618,5 +618,123 @@ fn test_inner_join(#[case] code: &str) {
     assert_eq!(
         extract_join_rows(tile),
         vec![((30, 20), (100, "a3".to_string(), "b2".to_string()))]
+    );
+}
+
+/// `sum(source1())` accumulates values across batches and emits the final sum only
+/// once the data source signals that it is done producing output.
+#[test]
+fn test_incremental_global_aggregate() {
+    let code = "sum(source1())";
+    let mut ctx = GlobalContext::default();
+
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_test_source(test_source.clone());
+
+    let mut producer = ctx.compile_program(code, Box::new(|| {}));
+
+    // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(10)),
+        (Value::UInt(1), Value::Int(20)),
+    ]);
+    let result = producer.get(producer.tiling().universal_guard());
+    assert_eq!(
+        result,
+        Tile::Scalar(ColumnValue::Ints(vec![])),
+        "should produce no output before source is done (after first batch)"
+    );
+
+    // Second batch: adds 30 more; running total 60, still not terminal.
+    test_source
+        .borrow_mut()
+        .add_data(&[(Value::UInt(2), Value::Int(30))]);
+    let result = producer.get(producer.tiling().universal_guard());
+    assert_eq!(
+        result,
+        Tile::Scalar(ColumnValue::Ints(vec![])),
+        "should produce no output before source is done (after second batch)"
+    );
+
+    // Signal that the source is exhausted; the accumulated sum should now be emitted.
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    let result = producer.get(producer.tiling().universal_guard());
+    assert_eq!(
+        result,
+        Tile::Scalar(ColumnValue::Ints(vec![60])),
+        "should emit final sum once source is terminal"
+    );
+}
+
+#[test_log::test]
+fn test_incremental_aggregates() {
+    let code = "[sum(x) for x in groupby(source1(), lambda x: x // 10)]";
+    let mut ctx = GlobalContext::default();
+
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_test_source(test_source.clone());
+
+    let notified = Rc::new(RefCell::new(false));
+    let notified_clone = notified.clone();
+    let consumer: Box<dyn Consumer> = Box::new(move || {
+        *notified_clone.borrow_mut() = true;
+    });
+    let mut producer = ctx.compile_program(code, consumer);
+
+    ctx.scheduler().check_for_notifications();
+    assert!(*notified.borrow(), "expected notification (pipeline path)");
+    *notified.borrow_mut() = false;
+
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(10)),
+        (Value::UInt(1), Value::Int(20)),
+    ]);
+
+    let result = producer.get(producer.tiling().universal_guard());
+    assert_eq!(
+        result,
+        Tile::SealedFunction {
+            domain: ColumnValue::Ints(vec![]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            domain_predicate: Predicate::False
+        }
+    );
+
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(2), Value::Int(10)),
+        (Value::UInt(3), Value::Int(30)),
+    ]);
+    let result = producer.get(producer.tiling().universal_guard());
+    assert_eq!(
+        result,
+        Tile::SealedFunction {
+            domain: ColumnValue::Ints(vec![]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            domain_predicate: Predicate::False
+        }
+    );
+
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+
+    let result = producer.get(producer.tiling().universal_guard());
+    assert_eq!(
+        sort_sealed_function_by_domain(result),
+        sort_sealed_function_by_domain(Tile::SealedFunction {
+            domain: ColumnValue::Ints(vec![1, 2, 3]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 20, 30]))),
+            domain_predicate: Predicate::True
+        })
     );
 }

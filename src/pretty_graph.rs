@@ -102,7 +102,7 @@ pub fn fmt_extent(extent: &Extent) -> String {
             parts.sort();
             format!("{{{}}}", parts.join(", "))
         }
-        Extent::UIntRange { start, end } => format!("[{start}..{end})"),
+        Extent::UIntRange(set) => format!("{set}"),
         Extent::DataSourceDomain(_) => "DataSource".to_string(),
         Extent::Union(variants) => {
             let parts: Vec<String> = variants.iter().map(fmt_extent).collect();

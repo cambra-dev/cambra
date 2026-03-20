@@ -6,7 +6,8 @@ use std::{cell::RefCell, cmp::Ordering, collections::HashMap, hash::Hash, rc::Rc
 use bit_set::BitSet;
 use bit_vec::BitVec;
 use intervalsets::numeric::Domain;
-use intervalsets::Side;
+use intervalsets::ops::Difference;
+use intervalsets::{Bounding, Interval, IntervalSet, MaybeEmpty, Side};
 
 use crate::interpreter::{
     apply_binop_column, apply_unaryop_column, tuple_field, BinOpKind, UnaryOpKind,
@@ -28,11 +29,11 @@ pub enum Extent {
     Record(HashMap<String, Extent>),
     /// A union type: one of several possible extents
     Union(Vec<Extent>),
-    // Right-open range of indices: [start, end)
-    UIntRange {
-        start: usize,
-        end: usize,
-    },
+    /// A finite set of unsigned integer indices, represented as an interval set.
+    ///
+    /// Created from a CCL `UIntRange(n)` type as the full set `[0, n)`, and
+    /// shrunk directly as individual elements or sub-intervals are released.
+    UIntRange(IntervalSet<usize>),
     DataSourceDomain(Rc<RefCell<dyn DataSourceDomainExtentImpl>>),
     /// A restricted extent: wraps another extent with a restriction predicate.
     Restricted {
@@ -68,10 +69,7 @@ impl PartialEq for Extent {
             ) => b1 == b2 && Rc::ptr_eq(r1, r2),
             // Union equality is order-sensitive (structural).
             (Extent::Union(u1), Extent::Union(u2)) => u1 == u2,
-            (
-                Extent::UIntRange { start: s1, end: e1 },
-                Extent::UIntRange { start: s2, end: e2 },
-            ) => s1 == s2 && e1 == e2,
+            (Extent::UIntRange(s1), Extent::UIntRange(s2)) => s1 == s2,
             (Extent::DataSourceDomain(d1), Extent::DataSourceDomain(d2)) => {
                 d1.borrow().get_id() == d2.borrow().get_id()
             }
@@ -99,7 +97,7 @@ impl Extent {
                 subscribe: true,
             },
             // Literal range extents are fully ready immediately
-            Extent::UIntRange { .. } => NotifyOrSubscribeResult {
+            Extent::UIntRange(..) => NotifyOrSubscribeResult {
                 notify: true,
                 subscribe: false,
             },
@@ -198,13 +196,10 @@ impl Extent {
             // Scalar self vs union other: `self` must include every variant.
             (_, Extent::Union(variants)) => variants.iter().all(|v| self.includes(v)),
 
-            (Extent::Base(BaseType::UInt), Extent::UIntRange { .. }) => true,
+            (Extent::Base(BaseType::UInt), Extent::UIntRange(..)) => true,
 
-            // UIntRange: [s1, e1) includes [s2, e2) iff s1 ≤ s2 and e2 ≤ e1.
-            (
-                Extent::UIntRange { start: s1, end: e1 },
-                Extent::UIntRange { start: s2, end: e2 },
-            ) => s1 <= s2 && e2 <= e1,
+            // UIntRange: s1 includes s2 iff s2 is a subset of s1.
+            (Extent::UIntRange(s1), Extent::UIntRange(s2)) => s2.difference(s1).is_empty(),
 
             // DataSourceDomain: identity check
             (Extent::DataSourceDomain(d1), Extent::DataSourceDomain(d2)) => d1 == d2,
@@ -305,7 +300,7 @@ impl std::fmt::Display for Extent {
                 let extent_strs: Vec<String> = extents.iter().map(|e| format!("{e}")).collect();
                 write!(f, "({})", extent_strs.join(" | "))
             }
-            Extent::UIntRange { start, end } => write!(f, "[{start}, {end})"),
+            Extent::UIntRange(set) => write!(f, "{set}"),
             Extent::DataSourceDomain(_) => write!(f, "DataSource"),
             Extent::Restricted { base, .. } => write!(f, "Restricted({base})"),
         }
@@ -319,6 +314,47 @@ impl std::fmt::Debug for Extent {
 }
 
 impl Extent {
+    /// Construct a `UIntRange` extent covering `[0, n)`.
+    ///
+    /// The resulting interval set contains every unsigned integer in `[0, n)`.
+    /// For `n == 0`, the set is empty.
+    pub fn uint_range(n: usize) -> Self {
+        Self::uint_range_interval(0, n)
+    }
+
+    /// Construct a `UIntRange` extent covering `[start, end)`.
+    ///
+    /// Returns an empty set when `start >= end`.
+    pub fn uint_range_interval(start: usize, end: usize) -> Self {
+        if start >= end {
+            Extent::UIntRange(IntervalSet::from(Interval::<usize>::empty()))
+        } else {
+            Extent::UIntRange(IntervalSet::from(Interval::closed_open(start, end)))
+        }
+    }
+
+    /// If this is a `UIntRange` whose remaining set is a single contiguous
+    /// range starting at `0` (i.e. `[0, n)`), return `n`.
+    ///
+    /// Used to convert a compile-time extent back to a CCL `Type::UIntRange(n)`.
+    pub fn as_uint_range_size(&self) -> Option<usize> {
+        if let Extent::UIntRange(set) = self {
+            if set.is_empty() {
+                return Some(0);
+            }
+            let intervals = set.intervals();
+            if intervals.len() == 1 {
+                let iv = &intervals[0];
+                if iv.lval() == Some(&0) {
+                    // Discrete intervals are normalized to closed bounds,
+                    // so the right bound is n-1 and n = rval + 1.
+                    return iv.rval().map(|r| r + 1);
+                }
+            }
+        }
+        None
+    }
+
     /// Create a function extent from domain and codomain
     pub fn function(domain: Extent, codomain: Extent) -> Self {
         Extent::Function {
@@ -544,8 +580,44 @@ impl std::fmt::Debug for Value {
 }
 
 impl Domain for Value {
-    fn try_adjacent(&self, _side: Side) -> Option<Self> {
-        None
+    /// Finds the next smaller or larger element, or None if no such element exists
+    /// (like <0 for usize, or anything for strings and floats).
+    fn try_adjacent(&self, side: Side) -> Option<Self> {
+        match (self, side) {
+            (Value::Bool(false), Side::Left) => None,
+            (Value::Bool(true), Side::Left) => Some(Value::from(false)),
+            (Value::Bool(false), Side::Right) => Some(Value::from(true)),
+            (Value::Bool(true), Side::Right) => None,
+            (Value::Int(i), Side::Left) => i.checked_sub(1).map(Value::from),
+            (Value::Int(i), Side::Right) => i.checked_add(1).map(Value::from),
+            (Value::UInt(i), Side::Left) => i.checked_sub(1).map(Value::from),
+            (Value::UInt(i), Side::Right) => i.checked_add(1).map(Value::from),
+            _ => None,
+        }
+    }
+}
+
+impl From<i64> for Value {
+    fn from(v: i64) -> Self {
+        Value::Int(v)
+    }
+}
+
+impl From<usize> for Value {
+    fn from(v: usize) -> Self {
+        Value::UInt(v)
+    }
+}
+
+impl From<String> for Value {
+    fn from(v: String) -> Self {
+        Value::String(v)
+    }
+}
+
+impl From<bool> for Value {
+    fn from(v: bool) -> Self {
+        Value::Bool(v)
     }
 }
 
@@ -672,7 +744,7 @@ impl ColumnValue {
             Extent::Base(BaseType::Int) => {
                 ColumnValue::Ints(values.iter().map(Value::as_int).collect())
             }
-            Extent::Base(BaseType::UInt) | Extent::UIntRange { .. } => {
+            Extent::Base(BaseType::UInt) | Extent::UIntRange(..) => {
                 ColumnValue::UInts(values.iter().map(Value::as_uint).collect())
             }
             Extent::Base(BaseType::String) => {
@@ -803,7 +875,7 @@ impl ColumnValue {
             (ColumnValue::Bools(_), Extent::Base(BaseType::Bool)) => true,
             (ColumnValue::Ints(_), Extent::Base(BaseType::Int)) => true,
             (ColumnValue::UInts(_), Extent::Base(BaseType::UInt)) => true,
-            (ColumnValue::UInts(_), Extent::UIntRange { .. }) => true,
+            (ColumnValue::UInts(_), Extent::UIntRange(..)) => true,
             (ColumnValue::Strings(_), Extent::Base(BaseType::String)) => true,
             (ColumnValue::Records(fields), Extent::Record(ext_fields)) => {
                 fields.len() == ext_fields.len()
@@ -1241,8 +1313,9 @@ mod tests {
 
     #[test]
     fn test_extent_display_uint_range() {
-        let e = Extent::UIntRange { start: 2, end: 5 };
-        assert_eq!(e.to_string(), "[2, 5)");
+        // Discrete intervals are normalised to closed form: [2, 5) -> [2, 4].
+        let e = Extent::uint_range_interval(2, 5);
+        assert_eq!(e.to_string(), "{[2, 4]}");
     }
 
     #[test]
@@ -1271,15 +1344,15 @@ mod tests {
 
     #[test]
     fn test_includes_uint_range_subset() {
-        let wide = Extent::UIntRange { start: 0, end: 10 };
-        let narrow = Extent::UIntRange { start: 2, end: 7 };
+        let wide = Extent::uint_range(10);
+        let narrow = Extent::uint_range_interval(2, 7);
         assert!(wide.includes(&narrow));
         assert!(!narrow.includes(&wide));
     }
 
     #[test]
     fn test_includes_uint_range_equal() {
-        let r = Extent::UIntRange { start: 3, end: 6 };
+        let r = Extent::uint_range_interval(3, 6);
         assert!(r.includes(&r));
     }
 
@@ -1295,13 +1368,10 @@ mod tests {
     #[test]
     fn test_includes_record_covariant_field() {
         // Wide has field "a" = Int; narrow has field "a" = Int and "b" = Bool (different size).
-        let wide = Extent::Record(HashMap::from([(
-            "a".to_string(),
-            Extent::UIntRange { start: 0, end: 10 },
-        )]));
+        let wide = Extent::Record(HashMap::from([("a".to_string(), Extent::uint_range(10))]));
         let narrow = Extent::Record(HashMap::from([(
             "a".to_string(),
-            Extent::UIntRange { start: 2, end: 5 },
+            Extent::uint_range_interval(2, 5),
         )]));
         assert!(wide.includes(&narrow));
         assert!(!narrow.includes(&wide));
@@ -1343,8 +1413,8 @@ mod tests {
     #[test]
     fn test_includes_function_codomain_covariant() {
         let codomain = Extent::Base(BaseType::Int);
-        let narrow_domain = Extent::UIntRange { start: 0, end: 5 };
-        let wide_domain = Extent::UIntRange { start: 0, end: 10 };
+        let narrow_domain = Extent::uint_range(5);
+        let wide_domain = Extent::uint_range(10);
         let wide_fn = Extent::Function {
             domain: Box::new(wide_domain),
             codomain: Box::new(codomain.clone()),

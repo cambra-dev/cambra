@@ -14,6 +14,24 @@ Tilings and Tiles are the data model used by `TileOperator` and `TileProducer`. 
 describes the *shape* of data a producer will emit — analogous to a type. A `Tile` is the
 materialized data itself, shaped according to its `Tiling`.
 
+### Extent
+
+An `Extent` is the type-level view of a value: the set of all values a term can take on. Extents
+are used in `Tiling` to describe domain and codomain shapes, and by producers to track which
+values remain to be emitted or have already been released.
+
+| Variant | Meaning |
+|---------|---------|
+| `Base(BaseType)` | A primitive type: `Int`, `UInt`, `String`, `Bool`, or `Unit`. |
+| `Function { domain, codomain }` | A function type mapping one extent to another. |
+| `Record(fields)` | A record type with named field extents. |
+| `Union(variants)` | A union type: one of several possible extents. |
+| `UIntRange(IntervalSet<usize>)` | A finite, mutable set of unsigned integer indices. Created from a CCL `UIntRange(n)` type as the full set `[0, n)`, and shrunk directly as individual elements or sub-intervals are released by `IterateExtentProducer`. Constructors: `Extent::uint_range(n)` for `[0, n)`, `Extent::uint_range_interval(start, end)` for arbitrary half-open ranges. |
+| `DataSourceDomain(…)` | The domain of a streaming data source; polled externally for new elements. |
+| `Restricted { base, restriction }` | A subset of `base` filtered by a `Restriction` handle; populated at runtime by `Filter` operators. |
+
+At runtime, `Extent`s are responsible for tracking which elements are available and what has been released and forgotten.
+
 ### Tiling
 
 Each `TileOperator` declares a `Tiling` that tells consumers what structure to expect:
@@ -58,7 +76,7 @@ the previous version of the interpreter.
 | `CurriedFunction(bool)` | All-or-nothing interest in the lookup table. |
 | `Aggregation(bool)` | All-or-nothing interest in the aggregate result. |
 | `Record(fields)` | Per-field `TileGuard`s, allowing fine-grained field demand. |
-| `SealedFunction(SealedFunctionGuard)` | Structured interest in a function tile (see below). |
+| `Function(FunctionGuard)` | Structured interest in a function tile (see below). |
 
 `TileGuard::intersect()` computes the overlap between two guards (conjunction of interest
 regions). `is_universal()` and `is_empty()` test the extremes.
@@ -66,9 +84,9 @@ regions). `is_universal()` and `is_empty()` test the extremes.
 TileGuards are also used to extract portions of a tile that a consumer is interested. This will be implemented
 as a `split(guard: &TileGuard)` method on `Tile` in the future.
 
-### SealedFunctionGuard
+### FunctionGuard
 
-Refines interest in a `SealedFunction` tiling:
+Refines interest in a `SealedFunction` or `CurriedFunction` tiling:
 
 | Variant | Meaning |
 |---------|---------|

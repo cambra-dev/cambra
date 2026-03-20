@@ -11,9 +11,10 @@
 use std::{cell::RefCell, collections::HashMap, hash::Hash, rc::Rc};
 
 use bit_vec::BitVec;
+use intervalsets::{ops::Difference, Bounding, Interval, IntervalSet};
 use log::{debug, trace};
 
-pub use crate::interpreter::tiling::{Predicate, SealedFunctionGuard, Tile, TileGuard, Tiling};
+pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, Tiling};
 use crate::{
     ccl::AggregateKind,
     interpreter::{
@@ -75,7 +76,9 @@ pub trait TileProducer {
     fn tiling(&self) -> &Tiling;
 
     /// Return the name of the concrete producer type.
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &'static str {
+        std::any::type_name::<Self>().rsplit_once("::").unwrap().1
+    }
 
     /// Fetch the current tile value.
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
@@ -338,10 +341,6 @@ impl MapApplyProducer {
 }
 
 impl TileProducer for MapApplyProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -362,8 +361,8 @@ impl TileProducer for MapApplyProducer {
         let f_codomain_extent = f_tiling.extent().split_function().unwrap().1.clone();
         let i_tiling = self.input.tiling();
         let input_guard = match projection_guard {
-            TileGuard::SealedFunction(SealedFunctionGuard::Domain(p)) => {
-                TileGuard::SealedFunction(SealedFunctionGuard::Domain(p))
+            TileGuard::Function(FunctionGuard::Domain(p)) => {
+                TileGuard::Function(FunctionGuard::Domain(p))
             }
             _ => i_tiling.universal_guard(),
         };
@@ -393,8 +392,8 @@ impl TileProducer for MapApplyProducer {
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
-            TileGuard::SealedFunction(SealedFunctionGuard::Domain(p)) => {
-                TileGuard::SealedFunction(SealedFunctionGuard::Domain(p))
+            TileGuard::Function(FunctionGuard::Domain(p)) => {
+                TileGuard::Function(FunctionGuard::Domain(p))
             }
             _ => todo!(),
         });
@@ -501,10 +500,6 @@ impl MapToConstProducer {
 }
 
 impl TileProducer for MapToConstProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -524,8 +519,8 @@ impl TileProducer for MapToConstProducer {
         );
         let i_tiling = self.input.tiling();
         let input_guard = match projection_guard {
-            TileGuard::SealedFunction(SealedFunctionGuard::Domain(p)) => {
-                TileGuard::SealedFunction(SealedFunctionGuard::Domain(p))
+            TileGuard::Function(FunctionGuard::Domain(p)) => {
+                TileGuard::Function(FunctionGuard::Domain(p))
             }
             _ => i_tiling.universal_guard(),
         };
@@ -555,8 +550,8 @@ impl TileProducer for MapToConstProducer {
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
-            TileGuard::SealedFunction(SealedFunctionGuard::Domain(p)) => {
-                TileGuard::SealedFunction(SealedFunctionGuard::Domain(p))
+            TileGuard::Function(FunctionGuard::Domain(p)) => {
+                TileGuard::Function(FunctionGuard::Domain(p))
             }
             _ => todo!(),
         });
@@ -647,6 +642,9 @@ impl TileOperator for IterateExtent {
 /// Producer for [`IterateExtent`]: emits an identity sealed-function tile.
 struct IterateExtentProducer {
     /// The extent being iterated.
+    ///
+    /// For `UIntRange` extents this is an `IntervalSet<usize>` that shrinks
+    /// directly as sub-intervals are released.
     extent: Extent,
     /// Output tiling.
     tiling: Tiling,
@@ -670,12 +668,38 @@ fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
     }
 }
 
-fn release_extent(extent: &mut Extent, obsolete_guard: &SealedFunctionGuard) {
+/// Convert a `IntervalSet<Value::UInt>` values into an
+/// `IntervalSet<usize>`, preserving bound types.
+///
+/// Discrete `Value` intervals are normalised to closed form by `intervalsets`,
+/// so the resulting `usize` intervals are also closed.
+fn predicate_intervals_to_usize(intervals: &IntervalSet<Value>) -> IntervalSet<usize> {
+    IntervalSet::from_iter(intervals.intervals().iter().map(|iv| {
+        // Left-unbounded intervals (e.g. (-∞, 3]) are clamped to [0, r] since
+        // UIntRange indices are always non-negative.
+        let left: usize = iv.lval().map_or(0, |v| v.as_uint());
+        match iv.rval() {
+            Some(r) => Interval::closed(left, r.as_uint()),
+            None => Interval::closed_unbound(left),
+        }
+    }))
+}
+
+/// Release values from `extent` according to `obsolete_guard`.
+///
+/// For [`Extent::UIntRange`] extents, released sub-intervals are subtracted
+/// directly from the stored [`IntervalSet<usize>`], so arbitrary non-contiguous
+/// releases are handled without any external accumulator.
+fn release_extent(extent: &mut Extent, obsolete_guard: &FunctionGuard) {
     match extent {
         Extent::Record(fields) => match obsolete_guard {
-            g if g.is_univeral() => fields.values_mut().for_each(|e| release_extent(e, g)),
+            g if g.is_univeral() => {
+                for e in fields.values_mut() {
+                    release_extent(e, g);
+                }
+            }
             g if g.is_empty() => {}
-            SealedFunctionGuard::Domain(p) => {
+            FunctionGuard::Domain(p) => {
                 // A Record predicate is a conjunction: {f0: p0, f1: p1} means
                 // "release pairs where p0(f0) AND p1(f1)".  We can only safely
                 // advance a dimension's extent when all other dimensions are
@@ -687,7 +711,7 @@ fn release_extent(extent: &mut Extent, obsolete_guard: &SealedFunctionGuard) {
                         .iter()
                         .all(|(k, p)| k == f || *p == Predicate::True);
                     if others_all_true {
-                        release_extent(e, &SealedFunctionGuard::Domain(field_preds[f].clone()));
+                        release_extent(e, &FunctionGuard::Domain(field_preds[f].clone()));
                     } else {
                         // TODO: handle the case where multiple fields have
                         // non-trivial predicates; requires releasing the
@@ -699,18 +723,27 @@ fn release_extent(extent: &mut Extent, obsolete_guard: &SealedFunctionGuard) {
         },
         Extent::DataSourceDomain(source) => {
             source.borrow_mut().release(match obsolete_guard {
-                SealedFunctionGuard::Universal => Predicate::True,
-                SealedFunctionGuard::Domain(p) => p.clone(),
+                FunctionGuard::Universal => Predicate::True,
+                FunctionGuard::Domain(p) => p.clone(),
                 _ => Predicate::False,
             });
         }
-        Extent::UIntRange { start, end } => match obsolete_guard {
-            SealedFunctionGuard::Universal | SealedFunctionGuard::Domain(Predicate::True) => {
-                *end = 0
+        Extent::UIntRange(remaining) => match obsolete_guard {
+            FunctionGuard::Universal | FunctionGuard::Domain(Predicate::True) => {
+                *remaining = IntervalSet::from(Interval::<usize>::empty());
             }
-            SealedFunctionGuard::Empty | SealedFunctionGuard::Domain(Predicate::False) => {}
-            SealedFunctionGuard::Domain(Predicate::LessThanEq(v)) => *start = v.as_uint() + 1,
-            _ => todo!(),
+            FunctionGuard::Empty | FunctionGuard::Domain(Predicate::False) => {}
+            FunctionGuard::Domain(Predicate::LessThanEq(v)) => {
+                // Release every index up to and including v.
+                let to_remove = IntervalSet::from(Interval::closed(0usize, v.as_uint()));
+                *remaining = remaining.difference(&to_remove);
+            }
+            FunctionGuard::Domain(Predicate::Intervals(intervals)) => {
+                // Subtract the released sub-intervals directly from the remaining set.
+                let to_remove = predicate_intervals_to_usize(intervals);
+                *remaining = remaining.difference(&to_remove);
+            }
+            _ => todo!("Got {obsolete_guard:?} for UIntRange"),
         },
         _ => panic!("Unexpected extent: {extent:?}"),
     }
@@ -720,7 +753,24 @@ fn release_extent(extent: &mut Extent, obsolete_guard: &SealedFunctionGuard) {
 fn iterate_extent(extent: &Extent) -> ColumnValue {
     match extent {
         Extent::Base(BaseType::Unit) => ColumnValue::Units(1),
-        Extent::UIntRange { start, end, .. } => ColumnValue::from_uints((*start..*end).collect()),
+        Extent::UIntRange(remaining) => {
+            // Discrete intervals are normalised to closed bounds, so iterate
+            // each [a, b] as a..=b to produce all remaining indices.
+            let values: Vec<usize> = remaining
+                .intervals()
+                .iter()
+                .flat_map(|iv| {
+                    let left = *iv
+                        .lval()
+                        .expect("UIntRange: unexpected left-unbounded interval");
+                    let right = *iv
+                        .rval()
+                        .expect("UIntRange: unexpected right-unbounded interval");
+                    left..=right
+                })
+                .collect();
+            ColumnValue::from_uints(values)
+        }
         Extent::DataSourceDomain(source_impl) => source_impl.borrow_mut().get_elements(),
         Extent::Record(fields) => iterate_record(fields),
         Extent::Restricted { .. } => {
@@ -739,10 +789,6 @@ fn iterate_record(fields: &HashMap<String, Extent>) -> ColumnValue {
 }
 
 impl TileProducer for IterateExtentProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn inspect(&self, _opts: &VizOptions) -> InspectNode {
         InspectNode::leaf("IterateExtent").annotate(format!("{:?}", self.extent))
     }
@@ -759,7 +805,7 @@ impl TileProducer for IterateExtentProducer {
 
     fn release(&mut self, obsolete_guard: TileGuard) {
         debug!("IterateExtentProducer release: {obsolete_guard:?}");
-        let TileGuard::SealedFunction(obsolete_guard) = obsolete_guard else {
+        let TileGuard::Function(obsolete_guard) = obsolete_guard else {
             panic!("IterateExtent::release expected SealedFunctionGuard, got {obsolete_guard:?}")
         };
         release_extent(&mut self.extent, &obsolete_guard);
@@ -861,10 +907,6 @@ impl MapSourceProducer {
 }
 
 impl TileProducer for MapSourceProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1007,10 +1049,6 @@ impl ZipProducer {
 }
 
 impl TileProducer for ZipProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1073,8 +1111,8 @@ impl TileProducer for ZipProducer {
             i.release(match &obsolete_guard {
                 g if g.is_universal() => i.tiling().universal_guard(),
                 g if g.is_empty() => i.tiling().empty_guard(),
-                TileGuard::SealedFunction(SealedFunctionGuard::Domain(p)) => {
-                    TileGuard::SealedFunction(SealedFunctionGuard::Domain(p.clone()))
+                TileGuard::Function(FunctionGuard::Domain(p)) => {
+                    TileGuard::Function(FunctionGuard::Domain(p.clone()))
                 }
                 _ => todo!(),
             })
@@ -1167,10 +1205,6 @@ impl ScalarTupleProducer {
 }
 
 impl TileProducer for ScalarTupleProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1270,10 +1304,6 @@ impl ConverseProducer {
 }
 
 impl TileProducer for ConverseProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1345,7 +1375,12 @@ impl TileProducer for ConverseProducer {
         debug!("ConverseProducer release: {obsolete_guard:?}");
         match obsolete_guard {
             g if g.is_universal() => self.input.release(self.input.tiling().universal_guard()),
-            // TODO flip domain and codomain guards
+            TileGuard::Function(FunctionGuard::Codomain(g)) => {
+                if let TileGuard::Function(FunctionGuard::Domain(p)) = g.as_ref() {
+                    self.input
+                        .release(TileGuard::Function(FunctionGuard::Domain(p.clone())))
+                }
+            }
             _ => {}
         }
     }
@@ -1457,10 +1492,6 @@ struct MapComposeProducer {
 }
 
 impl TileProducer for MapComposeProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1502,8 +1533,18 @@ impl TileProducer for MapComposeProducer {
 
     fn release(&mut self, obsolete_guard: TileGuard) {
         debug!("MapComposeProducer release: {obsolete_guard:?}");
-        if obsolete_guard.is_universal() {
-            self.input.release(self.input.tiling().universal_guard());
+        match obsolete_guard {
+            g if g.is_universal() => self.input.release(self.input.tiling().universal_guard()),
+            TileGuard::Function(FunctionGuard::Domain(p)) => self
+                .input
+                .release(TileGuard::Function(FunctionGuard::Domain(p))),
+            TileGuard::Function(FunctionGuard::Codomain(g))
+                if matches!(*g, TileGuard::Function(FunctionGuard::Domain(_))) =>
+            {
+                self.input
+                    .release(TileGuard::Function(FunctionGuard::Codomain(g)))
+            }
+            _ => panic!("Unexpected obsolete guard: {obsolete_guard:?}"),
         }
     }
 }
@@ -1599,10 +1640,6 @@ impl FilterProducer {
 }
 
 impl TileProducer for FilterProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1824,10 +1861,6 @@ impl AggregateProducer {
 }
 
 impl TileProducer for AggregateProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1845,7 +1878,17 @@ impl TileProducer for AggregateProducer {
         let is_terminal = input_result.is_terminal();
         let s = format!("{input_result:?}");
         let values = match input_result {
-            Tile::SealedFunction { codomain, .. } => scalar_tile_to_column_value(*codomain),
+            Tile::SealedFunction {
+                domain,
+                codomain,
+                domain_predicate,
+            } => {
+                self.input
+                    .release(TileGuard::Function(FunctionGuard::Domain(
+                        Predicate::from_column_value(&domain).union(&domain_predicate),
+                    )));
+                scalar_tile_to_column_value(*codomain)
+            }
             Tile::Scalar(ColumnValue::Variants(v)) if matches!(v[0], Value::Function(..)) => {
                 ColumnValue::from_values(
                     v[0].as_function()
@@ -1866,10 +1909,6 @@ impl TileProducer for AggregateProducer {
         };
         self.kind.accumulate(accumulator, &values, 0, values.len());
         terminal.set(0, is_terminal);
-        if is_terminal {
-            // TODO fine-grained release
-            self.input.release(i_tiling.universal_guard());
-        }
         self.accumulator.clone()
     }
 
@@ -1952,10 +1991,6 @@ impl ExtractAggregateProducer {
 }
 
 impl TileProducer for ExtractAggregateProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -2077,10 +2112,6 @@ struct MapExtractAggregateProducer {
 }
 
 impl TileProducer for MapExtractAggregateProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -2139,8 +2170,8 @@ impl TileProducer for MapExtractAggregateProducer {
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
-            TileGuard::SealedFunction(SealedFunctionGuard::Domain(p)) => {
-                TileGuard::SealedFunction(SealedFunctionGuard::Domain(p))
+            TileGuard::Function(FunctionGuard::Domain(p)) => {
+                TileGuard::Function(FunctionGuard::Domain(p))
             }
             _ => todo!(),
         });
@@ -2236,10 +2267,6 @@ struct MapAggregateProducer {
 }
 
 impl TileProducer for MapAggregateProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -2256,7 +2283,7 @@ impl TileProducer for MapAggregateProducer {
         let Tile::CurriedFunction {
             domain1,
             offsets,
-            domain2: _,
+            domain2,
             codomain,
             domain_predicate,
         } = input_tile
@@ -2283,7 +2310,17 @@ impl TileProducer for MapAggregateProducer {
                 .or_insert_with(|| kind.initial_accumulator(&output_extent));
             kind.accumulate(acc, &codomain, start, end);
         }
+
+        // Release received values
+        self.input
+            .release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                TileGuard::Function(FunctionGuard::Domain(Predicate::from_column_value(
+                    &domain2,
+                ))),
+            ))));
+
         // Build the output tile from all known per-key accumulators.
+        // TODO apply the domain predicate to each domain value.
         let is_terminal = domain_predicate.as_bool().unwrap_or(false);
         let n = self.accumulators.len();
         let (domain_values, accumulator_values): (Vec<Value>, Vec<Value>) = self
@@ -2437,10 +2474,6 @@ struct SplitProducer {
 }
 
 impl TileProducer for SplitProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -2547,10 +2580,6 @@ struct ConstantProducer {
 }
 
 impl TileProducer for ConstantProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -2635,10 +2664,6 @@ struct ToScalarProducer {
 }
 
 impl TileProducer for ToScalarProducer {
-    fn name(&self) -> &'static str {
-        std::any::type_name::<Self>()
-    }
-
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -2678,4 +2703,165 @@ fn extract_hashmap_values<K: Clone + Eq + Hash, InputV, V, F: Fn(InputV) -> V>(
     f: F,
 ) -> HashMap<K, V> {
     source.into_iter().map(|(k, v)| (k.clone(), f(v))).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use intervalsets::ops::Contains;
+    use intervalsets::MaybeEmpty;
+
+    use super::*;
+    use crate::interpreter::{ColumnValue, Extent, Value};
+
+    /// Helper: extract the `IntervalSet<usize>` from a `UIntRange` extent.
+    fn uint_range_set(extent: &Extent) -> &IntervalSet<usize> {
+        let Extent::UIntRange(ref s) = extent else {
+            panic!("expected UIntRange, got {extent:?}");
+        };
+        s
+    }
+
+    /// `FunctionGuard::Universal` releases everything — extent becomes empty.
+    #[test]
+    fn release_extent_universal_clears_uint_range() {
+        let mut extent = Extent::uint_range(5); // [0, 4]
+        release_extent(&mut extent, &FunctionGuard::Universal);
+        assert!(
+            uint_range_set(&extent).is_empty(),
+            "universal release should empty the extent"
+        );
+    }
+
+    /// `Predicate::True` is equivalent to `Universal` — same result.
+    #[test]
+    fn release_extent_predicate_true_clears_uint_range() {
+        let mut extent = Extent::uint_range(5);
+        release_extent(&mut extent, &FunctionGuard::Domain(Predicate::True));
+        assert!(uint_range_set(&extent).is_empty());
+    }
+
+    /// `FunctionGuard::Empty` releases nothing — extent is unchanged.
+    #[test]
+    fn release_extent_empty_guard_is_noop() {
+        let mut extent = Extent::uint_range(5); // [0, 4]
+        release_extent(&mut extent, &FunctionGuard::Empty);
+        let s = uint_range_set(&extent);
+        for i in 0..5usize {
+            assert!(s.contains(&i), "{i} should still be present");
+        }
+    }
+
+    /// `Predicate::False` also releases nothing.
+    #[test]
+    fn release_extent_predicate_false_is_noop() {
+        let mut extent = Extent::uint_range(5);
+        release_extent(&mut extent, &FunctionGuard::Domain(Predicate::False));
+        let s = uint_range_set(&extent);
+        for i in 0..5usize {
+            assert!(s.contains(&i), "{i} should still be present");
+        }
+    }
+
+    /// `Predicate::LessThanEq(v)` releases [0, v] inclusive.
+    #[test]
+    fn release_extent_less_than_eq_releases_prefix() {
+        let mut extent = Extent::uint_range(10); // [0, 9]
+        release_extent(
+            &mut extent,
+            &FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(4))),
+        );
+        let s = uint_range_set(&extent);
+        for i in 0..=4usize {
+            assert!(!s.contains(&i), "{i} should be released");
+        }
+        for i in 5..10usize {
+            assert!(s.contains(&i), "{i} should remain");
+        }
+    }
+
+    /// `Predicate::Intervals` with only bounded intervals subtracts each one.
+    #[test]
+    fn release_extent_bounded_intervals_predicate() {
+        // Release {2, 3} ∪ {7} from [0, 9].
+        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3, 7]));
+        let mut extent = Extent::uint_range(10);
+        release_extent(&mut extent, &FunctionGuard::Domain(p));
+        let s = uint_range_set(&extent);
+        assert!(!s.contains(&2usize), "2 should be released");
+        assert!(!s.contains(&3usize), "3 should be released");
+        assert!(!s.contains(&7usize), "7 should be released");
+        for i in [0, 1, 4, 5, 6, 8, 9usize] {
+            assert!(s.contains(&i), "{i} should remain");
+        }
+    }
+
+    /// `Predicate::Intervals` with a right-unbounded interval (e.g. [5, +∞))
+    /// releases everything from 5 to the end of the extent.
+    #[test]
+    fn release_extent_right_unbounded_intervals_predicate() {
+        // LessThanEq(4) union True = True, so build the right-unbounded interval
+        // directly via the complement: values NOT ≤ 4 are > 4, i.e. [5, +∞).
+        // We exercise this by unioning {5} with a GreaterThan-style Intervals predicate.
+        // Simplest path: union two Intervals so the result stays as Intervals.
+        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![5])).union(
+            &Predicate::from_column_value(&ColumnValue::UInts(vec![6, 7, 8, 9, 10])),
+        );
+        let mut extent = Extent::uint_range(10); // [0, 9]
+        release_extent(&mut extent, &FunctionGuard::Domain(p));
+        let s = uint_range_set(&extent);
+        for i in 0..5usize {
+            assert!(s.contains(&i), "{i} should remain");
+        }
+        for i in 5..10usize {
+            assert!(!s.contains(&i), "{i} should be released");
+        }
+    }
+
+    /// Releasing a `Predicate::Intervals` that contains a left-unbounded interval
+    /// (produced by `Predicate::union(LessThanEq, Intervals)`) must subtract the
+    /// full interval from the `UIntRange` extent, not silently drop it.
+    #[test]
+    fn release_extent_left_unbounded_intervals_predicate() {
+        // Build the predicate that union() produces from LessThanEq(3) | {7}:
+        // result is Predicate::Intervals containing (-∞, 3] ∪ {7}.
+        let p = Predicate::LessThanEq(Value::UInt(3))
+            .union(&Predicate::from_column_value(&ColumnValue::UInts(vec![7])));
+
+        let mut extent = Extent::uint_range(10); // [0, 9]
+        release_extent(&mut extent, &FunctionGuard::Domain(p));
+
+        // After releasing (-∞, 3] ∪ {7}, remaining should be {4, 5, 6, 8, 9}.
+        let Extent::UIntRange(ref remaining) = extent else {
+            panic!("expected UIntRange");
+        };
+        assert!(!remaining.contains(&0usize), "0 should be released");
+        assert!(!remaining.contains(&3usize), "3 should be released");
+        assert!(remaining.contains(&4usize), "4 should remain");
+        assert!(!remaining.contains(&7usize), "7 should be released");
+        assert!(remaining.contains(&9usize), "9 should remain");
+    }
+
+    #[test]
+    fn iterate_extent_fragmented_uint_range() {
+        // Simulate [0,5) with indices 1,2,3 already released → {[0,0],[4,4]}
+        let mut extent = Extent::uint_range(5);
+        // release [1,3]
+        if let Extent::UIntRange(ref mut set) = extent {
+            let to_remove = IntervalSet::from(Interval::closed(1usize, 3usize));
+            *set = set.difference(&to_remove);
+        }
+        let tiling = Tiling::SealedFunction {
+            domain: extent.clone(),
+            codomain: Box::new(Tiling::Scalar(extent.clone())),
+        };
+        let mut producer = IterateExtentProducer::new(extent, tiling);
+        let tile = producer.get(producer.tiling().universal_guard());
+        let Tile::SealedFunction { domain, .. } = tile else {
+            panic!()
+        };
+        let ColumnValue::UInts(vals) = domain else {
+            panic!()
+        };
+        assert_eq!(vals, vec![0, 4]);
+    }
 }

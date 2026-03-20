@@ -1,7 +1,7 @@
 use cambra::{
     ccl::context::GlobalContext,
     interpreter::{
-        tile_operators::{SealedFunctionGuard, Tile, TileGuard},
+        tile_operators::{FunctionGuard, Tile, TileGuard},
         Consumer,
     },
     web_inspector::WebInspector,
@@ -44,7 +44,7 @@ fn run_program(code: &str, inspect_port: Option<u16>) {
             Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
             Tile::SealedFunction {
                 domain_predicate, ..
-            } => TileGuard::SealedFunction(SealedFunctionGuard::Domain(domain_predicate.clone())),
+            } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
             other => panic!("Unexpected top-level tile shape: {other:?}"),
         };
         debug!("Main releasing with {release_guard:?}");

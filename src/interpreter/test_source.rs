@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use intervalsets::ops::Contains;
+
 use crate::{
     ccl::Type,
     interpreter::{tiling::Predicate, ColumnValue, DataSourceDomainExtentImpl, Extent, Value},
@@ -107,6 +109,7 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         match &obsolete {
             Predicate::True => self.data.clear(),
             Predicate::LessThanEq(value) => self.data.retain(|k, _| k > value),
+            Predicate::Intervals(intervals) => self.data.retain(|k, _| !intervals.contains(k)),
             _ => {}
         }
     }
