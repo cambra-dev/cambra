@@ -484,3 +484,14 @@ fills this in from the type of `bound_expr`.
      `compile_tile_operators.rs` UnaryOp compilation case. ✓
    - `tests/compilation_pipeline.rs`: end-to-end pipeline tests (Python → CCL lower → infer → compile → eval). ✓
    - `lowering.rs` direct path removed after parity confirmed. ✓
+   - `ccl/lower.rs`: annotated assignment lowering (`x: T = expr` → `Expr::Let` with
+     `TypedBinding::user_annotation` set); `lower_type_annotation` helper for primitive
+     type names (`int`, `str`, `bool`, `None`); `TypedBinding::new_annotated` and
+     `Expr::let_bind_annotated` constructors. Annotation check in `infer_let` upgraded
+     from structural `!=` to `constrain_equal`. ✓
+   - `ccl/lower.rs`: general function application lowering — unknown non-source calls
+     with ≥1 argument lower to a left-to-right curried `Apply` chain
+     (`f(a, b)` → `Apply(Apply(Var(f), a), b)`). ✓
+   - `tests/type_check.rs`: lower + infer integration tests (literals, arithmetic,
+     let bindings, unary ops, lists, aggregates, tuples, type annotations,
+     data sources, groupby). ✓

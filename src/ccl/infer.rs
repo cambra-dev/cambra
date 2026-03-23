@@ -524,15 +524,16 @@ fn infer_let(
     ctx: &mut TypeInferenceContext,
 ) -> Result<Type, InferError> {
     let bound_ty = infer_expr(bound_expr, ctx)?;
-    // Check user annotation on the binding site (e.g. `x: Int = expr`)
-    // against the inferred expression type.
+    // Check user annotation on the binding site (e.g. `x: Int = expr`) via
+    // constrain_equal so that partially-resolved Infer variables are handled
+    // correctly (e.g. annotation=Int, bound_ty=Infer(id) → sets id→Int rather
+    // than spuriously failing with !=).
     if let Some(ref annotation) = binding.user_annotation {
-        if *annotation != bound_ty {
-            return Err(InferError::AnnotationMismatch {
+        ctx.constrain_equal(annotation, &bound_ty)
+            .map_err(|_| InferError::AnnotationMismatch {
                 annotation: annotation.clone(),
-                inferred: bound_ty,
-            });
-        }
+                inferred: bound_ty.clone(),
+            })?;
     }
     // Normalize Hole → fresh registered Infer before existing binding-type logic.
     if matches!(binding.ty, Type::Hole) {

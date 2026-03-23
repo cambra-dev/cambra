@@ -26,6 +26,8 @@
 //! | Unary negation (`-x`) | [`Expr::UnaryOp`] with [`crate::ccl::UnaryOpKind::Neg`] |
 //! | Boolean negation (`not x`) | [`Expr::UnaryOp`] with [`crate::ccl::UnaryOpKind::Not`] |
 //! | Unary plus (`+x`) | identity — lowered to `x` directly |
+//! | General function call `f(a)`, `f(a, b, ...)` | left-to-right curried [`Expr::Apply`] chain |
+//! | Annotated assignment `x: T = expr` | [`Expr::Let`] with [`crate::ccl::TypedBinding::user_annotation`] set |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
 //!
@@ -51,6 +53,7 @@ use crate::ccl::{
     AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, HashJoinSpec, Lit, LogicKind,
     Type, TypedExprNode, UnaryOpKind,
 };
+use crate::interpreter::BaseType;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -147,7 +150,12 @@ pub fn lower_expr(
 /// Lower a block of Python statements to a nested CCL expression.
 ///
 /// All statements except the last must be simple name assignments
-/// (`x = expr`); each becomes an [`Expr::Let`] binding wrapping the rest.
+/// (`x = expr`) or annotated assignments (`x: T = expr`); each becomes an
+/// [`Expr::Let`] binding wrapping the rest. Annotated assignments set
+/// [`crate::ccl::TypedBinding::user_annotation`] which inference validates against the
+/// inferred type and signals [`crate::ccl::infer::InferError::AnnotationMismatch`]
+/// on conflict.
+///
 /// The last statement must be a bare expression (`StmtKind::Expr`).
 pub fn lower_stmts(stmts: &[pyast::Stmt], ctx: &LoweringContext) -> Result<Expr, LoweringError> {
     if stmts.is_empty() {
@@ -187,6 +195,27 @@ pub fn lower_stmts(stmts: &[pyast::Stmt], ctx: &LoweringContext) -> Result<Expr,
                 let val = lower_expr(value, ctx)?;
                 Ok(Expr::let_bind(name, val, body))
             }
+            pyast::StmtKind::AnnAssign {
+                target,
+                annotation,
+                value: Some(value),
+                ..
+            } => {
+                let name = match &target.node {
+                    pyast::ExprKind::Name { id, .. } => id.clone(),
+                    _ => {
+                        return Err(LoweringError::Unsupported(
+                            "Destructuring annotated assignment not supported".into(),
+                        ))
+                    }
+                };
+                let annotation_ty = lower_type_annotation(annotation)?;
+                let val = lower_expr(value, ctx)?;
+                Ok(Expr::let_bind_annotated(name, val, body, annotation_ty))
+            }
+            pyast::StmtKind::AnnAssign { value: None, .. } => Err(LoweringError::Unsupported(
+                "Annotated assignment without a value is not supported".into(),
+            )),
             _ => Err(LoweringError::Unsupported(
                 "Only assignment statements are supported before the final expression".into(),
             )),
@@ -196,6 +225,31 @@ pub fn lower_stmts(stmts: &[pyast::Stmt], ctx: &LoweringContext) -> Result<Expr,
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Lower a Python type annotation expression to a CCL [`Type`].
+///
+/// Handles the primitive type names: `int` → [`Type::Base`]([`BaseType::Int`]),
+/// `str` → `String`, `bool` → `Bool`, and `None` (the constant) → `Unit`.
+fn lower_type_annotation(annotation: &pyast::Expr) -> Result<Type, LoweringError> {
+    match &annotation.node {
+        pyast::ExprKind::Name { id, .. } => match id.as_str() {
+            "int" => Ok(Type::Base(BaseType::Int)),
+            "str" => Ok(Type::Base(BaseType::String)),
+            "bool" => Ok(Type::Base(BaseType::Bool)),
+            _ => Err(LoweringError::Unsupported(format!(
+                "Unknown type annotation: {id}"
+            ))),
+        },
+        pyast::ExprKind::Constant {
+            value: pyast::Constant::None,
+            ..
+        } => Ok(Type::Base(BaseType::Unit)),
+        _ => Err(LoweringError::Unsupported(format!(
+            "Unsupported type annotation form: {:?}",
+            &annotation.node
+        ))),
+    }
+}
 
 fn lower_constant(constant: &pyast::Constant) -> Result<Expr, LoweringError> {
     let lit = match constant {
@@ -277,9 +331,20 @@ fn lower_call(
         name if ctx.known_sources.contains(name) => {
             Ok(Expr::new(TypedExprNode::Source(name.to_string())))
         }
-        _ => Err(LoweringError::Unsupported(format!(
-            "Unknown function: {name}"
-        ))),
+        _ => {
+            // For zero-argument calls, only registered sources are allowed.
+            if args.is_empty() {
+                return Err(LoweringError::Unsupported(format!(
+                    "Unknown zero-argument function: {name}; register it as a data source"
+                )));
+            }
+            // General function application: lower as a left-to-right curried Apply chain.
+            // f(a, b, c) becomes Apply(Apply(Apply(Var(f), a), b), c) in curried notation.
+            args.iter()
+                .try_fold(Expr::var(name.to_string()), |func, arg| {
+                    Ok(Expr::apply(lower_expr(arg, ctx)?, func))
+                })
+        }
     }
 }
 
@@ -1093,10 +1158,21 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
         ));
     }
 
-    /// Unsupported call targets produce a `LoweringError::Unsupported`.
+    /// A single-argument call to an unknown (non-builtin, non-source) name lowers
+    /// to an `Apply` node — general function application.
     #[test]
-    fn test_lower_unknown_function() {
+    fn test_lower_unknown_function_single_arg() {
         let expr = parse_expr("foo(x)");
+        let ccl =
+            lower_expr(&expr, &LoweringContext::default()).expect("expected lowering to succeed");
+        // foo(x) == x ▷ foo in pipeline notation
+        assert_eq!(symbolic(&ccl), "x ▷ foo");
+    }
+
+    /// A zero-argument call to an unknown (non-source) name still fails.
+    #[test]
+    fn test_lower_unknown_zero_arg_fails() {
+        let expr = parse_expr("foo()");
         let err =
             lower_expr(&expr, &LoweringContext::default()).expect_err("expected lowering error");
         assert!(

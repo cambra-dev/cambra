@@ -312,8 +312,9 @@ pub struct TypedBinding {
     pub ty: Type,
     /// User-written type annotation, if any.
     ///
-    /// `None` for all bindings produced by the current lowering pass.
-    /// Reserved for future use when Python type annotations are propagated.
+    /// Set by lowering when the source Python carries an explicit type annotation
+    /// (e.g. `x: int = expr`). The inference pass checks that the inferred type is
+    /// compatible with it and raises [`infer::InferError::AnnotationMismatch`] on conflict.
     pub user_annotation: Option<Type>,
 }
 
@@ -327,6 +328,18 @@ impl TypedBinding {
             name: name.to_string(),
             ty: Type::Hole,
             user_annotation: None,
+        }
+    }
+
+    /// Create an annotated binding with a [`Type::Hole`] placeholder and a user annotation.
+    ///
+    /// Use this at lowering time when the source Python carries an explicit type annotation
+    /// (e.g. `x: int = expr`). `ty` is still [`Type::Hole`] — the inference pass fills it in.
+    pub fn new_annotated(name: impl Into<String>, annotation: Type) -> Self {
+        TypedBinding {
+            name: name.into(),
+            ty: Type::Hole,
+            user_annotation: Some(annotation),
         }
     }
 }
@@ -634,6 +647,24 @@ impl TypedExpr {
                 ty,
                 user_annotation: None,
             },
+            bound_expr: Box::new(bound_expr),
+            body: Box::new(body),
+        })
+    }
+
+    /// Construct an annotated let binding expression.
+    ///
+    /// Like [`let_bind`] but sets [`TypedBinding::user_annotation`] to `annotation`.
+    /// Inference validates that the inferred type of `bound_expr` is compatible with
+    /// `annotation` and raises [`infer::InferError::AnnotationMismatch`] on conflict.
+    pub fn let_bind_annotated(
+        name: impl Into<String>,
+        bound_expr: Self,
+        body: Self,
+        annotation: Type,
+    ) -> Self {
+        Self::new(TypedExprNode::Let {
+            binding: TypedBinding::new_annotated(name, annotation),
             bound_expr: Box::new(bound_expr),
             body: Box::new(body),
         })

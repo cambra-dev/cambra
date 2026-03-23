@@ -219,7 +219,7 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
     debug_assert!(
         !matches!(expr.ty, Type::Hole),
         "Type::Hole found in resolve() on expression node {:?}; inference failed to convert it",
-        std::mem::discriminant(&expr.node)
+        &expr.node
     );
 
     // Resolve this node's type slot.
