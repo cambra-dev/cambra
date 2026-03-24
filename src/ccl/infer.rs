@@ -363,11 +363,24 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
         // ----- GroupBy -----
         TypedExprNode::GroupBy { collection, key } => infer_groupby(collection, key, ctx),
 
-        // ----- Join / Jump / Record -----
+        // ----- Join / Jump -----
         //
         // Not yet handled by this pass; sub-expressions are not visited.
-        TypedExprNode::Join { .. } | TypedExprNode::Jump { .. } | TypedExprNode::Record(_) => {
+        TypedExprNode::Join { .. } | TypedExprNode::Jump { .. } => {
             Ok(Type::Infer(ctx.fresh_infer_var()))
+        }
+
+        // ----- Record constructor -----
+        //
+        // Infer each field expression and collect the field name–type pairs
+        // into a `Type::Record`. This mirrors `Tuple` inference but preserves
+        // field names.
+        TypedExprNode::Record(fields) => {
+            let field_types: Result<Vec<(String, Type)>, InferError> = fields
+                .iter_mut()
+                .map(|(name, expr)| Ok((name.clone(), infer_expr(expr, ctx)?)))
+                .collect();
+            Ok(Type::Record(field_types?))
         }
 
         // ----- External data source reference -----
@@ -1902,5 +1915,36 @@ mod tests {
                 type_b: Type::Base(BaseType::Int),
             })
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Record inference tests
+    // -----------------------------------------------------------------------
+
+    /// A record literal `{x: 1, y: "hi"}` infers to `Record([("x", Int), ("y", String)])`.
+    #[test]
+    fn test_infer_record_literal() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::new(TypedExprNode::Record(vec![
+            ("x".into(), Expr::lit(Lit::Int(1))),
+            ("y".into(), Expr::lit(Lit::String("hi".into()))),
+        ]));
+        let ty = infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(
+            ty,
+            Type::Record(vec![
+                ("x".into(), Type::Base(BaseType::Int)),
+                ("y".into(), Type::Base(BaseType::String)),
+            ])
+        );
+    }
+
+    /// An empty record infers to `Record([])`.
+    #[test]
+    fn test_infer_record_empty() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::new(TypedExprNode::Record(vec![]));
+        let ty = infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(ty, Type::Record(vec![]));
     }
 }
