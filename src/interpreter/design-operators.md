@@ -64,6 +64,8 @@ A `Tile` holds the actual data. Its shape mirrors its `Tiling`:
 `Tile::is_terminal()` returns true when a tile carries complete, final data. No larger tiles will ever be returned, although
 equivalent tiles with some data released may.
 
+`Tile`s also support `merge` to combine two tiles, `remove_guarded` to filter out data in a `Tile` matching a `TileGuard`, and `to_guard` to construct a `TileGuard` that corresponds to the data in a `Tile`
+
 ### TileGuard
 
 A `TileGuard` specifies a sub-tiling (a downward-closed, ⊕-closed subset of tiles) of interest. It drives
@@ -77,9 +79,12 @@ the previous version of the interpreter.
 | `Aggregation(bool)` | All-or-nothing interest in the aggregate result. |
 | `Record(fields)` | Per-field `TileGuard`s, allowing fine-grained field demand. |
 | `Function(FunctionGuard)` | Structured interest in a function tile (see below). |
+| `Or(arms)` | Union of multiple guards; produced when two `Record` guards are unioned, because OR cannot be pushed through the AND semantics of a `Record` guard. Arms are always flat (no nested `Or`). |
 
 `TileGuard::intersect()` computes the overlap between two guards (conjunction of interest
-regions). `is_universal()` and `is_empty()` test the extremes.
+regions). `TileGuard::union()` computes the union; for `Record` guards this produces an `Or`
+variant because the field-wise AND semantics prevent distributing OR through the conjunction.
+`is_universal()` and `is_empty()` test the extremes.
 
 TileGuards are also used to extract portions of a tile that a consumer is interested. This will be implemented
 as a `split(guard: &TileGuard)` method on `Tile` in the future.
@@ -106,11 +111,15 @@ signal in tiles and as a region specifier in guards.
 | `False` | No values. Empty predicate; annihilator under `intersect`. |
 | `LessThanEq(Value)` | All values ≤ the given value (upper-bound streaming signal). |
 | `Intervals(IntervalSet<Value>)` | Arbitrary union of intervals. |
-| `Record(fields)` | Per-field predicates for record-typed extents. |
+| `Record(fields)` | Per-field predicates for record-typed extents. AND semantics: a value satisfies `Record(fields)` iff it satisfies every field predicate. |
+| `Or(arms)` | Union of multiple predicates; produced when two `Record` predicates are unioned, because OR cannot be pushed through the AND-conjunction of a `Record`. Arms are always flat (no nested `Or`). |
 
 `Predicate::intersect()` computes the conjunction of two predicates.
+`Predicate::union()` computes the disjunction; for `Record` predicates this produces an `Or`
+variant for the same reason as `TileGuard`.
 `Predicate::as_bool()` short-circuits to `Some(true/false)` when the predicate is trivially
-`True` or `False` (including uniform record predicates).
+`True` or `False` (including uniform record predicates and `Or` predicates whose arms are all
+`False`).
 
 ---
 
@@ -138,7 +147,8 @@ during compilation; producers are created on demand at runtime.
 | `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts the final value from an `Aggregation` tile, emitting it only when the aggregation is marked terminal. |
 | `MapAggregate` | `CurriedFunction(domain → codomain)` | `SealedFunction(domain → Aggregation)` | Performs a per-key aggregation |
 | `MapExtractAggregate` | `SealedFunction(extent → Aggregation)` | `SealedFunction(extent → Scalar)` | Extracts terminal per-key aggregation results from a `SealedFunction(D, Aggregation)`, producing `SealedFunction(D, Scalar)`. |
-| `Split` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Forwards `get` requests and tracks the intersection of release guards. <br>TODO this should probably turn into the Memo operator |
+| `Split` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Forwards `get` requests and tracks the intersection of release guards. |
+| `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Immediately releases data from its input upon receipt so that the input can clear out any state. |
 
 TODOs for implementing hash joins:
 

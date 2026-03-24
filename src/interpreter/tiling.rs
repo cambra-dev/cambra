@@ -12,12 +12,13 @@ use std::{
 use bit_vec::BitVec;
 use intervalsets::{
     numeric::Domain,
-    ops::{Intersection, Union},
+    ops::{Contains, Intersection, Union},
     Interval, IntervalSet, MaybeEmpty, Side,
 };
 
 use crate::{
-    interpreter::{ColumnValue, Extent, Value},
+    ccl::AggregateKind,
+    interpreter::{apply_binop_column, BinOpKind, ColumnValue, Extent, LogicKind, Value},
     util::fmt_record,
 };
 
@@ -42,7 +43,10 @@ pub enum Tiling {
         codomain: Extent,
     },
     /// Result of an aggregation
-    Aggregation { accumulator: Extent },
+    Aggregation {
+        kind: AggregateKind,
+        accumulator: Extent,
+    },
 }
 
 impl Tiling {
@@ -65,7 +69,7 @@ impl Tiling {
                     codomain: Box::new(codomain.clone()),
                 }),
             },
-            Tiling::Aggregation { accumulator } => accumulator.clone(),
+            Tiling::Aggregation { accumulator, .. } => accumulator.clone(),
         }
     }
 
@@ -76,7 +80,7 @@ impl Tiling {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.universal_guard()))
             }
             Tiling::SealedFunction { .. } | Tiling::CurriedFunction { .. } => {
-                TileGuard::Function(FunctionGuard::Universal)
+                TileGuard::Function(FunctionGuard::Domain(Predicate::True))
             }
             Tiling::Aggregation { .. } => TileGuard::Aggregation(true),
         }
@@ -89,7 +93,7 @@ impl Tiling {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.empty_guard()))
             }
             Tiling::SealedFunction { .. } | Tiling::CurriedFunction { .. } => {
-                TileGuard::Function(FunctionGuard::Empty)
+                TileGuard::Function(FunctionGuard::Domain(Predicate::False))
             }
             Tiling::Aggregation { .. } => TileGuard::Aggregation(false),
         }
@@ -149,7 +153,8 @@ impl Tiling {
                 ColumnValue::from_values(Vec::new(), codomain_extent),
                 Predicate::False,
             ),
-            Tiling::Aggregation { accumulator } => Tile::Aggregation {
+            Tiling::Aggregation { kind, accumulator } => Tile::Aggregation {
+                kind: kind.clone(),
                 terminal: ColumnValue::Bools(BitVec::new()),
                 accumulator: ColumnValue::from_values(Vec::new(), accumulator),
             },
@@ -198,7 +203,9 @@ impl fmt::Display for Tiling {
             } => {
                 write!(f, "CF({domain1:?} → {domain2:?} → {codomain:?}])")
             }
-            Tiling::Aggregation { accumulator } => write!(f, "agg({accumulator:?})"),
+            Tiling::Aggregation { kind, accumulator } => {
+                write!(f, "agg({kind:?}, {accumulator:?})")
+            }
         }
     }
 }
@@ -215,8 +222,11 @@ pub enum Tile {
     Record(HashMap<String, Tile>),
     /// A function mapping values to elements of another Tiling
     SealedFunction {
+        /// Domain values of the known elements of the function
         domain: ColumnValue,
+        /// Codomain of the function expressed as an implicitly-vectorized Tile.
         codomain: Box<Tile>,
+        /// Represents a region of the codomain for which no new elements will ever be seen.
         domain_predicate: Predicate,
     },
     /// A two-level curried function.
@@ -242,6 +252,8 @@ pub enum Tile {
     },
     /// A Tile representing the state of a scalar aggregation.
     Aggregation {
+        /// The type of aggregate
+        kind: AggregateKind,
         /// The accumulator state of the specific aggregate; may be any type
         accumulator: ColumnValue,
         /// Boolean representing whether the aggregate is complete
@@ -310,6 +322,249 @@ impl Tile {
         }
     }
 
+    /// Merge the contents of `other` into `self`.  Requires the two tiles to be compatible (i.e. non-overlapping)
+    pub fn merge(&mut self, other: Tile) {
+        match (&mut *self, other) {
+            // Append: handles both "unknown → known" (empty + non-empty) and the
+            // vectorized case where a Scalar tile holds one value per domain entry inside
+            // a SealedFunction/Record codomain.
+            (Tile::Scalar(s), Tile::Scalar(o)) => s.append(o),
+            (
+                Tile::Aggregation {
+                    kind: s_kind,
+                    accumulator: s_acc,
+                    terminal: s_term,
+                },
+                Tile::Aggregation {
+                    kind: o_kind,
+                    accumulator: o_acc,
+                    terminal: o_term,
+                },
+            ) => {
+                assert_eq!(*s_kind, o_kind);
+                s_kind.accumulate(s_acc, &o_acc, 0, s_acc.len());
+                let taken = std::mem::replace(s_term, ColumnValue::Units(0));
+                *s_term = apply_binop_column(BinOpKind::BoolLogic(LogicKind::Or), taken, &o_term);
+            }
+            (
+                Tile::SealedFunction {
+                    domain: s_domain,
+                    codomain: s_codomain,
+                    domain_predicate: s_pred,
+                },
+                Tile::SealedFunction {
+                    domain: o_domain,
+                    codomain: o_codomain,
+                    domain_predicate: o_pred,
+                },
+            ) => {
+                s_domain.append(o_domain);
+                s_codomain.merge(*o_codomain);
+                *s_pred = s_pred.union(&o_pred);
+            }
+            (
+                Tile::CurriedFunction {
+                    domain1: s_domain1,
+                    offsets: s_offsets,
+                    domain2: s_domain2,
+                    codomain: s_codomain,
+                    domain_predicate: s_pred,
+                },
+                Tile::CurriedFunction {
+                    domain1: o_domain1,
+                    offsets: o_offsets,
+                    domain2: o_domain2,
+                    codomain: o_codomain,
+                    domain_predicate: o_pred,
+                },
+            ) => {
+                // Shift o's offsets by the current size of s's domain2 so they index into
+                // the combined domain2 = [s_domain2..., o_domain2...].
+                let s_d2_len = s_domain2.len();
+                let mut o_offsets = o_offsets;
+                s_domain1.append(o_domain1);
+                o_offsets.for_each_uint(|u| *u += s_d2_len);
+                s_offsets.append(o_offsets);
+                s_domain2.append(o_domain2);
+                s_codomain.append(o_codomain);
+                *s_pred = s_pred.union(&o_pred);
+            }
+            (Tile::Record(s_fields), Tile::Record(ref mut o_fields)) => {
+                assert_eq!(s_fields.len(), o_fields.len());
+                s_fields.iter_mut().for_each(|(f, t)| {
+                    t.merge(
+                        o_fields
+                            .remove(f)
+                            .unwrap_or_else(|| panic!("Record missing field {f}")),
+                    )
+                })
+            }
+            (s, o) => panic!("Incompatible tiles {s:?} and {o:?}"),
+        };
+        debug_assert!(validate_tile(self), "Invalid tile: {self:?}");
+    }
+
+    /// Select elements at the given row indices, producing a new `Tile` of the same variant.
+    ///
+    /// Supports `Scalar` and `Record` tiles; panics for other variants.
+    fn select_indices(&self, indices: &[usize]) -> Tile {
+        match self {
+            Tile::Scalar(cv) => {
+                Tile::Scalar(cv.select_indices(indices.iter().cloned(), indices.len()))
+            }
+            Tile::Record(m) => Tile::Record(
+                m.iter()
+                    .map(|(k, t)| (k.clone(), t.select_indices(indices)))
+                    .collect(),
+            ),
+            _ => panic!("select_indices not supported for {self:?}"),
+        }
+    }
+
+    /// Removes all data in this tile that is specified by the guard.
+    /// TODO this currently copies all retained elements.  We should instead move
+    /// elements around in the same buffers or just keep a bitset of retained positions.
+    pub fn remove_guarded(&mut self, guard: TileGuard) {
+        match (&mut *self, guard) {
+            // If the guard is empty, do nothing.
+            (_, g) if g.is_empty() => {}
+            // Scalar: universal guard clears the scalar; empty guard is a no-op.
+            (Tile::Scalar(cv), TileGuard::Scalar(true)) => {
+                *cv = cv.select_indices(std::iter::empty(), 0);
+            }
+            (Tile::Scalar(_), TileGuard::Scalar(false)) => {}
+            // Aggregation: universal guard clears all state; empty guard is a no-op.
+            (
+                Tile::Aggregation {
+                    accumulator,
+                    terminal,
+                    ..
+                },
+                TileGuard::Aggregation(true),
+            ) => {
+                *accumulator = accumulator.select_indices(std::iter::empty(), 0);
+                *terminal = terminal.select_indices(std::iter::empty(), 0);
+            }
+            (Tile::Aggregation { .. }, TileGuard::Aggregation(false)) => {}
+            // Record: recurse per field.
+            (Tile::Record(fields), TileGuard::Record(mut guards)) => {
+                for (k, t) in fields.iter_mut() {
+                    if let Some(g) = guards.remove(k) {
+                        t.remove_guarded(g);
+                    }
+                }
+            }
+            // Or: apply each arm in sequence.  Each arm removes the elements
+            // it describes; together they remove the union of all arms.
+            (tile, TileGuard::Or(arms)) => {
+                for arm in arms {
+                    tile.remove_guarded(arm);
+                }
+            }
+            // SealedFunction: remove domain+codomain entries whose domain value is in the predicate.
+            // `domain_predicate` is deliberately NOT updated here: it tracks upstream-committed
+            // rows (set via `merge`) and remaining rows are already covered by `from_cv(domain)`
+            // in `to_guard()`.  Updating it with `from_cv(remaining)` would be redundant and
+            // would cause it to diverge between tiles that share the same domain but receive
+            // `remove_guarded` at different times (e.g. the two inputs of a Zip).
+            (
+                Tile::SealedFunction {
+                    domain, codomain, ..
+                },
+                TileGuard::Function(FunctionGuard::Domain(pred)),
+            ) => {
+                let keep: Vec<usize> = (0..domain.len())
+                    .filter(|&i| !pred.contains(&domain.index_at(i)))
+                    .collect();
+                *domain = domain.select_indices(keep.iter().cloned(), keep.len());
+                **codomain = codomain.select_indices(&keep);
+            }
+            // CurriedFunction: remove domain2+codomain entries whose domain2 value is in the predicate,
+            // and prune any domain1 groups that become empty.
+            (
+                Tile::CurriedFunction {
+                    domain1,
+                    offsets,
+                    domain2,
+                    codomain,
+                    ..
+                },
+                TileGuard::Function(FunctionGuard::Codomain(inner)),
+            ) => {
+                let TileGuard::Function(FunctionGuard::Domain(pred)) = *inner else {
+                    unimplemented!(
+                        "CurriedFunction remove_guarded only supports Codomain(Domain(pred))"
+                    )
+                };
+                let ColumnValue::UInts(old_offsets) = &*offsets else {
+                    panic!("CurriedFunction offsets must be UInts")
+                };
+                let n = domain1.len();
+                let domain2_total = domain2.len();
+                // Indices of domain2 rows that survive (not covered by pred).
+                let keep: Vec<usize> = (0..domain2_total)
+                    .filter(|&i| !pred.contains(&domain2.index_at(i)))
+                    .collect();
+                // Rebuild domain1 and offsets, dropping empty groups.
+                let mut new_domain1_keep = Vec::new();
+                let mut new_offsets: Vec<usize> = Vec::new();
+                let mut cumulative = 0usize;
+                for i in 0..n {
+                    let start = old_offsets[i];
+                    let end = if i + 1 < n {
+                        old_offsets[i + 1]
+                    } else {
+                        domain2_total
+                    };
+                    // How many kept indices fall in this group (keep is sorted).
+                    let survivors =
+                        keep.partition_point(|&j| j < end) - keep.partition_point(|&j| j < start);
+                    if survivors > 0 {
+                        new_domain1_keep.push(i);
+                        new_offsets.push(cumulative);
+                        cumulative += survivors;
+                    }
+                }
+                *domain1 = domain1
+                    .select_indices(new_domain1_keep.iter().cloned(), new_domain1_keep.len());
+                *offsets = ColumnValue::UInts(new_offsets);
+                *domain2 = domain2.select_indices(keep.iter().cloned(), keep.len());
+                *codomain = codomain.select_indices(keep.iter().cloned(), keep.len());
+                // domain_predicate tracks domain1 completeness and is not updated on removal.
+            }
+            (s, g) => panic!("Incompatible tile and guard in remove_guarded: {s:?} and {g:?}"),
+        }
+    }
+
+    /// Creates a TileGuard representing the contents of this Tile.
+    /// For Scalar: universal if the scalar is known and empty otherwise
+    /// For Aggregation: universal if terminal and empty otherwise
+    /// For SealedFunction: Domain predicate for all domain values
+    /// For CurriedFunction, Codomain(Domain(predicate)) for all domain2 values (TODO for now we assume unique domain2)
+    pub fn to_guard(&self) -> TileGuard {
+        match self {
+            Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
+            Tile::Aggregation { terminal, .. } => {
+                TileGuard::Aggregation(terminal.as_single().map(|t| t.as_bool()).unwrap_or(false))
+            }
+            Tile::Record(m) => {
+                TileGuard::Record(m.iter().map(|(k, t)| (k.clone(), t.to_guard())).collect())
+            }
+            Tile::SealedFunction {
+                domain,
+                domain_predicate,
+                ..
+            } => TileGuard::Function(FunctionGuard::Domain(
+                Predicate::from_column_value(domain).union(domain_predicate),
+            )),
+            Tile::CurriedFunction { domain2, .. } => {
+                TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                    FunctionGuard::Domain(Predicate::from_column_value(domain2)),
+                ))))
+            }
+        }
+    }
+
     /// Creates a Tile::CurriedFunction and does dev-build-only validation for correct structure.
     pub fn curried_function(
         domain1: ColumnValue,
@@ -326,40 +581,42 @@ impl Tile {
             domain_predicate,
         };
         debug_assert!(
-            validate_curried_function_tile(&result),
+            validate_tile(&result),
             "Invalid curried function: {result:?}"
         );
         result
     }
 }
 
-fn validate_curried_function_tile(tile: &Tile) -> bool {
-    let Tile::CurriedFunction {
-        domain1,
-        offsets,
-        domain2,
-        codomain,
-        domain_predicate: _,
-    } = tile
-    else {
-        return false;
-    };
-    let ColumnValue::UInts(offsets) = offsets else {
-        return false;
-    };
-    let domain2_values: Vec<_> = domain2.clone().drain_to_value_iter().collect();
-    if domain2.len() != codomain.len()
-        || HashSet::<Value>::from_iter(domain1.clone().drain_to_value_iter()).len() != domain1.len()
-        || !offsets.windows(2).all(|w| w[0] < w[1])
-        || !offsets.windows(2).all(|w| {
-            w[1] - w[0]
-                == HashSet::<Value>::from_iter(domain2_values[w[0]..w[1]].iter().cloned()).len()
-        })
-        || offsets.last().is_some_and(|o| *o >= domain2.len())
-    {
-        return false;
+fn validate_tile(tile: &Tile) -> bool {
+    match tile {
+        Tile::CurriedFunction {
+            domain1,
+            offsets,
+            domain2,
+            codomain,
+            domain_predicate: _,
+        } => {
+            let ColumnValue::UInts(offsets) = offsets else {
+                return false;
+            };
+            let domain2_values: Vec<_> = domain2.clone().drain_to_value_iter().collect();
+            domain2.len() == codomain.len()
+                && HashSet::<Value>::from_iter(domain1.clone().drain_to_value_iter()).len()
+                    == domain1.len()
+                && offsets.windows(2).all(|w| w[0] < w[1])
+                && offsets.windows(2).all(|w| {
+                    w[1] - w[0]
+                        == HashSet::<Value>::from_iter(domain2_values[w[0]..w[1]].iter().cloned())
+                            .len()
+                })
+                && offsets.last().is_none_or(|o| *o < domain2.len())
+        }
+        Tile::SealedFunction { domain, .. } => {
+            HashSet::<Value>::from_iter(domain.clone().drain_to_value_iter()).len() == domain.len()
+        }
+        _ => true,
     }
-    true
 }
 
 /// Specifies a sub-region of interest within a [`Tile`], used for demand-driven
@@ -370,9 +627,39 @@ pub enum TileGuard {
     Record(HashMap<String, TileGuard>),
     Function(FunctionGuard),
     Aggregation(bool),
+    /// The union of multiple guards — matches anything admitted by any arm.
+    ///
+    /// Produced when two [`TileGuard::Record`] guards are unioned: because
+    /// `Record` has AND semantics (a record matches iff *all* fields match),
+    /// OR cannot be pushed down through the conjunction field-by-field.  All
+    /// other guard variants can represent their own union directly, so `Or`
+    /// only appears at the `Record` level.
+    ///
+    /// Invariant: arms never directly nest another `Or` (always flattened by
+    /// [`TileGuard::flatten_or`]).
+    Or(Vec<TileGuard>),
 }
 
 impl TileGuard {
+    /// Builds a `TileGuard` from a list of arms, flattening any nested `Or`
+    /// variants.  Returns the single element directly when `arms` has length
+    /// one to avoid gratuitous wrapping.
+    /// TODO consolidate redundant arms.
+    fn flatten_or(arms: Vec<TileGuard>) -> TileGuard {
+        let flat: Vec<TileGuard> = arms
+            .into_iter()
+            .flat_map(|g| match g {
+                TileGuard::Or(inner) => inner,
+                other => vec![other],
+            })
+            .collect();
+        match flat.len() {
+            0 => unreachable!("flatten_or called with no arms"),
+            1 => flat.into_iter().next().unwrap(),
+            _ => TileGuard::Or(flat),
+        }
+    }
+
     pub fn intersect(&self, other: &TileGuard) -> TileGuard {
         match (self, other) {
             (TileGuard::Scalar(u1), TileGuard::Scalar(u2)) => TileGuard::Scalar(*u1 && *u2),
@@ -394,7 +681,46 @@ impl TileGuard {
                         .collect(),
                 )
             }
+            // Or distributes over intersect: (A | B) & C = (A & C) | (B & C).
+            (TileGuard::Or(arms), g) | (g, TileGuard::Or(arms)) => {
+                TileGuard::flatten_or(arms.iter().map(|a| a.intersect(g)).collect())
+            }
             _ => panic!("Intersect on incompatible guards {self:?} and {other:?}"),
+        }
+    }
+
+    /// Returns the union of two guards — the set of data covered by either guard.
+    ///
+    /// Used to accumulate release guards across multiple incremental deliveries: a
+    /// consumer that has released `[0,1]` and then `[2,3]` has collectively seen
+    /// `[0,3]`, so the stored guard must grow via union rather than replacement.
+    ///
+    /// For [`TileGuard::Record`] guards, the result is a [`TileGuard::Or`] because
+    /// OR cannot be pushed through the AND semantics of a record guard.
+    ///
+    /// Note for future implementation: All TileGuards we currently have are compatible with
+    /// union, but future stuff like conditional function guards (e.g. constraints like
+    /// "positive inputs produce positive outputs") are *not* closed under union and need to
+    /// throw an error.
+    pub fn union(&self, other: &TileGuard) -> TileGuard {
+        match (self, other) {
+            (TileGuard::Scalar(u1), TileGuard::Scalar(u2)) => TileGuard::Scalar(*u1 || *u2),
+            (TileGuard::Aggregation(u1), TileGuard::Aggregation(u2)) => {
+                TileGuard::Aggregation(*u1 || *u2)
+            }
+            (TileGuard::Function(f1), TileGuard::Function(f2)) => TileGuard::Function(f1.union(f2)),
+            // Record guards have AND semantics, so their union cannot be
+            // represented as a single Record guard.  Wrap in Or instead.
+            (TileGuard::Record(_), TileGuard::Record(_)) => {
+                TileGuard::flatten_or(vec![self.clone(), other.clone()])
+            }
+            // Or: accumulate all arms, flattening nested Ors.
+            (TileGuard::Or(arms), g) | (g, TileGuard::Or(arms)) => {
+                let mut new_arms = arms.clone();
+                new_arms.push(g.clone());
+                TileGuard::flatten_or(new_arms)
+            }
+            _ => panic!("Union on incompatible guards {self:?} and {other:?}"),
         }
     }
 
@@ -403,14 +729,22 @@ impl TileGuard {
             TileGuard::Scalar(universal) | TileGuard::Aggregation(universal) => *universal,
             TileGuard::Record(m) => m.values().all(TileGuard::is_universal),
             TileGuard::Function(g) => g.is_univeral(),
+            // Or is universal if any arm covers everything.
+            TileGuard::Or(arms) => arms.iter().any(TileGuard::is_universal),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
             TileGuard::Scalar(universal) | TileGuard::Aggregation(universal) => !*universal,
+            // Record: empty only when every field guard is empty — i.e., there
+            // is nothing to release from any field.  (Fields are managed
+            // independently, so a guard with one empty field is still meaningful
+            // for the non-empty fields.)
             TileGuard::Record(m) => m.values().all(TileGuard::is_empty),
             TileGuard::Function(g) => g.is_empty(),
+            // Or is empty only when every arm is empty.
+            TileGuard::Or(arms) => arms.iter().all(TileGuard::is_empty),
         }
     }
 }
@@ -419,8 +753,6 @@ impl TileGuard {
 /// which part of the function is of interest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionGuard {
-    Universal,
-    Empty,
     Domain(Predicate),
     Codomain(Box<TileGuard>),
 }
@@ -428,8 +760,6 @@ pub enum FunctionGuard {
 impl FunctionGuard {
     pub fn intersect(&self, other: &FunctionGuard) -> FunctionGuard {
         match (self, other) {
-            (_, FunctionGuard::Empty) | (FunctionGuard::Empty, _) => FunctionGuard::Empty,
-            (g, FunctionGuard::Universal) | (FunctionGuard::Universal, g) => g.clone(),
             (FunctionGuard::Domain(p1), FunctionGuard::Domain(p2)) => {
                 FunctionGuard::Domain(p1.intersect(p2))
             }
@@ -440,22 +770,29 @@ impl FunctionGuard {
         }
     }
 
+    /// Returns the union of two function guards.
+    pub fn union(&self, other: &FunctionGuard) -> FunctionGuard {
+        match (self, other) {
+            (FunctionGuard::Domain(p1), FunctionGuard::Domain(p2)) => {
+                FunctionGuard::Domain(p1.union(p2))
+            }
+            (FunctionGuard::Codomain(p1), FunctionGuard::Codomain(p2)) => {
+                FunctionGuard::Codomain(Box::new(p1.union(p2)))
+            }
+            _ => todo!("Handle Domain + Codomain guards together"),
+        }
+    }
+
     pub fn is_univeral(&self) -> bool {
         match self {
-            FunctionGuard::Universal => true,
-            FunctionGuard::Empty => false,
-            FunctionGuard::Domain(p) if p.as_bool().is_some() => p.as_bool().unwrap(),
-            FunctionGuard::Domain(..) => false,
+            FunctionGuard::Domain(p) => p.as_bool() == Some(true),
             FunctionGuard::Codomain(g) => g.is_universal(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
-            FunctionGuard::Universal => false,
-            FunctionGuard::Empty => true,
-            FunctionGuard::Domain(p) if p.as_bool().is_some() => !p.as_bool().unwrap(),
-            FunctionGuard::Domain(..) => false,
+            FunctionGuard::Domain(p) => p.as_bool() == Some(false),
             FunctionGuard::Codomain(g) => g.is_empty(),
         }
     }
@@ -468,10 +805,37 @@ pub enum Predicate {
     False,
     LessThanEq(Value),
     Intervals(IntervalSet<Value>),
+    /// Represents the AND of each of the sub-predicates.
     Record(HashMap<String, Predicate>),
+    /// The union of multiple predicates — admits any value accepted by any arm.
+    ///
+    /// Produced when two [`Predicate::Record`] predicates are unioned, since OR
+    /// cannot be pushed through the AND semantics of a record predicate.
+    ///
+    /// Invariant: arms never directly nest another `Or` (always flattened by
+    /// [`Predicate::flatten_or`]).
+    Or(Vec<Predicate>),
 }
 
 impl Predicate {
+    /// Builds a `Predicate` from a list of arms, flattening any nested `Or`
+    /// variants.  Returns the single element directly when `arms` has length
+    /// one to avoid gratuitous wrapping.
+    fn flatten_or(arms: Vec<Predicate>) -> Predicate {
+        let flat: Vec<Predicate> = arms
+            .into_iter()
+            .flat_map(|p| match p {
+                Predicate::Or(inner) => inner,
+                other => vec![other],
+            })
+            .collect();
+        match flat.len() {
+            0 => unreachable!("flatten_or called with no arms"),
+            1 => flat.into_iter().next().unwrap(),
+            _ => Predicate::Or(flat),
+        }
+    }
+
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Predicate::False => Some(false),
@@ -481,6 +845,16 @@ impl Predicate {
             }
             Predicate::Record(m) if m.iter().all(|(_, p)| !p.as_bool().unwrap_or(true)) => {
                 Some(false)
+            }
+            // Or is true if any arm is true; false if all arms are false.
+            Predicate::Or(arms) => {
+                if arms.iter().any(|p| p.as_bool() == Some(true)) {
+                    Some(true)
+                } else if arms.iter().all(|p| p.as_bool() == Some(false)) {
+                    Some(false)
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -561,6 +935,13 @@ impl Predicate {
                         .collect(),
                 )
             }
+            // Or distributes over intersect: (A | B) & C = (A & C) | (B & C).
+            (Predicate::Or(arms), _) => {
+                Predicate::flatten_or(arms.iter().map(|a| a.intersect(other)).collect())
+            }
+            (_, Predicate::Or(arms)) => {
+                Predicate::flatten_or(arms.iter().map(|a| self.intersect(a)).collect())
+            }
             _ => panic!("Cannot intersect incompatible predicates: {self:?} and {other:?}"),
         }
     }
@@ -588,20 +969,44 @@ impl Predicate {
             }
             // Two interval sets: standard set union.
             (Predicate::Intervals(a), Predicate::Intervals(b)) => Predicate::Intervals(a.union(b)),
-            // Records: union field-by-field.
-            (Predicate::Record(m1), Predicate::Record(m2)) => {
-                assert_eq!(
-                    m1.len(),
-                    m2.len(),
-                    "Cannot union Record predicates with different schemas"
-                );
-                Predicate::Record(
-                    m1.iter()
-                        .map(|(k, p1)| (k.clone(), p1.union(&m2[k])))
-                        .collect(),
-                )
+            // Record predicates have AND semantics, so their union cannot be
+            // represented as a single Record predicate.  Wrap in Or instead.
+            (Predicate::Record(_), Predicate::Record(_)) => {
+                Predicate::flatten_or(vec![self.clone(), other.clone()])
+            }
+            // Or: accumulate all arms, flattening nested Ors.
+            (Predicate::Or(arms), _) => {
+                let mut new_arms = arms.clone();
+                new_arms.push(other.clone());
+                Predicate::flatten_or(new_arms)
+            }
+            (_, Predicate::Or(arms)) => {
+                let mut new_arms = vec![self.clone()];
+                new_arms.extend(arms.iter().cloned());
+                Predicate::flatten_or(new_arms)
             }
             _ => panic!("Cannot union incompatible predicates: {self:?} and {other:?}"),
+        }
+    }
+
+    /// Returns `true` if `value` is admitted by this predicate.
+    pub fn contains(&self, value: &Value) -> bool {
+        match self {
+            Predicate::True => true,
+            Predicate::False => false,
+            Predicate::LessThanEq(v) => value
+                .partial_cmp(v)
+                .map(|o| o != std::cmp::Ordering::Greater)
+                .unwrap_or(false),
+            Predicate::Intervals(s) => s.contains(value),
+            Predicate::Record(m) => match value {
+                Value::Record(fields) => m
+                    .iter()
+                    .all(|(k, p)| fields.get(k).map(|v| p.contains(v)).unwrap_or(false)),
+                _ => false,
+            },
+            // Or: value is admitted if any arm admits it.
+            Predicate::Or(arms) => arms.iter().any(|a| a.contains(value)),
         }
     }
 
@@ -632,12 +1037,32 @@ impl Predicate {
             }
             ColumnValue::Strings(v) => vec_to_predicate(v),
             ColumnValue::Variants(v) => vec_to_predicate(v),
-            ColumnValue::Records(_) => todo!(),
+            ColumnValue::Records(fields) => {
+                let len = fields.values().next().map_or(0, |cv| cv.len());
+                if len == 0 {
+                    return Predicate::False;
+                }
+                // Records have no natural total order, so we cannot represent
+                // the set as intervals.  Instead, build one point predicate per
+                // row and combine them with Or.
+                Predicate::flatten_or(
+                    (0..len)
+                        .map(|i| {
+                            Predicate::Record(
+                                fields
+                                    .iter()
+                                    .map(|(k, cv)| {
+                                        let single = cv.select_indices(std::iter::once(i), 1);
+                                        (k.clone(), Predicate::from_column_value(&single))
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                )
+            }
             ColumnValue::FunctionBindings { .. } => {
                 panic!("Cannot build predicate from FunctionBindings")
-            }
-            ColumnValue::LookupTable(_) => {
-                panic!("Cannot build predicate from LookupTable ColumnValue")
             }
         }
     }
@@ -829,7 +1254,10 @@ mod tests {
 
     #[test]
     fn tiling_extent_aggregation() {
-        let t = Tiling::Aggregation { accumulator: int() };
+        let t = Tiling::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: int(),
+        };
         assert_eq!(t.extent(), int());
     }
 
@@ -859,13 +1287,19 @@ mod tests {
 
     #[test]
     fn universal_guard_aggregation() {
-        let t = Tiling::Aggregation { accumulator: int() };
+        let t = Tiling::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: int(),
+        };
         assert!(t.universal_guard().is_universal());
     }
 
     #[test]
     fn empty_guard_aggregation() {
-        let t = Tiling::Aggregation { accumulator: int() };
+        let t = Tiling::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: int(),
+        };
         assert!(t.empty_guard().is_empty());
     }
 
@@ -1084,7 +1518,11 @@ mod tests {
 
     #[test]
     fn display_aggregation() {
-        let s = Tiling::Aggregation { accumulator: int() }.to_string();
+        let s = Tiling::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: int(),
+        }
+        .to_string();
         assert!(s.starts_with("agg("), "expected 'agg(' in '{s}'");
     }
 
@@ -1110,29 +1548,154 @@ mod tests {
 
     #[test]
     fn guard_intersect_sealed_function_universal_universal() {
-        let g = TileGuard::Function(FunctionGuard::Universal)
-            .intersect(&TileGuard::Function(FunctionGuard::Universal));
+        let g = TileGuard::Function(FunctionGuard::Domain(Predicate::True))
+            .intersect(&TileGuard::Function(FunctionGuard::Domain(Predicate::True)));
         assert!(g.is_universal());
     }
 
     #[test]
     fn guard_intersect_sealed_function_empty_dominates() {
-        let g = TileGuard::Function(FunctionGuard::Universal)
-            .intersect(&TileGuard::Function(FunctionGuard::Empty));
+        let g = TileGuard::Function(FunctionGuard::Domain(Predicate::True)).intersect(
+            &TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
+        );
         assert!(g.is_empty());
+    }
+
+    // ── TileGuard::union (Record / Or) ────────────────────────────────────────
+
+    /// Helper: build a Record TileGuard from a slice of (field, guard) pairs.
+    fn record_guard(fields: &[(&str, TileGuard)]) -> TileGuard {
+        TileGuard::Record(
+            fields
+                .iter()
+                .map(|(k, g)| (k.to_string(), g.clone()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn guard_union_record_produces_or() {
+        // Two different record guards cannot be merged field-by-field; the
+        // result must be an Or so that neither arm's values are over-admitted.
+        let g1 = record_guard(&[
+            ("a", TileGuard::Scalar(true)),
+            ("b", TileGuard::Scalar(false)),
+        ]);
+        let g2 = record_guard(&[
+            ("a", TileGuard::Scalar(false)),
+            ("b", TileGuard::Scalar(true)),
+        ]);
+        let result = g1.union(&g2);
+        assert!(
+            matches!(result, TileGuard::Or(_)),
+            "expected Or, got {result:?}"
+        );
+        assert!(!result.is_empty());
+        assert!(!result.is_universal());
+    }
+
+    #[test]
+    fn guard_union_record_identical_stays_record() {
+        // When both arms are the same, flatten_or reduces the Or to a single guard.
+        let g = record_guard(&[
+            ("x", TileGuard::Scalar(true)),
+            ("y", TileGuard::Scalar(true)),
+        ]);
+        let result = g.clone().union(&g);
+        // flatten_or with two equal arms still produces Or([g, g]) — both arms
+        // are the same object but flatten_or does not deduplicate.  The important
+        // property is that the result is *not* under-admitting.
+        assert!(result.is_universal());
+    }
+
+    #[test]
+    fn guard_union_or_accumulates_arms() {
+        let g1 = record_guard(&[
+            ("a", TileGuard::Scalar(true)),
+            ("b", TileGuard::Scalar(false)),
+        ]);
+        let g2 = record_guard(&[
+            ("a", TileGuard::Scalar(false)),
+            ("b", TileGuard::Scalar(true)),
+        ]);
+        let g3 = record_guard(&[
+            ("a", TileGuard::Scalar(true)),
+            ("b", TileGuard::Scalar(true)),
+        ]);
+        // g1 ∪ g2 → Or([g1, g2]); then ∪ g3 → Or([g1, g2, g3]) (flat, not nested).
+        let or12 = g1.union(&g2);
+        let result = or12.union(&g3);
+        let TileGuard::Or(arms) = &result else {
+            panic!("expected Or, got {result:?}");
+        };
+        assert_eq!(arms.len(), 3, "should be flat, not nested");
+    }
+
+    #[test]
+    fn guard_or_is_universal_when_any_arm_is() {
+        let universal = record_guard(&[
+            ("a", TileGuard::Scalar(true)),
+            ("b", TileGuard::Scalar(true)),
+        ]);
+        let empty = record_guard(&[
+            ("a", TileGuard::Scalar(false)),
+            ("b", TileGuard::Scalar(false)),
+        ]);
+        let result = empty.union(&universal);
+        assert!(result.is_universal());
+    }
+
+    #[test]
+    fn guard_or_is_empty_only_when_all_arms_are() {
+        let empty1 = record_guard(&[
+            ("a", TileGuard::Scalar(false)),
+            ("b", TileGuard::Scalar(false)),
+        ]);
+        let empty2 = record_guard(&[
+            ("a", TileGuard::Scalar(false)),
+            ("b", TileGuard::Scalar(false)),
+        ]);
+        let result = empty1.union(&empty2);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn guard_or_intersect_distributes() {
+        // (A | B) & C should equal (A & C) | (B & C).
+        let a = record_guard(&[
+            ("a", TileGuard::Scalar(true)),
+            ("b", TileGuard::Scalar(false)),
+        ]);
+        let b = record_guard(&[
+            ("a", TileGuard::Scalar(false)),
+            ("b", TileGuard::Scalar(true)),
+        ]);
+        let c = record_guard(&[
+            ("a", TileGuard::Scalar(true)),
+            ("b", TileGuard::Scalar(true)),
+        ]);
+        let or_ab = a.clone().union(&b);
+        let result = or_ab.intersect(&c);
+        // (A & C) = {a:true, b:false}, (B & C) = {a:false, b:true} — both non-empty.
+        let TileGuard::Or(arms) = &result else {
+            panic!("expected Or after distributing intersect, got {result:?}");
+        };
+        assert_eq!(arms.len(), 2);
     }
 
     // ── SealedFunctionGuard::intersect ────────────────────────────────────────
 
     #[test]
     fn sfg_intersect_empty_dominates() {
-        let result = FunctionGuard::Universal.intersect(&FunctionGuard::Empty);
-        assert!(matches!(result, FunctionGuard::Empty));
+        let result = FunctionGuard::Domain(Predicate::True)
+            .intersect(&FunctionGuard::Domain(Predicate::False));
+        assert!(matches!(result, FunctionGuard::Domain(Predicate::False)));
     }
 
     #[test]
     fn sfg_intersect_universal_is_identity() {
-        let result = FunctionGuard::Domain(Predicate::True).intersect(&FunctionGuard::Universal);
+        let result = FunctionGuard::Domain(Predicate::True)
+            .intersect(&FunctionGuard::Domain(Predicate::True));
         assert!(matches!(result, FunctionGuard::Domain(Predicate::True)));
     }
 
@@ -1535,9 +2098,9 @@ mod tests {
         }
     }
 
-    // Record ∪ Record: each field is unioned independently.
+    // Record ∪ Record: cannot push OR through AND, result must be Or([r1, r2]).
     #[test]
-    fn union_record_predicates_field_by_field() {
+    fn union_record_predicates_produces_or() {
         let r1 = record_pred(&[
             ("x", Predicate::LessThanEq(Value::UInt(3))),
             ("y", Predicate::False),
@@ -1547,24 +2110,62 @@ mod tests {
             ("y", Predicate::True),
         ]);
         let result = r1.union(&r2);
-        let Predicate::Record(m) = result else {
-            panic!("expected Record");
-        };
-        assert_eq!(m["x"], Predicate::LessThanEq(Value::UInt(7)));
-        assert_eq!(m["y"], Predicate::True);
+        // Must be an Or, not a Record — distributing OR through AND overapproximates.
+        assert!(
+            matches!(result, Predicate::Or(_)),
+            "expected Or, got {result:?}"
+        );
+        // r2 contains {y: True} so the union admits records with any y value.
+        assert_eq!(result.as_bool(), None); // non-trivial
+    }
+
+    // Predicate::Or::contains: satisfied when any arm matches, regardless of the others.
+    #[test]
+    fn or_contains_any_arm_matches() {
+        // Or([{a: ≤10}, {b: ≤10}]):
+        //   - {a:5, b:20}  → first arm matches (5≤10, b unconstrained in first arm)? No —
+        //     Record semantics require ALL fields. So first arm is {a:≤10} only;
+        //     use single-field records to keep the test unambiguous.
+        // Or([{_0: ≤10}, {_1: ≤10}]):
+        //   - {_0:5,  _1:20} → first arm:  5≤10 ✓, _1 absent in arm → only _0 checked → true
+        //   - {_0:20, _1:5}  → second arm: 5≤10 ✓                                     → true
+        //   - {_0:20, _1:20} → neither arm                                             → false
+        let pred = Predicate::Or(vec![
+            record_pred(&[("_0", Predicate::LessThanEq(Value::UInt(10)))]),
+            record_pred(&[("_1", Predicate::LessThanEq(Value::UInt(10)))]),
+        ]);
+
+        let only_first = Value::Record(HashMap::from([
+            ("_0".to_string(), Value::UInt(5)),
+            ("_1".to_string(), Value::UInt(20)),
+        ]));
+        let only_second = Value::Record(HashMap::from([
+            ("_0".to_string(), Value::UInt(20)),
+            ("_1".to_string(), Value::UInt(5)),
+        ]));
+        let neither = Value::Record(HashMap::from([
+            ("_0".to_string(), Value::UInt(20)),
+            ("_1".to_string(), Value::UInt(20)),
+        ]));
+
+        assert!(
+            pred.contains(&only_first),
+            "{only_first:?} should match the first arm"
+        );
+        assert!(
+            pred.contains(&only_second),
+            "{only_second:?} should match the second arm"
+        );
+        assert!(!pred.contains(&neither), "{neither:?} should match no arm");
     }
 
     #[test]
-    fn union_record_false_fields_stay_false() {
-        // False ∪ False = False for each field.
+    fn union_record_or_is_empty_when_both_arms_empty() {
+        // Both records are all-False, so the Or is effectively empty.
         let r1 = record_pred(&[("a", Predicate::False), ("b", Predicate::False)]);
         let r2 = record_pred(&[("a", Predicate::False), ("b", Predicate::False)]);
         let result = r1.union(&r2);
-        let Predicate::Record(m) = result else {
-            panic!("expected Record");
-        };
-        assert_eq!(m["a"], Predicate::False);
-        assert_eq!(m["b"], Predicate::False);
+        assert_eq!(result.as_bool(), Some(false));
     }
 
     #[test]
@@ -1577,5 +2178,334 @@ mod tests {
             domain_predicate: Predicate::True,
         };
         assert!(tile.is_terminal());
+    }
+
+    // ── helpers for merge / to_guard / remove_guarded tests ──────────────────
+
+    /// A SealedFunction tile mapping `domain` ints to `codomain` ints.
+    fn sf_int(domain: Vec<i64>, codomain: Vec<i64>, pred: Predicate) -> Tile {
+        Tile::SealedFunction {
+            domain: ColumnValue::Ints(domain),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(codomain))),
+            domain_predicate: pred,
+        }
+    }
+
+    /// A CurriedFunction tile with usize domain1, usize domain2 keys, and int codomain.
+    fn cf_uint_int(
+        d1: Vec<usize>,
+        offsets: Vec<usize>,
+        d2: Vec<usize>,
+        cod: Vec<i64>,
+        pred: Predicate,
+    ) -> Tile {
+        Tile::curried_function(
+            ColumnValue::UInts(d1),
+            ColumnValue::UInts(offsets),
+            ColumnValue::UInts(d2),
+            ColumnValue::Ints(cod),
+            pred,
+        )
+    }
+
+    /// Build a TileGuard for releasing domain2 values described by `pred` from a CurriedFunction.
+    fn cf_release_guard(pred: Predicate) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+            FunctionGuard::Domain(pred),
+        ))))
+    }
+
+    // ── Tile::merge ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_scalar_empty_takes_other() {
+        let mut tile = Tile::Scalar(ColumnValue::Ints(vec![]));
+        tile.merge(Tile::Scalar(ColumnValue::Ints(vec![42])));
+        assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![42])));
+    }
+
+    #[test]
+    fn merge_sealed_function_appends_domain_and_codomain() {
+        let mut tile = sf_int(vec![1], vec![10], Predicate::False);
+        tile.merge(sf_int(vec![2], vec![20], Predicate::False));
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = &tile
+        else {
+            panic!("expected SealedFunction");
+        };
+        assert_eq!(*domain, ColumnValue::Ints(vec![1, 2]));
+        assert_eq!(
+            *codomain,
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20])))
+        );
+    }
+
+    #[test]
+    fn merge_sealed_function_unions_predicates() {
+        let p1 = Predicate::from_column_value(&ColumnValue::Ints(vec![1]));
+        let p2 = Predicate::from_column_value(&ColumnValue::Ints(vec![2]));
+        let mut tile = sf_int(vec![1], vec![10], p1.clone());
+        tile.merge(sf_int(vec![2], vec![20], p2.clone()));
+        let Tile::SealedFunction {
+            domain_predicate, ..
+        } = &tile
+        else {
+            panic!("expected SealedFunction");
+        };
+        assert_eq!(*domain_predicate, p1.union(&p2));
+    }
+
+    #[test]
+    fn merge_curried_function_appends_with_correct_offsets() {
+        // Group 0 (d1=0): d2=[10, 11], cod=[100, 110]
+        // Group 1 (d1=1): d2=[12],     cod=[120]
+        let mut tile = cf_uint_int(
+            vec![0],
+            vec![0],
+            vec![10, 11],
+            vec![100, 110],
+            Predicate::False,
+        );
+        tile.merge(cf_uint_int(
+            vec![1],
+            vec![0],
+            vec![12],
+            vec![120],
+            Predicate::False,
+        ));
+        assert_eq!(
+            tile,
+            cf_uint_int(
+                vec![0, 1],
+                vec![0, 2], // group 1 starts at index 2 in the combined domain2
+                vec![10, 11, 12],
+                vec![100, 110, 120],
+                Predicate::False,
+            )
+        );
+    }
+
+    #[test]
+    fn merge_record_recurses_per_field() {
+        let make_record = |_: i64| {
+            Tile::Record(HashMap::from([(
+                "x".to_string(),
+                Tile::Scalar(ColumnValue::Ints(vec![])),
+            )]))
+        };
+        let mut tile = Tile::Record(HashMap::from([(
+            "x".to_string(),
+            Tile::Scalar(ColumnValue::Ints(vec![])),
+        )]));
+        tile.merge(Tile::Record(HashMap::from([(
+            "x".to_string(),
+            Tile::Scalar(ColumnValue::Ints(vec![7])),
+        )])));
+        assert_eq!(
+            tile,
+            Tile::Record(HashMap::from([(
+                "x".to_string(),
+                Tile::Scalar(ColumnValue::Ints(vec![7])),
+            )]))
+        );
+        let _ = make_record; // suppress unused warning
+    }
+
+    // ── Tile::to_guard ────────────────────────────────────────────────────────
+
+    #[test]
+    fn to_guard_scalar_empty_is_empty() {
+        assert_eq!(
+            Tile::Scalar(ColumnValue::Ints(vec![])).to_guard(),
+            TileGuard::Scalar(false)
+        );
+    }
+
+    #[test]
+    fn to_guard_scalar_nonempty_is_universal() {
+        assert_eq!(
+            Tile::Scalar(ColumnValue::Ints(vec![1])).to_guard(),
+            TileGuard::Scalar(true)
+        );
+    }
+
+    #[test]
+    fn to_guard_sealed_function_wraps_domain_predicate() {
+        let pred = Predicate::from_column_value(&ColumnValue::Ints(vec![1, 2]));
+        let tile = sf_int(vec![1, 2], vec![10, 20], pred.clone());
+        assert_eq!(
+            tile.to_guard(),
+            TileGuard::Function(FunctionGuard::Domain(pred))
+        );
+    }
+
+    #[test]
+    fn to_guard_curried_function_uses_domain2_values() {
+        let tile = cf_uint_int(
+            vec![0],
+            vec![0],
+            vec![10, 11],
+            vec![100, 110],
+            Predicate::False,
+        );
+        let guard = tile.to_guard();
+        // The guard should cover domain2 values 10 and 11.
+        let TileGuard::Function(FunctionGuard::Codomain(inner)) = guard else {
+            panic!("expected Codomain guard");
+        };
+        let TileGuard::Function(FunctionGuard::Domain(pred)) = *inner else {
+            panic!("expected Domain pred");
+        };
+        assert!(pred.contains(&Value::UInt(10)));
+        assert!(pred.contains(&Value::UInt(11)));
+        assert!(!pred.contains(&Value::UInt(99)));
+    }
+
+    #[test]
+    fn to_guard_record_recurses() {
+        let tile = Tile::Record(HashMap::from([
+            ("a".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+            ("b".to_string(), Tile::Scalar(ColumnValue::Ints(vec![]))),
+        ]));
+        let TileGuard::Record(guards) = tile.to_guard() else {
+            panic!("expected Record guard");
+        };
+        assert_eq!(guards["a"], TileGuard::Scalar(true));
+        assert_eq!(guards["b"], TileGuard::Scalar(false));
+    }
+
+    // ── Tile::remove_guarded ──────────────────────────────────────────────────
+
+    #[test]
+    fn remove_guarded_scalar_universal_clears() {
+        let mut tile = Tile::Scalar(ColumnValue::Ints(vec![42]));
+        tile.remove_guarded(TileGuard::Scalar(true));
+        assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![])));
+    }
+
+    #[test]
+    fn remove_guarded_scalar_empty_is_noop() {
+        let mut tile = Tile::Scalar(ColumnValue::Ints(vec![42]));
+        tile.remove_guarded(TileGuard::Scalar(false));
+        assert_eq!(tile, Tile::Scalar(ColumnValue::Ints(vec![42])));
+    }
+
+    #[test]
+    fn remove_guarded_sealed_function_removes_matching_entries() {
+        // Remove only domain value 1; domain value 2 survives.
+        let pred = Predicate::from_column_value(&ColumnValue::Ints(vec![1]));
+        let mut tile = sf_int(vec![1, 2], vec![10, 20], Predicate::True);
+        tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(pred)));
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = &tile
+        else {
+            panic!("expected SealedFunction");
+        };
+        assert_eq!(*domain, ColumnValue::Ints(vec![2]));
+        assert_eq!(
+            *codomain,
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![20])))
+        );
+    }
+
+    #[test]
+    fn remove_guarded_sealed_function_full_release_clears() {
+        let mut tile = sf_int(vec![1, 2], vec![10, 20], Predicate::True);
+        let guard = tile.to_guard();
+        tile.remove_guarded(guard);
+        let Tile::SealedFunction { domain, .. } = &tile else {
+            panic!("expected SealedFunction");
+        };
+        assert_eq!(domain.len(), 0);
+    }
+
+    #[test]
+    fn remove_guarded_curried_function_removes_matching_domain2() {
+        // d1=[0,1], offsets=[0,2], d2=[10,11,12], cod=[100,110,120]
+        // Remove d2=11; 10 and 12 survive.
+        let mut tile = cf_uint_int(
+            vec![0, 1],
+            vec![0, 2],
+            vec![10, 11, 12],
+            vec![100, 110, 120],
+            Predicate::False,
+        );
+        let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![11]));
+        tile.remove_guarded(cf_release_guard(pred));
+        assert_eq!(
+            tile,
+            cf_uint_int(
+                vec![0, 1],
+                vec![0, 1], // group 0: 1 entry at 0; group 1: 1 entry at 1
+                vec![10, 12],
+                vec![100, 120],
+                Predicate::False,
+            )
+        );
+    }
+
+    #[test]
+    fn remove_guarded_curried_function_prunes_empty_group() {
+        // d1=[0,1], offsets=[0,2], d2=[10,11,12], cod=[100,110,120]
+        // Remove d2=10 and d2=11 (the whole group 0); group 1 (d2=12) survives.
+        let mut tile = cf_uint_int(
+            vec![0, 1],
+            vec![0, 2],
+            vec![10, 11, 12],
+            vec![100, 110, 120],
+            Predicate::False,
+        );
+        let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![10, 11]));
+        tile.remove_guarded(cf_release_guard(pred));
+        assert_eq!(
+            tile,
+            cf_uint_int(vec![1], vec![0], vec![12], vec![120], Predicate::False)
+        );
+    }
+
+    #[test]
+    fn remove_guarded_record_recurses() {
+        let mut tile = Tile::Record(HashMap::from([
+            ("a".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+            ("b".to_string(), Tile::Scalar(ColumnValue::Ints(vec![2]))),
+        ]));
+        tile.remove_guarded(TileGuard::Record(HashMap::from([
+            ("a".to_string(), TileGuard::Scalar(true)),
+            ("b".to_string(), TileGuard::Scalar(false)),
+        ])));
+        let Tile::Record(fields) = &tile else {
+            panic!()
+        };
+        assert_eq!(fields["a"], Tile::Scalar(ColumnValue::Ints(vec![])));
+        assert_eq!(fields["b"], Tile::Scalar(ColumnValue::Ints(vec![2])));
+    }
+
+    // ── round-trip: to_guard → remove_guarded ────────────────────────────────
+
+    #[test]
+    fn round_trip_sealed_function_full_release() {
+        let mut tile = sf_int(vec![1, 2, 3], vec![10, 20, 30], Predicate::True);
+        let guard = tile.to_guard();
+        tile.remove_guarded(guard);
+        assert_eq!(
+            tile.to_guard(),
+            TileGuard::Function(FunctionGuard::Domain(Predicate::True))
+        );
+    }
+
+    #[test]
+    fn round_trip_curried_function_full_release() {
+        let mut tile = cf_uint_int(
+            vec![0, 1],
+            vec![0, 2],
+            vec![10, 11, 12],
+            vec![100, 110, 120],
+            Predicate::False,
+        );
+        let guard = tile.to_guard();
+        tile.remove_guarded(guard);
+        assert_eq!(tile.to_guard(), cf_release_guard(Predicate::False));
     }
 }

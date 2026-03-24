@@ -34,8 +34,8 @@ use crate::{
         ccl_compile_util::{validate_type, CompileError},
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, Filter, IterateExtent, MapAggregate,
-            MapApply, MapCompose, MapExtractAggregate, MapSource, MapToConst, ScalarTuple, Split,
-            TileOperator, Tiling, ToScalar, Zip,
+            MapApply, MapCompose, MapExtractAggregate, MapSource, MapToConst, Memo, ScalarTuple,
+            Split, TileOperator, Tiling, ToScalar, Zip,
         },
         transform_hashmap_values, tuple_field, ArithmeticKind, BaseType, BinOpKind, CompareKind,
         DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
@@ -49,18 +49,35 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// A variable binding during tile compilation.
-#[derive(Clone)]
 enum TileVarBinding {
     /// Lambda parameter — each reference produces a fresh [`IterateExtent`].
     Param(Extent),
     /// Let-bound (or β-reduced lambda arg) — each reference re-compiles the
-    /// bound expression. Sharing via `Split` is future work.
+    /// bound expression.
     ///
     /// The second field captures the binding that was active for this name
     /// *before* this `Let` was introduced (if any). This allows [`compile_var`]
     /// to evaluate the bound expression in its correct outer scope without
     /// reaching back through the scope stack.
     Let(Box<Expr>, Option<Box<TileVarBinding>>),
+    /// Pre-compiled operator wrapped in a shared [`Memo`] + [`Split`].
+    ///
+    /// Each reference via [`compile_var`] produces a fresh [`Split`] handle
+    /// that subscribes to the same underlying [`Memo`] producer, avoiding
+    /// redundant recompilation of the bound expression.
+    Operator(Rc<Split>),
+}
+
+impl Clone for TileVarBinding {
+    fn clone(&self) -> Self {
+        match self {
+            TileVarBinding::Param(e) => TileVarBinding::Param(e.clone()),
+            TileVarBinding::Let(e, s) => TileVarBinding::Let(e.clone(), s.clone()),
+            // Cloning an Operator binding shares the same Rc — all clones
+            // call split() on the same underlying Split root when used.
+            TileVarBinding::Operator(rc) => TileVarBinding::Operator(rc.clone()),
+        }
+    }
 }
 
 /// Compilation context for tile compilation.
@@ -407,11 +424,16 @@ fn compile_var(
     name: &str,
     ctx: &mut TileCompileContext,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
+    // Handle Operator bindings first without cloning — each reference produces
+    // a fresh Split handle from the shared Rc<Split>.
+    if let Some(TileVarBinding::Operator(rc)) = ctx.lookup(name) {
+        return Ok(Box::new(rc.split()));
+    }
+
     match ctx.lookup(name).cloned() {
         Some(TileVarBinding::Param(extent)) => Ok(Box::new(IterateExtent::new(extent))),
         Some(TileVarBinding::Let(expr, shadowed)) => {
-            // Let-bound: re-compile the binding expression each time (sharing via
-            // Split is future work).
+            // Let-bound: re-compile the binding expression each time.
             //
             // The bound expression belongs to the scope *before* this Let was
             // introduced.  If it references `name`, evaluating it in the current
@@ -432,6 +454,8 @@ fn compile_var(
                 None => compile_tile_inner(&expr, ctx),
             }
         }
+        // Already handled above via the early-return.
+        Some(TileVarBinding::Operator(_)) => unreachable!(),
         None => Err(CompileError::TypeError(format!("Unbound variable: {name}"))),
     }
 }
@@ -663,9 +687,11 @@ fn compile_lambda(
     }
 }
 
-/// Compile a let binding by re-compiling the bound expression at each use site.
+/// Compile a let binding.
 ///
-/// Sharing via `Split` is future work.
+/// The bound expression is compiled once and wrapped in [`Memo`] + [`Split`]
+/// so that multiple references to the variable in `body` share the same
+/// underlying producer rather than recompiling the expression each time.
 fn compile_let(
     name: &str,
     bound_ty: &Type,
@@ -675,13 +701,14 @@ fn compile_let(
 ) -> Result<Box<dyn TileOperator>, CompileError> {
     // Validate the type annotation is well-formed.
     ctx.extent_of(bound_ty)?;
+    // Compile the bound expression eagerly in the *current* (outer) scope so
+    // that any free occurrences of `name` inside `bound_expr` correctly
+    // resolve to the outer binding rather than the one we are about to create.
+    let bound_op = compile_tile_inner(bound_expr, ctx)?;
+    let split = Rc::new(Split::new(Box::new(Memo::new(bound_op))));
     {
         let mut scope = ctx.enter_scope();
-        let shadowed = scope.lookup(name).cloned().map(Box::new);
-        scope.bind(
-            name,
-            TileVarBinding::Let(Box::new(bound_expr.clone()), shadowed),
-        );
+        scope.bind(name, TileVarBinding::Operator(split));
         compile_tile_inner(body, &mut scope)
     }
 }
@@ -822,67 +849,31 @@ fn resolve_to_expr<'a>(expr: &'a Expr, ctx: &'a TileCompileContext) -> &'a Expr 
     expr
 }
 
-/// Convert a [`crate::interpreter::Extent`] back to the corresponding CCL [`Type`].
-///
-/// Used to annotate synthetic lambda parameters when building materialisation
-/// expressions in [`compile_groupby`].  Only extents arising from CCL types
-/// are supported; others return [`CompileError::TypeError`].
-fn extent_to_type(extent: &Extent) -> Result<Type, CompileError> {
-    match extent {
-        Extent::UIntRange(_) => {
-            let n = extent.as_uint_range_size().ok_or_else(|| {
-                CompileError::TypeError(
-                    "Cannot convert fragmented UIntRange extent to CCL type".to_string(),
-                )
-            })?;
-            Ok(Type::UIntRange(n))
-        }
-        Extent::Base(bt) => Ok(Type::Base(bt.clone())),
-        Extent::DataSourceDomain(imp) => Ok(Type::DataSource(imp.borrow().get_id().to_string())),
-        other => Err(CompileError::TypeError(format!(
-            "Cannot convert extent to CCL type: {other:?}"
-        ))),
-    }
-}
-
-/// Build a synthetic CCL expression that materialises a function-valued
-/// collection over its finite domain.
-///
-/// Returns `λ "_groupby_idx" : domain_type. Apply(collection_expr, Var("_groupby_idx"))`.
-/// When compiled, this iterates the domain, looks up each element, and yields
-/// a `SealedFunction(domain, V)` tile.
-fn build_materialization_expr(
-    collection_expr: &Expr,
-    domain: &Extent,
-) -> Result<Expr, CompileError> {
-    let domain_type = extent_to_type(domain)?;
-    Ok(Expr::lambda(
-        "_groupby_idx",
-        domain_type,
-        Expr::apply(Expr::var("_groupby_idx"), collection_expr.clone()),
-    ))
-}
-
 /// Compile a `groupby(collection, key)` expression to a [`CurriedFunction`] tile.
 ///
 /// The output maps each key value `K` to the list of collection elements `V`
 /// that produce that key.  The pipeline is:
 ///
-/// 1. Compile `collection` → `Scalar(Function(D, V))`.
-/// 2. Materialise the collection: build `λ "_groupby_idx". collection["_groupby_idx"]`
-///    which compiles to `SealedFunction(D, V)`.
-/// 3. Apply the key to each element: `Apply(key, mat_expr)`.  For lambda keys
-///    this β-reduces so that element-wise operations (e.g. `x // 2`) work over
-///    the materialized SealedFunction.  Result: `SealedFunction(D, K)`.
-/// 4. [`Converse`] inverts `D → K` to `CurriedFunction(K, D)`.
-/// 5. [`MapCompose`] applies the collection again to each domain index, turning
-///    `CurriedFunction(K, D)` into `CurriedFunction(K, V)`.
+/// 1. Compile `collection` once, wrap in [`Memo`] + [`Split`] (`col_split`).
+/// 2. If the collection has tiling `Scalar(Function(D, V))` (e.g., a list literal),
+///    materialise it into `SealedFunction(D, V)` via
+///    `MapApply(IterateExtent(D), col_split_handle)`, then wrap that in another
+///    [`Memo`] + [`Split`] (`mat_split`).  For collections that are already
+///    `SealedFunction`, `mat_split` is just `col_split`.
+/// 3. Bind `"_groupby_mat"` → `Operator(mat_split)` so the key expression can
+///    reference the materialized `SealedFunction(D, V)` via a fresh split handle.
+/// 4. Apply the key to each element: `Apply(key, Var("_groupby_mat"))`.  For lambda
+///    keys this β-reduces so that element-wise operations (e.g. `x // 2`) work over
+///    the materialised `SealedFunction`.  Result: `SealedFunction(D, K)`.
+/// 5. [`Converse`] inverts `D → K` to `CurriedFunction(K, D)`.
+/// 6. [`MapCompose`] applies the collection (via `col_split`) to each domain index,
+///    turning `CurriedFunction(K, D)` into `CurriedFunction(K, V)`.
 fn compile_groupby(
     collection_expr: &Expr,
     key_expr: &Expr,
     ctx: &mut TileCompileContext,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
-    // 1. Compile collection to obtain its domain extent.
+    // 1. Compile collection once and wrap in Memo + Split for sharing.
     let collection_op = compile_tile_inner(collection_expr, ctx)?;
     let (collection_domain, _) =
         collection_op
@@ -891,25 +882,43 @@ fn compile_groupby(
             .ok_or_else(|| {
                 CompileError::TypeError("GroupBy: collection must have a function type".into())
             })?;
+    let col_split = Rc::new(Split::new(Box::new(Memo::new(collection_op))));
 
-    // 2. Build a materialisation expression that compiles to SealedFunction(D, V).
-    let mat_expr = build_materialization_expr(collection_expr, &collection_domain)?;
+    // 2. Ensure the binding exposes a SealedFunction(D, V) tiling.
+    //    List literals compile to Scalar(Function(D, V)); wrapping them in
+    //    MapApply(IterateExtent(D), split_handle) materialises them into
+    //    SealedFunction(D, V), which is what key lambda β-reduction expects.
+    let mat_split: Rc<Split> = if matches!(col_split.tiling(), Tiling::Scalar(_)) {
+        let mat_op: Box<dyn TileOperator> = Box::new(MapApply::new(
+            Box::new(IterateExtent::new(collection_domain)),
+            Box::new(col_split.split()),
+        ));
+        Rc::new(Split::new(Box::new(Memo::new(mat_op))))
+    } else {
+        // Already SealedFunction — reuse col_split directly.
+        Rc::clone(&col_split)
+    };
 
-    // 3. Apply the key to each element.
-    //    Expr::apply(argument, function) → Apply { function, argument }.
+    // 3–4. Bind "_groupby_mat" and apply the key.
+    //    Expr::apply(argument, function) → Apply { function: key_expr, argument }.
     //    Lambda keys are β-reduced by compile_apply; non-lambda keys fall back
-    //    to MapApply(materialized, key_fn).
-    let keyed_expr = Expr::apply(mat_expr, key_expr.clone());
-    let keyed_op = compile_tile_inner(&keyed_expr, ctx)?;
+    //    to MapApply(materialised, key_fn).
+    let keyed_op = {
+        let mut scope = ctx.enter_scope();
+        scope.bind("_groupby_mat", TileVarBinding::Operator(mat_split));
+        let keyed_expr = Expr::apply(Expr::var("_groupby_mat"), key_expr.clone());
+        compile_tile_inner(&keyed_expr, &mut scope)?
+    };
     // keyed_op tiling: SealedFunction(D, K)
 
-    // 4. Invert D → K into CurriedFunction(K, D).
+    // 5. Invert D → K into CurriedFunction(K, D).
     let converse_op: Box<dyn TileOperator> = Box::new(Converse::new(keyed_op));
 
-    // 5. Replace domain indices with collection elements: CurriedFunction(K, V).
-    //    Recompile collection because TileOperator is not Clone.
-    let collection_op_2 = compile_tile_inner(collection_expr, ctx)?;
-    let grouped_op: Box<dyn TileOperator> = Box::new(MapCompose::new(converse_op, collection_op_2));
+    // 6. Replace domain indices with collection elements: CurriedFunction(K, V).
+    //    Use a fresh split handle from col_split instead of recompiling.
+    let collection_for_compose: Box<dyn TileOperator> = Box::new(col_split.split());
+    let grouped_op: Box<dyn TileOperator> =
+        Box::new(MapCompose::new(converse_op, collection_for_compose));
 
     Ok(grouped_op)
 }

@@ -692,10 +692,6 @@ pub enum ColumnValue {
         outputs: Box<ColumnValue>,
     },
     Records(HashMap<String, ColumnValue>),
-    /// TODO: consider a more efficient representation here.
-    ///   Using Value massively simplifies the code but probably has a
-    ///   nontrivial perf cost
-    LookupTable(HashMap<Value, Vec<Value>>),
 }
 
 impl ColumnValue {
@@ -725,7 +721,6 @@ impl ColumnValue {
             ColumnValue::Records(r) => {
                 Value::Record(r.iter().map(|(k, v)| (k.clone(), v.index_at(i))).collect())
             }
-            ColumnValue::LookupTable(..) => panic!("Cannot index LookupTable"),
         }
     }
 
@@ -851,7 +846,6 @@ impl ColumnValue {
                         .collect(),
                 )
             }
-            ColumnValue::LookupTable(..) => panic!("Cannot select_indices on LookupTable"),
         }
     }
 
@@ -866,7 +860,6 @@ impl ColumnValue {
             ColumnValue::Variants(v) => v.len(),
             ColumnValue::Records(m) => m.values().next().expect("Empty Record").len(),
             ColumnValue::FunctionBindings { inputs, .. } => inputs.len(),
-            ColumnValue::LookupTable(m) => m.len(),
         }
     }
 
@@ -950,7 +943,6 @@ impl ColumnValue {
                         .map(|e| (e.0.clone(), e.1.as_single().expect("Not single").clone()))
                         .collect(),
                 )),
-                ColumnValue::LookupTable(..) => panic!("Cannot cast LookupTable to single element"),
             }
         } else {
             None
@@ -1018,34 +1010,7 @@ impl ColumnValue {
                     Value::Record(m.iter().map(|(k, v)| (k.clone(), v.index_at(i))).collect())
                 }))
             }
-            // Convert the table to a list of key-value pairs, flattening out the vectors of values
-            ColumnValue::LookupTable(m) => {
-                let m = std::mem::take(m);
-                Box::new(m.into_iter().flat_map(|(key, values)| {
-                    values.into_iter().map(move |v| {
-                        Value::Function(vec![FuncBinding {
-                            input: key.clone(),
-                            output: v,
-                        }])
-                    })
-                }))
-            }
         }
-    }
-
-    pub fn function_converse(data: ColumnValue) -> ColumnValue {
-        let (mut inputs, mut outputs) = match data {
-            ColumnValue::FunctionBindings { inputs, outputs } => (*inputs, *outputs),
-            _ => panic!("Not a function"),
-        };
-        let mut map: HashMap<Value, Vec<Value>> = HashMap::new();
-        for (i, o) in inputs
-            .drain_to_value_iter()
-            .zip(outputs.drain_to_value_iter())
-        {
-            map.entry(o).or_default().push(i);
-        }
-        ColumnValue::LookupTable(map)
     }
 
     /// Create a `ColumnValue` from a `Vec<i64>`.
@@ -1094,6 +1059,45 @@ impl ColumnValue {
     pub fn strings(values: &[&str]) -> ColumnValue {
         ColumnValue::Strings(values.iter().map(|s| s.to_string()).collect())
     }
+
+    pub fn append(&mut self, other: ColumnValue) {
+        match (self, other) {
+            (ColumnValue::Units(s), ColumnValue::Units(o)) => *s += o,
+            (ColumnValue::Ints(s), ColumnValue::Ints(mut o)) => s.append(&mut o),
+            (ColumnValue::UInts(s), ColumnValue::UInts(mut o)) => s.append(&mut o),
+            (ColumnValue::Bools(s), ColumnValue::Bools(mut o)) => s.append(&mut o),
+            (ColumnValue::Strings(s), ColumnValue::Strings(mut o)) => s.append(&mut o),
+            (ColumnValue::Variants(s), ColumnValue::Variants(mut o)) => s.append(&mut o),
+            (
+                ColumnValue::FunctionBindings {
+                    inputs: si,
+                    outputs: so,
+                },
+                ColumnValue::FunctionBindings {
+                    inputs: oi,
+                    outputs: oo,
+                },
+            ) => {
+                si.append(*oi);
+                so.append(*oo);
+            }
+            (ColumnValue::Records(s), ColumnValue::Records(o)) => {
+                for (k, v) in o {
+                    s.get_mut(&k)
+                        .unwrap_or_else(|| panic!("Missing field {k} in append"))
+                        .append(v);
+                }
+            }
+            _ => panic!("Mismatched ColumnValue variants in append"),
+        }
+    }
+
+    pub fn for_each_uint(&mut self, f: impl Fn(&mut usize)) {
+        match self {
+            ColumnValue::UInts(v) => v.iter_mut().for_each(f),
+            _ => panic!("Not UInts"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1125,29 +1129,6 @@ mod tests {
     fn test_cartesian_product_empty_map() {
         let result = ColumnValue::cartesian_product(HashMap::new());
         assert_eq!(result, ColumnValue::Records(HashMap::new()));
-    }
-
-    #[test]
-    fn test_function_converse() {
-        let data = ColumnValue::FunctionBindings {
-            inputs: Box::new(ColumnValue::UInts(vec![0, 1, 2])),
-            outputs: Box::new(ColumnValue::Strings(vec![
-                "a".to_string(),
-                "b".to_string(),
-                "b".to_string(),
-            ])),
-        };
-        let result = ColumnValue::function_converse(data);
-        assert_eq!(
-            result,
-            ColumnValue::LookupTable(HashMap::from([
-                (Value::String("a".to_string()), vec![Value::UInt(0)]),
-                (
-                    Value::String("b".to_string()),
-                    vec![Value::UInt(1), Value::UInt(2)]
-                )
-            ]))
-        );
     }
 
     // --- Display tests ---
