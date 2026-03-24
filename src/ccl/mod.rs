@@ -70,11 +70,25 @@ pub fn reset_infer_var_counter() {
     INFER_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
 
-// TODO: `BaseType` belongs here (or in a shared module), not in the interpreter.
-// Move it to `ccl` and have the interpreter import from `ccl`; this removes the
-// upward dependency from `ccl` into `crate::interpreter`. See also `ccl::infer`
-// which has the same non-test import.
-use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
+use crate::interpreter::{ColumnValue, Extent, Value};
+
+/// Primitive base types shared between the CCL type system and the interpreter.
+///
+/// Defined here (in `ccl`) and re-exported by the interpreter so that
+/// `ccl` does not depend upward on `interpreter`. See `interpreter/types.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BaseType {
+    /// Signed 64-bit integer.
+    Int,
+    /// Unsigned 64-bit integer.
+    UInt,
+    /// Unicode string.
+    String,
+    /// Boolean value.
+    Bool,
+    /// The unit type (equivalent to Python `None`).
+    Unit,
+}
 
 /// Errors about types that can be used by any phase of compilation
 pub enum TypeError {

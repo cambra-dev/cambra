@@ -341,11 +341,11 @@ fn binop_prec(op: &BinOpKind) -> Precedence {
 #[cfg(test)]
 mod tests {
     use super::symbolic;
+    use crate::ccl::BaseType;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, Expr, HashJoinSpec, Lit, LogicKind, Pattern,
         Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
     };
-    use crate::interpreter::BaseType;
     use rstest::rstest;
     use std::rc::Rc;
 

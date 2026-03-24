@@ -49,11 +49,11 @@ use std::{collections::HashSet, rc::Rc};
 use bit_set::BitSet;
 use rustpython_parser::ast as pyast;
 
+use crate::ccl::BaseType;
 use crate::ccl::{
     AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, HashJoinSpec, Lit, LogicKind,
     Type, TypedExprNode, UnaryOpKind,
 };
-use crate::interpreter::BaseType;
 
 // ---------------------------------------------------------------------------
 // Error type

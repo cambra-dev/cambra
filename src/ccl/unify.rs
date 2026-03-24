@@ -338,8 +338,8 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::BaseType;
     use crate::ccl::{Expr, Lit, Type};
-    use crate::interpreter::BaseType;
 
     #[test]
     fn test_register_and_probe_unresolved() {

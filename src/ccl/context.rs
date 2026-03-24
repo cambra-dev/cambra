@@ -13,12 +13,12 @@ use crate::{
         infer::{infer, TypeInferenceContext},
         lower::{lower_stmts, LoweringContext},
         symbolic::symbolic,
-        Type,
+        BaseType, Type,
     },
     interpreter::{
         compile_tile_operators::{compile_tile, TileCompileContext},
         tile_operators::TileProducer,
-        BaseType, Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource, TestDataSource,
+        Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource, TestDataSource,
     },
     pretty_graph::{pretty_tile_operator, pretty_tile_producer},
 };

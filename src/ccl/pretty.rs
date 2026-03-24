@@ -183,11 +183,11 @@ fn unaryop_symbol(op: &UnaryOpKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::pretty;
+    use crate::ccl::BaseType;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, Expr, Lit, Pattern, Type, TypedBinding,
         TypedExpr, TypedExprNode, UnaryOpKind,
     };
-    use crate::interpreter::BaseType;
     use rstest::rstest;
 
     #[rstest]

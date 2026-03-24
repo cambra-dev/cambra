@@ -407,15 +407,12 @@ impl Extent {
     }
 }
 
-/// Base types in CCL
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum BaseType {
-    Int,
-    UInt,
-    String,
-    Bool,
-    Unit,
-}
+/// Base types in CCL — re-exported from [`crate::ccl::BaseType`].
+///
+/// The authoritative definition lives in `ccl/mod.rs`; this re-export keeps
+/// all interpreter callsites (`crate::interpreter::BaseType`) working without
+/// changes.
+pub use crate::ccl::BaseType;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FunctionDef {

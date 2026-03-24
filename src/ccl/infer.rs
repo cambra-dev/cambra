@@ -25,12 +25,11 @@ use std::ops::{Deref, DerefMut};
 
 use log::trace;
 
+use crate::ccl::BaseType;
 use crate::ccl::{
     fresh_infer_var_id, unify::UnificationTable, BinOpKind, Expr, InferVarId, Lit, RefinementKind,
     Type, TypedExprNode, UnaryOpKind,
 };
-// TODO: once `BaseType` moves to `ccl`, this import goes away.
-use crate::interpreter::BaseType;
 use crate::util::ScopeStack;
 
 // ---------------------------------------------------------------------------
@@ -852,11 +851,11 @@ fn reconcile_constraints(constraints: Vec<TypeConstraint>) -> Result<Option<Type
 mod tests {
     use super::*;
     use crate::ccl::symbolic::symbolic;
+    use crate::ccl::BaseType;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, Lit, LogicKind, Type,
         TypedBinding, TypedExpr, TypedExprNode,
     };
-    use crate::interpreter::BaseType;
 
     // -----------------------------------------------------------------------
     // Unit tests
