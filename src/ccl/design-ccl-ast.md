@@ -98,7 +98,11 @@ The result type is `Fun(K, Fun(UInt, V))` where `K` is the key type and `V` is t
 
 ### `Case` only — no `IfThenElse`
 
-Python `if/else` and `if/elif/.../else` chains are lowered to `Case` during Python → CCL lowering. There is no `IfThenElse` node in the CCL AST. `Case` subsumes all multi-way branching.
+Python `if/else`, `elif` chains, and ternary `if` expressions are all lowered to `Case` during Python → CCL lowering. There is no `IfThenElse` node in the CCL AST. `Case` subsumes all multi-way branching.
+
+`Case` holds an ordered list of `Branch { guard, body }` values. Guards are arbitrary `TypedExpr` nodes constrained to `Bool` at inference time; the first truthy guard wins. `elif` chains are **flattened** into a single `Case`: when `lower_if` recurses into the `orelse` block and the result is itself a `Case`, its branches are extended directly rather than nested, so `if c1: … elif c2: … else: …` produces `{ c1 → …; c2 → …; true → … }`. Structural pattern decomposition is represented as `Let` bindings in arm bodies; literal matching is an equality guard expression.
+
+Python `match` statements (planned) will desugar entirely at lowering time: the scrutinee is bound with a fresh `Let(__scrut)` node, then each arm produces a guard (`__scrut == lit` for literal patterns, `Lit(true)` for wildcard/structural) and a body (with `Let` bindings for any captured variable names). No IR changes are needed for `match` support.
 
 ### `Join`/`Jump` for loops
 
@@ -237,9 +241,12 @@ enum TypedExprNode {
         input: Box<TypedExpr>,                // expression being aggregated (must be of type Fun)
         kind: AggregateKind,                  // the aggregation operation (Sum, Max, …)
     },
+    /// Multi-way conditional branching. Evaluates each `Branch` in order;
+    /// the first branch whose guard evaluates to `true` wins. Guards must
+    /// have type `Bool`. Python `if/else`, `elif` chains (flattened), and
+    /// ternary `if` are all lowered to this node.
     Case {
-        scrutinee: Box<TypedExpr>,
-        branches: Vec<(Pattern, TypedExpr)>,
+        branches: Vec<Branch>,  // Branch { guard: TypedExpr, body: TypedExpr }
     },
     Join {
         name: String,       // join-point label
@@ -261,14 +268,6 @@ enum TypedExprNode {
     Record(Vec<(String, TypedExpr)>),
     // Built-in data source
     Source(String),
-}
-
-enum Pattern {
-    Lit(Literal),
-    Var(String),
-    Tuple(Vec<Pattern>),
-    Record(Vec<(String, Pattern)>),
-    Wildcard,
 }
 
 enum Type {
@@ -408,10 +407,14 @@ pass only constrains both operands to `String` and returns `String` as the resul
 | `Neg` | operand constrained to `Int` | `Int` |
 | `Not` | operand constrained to `Bool` | `Bool` |
 
+### `Case` inference
+
+For each `Branch { guard, body }`: the guard is constrained to `Type::Base(BaseType::Bool)`; body types across all branches are unified via `constrain_equal`. The overall `Case` type is the unified body type. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
+
 ### TODOs
 
-- `Case` arm scope: push pattern variable bindings into ctx.
 - Infer `Let.ty` from the type of `value` (required before `Let` nodes can be compiled; see §Compilation).
+- Python `match` statement lowering: desugar at lowering time using `Let(__scrut)` + guard expressions (no IR changes needed).
 
 ---
 
@@ -436,8 +439,7 @@ The `Let` operator stores `(variable: Var, definition: Operator, body: Operator,
 The bound variable is subscribed to `definition` exactly once via a `VarProducer`, so multiple
 `VarRef(name)` nodes in the body all resolve to the same producer and the value is computed once.
 
-**Prerequisite**: `Let.bound_ty` must be `Some(T)` before compilation — the type inference pass
-fills this in from the type of `bound_expr`.
+**Prerequisite**: `binding.ty` on the `Let` node's `TypedBinding` must be resolved to a concrete type before compilation — the type inference pass fills it from the inferred type of `bound_expr`.
 
 ---
 
@@ -446,9 +448,8 @@ fills this in from the type of `bound_expr`.
 1. Define the node types above in a new `src/ccl/` module. ✓
 2. Add pretty printer (`src/ccl/pretty.rs`) and Python → CCL lowering (`src/ccl/lower.rs`) with snapshot tests. ✓
 3. Insert CCL as the IR between Python and operators (in progress):
-   - `ccl/lower.rs`:  `lower_list_comp` produces unannotated lambdas
-     (`param_ty: None`) — type annotation moved to
-     the inference pass. ✓
+   - `ccl/lower.rs`: `lower_list_comp` produces unannotated lambdas
+     (`param.ty: Type::Hole`) — type annotation moved to the inference pass. ✓
    - `interpreter/compile_ccl.rs`: CCL → operator compilation step created;
      `CompileContext`, `CompileError`, `compile()`, and unit tests. ✓
    - `ccl/infer.rs`: limited type inference pass; `TypeInferenceContext`, `InferError`,
@@ -464,8 +465,8 @@ fills this in from the type of `bound_expr`.
      lowering from `groupby(collection, key)` call sites; type inference propagates collection
      element type onto key lambda `param_ty`. ✓
    - Source injection across all three CCL pipeline stages: `Expr::Source`, `Type::DataSource`,
-     `CclLoweringContext`, `TypeInferenceContext` source registry, `CompileContext` source registries,
-     `CclPipelineSources` convenience bundle. CCL pipeline variants of source/join tests added. ✓
+     `LoweringContext`, `TypeInferenceContext` source registry, `CompileContext` source registries.
+     CCL pipeline variants of source/join tests added. ✓
    - `ccl/mod.rs` + all call sites: introduce `TypedExpr { node: TypedExprNode, ty, user_annotation }`
      as the primary expression type; rename `Expr` enum to `TypedExprNode`; keep `pub type Expr =
      TypedExpr` alias; remove `TypeAnnotation` variant; remove `Let.bound_ty` field; fill `ty` on
@@ -495,3 +496,9 @@ fills this in from the type of `bound_expr`.
    - `tests/type_check.rs`: lower + infer integration tests (literals, arithmetic,
      let bindings, unary ops, lists, aggregates, tuples, type annotations,
      data sources, groupby). ✓
+   - `ccl/mod.rs` + `ccl/infer.rs` + `ccl/lower.rs` + `ccl/symbolic.rs` + `ccl/pretty.rs`
+     + `ccl/unify.rs`: `Case` redesigned as guard-based branching — `branches: Vec<Branch>`
+     (`Branch { guard, body }`) with guards constrained to `Bool` and arm types unified;
+     `lower_if` for `StmtKind::If` → `Case` with `elif` chains **flattened** into a single node;
+     `ExprKind::IfExp` ternary lowering; `InferError::EmptyCase` for 0-branch `Case`.
+     `tests/type_check.rs`: `if/else`, `elif`, ternary integration tests. ✓

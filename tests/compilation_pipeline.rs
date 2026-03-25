@@ -243,8 +243,6 @@ fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: Tile) {
 // ---------------------------------------------------------------------------
 // Filtered comprehensions
 // ---------------------------------------------------------------------------
-//
-// TODO: `ccl::lower` does not yet support `if` clauses in comprehensions.
 
 #[rstest]
 #[case("[x for x in [1, 2, 3] if x < 0]", make_int_list(&[]))]

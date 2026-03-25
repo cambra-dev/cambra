@@ -12,7 +12,7 @@
 //! The formatting is intentionally kept human-readable and stable so that tests
 //! can pin expected tree strings directly.
 
-use crate::ccl::{Expr, Lit, RefinementKind, Type, TypedExprNode, UnaryOpKind};
+use crate::ccl::{Branch, Expr, Lit, RefinementKind, Type, TypedExprNode, UnaryOpKind};
 use crate::pretty_tree::{render, InspectNode};
 
 // ---------------------------------------------------------------------------
@@ -120,13 +120,11 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             node
         }
 
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            let mut node = InspectNode::new("Case").child("scrutinee", expr_to_node(scrutinee));
-            for (i, (_pat, arm)) in branches.iter().enumerate() {
-                node = node.child(format!("branch_{i}"), expr_to_node(arm));
+        TypedExprNode::Case { branches } => {
+            let mut node = InspectNode::new("Case");
+            for (i, Branch { guard, body }) in branches.iter().enumerate() {
+                node = node.child(format!("guard_{i}"), expr_to_node(guard));
+                node = node.child(format!("arm_{i}"), expr_to_node(body));
             }
             node
         }
@@ -185,8 +183,8 @@ mod tests {
     use super::pretty;
     use crate::ccl::BaseType;
     use crate::ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, Expr, Lit, Pattern, Type, TypedBinding,
-        TypedExpr, TypedExprNode, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, Lit, Type, TypedBinding, TypedExpr,
+        TypedExprNode, UnaryOpKind,
     };
     use rstest::rstest;
 
@@ -295,16 +293,15 @@ Record
 └── a: Lit(1)
 "
     )]
-    // Case with wildcard branch
+    // Case with a single guard + arm
     #[case(
         TypedExpr::new(TypedExprNode::Case {
-            scrutinee: Box::new(Expr::var("x")),
-            branches: vec![(Pattern::Wildcard, Expr::lit(Lit::Int(0)))],
+            branches: vec![Branch { guard: Expr::lit(Lit::Bool(true)), body: Expr::lit(Lit::Int(0)) }],
         }),
         "\
 Case
-├── scrutinee: Var(x)
-└── branch_0: Lit(0)
+├── guard_0: Lit(true)
+└── arm_0: Lit(0)
 "
     )]
     // Join + Jump: loop_body (non-last) has a child → triggers │   continuation prefix

@@ -51,8 +51,8 @@ use rustpython_parser::ast as pyast;
 
 use crate::ccl::BaseType;
 use crate::ccl::{
-    AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, HashJoinSpec, Lit, LogicKind,
-    Type, TypedExprNode, UnaryOpKind,
+    AggregateKind, ArithmeticKind, BinOpKind, Branch, CompareKind, Expr, HashJoinSpec, Lit,
+    LogicKind, Type, TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -140,6 +140,24 @@ pub fn lower_expr(
         },
         pyast::ExprKind::Lambda { args, body } => lower_lambda(args, body, ctx),
         pyast::ExprKind::UnaryOp { op, operand } => lower_unaryop(op, operand, ctx),
+        // Ternary `value if test else orelse` → Case { [guard → value, true → orelse] }
+        pyast::ExprKind::IfExp { test, body, orelse } => {
+            let guard = lower_expr(test, ctx)?;
+            let true_arm = lower_expr(body, ctx)?;
+            let false_arm = lower_expr(orelse, ctx)?;
+            Ok(Expr::new(TypedExprNode::Case {
+                branches: vec![
+                    Branch {
+                        guard,
+                        body: true_arm,
+                    },
+                    Branch {
+                        guard: Expr::lit(Lit::Bool(true)),
+                        body: false_arm,
+                    },
+                ],
+            }))
+        }
         _ => Err(LoweringError::Unsupported(format!(
             "Expression type not supported: {:?}",
             expr.node
@@ -164,12 +182,13 @@ pub fn lower_stmts(stmts: &[pyast::Stmt], ctx: &LoweringContext) -> Result<Expr,
 
     let (last, rest) = stmts.split_last().unwrap();
 
-    // The final statement must be a bare expression.
+    // The final statement must be a bare expression or an if/else block.
     let final_expr = match &last.node {
         pyast::StmtKind::Expr { value } => lower_expr(value, ctx)?,
+        pyast::StmtKind::If { test, body, orelse } => lower_if(test, body, orelse, ctx)?,
         _ => {
             return Err(LoweringError::Unsupported(
-                "Last statement must be a bare expression".into(),
+                "Last statement must be a bare expression or if/else".into(),
             ))
         }
     };
@@ -249,6 +268,47 @@ fn lower_type_annotation(annotation: &pyast::Expr) -> Result<Type, LoweringError
             &annotation.node
         ))),
     }
+}
+
+/// Lower a `StmtKind::If` (or `elif` chain) to a [`TypedExprNode::Case`] expression.
+///
+/// The condition becomes the first branch guard and the `then` block becomes its
+/// body. `elif` chains are **flattened**: when `orelse` lowers to a [`TypedExprNode::Case`],
+/// its branches are appended directly rather than nested, producing a single flat
+/// `Case` with one [`Branch`] per condition. A plain `else` block becomes the
+/// final branch with an always-`true` guard.
+///
+/// A bare `if` without an `else` clause is not value-returning and is rejected
+/// with [`LoweringError::Unsupported`].
+fn lower_if(
+    test: &pyast::Expr,
+    body: &[pyast::Stmt],
+    orelse: &[pyast::Stmt],
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
+    if orelse.is_empty() {
+        return Err(LoweringError::Unsupported(
+            "if without else is not supported as a value-returning expression".into(),
+        ));
+    }
+    let guard = lower_expr(test, ctx)?;
+    let true_arm = lower_stmts(body, ctx)?;
+    let false_arm = lower_stmts(orelse, ctx)?;
+    // Flatten elif chains: if the else branch is itself a Case, extend our
+    // branches with its branches rather than nesting.
+    let mut branches = vec![Branch {
+        guard,
+        body: true_arm,
+    }];
+    if let TypedExprNode::Case { branches: inner } = false_arm.node {
+        branches.extend(inner);
+    } else {
+        branches.push(Branch {
+            guard: Expr::lit(Lit::Bool(true)),
+            body: false_arm,
+        });
+    }
+    Ok(Expr::new(TypedExprNode::Case { branches }))
 }
 
 fn lower_constant(constant: &pyast::Constant) -> Result<Expr, LoweringError> {
@@ -1246,7 +1306,8 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     /// ctx.scope for each branch or value_op.subscribe() will panic on the
     /// inner tmp VarRef.
     #[test]
-    #[ignore = "if/else statement lowering not yet implemented (StmtKind::If unsupported)"]
+    #[ignore = "if/else as a non-final statement (assignment-binding desugaring) is not yet \
+                implemented; if/else as a final value-returning statement is now supported"]
     fn test_lower_if_else_branch_locals() {
         let code = "\
 if cond:
@@ -1258,8 +1319,9 @@ else:
 result";
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
-        // Fill in the expected string when StmtKind::If lowering is added.
-        // Structure: let result = case cond of { True → let tmp = 1 in tmp + 1 | False → let tmp = 2 in tmp + 2 } in result
+        // Non-final if/else with assignment desugaring: this test remains ignored.
+        // When implemented, the expected structure is:
+        // let result = { cond → let tmp = 1 in tmp + 1; true → let tmp = 2 in tmp + 2 } in result
         assert_eq!(symbolic(&ccl), "");
     }
 
@@ -1281,5 +1343,51 @@ x";
         // Fill in the expected string when ExprKind::NamedExpr lowering is added.
         // Structure: let x = (let y = 5 in y) + 1 in x
         assert_eq!(symbolic(&ccl), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // if/else statement lowering tests
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    // Simple if/else as the final statement.
+    #[case("if x:\n    1\nelse:\n    0", "{ x → 1; true → 0 }")]
+    // Scrutinee from an outer let binding.
+    #[case(
+        "x = 5\nif x > 3:\n    10\nelse:\n    0",
+        "let x = 5\nin { x > 3 → 10; true → 0 }"
+    )]
+    // elif chain: orelse is itself a StmtKind::If; branches are flattened into a single Case.
+    #[case(
+        "if c1:\n    1\nelif c2:\n    2\nelse:\n    3",
+        "{ c1 → 1; c2 → 2; true → 3 }"
+    )]
+    // Multi-statement arm body: last stmt must be a bare expression.
+    #[case(
+        "if x:\n    a = 1\n    a\nelse:\n    0",
+        "{ x → let a = 1\nin a; true → 0 }"
+    )]
+    fn test_lower_if(#[case] code: &str, #[case] expected: &str) {
+        let stmts = parse_module(code);
+        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        assert_eq!(symbolic(&ccl), expected);
+    }
+
+    #[rstest]
+    // Ternary: `body if test else orelse` → `{ test → body; true → orelse }`
+    #[case("1 if x else 0", "{ x → 1; true → 0 }")]
+    #[case("\"yes\" if flag else \"no\"", "{ flag → \"yes\"; true → \"no\" }")]
+    fn test_lower_if_expr(#[case] code: &str, #[case] expected: &str) {
+        let expr = parse_expr(code);
+        let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");
+        assert_eq!(symbolic(&ccl), expected);
+    }
+
+    #[test]
+    fn test_lower_if_without_else_rejected() {
+        let stmts = parse_module("if x:\n    1");
+        let err =
+            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        assert!(matches!(err, LoweringError::Unsupported(_)));
     }
 }

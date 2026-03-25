@@ -9,7 +9,7 @@
 //! variables across the typed-expression tree, and by a post-inference resolution pass to
 //! replace any remaining [`crate::ccl::Type::Infer`] placeholders with their concrete types.
 
-use crate::ccl::{InferVarId, Type};
+use crate::ccl::{Branch, InferVarId, Type};
 
 // ---------------------------------------------------------------------------
 // Internal entry type
@@ -291,13 +291,10 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
             resolve(collection, table);
             resolve(key, table);
         }
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            resolve(scrutinee, table);
-            for (_, arm) in branches {
-                resolve(arm, table);
+        TypedExprNode::Case { branches } => {
+            for Branch { guard, body } in branches {
+                resolve(guard, table);
+                resolve(body, table);
             }
         }
         TypedExprNode::Join {

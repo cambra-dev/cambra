@@ -11,7 +11,7 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, Expr, Lit, LogicKind, Pattern, Type, TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, Type, TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -206,21 +206,18 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             (Precedence::Atom, format!("({})", items.join(", ")))
         }
 
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            let scr = fmt(scrutinee, Precedence::Lowest);
+        TypedExprNode::Case { branches } => {
             let arms: Vec<_> = branches
                 .iter()
-                .map(|(pat, arm)| {
-                    format!("{} → {}", fmt_pattern(pat), fmt(arm, Precedence::Lowest))
+                .map(|Branch { guard, body }| {
+                    format!(
+                        "{} → {}",
+                        fmt(guard, Precedence::Lowest),
+                        fmt(body, Precedence::Lowest)
+                    )
                 })
                 .collect();
-            (
-                Precedence::Lowest,
-                format!("case {scr} of {{ {} }}", arms.join("; ")),
-            )
+            (Precedence::Lowest, format!("{{ {} }}", arms.join("; ")))
         }
 
         TypedExprNode::Join {
@@ -289,26 +286,6 @@ fn fmt_apply_func(func: &Expr) -> String {
     }
 }
 
-/// Render a [`Pattern`] as a symbolic string.
-fn fmt_pattern(pat: &Pattern) -> String {
-    match pat {
-        Pattern::Lit(lit) => fmt_lit(lit),
-        Pattern::Var(name) => name.clone(),
-        Pattern::Tuple(pats) => {
-            let parts: Vec<_> = pats.iter().map(fmt_pattern).collect();
-            format!("({})", parts.join(", "))
-        }
-        Pattern::Record(fields) => {
-            let parts: Vec<_> = fields
-                .iter()
-                .map(|(k, p)| format!("{k}: {}", fmt_pattern(p)))
-                .collect();
-            format!("({})", parts.join(", "))
-        }
-        Pattern::Wildcard => "_".to_string(),
-    }
-}
-
 /// Render a [`Lit`] as its CCL symbolic form.
 fn fmt_lit(lit: &Lit) -> String {
     match lit {
@@ -343,8 +320,8 @@ mod tests {
     use super::symbolic;
     use crate::ccl::BaseType;
     use crate::ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, Expr, HashJoinSpec, Lit, LogicKind, Pattern,
-        Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, HashJoinSpec, Lit, LogicKind, Type,
+        TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
     };
     use rstest::rstest;
     use std::rc::Rc;
@@ -507,27 +484,22 @@ in x"
         ])),
         "(a: 1, b: 2)"
     )]
-    // Case with wildcard
+    // Case: single always-true guard
     #[case(
         TypedExpr::new(TypedExprNode::Case {
-            scrutinee: Box::new(Expr::var("x")),
-            branches: vec![(Pattern::Wildcard, Expr::lit(Lit::Int(0)))],
+            branches: vec![Branch { guard: Expr::lit(Lit::Bool(true)), body: Expr::lit(Lit::Int(0)) }],
         }),
-        "case x of { _ → 0 }"
+        "{ true → 0 }"
     )]
-    // Case with tuple pattern
+    // Case: two guards (if/else pattern)
     #[case(
         TypedExpr::new(TypedExprNode::Case {
-            scrutinee: Box::new(Expr::var("x")),
-            branches: vec![(
-                Pattern::Tuple(vec![
-                    Pattern::Var("a".to_string()),
-                    Pattern::Var("b".to_string()),
-                ]),
-                Expr::var("a"),
-            )],
+            branches: vec![
+                Branch { guard: Expr::var("x"), body: Expr::lit(Lit::Int(1)) },
+                Branch { guard: Expr::lit(Lit::Bool(true)), body: Expr::lit(Lit::Int(0)) },
+            ],
         }),
-        "case x of { (a, b) → a }"
+        "{ x → 1; true → 0 }"
     )]
     // Lambda with predicate refinement, no type annotation
     #[case(

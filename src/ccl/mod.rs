@@ -460,19 +460,23 @@ pub enum TypedExprNode {
     /// function-encoding of lists used at the operator-graph level.
     List(Vec<TypedExpr>),
 
-    /// Multi-way pattern matching.
+    /// Multi-way conditional branching.
     ///
-    /// Evaluates `scrutinee` and tests each `(pattern, arm)` pair in order,
-    /// binding matched sub-terms in scope for the arm expression.
+    /// Evaluates each [`Branch`] in order; the first branch whose guard evaluates
+    /// to `true` wins. Guards must have type [`Type::Base(BaseType::Bool)`].
     ///
-    /// Python `if`/`elif`/`else` chains are lowered to `Case` during
-    /// Python → CCL lowering; there is no separate `IfThenElse` node.
+    /// `if`/`elif`/`else` chains are flattened into a single `Case` with one
+    /// [`Branch`] per condition. Ternary `if` expressions produce a 2-branch
+    /// `Case`. Python `match` statement lowering (planned) will desugar patterns
+    /// into guards and [`TypedExprNode::Let`] bindings before producing `Case`.
+    ///
+    /// NOTE: All arms must currently infer the **same** type. Mismatched arm types
+    /// are a hard [`crate::ccl::infer::InferError::TypeMismatch`] rather than
+    /// producing a [`Type::Union`].
     Case {
-        /// The expression being matched.
-        scrutinee: Box<TypedExpr>,
-        /// Ordered list of pattern–arm pairs. Evaluated top-to-bottom; the
-        /// first matching pattern wins.
-        branches: Vec<(Pattern, TypedExpr)>,
+        /// Ordered list of branches. Evaluated top-to-bottom; the first branch
+        /// whose guard is `true` wins.
+        branches: Vec<Branch>,
     },
 
     /// A loop join point.
@@ -785,23 +789,17 @@ impl TypedExpr {
     }
 }
 
-/// A pattern in a [`TypedExprNode::Case`] branch.
+/// A single conditional branch in a [`TypedExprNode::Case`] expression.
 ///
-/// Patterns are tested against the scrutinee. The first branch whose pattern
-/// matches wins, and any [`Pattern::Var`] sub-patterns in it are bound in
-/// scope for the corresponding arm expression.
+/// Holds a `guard` (a boolean expression) and a `body` (the value produced
+/// when the guard is `true`). [`TypedExprNode::Case`] evaluates branches in
+/// order and returns the first body whose guard is satisfied.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Pattern {
-    /// Match a specific literal value.
-    Lit(Lit),
-    /// Bind the matched value to a name in the arm.
-    Var(String),
-    /// Destructure a tuple, matching and binding each element in order.
-    Tuple(Vec<Pattern>),
-    /// Destructure a record by field name, matching each named field.
-    Record(Vec<(String, Pattern)>),
-    /// Match any value without binding.
-    Wildcard,
+pub struct Branch {
+    /// Boolean guard; constrained to [`Type::Base(BaseType::Bool)`] during inference.
+    pub guard: TypedExpr,
+    /// Value expression; evaluated when `guard` is `true`.
+    pub body: TypedExpr,
 }
 
 /// A CCL type annotation.
@@ -831,6 +829,9 @@ pub enum Type {
     /// A named product type (record).
     Record(Vec<(String, Type)>),
     /// A sum type.
+    ///
+    /// Representable in the type system but not yet produced by inference.
+    /// TODO: Generating and compiling `Union` types.
     Union(Vec<Type>),
     /// A refinement of another type
     Refinement(Box<Type>, Refinement),

@@ -143,12 +143,31 @@ fn test_concat_strings() {
 
 #[test]
 fn test_let_simple() {
-    assert_eq!(infer_program("x = 2\nx"), int());
+    assert_eq!(
+        infer_program(
+            r#"
+x = 2
+x
+"#
+            .trim()
+        ),
+        int()
+    );
 }
 
 #[test]
 fn test_let_chain() {
-    assert_eq!(infer_program("x = 2\ny = x\ny + x"), int());
+    assert_eq!(
+        infer_program(
+            r#"
+x = 2
+y = x
+y + x
+"#
+            .trim()
+        ),
+        int()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -255,19 +274,43 @@ fn test_tuple_index() {
 #[test]
 fn test_ann_assign_int_ok() {
     // x: int = 2; x — annotation matches inferred Int
-    assert_eq!(infer_program("x: int = 2\nx"), int());
+    assert_eq!(
+        infer_program(
+            r#"
+x: int = 2
+x
+"#
+            .trim()
+        ),
+        int()
+    );
 }
 
 #[test]
 fn test_ann_assign_compatible_expr() {
     // x: int = 1 + 2; x — annotation-compatible with inferred Int
-    assert_eq!(infer_program("x: int = 1 + 2\nx"), int());
+    assert_eq!(
+        infer_program(
+            r#"
+x: int = 1 + 2
+x
+"#
+            .trim()
+        ),
+        int()
+    );
 }
 
 #[test]
 fn test_ann_assign_mismatch() {
     // x: str = 2; x — mismatch: annotation says String but value is Int
-    let err = infer_program_err("x: str = 2\nx");
+    let err = infer_program_err(
+        r#"
+x: str = 2
+x
+"#
+        .trim(),
+    );
     assert!(
         matches!(err, InferError::AnnotationMismatch { .. }),
         "expected AnnotationMismatch, got {err:?}"
@@ -302,6 +345,113 @@ fn test_groupby_aggregate() {
     // g = groups(1)
     // sum(g)
     // Expected: Int (sum of a group of integers)
-    let ty = infer_program("groups = groupby([1, 2, 3], lambda x: x)\ng = groups(1)\nsum(g)");
+    let ty = infer_program(
+        r#"
+groups = groupby([1, 2, 3], lambda x: x)
+g = groups(1)
+sum(g)
+"#
+        .trim(),
+    );
     assert_eq!(ty, int(), "expected Int, got {ty}");
+}
+
+// ---------------------------------------------------------------------------
+// Case / if expression tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_if_else_int() {
+    assert_eq!(
+        infer_program(
+            r#"
+if True:
+    1
+else:
+    0
+"#
+            .trim()
+        ),
+        int()
+    );
+}
+
+#[test]
+fn test_if_else_string() {
+    assert_eq!(
+        infer_program(
+            r#"
+if True:
+    "yes"
+else:
+    "no"
+"#
+            .trim()
+        ),
+        string()
+    );
+}
+
+#[test]
+fn test_if_else_with_let() {
+    // let binding in scope for the condition
+    assert_eq!(
+        infer_program(
+            r#"
+x = 5
+if x > 3:
+    10
+else:
+    0
+"#
+            .trim()
+        ),
+        int()
+    );
+}
+
+#[test]
+fn test_elif_chain() {
+    assert_eq!(
+        infer_program(
+            r#"
+if True:
+    1
+elif False:
+    2
+else:
+    3
+"#
+            .trim()
+        ),
+        int()
+    );
+}
+
+#[test]
+fn test_ternary_int() {
+    assert_eq!(infer_program("1 if True else 0"), int());
+}
+
+#[test]
+fn test_ternary_string() {
+    assert_eq!(infer_program(r#""yes" if True else "no""#), string());
+}
+
+#[test]
+fn test_if_else_arm_type_mismatch() {
+    // Arms return different types — inference must report a type mismatch.
+    let err = infer_program_err(
+        r#"
+if True:
+    1
+else:
+    "oops"
+"#
+        .trim(),
+    );
+    assert!(
+        matches!(err, InferError::TypeMismatch { .. }),
+        "expected TypeMismatch, got {err:?}"
+    );
 }

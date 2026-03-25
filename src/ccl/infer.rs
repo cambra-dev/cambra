@@ -27,8 +27,8 @@ use log::trace;
 
 use crate::ccl::BaseType;
 use crate::ccl::{
-    fresh_infer_var_id, unify::UnificationTable, BinOpKind, Expr, InferVarId, Lit, RefinementKind,
-    Type, TypedExprNode, UnaryOpKind,
+    fresh_infer_var_id, unify::UnificationTable, BinOpKind, Branch, Expr, InferVarId, Lit,
+    RefinementKind, Type, TypedExprNode, UnaryOpKind,
 };
 use crate::util::ScopeStack;
 
@@ -198,6 +198,11 @@ pub enum InferError {
     ///
     /// TODO: add BinOp arithmetic/comparison type rules.
     Unsupported(String),
+    /// A [`crate::ccl::TypedExprNode::Case`] with no branches was encountered.
+    ///
+    /// Lowering never produces a 0-branch `Case`; this indicates a malformed
+    /// AST constructed outside the normal lowering path.
+    EmptyCase,
 }
 
 // ---------------------------------------------------------------------------
@@ -321,19 +326,11 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
 
         // ----- Case -----
         //
-        // Recurse into the scrutinee and arms for mutation side-effects.
-        // Pattern variable bindings are not pushed into scope; arms with
-        // unbound variables silently produce Infer rather than aborting.
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            infer_expr(scrutinee, ctx)?;
-            for (_, arm) in branches.iter_mut() {
-                let _ = infer_expr(arm, ctx);
-            }
-            Ok(Type::Infer(ctx.fresh_infer_var()))
-        }
+        // For each branch: constrain the guard to Bool, infer the arm body type,
+        // and unify all arm types via `constrain_equal`.
+        //
+        // Returns the unified arm type, or `InferError::EmptyCase` for 0-branch `Case`.
+        TypedExprNode::Case { branches } => infer_case(branches, ctx),
 
         // ----- Tuple constructor -----
         //
@@ -662,6 +659,43 @@ fn infer_groupby(
     }
 }
 
+/// Infer the type of a [`TypedExprNode::Case`] expression.
+///
+/// For each branch, the guard is constrained to [`Type::Base(BaseType::Bool)`]
+/// and the body type is collected. All body types are unified via
+/// [`constrain_equal`](TypeInferenceContext::constrain_equal); the unified
+/// type is returned as the `Case` expression's type.
+///
+/// # Errors
+///
+/// - [`InferError::EmptyCase`] — `branches` is empty (malformed AST; lowering never produces this).
+/// - [`InferError::TypeMismatch`] — two arms unify to distinct concrete types (e.g. `Int` vs
+///   `String`). All arms must currently agree on one type; [`Type::Union`] is not yet produced.
+fn infer_case(branches: &mut [Branch], ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
+    let mut result_ty: Option<Type> = None;
+    for Branch { guard, body } in branches.iter_mut() {
+        // Guards must be boolean expressions.
+        let guard_ty = infer_expr(guard, ctx)?;
+        ctx.constrain_equal(&guard_ty, &Type::Base(BaseType::Bool))?;
+        // Collect the arm body type and unify with the accumulated result type.
+        let arm_ty = infer_expr(body, ctx)?;
+        match result_ty.take() {
+            None => result_ty = Some(arm_ty),
+            Some(prev) => {
+                ctx.constrain_equal(&prev, &arm_ty)?;
+                // Keep `prev` unless `arm_ty` is concrete: stable accumulation
+                // that only replaces when the new value is strictly more informative.
+                result_ty = Some(if matches!(arm_ty, Type::Infer(_)) {
+                    prev
+                } else {
+                    arm_ty
+                });
+            }
+        }
+    }
+    result_ty.ok_or(InferError::EmptyCase)
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -866,7 +900,7 @@ mod tests {
     use crate::ccl::symbolic::symbolic;
     use crate::ccl::BaseType;
     use crate::ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, Lit, LogicKind, Type,
+        AggregateKind, ArithmeticKind, BinOpKind, Branch, CompareKind, Expr, Lit, LogicKind, Type,
         TypedBinding, TypedExpr, TypedExprNode,
     };
 
@@ -1946,5 +1980,63 @@ mod tests {
         let mut expr = Expr::new(TypedExprNode::Record(vec![]));
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Record(vec![]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Case inference tests
+    // -----------------------------------------------------------------------
+
+    /// A `Case` arm that uses a `Let` binding in its body: variable `x` is
+    /// bound via `Let` and used in arithmetic — the arm result is `Int`.
+    #[test]
+    fn test_infer_case_let_binding_in_arm() {
+        let mut ctx = TypeInferenceContext::new();
+        // { true → let x = 42 in x + 1 }
+        let mut expr = Expr::new(TypedExprNode::Case {
+            branches: vec![Branch {
+                guard: Expr::lit(Lit::Bool(true)),
+                body: Expr::let_bind(
+                    "x",
+                    Expr::lit(Lit::Int(42)),
+                    Expr::binop(
+                        Expr::var("x"),
+                        BinOpKind::Arithmetic(ArithmeticKind::Add),
+                        Expr::lit(Lit::Int(1)),
+                    ),
+                ),
+            }],
+        });
+        let ty = infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(ty, Type::Base(BaseType::Int));
+    }
+
+    /// All `Case` branches must agree on the result type; unification of
+    /// compatible types (both `Int`) succeeds and returns `Int`.
+    #[test]
+    fn test_infer_case_branches_unified() {
+        let mut ctx = TypeInferenceContext::new();
+        // { true → 1; true → 2 }
+        let mut expr = Expr::new(TypedExprNode::Case {
+            branches: vec![
+                Branch {
+                    guard: Expr::lit(Lit::Bool(true)),
+                    body: Expr::lit(Lit::Int(1)),
+                },
+                Branch {
+                    guard: Expr::lit(Lit::Bool(true)),
+                    body: Expr::lit(Lit::Int(2)),
+                },
+            ],
+        });
+        let ty = infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(ty, Type::Base(BaseType::Int));
+    }
+
+    /// An empty `Case` (no branches) is a malformed AST; inference returns [`InferError::EmptyCase`].
+    #[test]
+    fn test_infer_case_no_branches() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::new(TypedExprNode::Case { branches: vec![] });
+        assert_eq!(infer(&mut expr, &mut ctx), Err(InferError::EmptyCase));
     }
 }
