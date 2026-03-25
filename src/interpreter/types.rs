@@ -678,6 +678,39 @@ pub struct FuncBinding {
     pub output: Value,
 }
 
+/// Retain elements of `v` where the corresponding `mask` bit is true.
+///
+/// Uses a two-pointer swap to avoid shifting: a left cursor finds positions to
+/// drop while a right cursor finds positions to keep; they swap and advance
+/// toward each other. Surviving elements appear in unspecified order.
+fn retain_vec<T>(v: &mut Vec<T>, mask: &BitVec) {
+    let n = v.len();
+    if n == 0 {
+        return;
+    }
+    let mut left = 0usize;
+    let mut right = n - 1;
+    loop {
+        // Advance left past positions that are already kept.
+        while left < right && mask[left] {
+            left += 1;
+        }
+        // Retreat right past positions that are already dropped.
+        while right > left && !mask[right] {
+            right -= 1;
+        }
+        if left >= right {
+            break;
+        }
+        // mask[left]==false and mask[right]==true: swap so the kept value moves left.
+        v.swap(left, right);
+        left += 1;
+        right -= 1;
+    }
+    let count = mask.iter().filter(|b| *b).count();
+    v.truncate(count);
+}
+
 /// Columnar data for vectorized execution.
 /// Each variant holds a typed batch of values produced during interpretation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -970,6 +1003,7 @@ impl ColumnValue {
     /// Drain this column into an owned iterator of [`Value`]s, one per row.
     ///
     /// After the call, `self` is left in a valid but empty state.
+    /// Note: this is quite expensive and should be used as a last resort.
     pub fn drain_to_value_iter(&mut self) -> Box<dyn Iterator<Item = Value>> {
         match self {
             ColumnValue::Units(n) => {
@@ -1093,10 +1127,74 @@ impl ColumnValue {
         }
     }
 
+    /// Retain only elements where `mask[i]` is true, in-place.
+    ///
+    /// Does not preserve element ordering; uses swap-remove to avoid shifting data.
+    pub fn retain(&mut self, mask: &BitVec) {
+        assert_eq!(
+            mask.len(),
+            self.len(),
+            "mask length must match column length"
+        );
+        match self {
+            ColumnValue::Units(_) => {
+                *self = ColumnValue::Units(mask.count_ones() as usize);
+            }
+            ColumnValue::Ints(v) => retain_vec(v, mask),
+            ColumnValue::UInts(v) => retain_vec(v, mask),
+            ColumnValue::Strings(v) => retain_vec(v, mask),
+            ColumnValue::Variants(v) => retain_vec(v, mask),
+            ColumnValue::Bools(v) => {
+                let n = v.len();
+                if n > 0 {
+                    let mut left = 0usize;
+                    let mut right = n - 1;
+                    loop {
+                        while left < right && mask[left] {
+                            left += 1;
+                        }
+                        while right > left && !mask[right] {
+                            right -= 1;
+                        }
+                        if left >= right {
+                            break;
+                        }
+                        let lv = v[left];
+                        let rv = v[right];
+                        v.set(left, rv);
+                        v.set(right, lv);
+                        left += 1;
+                        right -= 1;
+                    }
+                }
+                let count = mask.iter().filter(|b| *b).count();
+                v.truncate(count);
+            }
+            ColumnValue::FunctionBindings { inputs, outputs } => {
+                inputs.retain(mask);
+                outputs.retain(mask);
+            }
+            ColumnValue::Records(r) => {
+                for v in r.values_mut() {
+                    v.retain(mask);
+                }
+            }
+        }
+    }
+
     pub fn for_each_uint(&mut self, f: impl Fn(&mut usize)) {
         match self {
             ColumnValue::UInts(v) => v.iter_mut().for_each(f),
             _ => panic!("Not UInts"),
+        }
+    }
+
+    /// Returns a reference to the internal bitvec if this ColumnValue is bools.
+    pub fn as_bitvec(&self) -> Option<&BitVec> {
+        if let ColumnValue::Bools(b) = self {
+            Some(b)
+        } else {
+            None
         }
     }
 }
@@ -1130,6 +1228,38 @@ mod tests {
     fn test_cartesian_product_empty_map() {
         let result = ColumnValue::cartesian_product(HashMap::new());
         assert_eq!(result, ColumnValue::Records(HashMap::new()));
+    }
+
+    // --- retain_vec tests ---
+
+    #[test]
+    fn test_retain_vec_keep_some() {
+        // mask: keep indices 0 and 2, drop index 1.
+        // Order is unspecified; sort to compare.
+        let mut v = vec![10, 20, 30];
+        let mut mask = BitVec::from_elem(3, false);
+        mask.set(0, true);
+        mask.set(2, true);
+        retain_vec(&mut v, &mask);
+        v.sort();
+        assert_eq!(v, vec![10, 30]);
+    }
+
+    #[test]
+    fn test_retain_vec_keep_all() {
+        let mut v = vec![1, 2, 3];
+        let mask = BitVec::from_elem(3, true);
+        retain_vec(&mut v, &mask);
+        v.sort();
+        assert_eq!(v, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_retain_vec_keep_none() {
+        let mut v = vec![1, 2, 3];
+        let mask = BitVec::from_elem(3, false);
+        retain_vec(&mut v, &mask);
+        assert!(v.is_empty());
     }
 
     // --- Display tests ---

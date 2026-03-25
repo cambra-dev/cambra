@@ -52,7 +52,11 @@ fn run_pipeline(code: &str) -> Tile {
 /// Assert `code` produces `expected` via the direct path; additionally assert
 /// the pipeline path if `pipeline == Both`.
 fn check_tile(code: &str, expected: Tile) {
-    assert_eq!(run_pipeline(code), expected, "pipeline path");
+    assert_eq!(
+        sort_sealed_function_by_domain(run_pipeline(code)),
+        sort_sealed_function_by_domain(expected),
+        "pipeline path"
+    );
 }
 
 /// Scalar variant of [`parity`]: unwraps the result via [`ColumnValue::as_single`]
@@ -272,8 +276,6 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
 // Multi-generator comprehensions / joins
 // ---------------------------------------------------------------------------
 //
-// TODO: `ccl::lower` does not yet support multiple generators.
-//
 // The join tests check only the `outputs` of the resulting `FunctionBindings`
 // because the input key domain (cross-product indices) is an implementation
 // detail.
@@ -294,7 +296,7 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
 // TODO turn back to hash join
 #[case(
     "[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'e'] if x == y and True]",
-    ColumnValue::strings(&["bb", "cc"])
+    ColumnValue::strings(&["cc", "bb"])
 )]
 // Loop join with non-equality predicate involving both generators
 // TODO turn back to hash join
@@ -308,7 +310,7 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'd'] if x < y]",
-    ColumnValue::strings(&["ab", "ac", "ad", "bc", "bd", "cd"])
+    ColumnValue::strings(&["ab", "ac", "ad","cd", "bc", "bd"])
 )]
 // TODO turn back to hash join
 #[case(
@@ -317,7 +319,7 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y + z for x in ['a', 'b'] for y in ['b', 'c'] for z in ['b', 'c'] if x != y if y == z]",
-    ColumnValue::strings(&["abb", "acc", "bcc"])
+    ColumnValue::strings(&["abb", "bcc", "acc"])
 )]
 #[case(
     "[x + y for x in ['a', 'b', 'c'] for y in ['a', 'b', 'c'] if x == y if x < 'c']",
@@ -335,7 +337,7 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     ColumnValue::strings(&["abdf", "abef", "acdf", "acef"])
 )]
 fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
-    let result = run_pipeline(code);
+    let result = sort_sealed_function_by_domain(run_pipeline(code));
     match result {
         Tile::SealedFunction { codomain, .. } => {
             assert_eq!(scalar_tile_to_column_value(*codomain), expected);

@@ -404,26 +404,69 @@ impl Tile {
         debug_assert!(validate_tile(self), "Invalid tile: {self:?}");
     }
 
-    /// Select elements at the given row indices, producing a new `Tile` of the same variant.
-    ///
-    /// Supports `Scalar` and `Record` tiles; panics for other variants.
-    fn select_indices(&self, indices: &[usize]) -> Tile {
+    /// Retain in-place only the elements at positions where `mask[i]` is true.
+    pub fn retain(&mut self, mask: &BitVec) {
         match self {
-            Tile::Scalar(cv) => {
-                Tile::Scalar(cv.select_indices(indices.iter().cloned(), indices.len()))
+            Tile::Scalar(cv) => cv.retain(mask),
+            Tile::Record(m) => m.values_mut().for_each(|t| t.retain(mask)),
+            Tile::SealedFunction {
+                domain, codomain, ..
+            } => {
+                domain.retain(mask);
+                codomain.retain(mask);
             }
-            Tile::Record(m) => Tile::Record(
-                m.iter()
-                    .map(|(k, t)| (k.clone(), t.select_indices(indices)))
-                    .collect(),
-            ),
-            _ => panic!("select_indices not supported for {self:?}"),
+            Tile::CurriedFunction {
+                domain1,
+                offsets,
+                domain2,
+                codomain,
+                ..
+            } => {
+                // The mask is over the flat domain2/codomain rows.
+                assert_eq!(
+                    mask.len(),
+                    domain2.len(),
+                    "retain mask length must equal domain2 length"
+                );
+                // Clone offsets so we can write to *offsets afterward.
+                let old_offsets = match &*offsets {
+                    ColumnValue::UInts(v) => v.clone(),
+                    _ => panic!("CurriedFunction offsets must be UInts"),
+                };
+                let n = domain1.len();
+                let domain2_total = domain2.len();
+                // Recompute domain1 and offsets, dropping groups with no survivors.
+                // Collect kept domain2 indices in order so that group contiguity is
+                // preserved in the compacted flat arrays.
+                let mut new_domain1_keep: Vec<usize> = Vec::new();
+                let mut new_offsets: Vec<usize> = Vec::new();
+                let mut kept_indices: Vec<usize> = Vec::new();
+                for i in 0..n {
+                    let start = old_offsets[i];
+                    let end = if i + 1 < n {
+                        old_offsets[i + 1]
+                    } else {
+                        domain2_total
+                    };
+                    let group_kept: Vec<usize> = (start..end).filter(|&j| mask[j]).collect();
+                    if !group_kept.is_empty() {
+                        new_offsets.push(kept_indices.len());
+                        new_domain1_keep.push(i);
+                        kept_indices.extend(group_kept);
+                    }
+                }
+                let kept_len = kept_indices.len();
+                *domain1 = domain1
+                    .select_indices(new_domain1_keep.iter().cloned(), new_domain1_keep.len());
+                *offsets = ColumnValue::UInts(new_offsets);
+                *domain2 = domain2.select_indices(kept_indices.iter().cloned(), kept_len);
+                *codomain = codomain.select_indices(kept_indices.iter().cloned(), kept_len);
+            }
+            _ => panic!("retain not supported for {self:?}"),
         }
     }
 
     /// Removes all data in this tile that is specified by the guard.
-    /// TODO this currently copies all retained elements.  We should instead move
-    /// elements around in the same buffers or just keep a bitset of retained positions.
     pub fn remove_guarded(&mut self, guard: TileGuard) {
         match (&mut *self, guard) {
             // If the guard is empty, do nothing.
@@ -473,22 +516,16 @@ impl Tile {
                 },
                 TileGuard::Function(FunctionGuard::Domain(pred)),
             ) => {
-                let keep: Vec<usize> = (0..domain.len())
-                    .filter(|&i| !pred.contains(&domain.index_at(i)))
+                let mask: BitVec = (0..domain.len())
+                    .map(|i| !pred.contains(&domain.index_at(i)))
                     .collect();
-                *domain = domain.select_indices(keep.iter().cloned(), keep.len());
-                **codomain = codomain.select_indices(&keep);
+                domain.retain(&mask);
+                codomain.retain(&mask);
             }
             // CurriedFunction: remove domain2+codomain entries whose domain2 value is in the predicate,
             // and prune any domain1 groups that become empty.
             (
-                Tile::CurriedFunction {
-                    domain1,
-                    offsets,
-                    domain2,
-                    codomain,
-                    ..
-                },
+                tile @ Tile::CurriedFunction { .. },
                 TileGuard::Function(FunctionGuard::Codomain(inner)),
             ) => {
                 let TileGuard::Function(FunctionGuard::Domain(pred)) = *inner else {
@@ -496,41 +533,18 @@ impl Tile {
                         "CurriedFunction remove_guarded only supports Codomain(Domain(pred))"
                     )
                 };
-                let ColumnValue::UInts(old_offsets) = &*offsets else {
-                    panic!("CurriedFunction offsets must be UInts")
-                };
-                let n = domain1.len();
-                let domain2_total = domain2.len();
-                // Indices of domain2 rows that survive (not covered by pred).
-                let keep: Vec<usize> = (0..domain2_total)
-                    .filter(|&i| !pred.contains(&domain2.index_at(i)))
-                    .collect();
-                // Rebuild domain1 and offsets, dropping empty groups.
-                let mut new_domain1_keep = Vec::new();
-                let mut new_offsets: Vec<usize> = Vec::new();
-                let mut cumulative = 0usize;
-                for i in 0..n {
-                    let start = old_offsets[i];
-                    let end = if i + 1 < n {
-                        old_offsets[i + 1]
-                    } else {
-                        domain2_total
+                // Borrow domain2 only long enough to build the survival mask, then
+                // release so retain can take the mutable borrow.
+                let mask: BitVec = {
+                    let Tile::CurriedFunction { domain2, .. } = &*tile else {
+                        unreachable!()
                     };
-                    // How many kept indices fall in this group (keep is sorted).
-                    let survivors =
-                        keep.partition_point(|&j| j < end) - keep.partition_point(|&j| j < start);
-                    if survivors > 0 {
-                        new_domain1_keep.push(i);
-                        new_offsets.push(cumulative);
-                        cumulative += survivors;
-                    }
-                }
-                *domain1 = domain1
-                    .select_indices(new_domain1_keep.iter().cloned(), new_domain1_keep.len());
-                *offsets = ColumnValue::UInts(new_offsets);
-                *domain2 = domain2.select_indices(keep.iter().cloned(), keep.len());
-                *codomain = codomain.select_indices(keep.iter().cloned(), keep.len());
+                    (0..domain2.len())
+                        .map(|i| !pred.contains(&domain2.index_at(i)))
+                        .collect()
+                };
                 // domain_predicate tracks domain1 completeness and is not updated on removal.
+                tile.retain(&mask);
             }
             (s, g) => panic!("Incompatible tile and guard in remove_guarded: {s:?} and {g:?}"),
         }
@@ -829,10 +843,33 @@ impl Predicate {
                 other => vec![other],
             })
             .collect();
-        match flat.len() {
-            0 => unreachable!("flatten_or called with no arms"),
-            1 => flat.into_iter().next().unwrap(),
-            _ => Predicate::Or(flat),
+        if flat.is_empty() {
+            unreachable!("flatten_or called with no arms");
+        }
+        // Drop any arm that is subsumed by another arm in the list.
+        // When two arms mutually subsume each other (i.e., are semantically
+        // equivalent) the one with the lower index is kept, avoiding both
+        // being removed.  The condition reads: remove arm[i] if there exists
+        // arm[j] (j ≠ i) that subsumes arm[i], unless arm[i] also subsumes
+        // arm[j] and i < j (in which case we prefer arm[i]).
+        let keep: Vec<bool> = flat
+            .iter()
+            .enumerate()
+            .map(|(i, arm)| {
+                !flat.iter().enumerate().any(|(j, other)| {
+                    j != i && other.subsumes(arm) && (j < i || !arm.subsumes(other))
+                })
+            })
+            .collect();
+        let reduced: Vec<Predicate> = flat
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(p, k)| k.then_some(p))
+            .collect();
+        match reduced.len() {
+            0 => unreachable!("flatten_or: all arms were removed by subsumption"),
+            1 => reduced.into_iter().next().unwrap(),
+            _ => Predicate::Or(reduced),
         }
     }
 
@@ -1007,6 +1044,58 @@ impl Predicate {
             },
             // Or: value is admitted if any arm admits it.
             Predicate::Or(arms) => arms.iter().any(|a| a.contains(value)),
+        }
+    }
+
+    /// Returns `true` if every value admitted by `other` is also admitted by `self`.
+    ///
+    /// In set terms: `other ⊆ self`.  Used by [`Predicate::flatten_or`] to
+    /// eliminate redundant arms: if arm A subsumes arm B, B adds nothing to the
+    /// union and can be dropped.
+    pub fn subsumes(&self, other: &Predicate) -> bool {
+        match (self, other) {
+            // True is the universal set; it subsumes everything.
+            (Predicate::True, _) => true,
+            // A non-True predicate cannot subsume the universal set.
+            (_, Predicate::True) => false,
+            // Everything subsumes the empty set.
+            (_, Predicate::False) => true,
+            // The empty set subsumes nothing non-empty (non-empty handled above).
+            (Predicate::False, _) => false,
+            // Two upper bounds: (-∞,a] ⊇ (-∞,b] iff a >= b.
+            (Predicate::LessThanEq(a), Predicate::LessThanEq(b)) => a
+                .partial_cmp(b)
+                .map(|o| o != std::cmp::Ordering::Less)
+                .unwrap_or(false),
+            // (-∞,v] subsumes an interval set iff every interval in s fits within (-∞,v].
+            //
+            // Note: `IntervalSet::contains(&IntervalSet)` has a known bug in the
+            // `intervalsets` crate (it iterates `self` instead of `rhs`), so we
+            // iterate the intervals of the rhs ourselves throughout this method.
+            (Predicate::LessThanEq(v), Predicate::Intervals(s)) => {
+                let upper = Interval::unbound_closed(v.clone());
+                s.intervals().iter().all(|iv| upper.contains(iv))
+            }
+            // An interval set subsumes (-∞,v] only if it contains the whole half-line.
+            (Predicate::Intervals(s), Predicate::LessThanEq(v)) => {
+                s.contains(&Interval::unbound_closed(v.clone()))
+            }
+            // Interval set containment: self ⊇ other iff every interval of other
+            // is contained within some interval of self.
+            (Predicate::Intervals(a), Predicate::Intervals(b)) => {
+                b.intervals().iter().all(|iv| a.contains(iv))
+            }
+            // Record (AND semantics): self ⊇ other iff every field of self subsumes
+            // the corresponding field of other.
+            (Predicate::Record(m1), Predicate::Record(m2)) if m1.len() == m2.len() => m1
+                .iter()
+                .all(|(k, p1)| m2.get(k).is_some_and(|p2| p1.subsumes(p2))),
+            // A union subsumes `other` if any of its arms subsumes it.
+            (Predicate::Or(arms), _) => arms.iter().any(|a| a.subsumes(other)),
+            // self subsumes a union iff it subsumes every arm.
+            (_, Predicate::Or(arms)) => arms.iter().all(|a| self.subsumes(a)),
+            // Incompatible variants (e.g. Record vs LessThanEq): conservative false.
+            _ => false,
         }
     }
 
@@ -2101,21 +2190,23 @@ mod tests {
     // Record ∪ Record: cannot push OR through AND, result must be Or([r1, r2]).
     #[test]
     fn union_record_predicates_produces_or() {
+        // Neither record subsumes the other: r1 is looser on x, r2 is looser on y.
+        // r1 admits {x≤5, y≤3}; r2 admits {x≤3, y≤7}.  Each admits records the
+        // other does not, so neither is redundant and the union must be an Or.
         let r1 = record_pred(&[
-            ("x", Predicate::LessThanEq(Value::UInt(3))),
-            ("y", Predicate::False),
+            ("x", Predicate::LessThanEq(Value::UInt(5))),
+            ("y", Predicate::LessThanEq(Value::UInt(3))),
         ]);
         let r2 = record_pred(&[
-            ("x", Predicate::LessThanEq(Value::UInt(7))),
-            ("y", Predicate::True),
+            ("x", Predicate::LessThanEq(Value::UInt(3))),
+            ("y", Predicate::LessThanEq(Value::UInt(7))),
         ]);
         let result = r1.union(&r2);
-        // Must be an Or, not a Record — distributing OR through AND overapproximates.
+        // Must be an Or — OR cannot be pushed through AND for records.
         assert!(
             matches!(result, Predicate::Or(_)),
             "expected Or, got {result:?}"
         );
-        // r2 contains {y: True} so the union admits records with any y value.
         assert_eq!(result.as_bool(), None); // non-trivial
     }
 
@@ -2178,6 +2269,186 @@ mod tests {
             domain_predicate: Predicate::True,
         };
         assert!(tile.is_terminal());
+    }
+
+    // ── Predicate::subsumes ───────────────────────────────────────────────────
+
+    // True subsumes everything; nothing other than True subsumes True.
+    #[test]
+    fn subsumes_true_subsumes_all() {
+        assert!(Predicate::True.subsumes(&Predicate::True));
+        assert!(Predicate::True.subsumes(&Predicate::False));
+        assert!(Predicate::True.subsumes(&Predicate::LessThanEq(Value::UInt(5))));
+    }
+
+    #[test]
+    fn subsumes_non_true_does_not_subsume_true() {
+        assert!(!Predicate::False.subsumes(&Predicate::True));
+        assert!(!Predicate::LessThanEq(Value::UInt(5)).subsumes(&Predicate::True));
+    }
+
+    // False (empty set) is subsumed by everything; it only subsumes itself.
+    #[test]
+    fn subsumes_everything_subsumes_false() {
+        assert!(Predicate::False.subsumes(&Predicate::False));
+        assert!(Predicate::True.subsumes(&Predicate::False));
+        assert!(Predicate::LessThanEq(Value::UInt(0)).subsumes(&Predicate::False));
+    }
+
+    #[test]
+    fn subsumes_false_does_not_subsume_nonempty() {
+        assert!(!Predicate::False.subsumes(&Predicate::True));
+        assert!(!Predicate::False.subsumes(&Predicate::LessThanEq(Value::UInt(3))));
+    }
+
+    // LessThanEq: (-∞,a] ⊇ (-∞,b] iff a >= b.
+    #[test]
+    fn subsumes_less_than_eq_looser_subsumes_tighter() {
+        assert!(
+            Predicate::LessThanEq(Value::UInt(7)).subsumes(&Predicate::LessThanEq(Value::UInt(3)))
+        );
+    }
+
+    #[test]
+    fn subsumes_less_than_eq_equal_bounds() {
+        assert!(
+            Predicate::LessThanEq(Value::UInt(5)).subsumes(&Predicate::LessThanEq(Value::UInt(5)))
+        );
+    }
+
+    #[test]
+    fn subsumes_less_than_eq_tighter_does_not_subsume_looser() {
+        assert!(
+            !Predicate::LessThanEq(Value::UInt(3)).subsumes(&Predicate::LessThanEq(Value::UInt(7)))
+        );
+    }
+
+    // LessThanEq vs Intervals.
+    #[test]
+    fn subsumes_less_than_eq_subsumes_contained_interval_set() {
+        // (-∞,10] ⊇ {3,7}: both points are <= 10.
+        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 7]));
+        assert!(Predicate::LessThanEq(Value::UInt(10)).subsumes(&s));
+    }
+
+    #[test]
+    fn subsumes_less_than_eq_does_not_subsume_escaping_interval_set() {
+        // (-∞,5] ⊉ {3,7}: 7 > 5.
+        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 7]));
+        assert!(!Predicate::LessThanEq(Value::UInt(5)).subsumes(&s));
+    }
+
+    #[test]
+    fn subsumes_interval_set_does_not_subsume_less_than_eq() {
+        // {3,7} ⊉ (-∞,10]: the half-line is unbounded, the set is finite.
+        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 7]));
+        assert!(!s.subsumes(&Predicate::LessThanEq(Value::UInt(10))));
+    }
+
+    // Intervals vs Intervals.
+    #[test]
+    fn subsumes_interval_superset_subsumes_subset() {
+        // {1,2,3,4} ⊇ {2,3}.
+        let big = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4]));
+        let small = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3]));
+        assert!(big.subsumes(&small));
+        assert!(!small.subsumes(&big));
+    }
+
+    #[test]
+    fn subsumes_equal_interval_sets() {
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3]));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3]));
+        assert!(a.subsumes(&b));
+        assert!(b.subsumes(&a));
+    }
+
+    #[test]
+    fn subsumes_disjoint_interval_sets_neither_subsumes() {
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2]));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 4]));
+        assert!(!a.subsumes(&b));
+        assert!(!b.subsumes(&a));
+    }
+
+    // Record: field-by-field AND semantics.
+    #[test]
+    fn subsumes_record_field_by_field() {
+        // {x: ≤10, y: ≤10} ⊇ {x: ≤5, y: ≤3}: both fields are looser in self.
+        let big = record_pred(&[
+            ("x", Predicate::LessThanEq(Value::UInt(10))),
+            ("y", Predicate::LessThanEq(Value::UInt(10))),
+        ]);
+        let small = record_pred(&[
+            ("x", Predicate::LessThanEq(Value::UInt(5))),
+            ("y", Predicate::LessThanEq(Value::UInt(3))),
+        ]);
+        assert!(big.subsumes(&small));
+        assert!(!small.subsumes(&big));
+    }
+
+    #[test]
+    fn subsumes_record_incomparable_fields() {
+        // {x: ≤5, y: ≤10}: x-field is tighter than r2, y-field is looser.
+        // Neither record subsumes the other.
+        let r1 = record_pred(&[
+            ("x", Predicate::LessThanEq(Value::UInt(5))),
+            ("y", Predicate::LessThanEq(Value::UInt(10))),
+        ]);
+        let r2 = record_pred(&[
+            ("x", Predicate::LessThanEq(Value::UInt(10))),
+            ("y", Predicate::LessThanEq(Value::UInt(5))),
+        ]);
+        assert!(!r1.subsumes(&r2));
+        assert!(!r2.subsumes(&r1));
+    }
+
+    #[test]
+    fn subsumes_record_with_true_field_subsumes_anything_in_that_field() {
+        // {x: True, y: ≤3} ⊇ {x: ≤7, y: ≤3}: True subsumes any x predicate.
+        let big = record_pred(&[
+            ("x", Predicate::True),
+            ("y", Predicate::LessThanEq(Value::UInt(3))),
+        ]);
+        let small = record_pred(&[
+            ("x", Predicate::LessThanEq(Value::UInt(7))),
+            ("y", Predicate::LessThanEq(Value::UInt(3))),
+        ]);
+        assert!(big.subsumes(&small));
+        assert!(!small.subsumes(&big));
+    }
+
+    // Or: union subsumes `other` if any arm does; self subsumes a union iff it
+    // subsumes every arm.
+    #[test]
+    fn subsumes_or_any_arm_suffices() {
+        // Or([≤3, ≤10]) ⊇ ≤5 because the ≤10 arm already covers it.
+        let or_pred =
+            Predicate::LessThanEq(Value::UInt(3)).union(&Predicate::LessThanEq(Value::UInt(10)));
+        // union of two LessThanEqs collapses to just LessThanEq(10), so
+        // construct an Or via Record union to exercise the Or path.
+        let arm_a = record_pred(&[("x", Predicate::LessThanEq(Value::UInt(10)))]);
+        let arm_b = record_pred(&[("x", Predicate::LessThanEq(Value::UInt(3)))]);
+        let or_rec = arm_a.union(&arm_b); // Or([arm_a, arm_b]) simplified to [arm_a]
+        let target = record_pred(&[("x", Predicate::LessThanEq(Value::UInt(5)))]);
+        assert!(or_pred.subsumes(&Predicate::LessThanEq(Value::UInt(5))));
+        assert!(or_rec.subsumes(&target));
+    }
+
+    #[test]
+    fn subsumes_value_must_subsume_all_or_arms() {
+        // ≤10 ⊇ Or([≤3, ≤7]) because 10 >= both 3 and 7.
+        let or_pred =
+            Predicate::LessThanEq(Value::UInt(3)).union(&Predicate::LessThanEq(Value::UInt(7)));
+        assert!(Predicate::LessThanEq(Value::UInt(10)).subsumes(&or_pred));
+    }
+
+    #[test]
+    fn subsumes_value_does_not_subsume_or_if_any_arm_escapes() {
+        // ≤5 ⊉ Or([≤3, ≤7]) because the ≤7 arm extends beyond 5.
+        let or_pred =
+            Predicate::LessThanEq(Value::UInt(3)).union(&Predicate::LessThanEq(Value::UInt(7)));
+        assert!(!Predicate::LessThanEq(Value::UInt(5)).subsumes(&or_pred));
     }
 
     // ── helpers for merge / to_guard / remove_guarded tests ──────────────────
@@ -2507,5 +2778,139 @@ mod tests {
         let guard = tile.to_guard();
         tile.remove_guarded(guard);
         assert_eq!(tile.to_guard(), cf_release_guard(Predicate::False));
+    }
+
+    // ── Tile::retain (CurriedFunction) ────────────────────────────────────────
+    //
+    // The mask is over the flat domain2/codomain rows.
+    // Groups with no surviving rows are pruned from domain1 and offsets.
+    //
+    // Test tile layout (used throughout):
+    //   Group 0 (d1=10): d2=[0,1],     cod=[100,110]       — flat positions 0,1
+    //   Group 1 (d1=20): d2=[2,3,4],   cod=[200,210,220]   — flat positions 2,3,4
+    //   Group 2 (d1=30): d2=[5],       cod=[300]           — flat position 5
+
+    fn cf_three_groups() -> Tile {
+        cf_uint_int(
+            vec![10, 20, 30],
+            vec![0, 2, 5],
+            vec![0, 1, 2, 3, 4, 5],
+            vec![100, 110, 200, 210, 220, 300],
+            Predicate::False,
+        )
+    }
+
+    #[test]
+    fn retain_curried_function_keep_all_is_noop() {
+        let mut tile = cf_three_groups();
+        tile.retain(&BitVec::from_elem(6, true));
+        assert_eq!(tile, cf_three_groups());
+    }
+
+    #[test]
+    fn retain_curried_function_keep_none_empties_tile() {
+        let mut tile = cf_three_groups();
+        tile.retain(&BitVec::from_elem(6, false));
+        assert_eq!(
+            tile,
+            cf_uint_int(vec![], vec![], vec![], vec![], Predicate::False)
+        );
+    }
+
+    #[test]
+    fn retain_curried_function_keep_entire_first_group() {
+        let mut tile = cf_three_groups();
+        // Keep positions 0,1 (group 0); drop the rest.
+        tile.retain(&BitVec::from_fn(6, |i| i < 2));
+        assert_eq!(
+            tile,
+            cf_uint_int(
+                vec![10],
+                vec![0],
+                vec![0, 1],
+                vec![100, 110],
+                Predicate::False
+            )
+        );
+    }
+
+    #[test]
+    fn retain_curried_function_keep_entire_middle_group() {
+        let mut tile = cf_three_groups();
+        // Keep positions 2,3,4 (group 1); drop the rest.
+        tile.retain(&BitVec::from_fn(6, |i| (2..=4).contains(&i)));
+        assert_eq!(
+            tile,
+            cf_uint_int(
+                vec![20],
+                vec![0],
+                vec![2, 3, 4],
+                vec![200, 210, 220],
+                Predicate::False,
+            )
+        );
+    }
+
+    #[test]
+    fn retain_curried_function_keep_entire_last_group() {
+        let mut tile = cf_three_groups();
+        // Keep position 5 (group 2); drop the rest.
+        tile.retain(&BitVec::from_fn(6, |i| i == 5));
+        assert_eq!(
+            tile,
+            cf_uint_int(vec![30], vec![0], vec![5], vec![300], Predicate::False)
+        );
+    }
+
+    #[test]
+    fn retain_curried_function_drop_entire_middle_group() {
+        let mut tile = cf_three_groups();
+        // Keep groups 0 and 2; drop group 1 (positions 2,3,4).
+        tile.retain(&BitVec::from_fn(6, |i| !(2..=4).contains(&i)));
+        assert_eq!(
+            tile,
+            cf_uint_int(
+                vec![10, 30],
+                vec![0, 2],
+                vec![0, 1, 5],
+                vec![100, 110, 300],
+                Predicate::False,
+            )
+        );
+    }
+
+    #[test]
+    fn retain_curried_function_partial_mask_within_group() {
+        let mut tile = cf_three_groups();
+        // Keep only d2[1] from group 0 and d2[3] from group 1; drop everything else.
+        // Positions kept: 1 and 3.
+        tile.retain(&BitVec::from_fn(6, |i| i == 1 || i == 3));
+        assert_eq!(
+            tile,
+            cf_uint_int(
+                vec![10, 20],
+                vec![0, 1],
+                vec![1, 3],
+                vec![110, 210],
+                Predicate::False,
+            )
+        );
+    }
+
+    #[test]
+    fn retain_curried_function_partial_mask_prunes_empty_group() {
+        let mut tile = cf_three_groups();
+        // Keep d2[2] and d2[4] (both in group 1); groups 0 and 2 have no survivors.
+        tile.retain(&BitVec::from_fn(6, |i| i == 2 || i == 4));
+        assert_eq!(
+            tile,
+            cf_uint_int(
+                vec![20],
+                vec![0],
+                vec![2, 4],
+                vec![200, 220],
+                Predicate::False
+            )
+        );
     }
 }

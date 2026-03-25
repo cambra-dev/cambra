@@ -72,7 +72,7 @@ pub fn reset_infer_var_counter() {
     INFER_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
 
-use crate::interpreter::{ColumnValue, Extent, Value};
+use crate::interpreter::{ColumnValue, Extent};
 
 /// Primitive base types shared between the CCL type system and the interpreter.
 ///
@@ -286,12 +286,14 @@ impl AggregateKind {
         };
     }
 
-    pub fn extract(&self, accumulator: &ColumnValue) -> Value {
-        match (self, accumulator) {
-            (AggregateKind::Sum, ColumnValue::Ints(ref acc)) => Value::Int(acc[0]),
-            (AggregateKind::Max, ColumnValue::Ints(ref acc)) => Value::Int(acc[0]),
-            (AggregateKind::Max, ColumnValue::UInts(ref acc)) => Value::UInt(acc[0]),
-            (AggregateKind::Max, ColumnValue::Strings(ref acc)) => Value::String(acc[0].clone()),
+    /// Convert accumulator state into output state.
+    /// Currently, we only have aggregates where the extracted state is equal to the accumulators.
+    pub fn extract(&self, accumulator: ColumnValue) -> ColumnValue {
+        match (self, &accumulator) {
+            (AggregateKind::Sum, ColumnValue::Ints(_))
+            | (AggregateKind::Max, ColumnValue::Ints(_))
+            | (AggregateKind::Max, ColumnValue::UInts(_))
+            | (AggregateKind::Max, ColumnValue::Strings(_)) => accumulator,
             _ => panic!("Invalid accumulate"),
         }
     }

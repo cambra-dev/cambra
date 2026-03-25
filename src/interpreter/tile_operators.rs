@@ -503,7 +503,6 @@ impl TileProducer for MapResultProducer {
         let input_tile = self.input.get(input_guard);
         let function_tile = self.function.get(self.function.tiling().universal_guard());
 
-        debug!("map impl {i_tiling} {f_codomain_extent}");
         process_tile_result(self.tiling(), input_tile, move |codomain| {
             apply_function_tile(function_tile, codomain, &f_codomain_extent)
         })
@@ -777,7 +776,7 @@ fn release_extent(extent: &mut Extent, pred: &Predicate) {
                     .count()
                     < field_preds.len() - 1
                 {
-                    unimplemented!()
+                    unimplemented!("Got predicate {p:?}")
                 }
                 for (f, e) in fields.iter_mut() {
                     let others_all_true = field_preds
@@ -1489,13 +1488,6 @@ impl TileProducer for FilterProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let pred_guard = self.predicate.tiling().universal_guard();
         let i_guard = self.input.tiling().universal_guard();
-        let (domain_extent, codomain_tiling) = match self.tiling() {
-            Tiling::SealedFunction { domain, codomain } => {
-                (domain.clone(), codomain.as_ref().clone())
-            }
-            _ => panic!("Filter tiling must be SealedFunction"),
-        };
-        let codomain_extent = codomain_tiling.extent();
         let predicate_result = self.predicate.get(pred_guard);
         let input_result = self.input.get(i_guard);
 
@@ -1504,88 +1496,55 @@ impl TileProducer for FilterProducer {
             (
                 Tile::Scalar(pred),
                 Tile::SealedFunction {
-                    mut domain,
+                    domain,
                     codomain,
                     domain_predicate,
                 },
-            ) => {
-                let mut codomain = scalar_tile_to_column_value(*codomain);
-                match pred.as_single() {
-                    Some(Value::Function(f)) => {
-                        // Build the set of domain values where the predicate is true.
-                        let keep_set: std::collections::HashSet<Value> = f
-                            .into_iter()
-                            .filter_map(|b| (b.output == Value::Bool(true)).then_some(b.input))
-                            .collect();
-                        let (kept_domain, kept_codomain): (Vec<Value>, Vec<Value>) = domain
-                            .drain_to_value_iter()
-                            .zip(codomain.drain_to_value_iter())
-                            .filter(|(d, _)| keep_set.contains(d))
-                            .unzip();
-                        Tile::SealedFunction {
-                            domain: ColumnValue::from_values(kept_domain, &domain_extent),
-                            codomain: Box::new(column_value_to_tile(
-                                ColumnValue::from_values(kept_codomain, &codomain_extent),
-                                &codomain_tiling,
-                            )),
-                            domain_predicate,
-                        }
-                    }
-                    Some(Value::ComputableFunction(f)) => {
-                        // Apply predicate to all domain values at once to get a bool mask.
-                        let mut mask = f.apply(domain.clone());
-                        let (kept_domain, kept_codomain): (Vec<Value>, Vec<Value>) = domain
-                            .drain_to_value_iter()
-                            .zip(codomain.drain_to_value_iter())
-                            .zip(mask.drain_to_value_iter())
-                            .filter_map(|((d, c), m)| (m == Value::Bool(true)).then_some((d, c)))
-                            .unzip();
-                        Tile::SealedFunction {
-                            domain: ColumnValue::from_values(kept_domain, &domain_extent),
-                            codomain: Box::new(column_value_to_tile(
-                                ColumnValue::from_values(kept_codomain, &codomain_extent),
-                                &codomain_tiling,
-                            )),
-                            domain_predicate,
-                        }
-                    }
-                    _ => panic!("Filter predicate is not a function"),
+            ) => match pred.as_single() {
+                Some(Value::ComputableFunction(f)) => {
+                    let func_result = f.apply(domain.clone());
+                    let mask = func_result
+                        .as_bitvec()
+                        .unwrap_or_else(|| panic!("Expected boolean mask"));
+                    let mut output = Tile::SealedFunction {
+                        domain,
+                        codomain,
+                        domain_predicate,
+                    };
+                    output.retain(mask);
+                    output
                 }
-            }
+                _ => panic!("Filter predicate is not a function"),
+            },
             // Both predicate and input are function tiles sharing the same domain.
             (
                 Tile::SealedFunction {
-                    domain: mut pred_inputs,
+                    domain: pred_inputs,
                     codomain: pred_outputs,
                     ..
                 },
                 Tile::SealedFunction {
-                    domain: mut i_inputs,
+                    domain: i_inputs,
                     codomain: i_outputs,
                     domain_predicate,
                 },
             ) => {
-                let mut pred_outputs = scalar_tile_to_column_value(*pred_outputs);
-                let mut i_outputs = scalar_tile_to_column_value(*i_outputs);
+                // We rely on having the predicate and input sharing exactly the same domain
+                // so that we can cheaply extract the bitmask from the predicate codomain.
+                // This check is expensive, so only run it in debug builds.
+                debug_assert_eq!(pred_inputs, i_inputs);
+                let pred_outputs = scalar_tile_to_column_value(*pred_outputs);
                 // Build a domain-value → bool map from the predicate tile.
-                let keep_map: HashMap<Value, bool> = pred_inputs
-                    .drain_to_value_iter()
-                    .zip(pred_outputs.drain_to_value_iter())
-                    .map(|(k, v)| (k, v == Value::Bool(true)))
-                    .collect();
-                let (kept_domain, kept_codomain): (Vec<Value>, Vec<Value>) = i_inputs
-                    .drain_to_value_iter()
-                    .zip(i_outputs.drain_to_value_iter())
-                    .filter(|(d, _)| *keep_map.get(d).unwrap_or(&false))
-                    .unzip();
-                Tile::SealedFunction {
-                    domain: ColumnValue::from_values(kept_domain, &domain_extent),
-                    codomain: Box::new(column_value_to_tile(
-                        ColumnValue::from_values(kept_codomain, &codomain_extent),
-                        &codomain_tiling,
-                    )),
+                let mask = pred_outputs
+                    .as_bitvec()
+                    .unwrap_or_else(|| panic!("Expected bools"));
+                let mut output = Tile::SealedFunction {
+                    domain: i_inputs,
+                    codomain: i_outputs,
                     domain_predicate,
-                }
+                };
+                output.retain(mask);
+                output
             }
             _ => panic!("Invalid Filter input tiles"),
         }
@@ -1593,6 +1552,13 @@ impl TileProducer for FilterProducer {
 
     fn release(&mut self, obsolete_guard: TileGuard) {
         debug!("{} release: {obsolete_guard:?}", self.name());
+        if matches!(self.predicate.tiling(), Tiling::SealedFunction { .. }) {
+            // Both predicate and input share the same underlying domain source, so both
+            // must be released together; releasing only one leaves the other's upstream
+            // SplitProducer release-guard stale, causing it to re-deliver already-consumed
+            // data while the other side returns nothing on the next get().
+            self.predicate.release(obsolete_guard.clone());
+        }
         self.input.release(obsolete_guard);
     }
 }
@@ -1823,7 +1789,7 @@ impl TileProducer for ExtractAggregateProducer {
         };
         if self.only_terminal {
             if terminal.index_at(0).as_bool() {
-                Tile::Scalar(ColumnValue::single(self.kind.extract(&accumulator)))
+                Tile::Scalar(self.kind.extract(accumulator))
             } else {
                 self.tiling().empty_tile()
             }
@@ -1932,7 +1898,7 @@ impl TileProducer for MapExtractAggregateProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_result = self.input.get(self.input.tiling().universal_guard());
         let Tile::SealedFunction {
-            mut domain,
+            domain,
             codomain,
             domain_predicate,
         } = input_result
@@ -1940,36 +1906,24 @@ impl TileProducer for MapExtractAggregateProducer {
             panic!("MapExtractAggregate expected SealedFunction tile")
         };
         let Tile::Aggregation {
-            mut accumulator,
-            mut terminal,
+            accumulator,
+            terminal,
             ..
         } = *codomain
         else {
             panic!("MapExtractAggregate expected SealedFunction(Aggregation) codomain")
         };
-        let output_extent = self.tiling().codomain().unwrap().extent();
-        let domain_extent = self.tiling().domain_extent().unwrap();
         // Emit only the domain elements whose per-key aggregation is terminal.
-        let (kept_domain, kept_values): (Vec<Value>, Vec<Value>) = domain
-            .drain_to_value_iter()
-            .zip(accumulator.drain_to_value_iter())
-            .zip(terminal.drain_to_value_iter())
-            .filter_map(|((d, a), t)| {
-                if t.as_bool() {
-                    Some((d, self.kind.extract(&ColumnValue::single(a))))
-                } else {
-                    None
-                }
-            })
-            .unzip();
-        Tile::SealedFunction {
-            domain: ColumnValue::from_values(kept_domain, &domain_extent),
-            codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
-                kept_values,
-                &output_extent,
-            ))),
+        let mask = terminal
+            .as_bitvec()
+            .unwrap_or_else(|| panic!("Expected bools"));
+        let mut output = Tile::SealedFunction {
+            domain,
+            codomain: Box::new(Tile::Scalar(self.kind.extract(accumulator))),
             domain_predicate,
-        }
+        };
+        output.retain(mask);
+        output
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
@@ -2127,7 +2081,7 @@ impl TileProducer for MapAggregateProducer {
         let (domain_values, accumulator_values): (Vec<Value>, Vec<Value>) = self
             .accumulators
             .iter()
-            .map(|(key, acc)| (key.clone(), self.kind.extract(acc)))
+            .map(|(key, acc)| (key.clone(), acc.as_single().unwrap()))
             .unzip();
         Tile::SealedFunction {
             domain: ColumnValue::from_values(domain_values, &domain_extent),
