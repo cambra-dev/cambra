@@ -312,13 +312,85 @@ fn column_value_to_tile(cv: ColumnValue, tiling: &Tiling) -> Tile {
     }
 }
 
-/// Applies a function operator element-wise over a sealed-function input.
+/// Creates a new tiling based on the input tiling and a transformation of the deepest codomain
+/// of the input (i.e. the "result" of the tiling).
+fn change_tiling_result(
+    input_tiling: &Tiling,
+    transformation: impl FnOnce(&Extent) -> Tiling,
+) -> Tiling {
+    match input_tiling {
+        Tiling::Scalar(e) => transformation(e),
+        Tiling::Record(fields) => {
+            transformation(&Extent::Record(transform_hashmap_values(fields, |t| {
+                t.extent()
+            })))
+        }
+        Tiling::SealedFunction { domain, codomain } => Tiling::SealedFunction {
+            domain: domain.clone(),
+            codomain: Box::new(change_tiling_result(codomain, transformation)),
+        },
+        Tiling::CurriedFunction {
+            domain1,
+            domain2,
+            codomain,
+        } => Tiling::CurriedFunction {
+            domain1: domain1.clone(),
+            domain2: domain2.clone(),
+            codomain: transformation(codomain).extent(),
+        },
+        _ => panic!("Cannot apply Map to {input_tiling}"),
+    }
+}
+
+/// Apply the given transformation to the ColumnValue that is the deepest codomain of the
+/// provided nested function tile (i.e. the "result" of the tile).
+fn process_tile_result(
+    input_tiling: &Tiling,
+    input_tile: Tile,
+    transformation: impl FnOnce(ColumnValue) -> ColumnValue,
+) -> Tile {
+    match input_tile {
+        Tile::Scalar(t) => column_value_to_tile(transformation(t), input_tiling),
+        Tile::Record(fields) => column_value_to_tile(
+            transformation(scalar_tile_to_column_value(Tile::Record(fields))),
+            input_tiling,
+        ),
+        Tile::SealedFunction {
+            domain,
+            codomain,
+            domain_predicate,
+        } => Tile::SealedFunction {
+            domain,
+            domain_predicate,
+            codomain: Box::new(process_tile_result(
+                &input_tiling.codomain().unwrap_or_else(|| unreachable!()),
+                *codomain,
+                transformation,
+            )),
+        },
+        Tile::CurriedFunction {
+            domain1,
+            offsets,
+            domain2,
+            codomain,
+            domain_predicate,
+        } => Tile::CurriedFunction {
+            domain1,
+            offsets,
+            domain2,
+            codomain: transformation(codomain),
+            domain_predicate,
+        },
+        _ => panic!("Cannot apply Map to {input_tile:?}"),
+    }
+}
+
+/// Applies a function operator element-wise over a function input, N curried levels deep.
 ///
-/// `input` must be a `SealedFunction` tile; `function` is applied to each
-/// codomain element.  The output is a `SealedFunction` with the same domain
-/// and the function's codomain.
-pub struct MapApply {
-    /// Output tiling: `SealedFunction { domain: input.domain, codomain: function.codomain }`.
+/// `input` must be a `SealedFunction` or `CurriedFunction` tile, with the appropriate level
+/// of nesting.
+pub struct MapResult {
+    /// Output tiling matches `input` tiling, transforming the codomain according to `function`.
     tiling: Tiling,
     /// The sealed-function input to iterate over.
     input: Box<dyn TileOperator>,
@@ -326,39 +398,29 @@ pub struct MapApply {
     function: Box<dyn TileOperator>,
 }
 
-impl MapApply {
+impl MapResult {
     /// Create a new `Map` operator applying `function` to each element of `input`.
     ///
     /// The output `tiling` and `extent` are derived from the inputs: the codomain
     /// of `function` becomes the output value extent, threaded through the domain
     /// (if any) of `input`.
     pub fn new(input: Box<dyn TileOperator>, function: Box<dyn TileOperator>) -> Self {
+        let function_domain_extent = function.tiling().domain_extent().unwrap_or_else(|| {
+            panic!(
+                "Map function had non-function tiling {:?}",
+                function.tiling()
+            )
+        });
         let output_tiling = function.tiling().codomain().unwrap_or_else(|| {
             panic!(
                 "Map function had non-function tiling {:?}",
                 function.tiling()
             )
         });
-        let tiling = if let Tiling::SealedFunction {
-            domain: input_domain_extent,
-            codomain: input_codomain_tiling,
-        } = input.tiling()
-        {
-            assert!(function
-                .tiling()
-                .domain_extent()
-                .unwrap()
-                .includes(&input_codomain_tiling.extent()));
-            Tiling::SealedFunction {
-                domain: input_domain_extent.clone(),
-                codomain: Box::new(output_tiling),
-            }
-        } else {
-            panic!(
-                "Map requires SealedFunction input, got {:?}",
-                input.tiling()
-            );
-        };
+        let tiling = change_tiling_result(input.tiling(), move |codomain_extent| {
+            assert_eq!(function_domain_extent, *codomain_extent);
+            output_tiling
+        });
         Self {
             tiling,
             input,
@@ -367,15 +429,13 @@ impl MapApply {
     }
 }
 
-impl TileOperator for MapApply {
+impl TileOperator for MapResult {
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapApply")
-            .with_tiling(self.tiling.to_string())
-            .child("fn", self.function.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("fn", self.function.inspect(opts))
             .child("input", self.input.inspect(opts))
     }
 
@@ -398,9 +458,9 @@ impl TileOperator for MapApply {
             Box::new(consumer_wrapper.clone()),
             scheduler,
         );
-        Box::new(MapApplyProducer {
+        Box::new(MapResultProducer {
             base: ProducerBase {
-                id: MapApplyProducer::alloc_id(),
+                id: MapResultProducer::alloc_id(),
                 tiling: self.tiling.clone(),
             },
             input: input_producer,
@@ -409,13 +469,13 @@ impl TileOperator for MapApply {
     }
 }
 
-struct MapApplyProducer {
+struct MapResultProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     function: Box<dyn TileProducer>,
 }
 
-impl TileProducer for MapApplyProducer {
+impl TileProducer for MapResultProducer {
     fn base(&self) -> &ProducerBase {
         &self.base
     }
@@ -432,53 +492,36 @@ impl TileProducer for MapApplyProducer {
             "MapApply expected function tiling, Got {f_tiling:?}"
         );
         let f_codomain_extent = f_tiling.extent().split_function().unwrap().1.clone();
-        let i_tiling = self.input.tiling();
+        let i_tiling = self.input.tiling().clone();
         let input_guard = match projection_guard {
             TileGuard::Function(FunctionGuard::Domain(p)) => {
                 TileGuard::Function(FunctionGuard::Domain(p))
             }
             _ => i_tiling.universal_guard(),
         };
-        let input_result = self.input.get(input_guard);
 
-        let Tile::SealedFunction {
-            domain: i_domain,
-            codomain: i_codomain,
-            domain_predicate: i_domain_predicate,
-        } = input_result
-        else {
-            panic!("Map only applies to SealedFunction tilings")
-        };
+        let input_tile = self.input.get(input_guard);
+        let function_tile = self.function.get(self.function.tiling().universal_guard());
 
-        let function_result = self.function.get(f_tiling.universal_guard());
-        let input = scalar_tile_to_column_value(*i_codomain);
-        let output = apply_function_tile(function_result, input, &f_codomain_extent);
-        Tile::SealedFunction {
-            domain: i_domain,
-            codomain: Box::new(Tile::Scalar(output)),
-            domain_predicate: i_domain_predicate,
-        }
+        debug!("map impl {i_tiling} {f_codomain_extent}");
+        process_tile_result(self.tiling(), input_tile, move |codomain| {
+            apply_function_tile(function_tile, codomain, &f_codomain_extent)
+        })
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
         debug!("{} release: {obsolete_guard:?}", self.name());
-        self.input.release(match obsolete_guard {
-            g if g.is_universal() => self.input.tiling().universal_guard(),
-            g if g.is_empty() => self.input.tiling().empty_guard(),
-            TileGuard::Function(FunctionGuard::Domain(p)) => {
-                TileGuard::Function(FunctionGuard::Domain(p))
-            }
-            _ => todo!(),
-        });
+        // TODO once we have guards that express codomain predicates, handle them here
+        self.input.release(obsolete_guard);
     }
 }
 
-/// Takes a SealedFunction input and returns a SealedFunction with same domain
+/// Takes a function input and returns a function with the same structure
 /// but with a constant codomain.
 ///
-/// `input` must be a `SealedFunction` tile; `constant` must be a Scalar.
-pub struct MapToConst {
-    /// Output tiling: `SealedFunction { domain: input.domain, codomain: constant.codomain }`.
+/// `input` must be a `SealedFunction` or `CurriedFunction` tile; `constant` must be a Scalar.
+pub struct MapResultToConst {
+    /// Output tiling matches `input` tiling, transforming the codomain to `constant`.
     tiling: Tiling,
     /// The sealed-function input to iterate over.
     input: Box<dyn TileOperator>,
@@ -486,25 +529,10 @@ pub struct MapToConst {
     constant: Box<dyn TileOperator>,
 }
 
-impl MapToConst {
-    /// Create a new `MapToConst` operator that maps any codomain to the given constant.
+impl MapResultToConst {
+    /// Create a new `MapResultToConst` operator that maps any codomain to the given constant.
     pub fn new(input: Box<dyn TileOperator>, constant: Box<dyn TileOperator>) -> Self {
-        let tiling = if let Tiling::SealedFunction {
-            domain: input_domain_tiling,
-            codomain: _,
-        } = input.tiling()
-        {
-            assert!(constant.tiling().is_scalar());
-            Tiling::SealedFunction {
-                domain: input_domain_tiling.clone(),
-                codomain: Box::new(constant.tiling().clone()),
-            }
-        } else {
-            panic!(
-                "Map requires SealedFunction input, got {:?}",
-                input.tiling()
-            );
-        };
+        let tiling = change_tiling_result(input.tiling(), |_| constant.tiling().clone());
         Self {
             tiling,
             input,
@@ -513,7 +541,7 @@ impl MapToConst {
     }
 }
 
-impl TileOperator for MapToConst {
+impl TileOperator for MapResultToConst {
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -575,44 +603,25 @@ impl TileProducer for MapToConstProducer {
             c_tiling.is_scalar(),
             "MapToConst expected scalar tiling, Got {c_tiling:?}"
         );
-        let i_tiling = self.input.tiling();
+        let i_tiling = self.input.tiling().clone();
         let input_guard = match projection_guard {
             TileGuard::Function(FunctionGuard::Domain(p)) => {
                 TileGuard::Function(FunctionGuard::Domain(p))
             }
             _ => i_tiling.universal_guard(),
         };
-        let input_result = self.input.get(input_guard);
+        let input_tile = self.input.get(input_guard);
+        let constant_tile = self.constant.get(c_tiling.universal_guard());
 
-        let Tile::SealedFunction {
-            domain: i_domain,
-            codomain: _,
-            domain_predicate: i_domain_predicate,
-        } = input_result
-        else {
-            panic!("Map only applies to SealedFunction tilings")
-        };
-
-        let len = i_domain.len();
-        let constant_result = self.constant.get(c_tiling.universal_guard());
-
-        Tile::SealedFunction {
-            domain: i_domain,
-            codomain: Box::new(repeat_tile(constant_result, len)),
-            domain_predicate: i_domain_predicate,
-        }
+        process_tile_result(self.tiling(), input_tile, move |codomain| {
+            scalar_tile_to_column_value(repeat_tile(constant_tile, codomain.len()))
+        })
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
         debug!("{} release: {obsolete_guard:?}", self.name());
-        self.input.release(match obsolete_guard {
-            g if g.is_universal() => self.input.tiling().universal_guard(),
-            g if g.is_empty() => self.input.tiling().empty_guard(),
-            TileGuard::Function(FunctionGuard::Domain(p)) => {
-                TileGuard::Function(FunctionGuard::Domain(p))
-            }
-            _ => todo!(),
-        });
+        // TODO once we have guards that express codomain predicates, handle them here
+        self.input.release(obsolete_guard);
     }
 }
 
@@ -875,13 +884,13 @@ impl TileProducer for IterateExtentProducer {
 /// source to its corresponding output value.
 ///
 /// Unlike [`IterateExtent`], which produces an identity function (domain→domain),
-/// `MapSource` calls [`DataSourceDomainExtentImpl::get`] for each domain key to
+/// `MapResultWithSource` calls [`DataSourceDomainExtentImpl::get`] for each domain key to
 /// look up the actual output value.  The result is
 /// `SealedFunction { domain: keys, codomain: Scalar(output_values) }`.
 ///
 /// Notification at subscription time: if the source already has data when
 /// `subscribe` is called, the consumer is notified immediately.
-pub struct MapSource {
+pub struct MapResultWithSource {
     input: Box<dyn TileOperator>,
     /// The data source providing both domain keys and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
@@ -889,8 +898,8 @@ pub struct MapSource {
     tiling: Tiling,
 }
 
-impl MapSource {
-    /// Create a new `MapSource` wrapping `source`.
+impl MapResultWithSource {
+    /// Create a new `MapResultWithSource` wrapping `source`.
     ///
     /// The output tiling is derived from the source's
     /// [`output_value_extent`](DataSourceDomainExtentImpl::output_value_extent).
@@ -898,12 +907,12 @@ impl MapSource {
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
         input: Box<dyn TileOperator>,
     ) -> Self {
-        let domain = Extent::DataSourceDomain(source.clone());
+        let source_domain_extent = Extent::DataSourceDomain(source.clone());
         let output_extent = source.borrow().output_value_extent();
-        let tiling = Tiling::SealedFunction {
-            domain,
-            codomain: Box::new(Tiling::Scalar(output_extent)),
-        };
+        let tiling = change_tiling_result(input.tiling(), move |codomain_extent| {
+            assert_eq!(source_domain_extent, *codomain_extent);
+            Tiling::Scalar(output_extent)
+        });
         Self {
             input,
             source: source.clone(),
@@ -912,7 +921,7 @@ impl MapSource {
     }
 }
 
-impl TileOperator for MapSource {
+impl TileOperator for MapResultWithSource {
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -927,9 +936,9 @@ impl TileOperator for MapSource {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        Box::new(MapSourceProducer {
+        Box::new(MapResultWithSourceProducer {
             base: ProducerBase {
-                id: MapSourceProducer::alloc_id(),
+                id: MapResultWithSourceProducer::alloc_id(),
                 tiling: self.tiling.clone(),
             },
             input: self
@@ -940,15 +949,15 @@ impl TileOperator for MapSource {
     }
 }
 
-/// Producer for [`MapSource`]: maps each domain key to its output value on `get`.
-struct MapSourceProducer {
+/// Producer for [`MapNSource`]: maps each domain key to its output value on `get`.
+struct MapResultWithSourceProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     /// The data source used for both domain enumeration and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
 }
 
-impl TileProducer for MapSourceProducer {
+impl TileProducer for MapResultWithSourceProducer {
     fn base(&self) -> &ProducerBase {
         &self.base
     }
@@ -961,26 +970,11 @@ impl TileProducer for MapSourceProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_result = self.input.get(self.input.tiling().universal_guard());
-        let Tile::SealedFunction {
-            domain: i_domain,
-            codomain: i_codomain,
-            domain_predicate,
-            ..
-        } = input_result
-        else {
-            panic!("MapSource expected SealedFunction input tile")
-        };
-        let Tile::Scalar(i_codomain) = *i_codomain else {
-            panic!("MapSource expected SealedFunction input tile")
-        };
+        let input_tile = self.input.get(self.input.tiling().universal_guard());
         let source = self.source.borrow();
-        let codomain = source.get(i_codomain);
-        Tile::SealedFunction {
-            domain: i_domain,
-            codomain: Box::new(Tile::Scalar(codomain)),
-            domain_predicate,
-        }
+        process_tile_result(self.tiling(), input_tile, move |codomain| {
+            source.get(codomain)
+        })
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
@@ -1401,167 +1395,6 @@ impl TileProducer for ConverseProducer {
                 }
             }
             _ => {}
-        }
-    }
-}
-
-/// Applies a function to every value in a [`Tile::CurriedFunction`], producing a new
-/// `CurriedFunction` with the same domain but mapped codomain values.
-///
-/// For a input `D → [C]` and a function `C → E`, `MapCompose` produces `D → [E]`
-/// by applying the function independently to every element in each codomain list.
-pub struct MapCompose {
-    /// Output tiling: `CurriedFunction { domain: input.domain, codomain: function.output_extent }`.
-    tiling: Tiling,
-    /// The lookup-function input whose values are transformed.
-    input: Box<dyn TileOperator>,
-    /// The function applied to each value in the input's codomain lists.
-    function: Box<dyn TileOperator>,
-}
-
-impl MapCompose {
-    /// Create a new `MapCompose` operator.
-    ///
-    /// `input` must have a `CurriedFunction` tiling; `function` must have a function
-    /// tiling whose domain includes the input's codomain extent.  The output tiling is
-    /// `CurriedFunction { domain: input.domain, codomain: function.output_extent }`.
-    pub fn new(input: Box<dyn TileOperator>, function: Box<dyn TileOperator>) -> Self {
-        let (domain1, domain2, input_codomain) = match input.tiling() {
-            Tiling::CurriedFunction {
-                domain1,
-                domain2,
-                codomain,
-            } => (domain1.clone(), domain2.clone(), codomain.clone()),
-            t => panic!("MapCompose requires CurriedFunction input, got {t:?}"),
-        };
-        let output_tiling = function.tiling().codomain().unwrap_or_else(|| {
-            panic!(
-                "MapCompose function had non-function tiling {:?}",
-                function.tiling()
-            )
-        });
-        assert!(
-            function
-                .tiling()
-                .domain_extent()
-                .unwrap()
-                .includes(&input_codomain),
-            "MapCompose function domain must include input codomain"
-        );
-        let tiling = Tiling::CurriedFunction {
-            domain1,
-            domain2,
-            codomain: output_tiling.extent(),
-        };
-        Self {
-            tiling,
-            input,
-            function,
-        }
-    }
-}
-
-impl TileOperator for MapCompose {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
-
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("fn", self.function.inspect(opts))
-            .child("input", self.input.inspect(opts))
-    }
-
-    fn subscribe(
-        &mut self,
-        _intent_guard: TileGuard,
-        mut consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
-    ) -> Box<dyn TileProducer> {
-        let consumer_wrapper = Rc::new(RefCell::new(move || {
-            consumer.notify();
-        }));
-        let function_producer = self.function.subscribe(
-            self.function.tiling().universal_guard(),
-            Box::new(consumer_wrapper.clone()),
-            scheduler,
-        );
-        let input_producer = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            Box::new(consumer_wrapper.clone()),
-            scheduler,
-        );
-        Box::new(MapComposeProducer {
-            base: ProducerBase {
-                id: MapComposeProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
-            input: input_producer,
-            function: function_producer,
-        })
-    }
-}
-
-/// Producer for [`MapCompose`].
-struct MapComposeProducer {
-    base: ProducerBase,
-    /// The subscribed input producer.
-    input: Box<dyn TileProducer>,
-    /// The subscribed function producer.
-    function: Box<dyn TileProducer>,
-}
-
-impl TileProducer for MapComposeProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
-
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        node.child("fn", self.function.inspect(opts))
-            .child("input", self.input.inspect(opts))
-    }
-
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let out_codomain_extent = match self.tiling() {
-            Tiling::CurriedFunction { codomain, .. } => codomain.clone(),
-            t => panic!("MapCompose output tiling is not CurriedFunction: {t:?}"),
-        };
-        let f_tiling = self.function.tiling();
-        assert!(
-            f_tiling.is_function(),
-            "MapCompose expected function tiling, got {f_tiling:?}"
-        );
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
-        let Tile::CurriedFunction {
-            domain1,
-            offsets,
-            domain2,
-            codomain,
-            domain_predicate,
-        } = input_tile
-        else {
-            panic!("MapCompose requires a CurriedFunction tile")
-        };
-        let function_tile = self.function.get(f_tiling.universal_guard());
-        // All function representations map each codomain element 1-to-1, so domain
-        // and offsets carry over unchanged; only the codomain values are remapped.
-        let new_codomain = apply_function_tile(function_tile, codomain, &out_codomain_extent);
-        Tile::curried_function(domain1, offsets, domain2, new_codomain, domain_predicate)
-    }
-
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
-        match obsolete_guard {
-            g if g.is_universal() => self.input.release(self.input.tiling().universal_guard()),
-            TileGuard::Function(FunctionGuard::Domain(p)) => self
-                .input
-                .release(TileGuard::Function(FunctionGuard::Domain(p))),
-            TileGuard::Function(FunctionGuard::Codomain(g))
-                if matches!(*g, TileGuard::Function(FunctionGuard::Domain(_))) =>
-            {
-                self.input
-                    .release(TileGuard::Function(FunctionGuard::Codomain(g)))
-            }
-            _ => panic!("Unexpected obsolete guard: {obsolete_guard:?}"),
         }
     }
 }

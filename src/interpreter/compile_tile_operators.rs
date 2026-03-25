@@ -34,8 +34,8 @@ use crate::{
         ccl_compile_util::{validate_type, CompileError},
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, Filter, IterateExtent, MapAggregate,
-            MapApply, MapCompose, MapExtractAggregate, MapSource, MapToConst, Memo, ScalarTuple,
-            Split, TileOperator, Tiling, ToScalar, Zip,
+            MapExtractAggregate, MapResult, MapResultToConst, MapResultWithSource, Memo,
+            ScalarTuple, Split, TileOperator, Tiling, ToScalar, Zip,
         },
         transform_hashmap_values, tuple_field, ArithmeticKind, BaseType, BinOpKind, CompareKind,
         DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
@@ -290,16 +290,16 @@ fn map_apply(
     function: Box<dyn TileOperator>,
 ) -> Box<dyn TileOperator> {
     if input.tiling().is_scalar() {
-        // Wrap and unwrap the scalar in Unit -> Scalar so we can use MapApply
-        Box::new(ToScalar::new(Box::new(MapApply::new(
-            Box::new(MapToConst::new(
+        // Wrap and unwrap the scalar in Unit -> Scalar so we can use MapNApply
+        Box::new(ToScalar::new(Box::new(MapResult::new(
+            Box::new(MapResultToConst::new(
                 Box::new(IterateExtent::new(Extent::Base(BaseType::Unit))),
                 input,
             )),
             function,
         ))))
     } else {
-        Box::new(MapApply::new(input, function))
+        Box::new(MapResult::new(input, function))
     }
 }
 
@@ -335,7 +335,7 @@ fn lift_scalar_to_function(
     // (actual function output) both share the same underlying data.
     let split = Split::new(function_op);
     let split_for_zip = Box::new(split.split()) as Box<dyn TileOperator>;
-    let lifted = Box::new(MapToConst::new(
+    let lifted = Box::new(MapResultToConst::new(
         Box::new(split) as Box<dyn TileOperator>,
         scalar_op,
     ));
@@ -398,7 +398,7 @@ fn compile_source(
         .sources
         .get(name)
         .ok_or_else(|| CompileError::TypeError(format!("Unknown data source: {name}")))?;
-    Ok(Box::new(MapSource::new(
+    Ok(Box::new(MapResultWithSource::new(
         source.clone(),
         Box::new(IterateExtent::new(Extent::DataSourceDomain(source.clone()))),
     )))
@@ -610,11 +610,11 @@ fn compile_apply(
             // Scalar even though the argument has a domain — we must still
             // iterate over that domain.  Example: `[42 for x in [1, 2]]`
             // should yield [42, 42], not just 42.  Compile the argument here
-            // (scope already dropped) and wrap with MapToConst.
+            // (scope already dropped) and wrap with MapNToConst.
             if body_op.tiling().is_scalar() {
                 let arg_op = compile_tile_inner(argument, ctx)?;
                 if !arg_op.tiling().is_scalar() {
-                    return Ok(Box::new(MapToConst::new(arg_op, body_op)));
+                    return Ok(Box::new(MapResultToConst::new(arg_op, body_op)));
                 }
             }
             Ok(body_op)
@@ -626,17 +626,17 @@ fn compile_apply(
             "Lambda '{param:?}' has no type annotation in Apply; ccl::infer must run before compile_tile"
         ))),
         TypedExprNode::Source(name) => {
-            // Apply the source as a point-lookup table via MapApply.
+            // Apply the source as a point-lookup table via MapNApply.
             //
-            // `compile_source` returns `MapSource(IterateExtent(DataSourceDomain), src)`,
+            // `compile_source` returns `MapNSource(IterateExtent(DataSourceDomain), src)`,
             // a `SealedFunction(DataSourceDomain, element)`.  The `argument` provides
             // the keys to look up — for single-generator comprehensions it is
             // `Var("__iter_record")` with type `DataSource(name)`, so it compiles to
-            // `IterateExtent(DataSourceDomain)` and `MapApply` is equivalent to
-            // `MapSource` directly.  For multi-generator comprehensions the argument
+            // `IterateExtent(DataSourceDomain)` and `MapNApply` is equivalent to
+            // `MapNSource` directly.  For multi-generator comprehensions the argument
             // is `TupleIndex(Var("__iter_record"), i)`, which has tiling
             // `SealedFunction(cross_product_record_extent, DataSourceDomain(src_i))`.
-            // Using `MapApply` in both cases ensures the output tile carries the
+            // Using `MapNApply` in both cases ensures the output tile carries the
             // correct outer domain (the cross-product extent), threading it through
             // the source lookup.
             let source_op = compile_source(name, ctx)?;
@@ -857,7 +857,7 @@ fn resolve_to_expr<'a>(expr: &'a Expr, ctx: &'a TileCompileContext) -> &'a Expr 
 /// 1. Compile `collection` once, wrap in [`Memo`] + [`Split`] (`col_split`).
 /// 2. If the collection has tiling `Scalar(Function(D, V))` (e.g., a list literal),
 ///    materialise it into `SealedFunction(D, V)` via
-///    `MapApply(IterateExtent(D), col_split_handle)`, then wrap that in another
+///    `MapNApply(IterateExtent(D), col_split_handle)`, then wrap that in another
 ///    [`Memo`] + [`Split`] (`mat_split`).  For collections that are already
 ///    `SealedFunction`, `mat_split` is just `col_split`.
 /// 3. Bind `"_groupby_mat"` → `Operator(mat_split)` so the key expression can
@@ -866,7 +866,7 @@ fn resolve_to_expr<'a>(expr: &'a Expr, ctx: &'a TileCompileContext) -> &'a Expr 
 ///    keys this β-reduces so that element-wise operations (e.g. `x // 2`) work over
 ///    the materialised `SealedFunction`.  Result: `SealedFunction(D, K)`.
 /// 5. [`Converse`] inverts `D → K` to `CurriedFunction(K, D)`.
-/// 6. [`MapCompose`] applies the collection (via `col_split`) to each domain index,
+/// 6. [`MapNApply`] applies the collection (via `col_split`) to each domain index,
 ///    turning `CurriedFunction(K, D)` into `CurriedFunction(K, V)`.
 fn compile_groupby(
     collection_expr: &Expr,
@@ -886,10 +886,10 @@ fn compile_groupby(
 
     // 2. Ensure the binding exposes a SealedFunction(D, V) tiling.
     //    List literals compile to Scalar(Function(D, V)); wrapping them in
-    //    MapApply(IterateExtent(D), split_handle) materialises them into
+    //    MapNApply(IterateExtent(D), split_handle) materialises them into
     //    SealedFunction(D, V), which is what key lambda β-reduction expects.
     let mat_split: Rc<Split> = if matches!(col_split.tiling(), Tiling::Scalar(_)) {
-        let mat_op: Box<dyn TileOperator> = Box::new(MapApply::new(
+        let mat_op: Box<dyn TileOperator> = Box::new(MapResult::new(
             Box::new(IterateExtent::new(collection_domain)),
             Box::new(col_split.split()),
         ));
@@ -902,7 +902,7 @@ fn compile_groupby(
     // 3–4. Bind "_groupby_mat" and apply the key.
     //    Expr::apply(argument, function) → Apply { function: key_expr, argument }.
     //    Lambda keys are β-reduced by compile_apply; non-lambda keys fall back
-    //    to MapApply(materialised, key_fn).
+    //    to MapNApply(materialised, key_fn).
     let keyed_op = {
         let mut scope = ctx.enter_scope();
         scope.bind("_groupby_mat", TileVarBinding::Operator(mat_split));
@@ -918,7 +918,7 @@ fn compile_groupby(
     //    Use a fresh split handle from col_split instead of recompiling.
     let collection_for_compose: Box<dyn TileOperator> = Box::new(col_split.split());
     let grouped_op: Box<dyn TileOperator> =
-        Box::new(MapCompose::new(converse_op, collection_for_compose));
+        Box::new(MapResult::new(converse_op, collection_for_compose));
 
     Ok(grouped_op)
 }
@@ -1000,6 +1000,7 @@ fn map_binop(op: &CclBinOp) -> BinOpKind {
 
 #[cfg(test)]
 mod tests {
+    use log::debug;
     use rstest_log::rstest;
     use std::{cell::RefCell, rc::Rc};
 
@@ -1013,6 +1014,7 @@ mod tests {
             sort_sealed_function_by_domain, tile_operators::Tile, tiling::Predicate, BaseType,
             ColumnValue, Consumer, Scheduler, TestDataSource, Value,
         },
+        pretty_graph::pretty_tile_producer,
     };
 
     /// Compile and evaluate a CCL expression, returning the resulting [`Tile`].
@@ -1022,6 +1024,7 @@ mod tests {
         let mut op = compile_tile(expr, &mut ctx).expect("compile failed");
         let guard = op.tiling().universal_guard();
         let mut producer = op.subscribe(guard, Box::new(|| {}), &mut scheduler);
+        debug!("Producer: {}", pretty_tile_producer(producer.as_ref()));
         let p_guard = producer.tiling().universal_guard();
         producer.get(p_guard)
     }
@@ -1030,7 +1033,7 @@ mod tests {
     // Scalars
     // -----------------------------------------------------------------------
 
-    #[test]
+    #[test_log::test]
     fn test_literal_int() {
         let tile = eval_tile_expr(&Expr::lit(Lit::Int(5)));
         match tile {
@@ -1039,7 +1042,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn test_literal_bool() {
         let tile = eval_tile_expr(&Expr::lit(Lit::Bool(false)));
         match tile {
@@ -1048,7 +1051,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn test_binop_add() {
         let expr = Expr::binop(
             Expr::lit(Lit::Int(3)),
@@ -1062,7 +1065,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[test_log::test]
     fn test_binop_mul() {
         let expr = Expr::binop(
             Expr::lit(Lit::Int(5)),
@@ -1082,7 +1085,7 @@ mod tests {
 
     /// `(λx:Int. x)` applied to 3 via β-reduction: x is bound to Lit(3), body
     /// re-compiles Lit(3) → Scalar(Int(3)).
-    #[test]
+    #[test_log::test]
     fn test_apply_lambda_identity() {
         let expr = Expr::apply(
             Expr::lit(Lit::Int(3)),
@@ -1096,7 +1099,7 @@ mod tests {
     }
 
     /// `(λx:Int. 42)` applied to anything → 42 (body ignores x).
-    #[test]
+    #[test_log::test]
     fn test_apply_lambda_const() {
         let expr = Expr::apply(
             Expr::lit(Lit::Int(99)),
@@ -1110,7 +1113,7 @@ mod tests {
     }
 
     /// `(λx:Int. x + 2)` applied to 5 → 7.
-    #[test]
+    #[test_log::test]
     fn test_apply_lambda_binop() {
         let expr = Expr::apply(
             Expr::lit(Lit::Int(5)),
@@ -1136,7 +1139,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `let x:Int = 5 in x + 1` → Scalar(Int(6)).
-    #[test]
+    #[test_log::test]
     fn test_let_binding() {
         use crate::ccl::TypedExpr;
         let expr = TypedExpr::new(TypedExprNode::Let {
@@ -1168,7 +1171,7 @@ mod tests {
     /// Compiles the body `Apply(list, Var(i))` in lambda context:
     /// - `IterateExtent([0,3))` for `i`
     /// - `Map(IterateExtent, Constant(Function([0→10,1→20,2→30])))` → SealedFunction
-    #[test]
+    #[test_log::test]
     fn test_lambda_list_lookup() {
         // λi:[0,3). [10,20,30][i]
         let list = Expr::list(vec![
@@ -1232,7 +1235,7 @@ mod tests {
     /// The lowering wraps the outer iterator lambda with a
     /// `RefinementKind::Predicate`; `compile_lambda` should compile that
     /// into a `Filter` operator so only the matching indices survive.
-    #[test]
+    #[test_log::test]
     fn test_list_comp_predicate_filter() {
         let tile = run_pipeline("[x for x in [1,2,3] if x > 1]");
         match tile {
@@ -1249,7 +1252,7 @@ mod tests {
     }
 
     /// `[x for x in [10,20,30] if x > 100]` — no element passes the predicate.
-    #[test]
+    #[test_log::test]
     fn test_list_comp_predicate_filter_none_pass() {
         let tile = run_pipeline("[x for x in [10,20,30] if x > 100]");
         match tile {
@@ -1265,7 +1268,7 @@ mod tests {
     }
 
     /// A lambda with a HashJoin refinement must return `CompileError::Unsupported`.
-    #[test]
+    #[test_log::test]
     fn test_lambda_hash_join_refinement_errors() {
         let spec = HashJoinSpec {
             build_gen_position: 0,
