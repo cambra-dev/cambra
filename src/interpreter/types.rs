@@ -7,6 +7,7 @@ use bit_vec::BitVec;
 use intervalsets::numeric::Domain;
 use intervalsets::ops::Difference;
 use intervalsets::{Bounding, Interval, IntervalSet, MaybeEmpty, Side};
+use smol_str::SmolStr;
 
 use crate::interpreter::{
     apply_binop_column, apply_unaryop_column, tuple_field, BinOpKind, UnaryOpKind,
@@ -262,7 +263,7 @@ pub trait DataSourceDomainExtentImpl {
     /// Used by [`crate::interpreter::tile_operators::MapSource`] to map each domain
     /// element to its corresponding output value when building a
     /// `SealedFunction { domain, codomain: Scalar(output_values) }` tile.
-    fn get(&self, key: &Value) -> Value;
+    fn get(&self, keys: ColumnValue) -> ColumnValue;
     /// Returns the [`Extent`] of each output value produced by this source.
     /// Used to type the codomain of [`crate::interpreter::tile_operators::MapSource`].
     fn output_value_extent(&self) -> Extent;
@@ -454,7 +455,7 @@ impl std::fmt::Display for FunctionDef {
 pub enum Value {
     Int(i64),
     UInt(usize),
-    String(String),
+    String(SmolStr),
     Bool(bool),
     Unit,
     /// A function value (collection of bindings)
@@ -613,8 +614,8 @@ impl From<usize> for Value {
     }
 }
 
-impl From<String> for Value {
-    fn from(v: String) -> Self {
+impl From<SmolStr> for Value {
+    fn from(v: SmolStr) -> Self {
         Value::String(v)
     }
 }
@@ -647,7 +648,7 @@ impl Value {
         }
     }
 
-    pub fn as_string(&self) -> &str {
+    pub fn as_string(&self) -> &SmolStr {
         match self {
             Value::String(s) => s,
             _ => panic!("Not string: {self:?}"),
@@ -684,7 +685,7 @@ pub enum ColumnValue {
     Units(usize),
     Ints(Vec<i64>),
     UInts(Vec<usize>),
-    Strings(Vec<String>),
+    Strings(Vec<SmolStr>),
     Bools(BitVec),
     Variants(Vec<Value>),
     FunctionBindings {
@@ -755,7 +756,7 @@ impl ColumnValue {
                 ColumnValue::UInts(values.iter().map(Value::as_uint).collect())
             }
             Extent::Base(BaseType::String) => {
-                ColumnValue::Strings(values.iter().map(|v| v.as_string().to_string()).collect())
+                ColumnValue::Strings(values.iter().map(|v| v.as_string().clone()).collect())
             }
             Extent::Record(m) => {
                 // Pivot the list of Records into a Record of ColumnValues
@@ -1057,7 +1058,7 @@ impl ColumnValue {
 
     /// Construct a `ColumnValue` containing the given string values.
     pub fn strings(values: &[&str]) -> ColumnValue {
-        ColumnValue::Strings(values.iter().map(|s| s.to_string()).collect())
+        ColumnValue::Strings(values.iter().map(|s| (*s).into()).collect())
     }
 
     pub fn append(&mut self, other: ColumnValue) {
@@ -1138,7 +1139,7 @@ mod tests {
         assert_eq!(Value::Int(42).to_string(), "42");
         assert_eq!(Value::Int(-7).to_string(), "-7");
         assert_eq!(Value::UInt(3).to_string(), "u3");
-        assert_eq!(Value::String("hello".to_string()).to_string(), "\"hello\"");
+        assert_eq!(Value::String("hello".into()).to_string(), "\"hello\"");
         assert_eq!(Value::Bool(true).to_string(), "true");
         assert_eq!(Value::Bool(false).to_string(), "false");
         assert_eq!(Value::Unit.to_string(), "()");
@@ -1150,11 +1151,11 @@ mod tests {
         let f = Value::Function(vec![
             FuncBinding {
                 input: Value::UInt(0),
-                output: Value::String("a".to_string()),
+                output: Value::String("a".into()),
             },
             FuncBinding {
                 input: Value::UInt(1),
-                output: Value::String("b".to_string()),
+                output: Value::String("b".into()),
             },
         ]);
         assert_eq!(f.to_string(), r#"Function [ "a", "b" ]"#);
@@ -1165,11 +1166,11 @@ mod tests {
         // Inputs are not u0..uN — should be shown explicitly.
         let f = Value::Function(vec![
             FuncBinding {
-                input: Value::String("x".to_string()),
+                input: Value::String("x".into()),
                 output: Value::Int(1),
             },
             FuncBinding {
-                input: Value::String("y".to_string()),
+                input: Value::String("y".into()),
                 output: Value::Int(2),
             },
         ]);

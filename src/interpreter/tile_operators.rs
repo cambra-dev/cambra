@@ -963,6 +963,7 @@ impl TileProducer for MapSourceProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_result = self.input.get(self.input.tiling().universal_guard());
         let Tile::SealedFunction {
+            domain: i_domain,
             codomain: i_codomain,
             domain_predicate,
             ..
@@ -970,19 +971,13 @@ impl TileProducer for MapSourceProducer {
         else {
             panic!("MapSource expected SealedFunction input tile")
         };
-        let Tile::Scalar(domain) = *i_codomain else {
+        let Tile::Scalar(i_codomain) = *i_codomain else {
             panic!("MapSource expected SealedFunction input tile")
         };
         let source = self.source.borrow();
-        let output_extent = source.output_value_extent();
-        let output_values: Vec<Value> = domain
-            .clone()
-            .drain_to_value_iter()
-            .map(|key| source.get(&key))
-            .collect();
-        let codomain = ColumnValue::from_values(output_values, &output_extent);
+        let codomain = source.get(i_codomain);
         Tile::SealedFunction {
-            domain,
+            domain: i_domain,
             codomain: Box::new(Tile::Scalar(codomain)),
             domain_predicate,
         }

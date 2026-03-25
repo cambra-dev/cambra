@@ -3,6 +3,7 @@
 use std::ops::{AddAssign, DivAssign, MulAssign, SubAssign};
 
 use bit_vec::BitVec;
+use smol_str::{SmolStr, SmolStrBuilder};
 
 use super::ColumnValue;
 
@@ -62,8 +63,15 @@ fn zip_arithmetic<T: Copy + AddAssign<T> + SubAssign<T> + MulAssign<T> + DivAssi
     l
 }
 
-fn zip_concat(mut l: Vec<String>, r: &[String]) -> Vec<String> {
-    l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a += b);
+fn zip_concat(mut l: Vec<SmolStr>, r: &[SmolStr]) -> Vec<SmolStr> {
+    l.iter_mut().zip(r.iter()).for_each(|(a, b)| {
+        *a = {
+            let mut builder = SmolStrBuilder::new();
+            builder.push_str(a);
+            builder.push_str(b);
+            builder.finish()
+        }
+    });
     l
 }
 

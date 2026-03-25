@@ -24,6 +24,7 @@ use cambra::interpreter::{
     FuncBinding, FunctionGuard, Predicate, TestDataSource, Tile, TileGuard, Value,
 };
 use rstest_log::rstest;
+use smol_str::SmolStr;
 
 // ---------------------------------------------------------------------------
 // Helpers — CCL pipeline path
@@ -88,7 +89,7 @@ fn make_tuple(v: &[Value]) -> Value {
 
 #[rstest]
 #[case("2", Value::Int(2))]
-#[case(r#""hello""#, Value::String("hello".to_string()))]
+#[case(r#""hello""#, Value::String("hello".into()))]
 #[case("True", Value::Bool(true))]
 #[case("[]", Value::Function(vec![]))]
 #[case("[1, 2]", Value::Function(vec![
@@ -174,10 +175,10 @@ fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
 #[rstest]
 #[case(
     "('a', 1)",
-    make_tuple(&[Value::String("a".to_string()), Value::Int(1)])
+    make_tuple(&[Value::String("a".into()), Value::Int(1)])
 )]
-#[case("('a', 1)[0]", Value::String("a".to_string()))]
-#[case("x = ('a', 1); x[0]", Value::String("a".to_string()))]
+#[case("('a', 1)[0]", Value::String("a".into()))]
+#[case("x = ('a', 1); x[0]", Value::String("a".into()))]
 fn test_tuples(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -224,8 +225,8 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
                     (
                         tuple_field(1),
                         ColumnValue::Strings(vec![
-                            String::from("a"),
-                            String::from("b"),
+                            "a".into(),
+                            "b".into(),
                         ]),
                     ),
                 ]))),
@@ -375,8 +376,8 @@ fn test_test_source(#[case] code: &str) {
     ctx.register_test_source(data_source.clone());
 
     data_source.borrow_mut().add_data(&[
-        (Value::UInt(10), Value::String("foo".to_string())),
-        (Value::UInt(20), Value::String("bar".to_string())),
+        (Value::UInt(10), Value::String("foo".into())),
+        (Value::UInt(20), Value::String("bar".into())),
     ]);
 
     let notified = Rc::new(RefCell::new(false));
@@ -410,12 +411,9 @@ fn test_test_source(#[case] code: &str) {
         ColumnValue::Strings(v) => v,
         other => panic!("expected Strings codomain, got {other:?}"),
     };
-    let mut pairs: Vec<(usize, String)> = keys.into_iter().zip(vals).collect();
+    let mut pairs: Vec<(usize, SmolStr)> = keys.into_iter().zip(vals).collect();
     pairs.sort_by_key(|(k, _)| *k);
-    assert_eq!(
-        pairs,
-        vec![(10, "foo".to_string()), (20, "bar".to_string())]
-    );
+    assert_eq!(pairs, vec![(10, "foo".into()), (20, "bar".into())]);
 
     // Changing the yield guard without adding new data must not notify.
     data_source
@@ -458,14 +456,14 @@ fn test_inner_join(#[case] code: &str) {
         Value::UInt(10),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
-            (tuple_field(1), Value::String("a1".to_string())),
+            (tuple_field(1), Value::String("a1".into())),
         ])),
     )]);
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
-            (tuple_field(1), Value::String("b1".to_string())),
+            (tuple_field(1), Value::String("b1".into())),
         ])),
     )]);
 
@@ -487,7 +485,7 @@ fn test_inner_join(#[case] code: &str) {
     //   codomain = Record { _0: Scalar(Ints), _1: Scalar(Strings), _2: Scalar(Strings) }
     // Returns pairs sorted by (domain._0, domain._1) for deterministic comparison.
     type DomainKey = (usize, usize);
-    type JoinOutput = (i64, String, String);
+    type JoinOutput = (i64, SmolStr, SmolStr);
     fn extract_join_rows(tile: Tile) -> Vec<(DomainKey, JoinOutput)> {
         let Tile::SealedFunction {
             domain, codomain, ..
@@ -551,21 +549,21 @@ fn test_inner_join(#[case] code: &str) {
 
     assert_eq!(
         extract_join_rows(tile),
-        vec![((10, 10), (100, "a1".to_string(), "b1".to_string()))]
+        vec![((10, 10), (100, "a1".into(), "b1".into()))]
     );
 
     data_source1.borrow_mut().add_data(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(200)),
-            (tuple_field(1), Value::String("a2".to_string())),
+            (tuple_field(1), Value::String("a2".into())),
         ])),
     )]);
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
-            (tuple_field(1), Value::String("b2".to_string())),
+            (tuple_field(1), Value::String("b2".into())),
         ])),
     )]);
 
@@ -579,8 +577,8 @@ fn test_inner_join(#[case] code: &str) {
     assert_eq!(
         extract_join_rows(tile),
         vec![
-            ((10, 10), (100, "a1".to_string(), "b1".to_string())),
-            ((10, 20), (100, "a1".to_string(), "b2".to_string())),
+            ((10, 10), (100, "a1".into(), "b1".into())),
+            ((10, 20), (100, "a1".into(), "b2".into())),
         ]
     );
 
@@ -601,7 +599,7 @@ fn test_inner_join(#[case] code: &str) {
         Value::UInt(30),
         Value::Record(HashMap::from([
             (tuple_field(0), Value::Int(100)),
-            (tuple_field(1), Value::String("a3".to_string())),
+            (tuple_field(1), Value::String("a3".into())),
         ])),
     )]);
 
@@ -617,7 +615,7 @@ fn test_inner_join(#[case] code: &str) {
     // == src2[20]._0=100 (kept).
     assert_eq!(
         extract_join_rows(tile),
-        vec![((30, 20), (100, "a3".to_string(), "b2".to_string()))]
+        vec![((30, 20), (100, "a3".into(), "b2".into()))]
     );
 }
 

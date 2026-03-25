@@ -20,6 +20,8 @@ use std::{
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
+use smol_str::SmolStr;
+
 /// Global counter for assigning unique IDs to [`Refinement`] instances.
 static REFINEMENT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -249,7 +251,7 @@ impl AggregateKind {
             (AggregateKind::Max, Extent::Base(BaseType::Int)) => ColumnValue::Ints(vec![i64::MIN]),
             (AggregateKind::Max, Extent::Base(BaseType::UInt)) => ColumnValue::UInts(vec![0]),
             (AggregateKind::Max, Extent::Base(BaseType::String)) => {
-                ColumnValue::Strings(vec![String::new()])
+                ColumnValue::Strings(vec![SmolStr::default()])
             }
             _ => panic!("No identity for {self:?} over {accumulator_extent:?}"),
         }

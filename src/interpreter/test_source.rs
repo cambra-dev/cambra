@@ -89,11 +89,18 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         self.element_extent.clone()
     }
 
-    fn get(&self, key: &Value) -> Value {
-        self.data
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| panic!("Key {key:?} not found in TestDataSource"))
+    fn get(&self, mut keys: ColumnValue) -> ColumnValue {
+        ColumnValue::from_values(
+            keys.drain_to_value_iter()
+                .map(|key| {
+                    self.data
+                        .get(&key)
+                        .unwrap_or_else(|| panic!("Key {key:?} not found in TestDataSource"))
+                })
+                .cloned()
+                .collect(),
+            &self.output_value_extent(),
+        )
     }
 
     fn output_value_extent(&self) -> Extent {

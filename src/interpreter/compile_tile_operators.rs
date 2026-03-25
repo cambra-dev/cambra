@@ -412,7 +412,7 @@ fn compile_source(
 fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, CompileError> {
     let (value, extent) = match lit {
         Lit::Int(n) => (Value::Int(*n), Extent::Base(BaseType::Int)),
-        Lit::String(s) => (Value::String(s.clone()), Extent::Base(BaseType::String)),
+        Lit::String(s) => (Value::String(s.into()), Extent::Base(BaseType::String)),
         Lit::Bool(b) => (Value::Bool(*b), Extent::Base(BaseType::Bool)),
         Lit::Unit => (Value::Unit, Extent::Base(BaseType::Unit)),
     };
@@ -817,7 +817,7 @@ fn expr_to_value(expr: &Expr) -> Result<Value, CompileError> {
     match &expr.node {
         TypedExprNode::Lit(lit) => Ok(match lit {
             Lit::Int(n) => Value::Int(*n),
-            Lit::String(s) => Value::String(s.clone()),
+            Lit::String(s) => Value::String(s.into()),
             Lit::Bool(b) => Value::Bool(*b),
             Lit::Unit => Value::Unit,
         }),

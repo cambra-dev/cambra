@@ -5,6 +5,7 @@ use std::{
 };
 
 use log::{debug, trace};
+use smol_str::SmolStr;
 
 use crate::interpreter::{
     tiling::Predicate, ColumnValue, DataSourceDomainExtentImpl, Extent, Value,
@@ -16,7 +17,7 @@ use crate::interpreter::{
 /// blocks — it simply drains whatever the reader thread has buffered so far.
 pub struct StdinDataSource {
     /// Currently available data.
-    buffer: Vec<String>,
+    buffer: Vec<SmolStr>,
 
     /// Offset of indices in the buffer.  Indices less than this have been released.
     start_idx: usize,
@@ -31,7 +32,7 @@ pub struct StdinDataSource {
     closed: bool,
 
     /// Lines arriving from the background reader thread.  `None` signals EOF.
-    receiver: Receiver<Option<String>>,
+    receiver: Receiver<Option<SmolStr>>,
 }
 
 impl StdinDataSource {
@@ -39,21 +40,17 @@ impl StdinDataSource {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let mut reader = std::io::BufReader::new(std::io::stdin());
+            let mut buf = String::new();
             loop {
-                let mut line = String::new();
-                match reader.read_line(&mut line) {
+                buf.clear();
+                match reader.read_line(&mut buf) {
                     Ok(0) => {
                         // EOF — signal the main thread and stop.
                         let _ = sender.send(None);
                         return;
                     }
                     Ok(_) => {
-                        if line.ends_with('\n') {
-                            line.pop();
-                            if line.ends_with('\r') {
-                                line.pop();
-                            }
-                        }
+                        let line = SmolStr::new(buf.trim_end_matches(['\n', '\r']));
                         if sender.send(Some(line)).is_err() {
                             // Receiver was dropped (source closed); stop reading.
                             return;
@@ -73,7 +70,7 @@ impl StdinDataSource {
         }
     }
 
-    fn get_opt(&self, i: usize) -> Option<&str> {
+    fn get_opt(&self, i: usize) -> Option<&SmolStr> {
         if self.closed || self.start_idx > i || i >= self.ready_size {
             None
         } else {
@@ -82,12 +79,12 @@ impl StdinDataSource {
     }
 
     /// Returns the line at the given index.
-    fn get(&self, i: usize) -> &str {
+    fn get(&self, i: usize) -> &SmolStr {
         self.get_opt(i)
             .unwrap_or_else(|| panic!("Invalid StdinDataSource::get({i})"))
     }
 
-    fn add(&mut self, line: String) {
+    fn add(&mut self, line: SmolStr) {
         self.buffer.push(line);
         self.ready_size += 1;
     }
@@ -171,9 +168,11 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         Extent::Base(crate::interpreter::BaseType::UInt)
     }
 
-    fn get(&self, key: &Value) -> Value {
+    fn get(&self, key: ColumnValue) -> ColumnValue {
         match key {
-            Value::UInt(i) => Value::String(self.get(*i).to_string()),
+            ColumnValue::UInts(v) => {
+                ColumnValue::Strings(v.iter().map(|i| self.get(*i)).cloned().collect())
+            }
             other => panic!("StdinDataSource::get expected UInt key, got {other:?}"),
         }
     }
@@ -203,8 +202,8 @@ mod tests {
     fn test_stdin_datasource() {
         let mut source = StdinDataSource::new();
         assert_eq!(Predicate::False, source.get_yield_predicate());
-        source.add("a".to_string());
-        source.add("b".to_string());
+        source.add("a".into());
+        source.add("b".into());
         assert_eq!("a", source.get(0));
         assert_eq!("b", source.get(1));
         assert_eq!(None, source.get_opt(2));
@@ -219,7 +218,7 @@ mod tests {
         );
         assert_eq!(None, source.get_opt(0));
         assert_eq!("b", source.get(1));
-        source.add("c".to_string());
+        source.add("c".into());
         assert_eq!(None, source.get_opt(0));
         assert_eq!("b", source.get(1));
         assert_eq!("c", source.get(2));
