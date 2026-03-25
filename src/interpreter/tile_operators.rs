@@ -13,7 +13,7 @@ use std::{
     collections::HashMap,
     hash::Hash,
     rc::Rc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{Mutex, OnceLock},
 };
 
 use bit_vec::BitVec;
@@ -67,8 +67,38 @@ pub trait TileOperator {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer>;
 
-    /// Render this operator as an [`InspectNode`] for visualization.
-    fn inspect(&self, _opts: &VizOptions) -> InspectNode;
+    /// Inspect this producer as an [`InspectNode`] for visualization.
+    ///
+    /// Always includes name and tiling, and impls can add children with `add_inspect_children`
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        let name: &'static str = std::any::type_name::<Self>().rsplit_once("::").unwrap().1;
+        self.add_inspect_children(
+            InspectNode::new(name).with_tiling(self.tiling().to_string()),
+            opts,
+        )
+    }
+
+    /// Hook for adding any children to the InspectNode.
+    fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+        node
+    }
+}
+
+/// Per-display-name instance counters, shared across all producer types.
+///
+/// Each key is the display name of a producer (e.g. `"MapApply"`, `"Memo"`),
+/// and the value is the next ID to assign.  IDs start at 1.
+static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLock::new();
+
+/// Common identity and tiling state shared by every [`TileProducer`].
+///
+/// Storing these together avoids repeating the same two fields and their
+/// trivial accessor implementations across every producer struct.
+pub struct ProducerBase {
+    /// Instance-unique ID, allocated by [`TileProducer::alloc_id`].
+    pub id: usize,
+    /// Output tiling for this producer.
+    pub tiling: Tiling,
 }
 
 /// Live runtime counterpart of a [`TileOperator`].
@@ -76,18 +106,48 @@ pub trait TileOperator {
 /// Created by [`TileOperator::subscribe`], a producer services `get` queries
 /// and accepts `release` notifications from its consumer.
 pub trait TileProducer {
-    /// Return the [`Tiling`] that describes this producer's output shape.
-    /// If the operator has unbound arguments, the tiling will be a curried function
-    /// from inputs to the output.
-    fn tiling(&self) -> &Tiling;
+    /// Return the shared identity/tiling state for this producer.
+    ///
+    /// Implement as `fn base(&self) -> &ProducerBase { &self.base }`.
+    fn base(&self) -> &ProducerBase;
 
-    /// Return the name of the concrete producer type.
+    /// Return the [`Tiling`] that describes this producer's output shape.
+    fn tiling(&self) -> &Tiling {
+        &self.base().tiling
+    }
+
+    /// Return the instance-unique numeric ID assigned at construction.
+    fn producer_id(&self) -> usize {
+        self.base().id
+    }
+
+    /// Allocate the next instance ID for this producer type.
+    ///
+    /// The counter key is derived from `Self`'s type name with the `"Producer"`
+    /// suffix stripped.  Call this from each producer's constructor to
+    /// initialise its `id` field: `id: Self::alloc_id()`.
+    fn alloc_id() -> usize
+    where
+        Self: Sized,
+    {
+        let raw: &'static str = std::any::type_name::<Self>().rsplit_once("::").unwrap().1;
+        let key: &'static str = raw.strip_suffix("Producer").unwrap_or(raw);
+        let map = PRODUCER_COUNTERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut counters = map.lock().unwrap();
+        let counter = counters.entry(key).or_insert(0);
+        *counter += 1;
+        *counter
+    }
+
+    /// Return the name of the concrete producer type, disambiguated by instance.
+    ///
+    /// The default implementation derives the display name from the concrete
+    /// type name by stripping the `"Producer"` suffix, then appends `#<id>`.
+    /// For example, `MapApplyProducer` with id 3 → `"MapApply#3"`.
     fn name(&self) -> String {
-        std::any::type_name::<Self>()
-            .rsplit_once("::")
-            .unwrap()
-            .1
-            .to_string()
+        let raw = std::any::type_name::<Self>().rsplit_once("::").unwrap().1;
+        let base = raw.strip_suffix("Producer").unwrap_or(raw);
+        format!("{}#{}", base, self.producer_id())
     }
 
     /// Fetch the current tile value.
@@ -119,10 +179,18 @@ pub trait TileProducer {
 
     /// Inspect this producer as an [`InspectNode`] for visualization.
     ///
-    /// The default implementation heuristically extracts the type name from Debug
-    /// output. Override this for proper visualization — the fallback exists only
-    /// so that new Producer types are displayable before a custom impl is added.
-    fn inspect(&self, _opts: &VizOptions) -> InspectNode;
+    /// Always includes name and tiling, and impls can add children with `add_inspect_children`
+    fn inspect(&self, opts: &VizOptions) -> InspectNode {
+        self.add_inspect_children(
+            InspectNode::new(self.name()).with_tiling(self.tiling().to_string()),
+            opts,
+        )
+    }
+
+    /// Hook for adding any children to the InspectNode.
+    fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+        node
+    }
 }
 
 /// Repeat a scalar or record-of-scalars tile `len` times along the domain axis.
@@ -330,43 +398,30 @@ impl TileOperator for MapApply {
             Box::new(consumer_wrapper.clone()),
             scheduler,
         );
-        Box::new(MapApplyProducer::new(
-            self.tiling.clone(),
-            input_producer,
-            function_producer,
-        ))
+        Box::new(MapApplyProducer {
+            base: ProducerBase {
+                id: MapApplyProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
+            input: input_producer,
+            function: function_producer,
+        })
     }
 }
 
 struct MapApplyProducer {
-    tiling: Tiling,
+    base: ProducerBase,
     input: Box<dyn TileProducer>,
     function: Box<dyn TileProducer>,
 }
 
-impl MapApplyProducer {
-    pub fn new(
-        tiling: Tiling,
-        input: Box<dyn TileProducer>,
-        function: Box<dyn TileProducer>,
-    ) -> Self {
-        Self {
-            tiling,
-            input,
-            function,
-        }
-    }
-}
-
 impl TileProducer for MapApplyProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapApply")
-            .with_tiling(self.tiling.to_string())
-            .child("fn", self.function.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("fn", self.function.inspect(opts))
             .child("input", self.input.inspect(opts))
     }
 
@@ -406,7 +461,7 @@ impl TileProducer for MapApplyProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("MapApplyProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -463,10 +518,8 @@ impl TileOperator for MapToConst {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapToConst")
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
             .child("constant", self.constant.inspect(opts))
     }
 
@@ -489,43 +542,30 @@ impl TileOperator for MapToConst {
             Box::new(consumer_wrapper.clone()),
             scheduler,
         );
-        Box::new(MapToConstProducer::new(
-            self.tiling.clone(),
-            input_producer,
-            constant_producer,
-        ))
+        Box::new(MapToConstProducer {
+            base: ProducerBase {
+                id: MapToConstProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
+            input: input_producer,
+            constant: constant_producer,
+        })
     }
 }
 
 struct MapToConstProducer {
-    tiling: Tiling,
+    base: ProducerBase,
     input: Box<dyn TileProducer>,
     constant: Box<dyn TileProducer>,
 }
 
-impl MapToConstProducer {
-    pub fn new(
-        tiling: Tiling,
-        input: Box<dyn TileProducer>,
-        constant: Box<dyn TileProducer>,
-    ) -> Self {
-        Self {
-            tiling,
-            input,
-            constant,
-        }
-    }
-}
-
 impl TileProducer for MapToConstProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapToConst")
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
             .child("constant", self.constant.inspect(opts))
     }
 
@@ -564,7 +604,7 @@ impl TileProducer for MapToConstProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("MapToConstProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -628,10 +668,6 @@ impl TileOperator for IterateExtent {
         &self.tiling
     }
 
-    fn inspect(&self, _opts: &VizOptions) -> InspectNode {
-        InspectNode::leaf("IterateExtent").with_tiling(self.tiling().to_string())
-    }
-
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -650,29 +686,24 @@ impl TileOperator for IterateExtent {
             Self::add_all_source_handles(&self.extent, consumer_wrapper, scheduler);
         }
 
-        Box::new(IterateExtentProducer::new(
-            self.extent.clone(),
-            self.tiling.clone(),
-        ))
+        Box::new(IterateExtentProducer {
+            base: ProducerBase {
+                id: IterateExtentProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
+            extent: self.extent.clone(),
+        })
     }
 }
 
 /// Producer for [`IterateExtent`]: emits an identity sealed-function tile.
 struct IterateExtentProducer {
+    base: ProducerBase,
     /// The extent being iterated.
     ///
     /// For `UIntRange` extents this is an `IntervalSet<usize>` that shrinks
     /// directly as sub-intervals are released.
     extent: Extent,
-    /// Output tiling.
-    tiling: Tiling,
-}
-
-impl IterateExtentProducer {
-    /// Create a new `IterateExtentProducer` for the given extent and tiling.
-    pub fn new(extent: Extent, tiling: Tiling) -> Self {
-        Self { extent, tiling }
-    }
 }
 
 fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
@@ -817,8 +848,8 @@ fn iterate_record(fields: &HashMap<String, Extent>) -> ColumnValue {
 }
 
 impl TileProducer for IterateExtentProducer {
-    fn inspect(&self, _opts: &VizOptions) -> InspectNode {
-        InspectNode::leaf("IterateExtent").with_tiling(self.tiling().to_string())
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -832,15 +863,11 @@ impl TileProducer for IterateExtentProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("IterateExtentProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         let TileGuard::Function(FunctionGuard::Domain(pred)) = obsolete_guard else {
             panic!("IterateExtent::release expected Domain guard, got {obsolete_guard:?}")
         };
         release_extent(&mut self.extent, &pred);
-    }
-
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
     }
 }
 
@@ -890,11 +917,8 @@ impl TileOperator for MapSource {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapSource")
-            .annotate(self.source.borrow().get_id().to_string())
-            .with_tiling(self.tiling().to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn subscribe(
@@ -903,45 +927,34 @@ impl TileOperator for MapSource {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        Box::new(MapSourceProducer::new(
-            self.input
+        Box::new(MapSourceProducer {
+            base: ProducerBase {
+                id: MapSourceProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
+            input: self
+                .input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
-            self.source.clone(),
-            self.tiling.clone(),
-        ))
+            source: self.source.clone(),
+        })
     }
 }
 
 /// Producer for [`MapSource`]: maps each domain key to its output value on `get`.
 struct MapSourceProducer {
+    base: ProducerBase,
     input: Box<dyn TileProducer>,
     /// The data source used for both domain enumeration and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-    /// Output tiling.
-    tiling: Tiling,
-}
-
-impl MapSourceProducer {
-    fn new(
-        input: Box<dyn TileProducer>,
-        source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
-        tiling: Tiling,
-    ) -> Self {
-        Self {
-            input,
-            source,
-            tiling,
-        }
-    }
 }
 
 impl TileProducer for MapSourceProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapSource")
+        InspectNode::new(self.name())
             .annotate(self.source.borrow().get_id().to_string())
             .with_tiling(self.tiling().to_string())
             .child("input", self.input.inspect(opts))
@@ -976,7 +989,7 @@ impl TileProducer for MapSourceProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("MapSourceProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         self.input.release(obsolete_guard);
     }
 }
@@ -1030,8 +1043,7 @@ impl TileOperator for Zip {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut node = InspectNode::new("Zip").with_tiling(self.tiling.to_string());
+    fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
         for (i, input) in self.inputs.iter().enumerate() {
             node = node.child(format!("{i}"), input.inspect(opts));
         }
@@ -1047,9 +1059,13 @@ impl TileOperator for Zip {
         let consumer_wrapper = Rc::new(RefCell::new(move || {
             consumer.notify();
         }));
-        Box::new(ZipProducer::new(
-            self.tiling.clone(),
-            self.inputs
+        Box::new(ZipProducer {
+            base: ProducerBase {
+                id: ZipProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
+            inputs: self
+                .inputs
                 .iter_mut()
                 .map(|i| {
                     i.subscribe(
@@ -1059,32 +1075,23 @@ impl TileOperator for Zip {
                     )
                 })
                 .collect(),
-        ))
+        })
     }
 }
 
 /// Producer for [`Zip`]: pulls each input and assembles a record-codomain tile.
-pub struct ZipProducer {
-    /// Output tiling.
-    tiling: Tiling,
+struct ZipProducer {
+    base: ProducerBase,
     /// Live input producers, in field order.
     inputs: Vec<Box<dyn TileProducer>>,
 }
 
-impl ZipProducer {
-    /// Create a new `ZipProducer` from a tiling and a list of input producers.
-    pub fn new(tiling: Tiling, inputs: Vec<Box<dyn TileProducer>>) -> Self {
-        Self { tiling, inputs }
-    }
-}
-
 impl TileProducer for ZipProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut node = InspectNode::new("Zip").with_tiling(self.tiling.to_string());
+    fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
         for (i, input) in self.inputs.iter().enumerate() {
             node = node.child(format!("_{i}"), input.inspect(opts));
         }
@@ -1136,7 +1143,7 @@ impl TileProducer for ZipProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("ZipProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         self.inputs.iter_mut().for_each(|i| {
             i.release(match &obsolete_guard {
                 g if g.is_universal() => i.tiling().universal_guard(),
@@ -1187,8 +1194,7 @@ impl TileOperator for ScalarTuple {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut node = InspectNode::new("ScalarTuple").with_tiling(self.tiling.to_string());
+    fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
         for (i, input) in self.inputs.iter().enumerate() {
             node = node.child(format!("{i}"), input.inspect(opts));
         }
@@ -1204,9 +1210,13 @@ impl TileOperator for ScalarTuple {
         let consumer_wrapper = Rc::new(RefCell::new(move || {
             consumer.notify();
         }));
-        Box::new(ScalarTupleProducer::new(
-            self.tiling.clone(),
-            self.inputs
+        Box::new(ScalarTupleProducer {
+            base: ProducerBase {
+                id: ScalarTupleProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
+            inputs: self
+                .inputs
                 .iter_mut()
                 .map(|i| {
                     i.subscribe(
@@ -1216,31 +1226,23 @@ impl TileOperator for ScalarTuple {
                     )
                 })
                 .collect(),
-        ))
+        })
     }
 }
 
 /// Producer for [`ScalarTuple`]: pulls each scalar input and combines them into
 /// a `Tile::Scalar(ColumnValue::Records)`.
-pub struct ScalarTupleProducer {
-    tiling: Tiling,
+struct ScalarTupleProducer {
+    base: ProducerBase,
     inputs: Vec<Box<dyn TileProducer>>,
 }
 
-impl ScalarTupleProducer {
-    /// Create a new `ScalarTupleProducer` from a tiling and a list of input producers.
-    pub fn new(tiling: Tiling, inputs: Vec<Box<dyn TileProducer>>) -> Self {
-        Self { tiling, inputs }
-    }
-}
-
 impl TileProducer for ScalarTupleProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let mut node = InspectNode::new("ScalarTuple").with_tiling(self.tiling.to_string());
+    fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
         for (i, input) in self.inputs.iter().enumerate() {
             node = node.child(format!("{i}"), input.inspect(opts));
         }
@@ -1261,7 +1263,7 @@ impl TileProducer for ScalarTupleProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("ScalarTupleProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
     }
 }
 
@@ -1298,10 +1300,8 @@ impl TileOperator for Converse {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("Converse")
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn subscribe(
@@ -1310,38 +1310,32 @@ impl TileOperator for Converse {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        Box::new(ConverseProducer::new(
-            self.tiling().clone(),
-            self.input
+        Box::new(ConverseProducer {
+            base: ProducerBase {
+                id: ConverseProducer::alloc_id(),
+                tiling: self.tiling().clone(),
+            },
+            input: self
+                .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
-        ))
+        })
     }
 }
 
 /// Producer for [`Converse`]: inverts a sealed-function tile into a lookup-function tile.
-pub struct ConverseProducer {
-    /// Output tiling.
-    tiling: Tiling,
+struct ConverseProducer {
+    base: ProducerBase,
     /// The upstream producer whose output is inverted.
     input: Box<dyn TileProducer>,
 }
 
-impl ConverseProducer {
-    /// Create a new `ConverseProducer` from a tiling and an input producer.
-    pub fn new(tiling: Tiling, input: Box<dyn TileProducer>) -> Self {
-        Self { tiling, input }
-    }
-}
-
 impl TileProducer for ConverseProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("Converse")
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -1367,7 +1361,7 @@ impl TileProducer for ConverseProducer {
                         a.partial_cmp(b)
                             .expect("CurriedFunction domain values must be comparable")
                     });
-                    let (out_domain_extent, out_codomain_extent) = match &self.tiling {
+                    let (out_domain_extent, out_codomain_extent) = match self.tiling() {
                         Tiling::CurriedFunction {
                             domain1, codomain, ..
                         } => (domain1.clone(), codomain.clone()),
@@ -1402,7 +1396,7 @@ impl TileProducer for ConverseProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("ConverseProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         match obsolete_guard {
             g if g.is_universal() => self.input.release(self.input.tiling().universal_guard()),
             TileGuard::Function(FunctionGuard::Codomain(g)) => {
@@ -1477,10 +1471,8 @@ impl TileOperator for MapCompose {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapCompose")
-            .with_tiling(self.tiling.to_string())
-            .child("fn", self.function.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("fn", self.function.inspect(opts))
             .child("input", self.input.inspect(opts))
     }
 
@@ -1504,7 +1496,10 @@ impl TileOperator for MapCompose {
             scheduler,
         );
         Box::new(MapComposeProducer {
-            tiling: self.tiling.clone(),
+            base: ProducerBase {
+                id: MapComposeProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
             input: input_producer,
             function: function_producer,
         })
@@ -1513,8 +1508,7 @@ impl TileOperator for MapCompose {
 
 /// Producer for [`MapCompose`].
 struct MapComposeProducer {
-    /// Output tiling.
-    tiling: Tiling,
+    base: ProducerBase,
     /// The subscribed input producer.
     input: Box<dyn TileProducer>,
     /// The subscribed function producer.
@@ -1522,19 +1516,17 @@ struct MapComposeProducer {
 }
 
 impl TileProducer for MapComposeProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapCompose")
-            .with_tiling(self.tiling.to_string())
-            .child("fn", self.function.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("fn", self.function.inspect(opts))
             .child("input", self.input.inspect(opts))
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let out_codomain_extent = match &self.tiling {
+        let out_codomain_extent = match self.tiling() {
             Tiling::CurriedFunction { codomain, .. } => codomain.clone(),
             t => panic!("MapCompose output tiling is not CurriedFunction: {t:?}"),
         };
@@ -1562,7 +1554,7 @@ impl TileProducer for MapComposeProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("MapComposeProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         match obsolete_guard {
             g if g.is_universal() => self.input.release(self.input.tiling().universal_guard()),
             TileGuard::Function(FunctionGuard::Domain(p)) => self
@@ -1615,10 +1607,8 @@ impl TileOperator for Filter {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("Filter")
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
             .child("predicate", self.predicate.inspect(opts))
     }
 
@@ -1641,43 +1631,30 @@ impl TileOperator for Filter {
             Box::new(consumer_wrapper.clone()),
             scheduler,
         );
-        Box::new(FilterProducer::new(
-            self.tiling.clone(),
-            input_producer,
-            predicate_producer,
-        ))
+        Box::new(FilterProducer {
+            base: ProducerBase {
+                id: FilterProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
+            input: input_producer,
+            predicate: predicate_producer,
+        })
     }
 }
 
 struct FilterProducer {
-    tiling: Tiling,
+    base: ProducerBase,
     input: Box<dyn TileProducer>,
     predicate: Box<dyn TileProducer>,
 }
 
-impl FilterProducer {
-    pub fn new(
-        tiling: Tiling,
-        input: Box<dyn TileProducer>,
-        predicate: Box<dyn TileProducer>,
-    ) -> Self {
-        Self {
-            tiling,
-            input,
-            predicate,
-        }
-    }
-}
-
 impl TileProducer for FilterProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("Filter")
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
             .child("predicate", self.predicate.inspect(opts))
     }
 
@@ -1787,7 +1764,7 @@ impl TileProducer for FilterProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("FilterProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         self.input.release(obsolete_guard);
     }
 }
@@ -1800,8 +1777,6 @@ impl TileProducer for FilterProducer {
 pub struct Aggregate {
     /// The `SealedFunction`-typed input whose codomain elements are aggregated.
     input: Box<dyn TileOperator>,
-    /// The aggregation operation (Sum, Max, …).
-    kind: AggregateKind,
     /// Output tiling — always `Tiling::Aggregation { accumulator: <output extent> }`.
     tiling: Tiling,
 }
@@ -1822,11 +1797,7 @@ impl Aggregate {
             kind: kind.clone(),
             accumulator: kind.output_extent(&codomain_extent).unwrap_or_else(err),
         };
-        Self {
-            input,
-            kind,
-            tiling,
-        }
+        Self { input, tiling }
     }
 }
 
@@ -1835,11 +1806,8 @@ impl TileOperator for Aggregate {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("Aggregate")
-            .annotate(format!("({:?})", self.kind))
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn subscribe(
@@ -1856,12 +1824,11 @@ impl TileOperator for Aggregate {
 }
 
 struct AggregateProducer {
+    base: ProducerBase,
     /// The subscribed input producer.
     input: Box<dyn TileProducer>,
     /// The aggregation operation.
     kind: AggregateKind,
-    /// Output tiling.
-    tiling: Tiling,
     /// Running accumulation state; updated in place on each `get`.
     accumulator: Tile,
 }
@@ -1884,7 +1851,10 @@ impl AggregateProducer {
             other => panic!("AggregateProducer created with non-Aggregation tiling: {other:?}"),
         };
         Self {
-            tiling,
+            base: ProducerBase {
+                id: Self::alloc_id(),
+                tiling,
+            },
             input,
             kind,
             accumulator,
@@ -1893,15 +1863,12 @@ impl AggregateProducer {
 }
 
 impl TileProducer for AggregateProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("Aggregate")
-            .annotate(format!("({:?})", self.kind))
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -1939,7 +1906,7 @@ impl TileProducer for AggregateProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("AggregateProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         // Nothing to do. We could consider sanity checking that get is not called
         // after a universal release.
     }
@@ -1973,8 +1940,8 @@ impl TileOperator for ExtractAggregate {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("ExtractAggregate").child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn subscribe(
@@ -1983,46 +1950,34 @@ impl TileOperator for ExtractAggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        Box::new(ExtractAggregateProducer::new(
-            self.tiling().clone(),
-            self.input
+        Box::new(ExtractAggregateProducer {
+            base: ProducerBase {
+                id: ExtractAggregateProducer::alloc_id(),
+                tiling: self.tiling().clone(),
+            },
+            input: self
+                .input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
-            self.kind.clone(),
-            self.only_terminal,
-        ))
+            kind: self.kind.clone(),
+            only_terminal: self.only_terminal,
+        })
     }
 }
 
 struct ExtractAggregateProducer {
+    base: ProducerBase,
     input: Box<dyn TileProducer>,
-    tiling: Tiling,
     kind: AggregateKind,
     only_terminal: bool,
 }
 
-impl ExtractAggregateProducer {
-    pub fn new(
-        tiling: Tiling,
-        input: Box<dyn TileProducer>,
-        kind: AggregateKind,
-        only_terminal: bool,
-    ) -> Self {
-        Self {
-            input,
-            tiling,
-            kind,
-            only_terminal,
-        }
-    }
-}
-
 impl TileProducer for ExtractAggregateProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("ExtractAggregate").child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -2050,7 +2005,7 @@ impl TileProducer for ExtractAggregateProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("ExtractAggregateProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         if obsolete_guard.is_universal() {
             self.input.release(self.input.tiling().universal_guard());
         }
@@ -2104,11 +2059,8 @@ impl TileOperator for MapExtractAggregate {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapExtractAggregate")
-            .annotate(format!("({:?})", self.kind))
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn subscribe(
@@ -2121,7 +2073,10 @@ impl TileOperator for MapExtractAggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapExtractAggregateProducer {
-            tiling: self.tiling.clone(),
+            base: ProducerBase {
+                id: MapExtractAggregateProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
             input: input_producer,
             kind: self.kind.clone(),
         })
@@ -2130,8 +2085,7 @@ impl TileOperator for MapExtractAggregate {
 
 /// Producer for [`MapExtractAggregate`].
 struct MapExtractAggregateProducer {
-    /// Output tiling.
-    tiling: Tiling,
+    base: ProducerBase,
     /// The subscribed input producer.
     input: Box<dyn TileProducer>,
     /// The aggregation operation used to extract final values.
@@ -2139,15 +2093,12 @@ struct MapExtractAggregateProducer {
 }
 
 impl TileProducer for MapExtractAggregateProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapExtractAggregate")
-            .annotate(format!("({:?})", self.kind))
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -2168,8 +2119,8 @@ impl TileProducer for MapExtractAggregateProducer {
         else {
             panic!("MapExtractAggregate expected SealedFunction(Aggregation) codomain")
         };
-        let output_extent = self.tiling.codomain().unwrap().extent();
-        let domain_extent = self.tiling.domain_extent().unwrap();
+        let output_extent = self.tiling().codomain().unwrap().extent();
+        let domain_extent = self.tiling().domain_extent().unwrap();
         // Emit only the domain elements whose per-key aggregation is terminal.
         let (kept_domain, kept_values): (Vec<Value>, Vec<Value>) = domain
             .drain_to_value_iter()
@@ -2194,7 +2145,7 @@ impl TileProducer for MapExtractAggregateProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("MapExtractAggregateProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -2258,11 +2209,8 @@ impl TileOperator for MapAggregate {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapAggregate")
-            .annotate(format!("({:?})", self.kind))
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn subscribe(
@@ -2275,7 +2223,10 @@ impl TileOperator for MapAggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapAggregateProducer {
-            tiling: self.tiling.clone(),
+            base: ProducerBase {
+                id: MapAggregateProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
             input: input_producer,
             kind: self.kind.clone(),
             accumulators: HashMap::new(),
@@ -2285,8 +2236,7 @@ impl TileOperator for MapAggregate {
 
 /// Producer for [`MapAggregate`].
 struct MapAggregateProducer {
-    /// Output tiling.
-    tiling: Tiling,
+    base: ProducerBase,
     /// The subscribed lookup-function producer.
     input: Box<dyn TileProducer>,
     /// The aggregation operation.
@@ -2296,20 +2246,17 @@ struct MapAggregateProducer {
 }
 
 impl TileProducer for MapAggregateProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("MapAggregate")
-            .annotate(format!("({:?})", self.kind))
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
-        trace!("MapAggregate received {input_tile:?}");
+        trace!("{} received {input_tile:?}", self.name());
         let upstream_guard = input_tile.to_guard();
         let Tile::CurriedFunction {
             domain1,
@@ -2322,8 +2269,8 @@ impl TileProducer for MapAggregateProducer {
             panic!("MapAggregate requires a CurriedFunction tile")
         };
         // output_extent is the accumulator extent from the Aggregation codomain tiling.
-        let output_extent = self.tiling.codomain().unwrap().extent();
-        let domain_extent = self.tiling.domain_extent().unwrap();
+        let output_extent = self.tiling().codomain().unwrap().extent();
+        let domain_extent = self.tiling().domain_extent().unwrap();
         // Merge newly arrived values into per-key accumulators.
         let kind = &self.kind;
         let accumulators = &mut self.accumulators;
@@ -2366,7 +2313,7 @@ impl TileProducer for MapAggregateProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("MapAggregateProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         if obsolete_guard.is_universal() {
             self.accumulators.clear();
             self.input.release(self.input.tiling().universal_guard());
@@ -2380,6 +2327,8 @@ impl TileProducer for MapAggregateProducer {
 /// [`Split::split`] shares the same object from the start — even before any
 /// [`TileOperator::subscribe`] call has initialised the inner producer.
 struct SplitShared {
+    /// Instance ID shared by all [`SplitProducer`]s from the same split group.
+    id: usize,
     /// Inner producer, set on the first [`Split::subscribe`] call.
     producer: Option<Box<dyn TileProducer>>,
     /// Every consumer registered via [`Split::subscribe`], in order.
@@ -2408,6 +2357,7 @@ impl Split {
     pub fn new(input: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
         let shared = Rc::new(RefCell::new(SplitShared {
+            id: SplitProducer::alloc_id(),
             producer: None,
             consumers: Vec::new(),
             release_guards: Vec::new(),
@@ -2439,13 +2389,13 @@ impl TileOperator for Split {
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        let id = Rc::as_ptr(&self.shared) as usize;
+        let id = self.shared.borrow().id;
         if self.primary {
-            InspectNode::new(format!("Split#{id:x}"))
+            InspectNode::new(format!("Split#{id}"))
                 .with_tiling(self.tiling().to_string())
                 .child("input", self.input.borrow().inspect(opts))
         } else {
-            InspectNode::leaf(format!("→ Split#{id:x}"))
+            InspectNode::leaf(format!("→ Split#{id}"))
         }
     }
 
@@ -2485,7 +2435,10 @@ impl TileOperator for Split {
         }
 
         Box::new(SplitProducer {
-            tiling: self.tiling.clone(),
+            base: ProducerBase {
+                id: self.shared.borrow().id,
+                tiling: self.tiling.clone(),
+            },
             shared: self.shared.clone(),
             index,
         })
@@ -2493,7 +2446,7 @@ impl TileOperator for Split {
 }
 
 struct SplitProducer {
-    tiling: Tiling,
+    base: ProducerBase,
     /// Shared state (consumers + release guards).
     shared: Rc<RefCell<SplitShared>>,
     /// This producer's index into `shared.consumers` and `shared.release_guards`.
@@ -2501,19 +2454,14 @@ struct SplitProducer {
 }
 
 impl TileProducer for SplitProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
-
-    fn name(&self) -> String {
-        let id = Rc::as_ptr(&self.shared) as usize;
-        format!("Split#{id:x}")
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         if self.index == 0 {
             InspectNode::new(self.name())
-                .with_tiling(self.tiling.to_string())
+                .with_tiling(self.tiling().to_string())
                 .child(
                     "input",
                     self.shared
@@ -2563,7 +2511,7 @@ impl TileProducer for SplitProducer {
             shared
                 .release_guards
                 .iter()
-                .fold(self.tiling.universal_guard(), |acc, g| acc.intersect(g))
+                .fold(self.tiling().universal_guard(), |acc, g| acc.intersect(g))
         };
         debug!("{} releasing: {result:?}", self.name());
         self.shared
@@ -2596,10 +2544,8 @@ impl TileOperator for Memo {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("Memo")
-            .with_tiling(self.tiling().to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn subscribe(
@@ -2609,40 +2555,29 @@ impl TileOperator for Memo {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(MemoProducer {
-            id: get_memo_id(),
+            base: ProducerBase {
+                id: MemoProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
             input: self.input.subscribe(intent_guard, consumer, scheduler),
-            tiling: self.tiling.clone(),
             cached_tile: self.tiling().empty_tile(),
         })
     }
 }
 
-// TODO replace with a general purpose counter map for all producer types
-static COUNTER: AtomicUsize = AtomicUsize::new(1);
-fn get_memo_id() -> usize {
-    COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
 struct MemoProducer {
-    id: usize,
+    base: ProducerBase,
     input: Box<dyn TileProducer>,
-    tiling: Tiling,
     cached_tile: Tile,
 }
 
 impl TileProducer for MemoProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn name(&self) -> String {
-        format!("Memo#{}", self.id)
-    }
-
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new(self.name())
-            .with_tiling(self.tiling().to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
@@ -2701,10 +2636,8 @@ impl TileOperator for Constant {
         &self.tiling
     }
 
-    fn inspect(&self, _opts: &VizOptions) -> InspectNode {
-        InspectNode::leaf("Constant")
-            .with_tiling(self.tiling.to_string())
-            .annotate(format!("{}", self.value))
+    fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+        node.annotate(format!("{}", self.value))
     }
 
     fn subscribe(
@@ -2715,40 +2648,41 @@ impl TileOperator for Constant {
     ) -> Box<dyn TileProducer> {
         consumer.notify();
         Box::new(ConstantProducer {
+            base: ProducerBase {
+                id: ConstantProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
             value: self.value.clone(),
-            tiling: self.tiling.clone(),
             released: false,
         })
     }
 }
 
 struct ConstantProducer {
+    base: ProducerBase,
     value: Value,
-    tiling: Tiling,
     released: bool,
 }
 
 impl TileProducer for ConstantProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, _opts: &VizOptions) -> InspectNode {
-        InspectNode::leaf("Constant")
-            .with_tiling(self.tiling.to_string())
-            .annotate(format!("{}", self.value))
+    fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+        node.annotate(format!("{}", self.value))
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         if self.released {
-            self.tiling.empty_tile()
+            self.tiling().empty_tile()
         } else {
             Tile::Scalar(ColumnValue::single(self.value.clone()))
         }
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("ConstantProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         if obsolete_guard.is_universal() {
             self.released = true;
         }
@@ -2787,10 +2721,8 @@ impl TileOperator for ToScalar {
         &self.tiling
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("ToScalar")
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn subscribe(
@@ -2803,28 +2735,28 @@ impl TileOperator for ToScalar {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(ToScalarProducer {
+            base: ProducerBase {
+                id: ToScalarProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
             input: input_producer,
-            tiling: self.tiling.clone(),
         })
     }
 }
 
 struct ToScalarProducer {
+    base: ProducerBase,
     /// The subscribed input producer.
     input: Box<dyn TileProducer>,
-    /// Cached output tiling (the codomain of the input's `SealedFunction`).
-    tiling: Tiling,
 }
 
 impl TileProducer for ToScalarProducer {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
+    fn base(&self) -> &ProducerBase {
+        &self.base
     }
 
-    fn inspect(&self, opts: &VizOptions) -> InspectNode {
-        InspectNode::new("ToScalar")
-            .with_tiling(self.tiling.to_string())
-            .child("input", self.input.inspect(opts))
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -2842,7 +2774,7 @@ impl TileProducer for ToScalarProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("ToScalarProducer release: {obsolete_guard:?}");
+        debug!("{} release: {obsolete_guard:?}", self.name());
         // The input is always read in full (universal guard), so only a universal
         // release can be propagated meaningfully.
         if obsolete_guard.is_universal() {
@@ -2985,7 +2917,10 @@ mod tests {
             domain: extent.clone(),
             codomain: Box::new(Tiling::Scalar(extent.clone())),
         };
-        let mut producer = IterateExtentProducer::new(extent, tiling);
+        let mut producer = IterateExtentProducer {
+            base: ProducerBase { id: 0, tiling },
+            extent,
+        };
         let tile = producer.get(producer.tiling().universal_guard());
         let Tile::SealedFunction { domain, .. } = tile else {
             panic!()
