@@ -237,49 +237,33 @@ pub fn scalar_tile_to_column_value(tile: Tile) -> ColumnValue {
 fn apply_function_tile(
     function_tile: Tile,
     mut input: ColumnValue,
+    input_extent: &Extent,
     output_extent: &Extent,
 ) -> ColumnValue {
     match function_tile {
         Tile::Scalar(func) => match func.as_single() {
             Some(Value::ComputableFunction(f)) => f.apply(input),
             Some(Value::Function(bindings)) => {
-                let output_values: Vec<Value> = if bindings_are_list(&bindings) {
-                    let table: Vec<Value> = bindings.into_iter().map(|b| b.output).collect();
-                    input
-                        .drain_to_value_iter()
-                        .map(|v| table[v.as_uint()].clone())
-                        .collect()
+                if bindings_are_list(&bindings) {
+                    // Inputs are sequential u0, u1, … so input holds raw indices.
+                    let table = ColumnValue::from_values(
+                        bindings.into_iter().map(|b| b.output).collect(),
+                        output_extent,
+                    );
+                    input.transform_by_list(table)
                 } else {
-                    let table: HashMap<Value, Value> =
-                        bindings.into_iter().map(|b| (b.input, b.output)).collect();
-                    input
-                        .drain_to_value_iter()
-                        .map(|v| table[&v].clone())
-                        .collect()
-                };
-                ColumnValue::from_values(output_values, output_extent)
+                    let (keys, values) = bindings.into_iter().map(|b| (b.input, b.output)).unzip();
+                    let keys = ColumnValue::from_values(keys, input_extent);
+                    let values = ColumnValue::from_values(values, output_extent);
+                    input.transform_by_map(keys, values)
+                }
             }
             None => ColumnValue::from_values(Vec::new(), output_extent),
             _ => panic!("apply_function_tile: Scalar tile is not a function value"),
         },
         Tile::SealedFunction {
-            mut domain,
-            codomain,
-            ..
-        } => {
-            let Tile::Scalar(mut codomain_col) = *codomain else {
-                panic!("apply_function_tile: SealedFunction must have a Scalar codomain")
-            };
-            let table: HashMap<Value, Value> = domain
-                .drain_to_value_iter()
-                .zip(codomain_col.drain_to_value_iter())
-                .collect();
-            let output_values: Vec<Value> = input
-                .drain_to_value_iter()
-                .map(|v| table[&v].clone())
-                .collect();
-            ColumnValue::from_values(output_values, output_extent)
-        }
+            domain, codomain, ..
+        } => input.transform_by_map(domain, scalar_tile_to_column_value(*codomain)),
         tile => panic!("apply_function_tile: not a function tile: {tile:?}"),
     }
 }
@@ -491,7 +475,8 @@ impl TileProducer for MapResultProducer {
             f_tiling.is_function(),
             "MapApply expected function tiling, Got {f_tiling:?}"
         );
-        let f_codomain_extent = f_tiling.extent().split_function().unwrap().1.clone();
+        let f_extent = f_tiling.extent();
+        let (f_domain_extent, f_codomain_extent) = f_extent.split_function().unwrap();
         let i_tiling = self.input.tiling().clone();
         let input_guard = match projection_guard {
             TileGuard::Function(FunctionGuard::Domain(p)) => {
@@ -502,9 +487,8 @@ impl TileProducer for MapResultProducer {
 
         let input_tile = self.input.get(input_guard);
         let function_tile = self.function.get(self.function.tiling().universal_guard());
-
         process_tile_result(self.tiling(), input_tile, move |codomain| {
-            apply_function_tile(function_tile, codomain, &f_codomain_extent)
+            apply_function_tile(function_tile, codomain, f_domain_extent, f_codomain_extent)
         })
     }
 
@@ -1317,6 +1301,47 @@ struct ConverseProducer {
     input: Box<dyn TileProducer>,
 }
 
+/// Sort row indices by typed key, detect group boundaries, and assemble the
+/// curried-function tile for [`ConverseProducer`].
+///
+/// `K` is the native element type of the codomain column; using it directly
+/// avoids boxing to [`Value`] for most column types. `codomain` and `domain`
+/// are re-indexed via [`ColumnValue::select_indices`].
+fn converse_group_by_key<K: PartialOrd>(
+    keys: &[K],
+    codomain: &ColumnValue,
+    domain: &ColumnValue,
+    domain_predicate: Predicate,
+) -> Tile {
+    let n = keys.len();
+    // Sort row indices by codomain key; equal keys will be adjacent.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by(|&a, &b| keys[a].partial_cmp(&keys[b]).expect("Type mismatch"));
+    // Identify group boundaries: a new group starts wherever the sorted key changes.
+    let mut group_starts: Vec<usize> = Vec::new();
+    for i in 0..n {
+        if i == 0 || keys[order[i]] != keys[order[i - 1]] {
+            group_starts.push(i);
+        }
+    }
+    let num_groups = group_starts.len();
+    // domain1: one codomain value per group (the key for the outer lookup).
+    let domain1_col = codomain.select_indices(group_starts.iter().map(|&s| order[s]), num_groups);
+    // domain2/codomain_out: original domain values reordered to match sorted groups.
+    let domain2_col = domain.select_indices(order.into_iter(), n);
+    Tile::curried_function(
+        domain1_col,
+        ColumnValue::UInts(group_starts),
+        domain2_col.clone(),
+        domain2_col,
+        if domain_predicate.as_bool().unwrap_or(false) {
+            Predicate::True
+        } else {
+            Predicate::False
+        },
+    )
+}
+
 impl TileProducer for ConverseProducer {
     fn base(&self) -> &ProducerBase {
         &self.base
@@ -1330,52 +1355,51 @@ impl TileProducer for ConverseProducer {
         let input_tile = self.input.get(self.input.tiling().universal_guard());
         match input_tile {
             Tile::SealedFunction {
-                mut domain,
+                domain,
                 codomain,
                 domain_predicate,
             } => match *codomain {
-                Tile::Scalar(mut codomain) => {
-                    // Invert the function: group domain values by their output value.
-                    let mut grouped: HashMap<Value, Vec<Value>> = HashMap::new();
-                    for (i, o) in domain
-                        .drain_to_value_iter()
-                        .zip(codomain.drain_to_value_iter())
-                    {
-                        grouped.entry(o).or_default().push(i);
+                Tile::Scalar(codomain) => {
+                    // Dispatch on the native element type of the codomain column so that
+                    // sorting uses typed comparison (PartialOrd) and avoids boxing to Value
+                    // wherever the inner type is already ordered natively.
+                    match &codomain {
+                        ColumnValue::Units(n) => {
+                            // All codomains are unit; create one group with all rows in order.
+                            let keys = vec![(); *n];
+                            converse_group_by_key(&keys, &codomain, &domain, domain_predicate)
+                        }
+                        ColumnValue::Ints(v) => {
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate)
+                        }
+                        ColumnValue::UInts(v) => {
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate)
+                        }
+                        ColumnValue::Strings(v) => {
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate)
+                        }
+                        ColumnValue::Bools(bv) => {
+                            // Materialise as Vec<bool> so the element type is PartialOrd.
+                            let v: Vec<bool> = bv.iter().collect();
+                            converse_group_by_key(&v, &codomain, &domain, domain_predicate)
+                        }
+                        ColumnValue::Variants(v) => {
+                            // Value is PartialOrd; pass the inner vec directly.
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate)
+                        }
+                        ColumnValue::Records(_) => {
+                            // No native slice to borrow; materialise one Value per row for sorting.
+                            // TODO: benchmark this and figure out a way to avoid if needed.
+                            let n = codomain.len();
+                            let keys: Vec<Value> = (0..n).map(|i| codomain.index_at(i)).collect();
+                            converse_group_by_key(&keys, &codomain, &domain, domain_predicate)
+                        }
+                        ColumnValue::FunctionBindings { .. } => {
+                            panic!(
+                                "Cannot converse a function whose codomain is a function binding"
+                            )
+                        }
                     }
-                    // Sort by key so downstream consumers can do O(log n) binary-search lookups.
-                    let mut sorted: Vec<(Value, Vec<Value>)> = grouped.into_iter().collect();
-                    sorted.sort_by(|(a, _), (b, _)| {
-                        a.partial_cmp(b)
-                            .expect("CurriedFunction domain values must be comparable")
-                    });
-                    let (out_domain_extent, out_codomain_extent) = match self.tiling() {
-                        Tiling::CurriedFunction {
-                            domain1, codomain, ..
-                        } => (domain1.clone(), codomain.clone()),
-                        _ => unreachable!(),
-                    };
-                    let mut domain_vals: Vec<Value> = Vec::with_capacity(sorted.len());
-                    let mut offset_vals: Vec<usize> = Vec::with_capacity(sorted.len());
-                    let mut codomain_vals: Vec<Value> = Vec::new();
-                    for (key, values) in sorted {
-                        domain_vals.push(key);
-                        offset_vals.push(codomain_vals.len());
-                        codomain_vals.extend(values);
-                    }
-                    let output_codomain =
-                        ColumnValue::from_values(codomain_vals, &out_codomain_extent);
-                    Tile::curried_function(
-                        ColumnValue::from_values(domain_vals, &out_domain_extent),
-                        ColumnValue::UInts(offset_vals),
-                        output_codomain.clone(),
-                        output_codomain,
-                        if domain_predicate.as_bool().unwrap_or(false) {
-                            Predicate::True
-                        } else {
-                            Predicate::False
-                        },
-                    )
                 }
                 _ => panic!("Can only converse functions with scalar codomains"),
             },

@@ -1,6 +1,7 @@
 //! Core types for the CCL interpreter: Guard, Extent, BaseType, Value, FuncBinding, ColumnValue.
 
 use std::iter;
+use std::mem::take;
 use std::{cell::RefCell, cmp::Ordering, collections::HashMap, hash::Hash, rc::Rc};
 
 use bit_vec::BitVec;
@@ -1013,25 +1014,12 @@ impl ColumnValue {
             }
             ColumnValue::Bools(v) => {
                 // BitVec::take gives us ownership so we can return a 'static iterator.
-                let v = std::mem::take(v);
-                Box::new(v.into_iter().map(Value::Bool))
+                Box::new(take(v).into_iter().map(Value::Bool))
             }
-            ColumnValue::Ints(v) => {
-                let v = std::mem::take(v);
-                Box::new(v.into_iter().map(Value::Int))
-            }
-            ColumnValue::UInts(v) => {
-                let v = std::mem::take(v);
-                Box::new(v.into_iter().map(Value::UInt))
-            }
-            ColumnValue::Strings(v) => {
-                let v = std::mem::take(v);
-                Box::new(v.into_iter().map(Value::String))
-            }
-            ColumnValue::Variants(v) => {
-                let v = std::mem::take(v);
-                Box::new(v.into_iter())
-            }
+            ColumnValue::Ints(v) => Box::new(take(v).into_iter().map(Value::Int)),
+            ColumnValue::UInts(v) => Box::new(take(v).into_iter().map(Value::UInt)),
+            ColumnValue::Strings(v) => Box::new(take(v).into_iter().map(Value::String)),
+            ColumnValue::Variants(v) => Box::new(take(v).into_iter()),
             ColumnValue::FunctionBindings { inputs, outputs } => Box::new(
                 inputs
                     .drain_to_value_iter()
@@ -1039,7 +1027,7 @@ impl ColumnValue {
                     .map(|(input, output)| Value::Function(vec![FuncBinding { input, output }])),
             ),
             ColumnValue::Records(m) => {
-                let m = std::mem::take(m);
+                let m = take(m);
                 let n = m.values().next().map(|v| v.len()).unwrap_or(0);
                 Box::new((0..n).map(move |i| {
                     Value::Record(m.iter().map(|(k, v)| (k.clone(), v.index_at(i))).collect())
@@ -1180,6 +1168,69 @@ impl ColumnValue {
                 }
             }
         }
+    }
+
+    /// Map each element of `self` through a lookup table defined by parallel
+    /// `(map_keys, map_values)` columns.
+    ///
+    /// Builds a `HashMap<key_type, position>` from `map_keys`, then uses
+    /// [`ColumnValue::select_indices`] to extract the corresponding `map_values`
+    /// entries.  Dispatching the value-type through `select_indices` means only
+    /// the key type needs an explicit match arm here.
+    ///
+    /// Drains `self` as a side effect (the column is left empty after the call).
+    pub fn transform_by_map(
+        &mut self,
+        map_keys: ColumnValue,
+        map_values: ColumnValue,
+    ) -> ColumnValue {
+        let indices: Vec<usize> = match (self, map_keys) {
+            (ColumnValue::UInts(v), ColumnValue::UInts(mk)) => {
+                let pos: HashMap<usize, usize> =
+                    mk.into_iter().enumerate().map(|(i, k)| (k, i)).collect();
+                take(v).into_iter().map(|k| pos[&k]).collect()
+            }
+            (ColumnValue::Ints(v), ColumnValue::Ints(mk)) => {
+                let pos: HashMap<i64, usize> =
+                    mk.into_iter().enumerate().map(|(i, k)| (k, i)).collect();
+                take(v).into_iter().map(|k| pos[&k]).collect()
+            }
+            (ColumnValue::Strings(v), ColumnValue::Strings(mk)) => {
+                let pos: HashMap<SmolStr, usize> =
+                    mk.into_iter().enumerate().map(|(i, k)| (k, i)).collect();
+                take(v).into_iter().map(|k| pos[&k]).collect()
+            }
+            (ColumnValue::Bools(v), ColumnValue::Bools(mk)) => {
+                let pos: HashMap<bool, usize> =
+                    mk.into_iter().enumerate().map(|(i, k)| (k, i)).collect();
+                take(v).into_iter().map(|k| pos[&k]).collect()
+            }
+            (ColumnValue::Variants(v), ColumnValue::Variants(mk)) => {
+                let pos: HashMap<Value, usize> =
+                    mk.into_iter().enumerate().map(|(i, k)| (k, i)).collect();
+                take(v).into_iter().map(|k| pos[&k]).collect()
+            }
+            (s, mk) => panic!(
+                "transform_by_map: key type mismatch or unsupported: {:?} vs {:?}",
+                s, mk
+            ),
+        };
+        let n = indices.len();
+        map_values.select_indices(indices.into_iter(), n)
+    }
+
+    /// Map each element of `self` (which must be [`ColumnValue::UInts`] used as
+    /// zero-based indices) through `map`, returning the selected entries.
+    ///
+    /// Delegates entirely to [`ColumnValue::select_indices`], so `map` may be
+    /// any `ColumnValue` variant.  Drains `self` as a side effect.
+    pub fn transform_by_list(&mut self, map: ColumnValue) -> ColumnValue {
+        let ColumnValue::UInts(v) = self else {
+            panic!("transform_by_list: input must be UInts, got {self:?}")
+        };
+        let indices = take(v);
+        let n = indices.len();
+        map.select_indices(indices.into_iter(), n)
     }
 
     pub fn for_each_uint(&mut self, f: impl Fn(&mut usize)) {
