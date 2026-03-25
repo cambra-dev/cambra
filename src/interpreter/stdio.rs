@@ -1,36 +1,75 @@
+use std::{
+    io::BufRead,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
+};
+
 use log::{debug, trace};
 
 use crate::interpreter::{
     tiling::Predicate, ColumnValue, DataSourceDomainExtentImpl, Extent, Value,
 };
 
-/// Buffers and tracks lines available on stdin
-#[derive(Default)]
+/// Buffers and tracks lines available on stdin.
+///
+/// Lines are read by a background thread so that `check_for_new_data` never
+/// blocks — it simply drains whatever the reader thread has buffered so far.
 pub struct StdinDataSource {
-    /// Currently available data
+    /// Currently available data.
     buffer: Vec<String>,
 
-    /// Offset of indices in the buffer.  Indices less than this have been released
+    /// Offset of indices in the buffer.  Indices less than this have been released.
     start_idx: usize,
 
-    /// Logical size of the buffer, including released lines
+    /// Logical size of the buffer, including released lines.
     ready_size: usize,
 
-    /// Whether EOF has been observed on stdin
+    /// Whether EOF has been observed on stdin.
     eof_reached: bool,
 
-    /// Whether the source has been released with Universal
+    /// Whether the source has been released with Universal.
     closed: bool,
+
+    /// Lines arriving from the background reader thread.  `None` signals EOF.
+    receiver: Receiver<Option<String>>,
 }
 
 impl StdinDataSource {
     pub fn new() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(std::io::stdin());
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        // EOF — signal the main thread and stop.
+                        let _ = sender.send(None);
+                        return;
+                    }
+                    Ok(_) => {
+                        if line.ends_with('\n') {
+                            line.pop();
+                            if line.ends_with('\r') {
+                                line.pop();
+                            }
+                        }
+                        if sender.send(Some(line)).is_err() {
+                            // Receiver was dropped (source closed); stop reading.
+                            return;
+                        }
+                    }
+                    Err(err) => panic!("Error reading from stdin: {err}"),
+                }
+            }
+        });
         Self {
             buffer: Vec::new(),
             start_idx: 0,
             ready_size: 0,
             eof_reached: false,
             closed: false,
+            receiver,
         }
     }
 
@@ -42,7 +81,7 @@ impl StdinDataSource {
         }
     }
 
-    /// Returns the line at the given index
+    /// Returns the line at the given index.
     fn get(&self, i: usize) -> &str {
         self.get_opt(i)
             .unwrap_or_else(|| panic!("Invalid StdinDataSource::get({i})"))
@@ -53,7 +92,7 @@ impl StdinDataSource {
         self.ready_size += 1;
     }
 
-    /// Releases all lines up to and including the given index
+    /// Releases all lines up to and including the given index.
     fn release_index(&mut self, i: usize) {
         if i < self.start_idx {
             // Already released, do nothing
@@ -74,39 +113,41 @@ impl StdinDataSource {
     }
 }
 
+impl Default for StdinDataSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DataSourceDomainExtentImpl for StdinDataSource {
     fn get_id(&self) -> &str {
         "stdin"
     }
 
-    /// Reads stdin for a newline, blocking until a new line is available or EOF is observed
+    /// Drains any lines that the background reader thread has buffered.
+    ///
+    /// Returns `true` if at least one new line (or EOF) was received, which
+    /// tells the scheduler to re-notify consumers.  Never blocks.
     fn check_for_new_data(&mut self) -> bool {
         trace!("Checking for new data on stdin");
-        let input = std::io::stdin();
-        let mut line = String::new();
-        match input.read_line(&mut line) {
-            Ok(0) => {
-                debug!("EOF reached on stdin");
-                // EOF reached
-                self.eof_reached = true;
-                true
-            }
-            Ok(_) => {
-                if line.ends_with('\n') {
-                    line.pop();
-                    if line.ends_with('\r') {
-                        line.pop();
-                    }
+        let mut got_data = false;
+        loop {
+            match self.receiver.try_recv() {
+                Ok(Some(line)) => {
+                    self.add(line);
+                    got_data = true;
                 }
-                self.add(line);
-                // For now, always break. Ideally, we would check if there's any new data immediately
-                // available, but that's annoying to do with the standard rust libs
-                true
-            }
-            Err(err) => {
-                panic!("Error reading from stdin: {err}");
+                Ok(None) => {
+                    debug!("EOF reached on stdin");
+                    self.eof_reached = true;
+                    got_data = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
             }
         }
+        got_data
     }
 
     fn get_yield_predicate(&self) -> Predicate {
@@ -121,7 +162,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         predicate
     }
 
-    /// Returns the currently readable set of indices
+    /// Returns the currently readable set of indices.
     fn get_elements(&self) -> ColumnValue {
         ColumnValue::UInts((self.start_idx..self.ready_size).collect())
     }
