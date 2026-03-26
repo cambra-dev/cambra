@@ -215,6 +215,18 @@ pub enum UnaryOpKind {
     Not,
 }
 
+/// The key identifying which field a [`TypedExprNode::Proj`] projects.
+///
+/// Supports both positional tuple fields (`.0`, `.1`, …) and named record
+/// fields (`.name`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjKey {
+    /// Integer-indexed tuple projection: `.0`, `.1`, …
+    Index(usize),
+    /// Named record-field projection: `.fieldname`.
+    Field(String),
+}
+
 /// Types of aggregations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregateKind {
@@ -525,10 +537,12 @@ pub enum TypedExprNode {
     /// named `_0`, `_1`, … (via [`crate::interpreter::tuple_field`]).
     Tuple(Vec<TypedExpr>),
 
-    /// Integer-index access into a tuple: `t[n]`.
+    /// A first-class projection morphism `.n` (tuple) or `.name` (record).
     ///
-    /// Compiles to a [`crate::interpreter::RecordField`] with field name `_n`.
-    TupleIndex(Box<TypedExpr>, usize),
+    /// `Proj(k)` represents the morphism `λ t → t.k` in point-free form.
+    /// Tuple index access `t[n]` is lowered as `Apply(Proj(Index(n)), t)`.
+    /// Introduced by lowering; absent in the higher-level design.
+    Proj(ProjKey),
 
     /// A record constructor. Lowering from Python syntax is not yet implemented.
     Record(Vec<(String, TypedExpr)>),
@@ -697,9 +711,19 @@ impl TypedExpr {
         Self::new(TypedExprNode::Tuple(elts))
     }
 
-    /// Construct a tuple index expression.
-    pub fn tuple_index(t: Self, idx: usize) -> Self {
-        Self::new(TypedExprNode::TupleIndex(Box::new(t), idx))
+    /// Construct a first-class projection morphism node.
+    ///
+    /// `Proj(Field(f))` acts as the function `λ t → t.f`.
+    pub fn proj_field(field: impl Into<String>) -> Self {
+        Self::new(TypedExprNode::Proj(ProjKey::Field(field.into())))
+    }
+
+    /// Construct a first-class projection morphism node.
+    ///
+    /// `Proj(Index(n))` acts as the function `λ t → t.n`. Tuple subscript `t[n]`
+    /// is lowered as `Expr::apply(t, Expr::proj_index(n))`.
+    pub fn proj_index(i: usize) -> Self {
+        Self::new(TypedExprNode::Proj(ProjKey::Index(i)))
     }
 
     /// Construct a unary operation expression.

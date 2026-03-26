@@ -115,8 +115,7 @@ impl UnificationTable {
         let root = self.find(id);
         assert!(
             self.probe(root).is_none_or(|existing| existing == ty),
-            "UnificationTable::set: variable {:?} already solved to a different type",
-            root
+            "UnificationTable::set: variable {root:?} already solved to a different type"
         );
         let idx = root.0 as usize;
         if idx < self.entries.len() {
@@ -285,7 +284,7 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
                 resolve(e, table);
             }
         }
-        TypedExprNode::TupleIndex(tuple, _) => resolve(tuple, table),
+        TypedExprNode::Proj(_) => {} // leaf: no sub-expressions to resolve
         TypedExprNode::Aggregate { input, .. } => resolve(input, table),
         TypedExprNode::GroupBy { collection, key } => {
             resolve(collection, table);

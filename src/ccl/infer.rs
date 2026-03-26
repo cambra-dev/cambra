@@ -27,7 +27,7 @@ use log::trace;
 
 use crate::ccl::BaseType;
 use crate::ccl::{
-    fresh_infer_var_id, unify::UnificationTable, BinOpKind, Branch, Expr, InferVarId, Lit,
+    fresh_infer_var_id, unify::UnificationTable, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey,
     RefinementKind, Type, TypedExprNode, UnaryOpKind,
 };
 use crate::util::ScopeStack;
@@ -341,21 +341,14 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
             Ok(Type::Tuple(types?))
         }
 
-        // ----- Tuple index -----
+        // ----- Proj -----
         //
-        // Infer the tuple expression, then return the element type at the given index.
-        // Returns Unknown if the expression is not a known Tuple type or the index is out of bounds.
-        TypedExprNode::TupleIndex(tuple, idx) => {
-            let ty = infer_expr(tuple, ctx)?;
-            let idx = *idx;
-            Ok(match ty {
-                Type::Tuple(types) => types
-                    .into_iter()
-                    .nth(idx)
-                    .unwrap_or_else(|| Type::Infer(ctx.fresh_infer_var())),
-                _ => Type::Infer(ctx.fresh_infer_var()),
-            })
-        }
+        // First-class projection morphism. A bare Proj node
+        // has a polymorphic function type; return a function with fresh inference variables.
+        TypedExprNode::Proj(_) => Ok(Type::Fun(
+            Box::new(Type::Infer(ctx.fresh_infer_var())),
+            Box::new(Type::Infer(ctx.fresh_infer_var())),
+        )),
 
         // ----- GroupBy -----
         TypedExprNode::GroupBy { collection, key } => infer_groupby(collection, key, ctx),
@@ -493,29 +486,57 @@ fn infer_apply(
     ctx: &mut TypeInferenceContext,
 ) -> Result<Type, InferError> {
     let arg_ty = infer_expr(argument, ctx)?;
-    if let TypedExprNode::Lambda { param, .. } = &mut function.node {
-        // Normalize Hole → fresh registered Infer before existing param-type logic.
-        if matches!(param.ty, Type::Hole) {
-            param.ty = Type::Infer(ctx.fresh_infer_var());
-        }
-        if matches!(param.ty, Type::Infer(_)) {
-            // If the function is a lambda with unresolved type, infer it from the argument.
-            // If a user annotation is present, verify it matches before accepting arg_ty.
-            if let Some(ref annotation) = param.user_annotation {
-                if *annotation != arg_ty {
-                    return Err(InferError::AnnotationMismatch {
-                        annotation: annotation.clone(),
-                        inferred: arg_ty,
-                    });
-                }
+    let mut maybe_codomain_ty = None;
+    match &mut function.node {
+        TypedExprNode::Lambda { param, .. } => {
+            // Normalize Hole → fresh registered Infer before existing param-type logic.
+            if matches!(param.ty, Type::Hole) {
+                param.ty = Type::Infer(ctx.fresh_infer_var());
             }
-            param.ty = arg_ty.clone();
+            if matches!(param.ty, Type::Infer(_)) {
+                // If the function is a lambda with unresolved type, infer it from the argument.
+                // If a user annotation is present, verify it matches before accepting arg_ty.
+                if let Some(ref annotation) = param.user_annotation {
+                    if *annotation != arg_ty {
+                        return Err(InferError::AnnotationMismatch {
+                            annotation: annotation.clone(),
+                            inferred: arg_ty,
+                        });
+                    }
+                }
+                param.ty = arg_ty.clone();
+            }
         }
+        // For projections, if the type is known, constrain the projection's type accordingly.
+        TypedExprNode::Proj(key) => match (key, &arg_ty) {
+            (ProjKey::Index(idx), Type::Tuple(types)) => {
+                maybe_codomain_ty = Some(
+                    types
+                        .get(*idx)
+                        .cloned()
+                        .unwrap_or(Type::Infer(ctx.fresh_infer_var())),
+                );
+            }
+            (ProjKey::Field(field), Type::Record(types)) => {
+                maybe_codomain_ty = Some(
+                    types
+                        .iter()
+                        .find_map(|(name, typ)| if field == name { Some(typ) } else { None })
+                        .cloned()
+                        .unwrap_or(Type::Infer(ctx.fresh_infer_var())),
+                );
+            }
+            _ => {}
+        },
+        _ => {}
     }
     // Infer function type and return its codomain.
     match infer_expr(function, ctx)? {
         Type::Fun(domain, codomain) => {
             ctx.constrain_equal(&domain, &arg_ty)?;
+            if let Some(codomain_ty) = maybe_codomain_ty {
+                ctx.constrain_equal(&codomain, &codomain_ty)?;
+            }
             Ok(*codomain)
         }
         _ => Ok(Type::Infer(ctx.fresh_infer_var())),
@@ -770,12 +791,17 @@ fn collect_constraints_into(
                         return;
                     }
                 }
-                TypedExprNode::TupleIndex(tuple, idx) => {
-                    let idx = *idx;
-                    if matches!(&tuple.node, TypedExprNode::Var(v) if v == param) {
-                        if let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx) {
-                            out.push(TypeConstraint::TupleField(idx, *domain));
-                            return;
+                // Apply(Proj(Index(n)), Var(param)) — tuple field projection.
+                TypedExprNode::Apply {
+                    function: proj_fn,
+                    argument: proj_arg,
+                } => {
+                    if let TypedExprNode::Proj(ProjKey::Index(idx)) = &proj_fn.node {
+                        if matches!(&proj_arg.node, TypedExprNode::Var(v) if v == param) {
+                            if let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx) {
+                                out.push(TypeConstraint::TupleField(*idx, *domain));
+                                return;
+                            }
                         }
                     }
                 }
@@ -830,12 +856,7 @@ fn collect_constraints_into(
             }
         }
 
-        // idx is a usize constant, not an expression; nothing to search.
-        TypedExprNode::TupleIndex(tuple, _) => collect_constraints_into(param, tuple, ctx, out),
-
         // Leaf nodes with no sub-expressions to search.
-        TypedExprNode::Source(_) | TypedExprNode::Lit(_) | TypedExprNode::Var(_) => {}
-
         _ => {}
     }
 }
@@ -1728,9 +1749,9 @@ mod tests {
             "p",
             Type::infer(),
             Expr::binop(
-                Expr::apply(Expr::tuple_index(Expr::var("p"), 0), f),
+                Expr::apply(Expr::apply(Expr::var("p"), Expr::proj_index(0)), f),
                 BinOpKind::BoolLogic(LogicKind::And),
-                Expr::apply(Expr::tuple_index(Expr::var("p"), 2), g),
+                Expr::apply(Expr::apply(Expr::var("p"), Expr::proj_index(2)), g),
             ),
         );
         let mut ctx = TypeInferenceContext::new();
@@ -1752,9 +1773,9 @@ mod tests {
             "p",
             Type::infer(),
             Expr::binop(
-                Expr::apply(Expr::tuple_index(Expr::var("p"), 0), f),
+                Expr::apply(Expr::apply(Expr::var("p"), Expr::proj_index(0)), f),
                 BinOpKind::BoolLogic(LogicKind::And),
-                Expr::apply(Expr::tuple_index(Expr::var("p"), 0), g),
+                Expr::apply(Expr::apply(Expr::var("p"), Expr::proj_index(0)), g),
             ),
         );
         let mut ctx = TypeInferenceContext::new();

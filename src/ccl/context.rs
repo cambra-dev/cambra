@@ -72,12 +72,12 @@ impl GlobalContext {
         infer(&mut expr, ctx).expect("type inference failed");
 
         let ccl_repr = symbolic(&expr);
-        debug!("CCL:\n{}", ccl_repr);
+        debug!("CCL:\n{ccl_repr}");
 
         let mut op = compile_tile(&expr, self.compile()).expect("compile failed");
 
         let operator_tree = pretty_tile_operator(op.as_ref());
-        debug!("Operators:\n{}", operator_tree);
+        debug!("Operators:\n{operator_tree}");
 
         let producer = op.subscribe(op.tiling().universal_guard(), consumer, self.scheduler());
 

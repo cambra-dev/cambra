@@ -12,7 +12,7 @@
 //! The formatting is intentionally kept human-readable and stable so that tests
 //! can pin expected tree strings directly.
 
-use crate::ccl::{Branch, Expr, Lit, RefinementKind, Type, TypedExprNode, UnaryOpKind};
+use crate::ccl::{Branch, Expr, Lit, ProjKey, RefinementKind, Type, TypedExprNode, UnaryOpKind};
 use crate::pretty_tree::{render, InspectNode};
 
 // ---------------------------------------------------------------------------
@@ -108,10 +108,6 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             node
         }
 
-        TypedExprNode::TupleIndex(tuple, idx) => {
-            InspectNode::new(format!("TupleIndex({idx})")).child("tuple", expr_to_node(tuple))
-        }
-
         TypedExprNode::Record(fields) => {
             let mut node = InspectNode::new("Record");
             for (field, e) in fields {
@@ -151,6 +147,11 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             .child("key", expr_to_node(key)),
 
         TypedExprNode::Source(name) => InspectNode::leaf(format!("Source({name})")),
+
+        TypedExprNode::Proj(key) => InspectNode::leaf(match key {
+            ProjKey::Index(n) => format!(".{n}"),
+            ProjKey::Field(s) => format!(".{s}"),
+        }),
     }
 }
 
@@ -183,8 +184,8 @@ mod tests {
     use super::pretty;
     use crate::ccl::BaseType;
     use crate::ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, Lit, Type, TypedBinding, TypedExpr,
-        TypedExprNode, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, Lit, ProjKey, Type, TypedBinding,
+        TypedExpr, TypedExprNode, UnaryOpKind,
     };
     use rstest::rstest;
 
@@ -196,6 +197,9 @@ mod tests {
     #[case(Expr::lit(Lit::Unit), "Lit(unit)\n")]
     // Variable
     #[case(Expr::var("x"), "Var(x)\n")]
+    // Proj
+    #[case(TypedExpr::new(TypedExprNode::Proj(ProjKey::Index(0))), ".0\n")]
+    #[case(TypedExpr::new(TypedExprNode::Proj(ProjKey::Field("name".to_string()))), ".name\n")]
     // BinOp
     #[case(
         Expr::binop(

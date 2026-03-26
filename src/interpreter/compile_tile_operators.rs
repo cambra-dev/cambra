@@ -27,8 +27,8 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use crate::{
     ccl::{
-        AggregateKind, ArithmeticKind as CclArith, BinOpKind as CclBinOp, Expr, Lit, Refinement,
-        RefinementKind, Type, TypedExprNode, UnaryOpKind as CclUnaryOp,
+        AggregateKind, ArithmeticKind as CclArith, BinOpKind as CclBinOp, Expr, Lit, ProjKey,
+        Refinement, RefinementKind, Type, TypedExprNode, UnaryOpKind as CclUnaryOp,
     },
     interpreter::{
         ccl_compile_util::{validate_type, CompileError},
@@ -253,7 +253,6 @@ fn compile_tile_inner(
             compile_let(&binding.name, &binding.ty, bound_expr, body, ctx)
         }
         TypedExprNode::Tuple(elts) => compile_tuple(elts, ctx),
-        TypedExprNode::TupleIndex(tuple, idx) => compile_tuple_index(tuple, *idx, ctx),
         TypedExprNode::List(elts) => compile_list(elts),
         TypedExprNode::Aggregate { input, kind } => compile_aggregate(input, kind, ctx),
         TypedExprNode::GroupBy { collection, key } => compile_groupby(collection, key, ctx),
@@ -634,7 +633,7 @@ fn compile_apply(
             // `Var("__iter_record")` with type `DataSource(name)`, so it compiles to
             // `IterateExtent(DataSourceDomain)` and `MapNApply` is equivalent to
             // `MapNSource` directly.  For multi-generator comprehensions the argument
-            // is `TupleIndex(Var("__iter_record"), i)`, which has tiling
+            // is `Apply(Proj(Index(i)), Var("__iter_record"))`, which has tiling
             // `SealedFunction(cross_product_record_extent, DataSourceDomain(src_i))`.
             // Using `MapNApply` in both cases ensures the output tile carries the
             // correct outer domain (the cross-product extent), threading it through
@@ -642,6 +641,18 @@ fn compile_apply(
             let source_op = compile_source(name, ctx)?;
             let arg_op = compile_tile_inner(argument, ctx)?;
             Ok(map_apply(arg_op, source_op))
+        }
+        TypedExprNode::Proj(ProjKey::Index(idx)) => {
+            // Apply(Proj(Index(n)), tuple) — tuple field projection.
+            // Equivalent to the old TupleIndex(tuple, n) node.
+            compile_tuple_index(argument, *idx, ctx)
+        }
+        TypedExprNode::Proj(ProjKey::Field(_)) => {
+            // Named record-field projection — not yet supported by the tile compiler.
+            Err(CompileError::Unsupported(
+                "Named record-field projection (Proj::Field) is not yet supported by compile_tile"
+                    .into(),
+            ))
         }
         _ => {
             // Non-lambda function: use Map(input=arg, function=f).

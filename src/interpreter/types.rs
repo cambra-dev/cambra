@@ -444,7 +444,7 @@ impl FunctionDef {
 impl std::fmt::Display for FunctionDef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FunctionDef::UnaryOp(op) => write!(f, "UnaryOp({:?})", op),
+            FunctionDef::UnaryOp(op) => write!(f, "UnaryOp({op:?})"),
             FunctionDef::BinOp(op) => write!(f, "BinOp({})", fmt_binop(op)),
             FunctionDef::RecordField(field) => write!(f, ".{field}"),
         }

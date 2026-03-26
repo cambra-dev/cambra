@@ -85,10 +85,7 @@ fn main() {
     run_program(&code, inspect_port);
 
     if let Some(port) = inspect_port {
-        eprintln!(
-            "Program finished. Inspector at http://localhost:{} — press Ctrl+C to exit.",
-            port
-        );
+        eprintln!("Program finished. Inspector at http://localhost:{port} — press Ctrl+C to exit.");
         loop {
             std::thread::park();
         }

@@ -11,7 +11,8 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, Type, TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, ProjKey, Type, TypedExprNode,
+    UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -133,12 +134,16 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             // Apply is left-associative: `x ▷ f ▷ g` means `(x ▷ f) ▷ g`.
             // Render arg at Apply so a nested Apply is not parenthesised
             // (left-assoc), but Lambda / BinOp / etc. are.
+            let is_proj = matches!(function.node, TypedExprNode::Proj(..));
             let rendered_arg = fmt(argument, Precedence::Apply);
             let rendered_func = fmt_apply_func(function);
-            (
-                Precedence::Apply,
-                format!("{rendered_arg} ▷ {rendered_func}"),
-            )
+            let rendered_ap = if is_proj {
+                // Postfix dot-access: `t ▷ .0` renders as `t.0` (no space or ▷).
+                format!("{rendered_arg}{rendered_func}")
+            } else {
+                format!("{rendered_arg} ▷ {rendered_func}")
+            };
+            (Precedence::Apply, rendered_ap)
         }
 
         TypedExprNode::Lambda {
@@ -191,11 +196,6 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
         TypedExprNode::Tuple(elts) => {
             let items: Vec<_> = elts.iter().map(|e| fmt(e, Precedence::Lowest)).collect();
             (Precedence::Atom, format!("({})", items.join(", ")))
-        }
-
-        TypedExprNode::TupleIndex(tuple, idx) => {
-            let t = fmt(tuple, Precedence::Atom);
-            (Precedence::Subscript, format!("{t}[{idx}]"))
         }
 
         TypedExprNode::Record(fields) => {
@@ -263,6 +263,14 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
         }
 
         TypedExprNode::Source(name) => (Precedence::Atom, format!("source({name})")),
+
+        TypedExprNode::Proj(key) => (
+            Precedence::Atom,
+            match key {
+                ProjKey::Index(n) => format!(".{n}"),
+                ProjKey::Field(s) => format!(".{s}"),
+            },
+        ),
     }
 }
 
@@ -338,6 +346,16 @@ mod tests {
     #[case(Expr::lit(Lit::Unit), "unit")]
     // Variable
     #[case(Expr::var("x"), "x")]
+    // Proj: bare tuple index and record field
+    #[case(Expr::proj_index(0), ".0")]
+    #[case(Expr::proj_index(1), ".1")]
+    #[case(Expr::proj_field("name".to_string()), ".name")]
+    // Apply with Proj as function: renders as postfix dot-access `t.0` / `r.id`
+    #[case(Expr::apply(Expr::var("x"), Expr::proj_index(0)), "x.0")]
+    #[case(
+        Expr::apply(Expr::var("r"), Expr::proj_field("id".to_string())),
+        "r.id"
+    )]
     // BinOp: left-assoc, no parens on left child at same prec
     #[case(
         Expr::binop(
@@ -545,6 +563,29 @@ in k(0)"
     )]
     fn test_symbolic_expr(#[case] expr: Expr, #[case] expected: &str) {
         assert_eq!(symbolic(&expr), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Projection special-case rendering
+    // -----------------------------------------------------------------------
+
+    /// When `Proj` appears as the **function** in an `Apply`, the printer renders
+    /// `t ▷ .0` as postfix dot-access `t.0` instead of `t ▷ .0`, keeping
+    /// point-free pipeline expressions readable.
+    #[test]
+    fn test_symbolic_proj_as_function_renders_postfix() {
+        // t ▷ .0  →  t.0
+        let expr = Expr::apply(Expr::var("t"), Expr::proj_index(0));
+        assert_eq!(symbolic(&expr), "t.0");
+
+        // rec ▷ .name  →  rec.name
+        let expr = Expr::apply(Expr::var("rec"), Expr::proj_field("name".to_string()));
+        assert_eq!(symbolic(&expr), "rec.name");
+
+        // When Proj is in the argument position (unusual), normal ▷ notation is used.
+        // .0 ▷ f  →  .0 ▷ f
+        let expr = Expr::apply(Expr::proj_index(0), Expr::var("f"));
+        assert_eq!(symbolic(&expr), ".0 ▷ f");
     }
 
     // -----------------------------------------------------------------------

@@ -211,9 +211,16 @@ struct TypedExpr {
 /// Type alias for call-site convenience: `Expr` == `TypedExpr`.
 type Expr = TypedExpr;
 
+/// Key for a first-class projection morphism. Identifies which field is projected.
+enum ProjKey {
+    Index(usize),   // tuple field: .0, .1, …
+    Field(String),  // record field: .fieldname
+}
+
 enum TypedExprNode {
     Lit(Literal),
     Var(String),
+    Proj(ProjKey),
     Apply{
       function: Box<TypedExpr>,
       argument: Box<TypedExpr>
@@ -264,7 +271,7 @@ enum TypedExprNode {
     },
     // Construction — lowering stubbed, deferred
     Tuple(Vec<TypedExpr>),
-    TupleIndex(Box<TypedExpr>, usize),        // integer-index access into a tuple: t[n]
+    Proj(ProjKey),                            // first-class projection morphism: .n or .name
     Record(Vec<(String, TypedExpr)>),
     // Built-in data source
     Source(String),

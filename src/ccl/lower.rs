@@ -132,7 +132,7 @@ pub fn lower_expr(
                 let idx: usize = n.try_into().map_err(|_| {
                     LoweringError::Unsupported("Tuple index must be non-negative".into())
                 })?;
-                Ok(Expr::tuple_index(lower_expr(value, ctx)?, idx))
+                Ok(Expr::apply(lower_expr(value, ctx)?, Expr::proj_index(idx)))
             }
             _ => Err(LoweringError::Unsupported(
                 "Only integer subscripts are supported".into(),
@@ -613,9 +613,6 @@ fn ccl_gen_vars_referenced_inner(
                 ccl_gen_vars_referenced_inner(item, gen_var_names, result, shadowed);
             }
         }
-        TypedExprNode::TupleIndex(expr, _) => {
-            ccl_gen_vars_referenced_inner(expr, gen_var_names, result, shadowed);
-        }
         TypedExprNode::GroupBy { collection, key } => {
             ccl_gen_vars_referenced_inner(collection, gen_var_names, result, shadowed);
             ccl_gen_vars_referenced_inner(key, gen_var_names, result, shadowed);
@@ -865,7 +862,7 @@ fn lower_list_comp(
         if single_gen {
             vref
         } else {
-            Expr::tuple_index(vref, i)
+            Expr::apply(vref, Expr::proj_index(i))
         }
     };
 
