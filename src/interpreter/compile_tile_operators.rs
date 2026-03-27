@@ -1002,6 +1002,9 @@ fn map_binop(op: &CclBinOp) -> BinOpKind {
         CclBinOp::Compare(CclCmp::LessOrEq) => BinOpKind::Compare(CompareKind::LessOrEq),
         CclBinOp::Compare(CclCmp::Greater) => BinOpKind::Compare(CompareKind::Greater),
         CclBinOp::Compare(CclCmp::GreaterOrEq) => BinOpKind::Compare(CompareKind::GreaterOrEq),
+        // Compose is a point-free combinator produced by lambda elimination;
+        // it is never present in interpreter input.
+        CclBinOp::Compose => unreachable!("Compose BinOp cannot appear in interpreter input"),
     }
 }
 

@@ -31,8 +31,9 @@ See [docs/operational-semantics/summary.md](operational-semantics/summary.md) fo
 Python source
   → parse   (rustpython_parser)
   → lower   (ccl/lower.rs: Python AST → CCL Expr)
-  → infer   (ccl/infer.rs: limited type inference)
-  → compile (interpreter/compile_tile_operators.rs: CCL Expr → tile operators)
+  → infer        (ccl/infer.rs: limited type inference)
+  → lambda_elim  (ccl/lambda_elim.rs: lambda → point-free combinators)
+  → compile      (interpreter/compile_tile_operators.rs: CCL Expr → tile operators)
   → subscribe()
   → tile producer/consumer dataflow
 ```

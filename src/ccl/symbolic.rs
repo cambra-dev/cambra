@@ -38,6 +38,12 @@ enum Precedence {
     /// chaining them (e.g. `a < b < c`) is not valid CCL, so no associativity
     /// issue arises between them.
     Cmp,
+    /// `≫` — point-free function composition.
+    ///
+    /// Looser than arithmetic (`+`, `*`) so that `f ≫ g + 1` reads as
+    /// `f ≫ (g + 1)`, matching the convention that composition is the
+    /// outermost structure in a point-free expression.
+    Compose,
     /// `+`, `-`, `++` — additive arithmetic and string concatenation share this
     /// level because they have equal precedence in Python and are all
     /// left-associative.
@@ -68,7 +74,8 @@ impl Precedence {
             Self::Or => Self::And,
             Self::And => Self::Not,
             Self::Not => Self::Cmp,
-            Self::Cmp => Self::Add,
+            Self::Cmp => Self::Compose,
+            Self::Compose => Self::Add,
             Self::Add => Self::Mul,
             Self::Mul => Self::Apply,
             Self::Apply => Self::Unary,
@@ -312,6 +319,7 @@ fn binop_prec(op: &BinOpKind) -> Precedence {
         }
         BinOpKind::BoolLogic(LogicKind::And | LogicKind::Nand) => Precedence::And,
         BinOpKind::Compare(_) => Precedence::Cmp,
+        BinOpKind::Compose => Precedence::Compose,
         BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::Sub) | BinOpKind::Concat => {
             Precedence::Add
         }

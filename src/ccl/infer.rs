@@ -642,6 +642,12 @@ fn infer_binop(
             ctx.constrain_equal(&right_ty, &Type::Base(BaseType::Bool))?;
             Ok(Type::Base(BaseType::Bool))
         }
+        BinOpKind::Compose => {
+            // Compose (≫) is introduced by lambda_elim; type inference
+            // runs before that pass so this arm should never be reached in
+            // the normal pipeline. Return a fresh inference variable.
+            Ok(Type::Infer(ctx.fresh_infer_var()))
+        }
     }
 }
 

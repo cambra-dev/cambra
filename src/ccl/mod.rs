@@ -8,8 +8,10 @@
 
 pub mod context;
 pub mod infer;
+pub mod lambda_elim;
 pub mod lower;
 pub mod pretty;
+pub mod simplify;
 pub mod symbolic;
 pub mod unify;
 
@@ -175,6 +177,11 @@ pub enum BinOpKind {
     Concat,
     /// A comparison that produces a boolean result.
     Compare(CompareKind),
+    /// Point-free function composition: `f ≫ g` means "apply `f` then `g`".
+    ///
+    /// Introduced by the lambda elimination pass ([`lambda_elim`]); does not
+    /// appear in source-level CCL produced by [`lower`] or [`infer`].
+    Compose,
 }
 
 impl BinOpKind {
@@ -202,6 +209,7 @@ impl BinOpKind {
             Self::BoolLogic(LogicKind::Nor) => "nor",
             Self::BoolLogic(LogicKind::Xor) => "xor",
             Self::BoolLogic(LogicKind::Xnor) => "xnor",
+            Self::Compose => "≫",
         }
     }
 }

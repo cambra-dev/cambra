@@ -14,6 +14,7 @@ Python source
   → lower          (ccl/lower.rs: Python AST → CCL AST, structural only)
   → infer          (ccl/infer.rs: type inference, converts Hole→Infer and fills ty on every node)
   → resolve        (ccl/unify.rs: substitutes solved Infer vars with concrete types)
+  → lambda_elim    (ccl/lambda_elim.rs: Lambda → point-free combinators)
   → optimize       (tree rewrites on CCL AST)
   → compile        (interpreter/compile_tile_operators.rs: CCL AST → tile operators)
   → subscribe()
@@ -186,6 +187,9 @@ enum BinOpKind {
     BoolLogic(LogicKind),
     Concat,
     Compare(CompareKind),
+    /// Left-to-right function composition: `f ≫ g` means "apply f, then g".
+    /// Introduced by `lambda_elim`; absent in source-level CCL.
+    Compose,
 }
 
 enum UnaryOpKind {
@@ -425,6 +429,55 @@ For each `Branch { guard, body }`: the guard is constrained to `Type::Base(BaseT
 
 ---
 
+## Lambda Elimination (`ccl/lambda_elim.rs`)
+
+`lambda_elim::run` converts a fully type-inferred CCL expression containing
+`Lambda` nodes into a point-free expression of primitive combinators, following
+the Cartesian Closed Category (CCC) structure described in
+`docs/operational-semantics/lowering.md`.
+
+### Output nodes introduced
+
+| Source form | CCL AST after `lambda_elim` |
+|---|---|
+| `f ≫ g` | `BinOp { left: f, op: Compose, right: g }` |
+| `.n` (projection) | `Proj(ProjKey::Index(n))` |
+| `.field` | `Proj(ProjKey::Field("field"))` |
+
+### Built-in combinators
+
+The output references the following `Var` names (not yet wired to operators):
+
+| Name | Meaning |
+|---|---|
+| `"id"` | identity morphism |
+| `"apply"` | function application as a morphism |
+| `"curry"` | currying |
+| `"uncurry"` | uncurrying |
+| `"const"` | constant lift: `const(c) = λ _ → c` |
+| `"zip"` | product/fanout: `zip(f, g) = λ x → (f(x), g(x))`, written `⟨f, g⟩` |
+| `"map"` | post-composition: `map(g)` applied to a curried function |
+| `"compose"` | composition as a first-class morphism |
+| `"restrict"` | domain restriction for filtered lambdas |
+| `"aggregate"` | fold/reduce |
+| `"converse"` | grouping by key |
+
+### `zip` encoding
+
+`⟨f, g⟩` (pointwise function pairing) is encoded as:
+```
+Apply { argument: Tuple([f, g]), function: Var("zip") }
+```
+There is no dedicated `Zip` AST node; it reuses the existing `Apply` + `Tuple` nodes.
+
+### `Let` nodes after rule 7
+
+When the lambda-elimination rule 7 rewrites a `Let` inside a lambda body, the
+bound variable changes type from `T` to `ParamTy ⇒ T`. The rewritten `Let` node
+has `bound_ty: None` because the old annotation is stale and would be incorrect.
+
+---
+
 ## Compilation
 
 The compilation pass (`interpreter/compile_tile_operators.rs`) transforms a fully-type-inferred
@@ -509,3 +562,5 @@ The bound variable is subscribed to `definition` exactly once via a `VarProducer
      `lower_if` for `StmtKind::If` → `Case` with `elif` chains **flattened** into a single node;
      `ExprKind::IfExp` ternary lowering; `InferError::EmptyCase` for 0-branch `Case`.
      `tests/type_check.rs`: `if/else`, `elif`, ternary integration tests. ✓
+   - `ccl/lambda_elim.rs`: lambda elimination pass; CCC rewrite rules eliminating all `Lambda` nodes
+     into point-free combinators (`BinOpKind::Compose`, `Expr::Proj`, built-in `Var` names). ✓
