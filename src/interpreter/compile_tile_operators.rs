@@ -1015,19 +1015,14 @@ fn map_binop(op: &CclBinOp) -> BinOpKind {
 #[cfg(test)]
 mod tests {
     use log::debug;
-    use rstest_log::rstest;
-    use std::{cell::RefCell, rc::Rc};
 
     use super::*;
     use crate::{
         ccl::{
-            context::GlobalContext, ArithmeticKind as CclArith, BinOpKind as CclBinOp, Expr,
-            HashJoinSpec, Lit, Type, TypedBinding,
+            ArithmeticKind as CclArith, BinOpKind as CclBinOp, Expr, HashJoinSpec, Lit, Type,
+            TypedBinding,
         },
-        interpreter::{
-            sort_sealed_function_by_domain, tile_operators::Tile, tiling::Predicate, BaseType,
-            ColumnValue, Consumer, Scheduler, TestDataSource, Value,
-        },
+        interpreter::{tile_operators::Tile, BaseType, Scheduler, Value},
         pretty_graph::pretty_tile_producer,
     };
 
@@ -1244,43 +1239,6 @@ mod tests {
     // Predicate refinements
     // -----------------------------------------------------------------------
 
-    /// `[x for x in [1,2,3] if x > 1]` should filter to the 2 elements > 1.
-    ///
-    /// The lowering wraps the outer iterator lambda with a
-    /// `RefinementKind::Predicate`; `compile_lambda` should compile that
-    /// into a `Filter` operator so only the matching indices survive.
-    #[test_log::test]
-    fn test_list_comp_predicate_filter() {
-        let tile = run_pipeline("[x for x in [1,2,3] if x > 1]");
-        match tile {
-            Tile::SealedFunction { domain, .. } => {
-                // Values 2 and 3 satisfy x > 1; value 1 does not.
-                assert_eq!(
-                    domain.len(),
-                    2,
-                    "expected 2 domain elements after x > 1 filter"
-                );
-            }
-            other => panic!("expected SealedFunction, got {other:?}"),
-        }
-    }
-
-    /// `[x for x in [10,20,30] if x > 100]` — no element passes the predicate.
-    #[test_log::test]
-    fn test_list_comp_predicate_filter_none_pass() {
-        let tile = run_pipeline("[x for x in [10,20,30] if x > 100]");
-        match tile {
-            Tile::SealedFunction { domain, .. } => {
-                assert_eq!(
-                    domain.len(),
-                    0,
-                    "expected 0 domain elements when no element passes"
-                );
-            }
-            other => panic!("expected SealedFunction, got {other:?}"),
-        }
-    }
-
     /// A lambda with a HashJoin refinement must return `CompileError::Unsupported`.
     #[test_log::test]
     fn test_lambda_hash_join_refinement_errors() {
@@ -1301,129 +1259,6 @@ mod tests {
         assert!(
             matches!(result, Err(CompileError::Unsupported(_))),
             "expected Unsupported error for hash-join refinement",
-        );
-    }
-
-    fn run_pipeline(code: &str) -> Tile {
-        let mut ctx = GlobalContext::default();
-
-        let test_source = Rc::new(RefCell::new(TestDataSource::new(
-            "source1",
-            Type::Base(BaseType::Int),
-            Extent::Base(BaseType::Int),
-        )));
-        test_source.borrow_mut().add_data(&[
-            (Value::UInt(0), Value::Int(10)),
-            (Value::UInt(1), Value::Int(20)),
-        ]);
-        ctx.register_test_source(test_source.clone());
-
-        let notified = Rc::new(RefCell::new(false));
-        let notified_clone = notified.clone();
-        let consumer: Box<dyn Consumer> = Box::new(move || {
-            *notified_clone.borrow_mut() = true;
-        });
-        let mut producer = ctx.compile_program(code, consumer);
-
-        ctx.scheduler().check_for_notifications();
-        assert!(*notified.borrow(), "expected notification (pipeline path)");
-        let result = producer.get(producer.tiling().universal_guard());
-        result
-    }
-
-    #[rstest]
-    #[case(
-        "[x + 1 for x in [1,2,3]]",
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![0, 1, 2]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4]))),
-            domain_predicate: Predicate::True,
-        })]
-    #[case(
-        "y = 1; [x + y for x in [1,2,3]]",
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![0, 1, 2]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4]))),
-            domain_predicate: Predicate::True,
-        })]
-    #[case(
-        "y = 1; z = [1,2,3]; [x + y for x in z]",
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![0, 1, 2]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4]))),
-            domain_predicate: Predicate::True,
-        })]
-    #[case(
-        "y = 1; z = [(1, 'a'),(2, 'b'),(3, 'c')]; [x[0] + y for x in z]",
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![0, 1, 2]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4]))),
-            domain_predicate: Predicate::True,
-        })]
-    #[case(
-        "a = [1,2]; b = [10, 20]; [x + y for x in a for y in b]",
-        Tile::SealedFunction {
-            domain: ColumnValue::Records({
-                let mut m = HashMap::new();
-                m.insert("_0".to_string(), ColumnValue::UInts(vec![0, 0, 1, 1]));
-                m.insert("_1".to_string(), ColumnValue::UInts(vec![0, 1, 0, 1]));
-                m
-            }),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![11, 21, 12, 22]))),
-            domain_predicate: Predicate::Record(HashMap::from([(tuple_field(0), Predicate::True), (tuple_field(1), Predicate::True)])),
-        })]
-    #[case(
-        "a = [1,2]; b = [10, 20]; [x + y for x in a for y in b if x == y // 10 and True]",
-        Tile::SealedFunction {
-            domain: ColumnValue::Records({
-                let mut m = HashMap::new();
-                m.insert("_0".to_string(), ColumnValue::UInts(vec![0, 1]));
-                m.insert("_1".to_string(), ColumnValue::UInts(vec![0, 1]));
-                m
-            }),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![11, 22]))),
-            domain_predicate: Predicate::Record(HashMap::from([(tuple_field(0), Predicate::True), (tuple_field(1), Predicate::True)])),
-        })]
-    #[case(
-        "sum([1,2,3])",
-        Tile::Scalar(ColumnValue::Ints(vec![6])))]
-    #[case(
-        "max([x + 1 for x in [1,2,3]])",
-        Tile::Scalar(ColumnValue::Ints(vec![4])))]
-    #[case(
-        "max([x + sum([1,2,3]) for x in [1,2,3]])",
-        Tile::Scalar(ColumnValue::Ints(vec![9])))]
-    #[case(
-        "[sum(x) for x in groupby([2,3,4,5], lambda x: x // 2)]",
-        Tile::SealedFunction {
-            domain: ColumnValue::Ints(vec![1, 2]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 9]))),
-            domain_predicate: Predicate::True
-        })]
-    #[case(
-        "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], lambda x: x // 2)]",
-        Tile::SealedFunction {
-            domain: ColumnValue::Ints(vec![6, 7]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![25, 29]))),
-            domain_predicate: Predicate::True
-        })]
-    #[case("[s for s in source1() if s < 15]",
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![0, 1]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
-            domain_predicate: Predicate::False
-        })]
-    #[case("source1()",
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(vec![0, 1]),
-            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
-            domain_predicate: Predicate::False
-        })]
-    fn test_tile_e2e(#[case] code: &str, #[case] expected: Tile) {
-        let tile = run_pipeline(code);
-        assert_eq!(
-            sort_sealed_function_by_domain(tile),
-            sort_sealed_function_by_domain(expected),
         );
     }
 }

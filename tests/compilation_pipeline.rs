@@ -206,6 +206,8 @@ fn test_comprehensions(#[case] code: &str, #[case] expected: Tile) {
 //
 #[rstest]
 #[case("y = 5; [x + y for x in [10, 20]]", make_int_list(&[15, 25]))]
+#[case("y = 1; z = [1,2,3]; [x + y for x in z]", make_int_list(&[2, 3, 4]))]
+#[case("y = 1; z = [(1, 'a'),(2, 'b'),(3, 'c')]; [x[0] + y for x in z]", make_int_list(&[2, 3, 4]))]
 fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
@@ -336,6 +338,14 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     if a != b]",
     ColumnValue::strings(&["abdf", "abef", "acdf", "acef"])
 )]
+#[case(
+    "a = [1,2]; b = [10, 20]; [x + y for x in a for y in b]",
+    ColumnValue::Ints(vec![11, 21, 12, 22])
+)]
+#[case(
+    "a = [1,2]; b = [10, 20]; [x + y for x in a for y in b if x == y // 10 and True]",
+    ColumnValue::Ints(vec![11, 22])
+)]
 fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
     let result = sort_sealed_function_by_domain(run_pipeline(code));
     match result {
@@ -344,6 +354,43 @@ fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
         }
         other => panic!("expected FunctionBindings, got: {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregates
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[case("sum([1,2,3])", Value::Int(6))]
+#[case("max([x + 1 for x in [1,2,3]])", Value::Int(4))]
+#[case("max([x + sum([1,2,3]) for x in [1,2,3]])", Value::Int(9))]
+fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Groupby
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[case(
+    "[sum(x) for x in groupby([2,3,4,5], lambda x: x // 2)]",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![1, 2]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 9]))),
+        domain_predicate: Predicate::True,
+    }
+)]
+#[case(
+    "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], lambda x: x // 2)]",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![6, 7]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![25, 29]))),
+        domain_predicate: Predicate::True,
+    }
+)]
+fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +468,43 @@ fn test_test_source(#[case] code: &str) {
         .set_yield_predicate(Predicate::True);
     ctx.scheduler().check_for_notifications();
     assert!(!*notified.borrow());
+}
+
+/// Filtering a data source while in non-terminal state: only elements that
+/// satisfy the predicate appear in the codomain; the domain reflects all
+/// received source keys and the domain predicate remains `False` (not done).
+#[test]
+fn test_source_filter_nonterminal() {
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(10)),
+        (Value::UInt(1), Value::Int(20)),
+    ]);
+    ctx.register_test_source(test_source.clone());
+
+    let notified = Rc::new(RefCell::new(false));
+    let notified_clone = notified.clone();
+    let consumer: Box<dyn Consumer> = Box::new(move || {
+        *notified_clone.borrow_mut() = true;
+    });
+    let mut producer = ctx.compile_program("[s for s in source1() if s < 15]", consumer);
+    ctx.scheduler().check_for_notifications();
+    assert!(*notified.borrow());
+
+    let tile = producer.get(producer.tiling().universal_guard());
+    assert_eq!(
+        sort_sealed_function_by_domain(tile),
+        sort_sealed_function_by_domain(Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+            domain_predicate: Predicate::False,
+        })
+    );
 }
 
 /// Test a join between two data sources, including incremental data addition
