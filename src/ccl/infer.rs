@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
-use log::trace;
+use log::{debug, trace};
 
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::BaseType;
@@ -181,6 +181,17 @@ pub enum InferError {
     /// Lowering never produces a 0-branch `Case`; this indicates a malformed
     /// AST constructed outside the normal lowering path.
     EmptyCase,
+    /// A [`Type::Hole`] placeholder survived past inference.
+    /// The `String` is the symbolic representation of the offending expression.
+    UnresolvedHole(String),
+    /// An unresolved [`Type::Infer`] variable survived past resolution.
+    /// The `String` is the symbolic representation of the offending expression.
+    UnresolvedInfer(InferVarId, String),
+    /// Multiple type errors were found in a single pass.
+    ///
+    /// Returned by [`infer`] when [`check_fully_typed`] reports more than one
+    /// missing type, so that all diagnostics are surfaced at once.
+    Multiple(Vec<InferError>),
 }
 
 // ---------------------------------------------------------------------------
@@ -198,10 +209,150 @@ pub enum InferError {
 pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
     infer_expr(expr, ctx)?;
     crate::ccl::unify::resolve(expr, &mut ctx.table);
+    if let Err(errs) = check_fully_typed(expr) {
+        return Err(InferError::Multiple(errs));
+    }
     // Return the type from expr.ty (post-resolve) rather than the pre-resolve return value
     // from infer_expr: the two can differ when infer_expr returns an Infer var that
     // constrain_equal subsequently solved (e.g. the left operand of a BinOp).
     Ok(expr.ty.clone())
+}
+
+/// Check that every [`crate::ccl::TypedExpr::ty`] and [`crate::ccl::TypedBinding::ty`]
+/// in the tree is a fully concrete type — no [`Type::Hole`] or [`Type::Infer`] anywhere,
+/// including nested inside compound types like `Fun` or `Tuple` and inside refinements.
+///
+/// Returns `Ok(())` if the tree is fully annotated, or all holes and unresolved
+/// inference variables found in a depth-first walk.
+pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
+    let mut errors = Vec::new();
+    collect_expr_errors(expr, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Recursively collect all type errors from `expr` into `errors`.
+fn collect_expr_errors(expr: &Expr, errors: &mut Vec<InferError>) {
+    collect_type_errors(&expr.ty, &symbolic(expr), errors);
+    match &expr.node {
+        TypedExprNode::Lit(_) | TypedExprNode::Var(_) => {}
+        TypedExprNode::Apply { function, argument } => {
+            collect_expr_errors(function, errors);
+            collect_expr_errors(argument, errors);
+        }
+        TypedExprNode::BinOp { left, right, .. } => {
+            collect_expr_errors(left, errors);
+            collect_expr_errors(right, errors);
+        }
+        TypedExprNode::UnaryOp(_, operand) => {
+            collect_expr_errors(operand, errors);
+        }
+        TypedExprNode::Lambda { param, body, .. } => {
+            collect_type_errors(&param.ty, &param.name, errors);
+            collect_expr_errors(body, errors);
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            collect_type_errors(&binding.ty, &binding.name, errors);
+            collect_expr_errors(bound_expr, errors);
+            collect_expr_errors(body, errors);
+        }
+        TypedExprNode::Tuple(elems) => {
+            for elem in elems {
+                collect_expr_errors(elem, errors);
+            }
+        }
+        TypedExprNode::Record(fields) => {
+            for (_, val) in fields {
+                collect_expr_errors(val, errors);
+            }
+        }
+        TypedExprNode::List(elems) => {
+            for elem in elems {
+                collect_expr_errors(elem, errors);
+            }
+        }
+        TypedExprNode::Proj(_) => {}
+        TypedExprNode::Case { branches } => {
+            for branch in branches {
+                collect_expr_errors(&branch.guard, errors);
+                collect_expr_errors(&branch.body, errors);
+            }
+        }
+        TypedExprNode::GroupBy { collection, key } => {
+            collect_expr_errors(collection, errors);
+            collect_expr_errors(key, errors);
+        }
+        TypedExprNode::Aggregate { input, .. } => {
+            collect_expr_errors(input, errors);
+        }
+        TypedExprNode::Join {
+            params,
+            loop_body,
+            outer_body,
+            ..
+        } => {
+            for p in params {
+                collect_type_errors(&p.ty, &p.name, errors);
+            }
+            collect_expr_errors(loop_body, errors);
+            collect_expr_errors(outer_body, errors);
+        }
+        TypedExprNode::Jump { args, .. } => {
+            for arg in args {
+                collect_expr_errors(arg, errors);
+            }
+        }
+        TypedExprNode::Source(_) => {}
+        TypedExprNode::Compose(morphisms) => {
+            for m in morphisms {
+                collect_expr_errors(m, errors);
+            }
+        }
+    }
+}
+
+/// Collect all holes and unresolved inference variables in `ty` into `errors`.
+///
+/// `context_sym` is the symbolic representation of the expression whose type
+/// is being checked, used as the context string in any error pushed.
+fn collect_type_errors(ty: &Type, context_sym: &str, errors: &mut Vec<InferError>) {
+    match ty {
+        Type::Hole => errors.push(InferError::UnresolvedHole(context_sym.to_string())),
+        Type::Infer(id) => errors.push(InferError::UnresolvedInfer(*id, context_sym.to_string())),
+        Type::Fun(domain, codomain) => {
+            collect_type_errors(domain, context_sym, errors);
+            collect_type_errors(codomain, context_sym, errors);
+        }
+        Type::Tuple(elems) => {
+            for elem in elems {
+                collect_type_errors(elem, context_sym, errors);
+            }
+        }
+        Type::Record(fields) => {
+            for (_, ty) in fields {
+                collect_type_errors(ty, context_sym, errors);
+            }
+        }
+        Type::Union(variants) => {
+            for variant in variants {
+                collect_type_errors(variant, context_sym, errors);
+            }
+        }
+        Type::Refinement(inner, refinement) => {
+            if let RefinementKind::Predicate(def) = &refinement.kind {
+                collect_expr_errors(&def.borrow(), errors);
+            }
+            collect_type_errors(inner, context_sym, errors);
+        }
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {}
+    }
 }
 
 /// Walk `expr` and fill in `ty` on every node. Does not call `resolve`.
@@ -333,12 +484,7 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
                     Type::Tuple(vec![Type::Infer(ctx.fresh_infer_var()), field_ty.clone()])
                 }
                 // TODO properly handle n-ary tuples and records
-                _ => {
-                    return Ok(Type::fun(
-                        Type::Infer(ctx.fresh_infer_var()),
-                        Type::Infer(ctx.fresh_infer_var()),
-                    ))
-                }
+                _ => Type::Infer(ctx.fresh_infer_var()),
             };
 
             Ok(Type::Fun(Box::new(record_ty), Box::new(field_ty)))
@@ -512,21 +658,28 @@ fn infer_apply(
         // For projections, if the type is known, constrain the projection's type accordingly.
         TypedExprNode::Proj(key) => match (key, &arg_ty) {
             (ProjKey::Index(idx), Type::Tuple(types)) => {
-                maybe_codomain_ty = Some(
-                    types
-                        .get(*idx)
-                        .cloned()
-                        .unwrap_or(Type::Infer(ctx.fresh_infer_var())),
-                );
+                debug!("matched {idx} with types {types:#?}");
+                let proj_ty = types.get(*idx).cloned();
+                if let Some(proj_ty) = proj_ty {
+                    maybe_codomain_ty = Some(proj_ty);
+                } else {
+                    return Err(InferError::Unsupported(format!(
+                        "Invalid tuple index {idx} for {arg_ty}"
+                    )));
+                }
             }
             (ProjKey::Field(field), Type::Record(types)) => {
-                maybe_codomain_ty = Some(
-                    types
-                        .iter()
-                        .find_map(|(name, typ)| if field == name { Some(typ) } else { None })
-                        .cloned()
-                        .unwrap_or(Type::Infer(ctx.fresh_infer_var())),
-                );
+                let proj_ty = types
+                    .iter()
+                    .find_map(|(name, typ)| if field == name { Some(typ) } else { None })
+                    .cloned();
+                if let Some(proj_ty) = proj_ty {
+                    maybe_codomain_ty = Some(proj_ty);
+                } else {
+                    return Err(InferError::Unsupported(format!(
+                        "Invalid record field {field} for {arg_ty}"
+                    )));
+                }
             }
             _ => {}
         },
@@ -541,7 +694,7 @@ fn infer_apply(
             }
             Ok(*codomain)
         }
-        _ => Ok(Type::Infer(ctx.fresh_infer_var())),
+        ty => unreachable!("Apply function must have function type, got {ty}"),
     }
 }
 
@@ -591,7 +744,10 @@ fn infer_let(
 /// the first element's type is itself an unresolved inference variable.
 fn infer_list(elts: &mut [Expr], ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
     let Some(first) = elts.first_mut() else {
-        return Ok(Type::Infer(ctx.fresh_infer_var()));
+        return Ok(Type::Fun(
+            Box::new(Type::UIntRange(0)),
+            Box::new(Type::Base(BaseType::Unit)),
+        ));
     };
     let elem_ty = match infer_expr(first, ctx)? {
         Type::Infer(_) => return Ok(Type::Infer(ctx.fresh_infer_var())),
@@ -1066,9 +1222,9 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::list(vec![]);
         let ty = infer(&mut expr, &mut ctx).unwrap();
-        assert!(
-            matches!(ty, Type::Infer(_)),
-            "empty list should return an inference variable"
+        assert_eq!(
+            ty,
+            Type::fun(Type::UIntRange(0), Type::Base(BaseType::Unit))
         );
     }
 
@@ -2120,5 +2276,151 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::new(TypedExprNode::Case { branches: vec![] });
         assert_eq!(infer(&mut expr, &mut ctx), Err(InferError::EmptyCase));
+    }
+
+    // -----------------------------------------------------------------------
+    // check_fully_typed unit tests
+    // -----------------------------------------------------------------------
+
+    /// A literal with a concrete type passes the fully-typed check.
+    #[test]
+    fn test_check_fully_typed_ok_literal() {
+        let expr = Expr::lit(Lit::Int(42)).with_ty(Type::Base(BaseType::Int));
+        assert_eq!(check_fully_typed(&expr), Ok(()));
+    }
+
+    /// A nested expression where every node has a concrete type passes.
+    ///
+    /// `Apply(λ x : Int → x, 42)` — all three nodes are given concrete types
+    /// directly, simulating a fully-resolved tree.
+    #[test]
+    fn test_check_fully_typed_ok_nested() {
+        let lambda = Expr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "x".into(),
+                ty: Type::Base(BaseType::Int),
+                user_annotation: None,
+            },
+            body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
+            refinement: None,
+        })
+        .with_ty(Type::Fun(
+            Box::new(Type::Base(BaseType::Int)),
+            Box::new(Type::Base(BaseType::Int)),
+        ));
+        let expr = Expr::new(TypedExprNode::Apply {
+            function: Box::new(lambda),
+            argument: Box::new(Expr::lit(Lit::Int(42)).with_ty(Type::Base(BaseType::Int))),
+        })
+        .with_ty(Type::Base(BaseType::Int));
+        assert_eq!(check_fully_typed(&expr), Ok(()));
+    }
+
+    /// A `Type::Hole` on the root node fails with `UnresolvedHole`.
+    ///
+    /// The context string is the symbolic representation of the offending expression,
+    /// which for a literal `1` is just `"1"`.
+    #[test]
+    fn test_check_fully_typed_hole_on_root() {
+        // TypedExpr::new sets ty: Type::Hole — don't call with_ty.
+        let expr = Expr::lit(Lit::Int(1));
+        assert_eq!(
+            check_fully_typed(&expr),
+            Err(vec![InferError::UnresolvedHole("1".into())])
+        );
+    }
+
+    /// A `Type::Hole` buried in a child node is caught by the depth-first walk.
+    ///
+    /// The context names the offending child (`"42"`), not the outer Apply node.
+    #[test]
+    fn test_check_fully_typed_hole_in_child() {
+        // The Apply node itself has a concrete type, but the argument still has Hole.
+        let arg = Expr::lit(Lit::Int(42)); // ty: Hole
+        let func = Expr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "x".into(),
+                ty: Type::Hole,
+                user_annotation: None,
+            },
+            body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
+            refinement: None,
+        })
+        .with_ty(Type::Fun(
+            Box::new(Type::Base(BaseType::Int)),
+            Box::new(Type::Base(BaseType::Int)),
+        ));
+        let expr = Expr::new(TypedExprNode::Apply {
+            function: Box::new(func),
+            argument: Box::new(arg),
+        })
+        .with_ty(Type::Base(BaseType::Int));
+        assert_eq!(
+            check_fully_typed(&expr),
+            Err(vec![
+                InferError::UnresolvedHole("x".into()),
+                InferError::UnresolvedHole("42".into())
+            ])
+        );
+    }
+
+    /// A `Type::Infer` on the root node fails with `UnresolvedInfer`.
+    ///
+    /// The context string is the symbolic representation of the offending expression
+    /// (`"1"`), and the var ID matches the one used to build the type.
+    #[test]
+    fn test_check_fully_typed_infer_on_root() {
+        let mut ctx = TypeInferenceContext::new();
+        let id = ctx.fresh_infer_var();
+        let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Infer(id));
+        assert_eq!(
+            check_fully_typed(&expr),
+            Err(vec![InferError::UnresolvedInfer(id, "1".into())])
+        );
+    }
+
+    /// A `Type::Infer` inside a lambda parameter binding is caught.
+    ///
+    /// The context string is the parameter name (`"x"`), not the whole lambda,
+    /// because `check_fully_typed` passes `|| param.name.clone()` for param checks.
+    #[test]
+    fn test_check_fully_typed_infer_in_lambda_param() {
+        let mut ctx = TypeInferenceContext::new();
+        let id = ctx.fresh_infer_var();
+        // The lambda's own type is concrete, but the param still holds an Infer var.
+        let expr = Expr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "x".into(),
+                ty: Type::Infer(id), // unsolved
+                user_annotation: None,
+            },
+            body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
+            refinement: None,
+        })
+        .with_ty(Type::Fun(
+            Box::new(Type::Base(BaseType::Int)),
+            Box::new(Type::Base(BaseType::Int)),
+        ));
+        assert_eq!(
+            check_fully_typed(&expr),
+            Err(vec![InferError::UnresolvedInfer(id, "x".into())])
+        );
+    }
+
+    /// A `Type::Hole` nested inside a `Fun` type (not just at a node boundary)
+    /// is caught by the recursive `check_type` walk.
+    ///
+    /// The context string is the symbolic form of the node whose type is malformed (`"1"`).
+    #[test]
+    fn test_check_fully_typed_hole_inside_fun_type() {
+        // The node type is Fun(Hole, Int) — the Hole is inside the compound type.
+        let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Fun(
+            Box::new(Type::Hole),
+            Box::new(Type::Base(BaseType::Int)),
+        ));
+        assert_eq!(
+            check_fully_typed(&expr),
+            Err(vec![InferError::UnresolvedHole("1".into())])
+        );
     }
 }
