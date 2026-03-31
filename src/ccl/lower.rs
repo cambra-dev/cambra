@@ -1343,7 +1343,13 @@ x";
     }
 
     // -----------------------------------------------------------------------
-    // if/else statement lowering tests
+    // if/else lowering tests
+    //
+    // TODO: CHL if/else is currently only supported in *tail position*, where
+    // the whole block is treated as an expression. Non-tail if/else statements
+    // (where bindings from inside the block are used by subsequent statements)
+    // require a statement-level IR pass that doesn't yet exist; see
+    // `test_lower_if_else_branch_locals` and `test_lower_non_tail_if` below.
     // -----------------------------------------------------------------------
 
     #[rstest]
@@ -1378,6 +1384,20 @@ x";
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
+    }
+
+    /// A bare `if` (no `else`) in non-tail position: rejected today because
+    /// CHL has no side effects, so a branch that produces no value on the
+    /// false path has no well-typed CCL representation. Requires a
+    /// statement-level IR to handle correctly.
+    #[test]
+    #[ignore = "non-tail if/else requires a statement-level IR pass (not yet implemented)"]
+    fn test_lower_non_tail_if() {
+        let code = "x = 1\nif x > 0:\n    x = x + 1\nresult = x\nresult";
+        let stmts = parse_module(code);
+        let _ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        // Expected once implemented:
+        // let x = 1 in let x = { x > 0 → x + 1; true → x } in let result = x in result
     }
 
     #[test]
