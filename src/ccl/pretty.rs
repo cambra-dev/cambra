@@ -148,6 +148,14 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
 
         TypedExprNode::Source(name) => InspectNode::leaf(format!("Source({name})")),
 
+        TypedExprNode::Compose(elts) => {
+            let mut node = InspectNode::new("Compose");
+            for (i, e) in elts.iter().enumerate() {
+                node = node.child(i.to_string(), expr_to_node(e));
+            }
+            node
+        }
+
         TypedExprNode::Proj(key) => InspectNode::leaf(match key {
             ProjKey::Index(n) => format!(".{n}"),
             ProjKey::Field(s) => format!(".{s}"),

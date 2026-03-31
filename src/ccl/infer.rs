@@ -375,6 +375,14 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
         TypedExprNode::Source(name) => ctx
             .source_type(name)
             .ok_or_else(|| InferError::UnboundVariable(name.clone())),
+
+        // ----- N-ary compose -----
+        //
+        // Produced by simplify after type inference; should not appear here in
+        // normal compilation. Infer the type chain: each morphism's codomain
+        // must equal the next morphism's domain; the result is `domain(f₀) →
+        // codomain(fₙ₋₁)`.
+        TypedExprNode::Compose(elts) => infer_compose(elts, ctx),
     }?;
 
     // Check user_annotation compatibility. If the user provided an explicit annotation,
@@ -671,13 +679,30 @@ fn infer_binop(
             ctx.constrain_equal(&right_ty, &Type::Base(BaseType::Bool))?;
             Ok(Type::Base(BaseType::Bool))
         }
-        BinOpKind::Compose => {
-            let (left_d, left_c) = require_fun(left_ty, left, ctx, "left")?;
-            let (right_d, right_c) = require_fun(right_ty, right, ctx, "right")?;
-            ctx.constrain_equal(&left_c, &right_d)?;
-            Ok(Type::Fun(Box::new(left_d), Box::new(right_c)))
-        }
     }
+}
+
+/// Infer the type of a [`TypedExprNode::Compose`] node.
+///
+/// Each element must be a function. Adjacent elements are constrained so that
+/// the codomain of element `i` equals the domain of element `i+1`. The result
+/// type is `Fun(domain(f₀), codomain(fₙ₋₁))`.
+fn infer_compose(elts: &mut [Expr], ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
+    assert!(elts.len() >= 2, "Compose requires at least two elements");
+    // Infer all element types up front.
+    let tys: Vec<Type> = elts
+        .iter_mut()
+        .map(|e| infer_expr(e, ctx))
+        .collect::<Result<_, _>>()?;
+    // Extract domain of the first and chain all adjacent pairs.
+    let (overall_domain, mut prev_codomain) =
+        require_fun(tys[0].clone(), &elts[0], ctx, "compose[0]")?;
+    for (i, ty) in tys.into_iter().enumerate().skip(1) {
+        let (d_i, c_i) = require_fun(ty, &elts[i], ctx, &format!("compose[{i}]"))?;
+        ctx.constrain_equal(&prev_codomain, &d_i)?;
+        prev_codomain = c_i;
+    }
+    Ok(Type::Fun(Box::new(overall_domain), Box::new(prev_codomain)))
 }
 
 /// Infer the type of a [`TypedExprNode::GroupBy`] node.

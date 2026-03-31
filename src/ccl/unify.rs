@@ -419,6 +419,11 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
                 resolve(e, table);
             }
         }
+        TypedExprNode::Compose(elts) => {
+            for e in elts {
+                resolve(e, table);
+            }
+        }
         // Leaf nodes — no sub-expressions to recurse into.
         TypedExprNode::Lit(_) | TypedExprNode::Var(_) | TypedExprNode::Source(_) => {}
     }

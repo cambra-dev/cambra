@@ -122,7 +122,7 @@ pub(crate) fn proj_idx(n: usize) -> Expr {
 
 /// Build `f ≫ g`: left-to-right function composition.
 pub(crate) fn compose(f: Expr, g: Expr) -> Expr {
-    Expr::binop(f, BinOpKind::Compose, g)
+    Expr::compose(vec![f, g])
 }
 
 /// Build `⟨f, g⟩`: the product/fanout `zip(f, g)` using the `zip` built-in.
@@ -215,6 +215,8 @@ fn is_free(param: &str, expr: &Expr) -> bool {
         } => is_free(param, loop_body) || is_free(param, outer_body),
 
         TypedExprNode::Jump { args, .. } => args.iter().any(|a| is_free(param, a)),
+
+        TypedExprNode::Compose(elts) => elts.iter().any(|e| is_free(param, e)),
 
         // Source, Aggregate, GroupBy have no binding structure referencing free vars
         TypedExprNode::Source(_)
@@ -349,6 +351,12 @@ fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
                 .collect(),
         },
 
+        TypedExprNode::Compose(elts) => TypedExprNode::Compose(
+            elts.into_iter()
+                .map(|e| substitute(e, name, replacement))
+                .collect(),
+        ),
+
         // Atoms handled above; these shouldn't be reached but return as-is for safety.
         other => other,
     };
@@ -387,7 +395,6 @@ fn op_function_name(op: &BinOpKind) -> &'static str {
         BinOpKind::BoolLogic(LogicKind::Nor) => "nor",
         BinOpKind::BoolLogic(LogicKind::Xor) => "xor",
         BinOpKind::BoolLogic(LogicKind::Xnor) => "xnor",
-        BinOpKind::Compose => unreachable!("Compose is handled separately"),
     }
 }
 
@@ -473,18 +480,25 @@ fn elim_lambda(ctx: &mut ElimContext, param: &str, body: Expr) -> Result<Expr, L
             Ok(compose(zip_pair(elim_arg, elim_fn), Expr::var("apply")))
         }
 
-        // Compose in body: λ x → f ≫ g  ⟹  ⟨λx→f, λx→g⟩ ≫ (≫)
-        TypedExprNode::BinOp {
-            left,
-            op: BinOpKind::Compose,
-            right,
-        } => {
-            let elim_f = elim_lambda(ctx, param, *left)?;
-            let elim_g = elim_lambda(ctx, param, *right)?;
-            Ok(compose(zip_pair(elim_f, elim_g), Expr::var("compose")))
+        // Compose in body: λ x → f ≫ g  ⟹  ⟨λx→f, λx→g⟩ ≫ compose
+        //
+        // For an n-ary Compose([f₀, f₁, …]), eliminate the lambda through each
+        // element and re-build a pairwise chain: ⟨λx→f₀, λx→f₁⟩ ≫ compose ≫ …
+        TypedExprNode::Compose(elts) => {
+            let mut elim_elts = elts
+                .into_iter()
+                .map(|e| elim_lambda(ctx, param, e))
+                .collect::<Result<Vec<_>, _>>()?;
+            // Fold pairwise from the left: ⟨e0, e1⟩ ≫ compose, then compose
+            // the result with e2, etc.
+            let mut acc = elim_elts.remove(0);
+            for next in elim_elts {
+                acc = compose(zip_pair(acc, next), Expr::var("compose"));
+            }
+            Ok(acc)
         }
 
-        // BinOp (non-Compose) — desugar to Apply + Tuple, then apply the application rule.
+        // BinOp — desugar to Apply + Tuple, then apply the application rule.
         // a op b  ≡  (a, b) ▷ op_fn
         TypedExprNode::BinOp { left, op, right } => {
             let op_name = op_function_name(&op).to_string();
@@ -614,6 +628,17 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
                 op,
                 right: Box::new(elim_lambdas(ctx, *right)?),
             },
+            ty,
+            user_annotation,
+        }),
+
+        TypedExprNode::Compose(terms) => Ok(TypedExpr {
+            node: TypedExprNode::Compose(
+                terms
+                    .into_iter()
+                    .map(|t| elim_lambdas(ctx, t))
+                    .collect::<Result<_, _>>()?,
+            ),
             ty,
             user_annotation,
         }),

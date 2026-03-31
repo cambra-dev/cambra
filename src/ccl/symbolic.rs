@@ -299,6 +299,23 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
 
         TypedExprNode::Source(name) => (Precedence::Atom, format!("source({name})")),
 
+        // N-ary compose: render as `f₀ ≫ f₁ ≫ … ≫ fₙ₋₁` at Compose precedence.
+        // Left element at Compose (left-associative); each subsequent element
+        // one level tighter to force parens on a nested same-precedence compose.
+        TypedExprNode::Compose(elts) => {
+            let mut it = elts.iter();
+            let first = fmt(
+                it.next().expect("Compose is non-empty"),
+                Precedence::Compose,
+                opts,
+            );
+            let rest = it
+                .map(|e| fmt(e, Precedence::Compose.next_highest(), opts))
+                .collect::<Vec<_>>()
+                .join(" ≫ ");
+            (Precedence::Compose, format!("{first} ≫ {rest}"))
+        }
+
         TypedExprNode::Proj(key) => (
             Precedence::Atom,
             match key {
@@ -359,7 +376,6 @@ fn binop_prec(op: &BinOpKind) -> Precedence {
         }
         BinOpKind::BoolLogic(LogicKind::And | LogicKind::Nand) => Precedence::And,
         BinOpKind::Compare(_) => Precedence::Cmp,
-        BinOpKind::Compose => Precedence::Compose,
         BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::Sub) | BinOpKind::Concat => {
             Precedence::Add
         }

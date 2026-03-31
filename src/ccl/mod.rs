@@ -177,11 +177,6 @@ pub enum BinOpKind {
     Concat,
     /// A comparison that produces a boolean result.
     Compare(CompareKind),
-    /// Point-free function composition: `f ≫ g` means "apply `f` then `g`".
-    ///
-    /// Introduced by the lambda elimination pass ([`lambda_elim`]); does not
-    /// appear in source-level CCL produced by [`lower`] or [`infer`].
-    Compose,
 }
 
 impl BinOpKind {
@@ -209,7 +204,6 @@ impl BinOpKind {
             Self::BoolLogic(LogicKind::Nor) => "nor",
             Self::BoolLogic(LogicKind::Xor) => "xor",
             Self::BoolLogic(LogicKind::Xnor) => "xnor",
-            Self::Compose => "≫",
         }
     }
 }
@@ -584,6 +578,16 @@ pub enum TypedExprNode {
     /// via the source registry; [`crate::interpreter::compile_ccl`] compiles it to
     /// the appropriate reader operator.
     Source(String),
+
+    /// N-ary point-free function composition: `f₀ ≫ f₁ ≫ … ≫ fₙ₋₁`.
+    ///
+    /// Introduced by [`crate::ccl::lambda_elim`]; always contains at least
+    /// two morphisms. [`crate::ccl::simplify`] flattens nested two-element
+    /// `Compose` nodes into longer chains.
+    ///
+    /// Semantics: element `i` is applied before element `i+1`, so
+    /// `Compose([f, g])` means "apply `f`, then pipe the result to `g`".
+    Compose(Vec<TypedExpr>),
 }
 
 /// A CCL expression with a type slot on every node.
@@ -737,6 +741,16 @@ impl TypedExpr {
     /// Construct a unary operation expression.
     pub fn unary(op: UnaryOpKind, operand: Self) -> Self {
         Self::new(TypedExprNode::UnaryOp(op, Box::new(operand)))
+    }
+
+    /// Construct an n-ary composition expression.
+    ///
+    /// `exprs` must contain at least two morphisms. The composition is
+    /// left-to-right: `exprs[0]` is applied first, `exprs[1]` second, and so
+    /// on.
+    pub fn compose(exprs: Vec<Self>) -> Self {
+        debug_assert!(exprs.len() >= 2, "Compose requires at least two morphisms");
+        Self::new(TypedExprNode::Compose(exprs))
     }
 
     /// Construct a binary operation expression.
