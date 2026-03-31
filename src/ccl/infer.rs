@@ -25,6 +25,7 @@ use std::ops::{Deref, DerefMut};
 
 use log::trace;
 
+use crate::ccl::symbolic::symbolic;
 use crate::ccl::BaseType;
 use crate::ccl::{
     fresh_infer_var_id, unify::UnificationTable, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey,
@@ -129,31 +130,8 @@ impl TypeInferenceContext {
     }
 
     /// Constrain two types to be equal, recording the solution in the [`UnificationTable`].
-    ///
-    /// - Both `Infer`: union the two variables.
-    /// - One `Infer`, one concrete: set the variable to the concrete type.
-    /// - Both concrete and equal: no-op.
-    /// - Both concrete and different: returns [`InferError::TypeMismatch`].
     fn constrain_equal(&mut self, a: &Type, b: &Type) -> Result<(), InferError> {
-        match (a, b) {
-            (Type::Infer(a_id), Type::Infer(b_id)) => {
-                self.table
-                    .unify(*a_id, *b_id)
-                    .map_err(|(type_a, type_b)| InferError::TypeMismatch { type_a, type_b })?;
-                Ok(())
-            }
-            (Type::Infer(id), concrete) | (concrete, Type::Infer(id)) => {
-                // Ensure this is a actually a concrete type: guards against case reordering.
-                debug_assert!(!matches!(concrete, Type::Infer(_)));
-                self.table.set(*id, concrete.clone());
-                Ok(())
-            }
-            (a, b) if a == b => Ok(()),
-            (type_a, type_b) => Err(InferError::TypeMismatch {
-                type_a: type_a.clone(),
-                type_b: type_b.clone(),
-            }),
-        }
+        self.table.constrain_equal(a, b)
     }
 }
 
@@ -345,10 +323,26 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
         //
         // First-class projection morphism. A bare Proj node
         // has a polymorphic function type; return a function with fresh inference variables.
-        TypedExprNode::Proj(_) => Ok(Type::Fun(
-            Box::new(Type::Infer(ctx.fresh_infer_var())),
-            Box::new(Type::Infer(ctx.fresh_infer_var())),
-        )),
+        TypedExprNode::Proj(key) => {
+            let field_ty = Type::Infer(ctx.fresh_infer_var());
+            let record_ty = match key {
+                ProjKey::Index(0) => {
+                    Type::Tuple(vec![field_ty.clone(), Type::Infer(ctx.fresh_infer_var())])
+                }
+                ProjKey::Index(1) => {
+                    Type::Tuple(vec![Type::Infer(ctx.fresh_infer_var()), field_ty.clone()])
+                }
+                // TODO properly handle n-ary tuples and records
+                _ => {
+                    return Ok(Type::fun(
+                        Type::Infer(ctx.fresh_infer_var()),
+                        Type::Infer(ctx.fresh_infer_var()),
+                    ))
+                }
+            };
+
+            Ok(Type::Fun(Box::new(record_ty), Box::new(field_ty)))
+        }
 
         // ----- GroupBy -----
         TypedExprNode::GroupBy { collection, key } => infer_groupby(collection, key, ctx),
@@ -607,6 +601,41 @@ fn infer_list(elts: &mut [Expr], ctx: &mut TypeInferenceContext) -> Result<Type,
     Ok(Type::Fun(Box::new(Type::UIntRange(n)), Box::new(elem_ty)))
 }
 
+/// Destructure `ty` as a function type `(domain, codomain)`.
+///
+/// - If it is already `Fun(d, c)`, return `(d, c)` directly.
+/// - If it is `Infer(id)`, constrain the variable to `Fun(fresh_d, fresh_c)` and
+///   return the fresh pair.  This is sound in any context where a function type
+///   is required (e.g. both sides of `≫`): the constraint will be resolved once
+///   enough information flows into the surrounding expression.  Without this,
+///   the post-composition morphism produced by the `curry_compose` simplification
+///   rule (`curry(f ≫ g)  →  curry(f) ≫ map(g)`) fails inference because
+///   `map(g)` has an unresolved codomain.
+/// - Anything else is a hard type error.
+fn require_fun(
+    ty: Type,
+    expr: &Expr,
+    ctx: &mut TypeInferenceContext,
+    side: &str,
+) -> Result<(Type, Type), InferError> {
+    match ty {
+        Type::Fun(d, c) => Ok((*d, *c)),
+        Type::Infer(id) => {
+            let d = Type::Infer(ctx.fresh_infer_var());
+            let c = Type::Infer(ctx.fresh_infer_var());
+            ctx.constrain_equal(
+                &Type::Infer(id),
+                &Type::Fun(Box::new(d.clone()), Box::new(c.clone())),
+            )?;
+            Ok((d, c))
+        }
+        other => Err(InferError::Unsupported(format!(
+            "Compose expects functions, got {side} {}: {other}",
+            symbolic(expr),
+        ))),
+    }
+}
+
 /// Infer the type of a [`TypedExprNode::BinOp`] node.
 /// Infer both operands then apply the operation's type rules via the
 /// UnificationTable.  String + String → Concat rewriting is deferred to
@@ -643,10 +672,10 @@ fn infer_binop(
             Ok(Type::Base(BaseType::Bool))
         }
         BinOpKind::Compose => {
-            // Compose (≫) is introduced by lambda_elim; type inference
-            // runs before that pass so this arm should never be reached in
-            // the normal pipeline. Return a fresh inference variable.
-            Ok(Type::Infer(ctx.fresh_infer_var()))
+            let (left_d, left_c) = require_fun(left_ty, left, ctx, "left")?;
+            let (right_d, right_c) = require_fun(right_ty, right, ctx, "right")?;
+            ctx.constrain_equal(&left_c, &right_d)?;
+            Ok(Type::Fun(Box::new(left_d), Box::new(right_c)))
         }
     }
 }
@@ -737,6 +766,7 @@ fn lit_type(lit: &Lit) -> Type {
     }
 }
 
+// TODO replace this with the general type handling in the unification table.
 #[derive(Debug, Clone)]
 enum TypeConstraint {
     Type(Type),

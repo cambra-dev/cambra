@@ -675,7 +675,8 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{Expr, Lit, Type};
+    use crate::ccl::{symbolic::symbolic, Expr, Lit, Type};
+    use test_log::test;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -701,6 +702,16 @@ mod tests {
         Expr::tuple(vec![a, b])
     }
 
+    fn assert_expr_eq(result: Expr, expected: Expr) {
+        assert_eq!(
+            result,
+            expected,
+            "{} vs expected {}",
+            symbolic(&result),
+            symbolic(&expected)
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Unit tests for elim_lambda (one rule each)
     // -----------------------------------------------------------------------
@@ -718,21 +729,21 @@ mod tests {
         let body = Expr::apply(var("x"), Expr::proj_index(0));
         let expr = lam("x", body);
         let result = run(expr).unwrap();
-        assert_eq!(result, proj_idx(0));
+        assert_expr_eq(result, proj_idx(0));
     }
 
     /// Constant (literal): λ x → 42  ⟹  const(42)
     #[test]
     fn literal_constant() {
         let result = elim_lambda(&mut ElimContext::new(), "x", lit(42)).unwrap();
-        assert_eq!(result, const_(lit(42)));
+        assert_expr_eq(result, const_(lit(42)));
     }
 
     /// Constant (free var): λ x → y  ⟹  const(y)  (y ≠ x, free in outer scope)
     #[test]
     fn var_constant() {
         let result = elim_lambda(&mut ElimContext::new(), "x", var("y")).unwrap();
-        assert_eq!(result, const_(var("y")));
+        assert_expr_eq(result, const_(var("y")));
     }
 
     /// Application: λ x → x ▷ f  ⟹  ⟨id, const(f)⟩ ≫ apply  (pre-simplification)
@@ -741,7 +752,7 @@ mod tests {
         let body = app(var("x"), var("f"));
         let result = elim_lambda(&mut ElimContext::new(), "x", body).unwrap();
         let expected = compose(zip_pair(id(), const_(var("f"))), var("apply"));
-        assert_eq!(result, expected);
+        assert_expr_eq(result, expected);
     }
 
     /// Tuple: λ x → (x, f)  ⟹  zip(id, const(f))  (pre-simplification)
@@ -750,7 +761,7 @@ mod tests {
         let body = tup(var("x"), var("f"));
         let result = elim_lambda(&mut ElimContext::new(), "x", body).unwrap();
         let expected = zip_pair(id(), const_(var("f")));
-        assert_eq!(result, expected);
+        assert_expr_eq(result, expected);
     }
 
     /// Nested lambda: λ x → λ y → x  ⟹  curry(.0)
@@ -758,7 +769,7 @@ mod tests {
     fn nested_lambda_uses_first() {
         let expr = lam("x", lam("y", var("x")));
         let result = run(expr).unwrap();
-        assert_eq!(result, curry(proj_idx(0)));
+        assert_expr_eq(result, curry(proj_idx(0)));
     }
 
     /// Let binding: λ x → let v = x in v  ⟹  let v = id in v  (after simplification)
@@ -769,7 +780,7 @@ mod tests {
         // elim_lambda produces: let v = id in ⟨id, const(v)⟩ ≫ apply
         // const-apply simplifies the body to: id ≫ v → v
         let expected = Expr::let_bind("v", id(), var("v"));
-        assert_eq!(result, expected);
+        assert_expr_eq(result, expected);
     }
 
     /// Refinement: λ x | pred(x) → x ▷ f  ⟹  pred ▷ restrict ≫ f  (after simplification)
@@ -782,7 +793,7 @@ mod tests {
         // Desugars to: (λx → x ▷ pred) ▷ restrict ≫ (λx → x ▷ f)
         // Each lambda simplifies via const-apply: pred and f respectively.
         let expected = compose(app(var("pred"), var("restrict")), var("f"));
-        assert_eq!(result, expected);
+        assert_expr_eq(result, expected);
     }
 
     // -----------------------------------------------------------------------
@@ -794,7 +805,7 @@ mod tests {
     fn example_basic_compose() {
         let expr = lam("i", app(app(var("i"), var("f")), var("g")));
         let result = run(expr).unwrap();
-        assert_eq!(result, compose(var("f"), var("g")));
+        assert_expr_eq(result, compose(var("f"), var("g")));
     }
 
     /// λ r → r.0 ▷ c1 + r.1 ▷ c2  ⟹  ⟨.0 ≫ c1, .1 ≫ c2⟩ ≫ add
@@ -814,7 +825,7 @@ mod tests {
             ),
             var("add"),
         );
-        assert_eq!(result, expected);
+        assert_expr_eq(result, expected);
     }
 
     /// λ i → (i, c) ▷ f  ⟹  ⟨id, const(c)⟩ ≫ f
@@ -823,6 +834,6 @@ mod tests {
         let expr = lam("i", app(tup(var("i"), var("c")), var("f")));
         let result = run(expr).unwrap();
         let expected = compose(zip_pair(id(), const_(var("c"))), var("f"));
-        assert_eq!(result, expected);
+        assert_expr_eq(result, expected);
     }
 }

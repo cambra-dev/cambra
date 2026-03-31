@@ -11,8 +11,8 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, ProjKey, Type, TypedExprNode,
-    UnaryOpKind,
+    ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, ProjKey, Refinement, RefinementKind,
+    Type, TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,9 +90,20 @@ impl Precedence {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Options for configuring the output of `symbolic`
+#[derive(Default)]
+struct SymbolicOpts {
+    show_types: bool,
+}
+
 /// Render a CCL expression as a symbolic string.
 pub fn symbolic(expr: &Expr) -> String {
-    fmt(expr, Precedence::Lowest)
+    fmt(expr, Precedence::Lowest, &SymbolicOpts::default())
+}
+
+/// Render a CCL expression as a symbolic string.
+pub fn symbolic_typed(expr: &Expr) -> String {
+    fmt(expr, Precedence::Lowest, &SymbolicOpts { show_types: true })
 }
 
 // ---------------------------------------------------------------------------
@@ -100,8 +111,8 @@ pub fn symbolic(expr: &Expr) -> String {
 // ---------------------------------------------------------------------------
 
 /// Render `expr`, wrapping in `( )` if its precedence is below `min_prec`.
-fn fmt(expr: &Expr, min_prec: Precedence) -> String {
-    let (self_prec, text) = fmt_inner(expr);
+fn fmt(expr: &Expr, min_prec: Precedence, opts: &SymbolicOpts) -> String {
+    let (self_prec, text) = fmt_inner(expr, opts);
     if self_prec < min_prec {
         format!("({text})")
     } else {
@@ -110,8 +121,8 @@ fn fmt(expr: &Expr, min_prec: Precedence) -> String {
 }
 
 /// Returns `(self_prec, rendered_text)` without outer parentheses.
-fn fmt_inner(expr: &Expr) -> (Precedence, String) {
-    match &expr.node {
+fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
+    let res = match &expr.node {
         TypedExprNode::Lit(lit) => (Precedence::Atom, fmt_lit(lit)),
 
         TypedExprNode::Var(name) => (Precedence::Atom, name.clone()),
@@ -120,19 +131,19 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             let op_prec = binop_prec(op);
             let sym = op.sym();
             // Left at same prec is fine (left-associative).
-            let l = fmt(left, op_prec);
+            let l = fmt(left, op_prec, opts);
             // Right needs one level tighter to avoid right-association.
-            let r = fmt(right, op_prec.next_highest());
+            let r = fmt(right, op_prec.next_highest(), opts);
             (op_prec, format!("{l} {sym} {r}"))
         }
 
         TypedExprNode::UnaryOp(op, operand) => match op {
             UnaryOpKind::Neg => {
-                let s = format!("-{}", fmt(operand, Precedence::Unary));
+                let s = format!("-{}", fmt(operand, Precedence::Unary, opts));
                 (Precedence::Unary, s)
             }
             UnaryOpKind::Not => {
-                let s = format!("not {}", fmt(operand, Precedence::Not));
+                let s = format!("not {}", fmt(operand, Precedence::Not, opts));
                 (Precedence::Not, s)
             }
         },
@@ -142,8 +153,8 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             // Render arg at Apply so a nested Apply is not parenthesised
             // (left-assoc), but Lambda / BinOp / etc. are.
             let is_proj = matches!(function.node, TypedExprNode::Proj(..));
-            let rendered_arg = fmt(argument, Precedence::Apply);
-            let rendered_func = fmt_apply_func(function);
+            let rendered_arg = fmt(argument, Precedence::Apply, opts);
+            let rendered_func = fmt_apply_func(function, opts);
             let rendered_ap = if is_proj {
                 // Postfix dot-access: `t ▷ .0` renders as `t.0` (no space or ▷).
                 format!("{rendered_arg}{rendered_func}")
@@ -162,18 +173,26 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
                 (Type::Hole | Type::Infer(_), None) => format!("λ {}", param.name),
                 (ty, None) => format!("λ {} : {ty}", param.name),
                 (Type::Hole | Type::Infer(_), Some(r)) => {
-                    format!("λ {} : {{??? | Refined({})}}", param.name, r.description)
+                    format!(
+                        "λ {} : {{??? | Refined({})}}",
+                        param.name,
+                        fmt_refinement(r, opts)
+                    )
                 }
                 (ty, Some(r)) => {
-                    format!("λ {} : {{{ty} | Refined({})}}", param.name, r.description)
+                    format!(
+                        "λ {} : {{{ty} | Refined({})}}",
+                        param.name,
+                        fmt_refinement(r, opts)
+                    )
                 }
             };
-            let body_str = fmt(body, Precedence::Lowest);
+            let body_str = fmt(body, Precedence::Lowest, opts);
             (Precedence::Lowest, format!("{header} → {body_str}"))
         }
 
         TypedExprNode::Aggregate { input, kind } => {
-            let input_str = fmt(input, Precedence::Lowest);
+            let input_str = fmt(input, Precedence::Lowest, opts);
             (Precedence::Lowest, format!("{kind:?}({input_str})"))
         }
 
@@ -187,8 +206,8 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
             } else {
                 String::new()
             };
-            let val_str = fmt(value, Precedence::Lowest);
-            let body_str = fmt(body, Precedence::Lowest);
+            let val_str = fmt(value, Precedence::Lowest, opts);
+            let body_str = fmt(body, Precedence::Lowest, opts);
             (
                 Precedence::Lowest,
                 format!("let {}{ty_str} = {val_str}\nin {body_str}", binding.name),
@@ -196,19 +215,25 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
         }
 
         TypedExprNode::List(elts) => {
-            let items: Vec<_> = elts.iter().map(|e| fmt(e, Precedence::Lowest)).collect();
+            let items: Vec<_> = elts
+                .iter()
+                .map(|e| fmt(e, Precedence::Lowest, opts))
+                .collect();
             (Precedence::Atom, format!("[{}]", items.join(", ")))
         }
 
         TypedExprNode::Tuple(elts) => {
-            let items: Vec<_> = elts.iter().map(|e| fmt(e, Precedence::Lowest)).collect();
+            let items: Vec<_> = elts
+                .iter()
+                .map(|e| fmt(e, Precedence::Lowest, opts))
+                .collect();
             (Precedence::Atom, format!("({})", items.join(", ")))
         }
 
         TypedExprNode::Record(fields) => {
             let items: Vec<_> = fields
                 .iter()
-                .map(|(k, e)| format!("{k}: {}", fmt(e, Precedence::Lowest)))
+                .map(|(k, e)| format!("{k}: {}", fmt(e, Precedence::Lowest, opts)))
                 .collect();
             (Precedence::Atom, format!("({})", items.join(", ")))
         }
@@ -219,8 +244,8 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
                 .map(|Branch { guard, body }| {
                     format!(
                         "{} → {}",
-                        fmt(guard, Precedence::Lowest),
-                        fmt(body, Precedence::Lowest)
+                        fmt(guard, Precedence::Lowest, opts),
+                        fmt(body, Precedence::Lowest, opts)
                     )
                 })
                 .collect();
@@ -241,8 +266,8 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
                     t => format!("{}: {t}", p.name),
                 })
                 .collect();
-            let body_str = fmt(loop_body, Precedence::Lowest);
-            let rest_str = fmt(outer_body, Precedence::Lowest);
+            let body_str = fmt(loop_body, Precedence::Lowest, opts);
+            let rest_str = fmt(outer_body, Precedence::Lowest, opts);
             (
                 Precedence::Lowest,
                 format!(
@@ -253,7 +278,10 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
         }
 
         TypedExprNode::Jump { target, args } => {
-            let arg_strs: Vec<_> = args.iter().map(|a| fmt(a, Precedence::Lowest)).collect();
+            let arg_strs: Vec<_> = args
+                .iter()
+                .map(|a| fmt(a, Precedence::Lowest, opts))
+                .collect();
             (
                 Precedence::Atom,
                 format!("{target}({})", arg_strs.join(", ")),
@@ -261,8 +289,8 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
         }
 
         TypedExprNode::GroupBy { collection, key } => {
-            let coll_str = fmt(collection, Precedence::Lowest);
-            let key_str = fmt(key, Precedence::Lowest);
+            let coll_str = fmt(collection, Precedence::Lowest, opts);
+            let key_str = fmt(key, Precedence::Lowest, opts);
             (
                 Precedence::Lowest,
                 format!("GroupBy({coll_str}, {key_str})"),
@@ -278,6 +306,11 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
                 ProjKey::Field(s) => format!(".{s}"),
             },
         ),
+    };
+    if opts.show_types {
+        (res.0, format!("{}:<{}>", res.1, expr.ty))
+    } else {
+        res
     }
 }
 
@@ -292,12 +325,12 @@ fn fmt_inner(expr: &Expr) -> (Precedence, String) {
 /// - [`Expr::Lambda`] in func position: wrap in parens so its greedy `→ body`
 ///   does not absorb the rest of the chain without parens.
 /// - Anything else: render at [`Precedence::Lowest`] (no extra wrapping needed).
-fn fmt_apply_func(func: &Expr) -> String {
+fn fmt_apply_func(func: &Expr, opts: &SymbolicOpts) -> String {
     match &func.node {
         TypedExprNode::Apply { .. } | TypedExprNode::Lambda { .. } => {
-            format!("({})", fmt(func, Precedence::Lowest))
+            format!("({})", fmt(func, Precedence::Lowest, opts))
         }
-        _ => fmt(func, Precedence::Lowest),
+        _ => fmt(func, Precedence::Lowest, opts),
     }
 }
 
@@ -308,6 +341,13 @@ fn fmt_lit(lit: &Lit) -> String {
         Lit::String(s) => format!("\"{}\"", s.escape_default()),
         Lit::Bool(b) => b.to_string(),
         Lit::Unit => "unit".to_string(),
+    }
+}
+
+fn fmt_refinement(r: &Refinement, opts: &SymbolicOpts) -> String {
+    match &r.kind {
+        RefinementKind::Predicate(p) => fmt(&p.borrow(), Precedence::Atom, opts),
+        RefinementKind::HashJoin(..) => r.description.clone(),
     }
 }
 
@@ -536,7 +576,7 @@ in x"
             Expr::lit(Lit::Bool(true)),
             "x > 0",
         ),
-        "λ x : {??? | Refined(x > 0)} → x"
+        "λ x : {??? | Refined(true)} → x"
     )]
     // Lambda with predicate refinement and type annotation
     #[case(
@@ -547,7 +587,7 @@ in x"
             Expr::lit(Lit::Bool(true)),
             "x > 0",
         ),
-        "λ x : {Int | Refined(x > 0)} → x"
+        "λ x : {Int | Refined(true)} → x"
     )]
     // Aggregate
     #[case(Expr::aggregate(Expr::var("xs"), AggregateKind::Max), "Max(xs)")]

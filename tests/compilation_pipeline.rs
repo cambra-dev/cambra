@@ -515,11 +515,11 @@ fn test_source_filter_nonterminal() {
 )]
 fn test_inner_join(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
-    let record_type = Type::Record(vec![
-        (tuple_field(0), Type::Base(BaseType::Int)),
-        (tuple_field(1), Type::Base(BaseType::String)),
+    let record_type = Type::Tuple(vec![
+        Type::Base(BaseType::Int),
+        Type::Base(BaseType::String),
     ]);
-    let record_extent = Extent::record(HashMap::from([
+    let record_extent = Extent::Record(HashMap::from([
         (tuple_field(0), Extent::Base(BaseType::Int)),
         (tuple_field(1), Extent::Base(BaseType::String)),
     ]));

@@ -9,7 +9,11 @@
 //! variables across the typed-expression tree, and by a post-inference resolution pass to
 //! replace any remaining [`crate::ccl::Type::Infer`] placeholders with their concrete types.
 
-use crate::ccl::{Branch, InferVarId, Type};
+use std::{collections::HashMap, fmt::Display};
+
+use log::trace;
+
+use crate::ccl::{infer::InferError, Branch, InferVarId, Type};
 
 // ---------------------------------------------------------------------------
 // Internal entry type
@@ -31,6 +35,16 @@ enum Entry {
     Link(InferVarId),
 }
 
+impl Display for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Root(Some(ty)) => write!(f, "{ty}"),
+            Self::Root(None) => write!(f, "?"),
+            Self::Link(id) => write!(f, "#{id}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UnificationTable
 // ---------------------------------------------------------------------------
@@ -50,6 +64,18 @@ pub struct UnificationTable {
     ///
     /// `None` at an index means that variable has never been registered.
     entries: Vec<Option<Entry>>,
+}
+
+impl Display for UnificationTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let elements: Vec<_> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.as_ref().map(|e| format!("{i}: {e}")))
+            .collect();
+        write!(f, "{}", elements.join("\n"))
+    }
 }
 
 impl UnificationTable {
@@ -113,9 +139,14 @@ impl UnificationTable {
     /// of build profile.
     pub fn set(&mut self, id: InferVarId, ty: Type) {
         let root = self.find(id);
+        let existing = self.probe(root);
         assert!(
-            self.probe(root).is_none_or(|existing| existing == ty),
-            "UnificationTable::set: variable {root:?} already solved to a different type"
+            existing
+                .as_ref()
+                .is_none_or(|e| self.constrain_equal(e, &ty).is_ok()),
+            "UnificationTable::set: variable {root:?} already solved to a different type: {} vs {}",
+            existing.unwrap(),
+            ty
         );
         let idx = root.0 as usize;
         if idx < self.entries.len() {
@@ -178,7 +209,7 @@ impl UnificationTable {
             }
             (Some(ty_a), Some(ty_b)) => {
                 if ty_a != ty_b {
-                    return Err((ty_a, ty_b));
+                    return self.constrain_equal(&ty_a, &ty_b).or(Err((ty_a, ty_b)));
                 }
                 // Both solved to the same type — link b to a (idempotent).
                 let idx_b = root_b.0 as usize;
@@ -196,11 +227,81 @@ impl UnificationTable {
         }
         Ok(())
     }
+
+    /// Constrain two types to be equal, recording the solution in the [`UnificationTable`].
+    ///
+    /// - Both `Infer`: union the two variables.
+    /// - One `Infer`, one concrete: set the variable to the concrete type.
+    /// - Both concrete and equal: no-op.
+    /// - Both concrete and different: returns [`InferError::TypeMismatch`].
+    /// - Structured types: recurse element-wise
+    pub fn constrain_equal(&mut self, a: &Type, b: &Type) -> Result<(), InferError> {
+        trace!("Constraining {a} and {b}");
+        match (a, b) {
+            (Type::Infer(a_id), Type::Infer(b_id)) => {
+                self.unify(*a_id, *b_id)
+                    .map_err(|(type_a, type_b)| InferError::TypeMismatch { type_a, type_b })?;
+                Ok(())
+            }
+            (Type::Infer(id), concrete) | (concrete, Type::Infer(id)) => {
+                // Ensure this is a actually a concrete type: guards against case reordering.
+                debug_assert!(!matches!(concrete, Type::Infer(_)));
+                self.set(*id, concrete.clone());
+                Ok(())
+            }
+            (Type::Fun(a_domain, a_codomain), Type::Fun(b_domain, b_codomain)) => self
+                .constrain_equal(a_domain, b_domain)
+                .and(self.constrain_equal(a_codomain, b_codomain)),
+            // Constrain tuples index-wise.  Implicitly allow tuples of non-equal size,
+            // ignoring unmatched indices
+            (Type::Tuple(a), Type::Tuple(b)) => a
+                .iter()
+                .zip(b.iter())
+                .try_for_each(|(a, b)| self.constrain_equal(a, b)),
+            // Constrain tuples field-wise.  Implicitly allow mismatched records, ignoring
+            // unmatched fields
+            (Type::Record(a), Type::Record(b)) => {
+                let a_map: HashMap<_, _> = a.iter().cloned().collect();
+                for (f, b_ty) in b.iter() {
+                    if let Some(a_ty) = a_map.get(f) {
+                        self.constrain_equal(a_ty, b_ty)?;
+                    }
+                }
+                Ok(())
+            }
+            (a, b) if a == b => Ok(()),
+            (type_a, type_b) => Err(InferError::TypeMismatch {
+                type_a: type_a.clone(),
+                type_b: type_b.clone(),
+            }),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Resolution pass
 // ---------------------------------------------------------------------------
+
+/// Find any Infer placeholders inside the given type and replace them with
+/// concrete types if possible.
+fn resolve_type(ty: &mut Type, table: &mut UnificationTable) {
+    match ty {
+        Type::Infer(id) => {
+            if let Some(mut new_ty) = table.probe(*id) {
+                // Recurse into the resolved type in case it is a composite type with unknown elements
+                resolve_type(&mut new_ty, table);
+                *ty = new_ty;
+            }
+        }
+        Type::Fun(domain, codomain) => {
+            resolve_type(domain, table);
+            resolve_type(codomain, table);
+        }
+        Type::Tuple(types) => types.iter_mut().for_each(|t| resolve_type(t, table)),
+        Type::Record(types) => types.iter_mut().for_each(|(_, t)| resolve_type(t, table)),
+        _ => {}
+    };
+}
 
 /// Walk `expr` and replace every [`Type::Infer(id)`](crate::ccl::Type::Infer)
 /// with the solved type from `table`, if one exists.
@@ -221,12 +322,8 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
         &expr.node
     );
 
-    // Resolve this node's type slot.
-    if let Type::Infer(id) = expr.ty {
-        if let Some(ty) = table.probe(id) {
-            expr.ty = ty;
-        }
-    }
+    // Resolve this node's type slot, recursing into composite types
+    resolve_type(&mut expr.ty, table);
     // Recurse into sub-expressions.
     use crate::ccl::TypedExprNode;
     match &mut expr.node {
@@ -453,5 +550,217 @@ mod tests {
         let (ty_a, ty_b) = result.unwrap_err();
         assert_eq!(ty_a, Type::Base(BaseType::Int));
         assert_eq!(ty_b, Type::Base(BaseType::String));
+    }
+
+    // ---------------------------------------------------------------------------
+    // constrain_equal tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_constrain_equal_two_infer_vars_unions_them() {
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let b = table.fresh_var();
+        table
+            .constrain_equal(&Type::Infer(a), &Type::Infer(b))
+            .unwrap();
+        // Setting one should be visible through the other.
+        table.set(a, Type::Base(BaseType::Int));
+        assert_eq!(table.probe(b), Some(Type::Base(BaseType::Int)));
+    }
+
+    #[test]
+    fn test_constrain_equal_infer_and_concrete_solves_var() {
+        let mut table = UnificationTable::new();
+        let v = table.fresh_var();
+        table
+            .constrain_equal(&Type::Infer(v), &Type::Base(BaseType::Bool))
+            .unwrap();
+        assert_eq!(table.probe(v), Some(Type::Base(BaseType::Bool)));
+    }
+
+    #[test]
+    fn test_constrain_equal_concrete_and_infer_solves_var() {
+        // Same as above but arguments are swapped — both orders must work.
+        let mut table = UnificationTable::new();
+        let v = table.fresh_var();
+        table
+            .constrain_equal(&Type::Base(BaseType::UInt), &Type::Infer(v))
+            .unwrap();
+        assert_eq!(table.probe(v), Some(Type::Base(BaseType::UInt)));
+    }
+
+    #[test]
+    fn test_constrain_equal_same_concrete_types_is_ok() {
+        let mut table = UnificationTable::new();
+        let result =
+            table.constrain_equal(&Type::Base(BaseType::String), &Type::Base(BaseType::String));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_constrain_equal_different_concrete_types_is_err() {
+        let mut table = UnificationTable::new();
+        let result = table.constrain_equal(&Type::Base(BaseType::Int), &Type::Base(BaseType::Bool));
+        assert!(matches!(result, Err(InferError::TypeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_constrain_equal_fun_types_compatible() {
+        // (Int → Bool) == (Int → Bool) should succeed and leave no unsolved vars.
+        let mut table = UnificationTable::new();
+        let a = Type::Fun(
+            Box::new(Type::Base(BaseType::Int)),
+            Box::new(Type::Base(BaseType::Bool)),
+        );
+        let b = a.clone();
+        assert!(table.constrain_equal(&a, &b).is_ok());
+    }
+
+    #[test]
+    fn test_constrain_equal_fun_types_solves_infer_components() {
+        // (Infer(d) → Bool) == (Int → Bool) should solve d = Int.
+        let mut table = UnificationTable::new();
+        let d = table.fresh_var();
+        let lhs = Type::Fun(
+            Box::new(Type::Infer(d)),
+            Box::new(Type::Base(BaseType::Bool)),
+        );
+        let rhs = Type::Fun(
+            Box::new(Type::Base(BaseType::Int)),
+            Box::new(Type::Base(BaseType::Bool)),
+        );
+        table.constrain_equal(&lhs, &rhs).unwrap();
+        assert_eq!(table.probe(d), Some(Type::Base(BaseType::Int)));
+    }
+
+    #[test]
+    fn test_constrain_equal_fun_types_domain_mismatch_is_err() {
+        let mut table = UnificationTable::new();
+        let lhs = Type::Fun(
+            Box::new(Type::Base(BaseType::Int)),
+            Box::new(Type::Base(BaseType::Bool)),
+        );
+        let rhs = Type::Fun(
+            Box::new(Type::Base(BaseType::String)),
+            Box::new(Type::Base(BaseType::Bool)),
+        );
+        assert!(matches!(
+            table.constrain_equal(&lhs, &rhs),
+            Err(InferError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_constrain_equal_tuple_types_compatible() {
+        let mut table = UnificationTable::new();
+        let v = table.fresh_var();
+        let lhs = Type::Tuple(vec![Type::Infer(v), Type::Base(BaseType::Bool)]);
+        let rhs = Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Bool)]);
+        table.constrain_equal(&lhs, &rhs).unwrap();
+        assert_eq!(table.probe(v), Some(Type::Base(BaseType::Int)));
+    }
+
+    #[test]
+    fn test_constrain_equal_tuple_types_mismatch_is_err() {
+        let mut table = UnificationTable::new();
+        let lhs = Type::Tuple(vec![Type::Base(BaseType::Int)]);
+        let rhs = Type::Tuple(vec![Type::Base(BaseType::Bool)]);
+        assert!(matches!(
+            table.constrain_equal(&lhs, &rhs),
+            Err(InferError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_constrain_equal_record_types_field_wise() {
+        let mut table = UnificationTable::new();
+        let v = table.fresh_var();
+        let lhs = Type::Record(vec![
+            ("x".to_string(), Type::Infer(v)),
+            ("y".to_string(), Type::Base(BaseType::Bool)),
+        ]);
+        let rhs = Type::Record(vec![
+            ("x".to_string(), Type::Base(BaseType::Int)),
+            ("y".to_string(), Type::Base(BaseType::Bool)),
+        ]);
+        table.constrain_equal(&lhs, &rhs).unwrap();
+        assert_eq!(table.probe(v), Some(Type::Base(BaseType::Int)));
+    }
+
+    #[test]
+    fn test_constrain_equal_record_types_field_mismatch_is_err() {
+        let mut table = UnificationTable::new();
+        let lhs = Type::Record(vec![("x".to_string(), Type::Base(BaseType::Int))]);
+        let rhs = Type::Record(vec![("x".to_string(), Type::Base(BaseType::Bool))]);
+        assert!(matches!(
+            table.constrain_equal(&lhs, &rhs),
+            Err(InferError::TypeMismatch { .. })
+        ));
+    }
+
+    // ---------------------------------------------------------------------------
+    // resolve tests — composite and chained cases
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_fun_type_with_infer_components() {
+        // An expression typed Fun(Infer(d), Infer(c)) should have both vars resolved.
+        let mut table = UnificationTable::new();
+        let d = table.fresh_var();
+        let c = table.fresh_var();
+        table.set(d, Type::Base(BaseType::Int));
+        table.set(c, Type::Base(BaseType::Bool));
+
+        let mut expr = Expr::lit(Lit::Int(0)).with_ty(Type::Fun(
+            Box::new(Type::Infer(d)),
+            Box::new(Type::Infer(c)),
+        ));
+        resolve(&mut expr, &mut table);
+        assert_eq!(
+            expr.ty,
+            Type::Fun(
+                Box::new(Type::Base(BaseType::Int)),
+                Box::new(Type::Base(BaseType::Bool))
+            )
+        );
+    }
+
+    #[test]
+    fn test_resolve_chained_infer_variables() {
+        // Infer(a) → Infer(b) → Int: resolving a should eventually yield Int.
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let b = table.fresh_var();
+        table.set(b, Type::Base(BaseType::Int));
+        // Union a and b so a resolves through b.
+        table.unify(a, b).unwrap();
+
+        let mut expr = Expr::lit(Lit::Int(0)).with_ty(Type::Infer(a));
+        resolve(&mut expr, &mut table);
+        assert_eq!(expr.ty, Type::Base(BaseType::Int));
+    }
+
+    #[test]
+    fn test_resolve_apply_recurses_into_subexprs() {
+        let mut table = UnificationTable::new();
+        let fn_var = table.fresh_var();
+        let arg_var = table.fresh_var();
+        table.set(fn_var, Type::Base(BaseType::Int));
+        table.set(arg_var, Type::Base(BaseType::Bool));
+
+        let mut expr = Expr::new(crate::ccl::TypedExprNode::Apply {
+            function: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Infer(fn_var))),
+            argument: Box::new(Expr::lit(Lit::Int(1)).with_ty(Type::Infer(arg_var))),
+        })
+        .with_ty(Type::Base(BaseType::Unit));
+
+        resolve(&mut expr, &mut table);
+
+        let crate::ccl::TypedExprNode::Apply { function, argument } = &expr.node else {
+            panic!("expected Apply");
+        };
+        assert_eq!(function.ty, Type::Base(BaseType::Int));
+        assert_eq!(argument.ty, Type::Base(BaseType::Bool));
     }
 }

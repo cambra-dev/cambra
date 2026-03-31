@@ -597,13 +597,13 @@ pub enum TypedExprNode {
 /// inference pass checks that the inferred type is compatible with it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedExpr {
-    /// The expression kind.
-    pub node: TypedExprNode,
     /// The inferred type of this expression.
     ///
     /// Starts as [`Type::Hole`] (lowering placeholder); converted to [`Type::Infer`]
     /// at inference entry and written to a concrete type by [`infer::infer`].
     pub ty: Type,
+    /// The expression kind.
+    pub node: TypedExprNode,
     /// User-written type annotation, if any.
     ///
     /// Checked against the inferred type by [`infer::infer`]; `None` for all
@@ -930,6 +930,11 @@ impl fmt::Display for Type {
 }
 
 impl Type {
+    /// Helper for creating function types
+    pub fn fun(domain: Self, codomain: Self) -> Self {
+        Type::Fun(Box::new(domain), Box::new(codomain))
+    }
+
     /// If this is a function type, return the codomain type, otherwise None
     pub fn codomain(&self) -> Option<Type> {
         if let Type::Fun(_, codomain) = &self {
