@@ -140,17 +140,63 @@ impl UnificationTable {
     pub fn set(&mut self, id: InferVarId, ty: Type) {
         let root = self.find(id);
         let existing = self.probe(root);
-        assert!(
-            existing
-                .as_ref()
-                .is_none_or(|e| self.constrain_equal(e, &ty).is_ok()),
-            "UnificationTable::set: variable {root:?} already solved to a different type: {} vs {}",
-            existing.unwrap(),
-            ty
-        );
+
+        // For PartialTuple/PartialRecord, merge entries instead of overwriting.
+        // This lets a variable constrained by multiple projections (e.g. `.0` and
+        // `.1` on the same parameter) accumulate all known index/field types.
+        let to_store = match (existing, ty) {
+            // Merge two PartialTuples: validate overlapping indices, append new ones.
+            (Some(Type::PartialTuple(mut existing_entries)), Type::PartialTuple(new_entries)) => {
+                for (new_idx, new_ty) in new_entries {
+                    if let Some(pos) = existing_entries.iter().position(|(i, _)| *i == new_idx) {
+                        // Clone before the constrain_equal call to release the index borrow.
+                        let existing_ty = existing_entries[pos].1.clone();
+                        self.constrain_equal(&existing_ty, &new_ty)
+                            .unwrap_or_else(|_| {
+                                panic!(
+                                    "UnificationTable::set: type conflict at index {new_idx} \
+                                 merging PartialTuple: {existing_ty} vs {new_ty}"
+                                )
+                            });
+                    } else {
+                        existing_entries.push((new_idx, new_ty));
+                    }
+                }
+                Type::PartialTuple(existing_entries)
+            }
+            // Merge two PartialRecords: validate overlapping fields, append new ones.
+            (Some(Type::PartialRecord(mut existing_entries)), Type::PartialRecord(new_entries)) => {
+                for (new_name, new_ty) in new_entries {
+                    if let Some(pos) = existing_entries.iter().position(|(n, _)| *n == new_name) {
+                        let existing_ty = existing_entries[pos].1.clone();
+                        self.constrain_equal(&existing_ty, &new_ty)
+                            .unwrap_or_else(|_| {
+                                panic!(
+                                    "UnificationTable::set: type conflict for field '{new_name}' \
+                                 merging PartialRecord: {existing_ty} vs {new_ty}"
+                                )
+                            });
+                    } else {
+                        existing_entries.push((new_name, new_ty));
+                    }
+                }
+                Type::PartialRecord(existing_entries)
+            }
+            // Default: assert compatible (for equal types or Infer unification), then overwrite.
+            (Some(existing_ty), ty) => {
+                assert!(
+                    self.constrain_equal(&existing_ty, &ty).is_ok(),
+                    "UnificationTable::set: variable {root:?} already solved to a different type: \
+                     {existing_ty} vs {ty}"
+                );
+                ty
+            }
+            (None, ty) => ty,
+        };
+
         let idx = root.0 as usize;
         if idx < self.entries.len() {
-            self.entries[idx] = Some(Entry::Root(Some(ty)));
+            self.entries[idx] = Some(Entry::Root(Some(to_store)));
         }
     }
 
@@ -907,10 +953,7 @@ mod tests {
         assert!(table.constrain_equal(&lhs, &rhs).is_ok());
     }
 
-    // PR 2: fix UnificationTable::set to merge PartialTuple entries instead of overwriting,
-    // enabling multi-projection inference for a single tuple variable.
     #[test]
-    #[ignore]
     fn test_partial_tuple_merge_via_set() {
         // ?p constrained by both .0 (Int) and .1 (String) — set should accumulate both.
         let mut table = UnificationTable::new();
@@ -929,9 +972,7 @@ mod tests {
         );
     }
 
-    // PR 2: same as above but for PartialRecord.
     #[test]
-    #[ignore]
     fn test_partial_record_merge_via_set() {
         // ?r constrained by both .x (Int) and .y (Bool) — set should accumulate both.
         let mut table = UnificationTable::new();

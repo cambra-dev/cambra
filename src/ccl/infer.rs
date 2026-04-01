@@ -969,7 +969,18 @@ fn lit_type(lit: &Lit) -> Type {
 #[derive(Debug, Clone)]
 enum TypeConstraint {
     Type(Type),
-    // TODO handle nested tuples
+    // Carries a concrete index into a tuple-typed parameter, emitted by
+    // `collect_constraints_into` for every entry in a `PartialTuple` domain.
+    // `reconcile_constraints` assembles them into a concrete `Tuple` type.
+    //
+    // Known limitation:
+    // - There is no `RecordField` analogue. Multiple record-field projections of the
+    //   same standalone lambda parameter (e.g. `p.x` and `p.y`) each emit
+    //   `Type(PartialRecord(...))`, which conflicts in `reconcile_constraints` instead
+    //   of merging. `UnificationTable::set` merges `PartialRecord` entries at inference
+    //   time, but the pre-inference constraint collection path does not support this.
+    //   A `RecordField(String, Type)` variant (mirroring `TupleField`) would fix it.
+    // TODO: handle nested tuples.
     TupleField(usize, Type),
 }
 
@@ -1020,7 +1031,18 @@ fn collect_constraints_into(
             match &argument.node {
                 TypedExprNode::Var(v) if v == param => {
                     if let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx) {
-                        out.push(TypeConstraint::Type(*domain));
+                        // Decompose any PartialTuple domain into individual TupleField
+                        // constraints so reconcile_constraints can merge them into a
+                        // concrete Tuple type. Single-entry PartialTuples arise from bare
+                        // Proj morphisms; multi-entry ones from set() accumulation.
+                        match *domain {
+                            Type::PartialTuple(entries) => {
+                                for (idx, field_ty) in entries {
+                                    out.push(TypeConstraint::TupleField(idx, field_ty));
+                                }
+                            }
+                            domain => out.push(TypeConstraint::Type(domain)),
+                        }
                         // Don't recurse: function was already inferred (possibly mutated),
                         // and argument = Var(param) has no sub-patterns to search.
                         return;
@@ -1130,6 +1152,13 @@ fn reconcile_constraints(constraints: Vec<TypeConstraint>) -> Result<Option<Type
             }
         }
     }
+    // Mixed Type and TupleField constraints indicate a bug in collect_constraints_into:
+    // PartialTuple domains must always be fully decomposed into TupleField entries there.
+    assert!(
+        base_type.is_none() || tuple_type.is_empty(),
+        "reconcile_constraints: mixed Type and TupleField constraints — \
+         PartialTuple domains must be decomposed by collect_constraints_into"
+    );
     if base_type.is_some() {
         Ok(base_type)
     } else if !tuple_type.is_empty() {
@@ -2023,6 +2052,54 @@ mod tests {
         );
     }
 
+    /// Mixed [`TypeConstraint::Type`] and [`TypeConstraint::TupleField`] entries
+    /// indicate a bug in [`collect_constraints_into`] — `PartialTuple` domains must
+    /// be fully decomposed into `TupleField` entries before reaching the reconciler.
+    /// The assert in [`reconcile_constraints`] fires to surface this rather than
+    /// silently discarding the `TupleField` data.
+    #[test]
+    #[should_panic(expected = "mixed Type and TupleField constraints")]
+    fn test_reconcile_panics_on_mixed_type_and_tuple_field() {
+        let constraints = vec![
+            TypeConstraint::Type(Type::PartialTuple(vec![(0, Type::Base(BaseType::Int))])),
+            TypeConstraint::TupleField(1, Type::Base(BaseType::Bool)),
+        ];
+        reconcile_constraints(constraints).ok();
+    }
+
+    /// A function applied to `param` whose domain is a multi-entry `PartialTuple`
+    /// should decompose into multiple `TupleField` constraints and correctly infer
+    /// the full `Tuple` type for `param`.
+    #[test]
+    fn test_infer_lambda_multi_entry_partial_tuple_domain_decomposes() {
+        let mut ctx = TypeInferenceContext::new();
+        // λ p → p ► f
+        // f : Fun(PartialTuple([(0, Int), (1, Bool)]), Int) — a multi-entry domain.
+        // collect_constraints_into decomposes it into TupleField(0, Int) and
+        // TupleField(1, Bool), so reconcile_constraints infers p : (Int, Bool).
+        let f_ty = Type::Fun(
+            Box::new(Type::PartialTuple(vec![
+                (0, Type::Base(BaseType::Int)),
+                (1, Type::Base(BaseType::Bool)),
+            ])),
+            Box::new(Type::Base(BaseType::Int)),
+        );
+        let body = Expr::apply(Expr::var("p"), Expr::var("f"));
+        let mut expr = Expr::lambda("p", Type::infer(), body);
+        let mut scoped = ctx.enter_scope();
+        scoped.bind("f", f_ty);
+        let ty = infer(&mut expr, &mut scoped).unwrap();
+        if let Type::Fun(domain, _) = ty {
+            assert_eq!(
+                *domain,
+                Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Bool)]),
+                "expected p : (Int, Bool), got {domain}"
+            );
+        } else {
+            panic!("expected Fun type for lambda");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // AnnotationMismatch: user_annotation conflicts with inferred type
     // -----------------------------------------------------------------------
@@ -2521,16 +2598,17 @@ mod tests {
         }
     }
 
-    // PR 2: once set() merges PartialTuple entries, a lambda that projects two
-    // different fields of the same parameter should infer a full concrete tuple type.
+    /// A lambda that applies two different projections to the same parameter
+    /// should infer a tuple-typed domain after `set()` merging and `TupleField`
+    /// constraint accumulation in `collect_constraints_into`.
     #[test]
     #[ignore]
     fn test_infer_lambda_two_proj_on_same_param() {
         let mut ctx = TypeInferenceContext::new();
-        // λ p → (Apply(p, .0) + 0, Apply(p, .1))
-        // .0 feeds into Int addition → p[0] : Int
-        // .1 returns String literal  → p[1] : String
-        // Expected: p : (Int, String)
+        // λ p → ((p ► .0) + 0, p ► .1)
+        // p ► .0 feeds into Int addition → p[0] : Int
+        // p ► .1 is unconstrained
+        // Expected domain: (Int, ?b)
         let body = Expr::new(TypedExprNode::Tuple(vec![
             Expr::new(TypedExprNode::BinOp {
                 op: BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -2541,13 +2619,19 @@ mod tests {
         ]));
         let mut expr = Expr::lambda("p", Type::infer(), body);
         let ty = infer(&mut expr, &mut ctx).unwrap();
-        // After PR 2, p should be inferred as (Int, ?b); .1 is still unconstrained
-        // until a concrete String is provided, so we only assert the domain contains index 0.
         if let Type::Fun(domain, _) = ty {
-            assert!(
-                matches!(*domain, Type::Tuple(_) | Type::PartialTuple(_)),
-                "expected tuple-typed domain for p, got {domain}"
-            );
+            match *domain {
+                Type::Tuple(ref elts) if elts.len() == 2 => {
+                    assert_eq!(
+                        elts[0],
+                        Type::Base(BaseType::Int),
+                        "expected p[0] : Int, got {}",
+                        elts[0]
+                    );
+                    // elts[1] remains as an unconstrained infer variable
+                }
+                ref other => panic!("expected 2-element Tuple domain for p, got {other}"),
+            }
         } else {
             panic!("expected Fun type for lambda");
         }

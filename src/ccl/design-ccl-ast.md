@@ -448,17 +448,18 @@ length ≥ n+1, constraining `?a` to the element type at that index.
 - `PartialRecord ↔ Record`: constrain `?a` against `Record["x"]`. Missing field is a `TypeMismatch`.
 - `PartialRecord ↔ PartialRecord`: constrain overlapping fields only.
 
-**Limitation (PR 2)**: `UnificationTable::set` currently overwrites an existing
-`PartialTuple`/`PartialRecord` solution rather than merging entries. This means a
-lambda that applies two different projections to the same parameter (e.g. `p[0]` and
-`p[1]`) accumulates only the last constraint. Fix: merge entries in `set` when both
-old and new values are `PartialTuple`/`PartialRecord`.
+**Multi-projection accumulation**: `UnificationTable::set` merges `PartialTuple`/`PartialRecord`
+entries when called on a variable that is already solved to one of those types. Overlapping
+indices/fields are validated via `constrain_equal`; non-overlapping entries are appended.
+Additionally, `collect_constraints_into` detects single-entry `PartialTuple` domains from
+projection morphisms and emits `TypeConstraint::TupleField` rather than `TypeConstraint::Type`,
+so `reconcile_constraints` can merge multiple projections of the same parameter into a
+concrete `Tuple` type.
 
 ### TODOs
 
 - Infer `Let.ty` from the type of `value` (required before `Let` nodes can be compiled; see §Compilation).
 - Python `match` statement lowering: desugar at lowering time using `Let(__scrut)` + guard expressions (no IR changes needed).
-- PR 2: fix `UnificationTable::set` to merge `PartialTuple`/`PartialRecord` entries instead of overwriting, enabling full multi-projection constraint accumulation.
 
 ---
 
