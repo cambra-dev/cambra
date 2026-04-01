@@ -287,6 +287,8 @@ enum Type {
     Fun(Box<Type>, Box<Type>),           // T ⇒ U
     Tuple(Vec<Type>),
     Record(Vec<(String, Type)>),
+    PartialTuple(Vec<(usize, Type)>),    // partial tuple: only listed indices constrained; domain of Proj(Index(n))
+    PartialRecord(Vec<(String, Type)>),  // partial record: only listed fields constrained; domain of Proj(Field("x"))
     Union(Vec<Type>),
     Hole,                                // lowering placeholder; converted to Infer at inference entry
     Infer(InferVarId),                   // type-checker variable; registered in UnificationTable
@@ -422,10 +424,41 @@ pass only constrains both operands to `String` and returns `String` as the resul
 
 For each `Branch { guard, body }`: the guard is constrained to `Type::Base(BaseType::Bool)`; body types across all branches are unified via `constrain_equal`. The overall `Case` type is the unified body type. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
 
+### `Proj` inference — `PartialTuple` / `PartialRecord` domain types
+
+A bare `Proj(key)` node — i.e. the projection morphism, not an application of it — is
+inferred as a function type whose domain is a **partial** structural type:
+
+| Key | Inferred type |
+|---|---|
+| `Proj(Index(n))` | `PartialTuple([(n, ?a)]) ⇒ ?a` |
+| `Proj(Field("x"))` | `PartialRecord([("x", ?a)]) ⇒ ?a` |
+
+`PartialTuple([(n, ?a)])` means "a tuple whose index `n` has type `?a`; all other
+positions are unconstrained." This correctly unifies with any concrete `Tuple` of
+length ≥ n+1, constraining `?a` to the element type at that index.
+
+`PartialRecord([("x", ?a)])` means "a record that has at least field `"x"` of type
+`?a`; all other fields are unconstrained."
+
+**Unification rules** (in `constrain_equal`):
+
+- `PartialTuple ↔ Tuple`: constrain `?a` against `Tuple[n]`. Out-of-bounds index is a `TypeMismatch`.
+- `PartialTuple ↔ PartialTuple`: constrain overlapping indices. Non-overlapping entries are left unconstrained (PR 2 will merge them via `set`).
+- `PartialRecord ↔ Record`: constrain `?a` against `Record["x"]`. Missing field is a `TypeMismatch`.
+- `PartialRecord ↔ PartialRecord`: constrain overlapping fields only.
+
+**Limitation (PR 2)**: `UnificationTable::set` currently overwrites an existing
+`PartialTuple`/`PartialRecord` solution rather than merging entries. This means a
+lambda that applies two different projections to the same parameter (e.g. `p[0]` and
+`p[1]`) accumulates only the last constraint. Fix: merge entries in `set` when both
+old and new values are `PartialTuple`/`PartialRecord`.
+
 ### TODOs
 
 - Infer `Let.ty` from the type of `value` (required before `Let` nodes can be compiled; see §Compilation).
 - Python `match` statement lowering: desugar at lowering time using `Let(__scrut)` + guard expressions (no IR changes needed).
+- PR 2: fix `UnificationTable::set` to merge `PartialTuple`/`PartialRecord` entries instead of overwriting, enabling full multi-projection constraint accumulation.
 
 ---
 

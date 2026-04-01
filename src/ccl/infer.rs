@@ -351,6 +351,16 @@ fn collect_type_errors(ty: &Type, context_sym: &str, errors: &mut Vec<InferError
             }
             collect_type_errors(inner, context_sym, errors);
         }
+        Type::PartialTuple(entries) => {
+            for (_, ty) in entries {
+                collect_type_errors(ty, context_sym, errors);
+            }
+        }
+        Type::PartialRecord(entries) => {
+            for (_, ty) in entries {
+                collect_type_errors(ty, context_sym, errors);
+            }
+        }
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {}
     }
 }
@@ -472,22 +482,17 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
 
         // ----- Proj -----
         //
-        // First-class projection morphism. A bare Proj node
-        // has a polymorphic function type; return a function with fresh inference variables.
+        // First-class projection morphism. A bare `Proj(Index(n))` gets type
+        // `PartialTuple({n => ?a}) ⇒ ?a`; a bare `Proj(Field("x"))` gets type
+        // `PartialRecord({x => ?a}) ⇒ ?a`.  These partial domain types unify
+        // correctly with any concrete `Tuple`/`Record` during application.
         TypedExprNode::Proj(key) => {
             let field_ty = Type::Infer(ctx.fresh_infer_var());
-            let record_ty = match key {
-                ProjKey::Index(0) => {
-                    Type::Tuple(vec![field_ty.clone(), Type::Infer(ctx.fresh_infer_var())])
-                }
-                ProjKey::Index(1) => {
-                    Type::Tuple(vec![Type::Infer(ctx.fresh_infer_var()), field_ty.clone()])
-                }
-                // TODO properly handle n-ary tuples and records
-                _ => Type::Infer(ctx.fresh_infer_var()),
+            let domain_ty = match key {
+                ProjKey::Index(idx) => Type::PartialTuple(vec![(*idx, field_ty.clone())]),
+                ProjKey::Field(name) => Type::PartialRecord(vec![(name.clone(), field_ty.clone())]),
             };
-
-            Ok(Type::Fun(Box::new(record_ty), Box::new(field_ty)))
+            Ok(Type::fun(domain_ty, field_ty))
         }
 
         // ----- GroupBy -----
@@ -655,7 +660,8 @@ fn infer_apply(
                 param.ty = arg_ty.clone();
             }
         }
-        // For projections, if the type is known, constrain the projection's type accordingly.
+        // For projections, if the argument type is known (concrete or partial),
+        // directly look up the projected element type to improve inference.
         TypedExprNode::Proj(key) => match (key, &arg_ty) {
             (ProjKey::Index(idx), Type::Tuple(types)) => {
                 debug!("matched {idx} with types {types:#?}");
@@ -667,6 +673,12 @@ fn infer_apply(
                         "Invalid tuple index {idx} for {arg_ty}"
                     )));
                 }
+            }
+            (ProjKey::Index(idx), Type::PartialTuple(entries)) => {
+                maybe_codomain_ty =
+                    entries
+                        .iter()
+                        .find_map(|(i, t)| if i == idx { Some(t.clone()) } else { None });
             }
             (ProjKey::Field(field), Type::Record(types)) => {
                 let proj_ty = types
@@ -680,6 +692,12 @@ fn infer_apply(
                         "Invalid record field {field} for {arg_ty}"
                     )));
                 }
+            }
+            (ProjKey::Field(field), Type::PartialRecord(entries)) => {
+                maybe_codomain_ty =
+                    entries
+                        .iter()
+                        .find_map(|(n, t)| if n == field { Some(t.clone()) } else { None });
             }
             _ => {}
         },
@@ -2422,5 +2440,116 @@ mod tests {
             check_fully_typed(&expr),
             Err(vec![InferError::UnresolvedHole("1".into())])
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Proj / PartialTuple / PartialRecord inference tests
+    // -----------------------------------------------------------------------
+
+    /// `Proj(Index(2))` applied to a 3-tuple infers the third element type.
+    ///
+    /// This was the broken case before PartialTuple: the old fallback produced
+    /// `Fun(?a, ?b)` for any index ≥ 2, losing all structural information.
+    #[test]
+    fn test_infer_proj_index_2_on_3_tuple() {
+        let mut ctx = TypeInferenceContext::new();
+        // Apply((1, "hello", true), .2)  =>  Bool
+        let mut expr = Expr::apply(
+            Expr::new(TypedExprNode::Tuple(vec![
+                Expr::lit(Lit::Int(1)),
+                Expr::lit(Lit::String("hello".into())),
+                Expr::lit(Lit::Bool(true)),
+            ])),
+            Expr::proj_index(2),
+        );
+        let ty = infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(ty, Type::Base(BaseType::Bool));
+    }
+
+    /// `Proj(Field("x"))` applied to a record infers the field type.
+    #[test]
+    fn test_infer_proj_field_on_record() {
+        let mut ctx = TypeInferenceContext::new();
+        // Apply({x: 42, y: "hi"}, .x)  =>  Int
+        let mut expr = Expr::apply(
+            Expr::new(TypedExprNode::Record(vec![
+                ("x".to_string(), Expr::lit(Lit::Int(42))),
+                ("y".to_string(), Expr::lit(Lit::String("hi".into()))),
+            ])),
+            Expr::proj_field("x"),
+        );
+        let ty = infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(ty, Type::Base(BaseType::Int));
+    }
+
+    /// A bare `Proj(Index(n))` has domain type `PartialTuple({n => ?a})`.
+    #[test]
+    fn test_bare_proj_index_has_partial_tuple_domain() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::proj_index(3);
+        // Use infer_expr directly: a bare Proj has an unresolved codomain (?a), so
+        // infer() would reject it via check_fully_typed. We only care about shape here.
+        let ty = infer_expr(&mut expr, &mut ctx).unwrap();
+        // Expect Fun(PartialTuple([...]), ?) — domain must be a PartialTuple with one entry at 3.
+        match ty {
+            Type::Fun(domain, _) => {
+                assert!(
+                    matches!(*domain, Type::PartialTuple(ref entries) if entries.len() == 1 && entries[0].0 == 3),
+                    "expected PartialTuple with index 3, got {domain}"
+                );
+            }
+            other => panic!("expected Fun, got {other}"),
+        }
+    }
+
+    /// A bare `Proj(Field("z"))` has domain type `PartialRecord({"z" => ?a})`.
+    #[test]
+    fn test_bare_proj_field_has_partial_record_domain() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::proj_field("z");
+        // Use infer_expr directly: a bare Proj has an unresolved codomain (?a), so
+        // infer() would reject it via check_fully_typed. We only care about shape here.
+        let ty = infer_expr(&mut expr, &mut ctx).unwrap();
+        match ty {
+            Type::Fun(domain, _) => {
+                assert!(
+                    matches!(*domain, Type::PartialRecord(ref entries) if entries.len() == 1 && entries[0].0 == "z"),
+                    "expected PartialRecord with field z, got {domain}"
+                );
+            }
+            other => panic!("expected Fun, got {other}"),
+        }
+    }
+
+    // PR 2: once set() merges PartialTuple entries, a lambda that projects two
+    // different fields of the same parameter should infer a full concrete tuple type.
+    #[test]
+    #[ignore]
+    fn test_infer_lambda_two_proj_on_same_param() {
+        let mut ctx = TypeInferenceContext::new();
+        // λ p → (Apply(p, .0) + 0, Apply(p, .1))
+        // .0 feeds into Int addition → p[0] : Int
+        // .1 returns String literal  → p[1] : String
+        // Expected: p : (Int, String)
+        let body = Expr::new(TypedExprNode::Tuple(vec![
+            Expr::new(TypedExprNode::BinOp {
+                op: BinOpKind::Arithmetic(ArithmeticKind::Add),
+                left: Box::new(Expr::apply(Expr::var("p"), Expr::proj_index(0))),
+                right: Box::new(Expr::lit(Lit::Int(0))),
+            }),
+            Expr::apply(Expr::var("p"), Expr::proj_index(1)),
+        ]));
+        let mut expr = Expr::lambda("p", Type::infer(), body);
+        let ty = infer(&mut expr, &mut ctx).unwrap();
+        // After PR 2, p should be inferred as (Int, ?b); .1 is still unconstrained
+        // until a concrete String is provided, so we only assert the domain contains index 0.
+        if let Type::Fun(domain, _) = ty {
+            assert!(
+                matches!(*domain, Type::Tuple(_) | Type::PartialTuple(_)),
+                "expected tuple-typed domain for p, got {domain}"
+            );
+        } else {
+            panic!("expected Fun type for lambda");
+        }
     }
 }

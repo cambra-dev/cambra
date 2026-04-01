@@ -269,6 +269,69 @@ impl UnificationTable {
                 }
                 Ok(())
             }
+            // PartialTuple ↔ Tuple: constrain each indexed element.
+            // An out-of-bounds index is a type error — projecting beyond the tuple length.
+            (Type::PartialTuple(partial), Type::Tuple(full))
+            | (Type::Tuple(full), Type::PartialTuple(partial)) => {
+                for (idx, ty) in partial {
+                    match full.get(*idx) {
+                        Some(full_ty) => self.constrain_equal(ty, full_ty)?,
+                        None => {
+                            return Err(InferError::TypeMismatch {
+                                type_a: a.clone(),
+                                type_b: b.clone(),
+                            })
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            // PartialTuple ↔ PartialTuple: validate overlapping indices only.
+            // Non-overlapping indices are left unconstrained — merging requires
+            // `set` to accumulate entries, which is deferred to PR 2.
+            (Type::PartialTuple(a), Type::PartialTuple(b)) => {
+                let a_map: HashMap<usize, &Type> = a.iter().map(|(i, t)| (*i, t)).collect();
+                for (idx, b_ty) in b {
+                    if let Some(a_ty) = a_map.get(idx) {
+                        self.constrain_equal(a_ty, b_ty)?;
+                    }
+                }
+                Ok(())
+            }
+
+            // PartialRecord ↔ Record: constrain each named field.
+            // A field present in the partial type but absent from the full record is a type error.
+            (Type::PartialRecord(partial), Type::Record(full))
+            | (Type::Record(full), Type::PartialRecord(partial)) => {
+                let full_map: HashMap<&str, &Type> =
+                    full.iter().map(|(n, t)| (n.as_str(), t)).collect();
+                for (name, ty) in partial {
+                    match full_map.get(name.as_str()) {
+                        Some(full_ty) => self.constrain_equal(ty, full_ty)?,
+                        None => {
+                            return Err(InferError::TypeMismatch {
+                                type_a: a.clone(),
+                                type_b: b.clone(),
+                            })
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            // PartialRecord ↔ PartialRecord: validate overlapping fields only.
+            // Non-overlapping fields are left unconstrained — merging is deferred to PR 2.
+            (Type::PartialRecord(a), Type::PartialRecord(b)) => {
+                let a_map: HashMap<&str, &Type> = a.iter().map(|(n, t)| (n.as_str(), t)).collect();
+                for (name, b_ty) in b {
+                    if let Some(a_ty) = a_map.get(name.as_str()) {
+                        self.constrain_equal(a_ty, b_ty)?;
+                    }
+                }
+                Ok(())
+            }
+
             (a, b) if a == b => Ok(()),
             (type_a, type_b) => Err(InferError::TypeMismatch {
                 type_a: type_a.clone(),
@@ -299,6 +362,10 @@ fn resolve_type(ty: &mut Type, table: &mut UnificationTable) {
         }
         Type::Tuple(types) => types.iter_mut().for_each(|t| resolve_type(t, table)),
         Type::Record(types) => types.iter_mut().for_each(|(_, t)| resolve_type(t, table)),
+        Type::PartialTuple(entries) => entries.iter_mut().for_each(|(_, t)| resolve_type(t, table)),
+        Type::PartialRecord(entries) => {
+            entries.iter_mut().for_each(|(_, t)| resolve_type(t, table))
+        }
         _ => {}
     };
 }
@@ -744,6 +811,148 @@ mod tests {
         let mut expr = Expr::lit(Lit::Int(0)).with_ty(Type::Infer(a));
         resolve(&mut expr, &mut table);
         assert_eq!(expr.ty, Type::Base(BaseType::Int));
+    }
+
+    // ---------------------------------------------------------------------------
+    // PartialTuple / PartialRecord constrain_equal tests
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_partial_tuple_vs_tuple_constrains_indexed_field() {
+        // PartialTuple({0 => ?a}) ↔ Tuple([Int, String]) should solve ?a = Int.
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let partial = Type::PartialTuple(vec![(0, Type::Infer(a))]);
+        let full = Type::Tuple(vec![
+            Type::Base(BaseType::Int),
+            Type::Base(BaseType::String),
+        ]);
+        table.constrain_equal(&partial, &full).unwrap();
+        assert_eq!(table.probe(a), Some(Type::Base(BaseType::Int)));
+    }
+
+    #[test]
+    fn test_partial_tuple_vs_tuple_out_of_bounds_is_err() {
+        // PartialTuple({2 => ?a}) ↔ Tuple([Int, String]) — index 2 is out of bounds.
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let partial = Type::PartialTuple(vec![(2, Type::Infer(a))]);
+        let full = Type::Tuple(vec![
+            Type::Base(BaseType::Int),
+            Type::Base(BaseType::String),
+        ]);
+        assert!(matches!(
+            table.constrain_equal(&partial, &full),
+            Err(InferError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_partial_tuple_vs_partial_tuple_overlapping_index_is_compatible() {
+        // PartialTuple({0 => Int}) ↔ PartialTuple({0 => Int}) — same index, same type.
+        let mut table = UnificationTable::new();
+        let lhs = Type::PartialTuple(vec![(0, Type::Base(BaseType::Int))]);
+        let rhs = Type::PartialTuple(vec![(0, Type::Base(BaseType::Int))]);
+        assert!(table.constrain_equal(&lhs, &rhs).is_ok());
+    }
+
+    #[test]
+    fn test_partial_tuple_vs_partial_tuple_overlapping_index_conflict_is_err() {
+        // PartialTuple({0 => Int}) ↔ PartialTuple({0 => String}) — type conflict at index 0.
+        let mut table = UnificationTable::new();
+        let lhs = Type::PartialTuple(vec![(0, Type::Base(BaseType::Int))]);
+        let rhs = Type::PartialTuple(vec![(0, Type::Base(BaseType::String))]);
+        assert!(matches!(
+            table.constrain_equal(&lhs, &rhs),
+            Err(InferError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_partial_record_vs_record_constrains_matching_field() {
+        // PartialRecord({x => ?a}) ↔ Record([x: Int, y: Bool]) should solve ?a = Int.
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let partial = Type::PartialRecord(vec![("x".to_string(), Type::Infer(a))]);
+        let full = Type::Record(vec![
+            ("x".to_string(), Type::Base(BaseType::Int)),
+            ("y".to_string(), Type::Base(BaseType::Bool)),
+        ]);
+        table.constrain_equal(&partial, &full).unwrap();
+        assert_eq!(table.probe(a), Some(Type::Base(BaseType::Int)));
+    }
+
+    #[test]
+    fn test_partial_record_vs_record_missing_field_is_err() {
+        // PartialRecord({z => ?a}) ↔ Record([x: Int, y: Bool]) — field z is absent.
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let partial = Type::PartialRecord(vec![("z".to_string(), Type::Infer(a))]);
+        let full = Type::Record(vec![
+            ("x".to_string(), Type::Base(BaseType::Int)),
+            ("y".to_string(), Type::Base(BaseType::Bool)),
+        ]);
+        assert!(matches!(
+            table.constrain_equal(&partial, &full),
+            Err(InferError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_partial_record_vs_partial_record_overlapping_field_compatible() {
+        // PartialRecord({x => Int}) ↔ PartialRecord({x => Int}) — same field, same type.
+        let mut table = UnificationTable::new();
+        let lhs = Type::PartialRecord(vec![("x".to_string(), Type::Base(BaseType::Int))]);
+        let rhs = Type::PartialRecord(vec![("x".to_string(), Type::Base(BaseType::Int))]);
+        assert!(table.constrain_equal(&lhs, &rhs).is_ok());
+    }
+
+    // PR 2: fix UnificationTable::set to merge PartialTuple entries instead of overwriting,
+    // enabling multi-projection inference for a single tuple variable.
+    #[test]
+    #[ignore]
+    fn test_partial_tuple_merge_via_set() {
+        // ?p constrained by both .0 (Int) and .1 (String) — set should accumulate both.
+        let mut table = UnificationTable::new();
+        let p = table.fresh_var();
+        let a = table.fresh_var();
+        let b = table.fresh_var();
+        table.set(a, Type::Base(BaseType::Int));
+        table.set(b, Type::Base(BaseType::String));
+        table.set(p, Type::PartialTuple(vec![(0, Type::Infer(a))]));
+        table.set(p, Type::PartialTuple(vec![(1, Type::Infer(b))]));
+        // After merge, p should see both index 0 and index 1.
+        let ty = table.probe(p).expect("p should be solved");
+        assert!(
+            matches!(&ty, Type::PartialTuple(entries) if entries.len() == 2),
+            "expected merged PartialTuple with 2 entries, got {ty}"
+        );
+    }
+
+    // PR 2: same as above but for PartialRecord.
+    #[test]
+    #[ignore]
+    fn test_partial_record_merge_via_set() {
+        // ?r constrained by both .x (Int) and .y (Bool) — set should accumulate both.
+        let mut table = UnificationTable::new();
+        let r = table.fresh_var();
+        let a = table.fresh_var();
+        let b = table.fresh_var();
+        table.set(a, Type::Base(BaseType::Int));
+        table.set(b, Type::Base(BaseType::Bool));
+        table.set(
+            r,
+            Type::PartialRecord(vec![("x".to_string(), Type::Infer(a))]),
+        );
+        table.set(
+            r,
+            Type::PartialRecord(vec![("y".to_string(), Type::Infer(b))]),
+        );
+        let ty = table.probe(r).expect("r should be solved");
+        assert!(
+            matches!(&ty, Type::PartialRecord(entries) if entries.len() == 2),
+            "expected merged PartialRecord with 2 entries, got {ty}"
+        );
     }
 
     #[test]

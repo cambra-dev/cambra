@@ -876,6 +876,20 @@ pub enum Type {
     Tuple(Vec<Type>),
     /// A named product type (record).
     Record(Vec<(String, Type)>),
+    /// A partially-known tuple: only the listed index positions are constrained.
+    ///
+    /// Used as the domain type of index-projection morphisms during inference.
+    /// `Proj(Index(n))` gets type `PartialTuple([(n, ?a)]) ⇒ ?a`.
+    /// Unifies with [`Type::Tuple`] by constraining each indexed element, and
+    /// with another `PartialTuple` by constraining overlapping indices.
+    PartialTuple(Vec<(usize, Type)>),
+    /// A partially-known record: only the listed named fields are constrained.
+    ///
+    /// Used as the domain type of field-projection morphisms during inference.
+    /// `Proj(Field("x"))` gets type `PartialRecord([("x", ?a)]) ⇒ ?a`.
+    /// Unifies with [`Type::Record`] by constraining matching fields, and with
+    /// another `PartialRecord` by constraining overlapping fields.
+    PartialRecord(Vec<(String, Type)>),
     /// A sum type.
     ///
     /// Representable in the type system but not yet produced by inference.
@@ -930,6 +944,14 @@ impl fmt::Display for Type {
             Type::Record(fields) => {
                 let parts: Vec<_> = fields.iter().map(|(n, t)| format!("{n}: {t}")).collect();
                 write!(f, "{{{}}}", parts.join(", "))
+            }
+            Type::PartialTuple(entries) => {
+                let parts: Vec<_> = entries.iter().map(|(i, t)| format!(".{i}: {t}")).collect();
+                write!(f, "{{{}..}}", parts.join(", "))
+            }
+            Type::PartialRecord(entries) => {
+                let parts: Vec<_> = entries.iter().map(|(n, t)| format!("{n}: {t}")).collect();
+                write!(f, "{{{}..}}", parts.join(", "))
             }
             Type::Union(ts) => {
                 let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
