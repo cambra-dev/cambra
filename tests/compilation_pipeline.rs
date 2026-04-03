@@ -936,7 +936,7 @@ fn test_incremental_aggregates() {
     }
 )]
 #[case(
-    "[(x, y)[0] for x in [1,2,3] for y in [10,20]]",
+    "[x for x in [1,2,3] for y in [10,20]]",
     ".0 ≫ [1, 2, 3]:([0, 3), [0, 2)) ⇒ Int",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([

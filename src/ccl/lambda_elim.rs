@@ -41,6 +41,7 @@
 
 use log::debug;
 
+use crate::ccl::infer::debug_typecheck;
 use crate::ccl::simplify::simplify;
 use crate::ccl::AggregateKind;
 use crate::ccl::{
@@ -551,12 +552,20 @@ fn elim_lambda(
             let pair_ty = Type::Tuple(vec![param_ty.clone(), y_ty.clone()]);
             // Annotate the projection morphisms with their concrete types so that
             // downstream type computations (e.g. zip_pair_ty) can see the domain.
+            // Also annotate the pair variable itself so that the identity rule in
+            // the recursive call can produce a typed `id` morphism.
             let proj0_ty = Type::fun(pair_ty.clone(), param_ty.clone());
             let proj1_ty = Type::fun(pair_ty.clone(), y_ty.clone());
-            let sub_x = Expr::apply(Expr::var(&pair), Expr::proj_index(0).with_ty(proj0_ty))
-                .with_ty(param_ty.clone());
-            let sub_y =
-                Expr::apply(Expr::var(&pair), Expr::proj_index(1).with_ty(proj1_ty)).with_ty(y_ty);
+            let sub_x = Expr::apply(
+                Expr::var(&pair).with_ty(pair_ty.clone()),
+                Expr::proj_index(0).with_ty(proj0_ty),
+            )
+            .with_ty(param_ty.clone());
+            let sub_y = Expr::apply(
+                Expr::var(&pair).with_ty(pair_ty.clone()),
+                Expr::proj_index(1).with_ty(proj1_ty),
+            )
+            .with_ty(y_ty);
             let merged = substitute(substitute(desugared_inner, &y, &sub_y), param, &sub_x);
             let inner_elim = elim_lambda(ctx, &pair, &pair_ty, merged)?;
             Ok(curry(inner_elim))
@@ -686,7 +695,18 @@ fn elim_lambda(
             let new_def = elim_lambda(ctx, param, param_ty, *def)?;
             // In the let body, each free occurrence of v is replaced by x ▷ v
             // (i.e. the renamed function v applied to the current argument x).
-            let call_v = Expr::apply(Expr::var(param), Expr::var(&v));
+            // Type `call_v` using the types already computed for `new_def` and
+            // `param_ty`, so that `elim_lambda` on the substituted body can
+            // propagate types into the combinator arguments it builds.
+            let call_v_result_ty = match &new_def.ty {
+                Type::Fun(_, cod) => *cod.clone(),
+                _ => Type::Hole,
+            };
+            let call_v = Expr::apply(
+                Expr::var(param).with_ty(param_ty.clone()),
+                Expr::var(&v).with_ty(new_def.ty.clone()),
+            )
+            .with_ty(call_v_result_ty);
             let substituted_body = substitute(*let_body, &v, &call_v);
             let new_body = elim_lambda(ctx, param, param_ty, substituted_body)?;
             Ok(Expr::let_bind(v, new_def, new_body).with_ty(result_ty))
@@ -706,6 +726,9 @@ fn elim_lambda(
             "unsupported body kind in lambda elimination for param '{param}'"
         ))),
     };
+    if let Ok(e) = &result {
+        debug_typecheck(e);
+    }
     result
 }
 
@@ -724,7 +747,7 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
         ty,
         user_annotation,
     } = expr;
-    match node {
+    let result = match node {
         // Lambda with predicate refinement: desugar to composition with restrict.
         // λ x | pred → body  ⟹  (λx→pred) ▷ restrict ≫ (λx→body)
         TypedExprNode::Lambda {
@@ -883,7 +906,11 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
         node => Err(LambdaElimError::Unsupported(format!(
             "unsupported node kind in lambda elimination: {node:?}"
         ))),
+    };
+    if let Ok(e) = &result {
+        debug_typecheck(e);
     }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -893,7 +920,7 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{symbolic::symbolic, Expr, Lit, Type};
+    use crate::ccl::{symbolic::symbolic, BaseType, Expr, Lit, Type};
     use test_log::test;
 
     // -----------------------------------------------------------------------
@@ -904,10 +931,6 @@ mod tests {
         Expr::var(s)
     }
 
-    fn lam(p: &str, body: Expr) -> Expr {
-        Expr::lambda(p, Type::Hole, body)
-    }
-
     fn app(arg: Expr, func: Expr) -> Expr {
         Expr::apply(arg, func)
     }
@@ -916,15 +939,27 @@ mod tests {
         Expr::lit(Lit::Int(n))
     }
 
-    fn tup(a: Expr, b: Expr) -> Expr {
-        Expr::tuple(vec![a, b])
+    /// `Int` base type, used to give test expressions concrete types for the
+    /// typechecker.
+    fn int_ty() -> Type {
+        Type::Base(BaseType::Int)
     }
 
+    /// Build a `Fun(a, b)` type.
+    fn fun_ty(a: Type, b: Type) -> Type {
+        Type::Fun(Box::new(a), Box::new(b))
+    }
+
+    /// Compare two expressions structurally, ignoring type annotations.
+    ///
+    /// The lambda-elimination unit tests care about combinator structure, not
+    /// about the exact types that inference fills in.  Comparing via
+    /// [`symbolic`] strips types and gives a clean structural diff.
     fn assert_expr_eq(result: Expr, expected: Expr) {
         assert_eq!(
-            result,
-            expected,
-            "{} vs expected {}",
+            symbolic(&result),
+            symbolic(&expected),
+            "left: {} vs expected: {}",
             symbolic(&result),
             symbolic(&expected)
         );
@@ -944,8 +979,14 @@ mod tests {
     /// λ x → x.0  ⟹  .0  (via application rule + simplification)
     #[test]
     fn proj0_via_apply() {
-        let body = Expr::apply(var("x"), Expr::proj_index(0));
-        let expr = lam("x", body);
+        // Typed: x: (Int, Int), .0: (Int, Int) → Int, body: Int
+        let param_ty = Type::Tuple(vec![int_ty(), int_ty()]);
+        let body = Expr::apply(
+            var("x").with_ty(param_ty.clone()),
+            Expr::proj_index(0).with_ty(fun_ty(param_ty.clone(), int_ty())),
+        )
+        .with_ty(int_ty());
+        let expr = Expr::lambda("x", param_ty, body);
         let result = run(expr).unwrap();
         assert_expr_eq(result, proj_idx(0));
     }
@@ -967,8 +1008,14 @@ mod tests {
     /// Application: λ x → x ▷ f  ⟹  ⟨id, const(f)⟩ ≫ apply  (pre-simplification)
     #[test]
     fn apply_pre_simplification() {
-        let body = app(var("x"), var("f"));
-        let result = elim_lambda(&mut ElimContext::new(), "x", &Type::Hole, body).unwrap();
+        // Typed: x: Int, f: Int → Int, body: Int
+        let param_ty = int_ty();
+        let body = app(
+            var("x").with_ty(param_ty.clone()),
+            var("f").with_ty(fun_ty(int_ty(), int_ty())),
+        )
+        .with_ty(int_ty());
+        let result = elim_lambda(&mut ElimContext::new(), "x", &param_ty, body).unwrap();
         let expected = compose(zip_pair(id(), const_(var("f"))), var("apply"));
         assert_expr_eq(result, expected);
     }
@@ -976,8 +1023,14 @@ mod tests {
     /// Tuple: λ x → (x, f)  ⟹  zip(id, const(f))  (pre-simplification)
     #[test]
     fn tuple() {
-        let body = tup(var("x"), var("f"));
-        let result = elim_lambda(&mut ElimContext::new(), "x", &Type::Hole, body).unwrap();
+        // Typed: x: Int, f: Int, body: (Int, Int)
+        let param_ty = int_ty();
+        let body = Expr::tuple(vec![
+            var("x").with_ty(param_ty.clone()),
+            var("f").with_ty(int_ty()),
+        ])
+        .with_ty(Type::Tuple(vec![int_ty(), int_ty()]));
+        let result = elim_lambda(&mut ElimContext::new(), "x", &param_ty, body).unwrap();
         let expected = zip_pair(id(), const_(var("f")));
         assert_expr_eq(result, expected);
     }
@@ -985,7 +1038,10 @@ mod tests {
     /// Nested lambda: λ x → λ y → x  ⟹  curry(.0)
     #[test]
     fn nested_lambda_uses_first() {
-        let expr = lam("x", lam("y", var("x")));
+        // Typed: x: Int, y: Int; inner lambda type Int → Int
+        let inner = Expr::lambda("y", int_ty(), var("x").with_ty(int_ty()))
+            .with_ty(fun_ty(int_ty(), int_ty()));
+        let expr = Expr::lambda("x", int_ty(), inner);
         let result = run(expr).unwrap();
         assert_expr_eq(result, curry(proj_idx(0)));
     }
@@ -993,11 +1049,20 @@ mod tests {
     /// Let binding: λ x → let v = x in v  ⟹  let v = id in v  (after simplification)
     #[test]
     fn let_binding() {
-        let expr = lam("x", Expr::let_bind("v", var("x"), var("v")));
+        // Typed: x: Int, v: Int
+        let param_ty = int_ty();
+        let let_expr = Expr::let_bind(
+            "v",
+            var("x").with_ty(param_ty.clone()),
+            var("v").with_ty(int_ty()),
+        )
+        .with_ty(int_ty());
+        let expr = Expr::lambda("x", param_ty, let_expr);
         let result = run(expr).unwrap();
         // elim_lambda produces: let v = id in ⟨id, const(v)⟩ ≫ apply
         // const-apply simplifies the body to: id ≫ v → v
-        let expected = Expr::let_bind("v", id(), var("v"));
+        // The binding acquires type Int → Int because new_def = id : Int → Int.
+        let expected = Expr::let_bind("v", id().with_ty(fun_ty(int_ty(), int_ty())), var("v"));
         assert_expr_eq(result, expected);
     }
 
@@ -1008,7 +1073,13 @@ mod tests {
     /// λ i → i ▷ f ▷ g  ⟹  f ≫ g
     #[test]
     fn example_basic_compose() {
-        let expr = lam("i", app(app(var("i"), var("f")), var("g")));
+        // Typed: i: Int, f: Int → Int, g: Int → Int
+        let param_ty = int_ty();
+        let f_ty = fun_ty(int_ty(), int_ty());
+        let g_ty = fun_ty(int_ty(), int_ty());
+        let if_ = app(var("i").with_ty(param_ty.clone()), var("f").with_ty(f_ty)).with_ty(int_ty());
+        let body = app(if_, var("g").with_ty(g_ty)).with_ty(int_ty());
+        let expr = Expr::lambda("i", param_ty, body);
         let result = run(expr).unwrap();
         assert_expr_eq(result, compose(var("f"), var("g")));
     }
@@ -1016,11 +1087,29 @@ mod tests {
     /// λ r → r.0 ▷ c1 + r.1 ▷ c2  ⟹  ⟨.0 ≫ c1, .1 ≫ c2⟩ ≫ add
     #[test]
     fn example_lambda_of_tuple() {
-        // λ r → (r.0 ▷ c1, r.1 ▷ c2) ▷ add   (BinOp desugared)
-        let r0 = Expr::apply(var("r"), Expr::proj_index(0));
-        let r1 = Expr::apply(var("r"), Expr::proj_index(1));
-        let body = app(tup(app(r0, var("c1")), app(r1, var("c2"))), var("add"));
-        let expr = lam("r", body);
+        // Typed: r: (Int, Int), .0/.1: (Int,Int)→Int, c1/c2: Int→Int,
+        //        add: (Int,Int)→Int
+        let r_ty = Type::Tuple(vec![int_ty(), int_ty()]);
+        let proj_ty = fun_ty(r_ty.clone(), int_ty());
+        let c_ty = fun_ty(int_ty(), int_ty());
+        let add_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
+
+        let r0 = Expr::apply(
+            var("r").with_ty(r_ty.clone()),
+            Expr::proj_index(0).with_ty(proj_ty.clone()),
+        )
+        .with_ty(int_ty());
+        let r1 = Expr::apply(
+            var("r").with_ty(r_ty.clone()),
+            Expr::proj_index(1).with_ty(proj_ty),
+        )
+        .with_ty(int_ty());
+        let r0c1 = app(r0, var("c1").with_ty(c_ty.clone())).with_ty(int_ty());
+        let r1c2 = app(r1, var("c2").with_ty(c_ty)).with_ty(int_ty());
+        let tuple_result =
+            Expr::tuple(vec![r0c1, r1c2]).with_ty(Type::Tuple(vec![int_ty(), int_ty()]));
+        let body = app(tuple_result, var("add").with_ty(add_ty)).with_ty(int_ty());
+        let expr = Expr::lambda("r", r_ty, body);
         let result = run(expr).unwrap();
         // Expected: zip(.0 ≫ c1, .1 ≫ c2) ≫ add
         let expected = compose(
@@ -1036,7 +1125,16 @@ mod tests {
     /// λ i → (i, c) ▷ f  ⟹  ⟨id, const(c)⟩ ≫ f
     #[test]
     fn example_free_var_capture() {
-        let expr = lam("i", app(tup(var("i"), var("c")), var("f")));
+        // Typed: i: Int, c: Int, f: (Int, Int) → Int
+        let param_ty = int_ty();
+        let f_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
+        let tuple_body = Expr::tuple(vec![
+            var("i").with_ty(param_ty.clone()),
+            var("c").with_ty(int_ty()),
+        ])
+        .with_ty(Type::Tuple(vec![int_ty(), int_ty()]));
+        let body = app(tuple_body, var("f").with_ty(f_ty)).with_ty(int_ty());
+        let expr = Expr::lambda("i", param_ty, body);
         let result = run(expr).unwrap();
         let expected = compose(zip_pair(id(), const_(var("c"))), var("f"));
         assert_expr_eq(result, expected);

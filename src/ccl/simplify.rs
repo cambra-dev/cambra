@@ -27,6 +27,7 @@
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` |
 //! | Zip beta | `⟨f0, f1⟩ ≫ ⟨.n ≫ g, .m ≫ h⟩` | `⟨f_n ≫ g, f_m ≫ h⟩` |
 
+use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{id, zip_pair};
 use crate::ccl::{Expr, Lit, ProjKey, RefinementKind, Type, TypedExpr, TypedExprNode};
 
@@ -44,16 +45,17 @@ pub fn simplify(mut expr: Expr) -> Expr {
 
 /// One bottom-up simplification pass. Returns `true` if any rule fired.
 fn simplify_once(expr: &mut Expr) -> bool {
-    let mut type_changed = false;
+    let mut changed = false;
     if let Type::Fun(domain, _) = &mut expr.ty {
         if let Type::Refinement(_, refinment) = &mut **domain {
             if let RefinementKind::Predicate(pred) = &refinment.kind {
-                type_changed = simplify_once(&mut pred.borrow_mut())
+                changed = simplify_once(&mut pred.borrow_mut())
             }
         }
     }
-    let changed = recurse_simplify(expr);
-    type_changed | changed | apply_simplification_rules(expr)
+    changed |= recurse_simplify(expr);
+    changed |= apply_simplification_rules(expr);
+    changed
 }
 
 /// Recursively apply [`simplify_once`] to all child expressions (bottom-up).
@@ -120,16 +122,21 @@ fn take(expr: &mut Expr) -> Expr {
 /// Returns `true` if any rule fired.
 fn apply_simplification_rules(expr: &mut Expr) -> bool {
     let mut changed = false;
-    changed |= try_compose_identity(expr);
-    changed |= try_product_beta_fst(expr);
-    changed |= try_product_beta_snd(expr);
-    changed |= try_ccc_universal(expr);
-    changed |= try_exponential_beta(expr);
-    changed |= try_exponential_eta(expr);
-    changed |= try_zip_beta(expr);
-    changed |= try_const_apply(expr);
-    changed |= try_product_eta(expr);
-    changed |= try_flatten_compose(expr);
+    changed |= check(try_compose_identity(expr), expr);
+    changed |= check(try_product_beta_fst(expr), expr);
+    changed |= check(try_product_beta_snd(expr), expr);
+    changed |= check(try_ccc_universal(expr), expr);
+    changed |= check(try_exponential_beta(expr), expr);
+    changed |= check(try_exponential_eta(expr), expr);
+    changed |= check(try_zip_beta(expr), expr);
+    changed |= check(try_const_apply(expr), expr);
+    changed |= check(try_product_eta(expr), expr);
+    changed |= check(try_flatten_compose(expr), expr);
+    changed
+}
+
+fn check(changed: bool, expr: &Expr) -> bool {
+    debug_typecheck(expr);
     changed
 }
 
@@ -496,6 +503,7 @@ fn try_product_eta(expr: &mut Expr) -> bool {
     if matched {
         let TypedExpr {
             node: TypedExprNode::Apply { argument, .. },
+            ty,
             ..
         } = take(expr)
         else {
@@ -522,7 +530,7 @@ fn try_product_eta(expr: &mut Expr) -> bool {
         } else {
             Expr::compose(compose_elts)
         };
-        *expr = f;
+        *expr = f.with_ty(ty.clone());
         return true;
     }
     false
@@ -769,282 +777,627 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::lambda_elim::{compose, const_, curry, id, proj_idx, zip_pair};
-    use crate::ccl::Expr;
+    use crate::ccl::lambda_elim::{curry, zip_pair};
+    use crate::ccl::{BaseType, Expr};
 
     fn var(s: &str) -> Expr {
         Expr::var(s)
     }
 
+    fn id() -> Expr {
+        Expr::var("id")
+    }
+
+    fn proj_idx(n: usize) -> Expr {
+        Expr::proj_index(n)
+    }
+
+    fn typed_const(c: Expr, param_ty: Type) -> Expr {
+        let result_ty = fun_ty(param_ty.clone(), c.ty.clone());
+        let const_var_ty = fun_ty(c.ty.clone(), result_ty.clone());
+        Expr::apply(c, var("const").with_ty(const_var_ty)).with_ty(result_ty)
+    }
+
+    fn int_ty() -> Type {
+        Type::Base(BaseType::Int)
+    }
+
+    fn fun_ty(a: Type, b: Type) -> Type {
+        Type::Fun(Box::new(a), Box::new(b))
+    }
+
+    fn typed_compose(elts: Vec<Expr>) -> Expr {
+        let mut fun_tys = Vec::new();
+        for e in &elts {
+            if let Type::Fun(d, c) = &e.ty {
+                fun_tys.push(((*d).clone(), (*c).clone()));
+            } else {
+                panic!("compose element not a function: {e:?}");
+            }
+        }
+        let ty = Type::Fun(
+            fun_tys.first().unwrap().0.clone(),
+            fun_tys.last().unwrap().1.clone(),
+        );
+        Expr::compose(elts).with_ty(ty)
+    }
+
+    fn typed_compose2(f: Expr, g: Expr) -> Expr {
+        typed_compose(vec![f, g])
+    }
+
     /// Compose identity (left): id ≫ f  ⟹  f
     #[test]
     fn simplify_compose_identity_left() {
-        let expr = compose(id(), var("f"));
-        assert_eq!(simplify(expr), var("f"));
+        let f_ty = fun_ty(int_ty(), int_ty());
+        let expr = typed_compose2(id().with_ty(f_ty.clone()), var("f").with_ty(f_ty.clone()));
+        let simplified = simplify(expr);
+        assert_eq!(simplified, var("f").with_ty(f_ty));
     }
 
     /// Compose identity (right): f ≫ id  ⟹  f
     #[test]
     fn simplify_compose_identity_right() {
-        let expr = compose(var("f"), id());
-        assert_eq!(simplify(expr), var("f"));
+        let f_ty = fun_ty(int_ty(), int_ty());
+        let expr = typed_compose2(var("f").with_ty(f_ty.clone()), id().with_ty(f_ty.clone()));
+        assert_eq!(simplify(expr), var("f").with_ty(f_ty));
     }
 
     /// Compose identity (middle of n-ary): f ≫ id ≫ g  ⟹  f ≫ g
     #[test]
     fn simplify_compose_identity_middle() {
-        let expr = Expr::compose(vec![var("f"), id(), var("g")]);
-        let expected = Expr::compose(vec![var("f"), var("g")]);
+        let f_ty = fun_ty(int_ty(), int_ty());
+        let expr = typed_compose(vec![
+            var("f").with_ty(f_ty.clone()),
+            id().with_ty(f_ty.clone()),
+            var("g").with_ty(f_ty.clone()),
+        ]);
+        let expected = typed_compose2(
+            var("f").with_ty(f_ty.clone()),
+            var("g").with_ty(f_ty.clone()),
+        );
         assert_eq!(simplify(expr), expected);
     }
 
     /// Product beta (first): ⟨f, g⟩ ≫ .0  ⟹  f
     #[test]
     fn simplify_product_beta_fst() {
-        let expr = compose(zip_pair(var("f"), var("g")), proj_idx(0));
-        assert_eq!(simplify(expr), var("f"));
+        let f_ty = fun_ty(int_ty(), int_ty());
+        let g_ty = fun_ty(int_ty(), int_ty());
+        let f = var("f").with_ty(f_ty.clone());
+        let g = var("g").with_ty(g_ty.clone());
+        let zip = zip_pair(f.clone(), g); // A -> (B, C)
+        let proj_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
+        let expr = typed_compose2(zip, proj_idx(0).with_ty(proj_ty));
+        assert_eq!(simplify(expr), f);
     }
 
     /// Product beta (first) inside a longer compose: a ≫ ⟨f, g⟩ ≫ .0 ≫ b  ⟹  a ≫ f ≫ b
     #[test]
     fn simplify_product_beta_fst_pairwise() {
-        let expr = Expr::compose(vec![
-            var("a"),
-            zip_pair(var("f"), var("g")),
-            proj_idx(0),
-            var("b"),
-        ]);
-        let expected = Expr::compose(vec![var("a"), var("f"), var("b")]);
+        let ty = fun_ty(int_ty(), int_ty());
+        let a = var("a").with_ty(ty.clone());
+        let f = var("f").with_ty(ty.clone());
+        let g = var("g").with_ty(ty.clone());
+        let b = var("b").with_ty(ty.clone());
+
+        let zip = zip_pair(f.clone(), g);
+        let proj_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
+        let proj = proj_idx(0).with_ty(proj_ty);
+
+        let expr = typed_compose(vec![a.clone(), zip, proj, b.clone()]);
+        let expected = typed_compose(vec![a, f, b]);
         assert_eq!(simplify(expr), expected);
     }
 
     /// Product beta (second): ⟨f, g⟩ ≫ .1  ⟹  g
     #[test]
     fn simplify_product_beta_snd() {
-        let expr = compose(zip_pair(var("f"), var("g")), proj_idx(1));
-        assert_eq!(simplify(expr), var("g"));
+        let f_ty = fun_ty(int_ty(), int_ty());
+        let g_ty = fun_ty(int_ty(), int_ty());
+        let f = var("f").with_ty(f_ty.clone());
+        let g = var("g").with_ty(g_ty.clone());
+        let zip = zip_pair(f, g.clone()); // A -> (B, C)
+        let proj_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
+        let expr = typed_compose2(zip, proj_idx(1).with_ty(proj_ty));
+        assert_eq!(simplify(expr), g);
     }
 
     /// Product beta (second) inside a longer compose: a ≫ ⟨f, g⟩ ≫ .1 ≫ b  ⟹  a ≫ g ≫ b
     #[test]
     fn simplify_product_beta_snd_pairwise() {
-        let expr = Expr::compose(vec![
-            var("a"),
-            zip_pair(var("f"), var("g")),
-            proj_idx(1),
-            var("b"),
-        ]);
-        let expected = Expr::compose(vec![var("a"), var("g"), var("b")]);
+        let ty = fun_ty(int_ty(), int_ty());
+        let a = var("a").with_ty(ty.clone());
+        let f = var("f").with_ty(ty.clone());
+        let g = var("g").with_ty(ty.clone());
+        let b = var("b").with_ty(ty.clone());
+
+        let zip = zip_pair(f, g.clone());
+        let proj_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
+        let proj = proj_idx(1).with_ty(proj_ty);
+
+        let expr = typed_compose(vec![a.clone(), zip, proj, b.clone()]);
+        let expected = typed_compose(vec![a, g, b]);
         assert_eq!(simplify(expr), expected);
     }
 
     /// Product eta: ⟨f ≫ .0, f ≫ .1⟩  ⟹  f
     #[test]
     fn simplify_product_eta() {
+        let f_ty = fun_ty(int_ty(), Type::Tuple(vec![int_ty(), int_ty()]));
+        let f = var("f").with_ty(f_ty.clone());
+        let proj0_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
+        let proj1_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
+
         let expr = zip_pair(
-            compose(var("f"), proj_idx(0)),
-            compose(var("f"), proj_idx(1)),
+            typed_compose2(f.clone(), proj_idx(0).with_ty(proj0_ty)),
+            typed_compose2(f.clone(), proj_idx(1).with_ty(proj1_ty)),
         );
-        assert_eq!(simplify(expr), var("f"));
+        assert_eq!(simplify(expr), f);
     }
 
     /// Product eta with n-ary arms: ⟨f ≫ g ≫ .0, f ≫ g ≫ .1⟩  ⟹  f ≫ g
-    #[test]
+    #[test_log::test]
     fn simplify_product_eta_nary_arms() {
+        let f_ty = fun_ty(int_ty(), int_ty());
+        let g_ty = fun_ty(int_ty(), Type::Tuple(vec![int_ty(), int_ty()]));
+        let f = var("f").with_ty(f_ty.clone());
+        let g = var("g").with_ty(g_ty.clone());
+        let proj_ty = fun_ty(Type::Tuple(vec![int_ty(), int_ty()]), int_ty());
+
         let expr = zip_pair(
-            Expr::compose(vec![var("f"), var("g"), proj_idx(0)]),
-            Expr::compose(vec![var("f"), var("g"), proj_idx(1)]),
+            typed_compose(vec![
+                f.clone(),
+                g.clone(),
+                proj_idx(0).with_ty(proj_ty.clone()),
+            ]),
+            typed_compose(vec![f.clone(), g.clone(), proj_idx(1).with_ty(proj_ty)]),
         );
-        let expected = Expr::compose(vec![var("f"), var("g")]);
+        let expected = typed_compose2(f, g);
         assert_eq!(simplify(expr), expected);
     }
 
     /// Exponential beta: ⟨g, curry(h)⟩ ≫ apply  ⟹  ⟨id, g⟩ ≫ h  (flattened to n-ary Compose)
     #[test]
     fn simplify_exponential_beta() {
-        let expr = compose(zip_pair(var("g"), curry(var("h"))), var("apply"));
-        let expected = Expr::compose(vec![zip_pair(id(), var("g")), var("h")]);
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+
+        let g_ty = fun_ty(a_ty.clone(), b_ty.clone());
+        let h_ty = fun_ty(Type::Tuple(vec![a_ty.clone(), b_ty.clone()]), c_ty.clone());
+        let curry_h_ty = fun_ty(a_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone()));
+
+        let g = var("g").with_ty(g_ty.clone());
+        let h = var("h").with_ty(h_ty.clone());
+        let curry_h = curry(h.clone()).with_ty(curry_h_ty.clone());
+
+        let zip = zip_pair(g.clone(), curry_h);
+        let apply_ty = fun_ty(
+            Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
+            c_ty.clone(),
+        );
+        let apply = var("apply").with_ty(apply_ty);
+
+        let expr = typed_compose2(zip, apply);
+
+        let id_ty = fun_ty(a_ty.clone(), a_ty.clone());
+        let expected = typed_compose2(zip_pair(id().with_ty(id_ty), g), h);
+
         assert_eq!(simplify(expr), expected);
     }
 
     /// Exponential beta inside a longer compose: a ≫ ⟨g, curry(h)⟩ ≫ apply ≫ b
     #[test]
     fn simplify_exponential_beta_pairwise() {
-        let expr = Expr::compose(vec![
-            var("a"),
-            zip_pair(var("g"), curry(var("h"))),
-            var("apply"),
-            var("b"),
-        ]);
-        let expected = Expr::compose(vec![var("a"), zip_pair(id(), var("g")), var("h"), var("b")]);
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+
+        let g_ty = fun_ty(a_ty.clone(), b_ty.clone());
+        let h_ty = fun_ty(Type::Tuple(vec![a_ty.clone(), b_ty.clone()]), c_ty.clone());
+        let curry_h_ty = fun_ty(a_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone()));
+
+        let aa_ty = fun_ty(a_ty.clone(), a_ty.clone());
+        let bb_ty = fun_ty(c_ty.clone(), c_ty.clone());
+
+        let aa = var("a").with_ty(aa_ty.clone());
+        let bb = var("b").with_ty(bb_ty.clone());
+
+        let g = var("g").with_ty(g_ty.clone());
+        let h = var("h").with_ty(h_ty.clone());
+        let curry_h = curry(h.clone()).with_ty(curry_h_ty.clone());
+
+        let zip = zip_pair(g.clone(), curry_h);
+        let apply_ty = fun_ty(
+            Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
+            c_ty.clone(),
+        );
+        let apply = var("apply").with_ty(apply_ty);
+
+        let expr = typed_compose(vec![aa.clone(), zip, apply, bb.clone()]);
+
+        let id_ty = fun_ty(a_ty.clone(), a_ty.clone());
+        let expected = typed_compose(vec![aa, zip_pair(id().with_ty(id_ty), g), h, bb]);
+
         assert_eq!(simplify(expr), expected);
     }
 
     /// Const-apply: ⟨f, const(g)⟩ ≫ apply  ⟹  f ≫ g  (flattened to n-ary Compose)
     #[test]
     fn simplify_const_apply() {
-        let expr = compose(zip_pair(var("f"), const_(var("g"))), var("apply"));
-        let expected = Expr::compose(vec![var("f"), var("g")]);
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+
+        let f_ty = fun_ty(a_ty.clone(), b_ty.clone());
+        let g_ty = fun_ty(b_ty.clone(), c_ty.clone());
+
+        let f = var("f").with_ty(f_ty.clone());
+        let g = var("g").with_ty(g_ty.clone());
+        let const_g = typed_const(g.clone(), a_ty.clone());
+
+        let zip = zip_pair(f.clone(), const_g);
+        let apply_ty = fun_ty(
+            Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
+            c_ty.clone(),
+        );
+        let apply = var("apply").with_ty(apply_ty);
+
+        let expr = typed_compose2(zip, apply);
+        let expected = typed_compose2(f, g);
+
         assert_eq!(simplify(expr), expected);
     }
 
     /// Const-apply inside a longer compose: a ≫ ⟨f, const(g)⟩ ≫ apply ≫ b  ⟹  a ≫ f ≫ g ≫ b
     #[test]
     fn simplify_const_apply_pairwise() {
-        let expr = Expr::compose(vec![
-            var("a"),
-            zip_pair(var("f"), const_(var("g"))),
-            var("apply"),
-            var("b"),
-        ]);
-        let expected = Expr::compose(vec![var("a"), var("f"), var("g"), var("b")]);
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+
+        let f_ty = fun_ty(a_ty.clone(), b_ty.clone());
+        let g_ty = fun_ty(b_ty.clone(), c_ty.clone());
+
+        let aa_ty = fun_ty(a_ty.clone(), a_ty.clone());
+        let bb_ty = fun_ty(c_ty.clone(), c_ty.clone());
+
+        let aa = var("a").with_ty(aa_ty.clone());
+        let bb = var("b").with_ty(bb_ty.clone());
+
+        let f = var("f").with_ty(f_ty.clone());
+        let g = var("g").with_ty(g_ty.clone());
+        let const_g = typed_const(g.clone(), a_ty.clone());
+
+        let zip = zip_pair(f.clone(), const_g);
+        let apply_ty = fun_ty(
+            Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
+            c_ty.clone(),
+        );
+        let apply = var("apply").with_ty(apply_ty);
+
+        let expr = typed_compose(vec![aa.clone(), zip, apply, bb.clone()]);
+        let expected = typed_compose(vec![aa, f, g, bb]);
+
         assert_eq!(simplify(expr), expected);
     }
 
     /// Exponential eta: curry(⟨.1, .0 ≫ f⟩ ≫ apply)  ⟹  f
     #[test]
     fn simplify_exponential_eta() {
-        let expr = curry(compose(
-            zip_pair(proj_idx(1), compose(proj_idx(0), var("f"))),
-            var("apply"),
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+        let bc_ty = fun_ty(b_ty.clone(), c_ty.clone());
+        let f_ty = fun_ty(a_ty.clone(), bc_ty.clone());
+        let f = var("f").with_ty(f_ty.clone());
+
+        let ab_tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p1 = proj_idx(1).with_ty(fun_ty(ab_tup_ty.clone(), b_ty.clone()));
+        let p0 = proj_idx(0).with_ty(fun_ty(ab_tup_ty.clone(), a_ty.clone()));
+
+        let p0_f = typed_compose2(p0, f.clone());
+        let zip = zip_pair(p1, p0_f);
+        let apply = var("apply").with_ty(fun_ty(
+            Type::Tuple(vec![b_ty.clone(), bc_ty.clone()]),
+            c_ty.clone(),
         ));
-        assert_eq!(simplify(expr), var("f"));
+        let inner_compose = typed_compose2(zip, apply);
+
+        let curry_var = var("curry").with_ty(fun_ty(inner_compose.ty.clone(), f_ty.clone()));
+        let expr = Expr::apply(inner_compose, curry_var).with_ty(f_ty.clone());
+
+        assert_eq!(simplify(expr), f);
     }
 
     /// CCC universal: `⟨.1, .0 ≫ curry(f)⟩ ≫ apply  ⟹  f`
     #[test]
     fn simplify_ccc_universal() {
-        let expr = compose(
-            zip_pair(proj_idx(1), compose(proj_idx(0), curry(var("f")))),
-            var("apply"),
-        );
-        assert_eq!(simplify(expr), var("f"));
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+
+        let f_ty = fun_ty(Type::Tuple(vec![a_ty.clone(), b_ty.clone()]), c_ty.clone());
+        let f = var("f").with_ty(f_ty.clone());
+
+        let curry_f_ty = fun_ty(a_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone()));
+        let curry_var = var("curry").with_ty(fun_ty(f_ty.clone(), curry_f_ty.clone()));
+        let curry_f = Expr::apply(f.clone(), curry_var).with_ty(curry_f_ty.clone());
+
+        let ab_tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p1 = proj_idx(1).with_ty(fun_ty(ab_tup_ty.clone(), b_ty.clone()));
+        let p0 = proj_idx(0).with_ty(fun_ty(ab_tup_ty.clone(), a_ty.clone()));
+
+        let p0_curry_f = typed_compose2(p0, curry_f);
+        let zip = zip_pair(p1, p0_curry_f);
+        let apply = var("apply").with_ty(fun_ty(
+            Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
+            c_ty.clone(),
+        ));
+
+        let expr = typed_compose2(zip, apply);
+        assert_eq!(simplify(expr), f);
     }
 
     /// CCC universal inside a longer compose: a ≫ ⟨.1, .0 ≫ curry(f)⟩ ≫ apply ≫ b  ⟹  a ≫ f ≫ b
     #[test]
     fn simplify_ccc_universal_pairwise() {
-        let expr = Expr::compose(vec![
-            var("a"),
-            zip_pair(proj_idx(1), compose(proj_idx(0), curry(var("f")))),
-            var("apply"),
-            var("b"),
-        ]);
-        let expected = Expr::compose(vec![var("a"), var("f"), var("b")]);
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+
+        let f_ty = fun_ty(Type::Tuple(vec![a_ty.clone(), b_ty.clone()]), c_ty.clone());
+        let f = var("f").with_ty(f_ty.clone());
+
+        let aa_ty = fun_ty(a_ty.clone(), Type::Tuple(vec![a_ty.clone(), b_ty.clone()]));
+        let bb_ty = fun_ty(c_ty.clone(), c_ty.clone());
+        let aa = var("a").with_ty(aa_ty.clone());
+        let bb = var("b").with_ty(bb_ty.clone());
+
+        let curry_f_ty = fun_ty(a_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone()));
+        let curry_var = var("curry").with_ty(fun_ty(f_ty.clone(), curry_f_ty.clone()));
+        let curry_f = Expr::apply(f.clone(), curry_var).with_ty(curry_f_ty.clone());
+
+        let ab_tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p1 = proj_idx(1).with_ty(fun_ty(ab_tup_ty.clone(), b_ty.clone()));
+        let p0 = proj_idx(0).with_ty(fun_ty(ab_tup_ty.clone(), a_ty.clone()));
+
+        let p0_curry_f = typed_compose2(p0, curry_f);
+        let zip = zip_pair(p1, p0_curry_f);
+        let apply = var("apply").with_ty(fun_ty(
+            Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
+            c_ty.clone(),
+        ));
+
+        let expr = typed_compose(vec![aa.clone(), zip, apply, bb.clone()]);
+        let expected = typed_compose(vec![aa, f, bb]);
         assert_eq!(simplify(expr), expected);
     }
 
     /// Flatten: f ≫ g ≫ h (binary tree)  ⟹  Compose([f, g, h])
     #[test]
     fn simplify_flatten_compose() {
-        // Binary tree: f ≫ (g ≫ h)
-        let expr = compose(var("f"), compose(var("g"), var("h")));
-        let expected = Expr::compose(vec![var("f"), var("g"), var("h")]);
+        let f_ty = fun_ty(int_ty(), int_ty());
+        let f = var("f").with_ty(f_ty.clone());
+        let g = var("g").with_ty(f_ty.clone());
+        let h = var("h").with_ty(f_ty.clone());
+
+        let expr = typed_compose2(f.clone(), typed_compose2(g.clone(), h.clone()));
+        let expected = typed_compose(vec![f, g, h]);
         assert_eq!(simplify(expr), expected);
     }
 
     /// Flatten left-associative: (f ≫ g) ≫ h  ⟹  Compose([f, g, h])
     #[test]
     fn simplify_flatten_compose_left_assoc() {
-        let expr = compose(compose(var("f"), var("g")), var("h"));
-        let expected = Expr::compose(vec![var("f"), var("g"), var("h")]);
+        let f_ty = fun_ty(int_ty(), int_ty());
+        let f = var("f").with_ty(f_ty.clone());
+        let g = var("g").with_ty(f_ty.clone());
+        let h = var("h").with_ty(f_ty.clone());
+
+        let expr = typed_compose2(typed_compose2(f.clone(), g.clone()), h.clone());
+        let expected = typed_compose(vec![f, g, h]);
         assert_eq!(simplify(expr), expected);
     }
 
     /// Zip beta, n1=0 (id left): ⟨id, f⟩ ≫ ⟨.0 ≫ g, .1⟩  ⟹  ⟨g, f⟩
     #[test]
     fn simplify_zip_beta_n1_0_id() {
-        let expr = compose(
-            zip_pair(id(), var("f")),
-            zip_pair(compose(proj_idx(0), var("g")), proj_idx(1)),
-        );
-        assert_eq!(simplify(expr), zip_pair(var("g"), var("f")));
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+
+        let id_val = id().with_ty(fun_ty(a_ty.clone(), a_ty.clone()));
+        let f = var("f").with_ty(fun_ty(a_ty.clone(), b_ty.clone()));
+        let zip1 = zip_pair(id_val, f.clone());
+
+        let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
+        let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p0 = proj_idx(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
+        let p1 = proj_idx(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
+
+        let p0_g = typed_compose2(p0, g.clone());
+        let zip2 = zip_pair(p0_g, p1);
+
+        let expr = typed_compose2(zip1, zip2);
+        let expected = zip_pair(g, f);
+        assert_eq!(simplify(expr), expected);
     }
 
     /// Zip beta, n1=0 (general h): ⟨h, f⟩ ≫ ⟨.0 ≫ g, .1⟩  ⟹  ⟨h ≫ g, f⟩
     #[test]
     fn simplify_zip_beta_n1_0_general() {
-        let expr = compose(
-            zip_pair(var("h"), var("f")),
-            zip_pair(compose(proj_idx(0), var("g")), proj_idx(1)),
-        );
-        let expected = zip_pair(Expr::compose(vec![var("h"), var("g")]), var("f"));
+        let x_ty = int_ty();
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+
+        let h = var("h").with_ty(fun_ty(x_ty.clone(), a_ty.clone()));
+        let f = var("f").with_ty(fun_ty(x_ty.clone(), b_ty.clone()));
+        let zip1 = zip_pair(h.clone(), f.clone());
+
+        let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
+        let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p0 = proj_idx(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
+        let p1 = proj_idx(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
+
+        let p0_g = typed_compose2(p0, g.clone());
+        let zip2 = zip_pair(p0_g, p1);
+
+        let expr = typed_compose2(zip1, zip2);
+        let expected = zip_pair(typed_compose2(h, g), f);
         assert_eq!(simplify(expr), expected);
     }
 
     /// Zip beta, n1=1 (id left): ⟨id, f⟩ ≫ ⟨.1, .0 ≫ g⟩  ⟹  ⟨f, g⟩
     #[test]
     fn simplify_zip_beta_n1_1_id() {
-        let expr = compose(
-            zip_pair(id(), var("f")),
-            zip_pair(proj_idx(1), compose(proj_idx(0), var("g"))),
-        );
-        assert_eq!(simplify(expr), zip_pair(var("f"), var("g")));
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+
+        let id_val = id().with_ty(fun_ty(a_ty.clone(), a_ty.clone()));
+        let f = var("f").with_ty(fun_ty(a_ty.clone(), b_ty.clone()));
+        let zip1 = zip_pair(id_val, f.clone());
+
+        let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
+        let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p0 = proj_idx(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
+        let p1 = proj_idx(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
+
+        let p0_g = typed_compose2(p0, g.clone());
+        let zip2 = zip_pair(p1, p0_g);
+
+        let expr = typed_compose2(zip1, zip2);
+        let expected = zip_pair(f, g);
+        assert_eq!(simplify(expr), expected);
     }
 
     /// Zip beta, n1=1 (general h): ⟨h, f⟩ ≫ ⟨.1, .0 ≫ g⟩  ⟹  ⟨f, h ≫ g⟩
     #[test]
     fn simplify_zip_beta_n1_1_general() {
-        let expr = compose(
-            zip_pair(var("h"), var("f")),
-            zip_pair(proj_idx(1), compose(proj_idx(0), var("g"))),
-        );
-        let expected = zip_pair(var("f"), Expr::compose(vec![var("h"), var("g")]));
+        let x_ty = int_ty();
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+
+        let h = var("h").with_ty(fun_ty(x_ty.clone(), a_ty.clone()));
+        let f = var("f").with_ty(fun_ty(x_ty.clone(), b_ty.clone()));
+        let zip1 = zip_pair(h.clone(), f.clone());
+
+        let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
+        let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p0 = proj_idx(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
+        let p1 = proj_idx(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
+
+        let p0_g = typed_compose2(p0, g.clone());
+        let zip2 = zip_pair(p1, p0_g);
+
+        let expr = typed_compose2(zip1, zip2);
+        let expected = zip_pair(f, typed_compose2(h, g));
         assert_eq!(simplify(expr), expected);
     }
 
     /// Zip beta, both arms suffixed: ⟨h, f⟩ ≫ ⟨.0 ≫ g, .1 ≫ i⟩  ⟹  ⟨h ≫ g, f ≫ i⟩
     #[test]
     fn simplify_zip_beta_both_arms() {
-        let expr = compose(
-            zip_pair(var("h"), var("f")),
-            zip_pair(
-                compose(proj_idx(0), var("g")),
-                compose(proj_idx(1), var("i")),
-            ),
-        );
-        let expected = zip_pair(
-            Expr::compose(vec![var("h"), var("g")]),
-            Expr::compose(vec![var("f"), var("i")]),
-        );
+        let x_ty = int_ty();
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+        let d_ty = int_ty();
+
+        let h = var("h").with_ty(fun_ty(x_ty.clone(), a_ty.clone()));
+        let f = var("f").with_ty(fun_ty(x_ty.clone(), b_ty.clone()));
+        let zip1 = zip_pair(h.clone(), f.clone());
+
+        let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
+        let i = var("i").with_ty(fun_ty(b_ty.clone(), d_ty.clone()));
+
+        let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p0 = proj_idx(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
+        let p1 = proj_idx(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
+
+        let p0_g = typed_compose2(p0, g.clone());
+        let p1_i = typed_compose2(p1, i.clone());
+        let zip2 = zip_pair(p0_g, p1_i);
+
+        let expr = typed_compose2(zip1, zip2);
+        let expected = zip_pair(typed_compose2(h, g), typed_compose2(f, i));
         assert_eq!(simplify(expr), expected);
     }
 
     /// Zip beta in n-ary compose: a ≫ ⟨h, f⟩ ≫ ⟨.0 ≫ g, .1⟩ ≫ b  ⟹  a ≫ ⟨h ≫ g, f⟩ ≫ b
     #[test]
     fn simplify_zip_beta_pairwise() {
-        let expr = Expr::compose(vec![
-            var("a"),
-            zip_pair(var("h"), var("f")),
-            zip_pair(compose(proj_idx(0), var("g")), proj_idx(1)),
-            var("b"),
-        ]);
-        let expected = Expr::compose(vec![
-            var("a"),
-            zip_pair(Expr::compose(vec![var("h"), var("g")]), var("f")),
-            var("b"),
-        ]);
+        let x_ty = int_ty();
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+
+        let aa = var("a").with_ty(fun_ty(x_ty.clone(), x_ty.clone()));
+        let h = var("h").with_ty(fun_ty(x_ty.clone(), a_ty.clone()));
+        let f = var("f").with_ty(fun_ty(x_ty.clone(), b_ty.clone()));
+        let zip1 = zip_pair(h.clone(), f.clone());
+
+        let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
+        let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p0 = proj_idx(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
+        let p1 = proj_idx(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
+
+        let p0_g = typed_compose2(p0, g.clone());
+        let zip2 = zip_pair(p0_g, p1);
+
+        let bb = var("b").with_ty(fun_ty(
+            Type::Tuple(vec![c_ty.clone(), b_ty.clone()]),
+            x_ty.clone(),
+        ));
+
+        let expr = typed_compose(vec![aa.clone(), zip1, zip2, bb.clone()]);
+        let expected = typed_compose(vec![aa, zip_pair(typed_compose2(h, g), f), bb]);
         assert_eq!(simplify(expr), expected);
     }
 
     /// Zip beta with n-ary arm: ⟨h, f⟩ ≫ ⟨.0 ≫ g ≫ k, .1⟩  ⟹  ⟨h ≫ g ≫ k, f⟩
     #[test]
     fn simplify_zip_beta_nary_arm() {
-        let expr = compose(
-            zip_pair(var("h"), var("f")),
-            zip_pair(
-                Expr::compose(vec![proj_idx(0), var("g"), var("k")]),
-                proj_idx(1),
-            ),
-        );
-        let expected = zip_pair(Expr::compose(vec![var("h"), var("g"), var("k")]), var("f"));
+        let x_ty = int_ty();
+        let a_ty = int_ty();
+        let b_ty = int_ty();
+        let c_ty = int_ty();
+        let d_ty = int_ty();
+
+        let h = var("h").with_ty(fun_ty(x_ty.clone(), a_ty.clone()));
+        let f = var("f").with_ty(fun_ty(x_ty.clone(), b_ty.clone()));
+        let zip1 = zip_pair(h.clone(), f.clone());
+
+        let g = var("g").with_ty(fun_ty(a_ty.clone(), c_ty.clone()));
+        let k = var("k").with_ty(fun_ty(c_ty.clone(), d_ty.clone()));
+
+        let tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
+        let p0 = proj_idx(0).with_ty(fun_ty(tup_ty.clone(), a_ty.clone()));
+        let p1 = proj_idx(1).with_ty(fun_ty(tup_ty.clone(), b_ty.clone()));
+
+        let p0_g_k = typed_compose(vec![p0, g.clone(), k.clone()]);
+        let zip2 = zip_pair(p0_g_k, p1);
+
+        let expr = typed_compose2(zip1, zip2);
+        let expected = zip_pair(typed_compose(vec![h, g, k]), f);
         assert_eq!(simplify(expr), expected);
     }
 
     /// Idempotency: simplify(simplify(e)) == simplify(e)
     #[test]
     fn simplify_idempotent() {
-        let expr = compose(id(), compose(var("f"), var("g")));
+        let f_ty = fun_ty(int_ty(), int_ty());
+        let f = var("f").with_ty(f_ty.clone());
+        let g = var("g").with_ty(f_ty.clone());
+
+        let expr = typed_compose2(
+            id().with_ty(f_ty.clone()),
+            typed_compose2(f.clone(), g.clone()),
+        );
         let once = simplify(expr);
         let twice = simplify(once.clone());
         assert_eq!(once, twice);

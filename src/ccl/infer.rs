@@ -149,7 +149,7 @@ impl DerefMut for TypeInferenceContext {
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur during limited type inference.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
     UnboundVariable(String),
@@ -157,7 +157,16 @@ pub enum InferError {
     /// used as the argument of a typed function in the lambda body.
     CannotInferParam(String),
     /// A type mismatch was detected between two solved types.
-    TypeMismatch { type_a: Type, type_b: Type },
+    TypeMismatch {
+        type_a: Type,
+        type_b: Type,
+        ctx: String,
+    },
+    /// A [`Type::Fun`] was required — e.g. in a function-application or
+    /// [`TypedExprNode::Compose`] position — but a non-function type was found.
+    ///
+    /// The inner [`Type`] is the actual type of the offending expression.
+    ExpectedFunction(Type),
     /// A user-written annotation on a binding site conflicts with the inferred type.
     ///
     /// Distinct from [`TypeMismatch`] so error messages can say
@@ -190,6 +199,60 @@ pub enum InferError {
     Multiple(Vec<InferError>),
 }
 
+impl std::fmt::Debug for InferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InferError::UnboundVariable(name) => write!(f, "Unbound variable: '{}'", name),
+            InferError::CannotInferParam(name) => {
+                write!(f, "Cannot infer type for parameter: '{}'", name)
+            }
+            InferError::TypeMismatch {
+                ctx,
+                type_a,
+                type_b,
+            } => {
+                write!(
+                    f,
+                    "Type mismatch for {}: expected {}, found {}",
+                    ctx, type_a, type_b
+                )
+            }
+            InferError::ExpectedFunction(ty) => {
+                write!(f, "Expected function type, found {}", ty)
+            }
+            InferError::AnnotationMismatch {
+                annotation,
+                inferred,
+            } => {
+                write!(
+                    f,
+                    "Annotation mismatch: annotated as {}, but inferred as {}",
+                    annotation, inferred
+                )
+            }
+            InferError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),
+            InferError::EmptyCase => write!(f, "Case expression must have at least one branch"),
+            InferError::UnresolvedHole(sym) => {
+                write!(f, "Unresolved type hole in expression: {}", sym)
+            }
+            InferError::UnresolvedInfer(id, sym) => {
+                write!(
+                    f,
+                    "Unresolved inference variable {} in expression: {}",
+                    id, sym
+                )
+            }
+            InferError::Multiple(errors) => {
+                writeln!(f, "Multiple type errors:")?;
+                for err in errors {
+                    writeln!(f, "  - {:?}", err)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -220,6 +283,8 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, In
 ///
 /// Returns `Ok(())` if the tree is fully annotated, or all holes and unresolved
 /// inference variables found in a depth-first walk.
+///
+/// TODO fold this into [`typecheck`]
 pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
     let mut errors = Vec::new();
     collect_expr_errors(expr, &mut errors);
@@ -361,6 +426,449 @@ fn collect_type_errors(ty: &Type, context_sym: &str, errors: &mut Vec<InferError
     }
 }
 
+/// Check that the types in a fully-annotated expression tree are semantically
+/// consistent.
+///
+/// Valid on both the lambda-bearing form produced by inference and the
+/// lambda-free form produced by [`crate::ccl::lambda_elim`] and
+/// [`crate::ccl::simplify`]. After lambda elimination, [`TypedExprNode::BinOp`]
+/// and [`TypedExprNode::UnaryOp`] nodes are desugared away, so those rules
+/// become vacuously satisfied; the rules for [`TypedExprNode::Apply`],
+/// [`TypedExprNode::Compose`], [`TypedExprNode::Tuple`], and
+/// [`TypedExprNode::Proj`] carry the full semantic load.
+///
+/// Recursively inspects every node and verifies that its annotated [`Type`]
+/// is consistent with its sub-expression types and with the type rules of
+/// the expression.
+///
+/// Assumes [`check_fully_typed`] has already passed (no [`Type::Hole`] or
+/// [`Type::Infer`] placeholders remain). Returns `Ok(())` if no errors are
+/// found, or all discovered errors as `Err(errs)`.
+pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
+    let mut errors = Vec::new();
+    collect_typecheck_errors(expr, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// In debug mode only, typecheck the expression and panic if any errors are found.
+pub fn debug_typecheck(expr: &Expr) {
+    debug_assert_eq!(
+        typecheck(expr),
+        Ok(()),
+        "Failed to typecheck result: {}",
+        symbolic(expr)
+    );
+}
+
+/// Recursively collect semantic type errors from `expr` into `errors`.
+fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
+    match &expr.node {
+        // Literal: node type must match the concrete base type of the literal.
+        TypedExprNode::Lit(lit) => {
+            let expected = lit_type(lit);
+            if expr.ty != expected {
+                errors.push(InferError::TypeMismatch {
+                    ctx: symbolic(expr),
+                    type_a: expected,
+                    type_b: expr.ty.clone(),
+                });
+            }
+        }
+
+        // Variable references are resolved by the scope at inference time.
+        TypedExprNode::Var(_) => {}
+
+        TypedExprNode::BinOp { left, op, right } => {
+            collect_typecheck_errors(left, errors);
+            collect_typecheck_errors(right, errors);
+            check_binop_types(&expr.ty, left, op, right, errors);
+        }
+
+        TypedExprNode::UnaryOp(op, inner) => {
+            collect_typecheck_errors(inner, errors);
+            check_unaryop_types(&expr.ty, op, inner, errors);
+        }
+
+        TypedExprNode::Apply { function, argument } => {
+            collect_typecheck_errors(function, errors);
+            collect_typecheck_errors(argument, errors);
+            match &function.ty {
+                Type::Fun(domain, codomain) => {
+                    if !typecheck_equal(&argument.ty, domain) {
+                        errors.push(InferError::TypeMismatch {
+                            ctx: format!("domain of {}", symbolic(expr)),
+                            type_a: (**domain).clone(),
+                            type_b: argument.ty.clone(),
+                        });
+                    }
+                    if !typecheck_equal(&expr.ty, codomain) {
+                        errors.push(InferError::TypeMismatch {
+                            ctx: format!("codomain of {}", symbolic(expr)),
+                            type_a: (**codomain).clone(),
+                            type_b: expr.ty.clone(),
+                        });
+                    }
+                }
+                _ => errors.push(InferError::ExpectedFunction(function.ty.clone())),
+            }
+        }
+
+        TypedExprNode::Lambda { body, .. } => {
+            collect_typecheck_errors(body, errors);
+            // Node type must be Fun; its codomain must match the body type.
+            // The domain may be a Refinement-wrapped version of param.ty — we
+            // do not recheck that here; the inference pass already validates it.
+            match &expr.ty {
+                Type::Fun(_, codomain) => {
+                    if !typecheck_equal(codomain, &body.ty) {
+                        errors.push(InferError::TypeMismatch {
+                            ctx: symbolic(body),
+                            type_a: body.ty.clone(),
+                            type_b: (**codomain).clone(),
+                        });
+                    }
+                }
+                _ => errors.push(InferError::ExpectedFunction(expr.ty.clone())),
+            }
+        }
+
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            collect_typecheck_errors(bound_expr, errors);
+            collect_typecheck_errors(body, errors);
+            if !typecheck_equal(&binding.ty, &bound_expr.ty) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: symbolic(bound_expr),
+                    type_a: binding.ty.clone(),
+                    type_b: bound_expr.ty.clone(),
+                });
+            }
+            if !typecheck_equal(&expr.ty, &body.ty) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: symbolic(body),
+                    type_a: body.ty.clone(),
+                    type_b: expr.ty.clone(),
+                });
+            }
+        }
+
+        TypedExprNode::Case { branches } => {
+            let bool_ty = Type::Base(BaseType::Bool);
+            for Branch { guard, body } in branches {
+                collect_typecheck_errors(guard, errors);
+                collect_typecheck_errors(body, errors);
+                if !typecheck_equal(&guard.ty, &bool_ty) {
+                    errors.push(InferError::TypeMismatch {
+                        ctx: symbolic(expr),
+                        type_a: bool_ty.clone(),
+                        type_b: guard.ty.clone(),
+                    });
+                }
+                if !typecheck_equal(&body.ty, &expr.ty) {
+                    errors.push(InferError::TypeMismatch {
+                        ctx: symbolic(expr),
+                        type_a: expr.ty.clone(),
+                        type_b: body.ty.clone(),
+                    });
+                }
+            }
+        }
+
+        TypedExprNode::List(elts) => {
+            for elt in elts.iter() {
+                collect_typecheck_errors(elt, errors);
+            }
+            check_list_types(&expr.ty, elts, errors);
+        }
+
+        TypedExprNode::Tuple(elts) => {
+            for elt in elts.iter() {
+                collect_typecheck_errors(elt, errors);
+            }
+            let elem_tys: Vec<Type> = elts.iter().map(|e| e.ty.clone()).collect();
+            let expected = Type::Tuple(elem_tys);
+            if !typecheck_equal(&expr.ty, &expected) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: symbolic(expr),
+                    type_a: expected,
+                    type_b: expr.ty.clone(),
+                });
+            }
+        }
+
+        TypedExprNode::Record(fields) => {
+            for (_, val) in fields.iter() {
+                collect_typecheck_errors(val, errors);
+            }
+            let field_tys: Vec<(String, Type)> = fields
+                .iter()
+                .map(|(n, e)| (n.clone(), e.ty.clone()))
+                .collect();
+            let expected = Type::Record(field_tys);
+            if !typecheck_equal(&expr.ty, &expected) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: symbolic(expr),
+                    type_a: expected,
+                    type_b: expr.ty.clone(),
+                });
+            }
+        }
+
+        // First-class projection morphisms: shape is determined by inference.
+        TypedExprNode::Proj(_) => {}
+
+        TypedExprNode::GroupBy { collection, key } => {
+            collect_typecheck_errors(collection, errors);
+            collect_typecheck_errors(key, errors);
+            if !matches!(collection.ty, Type::Fun(..)) {
+                errors.push(InferError::ExpectedFunction(collection.ty.clone()));
+            }
+            if !matches!(key.ty, Type::Fun(..)) {
+                errors.push(InferError::ExpectedFunction(key.ty.clone()));
+            }
+        }
+
+        TypedExprNode::Aggregate { input, .. } => {
+            collect_typecheck_errors(input, errors);
+            if !matches!(input.ty, Type::Fun(..)) {
+                errors.push(InferError::ExpectedFunction(input.ty.clone()));
+            }
+        }
+
+        // Join and Jump are not yet fully handled by inference; skip detailed checks.
+        TypedExprNode::Join {
+            loop_body,
+            outer_body,
+            ..
+        } => {
+            collect_typecheck_errors(loop_body, errors);
+            collect_typecheck_errors(outer_body, errors);
+        }
+
+        TypedExprNode::Jump { args, .. } => {
+            for arg in args.iter() {
+                collect_typecheck_errors(arg, errors);
+            }
+        }
+
+        TypedExprNode::Source(_) => {}
+
+        TypedExprNode::Compose(morphisms) => {
+            for m in morphisms.iter() {
+                collect_typecheck_errors(m, errors);
+            }
+            check_compose_types(&expr.ty, morphisms, errors);
+        }
+    }
+}
+
+// Checks if two types should be considered equal for the purposes of typechecking.
+// Currently treats refinements as transparent
+fn typecheck_equal(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Refinement(a, _), b) => typecheck_equal(a, b),
+        (a, Type::Refinement(b, _)) => typecheck_equal(a, b),
+        (Type::Fun(a_domain, a_codomain), Type::Fun(b_domain, b_codomain)) => {
+            typecheck_equal(a_domain, b_domain) && typecheck_equal(a_codomain, b_codomain)
+        }
+        _ => a == b,
+    }
+}
+
+/// Check [`BinOpKind`] type rules for a single binary-op node and push any
+/// errors into `errors`.
+///
+/// Note: [`BinOpKind::Arithmetic`] permits non-numeric operands because
+/// `String + String` is a valid pre-compile-time intermediate form that is
+/// rewritten to [`BinOpKind::Concat`] by the compiler.
+fn check_binop_types(
+    node_ty: &Type,
+    left: &Expr,
+    op: &BinOpKind,
+    right: &Expr,
+    errors: &mut Vec<InferError>,
+) {
+    match op {
+        BinOpKind::Arithmetic(_) => {
+            // Operands must agree with each other.
+            if !typecheck_equal(&left.ty, &right.ty) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
+                    type_a: left.ty.clone(),
+                    type_b: right.ty.clone(),
+                });
+            }
+            // Node type must match the operand type.
+            if !typecheck_equal(node_ty, &left.ty) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
+                    type_a: left.ty.clone(),
+                    type_b: node_ty.clone(),
+                });
+            }
+        }
+        BinOpKind::Concat => {
+            let string_ty = Type::Base(BaseType::String);
+            for ty in [&left.ty, &right.ty, node_ty] {
+                if !typecheck_equal(ty, &string_ty) {
+                    errors.push(InferError::TypeMismatch {
+                        ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
+                        type_a: string_ty.clone(),
+                        type_b: ty.clone(),
+                    });
+                }
+            }
+        }
+        BinOpKind::Compare(_) => {
+            // Operands must agree; result must be Bool.
+            if !typecheck_equal(&left.ty, &right.ty) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
+                    type_a: left.ty.clone(),
+                    type_b: right.ty.clone(),
+                });
+            }
+            let bool_ty = Type::Base(BaseType::Bool);
+            if !typecheck_equal(node_ty, &bool_ty) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
+                    type_a: bool_ty,
+                    type_b: node_ty.clone(),
+                });
+            }
+        }
+        BinOpKind::BoolLogic(_) => {
+            // All three (left operand, right operand, result) must be Bool.
+            let bool_ty = Type::Base(BaseType::Bool);
+            for ty in [&left.ty, &right.ty, node_ty] {
+                if !typecheck_equal(ty, &bool_ty) {
+                    errors.push(InferError::TypeMismatch {
+                        ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
+                        type_a: bool_ty.clone(),
+                        type_b: ty.clone(),
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Check [`UnaryOpKind`] type rules for a single unary-op node and push any
+/// errors into `errors`.
+fn check_unaryop_types(
+    node_ty: &Type,
+    op: &UnaryOpKind,
+    inner: &Expr,
+    errors: &mut Vec<InferError>,
+) {
+    let expected = match op {
+        UnaryOpKind::Neg => Type::Base(BaseType::Int),
+        UnaryOpKind::Not => Type::Base(BaseType::Bool),
+    };
+    if !typecheck_equal(&inner.ty, &expected) {
+        errors.push(InferError::TypeMismatch {
+            ctx: format!("{:?} {}", op, symbolic(inner)),
+            type_a: expected.clone(),
+            type_b: inner.ty.clone(),
+        });
+    }
+    if !typecheck_equal(node_ty, &expected) {
+        errors.push(InferError::TypeMismatch {
+            ctx: format!("{:?} {}", op, symbolic(inner)),
+            type_a: expected,
+            type_b: node_ty.clone(),
+        });
+    }
+}
+
+/// Check [`TypedExprNode::List`] type rules and push any errors into `errors`.
+///
+/// Verifies that all elements share the same type (inference silently drops
+/// errors for elements after the first) and that the node type is
+/// `Fun(UIntRange(n), elem_ty)`.
+fn check_list_types(node_ty: &Type, elts: &[Expr], errors: &mut Vec<InferError>) {
+    let Some(first) = elts.first() else {
+        return;
+    };
+    let elem_ty = &first.ty;
+    // All elements must share the type of the first element.
+    for elt in elts.iter().skip(1) {
+        if !typecheck_equal(&elt.ty, elem_ty) {
+            errors.push(InferError::TypeMismatch {
+                ctx: symbolic(elt),
+                type_a: elem_ty.clone(),
+                type_b: elt.ty.clone(),
+            });
+        }
+    }
+    // Node type must be Fun(UIntRange(n), elem_ty).
+    let expected = Type::Fun(
+        Box::new(Type::UIntRange(elts.len())),
+        Box::new(elem_ty.clone()),
+    );
+    if !typecheck_equal(node_ty, &expected) {
+        errors.push(InferError::TypeMismatch {
+            ctx: "list".to_string(),
+            type_a: expected,
+            type_b: node_ty.clone(),
+        });
+    }
+}
+
+/// Check [`TypedExprNode::Compose`] type rules and push any errors into `errors`.
+///
+/// Every morphism must be a [`Type::Fun`]; adjacent pairs must have compatible
+/// codomain/domain; the overall node type must be `Fun(first_domain, last_codomain)`.
+fn check_compose_types(node_ty: &Type, morphisms: &[Expr], errors: &mut Vec<InferError>) {
+    // Collect (domain, codomain) pairs, emitting ExpectedFunction for non-Fun morphisms.
+    let mut fun_tys: Vec<Option<(Type, Type)>> = Vec::with_capacity(morphisms.len());
+    for m in morphisms {
+        match &m.ty {
+            Type::Fun(d, c) => fun_tys.push(Some(((**d).clone(), (**c).clone()))),
+            _ => {
+                errors.push(InferError::ExpectedFunction(m.ty.clone()));
+                fun_tys.push(None);
+            }
+        }
+    }
+    // Adjacent codomain/domain must agree.
+    for i in 0..fun_tys.len().saturating_sub(1) {
+        if let (Some((_, prev_cod)), Some((next_dom, _))) = (&fun_tys[i], &fun_tys[i + 1]) {
+            if !typecheck_equal(prev_cod, next_dom) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: format!(
+                        "{} ≫ {}",
+                        symbolic(&morphisms[i]),
+                        symbolic(&morphisms[i + 1])
+                    ),
+                    type_a: prev_cod.clone(),
+                    type_b: next_dom.clone(),
+                });
+            }
+        }
+    }
+    // Overall node type must be Fun(first_domain, last_codomain).
+    if let (Some(first), Some(last)) = (fun_tys.first(), fun_tys.last()) {
+        if let (Some((first_dom, _)), Some((_, last_cod))) = (first, last) {
+            let expected = Type::Fun(Box::new(first_dom.clone()), Box::new(last_cod.clone()));
+            if !typecheck_equal(node_ty, &expected) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: "compose".to_string(),
+                    type_a: expected,
+                    type_b: node_ty.clone(),
+                });
+            }
+        }
+    }
+}
+
 /// Walk `expr` and fill in `ty` on every node. Does not call `resolve`.
 ///
 /// Currently handled:
@@ -411,10 +919,12 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
 
         // ----- Aggregation -----
         TypedExprNode::Aggregate { input, kind } => {
+            let kind = kind.clone();
             let input_type = infer_expr(input, ctx)?;
             let input_codomain = input_type
                 .codomain()
                 .ok_or_else(|| InferError::TypeMismatch {
+                    ctx: symbolic(expr),
                     type_a: Type::Fun(
                         Box::new(Type::Infer(ctx.fresh_infer_var())),
                         Box::new(Type::Infer(ctx.fresh_infer_var())),
@@ -1410,6 +1920,7 @@ mod tests {
         assert_eq!(
             result,
             Err(InferError::TypeMismatch {
+                ctx: "unify".into(),
                 type_a: Type::Base(BaseType::String),
                 type_b: Type::Base(BaseType::Int),
             })
@@ -1525,6 +2036,7 @@ mod tests {
         assert_eq!(
             infer(&mut expr, &mut ctx),
             Err(InferError::TypeMismatch {
+                ctx: "unify".into(),
                 type_a: Type::Base(BaseType::String),
                 type_b: Type::Base(BaseType::Int),
             })
@@ -1541,6 +2053,7 @@ mod tests {
         assert_eq!(
             result,
             Err(InferError::TypeMismatch {
+                ctx: "unify".into(),
                 type_a: Type::Base(BaseType::Int),
                 type_b: Type::Base(BaseType::String),
             })
@@ -1623,6 +2136,7 @@ mod tests {
         assert_eq!(
             infer(&mut expr, &mut ctx),
             Err(InferError::TypeMismatch {
+                ctx: "unify".into(),
                 type_a: Type::Base(BaseType::Int),
                 type_b: Type::Base(BaseType::Bool),
             })
@@ -2026,7 +2540,11 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         assert!(matches!(
             infer(&mut expr, &mut ctx),
-            Err(InferError::TypeMismatch { .. })
+            Err(InferError::TypeMismatch {
+                ctx: _,
+                type_a: Type::Base(BaseType::Int),
+                type_b: Type::Base(BaseType::String),
+            })
         ));
     }
 
@@ -2283,6 +2801,7 @@ mod tests {
         assert_eq!(
             infer(&mut expr, &mut ctx),
             Err(InferError::TypeMismatch {
+                ctx: "unify".into(),
                 type_a: Type::Base(BaseType::Bool),
                 type_b: Type::Base(BaseType::Int),
             })
@@ -2605,6 +3124,231 @@ mod tests {
             },
             other => panic!("expected Fun, got {other}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // typecheck tests
+    // -----------------------------------------------------------------------
+
+    /// A valid fully-inferred expression passes `typecheck` without errors.
+    #[test]
+    fn test_typecheck_valid_arithmetic() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            Expr::lit(Lit::Int(2)),
+        );
+        infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(typecheck(&expr), Ok(()));
+    }
+
+    /// A valid boolean logic expression passes `typecheck`.
+    #[test]
+    fn test_typecheck_valid_bool_logic() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Bool(true)),
+            BinOpKind::BoolLogic(LogicKind::And),
+            Expr::lit(Lit::Bool(false)),
+        );
+        infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(typecheck(&expr), Ok(()));
+    }
+
+    /// A valid comparison expression passes `typecheck`.
+    #[test]
+    fn test_typecheck_valid_compare() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Compare(CompareKind::Less),
+            Expr::lit(Lit::Int(2)),
+        );
+        infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(typecheck(&expr), Ok(()));
+    }
+
+    /// A valid `not` expression passes `typecheck`.
+    #[test]
+    fn test_typecheck_valid_unary_not() {
+        use crate::ccl::UnaryOpKind;
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::unary(UnaryOpKind::Not, Expr::lit(Lit::Bool(true)));
+        infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(typecheck(&expr), Ok(()));
+    }
+
+    /// A valid negation expression passes `typecheck`.
+    #[test]
+    fn test_typecheck_valid_unary_neg() {
+        use crate::ccl::UnaryOpKind;
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::unary(UnaryOpKind::Neg, Expr::lit(Lit::Int(5)));
+        infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(typecheck(&expr), Ok(()));
+    }
+
+    /// A homogeneous list passes `typecheck`.
+    #[test]
+    fn test_typecheck_valid_list() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::list(vec![
+            Expr::lit(Lit::Int(1)),
+            Expr::lit(Lit::Int(2)),
+            Expr::lit(Lit::Int(3)),
+        ]);
+        infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(typecheck(&expr), Ok(()));
+    }
+
+    /// A function application with matching types passes `typecheck`.
+    #[test]
+    fn test_typecheck_valid_apply() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::apply(
+            Expr::lit(Lit::Int(42)),
+            Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("x")),
+        );
+        infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(typecheck(&expr), Ok(()));
+    }
+
+    /// Corrupting a `BinOp::BoolLogic` operand type to `Int` is caught by `typecheck`.
+    ///
+    /// After inference `true and false` is correctly typed; forcibly setting one
+    /// operand's type to `Int` creates a node whose types are inconsistent.
+    #[test]
+    fn test_typecheck_bool_logic_wrong_operand_type() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Bool(true)),
+            BinOpKind::BoolLogic(LogicKind::And),
+            Expr::lit(Lit::Bool(false)),
+        );
+        infer(&mut expr, &mut ctx).unwrap();
+        // Corrupt the left operand's type.
+        if let TypedExprNode::BinOp { left, .. } = &mut expr.node {
+            left.ty = Type::Base(BaseType::Int);
+        }
+        let result = typecheck(&expr);
+        assert!(result.is_err(), "expected typecheck to report an error");
+        let errs = result.unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, InferError::TypeMismatch { .. })));
+    }
+
+    /// Corrupting a `Compare` result type away from `Bool` is caught by `typecheck`.
+    #[test]
+    fn test_typecheck_compare_wrong_result_type() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::binop(
+            Expr::lit(Lit::Int(1)),
+            BinOpKind::Compare(CompareKind::Less),
+            Expr::lit(Lit::Int(2)),
+        );
+        infer(&mut expr, &mut ctx).unwrap();
+        // Corrupt the node type to Int instead of Bool.
+        expr.ty = Type::Base(BaseType::Int);
+        let result = typecheck(&expr);
+        assert!(result.is_err());
+        let errs = result.unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, InferError::TypeMismatch { .. })));
+    }
+
+    /// Corrupting the `Not` operand to a non-Bool type is caught by `typecheck`.
+    #[test]
+    fn test_typecheck_unary_not_wrong_operand_type() {
+        use crate::ccl::UnaryOpKind;
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::unary(UnaryOpKind::Not, Expr::lit(Lit::Bool(true)));
+        infer(&mut expr, &mut ctx).unwrap();
+        if let TypedExprNode::UnaryOp(_, inner) = &mut expr.node {
+            inner.ty = Type::Base(BaseType::Int);
+        }
+        let result = typecheck(&expr);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .iter()
+            .any(|e| matches!(e, InferError::TypeMismatch { .. })));
+    }
+
+    /// A heterogeneous list — where element types differ — is caught by `typecheck`.
+    ///
+    /// Inference silently drops errors for elements after the first, so
+    /// `[1, "hello"]` passes `infer` but `typecheck` detects the mismatch.
+    #[test]
+    fn test_typecheck_list_heterogeneous() {
+        // Build a list whose elements have different concrete types by
+        // constructing the node directly with pre-typed children.
+        let int_elem = Expr::lit(Lit::Int(1)).with_ty(Type::Base(BaseType::Int));
+        let str_elem = Expr::lit(Lit::String("hello".into())).with_ty(Type::Base(BaseType::String));
+        let list_ty = Type::Fun(
+            Box::new(Type::UIntRange(2)),
+            Box::new(Type::Base(BaseType::Int)),
+        );
+        let expr = Expr::new(TypedExprNode::List(vec![int_elem, str_elem])).with_ty(list_ty);
+        let result = typecheck(&expr);
+        assert!(
+            result.is_err(),
+            "expected typecheck to catch heterogeneous list"
+        );
+        let errs = result.unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, InferError::TypeMismatch { .. })));
+    }
+
+    /// A function application where the argument type does not match the
+    /// function domain is caught by `typecheck`.
+    #[test]
+    fn test_typecheck_apply_argument_domain_mismatch() {
+        // Construct Apply((λ x : String → x) : Fun(String, String), 42 : Int)
+        // with the Apply node given type String.  The argument is Int but the
+        // domain is String — typecheck must detect this.
+        let lambda = Expr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "x".to_string(),
+                ty: Type::Base(BaseType::String),
+                user_annotation: None,
+            },
+            body: Box::new(Expr::var("x").with_ty(Type::Base(BaseType::String))),
+            refinement: None,
+        })
+        .with_ty(Type::Fun(
+            Box::new(Type::Base(BaseType::String)),
+            Box::new(Type::Base(BaseType::String)),
+        ));
+        let expr = Expr::new(TypedExprNode::Apply {
+            function: Box::new(lambda),
+            argument: Box::new(Expr::lit(Lit::Int(42)).with_ty(Type::Base(BaseType::Int))),
+        })
+        .with_ty(Type::Base(BaseType::String));
+        let result = typecheck(&expr);
+        assert!(
+            result.is_err(),
+            "expected typecheck to catch domain mismatch"
+        );
+        let errs = result.unwrap_err();
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, InferError::TypeMismatch { .. })));
+    }
+
+    /// A valid lambda and application combination passes `typecheck` end-to-end.
+    #[test]
+    fn test_typecheck_lambda_and_apply_valid() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut expr = Expr::apply(
+            Expr::lit(Lit::String("hello".into())),
+            Expr::lambda("s", Type::Base(BaseType::String), Expr::var("s")),
+        );
+        infer(&mut expr, &mut ctx).unwrap();
+        assert_eq!(typecheck(&expr), Ok(()));
     }
 
     /// A lambda that applies two different projections to the same parameter

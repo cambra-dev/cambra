@@ -10,7 +10,7 @@ use rustpython_parser::{ast as pyast, parser};
 
 use crate::{
     ccl::{
-        infer::{check_fully_typed, infer, TypeInferenceContext},
+        infer::{check_fully_typed, infer, typecheck, TypeInferenceContext},
         lambda_elim,
         lower::{lower_stmts, LoweringContext},
         symbolic::{symbolic, symbolic_typed},
@@ -185,6 +185,7 @@ pub fn new_compile_program(
     debug!("Table:\n{}", ctx.inference_ctx().table);
 
     check_fully_typed(&lambda_elim).expect("missing types");
+    typecheck(&lambda_elim).expect("type error after lambda elimination");
 
     let mut op =
         convert_to_operators(&lambda_elim, ctx.compile_ctx()).expect("Operator conversion failed");

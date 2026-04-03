@@ -272,6 +272,7 @@ impl UnificationTable {
                     return self
                         .constrain_equal(&ty_a, &ty_b)
                         .or(Err(InferError::TypeMismatch {
+                            ctx: "unify".to_string(),
                             type_a: ty_a,
                             type_b: ty_b,
                         })?);
@@ -334,6 +335,7 @@ impl UnificationTable {
             (Type::Tuple(a), Type::Tuple(b)) => {
                 if a.len() != b.len() {
                     return Err(InferError::TypeMismatch {
+                        ctx: "unify".to_string(),
                         type_a: Type::Tuple(a.clone()),
                         type_b: Type::Tuple(b.clone()),
                     });
@@ -346,6 +348,7 @@ impl UnificationTable {
             (Type::Record(a), Type::Record(b)) => {
                 if a.len() != b.len() {
                     return Err(InferError::TypeMismatch {
+                        ctx: "unify".to_string(),
                         type_a: Type::Record(a.clone()),
                         type_b: Type::Record(b.clone()),
                     });
@@ -356,6 +359,7 @@ impl UnificationTable {
                         self.constrain_equal(a_ty, b_ty)?;
                     } else {
                         return Err(InferError::TypeMismatch {
+                            ctx: "unify".to_string(),
                             type_a: Type::Record(a.clone()),
                             type_b: Type::Record(b.clone()),
                         });
@@ -372,6 +376,7 @@ impl UnificationTable {
                         Some(full_ty) => self.constrain_equal(ty, full_ty)?,
                         None => {
                             return Err(InferError::TypeMismatch {
+                                ctx: "unify".to_string(),
                                 type_a: a.clone(),
                                 type_b: b.clone(),
                             })
@@ -405,6 +410,7 @@ impl UnificationTable {
                         Some(full_ty) => self.constrain_equal(ty, full_ty)?,
                         None => {
                             return Err(InferError::TypeMismatch {
+                                ctx: "unify".to_string(),
                                 type_a: a.clone(),
                                 type_b: b.clone(),
                             })
@@ -437,6 +443,7 @@ impl UnificationTable {
 
             (a, b) if a == b => Ok(()),
             (type_a, type_b) => Err(InferError::TypeMismatch {
+                ctx: "unify".to_string(),
                 type_a: type_a.clone(),
                 type_b: type_b.clone(),
             }),
@@ -757,7 +764,7 @@ mod tests {
         table.set(b, Type::Base(BaseType::String));
         let result = table.unify(a, b);
         assert!(result.is_err());
-        let InferError::TypeMismatch { type_a, type_b } = result.unwrap_err() else {
+        let InferError::TypeMismatch { type_a, type_b, .. } = result.unwrap_err() else {
             panic!("Expected error")
         };
         assert_eq!(type_a, Type::Base(BaseType::Int));
