@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::BufRead,
     sync::mpsc::{self, Receiver, TryRecvError},
     thread,
@@ -33,6 +34,8 @@ pub struct StdinDataSource {
 
     /// Lines arriving from the background reader thread.  `None` signals EOF.
     receiver: Receiver<Option<SmolStr>>,
+
+    obsolete_predicates: HashMap<String, Predicate>,
 }
 
 impl StdinDataSource {
@@ -67,6 +70,7 @@ impl StdinDataSource {
             eof_reached: false,
             closed: false,
             receiver,
+            obsolete_predicates: HashMap::new(),
         }
     }
 
@@ -160,8 +164,23 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     }
 
     /// Returns the currently readable set of indices.
-    fn get_elements(&self) -> ColumnValue {
-        ColumnValue::UInts((self.start_idx..self.ready_size).collect())
+    fn get_elements(&self, producer: &str) -> ColumnValue {
+        let filter = self
+            .obsolete_predicates
+            .get(producer)
+            .unwrap_or_else(|| panic!("Unknown producer: {}", producer));
+        match filter {
+            Predicate::LessThanEq(Value::UInt(i)) => {
+                let values: Vec<_> = ((*i + 1)..self.ready_size).collect();
+                ColumnValue::from_uints(values)
+            }
+            Predicate::True => ColumnValue::from_uints(Vec::new()),
+            Predicate::False => {
+                let values: Vec<_> = (self.start_idx..self.ready_size).collect();
+                ColumnValue::from_uints(values)
+            }
+            _ => panic!("Unsupported predicate for StdinDataSource get_elements: {filter:?}"),
+        }
     }
 
     fn element_extent(&self) -> Extent {
@@ -181,7 +200,12 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         Extent::Base(crate::interpreter::BaseType::String)
     }
 
-    fn release(&mut self, obsolete: Predicate) {
+    fn release(&mut self, producer: &str, mut obsolete: Predicate) {
+        self.obsolete_predicates
+            .insert(producer.to_string(), obsolete.clone());
+        for pred in self.obsolete_predicates.values() {
+            obsolete = obsolete.intersect(pred);
+        }
         debug!("StdinDataSource::release: {obsolete:?}");
         match &obsolete {
             Predicate::LessThanEq(Value::UInt(i)) => self.release_index(*i),

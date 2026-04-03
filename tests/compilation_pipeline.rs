@@ -24,8 +24,6 @@ use cambra::interpreter::{
     sort_sealed_function_by_domain, tuple_field, BaseType, ColumnValue, Consumer, Extent,
     FuncBinding, FunctionGuard, Predicate, TestDataSource, Tile, TileGuard, Value,
 };
-use cambra::pretty_graph::pretty_tile_operator;
-use log::debug;
 use rstest_log::rstest;
 use smol_str::SmolStr;
 
@@ -79,6 +77,35 @@ fn make_int_list(v: &[i64]) -> Tile {
         domain: ColumnValue::UInts((0..v.len()).collect()),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(v.into()))),
         domain_predicate: Predicate::True,
+    }
+}
+
+/// Sort a `SealedFunction { domain: UInts, codomain: Scalar(Ints) }` tile by its
+/// domain keys so that structurally-equal-but-reordered tiles compare equal.
+///
+/// Used when the domain comes from a data source backed by a `HashMap`, where
+/// iteration order is non-deterministic.  Tiles with other shapes are returned
+/// unchanged.
+fn sort_tile(tile: Tile) -> Tile {
+    match tile {
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(keys),
+            codomain,
+            domain_predicate,
+        } if matches!(*codomain, Tile::Scalar(ColumnValue::Ints(_))) => {
+            let Tile::Scalar(ColumnValue::Ints(vals)) = *codomain else {
+                unreachable!()
+            };
+            let mut pairs: Vec<(usize, i64)> = keys.into_iter().zip(vals).collect();
+            pairs.sort_by_key(|(k, _)| *k);
+            let (sorted_keys, sorted_vals): (Vec<usize>, Vec<i64>) = pairs.into_iter().unzip();
+            Tile::SealedFunction {
+                domain: ColumnValue::UInts(sorted_keys),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(sorted_vals))),
+                domain_predicate,
+            }
+        }
+        other => other,
     }
 }
 
@@ -981,22 +1008,42 @@ fn test_incremental_aggregates() {
         ]))
     }
 )]
+#[case(
+    "[x + 10 for x in testsource1() if x < 15]",
+    "source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add:{source(testsource1) | Refined(x < 15)} ⇒ Int",
+    make_int_list(&[10, 20])
+)]
 fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expected_result: Tile) {
     use cambra::ccl::{context::new_compile_program, symbolic::symbolic};
 
     let mut ctx = GlobalContext::default();
+
+    // Register testsource1 for source-based test cases.
+    let data_source = Rc::new(RefCell::new(TestDataSource::new(
+        "testsource1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    data_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(0)),
+        (Value::UInt(1), Value::Int(10)),
+        (Value::UInt(2), Value::Int(20)),
+    ]);
+    data_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.register_test_source(data_source);
+
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let (expr, op, mut producer) = new_compile_program(&mut ctx, code, consumer);
+    let (expr, _, mut producer) = new_compile_program(&mut ctx, code, consumer);
     assert_eq!(format!("{}:{}", symbolic(&expr), expr.ty), expected_ccl);
-    debug!("Table:\n{}", ctx.inference_ctx().table);
-    debug!("Operators:\n{}", pretty_tile_operator(op.as_ref()));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
     let result = producer.get(producer.tiling().universal_guard());
-    assert_eq!(result, expected_result);
+    assert_eq!(sort_tile(result), sort_tile(expected_result));
 }

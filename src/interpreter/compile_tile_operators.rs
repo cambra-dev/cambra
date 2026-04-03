@@ -139,6 +139,16 @@ impl TileCompileContext {
         self.sources.insert(name.into(), impl_);
     }
 
+    pub fn get_source(
+        &self,
+        name: &str,
+    ) -> Result<Rc<RefCell<dyn DataSourceDomainExtentImpl>>, CompileError> {
+        self.sources
+            .get(name)
+            .cloned()
+            .ok_or_else(|| CompileError::TypeError(format!("Unknown data source: {name}")))
+    }
+
     /// Enter a fresh lexical scope, returning a guard that pops it on drop.
     ///
     /// The guard dereferences to `TileCompileContext`, so it can be passed as

@@ -602,7 +602,7 @@ impl Tile {
     }
 }
 
-fn validate_tile(tile: &Tile) -> bool {
+pub fn validate_tile(tile: &Tile) -> bool {
     match tile {
         Tile::CurriedFunction {
             domain1,
@@ -626,8 +626,11 @@ fn validate_tile(tile: &Tile) -> bool {
                 })
                 && offsets.last().is_none_or(|o| *o < domain2.len())
         }
-        Tile::SealedFunction { domain, .. } => {
+        Tile::SealedFunction {
+            domain, codomain, ..
+        } => {
             HashSet::<Value>::from_iter(domain.clone().drain_to_value_iter()).len() == domain.len()
+                && domain.len() == codomain.len()
         }
         _ => true,
     }

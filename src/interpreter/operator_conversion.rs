@@ -226,7 +226,13 @@ fn convert_impl(
         }
 
         // Data source: produces MapResultWithSource(IterateExtent(domain), source).
-        TypedExprNode::Source(name) => compile_source(name, ctx),
+        TypedExprNode::Source(name) => {
+            let input = input.unwrap_or(iterate_domain(&expr.ty, ctx)?);
+            Ok(Box::new(MapResultWithSource::new(
+                ctx.get_source(name)?,
+                input,
+            )))
+        }
 
         other => Err(CompileError::Unsupported(format!(
             "CCL node {other:?} is not yet supported in operator_conversion"
@@ -333,21 +339,6 @@ fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, CompileError> {
         Lit::Unit => (Value::Unit, Extent::Base(BaseType::Unit)),
     };
     Ok(Box::new(Constant::new(value, extent)))
-}
-
-/// Compile a data-source reference to a [`MapResultWithSource`] operator.
-fn compile_source(
-    name: &str,
-    ctx: &TileCompileContext,
-) -> Result<Box<dyn TileOperator>, CompileError> {
-    let Extent::DataSourceDomain(source_rc) = ctx.extent_of(&Type::DataSource(name.to_owned()))?
-    else {
-        unreachable!("extent_of(DataSource) always returns DataSourceDomain");
-    };
-    Ok(Box::new(MapResultWithSource::new(
-        source_rc.clone(),
-        Box::new(IterateExtent::new(Extent::DataSourceDomain(source_rc))),
-    )))
 }
 
 /// Build an operator that extracts field `_n` from the record codomain of `input`.

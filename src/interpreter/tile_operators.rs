@@ -24,8 +24,9 @@ pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, 
 use crate::{
     ccl::AggregateKind,
     interpreter::{
-        bindings_are_list, transform_hashmap_values, tuple_field, BaseType, ColumnValue, Consumer,
-        DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult, Scheduler, Value,
+        bindings_are_list, transform_hashmap_values, tuple_field, validate_tile, BaseType,
+        ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult,
+        Scheduler, Value,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -159,6 +160,7 @@ pub trait TileProducer {
             result,
             self.tiling()
         );
+        debug_assert!(validate_tile(&result), "Invalid tile: {result:?}");
         assert!(
             result.check_from(self.tiling()),
             "{result:?} vs {:?}",
@@ -666,6 +668,14 @@ impl TileOperator for IterateExtent {
         mut consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        let mut producer = Box::new(IterateExtentProducer {
+            base: ProducerBase {
+                id: IterateExtentProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
+            extent: self.extent.clone(),
+        });
+
         let NotifyOrSubscribeResult { notify, subscribe } =
             self.extent.subscribe_to_iteration_action();
         if notify {
@@ -676,15 +686,14 @@ impl TileOperator for IterateExtent {
                 consumer.notify();
             }));
             Self::add_all_source_handles(&self.extent, consumer_wrapper, scheduler);
+            let name = producer.name();
+            // Register this producer with any data sources in the extent by calling release with
+            // a false predicate.  This way the sources knows about all producers that read it
+            //before execution starts.
+            release_extent(&mut producer.extent, &Predicate::False, &name);
         }
 
-        Box::new(IterateExtentProducer {
-            base: ProducerBase {
-                id: IterateExtentProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
-            extent: self.extent.clone(),
-        })
+        producer
     }
 }
 
@@ -731,20 +740,24 @@ fn predicate_intervals_to_usize(intervals: &IntervalSet<Value>) -> IntervalSet<u
 /// For [`Extent::UIntRange`] extents, released sub-intervals are subtracted
 /// directly from the stored [`IntervalSet<usize>`], so arbitrary non-contiguous
 /// releases are handled without any external accumulator.
-fn release_extent(extent: &mut Extent, pred: &Predicate) {
+fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
     match extent {
         Extent::Record(fields) => match pred {
-            Predicate::True => {
+            p if p.as_bool().is_some_and(|p| p) => {
                 for e in fields.values_mut() {
-                    release_extent(e, &Predicate::True);
+                    release_extent(e, &Predicate::True, releaser);
                 }
             }
-            Predicate::False => {}
+            p if p.as_bool().is_some_and(|p| !p) => {
+                for e in fields.values_mut() {
+                    release_extent(e, &Predicate::False, releaser);
+                }
+            }
             // Or: apply each arm independently.  Each arm describes a distinct
             // sub-region; releasing all arms releases their union.
             Predicate::Or(arms) => {
                 for arm in arms {
-                    release_extent(extent, arm);
+                    release_extent(extent, arm, releaser);
                 }
             }
             p => {
@@ -767,7 +780,7 @@ fn release_extent(extent: &mut Extent, pred: &Predicate) {
                         .iter()
                         .all(|(k, p)| k == f || *p == Predicate::True);
                     if others_all_true {
-                        release_extent(e, &field_preds[f]);
+                        release_extent(e, &field_preds[f], releaser);
                     } else {
                         // TODO: handle the case where multiple fields have
                         // non-trivial predicates; requires releasing the
@@ -777,7 +790,7 @@ fn release_extent(extent: &mut Extent, pred: &Predicate) {
             }
         },
         Extent::DataSourceDomain(source) => {
-            source.borrow_mut().release(pred.clone());
+            source.borrow_mut().release(releaser, pred.clone());
         }
         Extent::UIntRange(remaining) => match pred {
             Predicate::True => {
@@ -801,7 +814,7 @@ fn release_extent(extent: &mut Extent, pred: &Predicate) {
 }
 
 /// Produce all values for the given extent.
-fn iterate_extent(extent: &Extent) -> ColumnValue {
+fn iterate_extent(extent: &Extent, producer: &str) -> ColumnValue {
     match extent {
         Extent::Base(BaseType::Unit) => ColumnValue::Units(1),
         Extent::UIntRange(remaining) => {
@@ -822,8 +835,8 @@ fn iterate_extent(extent: &Extent) -> ColumnValue {
                 .collect();
             ColumnValue::from_uints(values)
         }
-        Extent::DataSourceDomain(source_impl) => source_impl.borrow_mut().get_elements(),
-        Extent::Record(fields) => iterate_record(fields),
+        Extent::DataSourceDomain(source_impl) => source_impl.borrow_mut().get_elements(producer),
+        Extent::Record(fields) => iterate_record(fields, producer),
         Extent::Restricted { .. } => {
             panic!("Iterating over restricted extents not supported; use Filter operators instead")
         }
@@ -831,10 +844,10 @@ fn iterate_extent(extent: &Extent) -> ColumnValue {
     }
 }
 
-fn iterate_record(fields: &HashMap<String, Extent>) -> ColumnValue {
+fn iterate_record(fields: &HashMap<String, Extent>, producer: &str) -> ColumnValue {
     let data: HashMap<String, ColumnValue> = fields
         .iter()
-        .map(|(field, field_extent)| (field.clone(), iterate_extent(field_extent)))
+        .map(|(field, field_extent)| (field.clone(), iterate_extent(field_extent, producer)))
         .collect();
     ColumnValue::cartesian_product(data)
 }
@@ -845,7 +858,7 @@ impl TileProducer for IterateExtentProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let values = iterate_extent(&self.extent);
+        let values = iterate_extent(&self.extent, &self.name());
         let domain_predicate = get_iterate_extent_predicate(&self.extent);
         Tile::SealedFunction {
             domain: values.clone(),
@@ -855,11 +868,12 @@ impl TileProducer for IterateExtentProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        let name = self.name();
+        debug!("{} release: {obsolete_guard:?}", name);
         let TileGuard::Function(FunctionGuard::Domain(pred)) = obsolete_guard else {
             panic!("IterateExtent::release expected Domain guard, got {obsolete_guard:?}")
         };
-        release_extent(&mut self.extent, &pred);
+        release_extent(&mut self.extent, &pred, &name);
     }
 }
 
@@ -919,16 +933,12 @@ impl TileOperator for MapResultWithSource {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        Box::new(MapResultWithSourceProducer {
-            base: ProducerBase {
-                id: MapResultWithSourceProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
-            input: self
-                .input
+        Box::new(MapResultWithSourceProducer::new(
+            self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
-            source: self.source.clone(),
-        })
+            self.source.clone(),
+            self.tiling().clone(),
+        ))
     }
 }
 
@@ -938,6 +948,32 @@ struct MapResultWithSourceProducer {
     input: Box<dyn TileProducer>,
     /// The data source used for both domain enumeration and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+}
+
+impl MapResultWithSourceProducer {
+    fn new(
+        input: Box<dyn TileProducer>,
+        source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+        tiling: Tiling,
+    ) -> Self {
+        let result = Self {
+            base: ProducerBase {
+                id: MapResultWithSourceProducer::alloc_id(),
+                tiling,
+            },
+            input,
+            source,
+        };
+        // Register this producer with the source by calling release with a false predicate.
+        // This way the source knows about all producers that read it before execution starts.
+        // This prevents sources from deleting data that a producer it doesn't know about yet might
+        // need.
+        result
+            .source
+            .borrow_mut()
+            .release(&result.name(), Predicate::False);
+        result
+    }
 }
 
 impl TileProducer for MapResultWithSourceProducer {
@@ -962,6 +998,20 @@ impl TileProducer for MapResultWithSourceProducer {
 
     fn release(&mut self, obsolete_guard: TileGuard) {
         debug!("{} release: {obsolete_guard:?}", self.name());
+        match &obsolete_guard {
+            TileGuard::Function(FunctionGuard::Domain(pred)) => {
+                self.source.borrow_mut().release(&self.name(), pred.clone());
+            }
+            g if g.is_universal() => {
+                self.source
+                    .borrow_mut()
+                    .release(&self.name(), Predicate::True);
+            }
+            g if g.is_empty() => {}
+            _ => panic!(
+                "MapResultWithSourceProducer::release expected Domain or Universal guard, got {obsolete_guard:?}"
+            ),
+        }
         self.input.release(obsolete_guard);
     }
 }
@@ -2428,11 +2478,6 @@ impl TileProducer for SplitProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!(
-            "Release called on {} with stored guards {:?}: {obsolete_guard:?}",
-            self.name(),
-            self.shared.borrow().release_guards
-        );
         let result = {
             let mut shared = self.shared.borrow_mut();
             // Union with the existing stored guard so that the accumulated set of
@@ -2743,7 +2788,7 @@ mod tests {
     #[test]
     fn release_extent_predicate_true_clears_uint_range() {
         let mut extent = Extent::uint_range(5); // [0, 4]
-        release_extent(&mut extent, &Predicate::True);
+        release_extent(&mut extent, &Predicate::True, "");
         assert!(
             uint_range_set(&extent).is_empty(),
             "True release should empty the extent"
@@ -2754,7 +2799,7 @@ mod tests {
     #[test]
     fn release_extent_predicate_false_is_noop() {
         let mut extent = Extent::uint_range(5); // [0, 4]
-        release_extent(&mut extent, &Predicate::False);
+        release_extent(&mut extent, &Predicate::False, "");
         let s = uint_range_set(&extent);
         for i in 0..5usize {
             assert!(s.contains(&i), "{i} should still be present");
@@ -2765,7 +2810,7 @@ mod tests {
     #[test]
     fn release_extent_less_than_eq_releases_prefix() {
         let mut extent = Extent::uint_range(10); // [0, 9]
-        release_extent(&mut extent, &Predicate::LessThanEq(Value::UInt(4)));
+        release_extent(&mut extent, &Predicate::LessThanEq(Value::UInt(4)), "");
         let s = uint_range_set(&extent);
         for i in 0..=4usize {
             assert!(!s.contains(&i), "{i} should be released");
@@ -2781,7 +2826,7 @@ mod tests {
         // Release {2, 3} ∪ {7} from [0, 9].
         let p = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3, 7]));
         let mut extent = Extent::uint_range(10);
-        release_extent(&mut extent, &p);
+        release_extent(&mut extent, &p, "");
         let s = uint_range_set(&extent);
         assert!(!s.contains(&2usize), "2 should be released");
         assert!(!s.contains(&3usize), "3 should be released");
@@ -2803,7 +2848,7 @@ mod tests {
             &Predicate::from_column_value(&ColumnValue::UInts(vec![6, 7, 8, 9, 10])),
         );
         let mut extent = Extent::uint_range(10); // [0, 9]
-        release_extent(&mut extent, &p);
+        release_extent(&mut extent, &p, "");
         let s = uint_range_set(&extent);
         for i in 0..5usize {
             assert!(s.contains(&i), "{i} should remain");
@@ -2824,7 +2869,7 @@ mod tests {
             .union(&Predicate::from_column_value(&ColumnValue::UInts(vec![7])));
 
         let mut extent = Extent::uint_range(10); // [0, 9]
-        release_extent(&mut extent, &p);
+        release_extent(&mut extent, &p, "");
 
         // After releasing (-∞, 3] ∪ {7}, remaining should be {4, 5, 6, 8, 9}.
         let Extent::UIntRange(ref remaining) = extent else {

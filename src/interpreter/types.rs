@@ -11,7 +11,7 @@ use intervalsets::{Bounding, Interval, IntervalSet, MaybeEmpty, Side};
 use smol_str::SmolStr;
 
 use crate::interpreter::{
-    apply_binop_column, apply_unaryop_column, tuple_field, BinOpKind, UnaryOpKind,
+    apply_binop_column, apply_unaryop_column, tuple_field, BinOpKind, Predicate, UnaryOpKind,
 };
 use crate::pretty_graph::fmt_binop;
 use crate::util::fmt_record;
@@ -254,8 +254,10 @@ pub trait DataSourceDomainExtentImpl {
     fn check_for_new_data(&mut self) -> bool;
     /// Returns the current yield predicate: the region of domain values
     /// available to consume.
-    fn get_yield_predicate(&self) -> crate::interpreter::tiling::Predicate;
-    fn get_elements(&self) -> ColumnValue;
+    fn get_yield_predicate(&self) -> Predicate;
+    /// Returns the current set of domain elements as a ColumnValue, according to the stored
+    /// obsolete predicate of the producer.
+    fn get_elements(&self, producer: &str) -> ColumnValue;
     /// Returns the [`Extent`] of each individual domain element.
     /// Used to construct a typed empty [`ColumnValue`] when the domain is empty.
     fn element_extent(&self) -> Extent;
@@ -268,9 +270,9 @@ pub trait DataSourceDomainExtentImpl {
     /// Returns the [`Extent`] of each output value produced by this source.
     /// Used to type the codomain of [`crate::interpreter::tile_operators::MapSource`].
     fn output_value_extent(&self) -> Extent;
-    /// Release the region described by `obsolete` — those domain values no longer
+    /// Release the region described by `obsolete` for the given producer — those domain values no longer
     /// need to be retained by the source.
-    fn release(&mut self, obsolete: crate::interpreter::tiling::Predicate);
+    fn release(&mut self, producer: &str, obsolete: Predicate);
 }
 
 impl PartialEq for dyn DataSourceDomainExtentImpl {
@@ -893,7 +895,14 @@ impl ColumnValue {
             ColumnValue::UInts(v) => v.len(),
             ColumnValue::Strings(v) => v.len(),
             ColumnValue::Variants(v) => v.len(),
-            ColumnValue::Records(m) => m.values().next().expect("Empty Record").len(),
+            ColumnValue::Records(m) => {
+                let result = m.values().next().expect("Empty Record").len();
+                debug_assert!(
+                    m.values().all(|cv| cv.len() == result),
+                    "Inconsistent column lengths in Record",
+                );
+                result
+            }
             ColumnValue::FunctionBindings { inputs, .. } => inputs.len(),
         }
     }

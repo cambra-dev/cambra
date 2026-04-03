@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use intervalsets::ops::Contains;
+use log::debug;
 
 use crate::{
     ccl::Type,
@@ -20,7 +21,7 @@ pub struct TestDataSource {
     yield_predicate: Predicate,
     has_data: bool,
     data: HashMap<Value, Value>,
-    obsolete_predicate: Predicate,
+    obsolete_predicates: HashMap<String, Predicate>,
 }
 
 impl TestDataSource {
@@ -34,7 +35,7 @@ impl TestDataSource {
             yield_predicate: Predicate::False,
             has_data: false,
             data: HashMap::new(),
-            obsolete_predicate: Predicate::False,
+            obsolete_predicates: HashMap::new(),
         }
     }
 
@@ -81,8 +82,19 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         result
     }
 
-    fn get_elements(&self) -> ColumnValue {
-        ColumnValue::from_values(self.data.keys().cloned().collect(), &self.element_extent)
+    fn get_elements(&self, producer: &str) -> ColumnValue {
+        let filter = self
+            .obsolete_predicates
+            .get(producer)
+            .unwrap_or_else(|| panic!("Unknown producer: {}", producer));
+        ColumnValue::from_values(
+            self.data
+                .keys()
+                .filter(|k| !key_matches_predicate(k, filter))
+                .cloned()
+                .collect(),
+            &self.element_extent,
+        )
     }
 
     fn element_extent(&self) -> Extent {
@@ -111,13 +123,27 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         self.yield_predicate.clone()
     }
 
-    fn release(&mut self, obsolete: Predicate) {
-        self.obsolete_predicate = obsolete.clone();
-        match &obsolete {
-            Predicate::True => self.data.clear(),
-            Predicate::LessThanEq(value) => self.data.retain(|k, _| k > value),
-            Predicate::Intervals(intervals) => self.data.retain(|k, _| !intervals.contains(k)),
-            _ => {}
+    fn release(&mut self, producer: &str, mut obsolete: Predicate) {
+        self.obsolete_predicates
+            .insert(producer.to_string(), obsolete.clone());
+        for pred in self.obsolete_predicates.values() {
+            obsolete = obsolete.intersect(pred);
         }
+        debug!(
+            "TestDataSource::release: {obsolete:?} with obsolete predicates: {:?}",
+            self.obsolete_predicates
+        );
+        self.data
+            .retain(|k, _| !key_matches_predicate(k, &obsolete));
+    }
+}
+
+fn key_matches_predicate(key: &Value, predicate: &Predicate) -> bool {
+    match predicate {
+        Predicate::True => true,
+        Predicate::False => false,
+        Predicate::LessThanEq(value) => key <= value,
+        Predicate::Intervals(intervals) => intervals.contains(key),
+        _ => panic!("Unsupported predicate type in TestDataSource release: {predicate:?}"),
     }
 }
