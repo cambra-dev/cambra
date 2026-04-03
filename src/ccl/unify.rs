@@ -292,7 +292,21 @@ impl UnificationTable {
             (Type::Infer(id), concrete) | (concrete, Type::Infer(id)) => {
                 // Ensure this is a actually a concrete type: guards against case reordering.
                 debug_assert!(!matches!(concrete, Type::Infer(_)));
-                self.set(*id, concrete.clone());
+                // If already solved, recurse to check compatibility rather than
+                // calling set() directly — set() panics on conflict, but a
+                // conflict here is a user-level type error that should propagate.
+                if let Some(existing) = self.probe(*id) {
+                    self.constrain_equal(&existing, concrete)?;
+                    // PartialTuple/PartialRecord accumulate index/field knowledge across
+                    // multiple usage sites (e.g. `x[0]` and `x[1]` on the same param).
+                    // constrain_equal only validates overlapping entries; set() is the only
+                    // path that merges non-overlapping ones into the stored value.
+                    if matches!(concrete, Type::PartialTuple(_) | Type::PartialRecord(_)) {
+                        self.set(*id, concrete.clone());
+                    }
+                } else {
+                    self.set(*id, concrete.clone());
+                }
                 Ok(())
             }
             (Type::Fun(a_domain, a_codomain), Type::Fun(b_domain, b_codomain)) => self
@@ -333,9 +347,9 @@ impl UnificationTable {
                 Ok(())
             }
 
-            // PartialTuple ↔ PartialTuple: validate overlapping indices only.
-            // Non-overlapping indices are left unconstrained — merging requires
-            // `set` to accumulate entries, which is deferred to PR 2.
+            // PartialTuple ↔ PartialTuple: validate that overlapping indices agree.
+            // Non-overlapping indices are unconstrained here; accumulation of all
+            // known indices into the table happens via the Infer arm above (set()).
             (Type::PartialTuple(a), Type::PartialTuple(b)) => {
                 let a_map: HashMap<usize, &Type> = a.iter().map(|(i, t)| (*i, t)).collect();
                 for (idx, b_ty) in b {
@@ -366,8 +380,9 @@ impl UnificationTable {
                 Ok(())
             }
 
-            // PartialRecord ↔ PartialRecord: validate overlapping fields only.
-            // Non-overlapping fields are left unconstrained — merging is deferred to PR 2.
+            // PartialRecord ↔ PartialRecord: validate that overlapping fields agree.
+            // Non-overlapping fields are unconstrained here; accumulation happens
+            // via the Infer arm above (set()).
             (Type::PartialRecord(a), Type::PartialRecord(b)) => {
                 let a_map: HashMap<&str, &Type> = a.iter().map(|(n, t)| (n.as_str(), t)).collect();
                 for (name, b_ty) in b {
@@ -376,6 +391,14 @@ impl UnificationTable {
                     }
                 }
                 Ok(())
+            }
+
+            // TODO: This is a short-term workaround that treats all refinements as
+            // compatible with each other. To make this sound, we need to emit a
+            // subtyping constraint on these refinements, the checking of which can
+            // be delegated to an SMT solver.
+            (Type::Refinement(inner, _), other) | (other, Type::Refinement(inner, _)) => {
+                self.constrain_equal(inner, other)
             }
 
             (a, b) if a == b => Ok(()),
@@ -408,11 +431,34 @@ fn resolve_type(ty: &mut Type, table: &mut UnificationTable) {
         }
         Type::Tuple(types) => types.iter_mut().for_each(|t| resolve_type(t, table)),
         Type::Record(types) => types.iter_mut().for_each(|(_, t)| resolve_type(t, table)),
-        Type::PartialTuple(entries) => entries.iter_mut().for_each(|(_, t)| resolve_type(t, table)),
+        Type::PartialTuple(entries) => {
+            entries.iter_mut().for_each(|(_, t)| resolve_type(t, table));
+            // When body inference only constrains some indices of a tuple param
+            // (e.g. `x[0]` and `x[1]`), the table accumulates a PartialTuple.
+            // If the known indices form a complete range [0, N), the PartialTuple
+            // carries the same information as Tuple([T0..Tn-1]) and must be
+            // presented that way — the compiler cannot handle PartialTuple directly.
+            // Reaching compilation with a non-promotable PartialTuple is a compiler
+            // invariant violation (type inference should have rejected the program).
+            entries.sort_by_key(|(i, _)| *i);
+            let is_complete = !entries.is_empty()
+                && entries
+                    .iter()
+                    .enumerate()
+                    .all(|(pos, (idx, _))| pos == *idx);
+            if is_complete {
+                let types: Vec<Type> = entries.drain(..).map(|(_, t)| t).collect();
+                *ty = Type::Tuple(types);
+            }
+        }
         Type::PartialRecord(entries) => {
             entries.iter_mut().for_each(|(_, t)| resolve_type(t, table))
         }
-        _ => {}
+        Type::Union(variants) => variants.iter_mut().for_each(|t| resolve_type(t, table)),
+        // Resolve the base type inside a refinement; the predicate is a separate expression
+        // and is resolved via the expression-level resolve() pass.
+        Type::Refinement(inner, _) => resolve_type(inner, table),
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => {}
     };
 }
 
@@ -454,11 +500,7 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
                 "Type::Hole found in resolve() on Lambda param '{}'; inference failed to convert it",
                 param.name
             );
-            if let Type::Infer(id) = param.ty {
-                if let Some(ty) = table.probe(id) {
-                    param.ty = ty;
-                }
-            }
+            resolve_type(&mut param.ty, table);
             resolve(body, table);
             if let Some(r) = refinement {
                 if let crate::ccl::RefinementKind::Predicate(def) = &r.kind {

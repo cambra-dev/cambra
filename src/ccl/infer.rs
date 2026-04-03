@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
-use log::{debug, trace};
+use log::debug;
 
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::BaseType;
@@ -373,8 +373,8 @@ fn collect_type_errors(ty: &Type, context_sym: &str, errors: &mut Vec<InferError
 /// - Variables — looked up in the scope stack ([`TypeInferenceContext`])
 /// - Annotated lambdas — param type known; recurse into body
 /// - `Apply(Lambda(x, Infer), arg)` — infers arg type, writes it onto `param.ty`
-/// - Standalone unannotated lambdas — calls [`collect_param_constraint`] to
-///   find a usage-site type constraint for the parameter
+/// - Standalone unannotated lambdas — binds param as an inference variable and
+///   lets body inference constrain it at each usage site via the unification table
 /// - Lists — derives `Fun(UIntRange(n), elem_ty)` from the first element
 /// - Let bindings — infers value type, stores it in `bound_expr.ty`, binds name in scope
 /// - `GroupBy` — infers the collection type; uses its codomain to annotate the
@@ -568,65 +568,121 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
 // Non-trivial match-arm helpers
 // ---------------------------------------------------------------------------
 
+/// Replace every [`Type::Hole`] in `ty` (recursively) with a fresh inference
+/// variable, assigning one stable [`Type::Infer`] ID per structural position.
+fn replace_holes(ty: &mut Type, ctx: &mut TypeInferenceContext) {
+    match ty {
+        Type::Hole => *ty = Type::Infer(ctx.fresh_infer_var()),
+        Type::Fun(domain, codomain) => {
+            replace_holes(domain, ctx);
+            replace_holes(codomain, ctx);
+        }
+        Type::Tuple(elems) => elems.iter_mut().for_each(|t| replace_holes(t, ctx)),
+        Type::Record(fields) => fields.iter_mut().for_each(|(_, t)| replace_holes(t, ctx)),
+        Type::Union(variants) => variants.iter_mut().for_each(|t| replace_holes(t, ctx)),
+        Type::Refinement(inner, _) => replace_holes(inner, ctx),
+        Type::PartialTuple(entries) => entries.iter_mut().for_each(|(_, t)| replace_holes(t, ctx)),
+        Type::PartialRecord(entries) => entries.iter_mut().for_each(|(_, t)| replace_holes(t, ctx)),
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Infer(_) => {}
+    }
+}
+
+/// Return `true` if `ty` contains any [`Type::Infer`] variable that is not
+/// yet solved in `table`. Detects structured param types
+/// (e.g. `Tuple([Infer(a), Infer(b)])`) a shallow comparison would miss.
+fn has_unresolved_infer(ty: &Type, table: &mut UnificationTable) -> bool {
+    match ty {
+        Type::Infer(id) => table.probe(*id).is_none(),
+        Type::Fun(a, b) => has_unresolved_infer(a, table) || has_unresolved_infer(b, table),
+        Type::Tuple(elems) => elems.iter().any(|t| has_unresolved_infer(t, table)),
+        Type::Record(fields) => fields.iter().any(|(_, t)| has_unresolved_infer(t, table)),
+        Type::Union(variants) => variants.iter().any(|t| has_unresolved_infer(t, table)),
+        Type::PartialTuple(entries) => entries.iter().any(|(_, t)| has_unresolved_infer(t, table)),
+        Type::PartialRecord(entries) => entries.iter().any(|(_, t)| has_unresolved_infer(t, table)),
+        Type::Refinement(inner, _) => has_unresolved_infer(inner, table),
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => false,
+    }
+}
+
 /// Infer the type of a [`TypedExprNode::Lambda`] node.
 ///
-/// Resolves the parameter type (either from a user annotation, a call-site
-/// constraint collected by [`collect_param_constraint`], or a `Hole → Infer`
-/// conversion), then infers the body type inside a fresh scope.
+/// If the parameter type is unknown (`Hole` or `Infer`), it is left as an
+/// inference variable and bound in scope. Body inference then constrains the
+/// variable naturally at every usage site via the unification table.
+///
+/// After body inference, for a top-level `Infer` param:
+/// - If body constrained the var and a user annotation is present, the annotation
+///   is verified against the inferred type; a conflict returns
+///   [`InferError::AnnotationMismatch`] rather than a raw [`InferError::TypeMismatch`].
+/// - If no body constraint exists and an annotation is present, the annotation
+///   is accepted as the param type.
+/// - If neither body constraint nor annotation exists, returns
+///   [`InferError::CannotInferParam`].
+///   TODO: This is premature — the constraint may come from the call site
+///   (e.g. applying the lambda to a typed argument) or from an annotation on
+///   the whole expression. `CannotInferParam` should ideally be deferred until
+///   after full unification & substitution completes.
+///
+/// Structured param types (e.g. `Tuple`) are checked recursively by
+/// [`has_unresolved_infer`]; any unresolved position also returns
+/// [`InferError::CannotInferParam`].
 fn infer_lambda(
     param: &mut crate::ccl::TypedBinding,
     body: &mut Expr,
     refinement: &mut Option<crate::ccl::Refinement>,
     ctx: &mut TypeInferenceContext,
 ) -> Result<Type, InferError> {
-    // Normalize Hole → fresh registered Infer before existing param-type logic.
-    if matches!(param.ty, Type::Hole) {
-        param.ty = Type::Infer(ctx.fresh_infer_var());
-    }
-    if matches!(param.ty, Type::Infer(_)) {
-        let constraint = collect_param_constraint(&param.name, body, ctx)?;
-        match constraint {
-            Some(inferred) => {
-                // If a user annotation is present, verify it matches.
-                if let Some(ref annotation) = param.user_annotation {
-                    if *annotation != inferred {
-                        return Err(InferError::AnnotationMismatch {
-                            annotation: annotation.clone(),
-                            inferred,
-                        });
-                    }
-                }
-                param.ty = inferred;
-            }
-            None => {
-                // Body provides no usable constraint. If the user wrote an annotation,
-                // trust it — the annotation *is* the type (no inference needed to
-                // confirm it). Without an annotation there is no information at all.
-                match &param.user_annotation {
-                    Some(annotation) => param.ty = annotation.clone(),
-                    None => return Err(InferError::CannotInferParam(param.name.clone())),
-                }
-            }
-        }
-    }
-    // param.ty is now known; infer the body in a scope with param bound.
-    let mut p = param.ty.clone();
+    // Assign a stable Infer ID to every Hole in the param type before binding it
+    // in scope. This must be a pre-pass rather than minting variables on-the-fly:
+    // `param.ty` is cloned into the scope once and looked up once per usage site.
+    // Replacing Holes at lookup time would give each usage a distinct Infer ID,
+    // so constraints from different usage sites would never unify.
+    // Annotation application is deferred to after body inference so that body
+    // constraints are collected first and can be validated against the annotation.
+    replace_holes(&mut param.ty, ctx);
+    // Infer the body in a fresh scope with the param bound. All usage sites
+    // constrain param.ty via the unification table automatically — no pre-scan needed.
     let param_name = param.name.clone();
     let body_ty = {
         let mut scoped = ctx.enter_scope();
-        scoped.bind(&param_name, p.clone());
+        scoped.bind(&param_name, param.ty.clone());
         infer_expr(body, &mut scoped)?
     };
-    // Predicate is inferred in the outer scope (param not in scope).
-    // This reflects that the refinement predicate is a constraint on the
-    // *call site*, not an expression in the lambda body.
+    // Post-inference: for a bare Infer param, validate the annotation against body
+    // constraints (or use it as a fallback when the body provides none). For
+    // structured params, check recursively for any unresolved positions.
+    if let Type::Infer(id) = param.ty {
+        let probed = ctx.table.probe(id);
+        let ann = param.user_annotation.clone();
+        match (probed, ann) {
+            (Some(inferred), Some(ann)) => {
+                // Body constrained the param; verify the user annotation agrees.
+                ctx.constrain_equal(&ann, &inferred).map_err(|_| {
+                    InferError::AnnotationMismatch {
+                        annotation: ann.clone(),
+                        inferred: inferred.clone(),
+                    }
+                })?;
+                param.ty = ann;
+            }
+            (Some(_), None) => {} // resolved by body; no annotation to check
+            (None, Some(ann)) => param.ty = ann, // no body constraint; trust annotation
+            (None, None) => return Err(InferError::CannotInferParam(param.name.clone())),
+        }
+    } else if has_unresolved_infer(&param.ty, &mut ctx.table) {
+        // Structured param with at least one position that body inference never resolved.
+        return Err(InferError::CannotInferParam(param.name.clone()));
+    }
+    // Build the domain type; refinement wraps it but is inferred in the outer
+    // scope (param not in scope) because it is a constraint on the call site.
+    let mut domain = param.ty.clone();
     if let Some(refinement) = refinement {
         if let RefinementKind::Predicate(def) = &refinement.kind {
             infer_expr(&mut def.borrow_mut(), ctx)?;
         }
-        p = Type::Refinement(Box::new(p), refinement.clone())
+        domain = Type::Refinement(Box::new(domain), refinement.clone());
     }
-    Ok(Type::Fun(Box::new(p), Box::new(body_ty)))
+    Ok(Type::Fun(Box::new(domain), Box::new(body_ty)))
 }
 
 /// Infer the type of a [`TypedExprNode::Apply`] node.
@@ -965,216 +1021,6 @@ fn lit_type(lit: &Lit) -> Type {
     }
 }
 
-// TODO replace this with the general type handling in the unification table.
-#[derive(Debug, Clone)]
-enum TypeConstraint {
-    Type(Type),
-    // Carries a concrete index into a tuple-typed parameter, emitted by
-    // `collect_constraints_into` for every entry in a `PartialTuple` domain.
-    // `reconcile_constraints` assembles them into a concrete `Tuple` type.
-    //
-    // Known limitation:
-    // - There is no `RecordField` analogue. Multiple record-field projections of the
-    //   same standalone lambda parameter (e.g. `p.x` and `p.y`) each emit
-    //   `Type(PartialRecord(...))`, which conflicts in `reconcile_constraints` instead
-    //   of merging. `UnificationTable::set` merges `PartialRecord` entries at inference
-    //   time, but the pre-inference constraint collection path does not support this.
-    //   A `RecordField(String, Type)` variant (mirroring `TupleField`) would fix it.
-    // TODO: handle nested tuples.
-    TupleField(usize, Type),
-}
-
-/// Walk `body` looking for all `Apply(func, Var(param))` occurrences to derive
-/// a type constraint for a standalone (unannotated) lambda's parameter.
-///
-/// Collects every constraint found by [`collect_constraints_into`], then
-/// reconciles them via [`reconcile_constraints`]:
-///
-/// - No constraints found → `Ok(None)`
-/// - All constraints agree → `Ok(Some(ty))`
-/// - Conflicting constraints → `Err(InferError::TypeMismatch { .. })`
-///
-/// The full-walk behaviour means that in `[f(x) * g(x) for x in xs]` both
-/// `Apply(f, Var(x))` and `Apply(g, Var(x))` are examined, and a conflict
-/// between their domains produces a type error rather than silently using the
-/// first.
-fn collect_param_constraint(
-    param: &str,
-    body: &mut Expr,
-    ctx: &mut TypeInferenceContext,
-) -> Result<Option<Type>, InferError> {
-    let mut constraints = Vec::new();
-    collect_constraints_into(param, body, ctx, &mut constraints);
-    // Log before consuming constraints so we avoid cloning the Vec for the trace.
-    trace!("Collected constraints for {param}: {constraints:?}");
-    let result = reconcile_constraints(constraints);
-    trace!("Reconciled to {result:?}");
-    result
-}
-
-/// Accumulate every type constraint for `param` found in `body` into `out`.
-///
-/// For each `Apply(func, Var(param))` encountered, calls [`infer_expr`] on
-/// `func` and, if the result is a `Fun` type, pushes its domain onto `out`.
-/// Does not short-circuit: all matching sites in the entire subtree are visited.
-///
-/// Does not recurse into `Lambda` nodes that shadow `param`.
-fn collect_constraints_into(
-    param: &str,
-    body: &mut Expr,
-    ctx: &mut TypeInferenceContext,
-    out: &mut Vec<TypeConstraint>,
-) {
-    match &mut body.node {
-        TypedExprNode::Apply { function, argument } => {
-            // If argument is Var(param), the domain of function's type is the constraint.
-            match &argument.node {
-                TypedExprNode::Var(v) if v == param => {
-                    if let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx) {
-                        // Decompose any PartialTuple domain into individual TupleField
-                        // constraints so reconcile_constraints can merge them into a
-                        // concrete Tuple type. Single-entry PartialTuples arise from bare
-                        // Proj morphisms; multi-entry ones from set() accumulation.
-                        match *domain {
-                            Type::PartialTuple(entries) => {
-                                for (idx, field_ty) in entries {
-                                    out.push(TypeConstraint::TupleField(idx, field_ty));
-                                }
-                            }
-                            domain => out.push(TypeConstraint::Type(domain)),
-                        }
-                        // Don't recurse: function was already inferred (possibly mutated),
-                        // and argument = Var(param) has no sub-patterns to search.
-                        return;
-                    }
-                }
-                // Apply(Proj(Index(n)), Var(param)) — tuple field projection.
-                TypedExprNode::Apply {
-                    function: proj_fn,
-                    argument: proj_arg,
-                } => {
-                    if let TypedExprNode::Proj(ProjKey::Index(idx)) = &proj_fn.node {
-                        if matches!(&proj_arg.node, TypedExprNode::Var(v) if v == param) {
-                            if let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx) {
-                                out.push(TypeConstraint::TupleField(*idx, *domain));
-                                return;
-                            }
-                        }
-                    }
-                }
-                // infer failed or returned a non-Fun type; fall through to recursive search.
-                _ => {}
-            }
-            // Need to split borrows — collect separately on each child.
-            // We can't hold `&mut body.node` while calling collect_constraints_into on parts.
-            // So we reborrow here by calling the function with the child nodes directly.
-            // The match already extracted function and argument as mutable refs.
-            collect_constraints_into(param, function, ctx, out);
-            collect_constraints_into(param, argument, ctx, out);
-        }
-
-        // Don't recurse into a lambda that shadows param.
-        TypedExprNode::Lambda {
-            param: lam_param,
-            body: lam_body,
-            ..
-        } => {
-            if lam_param.name != param {
-                collect_constraints_into(param, lam_body, ctx, out);
-            }
-        }
-
-        TypedExprNode::Let {
-            binding,
-            bound_expr: value,
-            body: let_body,
-            ..
-        } => {
-            // Always search the value: it is evaluated in the outer scope, so
-            // `param` is still in play even if `binding.name == param`.
-            collect_constraints_into(param, value, ctx, out);
-            // Don't recurse into `body` when `binding.name == param`: the let-binding
-            // shadows `param` there, mirroring the Lambda shadowing guard above.
-            if binding.name != param {
-                collect_constraints_into(param, let_body, ctx, out);
-            }
-        }
-
-        TypedExprNode::BinOp { left, right, .. } => {
-            collect_constraints_into(param, left, ctx, out);
-            collect_constraints_into(param, right, ctx, out);
-        }
-
-        TypedExprNode::UnaryOp(_, inner) => collect_constraints_into(param, inner, ctx, out),
-
-        TypedExprNode::Tuple(elts) => {
-            for elt in elts {
-                collect_constraints_into(param, elt, ctx, out);
-            }
-        }
-
-        // Leaf nodes with no sub-expressions to search.
-        _ => {}
-    }
-}
-
-/// Reconcile a list of type constraints into a single optional type.
-///
-/// - Empty list → `Ok(None)` (no constraint found)
-/// - All equal → `Ok(Some(ty))` (unique constraint)
-/// - Any differ → `Err(TypeMismatch { type_a: first, type_b: other })`
-fn reconcile_constraints(constraints: Vec<TypeConstraint>) -> Result<Option<Type>, InferError> {
-    let iter = constraints.into_iter();
-    let mut base_type: Option<Type> = None;
-    let mut tuple_type = HashMap::new();
-    for other in iter {
-        match other {
-            TypeConstraint::Type(ty) => {
-                if let Some(base) = &base_type {
-                    if *base != ty {
-                        return Err(InferError::TypeMismatch {
-                            type_a: base.clone(),
-                            type_b: ty,
-                        });
-                    }
-                } else {
-                    base_type = Some(ty);
-                }
-            }
-            TypeConstraint::TupleField(idx, ty) => {
-                let prev = tuple_type.insert(idx, ty.clone());
-                if prev.as_ref().is_some_and(|p| p != &ty) {
-                    return Err(InferError::TypeMismatch {
-                        type_a: prev.unwrap(),
-                        type_b: ty,
-                    });
-                }
-            }
-        }
-    }
-    // Mixed Type and TupleField constraints indicate a bug in collect_constraints_into:
-    // PartialTuple domains must always be fully decomposed into TupleField entries there.
-    assert!(
-        base_type.is_none() || tuple_type.is_empty(),
-        "reconcile_constraints: mixed Type and TupleField constraints — \
-         PartialTuple domains must be decomposed by collect_constraints_into"
-    );
-    if base_type.is_some() {
-        Ok(base_type)
-    } else if !tuple_type.is_empty() {
-        if tuple_type.keys().cloned().max().unwrap_or(0) != tuple_type.len() - 1 {
-            return Ok(None);
-        }
-        Ok(Some(Type::Tuple(
-            (0..tuple_type.len())
-                .map(|i| tuple_type[&i].clone())
-                .collect(),
-        )))
-    } else {
-        Ok(None)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1289,6 +1135,33 @@ mod tests {
         let mut expr = Expr::lambda("x", Type::infer(), Expr::var("x"));
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(result, Err(InferError::CannotInferParam("x".into())));
+    }
+
+    /// `λ p → p._0` where `p : Tuple([Hole, Hole])`.
+    ///
+    /// `replace_holes` converts the param type to `Tuple([Infer(a), Infer(b)])`.
+    /// Body inference constrains `Infer(a)` via the index-0 projection but never
+    /// touches `Infer(b)`. A shallow check (`if let Type::Infer(id) = param.ty`)
+    /// would miss this because `param.ty` is a `Tuple`, not a top-level `Infer`.
+    /// `has_unresolved_infer` catches it recursively.
+    #[test]
+    fn test_cannot_infer_nested_tuple_param() {
+        let mut ctx = TypeInferenceContext::new();
+        // λ p → p._0  where p : (_, _)
+        let body = Expr::apply(Expr::var("p"), Expr::proj_index(0));
+        let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "p".to_string(),
+                ty: Type::Tuple(vec![Type::Hole, Type::Hole]),
+                user_annotation: None,
+            },
+            body: Box::new(body),
+            refinement: None,
+        });
+        assert_eq!(
+            infer(&mut expr, &mut ctx),
+            Err(InferError::CannotInferParam("p".into()))
+        );
     }
 
     /// Builds the unannotated list-comp CCL for `[elt for var in source]`.
@@ -1530,11 +1403,12 @@ mod tests {
     fn test_let_shadowing_no_constraint() {
         // λ x → let x = 42 in Apply(λ b:String → b, Var(x))
         //
-        // `let x = 42` shadows the outer lambda param `x`. The outer `x` never
-        // appears in an Apply before the shadowing, so no constraint exists for it.
-        // The body is skipped (shadowed), so Apply(f_string, Var(x)) — which refers
-        // to the *let-bound* x, not the outer param — does not create a false
-        // String constraint. Result: CannotInferParam("x").
+        // `let x = 42` shadows the outer lambda param `x`. The scope stack
+        // handles this correctly: the let-bound x (Int) shadows the lambda
+        // param x. The body's Apply sees the inner x (Int), not the outer param.
+        // Since `(λ b:String → b)(Int)` is a type error, inference returns
+        // TypeMismatch. The outer lambda param is never constrained — but the
+        // body type error surfaces first.
         let f_string = Expr::lambda("b", Type::Base(BaseType::String), Expr::var("b"));
         let mut expr = Expr::lambda(
             "x",
@@ -1551,7 +1425,10 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         assert_eq!(
             infer(&mut expr, &mut ctx),
-            Err(InferError::CannotInferParam("x".into()))
+            Err(InferError::TypeMismatch {
+                type_a: Type::Base(BaseType::String),
+                type_b: Type::Base(BaseType::Int),
+            })
         );
     }
 
@@ -1998,15 +1875,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // reconcile_constraints / TupleField tests (via collect_param_constraint)
+    // PartialTuple inference via body-inference unification
     // -----------------------------------------------------------------------
 
+    /// `λ p → f(p._0) + g(p._2)` where f : Int → Int and g : Bool → Bool.
+    ///
+    /// The pre-scan approach used to return `CannotInferParam` here because
+    /// `reconcile_constraints` detected a gap at index 1. Now that body
+    /// inference constrains `p` via the unification table, p is resolved to
+    /// `PartialTuple([(0, Int), (2, Bool)])`. The body then fails with a
+    /// type error from the `BoolLogic(And)` operator (Int vs Bool result).
     #[test]
-    fn test_reconcile_tuple_field_gap_returns_cannot_infer() {
-        // λ p → f(p._0) + g(p._2)
-        // TupleField constraints at indices 0 and 2 — index 1 is missing.
-        // reconcile_constraints detects the gap (max 2 != len-1 = 1) → Ok(None)
-        // → collect_param_constraint returns None → CannotInferParam("p").
+    fn test_tuple_field_gap_now_infers_partial_tuple() {
         let f = Expr::lambda("a", Type::Base(BaseType::Int), Expr::var("a"));
         let g = Expr::lambda("b", Type::Base(BaseType::Bool), Expr::var("b"));
         let mut expr = Expr::lambda(
@@ -2019,18 +1899,20 @@ mod tests {
             ),
         );
         let mut ctx = TypeInferenceContext::new();
-        assert_eq!(
+        // Body inference constrains p, but the And of Int and Bool is a type error.
+        assert!(matches!(
             infer(&mut expr, &mut ctx),
-            Err(InferError::CannotInferParam("p".into()))
-        );
+            Err(InferError::TypeMismatch { .. })
+        ));
     }
 
+    /// `λ p → f(p._0) + g(p._0)` where f : Int → Int and g : String → String.
+    ///
+    /// Both usages constrain p._0 via the unification table. The second usage
+    /// constrains p._0 as String while the first established Int, causing a
+    /// TypeMismatch.
     #[test]
-    fn test_reconcile_tuple_field_conflict_returns_mismatch() {
-        // λ p → f(p._0) + g(p._0)
-        // where f : Int → Int and g : String → String.
-        // TupleField constraints at the same index 0 with conflicting types →
-        // reconcile_constraints returns TypeMismatch.
+    fn test_tuple_field_conflict_returns_mismatch() {
         let f = Expr::lambda("a", Type::Base(BaseType::Int), Expr::var("a"));
         let g = Expr::lambda("b", Type::Base(BaseType::String), Expr::var("b"));
         let mut expr = Expr::lambda(
@@ -2043,40 +1925,20 @@ mod tests {
             ),
         );
         let mut ctx = TypeInferenceContext::new();
-        assert_eq!(
+        assert!(matches!(
             infer(&mut expr, &mut ctx),
-            Err(InferError::TypeMismatch {
-                type_a: Type::Base(BaseType::Int),
-                type_b: Type::Base(BaseType::String),
-            })
-        );
+            Err(InferError::TypeMismatch { .. })
+        ));
     }
 
-    /// Mixed [`TypeConstraint::Type`] and [`TypeConstraint::TupleField`] entries
-    /// indicate a bug in [`collect_constraints_into`] — `PartialTuple` domains must
-    /// be fully decomposed into `TupleField` entries before reaching the reconciler.
-    /// The assert in [`reconcile_constraints`] fires to surface this rather than
-    /// silently discarding the `TupleField` data.
+    /// `λ p → p ► f` where f has domain `PartialTuple([(0, Int), (1, Bool)])`.
+    ///
+    /// Body inference constrains p against f's domain via the unification table.
+    /// The resolution pass then promotes `PartialTuple([(0, Int), (1, Bool)])` to
+    /// `Tuple([Int, Bool])` because indices 0 and 1 form a complete range `[0, 2)`.
     #[test]
-    #[should_panic(expected = "mixed Type and TupleField constraints")]
-    fn test_reconcile_panics_on_mixed_type_and_tuple_field() {
-        let constraints = vec![
-            TypeConstraint::Type(Type::PartialTuple(vec![(0, Type::Base(BaseType::Int))])),
-            TypeConstraint::TupleField(1, Type::Base(BaseType::Bool)),
-        ];
-        reconcile_constraints(constraints).ok();
-    }
-
-    /// A function applied to `param` whose domain is a multi-entry `PartialTuple`
-    /// should decompose into multiple `TupleField` constraints and correctly infer
-    /// the full `Tuple` type for `param`.
-    #[test]
-    fn test_infer_lambda_multi_entry_partial_tuple_domain_decomposes() {
+    fn test_infer_lambda_partial_tuple_domain_promoted_to_tuple() {
         let mut ctx = TypeInferenceContext::new();
-        // λ p → p ► f
-        // f : Fun(PartialTuple([(0, Int), (1, Bool)]), Int) — a multi-entry domain.
-        // collect_constraints_into decomposes it into TupleField(0, Int) and
-        // TupleField(1, Bool), so reconcile_constraints infers p : (Int, Bool).
         let f_ty = Type::Fun(
             Box::new(Type::PartialTuple(vec![
                 (0, Type::Base(BaseType::Int)),
@@ -2093,7 +1955,7 @@ mod tests {
             assert_eq!(
                 *domain,
                 Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Bool)]),
-                "expected p : (Int, Bool), got {domain}"
+                "expected p : Tuple([Int, Bool]) after promotion, got {domain}"
             );
         } else {
             panic!("expected Fun type for lambda");
@@ -2101,11 +1963,54 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Deferred CannotInferParam: constraint comes from the call site
+    // -----------------------------------------------------------------------
+
+    /// `let g = λ x → x in let f = λ t → (t.0 ▸ g, t.2 ▸ g) in (0, 1, 2) ▸ f`
+    ///
+    /// `g`'s parameter type cannot be inferred from `g`'s own body, but usage
+    /// inside `f` constrains it to Int (via `t.0` and `t.2` when `f` is applied
+    /// to `(0, 1, 2)`). Unification should infer `g : Int ⇒ Int`,
+    /// `f : {Int, Int, Int} ⇒ {Int, Int}`, and the whole expression `{Int, Int}`.
+    ///
+    /// TODO: This currently fails with `CannotInferParam` because `infer_lambda`
+    /// errors out on `g` before the call-site constraints are visible. Fix
+    /// requires deferring `CannotInferParam` until after full unification &
+    /// substitution completes.
+    #[test]
+    #[ignore = "TODO: deferred CannotInferParam not yet implemented"]
+    fn test_lambda_type_inferred_from_call_site() {
+        let mut ctx = TypeInferenceContext::new();
+        let g_lambda = Expr::lambda("x", Type::infer(), Expr::var("x"));
+        let t0g = Expr::apply(
+            Expr::apply(Expr::var("t"), Expr::proj_index(0)),
+            Expr::var("g"),
+        );
+        let t2g = Expr::apply(
+            Expr::apply(Expr::var("t"), Expr::proj_index(2)),
+            Expr::var("g"),
+        );
+        let f_lambda = Expr::lambda("t", Type::infer(), Expr::tuple(vec![t0g, t2g]));
+        let tuple_012 = Expr::tuple(vec![
+            Expr::lit(Lit::Int(0)),
+            Expr::lit(Lit::Int(1)),
+            Expr::lit(Lit::Int(2)),
+        ]);
+        let inner = Expr::let_bind("f", f_lambda, Expr::apply(tuple_012, Expr::var("f")));
+        let mut expr = Expr::let_bind("g", g_lambda, inner);
+        let ty = infer(&mut expr, &mut ctx).expect("should infer successfully");
+        assert_eq!(
+            ty,
+            Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)])
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // AnnotationMismatch: user_annotation conflicts with inferred type
     // -----------------------------------------------------------------------
 
     /// Constructs a `Lambda` with `user_annotation: Some(Int)` but a body that
-    /// produces `String`. Inference should return `AnnotationMismatch`.
+    /// constrains the param to `String`. Inference should return `AnnotationMismatch`.
     ///
     /// This path is not yet reachable from the pipeline (lowering always sets
     /// `user_annotation: None`), but the error variant must be exercised
@@ -2114,7 +2019,9 @@ mod tests {
     fn test_infer_annotation_mismatch() {
         let mut ctx = TypeInferenceContext::new();
         // λ [x : annotated Int] → Apply(λ s : String → s, x)
-        // Constraint from Apply: x must be String, but annotation says Int.
+        // x starts as Infer(id); body inference applies x as an arg to a
+        // String-expecting function, constraining Infer(id) → String.
+        // Post-body check: constrain_equal(Int, String) → AnnotationMismatch.
         let inner = Expr::lambda("s", Type::Base(BaseType::String), Expr::var("s"));
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
@@ -2125,9 +2032,8 @@ mod tests {
             body: Box::new(Expr::apply(Expr::var("x"), inner)),
             refinement: None,
         });
-        let result = infer(&mut expr, &mut ctx);
         assert_eq!(
-            result,
+            infer(&mut expr, &mut ctx),
             Err(InferError::AnnotationMismatch {
                 annotation: Type::Base(BaseType::Int),
                 inferred: Type::Base(BaseType::String),

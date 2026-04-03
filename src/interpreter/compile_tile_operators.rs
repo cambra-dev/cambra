@@ -200,7 +200,9 @@ impl TileCompileContext {
             Type::Base(b) => Ok(Extent::Base(b.clone())),
             Type::UIntRange(n) => Ok(Extent::uint_range(*n)),
             other => Err(CompileError::TypeError(format!(
-                "Cannot convert CCL type {other:?} to an interpreter extent"
+                "Cannot convert CCL type {other:?} to an interpreter extent; \
+                 this is a compiler bug — type inference should have resolved \
+                 or rejected this type before compilation"
             ))),
         }
     }
