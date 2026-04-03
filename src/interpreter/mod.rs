@@ -6,6 +6,7 @@
 mod binop;
 pub mod ccl_compile_util;
 pub mod compile_tile_operators;
+pub mod operator_conversion;
 mod scheduler;
 mod stdio;
 mod test_source;

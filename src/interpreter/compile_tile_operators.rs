@@ -35,7 +35,7 @@ use crate::{
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, Filter, IterateExtent, MapAggregate,
             MapExtractAggregate, MapResult, MapResultToConst, MapResultWithSource, Memo,
-            ScalarTuple, Split, TileOperator, Tiling, ToScalar, Zip,
+            ScalarTuple, Splitter, TileOperator, Tiling, ToScalar, Zip,
         },
         transform_hashmap_values, tuple_field, ArithmeticKind, BaseType, BinOpKind, CompareKind,
         DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
@@ -49,7 +49,7 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// A variable binding during tile compilation.
-enum TileVarBinding {
+pub(crate) enum TileVarBinding {
     /// Lambda parameter — each reference produces a fresh [`IterateExtent`].
     Param(Extent),
     /// Let-bound (or β-reduced lambda arg) — each reference re-compiles the
@@ -65,7 +65,7 @@ enum TileVarBinding {
     /// Each reference via [`compile_var`] produces a fresh [`Split`] handle
     /// that subscribes to the same underlying [`Memo`] producer, avoiding
     /// redundant recompilation of the bound expression.
-    Operator(Rc<Split>),
+    Operator(Rc<Splitter>),
 }
 
 impl Clone for TileVarBinding {
@@ -98,7 +98,7 @@ pub struct TileCompileContext {
 /// Created by [`TileCompileContext::enter_scope`]; pops the innermost scope when
 /// dropped. Implements [`std::ops::Deref`]/[`std::ops::DerefMut`] targeting
 /// [`TileCompileContext`], so `&mut guard` coerces to `&mut TileCompileContext`.
-struct TileCompileContextGuard<'a> {
+pub(crate) struct TileCompileContextGuard<'a> {
     ctx: &'a mut TileCompileContext,
 }
 
@@ -143,18 +143,18 @@ impl TileCompileContext {
     ///
     /// The guard dereferences to `TileCompileContext`, so it can be passed as
     /// `&mut TileCompileContext` to recursive compile functions.
-    fn enter_scope(&mut self) -> TileCompileContextGuard<'_> {
+    pub(crate) fn enter_scope(&mut self) -> TileCompileContextGuard<'_> {
         self.scopes.push_scope();
         TileCompileContextGuard { ctx: self }
     }
 
     /// Bind `name` to `binding` in the innermost scope.
-    fn bind(&mut self, name: &str, binding: TileVarBinding) {
+    pub(crate) fn bind(&mut self, name: &str, binding: TileVarBinding) {
         self.scopes.bind(name, binding);
     }
 
     /// Look up `name` from innermost scope outward.
-    fn lookup(&self, name: &str) -> Option<&TileVarBinding> {
+    pub(crate) fn lookup(&self, name: &str) -> Option<&TileVarBinding> {
         self.scopes.lookup(name)
     }
 
@@ -228,7 +228,7 @@ pub fn compile_tile(
     compile_tile_inner(expr, ctx)
 }
 
-fn compile_tile_inner(
+pub(crate) fn compile_tile_inner(
     expr: &Expr,
     ctx: &mut TileCompileContext,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
@@ -334,10 +334,10 @@ fn lift_scalar_to_function(
 ) -> (Box<dyn TileOperator>, Box<dyn TileOperator>) {
     // Split the function operator so the Map (domain traversal) and the Zip
     // (actual function output) both share the same underlying data.
-    let split = Split::new(function_op);
-    let split_for_zip = Box::new(split.split()) as Box<dyn TileOperator>;
+    let split = Splitter::new(function_op);
+    let split_for_zip = split.split();
     let lifted = Box::new(MapResultToConst::new(
-        Box::new(split) as Box<dyn TileOperator>,
+        split.split() as Box<dyn TileOperator>,
         scalar_op,
     ));
     (lifted, split_for_zip)
@@ -428,7 +428,7 @@ fn compile_var(
     // Handle Operator bindings first without cloning — each reference produces
     // a fresh Split handle from the shared Rc<Split>.
     if let Some(TileVarBinding::Operator(rc)) = ctx.lookup(name) {
-        return Ok(Box::new(rc.split()));
+        return Ok(rc.split());
     }
 
     match ctx.lookup(name).cloned() {
@@ -718,7 +718,7 @@ fn compile_let(
     // that any free occurrences of `name` inside `bound_expr` correctly
     // resolve to the outer binding rather than the one we are about to create.
     let bound_op = compile_tile_inner(bound_expr, ctx)?;
-    let split = Rc::new(Split::new(Box::new(Memo::new(bound_op))));
+    let split = Rc::new(Splitter::new(Box::new(Memo::new(bound_op))));
     {
         let mut scope = ctx.enter_scope();
         scope.bind(name, TileVarBinding::Operator(split));
@@ -743,18 +743,16 @@ fn compile_tuple(
         // and the Zip itself share its output without re-iterating the domain.
         let first_fn_idx = ops.iter().position(|o| !o.tiling().is_scalar()).unwrap();
         let first_fn_op = ops.remove(first_fn_idx);
-        let domain_split = Split::new(first_fn_op);
-        let domain_split_clone = domain_split.split();
+        let domain_split = Splitter::new(first_fn_op);
 
         // Re-insert the split handle at the original position, then lift any scalars.
-        ops.insert(first_fn_idx, Box::new(domain_split));
+        ops.insert(first_fn_idx, domain_split.split());
         let ops: Vec<Box<dyn TileOperator>> = ops
             .into_iter()
             .map(|o| {
                 if o.tiling().is_scalar() {
                     // Each scalar lift gets its own clone of the split as its domain source.
-                    let (lifted, _) =
-                        lift_scalar_to_function(o, Box::new(domain_split_clone.split()));
+                    let (lifted, _) = lift_scalar_to_function(o, domain_split.split());
                     lifted
                 } else {
                     o
@@ -895,18 +893,18 @@ fn compile_groupby(
             .ok_or_else(|| {
                 CompileError::TypeError("GroupBy: collection must have a function type".into())
             })?;
-    let col_split = Rc::new(Split::new(Box::new(Memo::new(collection_op))));
+    let col_split = Rc::new(Splitter::new(Box::new(Memo::new(collection_op))));
 
     // 2. Ensure the binding exposes a SealedFunction(D, V) tiling.
     //    List literals compile to Scalar(Function(D, V)); wrapping them in
     //    MapNApply(IterateExtent(D), split_handle) materialises them into
     //    SealedFunction(D, V), which is what key lambda β-reduction expects.
-    let mat_split: Rc<Split> = if matches!(col_split.tiling(), Tiling::Scalar(_)) {
+    let mat_split: Rc<Splitter> = if matches!(col_split.tiling(), Tiling::Scalar(_)) {
         let mat_op: Box<dyn TileOperator> = Box::new(MapResult::new(
             Box::new(IterateExtent::new(collection_domain)),
-            Box::new(col_split.split()),
+            col_split.split(),
         ));
-        Rc::new(Split::new(Box::new(Memo::new(mat_op))))
+        Rc::new(Splitter::new(Box::new(Memo::new(mat_op))))
     } else {
         // Already SealedFunction — reuse col_split directly.
         Rc::clone(&col_split)
@@ -929,7 +927,7 @@ fn compile_groupby(
 
     // 6. Replace domain indices with collection elements: CurriedFunction(K, V).
     //    Use a fresh split handle from col_split instead of recompiling.
-    let collection_for_compose: Box<dyn TileOperator> = Box::new(col_split.split());
+    let collection_for_compose: Box<dyn TileOperator> = col_split.split();
     let grouped_op: Box<dyn TileOperator> =
         Box::new(MapResult::new(converse_op, collection_for_compose));
 

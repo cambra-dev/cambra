@@ -10,14 +10,16 @@ use rustpython_parser::{ast as pyast, parser};
 
 use crate::{
     ccl::{
-        infer::{infer, TypeInferenceContext},
+        infer::{check_fully_typed, infer, TypeInferenceContext},
+        lambda_elim,
         lower::{lower_stmts, LoweringContext},
-        symbolic::symbolic,
-        BaseType, Type,
+        symbolic::{symbolic, symbolic_typed},
+        BaseType, Expr, Type,
     },
     interpreter::{
         compile_tile_operators::{compile_tile, TileCompileContext},
-        tile_operators::TileProducer,
+        operator_conversion::convert_to_operators,
+        tile_operators::{TileOperator, TileProducer},
         Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource, TestDataSource,
     },
     pretty_graph::{pretty_tile_operator, pretty_tile_producer},
@@ -74,7 +76,7 @@ impl GlobalContext {
         let ccl_repr = symbolic(&expr);
         debug!("CCL:\n{ccl_repr}");
 
-        let mut op = compile_tile(&expr, self.compile()).expect("compile failed");
+        let mut op = compile_tile(&expr, self.compile_ctx()).expect("compile failed");
 
         let operator_tree = pretty_tile_operator(op.as_ref());
         debug!("Operators:\n{operator_tree}");
@@ -106,7 +108,7 @@ impl GlobalContext {
     }
 
     /// Returns the context for type inference
-    pub fn compile(&mut self) -> &mut TileCompileContext {
+    pub fn compile_ctx(&mut self) -> &mut TileCompileContext {
         &mut self.compile
     }
 
@@ -155,4 +157,41 @@ impl Default for GlobalContext {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Runs as much of the new compilation stack as we have implemented so far.
+pub fn new_compile_program(
+    ctx: &mut GlobalContext,
+    code: &str,
+    consumer: Box<dyn Consumer>,
+) -> (Expr, Box<dyn TileOperator>, Box<dyn TileProducer>) {
+    let result =
+        parser::parse(code, parser::Mode::Module, "<test>").expect("Failed to parse Python module");
+    let stmts = match result {
+        pyast::Mod::Module { body, .. } => body,
+        other => panic!("expected Module, got {other:?}"),
+    };
+    let mut expr = lower_stmts(&stmts, ctx.lowering_ctx()).expect("ccl lowering failed");
+
+    let infer_ctx = ctx.inference_ctx();
+    infer(&mut expr, infer_ctx).expect("type inference failed");
+
+    let ccl_repr = symbolic(&expr);
+    debug!("CCL:\n{ccl_repr}");
+
+    let lambda_elim = lambda_elim::run(expr).expect("Lambda elim failed");
+    debug!("λ-eliminated CCL:\n{}", symbolic_typed(&lambda_elim));
+
+    debug!("Table:\n{}", ctx.inference_ctx().table);
+
+    check_fully_typed(&lambda_elim).expect("missing types");
+
+    let mut op =
+        convert_to_operators(&lambda_elim, ctx.compile_ctx()).expect("Operator conversion failed");
+
+    let producer = op.subscribe(op.tiling().universal_guard(), consumer, ctx.scheduler());
+
+    debug!("Producers:\n{}", pretty_tile_producer(producer.as_ref()));
+
+    (lambda_elim, op, producer)
 }

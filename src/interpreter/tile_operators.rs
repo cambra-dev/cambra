@@ -1587,6 +1587,118 @@ impl TileProducer for FilterProducer {
     }
 }
 
+/// Applies a boolean predicate function to its own domain, producing an identity
+/// function over the surviving elements.
+///
+/// Unlike [`Filter`], which requires a separately-provided input stream and predicate
+/// stream that must share the same domain, `Restrict` derives the identity input
+/// directly from the predicate's domain. This avoids domain-mismatch panics when the
+/// predicate itself contains inner [`Filter`] operators that narrow the domain before
+/// the boolean values are produced.
+///
+/// The predicate operator must produce a `SealedFunction { domain: D, codomain: Bool }`.
+/// `Restrict` returns `SealedFunction { domain: D', codomain: D' }` where D' ⊆ D is the
+/// subset of domain elements for which the predicate is `true`.
+pub struct Restrict {
+    /// Output tiling — `SealedFunction(D, D)` mirroring an [`IterateExtent`] over D.
+    tiling: Tiling,
+    /// The boolean predicate over the domain to restrict.
+    predicate: Box<dyn TileOperator>,
+}
+
+impl Restrict {
+    /// Create a `Restrict` from a predicate operator.
+    ///
+    /// Panics if `predicate` does not have a `SealedFunction` tiling.
+    pub fn new(predicate: Box<dyn TileOperator>) -> Self {
+        let domain_extent = match predicate.tiling() {
+            Tiling::SealedFunction { domain, .. } => domain.clone(),
+            other => panic!("Restrict expects SealedFunction predicate tiling, got {other:?}"),
+        };
+        let tiling = Tiling::SealedFunction {
+            domain: domain_extent.clone(),
+            codomain: Box::new(Tiling::Scalar(domain_extent)),
+        };
+        Self { tiling, predicate }
+    }
+}
+
+impl TileOperator for Restrict {
+    fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("predicate", self.predicate.inspect(opts))
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let predicate_producer = self.predicate.subscribe(
+            self.predicate.tiling().universal_guard(),
+            consumer,
+            scheduler,
+        );
+        Box::new(RestrictProducer {
+            base: ProducerBase {
+                id: RestrictProducer::alloc_id(),
+                tiling: self.tiling.clone(),
+            },
+            predicate: predicate_producer,
+        })
+    }
+}
+
+struct RestrictProducer {
+    base: ProducerBase,
+    predicate: Box<dyn TileProducer>,
+}
+
+impl TileProducer for RestrictProducer {
+    fn base(&self) -> &ProducerBase {
+        &self.base
+    }
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("predicate", self.predicate.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let pred_guard = self.predicate.tiling().universal_guard();
+        let pred_result = self.predicate.get(pred_guard);
+        match pred_result {
+            Tile::SealedFunction {
+                domain,
+                codomain,
+                domain_predicate,
+            } => {
+                let pred_bools = scalar_tile_to_column_value(*codomain);
+                let mask = pred_bools
+                    .as_bitvec()
+                    .unwrap_or_else(|| panic!("Restrict: expected boolean predicate codomain"));
+                // Build identity: each surviving domain element maps to itself.
+                let mut output = Tile::SealedFunction {
+                    codomain: Box::new(Tile::Scalar(domain.clone())),
+                    domain,
+                    domain_predicate,
+                };
+                output.retain(mask);
+                output
+            }
+            _ => panic!("Restrict: predicate must produce a SealedFunction tile"),
+        }
+    }
+
+    fn release(&mut self, obsolete_guard: TileGuard) {
+        debug!("{} release: {obsolete_guard:?}", self.name());
+        self.predicate.release(obsolete_guard);
+    }
+}
+
 /// Reduces a `SealedFunction` input to a single scalar via an aggregation operation.
 ///
 /// On each `get`, reads all codomain values from the input and folds them into a
@@ -2146,19 +2258,17 @@ struct SplitShared {
 /// Allows for creating multiple TileOperators that all point to the same
 /// underlying operator.  Call [`Split::split`] to get additional handles;
 /// subscribing to any handle will reuse the same inner producer.
-pub struct Split {
+pub struct Splitter {
     input: Rc<RefCell<Box<dyn TileOperator>>>,
     tiling: Tiling,
     /// All mutable shared state.  Created eagerly so that clones produced by
     /// [`Split::split`] always share the same object.
     shared: Rc<RefCell<SplitShared>>,
-    /// True for the original handle returned by [`Split::new`]; false for
-    /// every copy returned by [`Split::split`].  The primary renders its input
-    /// subtree in inspect; copies emit a back-reference.
-    primary: bool,
+    /// Whether any Splits have been created yet.
+    used: RefCell<bool>,
 }
 
-impl Split {
+impl Splitter {
     /// Construct a new `Split` wrapping `input`.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
@@ -2172,21 +2282,38 @@ impl Split {
             input: Rc::new(RefCell::new(input)),
             tiling,
             shared,
-            primary: true,
+            used: RefCell::new(false),
         }
     }
 
     /// Return a new handle to the same split.  All handles share the same
     /// inner producer and consumer list; subscribing to any of them is
     /// equivalent.
-    pub fn split(&self) -> Self {
-        Self {
+    pub fn split(&self) -> Box<dyn TileOperator> {
+        let result = Split {
             input: self.input.clone(),
             tiling: self.tiling.clone(),
             shared: self.shared.clone(), // shares the Rc — always connected
-            primary: false,
-        }
+            primary: !*self.used.borrow(),
+        };
+        *self.used.borrow_mut() = true;
+        Box::new(result)
     }
+
+    pub fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+}
+
+struct Split {
+    input: Rc<RefCell<Box<dyn TileOperator>>>,
+    tiling: Tiling,
+    /// All mutable shared state.  Created eagerly so that clones produced by
+    /// [`Split::split`] always share the same object.
+    shared: Rc<RefCell<SplitShared>>,
+    /// True for the first handle returned by [`Splitter::split`], false for subsequent ones.
+    /// The primary renders its input subtree in inspect; copies emit a back-reference.
+    primary: bool,
 }
 
 impl TileOperator for Split {

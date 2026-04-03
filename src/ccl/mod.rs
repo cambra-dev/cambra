@@ -971,7 +971,16 @@ impl Type {
         Type::Fun(Box::new(domain), Box::new(codomain))
     }
 
-    /// If this is a function type, return the codomain type, otherwise None
+    /// If this is a function type, return the domain type, otherwise None.
+    pub fn domain(&self) -> Option<Type> {
+        if let Type::Fun(domain, _) = &self {
+            Some(domain.as_ref().clone())
+        } else {
+            None
+        }
+    }
+
+    /// If this is a function type, return the codomain type, otherwise None.
     pub fn codomain(&self) -> Option<Type> {
         if let Type::Fun(_, codomain) = &self {
             Some(codomain.as_ref().clone())

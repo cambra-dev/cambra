@@ -29,11 +29,12 @@ See [docs/operational-semantics/summary.md](operational-semantics/summary.md) fo
 
 ```
 Python source
-  → parse   (rustpython_parser)
-  → lower   (ccl/lower.rs: Python AST → CCL Expr)
-  → infer        (ccl/infer.rs: limited type inference)
-  → lambda_elim  (ccl/lambda_elim.rs: lambda → point-free combinators)
-  → compile      (interpreter/compile_tile_operators.rs: CCL Expr → tile operators)
+  → parse            (rustpython_parser)
+  → lower            (ccl/lower.rs: Python AST → CCL Expr)
+  → infer            (ccl/infer.rs: type inference + check_fully_typed validation)
+  → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators)
+  → simplify         (ccl/simplify.rs: CCC algebraic rewrites to fixed point)
+  → operator_conversion  (interpreter/operator_conversion.rs: λ-free CCL → tile operators)
   → subscribe()
   → tile producer/consumer dataflow
 ```

@@ -456,6 +456,14 @@ projection morphisms and emits `TypeConstraint::TupleField` rather than `TypeCon
 so `reconcile_constraints` can merge multiple projections of the same parameter into a
 concrete `Tuple` type.
 
+### `Compose` inference
+
+N-ary `Compose([f₀, f₁, …, fₙ₋₁])` is inferred by chaining: each morphism's codomain is constrained equal to the next morphism's domain. The overall type is `Fun(domain(f₀), codomain(fₙ₋₁))`. This case arises when `infer` is run over output from `simplify`, which can produce `Compose` nodes.
+
+### `check_fully_typed` validation
+
+After `resolve`, `infer` calls `check_fully_typed(expr)` to assert that every `ty` and every `TypedBinding::ty` in the tree is a concrete type — no `Type::Hole` or `Type::Infer(_)` anywhere, including inside compound types like `Fun` or `Tuple`. Returns `InferError::UnresolvedHole` or `InferError::UnresolvedInfer(id)` on failure, with the symbolic representation of the offending expression for debugging.
+
 ### TODOs
 
 - Infer `Let.ty` from the type of `value` (required before `Let` nodes can be compiled; see §Compilation).
@@ -477,10 +485,17 @@ the Cartesian Closed Category (CCC) structure described in
 | `f ≫ g` | `BinOp { left: f, op: Compose, right: g }` |
 | `.n` (projection) | `Proj(ProjKey::Index(n))` |
 | `.field` | `Proj(ProjKey::Field("field"))` |
+| `a + b` (and other non-compose BinOps) | `Apply { argument: Tuple([a, b]), function: Var("add") }` |
+| `-x`, `not x` (UnaryOps) | `Apply { argument: x, function: Var("neg") }` |
+
+Non-compose `BinOp` and `UnaryOp` nodes are desugared uniformly to function
+application form so that operator conversion can treat all operations as
+combinators.  This applies at all levels: inside lambda bodies (via
+`elim_lambda`) and at the top level of a program (via `elim_lambdas`).
 
 ### Built-in combinators
 
-The output references the following `Var` names (not yet wired to operators):
+The output references the following `Var` names:
 
 | Name | Meaning |
 |---|---|
@@ -495,6 +510,10 @@ The output references the following `Var` names (not yet wired to operators):
 | `"restrict"` | domain restriction for filtered lambdas |
 | `"aggregate"` | fold/reduce |
 | `"converse"` | grouping by key |
+| `"add"`, `"sub"`, `"mul"`, `"floor_div"` | arithmetic operations |
+| `"eq"`, `"neq"`, `"lt"`, `"le"`, `"gt"`, `"ge"` | comparison operations |
+| `"and"`, `"or"`, `"xor"`, etc. | boolean operations |
+| `"neg"`, `"not_fn"` | unary operations |
 
 ### `zip` encoding
 
@@ -514,9 +533,28 @@ has `bound_ty: None` because the old annotation is stale and would be incorrect.
 
 ## Compilation
 
-The compilation pass (`interpreter/compile_tile_operators.rs`) transforms a fully-type-inferred
-CCL AST into the tile-dataflow operator representation. End-to-end pipeline tests live in
-`tests/compilation_pipeline.rs`.
+There are two compilation passes that translate CCL into tile-dataflow operators. End-to-end pipeline tests live in `tests/compilation_pipeline.rs`.
+
+**`interpreter/operator_conversion.rs`** — the primary compilation path for λ-free CCL produced by `lambda_elim` + `simplify`. Accepts a point-free expression and a `TileCompileContext` (variable scope). Translates each combinator directly:
+
+| CCL form | Operator |
+|---|---|
+| `Compose([f, g, …])` | sequential pipeline: output of each feeds next |
+| `zip(f, g)` | `Zip` fan-out over a shared `Splitter`-wrapped domain |
+| `id` | identity (pass-through) |
+| `const(c)` | `MapResultToConst` |
+| `map(g)` | `MapResult` |
+| `Proj(Index(n))` | `tuple_field(n)` projection |
+| `add`, `sub`, … | `apply_binop` |
+| `neg`, `not_fn` | `apply_unaryop` |
+| `restrict` | `Restrict` |
+| `Lit` | `Constant` scalar |
+| `Tuple([…])` | `ScalarTuple` (scalar) or `Zip` (with domain) |
+| `List([…])` | `MapResult` over index stream |
+| `Source(name)` | data-source operator |
+| `Let { binding, … }` | `Memo`-wrapped `Splitter` bound in scope |
+
+**`interpreter/compile_tile_operators.rs`** — the older, deprecated compilation path that handles the full CCL AST including `Lambda` nodes (for the CHL pipeline). `Split` was renamed to `Splitter` and internal helpers made `pub(crate)` to allow `operator_conversion` to share context types.
 
 ### `Let` nodes compile to a dedicated `Let` operator
 
@@ -598,3 +636,13 @@ The bound variable is subscribed to `definition` exactly once via a `VarProducer
      `tests/type_check.rs`: `if/else`, `elif`, ternary integration tests. ✓
    - `ccl/lambda_elim.rs`: lambda elimination pass; CCC rewrite rules eliminating all `Lambda` nodes
      into point-free combinators (`BinOpKind::Compose`, `Expr::Proj`, built-in `Var` names). ✓
+   - `ccl/infer.rs` + `ccl/unify.rs`: `constrain_equal` moved onto `UnificationTable`; `check_fully_typed`
+     post-inference validation pass; `UnresolvedHole`/`UnresolvedInfer` error variants; improved `Proj`
+     inference (structured domain types for index 0/1); `infer_compose` for N-ary `Compose` nodes. ✓
+   - `ccl/lambda_elim.rs`: top-level `elim_lambdas` desugars non-compose `BinOp` and `UnaryOp` nodes to
+     `Apply`-form so `operator_conversion` treats all operations uniformly as combinators; `typed_tuple`
+     helper auto-types tuple nodes from element types; `zip_pair` now fully types its outer `Apply` node. ✓
+   - `interpreter/operator_conversion.rs`: new primary compilation path for λ-free CCL; translates
+     point-free expressions directly to tile operators without needing to handle `Lambda` nodes. ✓
+   - `interpreter/compile_tile_operators.rs`: `Split` renamed to `Splitter`; context types and
+     `compile_tile_inner` made `pub(crate)` to allow sharing with `operator_conversion`. ✓

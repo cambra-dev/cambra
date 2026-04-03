@@ -84,22 +84,6 @@ impl UnificationTable {
         Self::default()
     }
 
-    /// Register a fresh inference variable, allocating its slot.
-    ///
-    /// Must be called before any other method is used on `id`.
-    /// Calling `register` twice for the same `id` is a no-op.
-    pub fn register(&mut self, id: InferVarId) {
-        let idx = id.0 as usize;
-        // Grow the backing vec if needed.
-        if idx >= self.entries.len() {
-            self.entries.resize_with(idx + 1, || None);
-        }
-        // Only initialise if not already present.
-        if self.entries[idx].is_none() {
-            self.entries[idx] = Some(Entry::Root(None));
-        }
-    }
-
     /// Path-compressing find: returns the canonical representative for `id`.
     ///
     /// Traverses `Link` chains, then updates all traversed entries to point
@@ -140,6 +124,10 @@ impl UnificationTable {
     pub fn set(&mut self, id: InferVarId, ty: Type) {
         let root = self.find(id);
         let existing = self.probe(root);
+        trace!(
+            "Setting variable #{id} to type {ty} with root #{root} (existing: {})",
+            existing.as_ref().map_or("?".to_string(), |t| t.to_string())
+        );
 
         // For PartialTuple/PartialRecord, merge entries instead of overwriting.
         // This lets a variable constrained by multiple projections (e.g. `.0` and
@@ -196,6 +184,7 @@ impl UnificationTable {
 
         let idx = root.0 as usize;
         if idx < self.entries.len() {
+            trace!("Storing type {to_store} for root #{root}");
             self.entries[idx] = Some(Entry::Root(Some(to_store)));
         }
     }
@@ -215,11 +204,7 @@ impl UnificationTable {
 
     /// Allocate a fresh [`InferVarId`] and immediately register it in this table.
     ///
-    /// Combines allocation and registration into one step. Only available in
-    /// tests — production code must go through
-    /// [`crate::ccl::infer::TypeInferenceContext::fresh_infer_var`], which also
-    /// registers variables here but does so via the inference context.
-    #[cfg(test)]
+    /// Combines allocation and registration into one step
     pub fn fresh_var(&mut self) -> InferVarId {
         let id = crate::ccl::fresh_infer_var_id();
         self.register(id);
@@ -236,7 +221,7 @@ impl UnificationTable {
     /// Returns `Err((ty_a, ty_b))` if both variables are already solved to
     /// *different* types — this indicates a type conflict in the program being
     /// compiled.
-    pub fn unify(&mut self, a: InferVarId, b: InferVarId) -> Result<(), (Type, Type)> {
+    pub fn unify(&mut self, a: InferVarId, b: InferVarId) -> Result<(), InferError> {
         let root_a = self.find(a);
         let root_b = self.find(b);
         if root_a == root_b {
@@ -253,9 +238,43 @@ impl UnificationTable {
                     self.entries[idx_a] = Some(Entry::Link(root_b));
                 }
             }
+            (Some(Type::PartialTuple(mut a_elts)), Some(Type::PartialTuple(mut b_elts))) => {
+                a_elts.sort_by(|(l, _), (r, _)| l.cmp(r));
+                b_elts.sort_by(|(l, _), (r, _)| l.cmp(r));
+                let idx_a = root_a.0 as usize;
+                let idx_b = root_b.0 as usize;
+                let mut i_a = a_elts.iter();
+                let mut i_b = b_elts.iter();
+                let mut elts = Vec::new();
+                let mut a = i_a.next();
+                let mut b = i_b.next();
+                while a.is_some() || b.is_some() {
+                    if b.is_none() || a.is_some() && a.unwrap().0 < b.unwrap().0 {
+                        elts.push(a.unwrap().clone());
+                        a = i_a.next();
+                    } else if a.is_none() || b.is_some() && b.unwrap().0 < a.unwrap().0 {
+                        elts.push(b.unwrap().clone());
+                        b = i_b.next();
+                    } else {
+                        self.constrain_equal(&a.unwrap().1, &b.unwrap().1)?;
+                        elts.push(a.unwrap().clone());
+                        a = i_a.next();
+                        b = i_b.next();
+                    }
+                }
+                let result = Type::PartialTuple(elts);
+                self.entries[idx_a] = Some(Entry::Root(Some(result)));
+                self.entries[idx_b] = Some(Entry::Link(root_a));
+            }
+            // TODO implement the above logic for records too.
             (Some(ty_a), Some(ty_b)) => {
                 if ty_a != ty_b {
-                    return self.constrain_equal(&ty_a, &ty_b).or(Err((ty_a, ty_b)));
+                    return self
+                        .constrain_equal(&ty_a, &ty_b)
+                        .or(Err(InferError::TypeMismatch {
+                            type_a: ty_a,
+                            type_b: ty_b,
+                        })?);
                 }
                 // Both solved to the same type — link b to a (idempotent).
                 let idx_b = root_b.0 as usize;
@@ -285,8 +304,7 @@ impl UnificationTable {
         trace!("Constraining {a} and {b}");
         match (a, b) {
             (Type::Infer(a_id), Type::Infer(b_id)) => {
-                self.unify(*a_id, *b_id)
-                    .map_err(|(type_a, type_b)| InferError::TypeMismatch { type_a, type_b })?;
+                self.unify(*a_id, *b_id)?;
                 Ok(())
             }
             (Type::Infer(id), concrete) | (concrete, Type::Infer(id)) => {
@@ -312,19 +330,35 @@ impl UnificationTable {
             (Type::Fun(a_domain, a_codomain), Type::Fun(b_domain, b_codomain)) => self
                 .constrain_equal(a_domain, b_domain)
                 .and(self.constrain_equal(a_codomain, b_codomain)),
-            // Constrain tuples index-wise.  Implicitly allow tuples of non-equal size,
-            // ignoring unmatched indices
-            (Type::Tuple(a), Type::Tuple(b)) => a
-                .iter()
-                .zip(b.iter())
-                .try_for_each(|(a, b)| self.constrain_equal(a, b)),
-            // Constrain tuples field-wise.  Implicitly allow mismatched records, ignoring
-            // unmatched fields
+            // Constrain tuples index-wise.
+            (Type::Tuple(a), Type::Tuple(b)) => {
+                if a.len() != b.len() {
+                    return Err(InferError::TypeMismatch {
+                        type_a: Type::Tuple(a.clone()),
+                        type_b: Type::Tuple(b.clone()),
+                    });
+                };
+                a.iter()
+                    .zip(b.iter())
+                    .try_for_each(|(a, b)| self.constrain_equal(a, b))
+            }
+            // Constrain records field-wise
             (Type::Record(a), Type::Record(b)) => {
+                if a.len() != b.len() {
+                    return Err(InferError::TypeMismatch {
+                        type_a: Type::Record(a.clone()),
+                        type_b: Type::Record(b.clone()),
+                    });
+                };
                 let a_map: HashMap<_, _> = a.iter().cloned().collect();
                 for (f, b_ty) in b.iter() {
                     if let Some(a_ty) = a_map.get(f) {
                         self.constrain_equal(a_ty, b_ty)?;
+                    } else {
+                        return Err(InferError::TypeMismatch {
+                            type_a: Type::Record(a.clone()),
+                            type_b: Type::Record(b.clone()),
+                        });
                     }
                 }
                 Ok(())
@@ -406,6 +440,22 @@ impl UnificationTable {
                 type_a: type_a.clone(),
                 type_b: type_b.clone(),
             }),
+        }
+    }
+
+    /// Register a fresh inference variable, allocating its slot.
+    ///
+    /// Must be called before any other method is used on `id`.
+    /// Calling `register` twice for the same `id` is a no-op.
+    fn register(&mut self, id: InferVarId) {
+        let idx = id.0 as usize;
+        // Grow the backing vec if needed.
+        if idx >= self.entries.len() {
+            self.entries.resize_with(idx + 1, || None);
+        }
+        // Only initialise if not already present.
+        if self.entries[idx].is_none() {
+            self.entries[idx] = Some(Entry::Root(None));
         }
     }
 }
@@ -707,9 +757,11 @@ mod tests {
         table.set(b, Type::Base(BaseType::String));
         let result = table.unify(a, b);
         assert!(result.is_err());
-        let (ty_a, ty_b) = result.unwrap_err();
-        assert_eq!(ty_a, Type::Base(BaseType::Int));
-        assert_eq!(ty_b, Type::Base(BaseType::String));
+        let InferError::TypeMismatch { type_a, type_b } = result.unwrap_err() else {
+            panic!("Expected error")
+        };
+        assert_eq!(type_a, Type::Base(BaseType::Int));
+        assert_eq!(type_b, Type::Base(BaseType::String));
     }
 
     // ---------------------------------------------------------------------------

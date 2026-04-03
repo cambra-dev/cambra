@@ -17,12 +17,15 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use bit_vec::BitVec;
 use cambra::ccl::{context::GlobalContext, Type};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
     sort_sealed_function_by_domain, tuple_field, BaseType, ColumnValue, Consumer, Extent,
     FuncBinding, FunctionGuard, Predicate, TestDataSource, Tile, TileGuard, Value,
 };
+use cambra::pretty_graph::pretty_tile_operator;
+use log::debug;
 use rstest_log::rstest;
 use smol_str::SmolStr;
 
@@ -819,4 +822,181 @@ fn test_incremental_aggregates() {
             domain_predicate: Predicate::True
         })
     );
+}
+
+#[rstest]
+#[case("1", "1:Int", Tile::Scalar(ColumnValue::Ints(vec![1])))]
+#[case("1 + 2", "(1, 2) ▷ add:Int", Tile::Scalar(ColumnValue::Ints(vec![3])))]
+#[case(
+    "1 + 2 - 3 * 4",
+    "((1, 2) ▷ add, (3, 4) ▷ mul) ▷ sub:Int",
+    Tile::Scalar(ColumnValue::Ints(vec![-9]))
+)]
+#[case(
+    "[1,2,3]",
+    "[1, 2, 3]:[0, 3) ⇒ Int",
+    make_int_list(&[1,2,3])
+)]
+#[case(
+    "x = [1,2,3]; x",
+    "let x : [0, 3) ⇒ Int = [1, 2, 3]\nin x:[0, 3) ⇒ Int",
+    make_int_list(&[1,2,3])
+)]
+#[case(
+    "x = [1,2,3]; [y + 10 for y in x]",
+    "let x : [0, 3) ⇒ Int = [1, 2, 3]\nin x ≫ (id, 10 ▷ const) ▷ zip ≫ add:[0, 3) ⇒ Int",
+    make_int_list(&[11,12,13])
+)]
+#[case(
+    "[x + 10 + x for x in [1,2,3]]",
+    "[1, 2, 3] ≫ ((id, 10 ▷ const) ▷ zip ≫ add, id) ▷ zip ≫ add:[0, 3) ⇒ Int",
+    make_int_list(&[12,14,16])
+)]
+#[case(
+    "y = 10; [x + y for x in [1,2,3]]",
+    "let y : Int = 10\nin [1, 2, 3] ≫ (id, y ▷ const) ▷ zip ≫ add:[0, 3) ⇒ Int",
+    make_int_list(&[11,12,13])
+)]
+#[case(
+    "[x for x in [False,True] if x]",
+    "[false, true]:{[0, 2) | Refined(x)} ⇒ Bool",
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![1]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Bools(BitVec::from_elem(1, true)))),
+        domain_predicate: Predicate::True,
+    },
+)]
+#[case(
+    "[x + 10 for x in [1,2,3] if x == 2]",
+    "[1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:{[0, 3) | Refined(x == 2)} ⇒ Int",
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![1]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![12]))),
+        domain_predicate: Predicate::True,
+    },
+)]
+#[case(
+    "[x + y for x in [1,2,3] for y in [10,20]]",
+    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:([0, 3), [0, 2)) ⇒ Int",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![11, 21, 12, 22, 13, 23]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ]))
+    }
+)]
+#[case(
+    "[(x, y) for x in [1,2,3] for y in [10,20]]",
+    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip:([0, 3), [0, 2)) ⇒ (Int, Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1])),
+        ])),
+        codomain: Box::new( Tile::Record(HashMap::from([
+            ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 20, 10, 20, 10, 20]))),
+            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 2, 3, 3]))),
+        ]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ]))
+    }
+)]
+#[case(
+    "[(x, y)[0] for x in [1,2,3] for y in [10,20]]",
+    ".0 ≫ [1, 2, 3]:([0, 3), [0, 2)) ⇒ Int",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 2, 3, 3]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ]))
+    }
+)]
+#[case(
+    "[x + y for x in [1,2,3] if x == 2 for y in [10,20] if y == 10]",
+    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:{([0, 3), [0, 2)) | Refined(x == 2 and y == 10)} ⇒ Int",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![1])),
+            ("_1".into(), ColumnValue::UInts(vec![0])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![12]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ]))
+    }
+)]
+#[case(
+    "[x for x in [x for x in [x for x in [1,2,3]]]]",
+    "[1, 2, 3]:[0, 3) ⇒ Int",
+    make_int_list(&[1,2,3])
+)]
+#[case(
+    "[x for x in [y for y in [1,2,3] if y < 3] if x < 2]",
+    "[1, 2, 3]:{{[0, 3) | Refined(y < 3)} | Refined(x < 2)} ⇒ Int",
+    make_int_list(&[1])
+)]
+#[case(
+    "[(x, x) for x in [(x, x) for x in [1,2,3]]]",
+    "[1, 2, 3] ≫ (id, id) ▷ zip ≫ (id, id) ▷ zip:[0, 3) ⇒ ((Int, Int), (Int, Int))",
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![0, 1, 2]),
+        codomain: Box::new(Tile::Record(HashMap::from([
+            ("_1".into(), Tile::Record(HashMap::from([
+                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+                ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            ]))),
+            ("_0".into(), Tile::Record(HashMap::from([
+                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+                ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            ]))),
+        ]))),
+        domain_predicate: Predicate::True,
+    }
+)]
+#[case(
+    "[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]",
+    "(.0 ≫ [\"a\", \"b\"], .1 ≫ [\"c\", \"d\", \"e\"]) ▷ zip ≫ concat:([0, 2), [0, 3)) ⇒ String",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 0, 1, 1, 1])),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 2, 0, 1, 2])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::strings(&["ac", "ad", "ae", "bc", "bd", "be"]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ]))
+    }
+)]
+fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expected_result: Tile) {
+    use cambra::ccl::{context::new_compile_program, symbolic::symbolic};
+
+    let mut ctx = GlobalContext::default();
+    let notified = Rc::new(RefCell::new(false));
+    let notified_clone = notified.clone();
+    let consumer: Box<dyn Consumer> = Box::new(move || {
+        *notified_clone.borrow_mut() = true;
+    });
+    let (expr, op, mut producer) = new_compile_program(&mut ctx, code, consumer);
+    assert_eq!(format!("{}:{}", symbolic(&expr), expr.ty), expected_ccl);
+    debug!("Table:\n{}", ctx.inference_ctx().table);
+    debug!("Operators:\n{}", pretty_tile_operator(op.as_ref()));
+
+    ctx.scheduler().check_for_notifications();
+    assert!(*notified.borrow(), "expected notification (pipeline path)");
+    let result = producer.get(producer.tiling().universal_guard());
+    assert_eq!(result, expected_result);
 }

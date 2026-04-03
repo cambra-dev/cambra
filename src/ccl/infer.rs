@@ -23,13 +23,11 @@
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
-use log::debug;
-
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::BaseType;
 use crate::ccl::{
-    fresh_infer_var_id, unify::UnificationTable, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey,
-    RefinementKind, Type, TypedExprNode, UnaryOpKind,
+    unify::UnificationTable, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey, RefinementKind,
+    Type, TypedExprNode, UnaryOpKind,
 };
 use crate::util::ScopeStack;
 
@@ -111,9 +109,7 @@ impl TypeInferenceContext {
     /// a new variable during inference — the table entry is required for the
     /// post-inference resolution pass.
     pub fn fresh_infer_var(&mut self) -> InferVarId {
-        let id = fresh_infer_var_id();
-        self.table.register(id);
-        id
+        self.table.fresh_var()
     }
 
     /// Register the CCL type for an externally-managed data source.
@@ -487,12 +483,14 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
         // `PartialRecord({x => ?a}) ⇒ ?a`.  These partial domain types unify
         // correctly with any concrete `Tuple`/`Record` during application.
         TypedExprNode::Proj(key) => {
+            let domain_infer = Type::Infer(ctx.fresh_infer_var());
             let field_ty = Type::Infer(ctx.fresh_infer_var());
             let domain_ty = match key {
                 ProjKey::Index(idx) => Type::PartialTuple(vec![(*idx, field_ty.clone())]),
                 ProjKey::Field(name) => Type::PartialRecord(vec![(name.clone(), field_ty.clone())]),
             };
-            Ok(Type::fun(domain_ty, field_ty))
+            ctx.constrain_equal(&domain_infer, &domain_ty)?;
+            Ok(Type::fun(domain_infer, field_ty))
         }
 
         // ----- GroupBy -----
@@ -646,6 +644,7 @@ fn infer_lambda(
     let body_ty = {
         let mut scoped = ctx.enter_scope();
         scoped.bind(&param_name, param.ty.clone());
+        collect_constraints(&param_name, &param.ty, body, &mut scoped)?;
         infer_expr(body, &mut scoped)?
     };
     // Post-inference: for a bare Infer param, validate the annotation against body
@@ -685,6 +684,107 @@ fn infer_lambda(
     Ok(Type::Fun(Box::new(domain), Box::new(body_ty)))
 }
 
+/// Constrain a lambda param equal to all of it's usages in the lambda body.
+/// TODO: we probably shouldn't need this, but our handling of refinements is sketchy
+/// right now and the order in which constraints are added to the unification table
+/// affects whether or not refinements get dropped.  Once we have proper refinement
+/// unification this should be unnecessary.
+fn collect_constraints(
+    param: &str,
+    param_ty: &Type,
+    body: &mut Expr,
+    ctx: &mut TypeInferenceContext,
+) -> Result<(), InferError> {
+    match &mut body.node {
+        TypedExprNode::Apply { function, argument } => {
+            // If argument is Var(param), the domain of function's type is the constraint.
+            match &argument.node {
+                TypedExprNode::Var(v) if v == param => {
+                    if let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx) {
+                        ctx.constrain_equal(param_ty, domain.as_ref())?;
+                        // Don't recurse: function was already inferred (possibly mutated),
+                        // and argument = Var(param) has no sub-patterns to search.
+                        return Ok(());
+                    }
+                }
+                // Apply(Proj(Index(n)), Var(param)) — tuple field projection.
+                TypedExprNode::Apply {
+                    function: proj_fn,
+                    argument: proj_arg,
+                } => {
+                    if let TypedExprNode::Proj(ProjKey::Index(idx)) = &proj_fn.node {
+                        if matches!(&proj_arg.node, TypedExprNode::Var(v) if v == param) {
+                            if let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx) {
+                                ctx.constrain_equal(
+                                    param_ty,
+                                    &Type::PartialTuple(vec![(*idx, *domain.clone())]),
+                                )?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                // infer failed or returned a non-Fun type; fall through to recursive search.
+                _ => {}
+            }
+            // Need to split borrows — collect separately on each child.
+            // We can't hold `&mut body.node` while calling collect_constraints_into on parts.
+            // So we reborrow here by calling the function with the child nodes directly.
+            // The match already extracted function and argument as mutable refs.
+            collect_constraints(param, param_ty, function, ctx)?;
+            collect_constraints(param, param_ty, argument, ctx)?;
+            Ok(())
+        }
+
+        // Don't recurse into a lambda that shadows param.
+        TypedExprNode::Lambda {
+            param: lam_param,
+            body: lam_body,
+            ..
+        } => {
+            if lam_param.name != param {
+                collect_constraints(param, param_ty, lam_body, ctx)?;
+            }
+            Ok(())
+        }
+
+        TypedExprNode::Let {
+            binding,
+            bound_expr: value,
+            body: let_body,
+            ..
+        } => {
+            // Always search the value: it is evaluated in the outer scope, so
+            // `param` is still in play even if `binding.name == param`.
+            collect_constraints(param, param_ty, value, ctx)?;
+            // Don't recurse into `body` when `binding.name == param`: the let-binding
+            // shadows `param` there, mirroring the Lambda shadowing guard above.
+            if binding.name != param {
+                collect_constraints(param, param_ty, let_body, ctx)?;
+            }
+            Ok(())
+        }
+
+        TypedExprNode::BinOp { left, right, .. } => {
+            collect_constraints(param, param_ty, left, ctx)?;
+            collect_constraints(param, param_ty, right, ctx)?;
+            Ok(())
+        }
+
+        TypedExprNode::UnaryOp(_, inner) => collect_constraints(param, param_ty, inner, ctx),
+
+        TypedExprNode::Tuple(elts) => {
+            for elt in elts {
+                collect_constraints(param, param_ty, elt, ctx)?;
+            }
+            Ok(())
+        }
+
+        // Leaf nodes with no sub-expressions to search.
+        _ => Ok(()),
+    }
+}
+
 /// Infer the type of a [`TypedExprNode::Apply`] node.
 ///
 /// If the function is an unannotated lambda, annotates its parameter type from
@@ -720,7 +820,6 @@ fn infer_apply(
         // directly look up the projected element type to improve inference.
         TypedExprNode::Proj(key) => match (key, &arg_ty) {
             (ProjKey::Index(idx), Type::Tuple(types)) => {
-                debug!("matched {idx} with types {types:#?}");
                 let proj_ty = types.get(*idx).cloned();
                 if let Some(proj_ty) = proj_ty {
                     maybe_codomain_ty = Some(proj_ty);
@@ -2465,7 +2564,7 @@ mod tests {
         assert_eq!(ty, Type::Base(BaseType::Int));
     }
 
-    /// A bare `Proj(Index(n))` has domain type `PartialTuple({n => ?a})`.
+    /// A bare `Proj(Index(n))` has domain type `PartialTuple({n => ?a})` after being resolved.
     #[test]
     fn test_bare_proj_index_has_partial_tuple_domain() {
         let mut ctx = TypeInferenceContext::new();
@@ -2475,17 +2574,19 @@ mod tests {
         let ty = infer_expr(&mut expr, &mut ctx).unwrap();
         // Expect Fun(PartialTuple([...]), ?) — domain must be a PartialTuple with one entry at 3.
         match ty {
-            Type::Fun(domain, _) => {
-                assert!(
-                    matches!(*domain, Type::PartialTuple(ref entries) if entries.len() == 1 && entries[0].0 == 3),
-                    "expected PartialTuple with index 3, got {domain}"
-                );
-            }
+            Type::Fun(domain, _) => match domain.as_ref() {
+                Type::Infer(id) => match ctx.table.probe(*id) {
+                    Some(Type::PartialTuple(entries))
+                        if entries.len() == 1 && entries[0].0 == 3 => {}
+                    other => panic!("expected PartialTuple with index 3, got {other:?}"),
+                },
+                other => panic!("expected Infer type for Proj, got {other:?}"),
+            },
             other => panic!("expected Fun, got {other}"),
         }
     }
 
-    /// A bare `Proj(Field("z"))` has domain type `PartialRecord({"z" => ?a})`.
+    /// A bare `Proj(Field("z"))` has domain type `PartialRecord({"z" => ?a})` after being resolved.
     #[test]
     fn test_bare_proj_field_has_partial_record_domain() {
         let mut ctx = TypeInferenceContext::new();
@@ -2494,12 +2595,14 @@ mod tests {
         // infer() would reject it via check_fully_typed. We only care about shape here.
         let ty = infer_expr(&mut expr, &mut ctx).unwrap();
         match ty {
-            Type::Fun(domain, _) => {
-                assert!(
-                    matches!(*domain, Type::PartialRecord(ref entries) if entries.len() == 1 && entries[0].0 == "z"),
-                    "expected PartialRecord with field z, got {domain}"
-                );
-            }
+            Type::Fun(domain, _) => match domain.as_ref() {
+                Type::Infer(id) => match ctx.table.probe(*id) {
+                    Some(Type::PartialRecord(entries))
+                        if entries.len() == 1 && entries[0].0 == "z" => {}
+                    other => panic!("expected PartialTuple with index 3, got {other:?}"),
+                },
+                other => panic!("expected Infer type for Proj, got {other:?}"),
+            },
             other => panic!("expected Fun, got {other}"),
         }
     }

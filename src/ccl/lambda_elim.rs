@@ -39,8 +39,14 @@
 //! | `compose` | `Var("compose")` | composition as first-class morphism |
 //! | `zip` | `Var("zip")` | pointwise pairing of two functions |
 
+use log::debug;
+
 use crate::ccl::simplify::simplify;
-use crate::ccl::{BinOpKind, Branch, Expr, RefinementKind, Type, TypedExpr, TypedExprNode};
+use crate::ccl::AggregateKind;
+use crate::ccl::{
+    symbolic::symbolic, BaseType, BinOpKind, Branch, Expr, RefinementKind, Type, TypedExpr,
+    TypedExprNode,
+};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -75,7 +81,8 @@ impl std::fmt::Display for LambdaElimError {
 pub fn run(expr: Expr) -> Result<Expr, LambdaElimError> {
     let mut ctx = ElimContext::new();
     let point_free = elim_lambdas(&mut ctx, expr)?;
-    Ok(simplify(point_free))
+    let simplified = simplify(point_free);
+    Ok(simplified)
 }
 
 // ---------------------------------------------------------------------------
@@ -125,21 +132,53 @@ pub(crate) fn compose(f: Expr, g: Expr) -> Expr {
     Expr::compose(vec![f, g])
 }
 
+/// Build a [`TypedExprNode::Tuple`] whose type is inferred from its elements.
+///
+/// Sets the node's type to `Type::Tuple([e.ty for e in elts])`, using
+/// [`Type::Hole`] for any element whose type is not yet known.
+pub(crate) fn typed_tuple(elts: Vec<Expr>) -> Expr {
+    let ty = Type::Tuple(elts.iter().map(|e| e.ty.clone()).collect());
+    Expr::tuple(elts).with_ty(ty)
+}
+
 /// Build `⟨f, g⟩`: the product/fanout `zip(f, g)` using the `zip` built-in.
 ///
 /// Represented as `Apply { argument: Tuple([f, g]), function: Var("zip") }`,
-/// i.e. `(f, g) ▷ zip`.
+/// i.e. `(f, g) ▷ zip`.  Annotates all nodes with concrete types when
+/// available.
 pub(crate) fn zip_pair(f: Expr, g: Expr) -> Expr {
-    Expr::apply(Expr::tuple(vec![f, g]), Expr::var("zip"))
+    let result_ty = zip_pair_ty(&f, &g);
+    let inner_tuple = typed_tuple(vec![f, g]);
+    let zip_fn_ty = fun_ty_or_hole(&inner_tuple.ty, &result_ty);
+    let zip_var = Expr::var("zip").with_ty(zip_fn_ty);
+    Expr::apply(inner_tuple, zip_var).with_ty(result_ty)
 }
 
 /// Build `curry(f)`: `f ▷ curry` = `Apply { argument: f, function: Var("curry") }`.
+///
+/// Annotates the `curry` var with its type when `f` has a concrete function type.
 pub(crate) fn curry(f: Expr) -> Expr {
-    Expr::apply(f, Expr::var("curry"))
+    // If f: Tuple([A, B]) → C, then curry(f): A → (B → C)
+    let curry_result = match &f.ty {
+        Type::Fun(domain, codomain) => match domain.as_ref() {
+            Type::Tuple(elts) if elts.len() >= 2 => Type::fun(
+                elts[0].clone(),
+                Type::fun(elts[1].clone(), *codomain.clone()),
+            ),
+            _ => Type::Hole,
+        },
+        _ => Type::Hole,
+    };
+    let curry_fn_ty = fun_ty_or_hole(&f.ty, &curry_result);
+    let curry_var = Expr::var("curry").with_ty(curry_fn_ty);
+    Expr::apply(f, curry_var).with_ty(curry_result)
 }
 
 /// Build `const(c)`: `c ▷ const` = `Apply { argument: c, function: Var("const") }`.
-pub(crate) fn const_(c: Expr) -> Expr {
+///
+/// Leaves the `const` var untyped; use the typed inline form in `elim_lambda`
+/// when the result type (param domain) is known.
+pub fn const_(c: Expr) -> Expr {
     Expr::apply(c, Expr::var("const"))
 }
 
@@ -398,20 +437,33 @@ fn op_function_name(op: &BinOpKind) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Predicate refinement desugaring
-// ---------------------------------------------------------------------------
+/// Compute `Fun(domain, codomain)`, returning [`Type::Hole`] if either
+/// component is [`Type::Hole`] or [`Type::Infer`].
+///
+/// Used throughout lambda elimination to set result types only when concrete
+/// type information is available, leaving [`Type::Hole`] otherwise so the
+/// post-elimination inference pass can fill in the gaps without conflict.
+pub(crate) fn fun_ty_or_hole(domain: &Type, codomain: &Type) -> Type {
+    if matches!(domain, Type::Hole | Type::Infer(_))
+        || matches!(codomain, Type::Hole | Type::Infer(_))
+    {
+        Type::Hole
+    } else {
+        Type::fun(domain.clone(), codomain.clone())
+    }
+}
 
-/// Desugar a predicate-refined lambda into a composition with `restrict`.
+/// Compute the type of `zip(f, g): A → (B, C)` from `f: A → B` and `g: A → C`.
 ///
-/// `λ p | pred → body`  becomes  `(λp→pred) ▷ restrict ≫ (λp→body)`
-///
-/// Used by both [`elim_lambda`] (nested-lambda rule) and [`elim_lambdas`]
-/// (top-level refined lambda).
-fn desugar_predicate_refinement(param: &str, pred: Expr, body: Expr) -> Expr {
-    let pred_lam = Expr::lambda(param, Type::Hole, pred);
-    let body_lam = Expr::lambda(param, Type::Hole, body);
-    compose(Expr::apply(pred_lam, Expr::var("restrict")), body_lam)
+/// Returns [`Type::Hole`] if either argument does not have a concrete function
+/// type; inference will fill in the gaps in that case.
+pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr) -> Type {
+    match (&f.ty, &g.ty) {
+        (Type::Fun(a, b), Type::Fun(_, c)) => {
+            Type::fun(*a.clone(), Type::Tuple(vec![*b.clone(), *c.clone()]))
+        }
+        _ => Type::Hole,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -422,23 +474,43 @@ fn desugar_predicate_refinement(param: &str, pred: Expr, body: Expr) -> Expr {
 /// a free variable along the way. Lambdas that are constant in `param` are not
 /// eliminated.
 ///
+/// `param_ty` is the type of the lambda parameter being eliminated. It is used
+/// to set [`TypedExpr::ty`] on every new expression created, so that the
+/// post-elimination type-inference pass has concrete type anchors to work from.
+///
 /// **Precondition**: `body` must not itself be the lambda being eliminated —
 /// i.e. this function is called on the body of a `Lambda { param, body, .. }`.
-fn elim_lambda(ctx: &mut ElimContext, param: &str, body: Expr) -> Result<Expr, LambdaElimError> {
+fn elim_lambda(
+    ctx: &mut ElimContext,
+    param: &str,
+    param_ty: &Type,
+    body: Expr,
+) -> Result<Expr, LambdaElimError> {
+    debug!(
+        "elim_lambda: eliminating {param} from {} with param_ty={param_ty:?}",
+        symbolic(&body)
+    );
+    // Capture the body's type before consuming it; the result of eliminating
+    // `λ param → body` is a morphism `param_ty → body_ty`.
+    let body_ty = body.ty.clone();
+    let result_ty = fun_ty_or_hole(param_ty, &body_ty);
+
     // Constant: λ x → e  ⟹  const(e)  when x ∉ fv(e)
     // Checked before pattern-matching because a nested lambda that does not
     // reference param should also be treated as a constant.
     if !is_free(param, &body) {
-        return Ok(const_(body));
+        // const: T → (A → T) where T = body.ty and result_ty = A → T
+        let const_fn_ty = fun_ty_or_hole(&body.ty, &result_ty);
+        let const_var = Expr::var("const").with_ty(const_fn_ty);
+        return Ok(Expr::apply(body, const_var).with_ty(result_ty));
     }
 
-    // Extract node, preserving ty/user_annotation for potential later use
     let TypedExpr {
         node: body_node, ..
     } = body;
-    match body_node {
+    let result = match body_node {
         // Identity: λ x → x  ⟹  id
-        TypedExprNode::Var(ref name) if name == param => Ok(id()),
+        TypedExprNode::Var(ref name) if name == param => Ok(id().with_ty(result_ty)),
 
         // Nested lambda: λ x → λ y → body  ⟹  curry(λ(x,y) → body)
         TypedExprNode::Lambda {
@@ -447,13 +519,21 @@ fn elim_lambda(ctx: &mut ElimContext, param: &str, body: Expr) -> Result<Expr, L
             refinement,
         } => {
             let y = y_binding.name;
-            // If the inner lambda has a predicate refinement, desugar it first:
-            // λ y | pred → b  becomes  (λy→pred) ▷ restrict ≫ (λy→b)
+            let y_ty = y_binding.ty.clone();
             let desugared_inner = if let Some(ref r) = refinement {
                 match &r.kind {
                     RefinementKind::Predicate(pred_rc) => {
-                        let pred = pred_rc.borrow().clone();
-                        desugar_predicate_refinement(&y, pred, *inner_body)
+                        let mut pred = pred_rc.borrow_mut();
+                        *pred = elim_lambdas(ctx, pred.clone())?;
+                        // Desugar, preserving the lambda's type on the result.
+                        let param_name = y.clone();
+                        let param_ty = y_ty.clone();
+                        Expr::lambda(
+                            &param_name,
+                            Type::Refinement(Box::new(param_ty), r.clone()),
+                            *inner_body,
+                        )
+                        .with_ty(result_ty.clone())
                     }
                     RefinementKind::HashJoin(_) => {
                         return Err(LambdaElimError::Unsupported(
@@ -466,18 +546,34 @@ fn elim_lambda(ctx: &mut ElimContext, param: &str, body: Expr) -> Result<Expr, L
             };
 
             // Merge λ x → λ y into λ __pair where x = pair[0], y = pair[1].
+            // The pair variable has type (param_ty, y_ty).
             let pair = ctx.fresh_pair_name();
-            let sub_x = Expr::apply(Expr::var(&pair), Expr::proj_index(0));
-            let sub_y = Expr::apply(Expr::var(&pair), Expr::proj_index(1));
+            let pair_ty = Type::Tuple(vec![param_ty.clone(), y_ty.clone()]);
+            // Annotate the projection morphisms with their concrete types so that
+            // downstream type computations (e.g. zip_pair_ty) can see the domain.
+            let proj0_ty = Type::fun(pair_ty.clone(), param_ty.clone());
+            let proj1_ty = Type::fun(pair_ty.clone(), y_ty.clone());
+            let sub_x = Expr::apply(Expr::var(&pair), Expr::proj_index(0).with_ty(proj0_ty))
+                .with_ty(param_ty.clone());
+            let sub_y =
+                Expr::apply(Expr::var(&pair), Expr::proj_index(1).with_ty(proj1_ty)).with_ty(y_ty);
             let merged = substitute(substitute(desugared_inner, &y, &sub_y), param, &sub_x);
-            Ok(curry(elim_lambda(ctx, &pair, merged)?))
+            let inner_elim = elim_lambda(ctx, &pair, &pair_ty, merged)?;
+            Ok(curry(inner_elim))
         }
 
         // Application: λ x → e ▷ f  ⟹  ⟨λx→e, λx→f⟩ ≫ apply
         TypedExprNode::Apply { argument, function } => {
-            let elim_arg = elim_lambda(ctx, param, *argument)?;
-            let elim_fn = elim_lambda(ctx, param, *function)?;
-            Ok(compose(zip_pair(elim_arg, elim_fn), Expr::var("apply")))
+            let elim_arg = elim_lambda(ctx, param, param_ty, *argument)?;
+            let elim_fn = elim_lambda(ctx, param, param_ty, *function)?;
+            let pair = zip_pair(elim_arg, elim_fn);
+            // apply: Tuple([B, B→C]) → C; its domain is the codomain of pair
+            let apply_ty = match &pair.ty {
+                Type::Fun(_, cod) => fun_ty_or_hole(cod, &body_ty),
+                _ => Type::Hole,
+            };
+            let apply_var = Expr::var("apply").with_ty(apply_ty);
+            Ok(compose(pair, apply_var).with_ty(result_ty))
         }
 
         // Compose in body: λ x → f ≫ g  ⟹  ⟨λx→f, λx→g⟩ ≫ compose
@@ -487,23 +583,55 @@ fn elim_lambda(ctx: &mut ElimContext, param: &str, body: Expr) -> Result<Expr, L
         TypedExprNode::Compose(elts) => {
             let mut elim_elts = elts
                 .into_iter()
-                .map(|e| elim_lambda(ctx, param, e))
+                .map(|e| elim_lambda(ctx, param, param_ty, e))
                 .collect::<Result<Vec<_>, _>>()?;
             // Fold pairwise from the left: ⟨e0, e1⟩ ≫ compose, then compose
             // the result with e2, etc.
             let mut acc = elim_elts.remove(0);
             for next in elim_elts {
-                acc = compose(zip_pair(acc, next), Expr::var("compose"));
+                let pair = zip_pair(acc, next);
+                // compose: Tuple([A→B, B→C]) → (A→C); domain = codomain of pair
+                let compose_ty = match &pair.ty {
+                    Type::Fun(_, cod) => match cod.as_ref() {
+                        Type::Tuple(elts) if elts.len() == 2 => match (&elts[0], &elts[1]) {
+                            (Type::Fun(a, _), Type::Fun(_, c)) => {
+                                fun_ty_or_hole(cod, &Type::fun(*a.clone(), *c.clone()))
+                            }
+                            _ => Type::Hole,
+                        },
+                        _ => Type::Hole,
+                    },
+                    _ => Type::Hole,
+                };
+                let compose_var = Expr::var("compose").with_ty(compose_ty);
+                acc = compose(pair, compose_var);
             }
-            Ok(acc)
+            Ok(acc.with_ty(result_ty))
         }
 
         // BinOp — desugar to Apply + Tuple, then apply the application rule.
         // a op b  ≡  (a, b) ▷ op_fn
-        TypedExprNode::BinOp { left, op, right } => {
+        TypedExprNode::BinOp {
+            left,
+            mut op,
+            right,
+        } => {
+            if op == BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add)
+                && left.ty == Type::Base(BaseType::String)
+            {
+                // Special case: string concatenation uses `concat` function, not `add`.
+                op = BinOpKind::Concat;
+            }
             let op_name = op_function_name(&op).to_string();
-            let desugared = Expr::apply(Expr::tuple(vec![*left, *right]), Expr::var(&op_name));
-            elim_lambda(ctx, param, desugared)
+            // Annotate the intermediate nodes so that when the Apply rule
+            // recurses into the argument Tuple, body_ty is concrete.
+            let left = *left;
+            let right = *right;
+            let tuple = typed_tuple(vec![left, right]);
+            let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
+            let fn_var = Expr::var(&op_name).with_ty(fn_ty);
+            let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
+            elim_lambda(ctx, param, param_ty, desugared)
         }
 
         // UnaryOp — desugar to Apply, then apply the application rule.
@@ -513,27 +641,37 @@ fn elim_lambda(ctx: &mut ElimContext, param: &str, body: Expr) -> Result<Expr, L
                 UnaryOpKind::Neg => "neg",
                 UnaryOpKind::Not => "not_fn",
             };
-            let desugared = Expr::apply(*inner, Expr::var(op_name));
-            elim_lambda(ctx, param, desugared)
+            let inner = *inner;
+            let fn_ty = fun_ty_or_hole(&inner.ty, &body_ty);
+            let fn_var = Expr::var(op_name).with_ty(fn_ty);
+            let desugared = Expr::apply(inner, fn_var).with_ty(body_ty);
+            elim_lambda(ctx, param, param_ty, desugared)
         }
 
         // Tuple: λ x → (e1, ..., en)  ⟹  zip(λx→e1, ..., λx→en)
         // In CCC, a tuple of morphisms is a product morphism ⟨f1, ..., fn⟩ = zip(f1, ..., fn).
         TypedExprNode::Tuple(elts) => {
-            let elim_elts: Result<Vec<_>, _> = elts
+            let elim_elts: Vec<Expr> = elts
                 .into_iter()
-                .map(|e| elim_lambda(ctx, param, e))
-                .collect();
-            Ok(Expr::apply(Expr::tuple(elim_elts?), Expr::var("zip")))
+                .map(|e| elim_lambda(ctx, param, param_ty, e))
+                .collect::<Result<_, _>>()?;
+            let inner_tuple = typed_tuple(elim_elts);
+            let zip_fn_ty = fun_ty_or_hole(&inner_tuple.ty, &result_ty);
+            let zip_var = Expr::var("zip").with_ty(zip_fn_ty);
+            Ok(Expr::apply(inner_tuple, zip_var).with_ty(result_ty))
         }
 
         // Record — analogous to Tuple, element-wise.
         TypedExprNode::Record(fields) => {
             let elim_fields: Result<Vec<_>, _> = fields
                 .into_iter()
-                .map(|(k, e)| elim_lambda(ctx, param, e).map(|r| (k, r)))
+                .map(|(k, e)| elim_lambda(ctx, param, param_ty, e).map(|r| (k, r)))
                 .collect();
-            Ok(TypedExpr::new(TypedExprNode::Record(elim_fields?)))
+            Ok(TypedExpr {
+                node: TypedExprNode::Record(elim_fields?),
+                ty: result_ty,
+                user_annotation: None,
+            })
         }
 
         // Let binding:
@@ -545,29 +683,30 @@ fn elim_lambda(ctx: &mut ElimContext, param: &str, body: Expr) -> Result<Expr, L
             body: let_body,
         } => {
             let v = binding.name;
-            let new_def = elim_lambda(ctx, param, *def)?;
+            let new_def = elim_lambda(ctx, param, param_ty, *def)?;
             // In the let body, each free occurrence of v is replaced by x ▷ v
             // (i.e. the renamed function v applied to the current argument x).
             let call_v = Expr::apply(Expr::var(param), Expr::var(&v));
             let substituted_body = substitute(*let_body, &v, &call_v);
-            let new_body = elim_lambda(ctx, param, substituted_body)?;
-            Ok(Expr::let_bind(v, new_def, new_body))
+            let new_body = elim_lambda(ctx, param, param_ty, substituted_body)?;
+            Ok(Expr::let_bind(v, new_def, new_body).with_ty(result_ty))
         }
 
         // List — treat like Tuple: eliminate param element-wise.
         TypedExprNode::List(elts) => {
             let elim_elts: Result<Vec<_>, _> = elts
                 .into_iter()
-                .map(|e| elim_lambda(ctx, param, e))
+                .map(|e| elim_lambda(ctx, param, param_ty, e))
                 .collect();
-            Ok(Expr::list(elim_elts?))
+            Ok(Expr::list(elim_elts?).with_ty(result_ty))
         }
 
         // Unsupported constructs.
         _ => Err(LambdaElimError::Unsupported(format!(
             "unsupported body kind in lambda elimination for param '{param}'"
         ))),
-    }
+    };
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -593,13 +732,20 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
             body: inner_body,
             refinement: Some(ref r),
         } if matches!(r.kind, RefinementKind::Predicate(_)) => {
-            let pred = match &r.kind {
-                RefinementKind::Predicate(pred_rc) => pred_rc.borrow().clone(),
+            let mut pred = match &r.kind {
+                RefinementKind::Predicate(pred_rc) => pred_rc.borrow_mut(),
                 _ => unreachable!(),
             };
-            // Re-wrap so we can pass it to desugar
+            *pred = elim_lambdas(ctx, pred.clone())?;
+            // Desugar, preserving the lambda's type on the resulting Compose.
             let param_name = param.name.clone();
-            let desugared = desugar_predicate_refinement(&param_name, pred, *inner_body);
+            let param_ty = param.ty.clone();
+            let desugared = Expr::lambda(
+                &param_name,
+                Type::Refinement(Box::new(param_ty), r.clone()),
+                *inner_body,
+            )
+            .with_ty(ty);
             elim_lambdas(ctx, desugared)
         }
 
@@ -612,21 +758,15 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
 
         // Plain lambda (no refinement): eliminate then continue.
         TypedExprNode::Lambda { param, body, .. } => {
-            let result = elim_lambda(ctx, &param.name, *body)?;
+            let result = elim_lambda(ctx, &param.name, &param.ty, *body)?;
             elim_lambdas(ctx, result)
         }
 
-        // Recurse into all sub-expressions of non-lambda nodes.
-        TypedExprNode::Apply { function, argument } => Ok(Expr::apply(
-            elim_lambdas(ctx, *argument)?,
-            elim_lambdas(ctx, *function)?,
-        )),
-
-        TypedExprNode::BinOp { left, op, right } => Ok(TypedExpr {
-            node: TypedExprNode::BinOp {
-                left: Box::new(elim_lambdas(ctx, *left)?),
-                op,
-                right: Box::new(elim_lambdas(ctx, *right)?),
+        // Recurse into all sub-expressions of non-lambda nodes, preserving ty.
+        TypedExprNode::Apply { function, argument } => Ok(TypedExpr {
+            node: TypedExprNode::Apply {
+                function: Box::new(elim_lambdas(ctx, *function)?),
+                argument: Box::new(elim_lambdas(ctx, *argument)?),
             },
             ty,
             user_annotation,
@@ -643,7 +783,37 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
             user_annotation,
         }),
 
-        TypedExprNode::UnaryOp(op, inner) => Ok(Expr::unary(op, elim_lambdas(ctx, *inner)?)),
+        // BinOp (non-Compose): desugar to function application form.
+        // `a op b` ≡ `(a, b) ▷ op_fn` — mirrors what `elim_lambda` does for
+        // the same pattern inside a lambda body, making the CCL uniform.
+        TypedExprNode::BinOp { left, op, right } => {
+            let op_name = op_function_name(&op).to_string();
+            let left_elim = elim_lambdas(ctx, *left)?;
+            let right_elim = elim_lambdas(ctx, *right)?;
+            let tuple_ty = Type::Tuple(vec![left_elim.ty.clone(), right_elim.ty.clone()]);
+            let fn_ty = fun_ty_or_hole(&tuple_ty, &ty);
+            let tuple = Expr::tuple(vec![left_elim, right_elim]).with_ty(tuple_ty);
+            let fn_var = Expr::var(&op_name).with_ty(fn_ty);
+            let mut desugared = Expr::apply(tuple, fn_var);
+            desugared.ty = ty;
+            Ok(desugared)
+        }
+
+        // UnaryOp: desugar to function application form.
+        // `op(x)` ≡ `x ▷ op_fn` — mirrors `elim_lambda`'s treatment.
+        TypedExprNode::UnaryOp(op, inner) => {
+            use crate::ccl::UnaryOpKind;
+            let op_name = match op {
+                UnaryOpKind::Neg => "neg",
+                UnaryOpKind::Not => "not_fn",
+            };
+            let inner_elim = elim_lambdas(ctx, *inner)?;
+            let fn_ty = fun_ty_or_hole(&inner_elim.ty, &ty);
+            let fn_var = Expr::var(op_name).with_ty(fn_ty);
+            let mut desugared = Expr::apply(inner_elim, fn_var);
+            desugared.ty = ty;
+            Ok(desugared)
+        }
 
         TypedExprNode::Let {
             binding,
@@ -661,7 +831,11 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
 
         TypedExprNode::Tuple(elts) => {
             let elts2: Result<Vec<_>, _> = elts.into_iter().map(|e| elim_lambdas(ctx, e)).collect();
-            Ok(Expr::tuple(elts2?))
+            Ok(TypedExpr {
+                node: TypedExprNode::Tuple(elts2?),
+                ty,
+                user_annotation,
+            })
         }
 
         TypedExprNode::Record(fields) => {
@@ -669,22 +843,41 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
                 .into_iter()
                 .map(|(k, e)| elim_lambdas(ctx, e).map(|r| (k, r)))
                 .collect();
-            Ok(TypedExpr::new(TypedExprNode::Record(fields2?)))
-        }
-
-        TypedExprNode::List(elts) => {
-            let elts2: Result<Vec<_>, _> = elts.into_iter().map(|e| elim_lambdas(ctx, e)).collect();
-            Ok(Expr::list(elts2?))
-        }
-
-        // Atoms: no sub-expressions, return as-is.
-        node @ (TypedExprNode::Lit(_) | TypedExprNode::Var(_) | TypedExprNode::Proj(_)) => {
             Ok(TypedExpr {
-                node,
+                node: TypedExprNode::Record(fields2?),
                 ty,
                 user_annotation,
             })
         }
+
+        TypedExprNode::List(elts) => {
+            let elts2: Result<Vec<_>, _> = elts.into_iter().map(|e| elim_lambdas(ctx, e)).collect();
+            Ok(TypedExpr {
+                node: TypedExprNode::List(elts2?),
+                ty,
+                user_annotation,
+            })
+        }
+
+        TypedExprNode::Aggregate { input, kind } => {
+            let input2 = elim_lambdas(ctx, *input)?;
+            let kind_name = match kind {
+                AggregateKind::Sum => "sum",
+                AggregateKind::Max => "max",
+            };
+            let agg_ty = fun_ty_or_hole(&input2.ty, &ty);
+            Ok(Expr::apply(input2, Expr::var(kind_name).with_ty(agg_ty)).with_ty(ty))
+        }
+
+        // Atoms: no sub-expressions, return as-is.
+        node @ (TypedExprNode::Lit(_)
+        | TypedExprNode::Var(_)
+        | TypedExprNode::Proj(_)
+        | TypedExprNode::Source(_)) => Ok(TypedExpr {
+            node,
+            ty,
+            user_annotation,
+        }),
 
         // Control-flow constructs not yet supported.
         node => Err(LambdaElimError::Unsupported(format!(
@@ -744,7 +937,7 @@ mod tests {
     /// Identity: λ x → x  ⟹  id
     #[test]
     fn identity() {
-        let result = elim_lambda(&mut ElimContext::new(), "x", var("x")).unwrap();
+        let result = elim_lambda(&mut ElimContext::new(), "x", &Type::Hole, var("x")).unwrap();
         assert_eq!(result, id());
     }
 
@@ -760,14 +953,14 @@ mod tests {
     /// Constant (literal): λ x → 42  ⟹  const(42)
     #[test]
     fn literal_constant() {
-        let result = elim_lambda(&mut ElimContext::new(), "x", lit(42)).unwrap();
+        let result = elim_lambda(&mut ElimContext::new(), "x", &Type::Hole, lit(42)).unwrap();
         assert_expr_eq(result, const_(lit(42)));
     }
 
     /// Constant (free var): λ x → y  ⟹  const(y)  (y ≠ x, free in outer scope)
     #[test]
     fn var_constant() {
-        let result = elim_lambda(&mut ElimContext::new(), "x", var("y")).unwrap();
+        let result = elim_lambda(&mut ElimContext::new(), "x", &Type::Hole, var("y")).unwrap();
         assert_expr_eq(result, const_(var("y")));
     }
 
@@ -775,7 +968,7 @@ mod tests {
     #[test]
     fn apply_pre_simplification() {
         let body = app(var("x"), var("f"));
-        let result = elim_lambda(&mut ElimContext::new(), "x", body).unwrap();
+        let result = elim_lambda(&mut ElimContext::new(), "x", &Type::Hole, body).unwrap();
         let expected = compose(zip_pair(id(), const_(var("f"))), var("apply"));
         assert_expr_eq(result, expected);
     }
@@ -784,7 +977,7 @@ mod tests {
     #[test]
     fn tuple() {
         let body = tup(var("x"), var("f"));
-        let result = elim_lambda(&mut ElimContext::new(), "x", body).unwrap();
+        let result = elim_lambda(&mut ElimContext::new(), "x", &Type::Hole, body).unwrap();
         let expected = zip_pair(id(), const_(var("f")));
         assert_expr_eq(result, expected);
     }
@@ -805,19 +998,6 @@ mod tests {
         // elim_lambda produces: let v = id in ⟨id, const(v)⟩ ≫ apply
         // const-apply simplifies the body to: id ≫ v → v
         let expected = Expr::let_bind("v", id(), var("v"));
-        assert_expr_eq(result, expected);
-    }
-
-    /// Refinement: λ x | pred(x) → x ▷ f  ⟹  pred ▷ restrict ≫ f  (after simplification)
-    #[test]
-    fn refinement_desugar() {
-        let pred = app(var("x"), var("pred"));
-        let body_expr = app(var("x"), var("f"));
-        let expr = Expr::lambda_with_refinement("x", Type::Hole, body_expr, pred, "pred(x)");
-        let result = run(expr).unwrap();
-        // Desugars to: (λx → x ▷ pred) ▷ restrict ≫ (λx → x ▷ f)
-        // Each lambda simplifies via const-apply: pred and f respectively.
-        let expected = compose(app(var("pred"), var("restrict")), var("f"));
         assert_expr_eq(result, expected);
     }
 

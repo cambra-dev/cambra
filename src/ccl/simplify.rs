@@ -22,29 +22,13 @@
 //! | CCC universal | `⟨.1, .0 ≫ curry(f)⟩ ≫ apply` | `f` |
 //! | Exponential beta | `⟨g, curry(h)⟩ ≫ apply` | `⟨id, g⟩ ≫ h` |
 //! | Exponential eta | `curry(⟨.1, .0 ≫ f⟩ ≫ apply)` | `f` |
-//! | Curry-compose | `curry(f ≫ g)` | `curry(f) ≫ map(g)` |
 //! | Const-apply | `⟨f, const(g)⟩ ≫ apply` | `f ≫ g` |
 //! | Product eta | `⟨f ≫ .0, f ≫ .1⟩` | `f` |
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` |
+//! | Zip beta | `⟨f0, f1⟩ ≫ ⟨.n ≫ g, .m ≫ h⟩` | `⟨f_n ≫ g, f_m ≫ h⟩` |
 
-use crate::ccl::lambda_elim::{compose, curry, id, zip_pair};
-use crate::ccl::{Expr, Lit, ProjKey, TypedExpr, TypedExprNode};
-
-// ---------------------------------------------------------------------------
-// Flatten-compose helpers
-// ---------------------------------------------------------------------------
-
-/// Expand `expr` into its flat compose constituents.
-///
-/// If `expr` is an n-ary [`TypedExprNode::Compose`], return its elements;
-/// otherwise return a single-element `vec![expr]`.  Used by
-/// [`try_flatten_compose`] to merge already-flattened child compose nodes.
-fn flatten_compose_arm(expr: Expr) -> Vec<Expr> {
-    match expr.node {
-        TypedExprNode::Compose(elts) => elts,
-        _ => vec![expr],
-    }
-}
+use crate::ccl::lambda_elim::{id, zip_pair};
+use crate::ccl::{Expr, Lit, ProjKey, RefinementKind, Type, TypedExpr, TypedExprNode};
 
 // ---------------------------------------------------------------------------
 // Simplification pass
@@ -60,8 +44,16 @@ pub fn simplify(mut expr: Expr) -> Expr {
 
 /// One bottom-up simplification pass. Returns `true` if any rule fired.
 fn simplify_once(expr: &mut Expr) -> bool {
+    let mut type_changed = false;
+    if let Type::Fun(domain, _) = &mut expr.ty {
+        if let Type::Refinement(_, refinment) = &mut **domain {
+            if let RefinementKind::Predicate(pred) = &refinment.kind {
+                type_changed = simplify_once(&mut pred.borrow_mut())
+            }
+        }
+    }
     let changed = recurse_simplify(expr);
-    changed | apply_simplification_rules(expr)
+    type_changed | changed | apply_simplification_rules(expr)
 }
 
 /// Recursively apply [`simplify_once`] to all child expressions (bottom-up).
@@ -119,8 +111,11 @@ fn take(expr: &mut Expr) -> Expr {
 /// Rules are tried in a fixed order; each pass may enable earlier rules in the
 /// next fixed-point iteration. Key ordering constraints:
 /// - Product beta before product eta (eta needs reduced arms).
-/// - Exponential eta before curry-compose (curry-compose splits the pattern
-///   exponential eta needs).
+/// - Exponential eta before zip-beta (beta patterns may expose eta redexes).
+///
+/// Note: `curry_compose` (`curry(f ≫ g) ⟹ curry(f) ≫ map(g)`) is intentionally
+/// omitted. Splitting a curry prevents `exponential_beta` from recognising the
+/// `curry(h)` right-arm of a zip in multi-generator comprehension contexts.
 ///
 /// Returns `true` if any rule fired.
 fn apply_simplification_rules(expr: &mut Expr) -> bool {
@@ -131,11 +126,27 @@ fn apply_simplification_rules(expr: &mut Expr) -> bool {
     changed |= try_ccc_universal(expr);
     changed |= try_exponential_beta(expr);
     changed |= try_exponential_eta(expr);
-    changed |= try_curry_compose(expr);
+    changed |= try_zip_beta(expr);
     changed |= try_const_apply(expr);
     changed |= try_product_eta(expr);
     changed |= try_flatten_compose(expr);
     changed
+}
+
+// ---------------------------------------------------------------------------
+// Flatten-compose helpers
+// ---------------------------------------------------------------------------
+
+/// Expand `expr` into its flat compose constituents.
+///
+/// If `expr` is an n-ary [`TypedExprNode::Compose`], return its elements;
+/// otherwise return a single-element `vec![expr]`.  Used by
+/// [`try_flatten_compose`] to merge already-flattened child compose nodes.
+fn flatten_compose_arm(expr: Expr) -> Vec<Expr> {
+    match expr.node {
+        TypedExprNode::Compose(elts) => elts,
+        _ => vec![expr],
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,8 +237,7 @@ fn compose_split_last(expr: &Expr) -> Option<(&[Expr], &Expr)> {
 /// On the first match, takes ownership of the compose, removes those two
 /// elements, calls `apply(left, right)` to produce replacement elements, and
 /// splices them back.  A single-element result is unwrapped to a bare
-/// expression (preserving `ty` and `user_annotation` only for multi-element
-/// results).  Returns `true` if a rule fired.
+/// expression. Returns `true` if a rule fired.
 fn try_pairwise_in_compose(
     expr: &mut Expr,
     detect: impl Fn(&Expr, &Expr) -> bool,
@@ -256,11 +266,10 @@ fn try_pairwise_in_compose(
     *expr = if elts.len() == 1 {
         elts.pop().unwrap()
     } else {
-        let mut e = Expr::compose(elts);
-        e.ty = ty;
-        e.user_annotation = user_annotation;
-        e
+        Expr::compose(elts)
     };
+    expr.ty = ty;
+    expr.user_annotation = user_annotation;
     true
 }
 
@@ -413,52 +422,23 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
             else {
                 unreachable!()
             };
-            vec![zip_pair(id(), g), *h]
+            // Type id: A → A where A = domain(g).  Type zip(id, g): A → (A, B)
+            // where g: A → B.  Both fall back to Hole if g has no concrete type.
+            let g_dom = g.ty.domain();
+            let g_cod = g.ty.codomain();
+            let id_ty = g_dom
+                .as_ref()
+                .map(|a| Type::fun(a.clone(), a.clone()))
+                .unwrap_or(Type::Hole);
+            let zip_ty = match (g_dom.as_ref(), g_cod.as_ref()) {
+                (Some(a), Some(c)) => Type::fun(a.clone(), Type::Tuple(vec![a.clone(), c.clone()])),
+                _ => Type::Hole,
+            };
+            let id_node = id().with_ty(id_ty);
+            let zip_node = zip_pair(id_node, g).with_ty(zip_ty);
+            vec![zip_node, *h]
         },
     )
-}
-
-/// Curry-compose: `curry(f ≫ g)  ⟹  curry(f) ≫ map(g)`
-///
-/// For n-ary inner composes, peels the last element: `curry([e0,…,en-1]) ⟹
-/// curry([e0,…,en-2]) ≫ map(en-1)`.  Skips when the first or last element of
-/// the inner compose is `id`, since compose-identity reduction
-/// (`id ≫ g → g`) should simplify first.
-fn try_curry_compose(expr: &mut Expr) -> bool {
-    let matched = as_curry(expr).is_some_and(|inner| {
-        if let TypedExprNode::Compose(elts) = &inner.node {
-            elts.len() >= 2 && !is_id(elts.first().unwrap()) && !is_id(elts.last().unwrap())
-        } else {
-            false
-        }
-    });
-    if matched {
-        let TypedExpr {
-            node: TypedExprNode::Apply {
-                argument: inner, ..
-            },
-            ..
-        } = take(expr)
-        else {
-            unreachable!()
-        };
-        let TypedExpr {
-            node: TypedExprNode::Compose(mut inner_elts),
-            ..
-        } = *inner
-        else {
-            unreachable!()
-        };
-        let g = inner_elts.pop().unwrap();
-        let f = if inner_elts.len() == 1 {
-            inner_elts.pop().unwrap()
-        } else {
-            Expr::compose(inner_elts)
-        };
-        *expr = compose(curry(f), Expr::apply(g, Expr::var("map")));
-        return true;
-    }
-    false
 }
 
 /// Const-apply: `⟨f, const(g)⟩ ≫ apply  ⟹  f ≫ g`
@@ -546,6 +526,145 @@ fn try_product_eta(expr: &mut Expr) -> bool {
         return true;
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// Zip beta rule
+// ---------------------------------------------------------------------------
+
+/// Zip beta: `⟨f0, f1⟩ ≫ ⟨.n ≫ g, .m ≫ i⟩  ⟹  ⟨f_n ≫ g, f_m ≫ i⟩`
+///
+/// Each arm of the right zip must start with a projection (`n, m ∈ {0,1}`);
+/// each arm routes to whichever component of the left zip it selects, then
+/// applies its optional suffix.  Bare projections (no suffix)
+/// leave the component unchanged; compose identity subsequently reduces any
+/// `id ≫ …` that appears.
+///
+/// Covers all combinations of arm order and suffix presence:
+/// - `⟨h, f⟩ ≫ ⟨.0 ≫ g, .1⟩  ⟹  ⟨h ≫ g, f⟩`   (n=0, m=1, bare .1)
+/// - `⟨h, f⟩ ≫ ⟨.1, .0 ≫ g⟩  ⟹  ⟨f, h ≫ g⟩`   (n=1, m=0, bare .1)
+/// - `⟨h, f⟩ ≫ ⟨.0 ≫ g, .1 ≫ i⟩  ⟹  ⟨h ≫ g, f ≫ i⟩`  (both suffixed)
+///
+/// Operates pairwise in an n-ary compose; trailing elements are preserved.
+fn try_zip_beta(expr: &mut Expr) -> bool {
+    /// Returns the leading projection index of a zip arm.
+    ///
+    /// A zip arm may be a bare `Proj(Index(n))` or a compose whose first element
+    /// is `Proj(Index(n))`.  Returns `Some(n)` in both cases, `None` otherwise.
+    fn arm_leading_proj(expr: &Expr) -> Option<usize> {
+        match &expr.node {
+            TypedExprNode::Proj(ProjKey::Index(n)) => Some(*n),
+            TypedExprNode::Compose(elts) => {
+                if let Some(TypedExprNode::Proj(ProjKey::Index(n))) = elts.first().map(|e| &e.node)
+                {
+                    Some(*n)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Apply a zip arm to a base component.
+    ///
+    /// Given `base` (a left-zip component `f_n`) and an `arm` of the form `.n`
+    /// or `.n ≫ g ≫ …`, replaces the leading projection in `arm` with `base`,
+    /// yielding `base ≫ g ≫ …`.  Returns `base` unchanged when `arm` is a bare
+    /// projection (equivalent to `base ≫ id`, reduced by compose identity).
+    ///
+    /// The result type is `Fun(domain_of_base, codomain_of_arm)` when both are
+    /// concrete, falling back to [`Type::Hole`] otherwise.
+    fn apply_arm_suffix(base: Expr, arm: Expr) -> Expr {
+        // Result type: domain from base, codomain from arm (the arm carries the
+        // full type A→C where A is the tuple domain and C is the output type;
+        // substituting base for the leading proj gives domain(base)→C).
+        let result_ty = match (&base.ty, &arm.ty) {
+            (Type::Fun(dom, _), Type::Fun(_, cod)) => Type::fun(*dom.clone(), *cod.clone()),
+            _ => Type::Hole,
+        };
+        match arm.node {
+            TypedExprNode::Proj(_) => base,
+            TypedExprNode::Compose(mut elts) => {
+                elts[0] = base; // replace leading proj with base component
+                let result = if elts.len() == 1 {
+                    elts.pop().unwrap()
+                } else {
+                    Expr::compose(elts)
+                };
+                result.with_ty(result_ty)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    try_pairwise_in_compose(
+        expr,
+        |left, right| {
+            as_zip(left).is_some()
+                && as_zip(right).is_some_and(|(a, b)| {
+                    let n1 = arm_leading_proj(a);
+                    let n2 = arm_leading_proj(b);
+                    n1.is_some() && n2.is_some()
+                })
+        },
+        |left, right| {
+            // Peek at projection indices before consuming `right`
+            let (n1, n2) = {
+                let TypedExprNode::Apply { argument, .. } = &right.node else {
+                    unreachable!()
+                };
+                let TypedExprNode::Tuple(elts) = &argument.node else {
+                    unreachable!()
+                };
+                (
+                    arm_leading_proj(&elts[0]).unwrap(),
+                    arm_leading_proj(&elts[1]).unwrap(),
+                )
+            };
+            // Extract (f0, f1) from ⟨f0, f1⟩
+            let TypedExpr {
+                node: TypedExprNode::Apply { argument, .. },
+                ..
+            } = left
+            else {
+                unreachable!()
+            };
+            let TypedExpr {
+                node: TypedExprNode::Tuple(mut elts),
+                ..
+            } = *argument
+            else {
+                unreachable!()
+            };
+            let f1 = elts.swap_remove(1);
+            let f0 = elts.pop().unwrap();
+            // Extract (a, b) from ⟨a, b⟩
+            let TypedExpr {
+                node: TypedExprNode::Apply { argument, .. },
+                ..
+            } = right
+            else {
+                unreachable!()
+            };
+            let TypedExpr {
+                node: TypedExprNode::Tuple(mut elts),
+                ..
+            } = *argument
+            else {
+                unreachable!()
+            };
+            let b = elts.swap_remove(1);
+            let a = elts.pop().unwrap();
+            // Route each arm to the component it selects; clone when both arms
+            // pick the same component (n1 == n2).
+            let base_a = if n1 == 0 { f0.clone() } else { f1.clone() };
+            let base_b = if n2 == 0 { f0 } else { f1 };
+            let new_f = apply_arm_suffix(base_a, a);
+            let new_g = apply_arm_suffix(base_b, b);
+            vec![zip_pair(new_f, new_g)]
+        },
+    )
 }
 
 /// Exponential eta: `curry(⟨.1, .0 ≫ f⟩ ≫ apply)  ⟹  f`
@@ -657,10 +776,6 @@ mod tests {
         Expr::var(s)
     }
 
-    fn app(arg: Expr, func: Expr) -> Expr {
-        Expr::apply(arg, func)
-    }
-
     /// Compose identity (left): id ≫ f  ⟹  f
     #[test]
     fn simplify_compose_identity_left() {
@@ -765,26 +880,6 @@ mod tests {
         assert_eq!(simplify(expr), expected);
     }
 
-    /// Curry-compose: curry(f ≫ g)  ⟹  curry(f) ≫ map(g)  (flattened to n-ary Compose)
-    #[test]
-    fn simplify_curry_compose() {
-        let expr = curry(compose(var("f"), var("g")));
-        let expected = Expr::compose(vec![curry(var("f")), app(var("g"), var("map"))]);
-        assert_eq!(simplify(expr), expected);
-    }
-
-    /// Curry-compose with n-ary inner: curry(f ≫ g ≫ h)  ⟹  curry(f) ≫ map(g) ≫ map(h)
-    #[test]
-    fn simplify_curry_compose_nary() {
-        let expr = curry(Expr::compose(vec![var("f"), var("g"), var("h")]));
-        let expected = Expr::compose(vec![
-            curry(var("f")),
-            app(var("g"), var("map")),
-            app(var("h"), var("map")),
-        ]);
-        assert_eq!(simplify(expr), expected);
-    }
-
     /// Const-apply: ⟨f, const(g)⟩ ≫ apply  ⟹  f ≫ g  (flattened to n-ary Compose)
     #[test]
     fn simplify_const_apply() {
@@ -853,6 +948,96 @@ mod tests {
     fn simplify_flatten_compose_left_assoc() {
         let expr = compose(compose(var("f"), var("g")), var("h"));
         let expected = Expr::compose(vec![var("f"), var("g"), var("h")]);
+        assert_eq!(simplify(expr), expected);
+    }
+
+    /// Zip beta, n1=0 (id left): ⟨id, f⟩ ≫ ⟨.0 ≫ g, .1⟩  ⟹  ⟨g, f⟩
+    #[test]
+    fn simplify_zip_beta_n1_0_id() {
+        let expr = compose(
+            zip_pair(id(), var("f")),
+            zip_pair(compose(proj_idx(0), var("g")), proj_idx(1)),
+        );
+        assert_eq!(simplify(expr), zip_pair(var("g"), var("f")));
+    }
+
+    /// Zip beta, n1=0 (general h): ⟨h, f⟩ ≫ ⟨.0 ≫ g, .1⟩  ⟹  ⟨h ≫ g, f⟩
+    #[test]
+    fn simplify_zip_beta_n1_0_general() {
+        let expr = compose(
+            zip_pair(var("h"), var("f")),
+            zip_pair(compose(proj_idx(0), var("g")), proj_idx(1)),
+        );
+        let expected = zip_pair(Expr::compose(vec![var("h"), var("g")]), var("f"));
+        assert_eq!(simplify(expr), expected);
+    }
+
+    /// Zip beta, n1=1 (id left): ⟨id, f⟩ ≫ ⟨.1, .0 ≫ g⟩  ⟹  ⟨f, g⟩
+    #[test]
+    fn simplify_zip_beta_n1_1_id() {
+        let expr = compose(
+            zip_pair(id(), var("f")),
+            zip_pair(proj_idx(1), compose(proj_idx(0), var("g"))),
+        );
+        assert_eq!(simplify(expr), zip_pair(var("f"), var("g")));
+    }
+
+    /// Zip beta, n1=1 (general h): ⟨h, f⟩ ≫ ⟨.1, .0 ≫ g⟩  ⟹  ⟨f, h ≫ g⟩
+    #[test]
+    fn simplify_zip_beta_n1_1_general() {
+        let expr = compose(
+            zip_pair(var("h"), var("f")),
+            zip_pair(proj_idx(1), compose(proj_idx(0), var("g"))),
+        );
+        let expected = zip_pair(var("f"), Expr::compose(vec![var("h"), var("g")]));
+        assert_eq!(simplify(expr), expected);
+    }
+
+    /// Zip beta, both arms suffixed: ⟨h, f⟩ ≫ ⟨.0 ≫ g, .1 ≫ i⟩  ⟹  ⟨h ≫ g, f ≫ i⟩
+    #[test]
+    fn simplify_zip_beta_both_arms() {
+        let expr = compose(
+            zip_pair(var("h"), var("f")),
+            zip_pair(
+                compose(proj_idx(0), var("g")),
+                compose(proj_idx(1), var("i")),
+            ),
+        );
+        let expected = zip_pair(
+            Expr::compose(vec![var("h"), var("g")]),
+            Expr::compose(vec![var("f"), var("i")]),
+        );
+        assert_eq!(simplify(expr), expected);
+    }
+
+    /// Zip beta in n-ary compose: a ≫ ⟨h, f⟩ ≫ ⟨.0 ≫ g, .1⟩ ≫ b  ⟹  a ≫ ⟨h ≫ g, f⟩ ≫ b
+    #[test]
+    fn simplify_zip_beta_pairwise() {
+        let expr = Expr::compose(vec![
+            var("a"),
+            zip_pair(var("h"), var("f")),
+            zip_pair(compose(proj_idx(0), var("g")), proj_idx(1)),
+            var("b"),
+        ]);
+        let expected = Expr::compose(vec![
+            var("a"),
+            zip_pair(Expr::compose(vec![var("h"), var("g")]), var("f")),
+            var("b"),
+        ]);
+        assert_eq!(simplify(expr), expected);
+    }
+
+    /// Zip beta with n-ary arm: ⟨h, f⟩ ≫ ⟨.0 ≫ g ≫ k, .1⟩  ⟹  ⟨h ≫ g ≫ k, f⟩
+    #[test]
+    fn simplify_zip_beta_nary_arm() {
+        let expr = compose(
+            zip_pair(var("h"), var("f")),
+            zip_pair(
+                Expr::compose(vec![proj_idx(0), var("g"), var("k")]),
+                proj_idx(1),
+            ),
+        );
+        let expected = zip_pair(Expr::compose(vec![var("h"), var("g"), var("k")]), var("f"));
         assert_eq!(simplify(expr), expected);
     }
 
