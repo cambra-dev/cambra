@@ -3,14 +3,14 @@ use log::{debug, trace};
 use crate::{
     ccl::{
         symbolic::{symbolic, symbolic_typed},
-        Expr, Lit, ProjKey, RefinementKind, Type, TypedExprNode,
+        AggregateKind, Expr, Lit, ProjKey, RefinementKind, Type, TypedExprNode,
     },
     interpreter::{
         ccl_compile_util::CompileError,
         compile_tile_operators::{TileCompileContext, TileVarBinding},
         tile_operators::{
-            Constant, IterateExtent, MapResult, MapResultToConst, MapResultWithSource, Memo,
-            Restrict, ScalarTuple, Splitter, TileOperator, Tiling, Zip,
+            Aggregate, Constant, ExtractAggregate, IterateExtent, MapResult, MapResultToConst,
+            MapResultWithSource, Memo, Restrict, ScalarTuple, Splitter, TileOperator, Tiling, Zip,
         },
         tuple_field, ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind, Extent,
         FuncBinding, FunctionDef, LogicKind, UnaryOpKind, Value,
@@ -25,7 +25,9 @@ use std::rc::Rc;
 ///
 /// Additionally, the expression must be composed of the following structures:
 ///
-/// - Scalars: Scalars, tuples of scalars, and applications of functions to scalars are allowed
+/// - Scalars:
+///   - Constants, tuples of scalars, and applications of functions to scalars are allowed
+///   - function ▷ aggregation
 /// - Functions:
 ///   - List literals
 ///   - Data sources
@@ -46,7 +48,7 @@ use std::rc::Rc;
 ///
 /// Currently unsupported:
 /// - Curried functions
-/// - Aggregation
+/// - Keyed aggregation
 /// - Recursion
 pub fn convert_to_operators(
     expr: &Expr,
@@ -156,6 +158,9 @@ fn convert_impl(
                 }
                 name if unaryop_for_name(name).is_some() => {
                     apply_unaryop(get(input)?, unaryop_for_name(name).unwrap())
+                }
+                name if agg_for_name(name).is_some() => {
+                    apply_aggregate(get(input)?, agg_for_name(name).unwrap())
                 }
                 name if matches!(ctx.lookup(name), Some(TileVarBinding::Operator(_))) => {
                     let Some(TileVarBinding::Operator(split)) = ctx.lookup(name) else {
@@ -405,6 +410,17 @@ fn apply_unaryop(
     )))
 }
 
+fn apply_aggregate(
+    input: Box<dyn TileOperator>,
+    op: AggregateKind,
+) -> Result<Box<dyn TileOperator>, CompileError> {
+    Ok(Box::new(ExtractAggregate::new(
+        Box::new(Aggregate::new(input, op.clone())),
+        op,
+        true,
+    )))
+}
+
 /// Map a lambda-elimination combinator name to an interpreter [`BinOpKind`].
 ///
 /// Returns `None` for names that are not binary operation combinators.
@@ -427,6 +443,14 @@ fn binop_for_name(name: &str) -> Option<InterpreterBinOp> {
         "nor" => InterpreterBinOp::BoolLogic(LogicKind::Nor),
         "xor" => InterpreterBinOp::BoolLogic(LogicKind::Xor),
         "xnor" => InterpreterBinOp::BoolLogic(LogicKind::Xnor),
+        _ => return None,
+    })
+}
+
+fn agg_for_name(name: &str) -> Option<AggregateKind> {
+    Some(match name {
+        "sum" => AggregateKind::Sum,
+        "max" => AggregateKind::Max,
         _ => return None,
     })
 }

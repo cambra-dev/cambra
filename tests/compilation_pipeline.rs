@@ -1013,6 +1013,7 @@ fn test_incremental_aggregates() {
     "source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add:{source(testsource1) | Refined(x < 15)} ⇒ Int",
     make_int_list(&[10, 20])
 )]
+#[case("sum([1,2,3])", "[1, 2, 3] ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]
 fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expected_result: Tile) {
     use cambra::ccl::{context::new_compile_program, symbolic::symbolic};
 
