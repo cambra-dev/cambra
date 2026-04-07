@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
-use crate::ccl::symbolic::symbolic;
+use crate::ccl::symbolic::{symbolic, symbolic_typed};
 use crate::ccl::BaseType;
 use crate::ccl::{
     unify::UnificationTable, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey, RefinementKind,
@@ -460,8 +460,14 @@ pub fn debug_typecheck(expr: &Expr) {
         typecheck(expr),
         Ok(()),
         "Failed to typecheck result: {}",
-        symbolic(expr)
+        symbolic_typed(expr)
     );
+}
+
+// Helper to run typechecking inline when building an Expr
+pub fn dbg_typecheck_mv(expr: Expr) -> Expr {
+    debug_typecheck(&expr);
+    expr
 }
 
 /// Recursively collect semantic type errors from `expr` into `errors`.
@@ -1805,7 +1811,7 @@ mod tests {
 
         assert_eq!(
             symbolic(&expr),
-            "λ __list_comp_var : [0, 2) → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x)"
+            "λ __list_comp_var : [0, 1] → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x)"
         );
     }
 
@@ -1822,7 +1828,7 @@ mod tests {
 
         assert_eq!(
             symbolic(&expr),
-            "λ __list_comp_var : [0, 2) → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → 42)"
+            "λ __list_comp_var : [0, 1] → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → 42)"
         );
     }
 
@@ -1844,7 +1850,7 @@ mod tests {
 
         assert_eq!(
             symbolic(&expr),
-            "λ __list_comp_var : [0, 2) → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x + 2)"
+            "λ __list_comp_var : [0, 1] → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x + 2)"
         );
     }
 
@@ -1863,8 +1869,8 @@ mod tests {
 
         assert_eq!(
             symbolic(&outer_comp),
-            "λ __list_comp_var : [0, 2) → __list_comp_var \
-             ▷ (λ __list_comp_var : [0, 2) → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x)) \
+            "λ __list_comp_var : [0, 1] → __list_comp_var \
+             ▷ (λ __list_comp_var : [0, 1] → __list_comp_var ▷ [10, 20] ▷ (λ x : Int → x)) \
              ▷ (λ y : Int → y)"
         );
     }

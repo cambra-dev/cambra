@@ -170,14 +170,15 @@ impl UnificationTable {
                 }
                 Type::PartialRecord(existing_entries)
             }
-            // Default: assert compatible (for equal types or Infer unification), then overwrite.
+            // Default: assert compatible (for equal types or Infer unification).
             (Some(existing_ty), ty) => {
+                trace!("UnificationTable::set: asserting equality of existing type {existing_ty} and new type {ty}");
                 assert!(
                     self.constrain_equal(&existing_ty, &ty).is_ok(),
                     "UnificationTable::set: variable {root:?} already solved to a different type: \
                      {existing_ty} vs {ty}"
                 );
-                ty
+                existing_ty
             }
             (None, ty) => ty,
         };
@@ -230,6 +231,11 @@ impl UnificationTable {
         // Prefer keeping a solved root as the root.
         let solved_a = self.probe(root_a);
         let solved_b = self.probe(root_b);
+        trace!(
+            "Unifying {a} and {b}; roots {root_a} and {root_b} with types {:?} and {:?}",
+            solved_a,
+            solved_b
+        );
         match (solved_a, solved_b) {
             (None, Some(_)) => {
                 // b's root is solved; make a link to b's root and store type there.
@@ -269,13 +275,7 @@ impl UnificationTable {
             // TODO implement the above logic for records too.
             (Some(ty_a), Some(ty_b)) => {
                 if ty_a != ty_b {
-                    return self
-                        .constrain_equal(&ty_a, &ty_b)
-                        .or(Err(InferError::TypeMismatch {
-                            ctx: "unify".to_string(),
-                            type_a: ty_a,
-                            type_b: ty_b,
-                        })?);
+                    return self.constrain_equal(&ty_a, &ty_b);
                 }
                 // Both solved to the same type — link b to a (idempotent).
                 let idx_b = root_b.0 as usize;

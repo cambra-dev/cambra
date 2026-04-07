@@ -81,6 +81,10 @@ pub enum LoweringError {
 #[derive(Default)]
 pub struct LoweringContext {
     known_sources: HashSet<String>,
+
+    /// Temporary option to choose between using the groupby node directly or
+    /// the generic CCL equivalent
+    pub use_ccl_for_groupby: bool,
 }
 
 impl LoweringContext {
@@ -364,6 +368,8 @@ fn lower_call(
     };
 
     match name {
+        // groupby(c: I -> A, key_fn: A -> K) lowers to
+        // λ k → λ i :(I | key_fn(c(i)) == k) → c(i)
         "groupby" => {
             if args.len() != 2 {
                 return Err(LoweringError::Unsupported(
@@ -371,8 +377,30 @@ fn lower_call(
                 ));
             }
             let collection = lower_expr(&args[0], ctx)?;
-            let key = lower_expr(&args[1], ctx)?;
-            Ok(Expr::groupby(collection, key))
+            let key_fn = lower_expr(&args[1], ctx)?;
+
+            if !ctx.use_ccl_for_groupby {
+                return Ok(Expr::groupby(collection, key_fn));
+            }
+            Ok(Expr::lambda(
+                "__gb_k",
+                Type::Hole,
+                Expr::lambda_with_refinement(
+                    "__gb_i",
+                    Type::Hole,
+                    Expr::apply(Expr::var("__gb_i"), collection.clone()),
+                    Expr::lambda(
+                        "__gb_r",
+                        Type::Hole,
+                        Expr::binop(
+                            Expr::apply(Expr::apply(Expr::var("__gb_r"), collection), key_fn),
+                            BinOpKind::Compare(CompareKind::Equals),
+                            Expr::var("__gb_k"),
+                        ),
+                    ),
+                    "groupby",
+                ),
+            ))
         }
         "sum" | "max" => {
             if args.len() != 1 {
@@ -1181,22 +1209,26 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
 
     #[rstest]
     // Variable collection and inline key lambda
-    #[case("groupby(xs, lambda x: x)", "GroupBy(xs, λ x → x)")]
+    #[case("groupby(xs, lambda x: x)", "λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ xs ▷ (λ x → x) == __gb_k))} → __gb_i ▷ xs")]
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], lambda x: x // 2)",
-        "GroupBy([1, 2, 3], λ x → x // 2)"
+        "λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k))} → __gb_i ▷ [1, 2, 3]"
     )]
     // Key is a variable reference (pre-defined function)
-    #[case("groupby(xs, key_fn)", "GroupBy(xs, key_fn)")]
+    #[case("groupby(xs, key_fn)", "λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k))} → __gb_i ▷ xs")]
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "λ __iter_record → __iter_record ▷ GroupBy(xs, key_fn) ▷ (λ x → Sum(x))"
+        "λ __iter_record → __iter_record ▷ (λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k))} → __gb_i ▷ xs) ▷ (λ x → Sum(x))"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");
+        let ctx = LoweringContext {
+            use_ccl_for_groupby: true,
+            ..Default::default()
+        };
+        let ccl = lower_expr(&expr, &ctx).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 

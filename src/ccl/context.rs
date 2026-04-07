@@ -11,7 +11,7 @@ use rustpython_parser::{ast as pyast, parser};
 use crate::{
     ccl::{
         infer::{check_fully_typed, infer, typecheck, TypeInferenceContext},
-        lambda_elim,
+        join_plan, lambda_elim,
         lower::{lower_stmts, LoweringContext},
         symbolic::{symbolic, symbolic_typed},
         BaseType, Expr, Type,
@@ -171,28 +171,34 @@ pub fn new_compile_program(
         pyast::Mod::Module { body, .. } => body,
         other => panic!("expected Module, got {other:?}"),
     };
+    ctx.lowering_ctx().use_ccl_for_groupby = true;
     let mut expr = lower_stmts(&stmts, ctx.lowering_ctx()).expect("ccl lowering failed");
+
+    debug!("Lowered:\n{}", symbolic(&expr));
 
     let infer_ctx = ctx.inference_ctx();
     infer(&mut expr, infer_ctx).expect("type inference failed");
 
     let ccl_repr = symbolic(&expr);
-    debug!("CCL:\n{ccl_repr}");
+    debug!("Inferred:\n{ccl_repr}");
 
     let lambda_elim = lambda_elim::run(expr).expect("Lambda elim failed");
-    debug!("λ-eliminated CCL:\n{}", symbolic_typed(&lambda_elim));
-
-    debug!("Table:\n{}", ctx.inference_ctx().table);
+    debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
+    debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
 
     check_fully_typed(&lambda_elim).expect("missing types");
     typecheck(&lambda_elim).expect("type error after lambda elimination");
 
+    let join_planned = join_plan::run(lambda_elim);
+
+    debug!("Join-planned CCL:\n{}", symbolic(&join_planned));
+
     let mut op =
-        convert_to_operators(&lambda_elim, ctx.compile_ctx()).expect("Operator conversion failed");
+        convert_to_operators(&join_planned, ctx.compile_ctx()).expect("Operator conversion failed");
 
     let producer = op.subscribe(op.tiling().universal_guard(), consumer, ctx.scheduler());
 
     debug!("Producers:\n{}", pretty_tile_producer(producer.as_ref()));
 
-    (lambda_elim, op, producer)
+    (join_planned, op, producer)
 }

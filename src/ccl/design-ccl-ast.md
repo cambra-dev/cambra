@@ -471,6 +471,43 @@ After `resolve`, `infer` calls `check_fully_typed(expr)` to assert that every `t
 
 ---
 
+## Join Planning (`ccl/join_plan.rs`)
+
+`join_plan::run` is an optimization pass that transforms keyed aggregates into efficient implementations
+using the `"converse"` combinator for grouping by key. This pass runs after `lambda_elim` and before
+the final `simplify` pass.
+
+In the future, this pass will also convert loop joins to hash joins or other efficient join plans.
+
+### Keyed Aggregates
+
+Keyed aggregates are patterns like `sum(x) for x in groupby(xs, key_fn)` where:
+- A collection is grouped by a key function
+- An aggregation operation is applied to each group
+- The pattern iterates first over the key, then over elements within that key's group
+
+### The Optimization
+
+The pass identifies constructs where a `curry` operator is applied to a type with a predicate refinement.
+The refinement expresses equality with a key: elements are partitioned when the key function applied
+to them equals a particular value. This pattern is rewritten to:
+
+1. Swap the iteration order: instead of iterating both the collection and key together,
+   iterate the collection and compute the key for each element
+2. Use the `"converse"` combinator to group elements by their key values
+3. Apply the aggregation operator to each group
+
+This transformation reduces the domain iteration complexity and allows the runtime to optimize
+group-by-key operations using dedicated grouping operators instead of generic iteration.
+
+### Implementation details
+
+The pass uses `replace_curried_correlated_refinements` to recursively traverse the expression tree,
+identifying and replacing patterns where we have a curry whose argument has a refinement of the form
+`(x, y) ▷ zip ≫ eq` where one side depends on the collection and the other on the key function.
+
+---
+
 ## Lambda Elimination (`ccl/lambda_elim.rs`)
 
 `lambda_elim::run` converts a fully type-inferred CCL expression containing
@@ -629,7 +666,7 @@ The bound variable is subscribed to `definition` exactly once via a `VarProducer
      let bindings, unary ops, lists, aggregates, tuples, type annotations,
      data sources, groupby). ✓
    - `ccl/mod.rs` + `ccl/infer.rs` + `ccl/lower.rs` + `ccl/symbolic.rs` + `ccl/pretty.rs`
-     + `ccl/unify.rs`: `Case` redesigned as guard-based branching — `branches: Vec<Branch>`
+     + `ccl/unify.rs`: `Case` redesigned as guard-based bra\nching — `branches: Vec<Branch>`
      (`Branch { guard, body }`) with guards constrained to `Bool` and arm types unified;
      `lower_if` for `StmtKind::If` → `Case` with `elif` chains **flattened** into a single node;
      `ExprKind::IfExp` ternary lowering; `InferError::EmptyCase` for 0-branch `Case`.
@@ -646,3 +683,7 @@ The bound variable is subscribed to `definition` exactly once via a `VarProducer
      point-free expressions directly to tile operators without needing to handle `Lambda` nodes. ✓
    - `interpreter/compile_tile_operators.rs`: `Split` renamed to `Splitter`; context types and
      `compile_tile_inner` made `pub(crate)` to allow sharing with `operator_conversion`. ✓
+   - `ccl/join_plan.rs`: keyed aggregate optimization pass (new module). Transforms groupby patterns with
+     predicate refinements into efficient `"converse"` (grouping) implementations; runs after `lambda_elim`
+     and before final `simplify`. `lambda_elim.rs` enhanced to track free variables in types (predicate
+     refinements) so groupby-aggregate patterns are properly identified. ✓

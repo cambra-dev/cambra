@@ -363,7 +363,13 @@ fn fmt_lit(lit: &Lit) -> String {
 
 fn fmt_refinement(r: &Refinement, opts: &SymbolicOpts) -> String {
     match &r.kind {
-        RefinementKind::Predicate(p) => fmt(&p.borrow(), Precedence::Atom, opts),
+        RefinementKind::Predicate(p) => {
+            if let Ok(pred) = &p.try_borrow() {
+                fmt(pred, Precedence::Atom, opts)
+            } else {
+                r.description.clone()
+            }
+        }
         RefinementKind::HashJoin(..) => r.description.clone(),
     }
 }
@@ -531,7 +537,7 @@ mod tests {
             ),
             Expr::var("x"),
         ),
-        "λ x : Int ⇒ Bool → x"
+        "λ x : (Int ⇒ Bool) → x"
     )]
     // Let (unannotated — bound_expr.ty is Unknown so no annotation printed)
     #[case(

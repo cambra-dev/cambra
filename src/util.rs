@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use log::{debug, trace};
+
 use crate::interpreter::tuple_field;
 
 /// Format a map of named fields as either a positional tuple or a named record.
@@ -142,9 +144,14 @@ impl<V> ScopeStack<V> {
     /// [`ScopeGuard`] over calling this directly.
     pub(crate) fn pop_scope(&mut self) {
         if !std::thread::panicking() {
-            self.scopes
+            let popped = self
+                .scopes
                 .pop()
                 .expect("ScopeStack: scope underflow in pop_scope");
+            trace!(
+                "ScopeStack: pop_scope; popped={:?}",
+                popped.keys().cloned().collect::<Vec<String>>()
+            );
         } else {
             self.scopes.pop();
         }
@@ -157,6 +164,7 @@ impl<V> ScopeStack<V> {
     /// Panics if called outside of an active scope (no scopes pushed).
     /// In debug builds, also panics if `name` is already bound in the current scope.
     pub fn bind(&mut self, name: &str, value: V) {
+        debug!("Binding '{name}' in scope");
         let scope = self
             .scopes
             .last_mut()
@@ -171,6 +179,24 @@ impl<V> ScopeStack<V> {
     /// Look up `name` from innermost scope outward, returning the first match.
     pub fn lookup(&self, name: &str) -> Option<&V> {
         self.scopes.iter().rev().find_map(|s| s.get(name))
+    }
+
+    pub fn fmt_scopes(&self) -> String
+    where
+        V: std::fmt::Display,
+    {
+        self.scopes
+            .iter()
+            .rev()
+            .map(|scope| {
+                let bindings: Vec<String> = scope
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {value}"))
+                    .collect();
+                format!("{{{}}}", bindings.join(", "))
+            })
+            .collect::<Vec<String>>()
+            .join(" , ")
     }
 }
 

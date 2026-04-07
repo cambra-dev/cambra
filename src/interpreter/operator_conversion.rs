@@ -9,8 +9,9 @@ use crate::{
         ccl_compile_util::CompileError,
         compile_tile_operators::{TileCompileContext, TileVarBinding},
         tile_operators::{
-            Aggregate, Constant, ExtractAggregate, IterateExtent, MapResult, MapResultToConst,
-            MapResultWithSource, Memo, Restrict, ScalarTuple, Splitter, TileOperator, Tiling, Zip,
+            Aggregate, Constant, Converse, ExtractAggregate, IterateExtent, MapAggregate,
+            MapExtractAggregate, MapResult, MapResultToConst, MapResultWithSource, Memo, Restrict,
+            ScalarTuple, Splitter, TileOperator, Tiling, Zip,
         },
         tuple_field, ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind, Extent,
         FuncBinding, FunctionDef, LogicKind, UnaryOpKind, Value,
@@ -125,11 +126,47 @@ fn convert_impl(
             Ok(Box::new(Zip::new(ops)))
         }
 
+        // Because MapResultToConst handles mapping at any depth of currying, map is a pass through and we just convert the argument
+        // and feed the input to to it.
+        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "map") =>
+        {
+            if input.is_none() {
+                return Err(CompileError::Unsupported("map requires an input".into()));
+            }
+            convert_impl(argument, input, ctx)
+        }
+
+        // converse translates 1:1 to the Converse operator
+        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "converse") =>
+        {
+            // TODO add a check that input is None; right now we end up with an incorrectly-iterated input
+            // from the outer compose that we ignore here for now.  Once we are properly handling refinement
+            // types throught the whole plan, Compose shouldn't need to iterate itself and let its first element
+            // do the iteration instead.
+            let input = convert_impl(argument, None, ctx)?;
+            Ok(Box::new(Converse::new(input)))
+        }
+
+        // If we are applying an aggregate, then it is a global aggregate that should use the Aggregate operator.
+        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if agg_for_name(n).is_some()) =>
+        {
+            if input.is_some() {
+                return Err(CompileError::Unsupported(
+                    "scalar aggregates expect no input".into(),
+                ));
+            }
+            let TypedExprNode::Var(name) = &function.node else {
+                unreachable!()
+            };
+            let input = convert_impl(argument, None, ctx)?;
+            apply_aggregate(input, agg_for_name(name).unwrap())
+        }
+
         TypedExprNode::Apply { argument, function } => {
             if input.is_some() {
                 return Err(CompileError::Unsupported(
-                    "Only higher-order combinators (map, const, zip) can take an input operator; found input for non-combinator application"
-                        .into(),
+                    format!("Only higher-order combinators (map, const, zip) can take an input operator; found input for non-combinator {}",
+                        symbolic(function)),
                 ));
             }
             let arg = convert_impl(argument, None, ctx)?;
@@ -159,8 +196,13 @@ fn convert_impl(
                 name if unaryop_for_name(name).is_some() => {
                     apply_unaryop(get(input)?, unaryop_for_name(name).unwrap())
                 }
+                // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
                 name if agg_for_name(name).is_some() => {
-                    apply_aggregate(get(input)?, agg_for_name(name).unwrap())
+                    let kind = agg_for_name(name).unwrap();
+                    Ok(Box::new(MapExtractAggregate::new(
+                        Box::new(MapAggregate::new(get(input)?, kind.clone())),
+                        kind,
+                    )))
                 }
                 name if matches!(ctx.lookup(name), Some(TileVarBinding::Operator(_))) => {
                     let Some(TileVarBinding::Operator(split)) = ctx.lookup(name) else {

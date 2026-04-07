@@ -8,6 +8,7 @@
 
 pub mod context;
 pub mod infer;
+pub mod join_plan;
 pub mod lambda_elim;
 pub mod lower;
 pub mod pretty;
@@ -29,7 +30,7 @@ static REFINEMENT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type RefinementId = u64;
 
-fn next_refinement_id() -> RefinementId {
+pub fn next_refinement_id() -> RefinementId {
     REFINEMENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -779,6 +780,7 @@ impl TypedExpr {
     /// Do not pass `Type::Infer(fresh_infer_var())` from lowering — `Hole` is
     /// the correct lowering placeholder.
     pub fn lambda(param: &str, param_ty: Type, body: TypedExpr) -> Self {
+        let result_ty = Type::fun(param_ty.clone(), body.ty.clone());
         Self::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 name: param.to_string(),
@@ -788,6 +790,7 @@ impl TypedExpr {
             body: Box::new(body),
             refinement: None,
         })
+        .with_ty(result_ty)
     }
 
     /// Build a [`TypedExprNode::Lambda`] with a predicate [`Refinement`].
@@ -935,8 +938,8 @@ impl fmt::Display for Type {
                     BaseType::Unit => "Unit",
                 }
             ),
-            Type::UIntRange(n) => write!(f, "[0, {n})"),
-            Type::Fun(a, b) => write!(f, "{a} ⇒ {b}"),
+            Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
+            Type::Fun(a, b) => write!(f, "({a} ⇒ {b})"),
             Type::Tuple(ts) => {
                 let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
                 write!(f, "({})", parts.join(", "))
@@ -957,7 +960,16 @@ impl fmt::Display for Type {
                 let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
                 write!(f, "{}", parts.join(" | "))
             }
-            Type::Refinement(t, r) => write!(f, "{{{t} | Refined({})}}", r.description),
+            Type::Refinement(t, r) => write!(
+                f,
+                "{{{t} | Refined({})}}",
+                match &r.kind {
+                    RefinementKind::Predicate(p) => p
+                        .try_borrow()
+                        .map_or(r.description.clone(), |e| symbolic::symbolic(&e)),
+                    RefinementKind::HashJoin(_) => r.description.clone(),
+                }
+            ),
             Type::Hole => write!(f, "_"),
             Type::Infer(id) => write!(f, "?{}", id.0),
             Type::DataSource(name) => write!(f, "source({name})"),

@@ -41,6 +41,7 @@ fn run_pipeline(code: &str) -> Tile {
         *notified_clone.borrow_mut() = true;
     });
     let mut producer = ctx.compile_program(code, consumer);
+    // let (_, _, mut producer) = new_compile_program(&mut ctx, code, consumer);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
     producer.get(producer.tiling().universal_guard())
@@ -77,35 +78,6 @@ fn make_int_list(v: &[i64]) -> Tile {
         domain: ColumnValue::UInts((0..v.len()).collect()),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(v.into()))),
         domain_predicate: Predicate::True,
-    }
-}
-
-/// Sort a `SealedFunction { domain: UInts, codomain: Scalar(Ints) }` tile by its
-/// domain keys so that structurally-equal-but-reordered tiles compare equal.
-///
-/// Used when the domain comes from a data source backed by a `HashMap`, where
-/// iteration order is non-deterministic.  Tiles with other shapes are returned
-/// unchanged.
-fn sort_tile(tile: Tile) -> Tile {
-    match tile {
-        Tile::SealedFunction {
-            domain: ColumnValue::UInts(keys),
-            codomain,
-            domain_predicate,
-        } if matches!(*codomain, Tile::Scalar(ColumnValue::Ints(_))) => {
-            let Tile::Scalar(ColumnValue::Ints(vals)) = *codomain else {
-                unreachable!()
-            };
-            let mut pairs: Vec<(usize, i64)> = keys.into_iter().zip(vals).collect();
-            pairs.sort_by_key(|(k, _)| *k);
-            let (sorted_keys, sorted_vals): (Vec<usize>, Vec<i64>) = pairs.into_iter().unzip();
-            Tile::SealedFunction {
-                domain: ColumnValue::UInts(sorted_keys),
-                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(sorted_vals))),
-                domain_predicate,
-            }
-        }
-        other => other,
     }
 }
 
@@ -861,32 +833,32 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[1,2,3]",
-    "[1, 2, 3]:[0, 3) ⇒ Int",
+    "[1, 2, 3]:([0, 2] ⇒ Int)",
     make_int_list(&[1,2,3])
 )]
 #[case(
     "x = [1,2,3]; x",
-    "let x : [0, 3) ⇒ Int = [1, 2, 3]\nin x:[0, 3) ⇒ Int",
+    "let x : ([0, 2] ⇒ Int) = [1, 2, 3]\nin x:([0, 2] ⇒ Int)",
     make_int_list(&[1,2,3])
 )]
 #[case(
     "x = [1,2,3]; [y + 10 for y in x]",
-    "let x : [0, 3) ⇒ Int = [1, 2, 3]\nin x ≫ (id, 10 ▷ const) ▷ zip ≫ add:[0, 3) ⇒ Int",
+    "let x : ([0, 2] ⇒ Int) = [1, 2, 3]\nin x ≫ (id, 10 ▷ const) ▷ zip ≫ add:([0, 2] ⇒ Int)",
     make_int_list(&[11,12,13])
 )]
 #[case(
     "[x + 10 + x for x in [1,2,3]]",
-    "[1, 2, 3] ≫ ((id, 10 ▷ const) ▷ zip ≫ add, id) ▷ zip ≫ add:[0, 3) ⇒ Int",
+    "[1, 2, 3] ≫ ((id, 10 ▷ const) ▷ zip ≫ add, id) ▷ zip ≫ add:([0, 2] ⇒ Int)",
     make_int_list(&[12,14,16])
 )]
 #[case(
     "y = 10; [x + y for x in [1,2,3]]",
-    "let y : Int = 10\nin [1, 2, 3] ≫ (id, y ▷ const) ▷ zip ≫ add:[0, 3) ⇒ Int",
+    "let y : Int = 10\nin [1, 2, 3] ≫ (id, y ▷ const) ▷ zip ≫ add:([0, 2] ⇒ Int)",
     make_int_list(&[11,12,13])
 )]
 #[case(
     "[x for x in [False,True] if x]",
-    "[false, true]:{[0, 2) | Refined(x)} ⇒ Bool",
+    "[false, true]:({[0, 1] | Refined([false, true])} ⇒ Bool)",
     Tile::SealedFunction {
         domain: ColumnValue::UInts(vec![1]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Bools(BitVec::from_elem(1, true)))),
@@ -895,7 +867,7 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x + 10 for x in [1,2,3] if x == 2]",
-    "[1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:{[0, 3) | Refined(x == 2)} ⇒ Int",
+    "[1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:({[0, 2] | Refined([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq)} ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::UInts(vec![1]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![12]))),
@@ -904,7 +876,7 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x + y for x in [1,2,3] for y in [10,20]]",
-    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:([0, 3), [0, 2)) ⇒ Int",
+    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:(([0, 2], [0, 1]) ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
@@ -919,7 +891,7 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[(x, y) for x in [1,2,3] for y in [10,20]]",
-    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip:([0, 3), [0, 2)) ⇒ (Int, Int)",
+    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip:(([0, 2], [0, 1]) ⇒ (Int, Int))",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
@@ -937,7 +909,7 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x for x in [1,2,3] for y in [10,20]]",
-    ".0 ≫ [1, 2, 3]:([0, 3), [0, 2)) ⇒ Int",
+    ".0 ≫ [1, 2, 3]:(([0, 2], [0, 1]) ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
@@ -952,7 +924,7 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x + y for x in [1,2,3] if x == 2 for y in [10,20] if y == 10]",
-    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:{([0, 3), [0, 2)) | Refined(x == 2 and y == 10)} ⇒ Int",
+    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:({([0, 2], [0, 1]) | Refined((id, .0 ≫ [1, 2, 3]) ▷ zip ≫ (id, .0 ≫ .1 ≫ [10, 20]) ▷ zip ≫ ((.0 ≫ .1, 2 ▷ const) ▷ zip ≫ eq, (.1, 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and)} ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![1])),
@@ -967,17 +939,17 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x for x in [x for x in [x for x in [1,2,3]]]]",
-    "[1, 2, 3]:[0, 3) ⇒ Int",
+    "[1, 2, 3]:([0, 2] ⇒ Int)",
     make_int_list(&[1,2,3])
 )]
 #[case(
     "[x for x in [y for y in [1,2,3] if y < 3] if x < 2]",
-    "[1, 2, 3]:{{[0, 3) | Refined(y < 3)} | Refined(x < 2)} ⇒ Int",
+    "[1, 2, 3]:({{[0, 2] | Refined([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} | Refined([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⇒ Int)",
     make_int_list(&[1])
 )]
 #[case(
     "[(x, x) for x in [(x, x) for x in [1,2,3]]]",
-    "[1, 2, 3] ≫ (id, id) ▷ zip ≫ (id, id) ▷ zip:[0, 3) ⇒ ((Int, Int), (Int, Int))",
+    "[1, 2, 3] ≫ (id, id) ▷ zip ≫ (id, id) ▷ zip:([0, 2] ⇒ ((Int, Int), (Int, Int)))",
     Tile::SealedFunction {
         domain: ColumnValue::UInts(vec![0, 1, 2]),
         codomain: Box::new(Tile::Record(HashMap::from([
@@ -995,7 +967,7 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]",
-    "(.0 ≫ [\"a\", \"b\"], .1 ≫ [\"c\", \"d\", \"e\"]) ▷ zip ≫ concat:([0, 2), [0, 3)) ⇒ String",
+    "(.0 ≫ [\"a\", \"b\"], .1 ≫ [\"c\", \"d\", \"e\"]) ▷ zip ≫ concat:(([0, 1], [0, 2]) ⇒ String)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0, 0, 0, 1, 1, 1])),
@@ -1010,10 +982,18 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x + 10 for x in testsource1() if x < 15]",
-    "source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add:{source(testsource1) | Refined(x < 15)} ⇒ Int",
+    "source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add:({source(testsource1) | Refined(source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt)} ⇒ Int)",
     make_int_list(&[10, 20])
 )]
 #[case("sum([1,2,3])", "[1, 2, 3] ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]
+#[case(
+    "[sum(x) for x in groupby([1,2,3,4], lambda y: y // 2)]",
+    "([1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:(Int ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![0, 1, 2]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))),
+        domain_predicate: Predicate::True,
+    })]
 fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expected_result: Tile) {
     use cambra::ccl::{context::new_compile_program, symbolic::symbolic};
 
@@ -1046,5 +1026,8 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
     let result = producer.get(producer.tiling().universal_guard());
-    assert_eq!(sort_tile(result), sort_tile(expected_result));
+    assert_eq!(
+        sort_sealed_function_by_domain(result),
+        sort_sealed_function_by_domain(expected_result)
+    );
 }
