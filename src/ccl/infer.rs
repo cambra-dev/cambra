@@ -1406,15 +1406,13 @@ fn infer_let(
                 inferred: bound_ty.clone(),
             })?;
     }
-    // Normalize Hole → fresh registered Infer before existing binding-type logic.
-    if matches!(binding.ty, Type::Hole) {
-        binding.ty = Type::Infer(ctx.fresh_infer_var());
-    }
-    // Move bound_ty into binding.ty when unresolved, avoiding a clone.
-    // The scope bind then clones from binding.ty instead of from bound_ty.
-    if matches!(binding.ty, Type::Infer(_)) {
-        binding.ty = bound_ty;
-    }
+    // Always replace the pre-inference placeholder with the inferred type.
+    // Expr::let_bind initialises binding.ty from bound_expr.ty *before*
+    // inference runs, which can be a structured type containing Holes (e.g.
+    // Fun(Infer(n), Hole) for a lambda whose body starts with ty=Hole).
+    // Only checking for bare Hole or bare Infer misses those cases, leaving a
+    // Hole embedded in binding.ty that panics resolve() later.
+    binding.ty = bound_ty;
     let body_ty = {
         let mut scoped = ctx.enter_scope();
         scoped.bind(&binding.name, binding.ty.clone());
