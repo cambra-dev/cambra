@@ -10,12 +10,13 @@ use crate::{
         compile_tile_operators::{TileCompileContext, TileVarBinding},
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, IterateExtent, MapAggregate,
-            MapExtractAggregate, MapResult, MapResultToConst, MapResultWithSource, Memo, Restrict,
-            ScalarTuple, Splitter, TileOperator, Tiling, Zip,
+            MapDomain, MapExtractAggregate, MapResult, MapResultToConst, MapResultWithSource, Memo,
+            Restrict, ScalarTuple, Splitter, TileOperator, Tiling, Uncurry, Zip,
         },
         tuple_field, ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind, Extent,
         FuncBinding, FunctionDef, LogicKind, UnaryOpKind, Value,
     },
+    pretty_graph::pretty_tile_operator,
 };
 use std::rc::Rc;
 
@@ -55,7 +56,7 @@ pub fn convert_to_operators(
     expr: &Expr,
     ctx: &mut TileCompileContext,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
-    convert_impl(expr, None, ctx)
+    convert_impl(expr, None, None, ctx)
 }
 
 /// Core conversion: translate `expr` into an operator that transforms `input`.
@@ -69,17 +70,28 @@ pub fn convert_to_operators(
 fn convert_impl(
     expr: &Expr,
     input: Option<Box<dyn TileOperator>>,
+    // TODO remove this once refinements are propagated correctly
+    // Currently, it forces iteration to be of the specified type if Some, overriding
+    // the type on the current expression.
+    // We only need this because Compose sometimes has a refined type that is not present
+    // on its first child.
+    input_ty: Option<Type>,
     ctx: &mut TileCompileContext,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
-    trace!("Converting {} with type {}", symbolic(expr), expr.ty);
-    match &expr.node {
+    let result: Result<Box<dyn TileOperator>, CompileError> = match &expr.node {
         // f ≫ g: left-to-right composition.  Apply left first, then right.
         TypedExprNode::Compose(elems) => {
-            let mut result = input.unwrap_or(iterate_domain(&expr.ty, ctx)?);
+            let mut result = input;
+            let mut input_ty = if result.is_none() {
+                Some(expr.ty.clone())
+            } else {
+                None
+            };
             for elem in elems.iter() {
-                result = convert_impl(elem, Some(result), ctx)?
+                result = Some(convert_impl(elem, result, input_ty, ctx)?);
+                input_ty = None
             }
-            Ok(result)
+            Ok(result.unwrap())
         }
 
         TypedExprNode::Lambda { .. } => {
@@ -92,18 +104,19 @@ fn convert_impl(
             bound_expr,
             body,
         } => {
-            let bound_op = convert_impl(bound_expr, None, ctx)?;
+            let bound_op = convert_impl(bound_expr, None, None, ctx)?;
             let split = Rc::new(Splitter::new(Box::new(Memo::new(bound_op))));
             let mut scope = ctx.enter_scope();
             scope.bind(&binding.name, TileVarBinding::Operator(split));
-            convert_impl(body, input, &mut scope)
+            convert_impl(body, input, None, &mut scope)
         }
 
         // const(c): maps every domain element to the constant value c.
         TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "const") =>
         {
-            let input = input.unwrap_or(iterate_domain(&expr.ty, ctx)?);
-            let const_op = convert_impl(argument, None, ctx)?;
+            let input =
+                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
+            let const_op = convert_impl(argument, None, None, ctx)?;
             Ok(Box::new(MapResultToConst::new(input, const_op)))
         }
 
@@ -116,12 +129,13 @@ fn convert_impl(
                     argument.node
                 )));
             };
-            let input = input.unwrap_or(iterate_domain(&expr.ty, ctx)?);
+            let input =
+                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
             // Wrap input in Split so every branch shares the same upstream producer.
             let split = Rc::new(Splitter::new(Box::new(Memo::new(input))));
             let mut ops = Vec::new();
             for elt in elts {
-                ops.push(convert_impl(elt, Some(split.split()), ctx)?);
+                ops.push(convert_impl(elt, Some(split.split()), None, ctx)?);
             }
             Ok(Box::new(Zip::new(ops)))
         }
@@ -133,18 +147,44 @@ fn convert_impl(
             if input.is_none() {
                 return Err(CompileError::Unsupported("map requires an input".into()));
             }
-            convert_impl(argument, input, ctx)
+            convert_impl(argument, input, None, ctx)
         }
 
         // converse translates 1:1 to the Converse operator
         TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "converse") =>
         {
-            // TODO add a check that input is None; right now we end up with an incorrectly-iterated input
-            // from the outer compose that we ignore here for now.  Once we are properly handling refinement
-            // types throught the whole plan, Compose shouldn't need to iterate itself and let its first element
-            // do the iteration instead.
-            let input = convert_impl(argument, None, ctx)?;
-            Ok(Box::new(Converse::new(input)))
+            let converse = Box::new(Converse::new(convert_impl(argument, None, None, ctx)?));
+            if let Some(input) = input {
+                Ok(Box::new(MapResult::new(input, converse)))
+            } else {
+                Ok(converse)
+            }
+        }
+
+        // map_domain transforms the codomain of its argument to a copy of the domain.
+        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "map_domain") =>
+        {
+            if input.is_some() {
+                return Err(CompileError::Unsupported(
+                    "map_domain requires no input".into(),
+                ));
+            }
+            Ok(Box::new(MapDomain::new(convert_impl(
+                argument, None, None, ctx,
+            )?)))
+        }
+
+        // uncurry flattens a curried function into a sealed function with a pair domain.
+        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "uncurry") =>
+        {
+            if input.is_some() {
+                return Err(CompileError::Unsupported(
+                    "uncurry requires no input".into(),
+                ));
+            }
+            Ok(Box::new(Uncurry::new(convert_impl(
+                argument, None, None, ctx,
+            )?)))
         }
 
         // If we are applying an aggregate, then it is a global aggregate that should use the Aggregate operator.
@@ -158,7 +198,7 @@ fn convert_impl(
             let TypedExprNode::Var(name) = &function.node else {
                 unreachable!()
             };
-            let input = convert_impl(argument, None, ctx)?;
+            let input = convert_impl(argument, None, None, ctx)?;
             apply_aggregate(input, agg_for_name(name).unwrap())
         }
 
@@ -169,13 +209,14 @@ fn convert_impl(
                         symbolic(function)),
                 ));
             }
-            let arg = convert_impl(argument, None, ctx)?;
-            convert_impl(function, Some(arg), ctx)
+            let arg = convert_impl(argument, None, None, ctx)?;
+            convert_impl(function, Some(arg), None, ctx)
         }
 
         // Standalone projection morphism: project field _n from codomain of input.
         TypedExprNode::Proj(ProjKey::Index(n)) => {
-            let input = input.unwrap_or(iterate_domain(&expr.ty, ctx)?);
+            let input =
+                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
             proj_field(input, *n)
         }
 
@@ -186,10 +227,11 @@ fn convert_impl(
 
         TypedExprNode::Var(name) => {
             let mut get = |input: Option<Box<dyn TileOperator>>| {
-                Ok(input.unwrap_or(iterate_domain(&expr.ty, ctx)?))
+                Ok(input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?))
             };
             match name.as_str() {
                 "id" => get(input),
+                "map_domain" => Ok(Box::new(MapDomain::new(get(input)?))),
                 name if binop_for_name(name).is_some() => {
                     apply_binop(get(input)?, binop_for_name(name).unwrap())
                 }
@@ -220,7 +262,8 @@ fn convert_impl(
         TypedExprNode::List(elts) => {
             let fn_const = compile_list_fn(elts)?;
             // Use the provided input as the index stream, or create one from UIntRange(n).
-            let index_stream = input.unwrap_or(iterate_domain(&expr.ty, ctx)?);
+            let index_stream =
+                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
             Ok(Box::new(MapResult::new(index_stream, fn_const)))
         }
 
@@ -248,7 +291,7 @@ fn convert_impl(
                     let split = Rc::new(Splitter::new(Box::new(Memo::new(domain))));
                     let ops: Result<Vec<_>, _> = elts
                         .iter()
-                        .map(|elt| convert_impl(elt, Some(split.split()), ctx))
+                        .map(|elt| convert_impl(elt, Some(split.split()), None, ctx))
                         .collect();
                     Ok(Box::new(Zip::new(ops?)))
                 }
@@ -256,7 +299,7 @@ fn convert_impl(
                 None => {
                     let ops: Result<Vec<_>, _> = elts
                         .iter()
-                        .map(|elt| convert_impl(elt, None, ctx))
+                        .map(|elt| convert_impl(elt, None, None, ctx))
                         .collect();
                     Ok(Box::new(ScalarTuple::new(ops?)))
                 }
@@ -274,7 +317,8 @@ fn convert_impl(
 
         // Data source: produces MapResultWithSource(IterateExtent(domain), source).
         TypedExprNode::Source(name) => {
-            let input = input.unwrap_or(iterate_domain(&expr.ty, ctx)?);
+            let input =
+                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
             Ok(Box::new(MapResultWithSource::new(
                 ctx.get_source(name)?,
                 input,
@@ -284,7 +328,16 @@ fn convert_impl(
         other => Err(CompileError::Unsupported(format!(
             "CCL node {other:?} is not yet supported in operator_conversion"
         ))),
+    };
+    if let Ok(op) = &result {
+        trace!(
+            "Converted {} : {} to\n{}",
+            symbolic(expr),
+            expr.ty,
+            pretty_tile_operator(op.as_ref())
+        );
     }
+    result
 }
 
 /// Build an [`IterateExtent`] for the given CCL type, threading predicate
@@ -298,6 +351,7 @@ fn iterate_domain(
     ty: &Type,
     ctx: &mut TileCompileContext,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
+    trace!("Iterating {ty}");
     if let Type::Fun(domain, _) = ty {
         iterate_type(domain, ctx)
     } else {
@@ -322,6 +376,7 @@ fn iterate_type(
         Ok(Box::new(Restrict::new(convert_impl(
             &pred.borrow(),
             Some(iterate_type(base, ctx)?),
+            None,
             ctx,
         )?)))
     } else {

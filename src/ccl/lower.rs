@@ -44,9 +44,8 @@
 //! This is intentional: the less-normalized representation preserves structure
 //! needed for optimization passes.
 
-use std::{collections::HashSet, rc::Rc};
+use std::collections::HashSet;
 
-use bit_set::BitSet;
 use rustpython_parser::ast as pyast;
 
 use crate::ccl::BaseType;
@@ -572,117 +571,6 @@ fn lower_boolop(
     Ok(acc)
 }
 
-// ---------------------------------------------------------------------------
-// Join-detection helpers (operate on the lowered CCL AST)
-// ---------------------------------------------------------------------------
-
-/// Compute the set of generator-variable indices referenced anywhere in a CCL [`Expr`].
-///
-/// Returns a [`BitSet`] where bit `i` is set when `expr` contains a [`Expr::Var`]
-/// whose name matches `gen_var_names[i]`.
-fn ccl_gen_vars_referenced(expr: &Expr, gen_var_names: &[&str]) -> BitSet {
-    let mut result = BitSet::new();
-    let mut shadowed = BitSet::new();
-    ccl_gen_vars_referenced_inner(expr, gen_var_names, &mut result, &mut shadowed);
-    result
-}
-
-fn ccl_gen_vars_referenced_inner(
-    expr: &Expr,
-    gen_var_names: &[&str],
-    result: &mut BitSet,
-    shadowed: &mut BitSet,
-) {
-    match &expr.node {
-        TypedExprNode::Var(name) => {
-            if let Some(i) = gen_var_names.iter().position(|n| *n == name.as_str()) {
-                // TODO once we support lambda expressions in CHL, test that the shadowing here
-                // actually works.
-                if !shadowed.contains(i) {
-                    result.insert(i);
-                }
-            }
-        }
-        TypedExprNode::BinOp { left, right, .. } => {
-            ccl_gen_vars_referenced_inner(left, gen_var_names, result, shadowed);
-            ccl_gen_vars_referenced_inner(right, gen_var_names, result, shadowed);
-        }
-        TypedExprNode::UnaryOp(_, operand) => {
-            ccl_gen_vars_referenced_inner(operand, gen_var_names, result, shadowed);
-        }
-        TypedExprNode::Apply { function, argument } => {
-            ccl_gen_vars_referenced_inner(function, gen_var_names, result, shadowed);
-            ccl_gen_vars_referenced_inner(argument, gen_var_names, result, shadowed);
-        }
-        TypedExprNode::Lambda { body, param, .. } => {
-            // Generator variables are free in the predicate; descend into body.
-            let outer_shadowed = shadowed.clone();
-            if let Some(i) = gen_var_names.iter().position(|n| *n == param.name) {
-                shadowed.insert(i);
-            }
-            ccl_gen_vars_referenced_inner(body, gen_var_names, result, shadowed);
-            *shadowed = outer_shadowed;
-        }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            ccl_gen_vars_referenced_inner(bound_expr, gen_var_names, result, shadowed);
-            let outer_shadowed = shadowed.clone();
-            if let Some(i) = gen_var_names.iter().position(|n| *n == binding.name) {
-                shadowed.insert(i);
-            }
-            ccl_gen_vars_referenced_inner(body, gen_var_names, result, shadowed);
-            *shadowed = outer_shadowed;
-        }
-        TypedExprNode::List(items) | TypedExprNode::Tuple(items) => {
-            for item in items {
-                ccl_gen_vars_referenced_inner(item, gen_var_names, result, shadowed);
-            }
-        }
-        TypedExprNode::GroupBy { collection, key } => {
-            ccl_gen_vars_referenced_inner(collection, gen_var_names, result, shadowed);
-            ccl_gen_vars_referenced_inner(key, gen_var_names, result, shadowed);
-        }
-        TypedExprNode::Lit(_) => {}
-        _ => {}
-    }
-}
-
-/// If `pred` is a CCL equality between expressions each referencing a distinct
-/// single generator variable, return `(build_gen, build_key, probe_gen, probe_key)`
-/// normalised so that `build_gen < probe_gen`.
-///
-/// Returns `None` for any other predicate shape.
-fn try_extract_ccl_equality_join<'a>(
-    pred: &'a Expr,
-    gen_var_names: &[&str],
-) -> Option<(usize, &'a Expr, usize, &'a Expr)> {
-    if let TypedExprNode::BinOp {
-        left,
-        op: BinOpKind::Compare(CompareKind::Equals),
-        right,
-    } = &pred.node
-    {
-        let refs_lhs = ccl_gen_vars_referenced(left, gen_var_names);
-        let refs_rhs = ccl_gen_vars_referenced(right, gen_var_names);
-        if refs_lhs.len() == 1 && refs_rhs.len() == 1 {
-            let gen_l = refs_lhs.iter().next().unwrap();
-            let gen_r = refs_rhs.iter().next().unwrap();
-            if gen_l != gen_r {
-                // Normalise: smaller generator index = build side.
-                return if gen_l < gen_r {
-                    Some((gen_l, left, gen_r, right))
-                } else {
-                    Some((gen_r, right, gen_l, left))
-                };
-            }
-        }
-    }
-    None
-}
-
 /// Lower a Python lambda expression to a curried [`Expr::Lambda`] chain.
 ///
 /// Each positional parameter becomes one lambda layer, outermost-first, so
@@ -814,35 +702,13 @@ fn lower_list_comp(
         .map(|e| lower_expr(e, ctx))
         .collect::<Result<_, _>>()?;
 
-    let gen_var_refs: Vec<&str> = gen_iter_vars.iter().map(String::as_str).collect();
-
     // Detect a 2-generator equality join on the CCL AST: exactly 2 generators,
     // 1 predicate, and the predicate is `lhs == rhs` where each side references
     // a distinct generator variable.  Emit a hash-join refinement instead of a
     // loop-join predicate.  Sources are cloned from the already-lowered
     // `gen_sources`; key expressions are taken directly from the lowered predicate.
     // TODO move this to a later phase of compilation.
-    let hash_join_spec: Option<HashJoinSpec> = if generators.len() == 2 && lowered_preds.len() == 1
-    {
-        if let Some((build_gen, build_key, probe_gen, probe_key)) =
-            try_extract_ccl_equality_join(&lowered_preds[0], &gen_var_refs)
-        {
-            Some(HashJoinSpec {
-                build_gen_position: build_gen,
-                probe_gen_position: probe_gen,
-                build_var_name: gen_iter_vars[build_gen].clone(),
-                probe_var_name: gen_iter_vars[probe_gen].clone(),
-                build_key: Rc::new(build_key.clone()),
-                probe_key: Rc::new(probe_key.clone()),
-                build_source: Rc::new(gen_sources[build_gen].clone()),
-                probe_source: Rc::new(gen_sources[probe_gen].clone()),
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let hash_join_spec: Option<HashJoinSpec> = None;
 
     // Combine all `if` guards into a single loop-join predicate (used when hash
     // join is not applicable — non-equality, 3+ generators, or multiple predicates).
@@ -958,7 +824,7 @@ fn lower_list_comp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{symbolic::symbolic, RefinementKind};
+    use crate::ccl::symbolic::symbolic;
     use rstest::rstest;
     use rustpython_parser::parser;
 
@@ -1120,58 +986,6 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
-    }
-
-    // -----------------------------------------------------------------------
-    // Hash join detection tests
-    // -----------------------------------------------------------------------
-
-    /// Verify that a 2-generator equality join produces a `RefinementKind::HashJoin`
-    /// and a non-equality predicate produces `RefinementKind::Predicate`.
-    #[test]
-    fn test_hash_join_kind_detection() {
-        // Equality join: `x == y` should give HashJoin
-        let eq_join = parse_module("[x for x in [1, 2] for y in [3, 4] if x == y]");
-        let eq_ccl = lower_stmts(&eq_join, &LoweringContext::default()).expect("lowering failed");
-        if let TypedExprNode::Lambda { refinement, .. } = &eq_ccl.node {
-            let r = refinement
-                .as_ref()
-                .expect("expected refinement for equality join");
-            assert!(
-                matches!(r.kind, RefinementKind::HashJoin(_)),
-                "expected HashJoin refinement for `x == y`, got Predicate"
-            );
-        } else {
-            panic!("expected Lambda at top level, got {eq_ccl:?}");
-        }
-
-        // Non-equality predicate: `x < y` should give Predicate (loop join)
-        let non_eq = parse_module("[x for x in [1, 2] for y in [3, 4] if x < y]");
-        let non_eq_ccl =
-            lower_stmts(&non_eq, &LoweringContext::default()).expect("lowering failed");
-        if let TypedExprNode::Lambda { refinement, .. } = &non_eq_ccl.node {
-            let r = refinement
-                .as_ref()
-                .expect("expected refinement for loop join");
-            assert!(
-                matches!(r.kind, RefinementKind::Predicate(_)),
-                "expected Predicate refinement for `x < y`, got HashJoin"
-            );
-        } else {
-            panic!("expected Lambda at top level, got {non_eq_ccl:?}");
-        }
-    }
-
-    /// Symbolic output for a 2-gen equality join includes `Refined(x == y)` in the header.
-    #[test]
-    fn test_hash_join_symbolic() {
-        let stmts = parse_module("[x for x in [1, 2] for y in [3, 4] if x == y]");
-        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
-        let sym = symbolic(&ccl);
-        assert!(
-            sym.contains("Refined(x == y)"),
-            "expected 'Refined(x == y)' in symbolic output, got: {sym}"
-        );
     }
 
     // -----------------------------------------------------------------------

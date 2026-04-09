@@ -140,6 +140,8 @@ during compilation; producers are created on demand at runtime.
 | `MapToConst` | `SealedFunction(extent → *)` | `SealedFunction(extent → Scalar)` | Replaces every codomain value of a sealed-function input with the same constant, preserving the domain. |
 | `ToScalar` | Constant: `Scalar`<br>Data: `SealedFunction(Unit → Scalar)` | `Scalar` | Unwraps a `SealedFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |
 | `Converse` | `SealedFunction(domain -> Scalar(codomain))` | `CurriedFunction(codomain → domain)` | Inverts a sealed-function operator: each codomain value maps to the list of domain values that produced it. |
+| `Uncurry` | `CurriedFunction(A → B → C)` | `SealedFunction(Record(A, B) → Scalar(C))` | Flattens a curried function into a sealed function with a pair domain: transforms the nested lookup structure `A → B → C` into a flat pair-keyed structure `(A, B) → C`. |
+| `MapDomain` | `SealedFunction(A → *)` | `SealedFunction(A → Scalar(A))` | Replaces the codomain of a sealed function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |
 | `MapCompose` | Function: Function: any tiling of type `A → B`<br>Data: `CurriedFunction(extent → A)` | `CurriedFunction(extent → B)` | Applies a function to every value in each codomain list of a `CurriedFunction`, producing a new `CurriedFunction` with the same domain but transformed values. |
 | `Filter` | Predicate: any tiling of type `A → bool` <br>Data: `SealedFunction(extent → Scalar(A))` | Same as input | Filters a sealed-function tile by a boolean predicate: keeps only domain elements where the predicate on the value evaluates to `true`. <br>TODO can probably remove this in favor of Restrict |
 | `Restrict` | Predicate: any tiling of type `A → bool` <br>Data: `SealedFunction(A → *)` | Same as input | Filters a sealed-function tile by a boolean predicate: keeps only domain elements whose predicate evaluates to `true`. |
@@ -152,7 +154,6 @@ during compilation; producers are created on demand at runtime.
 
 TODOs for implementing hash joins:
 
-- Add an uncurry that converts `CurriedFunction(A → UInt → B)` to `SealedFunction(Record(A, Uint) → B)`
 - Add support for MapApply to take a `CurriedFunction(A → UInt → B)` as the function argument, which will then convert `SealedFunction(C → A)` to `CurriedFunction(C → UInt → B)`
 
 ## Open Challenges

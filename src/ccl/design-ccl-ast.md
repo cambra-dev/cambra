@@ -301,34 +301,17 @@ enum Type {
 
 /// Carries the join strategy for a restricted Lambda (i.e. a filtered/joined comprehension).
 struct Refinement {
+    /// Unique ID for this refinement
+    id: RefinementId, 
     /// Human-readable description shown by the symbolic printer (e.g. `"x < 10"`, `"x == y"`).
     description: String,
-    /// Whether this is a loop join (arbitrary predicate) or hash join (equality between generators).
+    /// Always an arbitrary predicate.  TODO flatten this away
     kind: RefinementKind,
 }
 
 enum RefinementKind {
-    /// Arbitrary boolean predicate; compiled to a `ComputeRestriction::new_predicate` loop join.
-    /// The `Rc<RefCell<>>` holds the predicate expression and doubles as the cache key in `CompileContext`.
+    /// Arbitrary boolean predicate expressed as CCL.
     Predicate(Rc<RefCell<TypedExpr>>),
-    /// Equality key join between two generators; compiled to a `ComputeRestriction::new_join`
-    /// hash join using a `Converse` operator.
-    HashJoin(Box<HashJoinSpec>),
-}
-
-/// Specifies the two sides of a hash join.
-///
-/// Detection criteria: exactly 2 generators, exactly 1 `if` guard, the guard is
-/// `lhs == rhs` where each side references a distinct generator variable.
-struct HashJoinSpec {
-    build_gen: usize,              // generator index (0-based) for the build side
-    probe_gen: usize,              // generator index for the probe side
-    build_var_name: String,        // iteration variable name for the build side
-    probe_var_name: String,        // iteration variable name for the probe side
-    build_key: Rc<TypedExpr>,      // key expression referencing build_var_name
-    probe_key: Rc<TypedExpr>,      // key expression referencing probe_var_name
-    build_source: Rc<TypedExpr>,   // source list for the build side
-    probe_source: Rc<TypedExpr>,   // source list for the probe side
 }
 ```
 
@@ -473,11 +456,20 @@ After `resolve`, `infer` calls `check_fully_typed(expr)` to assert that every `t
 
 ## Join Planning (`ccl/join_plan.rs`)
 
-`join_plan::run` is an optimization pass that transforms keyed aggregates into efficient implementations
-using the `"converse"` combinator for grouping by key. This pass runs after `lambda_elim` and before
-the final `simplify` pass.
+`join_plan::run` is an optimization pass that transforms both keyed aggregates and loop joins into efficient implementations.
+This pass runs after `lambda_elim` and before the final `simplify` pass.
 
-In the future, this pass will also convert loop joins to hash joins or other efficient join plans.
+### Hash Joins
+
+Loop join patterns (where a predicate filters a cartesian product) are converted to hash-join strategies via `create_hash_joins`.
+The transformation rewrites cross-product iteration into a more efficient strategy where:
+1. One side builds a lookup table using the `Converse` operator
+2. The other side probes that lookup table using nested function application
+
+TODO we need to add an explicit filtering step as part of this logic.
+
+This conversion matches patterns of the form `(x, y) ▷ zip ≫ eq` and determines which element(s) of a tuple
+correspond to which key arguments in the refinement predicate.
 
 ### Keyed Aggregates
 

@@ -192,6 +192,7 @@ pub fn new_compile_program(
     let join_planned = join_plan::run(lambda_elim);
 
     debug!("Join-planned CCL:\n{}", symbolic(&join_planned));
+    debug!("Join-planned CCL:\n{}", symbolic_typed(&join_planned));
 
     let mut op =
         convert_to_operators(&join_planned, ctx.compile_ctx()).expect("Operator conversion failed");

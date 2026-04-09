@@ -391,17 +391,59 @@ impl MapResult {
     /// of `function` becomes the output value extent, threaded through the domain
     /// (if any) of `input`.
     pub fn new(input: Box<dyn TileOperator>, function: Box<dyn TileOperator>) -> Self {
-        let function_domain_extent = function.tiling().domain_extent().unwrap_or_else(|| {
-            panic!(
-                "Map function had non-function tiling {:?}",
-                function.tiling()
-            )
+        let function_tiling = function.tiling();
+
+        // Special case: when function is CurriedFunction(B, C, D), we need to produce a CurriedFunction output.
+        // The input domain becomes the output domain1, and the function's domain2/codomain become output domain2/codomain.
+        if let Tiling::CurriedFunction {
+            domain1: fn_domain1,
+            domain2: fn_domain2,
+            codomain: fn_codomain,
+        } = function_tiling
+        {
+            let input_tiling = input.tiling();
+            let input_domain = match input_tiling {
+                Tiling::SealedFunction { domain: d, codomain: c, .. } => {
+                    // Verify the codomain matches the function's domain1
+                    assert_eq!(
+                        c.extent(),
+                        *fn_domain1,
+                        "Input codomain extent must match function domain1"
+                    );
+                    d.clone()
+                }
+                Tiling::CurriedFunction { domain1: d, codomain: c, .. } => {
+                    // Verify the codomain matches the function's domain1
+                    assert_eq!(
+                        c, fn_domain1,
+                        "Input codomain extent must match function domain1"
+                    );
+                    d.clone()
+                }
+                _ => panic!(
+                    "MapResult with CurriedFunction function requires SealedFunction or CurriedFunction input, got {:?}",
+                    input_tiling
+                ),
+            };
+            // Output is CurriedFunction(input_domain, fn_domain2, fn_codomain)
+            let tiling = Tiling::CurriedFunction {
+                domain1: input_domain,
+                domain2: fn_domain2.clone(),
+                codomain: fn_codomain.clone(),
+            };
+            return Self {
+                tiling,
+                input,
+                function,
+            };
+        }
+
+        // Standard logic for non-CurriedFunction functions
+        let function_domain_extent = function_tiling.domain_extent().unwrap_or_else(|| {
+            panic!("Map function had non-function tiling {:?}", function_tiling)
         });
-        let output_tiling = function.tiling().codomain().unwrap_or_else(|| {
-            panic!(
-                "Map function had non-function tiling {:?}",
-                function.tiling()
-            )
+        let output_tiling = function_tiling.codomain().unwrap_or_else(|| {
+            panic!("Map function had non-function tiling {:?}", function_tiling)
         });
         let tiling = change_tiling_result(input.tiling(), move |codomain_extent| {
             assert_eq!(function_domain_extent, *codomain_extent);
@@ -472,7 +514,7 @@ impl TileProducer for MapResultProducer {
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let f_tiling = self.function.tiling();
+        let f_tiling = self.function.tiling().clone();
         assert!(
             f_tiling.is_function(),
             "MapApply expected function tiling, Got {f_tiling:?}"
@@ -489,6 +531,137 @@ impl TileProducer for MapResultProducer {
 
         let input_tile = self.input.get(input_guard);
         let function_tile = self.function.get(self.function.tiling().universal_guard());
+
+        // When the function is a CurriedFunction, we need special-case handling.
+        if let Tile::CurriedFunction {
+            domain1: f_domain,
+            offsets,
+            domain2: f_domain2,
+            codomain: f_codomain,
+            domain_predicate: _,
+        } = function_tile
+        {
+            let Tile::SealedFunction {
+                domain,
+                codomain: input_codomain,
+                domain_predicate,
+            } = input_tile
+            else {
+                panic!("Expected SealedFunction");
+            };
+
+            // Extract codomain values. For a Scalar codomain, get the ColumnValue directly.
+            // For other types, need to handle appropriately.
+            let codomain_values = match *input_codomain {
+                Tile::Scalar(ref cv) => cv.clone(),
+                _ => panic!("MapResult with CurriedFunction only supports Scalar codomains"),
+            };
+
+            // Get the correct extents from the CurriedFunction tiling
+            // For CurriedFunction(A, B, C), we need B and C extents for domain2 and codomain
+            let (f_domain2_extent, f_codomain_extent) = if let Tiling::CurriedFunction {
+                domain2: d2_extent,
+                codomain: c_extent,
+                ..
+            } = &f_tiling
+            {
+                (d2_extent.clone(), c_extent.clone())
+            } else {
+                panic!("Expected CurriedFunction tiling for CurriedFunction tile")
+            };
+
+            // Sort domain to ensure consistent ordering
+            let mut sort_indices: Vec<usize> = (0..domain.len()).collect();
+            sort_indices.sort_by(|&a, &b| {
+                domain
+                    .index_at(a)
+                    .partial_cmp(&domain.index_at(b))
+                    .expect("Cannot compare domain values")
+            });
+
+            // Reorder domain and codomain by sort indices
+            let sorted_domain =
+                domain.select_indices(sort_indices.iter().cloned(), sort_indices.len());
+            let sorted_codomain_values =
+                codomain_values.select_indices(sort_indices.iter().cloned(), sort_indices.len());
+
+            // For each element in sorted domain, find the corresponding codomain value,
+            // then look up that codomain value in f_domain to get f_domain2 and f_codomain values.
+            // TODO this is doing filtering implicitly here, but we should do it in a separate step.
+            // in order to do this we need to be able to construct a filter based on the presence of domain
+            // elements in another function, and we don't have that capability yet.
+            let mut new_domain =
+                ColumnValue::from_values(Vec::new(), &i_tiling.domain_extent().unwrap());
+            let mut new_offsets =
+                ColumnValue::from_values(Vec::new(), &Extent::Base(BaseType::UInt));
+            let mut new_domain2 = ColumnValue::from_values(Vec::new(), &f_domain2_extent);
+            let mut new_codomain = ColumnValue::from_values(Vec::new(), &f_codomain_extent);
+
+            // Build an index from f_domain values to their first and last indices.
+            // This avoids O(n*m) lookup by allowing O(1) range retrieval per value.
+            let mut f_domain_index: HashMap<Value, (usize, usize)> = HashMap::new();
+            for f_idx in 0..f_domain.len() {
+                let val = f_domain.index_at(f_idx);
+                f_domain_index
+                    .entry(val.clone())
+                    .and_modify(|(_, last)| *last = f_idx)
+                    .or_insert((f_idx, f_idx));
+            }
+
+            let mut current_offset = 0usize;
+            for i in 0..sorted_domain.len() {
+                let domain_value = sorted_domain.index_at(i);
+                let codomain_value = sorted_codomain_values.index_at(i);
+
+                // Look up index range for this codomain_value in O(1) time.
+                if let Some(&(first, last)) = f_domain_index.get(&codomain_value) {
+                    // Record this domain element and its starting offset
+                    new_domain.append(ColumnValue::from_values(
+                        vec![domain_value],
+                        &i_tiling.domain_extent().unwrap(),
+                    ));
+                    new_offsets.append(ColumnValue::from_values(
+                        vec![Value::UInt(current_offset)],
+                        &Extent::Base(BaseType::UInt),
+                    ));
+
+                    // Collect f_domain2 and f_codomain elements for this codomain value
+                    for f_idx in first..=last {
+                        // For each match in f_domain, get the corresponding group from offsets
+                        let group_start = offsets.index_at(f_idx).as_uint();
+                        let group_end = if f_idx + 1 < f_domain.len() {
+                            offsets.index_at(f_idx + 1).as_uint()
+                        } else {
+                            f_domain2.len()
+                        };
+
+                        // Append the group's domain2 and codomain values
+                        for group_idx in group_start..group_end {
+                            new_domain2.append(ColumnValue::from_values(
+                                vec![f_domain2.index_at(group_idx)],
+                                &f_domain2_extent,
+                            ));
+                            new_codomain.append(ColumnValue::from_values(
+                                vec![f_codomain.index_at(group_idx)],
+                                &f_codomain_extent,
+                            ));
+                            current_offset += 1;
+                        }
+                    }
+                }
+            }
+
+            // Build new CurriedFunction with filtered domain and transformed codomain
+            return Tile::CurriedFunction {
+                domain1: new_domain,
+                offsets: new_offsets,
+                domain2: new_domain2,
+                codomain: new_codomain,
+                domain_predicate,
+            };
+        }
+
+        // Standard logic for non-CurriedFunction outputs
         process_tile_result(self.tiling(), input_tile, move |codomain| {
             apply_function_tile(function_tile, codomain, f_domain_extent, f_codomain_extent)
         })
@@ -1469,6 +1642,261 @@ impl TileProducer for ConverseProducer {
             }
             _ => {}
         }
+    }
+}
+
+/// Replaces the codomain of a sealed function with the domain values themselves,
+/// creating an identity mapping where the codomain is a copy of the domain.
+///
+/// Takes a `SealedFunction(domain → codomain)` and produces `SealedFunction(domain → Scalar(domain))`.
+/// The output domain is unchanged; the codomain becomes a scalar version of the same domain values.
+pub struct MapDomain {
+    /// Output tiling: `SealedFunction { domain, codomain: Scalar(domain) }`.
+    tiling: Tiling,
+    /// The sealed-function input.
+    input: Box<dyn TileOperator>,
+}
+
+impl MapDomain {
+    /// Create a `MapDomain` operator that replaces the codomain with the domain values.
+    pub fn new(input: Box<dyn TileOperator>) -> Self {
+        let Tiling::SealedFunction { domain, .. } = input.tiling() else {
+            panic!(
+                "MapDomain expected SealedFunction, got {:?}",
+                input.tiling()
+            )
+        };
+        let tiling = Tiling::SealedFunction {
+            domain: domain.clone(),
+            codomain: Box::new(Tiling::Scalar(domain.clone())),
+        };
+        Self { tiling, input }
+    }
+}
+
+impl TileOperator for MapDomain {
+    fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        Box::new(MapDomainProducer {
+            base: ProducerBase {
+                id: MapDomainProducer::alloc_id(),
+                tiling: self.tiling().clone(),
+            },
+            input: self
+                .input
+                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+        })
+    }
+}
+
+/// Producer for [`MapDomain`]: replaces a sealed-function's codomain with its domain.
+struct MapDomainProducer {
+    base: ProducerBase,
+    /// The upstream producer whose codomain is replaced.
+    input: Box<dyn TileProducer>,
+}
+
+impl TileProducer for MapDomainProducer {
+    fn base(&self) -> &ProducerBase {
+        &self.base
+    }
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let input_tile = self.input.get(self.input.tiling().universal_guard());
+        match input_tile {
+            Tile::SealedFunction {
+                domain,
+                domain_predicate,
+                ..
+            } => Tile::SealedFunction {
+                codomain: Box::new(Tile::Scalar(domain.clone())),
+                domain,
+                domain_predicate,
+            },
+            _ => panic!("MapDomain expected SealedFunction tile"),
+        }
+    }
+
+    fn release(&mut self, obsolete_guard: TileGuard) {
+        debug!("{} release: {obsolete_guard:?}", self.name());
+        self.input.release(match obsolete_guard {
+            g if g.is_universal() => self.input.tiling().universal_guard(),
+            g if g.is_empty() => self.input.tiling().empty_guard(),
+            TileGuard::Function(FunctionGuard::Domain(p)) => {
+                TileGuard::Function(FunctionGuard::Domain(p))
+            }
+            _ => todo!(),
+        });
+    }
+}
+
+/// Flattens a curried function into a sealed function with a pair domain.
+///
+/// Takes a `CurriedFunction(A → B → C)` and produces `SealedFunction(Record(A, B) → Scalar(C))`.
+/// The two domain extents are packed into a record domain with fields `_0` (outer domain) and `_1` (inner domain),
+/// while the codomain becomes a scalar version of the original codomain.
+pub struct Uncurry {
+    /// Output tiling: `SealedFunction { domain: Record { _0: A, _1: B }, codomain: Scalar(C) }`.
+    tiling: Tiling,
+    /// The curried-function input.
+    input: Box<dyn TileOperator>,
+}
+
+impl Uncurry {
+    /// Create an `Uncurry` operator that flattens a curried function into a sealed function.
+    pub fn new(input: Box<dyn TileOperator>) -> Self {
+        let Tiling::CurriedFunction {
+            domain1,
+            domain2,
+            codomain,
+        } = input.tiling()
+        else {
+            panic!("Uncurry expected CurriedFunction, got {:?}", input.tiling())
+        };
+        let pair_extent = Extent::Record(HashMap::from([
+            (tuple_field(0), domain1.clone()),
+            (tuple_field(1), domain2.clone()),
+        ]));
+        let tiling = Tiling::SealedFunction {
+            domain: pair_extent,
+            codomain: Box::new(Tiling::Scalar(codomain.clone())),
+        };
+        Self { tiling, input }
+    }
+}
+
+impl TileOperator for Uncurry {
+    fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        Box::new(UncurryProducer {
+            base: ProducerBase {
+                id: UncurryProducer::alloc_id(),
+                tiling: self.tiling().clone(),
+            },
+            input: self
+                .input
+                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+        })
+    }
+}
+
+/// Producer for [`Uncurry`]: flattens a curried-function tile into a sealed-function tile with pair domain.
+struct UncurryProducer {
+    base: ProducerBase,
+    /// The upstream producer whose curried function is flattened.
+    input: Box<dyn TileProducer>,
+}
+
+impl TileProducer for UncurryProducer {
+    fn base(&self) -> &ProducerBase {
+        &self.base
+    }
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("input", self.input.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let input_tile = self.input.get(self.input.tiling().universal_guard());
+        match input_tile {
+            Tile::CurriedFunction {
+                domain1,
+                offsets,
+                domain2,
+                codomain,
+                domain_predicate,
+            } => {
+                // Extract offsets as a vec of usize.
+                let ColumnValue::UInts(offsets_vec) = offsets else {
+                    panic!("CurriedFunction offsets must be ColumnValue::UInts");
+                };
+
+                // Build an expansion index iterator: for each group i,
+                // emit i repeated (group_end - group_start) times.
+                let mut expansion_indices = Vec::new();
+                for i in 0..domain1.len() {
+                    let group_start = offsets_vec[i];
+                    let group_end = if i + 1 < offsets_vec.len() {
+                        offsets_vec[i + 1]
+                    } else {
+                        domain2.len()
+                    };
+                    for _ in group_start..group_end {
+                        expansion_indices.push(i);
+                    }
+                }
+
+                let total_rows = expansion_indices.len();
+                let expanded_domain1 =
+                    domain1.select_indices(expansion_indices.into_iter(), total_rows);
+
+                // Build the pair domain column as Record with fields _0 and _1.
+                let pair_domain = ColumnValue::Records(HashMap::from([
+                    (tuple_field(0), expanded_domain1),
+                    (tuple_field(1), domain2),
+                ]));
+
+                Tile::SealedFunction {
+                    domain: pair_domain,
+                    codomain: Box::new(Tile::Scalar(codomain)),
+                    domain_predicate,
+                }
+            }
+            _ => panic!("Uncurry expected CurriedFunction tile"),
+        }
+    }
+
+    fn release(&mut self, obsolete_guard: TileGuard) {
+        debug!("{} release: {obsolete_guard:?}", self.name());
+        let input_guard = match &obsolete_guard {
+            // Pass through empty and universal guards unchanged.
+            g if g.is_empty() => self.input.tiling().empty_guard(),
+            g if g.is_universal() => self.input.tiling().universal_guard(),
+            // Split domain guards on the pair domain (_0, _1) into record predicates.
+            TileGuard::Function(FunctionGuard::Domain(pred)) => {
+                let pair_fields = HashMap::from([(tuple_field(0), ()), (tuple_field(1), ())]);
+                let mut split_preds = pred.split_record(&pair_fields);
+                let outer_pred = split_preds.remove(&tuple_field(0)).unwrap();
+                let inner_pred = split_preds.remove(&tuple_field(1)).unwrap();
+                if outer_pred.as_bool().is_some_and(|x| !x) {
+                    TileGuard::Function(FunctionGuard::Domain(inner_pred))
+                } else if inner_pred.as_bool().is_some_and(|x| !x) {
+                    TileGuard::Function(FunctionGuard::Domain(outer_pred))
+                } else {
+                    todo!("Can only release single part of uncurry");
+                }
+            }
+            g => panic!("Unsupported obsolete guard: {g:?}"),
+        };
+        self.input.release(input_guard);
     }
 }
 
@@ -2907,5 +3335,353 @@ mod tests {
             panic!()
         };
         assert_eq!(vals, vec![0, 4]);
+    }
+
+    /// A test helper TileProducer that returns a pre-determined tile.
+    /// Useful for testing TileOperators by injecting tiles directly.
+    struct TestTileProducer {
+        base: ProducerBase,
+        tile: Tile,
+    }
+
+    impl TestTileProducer {
+        fn new(tile: Tile, tiling: Tiling) -> Self {
+            Self {
+                base: ProducerBase {
+                    id: Self::alloc_id(),
+                    tiling,
+                },
+                tile,
+            }
+        }
+    }
+
+    impl TileProducer for TestTileProducer {
+        fn base(&self) -> &ProducerBase {
+            &self.base
+        }
+
+        fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+            node
+        }
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            self.tile.clone()
+        }
+
+        fn release(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    #[test]
+    fn map_result_producer_curried_function() {
+        // Test MapResultProducer directly with unsorted domain input
+        // This tests the actual MapResultProducer.get_impl implementation
+
+        // Create a CurriedFunction tile
+        let curried_fn_tile = Tile::CurriedFunction {
+            domain1: ColumnValue::UInts(vec![0, 1]),
+            offsets: ColumnValue::UInts(vec![0, 2]),
+            domain2: ColumnValue::UInts(vec![10, 20, 30]),
+            codomain: ColumnValue::UInts(vec![100, 200, 300]),
+            domain_predicate: Predicate::True,
+        };
+
+        let function_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::UInt),
+            codomain: Extent::Base(BaseType::UInt),
+        };
+
+        // Create a SealedFunction tile with unsorted domain
+        let sealed_fn_tile = Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![2, 0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![1, 0, 1]))),
+            domain_predicate: Predicate::True,
+        };
+
+        let input_tiling = Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
+        };
+
+        // Create test producers
+        let function_producer = TestTileProducer::new(curried_fn_tile, function_tiling);
+        let input_producer = TestTileProducer::new(sealed_fn_tile, input_tiling);
+
+        // Create MapResultProducer and test it
+        let output_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::UInt),
+            codomain: Extent::Base(BaseType::UInt),
+        };
+
+        let mut map_result = MapResultProducer {
+            base: ProducerBase {
+                id: MapResultProducer::alloc_id(),
+                tiling: output_tiling,
+            },
+            input: Box::new(input_producer),
+            function: Box::new(function_producer),
+        };
+
+        // Get the result from MapResultProducer
+        let result = map_result.get(map_result.tiling().universal_guard());
+
+        // Verify the result
+        match result {
+            Tile::CurriedFunction {
+                domain1,
+                offsets,
+                domain2,
+                codomain,
+                ..
+            } => {
+                // After sorting unsorted input {2, 0, 1} with codomain {1, 0, 1},
+                // we get sorted {0, 1, 2} with codomain {0, 1, 1}
+                assert_eq!(domain1.len(), 3, "domain1 should have 3 elements");
+                assert_eq!(offsets.len(), 3, "offsets should have 3 elements");
+                assert_eq!(domain2.len(), 4, "domain2 should have 4 elements");
+                assert_eq!(codomain.len(), 4, "codomain should have 4 elements");
+
+                // Verify domain1 is sorted: [0, 1, 2]
+                if let ColumnValue::UInts(d1) = domain1 {
+                    assert_eq!(d1, vec![0, 1, 2], "domain1 should be sorted");
+                } else {
+                    panic!("domain1 should be UInts");
+                }
+
+                // Verify offsets: [0, 2, 3]
+                if let ColumnValue::UInts(offs) = offsets {
+                    assert_eq!(offs, vec![0, 2, 3], "offsets should be [0, 2, 3]");
+                } else {
+                    panic!("offsets should be UInts");
+                }
+
+                // Verify domain2: [10, 20, 30, 30]
+                if let ColumnValue::UInts(d2) = domain2 {
+                    assert_eq!(
+                        d2,
+                        vec![10, 20, 30, 30],
+                        "domain2 should be [10, 20, 30, 30]"
+                    );
+                } else {
+                    panic!("domain2 should be UInts");
+                }
+
+                // Verify codomain: [100, 200, 300, 300]
+                if let ColumnValue::UInts(cod) = codomain {
+                    assert_eq!(
+                        cod,
+                        vec![100, 200, 300, 300],
+                        "codomain should be [100, 200, 300, 300]"
+                    );
+                } else {
+                    panic!("codomain should be UInts");
+                }
+            }
+            _ => panic!("Expected CurriedFunction result"),
+        }
+    }
+
+    #[test]
+    fn uncurry_producer_basic() {
+        // Test UncurryProducer.get_impl with a simple CurriedFunction
+        //
+        // Creates a CurriedFunction with:
+        // - domain1: [1, 2] (two keys)
+        // - offsets: [0, 2] (key 1 has 2 items, key 2 has 1 item [implicit end at domain2.len()])
+        // - domain2: [10, 20, 30] (flattened second-level domain)
+        // - codomain: [100, 200, 300] (flattened codomain)
+        //
+        // Expected expansion_indices: [0, 0, 1] (key 0 repeated 2 times, key 1 repeated 1 time)
+        // Expected expanded_domain1: [1, 1, 2]
+        // Expected pair domain: Record with _0=[1,1,2] and _1=[10,20,30]
+
+        let curried_tile = Tile::CurriedFunction {
+            domain1: ColumnValue::UInts(vec![1, 2]),
+            offsets: ColumnValue::UInts(vec![0, 2]),
+            domain2: ColumnValue::UInts(vec![10, 20, 30]),
+            codomain: ColumnValue::UInts(vec![100, 200, 300]),
+            domain_predicate: Predicate::True,
+        };
+
+        let curried_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::UInt),
+            codomain: Extent::Base(BaseType::UInt),
+        };
+
+        let input_producer = TestTileProducer::new(curried_tile, curried_tiling.clone());
+
+        // Create UncurryProducer with the test producer as input
+        let output_tiling = Tiling::SealedFunction {
+            domain: Extent::Record(
+                [
+                    (tuple_field(0), Extent::Base(BaseType::UInt)),
+                    (tuple_field(1), Extent::Base(BaseType::UInt)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
+        };
+
+        let mut uncurry = UncurryProducer {
+            base: ProducerBase {
+                id: UncurryProducer::alloc_id(),
+                tiling: output_tiling,
+            },
+            input: Box::new(input_producer),
+        };
+
+        // Get the result from UncurryProducer
+        let result = uncurry.get(uncurry.tiling().universal_guard());
+
+        // Verify the result is a SealedFunction
+        match result {
+            Tile::SealedFunction {
+                domain,
+                codomain,
+                domain_predicate,
+            } => {
+                // Verify the domain is a Record with fields _0 and _1
+                match domain {
+                    ColumnValue::Records(fields) => {
+                        assert_eq!(fields.len(), 2, "domain should have 2 fields");
+                        assert!(
+                            fields.contains_key(&tuple_field(0)),
+                            "domain should have _0 field"
+                        );
+                        assert!(
+                            fields.contains_key(&tuple_field(1)),
+                            "domain should have _1 field"
+                        );
+
+                        // Verify expanded_domain1 (field _0): [1, 1, 2]
+                        let field_0 = &fields[&tuple_field(0)];
+                        if let ColumnValue::UInts(vals) = field_0 {
+                            assert_eq!(vals, &vec![1, 1, 2], "_0 should be expanded domain1");
+                        } else {
+                            panic!("_0 field should be UInts");
+                        }
+
+                        // Verify domain2 (field _1): [10, 20, 30]
+                        let field_1 = &fields[&tuple_field(1)];
+                        if let ColumnValue::UInts(vals) = field_1 {
+                            assert_eq!(vals, &vec![10, 20, 30], "_1 should be domain2");
+                        } else {
+                            panic!("_1 field should be UInts");
+                        }
+                    }
+                    _ => panic!("domain should be a Record"),
+                }
+
+                // Verify codomain is a Scalar
+                match *codomain {
+                    Tile::Scalar(ColumnValue::UInts(ref vals)) => {
+                        assert_eq!(vals, &vec![100, 200, 300], "codomain should match original");
+                    }
+                    _ => panic!("codomain should be Scalar(UInts)"),
+                }
+
+                // Verify domain_predicate is preserved
+                assert_eq!(
+                    domain_predicate,
+                    Predicate::True,
+                    "domain_predicate should be preserved"
+                );
+            }
+            _ => panic!("Expected SealedFunction result"),
+        }
+    }
+
+    #[test]
+    fn uncurry_producer_with_single_elements() {
+        // Test UncurryProducer with groups containing single elements
+        //
+        // - domain1: [A, B, C] (three keys)
+        // - offsets: [0, 1, 2] (each key has exactly 1 item [last implicit end at domain2.len()])
+        // - domain2: [X, Y, Z]
+        // - codomain: [1, 2, 3]
+        //
+        // Expected expansion_indices: [0, 1, 2]
+        // Expected expanded_domain1: [A, B, C]
+
+        let curried_tile = Tile::CurriedFunction {
+            domain1: ColumnValue::UInts(vec![100, 200, 300]),
+            offsets: ColumnValue::UInts(vec![0, 1, 2]),
+            domain2: ColumnValue::UInts(vec![10, 20, 30]),
+            codomain: ColumnValue::UInts(vec![1, 2, 3]),
+            domain_predicate: Predicate::False,
+        };
+
+        let curried_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::UInt),
+            codomain: Extent::Base(BaseType::UInt),
+        };
+
+        let input_producer = TestTileProducer::new(curried_tile, curried_tiling);
+
+        let output_tiling = Tiling::SealedFunction {
+            domain: Extent::Record(
+                [
+                    (tuple_field(0), Extent::Base(BaseType::UInt)),
+                    (tuple_field(1), Extent::Base(BaseType::UInt)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
+        };
+
+        let mut uncurry = UncurryProducer {
+            base: ProducerBase {
+                id: UncurryProducer::alloc_id(),
+                tiling: output_tiling,
+            },
+            input: Box::new(input_producer),
+        };
+
+        let result = uncurry.get(uncurry.tiling().universal_guard());
+
+        match result {
+            Tile::SealedFunction {
+                domain,
+                codomain: _,
+                domain_predicate,
+            } => {
+                match domain {
+                    ColumnValue::Records(fields) => {
+                        let field_0 = &fields[&tuple_field(0)];
+                        if let ColumnValue::UInts(vals) = field_0 {
+                            assert_eq!(
+                                vals,
+                                &vec![100, 200, 300],
+                                "expanded domain1 should be unchanged"
+                            );
+                        } else {
+                            panic!("_0 field should be UInts");
+                        }
+
+                        let field_1 = &fields[&tuple_field(1)];
+                        if let ColumnValue::UInts(vals) = field_1 {
+                            assert_eq!(vals, &vec![10, 20, 30], "domain2 should be unchanged");
+                        } else {
+                            panic!("_1 field should be UInts");
+                        }
+                    }
+                    _ => panic!("domain should be a Record"),
+                }
+
+                // Verify domain_predicate is preserved (False in this case)
+                assert_eq!(
+                    domain_predicate,
+                    Predicate::False,
+                    "domain_predicate should be preserved"
+                );
+            }
+            _ => panic!("Expected SealedFunction result"),
+        }
     }
 }

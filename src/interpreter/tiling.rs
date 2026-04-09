@@ -1218,14 +1218,14 @@ pub(super) fn transform_hashmap_values<K: Clone + Eq + Hash, InputV, V, F: Fn(&I
 pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
     /// Sort parallel `domain` and `cod_ints` vectors together by `domain` key,
     /// then rebuild the tile.
-    fn sort_and_rebuild<K: Ord + Clone>(
+    fn sort_and_rebuild<K: PartialOrd + Clone>(
         domain_vals: Vec<K>,
         cod_ints: Vec<i64>,
         domain_predicate: Predicate,
         mk_domain: impl Fn(Vec<K>) -> ColumnValue,
     ) -> Tile {
         let mut pairs: Vec<(K, i64)> = domain_vals.into_iter().zip(cod_ints).collect();
-        pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        pairs.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap());
         let (sorted_d, sorted_c): (Vec<K>, Vec<i64>) = pairs.into_iter().unzip();
         Tile::SealedFunction {
             domain: mk_domain(sorted_d),
@@ -1246,6 +1246,22 @@ pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
             (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::UInts(dom)) => {
                 sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::UInts)
             }
+            (
+                Tile::Scalar(ColumnValue::Ints(cod_ints)),
+                ref r @ ColumnValue::Records(ref fields),
+            ) => sort_and_rebuild(
+                r.clone().drain_to_value_iter().collect(),
+                cod_ints,
+                domain_predicate,
+                |v| {
+                    ColumnValue::from_values(
+                        v,
+                        &Extent::Record(transform_hashmap_values(fields, |_| {
+                            Extent::Base(crate::ccl::BaseType::UInt)
+                        })),
+                    )
+                },
+            ),
             (other_codomain, domain) => Tile::SealedFunction {
                 domain,
                 codomain: Box::new(other_codomain),
@@ -1439,7 +1455,8 @@ mod tests {
 
     #[test]
     fn codomain_lookup_function_is_none() {
-        // CurriedFunction has no structured codomain tiling.
+        // CurriedFunction has no structured codomain tiling via codomain().
+        // Its codomain is accessed through domain2 and codomain extents directly.
         assert_eq!(curried(int(), bool_ext(), int()).codomain(), None);
     }
 

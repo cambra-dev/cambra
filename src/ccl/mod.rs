@@ -840,6 +840,13 @@ impl TypedExpr {
     }
 }
 
+// Implement Default so that we can use std::mem::take out of Exprs.
+impl Default for TypedExpr {
+    fn default() -> Self {
+        Self::new(TypedExprNode::Lit(Lit::Int(0)))
+    }
+}
+
 /// A single conditional branch in a [`TypedExprNode::Case`] expression.
 ///
 /// Holds a `guard` (a boolean expression) and a `body` (the value produced
