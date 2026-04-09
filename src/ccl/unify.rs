@@ -454,7 +454,7 @@ impl UnificationTable {
     ///
     /// Must be called before any other method is used on `id`.
     /// Calling `register` twice for the same `id` is a no-op.
-    fn register(&mut self, id: InferVarId) {
+    pub fn register(&mut self, id: InferVarId) {
         let idx = id.0 as usize;
         // Grow the backing vec if needed.
         if idx >= self.entries.len() {
@@ -575,11 +575,7 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
                 "Type::Hole found in resolve() on Let binding '{}'; inference failed to convert it",
                 binding.name
             );
-            if let Type::Infer(id) = binding.ty {
-                if let Some(ty) = table.probe(id) {
-                    binding.ty = ty;
-                }
-            }
+            resolve_type(&mut binding.ty, table);
             resolve(bound_expr, table);
             resolve(body, table);
         }

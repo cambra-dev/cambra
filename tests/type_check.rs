@@ -50,8 +50,8 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
     infer(&mut expr, &mut ictx).expect("inference failed")
 }
 
-/// Like [`infer_program`] but expects inference to fail and returns the error.
-fn infer_program_err(code: &str) -> InferError {
+/// Like [`infer_program`] but expects inference to fail and returns all errors.
+fn infer_program_err(code: &str) -> Vec<InferError> {
     let lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
     let stmts = parse_module(code);
@@ -312,7 +312,8 @@ x
         .trim(),
     );
     assert!(
-        matches!(err, InferError::AnnotationMismatch { .. }),
+        err.iter()
+            .any(|e| matches!(e, InferError::AnnotationMismatch { .. })),
         "expected AnnotationMismatch, got {err:?}"
     );
 }
@@ -451,7 +452,8 @@ else:
         .trim(),
     );
     assert!(
-        matches!(err, InferError::TypeMismatch { .. }),
+        err.iter()
+            .any(|e| matches!(e, InferError::TypeMismatch { .. })),
         "expected TypeMismatch, got {err:?}"
     );
 }

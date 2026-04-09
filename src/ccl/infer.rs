@@ -153,8 +153,9 @@ impl DerefMut for TypeInferenceContext {
 pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
     UnboundVariable(String),
-    /// A standalone lambda's parameter type cannot be inferred — it is never
-    /// used as the argument of a typed function in the lambda body.
+    /// A lambda's parameter type could not be inferred from its body, any
+    /// call-site constraints, or a user annotation. Emitted post-resolve by
+    /// [`check_fully_typed`] when a `Type::Infer` remains in a param position.
     CannotInferParam(String),
     /// A type mismatch was detected between two solved types.
     TypeMismatch {
@@ -192,11 +193,6 @@ pub enum InferError {
     /// An unresolved [`Type::Infer`] variable survived past resolution.
     /// The `String` is the symbolic representation of the offending expression.
     UnresolvedInfer(InferVarId, String),
-    /// Multiple type errors were found in a single pass.
-    ///
-    /// Returned by [`infer`] when [`check_fully_typed`] reports more than one
-    /// missing type, so that all diagnostics are surfaced at once.
-    Multiple(Vec<InferError>),
 }
 
 impl std::fmt::Debug for InferError {
@@ -242,13 +238,6 @@ impl std::fmt::Debug for InferError {
                     id, sym
                 )
             }
-            InferError::Multiple(errors) => {
-                writeln!(f, "Multiple type errors:")?;
-                for err in errors {
-                    writeln!(f, "  - {:?}", err)?;
-                }
-                Ok(())
-            }
         }
     }
 }
@@ -265,12 +254,10 @@ impl std::fmt::Debug for InferError {
 ///
 /// After this call returns `Ok`, the tree is fully annotated and contains no
 /// `Type::Hole` or (ideally) `Type::Infer` placeholders.
-pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
-    infer_expr(expr, ctx)?;
+pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Vec<InferError>> {
+    infer_expr(expr, ctx).map_err(|e| vec![e])?;
     crate::ccl::unify::resolve(expr, &mut ctx.table);
-    if let Err(errs) = check_fully_typed(expr) {
-        return Err(InferError::Multiple(errs));
-    }
+    check_fully_typed(expr)?;
     // Return the type from expr.ty (post-resolve) rather than the pre-resolve return value
     // from infer_expr: the two can differ when infer_expr returns an Infer var that
     // constrain_equal subsequently solved (e.g. the left operand of a BinOp).
@@ -312,7 +299,14 @@ fn collect_expr_errors(expr: &Expr, errors: &mut Vec<InferError>) {
             collect_expr_errors(operand, errors);
         }
         TypedExprNode::Lambda { param, body, .. } => {
-            collect_type_errors(&param.ty, &param.name, errors);
+            if type_has_infer(&param.ty) {
+                // TODO: A future "errored table" tracking covered Infer IDs could suppress
+                // derivative UnresolvedInfer errors for this ID in expr.ty and body uses
+                // of this param.
+                errors.push(InferError::CannotInferParam(param.name.clone()));
+            } else {
+                collect_type_errors(&param.ty, &param.name, errors);
+            }
             collect_expr_errors(body, errors);
         }
         TypedExprNode::Let {
@@ -1084,9 +1078,14 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
 
 /// Replace every [`Type::Hole`] in `ty` (recursively) with a fresh inference
 /// variable, assigning one stable [`Type::Infer`] ID per structural position.
+///
+/// Any existing [`Type::Infer`] IDs are registered in the table if not already
+/// present. This handles IDs created outside inference (e.g. via the
+/// [`Type::infer`] test helper) so they participate in unification correctly.
 fn replace_holes(ty: &mut Type, ctx: &mut TypeInferenceContext) {
     match ty {
         Type::Hole => *ty = Type::Infer(ctx.fresh_infer_var()),
+        Type::Infer(id) => ctx.table.register(*id),
         Type::Fun(domain, codomain) => {
             replace_holes(domain, ctx);
             replace_holes(codomain, ctx);
@@ -1097,23 +1096,25 @@ fn replace_holes(ty: &mut Type, ctx: &mut TypeInferenceContext) {
         Type::Refinement(inner, _) => replace_holes(inner, ctx),
         Type::PartialTuple(entries) => entries.iter_mut().for_each(|(_, t)| replace_holes(t, ctx)),
         Type::PartialRecord(entries) => entries.iter_mut().for_each(|(_, t)| replace_holes(t, ctx)),
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Infer(_) => {}
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {}
     }
 }
 
-/// Return `true` if `ty` contains any [`Type::Infer`] variable that is not
-/// yet solved in `table`. Detects structured param types
-/// (e.g. `Tuple([Infer(a), Infer(b)])`) a shallow comparison would miss.
-fn has_unresolved_infer(ty: &Type, table: &mut UnificationTable) -> bool {
+/// Return `true` if `ty` contains any [`Type::Infer`] node.
+///
+/// Used post-[`crate::ccl::unify::resolve`], where every solved inference
+/// variable has already been substituted, so any remaining [`Type::Infer`] is
+/// genuinely unresolved.
+fn type_has_infer(ty: &Type) -> bool {
     match ty {
-        Type::Infer(id) => table.probe(*id).is_none(),
-        Type::Fun(a, b) => has_unresolved_infer(a, table) || has_unresolved_infer(b, table),
-        Type::Tuple(elems) => elems.iter().any(|t| has_unresolved_infer(t, table)),
-        Type::Record(fields) => fields.iter().any(|(_, t)| has_unresolved_infer(t, table)),
-        Type::Union(variants) => variants.iter().any(|t| has_unresolved_infer(t, table)),
-        Type::PartialTuple(entries) => entries.iter().any(|(_, t)| has_unresolved_infer(t, table)),
-        Type::PartialRecord(entries) => entries.iter().any(|(_, t)| has_unresolved_infer(t, table)),
-        Type::Refinement(inner, _) => has_unresolved_infer(inner, table),
+        Type::Infer(_) => true,
+        Type::Fun(a, b) => type_has_infer(a) || type_has_infer(b),
+        Type::Tuple(elems) => elems.iter().any(type_has_infer),
+        Type::Record(fields) => fields.iter().any(|(_, t)| type_has_infer(t)),
+        Type::Union(variants) => variants.iter().any(type_has_infer),
+        Type::PartialTuple(entries) => entries.iter().any(|(_, t)| type_has_infer(t)),
+        Type::PartialRecord(entries) => entries.iter().any(|(_, t)| type_has_infer(t)),
+        Type::Refinement(inner, _) => type_has_infer(inner),
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => false,
     }
 }
@@ -1130,16 +1131,15 @@ fn has_unresolved_infer(ty: &Type, table: &mut UnificationTable) -> bool {
 ///   [`InferError::AnnotationMismatch`] rather than a raw [`InferError::TypeMismatch`].
 /// - If no body constraint exists and an annotation is present, the annotation
 ///   is accepted as the param type.
-/// - If neither body constraint nor annotation exists, returns
-///   [`InferError::CannotInferParam`].
-///   TODO: This is premature — the constraint may come from the call site
-///   (e.g. applying the lambda to a typed argument) or from an annotation on
-///   the whole expression. `CannotInferParam` should ideally be deferred until
-///   after full unification & substitution completes.
+/// - If neither body constraint nor annotation exists, `param.ty` is left as
+///   `Infer(id)`. The constraint may still arrive from the call site or an
+///   expression-level annotation. After full unification and
+///   [`crate::ccl::unify::resolve`], any remaining unresolved param is caught
+///   by [`check_fully_typed`], which emits [`InferError::CannotInferParam`].
 ///
-/// Structured param types (e.g. `Tuple`) are checked recursively by
-/// [`has_unresolved_infer`]; any unresolved position also returns
-/// [`InferError::CannotInferParam`].
+/// Structured param types (e.g. `Tuple`) may contain a mix of resolved and
+/// unresolved positions; unresolved positions are likewise deferred to
+/// [`check_fully_typed`].
 fn infer_lambda(
     param: &mut crate::ccl::TypedBinding,
     body: &mut Expr,
@@ -1182,11 +1182,8 @@ fn infer_lambda(
             }
             (Some(_), None) => {} // resolved by body; no annotation to check
             (None, Some(ann)) => param.ty = ann, // no body constraint; trust annotation
-            (None, None) => return Err(InferError::CannotInferParam(param.name.clone())),
+            (None, None) => {}    // unresolved; defer to post-resolve check_fully_typed
         }
-    } else if has_unresolved_infer(&param.ty, &mut ctx.table) {
-        // Structured param with at least one position that body inference never resolved.
-        return Err(InferError::CannotInferParam(param.name.clone()));
     }
     // Build the domain type; refinement wraps it but is inferred in the outer
     // scope (param not in scope) because it is a constraint on the call site.
@@ -1740,7 +1737,7 @@ mod tests {
     fn test_infer_unbound_var() {
         let mut ctx = TypeInferenceContext::new();
         let result = infer(&mut Expr::var("y"), &mut ctx);
-        assert_eq!(result, Err(InferError::UnboundVariable("y".into())));
+        assert_eq!(result, Err(vec![InferError::UnboundVariable("y".into())]));
     }
 
     #[test]
@@ -1748,8 +1745,8 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         // λ x → x  — standalone; x is referenced but never used as an Apply argument.
         let mut expr = Expr::lambda("x", Type::infer(), Expr::var("x"));
-        let result = infer(&mut expr, &mut ctx);
-        assert_eq!(result, Err(InferError::CannotInferParam("x".into())));
+        let errs = infer(&mut expr, &mut ctx).unwrap_err();
+        assert!(errs.contains(&InferError::CannotInferParam("x".into())));
     }
 
     /// `λ p → p._0` where `p : Tuple([Hole, Hole])`.
@@ -1758,7 +1755,7 @@ mod tests {
     /// Body inference constrains `Infer(a)` via the index-0 projection but never
     /// touches `Infer(b)`. A shallow check (`if let Type::Infer(id) = param.ty`)
     /// would miss this because `param.ty` is a `Tuple`, not a top-level `Infer`.
-    /// `has_unresolved_infer` catches it recursively.
+    /// `type_has_infer` catches it recursively.
     #[test]
     fn test_cannot_infer_nested_tuple_param() {
         let mut ctx = TypeInferenceContext::new();
@@ -1773,10 +1770,8 @@ mod tests {
             body: Box::new(body),
             refinement: None,
         });
-        assert_eq!(
-            infer(&mut expr, &mut ctx),
-            Err(InferError::CannotInferParam("p".into()))
-        );
+        let errs = infer(&mut expr, &mut ctx).unwrap_err();
+        assert!(errs.contains(&InferError::CannotInferParam("p".into())));
     }
 
     /// Builds the unannotated list-comp CCL for `[elt for var in source]`.
@@ -1925,11 +1920,11 @@ mod tests {
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(
             result,
-            Err(InferError::TypeMismatch {
+            Err(vec![InferError::TypeMismatch {
                 ctx: "unify".into(),
                 type_a: Type::Base(BaseType::String),
                 type_b: Type::Base(BaseType::Int),
-            })
+            }])
         );
     }
 
@@ -1971,10 +1966,10 @@ mod tests {
         });
         assert_eq!(
             infer(&mut expr, &mut ctx),
-            Err(InferError::AnnotationMismatch {
+            Err(vec![InferError::AnnotationMismatch {
                 annotation: Type::Base(BaseType::String),
                 inferred: Type::Base(BaseType::Int),
-            })
+            }])
         );
     }
 
@@ -2009,7 +2004,7 @@ mod tests {
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(
             result,
-            Err(InferError::UnboundVariable("unbound_var".into()))
+            Err(vec![InferError::UnboundVariable("unbound_var".into())])
         );
         // The scope stack must be empty: "x" should not be visible.
         assert_eq!(ctx.lookup("x"), None);
@@ -2041,11 +2036,11 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         assert_eq!(
             infer(&mut expr, &mut ctx),
-            Err(InferError::TypeMismatch {
+            Err(vec![InferError::TypeMismatch {
                 ctx: "unify".into(),
                 type_a: Type::Base(BaseType::String),
                 type_b: Type::Base(BaseType::Int),
-            })
+            }])
         );
     }
 
@@ -2058,11 +2053,11 @@ mod tests {
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(
             result,
-            Err(InferError::TypeMismatch {
+            Err(vec![InferError::TypeMismatch {
                 ctx: "unify".into(),
                 type_a: Type::Base(BaseType::Int),
                 type_b: Type::Base(BaseType::String),
-            })
+            }])
         );
     }
 
@@ -2141,11 +2136,11 @@ mod tests {
         );
         assert_eq!(
             infer(&mut expr, &mut ctx),
-            Err(InferError::TypeMismatch {
+            Err(vec![InferError::TypeMismatch {
                 ctx: "unify".into(),
                 type_a: Type::Base(BaseType::Int),
                 type_b: Type::Base(BaseType::Bool),
-            })
+            }])
         );
     }
 
@@ -2284,7 +2279,7 @@ mod tests {
             "outer scope test",
         );
         let result = infer(&mut expr, &mut ctx);
-        assert_eq!(result, Err(InferError::UnboundVariable("x".into())));
+        assert_eq!(result, Err(vec![InferError::UnboundVariable("x".into())]));
     }
 
     // -----------------------------------------------------------------------
@@ -2353,7 +2348,8 @@ mod tests {
             AggregateKind::Sum,
         );
         assert!(
-            matches!(infer(&mut expr, &mut ctx), Err(InferError::Unsupported(_))),
+            infer(&mut expr, &mut ctx)
+                .is_err_and(|errs| errs.iter().any(|e| matches!(e, InferError::Unsupported(_)))),
             "Sum over String should be Unsupported"
         );
     }
@@ -2367,10 +2363,9 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::aggregate(Expr::lit(Lit::Int(42)), AggregateKind::Sum);
         assert!(
-            matches!(
-                infer(&mut expr, &mut ctx),
-                Err(InferError::TypeMismatch { .. })
-            ),
+            infer(&mut expr, &mut ctx).is_err_and(|errs| errs
+                .iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. }))),
             "Aggregate with non-function input should be TypeMismatch"
         );
     }
@@ -2489,7 +2484,7 @@ mod tests {
         );
         assert_eq!(
             infer(&mut expr, &mut ctx),
-            Err(InferError::UnboundVariable("xs".into()))
+            Err(vec![InferError::UnboundVariable("xs".into())])
         );
     }
 
@@ -2519,10 +2514,9 @@ mod tests {
         );
         let mut ctx = TypeInferenceContext::new();
         // Body inference constrains p, but the And of Int and Bool is a type error.
-        assert!(matches!(
-            infer(&mut expr, &mut ctx),
-            Err(InferError::TypeMismatch { .. })
-        ));
+        assert!(infer(&mut expr, &mut ctx).is_err_and(|errs| errs
+            .iter()
+            .any(|e| matches!(e, InferError::TypeMismatch { .. }))));
     }
 
     /// `λ p → f(p._0) + g(p._0)` where f : Int → Int and g : String → String.
@@ -2544,14 +2538,9 @@ mod tests {
             ),
         );
         let mut ctx = TypeInferenceContext::new();
-        assert!(matches!(
-            infer(&mut expr, &mut ctx),
-            Err(InferError::TypeMismatch {
-                ctx: _,
-                type_a: Type::Base(BaseType::Int),
-                type_b: Type::Base(BaseType::String),
-            })
-        ));
+        assert!(infer(&mut expr, &mut ctx).is_err_and(|errs| errs
+            .iter()
+            .any(|e| matches!(e, InferError::TypeMismatch { .. }))));
     }
 
     /// `λ p → p ► f` where f has domain `PartialTuple([(0, Int), (1, Bool)])`.
@@ -2595,13 +2584,7 @@ mod tests {
     /// inside `f` constrains it to Int (via `t.0` and `t.2` when `f` is applied
     /// to `(0, 1, 2)`). Unification should infer `g : Int ⇒ Int`,
     /// `f : {Int, Int, Int} ⇒ {Int, Int}`, and the whole expression `{Int, Int}`.
-    ///
-    /// TODO: This currently fails with `CannotInferParam` because `infer_lambda`
-    /// errors out on `g` before the call-site constraints are visible. Fix
-    /// requires deferring `CannotInferParam` until after full unification &
-    /// substitution completes.
     #[test]
-    #[ignore = "TODO: deferred CannotInferParam not yet implemented"]
     fn test_lambda_type_inferred_from_call_site() {
         let mut ctx = TypeInferenceContext::new();
         let g_lambda = Expr::lambda("x", Type::infer(), Expr::var("x"));
@@ -2657,10 +2640,10 @@ mod tests {
         });
         assert_eq!(
             infer(&mut expr, &mut ctx),
-            Err(InferError::AnnotationMismatch {
+            Err(vec![InferError::AnnotationMismatch {
                 annotation: Type::Base(BaseType::Int),
                 inferred: Type::Base(BaseType::String),
-            })
+            }])
         );
     }
 
@@ -2688,10 +2671,10 @@ mod tests {
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(
             result,
-            Err(InferError::AnnotationMismatch {
+            Err(vec![InferError::AnnotationMismatch {
                 annotation: Type::Base(BaseType::String),
                 inferred: Type::Base(BaseType::Int),
-            })
+            }])
         );
     }
 
@@ -2751,7 +2734,7 @@ mod tests {
         let mut expr = Expr::new(TypedExprNode::Source("ghost".into()));
         assert_eq!(
             infer(&mut expr, &mut ctx),
-            Err(InferError::UnboundVariable("ghost".into()))
+            Err(vec![InferError::UnboundVariable("ghost".into())])
         );
     }
 
@@ -2806,11 +2789,11 @@ mod tests {
         let mut expr = Expr::unary(UnaryOpKind::Neg, Expr::lit(Lit::Bool(true)));
         assert_eq!(
             infer(&mut expr, &mut ctx),
-            Err(InferError::TypeMismatch {
+            Err(vec![InferError::TypeMismatch {
                 ctx: "unify".into(),
                 type_a: Type::Base(BaseType::Bool),
                 type_b: Type::Base(BaseType::Int),
-            })
+            }])
         );
     }
 
@@ -2900,7 +2883,7 @@ mod tests {
     fn test_infer_case_no_branches() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::new(TypedExprNode::Case { branches: vec![] });
-        assert_eq!(infer(&mut expr, &mut ctx), Err(InferError::EmptyCase));
+        assert_eq!(infer(&mut expr, &mut ctx), Err(vec![InferError::EmptyCase]));
     }
 
     // -----------------------------------------------------------------------
@@ -3028,7 +3011,7 @@ mod tests {
         ));
         assert_eq!(
             check_fully_typed(&expr),
-            Err(vec![InferError::UnresolvedInfer(id, "x".into())])
+            Err(vec![InferError::CannotInferParam("x".into())])
         );
     }
 
