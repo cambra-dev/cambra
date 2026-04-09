@@ -924,7 +924,7 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x + y for x in [1,2,3] if x == 2 for y in [10,20] if y == 10]",
-    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:({([0, 2], [0, 1]) | Refined((id, .0 ≫ [1, 2, 3]) ▷ zip ≫ (id, .0 ≫ .1 ≫ [10, 20]) ▷ zip ≫ ((.0 ≫ .1, 2 ▷ const) ▷ zip ≫ eq, (.1, 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and)} ⇒ Int)",
+    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:({([0, 2], [0, 1]) | Refined(((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and)} ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![1])),
@@ -1007,19 +1007,27 @@ fn test_incremental_aggregates() {
     }
 )]
 #[case(
-    "[x + y for x in [1,2,3] for y in [2,3,4,5] if y - 2 == x + 2]",
-    // TODO: the hash join rule isn't smart enough to figure this one out yet because the refinement expression is too complex
-    "(.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add:({([0, 2], [0, 3]) | Refined((id, .0 ≫ [1, 2, 3]) ▷ zip ≫ (id, .0 ≫ .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ ((.1, 2 ▷ const) ▷ zip ≫ sub, (.0 ≫ .1, 2 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq)} ⇒ Int)",
+    "[x + y for x in [1,2,3] for y in [2,3,4,5] if y == x]",
+    "([1, 2, 3] ≫ [2, 3, 4, 5] ▷ converse) ▷ uncurry ▷ map_domain ≫ (.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add:(([0, 2], [0, 3]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![1, 2])),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6]))),
+        domain_predicate: Predicate::True,
+    }
+)]
+#[case(
+    "[x + y + 1 for x in [1,2,3] for y in [2,3,4,5] if y - 2 == x + 2]",
+    "(([1, 2, 3], 2 ▷ const) ▷ zip ≫ add ≫ (([2, 3, 4, 5], 2 ▷ const) ▷ zip ≫ sub) ▷ converse) ▷ uncurry ▷ map_domain ≫ ((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add, 1 ▷ const) ▷ zip ≫ add:(([0, 2], [0, 3]) ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
             ("_1".into(), ColumnValue::UInts(vec![3])),
         ])),
-        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![6]))),
-        domain_predicate: Predicate::Record(HashMap::from([
-            ("_0".into(), Predicate::True),
-            ("_1".into(), Predicate::True),
-        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+        domain_predicate: Predicate::True,
     }
 )]
 fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expected_result: Tile) {

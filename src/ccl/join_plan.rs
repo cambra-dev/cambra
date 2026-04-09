@@ -1,4 +1,4 @@
-use std::mem::take;
+use std::mem::{swap, take};
 
 use log::trace;
 
@@ -132,9 +132,9 @@ fn convert_groupby(body: &Expr, body_ty: &Type, refinement: &Expr) -> Option<Exp
     if args.len() != 2 {
         return None;
     }
-    let arg0_tuple_idx = starts_with_tuple_project(&args[0])?;
-    let arg1_tuple_idx = starts_with_tuple_project(&args[1])?;
-    let value_tuple_idx = starts_with_tuple_project(body)?;
+    let arg0_tuple_idx = is_function_of_single_tuple_arm(&args[0])?;
+    let arg1_tuple_idx = is_function_of_single_tuple_arm(&args[1])?;
+    let value_tuple_idx = is_function_of_single_tuple_arm(body)?;
     if arg0_tuple_idx == arg1_tuple_idx {
         return None;
     }
@@ -154,8 +154,12 @@ fn convert_groupby(body: &Expr, body_ty: &Type, refinement: &Expr) -> Option<Exp
         .codomain()
         .unwrap_or_else(|| panic!("Expected function, got {}", body.ty));
     let mut values = body.clone();
+    // Clear the refinement first before doing projection substitution.
+    values = values.with_ty(Type::fun(
+        Type::Tuple(vec![key_ty.clone(), value_idx_ty.clone()]),
+        value_ty.clone(),
+    ));
     replace_tuple_project_with_id(&mut values, &value_idx_ty);
-    values = values.with_ty(Type::fun(value_idx_ty.clone(), value_ty.clone()));
     let key_extract_idx = if arg0_tuple_idx == value_tuple_idx {
         0
     } else {
@@ -173,7 +177,6 @@ fn convert_groupby(body: &Expr, body_ty: &Type, refinement: &Expr) -> Option<Exp
     }
 
     replace_tuple_project_with_id(&mut keys, &value_idx_ty);
-    let keys = keys.with_ty(Type::fun(value_idx_ty.clone(), key_ty.clone()));
     let converse_ty = Type::fun(
         key_ty.clone(),
         Type::fun(value_idx_ty.clone(), value_idx_ty.clone()),
@@ -208,22 +211,124 @@ fn convert_groupby(body: &Expr, body_ty: &Type, refinement: &Expr) -> Option<Exp
     Some(grouped_values)
 }
 
-fn starts_with_tuple_project(expr: &Expr) -> Option<usize> {
+// Returns whether the given expression is a constant, or a function of a constant.
+fn is_constant(expr: &Expr) -> bool {
+    match &expr.node {
+        TypedExprNode::Apply { function, .. } if function.node == Expr::var("const").node => true,
+        TypedExprNode::Compose(elts) => elts.first().is_some_and(is_constant),
+        _ => false,
+    }
+}
+
+// Replaces the domain type of a constant expression with a new domain type.
+// Requires `is_constant(expr)` to be true.
+fn replace_constant_domain_type(expr: &mut Expr, ty: &Type) {
+    set_domain_ty(&mut expr.ty, ty);
+    match &mut expr.node {
+        TypedExprNode::Apply { .. } => {
+            let output_ty = expr.ty.clone();
+            let arg = if let TypedExprNode::Apply { function, argument } = &mut expr.node {
+                assert_eq!(function.node, Expr::var("const").node);
+                argument.clone()
+            } else {
+                unreachable!()
+            };
+
+            *expr = apply_primitive(*arg, "const", output_ty)
+        }
+        TypedExprNode::Compose(elts) => {
+            if let Some(e) = elts.first_mut() {
+                replace_constant_domain_type(e, ty);
+            }
+        }
+        _ => unreachable!(),
+    };
+}
+
+// Returns whether the given expression relies only on a single arm of its input tuple type,
+// and returns the index of that arm if so.
+fn is_function_of_single_tuple_arm(expr: &Expr) -> Option<usize> {
     match &expr.node {
         TypedExprNode::Proj(ProjKey::Index(i)) => Some(*i),
-        TypedExprNode::Compose(elts) => elts.first().and_then(starts_with_tuple_project),
+        TypedExprNode::Compose(elts) => elts.first().and_then(is_function_of_single_tuple_arm),
+        TypedExprNode::Apply { function, argument } if function.node == Expr::var("zip").node => {
+            is_function_of_single_tuple_arm(argument)
+        }
+        TypedExprNode::Tuple(elts) => {
+            let mut result = None;
+            for elt in elts.iter() {
+                if is_constant(elt) {
+                    continue;
+                }
+                if let Some(idx) = is_function_of_single_tuple_arm(elt) {
+                    if result.is_some_and(|x| x != idx) {
+                        return None;
+                    }
+                    result = Some(idx);
+                } else {
+                    return None;
+                }
+            }
+            result
+        }
         _ => None,
     }
 }
 
+fn set_domain_ty(fun_ty: &mut Type, ty: &Type) {
+    match fun_ty {
+        Type::Fun(domain, _) => {
+            **domain = ty.clone();
+        }
+        _ => panic!("Not function type: {}", fun_ty),
+    }
+}
+
+// Converts an expression that only reads a single arm of its input
+// (as determined by is_function_of_single_tuple_arm) to a function
+// of just that arm.
 fn replace_tuple_project_with_id(expr: &mut Expr, ty: &Type) {
     match &mut expr.node {
         TypedExprNode::Proj(ProjKey::Index(_)) => {
             *expr = id().with_ty(Type::fun(ty.clone(), ty.clone()))
         }
-        TypedExprNode::Compose(elts) => {
-            if let Some(first) = elts.first_mut() {
-                replace_tuple_project_with_id(first, ty);
+        TypedExprNode::Compose(_) => {
+            set_domain_ty(&mut expr.ty, ty);
+            if let TypedExprNode::Compose(elts) = &mut expr.node {
+                if let Some(first) = elts.first_mut() {
+                    replace_tuple_project_with_id(first, ty);
+                }
+            }
+        }
+        TypedExprNode::Apply { .. } => {
+            let mut output_ty = expr.ty.clone();
+            set_domain_ty(&mut output_ty, ty);
+            let arg = if let TypedExprNode::Apply { function, argument } = &mut expr.node {
+                assert_eq!(function.node, Expr::var("zip").node);
+                replace_tuple_project_with_id(argument, ty);
+                argument.clone()
+            } else {
+                unreachable!()
+            };
+            *expr = apply_primitive(*arg, "zip", output_ty);
+        }
+        TypedExprNode::Tuple(_) => {
+            if let Type::Tuple(elts) = &mut expr.ty {
+                elts.iter_mut().for_each(|elt| match elt {
+                    Type::Fun(domain, _) => {
+                        **domain = ty.clone();
+                    }
+                    _ => panic!(),
+                });
+            }
+            if let TypedExprNode::Tuple(elts) = &mut expr.node {
+                for elt in elts.iter_mut() {
+                    if is_constant(elt) {
+                        replace_constant_domain_type(elt, ty);
+                    } else {
+                        replace_tuple_project_with_id(elt, ty);
+                    }
+                }
             }
         }
         _ => {}
@@ -300,8 +405,20 @@ fn convert_loop_join(expr: &Expr, base_ty: &Type, refinement: &Expr) -> Option<E
     }
 
     // Determine which element of the body tuple corresponds to which key argument
-    let key0_idx = starts_with_tuple_project(&zip_args[0])?;
-    let key1_idx = starts_with_tuple_project(&zip_args[1])?;
+    let Some(mut key0_idx) = is_function_of_single_tuple_arm(&zip_args[0]) else {
+        trace!(
+            "convert_loop_join: zip_arg0 is complex {}",
+            symbolic(&zip_args[0])
+        );
+        return None;
+    };
+    let Some(mut key1_idx) = is_function_of_single_tuple_arm(&zip_args[1]) else {
+        trace!(
+            "convert_loop_join: zip_arg1 is complex {}",
+            symbolic(&zip_args[1])
+        );
+        return None;
+    };
 
     if key0_idx == key1_idx {
         trace!("convert_loop_join: both keys depend on same tuple element");
@@ -349,26 +466,19 @@ fn convert_loop_join(expr: &Expr, base_ty: &Type, refinement: &Expr) -> Option<E
             return None;
         }
 
-        // Verify that body tuple elements come from the same sources as refinement
-        let body_key0_idx = starts_with_tuple_project(&body_zip_args[0])?;
-        let body_key1_idx = starts_with_tuple_project(&body_zip_args[1])?;
-
-        if body_key0_idx != key0_idx || body_key1_idx != key1_idx {
-            // TODO remove this limit
-            trace!("convert_loop_join: body tuple keys don't match refinement keys");
-            return None;
+        let mut key0 = zip_args[0].clone();
+        let mut key1 = zip_args[1].clone();
+        if key0_idx != 0 {
+            swap(&mut key0, &mut key1);
+            swap(&mut key0_idx, &mut key1_idx);
         }
 
         let idx_ty0 = subtypes[key0_idx].clone();
         let idx_ty1 = subtypes[key1_idx].clone();
-        let value_ty0 = body_zip_args[0].ty.codomain()?.clone();
-        let value_ty1 = body_zip_args[1].ty.codomain()?.clone();
-        let mut key0 = zip_args[0].clone();
         replace_tuple_project_with_id(&mut key0, &idx_ty0);
-        key0 = key0.with_ty(Type::fun(idx_ty0.clone(), value_ty0.clone()));
-        let mut key1 = zip_args[1].clone();
+        typecheck(&key0).expect("Bad key0 expr");
         replace_tuple_project_with_id(&mut key1, &idx_ty1);
-        key1 = key1.with_ty(Type::fun(idx_ty1.clone(), value_ty1.clone()));
+        typecheck(&key1).expect("Bad key1 expr");
 
         trace!(
             "convert_loop_join: key0={} : {}\nkey1={} : {}",
@@ -379,10 +489,8 @@ fn convert_loop_join(expr: &Expr, base_ty: &Type, refinement: &Expr) -> Option<E
         );
 
         // Build side: group by the build projection using converse
-        let converse_ty = Type::fun(
-            value_ty1.clone(),
-            Type::fun(idx_ty1.clone(), idx_ty1.clone()),
-        );
+        let key_ty = zip_args[0].ty.codomain()?.clone();
+        let converse_ty = Type::fun(key_ty.clone(), Type::fun(idx_ty1.clone(), idx_ty1.clone()));
         let build_side = apply_primitive(key1, "converse", converse_ty);
         typecheck(&build_side).expect("Bad build expr");
 
@@ -542,37 +650,37 @@ mod tests {
     }
 
     #[test]
-    fn test_starts_with_tuple_project_on_projection() {
+    fn test_is_function_of_single_tuple_arm_on_projection() {
         let expr = proj_idx(0);
-        assert_eq!(starts_with_tuple_project(&expr), Some(0));
+        assert_eq!(is_function_of_single_tuple_arm(&expr), Some(0));
     }
 
     #[test]
-    fn test_starts_with_tuple_project_on_second_index() {
+    fn test_is_function_of_single_tuple_arm_on_second_index() {
         let expr = proj_idx(1);
-        assert_eq!(starts_with_tuple_project(&expr), Some(1));
+        assert_eq!(is_function_of_single_tuple_arm(&expr), Some(1));
     }
 
     #[test]
-    fn test_starts_with_tuple_project_on_var() {
+    fn test_is_function_of_single_tuple_arm_on_var() {
         let expr = var("x");
-        assert_eq!(starts_with_tuple_project(&expr), None);
+        assert_eq!(is_function_of_single_tuple_arm(&expr), None);
     }
 
     #[test]
-    fn test_starts_with_tuple_project_on_compose_with_projection_first() {
+    fn test_is_function_of_single_tuple_arm_on_compose_with_projection_first() {
         let proj0_ty = fun_ty(tuple_ty(vec![int_ty(), int_ty()]), int_ty());
         let f_ty = fun_ty(int_ty(), int_ty());
         let expr = compose(vec![proj_idx(1).with_ty(proj0_ty), var("f").with_ty(f_ty)]);
-        assert_eq!(starts_with_tuple_project(&expr), Some(1));
+        assert_eq!(is_function_of_single_tuple_arm(&expr), Some(1));
     }
 
     #[test]
-    fn test_starts_with_tuple_project_on_compose_without_projection() {
+    fn test_is_function_of_single_tuple_arm_on_compose_without_projection() {
         let f_ty = fun_ty(int_ty(), int_ty());
         let g_ty = fun_ty(int_ty(), int_ty());
         let expr = compose(vec![var("f").with_ty(f_ty), var("g").with_ty(g_ty)]);
-        assert_eq!(starts_with_tuple_project(&expr), None);
+        assert_eq!(is_function_of_single_tuple_arm(&expr), None);
     }
 
     #[test]
@@ -597,6 +705,7 @@ mod tests {
         // After replacement, should be identity function
         assert!(matches!(expr.node, TypedExprNode::Var(ref v) if v == "id"));
         assert_eq!(expr.ty, fun_ty(int_ty_val.clone(), int_ty_val));
+        typecheck(&expr).expect("Type checking failed after replacement");
     }
 
     #[test]
@@ -604,7 +713,11 @@ mod tests {
         let int_ty_val = int_ty();
         let proj0_ty = fun_ty(tuple_ty(vec![int_ty(), int_ty()]), int_ty());
         let f_ty = fun_ty(int_ty(), int_ty());
-        let mut expr = compose(vec![proj_idx(1).with_ty(proj0_ty), var("f").with_ty(f_ty)]);
+        let mut expr = compose(vec![
+            proj_idx(1).with_ty(proj0_ty),
+            var("f").with_ty(f_ty.clone()),
+        ])
+        .with_ty(f_ty);
         replace_tuple_project_with_id(&mut expr, &int_ty_val);
 
         // After replacement, first element should be identity
@@ -613,6 +726,7 @@ mod tests {
         } else {
             panic!("Expected Compose node");
         }
+        typecheck(&expr).expect("Type checking failed after replacement");
     }
 
     #[test]
@@ -1062,69 +1176,6 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_loop_join_rejects_mismatched_body_zip() {
-        let int_ty_val = int_ty();
-        let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
-
-        // Create body with zip that doesn't match refinement key indices
-        let body_args_tuple = Expr::tuple(vec![
-            proj_idx(0).with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
-            proj_idx(1).with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
-        ]);
-        let body_zip_apply = Expr::apply(
-            body_args_tuple,
-            var("zip").with_ty(fun_ty(
-                tuple_ty_val.clone(),
-                tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-            )),
-        )
-        .with_ty(fun_ty(
-            tuple_ty_val.clone(),
-            tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-        ));
-
-        let body = compose(vec![
-            body_zip_apply,
-            var("id").with_ty(fun_ty(
-                tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-                tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-            )),
-        ])
-        .with_ty(fun_ty(
-            tuple_ty_val.clone(),
-            tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-        ));
-
-        // Create refinement with swapped indices (1, 0 instead of 0, 1)
-        let ref_args_tuple = Expr::tuple(vec![
-            proj_idx(1).with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
-            proj_idx(0).with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
-        ]);
-        let ref_zip_apply = Expr::apply(
-            ref_args_tuple,
-            var("zip").with_ty(fun_ty(
-                tuple_ty_val.clone(),
-                tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-            )),
-        )
-        .with_ty(fun_ty(
-            tuple_ty_val.clone(),
-            tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-        ));
-
-        let ref_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
-        let refinement = compose(vec![
-            ref_zip_apply,
-            var("eq").with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
-        ])
-        .with_ty(ref_ty);
-
-        // Should fail because body keys don't match refinement keys
-        let result = convert_loop_join(&body, &tuple_ty_val, &refinement);
-        assert_eq!(result, None);
-    }
-
-    #[test]
     fn test_convert_loop_join_succeeds_with_valid_input() {
         let int_ty_val = int_ty();
         let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
@@ -1263,5 +1314,271 @@ mod tests {
             "Hash join result should have function type, got {:?}",
             hash_join.ty
         );
+    }
+
+    // Tests for is_function_of_single_tuple_arm with zip applications
+    #[test]
+    fn test_is_function_of_single_tuple_arm_on_zip_with_projection() {
+        let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
+        let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty());
+        let zip_fn_ty = fun_ty(
+            tuple_ty(vec![int_ty(), int_ty()]),
+            tuple_ty(vec![int_ty(), int_ty()]),
+        );
+        // zip(proj(0), ...) should return 0
+        let arg = proj_idx(0).with_ty(proj_ty);
+        let zip_app = Expr::apply(arg, var("zip").with_ty(zip_fn_ty));
+        assert_eq!(is_function_of_single_tuple_arm(&zip_app), Some(0));
+    }
+
+    #[test]
+    fn test_is_function_of_single_tuple_arm_on_zip_with_second_projection() {
+        let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
+        let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty());
+        let zip_fn_ty = fun_ty(
+            tuple_ty(vec![int_ty(), int_ty()]),
+            tuple_ty(vec![int_ty(), int_ty()]),
+        );
+        // zip(proj(1), ...) should return 1
+        let arg = proj_idx(1).with_ty(proj_ty);
+        let zip_app = Expr::apply(arg, var("zip").with_ty(zip_fn_ty));
+        assert_eq!(is_function_of_single_tuple_arm(&zip_app), Some(1));
+    }
+
+    #[test]
+    fn test_is_function_of_single_tuple_arm_on_zip_without_projection() {
+        let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
+        let f_ty = fun_ty(tuple_ty_val.clone(), int_ty());
+        let zip_fn_ty = fun_ty(
+            tuple_ty(vec![int_ty(), int_ty()]),
+            tuple_ty(vec![int_ty(), int_ty()]),
+        );
+        // zip(f, ...) where f is not a projection should return None
+        let arg = var("f").with_ty(f_ty);
+        let zip_app = Expr::apply(arg, var("zip").with_ty(zip_fn_ty));
+        assert_eq!(is_function_of_single_tuple_arm(&zip_app), None);
+    }
+
+    // Tests for is_function_of_single_tuple_arm with tuples
+    #[test]
+    fn test_is_function_of_single_tuple_arm_on_tuple_single_projection() {
+        let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
+        // A tuple containing a single projection should return that projection's index
+        let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty());
+        let tuple_expr = Expr::tuple(vec![proj_idx(0).with_ty(proj_ty)]);
+        assert_eq!(is_function_of_single_tuple_arm(&tuple_expr), Some(0));
+    }
+
+    #[test]
+    fn test_is_function_of_single_tuple_arm_on_tuple_all_same_projection() {
+        let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
+        let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty());
+        // A tuple where all non-constant elements use the same projection
+        let tuple_expr = Expr::tuple(vec![
+            proj_idx(0).with_ty(proj_ty.clone()),
+            proj_idx(0).with_ty(proj_ty.clone()),
+        ]);
+        assert_eq!(is_function_of_single_tuple_arm(&tuple_expr), Some(0));
+    }
+
+    #[test]
+    fn test_is_function_of_single_tuple_arm_on_tuple_different_projections() {
+        let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
+        let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty());
+        // A tuple where elements use different projections should return None
+        let tuple_expr = Expr::tuple(vec![
+            proj_idx(0).with_ty(proj_ty.clone()),
+            proj_idx(1).with_ty(proj_ty.clone()),
+        ]);
+        assert_eq!(is_function_of_single_tuple_arm(&tuple_expr), None);
+    }
+
+    #[test]
+    fn test_is_function_of_single_tuple_arm_on_tuple_with_constants() {
+        let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
+        let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty());
+        let const_fn_ty = fun_ty(tuple_ty_val.clone(), int_ty());
+        // A tuple with a projection and constant expressions should ignore constants
+        let tuple_expr = Expr::tuple(vec![
+            proj_idx(0).with_ty(proj_ty),
+            apply_primitive(var("c").with_ty(int_ty()), "const", const_fn_ty),
+        ]);
+        assert_eq!(is_function_of_single_tuple_arm(&tuple_expr), Some(0));
+    }
+
+    #[test]
+    fn test_is_function_of_single_tuple_arm_on_tuple_no_projections() {
+        let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
+        // A tuple with no projections (non-constant) should return None
+        let f_ty = fun_ty(tuple_ty_val.clone(), int_ty());
+        let tuple_expr = Expr::tuple(vec![var("f").with_ty(f_ty)]);
+        assert_eq!(is_function_of_single_tuple_arm(&tuple_expr), None);
+    }
+
+    // Tests for is_constant helper
+    #[test]
+    fn test_is_constant_on_const_apply() {
+        let int_ty_val = int_ty();
+        let const_expr = apply_primitive(var("c").with_ty(int_ty_val.clone()), "const", int_ty_val);
+        assert!(is_constant(&const_expr));
+    }
+
+    #[test]
+    fn test_is_constant_on_non_const_apply() {
+        let int_ty_val = int_ty();
+        let non_const_expr =
+            apply_primitive(var("f").with_ty(int_ty_val.clone()), "map", int_ty_val);
+        assert!(!is_constant(&non_const_expr));
+    }
+
+    #[test]
+    fn test_is_constant_on_compose_with_const() {
+        let int_ty_val = int_ty();
+        let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
+        let const_fn_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
+        let g_ty = fun_ty(int_ty_val.clone(), int_ty_val.clone());
+        let const_expr =
+            apply_primitive(var("c").with_ty(int_ty_val.clone()), "const", const_fn_ty);
+        let compose_expr = compose(vec![const_expr, var("g").with_ty(g_ty)])
+            .with_ty(fun_ty(tuple_ty_val, int_ty_val));
+        // A compose where the first element is const is considered constant
+        assert!(is_constant(&compose_expr));
+    }
+
+    #[test]
+    fn test_is_constant_on_var() {
+        let expr = var("x");
+        assert!(!is_constant(&expr));
+    }
+
+    // Tests for replace_tuple_project_with_id with Apply expressions
+    #[test]
+    fn test_replace_tuple_project_with_id_on_zip_apply() {
+        let int_ty_val = int_ty();
+        let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
+        let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
+        let zip_fn_ty = fun_ty(
+            tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
+            tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
+        );
+
+        let mut expr = Expr::apply(
+            proj_idx(0).with_ty(proj_ty),
+            var("zip").with_ty(zip_fn_ty.clone()),
+        )
+        .with_ty(fun_ty(
+            tuple_ty_val.clone(),
+            tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
+        ));
+
+        replace_tuple_project_with_id(&mut expr, &int_ty_val);
+
+        // After replacement, should be Apply with zip function
+        assert!(matches!(expr.node, TypedExprNode::Apply { .. }));
+        typecheck(&expr).expect("Type checking failed after replacement");
+    }
+
+    // Tests for replace_tuple_project_with_id with Tuple expressions
+    #[test]
+    fn test_replace_tuple_project_with_id_on_tuple() {
+        let int_ty_val = int_ty();
+        let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
+        let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
+
+        let mut expr = Expr::tuple(vec![
+            proj_idx(0).with_ty(proj_ty.clone()),
+            proj_idx(0).with_ty(proj_ty),
+        ])
+        .with_ty(tuple_ty(vec![
+            fun_ty(tuple_ty_val.clone(), int_ty_val.clone()),
+            fun_ty(tuple_ty_val, int_ty_val.clone()),
+        ]));
+
+        replace_tuple_project_with_id(&mut expr, &int_ty_val);
+
+        // After replacement, should still be a Tuple
+        assert!(matches!(expr.node, TypedExprNode::Tuple(_)));
+
+        // Check that the tuple type's function domains have been updated
+        if let Type::Tuple(ref elts) = expr.ty {
+            for elt in elts {
+                match elt {
+                    Type::Fun(domain, _) => {
+                        assert_eq!(**domain, int_ty_val);
+                    }
+                    _ => panic!("Expected function type in tuple"),
+                }
+            }
+        } else {
+            panic!("Expected tuple type");
+        }
+        typecheck(&expr).expect("Type checking failed after replacement");
+    }
+
+    #[test]
+    fn test_replace_tuple_project_with_id_on_tuple_with_constants() {
+        let int_ty_val = int_ty();
+        let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
+        let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
+        let const_fn_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
+
+        let const_expr = apply_primitive(
+            var("c").with_ty(int_ty_val.clone()),
+            "const",
+            const_fn_ty.clone(),
+        );
+
+        let mut expr =
+            Expr::tuple(vec![proj_idx(0).with_ty(proj_ty), const_expr]).with_ty(tuple_ty(vec![
+                fun_ty(tuple_ty_val.clone(), int_ty_val.clone()),
+                const_fn_ty,
+            ]));
+
+        replace_tuple_project_with_id(&mut expr, &int_ty_val);
+
+        // After replacement, should still be a Tuple
+        assert!(matches!(expr.node, TypedExprNode::Tuple(_)));
+        typecheck(&expr).expect("Type checking failed after replacement");
+    }
+
+    #[test]
+    fn test_replace_constant_domain_type_on_const_apply() {
+        let int_ty_val = int_ty();
+        let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
+        let const_fn_ty = fun_ty(tuple_ty_val, int_ty_val.clone());
+
+        let mut expr = apply_primitive(var("c").with_ty(int_ty_val.clone()), "const", const_fn_ty);
+
+        replace_constant_domain_type(&mut expr, &int_ty_val);
+
+        // After replacement, domain should be updated
+        if let Type::Fun(domain, _) = &expr.ty {
+            assert_eq!(**domain, int_ty_val);
+        } else {
+            panic!("Expected function type");
+        }
+    }
+
+    #[test]
+    fn test_replace_constant_domain_type_on_compose_with_const() {
+        let int_ty_val = int_ty();
+        let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
+        let const_fn_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
+        let g_ty = fun_ty(int_ty_val.clone(), int_ty_val.clone());
+
+        let const_expr =
+            apply_primitive(var("c").with_ty(int_ty_val.clone()), "const", const_fn_ty);
+
+        let mut expr = compose(vec![const_expr, var("g").with_ty(g_ty)])
+            .with_ty(fun_ty(tuple_ty_val, int_ty_val.clone()));
+
+        replace_constant_domain_type(&mut expr, &int_ty_val);
+
+        // After replacement, domain should be updated
+        if let Type::Fun(domain, _) = &expr.ty {
+            assert_eq!(**domain, int_ty_val);
+        } else {
+            panic!("Expected function type");
+        }
     }
 }

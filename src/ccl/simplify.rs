@@ -17,6 +17,7 @@
 //! | Rule | Pattern | Reduction |
 //! |------|---------|-----------|
 //! | Compose identity | `… ≫ id ≫ …` / `… ≫ id ≫ …` | remove `id` |
+//! | Const reduce | `f ≫ g ▷ const` | `g ▷ const` |
 //! | Product beta (fst) | `⟨f, g⟩ ≫ .0` | `f` |
 //! | Product beta (snd) | `⟨f, g⟩ ≫ .1` | `g` |
 //! | CCC universal | `⟨.1, .0 ≫ curry(f)⟩ ≫ apply` | `f` |
@@ -25,10 +26,10 @@
 //! | Const-apply | `⟨f, const(g)⟩ ≫ apply` | `f ≫ g` |
 //! | Product eta | `⟨f ≫ .0, f ≫ .1⟩` | `f` |
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` |
-//! | Zip beta | `⟨f0, f1⟩ ≫ ⟨.n ≫ g, .m ≫ h⟩` | `⟨f_n ≫ g, f_m ≫ h⟩` |
+//! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` |
 
 use crate::ccl::infer::debug_typecheck;
-use crate::ccl::lambda_elim::{id, zip_pair};
+use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
 use crate::ccl::{Expr, Lit, ProjKey, RefinementKind, Type, TypedExpr, TypedExprNode};
 
 // ---------------------------------------------------------------------------
@@ -123,15 +124,17 @@ fn take(expr: &mut Expr) -> Expr {
 fn apply_simplification_rules(expr: &mut Expr) -> bool {
     let mut changed = false;
     changed |= check(try_compose_identity(expr), expr);
+    changed |= check(try_const_reduce(expr), expr);
     changed |= check(try_product_beta_fst(expr), expr);
     changed |= check(try_product_beta_snd(expr), expr);
     changed |= check(try_ccc_universal(expr), expr);
     changed |= check(try_exponential_beta(expr), expr);
     changed |= check(try_exponential_eta(expr), expr);
-    changed |= check(try_zip_beta(expr), expr);
     changed |= check(try_const_apply(expr), expr);
     changed |= check(try_product_eta(expr), expr);
     changed |= check(try_flatten_compose(expr), expr);
+    changed |= check(try_zip_distribute_compose(expr), expr);
+
     changed
 }
 
@@ -295,6 +298,43 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
             } else {
                 vec![left]
             }
+        },
+    )
+}
+
+/// Const reduce: `f ≫ g ▷ const  ⟹  g ▷ const` (with updated type)
+///
+/// When composing with a lifted constant, the constant discards its input and
+/// returns the constant value. Therefore, any preceding function `f` has no effect.
+/// The type of the resulting `g ▷ const` changes from `codomain(f) → codomain(g)`
+/// to `domain(f) → codomain(g)`.
+///
+/// Operates pairwise in an n-ary compose; trailing elements are preserved.
+fn try_const_reduce(expr: &mut Expr) -> bool {
+    try_pairwise_in_compose(
+        expr,
+        |_left, right| as_const(right).is_some(),
+        |left, right| {
+            let Some(g) = as_const(&right) else {
+                unreachable!()
+            };
+
+            // Compute the new type for g ▷ const
+            // Original: g ▷ const has type codomain(f) → codomain(g)
+            // New: should be domain(f) → codomain(g)
+            let new_const_ty = match (&left.ty, &right.ty) {
+                (Type::Fun(left_dom, _), Type::Fun(_, right_cod)) => {
+                    Type::fun(left_dom.as_ref().clone(), right_cod.as_ref().clone())
+                }
+                _ => Type::Hole,
+            };
+
+            // Reconstruct g ▷ const with the new type
+            let const_var_ty = fun_ty_or_hole(&g.ty, &new_const_ty);
+            let const_var = Expr::var("const").with_ty(const_var_ty);
+            let new_const = Expr::apply(g.clone(), const_var).with_ty(new_const_ty);
+
+            vec![new_const]
         },
     )
 }
@@ -537,140 +577,87 @@ fn try_product_eta(expr: &mut Expr) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Zip beta rule
+// Zip distribute rule
 // ---------------------------------------------------------------------------
 
-/// Zip beta: `⟨f0, f1⟩ ≫ ⟨.n ≫ g, .m ≫ i⟩  ⟹  ⟨f_n ≫ g, f_m ≫ i⟩`
+/// Zip distribute: `⟨f0, f1⟩ ≫ ⟨g, h⟩  ⟹  ⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩`
 ///
-/// Each arm of the right zip must start with a projection (`n, m ∈ {0,1}`);
-/// each arm routes to whichever component of the left zip it selects, then
-/// applies its optional suffix.  Bare projections (no suffix)
-/// leave the component unchanged; compose identity subsequently reduces any
-/// `id ≫ …` that appears.
+/// Distributes a zip composition across another zip, but only when the left side
+/// is itself a zip and the right-side arms will simplify nicely after the composition.
+/// This latter property is called "simplifying" here and is defined in the `arm_is_simplifying` helper.
 ///
-/// Covers all combinations of arm order and suffix presence:
-/// - `⟨h, f⟩ ≫ ⟨.0 ≫ g, .1⟩  ⟹  ⟨h ≫ g, f⟩`   (n=0, m=1, bare .1)
-/// - `⟨h, f⟩ ≫ ⟨.1, .0 ≫ g⟩  ⟹  ⟨f, h ≫ g⟩`   (n=1, m=0, bare .1)
-/// - `⟨h, f⟩ ≫ ⟨.0 ≫ g, .1 ≫ i⟩  ⟹  ⟨h ≫ g, f ≫ i⟩`  (both suffixed)
+/// After this rule is applied, product_beta will be able to perform further simplification.
 ///
 /// Operates pairwise in an n-ary compose; trailing elements are preserved.
-fn try_zip_beta(expr: &mut Expr) -> bool {
-    /// Returns the leading projection index of a zip arm.
-    ///
-    /// A zip arm may be a bare `Proj(Index(n))` or a compose whose first element
-    /// is `Proj(Index(n))`.  Returns `Some(n)` in both cases, `None` otherwise.
-    fn arm_leading_proj(expr: &Expr) -> Option<usize> {
-        match &expr.node {
-            TypedExprNode::Proj(ProjKey::Index(n)) => Some(*n),
-            TypedExprNode::Compose(elts) => {
-                if let Some(TypedExprNode::Proj(ProjKey::Index(n))) = elts.first().map(|e| &e.node)
-                {
-                    Some(*n)
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        }
+fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
+    // Returns true if both arms are simplifying, but not both are id.
+    fn is_simplifying_zip(expr: &Expr) -> bool {
+        as_zip(expr)
+            .is_some_and(|(a, b)| is_simplifying(a) && is_simplifying(b) && !(is_id(a) && is_id(b)))
     }
 
-    /// Apply a zip arm to a base component.
-    ///
-    /// Given `base` (a left-zip component `f_n`) and an `arm` of the form `.n`
-    /// or `.n ≫ g ≫ …`, replaces the leading projection in `arm` with `base`,
-    /// yielding `base ≫ g ≫ …`.  Returns `base` unchanged when `arm` is a bare
-    /// projection (equivalent to `base ≫ id`, reduced by compose identity).
-    ///
-    /// The result type is `Fun(domain_of_base, codomain_of_arm)` when both are
-    /// concrete, falling back to [`Type::Hole`] otherwise.
-    fn apply_arm_suffix(base: Expr, arm: Expr) -> Expr {
-        // Result type: domain from base, codomain from arm (the arm carries the
-        // full type A→C where A is the tuple domain and C is the output type;
-        // substituting base for the leading proj gives domain(base)→C).
-        let result_ty = match (&base.ty, &arm.ty) {
-            (Type::Fun(dom, _), Type::Fun(_, cod)) => Type::fun(*dom.clone(), *cod.clone()),
-            _ => Type::Hole,
-        };
-        match arm.node {
-            TypedExprNode::Proj(_) => base,
-            TypedExprNode::Compose(mut elts) => {
-                elts[0] = base; // replace leading proj with base component
-                let result = if elts.len() == 1 {
-                    elts.pop().unwrap()
-                } else {
-                    Expr::compose(elts)
-                };
-                result.with_ty(result_ty)
-            }
-            _ => unreachable!(),
+    /// Returns true if the arm is simplifying: id, projection, lifted const, or a zip with simplifying arms.
+    fn is_simplifying(expr: &Expr) -> bool {
+        if is_id(expr) {
+            return true;
         }
+        if let TypedExprNode::Proj(ProjKey::Index(_)) = &expr.node {
+            return true;
+        }
+        // Lifted constant: <expr> ▷ const
+        if let TypedExprNode::Apply {
+            function,
+            argument: _,
+        } = &expr.node
+        {
+            if matches!(&function.node, TypedExprNode::Var(n) if n == "const") {
+                return true;
+            }
+        }
+        // Zip where both arms are simplifying
+        if is_simplifying_zip(expr) {
+            return true;
+        }
+        // Compose starting with projection (original behavior)
+        if let TypedExprNode::Compose(elts) = &expr.node {
+            if let Some(first) = elts.first() {
+                if is_simplifying(first) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     try_pairwise_in_compose(
         expr,
         |left, right| {
-            as_zip(left).is_some()
-                && as_zip(right).is_some_and(|(a, b)| {
-                    let n1 = arm_leading_proj(a);
-                    let n2 = arm_leading_proj(b);
-                    n1.is_some() && n2.is_some()
-                })
+            // Match: left is a zip, right is a zip with simplifying arms
+            // But don't match if both arms are just id (which would create unnecessary complexity)
+            as_zip(left).is_some() && is_simplifying_zip(right)
         },
         |left, right| {
-            // Peek at projection indices before consuming `right`
-            let (n1, n2) = {
-                let TypedExprNode::Apply { argument, .. } = &right.node else {
-                    unreachable!()
-                };
-                let TypedExprNode::Tuple(elts) = &argument.node else {
-                    unreachable!()
-                };
-                (
-                    arm_leading_proj(&elts[0]).unwrap(),
-                    arm_leading_proj(&elts[1]).unwrap(),
-                )
-            };
-            // Extract (f0, f1) from ⟨f0, f1⟩
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = left
-            else {
+            let Some((g, h)) = as_zip(&right) else {
                 unreachable!()
             };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
+
+            // Compute types for the composed expressions
+            let g_ty = match (&left.ty, &g.ty) {
+                (Type::Fun(dom, _), Type::Fun(_, cod)) => {
+                    Type::fun(dom.as_ref().clone(), cod.as_ref().clone())
+                }
+                _ => Type::Hole,
             };
-            let f1 = elts.swap_remove(1);
-            let f0 = elts.pop().unwrap();
-            // Extract (a, b) from ⟨a, b⟩
-            let TypedExpr {
-                node: TypedExprNode::Apply { argument, .. },
-                ..
-            } = right
-            else {
-                unreachable!()
+            let h_ty = match (&left.ty, &h.ty) {
+                (Type::Fun(dom, _), Type::Fun(_, cod)) => {
+                    Type::fun(dom.as_ref().clone(), cod.as_ref().clone())
+                }
+                _ => Type::Hole,
             };
-            let TypedExpr {
-                node: TypedExprNode::Tuple(mut elts),
-                ..
-            } = *argument
-            else {
-                unreachable!()
-            };
-            let b = elts.swap_remove(1);
-            let a = elts.pop().unwrap();
-            // Route each arm to the component it selects; clone when both arms
-            // pick the same component (n1 == n2).
-            let base_a = if n1 == 0 { f0.clone() } else { f1.clone() };
-            let base_b = if n2 == 0 { f0 } else { f1 };
-            let new_f = apply_arm_suffix(base_a, a);
-            let new_g = apply_arm_suffix(base_b, b);
-            vec![zip_pair(new_f, new_g)]
+
+            let g_compose = Expr::compose(vec![left.clone(), g.clone()]).with_ty(g_ty);
+            let h_compose = Expr::compose(vec![left.clone(), h.clone()]).with_ty(h_ty);
+            vec![zip_pair(g_compose, h_compose)]
         },
     )
 }
@@ -1401,5 +1388,167 @@ mod tests {
         let once = simplify(expr);
         let twice = simplify(once.clone());
         assert_eq!(once, twice);
+    }
+
+    /// Zip distribute doesn't match when left is not a zip
+    /// f ≫ ⟨.0, .1⟩ where f is not a zip
+    /// Should not distribute
+    #[test]
+    fn simplify_zip_no_distribute_when_left_not_zip() {
+        // Left is NOT a zip: just a function
+        let f = var("f").with_ty(fun_ty(int_ty(), Type::Tuple(vec![int_ty(), int_ty()])));
+
+        // Right is a zip with simplifying arms
+        let tup_ty = Type::Tuple(vec![int_ty(), int_ty()]);
+        let p0 = proj_idx(0).with_ty(fun_ty(tup_ty.clone(), int_ty()));
+        let p1 = proj_idx(1).with_ty(fun_ty(tup_ty.clone(), int_ty()));
+        let zip = zip_pair(p0, p1);
+
+        let expr = typed_compose2(f.clone(), zip.clone());
+        let simplified = simplify(expr);
+
+        // Should NOT distribute because left is not a zip
+        assert_eq!(simplified, typed_compose2(f, zip));
+    }
+
+    /// Zip distribute with projection arms: ⟨f0, f1⟩ ≫ ⟨.0, .1⟩
+    /// Both arms are projections (simplifying), but not both id
+    #[test]
+    fn simplify_zip_distribute_projection_arms() {
+        let int_fun = fun_ty(int_ty(), int_ty());
+        let int_pair = Type::Tuple(vec![int_ty(), int_ty()]);
+
+        let f0 = var("f0").with_ty(int_fun.clone());
+        let f1 = var("f1").with_ty(int_fun.clone());
+        let zip1 = zip_pair(f0.clone(), f1.clone());
+
+        // Both .0 and .1 are simplifying projections
+        let p0 = proj_idx(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
+        let p1 = proj_idx(1).with_ty(fun_ty(int_pair, int_ty()));
+
+        let zip2 = zip_pair(p0, p1);
+
+        let expr = typed_compose2(zip1.clone(), zip2);
+        let simplified = simplify(expr);
+
+        // Should distribute: ⟨f0 ≫ .0, f1 ≫ .1⟩
+        // Then further simplify via product_beta: ⟨f0, f1⟩
+        assert_eq!(simplified, zip1);
+    }
+
+    /// Zip distribute with composed arms: ⟨f0, f1⟩ ≫ ⟨.0 ≫ g, .1 ≫ h⟩
+    /// where both arms are composes starting with projections (simplifying)
+    #[test]
+    fn simplify_zip_distribute_composed_arms() {
+        let int_fun = fun_ty(int_ty(), int_ty());
+        let int_pair = Type::Tuple(vec![int_ty(), int_ty()]);
+
+        let f0 = var("f0").with_ty(int_fun.clone());
+        let f1 = var("f1").with_ty(int_fun.clone());
+        let zip1 = zip_pair(f0.clone(), f1.clone());
+
+        // .0 ≫ g and .1 ≫ h are composes starting with projections (simplifying)
+        let p0 = proj_idx(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
+        let p1 = proj_idx(1).with_ty(fun_ty(int_pair, int_ty()));
+
+        let g = var("g").with_ty(int_fun.clone());
+        let h = var("h").with_ty(int_fun.clone());
+
+        let p0_g = typed_compose2(p0, g.clone());
+        let p1_h = typed_compose2(p1, h.clone());
+        let zip2 = zip_pair(p0_g, p1_h);
+
+        let expr = typed_compose2(zip1.clone(), zip2);
+        let simplified = simplify(expr);
+
+        // Should distribute: ⟨f0 ≫ (.0 ≫ g), f1 ≫ (.1 ≫ h)⟩
+        // Which flattens to: ⟨f0 ≫ .0 ≫ g, f1 ≫ .1 ≫ h⟩
+        // Then product_beta simplifies: ⟨f0 ≫ g, f1 ≫ h⟩
+        let expected = zip_pair(typed_compose2(f0.clone(), g), typed_compose2(f1.clone(), h));
+        assert_eq!(simplified, expected);
+    }
+
+    /// Zip distribute in n-ary compose: a ≫ ⟨f0, f1⟩ ≫ ⟨.0, .1⟩ ≫ b
+    /// where right zip has simplifying arms (both projections)
+    #[test]
+    fn simplify_zip_distribute_nary_compose() {
+        let int_fun = fun_ty(int_ty(), int_ty());
+        let int_pair = Type::Tuple(vec![int_ty(), int_ty()]);
+
+        let aa = var("a").with_ty(int_fun.clone());
+        let f0 = var("f0").with_ty(int_fun.clone());
+        let f1 = var("f1").with_ty(int_fun.clone());
+        let zip1 = zip_pair(f0.clone(), f1.clone());
+
+        // Both .0 and .1 are simplifying projections
+        let p0 = proj_idx(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
+        let p1 = proj_idx(1).with_ty(fun_ty(int_pair.clone(), int_ty()));
+        let zip2 = zip_pair(p0, p1);
+
+        let bb = var("b").with_ty(fun_ty(int_pair, int_ty()));
+
+        let expr = typed_compose(vec![aa.clone(), zip1.clone(), zip2, bb.clone()]);
+        let simplified = simplify(expr);
+
+        // Should distribute: ⟨f0 ≫ .0, f1 ≫ .1⟩ then simplify via product_beta to ⟨f0, f1⟩
+        let expected = typed_compose(vec![aa, zip1, bb]);
+        assert_eq!(simplified, expected);
+    }
+
+    /// Zip distribute with composed/projected arms: ⟨f0, f1⟩ ≫ ⟨.0 ≫ id, .1 ≫ id⟩
+    /// Both arms are composes starting with projections (simplifying)
+    #[test]
+    fn simplify_zip_distribute_project_compose_arms() {
+        let int_fun = fun_ty(int_ty(), int_ty());
+        let int_pair = Type::Tuple(vec![int_ty(), int_ty()]);
+
+        let f0 = var("f0").with_ty(int_fun.clone());
+        let f1 = var("f1").with_ty(int_fun.clone());
+        let zip1 = zip_pair(f0.clone(), f1.clone());
+
+        // Both arms are composes: projection followed by identity
+        let p0 = proj_idx(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
+        let p1 = proj_idx(1).with_ty(fun_ty(int_pair, int_ty()));
+        let id_fn = id().with_ty(int_fun.clone());
+
+        let p0_id = typed_compose2(p0, id_fn.clone());
+        let p1_id = typed_compose2(p1, id_fn);
+        let zip2 = zip_pair(p0_id, p1_id);
+
+        let expr = typed_compose2(zip1.clone(), zip2);
+        let simplified = simplify(expr);
+
+        // Should distribute and simplify back to zip1 via product_beta
+        assert_eq!(simplified, zip1);
+    }
+
+    /// Zip distribute with composed projection arms (matching full behavior)
+    /// ⟨f0, f1⟩ ≫ ⟨.0 ≫ id, .1 ≫ id⟩ (simplifying arms)
+    #[test]
+    fn simplify_zip_distribute_complex_arms() {
+        let int_fun = fun_ty(int_ty(), int_ty());
+        let int_pair = Type::Tuple(vec![int_ty(), int_ty()]);
+
+        let f0 = var("f0").with_ty(int_fun.clone());
+        let f1 = var("f1").with_ty(int_fun.clone());
+        let zip1 = zip_pair(f0.clone(), f1.clone());
+
+        // .0 ≫ id and .1 ≫ id are projections composed with identity (simplifying)
+        let p0 = proj_idx(0).with_ty(fun_ty(int_pair.clone(), int_ty()));
+        let p1 = proj_idx(1).with_ty(fun_ty(int_pair, int_ty()));
+        let id_fn = id().with_ty(int_fun.clone());
+
+        let p0_id = typed_compose2(p0, id_fn.clone());
+        let p1_id = typed_compose2(p1, id_fn);
+        let zip2 = zip_pair(p0_id, p1_id);
+
+        let expr = typed_compose2(zip1.clone(), zip2);
+        let simplified = simplify(expr);
+
+        // After distribution: ⟨f0 ≫ (.0 ≫ id), f1 ≫ (.1 ≫ id)⟩
+        // After flattening: ⟨f0 ≫ .0 ≫ id, f1 ≫ .1 ≫ id⟩
+        // After product_beta: ⟨f0 ≫ id, f1 ≫ id⟩
+        // After compose identity: ⟨f0, f1⟩
+        assert_eq!(simplified, zip1);
     }
 }
