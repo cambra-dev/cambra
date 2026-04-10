@@ -193,6 +193,8 @@ pub enum InferError {
     /// An unresolved [`Type::Infer`] variable survived past resolution.
     /// The `String` is the symbolic representation of the offending expression.
     UnresolvedInfer(InferVarId, String),
+    // A partial tuple or partial record that was not resolved to a concrete Tuple/Record
+    UnresolvedPartial(String, String),
 }
 
 impl std::fmt::Debug for InferError {
@@ -237,6 +239,9 @@ impl std::fmt::Debug for InferError {
                     "Unresolved inference variable {} in expression: {}",
                     id, sym
                 )
+            }
+            InferError::UnresolvedPartial(name, sym) => {
+                write!(f, "Unresolved partial {} in expression: {}", name, sym)
             }
         }
     }
@@ -407,11 +412,19 @@ fn collect_type_errors(ty: &Type, context_sym: &str, errors: &mut Vec<InferError
             collect_type_errors(inner, context_sym, errors);
         }
         Type::PartialTuple(entries) => {
+            errors.push(InferError::UnresolvedPartial(
+                ty.to_string(),
+                context_sym.to_string(),
+            ));
             for (_, ty) in entries {
                 collect_type_errors(ty, context_sym, errors);
             }
         }
         Type::PartialRecord(entries) => {
+            errors.push(InferError::UnresolvedPartial(
+                ty.to_string(),
+                context_sym.to_string(),
+            ));
             for (_, ty) in entries {
                 collect_type_errors(ty, context_sym, errors);
             }

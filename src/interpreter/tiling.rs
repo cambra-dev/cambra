@@ -777,6 +777,8 @@ pub enum FunctionGuard {
 impl FunctionGuard {
     pub fn intersect(&self, other: &FunctionGuard) -> FunctionGuard {
         match (self, other) {
+            (a, _b) | (_b, a) if a.is_empty() => a.clone(),
+            (a, b) | (b, a) if a.is_univeral() => b.clone(),
             (FunctionGuard::Domain(p1), FunctionGuard::Domain(p2)) => {
                 FunctionGuard::Domain(p1.intersect(p2))
             }
@@ -790,13 +792,15 @@ impl FunctionGuard {
     /// Returns the union of two function guards.
     pub fn union(&self, other: &FunctionGuard) -> FunctionGuard {
         match (self, other) {
+            (a, b) | (b, a) if a.is_empty() => b.clone(),
+            (a, _b) | (_b, a) if a.is_univeral() => a.clone(),
             (FunctionGuard::Domain(p1), FunctionGuard::Domain(p2)) => {
                 FunctionGuard::Domain(p1.union(p2))
             }
             (FunctionGuard::Codomain(p1), FunctionGuard::Codomain(p2)) => {
                 FunctionGuard::Codomain(Box::new(p1.union(p2)))
             }
-            _ => todo!("Handle Domain + Codomain guards together"),
+            _ => todo!("Handle Domain + Codomain guards together, got {self:?} and {other:?}"),
         }
     }
 

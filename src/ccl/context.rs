@@ -178,9 +178,9 @@ pub fn new_compile_program(
 
     let infer_ctx = ctx.inference_ctx();
     infer(&mut expr, infer_ctx).expect("type inference failed");
-
-    let ccl_repr = symbolic(&expr);
-    debug!("Inferred:\n{ccl_repr}");
+    debug!("Inferred:\n{}", symbolic(&expr));
+    debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
+    typecheck(&expr).expect("Inference created invalid expr");
 
     let lambda_elim = lambda_elim::run(expr).expect("Lambda elim failed");
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));

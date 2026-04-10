@@ -473,11 +473,14 @@ fn substitute_in_type(ty: &mut Type, name: &str, replacement: &Expr) {
                 ..
             } = &mut *refinement
             {
-                // panic!();
                 let t = Expr::lit(Lit::Unit);
-                let old_pred = replace(&mut *pred_rc.borrow_mut(), t);
-                let new_pred = substitute(old_pred, name, replacement);
-                *pred_rc.borrow_mut() = new_pred;
+                // Substitute within the refinement, unless we are already inside that same refinement
+                // TODO: this probably simplifies once we remove the RefCell from the predicate.
+                if let Ok(mut pred) = pred_rc.try_borrow_mut() {
+                    let old_pred = replace(&mut *pred, t);
+                    let new_pred = substitute(old_pred, name, replacement);
+                    *pred = new_pred;
+                }
             }
         }
         Type::Fun(domain, codomain) => {

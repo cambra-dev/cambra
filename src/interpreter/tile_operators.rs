@@ -1195,39 +1195,113 @@ impl TileProducer for MapResultWithSourceProducer {
 /// All inputs must have `SealedFunction` tilings with compatible domains.
 /// Output fields are named `_0`, `_1`, … matching the input order.
 pub struct Zip {
-    /// Output tiling: `SealedFunction { domain: shared_domain, codomain: Record { _0, _1, … } }`.
+    /// Output tiling: either a `SealedFunction { domain, codomain: Record { _0, _1, … } }`
+    /// or a `CurriedFunction { domain1, domain2, codomain: Record { _0, _1, … } }`,
+    /// depending on the input operators.
     tiling: Tiling,
-    /// The input sealed-function operators to zip together.
+    /// The input function operators to zip together (either all `SealedFunction` or all `CurriedFunction`).
     inputs: Vec<Box<dyn TileOperator>>,
 }
 
 impl Zip {
     /// Create a new `Zip` operator over the given input operators.
     ///
-    /// All inputs must be `SealedFunction` tilings with the same domain.
-    /// The output `tiling` and `extent` are derived: each input's value extent
+    /// All inputs must be either all `SealedFunction` tilings with the same domain,
+    /// or all `CurriedFunction` tilings with the same domain1, offsets, and domain2.
+    /// The output `tiling` and `extent` are derived: each input's codomain extent
     /// becomes a field (`_0`, `_1`, …) in a `Record` codomain.
     pub fn new(inputs: Vec<Box<dyn TileOperator>>) -> Self {
+        trace!(
+            "Creating zip with inputs {}",
+            inputs
+                .iter()
+                .map(|i| i.tiling().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         assert!(!inputs.is_empty(), "Zip requires at least one input");
-        let domain = inputs[0]
-            .tiling()
-            .domain_extent()
-            .expect("Zip: all inputs must have a SealedFunction tiling")
-            .clone();
-        let tiling = Tiling::SealedFunction {
-            domain,
-            codomain: Box::new(Tiling::Record(
-                inputs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, op)| {
-                        (
-                            tuple_field(i),
-                            op.tiling().codomain().expect("Expected function").clone(),
-                        )
-                    })
-                    .collect(),
-            )),
+
+        let first_tiling = inputs[0].tiling();
+        let tiling = match first_tiling {
+            Tiling::SealedFunction { domain, .. } => {
+                // Verify all inputs are SealedFunction with the same domain
+                for op in inputs.iter() {
+                    if let Tiling::SealedFunction { domain: d, .. } = op.tiling() {
+                        assert_eq!(
+                            domain, d,
+                            "Zip: all SealedFunction inputs must have the same domain"
+                        );
+                    } else {
+                        panic!("Zip: all inputs must be the same type (all SealedFunction or all CurriedFunction)");
+                    }
+                }
+                Tiling::SealedFunction {
+                    domain: domain.clone(),
+                    codomain: Box::new(Tiling::Record(
+                        inputs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, op)| {
+                                (
+                                    tuple_field(i),
+                                    op.tiling()
+                                        .codomain()
+                                        .unwrap_or_else(|| {
+                                            panic!("Expected function, got {}", op.tiling())
+                                        })
+                                        .clone(),
+                                )
+                            })
+                            .collect(),
+                    )),
+                }
+            }
+            Tiling::CurriedFunction {
+                domain1,
+                domain2,
+                codomain: _,
+            } => {
+                // Verify all inputs are CurriedFunction with the same domain1 and domain2
+                for op in inputs.iter() {
+                    if let Tiling::CurriedFunction {
+                        domain1: d1,
+                        domain2: d2,
+                        ..
+                    } = op.tiling()
+                    {
+                        assert_eq!(
+                            domain1, d1,
+                            "Zip: all CurriedFunction inputs must have the same domain1"
+                        );
+                        assert_eq!(
+                            domain2, d2,
+                            "Zip: all CurriedFunction inputs must have the same domain2"
+                        );
+                    } else {
+                        panic!("Zip: all inputs must be the same type (all SealedFunction or all CurriedFunction)");
+                    }
+                }
+                Tiling::CurriedFunction {
+                    domain1: domain1.clone(),
+                    domain2: domain2.clone(),
+                    codomain: Extent::Record(
+                        inputs
+                            .iter()
+                            .enumerate()
+                            .map(|(i, op)| {
+                                if let Tiling::CurriedFunction { codomain: cod, .. } = op.tiling() {
+                                    (tuple_field(i), cod.clone())
+                                } else {
+                                    panic!("Expected CurriedFunction, got {}", op.tiling())
+                                }
+                            })
+                            .collect(),
+                    ),
+                }
+            }
+            _ => panic!(
+                "Zip: all inputs must have function tilings (SealedFunction or CurriedFunction)"
+            ),
         };
         Self { tiling, inputs }
     }
@@ -1299,41 +1373,114 @@ impl TileProducer for ZipProducer {
             .iter_mut()
             .map(|i| i.get(i.tiling().universal_guard()))
             .collect();
-        let mut domain_pred: Option<Predicate> = None;
-        let mut output_domain: Option<ColumnValue> = None;
-        let mut codomains = Vec::new();
-        for t in tiles.into_iter() {
-            match t {
-                Tile::SealedFunction {
-                    domain,
-                    codomain,
-                    domain_predicate,
-                } => {
-                    if let Some(ref prev) = domain_pred {
-                        assert_eq!(
-                            prev, &domain_predicate,
-                            "Zip: all inputs must have the same domain predicate"
-                        );
-                    }
-                    domain_pred = Some(domain_predicate);
-                    output_domain = Some(domain);
-                    codomains.push(*codomain);
-                }
-                _ => panic!("Can only zip functions"),
-            }
-        }
 
-        let codomain_record = Tile::Record(
-            codomains
-                .into_iter()
-                .enumerate()
-                .map(move |(i, cv)| (tuple_field(i), cv))
-                .collect(),
-        );
-        Tile::SealedFunction {
-            domain: output_domain.unwrap(),
-            codomain: Box::new(codomain_record),
-            domain_predicate: domain_pred.unwrap(),
+        match &tiles[0] {
+            Tile::SealedFunction { .. } => {
+                // All inputs are SealedFunction tiles
+                let mut domain_pred: Option<Predicate> = None;
+                let mut output_domain: Option<ColumnValue> = None;
+                let mut codomains = Vec::new();
+                for t in tiles.into_iter() {
+                    match t {
+                        Tile::SealedFunction {
+                            domain,
+                            codomain,
+                            domain_predicate,
+                        } => {
+                            if let Some(ref prev) = domain_pred {
+                                assert_eq!(
+                                    prev, &domain_predicate,
+                                    "Zip: all inputs must have the same domain predicate"
+                                );
+                            }
+                            domain_pred = Some(domain_predicate);
+                            output_domain = Some(domain);
+                            codomains.push(*codomain);
+                        }
+                        _ => panic!("Zip: cannot mix SealedFunction and other tile types"),
+                    }
+                }
+
+                let codomain_record = Tile::Record(
+                    codomains
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(i, cv)| (tuple_field(i), cv))
+                        .collect(),
+                );
+                Tile::SealedFunction {
+                    domain: output_domain.unwrap(),
+                    codomain: Box::new(codomain_record),
+                    domain_predicate: domain_pred.unwrap(),
+                }
+            }
+            Tile::CurriedFunction { .. } => {
+                // All inputs are CurriedFunction tiles
+                let mut domain1: Option<ColumnValue> = None;
+                let mut offsets: Option<ColumnValue> = None;
+                let mut domain2: Option<ColumnValue> = None;
+                let mut domain_pred: Option<Predicate> = None;
+                let mut codomains = Vec::new();
+
+                for t in tiles.into_iter() {
+                    match t {
+                        Tile::CurriedFunction {
+                            domain1: d1,
+                            offsets: offs,
+                            domain2: d2,
+                            codomain: cod,
+                            domain_predicate,
+                        } => {
+                            if let Some(ref prev_d1) = domain1 {
+                                assert_eq!(
+                                    prev_d1, &d1,
+                                    "Zip: all inputs must have the same domain1"
+                                );
+                            }
+                            if let Some(ref prev_offs) = offsets {
+                                assert_eq!(
+                                    prev_offs, &offs,
+                                    "Zip: all inputs must have the same offsets"
+                                );
+                            }
+                            if let Some(ref prev_d2) = domain2 {
+                                assert_eq!(
+                                    prev_d2, &d2,
+                                    "Zip: all inputs must have the same domain2"
+                                );
+                            }
+                            if let Some(ref prev) = domain_pred {
+                                assert_eq!(
+                                    prev, &domain_predicate,
+                                    "Zip: all inputs must have the same domain predicate"
+                                );
+                            }
+                            domain1 = Some(d1);
+                            offsets = Some(offs);
+                            domain2 = Some(d2);
+                            domain_pred = Some(domain_predicate);
+                            codomains.push(cod);
+                        }
+                        _ => panic!("Zip: cannot mix CurriedFunction and other tile types"),
+                    }
+                }
+
+                let codomain_record = ColumnValue::Records(
+                    codomains
+                        .into_iter()
+                        .enumerate()
+                        .map(move |(i, cv)| (tuple_field(i), cv))
+                        .collect(),
+                );
+                Tile::CurriedFunction {
+                    domain1: domain1.unwrap(),
+                    offsets: offsets.unwrap(),
+                    domain2: domain2.unwrap(),
+                    codomain: codomain_record,
+                    domain_predicate: domain_pred.unwrap(),
+                }
+            }
+            _ => panic!("Zip: all inputs must be SealedFunction or CurriedFunction tiles"),
         }
     }
 
@@ -1346,7 +1493,10 @@ impl TileProducer for ZipProducer {
                 TileGuard::Function(FunctionGuard::Domain(p)) => {
                     TileGuard::Function(FunctionGuard::Domain(p.clone()))
                 }
-                _ => todo!(),
+                TileGuard::Function(FunctionGuard::Codomain(g)) => {
+                    TileGuard::Function(FunctionGuard::Codomain(g.clone()))
+                }
+                g => unimplemented!("Unexpected guard {g:?}"),
             })
         });
     }

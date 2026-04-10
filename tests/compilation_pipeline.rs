@@ -18,11 +18,12 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use bit_vec::BitVec;
+use cambra::ccl::context::new_compile_program;
 use cambra::ccl::{context::GlobalContext, Type};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
     sort_sealed_function_by_domain, tuple_field, BaseType, ColumnValue, Consumer, Extent,
-    FuncBinding, FunctionGuard, Predicate, TestDataSource, Tile, TileGuard, Value,
+    FunctionGuard, Predicate, TestDataSource, Tile, TileGuard, Value,
 };
 use rstest_log::rstest;
 use smol_str::SmolStr;
@@ -40,7 +41,7 @@ fn run_pipeline(code: &str) -> Tile {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut producer = ctx.compile_program(code, consumer);
+    let (_, _, mut producer) = new_compile_program(&mut ctx, code, consumer);
     // let (_, _, mut producer) = new_compile_program(&mut ctx, code, consumer);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
@@ -97,13 +98,15 @@ fn make_tuple(v: &[Value]) -> Value {
 #[case("2", Value::Int(2))]
 #[case(r#""hello""#, Value::String("hello".into()))]
 #[case("True", Value::Bool(true))]
-#[case("[]", Value::Function(vec![]))]
-#[case("[1, 2]", Value::Function(vec![
-    FuncBinding { input: Value::UInt(0), output: Value::Int(1) },
-    FuncBinding { input: Value::UInt(1), output: Value::Int(2) },
-]))]
 fn test_literals(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+#[rstest]
+#[case("[]", Tile::SealedFunction { domain: ColumnValue::UInts(vec![]), codomain: Box::new(Tile::Scalar(ColumnValue::Units(0))), domain_predicate: Predicate::True })]
+#[case("[1, 2]", make_int_list(&[1, 2]))]
+fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +187,7 @@ fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
     make_tuple(&[Value::String("a".into()), Value::Int(1)])
 )]
 #[case("('a', 1)[0]", Value::String("a".into()))]
+#[case("('a', 1)[1]", Value::Int(1))]
 #[case("x = ('a', 1); x[0]", Value::String("a".into()))]
 fn test_tuples(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
@@ -303,9 +307,8 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     ColumnValue::strings(&["cc", "bb"])
 )]
 // Loop join with non-equality predicate involving both generators
-// TODO turn back to hash join
 #[case(
-    "[x + y for x in [1, 1] for y in [2, 2, 3] if x + 1 == y and True]",
+    "[x + y for x in [1, 1] for y in [2, 2, 3] if x + 1 == y]",
     ColumnValue::Ints(vec![3, 3, 3, 3])
 )]
 #[case(
@@ -316,9 +319,8 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     "[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'd'] if x < y]",
     ColumnValue::strings(&["ab", "ac", "ad","cd", "bc", "bd"])
 )]
-// TODO turn back to hash join
 #[case(
-    "[x + y for x in ['a', 'b'] for y in ['c', 'd'] if x == y and True]",
+    "[x + y for x in ['a', 'b'] for y in ['c', 'd'] if x == y]",
     ColumnValue::strings(&[])
 )]
 #[case(

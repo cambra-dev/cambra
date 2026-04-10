@@ -134,42 +134,31 @@ impl UnificationTable {
         // `.1` on the same parameter) accumulate all known index/field types.
         let to_store = match (existing, ty) {
             // Merge two PartialTuples: validate overlapping indices, append new ones.
-            (Some(Type::PartialTuple(mut existing_entries)), Type::PartialTuple(new_entries)) => {
-                for (new_idx, new_ty) in new_entries {
-                    if let Some(pos) = existing_entries.iter().position(|(i, _)| *i == new_idx) {
-                        // Clone before the constrain_equal call to release the index borrow.
-                        let existing_ty = existing_entries[pos].1.clone();
-                        self.constrain_equal(&existing_ty, &new_ty)
-                            .unwrap_or_else(|_| {
-                                panic!(
-                                    "UnificationTable::set: type conflict at index {new_idx} \
-                                 merging PartialTuple: {existing_ty} vs {new_ty}"
-                                )
-                            });
-                    } else {
-                        existing_entries.push((new_idx, new_ty));
-                    }
-                }
-                Type::PartialTuple(existing_entries)
+            (Some(Type::PartialTuple(existing_entries)), Type::PartialTuple(new_entries)) => {
+                Type::PartialTuple(self.merge_entries(existing_entries, new_entries))
             }
+            (Some(Type::PartialTuple(existing_entries)), Type::Tuple(new_entries)) => Type::Tuple(
+                self.merge_entries(
+                    existing_entries,
+                    new_entries.into_iter().enumerate().collect(),
+                )
+                .into_iter()
+                .enumerate()
+                .map(|(i, (idx, t))| {
+                    assert_eq!(i, idx);
+                    t
+                })
+                .collect(),
+            ),
+
             // Merge two PartialRecords: validate overlapping fields, append new ones.
-            (Some(Type::PartialRecord(mut existing_entries)), Type::PartialRecord(new_entries)) => {
-                for (new_name, new_ty) in new_entries {
-                    if let Some(pos) = existing_entries.iter().position(|(n, _)| *n == new_name) {
-                        let existing_ty = existing_entries[pos].1.clone();
-                        self.constrain_equal(&existing_ty, &new_ty)
-                            .unwrap_or_else(|_| {
-                                panic!(
-                                    "UnificationTable::set: type conflict for field '{new_name}' \
-                                 merging PartialRecord: {existing_ty} vs {new_ty}"
-                                )
-                            });
-                    } else {
-                        existing_entries.push((new_name, new_ty));
-                    }
-                }
-                Type::PartialRecord(existing_entries)
+            (Some(Type::PartialRecord(existing_entries)), Type::PartialRecord(new_entries)) => {
+                Type::PartialRecord(self.merge_entries(existing_entries, new_entries))
             }
+            (Some(Type::PartialRecord(existing_entries)), Type::Record(new_entries)) => {
+                Type::Record(self.merge_entries(existing_entries, new_entries))
+            }
+
             // Default: assert compatible (for equal types or Infer unification).
             (Some(existing_ty), ty) => {
                 trace!("UnificationTable::set: asserting equality of existing type {existing_ty} and new type {ty}");
@@ -188,6 +177,32 @@ impl UnificationTable {
             trace!("Storing type {to_store} for root #{root}");
             self.entries[idx] = Some(Entry::Root(Some(to_store)));
         }
+    }
+
+    // Merge the entries in `new_entries` into those in `existing_entries`, constraining types at
+    // matching indices to be equal.
+    fn merge_entries<T: Display + Eq + Ord>(
+        &mut self,
+        mut existing_entries: Vec<(T, Type)>,
+        new_entries: Vec<(T, Type)>,
+    ) -> Vec<(T, Type)> {
+        for (new_idx, new_ty) in new_entries {
+            if let Some(pos) = existing_entries.iter().position(|(i, _)| *i == new_idx) {
+                // Clone before the constrain_equal call to release the index borrow.
+                let existing_ty = existing_entries[pos].1.clone();
+                self.constrain_equal(&existing_ty, &new_ty)
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "UnificationTable::set: type conflict at index {new_idx} \
+                                 merging partial tuple/record: {existing_ty} vs {new_ty}"
+                        )
+                    });
+            } else {
+                existing_entries.push((new_idx, new_ty));
+            }
+        }
+        existing_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        existing_entries
     }
 
     /// Return the solved type for `id`, if any.
@@ -232,9 +247,9 @@ impl UnificationTable {
         let solved_a = self.probe(root_a);
         let solved_b = self.probe(root_b);
         trace!(
-            "Unifying {a} and {b}; roots {root_a} and {root_b} with types {:?} and {:?}",
-            solved_a,
-            solved_b
+            "Unifying {a} and {b}; roots {root_a} and {root_b} with types {} and {}",
+            solved_a.as_ref().unwrap_or(&Type::Hole),
+            solved_b.as_ref().unwrap_or(&Type::Hole)
         );
         match (solved_a, solved_b) {
             (None, Some(_)) => {
@@ -244,6 +259,9 @@ impl UnificationTable {
                     self.entries[idx_a] = Some(Entry::Link(root_b));
                 }
             }
+            // If we are unifying two partial tuples, then we need to combine the information from
+            // each.
+            // TODO implement the below logic for records too.
             (Some(Type::PartialTuple(mut a_elts)), Some(Type::PartialTuple(mut b_elts))) => {
                 a_elts.sort_by(|(l, _), (r, _)| l.cmp(r));
                 b_elts.sort_by(|(l, _), (r, _)| l.cmp(r));
@@ -272,7 +290,18 @@ impl UnificationTable {
                 self.entries[idx_a] = Some(Entry::Root(Some(result)));
                 self.entries[idx_b] = Some(Entry::Link(root_a));
             }
-            // TODO implement the above logic for records too.
+            // If we unify a partial structure with a refinement, we need to pull in the information
+            // from the refinement's base type into the partial structure too.
+            (Some(Type::Refinement(ty_a, _)), Some(ty_b @ Type::PartialTuple(_)))
+            | (Some(Type::Refinement(ty_a, _)), Some(ty_b @ Type::PartialRecord(_))) => {
+                self.constrain_equal(&ty_b, &ty_a)?;
+                self.entries[root_b.0 as usize] = Some(Entry::Link(root_a));
+            }
+            (Some(ty_a @ Type::PartialTuple(_)), Some(Type::Refinement(ty_b, _)))
+            | (Some(ty_a @ Type::PartialRecord(_)), Some(Type::Refinement(ty_b, _))) => {
+                self.constrain_equal(&ty_a, &ty_b)?;
+                self.entries[root_a.0 as usize] = Some(Entry::Link(root_b));
+            }
             (Some(ty_a), Some(ty_b)) => {
                 if ty_a != ty_b {
                     return self.constrain_equal(&ty_a, &ty_b);
@@ -320,7 +349,13 @@ impl UnificationTable {
                     // multiple usage sites (e.g. `x[0]` and `x[1]` on the same param).
                     // constrain_equal only validates overlapping entries; set() is the only
                     // path that merges non-overlapping ones into the stored value.
-                    if matches!(concrete, Type::PartialTuple(_) | Type::PartialRecord(_)) {
+                    if matches!(
+                        concrete,
+                        Type::PartialTuple(_)
+                            | Type::PartialRecord(_)
+                            | Type::Tuple(_)
+                            | Type::Record(_)
+                    ) {
                         self.set(*id, concrete.clone());
                     }
                 } else {
@@ -1114,5 +1149,269 @@ mod tests {
         };
         assert_eq!(function.ty, Type::Base(BaseType::Int));
         assert_eq!(argument.ty, Type::Base(BaseType::Bool));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Complex tuple inference tests (set, unify, constrain_equal)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_set_partial_tuple_then_full_tuple_merges() {
+        // ?p constrained as PartialTuple({0 => Int}), then set to Tuple([Int, String])
+        // Result: Tuple([Int, String]) with merged type info
+        let mut table = UnificationTable::new();
+        let p = table.fresh_var();
+        table.set(p, Type::PartialTuple(vec![(0, Type::Base(BaseType::Int))]));
+        table.set(
+            p,
+            Type::Tuple(vec![
+                Type::Base(BaseType::Int),
+                Type::Base(BaseType::String),
+            ]),
+        );
+        let ty = table.probe(p).expect("p should be solved");
+        assert!(matches!(
+            ty,
+            Type::Tuple(ref elts) if elts.len() == 2
+                && elts[0] == Type::Base(BaseType::Int)
+                && elts[1] == Type::Base(BaseType::String)
+        ));
+    }
+
+    #[test]
+    fn test_set_full_tuple_then_partial_tuple_merges() {
+        // Reverse order: Tuple([Int, String]) then PartialTuple({1 => String})
+        let mut table = UnificationTable::new();
+        let p = table.fresh_var();
+        table.set(
+            p,
+            Type::Tuple(vec![
+                Type::Base(BaseType::Int),
+                Type::Base(BaseType::String),
+            ]),
+        );
+        table.set(
+            p,
+            Type::PartialTuple(vec![(1, Type::Base(BaseType::String))]),
+        );
+        let ty = table.probe(p).expect("p should be solved");
+        assert!(matches!(
+            ty,
+            Type::Tuple(ref elts) if elts.len() == 2
+                && elts[0] == Type::Base(BaseType::Int)
+                && elts[1] == Type::Base(BaseType::String)
+        ));
+    }
+
+    #[test]
+    fn test_set_partial_tuple_then_full_tuple_conflicting_type_panics() {
+        // ?p constrained as PartialTuple({0 => Int}), then set to Tuple([String, ...])
+        // Index 0 has conflicting types — should panic
+        let mut table = UnificationTable::new();
+        let p = table.fresh_var();
+        table.set(p, Type::PartialTuple(vec![(0, Type::Base(BaseType::Int))]));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.set(p, Type::Tuple(vec![Type::Base(BaseType::String)]));
+        }));
+        assert!(result.is_err(), "Expected panic on type conflict");
+    }
+
+    #[test]
+    fn test_unify_two_partial_tuples_with_overlapping_indices() {
+        // PartialTuple({0 => Int, 2 => Bool}) unified with
+        // PartialTuple({0 => Int, 1 => String}) should validate 0 and merge to include 1, 2
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let b = table.fresh_var();
+        table.set(
+            a,
+            Type::PartialTuple(vec![
+                (0, Type::Base(BaseType::Int)),
+                (2, Type::Base(BaseType::Bool)),
+            ]),
+        );
+        table.set(
+            b,
+            Type::PartialTuple(vec![
+                (0, Type::Base(BaseType::Int)),
+                (1, Type::Base(BaseType::String)),
+            ]),
+        );
+        table.unify(a, b).unwrap();
+        let ty = table.probe(a).expect("a should be solved");
+        assert!(
+            matches!(&ty, Type::PartialTuple(entries) if entries.len() == 3),
+            "Expected merged PartialTuple with 3 indices, got {ty}"
+        );
+    }
+
+    #[test]
+    fn test_unify_two_partial_tuples_conflicting_index_is_err() {
+        // PartialTuple({0 => Int}) unified with PartialTuple({0 => String})
+        // Overlapping index 0 has conflicting types
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let b = table.fresh_var();
+        table.set(a, Type::PartialTuple(vec![(0, Type::Base(BaseType::Int))]));
+        table.set(
+            b,
+            Type::PartialTuple(vec![(0, Type::Base(BaseType::String))]),
+        );
+        let result = table.unify(a, b);
+        assert!(
+            result.is_err(),
+            "Expected error when unifying PartialTuples with conflicting indices"
+        );
+    }
+
+    #[test]
+    fn test_unify_partial_tuple_with_full_tuple() {
+        // PartialTuple({0 => ?a, 2 => ?c}) unified with Tuple([Int, String, Bool])
+        // Should constrain ?a = Int, ?c = Bool, and unify a and b's roots
+        let mut table = UnificationTable::new();
+        let p = table.fresh_var();
+        let q = table.fresh_var();
+        let a = table.fresh_var();
+        let r = table.fresh_var();
+
+        table.set(
+            p,
+            Type::PartialTuple(vec![(0, Type::Infer(a)), (2, Type::Infer(r))]),
+        );
+        table.set(
+            q,
+            Type::Tuple(vec![
+                Type::Base(BaseType::Int),
+                Type::Base(BaseType::String),
+                Type::Base(BaseType::Bool),
+            ]),
+        );
+        table.unify(p, q).unwrap();
+
+        assert_eq!(table.probe(a), Some(Type::Base(BaseType::Int)));
+        assert_eq!(table.probe(r), Some(Type::Base(BaseType::Bool)));
+    }
+
+    #[test]
+    fn test_constrain_equal_partial_tuple_with_non_overlapping_indices() {
+        // PartialTuple({0 => Int}) constrained equal to PartialTuple({1 => String})
+        // Non-overlapping indices — should succeed (no constraints between them)
+        let mut table = UnificationTable::new();
+        let lhs = Type::PartialTuple(vec![(0, Type::Base(BaseType::Int))]);
+        let rhs = Type::PartialTuple(vec![(1, Type::Base(BaseType::String))]);
+        assert!(table.constrain_equal(&lhs, &rhs).is_ok());
+    }
+
+    #[test]
+    fn test_constrain_equal_multiple_partial_tuple_indices() {
+        // PartialTuple({0 => ?a, 1 => ?b}) constrained with
+        // PartialTuple({0 => Int, 1 => String}) should solve ?a = Int, ?b = String
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let b = table.fresh_var();
+        let lhs = Type::PartialTuple(vec![(0, Type::Infer(a)), (1, Type::Infer(b))]);
+        let rhs = Type::PartialTuple(vec![
+            (0, Type::Base(BaseType::Int)),
+            (1, Type::Base(BaseType::String)),
+        ]);
+        table.constrain_equal(&lhs, &rhs).unwrap();
+        assert_eq!(table.probe(a), Some(Type::Base(BaseType::Int)));
+        assert_eq!(table.probe(b), Some(Type::Base(BaseType::String)));
+    }
+
+    #[test]
+    fn test_constrain_equal_partial_tuple_with_full_tuple_multiple_indices() {
+        // PartialTuple({0 => ?a, 2 => ?c}) constrained with Tuple([Int, String, Bool])
+        // Should solve ?a = Int, ?c = Bool
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let c = table.fresh_var();
+        let partial = Type::PartialTuple(vec![(0, Type::Infer(a)), (2, Type::Infer(c))]);
+        let full = Type::Tuple(vec![
+            Type::Base(BaseType::Int),
+            Type::Base(BaseType::String),
+            Type::Base(BaseType::Bool),
+        ]);
+        table.constrain_equal(&partial, &full).unwrap();
+        assert_eq!(table.probe(a), Some(Type::Base(BaseType::Int)));
+        assert_eq!(table.probe(c), Some(Type::Base(BaseType::Bool)));
+    }
+
+    #[test]
+    fn test_constrain_equal_full_tuple_with_partial_tuple_out_of_bounds() {
+        // Tuple([Int, String]) constrained with PartialTuple({3 => Bool})
+        // Index 3 is out of bounds
+        let mut table = UnificationTable::new();
+        let full = Type::Tuple(vec![
+            Type::Base(BaseType::Int),
+            Type::Base(BaseType::String),
+        ]);
+        let partial = Type::PartialTuple(vec![(3, Type::Base(BaseType::Bool))]);
+        let result = table.constrain_equal(&full, &partial);
+        assert!(
+            result.is_err(),
+            "Expected error for out-of-bounds index in PartialTuple"
+        );
+    }
+
+    #[test]
+    fn test_tuple_unify_then_extract_elements() {
+        // Tuple([?a, ?b, ?c]) unified with Tuple([Int, String, Bool])
+        // All three variables should be solved
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let b = table.fresh_var();
+        let c = table.fresh_var();
+        let lhs = Type::Tuple(vec![Type::Infer(a), Type::Infer(b), Type::Infer(c)]);
+        let rhs = Type::Tuple(vec![
+            Type::Base(BaseType::Int),
+            Type::Base(BaseType::String),
+            Type::Base(BaseType::Bool),
+        ]);
+        table.constrain_equal(&lhs, &rhs).unwrap();
+        assert_eq!(table.probe(a), Some(Type::Base(BaseType::Int)));
+        assert_eq!(table.probe(b), Some(Type::Base(BaseType::String)));
+        assert_eq!(table.probe(c), Some(Type::Base(BaseType::Bool)));
+    }
+
+    #[test]
+    fn test_nested_tuple_inference() {
+        // Tuple([Tuple([?a, ?b]), ?c]) constrained with
+        // Tuple([Tuple([Int, String]), Bool])
+        let mut table = UnificationTable::new();
+        let a = table.fresh_var();
+        let b = table.fresh_var();
+        let c = table.fresh_var();
+        let lhs = Type::Tuple(vec![
+            Type::Tuple(vec![Type::Infer(a), Type::Infer(b)]),
+            Type::Infer(c),
+        ]);
+        let rhs = Type::Tuple(vec![
+            Type::Tuple(vec![
+                Type::Base(BaseType::Int),
+                Type::Base(BaseType::String),
+            ]),
+            Type::Base(BaseType::Bool),
+        ]);
+        table.constrain_equal(&lhs, &rhs).unwrap();
+        assert_eq!(table.probe(a), Some(Type::Base(BaseType::Int)));
+        assert_eq!(table.probe(b), Some(Type::Base(BaseType::String)));
+        assert_eq!(table.probe(c), Some(Type::Base(BaseType::Bool)));
+    }
+
+    #[test]
+    fn test_partial_tuple_and_infer_var_unification() {
+        // ?p unified with ?q where ?q is constrained as PartialTuple({0 => Int})
+        // ?p should then see the PartialTuple constraint
+        let mut table = UnificationTable::new();
+        let p = table.fresh_var();
+        let q = table.fresh_var();
+        table.set(q, Type::PartialTuple(vec![(0, Type::Base(BaseType::Int))]));
+        table.unify(p, q).unwrap();
+        let ty = table.probe(p).expect("p should resolve through q");
+        assert!(
+            matches!(ty, Type::PartialTuple(ref entries) if entries.len() == 1),
+            "Expected PartialTuple with 1 entry, got {ty}"
+        );
     }
 }

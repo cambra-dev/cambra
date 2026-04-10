@@ -78,6 +78,7 @@ fn convert_impl(
     input_ty: Option<Type>,
     ctx: &mut TileCompileContext,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
+    trace!("Converting {}", symbolic(expr));
     let result: Result<Box<dyn TileOperator>, CompileError> = match &expr.node {
         // f ≫ g: left-to-right composition.  Apply left first, then right.
         TypedExprNode::Compose(elems) => {
@@ -104,11 +105,14 @@ fn convert_impl(
             bound_expr,
             body,
         } => {
+            if input.is_some() {
+                return Err(CompileError::Unsupported("let expects no input".into()));
+            }
             let bound_op = convert_impl(bound_expr, None, None, ctx)?;
             let split = Rc::new(Splitter::new(Box::new(Memo::new(bound_op))));
             let mut scope = ctx.enter_scope();
             scope.bind(&binding.name, TileVarBinding::Operator(split));
-            convert_impl(body, input, None, &mut scope)
+            convert_impl(body, None, None, &mut scope)
         }
 
         // const(c): maps every domain element to the constant value c.
@@ -250,7 +254,11 @@ fn convert_impl(
                     let Some(TileVarBinding::Operator(split)) = ctx.lookup(name) else {
                         unreachable!()
                     };
-                    Ok(split.split())
+                    if let Some(input) = input {
+                        Ok(Box::new(MapResult::new(input, split.split())))
+                    } else {
+                        Ok(split.split())
+                    }
                 }
                 _ => Err(CompileError::Unsupported(format!(
                     "unrecognised Var({name}) in λ-free CCL"
@@ -451,7 +459,7 @@ fn proj_field(
     n: usize,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
     let field_name = tuple_field(n);
-    let record_extent = codomain_extent(input.tiling());
+    let record_extent = result_extent(input.tiling());
     let field_extent = field_extent_of(&record_extent, &field_name)?;
     let fn_value = Value::ComputableFunction(FunctionDef::RecordField(field_name));
     let fn_extent = Extent::Function {
@@ -473,7 +481,7 @@ fn apply_binop(
     input: Box<dyn TileOperator>,
     op: InterpreterBinOp,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
-    let record_extent = codomain_extent(input.tiling());
+    let record_extent = result_extent(input.tiling());
     let out_extent = binop_output_extent(&op);
     let fn_value = Value::ComputableFunction(FunctionDef::BinOp(op));
     let fn_extent = Extent::Function {
@@ -494,7 +502,7 @@ fn apply_unaryop(
     input: Box<dyn TileOperator>,
     op: UnaryOpKind,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
-    let in_extent = codomain_extent(input.tiling());
+    let in_extent = result_extent(input.tiling());
     let out_extent = unaryop_output_extent(&op);
     let fn_value = Value::ComputableFunction(FunctionDef::UnaryOp(op));
     let fn_extent = Extent::Function {
@@ -587,11 +595,12 @@ fn unaryop_output_extent(op: &UnaryOpKind) -> Extent {
 /// For `Scalar(e)` returns `e`; for `Record(fields)` returns `Extent::Record` over
 /// the field extents (arising when a non-constant tuple is compiled via [`ScalarTuple`]);
 /// for `SealedFunction { codomain, .. }` returns `codomain.extent()`.
-fn codomain_extent(tiling: &Tiling) -> Extent {
+fn result_extent(tiling: &Tiling) -> Extent {
     match tiling {
         Tiling::Scalar(e) => e.clone(),
         Tiling::Record(_) => tiling.extent(),
         Tiling::SealedFunction { codomain, .. } => codomain.extent(),
+        Tiling::CurriedFunction { codomain, .. } => codomain.clone(),
         t => panic!("unexpected tiling in codomain_extent: {t:?}"),
     }
 }
