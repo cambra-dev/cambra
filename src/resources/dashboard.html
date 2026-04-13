@@ -1,10 +1,60 @@
 <!DOCTYPE html>
 <html lang="en">
 
+<!-- Colors
+ #0d263a Dark teal
+ #0e4351 Medium teal
+ #258da8 Teal
+ #6cc3c8 Light Teal
+ #c6e4dc Sea foam
+ #d85b2f Orange
+ #f38d41 Medium orange
+ #f6a438 Light orange
+ #fef0d3 Sand
+-->
+
+
 <head>
     <meta charset="utf-8">
     <title>Cambra Inspector</title>
     <style>
+        :root {
+            /* Brand colors */
+            --color-dark-teal: #0d263a;
+            --color-teal: #0e4351;
+            --color-bright-teal: #258da8;
+            --color-light-teal: #6cc3c8;
+            --color-sea-foam: #c6e4dc;
+            --color-orange: #d85b2f;
+            --color-bright-orange: #f38d41;
+            --color-light-orange: #f6a438;
+            --color-sand: #fef0d3;
+
+            /* Other colors */
+            --color-dark-grey: #45475a;
+
+            /* UI colors */
+            --color-bg-body: var(--color-dark-teal);
+            --color-text-primary: var(--color-sand);
+            --color-text-secondary: var(--color-orange);
+            --color-text-annotation: var(--color-light-teal);
+            --color-text-error: var(--color-light-orange);
+            --color-button-bg: var(--color-bright-teal);
+            --color-border-container: var(--color-teal);
+            --color-border-divider: var(--color-dark-grey);
+
+            /* SVG/Graph colors */
+            --color-svg-bg: var(--color-dark-teal);
+            --color-node-fill: var(--color-teal);
+            --color-node-border-default: var(--color-dark-grey);
+            --color-node-border-active: var(--color-light-orange);
+            --color-edge-stroke: var(--color-dark-grey);
+            --color-edge-label-bg: var(--color-dark-teal);
+            --color-edge-label-text: var(--color-light-orange);
+            --color-node-title: var(--color-orange);
+            --color-node-tiling: var(--color-sand);
+        }
+
         * {
             box-sizing: border-box;
             margin: 0;
@@ -14,19 +64,19 @@
         body {
             font-family: 'SF Mono', 'Menlo', 'Monaco', monospace;
             font-size: 13px;
-            background: #1e1e2e;
-            color: #cdd6f4;
+            background: var(--color-bg-body);
+            color: var(--color-text-primary);
             padding: 16px;
         }
 
         h1 {
             font-size: 18px;
             margin-bottom: 12px;
-            color: #89b4fa;
+            color: var(--color-text-secondary);
         }
 
         .tick {
-            color: #a6adc8;
+            color: var(--color-text-primary);
             margin-bottom: 12px;
         }
 
@@ -35,48 +85,74 @@
         }
 
         .section-title {
-            color: #89b4fa;
+            color: var(--color-text-secondary);
             font-size: 14px;
             margin-bottom: 8px;
-            border-bottom: 1px solid #313244;
+            border-bottom: 1px solid var(--color-border-divider);
             padding-bottom: 4px;
         }
 
         #error {
-            color: #f38ba8;
+            color: var(--color-text-error);
             margin: 8px 0;
         }
 
         #producer-container {
             overflow: auto;
-            border: 1px solid #313244;
+            border: 1px solid var(--color-border-container);
             border-radius: 4px;
+        }
+
+        #refresh {
+            background: var(--color-button-bg);
+            color: var(--color-bg-body);
+            border: none;
+            padding: 6px 16px;
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 13px;
+            cursor: pointer;
+            margin-bottom: 12px;
+        }
+
+        .pre-content {
+            margin-top: 8px;
+            overflow-x: auto;
+            color: var(--color-text-primary);
+        }
+
+        .producer-div {
+            line-height: 0;
+        }
+
+        .none-text {
+            padding: 8px;
+            color: var(--color-text-annotation);
         }
     </style>
 </head>
 
 <body>
     <h1>Cambra Runtime Inspector</h1>
-    <button id="refresh" onclick="poll()"
-        style="background:#89b4fa;color:#1e1e2e;border:none;padding:6px 16px;border-radius:4px;font-family:inherit;font-size:13px;cursor:pointer;margin-bottom:12px;">Refresh</button>
+    <button id="refresh" onclick="poll()">Refresh</button>
     <div class="tick" id="tick">Tick: --</div>
     <div id="error"></div>
     <div class="section">
         <details open>
             <summary class="section-title" style="cursor:pointer;">Python AST</summary>
-            <pre id="ast" style="margin-top:8px;overflow-x:auto;color:#cdd6f4;">Loading…</pre>
+            <pre id="ast" class="pre-content">Loading…</pre>
         </details>
     </div>
     <div class="section">
         <details open>
             <summary class="section-title" style="cursor:pointer;">CCL Operator Graph</summary>
-            <pre id="operators" style="margin-top:8px;overflow-x:auto;color:#cdd6f4;">Loading…</pre>
+            <pre id="operators" class="pre-content">Loading…</pre>
         </details>
     </div>
     <div class="section">
         <div class="section-title">Producer Graph</div>
         <div id="producer-container">
-            <div id="producer" style="line-height:0;"></div>
+            <div id="producer" class="producer-div"></div>
         </div>
     </div>
     <script>
@@ -100,11 +176,11 @@
         }
 
         // ── Layout constants ─────────────────────────────────────────────────
-        const NODE_W    = 188;  // node box width
+        const NODE_W = 188;  // node box width
         const TILING_LW = 24;   // approximate chars that fit on one tiling line
-        const H_GAP     = 24;   // minimum horizontal gap between sibling subtrees
-        const V_GAP     = 56;   // vertical gap between levels
-        const PAD       = 20;   // canvas padding
+        const H_GAP = 24;   // minimum horizontal gap between sibling subtrees
+        const V_GAP = 56;   // vertical gap between levels
+        const PAD = 20;   // canvas padding
 
         // ── Per-node height based on how many lines the tiling wraps to ───────
         // Title always occupies the first 26px; each additional tiling line
@@ -194,7 +270,7 @@
             if (realChildren.length === 0) return;
 
             const widths = realChildren.map(c => subtreeWidth(c.node));
-            const total  = widths.reduce((a, b) => a + b, 0) + H_GAP * (widths.length - 1);
+            const total = widths.reduce((a, b) => a + b, 0) + H_GAP * (widths.length - 1);
             let x = cx - total / 2;
             for (let i = 0; i < realChildren.length; i++) {
                 assignX(realChildren[i].node, x + widths[i] / 2);
@@ -224,6 +300,11 @@
             }
         }
 
+
+        // ── Helper to get CSS variable value ──────────────────────────────────
+        function getCSSVarColor(varName) {
+            return getComputedStyle(document.documentElement).getPropertyValue(varName).trim();
+        }
 
         // ── Build the SVG string for a producer tree ──────────────────────────
         function buildSvgGraph(root) {
@@ -259,14 +340,28 @@
             const maxY = Math.max(...nodes.map(n => n._y + nodeHeight(n)));
             const svgW = maxX - minX + 2 * PAD;
             const svgH = maxY + 2 * PAD;
-            const ox   = PAD - minX;   // layout → SVG x offset
-            const oy   = PAD;          // layout → SVG y offset
+            const ox = PAD - minX;   // layout → SVG x offset
+            const oy = PAD;          // layout → SVG y offset
+
+            // Resolve colors from CSS variables
+            const colors = {
+                svgBg: getCSSVarColor('--color-svg-bg'),
+                edgeStroke: getCSSVarColor('--color-edge-stroke'),
+                edgeLabelBg: getCSSVarColor('--color-edge-label-bg'),
+                edgeLabelText: getCSSVarColor('--color-edge-label-text'),
+                nodeFill: getCSSVarColor('--color-node-fill'),
+                nodeBorderDefault: getCSSVarColor('--color-node-border-default'),
+                nodeBorderActive: getCSSVarColor('--color-node-border-active'),
+                nodeTitle: getCSSVarColor('--color-node-title'),
+                nodeTiling: getCSSVarColor('--color-node-tiling'),
+                textAnnotation: getCSSVarColor('--color-text-annotation'),
+            };
 
             // 5. Generate SVG
             let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgW}" height="${svgH}" `
-                  + `style="font-family:'SF Mono',Menlo,Monaco,monospace;display:block;">`;
+                + `style="font-family:'SF Mono',Menlo,Monaco,monospace;display:block;">`;
 
-            s += `<rect width="${svgW}" height="${svgH}" fill="#1e1e2e"/>`;
+            s += `<rect width="${svgW}" height="${svgH}" fill="${colors.svgBg}"/>`;
 
             // ── Edges (drawn first so they sit behind nodes) ──────────────────
             for (const e of edges) {
@@ -275,24 +370,24 @@
                 // Normal edges: bottom of parent → top of child.
                 // Split cross-edges: top of split node → bottom of consumer.
                 // (e.from = consumer, e.to = split for cross-edges)
-                const x1 = e.splitRefId ? e.to._cx   + ox : e.from._cx + ox;
-                const y1 = e.splitRefId ? e.to._y    + oy : e.from._y  + oy + nodeHeight(e.from);
-                const x2 = e.splitRefId ? e.from._cx + ox : e.to._cx   + ox;
-                const y2 = e.splitRefId ? e.from._y  + oy + nodeHeight(e.from) : e.to._y + oy;
+                const x1 = e.splitRefId ? e.to._cx + ox : e.from._cx + ox;
+                const y1 = e.splitRefId ? e.to._y + oy : e.from._y + oy + nodeHeight(e.from);
+                const x2 = e.splitRefId ? e.from._cx + ox : e.to._cx + ox;
+                const y2 = e.splitRefId ? e.from._y + oy + nodeHeight(e.from) : e.to._y + oy;
 
                 {
                     // Solid gray bezier with symmetric control points.
                     // Midpoint of this curve is exactly ((x1+x2)/2, (y1+y2)/2).
                     const cm = (y1 + y2) / 2;
                     s += `<path d="M${x1},${y1} C${x1},${cm} ${x2},${cm} ${x2},${y2}" `
-                       + `fill="none" stroke="#45475a" stroke-width="1.5"/>`;
+                        + `fill="none" stroke="${colors.edgeStroke}" stroke-width="1.5"/>`;
                     if (e.label) {
-                        const lx  = (x1 + x2) / 2;
-                        const ly  = (y1 + y2) / 2;
-                        const fw  = e.label.length * 6.5 + 6;
-                        s += `<rect x="${lx-fw/2}" y="${ly-8}" width="${fw}" height="13" rx="2" fill="#1e1e2e"/>`;
-                        s += `<text x="${lx}" y="${ly+3}" text-anchor="middle" `
-                           + `fill="#6c7086" font-size="10">${esc(e.label)}</text>`;
+                        const lx = (x1 + x2) / 2;
+                        const ly = (y1 + y2) / 2;
+                        const fw = e.label.length * 6.5 + 6;
+                        s += `<rect x="${lx - fw / 2}" y="${ly - 8}" width="${fw}" height="13" rx="2" fill="${colors.edgeLabelBg}"/>`;
+                        s += `<text x="${lx}" y="${ly + 3}" text-anchor="middle" `
+                            + `fill="${colors.edgeLabelText}" font-size="10">${esc(e.label)}</text>`;
                     }
                 }
             }
@@ -300,34 +395,34 @@
             // ── Nodes ─────────────────────────────────────────────────────────
             for (const n of nodes) {
                 const nx = n._cx + ox - NODE_W / 2;
-                const ny = n._y  + oy;
+                const ny = n._y + oy;
                 const cx = n._cx + ox;
                 // Border highlights active nodes (yield guard present and not complete)
                 const yg = n.yield_guard;
-                const borderColor = (yg && yg !== '\u2205' && yg !== '*') ? '#f9e2af' : '#45475a';
+                const borderColor = (yg && yg !== '\u2205' && yg !== '*') ? colors.nodeBorderActive : colors.nodeBorderDefault;
                 s += `<rect x="${nx}" y="${ny}" width="${NODE_W}" height="${nodeHeight(n)}" rx="5" `
-                   + `fill="#313244" stroke="${borderColor}" stroke-width="1"/>`;
+                    + `fill="${colors.nodeFill}" stroke="${borderColor}" stroke-width="1"/>`;
 
                 // Line 1: type name (before first '('), bold purple
-                const parenIdx   = n.label.indexOf('(');
+                const parenIdx = n.label.indexOf('(');
                 // Line 1 title: type name + inline annotations (e.g. "(Sum)")
                 const typeName = parenIdx >= 0 ? n.label.slice(0, parenIdx) : n.label;
-                const args     = parenIdx >= 0 ? n.label.slice(parenIdx) : '';
+                const args = parenIdx >= 0 ? n.label.slice(parenIdx) : '';
                 const annInline = (n.annotations && n.annotations.length > 0)
                     ? ' ' + n.annotations.join(' ')
                     : '';
                 const titleText = typeName + (args || '') + annInline;
                 s += `<text x="${cx}" y="${ny + 18}" text-anchor="middle" font-size="12">`
-                   + `<tspan fill="#cba6f7" font-weight="bold">${esc(typeName + (args || ''))}</tspan>`;
+                    + `<tspan fill="${colors.nodeTitle}" font-weight="bold">${esc(typeName + (args || ''))}</tspan>`;
                 if (annInline)
-                    s += `<tspan fill="#a6adc8" font-size="11">${esc(annInline)}</tspan>`;
+                    s += `<tspan fill="${colors.textAnnotation}" font-size="11">${esc(annInline)}</tspan>`;
                 s += `</text>`;
 
                 // Line 2+: tiling, wrapped, teal
                 const tlines = tilingLines(n.tiling || '');
                 for (let i = 0; i < tlines.length; i++) {
                     s += `<text x="${cx}" y="${ny + 35 + i * 13}" text-anchor="middle" `
-                       + `fill="#94e2d5" font-size="11">${esc(tlines[i])}</text>`;
+                        + `fill="${colors.nodeTiling}" font-size="11">${esc(tlines[i])}</text>`;
                 }
 
             }
@@ -339,13 +434,13 @@
         // ── Polling ───────────────────────────────────────────────────────────
         async function poll() {
             try {
-                const r    = await fetch('/api/snapshot');
+                const r = await fetch('/api/snapshot');
                 const data = await r.json();
                 document.getElementById('tick').textContent = 'Tick: ' + data.tick;
                 document.getElementById('producer').innerHTML =
                     data.producer
                         ? buildSvgGraph(data.producer)
-                        : '<em style="padding:8px;color:#a6adc8;">none</em>';
+                        : '<em class="none-text">none</em>';
                 document.getElementById('error').textContent = '';
             } catch (e) {
                 document.getElementById('error').textContent = 'Connection error: ' + e.message;
