@@ -869,7 +869,7 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x + 10 for x in [1,2,3] if x == 2]",
-    "[1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:({[0, 2] | Refined([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq)} ⇒ Int)",
+    "[1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:({[0, 2] | Refined(([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq))} ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::UInts(vec![1]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![12]))),
@@ -926,7 +926,7 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x + y for x in [1,2,3] if x == 2 for y in [10,20] if y == 10]",
-    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:({([0, 2], [0, 1]) | Refined(((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and)} ⇒ Int)",
+    "(.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:({([0, 2], [0, 1]) | Refined((((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and))} ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![1])),
@@ -946,7 +946,7 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x for x in [y for y in [1,2,3] if y < 3] if x < 2]",
-    "[1, 2, 3]:({{[0, 2] | Refined([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} | Refined([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⇒ Int)",
+    "[1, 2, 3]:({{[0, 2] | Refined(([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt))} | Refined(([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ lt))} ⇒ Int)",
     make_int_list(&[1])
 )]
 #[case(
@@ -984,7 +984,7 @@ fn test_incremental_aggregates() {
 )]
 #[case(
     "[x + 10 for x in testsource1() if x < 15]",
-    "source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add:({source(testsource1) | Refined(source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt)} ⇒ Int)",
+    "source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add:({source(testsource1) | Refined((source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt))} ⇒ Int)",
     make_int_list(&[10, 20])
 )]
 #[case("sum([1,2,3])", "[1, 2, 3] ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]

@@ -22,12 +22,13 @@
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
 
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
 use crate::ccl::BaseType;
 use crate::ccl::{
-    unify::UnificationTable, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey, RefinementKind,
-    Type, TypedExprNode, UnaryOpKind,
+    unify::UnificationTable, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey, Type,
+    TypedExprNode, UnaryOpKind,
 };
 use crate::util::ScopeStack;
 
@@ -406,9 +407,7 @@ fn collect_type_errors(ty: &Type, context_sym: &str, errors: &mut Vec<InferError
             }
         }
         Type::Refinement(inner, refinement) => {
-            if let RefinementKind::Predicate(def) = &refinement.kind {
-                collect_expr_errors(&def.borrow(), errors);
-            }
+            collect_expr_errors(&refinement.pred, errors);
             collect_type_errors(inner, context_sym, errors);
         }
         Type::PartialTuple(entries) => {
@@ -1202,9 +1201,7 @@ fn infer_lambda(
     // scope (param not in scope) because it is a constraint on the call site.
     let mut domain = param.ty.clone();
     if let Some(refinement) = refinement {
-        if let RefinementKind::Predicate(def) = &refinement.kind {
-            infer_expr(&mut def.borrow_mut(), ctx)?;
-        }
+        infer_expr(Rc::make_mut(&mut refinement.pred), ctx)?;
         domain = Type::Refinement(Box::new(domain), refinement.clone());
     }
     Ok(Type::Fun(Box::new(domain), Box::new(body_ty)))
@@ -2251,13 +2248,8 @@ mod tests {
         // Return type must be Fun(Refinement(Int, r), Int).
         let mut ctx = TypeInferenceContext::new();
         let predicate = Expr::lambda("_", Type::Base(BaseType::Int), Expr::lit(Lit::Bool(true)));
-        let mut expr = Expr::lambda_with_refinement(
-            "x",
-            Type::Base(BaseType::Int),
-            Expr::var("x"),
-            predicate,
-            "test predicate",
-        );
+        let mut expr =
+            Expr::lambda_with_refinement("x", Type::Base(BaseType::Int), Expr::var("x"), predicate);
         let ty = infer(&mut expr, &mut ctx).unwrap();
         match ty {
             Type::Fun(domain, codomain) => {
@@ -2282,13 +2274,8 @@ mod tests {
         // by accidentally seeing the body's scope.
         let mut ctx = TypeInferenceContext::new();
         let predicate = Expr::var("x");
-        let mut expr = Expr::lambda_with_refinement(
-            "x",
-            Type::Base(BaseType::Int),
-            Expr::var("x"),
-            predicate,
-            "outer scope test",
-        );
+        let mut expr =
+            Expr::lambda_with_refinement("x", Type::Base(BaseType::Int), Expr::var("x"), predicate);
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(result, Err(vec![InferError::UnboundVariable("x".into())]));
     }

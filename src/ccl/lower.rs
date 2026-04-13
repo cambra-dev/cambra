@@ -17,8 +17,7 @@
 //! | Boolean operators (`and`, `or`) | left-folded [`Expr::BinOp`] chain |
 //! | List literals `[e0, e1, ...]` | [`Expr::List`] |
 //! | Single-generator list comprehensions (no `if`) | `Lambda`/`Apply` encoding |
-//! | 2-gen equality-join comprehensions (`if x.k == y.k`) | hash-join [`crate::ccl::RefinementKind::HashJoin`] |
-//! | Multi-gen filtered comprehensions (non-equality or 3+ generators) | loop-join [`crate::ccl::RefinementKind::Predicate`] |
+//! | Filtered comprehensions (any `if` guard) | loop-join predicate [`crate::ccl::Refinement`] |
 //! | Assignment + expression blocks | nested [`Expr::Let`] |
 //! | `sum(expr)` / `max(expr)` calls | [`Expr::Aggregate`] |
 //! | Lambda expressions `lambda x: body` | curried [`Expr::Lambda`] chain |
@@ -50,8 +49,8 @@ use rustpython_parser::ast as pyast;
 
 use crate::ccl::BaseType;
 use crate::ccl::{
-    AggregateKind, ArithmeticKind, BinOpKind, Branch, CompareKind, Expr, HashJoinSpec, Lit,
-    LogicKind, Type, TypedExprNode, UnaryOpKind,
+    AggregateKind, ArithmeticKind, BinOpKind, Branch, CompareKind, Expr, Lit, LogicKind, Type,
+    TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -397,7 +396,6 @@ fn lower_call(
                             Expr::var("__gb_k"),
                         ),
                     ),
-                    "groupby",
                 ),
             ))
         }
@@ -628,21 +626,11 @@ fn lower_lambda(
 /// λ __iter_record → __iter_record ▷ lower(source) ▷ (λ var → lower(body))
 /// ```
 ///
-/// **Multiple generators / non-equality predicates** — loop-join encoding.
-/// The outer lambda carries a [`RefinementKind::Predicate`] with the combined
-/// guard expression; the runtime filters via a correlation vector:
+/// **Generators with `if` guards** — loop-join encoding.
+/// All guards are ANDed into a single predicate; the outer lambda carries a
+/// [`crate::ccl::Refinement`] and the runtime filters via a correlation vector:
 /// ```text
 /// λ __iter_record : {T | Refined(pred)} →
-///   __iter_record[0] ▷ lower(source0) ▷ (λ var0 →
-///     __iter_record[1] ▷ lower(source1) ▷ (λ var1 → lower(body)))
-/// ```
-///
-/// **Two generators, single equality predicate** — hash-join encoding.
-/// Detected by [`try_extract_ccl_equality_join`] on the lowered predicate.
-/// The outer lambda carries a [`RefinementKind::HashJoin`]; `compile_ccl`
-/// translates it to an O(N+M) hash-join-based restriction:
-/// ```text
-/// λ __iter_record : {T | Refined(build_var == probe_var)} →
 ///   __iter_record[0] ▷ lower(source0) ▷ (λ var0 →
 ///     __iter_record[1] ▷ lower(source1) ▷ (λ var1 → lower(body)))
 /// ```
@@ -702,32 +690,13 @@ fn lower_list_comp(
         .map(|e| lower_expr(e, ctx))
         .collect::<Result<_, _>>()?;
 
-    // Detect a 2-generator equality join on the CCL AST: exactly 2 generators,
-    // 1 predicate, and the predicate is `lhs == rhs` where each side references
-    // a distinct generator variable.  Emit a hash-join refinement instead of a
-    // loop-join predicate.  Sources are cloned from the already-lowered
-    // `gen_sources`; key expressions are taken directly from the lowered predicate.
-    // TODO move this to a later phase of compilation.
-    let hash_join_spec: Option<HashJoinSpec> = None;
-
-    // Combine all `if` guards into a single loop-join predicate (used when hash
-    // join is not applicable — non-equality, 3+ generators, or multiple predicates).
-    // Description strings are built from the original pyast Display output.
+    // Combine all `if` guards into a single loop-join predicate.
     let mut pred_op: Option<Expr> = None;
-    let mut pred_desc = String::new();
-    if hash_join_spec.is_none() {
-        for (pyast_pred, lowered) in pyast_preds.iter().zip(lowered_preds) {
-            pred_op = Some(match pred_op {
-                Some(lhs) => {
-                    pred_desc.push_str(&format!(" and {pyast_pred}"));
-                    Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), lowered)
-                }
-                None => {
-                    pred_desc = format!("{pyast_pred}");
-                    lowered
-                }
-            });
-        }
+    for lowered in lowered_preds {
+        pred_op = Some(match pred_op {
+            Some(lhs) => Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), lowered),
+            None => lowered,
+        });
     }
 
     // Sources for the loop-join restriction lambda are cloned from the
@@ -776,20 +745,9 @@ fn lower_list_comp(
         );
     }
 
-    // ---- Phase 6: Attach restriction (hash join or loop-join predicate) ----------
-    if let Some(spec) = hash_join_spec {
-        // Equality join between two generators: emit a hash-join refinement.
-        // compile_ccl will construct the Converse/Lambda/Apply operator structure.
-        let desc = format!("{} == {}", spec.build_var_name, spec.probe_var_name);
-        Ok(Expr::lambda_with_hash_join(
-            outer_var,
-            Type::Hole,
-            body_expr,
-            spec,
-            &desc,
-        ))
-    } else if let Some(pred_op) = pred_op {
-        // Non-equality or multi-predicate: loop-join restriction lambda.
+    // ---- Phase 6: Attach predicate refinement if present ---------------
+    if let Some(pred_op) = pred_op {
+        // Predicate refinement lambda.
         // Uses an independent "__iter_record_restr" variable so it does not
         // recursively depend on a correlation vector.
         let restr_outer_var = "__iter_record_restr";
@@ -810,7 +768,6 @@ fn lower_list_comp(
             Type::Hole,
             body_expr,
             Expr::lambda(restr_outer_var, Type::Hole, pred_expr),
-            &pred_desc,
         ))
     } else {
         Ok(Expr::lambda(outer_var, Type::Hole, body_expr))

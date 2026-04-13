@@ -11,8 +11,8 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, ProjKey, Refinement, RefinementKind,
-    Type, TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, ProjKey, Refinement, Type,
+    TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,6 +99,14 @@ struct SymbolicOpts {
 /// Render a CCL expression as a symbolic string.
 pub fn symbolic(expr: &Expr) -> String {
     fmt(expr, Precedence::Lowest, &SymbolicOpts::default())
+}
+
+/// Render a CCL expression as an atom-precedence symbolic string.
+///
+/// Suitable for embedding in `{T | pred}` refinement display where complex
+/// predicates should be parenthesised automatically.
+pub fn symbolic_pred(expr: &Expr) -> String {
+    fmt(expr, Precedence::Atom, &SymbolicOpts::default())
 }
 
 /// Render a CCL expression as a symbolic string.
@@ -362,16 +370,7 @@ fn fmt_lit(lit: &Lit) -> String {
 }
 
 fn fmt_refinement(r: &Refinement, opts: &SymbolicOpts) -> String {
-    match &r.kind {
-        RefinementKind::Predicate(p) => {
-            if let Ok(pred) = &p.try_borrow() {
-                fmt(pred, Precedence::Atom, opts)
-            } else {
-                r.description.clone()
-            }
-        }
-        RefinementKind::HashJoin(..) => r.description.clone(),
-    }
+    fmt(&r.pred, Precedence::Atom, opts)
 }
 
 /// Return the precedence level for a binary operator.
@@ -398,11 +397,10 @@ mod tests {
     use super::symbolic;
     use crate::ccl::BaseType;
     use crate::ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, HashJoinSpec, Lit, LogicKind, Type,
-        TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, Type, TypedBinding,
+        TypedExpr, TypedExprNode, UnaryOpKind,
     };
     use rstest::rstest;
-    use std::rc::Rc;
 
     // -----------------------------------------------------------------------
     // Per-variant direct-construction tests
@@ -596,7 +594,6 @@ in x"
             Type::infer(),
             Expr::var("x"),
             Expr::lit(Lit::Bool(true)),
-            "x > 0",
         ),
         "λ x : {??? | Refined(true)} → x"
     )]
@@ -607,7 +604,6 @@ in x"
             Type::Base(BaseType::Int),
             Expr::var("x"),
             Expr::lit(Lit::Bool(true)),
-            "x > 0",
         ),
         "λ x : {Int | Refined(true)} → x"
     )]
@@ -661,47 +657,6 @@ in k(0)"
     // -----------------------------------------------------------------------
     // Refinement formatting tests
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_symbolic_lambda_hash_join_refinement_no_ty() {
-        // (None, Some(HashJoin)) → "λ x : {??? | Refined(x == y)} → body"
-        let spec = HashJoinSpec {
-            build_gen_position: 0,
-            probe_gen_position: 1,
-            build_var_name: "x".to_string(),
-            probe_var_name: "y".to_string(),
-            build_key: Rc::new(Expr::var("x")),
-            probe_key: Rc::new(Expr::var("y")),
-            build_source: Rc::new(Expr::lit(Lit::Int(0))),
-            probe_source: Rc::new(Expr::lit(Lit::Int(0))),
-        };
-        let expr =
-            Expr::lambda_with_hash_join("p", Type::infer(), Expr::lit(Lit::Unit), spec, "x == y");
-        assert_eq!(symbolic(&expr), "λ p : {??? | Refined(x == y)} → unit");
-    }
-
-    #[test]
-    fn test_symbolic_lambda_hash_join_refinement_with_ty() {
-        // (Some(ty), Some(HashJoin)) → "λ p : {Int | Refined(x == y)} → unit"
-        let spec = HashJoinSpec {
-            build_gen_position: 0,
-            probe_gen_position: 1,
-            build_var_name: "x".to_string(),
-            probe_var_name: "y".to_string(),
-            build_key: Rc::new(Expr::var("x")),
-            probe_key: Rc::new(Expr::var("y")),
-            build_source: Rc::new(Expr::lit(Lit::Int(0))),
-            probe_source: Rc::new(Expr::lit(Lit::Int(0))),
-        };
-        let expr = Expr::lambda_with_hash_join(
-            "p",
-            Type::Base(BaseType::Int),
-            Expr::lit(Lit::Unit),
-            spec,
-            "x == y",
-        );
-        assert_eq!(symbolic(&expr), "λ p : {Int | Refined(x == y)} → unit");
-    }
 
     // -----------------------------------------------------------------------
     // Complex test: precedence chain + fmt_apply_func + Let body

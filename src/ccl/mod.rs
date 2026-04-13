@@ -17,7 +17,6 @@ pub mod symbolic;
 pub mod unify;
 
 use std::{
-    cell::RefCell,
     fmt,
     rc::Rc,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
@@ -437,6 +436,9 @@ pub enum TypedExprNode {
         /// This is a separate field from `param.ty` because it can be set
         /// before the type is known, and its presence indicates that the
         /// refinement should be interpreted in the scope of this lambda.
+        ///
+        // NOTE: eventually we'd like to remove the Lambda.refinement field,
+        // only storing the refinement on the parm type directly.
         refinement: Option<Refinement>,
     },
 
@@ -799,7 +801,6 @@ impl TypedExpr {
         param_ty: Type,
         body: TypedExpr,
         refinement: TypedExpr,
-        refinement_desc: &str,
     ) -> Self {
         Self::new(TypedExprNode::Lambda {
             param: TypedBinding {
@@ -810,31 +811,7 @@ impl TypedExpr {
             body: Box::new(body),
             refinement: Some(Refinement {
                 id: next_refinement_id(),
-                description: refinement_desc.to_string(),
-                kind: RefinementKind::Predicate(Rc::new(RefCell::new(refinement))),
-            }),
-        })
-    }
-
-    /// Build a [`TypedExprNode::Lambda`] with a hash-join [`Refinement`].
-    pub fn lambda_with_hash_join(
-        param: &str,
-        param_ty: Type,
-        body: TypedExpr,
-        spec: HashJoinSpec,
-        desc: &str,
-    ) -> Self {
-        Self::new(TypedExprNode::Lambda {
-            param: TypedBinding {
-                name: param.to_string(),
-                ty: param_ty,
-                user_annotation: None,
-            },
-            body: Box::new(body),
-            refinement: Some(Refinement {
-                id: next_refinement_id(),
-                description: desc.to_string(),
-                kind: RefinementKind::HashJoin(Box::new(spec)),
+                pred: Rc::new(refinement),
             }),
         })
     }
@@ -967,16 +944,9 @@ impl fmt::Display for Type {
                 let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
                 write!(f, "{}", parts.join(" | "))
             }
-            Type::Refinement(t, r) => write!(
-                f,
-                "{{{t} | Refined({})}}",
-                match &r.kind {
-                    RefinementKind::Predicate(p) => p
-                        .try_borrow()
-                        .map_or(r.description.clone(), |e| symbolic::symbolic(&e)),
-                    RefinementKind::HashJoin(_) => r.description.clone(),
-                }
-            ),
+            Type::Refinement(t, r) => {
+                write!(f, "{{{t} | Refined({})}}", symbolic::symbolic_pred(&r.pred))
+            }
             Type::Hole => write!(f, "_"),
             Type::Infer(id) => write!(f, "?{}", id.0),
             Type::DataSource(name) => write!(f, "source({name})"),
@@ -1030,11 +1000,14 @@ pub struct Refinement {
     /// Used by [`crate::interpreter::compile_ccl::CompileContext`] as a cache key
     /// so that the same restriction [`crate::interpreter::Extent`] is shared across
     /// all uses of the same refinement.
+    ///
+    /// TODO: remove this ID (and the entire struct).
     pub id: RefinementId,
-    /// Human-readable description of the predicate or join condition.
-    pub description: String,
-    /// Whether this refinement is a loop-join predicate or a hash join.
-    pub kind: RefinementKind,
+    /// The predicate expression for this refinement.
+    ///
+    /// Wrapped in [`Rc`] so that a [`Refinement`] can be cheaply cloned and embedded
+    /// in type nodes (e.g. [`Type::Refinement`]) without duplicating the AST subtree.
+    pub pred: Rc<TypedExpr>,
 }
 
 impl PartialEq for Refinement {
@@ -1044,47 +1017,3 @@ impl PartialEq for Refinement {
 }
 
 impl Eq for Refinement {}
-
-/// Distinguishes loop-join (predicate) refinements from hash-join refinements and carries join strategy metadata.
-#[derive(Debug, Clone, PartialEq)]
-pub enum RefinementKind {
-    /// Arbitrary boolean predicate; compiled as an element-wise loop join.
-    Predicate(Rc<RefCell<TypedExpr>>),
-    /// Equality join between two generator key expressions; compiled as a hash join.
-    HashJoin(Box<HashJoinSpec>),
-}
-
-/// All data needed by [`crate::interpreter::compile_ccl`] to build a hash-join
-/// [`crate::interpreter::ComputeRestriction`].
-#[derive(Debug, Clone)]
-pub struct HashJoinSpec {
-    /// Position of the generator for the build side in the original list comp (always the earlier generator for now).
-    pub build_gen_position: usize,
-    /// Position of the generator for the build side in the original list com
-    pub probe_gen_position: usize,
-    /// Name of the build-side iterator variable (e.g. `"x"`).
-    pub build_var_name: String,
-    /// Name of the probe-side iterator variable (e.g. `"y"`).
-    pub probe_var_name: String,
-    /// CCL expression for the build-side join key; references `build_var_name` as a free variable.
-    pub build_key: Rc<TypedExpr>,
-    /// CCL expression for the probe-side join key; references `probe_var_name` as a free variable.
-    pub probe_key: Rc<TypedExpr>,
-    /// CCL expression for the build-side source list (no free generator variables).
-    pub build_source: Rc<TypedExpr>,
-    /// CCL expression for the probe-side source list (no free generator variables).
-    pub probe_source: Rc<TypedExpr>,
-}
-
-impl PartialEq for HashJoinSpec {
-    fn eq(&self, other: &Self) -> bool {
-        self.build_gen_position == other.build_gen_position
-            && self.probe_gen_position == other.probe_gen_position
-            && self.build_var_name == other.build_var_name
-            && self.probe_var_name == other.probe_var_name
-            && Rc::ptr_eq(&self.build_key, &other.build_key)
-            && Rc::ptr_eq(&self.probe_key, &other.probe_key)
-            && Rc::ptr_eq(&self.build_source, &other.build_source)
-            && Rc::ptr_eq(&self.probe_source, &other.probe_source)
-    }
-}

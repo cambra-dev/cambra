@@ -293,25 +293,26 @@ enum Type {
     Hole,                                // lowering placeholder; converted to Infer at inference entry
     Infer(InferVarId),                   // type-checker variable; registered in UnificationTable
     Error,                               // inference already failed here; suppresses cascades
-    Refinement(Box<Type>, Refinement),   // refined base type; `Refinement.kind` carries join strategy
+    Refinement(Box<Type>, Refinement),   // refined base type with a boolean predicate
     DataSource(String),                  // opaque domain type of a source
     // Future:
     // Pi { param, param_ty, body_ty }  — dependent function type
 }
 
-/// Carries the join strategy for a restricted Lambda (i.e. a filtered/joined comprehension).
+/// Carries a boolean predicate restricting a refined type.
+///
+/// Attached to a `Lambda` (via `Lambda.refinement`) and embedded in the lambda's
+/// parameter type (`Type::Refinement`).  The two locations share an `Rc` so that
+/// mutations during inference / elimination propagate to both.
+///
+/// TODO: remove `Lambda.refinement`; embed the refinement solely in
+/// `Lambda.param.ty = Type::Refinement(T, r)` at lowering time so there is a
+/// single canonical location for the pred.
 struct Refinement {
-    /// Unique ID for this refinement
-    id: RefinementId, 
-    /// Human-readable description shown by the symbolic printer (e.g. `"x < 10"`, `"x == y"`).
-    description: String,
-    /// Always an arbitrary predicate.  TODO flatten this away
-    kind: RefinementKind,
-}
-
-enum RefinementKind {
-    /// Arbitrary boolean predicate expressed as CCL.
-    Predicate(Rc<RefCell<TypedExpr>>),
+    /// Unique id used for equality comparisons and future caching.
+    id: RefinementId,
+    /// The boolean predicate expression (lambda-eliminated, point-free after `lambda_elim::run`).
+    pred: Rc<TypedExpr>,
 }
 ```
 
@@ -547,9 +548,11 @@ The output references the following `Var` names:
 ### `zip` encoding
 
 `⟨f, g⟩` (pointwise function pairing) is encoded as:
+
 ```
 Apply { argument: Tuple([f, g]), function: Var("zip") }
 ```
+
 There is no dedicated `Zip` AST node; it reuses the existing `Apply` + `Tuple` nodes.
 
 ### `Let` nodes after rule 7
@@ -617,8 +620,6 @@ The bound variable is subscribed to `definition` exactly once via a `VarProducer
      `infer()`, `collect_param_constraint()`; unit and pipeline tests. ✓
    - `interpreter/compile_ccl.rs` add support for compiling Let nodes to operators (see §Compilation above). ✓
    - `interpreter/let_op.rs`: dedicated `Let` operator and `LetProducer` replacing the Let-as-Apply-Lambda desugaring. ✓
-   - `ccl/mod.rs` + `ccl/lower.rs` + `interpreter/compile_ccl.rs`: hash join detection and compilation
-     (`RefinementKind::HashJoin`, `HashJoinSpec`, `compile_hash_join_restriction`). ✓
    - `ccl/mod.rs` + `ccl/lower.rs` + `ccl/infer.rs`: first-class `Aggregate` node (`AggregateKind`,
      `Expr::Aggregate`); lowering from `sum`/`max` call sites; type inference via `AggregateKind::output_type`. ✓
    - `ccl/lower.rs`: Python `lambda` expression lowering to curried `Expr::Lambda` chain. ✓
@@ -658,7 +659,7 @@ The bound variable is subscribed to `definition` exactly once via a `VarProducer
      let bindings, unary ops, lists, aggregates, tuples, type annotations,
      data sources, groupby). ✓
    - `ccl/mod.rs` + `ccl/infer.rs` + `ccl/lower.rs` + `ccl/symbolic.rs` + `ccl/pretty.rs`
-     + `ccl/unify.rs`: `Case` redesigned as guard-based bra\nching — `branches: Vec<Branch>`
+     + `ccl/unify.rs`: `Case` redesigned as guard-based branching — `branches: Vec<Branch>`
      (`Branch { guard, body }`) with guards constrained to `Bool` and arm types unified;
      `lower_if` for `StmtKind::If` → `Case` with `elif` chains **flattened** into a single node;
      `ExprKind::IfExp` ternary lowering; `InferError::EmptyCase` for 0-branch `Case`.
