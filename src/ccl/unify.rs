@@ -547,19 +547,9 @@ fn resolve_type(ty: &mut Type, table: &mut UnificationTable) {
             entries.iter_mut().for_each(|(_, t)| resolve_type(t, table))
         }
         Type::Union(variants) => variants.iter_mut().for_each(|t| resolve_type(t, table)),
-        // Resolve the base type inside a refinement, and also resolve the predicate
-        // expression embedded in it.
-        //
-        // Previously the predicate was stored as Rc<RefCell<TypedExpr>>,
-        // so mutating it via the Lambda arm of resolve() was visible to all Rc clones
-        // (including the copy inside Lambda.ty). Now that the pred is
-        // Rc<TypedExpr> (immutable), Rc::make_mut in the Lambda arm splits the
-        // shared Rc, leaving any other clones (e.g. inside Lambda.ty) unresolved.
-        // Resolving here ensures every occurrence of Type::Refinement has its pred resolved.
-        Type::Refinement(inner, r) => {
-            resolve_type(inner, table);
-            resolve(std::rc::Rc::make_mut(&mut r.pred), table);
-        }
+        // Resolve the base type inside a refinement; the predicate is a separate expression
+        // and is resolved via the expression-level resolve() pass.
+        Type::Refinement(inner, _) => resolve_type(inner, table),
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => {}
     };
 }
@@ -605,9 +595,9 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
             resolve_type(&mut param.ty, table);
             resolve(body, table);
             if let Some(r) = refinement {
-                // TODO: remove Lambda.refinement; embed refinement in Lambda.param.ty at
-                //       lowering time so there is a single canonical location for the pred.
-                resolve(std::rc::Rc::make_mut(&mut r.pred), table);
+                if let crate::ccl::RefinementKind::Predicate(def) = &r.kind {
+                    resolve(&mut def.borrow_mut(), table);
+                }
             }
         }
         TypedExprNode::Let {

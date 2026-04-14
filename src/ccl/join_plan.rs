@@ -1,5 +1,4 @@
 use std::mem::{swap, take};
-use std::rc::Rc;
 
 use log::trace;
 
@@ -8,7 +7,7 @@ use crate::ccl::{
     lambda_elim::{compose, id},
     simplify::simplify,
     symbolic::{symbolic, symbolic_typed},
-    Expr, ProjKey, Refinement, Type, TypedExprNode,
+    Expr, ProjKey, Refinement, RefinementKind, Type, TypedExprNode,
 };
 
 /// Looks for patterns in an expression that can be run more efficiently than the loop joins
@@ -27,10 +26,17 @@ fn replace_curried_correlated_refinements(expr: &mut Expr) {
             if matches!(&function.node, TypedExprNode::Var(n) if n == "curry")
                 && matches!(&argument.ty, Type::Refinement(..)) =>
         {
-            let Type::Refinement(inner_ty, Refinement { pred, .. }) = &argument.ty else {
+            let Type::Refinement(
+                inner_ty,
+                Refinement {
+                    kind: RefinementKind::Predicate(p),
+                    ..
+                },
+            ) = &argument.ty
+            else {
                 unreachable!();
             };
-            convert_groupby(argument, inner_ty, pred)
+            convert_groupby(argument, inner_ty, &p.borrow())
         }
 
         TypedExprNode::Apply { function, argument } => {
@@ -51,8 +57,12 @@ fn replace_curried_correlated_refinements(expr: &mut Expr) {
             body, refinement, ..
         } => {
             replace_curried_correlated_refinements(body);
-            if let Some(Refinement { pred, .. }) = refinement {
-                replace_curried_correlated_refinements(Rc::make_mut(pred));
+            if let Some(Refinement {
+                kind: RefinementKind::Predicate(p),
+                ..
+            }) = refinement
+            {
+                replace_curried_correlated_refinements(&mut p.borrow_mut());
             }
             None
         }
@@ -552,8 +562,8 @@ fn create_hash_joins(expr: &mut Expr) {
     );
     if let Type::Fun(domain, codomain) = expr.ty.clone() {
         if let Type::Refinement(base, refinement) = (*domain).clone() {
-            {
-                let pred = (*refinement.pred).clone();
+            if let RefinementKind::Predicate(pred_rc) = &refinement.kind {
+                let pred = pred_rc.borrow().clone();
                 trace!("Attempting loop join conversion for: {}", symbolic(expr));
                 if let Some(transformed) = convert_loop_join(expr, &base, &pred) {
                     trace!(

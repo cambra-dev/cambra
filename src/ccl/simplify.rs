@@ -30,7 +30,7 @@
 
 use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
-use crate::ccl::{Expr, Lit, ProjKey, Type, TypedExpr, TypedExprNode};
+use crate::ccl::{Expr, Lit, ProjKey, RefinementKind, Type, TypedExpr, TypedExprNode};
 
 // ---------------------------------------------------------------------------
 // Simplification pass
@@ -48,8 +48,10 @@ pub fn simplify(mut expr: Expr) -> Expr {
 fn simplify_once(expr: &mut Expr) -> bool {
     let mut changed = false;
     if let Type::Fun(domain, _) = &mut expr.ty {
-        if let Type::Refinement(_, refinement) = &mut **domain {
-            changed = simplify_once(std::rc::Rc::make_mut(&mut refinement.pred));
+        if let Type::Refinement(_, refinment) = &mut **domain {
+            if let RefinementKind::Predicate(pred) = &refinment.kind {
+                changed = simplify_once(&mut pred.borrow_mut())
+            }
         }
     }
     changed |= recurse_simplify(expr);

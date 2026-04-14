@@ -39,15 +39,17 @@
 //! | `compose` | `Var("compose")` | composition as first-class morphism |
 //! | `zip` | `Var("zip")` | pointwise pairing of two functions |
 
+use std::cell::RefCell;
+use std::mem::replace;
 use std::rc::Rc;
 
 use log::trace;
 
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
-use crate::ccl::{next_refinement_id, AggregateKind};
+use crate::ccl::{next_refinement_id, AggregateKind, Lit, Refinement};
 use crate::ccl::{
-    symbolic::symbolic, BaseType, BinOpKind, Branch, Expr, Refinement, Type, TypedExpr,
+    symbolic::symbolic, BaseType, BinOpKind, Branch, Expr, RefinementKind, Type, TypedExpr,
     TypedExprNode,
 };
 
@@ -211,8 +213,10 @@ fn is_free(param: &str, expr: &Expr) -> bool {
                 false
             } else {
                 let free_in_body = is_free(param, body);
-                let free_in_refinement =
-                    refinement.as_ref().is_some_and(|r| is_free(param, &r.pred));
+                let free_in_refinement = refinement.as_ref().is_some_and(|r| match &r.kind {
+                    RefinementKind::Predicate(pred_rc) => is_free(param, &pred_rc.borrow()),
+                    RefinementKind::HashJoin(_) => false,
+                });
                 free_in_body || free_in_refinement
             }
         }
@@ -272,8 +276,17 @@ fn is_free(param: &str, expr: &Expr) -> bool {
 fn is_free_in_type(param: &str, ty: &Type) -> bool {
     match ty {
         Type::Refinement(base, refinement) => {
-            let free = is_free_in_type(param, base);
-            free | is_free(param, &refinement.pred)
+            let mut free = is_free_in_type(param, base);
+            if let Refinement {
+                kind: RefinementKind::Predicate(pred_rc),
+                ..
+            } = &refinement
+            {
+                if let Ok(pred) = pred_rc.try_borrow() {
+                    free |= is_free(param, &pred);
+                }
+            }
+            free
         }
         Type::Fun(domain, codomain) => {
             is_free_in_type(param, domain) || is_free_in_type(param, codomain)
@@ -318,9 +331,15 @@ fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             body,
             mut refinement,
         } => {
-            if let Some(r) = &mut refinement {
-                let new_pred = substitute((*r.pred).clone(), name, replacement);
-                r.pred = Rc::new(new_pred);
+            if let Some(Refinement {
+                kind: RefinementKind::Predicate(pred_rc),
+                ..
+            }) = &mut refinement
+            {
+                let t = Expr::lit(Lit::Unit);
+                let old_pred = replace(&mut *pred_rc.borrow_mut(), t);
+                let new_pred = substitute(old_pred, name, replacement);
+                *pred_rc.borrow_mut() = new_pred;
             }
             if param.name == name {
                 // name is shadowed; do not substitute inside
@@ -449,8 +468,20 @@ fn substitute_in_type(ty: &mut Type, name: &str, replacement: &Expr) {
     match ty {
         Type::Refinement(base, refinement) => {
             substitute_in_type(base, name, replacement);
-            let new_pred = substitute((*refinement.pred).clone(), name, replacement);
-            refinement.pred = Rc::new(new_pred);
+            if let Refinement {
+                kind: RefinementKind::Predicate(pred_rc),
+                ..
+            } = &mut *refinement
+            {
+                let t = Expr::lit(Lit::Unit);
+                // Substitute within the refinement, unless we are already inside that same refinement
+                // TODO: this probably simplifies once we remove the RefCell from the predicate.
+                if let Ok(mut pred) = pred_rc.try_borrow_mut() {
+                    let old_pred = replace(&mut *pred, t);
+                    let new_pred = substitute(old_pred, name, replacement);
+                    *pred = new_pred;
+                }
+            }
         }
         Type::Fun(domain, codomain) => {
             substitute_in_type(domain, name, replacement);
@@ -590,17 +621,26 @@ fn elim_lambda(
             let mut y_ty = y_binding.ty.clone();
             let mut correlated_refinement = None;
             if let Some(ref r) = refinement {
-                // Handle refinements on the lambda.  There are two options:
-                // If the refinement is correlated with `param`, then we need to lift it to be
-                // over the tuple we are going to create, so remove it from y.
-                // If it is uncorrelated, attach it to y's type.
-                let base_ty = y_ty.clone();
-                if is_free(param, &r.pred) {
-                    correlated_refinement = Some((*r.pred).clone());
-                } else {
-                    y_ty = Type::Refinement(Box::new(base_ty), r.clone());
+                match &r.kind {
+                    RefinementKind::Predicate(p) => {
+                        // Handle refinements on the lambda.  There are two options:
+                        // If the refinement is correlated with `param`, then we need to lift it to be
+                        // over the tuple we are going to create, so remove it from y.
+                        // If it is uncorrelated, attach it to y's type.
+                        let param_ty = y_ty.clone();
+                        if is_free(param, &p.borrow()) {
+                            correlated_refinement = Some(p.borrow().clone());
+                        } else {
+                            y_ty = Type::Refinement(Box::new(param_ty), r.clone());
+                        };
+                    }
+                    RefinementKind::HashJoin(_) => {
+                        return Err(LambdaElimError::Unsupported(
+                            "HashJoin refinement on inner lambda in nested-lambda rule".to_string(),
+                        ));
+                    }
                 }
-            }
+            };
 
             // Merge λ x → λ y into λ __pair where x = pair[0], y = pair[1].
             // The pair variable has type (param_ty, y_ty).
@@ -626,16 +666,17 @@ fn elim_lambda(
 
             let mut inner_elim = elim_lambda(ctx, &pair, &pair_ty, merged)?;
 
-            // If we have a correlated refinement, we also need to do the same sort of pair
-            // substitution in the refinement to turn it into a λ-free function of the tuple.
+            // If we have a correlated refinement, we also need to do the same sort of pair substitution
+            // in the refinement to turn it into a λ-free function of the tuple.
             if let Some(pred) = correlated_refinement {
                 let ref_body = Expr::apply(Expr::var("__ref").with_ty(y_ty.clone()), pred)
                     .with_ty(Type::Base(BaseType::Bool));
                 let subbed_ref_body =
                     substitute(substitute(ref_body, "__ref", &sub_y), param, &sub_x);
                 let lambda_elim_ref_body = elim_lambda(ctx, &pair, &pair_ty, subbed_ref_body)?;
-                // TODO: it would be cleaner to not call this here, but instead call it directly
-                // from somewhere in elim_lambdas to avoid the mutual recursion.
+                // TODO: it would be cleaner to not call this here, but instead call it directly from somewhere
+                // in elim_lambdas to avoid the mutual recursion.  In order to do that, we need to either
+                // make elim_lambdas idempotent or find a way to call it on the new refinement exactly once.
                 let fully_elim_ref_body = elim_lambdas(ctx, lambda_elim_ref_body)?;
 
                 let inner_ty = inner_elim.ty.clone();
@@ -643,12 +684,14 @@ fn elim_lambda(
                     Box::new(inner_ty),
                     Refinement {
                         id: next_refinement_id(),
-                        pred: Rc::new(fully_elim_ref_body),
+                        description: "uncurried".into(),
+                        kind: RefinementKind::Predicate(Rc::new(RefCell::new(fully_elim_ref_body))),
                     },
                 ));
 
                 let curry_var =
                     Expr::var("curry").with_ty(Type::fun(inner_elim.ty.clone(), result_ty.clone()));
+
                 Ok(Expr::apply(inner_elim, curry_var).with_ty(result_ty))
             } else {
                 Ok(dbg_typecheck_mv(curry(inner_elim)))
@@ -833,36 +876,6 @@ fn elim_lambda(
 // Top-level traversal
 // ---------------------------------------------------------------------------
 
-/// Eliminates lambdas from any [`Type::Refinement`] preds embedded in a type tree.
-///
-/// Expression `.ty` fields can contain `Type::Refinement` nodes whose preds were
-/// computed before lambda elimination ran on their enclosing expression.  Walking
-/// the type tree here keeps embedded preds in sync with the rest of the IR and
-/// thus usable at runtime.
-fn elim_lambdas_in_type(ty: &mut Type, ctx: &mut ElimContext) -> Result<(), LambdaElimError> {
-    match ty {
-        Type::Fun(domain, codomain) => {
-            elim_lambdas_in_type(domain, ctx)?;
-            elim_lambdas_in_type(codomain, ctx)?;
-        }
-        Type::Refinement(inner, r) => {
-            elim_lambdas_in_type(inner, ctx)?;
-            let new_pred = elim_lambdas(ctx, (*r.pred).clone())?;
-            // Simplify after elimination so that combinators like `apply` produced
-            // by the Apply rule (e.g. `⟨id, const(f)⟩ ≫ apply → f`) are resolved
-            // before operator_conversion sees the pred.
-            r.pred = Rc::new(simplify(new_pred));
-        }
-        Type::Tuple(ts) | Type::Union(ts) => {
-            for t in ts {
-                elim_lambdas_in_type(t, ctx)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 /// Traverse `expr` and eliminate all [`TypedExprNode::Lambda`] nodes, outside-in.
 ///
 /// Applies [`elim_lambda`] to each lambda encountered.  After elimination
@@ -884,27 +897,31 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
             ref param,
             body: inner_body,
             refinement: Some(ref r),
-        } => {
-            let new_pred = elim_lambdas(ctx, (*r.pred).clone())?;
-            let new_r = Refinement {
-                id: r.id,
-                pred: Rc::new(new_pred),
+        } if matches!(r.kind, RefinementKind::Predicate(_)) => {
+            let mut pred = match &r.kind {
+                RefinementKind::Predicate(pred_rc) => pred_rc.borrow_mut(),
+                _ => unreachable!(),
             };
+            *pred = elim_lambdas(ctx, pred.clone())?;
+            // Desugar, preserving the lambda's type on the resulting Compose.
             let param_name = param.name.clone();
-            let old_param_ty = param.ty.clone();
-            let new_param_ty = Type::Refinement(Box::new(old_param_ty), new_r.clone());
-            // Force ty to match new_r, mirroring what RefCell sharing previously provided:
-            // the pred in Lambda.ty and Lambda.refinement were the same Rc<RefCell<_>>, so
-            // mutations were seen at both sites simultaneously.
-            // TODO: remove Lambda.refinement; set Lambda.param.ty = Type::Refinement(T, r) at
-            //       lowering time so there is a single canonical pred location.
-            let new_ty = match ty {
-                Type::Fun(_, body_ty) => Type::fun(new_param_ty.clone(), *body_ty),
-                other => other,
-            };
-            let desugared = Expr::lambda(&param_name, new_param_ty, *inner_body).with_ty(new_ty);
+            let param_ty = param.ty.clone();
+            let desugared = Expr::lambda(
+                &param_name,
+                Type::Refinement(Box::new(param_ty), r.clone()),
+                *inner_body,
+            )
+            .with_ty(ty);
+            debug_typecheck(&desugared);
             elim_lambdas(ctx, desugared)
         }
+
+        TypedExprNode::Lambda {
+            refinement: Some(ref r),
+            ..
+        } if matches!(r.kind, RefinementKind::HashJoin(_)) => Err(LambdaElimError::Unsupported(
+            "HashJoin refinement in lambda elimination".to_string(),
+        )),
 
         // Plain lambda (no refinement): eliminate then continue.
         TypedExprNode::Lambda {
@@ -1051,10 +1068,11 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
             "unsupported node kind in lambda elimination: {node:?}"
         ))),
     };
-    let mut result = result?;
-    elim_lambdas_in_type(&mut result.ty, ctx)?;
-    debug_typecheck(&result);
-    Ok(result)
+    if let Ok(e) = &result {
+        debug_typecheck(e);
+        debug_assert!(original_ty == e.ty, "{} vs {}", original_ty, e.ty);
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,6 +1275,7 @@ mod tests {
             int_ty(),
             Expr::var("x").with_ty(int_ty()),
             refinement_pred,
+            "y",
         )
         .with_ty(fun_ty(int_ty(), int_ty()));
 
@@ -1270,7 +1289,11 @@ mod tests {
             ..
         } = &result.node
         {
-            (*r.pred).clone()
+            if let RefinementKind::Predicate(pred_rc) = &r.kind {
+                pred_rc.borrow().clone()
+            } else {
+                panic!("Expected predicate refinement");
+            }
         } else {
             panic!("Expected lambda with refinement");
         };
@@ -1397,9 +1420,14 @@ mod tests {
         let inner_body = var("y").with_ty(y_ty.clone());
 
         // Inner lambda with refinement: λ y → y {bool_true}
-        let inner_lambda =
-            Expr::lambda_with_refinement("y", y_ty.clone(), inner_body, refinement_pred)
-                .with_ty(fun_ty(y_ty.clone(), y_ty.clone()));
+        let inner_lambda = Expr::lambda_with_refinement(
+            "y",
+            y_ty.clone(),
+            inner_body,
+            refinement_pred,
+            "test_ref",
+        )
+        .with_ty(fun_ty(y_ty.clone(), y_ty.clone()));
 
         // Test that the nested lambda can be successfully constructed and processed
         // The inner lambda should be a valid nested lambda for elim_lambda to handle
@@ -1440,8 +1468,9 @@ mod tests {
         let refinement_pred = Expr::lit(Lit::Bool(true)).with_ty(bool_ty.clone());
 
         // Create lambda with refinement (uses body1)
-        let _lambda = Expr::lambda_with_refinement("y", y_ty.clone(), body1, refinement_pred)
-            .with_ty(fun_ty(y_ty.clone(), y_ty.clone()));
+        let _lambda =
+            Expr::lambda_with_refinement("y", y_ty.clone(), body1, refinement_pred, "simple_ref")
+                .with_ty(fun_ty(y_ty.clone(), y_ty.clone()));
 
         // Eliminate the lambda using body2
         let mut ctx = ElimContext::new();

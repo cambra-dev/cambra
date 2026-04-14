@@ -28,7 +28,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use crate::{
     ccl::{
         AggregateKind, ArithmeticKind as CclArith, BinOpKind as CclBinOp, Expr, Lit, ProjKey,
-        Refinement, Type, TypedExprNode, UnaryOpKind as CclUnaryOp,
+        Refinement, RefinementKind, Type, TypedExprNode, UnaryOpKind as CclUnaryOp,
     },
     interpreter::{
         ccl_compile_util::{validate_type, CompileError},
@@ -584,8 +584,15 @@ fn compile_apply(
                     TileVarBinding::Let(Box::new(argument.clone()), shadowed),
                 );
                 let body_op = compile_tile_inner(body, &mut scope)?;
-                // Refinement is handled after β-reduction (below); nothing to do here.
-                Ok(body_op)
+                match refinement {
+                    Some(Refinement {
+                        kind: RefinementKind::HashJoin(_),
+                        ..
+                    }) => Err(CompileError::Unsupported(
+                        "hash-join refinements are not yet supported in β-reduced apply".into(),
+                    )),
+                    _ => Ok(body_op),
+                }
             }?;
             // Predicate refinement: apply the predicate lambda to the same `argument`
             // as the main lambda (β-reducing it here, outside the param scope).
@@ -596,9 +603,13 @@ fn compile_apply(
             // instead produce a SealedFunction over the predicate lambda's own base
             // domain (ignoring `argument`), so the Filter's HashMap lookup would find
             // no matching domain values and discard everything.
-            let body_op = if let Some(r) = refinement {
+            let body_op = if let Some(Refinement {
+                kind: RefinementKind::Predicate(def),
+                ..
+            }) = refinement
+            {
                 if !body_op.tiling().is_scalar() {
-                    let pred_op = compile_apply(&r.pred, argument, ctx)?;
+                    let pred_op = compile_apply(&def.borrow(), argument, ctx)?;
                     Box::new(Filter::new(body_op, pred_op)) as Box<dyn TileOperator>
                 } else {
                     body_op
@@ -681,11 +692,20 @@ fn compile_lambda(
     scope.bind(param, TileVarBinding::Param(domain));
     let body_op = compile_tile_inner(body, &mut scope)?;
     match refinement {
-        Some(r) => {
+        Some(Refinement {
+            kind: RefinementKind::Predicate(def),
+            ..
+        }) => {
             // Compile the predicate in the same scope so the parameter is visible.
-            let pred_op = compile_tile_inner(&r.pred, &mut scope)?;
+            let pred_op = compile_tile_inner(&def.borrow(), &mut scope)?;
             Ok(Box::new(Filter::new(body_op, pred_op)))
         }
+        Some(Refinement {
+            kind: RefinementKind::HashJoin(_),
+            ..
+        }) => Err(CompileError::Unsupported(
+            "hash-join refinements are not yet supported in tile compilation".into(),
+        )),
         None => Ok(body_op),
     }
 }
@@ -1005,7 +1025,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        ccl::{ArithmeticKind as CclArith, BinOpKind as CclBinOp, Expr, Lit, Type, TypedBinding},
+        ccl::{
+            ArithmeticKind as CclArith, BinOpKind as CclBinOp, Expr, HashJoinSpec, Lit, Type,
+            TypedBinding,
+        },
         interpreter::{tile_operators::Tile, BaseType, Scheduler, Value},
         pretty_graph::pretty_tile_producer,
     };
@@ -1217,5 +1240,32 @@ mod tests {
             }
             other => panic!("expected Record, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Predicate refinements
+    // -----------------------------------------------------------------------
+
+    /// A lambda with a HashJoin refinement must return `CompileError::Unsupported`.
+    #[test_log::test]
+    fn test_lambda_hash_join_refinement_errors() {
+        let spec = HashJoinSpec {
+            build_gen_position: 0,
+            probe_gen_position: 1,
+            build_var_name: "x".to_string(),
+            probe_var_name: "y".to_string(),
+            build_key: Rc::new(Expr::var("x")),
+            probe_key: Rc::new(Expr::var("y")),
+            build_source: Rc::new(Expr::list(vec![])),
+            probe_source: Rc::new(Expr::list(vec![])),
+        };
+        let expr =
+            Expr::lambda_with_hash_join("x", Type::UIntRange(2), Expr::var("x"), spec, "x == y");
+        let mut ctx = TileCompileContext::new();
+        let result = compile_tile(&expr, &mut ctx);
+        assert!(
+            matches!(result, Err(CompileError::Unsupported(_))),
+            "expected Unsupported error for hash-join refinement",
+        );
     }
 }

@@ -3,7 +3,7 @@ use log::{debug, trace};
 use crate::{
     ccl::{
         symbolic::{symbolic, symbolic_typed},
-        AggregateKind, Expr, Lit, ProjKey, Type, TypedExprNode,
+        AggregateKind, Expr, Lit, ProjKey, RefinementKind, Type, TypedExprNode,
     },
     interpreter::{
         ccl_compile_util::CompileError,
@@ -374,10 +374,15 @@ fn iterate_type(
     ctx: &mut TileCompileContext,
 ) -> Result<Box<dyn TileOperator>, CompileError> {
     if let Type::Refinement(base, refinement) = ty {
-        debug!("Converting predicate: {}", symbolic(&refinement.pred));
-        debug!("Converting predicate: {}", symbolic_typed(&refinement.pred));
+        let RefinementKind::Predicate(pred) = &refinement.kind else {
+            return Err(CompileError::TypeError(format!(
+                "unsupported non-predicate refinement in function domain: {refinement:?}"
+            )));
+        };
+        debug!("Converting predicate: {}", symbolic(&pred.borrow()));
+        debug!("Converting predicate: {}", symbolic_typed(&pred.borrow()));
         Ok(Box::new(Restrict::new(convert_impl(
-            &refinement.pred,
+            &pred.borrow(),
             Some(iterate_type(base, ctx)?),
             None,
             ctx,
