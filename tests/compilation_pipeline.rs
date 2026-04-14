@@ -16,6 +16,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bit_vec::BitVec;
 use cambra::ccl::context::new_compile_program;
@@ -95,6 +96,7 @@ fn make_tuple(v: &[Value]) -> Value {
 // ---------------------------------------------------------------------------
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("2", Value::Int(2))]
 #[case(r#""hello""#, Value::String("hello".into()))]
 #[case("True", Value::Bool(true))]
@@ -103,6 +105,7 @@ fn test_literals(#[case] code: &str, #[case] expected: Value) {
 }
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("[]", Tile::SealedFunction { domain: ColumnValue::UInts(vec![]), codomain: Box::new(Tile::Scalar(ColumnValue::Units(0))), domain_predicate: Predicate::True })]
 #[case("[1, 2]", make_int_list(&[1, 2]))]
 fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
@@ -114,6 +117,7 @@ fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("2 + 3", Value::Int(5))]
 #[case("4 * 5", Value::Int(20))]
 #[case("4 - 5", Value::Int(-1))]
@@ -130,6 +134,7 @@ fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("1 == 1", Value::Bool(true))]
 #[case("'a' == 'b'", Value::Bool(false))]
 #[case("1 != 1", Value::Bool(false))]
@@ -147,6 +152,7 @@ fn test_compare(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("True & True", Value::Bool(true))]
 #[case("True | False", Value::Bool(true))]
 #[case("True ^ True", Value::Bool(false))]
@@ -161,6 +167,7 @@ fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 //
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("x = 2; x", Value::Int(2))]
 #[case("x = 2; y = x; y", Value::Int(2))]
 #[case("x = 2; y = x; y + x + 1", Value::Int(5))]
@@ -172,6 +179,7 @@ fn test_let_bindings(#[case] code: &str, #[case] expected: Value) {
 // More Let bindings
 // ---------------------------------------------------------------------------
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("x = [x for x in [1,2,3]]; [y for y in x]", make_int_list(&[1,2,3]))]
 #[ignore = "need first class functions for this let"]
 fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
@@ -182,6 +190,7 @@ fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
 // Tuples / record fields
 // ---------------------------------------------------------------------------
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case(
     "('a', 1)",
     make_tuple(&[Value::String("a".into()), Value::Int(1)])
@@ -198,6 +207,7 @@ fn test_tuples(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("[x for x in [10, 20]]", make_int_list(&[10, 20]))]
 #[case("[42 for x in [10, 20]]", make_int_list(&[42, 42]))]
 #[case("[y for y in [x for x in [10, 20]]]", make_int_list(&[10, 20]))]
@@ -211,6 +221,7 @@ fn test_comprehensions(#[case] code: &str, #[case] expected: Tile) {
 // ---------------------------------------------------------------------------
 //
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("y = 5; [x + y for x in [10, 20]]", make_int_list(&[15, 25]))]
 #[case("y = 1; z = [1,2,3]; [x + y for x in z]", make_int_list(&[2, 3, 4]))]
 #[case("y = 1; z = [(1, 'a'),(2, 'b'),(3, 'c')]; [x[0] + y for x in z]", make_int_list(&[2, 3, 4]))]
@@ -223,6 +234,7 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("[(y, y)[1] for y in [10, 20]]", make_int_list(&[10, 20]))]
 #[case("[y[0] for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
 #[case(
@@ -257,6 +269,7 @@ fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: Tile) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("[x for x in [1, 2, 3] if x < 0]", make_int_list(&[]))]
 #[case("[x for x in [1, 2, 3] if x > 0]", make_int_list(&[1, 2, 3]))]
 #[case("[x for x in [1, 2, 3] if x > 10]", make_int_list(&[]))]
@@ -289,6 +302,7 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
 // detail.
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case(
     "[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]",
     ColumnValue::strings(&["ac", "ad", "ae", "bc", "bd", "be"])
@@ -365,6 +379,7 @@ fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("sum([1,2,3])", Value::Int(6))]
 #[case("max([x + 1 for x in [1,2,3]])", Value::Int(4))]
 #[case("max([x + sum([1,2,3]) for x in [1,2,3]])", Value::Int(9))]
@@ -377,6 +392,7 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case(
     "[sum(x) for x in groupby([2,3,4,5], lambda x: x // 2)]",
     Tile::SealedFunction {
@@ -410,6 +426,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 /// Also confirms that updating the yield guard without adding new data does not
 /// trigger a spurious notification.
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("testsource1()")]
 #[case("[x for x in testsource1()]")]
 #[case("[x + '' for x in testsource1()]")]
@@ -514,6 +531,7 @@ fn test_source_filter_nonterminal() {
 /// Test a join between two data sources, including incremental data addition
 /// and region release.
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case(
     "[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] == y[0] and True]"
 )]
@@ -826,6 +844,7 @@ fn test_incremental_aggregates() {
 }
 
 #[rstest]
+#[timeout(Duration::from_secs(1))]
 #[case("1", "1:Int", Tile::Scalar(ColumnValue::Ints(vec![1])))]
 #[case("1 + 2", "(1, 2) ▷ add:Int", Tile::Scalar(ColumnValue::Ints(vec![3])))]
 #[case(
