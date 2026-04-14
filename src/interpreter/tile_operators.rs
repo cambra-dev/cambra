@@ -12,6 +12,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     hash::Hash,
+    iter,
     rc::Rc,
     sync::{Mutex, OnceLock},
 };
@@ -883,10 +884,28 @@ struct IterateExtentProducer {
 fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
     match extent {
         Extent::DataSourceDomain(source) => source.borrow().get_yield_predicate(),
-        Extent::Record(fields) => Predicate::Record(transform_hashmap_values(
-            fields,
-            get_iterate_extent_predicate,
-        )),
+        Extent::Record(fields) => {
+            let mut output = Predicate::False;
+            for (field, _) in fields.iter() {
+                let field_predicate = Predicate::Record(
+                    fields
+                        .iter()
+                        .map(|(f, extent)| {
+                            (
+                                f.clone(),
+                                if f == field {
+                                    get_iterate_extent_predicate(extent)
+                                } else {
+                                    Predicate::True
+                                },
+                            )
+                        })
+                        .collect(),
+                );
+                output = output.union(&field_predicate);
+            }
+            output
+        }
         _ => Predicate::True,
     }
 }
@@ -940,14 +959,6 @@ fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
                 // unconstrained (Predicate::True), because the AND means the
                 // full cross-product sub-space is released along that axis.
                 let field_preds = p.split_record(fields);
-                if field_preds
-                    .values()
-                    .filter(|p| **p == Predicate::True)
-                    .count()
-                    < field_preds.len() - 1
-                {
-                    unimplemented!("Got predicate {p:?}")
-                }
                 for (f, e) in fields.iter_mut() {
                     let others_all_true = field_preds
                         .iter()
@@ -1174,6 +1185,11 @@ impl TileProducer for MapResultWithSourceProducer {
         match &obsolete_guard {
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
                 self.source.borrow_mut().release(&self.name(), pred.clone());
+            }
+            TileGuard::Function(FunctionGuard::Codomain(g)) => {
+                if let TileGuard::Function(FunctionGuard::Domain(pred)) = &**g {
+                    self.source.borrow_mut().release(&self.name(), pred.clone());
+                }
             }
             g if g.is_universal() => {
                 self.source
@@ -2014,10 +2030,18 @@ impl TileProducer for UncurryProducer {
                     (tuple_field(1), domain2),
                 ]));
 
+                let inner_pred = if domain_predicate.as_bool().unwrap_or(true) {
+                    Predicate::True
+                } else {
+                    Predicate::False
+                };
                 Tile::SealedFunction {
                     domain: pair_domain,
                     codomain: Box::new(Tile::Scalar(codomain)),
-                    domain_predicate,
+                    domain_predicate: Predicate::Record(HashMap::from([
+                        (tuple_field(0), domain_predicate),
+                        (tuple_field(1), inner_pred),
+                    ])),
                 }
             }
             _ => panic!("Uncurry expected CurriedFunction tile"),
@@ -2033,19 +2057,36 @@ impl TileProducer for UncurryProducer {
             // Split domain guards on the pair domain (_0, _1) into record predicates.
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
                 let pair_fields = HashMap::from([(tuple_field(0), ()), (tuple_field(1), ())]);
-                let mut split_preds = pred.split_record(&pair_fields);
-                let outer_pred = split_preds.remove(&tuple_field(0)).unwrap();
-                let inner_pred = split_preds.remove(&tuple_field(1)).unwrap();
-                if outer_pred.as_bool().is_some_and(|x| !x) {
-                    TileGuard::Function(FunctionGuard::Domain(inner_pred))
-                } else if inner_pred.as_bool().is_some_and(|x| !x) {
-                    TileGuard::Function(FunctionGuard::Domain(outer_pred))
-                } else {
-                    todo!("Can only release single part of uncurry");
+
+                let preds: Box<dyn Iterator<Item = &Predicate>> = match pred {
+                    Predicate::Or(preds) => Box::new(preds.iter()),
+                    _ => Box::new(iter::once(pred)),
+                };
+
+                let mut outer_guards = TileGuard::Function(FunctionGuard::Domain(Predicate::False));
+                let mut inner_guards = TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                    TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
+                )));
+                for pred in preds {
+                    let mut split_preds = pred.split_record(&pair_fields);
+                    let outer_pred = split_preds.remove(&tuple_field(0)).unwrap();
+                    let inner_pred = split_preds.remove(&tuple_field(1)).unwrap();
+                    let inner_guard = TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                        TileGuard::Function(FunctionGuard::Domain(inner_pred)),
+                    )));
+                    let outer_guard = TileGuard::Function(FunctionGuard::Domain(outer_pred));
+                    trace!("Inner guard: {inner_guard:?}");
+                    trace!("Outer guard: {outer_guard:?}");
+                    outer_guards = outer_guards.union(&outer_guard);
+                    inner_guards = inner_guards.union(&inner_guard);
                 }
+                trace!("Inner guards: {inner_guards:?}");
+                trace!("Outer guards: {outer_guards:?}");
+                outer_guards.intersect(&inner_guards)
             }
             g => panic!("Unsupported obsolete guard: {g:?}"),
         };
+        debug!("{} releasing up with: {input_guard:?}", self.name());
         self.input.release(input_guard);
     }
 }
@@ -3734,10 +3775,13 @@ mod tests {
                     _ => panic!("codomain should be Scalar(UInts)"),
                 }
 
-                // Verify domain_predicate is preserved
+                // Verify domain_predicate is transformed appropriately
                 assert_eq!(
                     domain_predicate,
-                    Predicate::True,
+                    Predicate::Record(HashMap::from([
+                        (tuple_field(0), Predicate::True),
+                        (tuple_field(1), Predicate::True),
+                    ])),
                     "domain_predicate should be preserved"
                 );
             }
@@ -3824,11 +3868,203 @@ mod tests {
                     _ => panic!("domain should be a Record"),
                 }
 
-                // Verify domain_predicate is preserved (False in this case)
+                // Verify domain_predicate is transformed appropriately
                 assert_eq!(
                     domain_predicate,
-                    Predicate::False,
+                    Predicate::Record(HashMap::from([
+                        (tuple_field(0), Predicate::False),
+                        (tuple_field(1), Predicate::False),
+                    ])),
                     "domain_predicate should be preserved"
+                );
+            }
+            _ => panic!("Expected SealedFunction result"),
+        }
+    }
+
+    #[test]
+    fn uncurry_domain_predicate_transformation_with_true() {
+        // Test that UncurryProducer.get() transforms domain_predicate correctly
+        // when the input has Predicate::True
+        //
+        // Previously, Predicate::True was preserved directly.
+        // Now, it should be transformed into a Record predicate with both
+        // fields (_0 and _1) set to Predicate::True.
+
+        let curried_tile = Tile::CurriedFunction {
+            domain1: ColumnValue::UInts(vec![1, 2, 3]),
+            offsets: ColumnValue::UInts(vec![0, 1, 2]),
+            domain2: ColumnValue::UInts(vec![10, 20, 30]),
+            codomain: ColumnValue::UInts(vec![100, 200, 300]),
+            domain_predicate: Predicate::True,
+        };
+
+        let curried_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::UInt),
+            codomain: Extent::Base(BaseType::UInt),
+        };
+
+        let input_producer = TestTileProducer::new(curried_tile, curried_tiling);
+
+        let output_tiling = Tiling::SealedFunction {
+            domain: Extent::Record(
+                [
+                    (tuple_field(0), Extent::Base(BaseType::UInt)),
+                    (tuple_field(1), Extent::Base(BaseType::UInt)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
+        };
+
+        let mut uncurry = UncurryProducer {
+            base: ProducerBase {
+                id: UncurryProducer::alloc_id(),
+                tiling: output_tiling,
+            },
+            input: Box::new(input_producer),
+        };
+
+        let result = uncurry.get(uncurry.tiling().universal_guard());
+
+        match result {
+            Tile::SealedFunction {
+                domain_predicate, ..
+            } => {
+                // Verify domain_predicate is transformed into a Record with both fields True
+                assert_eq!(
+                    domain_predicate,
+                    Predicate::Record(HashMap::from([
+                        (tuple_field(0), Predicate::True),
+                        (tuple_field(1), Predicate::True),
+                    ])),
+                    "domain_predicate should be transformed into Record(_0: True, _1: True)"
+                );
+            }
+            _ => panic!("Expected SealedFunction result"),
+        }
+    }
+
+    #[test]
+    fn iterate_extent_predicate_with_record() {
+        // Test that get_iterate_extent_predicate generates correct OR predicates for records
+        //
+        // When iterating over a record extent with multiple fields, the predicate
+        // should be the union of field-specific predicates (one predicate per field
+        // with that field's predicate true and others true, then OR'd together).
+
+        // Create a test extent with a record of base types
+        let extent = Extent::Record(
+            [
+                (tuple_field(0), Extent::Base(BaseType::UInt)),
+                (tuple_field(1), Extent::Base(BaseType::Int)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let predicate = get_iterate_extent_predicate(&extent);
+
+        // For a record extent with base-type fields, the predicate should be
+        // a union of field predicates. Since each field's predicate is True
+        // for base types, the resulting Record predicates are all identical
+        // {_0: True, _1: True} and may collapse.
+        match predicate {
+            Predicate::Record(fields) => {
+                // When two identical record predicates with all True union,
+                // they may collapse to a single Record
+                assert_eq!(fields.len(), 2, "Record should have 2 fields");
+                assert_eq!(
+                    fields.get(&tuple_field(0)),
+                    Some(&Predicate::True),
+                    "_0 field should be True"
+                );
+                assert_eq!(
+                    fields.get(&tuple_field(1)),
+                    Some(&Predicate::True),
+                    "_1 field should be True"
+                );
+            }
+            Predicate::True => {
+                // Also accept True if all record fields are True
+            }
+            Predicate::Or(preds) => {
+                // Or accept OR if it wasn't simplified
+                assert!(!preds.is_empty(), "OR predicate should have terms");
+                for pred in &preds {
+                    match pred {
+                        Predicate::Record(fields) => {
+                            assert_eq!(fields.len(), 2, "Record predicate should have all fields");
+                        }
+                        _ => panic!("Expected Record predicates in OR, got {pred:?}"),
+                    }
+                }
+            }
+            other => panic!("Unexpected predicate for record extent with base types: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uncurry_domain_predicate_transformation_with_false() {
+        // Test that UncurryProducer.get() transforms domain_predicate correctly
+        // when the input has Predicate::False
+        //
+        // Previously, Predicate::False was preserved directly.
+        // Now, it should be transformed into a Record predicate with both
+        // fields (_0 and _1) set to Predicate::False.
+
+        let curried_tile = Tile::CurriedFunction {
+            domain1: ColumnValue::UInts(vec![1, 2]),
+            offsets: ColumnValue::UInts(vec![0, 1]),
+            domain2: ColumnValue::UInts(vec![10, 20]),
+            codomain: ColumnValue::UInts(vec![100, 200]),
+            domain_predicate: Predicate::False,
+        };
+
+        let curried_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::UInt),
+            codomain: Extent::Base(BaseType::UInt),
+        };
+
+        let input_producer = TestTileProducer::new(curried_tile, curried_tiling);
+
+        let output_tiling = Tiling::SealedFunction {
+            domain: Extent::Record(
+                [
+                    (tuple_field(0), Extent::Base(BaseType::UInt)),
+                    (tuple_field(1), Extent::Base(BaseType::UInt)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
+        };
+
+        let mut uncurry = UncurryProducer {
+            base: ProducerBase {
+                id: UncurryProducer::alloc_id(),
+                tiling: output_tiling,
+            },
+            input: Box::new(input_producer),
+        };
+
+        let result = uncurry.get(uncurry.tiling().universal_guard());
+
+        match result {
+            Tile::SealedFunction {
+                domain_predicate, ..
+            } => {
+                // Verify domain_predicate is transformed into a Record with both fields False
+                assert_eq!(
+                    domain_predicate,
+                    Predicate::Record(HashMap::from([
+                        (tuple_field(0), Predicate::False),
+                        (tuple_field(1), Predicate::False),
+                    ])),
+                    "domain_predicate should be transformed into Record(_0: False, _1: False)"
                 );
             }
             _ => panic!("Expected SealedFunction result"),

@@ -17,12 +17,11 @@ use crate::{
         BaseType, Expr, Type,
     },
     interpreter::{
-        compile_tile_operators::{compile_tile, TileCompileContext},
-        operator_conversion::convert_to_operators,
+        operator_conversion::{convert_to_operators, OpConversionContext},
         tile_operators::{TileOperator, TileProducer},
         Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource, TestDataSource,
     },
-    pretty_graph::{pretty_tile_operator, pretty_tile_producer},
+    pretty_graph::pretty_tile_producer,
 };
 
 /// Bundles the per-stage registries needed to thread externally-managed data
@@ -36,8 +35,8 @@ pub struct GlobalContext {
     lowering: LoweringContext,
     /// Inference-stage registry: supplies the CCL function type for each source.
     inference: TypeInferenceContext,
-    /// Compilation context.
-    compile: TileCompileContext,
+    /// Operator Conversion context.
+    conversion: OpConversionContext,
     /// Scheduler for triggering notifications.
     scheduler: Scheduler,
 }
@@ -48,53 +47,11 @@ impl GlobalContext {
         let mut result = Self {
             lowering: LoweringContext::default(),
             inference: TypeInferenceContext::new(),
-            compile: TileCompileContext::new(),
+            conversion: OpConversionContext::new(),
             scheduler: Scheduler::new(),
         };
         result.register_stdin_source();
         result
-    }
-
-    /// Compile `code` and return the producer together with pre-rendered tree
-    /// strings for the web inspector: `(producer, ccl_repr, operator_tree)`.
-    pub fn compile_program_with_trees(
-        &mut self,
-        code: &str,
-        consumer: Box<dyn Consumer>,
-    ) -> (Box<dyn TileProducer>, String, String) {
-        let result = parser::parse(code, parser::Mode::Module, "<test>")
-            .expect("Failed to parse Python module");
-        let stmts = match result {
-            pyast::Mod::Module { body, .. } => body,
-            other => panic!("expected Module, got {other:?}"),
-        };
-        let mut expr = lower_stmts(&stmts, self.lowering_ctx()).expect("ccl lowering failed");
-
-        let ctx = self.inference_ctx();
-        infer(&mut expr, ctx).expect("type inference failed");
-
-        let ccl_repr = symbolic(&expr);
-        debug!("CCL:\n{ccl_repr}");
-
-        let mut op = compile_tile(&expr, self.compile_ctx()).expect("compile failed");
-
-        let operator_tree = pretty_tile_operator(op.as_ref());
-        debug!("Operators:\n{operator_tree}");
-
-        let producer = op.subscribe(op.tiling().universal_guard(), consumer, self.scheduler());
-
-        debug!("Producers:\n{}", pretty_tile_producer(producer.as_ref()));
-
-        (producer, ccl_repr, operator_tree)
-    }
-
-    /// Compile `code` and return the producer.
-    pub fn compile_program(
-        &mut self,
-        code: &str,
-        consumer: Box<dyn Consumer>,
-    ) -> Box<dyn TileProducer> {
-        self.compile_program_with_trees(code, consumer).0
     }
 
     /// Returns the context for lowering
@@ -107,9 +64,9 @@ impl GlobalContext {
         &mut self.inference
     }
 
-    /// Returns the context for type inference
-    pub fn compile_ctx(&mut self) -> &mut TileCompileContext {
-        &mut self.compile
+    /// Returns the context for operator conversion
+    pub fn conversion_ctx(&mut self) -> &mut OpConversionContext {
+        &mut self.conversion
     }
 
     pub fn scheduler(&mut self) -> &mut Scheduler {
@@ -131,7 +88,7 @@ impl GlobalContext {
                 Box::new(output_type),
             ),
         );
-        self.compile.register_source(name, ds);
+        self.conversion.register_source(name, ds);
     }
 
     /// Register a [`StdinDataSource`] under `name`.
@@ -149,7 +106,7 @@ impl GlobalContext {
             ),
         );
         let ds = Rc::new(RefCell::new(StdinDataSource::new()));
-        self.compile.register_source(name, ds);
+        self.conversion.register_source(name, ds);
     }
 }
 
@@ -159,8 +116,9 @@ impl Default for GlobalContext {
     }
 }
 
-/// Runs as much of the new compilation stack as we have implemented so far.
-pub fn new_compile_program(
+/// Compiles a CHL program to a TileProducer that will produce the output of the program.
+/// Returns the final state of the CCL, the TileOperator graph, and the TileProducer graph.
+pub fn compile_program(
     ctx: &mut GlobalContext,
     code: &str,
     consumer: Box<dyn Consumer>,
@@ -194,8 +152,8 @@ pub fn new_compile_program(
     debug!("Join-planned CCL:\n{}", symbolic(&join_planned));
     debug!("Join-planned CCL:\n{}", symbolic_typed(&join_planned));
 
-    let mut op =
-        convert_to_operators(&join_planned, ctx.compile_ctx()).expect("Operator conversion failed");
+    let mut op = convert_to_operators(&join_planned, ctx.conversion_ctx())
+        .expect("Operator conversion failed");
 
     let producer = op.subscribe(op.tiling().universal_guard(), consumer, ctx.scheduler());
 

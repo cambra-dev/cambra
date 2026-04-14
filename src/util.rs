@@ -41,14 +41,6 @@ pub fn fmt_record<V: std::fmt::Display>(
 /// [`lookup`](Self::lookup) searches from innermost to outermost, returning the first match.
 ///
 /// This type is generic over the stored value `V`:
-///
-/// | Type alias | `V` |
-/// |---|---|
-/// | [`TypeInferenceContext`](crate::ccl::infer::TypeInferenceContext) | [`Type`](crate::ccl::Type) |
-/// | [`TileCompileContext`](crate::interpreter::compile_tile_operators::TileCompileContext) | `TileVarBinding` |
-///
-/// # Examples
-///
 /// ```
 /// use cambra::util::ScopeStack;
 ///

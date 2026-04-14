@@ -19,12 +19,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use bit_vec::BitVec;
-use cambra::ccl::context::new_compile_program;
+use cambra::ccl::context::compile_program;
 use cambra::ccl::{context::GlobalContext, Type};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
     sort_sealed_function_by_domain, tuple_field, BaseType, ColumnValue, Consumer, Extent,
-    FunctionGuard, Predicate, TestDataSource, Tile, TileGuard, Value,
+    Predicate, TestDataSource, Tile, Value,
 };
 use rstest_log::rstest;
 use smol_str::SmolStr;
@@ -42,8 +42,7 @@ fn run_pipeline(code: &str) -> Tile {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let (_, _, mut producer) = new_compile_program(&mut ctx, code, consumer);
-    // let (_, _, mut producer) = new_compile_program(&mut ctx, code, consumer);
+    let (_, _, mut producer) = compile_program(&mut ctx, code, consumer);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
     producer.get(producer.tiling().universal_guard())
@@ -454,7 +453,7 @@ fn test_test_source(#[case] code: &str) {
         *notified_clone.borrow_mut() = true;
     });
 
-    let mut producer = ctx.compile_program(code, consumer);
+    let (_, _, mut producer) = compile_program(&mut ctx, code, consumer);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
 
@@ -513,7 +512,8 @@ fn test_source_filter_nonterminal() {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut producer = ctx.compile_program("[s for s in source1() if s < 15]", consumer);
+    let code = "[s for s in source1() if s < 15]";
+    let (_, _, mut producer) = compile_program(&mut ctx, code, consumer);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
 
@@ -532,6 +532,7 @@ fn test_source_filter_nonterminal() {
 /// and region release.
 #[rstest]
 #[timeout(Duration::from_secs(1))]
+#[case("[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] == y[0]]")]
 #[case(
     "[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] == y[0] and True]"
 )]
@@ -565,6 +566,9 @@ fn test_inner_join(#[case] code: &str) {
             (tuple_field(1), Value::String("a1".into())),
         ])),
     )]);
+    data_source1
+        .borrow_mut()
+        .set_yield_predicate(Predicate::LessThanEq(Value::from(10usize)));
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(10),
         Value::Record(HashMap::from([
@@ -572,6 +576,9 @@ fn test_inner_join(#[case] code: &str) {
             (tuple_field(1), Value::String("b1".into())),
         ])),
     )]);
+    data_source2
+        .borrow_mut()
+        .set_yield_predicate(Predicate::LessThanEq(Value::from(10usize)));
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -579,7 +586,8 @@ fn test_inner_join(#[case] code: &str) {
         *notified_clone.borrow_mut() = true;
     });
 
-    let mut producer = ctx.compile_program(code, consumer);
+    // let mut producer = ctx.compile_program(code, consumer);
+    let mut producer = compile_program(&mut ctx, code, consumer).2;
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
 
@@ -665,6 +673,9 @@ fn test_inner_join(#[case] code: &str) {
             (tuple_field(1), Value::String("a2".into())),
         ])),
     )]);
+    data_source1
+        .borrow_mut()
+        .set_yield_predicate(Predicate::LessThanEq(Value::from(20usize)));
     data_source2.borrow_mut().add_data(&[(
         Value::UInt(20),
         Value::Record(HashMap::from([
@@ -672,6 +683,9 @@ fn test_inner_join(#[case] code: &str) {
             (tuple_field(1), Value::String("b2".into())),
         ])),
     )]);
+    data_source2
+        .borrow_mut()
+        .set_yield_predicate(Predicate::LessThanEq(Value::from(20usize)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -688,19 +702,6 @@ fn test_inner_join(#[case] code: &str) {
         ]
     );
 
-    producer.release(TileGuard::Function(FunctionGuard::Domain(
-        Predicate::Record(HashMap::from([
-            (tuple_field(0), Predicate::True),
-            (tuple_field(1), Predicate::LessThanEq(Value::UInt(10))),
-        ])),
-    )));
-    producer.release(TileGuard::Function(FunctionGuard::Domain(
-        Predicate::Record(HashMap::from([
-            (tuple_field(0), Predicate::LessThanEq(Value::UInt(10))),
-            (tuple_field(1), Predicate::True),
-        ])),
-    )));
-
     data_source1.borrow_mut().add_data(&[(
         Value::UInt(30),
         Value::Record(HashMap::from([
@@ -708,6 +709,9 @@ fn test_inner_join(#[case] code: &str) {
             (tuple_field(1), Value::String("a3".into())),
         ])),
     )]);
+    data_source1
+        .borrow_mut()
+        .set_yield_predicate(Predicate::LessThanEq(Value::from(30usize)));
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -721,13 +725,18 @@ fn test_inner_join(#[case] code: &str) {
     // == src2[20]._0=100 (kept).
     assert_eq!(
         extract_join_rows(tile),
-        vec![((30, 20), (100, "a3".into(), "b2".into()))]
+        vec![
+            ((10, 10), (100, "a1".into(), "b1".into())),
+            ((10, 20), (100, "a1".into(), "b2".into())),
+            ((30, 10), (100, "a3".into(), "b1".into())),
+            ((30, 20), (100, "a3".into(), "b2".into()))
+        ]
     );
 }
 
 /// `sum(source1())` accumulates values across batches and emits the final sum only
 /// once the data source signals that it is done producing output.
-#[test]
+#[test_log::test]
 fn test_incremental_global_aggregate() {
     let code = "sum(source1())";
     let mut ctx = GlobalContext::default();
@@ -738,8 +747,7 @@ fn test_incremental_global_aggregate() {
         Extent::Base(BaseType::Int),
     )));
     ctx.register_test_source(test_source.clone());
-
-    let mut producer = ctx.compile_program(code, Box::new(|| {}));
+    let (_, _, mut producer) = compile_program(&mut ctx, code, Box::new(|| {}));
 
     // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
     test_source.borrow_mut().add_data(&[
@@ -793,7 +801,7 @@ fn test_incremental_aggregates() {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut producer = ctx.compile_program(code, consumer);
+    let (_, _, mut producer) = compile_program(&mut ctx, code, consumer);
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
@@ -1024,7 +1032,10 @@ fn test_incremental_aggregates() {
             ("_1".into(), ColumnValue::UInts(vec![0, 1])),
         ])),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6]))),
-        domain_predicate: Predicate::True,
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
     }
 )]
 #[case(
@@ -1036,7 +1047,10 @@ fn test_incremental_aggregates() {
             ("_1".into(), ColumnValue::UInts(vec![0, 1])),
         ])),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6]))),
-        domain_predicate: Predicate::True,
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
     }
 )]
 #[case(
@@ -1048,11 +1062,14 @@ fn test_incremental_aggregates() {
             ("_1".into(), ColumnValue::UInts(vec![3])),
         ])),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
-        domain_predicate: Predicate::True,
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
     }
 )]
 fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expected_result: Tile) {
-    use cambra::ccl::{context::new_compile_program, symbolic::symbolic};
+    use cambra::ccl::{context::compile_program, symbolic::symbolic};
 
     let mut ctx = GlobalContext::default();
 
@@ -1077,7 +1094,7 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let (expr, _, mut producer) = new_compile_program(&mut ctx, code, consumer);
+    let (expr, _, mut producer) = compile_program(&mut ctx, code, consumer);
     assert_eq!(format!("{}:{}", symbolic(&expr), expr.ty), expected_ccl);
 
     ctx.scheduler().check_for_notifications();

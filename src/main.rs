@@ -1,9 +1,13 @@
 use cambra::{
-    ccl::context::GlobalContext,
+    ccl::{
+        context::{compile_program, GlobalContext},
+        symbolic::symbolic,
+    },
     interpreter::{
         tile_operators::{FunctionGuard, Tile, TileGuard},
         Consumer,
     },
+    pretty_graph::pretty_tile_operator,
     web_inspector::WebInspector,
 };
 use log::debug;
@@ -20,9 +24,15 @@ fn run_program(code: &str, inspect_port: Option<u16>) {
     });
 
     let mut ctx = GlobalContext::default();
-    let (mut producer, ast_tree, operator_tree) = ctx.compile_program_with_trees(code, consumer);
+    let (ast_tree, operator_tree, mut producer) = compile_program(&mut ctx, code, consumer);
 
-    let inspector = inspect_port.map(|port| WebInspector::new(port, ast_tree, operator_tree));
+    let inspector = inspect_port.map(|port| {
+        WebInspector::new(
+            port,
+            symbolic(&ast_tree),
+            pretty_tile_operator(operator_tree.as_ref()),
+        )
+    });
 
     let mut tick = 0u64;
     loop {

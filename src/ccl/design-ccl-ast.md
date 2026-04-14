@@ -15,8 +15,8 @@ Python source
   → infer          (ccl/infer.rs: type inference, converts Hole→Infer and fills ty on every node)
   → resolve        (ccl/unify.rs: substitutes solved Infer vars with concrete types)
   → lambda_elim    (ccl/lambda_elim.rs: Lambda → point-free combinators)
-  → optimize       (tree rewrites on CCL AST)
-  → compile        (interpreter/compile_tile_operators.rs: CCL AST → tile operators)
+  → optimize       (tree rewrites on CCL AST, currently just join_plan.rs)
+  → convert        (interpreter/operator_conversion.rs: CCL AST → tile operators)
   → subscribe()
   → producer/consumer dataflow
 ```
@@ -393,7 +393,7 @@ operands without requiring explicit type annotations.
 | `BoolLogic` | both operands constrained to `Bool` | `Bool` |
 
 **Note**: String + String → `Concat` rewriting is performed at **compile time**
-(`compile_ccl.rs` and `compile_tile_operators.rs`), not at inference time. The inference
+(in `lambda_elim.rs`), not at inference time. The inference
 pass only constrains both operands to `String` and returns `String` as the result type.
 
 ### UnaryOp type rules
@@ -562,9 +562,10 @@ has `bound_ty: None` because the old annotation is stale and would be incorrect.
 
 ## Compilation
 
-There are two compilation passes that translate CCL into tile-dataflow operators. End-to-end pipeline tests live in `tests/compilation_pipeline.rs`.
+There are two compilation passes that translate CCL into tile-dataflow operators. 
 
-**`interpreter/operator_conversion.rs`** — the primary compilation path for λ-free CCL produced by `lambda_elim` + `simplify`. Accepts a point-free expression and a `TileCompileContext` (variable scope). Translates each combinator directly:
+`interpreter/operator_conversion.rs` converts the λ-free CCL produced by `lambda_elim` + `simplify` into `TileOperator`s.  This process is mostly
+a 1:1 correspondence, with each type of object lifted up to apply within a chain of composed terms.
 
 | CCL form | Operator |
 |---|---|
@@ -578,12 +579,12 @@ There are two compilation passes that translate CCL into tile-dataflow operators
 | `neg`, `not_fn` | `apply_unaryop` |
 | `restrict` | `Restrict` |
 | `Lit` | `Constant` scalar |
-| `Tuple([…])` | `ScalarTuple` (scalar) or `Zip` (with domain) |
+| `Tuple([…])` | `ScalarTuple` |
 | `List([…])` | `MapResult` over index stream |
 | `Source(name)` | data-source operator |
 | `Let { binding, … }` | `Memo`-wrapped `Splitter` bound in scope |
 
-**`interpreter/compile_tile_operators.rs`** — the older, deprecated compilation path that handles the full CCL AST including `Lambda` nodes (for the CHL pipeline). `Split` was renamed to `Splitter` and internal helpers made `pub(crate)` to allow `operator_conversion` to share context types.
+End-to-end pipeline tests live in `tests/compilation_pipeline.rs`.
 
 ### `Let` nodes compile to a dedicated `Let` operator
 
@@ -602,80 +603,3 @@ The bound variable is subscribed to `definition` exactly once via a `VarProducer
 
 **Prerequisite**: `binding.ty` on the `Let` node's `TypedBinding` must be resolved to a concrete type before compilation — the type inference pass fills it from the inferred type of `bound_expr`.
 
----
-
-## Planned implementation order
-
-1. Define the node types above in a new `src/ccl/` module. ✓
-2. Add pretty printer (`src/ccl/pretty.rs`) and Python → CCL lowering (`src/ccl/lower.rs`) with snapshot tests. ✓
-3. Insert CCL as the IR between Python and operators (in progress):
-   - `ccl/lower.rs`: `lower_list_comp` produces unannotated lambdas
-     (`param.ty: Type::Hole`) — type annotation moved to the inference pass. ✓
-   - `interpreter/compile_ccl.rs`: CCL → operator compilation step created;
-     `CompileContext`, `CompileError`, `compile()`, and unit tests. ✓
-   - `ccl/infer.rs`: limited type inference pass; `TypeInferenceContext`, `InferError`,
-     `infer()`, `collect_param_constraint()`; unit and pipeline tests. ✓
-   - `interpreter/compile_ccl.rs` add support for compiling Let nodes to operators (see §Compilation above). ✓
-   - `interpreter/let_op.rs`: dedicated `Let` operator and `LetProducer` replacing the Let-as-Apply-Lambda desugaring. ✓
-   - `ccl/mod.rs` + `ccl/lower.rs` + `interpreter/compile_ccl.rs`: hash join detection and compilation
-     (`RefinementKind::HashJoin`, `HashJoinSpec`, `compile_hash_join_restriction`). ✓
-   - `ccl/mod.rs` + `ccl/lower.rs` + `ccl/infer.rs`: first-class `Aggregate` node (`AggregateKind`,
-     `Expr::Aggregate`); lowering from `sum`/`max` call sites; type inference via `AggregateKind::output_type`. ✓
-   - `ccl/lower.rs`: Python `lambda` expression lowering to curried `Expr::Lambda` chain. ✓
-   - `ccl/mod.rs` + `ccl/lower.rs` + `ccl/infer.rs`: first-class `GroupBy` node (`Expr::GroupBy`);
-     lowering from `groupby(collection, key)` call sites; type inference propagates collection
-     element type onto key lambda `param_ty`. ✓
-   - Source injection across all three CCL pipeline stages: `Expr::Source`, `Type::DataSource`,
-     `LoweringContext`, `TypeInferenceContext` source registry, `CompileContext` source registries.
-     CCL pipeline variants of source/join tests added. ✓
-   - `ccl/mod.rs` + all call sites: introduce `TypedExpr { node: TypedExprNode, ty, user_annotation }`
-     as the primary expression type; rename `Expr` enum to `TypedExprNode`; keep `pub type Expr =
-     TypedExpr` alias; remove `TypeAnnotation` variant; remove `Let.bound_ty` field; fill `ty` on
-     every node in the inference pass. ✓
-   - `ccl/mod.rs` + `ccl/infer.rs` + `ccl/unify.rs` + all call sites: replace `Type::Unknown`
-     with `Type::Infer(InferVarId)` (unique per node via `AtomicU32` counter); add `UnificationTable`
-     (union-find over `InferVarId`) to `TypeInferenceContext`; add post-inference `resolve` pass in
-     `ccl::unify`. ✓
-   - `ccl/mod.rs` + `ccl/infer.rs` + `ccl/lower.rs`: introduce `Type::Hole` as the lowering
-     placeholder, separating lowering ownership from type-checker ownership. `TypedExpr::new()` and
-     `TypedBinding::new_unannotated()` now stamp `Hole`; `infer()` converts `Hole → Infer(ctx.fresh_infer_var())`
-     at entry; `fresh_infer_var_id()` is no longer called from lowering code. ✓
-   - `ccl/infer.rs`: BinOp and UnaryOp inference rules via `constrain_equal`; String+String→Concat
-     detection moved to compile time; `lower.rs` UnaryOp lowering; `interpreter/unary_op.rs`
-     `UnaryOpKind` enum + `apply_unaryop_column`; `FunctionDef::UnaryOp` in types;
-     `compile_tile_operators.rs` UnaryOp compilation case. ✓
-   - `tests/compilation_pipeline.rs`: end-to-end pipeline tests (Python → CCL lower → infer → compile → eval). ✓
-   - `lowering.rs` direct path removed after parity confirmed. ✓
-   - `ccl/lower.rs`: annotated assignment lowering (`x: T = expr` → `Expr::Let` with
-     `TypedBinding::user_annotation` set); `lower_type_annotation` helper for primitive
-     type names (`int`, `str`, `bool`, `None`); `TypedBinding::new_annotated` and
-     `Expr::let_bind_annotated` constructors. Annotation check in `infer_let` upgraded
-     from structural `!=` to `constrain_equal`. ✓
-   - `ccl/lower.rs`: general function application lowering — unknown non-source calls
-     with ≥1 argument lower to a left-to-right curried `Apply` chain
-     (`f(a, b)` → `Apply(Apply(Var(f), a), b)`). ✓
-   - `tests/type_check.rs`: lower + infer integration tests (literals, arithmetic,
-     let bindings, unary ops, lists, aggregates, tuples, type annotations,
-     data sources, groupby). ✓
-   - `ccl/mod.rs` + `ccl/infer.rs` + `ccl/lower.rs` + `ccl/symbolic.rs` + `ccl/pretty.rs`
-     + `ccl/unify.rs`: `Case` redesigned as guard-based bra\nching — `branches: Vec<Branch>`
-     (`Branch { guard, body }`) with guards constrained to `Bool` and arm types unified;
-     `lower_if` for `StmtKind::If` → `Case` with `elif` chains **flattened** into a single node;
-     `ExprKind::IfExp` ternary lowering; `InferError::EmptyCase` for 0-branch `Case`.
-     `tests/type_check.rs`: `if/else`, `elif`, ternary integration tests. ✓
-   - `ccl/lambda_elim.rs`: lambda elimination pass; CCC rewrite rules eliminating all `Lambda` nodes
-     into point-free combinators (`BinOpKind::Compose`, `Expr::Proj`, built-in `Var` names). ✓
-   - `ccl/infer.rs` + `ccl/unify.rs`: `constrain_equal` moved onto `UnificationTable`; `check_fully_typed`
-     post-inference validation pass; `UnresolvedHole`/`UnresolvedInfer` error variants; improved `Proj`
-     inference (structured domain types for index 0/1); `infer_compose` for N-ary `Compose` nodes. ✓
-   - `ccl/lambda_elim.rs`: top-level `elim_lambdas` desugars non-compose `BinOp` and `UnaryOp` nodes to
-     `Apply`-form so `operator_conversion` treats all operations uniformly as combinators; `typed_tuple`
-     helper auto-types tuple nodes from element types; `zip_pair` now fully types its outer `Apply` node. ✓
-   - `interpreter/operator_conversion.rs`: new primary compilation path for λ-free CCL; translates
-     point-free expressions directly to tile operators without needing to handle `Lambda` nodes. ✓
-   - `interpreter/compile_tile_operators.rs`: `Split` renamed to `Splitter`; context types and
-     `compile_tile_inner` made `pub(crate)` to allow sharing with `operator_conversion`. ✓
-   - `ccl/join_plan.rs`: keyed aggregate optimization pass (new module). Transforms groupby patterns with
-     predicate refinements into efficient `"converse"` (grouping) implementations; runs after `lambda_elim`
-     and before final `simplify`. `lambda_elim.rs` enhanced to track free variables in types (predicate
-     refinements) so groupby-aggregate patterns are properly identified. ✓

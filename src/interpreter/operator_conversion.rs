@@ -6,19 +6,19 @@ use crate::{
         AggregateKind, Expr, Lit, ProjKey, RefinementKind, Type, TypedExprNode,
     },
     interpreter::{
-        ccl_compile_util::CompileError,
-        compile_tile_operators::{TileCompileContext, TileVarBinding},
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, IterateExtent, MapAggregate,
             MapDomain, MapExtractAggregate, MapResult, MapResultToConst, MapResultWithSource, Memo,
             Restrict, ScalarTuple, Splitter, TileOperator, Tiling, Uncurry, Zip,
         },
-        tuple_field, ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind, Extent,
-        FuncBinding, FunctionDef, LogicKind, UnaryOpKind, Value,
+        tuple_field, ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
+        DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
+        Value,
     },
     pretty_graph::pretty_tile_operator,
+    util::ScopeStack,
 };
-use std::rc::Rc;
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 /// Converts a λ-eliminated CCL expression into an operator graph.
 ///
@@ -37,6 +37,7 @@ use std::rc::Rc;
 ///   - scalar ▷ const
 ///   - zip of n functions
 ///   - Compose chains of other functions
+///   - Applications of uncurry, map_domain, and converse
 /// - Let-bindings of the above
 ///  
 /// For converting to operators, scalars and application of functions to scalars are turned into a dag
@@ -49,14 +50,163 @@ use std::rc::Rc;
 /// pushing a Splitter into the scope to share it between uses.
 ///
 /// Currently unsupported:
-/// - Curried functions
-/// - Keyed aggregation
 /// - Recursion
 pub fn convert_to_operators(
     expr: &Expr,
-    ctx: &mut TileCompileContext,
-) -> Result<Box<dyn TileOperator>, CompileError> {
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
     convert_impl(expr, None, None, ctx)
+}
+
+/// Errors that can occur during CCL → operator-graph compilation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConversionError {
+    /// The CCL node or construct is not yet supported by this compilation pass.
+    Unsupported(String),
+    /// A type-level inconsistency was detected.
+    TypeError(String),
+}
+
+// ---------------------------------------------------------------------------
+// Context types
+// ---------------------------------------------------------------------------
+
+/// Compilation context for tile compilation.
+///
+/// Bundles the variable scope stack with the data-source registry needed to
+/// resolve [`Type::DataSource`] names to [`Extent::DataSourceDomain`] extents
+/// at compile time.
+#[derive(Default)]
+pub struct OpConversionContext {
+    /// Variable bindings in scope, innermost scope last.
+    scopes: ScopeStack<Rc<Splitter>>,
+    /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
+    sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+}
+
+/// RAII scope guard for [`TileCompileContext`].
+///
+/// Created by [`TileCompileContext::enter_scope`]; pops the innermost scope when
+/// dropped. Implements [`std::ops::Deref`]/[`std::ops::DerefMut`] targeting
+/// [`TileCompileContext`], so `&mut guard` coerces to `&mut TileCompileContext`.
+pub(crate) struct TileCompileContextGuard<'a> {
+    ctx: &'a mut OpConversionContext,
+}
+
+impl std::ops::Deref for TileCompileContextGuard<'_> {
+    type Target = OpConversionContext;
+    fn deref(&self) -> &OpConversionContext {
+        self.ctx
+    }
+}
+
+impl std::ops::DerefMut for TileCompileContextGuard<'_> {
+    fn deref_mut(&mut self) -> &mut OpConversionContext {
+        self.ctx
+    }
+}
+
+impl Drop for TileCompileContextGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.scopes.pop_scope();
+    }
+}
+
+impl OpConversionContext {
+    /// Create a new empty context with no registered sources.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a data-source implementation under `name`.
+    ///
+    /// After registration, [`Type::DataSource(name)`] resolves to
+    /// [`Extent::DataSourceDomain`] in [`Self::extent_of`].
+    pub fn register_source(
+        &mut self,
+        name: impl Into<String>,
+        impl_: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+    ) {
+        self.sources.insert(name.into(), impl_);
+    }
+
+    pub fn get_source(
+        &self,
+        name: &str,
+    ) -> Result<Rc<RefCell<dyn DataSourceDomainExtentImpl>>, ConversionError> {
+        self.sources
+            .get(name)
+            .cloned()
+            .ok_or_else(|| ConversionError::TypeError(format!("Unknown data source: {name}")))
+    }
+
+    /// Enter a fresh lexical scope, returning a guard that pops it on drop.
+    ///
+    /// The guard dereferences to `TileCompileContext`, so it can be passed as
+    /// `&mut TileCompileContext` to recursive compile functions.
+    pub(crate) fn enter_scope(&mut self) -> TileCompileContextGuard<'_> {
+        self.scopes.push_scope();
+        TileCompileContextGuard { ctx: self }
+    }
+
+    /// Bind `name` to `binding` in the innermost scope.
+    pub(crate) fn bind(&mut self, name: &str, binding: Rc<Splitter>) {
+        self.scopes.bind(name, binding);
+    }
+
+    /// Look up `name` from innermost scope outward.
+    pub(crate) fn lookup(&self, name: &str) -> Option<&Rc<Splitter>> {
+        self.scopes.lookup(name)
+    }
+
+    /// Convert a CCL [`Type`] to an interpreter [`Extent`].
+    ///
+    /// Refinements are enforced at runtime by [`Filter`] operators and are
+    /// never materialised as [`Extent::Restricted`] in the tile-operator path.
+    /// Every [`Type::Refinement`] wrapper — at any nesting depth — is stripped
+    /// so that compound types such as `Tuple([Refinement(...), Refinement(...)])`
+    /// never produce empty, unsubscribed [`Restriction`] objects that would
+    /// panic when iterated.
+    pub fn extent_of(&self, ty: &Type) -> Result<Extent, ConversionError> {
+        match ty {
+            // Strip refinements at every level — Filter handles them instead.
+            Type::Refinement(inner, _) => self.extent_of(inner),
+            // Look up the runtime impl and wrap it in DataSourceDomain.
+            Type::DataSource(name) => self
+                .sources
+                .get(name.as_str())
+                .map(|rc| Extent::DataSourceDomain(rc.clone()))
+                .ok_or_else(|| ConversionError::TypeError(format!("Unknown data source: {name}"))),
+            // Recurse through compound types so nested refinements are stripped.
+            Type::Tuple(ts) => {
+                let fields: Result<HashMap<String, Extent>, _> = ts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| Ok((tuple_field(i), self.extent_of(t)?)))
+                    .collect();
+                Ok(Extent::record(fields?))
+            }
+            Type::Record(named) => {
+                let fields: Result<HashMap<String, Extent>, _> = named
+                    .iter()
+                    .map(|(name, t)| Ok((name.clone(), self.extent_of(t)?)))
+                    .collect();
+                Ok(Extent::record(fields?))
+            }
+            Type::Fun(a, b) => Ok(Extent::Function {
+                domain: Box::new(self.extent_of(a)?),
+                codomain: Box::new(self.extent_of(b)?),
+            }),
+            // Leaf types — no refinements possible, handle inline.
+            Type::Base(b) => Ok(Extent::Base(b.clone())),
+            Type::UIntRange(n) => Ok(Extent::uint_range(*n)),
+            other => Err(ConversionError::TypeError(format!(
+                "Cannot convert CCL type {other:?} to an interpreter extent; \
+                 this is a compiler bug — type inference should have resolved \
+                 or rejected this type before compilation"
+            ))),
+        }
+    }
 }
 
 /// Core conversion: translate `expr` into an operator that transforms `input`.
@@ -65,8 +215,8 @@ pub fn convert_to_operators(
 /// an enclosing `Lambda`'s [`IterateExtent`] or a prior composition step).
 /// `None` means the expression is the start of the pipeline.
 ///
-/// Let-bound variables are stored in `ctx.scopes` as [`TileVarBinding::Operator`]
-/// entries; each use produces a fresh [`Split`] handle via [`Split::split`].
+/// Let-bound variables are stored in `ctx.scopes` as [`Splitter`]
+/// entries; each use produces a fresh [`Split`] handle via [`Splitter::split`].
 fn convert_impl(
     expr: &Expr,
     input: Option<Box<dyn TileOperator>>,
@@ -76,10 +226,10 @@ fn convert_impl(
     // We only need this because Compose sometimes has a refined type that is not present
     // on its first child.
     input_ty: Option<Type>,
-    ctx: &mut TileCompileContext,
-) -> Result<Box<dyn TileOperator>, CompileError> {
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
     trace!("Converting {}", symbolic(expr));
-    let result: Result<Box<dyn TileOperator>, CompileError> = match &expr.node {
+    let result: Result<Box<dyn TileOperator>, ConversionError> = match &expr.node {
         // f ≫ g: left-to-right composition.  Apply left first, then right.
         TypedExprNode::Compose(elems) => {
             let mut result = input;
@@ -106,12 +256,12 @@ fn convert_impl(
             body,
         } => {
             if input.is_some() {
-                return Err(CompileError::Unsupported("let expects no input".into()));
+                return Err(ConversionError::Unsupported("let expects no input".into()));
             }
             let bound_op = convert_impl(bound_expr, None, None, ctx)?;
             let split = Rc::new(Splitter::new(Box::new(Memo::new(bound_op))));
             let mut scope = ctx.enter_scope();
-            scope.bind(&binding.name, TileVarBinding::Operator(split));
+            scope.bind(&binding.name, split);
             convert_impl(body, None, None, &mut scope)
         }
 
@@ -128,7 +278,7 @@ fn convert_impl(
         TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "zip") =>
         {
             let TypedExprNode::Tuple(elts) = &argument.node else {
-                return Err(CompileError::Unsupported(format!(
+                return Err(ConversionError::Unsupported(format!(
                     "zip expects a Tuple argument, got {:?}",
                     argument.node
                 )));
@@ -136,7 +286,7 @@ fn convert_impl(
             let input =
                 input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
             // Wrap input in Split so every branch shares the same upstream producer.
-            let split = Rc::new(Splitter::new(Box::new(Memo::new(input))));
+            let split = Rc::new(Splitter::new(input));
             let mut ops = Vec::new();
             for elt in elts {
                 ops.push(convert_impl(elt, Some(split.split()), None, ctx)?);
@@ -149,7 +299,7 @@ fn convert_impl(
         TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "map") =>
         {
             if input.is_none() {
-                return Err(CompileError::Unsupported("map requires an input".into()));
+                return Err(ConversionError::Unsupported("map requires an input".into()));
             }
             convert_impl(argument, input, None, ctx)
         }
@@ -169,7 +319,7 @@ fn convert_impl(
         TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "map_domain") =>
         {
             if input.is_some() {
-                return Err(CompileError::Unsupported(
+                return Err(ConversionError::Unsupported(
                     "map_domain requires no input".into(),
                 ));
             }
@@ -182,7 +332,7 @@ fn convert_impl(
         TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "uncurry") =>
         {
             if input.is_some() {
-                return Err(CompileError::Unsupported(
+                return Err(ConversionError::Unsupported(
                     "uncurry requires no input".into(),
                 ));
             }
@@ -195,7 +345,7 @@ fn convert_impl(
         TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if agg_for_name(n).is_some()) =>
         {
             if input.is_some() {
-                return Err(CompileError::Unsupported(
+                return Err(ConversionError::Unsupported(
                     "scalar aggregates expect no input".into(),
                 ));
             }
@@ -208,7 +358,7 @@ fn convert_impl(
 
         TypedExprNode::Apply { argument, function } => {
             if input.is_some() {
-                return Err(CompileError::Unsupported(
+                return Err(ConversionError::Unsupported(
                     format!("Only higher-order combinators (map, const, zip) can take an input operator; found input for non-combinator {}",
                         symbolic(function)),
                 ));
@@ -224,7 +374,7 @@ fn convert_impl(
             proj_field(input, *n)
         }
 
-        TypedExprNode::Proj(ProjKey::Field(_)) => Err(CompileError::Unsupported(
+        TypedExprNode::Proj(ProjKey::Field(_)) => Err(ConversionError::Unsupported(
             "named field projection (Proj::Field) is not yet supported in operator_conversion"
                 .into(),
         )),
@@ -250,9 +400,9 @@ fn convert_impl(
                         kind,
                     )))
                 }
-                name if matches!(ctx.lookup(name), Some(TileVarBinding::Operator(_))) => {
-                    let Some(TileVarBinding::Operator(split)) = ctx.lookup(name) else {
-                        unreachable!()
+                name if ctx.lookup(name).is_some() => {
+                    let Some(split) = ctx.lookup(name) else {
+                        unreachable!();
                     };
                     if let Some(input) = input {
                         Ok(Box::new(MapResult::new(input, split.split())))
@@ -260,7 +410,7 @@ fn convert_impl(
                         Ok(split.split())
                     }
                 }
-                _ => Err(CompileError::Unsupported(format!(
+                _ => Err(ConversionError::Unsupported(format!(
                     "unrecognised Var({name}) in λ-free CCL"
                 ))),
             }
@@ -276,45 +426,22 @@ fn convert_impl(
         }
 
         // Tuple: compile to a record.
-        //
-        // If all elements are constants, materialise as a scalar record constant (optionally
-        // lifted over a domain stream).  Otherwise — which can occur when multi-step scalar
-        // math produces a tuple of sub-expressions as an operator argument — compile each
-        // element independently and combine them with [`Zip`].  When a shared domain stream
-        // is present it is distributed to every branch via [`Splitter`].
+        // Zipped tuples are handled by the zip rule earlier, so only tuples of scalars hit this case.
         TypedExprNode::Tuple(elts) => {
-            // Fast path: all-constant tuple.
-            if let Ok(value) = expr_to_value(expr) {
-                let extent = Extent::for_value(&value);
-                let const_op = Box::new(Constant::new(value, extent)) as Box<dyn TileOperator>;
-                return match input {
-                    None => Ok(const_op),
-                    Some(domain) => Ok(Box::new(MapResultToConst::new(domain, const_op))),
-                };
+            if input.is_some() {
+                return Err(ConversionError::Unsupported(
+                    "tuples expect no input".into(),
+                ));
             }
-            // Slow path: at least one element is a non-constant expression.
-            match input {
-                // With a domain stream: fan it out via Splitter, then zip.
-                Some(domain) => {
-                    let split = Rc::new(Splitter::new(Box::new(Memo::new(domain))));
-                    let ops: Result<Vec<_>, _> = elts
-                        .iter()
-                        .map(|elt| convert_impl(elt, Some(split.split()), None, ctx))
-                        .collect();
-                    Ok(Box::new(Zip::new(ops?)))
-                }
-                // Scalar context: each element is an independent scalar computation.
-                None => {
-                    let ops: Result<Vec<_>, _> = elts
-                        .iter()
-                        .map(|elt| convert_impl(elt, None, None, ctx))
-                        .collect();
-                    Ok(Box::new(ScalarTuple::new(ops?)))
-                }
-            }
+
+            let ops: Result<Vec<_>, _> = elts
+                .iter()
+                .map(|elt| convert_impl(elt, None, None, ctx))
+                .collect();
+            Ok(Box::new(ScalarTuple::new(ops?)))
         }
 
-        // Literal constant: produce a scalar, optionally lifted over a domain stream.
+        // Literal constant: produce a scalar.
         TypedExprNode::Lit(lit) => {
             assert!(
                 input.is_none(),
@@ -327,13 +454,17 @@ fn convert_impl(
         TypedExprNode::Source(name) => {
             let input =
                 input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
-            Ok(Box::new(MapResultWithSource::new(
-                ctx.get_source(name)?,
+            let source = ctx.get_source(name)?;
+            Ok(Box::new(MapResult::new(
                 input,
+                Box::new(MapResultWithSource::new(
+                    source,
+                    iterate_type(&Type::DataSource(name.clone()), ctx)?,
+                )),
             )))
         }
 
-        other => Err(CompileError::Unsupported(format!(
+        other => Err(ConversionError::Unsupported(format!(
             "CCL node {other:?} is not yet supported in operator_conversion"
         ))),
     };
@@ -357,13 +488,13 @@ fn convert_impl(
 /// stream is already narrowed before any downstream operator sees it.
 fn iterate_domain(
     ty: &Type,
-    ctx: &mut TileCompileContext,
-) -> Result<Box<dyn TileOperator>, CompileError> {
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
     trace!("Iterating {ty}");
     if let Type::Fun(domain, _) = ty {
         iterate_type(domain, ctx)
     } else {
-        Err(CompileError::TypeError(format!(
+        Err(ConversionError::TypeError(format!(
             "Cannot iterate non-function type {ty}"
         )))
     }
@@ -371,11 +502,11 @@ fn iterate_domain(
 
 fn iterate_type(
     ty: &Type,
-    ctx: &mut TileCompileContext,
-) -> Result<Box<dyn TileOperator>, CompileError> {
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
     if let Type::Refinement(base, refinement) = ty {
         let RefinementKind::Predicate(pred) = &refinement.kind else {
-            return Err(CompileError::TypeError(format!(
+            return Err(ConversionError::TypeError(format!(
                 "unsupported non-predicate refinement in function domain: {refinement:?}"
             )));
         };
@@ -393,7 +524,7 @@ fn iterate_type(
 }
 
 /// Compile a list literal to a [`Constant`] holding a `Value::Function` binding table.
-fn compile_list_fn(elts: &[Expr]) -> Result<Box<dyn TileOperator>, CompileError> {
+fn compile_list_fn(elts: &[Expr]) -> Result<Box<dyn TileOperator>, ConversionError> {
     let mut bindings = Vec::with_capacity(elts.len());
     let mut elt_extent = Extent::Base(BaseType::Unit);
     for (i, elt) in elts.iter().enumerate() {
@@ -415,7 +546,7 @@ fn compile_list_fn(elts: &[Expr]) -> Result<Box<dyn TileOperator>, CompileError>
 /// Evaluate a constant CCL expression to a [`Value`].
 ///
 /// Only [`TypedExprNode::Lit`] and constant [`TypedExprNode::Tuple`] are supported.
-fn expr_to_value(expr: &Expr) -> Result<Value, CompileError> {
+fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
     match &expr.node {
         TypedExprNode::Lit(lit) => Ok(match lit {
             Lit::Int(n) => Value::Int(*n),
@@ -424,21 +555,21 @@ fn expr_to_value(expr: &Expr) -> Result<Value, CompileError> {
             Lit::Unit => Value::Unit,
         }),
         TypedExprNode::Tuple(elts) => {
-            let fields: Result<std::collections::HashMap<String, Value>, _> = elts
+            let fields: Result<HashMap<String, Value>, _> = elts
                 .iter()
                 .enumerate()
                 .map(|(i, e)| Ok((tuple_field(i), expr_to_value(e)?)))
                 .collect();
             Ok(Value::Record(fields?))
         }
-        _ => Err(CompileError::Unsupported(format!(
+        _ => Err(ConversionError::Unsupported(format!(
             "only literals and constant tuples are supported in list elements, got: {expr:?}"
         ))),
     }
 }
 
 /// Compile a CCL literal to a [`Constant`] scalar operator.
-fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, CompileError> {
+fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, ConversionError> {
     let (value, extent) = match lit {
         Lit::Int(n) => (Value::Int(*n), Extent::Base(BaseType::Int)),
         Lit::String(s) => (
@@ -457,7 +588,7 @@ fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, CompileError> {
 fn proj_field(
     input: Box<dyn TileOperator>,
     n: usize,
-) -> Result<Box<dyn TileOperator>, CompileError> {
+) -> Result<Box<dyn TileOperator>, ConversionError> {
     let field_name = tuple_field(n);
     let record_extent = result_extent(input.tiling());
     let field_extent = field_extent_of(&record_extent, &field_name)?;
@@ -480,7 +611,7 @@ fn proj_field(
 fn apply_binop(
     input: Box<dyn TileOperator>,
     op: InterpreterBinOp,
-) -> Result<Box<dyn TileOperator>, CompileError> {
+) -> Result<Box<dyn TileOperator>, ConversionError> {
     let record_extent = result_extent(input.tiling());
     let out_extent = binop_output_extent(&op);
     let fn_value = Value::ComputableFunction(FunctionDef::BinOp(op));
@@ -501,7 +632,7 @@ fn apply_binop(
 fn apply_unaryop(
     input: Box<dyn TileOperator>,
     op: UnaryOpKind,
-) -> Result<Box<dyn TileOperator>, CompileError> {
+) -> Result<Box<dyn TileOperator>, ConversionError> {
     let in_extent = result_extent(input.tiling());
     let out_extent = unaryop_output_extent(&op);
     let fn_value = Value::ComputableFunction(FunctionDef::UnaryOp(op));
@@ -518,7 +649,7 @@ fn apply_unaryop(
 fn apply_aggregate(
     input: Box<dyn TileOperator>,
     op: AggregateKind,
-) -> Result<Box<dyn TileOperator>, CompileError> {
+) -> Result<Box<dyn TileOperator>, ConversionError> {
     Ok(Box::new(ExtractAggregate::new(
         Box::new(Aggregate::new(input, op.clone())),
         op,
@@ -606,14 +737,14 @@ fn result_extent(tiling: &Tiling) -> Extent {
 }
 
 /// Extract the extent of a named record field.
-fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, CompileError> {
+fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, ConversionError> {
     match record_extent {
         Extent::Record(fields) => fields
             .get(field_name)
             .cloned()
-            .ok_or_else(|| CompileError::TypeError(format!("record has no field {field_name}"))),
+            .ok_or_else(|| ConversionError::TypeError(format!("record has no field {field_name}"))),
         Extent::Restricted { base, .. } => field_extent_of(base, field_name),
-        other => Err(CompileError::TypeError(format!(
+        other => Err(ConversionError::TypeError(format!(
             "Proj applied to non-record extent {other:?}"
         ))),
     }

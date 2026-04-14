@@ -4,8 +4,6 @@
 //! Execution proceeds via the tile producer/consumer protocol using guards and tilings.
 
 mod binop;
-pub mod ccl_compile_util;
-pub mod compile_tile_operators;
 pub mod operator_conversion;
 mod scheduler;
 mod stdio;
