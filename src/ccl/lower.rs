@@ -20,6 +20,7 @@
 //! | 2-gen equality-join comprehensions (`if x.k == y.k`) | hash-join [`crate::ccl::RefinementKind::HashJoin`] |
 //! | Multi-gen filtered comprehensions (non-equality or 3+ generators) | loop-join [`crate::ccl::RefinementKind::Predicate`] |
 //! | Assignment + expression blocks | nested [`Expr::Let`] |
+//! | Augmented assignment `x op= e` | desugared to [`Expr::Let`] via [`Expr::BinOp`] |
 //! | `sum(expr)` / `max(expr)` calls | [`Expr::Aggregate`] |
 //! | Lambda expressions `lambda x: body` | curried [`Expr::Lambda`] chain |
 //! | `groupby(collection, key)` calls | [`Expr::GroupBy`] |
@@ -206,14 +207,7 @@ pub fn lower_stmts(stmts: &[pyast::Stmt], ctx: &LoweringContext) -> Result<Expr,
                         "Multiple assignment targets not supported".into(),
                     ));
                 }
-                let name = match &targets[0].node {
-                    pyast::ExprKind::Name { id, .. } => id.clone(),
-                    _ => {
-                        return Err(LoweringError::Unsupported(
-                            "Destructuring assignment not supported".into(),
-                        ))
-                    }
-                };
+                let name = extract_name_target(&targets[0], "assignment")?;
                 let val = lower_expr(value, ctx)?;
                 Ok(Expr::let_bind(name, val, body))
             }
@@ -223,14 +217,7 @@ pub fn lower_stmts(stmts: &[pyast::Stmt], ctx: &LoweringContext) -> Result<Expr,
                 value: Some(value),
                 ..
             } => {
-                let name = match &target.node {
-                    pyast::ExprKind::Name { id, .. } => id.clone(),
-                    _ => {
-                        return Err(LoweringError::Unsupported(
-                            "Destructuring annotated assignment not supported".into(),
-                        ))
-                    }
-                };
+                let name = extract_name_target(target, "annotated assignment")?;
                 let annotation_ty = lower_type_annotation(annotation)?;
                 let val = lower_expr(value, ctx)?;
                 Ok(Expr::let_bind_annotated(name, val, body, annotation_ty))
@@ -238,10 +225,39 @@ pub fn lower_stmts(stmts: &[pyast::Stmt], ctx: &LoweringContext) -> Result<Expr,
             pyast::StmtKind::AnnAssign { value: None, .. } => Err(LoweringError::Unsupported(
                 "Annotated assignment without a value is not supported".into(),
             )),
+            // Desugar `x op= e` → `x = x op e` and lower as a Let binding.
+            //
+            // Only simple name targets are supported; subscript and attribute
+            // targets (e.g. `x[0] += 1`, `x.field += 1`) return Unsupported.
+            pyast::StmtKind::AugAssign { target, op, value } => {
+                let name = extract_name_target(target, "augmented assignment")?;
+                // Correctness: lower_binop calls lower_expr on `target`, which
+                // produces Expr::Var(name) because the Name-only guard above
+                // already rejected non-Name targets. If that guard were ever
+                // loosened, lower_binop would silently lower a complex target
+                // expression (e.g. subscript) as both the read and the binding
+                // destination — review this coupling before relaxing the guard.
+                let val = lower_binop(target, op, value, ctx)?;
+                Ok(Expr::let_bind(name, val, body))
+            }
             _ => Err(LoweringError::Unsupported(
                 "Only assignment statements are supported before the final expression".into(),
             )),
         })
+}
+
+/// Extract a simple variable name from a Python assignment target.
+///
+/// Returns the name as a [`String`] when the target is an [`ExprKind::Name`],
+/// or [`LoweringError::Unsupported`] for destructuring, subscript, or attribute
+/// targets.
+fn extract_name_target(target: &pyast::Expr, context: &str) -> Result<String, LoweringError> {
+    match &target.node {
+        pyast::ExprKind::Name { id, .. } => Ok(id.clone()),
+        _ => Err(LoweringError::Unsupported(format!(
+            "{context}: only simple name targets are supported"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +957,60 @@ let x = 2 + 3
 in let x = x * 4
 in x"
     )]
+    // Augmented assignment: `x op= e` desugars to `x = x op e`.
+    #[case(
+        "\
+x = 0
+x += 1
+x",
+        "\
+let x = 0
+in let x = x + 1
+in x"
+    )]
+    #[case(
+        "\
+x = 10
+x -= 3
+x",
+        "\
+let x = 10
+in let x = x - 3
+in x"
+    )]
+    #[case(
+        "\
+x = 2
+x *= 5
+x",
+        "\
+let x = 2
+in let x = x * 5
+in x"
+    )]
+    #[case(
+        "\
+x = 7
+x //= 2
+x",
+        "\
+let x = 7
+in let x = x // 2
+in x"
+    )]
+    // Chained augmented assignments shadow in sequence.
+    #[case(
+        "\
+x = 0
+x += 1
+x += 2
+x",
+        "\
+let x = 0
+in let x = x + 1
+in let x = x + 2
+in x"
+    )]
     fn test_lower_stmts(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
@@ -1249,6 +1319,16 @@ x";
     #[test]
     fn test_lower_if_without_else_rejected() {
         let stmts = parse_module("if x:\n    1");
+        let err =
+            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        assert!(matches!(err, LoweringError::Unsupported(_)));
+    }
+
+    #[rstest]
+    #[case("x = [1]\nx[0] += 1\nx")]
+    #[case("x = 0\nx.field += 1\nx")]
+    fn test_augassign_non_name_target_rejected(#[case] code: &str) {
+        let stmts = parse_module(code);
         let err =
             lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
         assert!(matches!(err, LoweringError::Unsupported(_)));

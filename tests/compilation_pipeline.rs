@@ -175,6 +175,23 @@ fn test_let_bindings(#[case] code: &str, #[case] expected: Value) {
 }
 
 // ---------------------------------------------------------------------------
+// Augmented assignment
+// ---------------------------------------------------------------------------
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case("x = 0\nx += 1\nx", Value::Int(1))]
+#[case("x = 10\nx -= 3\nx", Value::Int(7))]
+#[case("x = 2\nx *= 5\nx", Value::Int(10))]
+#[case("x = 7\nx //= 2\nx", Value::Int(3))]
+// Chained augmented assignments accumulate correctly.
+#[case("x = 0\nx += 1\nx += 2\nx", Value::Int(3))]
+// Mix of plain and augmented assignment.
+#[case("x = 1\ny = x\nx += 4\ny", Value::Int(1))]
+fn test_augmented_assignment(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// ---------------------------------------------------------------------------
 // More Let bindings
 // ---------------------------------------------------------------------------
 #[rstest]
