@@ -18,7 +18,9 @@ use intervalsets::{
 
 use crate::{
     ccl::AggregateKind,
-    interpreter::{apply_binop_column, BinOpKind, ColumnValue, Extent, LogicKind, Value},
+    interpreter::{
+        apply_binop_column, tuple_field, BinOpKind, ColumnValue, Extent, LogicKind, Value,
+    },
     util::fmt_record,
 };
 
@@ -188,6 +190,17 @@ impl Tiling {
             },
         }
     }
+
+    /// Helper to create a tuple tiling, i.e. a Record tiling where all fields are from `tuple_field`
+    pub fn tuple(tilings: &[Tiling]) -> Tiling {
+        Tiling::Record(
+            tilings
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (tuple_field(i), t.clone()))
+                .collect(),
+        )
+    }
 }
 
 impl fmt::Display for Tiling {
@@ -262,6 +275,17 @@ pub enum Tile {
 }
 
 impl Tile {
+    /// Helper to create a tuple tile, i.e. a Record tile where all fields are from `tuple_field`
+    pub fn tuple(tiles: Vec<Tile>) -> Tile {
+        Tile::Record(
+            tiles
+                .into_iter()
+                .enumerate()
+                .map(|(i, t)| (tuple_field(i), t))
+                .collect(),
+        )
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Tile::Scalar(cv) => cv.len(),

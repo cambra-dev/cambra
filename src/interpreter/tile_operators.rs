@@ -19,7 +19,7 @@ use std::{
 
 use bit_vec::BitVec;
 use intervalsets::{ops::Difference, Bounding, Interval, IntervalSet};
-use log::{debug, trace};
+use log::trace;
 
 pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, Tiling};
 use crate::{
@@ -669,14 +669,15 @@ impl TileProducer for MapResultProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         // TODO once we have guards that express codomain predicates, handle them here
         self.input.release(obsolete_guard);
     }
 }
 
 /// Takes a function input and returns a function with the same structure
-/// but with a constant codomain.
+/// but with a constant codomain swapped or zipped in, as determined by the [`MapResultToConstMode`]
+/// param.
 ///
 /// `input` must be a `SealedFunction` or `CurriedFunction` tile; `constant` must be a Scalar.
 pub struct MapResultToConst {
@@ -686,16 +687,44 @@ pub struct MapResultToConst {
     input: Box<dyn TileOperator>,
     /// The constant to apply to each element.
     constant: Box<dyn TileOperator>,
+    /// Whether to zip with the constant instead of replacing with the constant.
+    mode: MapResultToConstMode,
+}
+
+/// The type fof MapResultToConst operation to perform
+#[derive(Debug, Clone, Copy)]
+pub enum MapResultToConstMode {
+    /// Replace the codomain with the constant
+    Replace,
+    /// Replace the codomain x with (constant, x)
+    ZipLeft,
+    /// Replace the codomain x with (x, constant)
+    ZipRight,
 }
 
 impl MapResultToConst {
     /// Create a new `MapResultToConst` operator that maps any codomain to the given constant.
-    pub fn new(input: Box<dyn TileOperator>, constant: Box<dyn TileOperator>) -> Self {
-        let tiling = change_tiling_result(input.tiling(), |_| constant.tiling().clone());
+    pub fn new(
+        input: Box<dyn TileOperator>,
+        constant: Box<dyn TileOperator>,
+        mode: MapResultToConstMode,
+    ) -> Self {
+        let tiling = match mode {
+            MapResultToConstMode::Replace => {
+                change_tiling_result(input.tiling(), |_| constant.tiling().clone())
+            }
+            MapResultToConstMode::ZipLeft => change_tiling_result(input.tiling(), |e| {
+                Tiling::tuple(&[constant.tiling().clone(), Tiling::Scalar(e.clone())])
+            }),
+            MapResultToConstMode::ZipRight => change_tiling_result(input.tiling(), |e| {
+                Tiling::tuple(&[Tiling::Scalar(e.clone()), constant.tiling().clone()])
+            }),
+        };
         Self {
             tiling,
             input,
             constant,
+            mode,
         }
     }
 }
@@ -736,6 +765,7 @@ impl TileOperator for MapResultToConst {
             },
             input: input_producer,
             constant: constant_producer,
+            mode: self.mode,
         })
     }
 }
@@ -744,6 +774,7 @@ struct MapToConstProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     constant: Box<dyn TileProducer>,
+    mode: MapResultToConstMode,
 }
 
 impl TileProducer for MapToConstProducer {
@@ -772,13 +803,24 @@ impl TileProducer for MapToConstProducer {
         let input_tile = self.input.get(input_guard);
         let constant_tile = self.constant.get(c_tiling.universal_guard());
 
+        let mode = self.mode;
         process_tile_result(self.tiling(), input_tile, move |codomain| {
-            scalar_tile_to_column_value(repeat_tile(constant_tile, codomain.len()))
+            let const_tile = repeat_tile(constant_tile, codomain.len());
+            let result_tile = match mode {
+                MapResultToConstMode::Replace => const_tile,
+                MapResultToConstMode::ZipLeft => {
+                    Tile::tuple(vec![const_tile, Tile::Scalar(codomain)])
+                }
+                MapResultToConstMode::ZipRight => {
+                    Tile::tuple(vec![Tile::Scalar(codomain), const_tile])
+                }
+            };
+            scalar_tile_to_column_value(result_tile)
         })
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         // TODO once we have guards that express codomain predicates, handle them here
         self.input.release(obsolete_guard);
     }
@@ -1053,7 +1095,7 @@ impl TileProducer for IterateExtentProducer {
 
     fn release(&mut self, obsolete_guard: TileGuard) {
         let name = self.name();
-        debug!("{} release: {obsolete_guard:?}", name);
+        trace!("{} release: {obsolete_guard:?}", name);
         let TileGuard::Function(FunctionGuard::Domain(pred)) = obsolete_guard else {
             panic!("IterateExtent::release expected Domain guard, got {obsolete_guard:?}")
         };
@@ -1181,7 +1223,7 @@ impl TileProducer for MapResultWithSourceProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         match &obsolete_guard {
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
                 self.source.borrow_mut().release(&self.name(), pred.clone());
@@ -1501,7 +1543,7 @@ impl TileProducer for ZipProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         self.inputs.iter_mut().for_each(|i| {
             i.release(match &obsolete_guard {
                 g if g.is_universal() => i.tiling().universal_guard(),
@@ -1624,7 +1666,7 @@ impl TileProducer for ScalarTupleProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
     }
 }
 
@@ -1797,7 +1839,7 @@ impl TileProducer for ConverseProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         match obsolete_guard {
             g if g.is_universal() => self.input.release(self.input.tiling().universal_guard()),
             TileGuard::Function(FunctionGuard::Codomain(g)) => {
@@ -1900,7 +1942,7 @@ impl TileProducer for MapDomainProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -2049,7 +2091,7 @@ impl TileProducer for UncurryProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         let input_guard = match &obsolete_guard {
             // Pass through empty and universal guards unchanged.
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -2086,7 +2128,7 @@ impl TileProducer for UncurryProducer {
             }
             g => panic!("Unsupported obsolete guard: {g:?}"),
         };
-        debug!("{} releasing up with: {input_guard:?}", self.name());
+        trace!("{} releasing up with: {input_guard:?}", self.name());
         self.input.release(input_guard);
     }
 }
@@ -2244,7 +2286,7 @@ impl TileProducer for FilterProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         if matches!(self.predicate.tiling(), Tiling::SealedFunction { .. }) {
             // Both predicate and input share the same underlying domain source, so both
             // must be released together; releasing only one leaves the other's upstream
@@ -2363,7 +2405,7 @@ impl TileProducer for RestrictProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         self.predicate.release(obsolete_guard);
     }
 }
@@ -2505,7 +2547,7 @@ impl TileProducer for AggregateProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         // Nothing to do. We could consider sanity checking that get is not called
         // after a universal release.
     }
@@ -2604,7 +2646,7 @@ impl TileProducer for ExtractAggregateProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         if obsolete_guard.is_universal() {
             self.input.release(self.input.tiling().universal_guard());
         }
@@ -2732,7 +2774,7 @@ impl TileProducer for MapExtractAggregateProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -2900,7 +2942,7 @@ impl TileProducer for MapAggregateProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         if obsolete_guard.is_universal() {
             self.accumulators.clear();
             self.input.release(self.input.tiling().universal_guard());
@@ -3110,7 +3152,7 @@ impl TileProducer for SplitProducer {
                 .iter()
                 .fold(self.tiling().universal_guard(), |acc, g| acc.intersect(g))
         };
-        debug!("{} releasing: {result:?}", self.name());
+        trace!("{} releasing: {result:?}", self.name());
         self.shared
             .borrow_mut()
             .producer
@@ -3181,7 +3223,7 @@ impl TileProducer for MemoProducer {
         let input = self.input.get(projection_guard);
         trace!("{} received {input:?}", self.name());
         let upstream_obsolete = input.to_guard();
-        debug!("{} releasing {upstream_obsolete:?}", self.name());
+        trace!("{} releasing {upstream_obsolete:?}", self.name());
         self.input.release(upstream_obsolete);
         trace!(
             "{} merging {input:?} into {:?}",
@@ -3193,7 +3235,7 @@ impl TileProducer for MemoProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("Release called on {}: {obsolete_guard:?}", self.name());
+        trace!("Release called on {}: {obsolete_guard:?}", self.name());
         // Remove any released data from the cached tile since the consumer
         // is no longer interested.
         self.cached_tile.remove_guarded(obsolete_guard.clone());
@@ -3279,7 +3321,7 @@ impl TileProducer for ConstantProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         if obsolete_guard.is_universal() {
             self.released = true;
         }
@@ -3371,7 +3413,7 @@ impl TileProducer for ToScalarProducer {
     }
 
     fn release(&mut self, obsolete_guard: TileGuard) {
-        debug!("{} release: {obsolete_guard:?}", self.name());
+        trace!("{} release: {obsolete_guard:?}", self.name());
         // The input is always read in full (universal guard), so only a universal
         // release can be propagated meaningfully.
         if obsolete_guard.is_universal() {

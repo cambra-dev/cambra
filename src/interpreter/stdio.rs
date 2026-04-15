@@ -159,7 +159,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         } else {
             Predicate::LessThanEq(Value::UInt(self.ready_size - 1))
         };
-        debug!("StdinDataSource yielding {predicate:?}");
+        trace!("StdinDataSource yielding {predicate:?}");
         predicate
     }
 
@@ -209,7 +209,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
         for pred in self.obsolete_predicates.values() {
             obsolete = obsolete.intersect(pred);
         }
-        debug!("StdinDataSource::release: {obsolete:?}");
+        trace!("StdinDataSource::release: {obsolete:?}");
         match &obsolete {
             Predicate::LessThanEq(Value::UInt(i)) => self.release_index(*i),
             Predicate::True => self.close(),

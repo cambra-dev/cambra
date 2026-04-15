@@ -26,6 +26,7 @@ use cambra::interpreter::{
     sort_sealed_function_by_domain, tuple_field, BaseType, ColumnValue, Consumer, Extent,
     Predicate, TestDataSource, Tile, Value,
 };
+use cambra::pretty_graph::pretty_tile_operator;
 use rstest_log::rstest;
 use smol_str::SmolStr;
 
@@ -866,6 +867,19 @@ fn test_incremental_aggregates() {
             domain_predicate: Predicate::True
         })
     );
+}
+
+// Test that we don't have splits in the operator graph for simple binops
+#[rstest]
+#[case("[1 + x + 1 for x in [1,2,3]]")]
+#[case("[(x, x)[0] + 2 for x in [1,2,3]]")]
+#[case("[(x, 0) for x in [1,2,3]]")]
+#[case("[x for x in [1,2,3] if x + 1 < 2]")]
+#[case("1 + 2 + 3")]
+fn test_no_splits(#[case] code: &str) {
+    let op = compile_program(&mut GlobalContext::default(), code, Box::new(|| {})).1;
+    let op_str = pretty_tile_operator(op.as_ref());
+    assert!(!op_str.contains("Split#"), "found split in {op_str}");
 }
 
 #[rstest]

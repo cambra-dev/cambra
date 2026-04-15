@@ -8,8 +8,9 @@ use crate::{
     interpreter::{
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, IterateExtent, MapAggregate,
-            MapDomain, MapExtractAggregate, MapResult, MapResultToConst, MapResultWithSource, Memo,
-            Restrict, ScalarTuple, Splitter, TileOperator, Tiling, Uncurry, Zip,
+            MapDomain, MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
+            MapResultWithSource, Memo, Restrict, ScalarTuple, Splitter, TileOperator, Tiling,
+            Uncurry, Zip,
         },
         tuple_field, ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
         DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
@@ -271,7 +272,11 @@ fn convert_impl(
             let input =
                 input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
             let const_op = convert_impl(argument, None, None, ctx)?;
-            Ok(Box::new(MapResultToConst::new(input, const_op)))
+            Ok(Box::new(MapResultToConst::new(
+                input,
+                const_op,
+                MapResultToConstMode::Replace,
+            )))
         }
 
         // zip(f, g, ...): fan-out — apply each morphism to the same inut.
@@ -285,13 +290,31 @@ fn convert_impl(
             };
             let input =
                 input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
-            // Wrap input in Split so every branch shares the same upstream producer.
-            let split = Rc::new(Splitter::new(input));
-            let mut ops = Vec::new();
-            for elt in elts {
-                ops.push(convert_impl(elt, Some(split.split()), None, ctx)?);
+
+            let consts: Vec<_> = elts.iter().map(is_const).collect();
+            if elts.len() == 2 && consts.iter().any(Option::is_some) {
+                // Check for zip-with-const and optimize
+                let (const_idx, mode) = if consts[0].is_some() {
+                    (0, MapResultToConstMode::ZipLeft)
+                } else {
+                    (1, MapResultToConstMode::ZipRight)
+                };
+                let non_const_arm = convert_impl(&elts[1 - const_idx], Some(input), None, ctx)?;
+                let const_arm = convert_impl(consts[const_idx].unwrap(), None, None, ctx)?;
+                Ok(Box::new(MapResultToConst::new(
+                    non_const_arm,
+                    const_arm,
+                    mode,
+                )))
+            } else {
+                // Wrap input in Split so every branch shares the same upstream producer.
+                let split = Rc::new(Splitter::new(input));
+                let mut ops = Vec::new();
+                for elt in elts {
+                    ops.push(convert_impl(elt, Some(split.split()), None, ctx)?);
+                }
+                Ok(Box::new(Zip::new(ops)))
             }
-            Ok(Box::new(Zip::new(ops)))
         }
 
         // Because MapResultToConst handles mapping at any depth of currying, map is a pass through and we just convert the argument
@@ -748,4 +771,14 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
             "Proj applied to non-record extent {other:?}"
         ))),
     }
+}
+
+// Returns x if the expr is x ▷ const, None otherwise
+fn is_const(expr: &Expr) -> Option<&Expr> {
+    if let TypedExprNode::Apply { function, argument } = &expr.node {
+        if matches!(&function.node, TypedExprNode::Var(n) if n == "const") {
+            return Some(argument.as_ref());
+        }
+    }
+    None
 }

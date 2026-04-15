@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use intervalsets::ops::Contains;
-use log::{debug, trace};
+use log::trace;
 
 use crate::{
     ccl::Type,
@@ -125,7 +125,7 @@ impl DataSourceDomainExtentImpl for TestDataSource {
     }
 
     fn release(&mut self, producer: &str, mut obsolete: Predicate) {
-        debug!(
+        trace!(
             "TestDataSource::release: {obsolete:?} with obsolete predicates: {:?}",
             self.obsolete_predicates
         );
@@ -137,7 +137,7 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         for pred in self.obsolete_predicates.values() {
             obsolete = obsolete.intersect(pred);
         }
-        debug!("TestDataSource::release: intersected to {obsolete:?}");
+        trace!("TestDataSource::release: intersected to {obsolete:?}");
         self.data
             .retain(|k, _| !key_matches_predicate(k, &obsolete));
     }
