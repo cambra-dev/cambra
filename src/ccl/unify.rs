@@ -263,8 +263,8 @@ impl UnificationTable {
             // each.
             // TODO implement the below logic for records too.
             (Some(Type::PartialTuple(mut a_elts)), Some(Type::PartialTuple(mut b_elts))) => {
-                a_elts.sort_by(|(l, _), (r, _)| l.cmp(r));
-                b_elts.sort_by(|(l, _), (r, _)| l.cmp(r));
+                a_elts.sort_by_key(|(i, _)| *i);
+                b_elts.sort_by_key(|(i, _)| *i);
                 let idx_a = root_a.0 as usize;
                 let idx_b = root_b.0 as usize;
                 let mut i_a = a_elts.iter();
