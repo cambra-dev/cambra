@@ -291,8 +291,8 @@ fn is_free_in_type(param: &str, ty: &Type) -> bool {
         Type::Fun(domain, codomain) => {
             is_free_in_type(param, domain) || is_free_in_type(param, codomain)
         }
-        Type::Tuple(elts) => elts.iter().all(|e| is_free_in_type(param, e)),
-        Type::Record(elts) => elts.iter().all(|(_, e)| is_free_in_type(param, e)),
+        Type::Tuple(elts) => elts.iter().any(|e| is_free_in_type(param, e)),
+        Type::Record(elts) => elts.iter().any(|(_, e)| is_free_in_type(param, e)),
         _ => false,
     }
 }
@@ -1486,6 +1486,46 @@ mod tests {
             eliminated.ty,
             fun_ty(y_ty.clone(), y_ty.clone()),
             "Result of eliminating λ y → y should be id: Int → Int"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_free / is_free_in_type
+    // -----------------------------------------------------------------------
+
+    /// Regression test: `is_free_in_type` must use `any`, not `all`, for tuples.
+    ///
+    /// A variable is free in a tuple type if it appears in ANY component.
+    /// The old bug used `.all()`, so a variable appearing in only one component
+    /// of a multi-element tuple type would not be detected as free, causing
+    /// `substitute` to silently skip the substitution.
+    #[test]
+    fn is_free_detects_var_in_partial_tuple_refinement() {
+        use crate::ccl::{next_refinement_id, Refinement, RefinementKind};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // pred = Var("x") — the refinement predicate references x.
+        let pred = Rc::new(RefCell::new(Expr::var("x")));
+        let refinement = Refinement {
+            id: next_refinement_id(),
+            description: "test".to_string(),
+            kind: RefinementKind::Predicate(pred),
+        };
+
+        // Tuple([Int, Refinement(Int, pred_x)]): x only appears in the second component.
+        let tuple_ty = Type::Tuple(vec![
+            int_ty(),
+            Type::Refinement(Box::new(int_ty()), refinement),
+        ]);
+
+        // Lit(42) typed with the tuple above — the expression node has no free vars,
+        // so the result depends entirely on is_free_in_type finding x in the type.
+        let expr = Expr::lit(Lit::Int(42)).with_ty(tuple_ty);
+
+        assert!(
+            is_free("x", &expr),
+            "x should be free: it appears in the refinement of the second tuple component"
         );
     }
 }
