@@ -290,7 +290,6 @@ fn convert_impl(
             };
             let input =
                 input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
-
             let consts: Vec<_> = elts.iter().map(is_const).collect();
             if elts.len() == 2 && consts.iter().any(Option::is_some) {
                 // Check for zip-with-const and optimize
@@ -308,7 +307,7 @@ fn convert_impl(
                 )))
             } else {
                 // Wrap input in Split so every branch shares the same upstream producer.
-                let split = Rc::new(Splitter::new(input));
+                let split = Rc::new(Splitter::new(Box::new(Memo::new(input))));
                 let mut ops = Vec::new();
                 for elt in elts {
                     ops.push(convert_impl(elt, Some(split.split()), None, ctx)?);

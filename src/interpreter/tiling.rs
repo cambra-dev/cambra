@@ -12,8 +12,8 @@ use std::{
 use bit_vec::BitVec;
 use intervalsets::{
     numeric::Domain,
-    ops::{Contains, Intersection, Union},
-    Interval, IntervalSet, MaybeEmpty, Side,
+    ops::{Complement, Contains, Difference, Intersection, Union},
+    Bounding, Interval, IntervalSet, MaybeEmpty, Side,
 };
 
 use crate::{
@@ -240,6 +240,8 @@ pub enum Tile {
         /// Codomain of the function expressed as an implicitly-vectorized Tile.
         codomain: Box<Tile>,
         /// Represents a region of the codomain for which no new elements will ever be seen.
+        /// Calls to `get` can still return tiles with data in this region, but such data is guaranteed to
+        /// be the same as data already observed.
         domain_predicate: Predicate,
     },
     /// A two-level curried function.
@@ -529,14 +531,11 @@ impl Tile {
                 }
             }
             // SealedFunction: remove domain+codomain entries whose domain value is in the predicate.
-            // `domain_predicate` is deliberately NOT updated here: it tracks upstream-committed
-            // rows (set via `merge`) and remaining rows are already covered by `from_cv(domain)`
-            // in `to_guard()`.  Updating it with `from_cv(remaining)` would be redundant and
-            // would cause it to diverge between tiles that share the same domain but receive
-            // `remove_guarded` at different times (e.g. the two inputs of a Zip).
             (
                 Tile::SealedFunction {
-                    domain, codomain, ..
+                    domain,
+                    codomain,
+                    domain_predicate: _,
                 },
                 TileGuard::Function(FunctionGuard::Domain(pred)),
             ) => {
@@ -545,6 +544,47 @@ impl Tile {
                     .collect();
                 domain.retain(&mask);
                 codomain.retain(&mask);
+            }
+            // CurriedFunction + Domain: remove entire domain1 groups whose key matches the
+            // predicate, along with all their domain2/codomain rows.
+            (
+                tile @ Tile::CurriedFunction { .. },
+                TileGuard::Function(FunctionGuard::Domain(pred)),
+            ) => {
+                // Borrow the tile to build a flat mask over domain2 rows, then release
+                // so that `retain` can take the mutable borrow.
+                let mask: BitVec = {
+                    let Tile::CurriedFunction {
+                        domain1,
+                        offsets,
+                        domain2,
+                        ..
+                    } = &*tile
+                    else {
+                        unreachable!()
+                    };
+                    let ColumnValue::UInts(offset_vec) = offsets else {
+                        panic!("CurriedFunction offsets must be UInts");
+                    };
+                    let n = domain1.len();
+                    let domain2_total = domain2.len();
+                    let mut mask = BitVec::from_elem(domain2_total, true);
+                    for i in 0..n {
+                        if pred.contains(&domain1.index_at(i)) {
+                            let start = offset_vec[i];
+                            let end = if i + 1 < n {
+                                offset_vec[i + 1]
+                            } else {
+                                domain2_total
+                            };
+                            for j in start..end {
+                                mask.set(j, false);
+                            }
+                        }
+                    }
+                    mask
+                };
+                tile.retain(&mask);
             }
             // CurriedFunction: remove domain2+codomain entries whose domain2 value is in the predicate,
             // and prune any domain1 groups that become empty.
@@ -595,11 +635,16 @@ impl Tile {
             } => TileGuard::Function(FunctionGuard::Domain(
                 Predicate::from_column_value(domain).union(domain_predicate),
             )),
-            Tile::CurriedFunction { domain2, .. } => {
+            Tile::CurriedFunction {
+                domain2,
+                domain_predicate,
+                ..
+            } => TileGuard::flatten_or(vec![
                 TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
                     FunctionGuard::Domain(Predicate::from_column_value(domain2)),
-                ))))
-            }
+                )))),
+                TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
+            ]),
         }
     }
 
@@ -687,13 +732,19 @@ impl TileGuard {
     /// one to avoid gratuitous wrapping.
     /// TODO consolidate redundant arms.
     fn flatten_or(arms: Vec<TileGuard>) -> TileGuard {
-        let flat: Vec<TileGuard> = arms
+        let mut flat: Vec<TileGuard> = arms
             .into_iter()
             .flat_map(|g| match g {
                 TileGuard::Or(inner) => inner,
                 other => vec![other],
             })
             .collect();
+        // Filter empty guards; if all are empty, keep the first as a canonical empty sentinel.
+        if flat.iter().any(|g| !g.is_empty()) {
+            flat.retain(|g| !g.is_empty());
+        } else {
+            flat.truncate(1);
+        }
         match flat.len() {
             0 => unreachable!("flatten_or called with no arms"),
             1 => flat.into_iter().next().unwrap(),
@@ -786,6 +837,56 @@ impl TileGuard {
             TileGuard::Function(g) => g.is_empty(),
             // Or is empty only when every arm is empty.
             TileGuard::Or(arms) => arms.iter().all(TileGuard::is_empty),
+        }
+    }
+
+    /// Check whether this guard is structurally compatible with `tiling`.
+    ///
+    /// A guard is compatible when its variant matches the shape of the tiling
+    /// it was derived from — e.g., a [`TileGuard::Scalar`] guard belongs to a
+    /// [`Tiling::Scalar`] tiling.  Used to assert that a guard passed to
+    /// [`TileProducer::release`] is well-formed.
+    pub fn check_from(&self, tiling: &Tiling) -> bool {
+        match (self, tiling) {
+            (TileGuard::Scalar(_), Tiling::Scalar(_)) => true,
+            (TileGuard::Aggregation(_), Tiling::Aggregation { .. }) => true,
+
+            // SealedFunction tilings can have domain guards which are always allowed, or
+            // codomain guards which match their codomain tiling
+            (
+                TileGuard::Function(FunctionGuard::Domain(pred)),
+                Tiling::SealedFunction { domain, .. },
+            ) => pred.is_applicable_to(domain),
+            (
+                TileGuard::Function(FunctionGuard::Codomain(g)),
+                Tiling::SealedFunction { codomain, .. },
+            ) => g.check_from(codomain.as_ref()),
+
+            // CurrriedFunction tilings support only domain guards or domain(codomain) guards to reference
+            // the inner domain.
+            (
+                TileGuard::Function(FunctionGuard::Domain(pred)),
+                Tiling::CurriedFunction { domain1, .. },
+            ) => pred.is_applicable_to(domain1),
+            (
+                TileGuard::Function(FunctionGuard::Codomain(g)),
+                Tiling::CurriedFunction { domain2, .. },
+            ) => match g.as_ref() {
+                TileGuard::Function(FunctionGuard::Domain(pred)) => pred.is_applicable_to(domain2),
+                _ => false,
+            },
+
+            // Record guards must have the same key set, with each field guard
+            // compatible with the corresponding field tiling.
+            (TileGuard::Record(guard_fields), Tiling::Record(tiling_fields)) => {
+                guard_fields.len() == tiling_fields.len()
+                    && guard_fields
+                        .iter()
+                        .all(|(k, g)| tiling_fields.get(k).is_some_and(|t| g.check_from(t)))
+            }
+            // All arms of an Or must be compatible with the same tiling.
+            (TileGuard::Or(arms), _) => arms.iter().all(|g| g.check_from(tiling)),
+            _ => false,
         }
     }
 }
@@ -908,12 +1009,10 @@ impl Predicate {
         match self {
             Predicate::False => Some(false),
             Predicate::True => Some(true),
-            Predicate::Record(m) if m.iter().all(|(_, p)| p.as_bool().unwrap_or(false)) => {
-                Some(true)
-            }
-            Predicate::Record(m) if m.iter().all(|(_, p)| !p.as_bool().unwrap_or(true)) => {
-                Some(false)
-            }
+            Predicate::Record(m) if m.iter().all(|(_, p)| p.is_true()) => Some(true),
+            Predicate::Record(m) if m.iter().all(|(_, p)| p.is_false()) => Some(false),
+            Predicate::Intervals(i) if i.complement().is_empty() => Some(true),
+            Predicate::Intervals(i) if i.is_empty() => Some(false),
             // Or is true if any arm is true; false if all arms are false.
             Predicate::Or(arms) => {
                 if arms.iter().any(|p| p.as_bool() == Some(true)) {
@@ -926,6 +1025,16 @@ impl Predicate {
             }
             _ => None,
         }
+    }
+
+    // Returns whether `self` is equivalent to Predicate::True
+    pub fn is_true(&self) -> bool {
+        self.as_bool().unwrap_or(false)
+    }
+
+    // Returns whether `self` is equivalent to Predicate::False
+    pub fn is_false(&self) -> bool {
+        !self.as_bool().unwrap_or(true)
     }
 
     pub fn split_record<V>(&self, fields: &HashMap<String, V>) -> HashMap<String, Predicate> {
@@ -1011,6 +1120,85 @@ impl Predicate {
                 Predicate::flatten_or(arms.iter().map(|a| self.intersect(a)).collect())
             }
             _ => panic!("Cannot intersect incompatible predicates: {self:?} and {other:?}"),
+        }
+    }
+
+    /// Returns the predicate that admits values in `self` but not in `other` (set difference).
+    ///
+    /// `self ∖ other = { x | x ∈ self ∧ x ∉ other }`
+    pub fn minus(&self, other: &Predicate) -> Predicate {
+        match (self, other) {
+            // p ∖ ∅ = p
+            (s, o) if o.is_false() => s.clone(),
+            // p ∖ U = ∅
+            (_, o) if o.is_true() => Predicate::False,
+            // ∅ ∖ p = ∅
+            (s, _) if s.is_false() => Predicate::False,
+            // U ∖ Intervals(s): everything not in s — representable as the complement.
+            (s, Predicate::Intervals(i)) if s.is_true() => {
+                let result = i.complement();
+                if result.is_empty() {
+                    Predicate::False
+                } else {
+                    Predicate::Intervals(result)
+                }
+            }
+            // (-∞, v] ∖ Intervals(s): subtract the interval set from the upper-bound half-line.
+            (Predicate::LessThanEq(v), Predicate::Intervals(s)) => {
+                let lhs = IntervalSet::new(vec![Interval::unbound_closed(v.clone())]);
+                let result = lhs.difference(s);
+                if result.is_empty() {
+                    Predicate::False
+                } else {
+                    Predicate::Intervals(result)
+                }
+            }
+            (Predicate::LessThanEq(v), Predicate::LessThanEq(s)) => {
+                let lhs = IntervalSet::new(vec![Interval::unbound_closed(v.clone())]);
+                let rhs = IntervalSet::new(vec![Interval::unbound_closed(s.clone())]);
+                let result = lhs.difference(&rhs);
+                if result.is_empty() {
+                    Predicate::False
+                } else {
+                    Predicate::Intervals(result)
+                }
+            }
+            // Intervals ∖ Intervals: standard set difference.
+            (Predicate::Intervals(a), Predicate::Intervals(b)) => {
+                let result = a.difference(b);
+                if result.is_empty() {
+                    Predicate::False
+                } else {
+                    Predicate::Intervals(result)
+                }
+            }
+            (Predicate::Intervals(a), Predicate::LessThanEq(b)) => {
+                let rhs = IntervalSet::new(vec![Interval::unbound_closed(b.clone())]);
+                let result = a.difference(&rhs);
+                if result.is_empty() {
+                    Predicate::False
+                } else {
+                    Predicate::Intervals(result)
+                }
+            }
+            // Record ∖ Record: subtract field-by-field.
+            (Predicate::Record(m1), Predicate::Record(m2)) => Predicate::Record(
+                m1.iter()
+                    .map(|(k, p1)| (k.clone(), p1.minus(m2.get(k).unwrap_or(&Predicate::False))))
+                    .collect(),
+            ),
+            // Or ∖ p: distribute the subtraction over each arm.
+            (Predicate::Or(arms), _) => {
+                Predicate::flatten_or(arms.iter().map(|a| a.minus(other)).collect())
+            }
+            (s, Predicate::Or(arms)) => {
+                let mut res = s.clone();
+                for arm in arms {
+                    res = res.minus(arm);
+                }
+                res
+            }
+            _ => panic!("Cannot subtract incompatible predicates: {self:?} minus {other:?}"),
         }
     }
 
@@ -1100,21 +1288,22 @@ impl Predicate {
                 .unwrap_or(false),
             // (-∞,v] subsumes an interval set iff every interval in s fits within (-∞,v].
             //
-            // Note: `IntervalSet::contains(&IntervalSet)` has a known bug in the
-            // `intervalsets` crate (it iterates `self` instead of `rhs`), so we
-            // iterate the intervals of the rhs ourselves throughout this method.
+            // All interval-vs-interval containment uses `interval_set_covers`
+            // rather than `.contains` directly — see that function for why.
             (Predicate::LessThanEq(v), Predicate::Intervals(s)) => {
-                let upper = Interval::unbound_closed(v.clone());
-                s.intervals().iter().all(|iv| upper.contains(iv))
+                let upper = IntervalSet::new(vec![Interval::unbound_closed(v.clone())]);
+                s.intervals()
+                    .iter()
+                    .all(|iv| interval_set_covers(&upper, iv))
             }
             // An interval set subsumes (-∞,v] only if it contains the whole half-line.
             (Predicate::Intervals(s), Predicate::LessThanEq(v)) => {
-                s.contains(&Interval::unbound_closed(v.clone()))
+                interval_set_covers(s, &Interval::unbound_closed(v.clone()))
             }
             // Interval set containment: self ⊇ other iff every interval of other
-            // is contained within some interval of self.
+            // is fully covered by self.
             (Predicate::Intervals(a), Predicate::Intervals(b)) => {
-                b.intervals().iter().all(|iv| a.contains(iv))
+                b.intervals().iter().all(|iv| interval_set_covers(a, iv))
             }
             // Record (AND semantics): self ⊇ other iff every field of self subsumes
             // the corresponding field of other.
@@ -1186,6 +1375,87 @@ impl Predicate {
             }
         }
     }
+
+    /// Check whether this predicate is structurally valid for the given [`Extent`].
+    ///
+    /// A predicate is applicable when it makes sense to use it as a filter over
+    /// values drawn from that extent:
+    ///
+    /// - [`Predicate::True`] and [`Predicate::False`] are applicable to any extent.
+    /// - [`Predicate::LessThanEq`] and [`Predicate::Intervals`] are applicable to
+    ///   scalar extents ([`Extent::Base`], [`Extent::UIntRange`]) whose element type
+    ///   matches the predicate's value type.
+    /// - [`Predicate::Record`] is applicable to [`Extent::Record`] when the key sets
+    ///   match and each field predicate is applicable to its field extent.
+    /// - [`Predicate::Or`] is applicable when every arm is applicable to the extent.
+    pub fn is_applicable_to(&self, extent: &Extent) -> bool {
+        // Resolve transparent extent wrappers before matching.
+        let extent = match extent {
+            Extent::DataSourceDomain(src) => src.borrow().element_extent(),
+            Extent::Restricted { base, .. } => *base.clone(),
+            other => other.clone(),
+        };
+        match self {
+            Predicate::True | Predicate::False => true,
+            Predicate::LessThanEq(v) => value_matches_scalar_extent(v, &extent),
+            Predicate::Intervals(s) => {
+                // An empty interval set is semantically False — applicable everywhere.
+                let Some(sample) = s
+                    .intervals()
+                    .first()
+                    .and_then(|iv| iv.lval().or_else(|| iv.rval()))
+                else {
+                    return true;
+                };
+                value_matches_scalar_extent(sample, &extent)
+            }
+            Predicate::Record(pred_fields) => match &extent {
+                Extent::Record(ext_fields) => {
+                    pred_fields.len() == ext_fields.len()
+                        && pred_fields
+                            .iter()
+                            .all(|(k, p)| ext_fields.get(k).is_some_and(|e| p.is_applicable_to(e)))
+                }
+                _ => false,
+            },
+            // Every arm must be applicable to the same extent.
+            Predicate::Or(arms) => arms.iter().all(|p| p.is_applicable_to(&extent)),
+        }
+    }
+}
+
+/// Returns `true` if `set` fully covers `iv` — i.e., every point in `iv` is also in `set`.
+///
+/// This is the safe replacement for `set.contains(iv)` / `outer_interval.contains(iv)`.
+/// The `intervalsets` crate has a bug in `HalfBounded::contains(&HalfBounded)`:
+/// it checks `self.contains(rhs.bound.value())`, which asks whether the bound *point*
+/// is inside `self`.  For equal open bounds this is wrong: `(-∞,1).contains((-∞,1))`
+/// asks `1 < 1 = false`, but `(-∞,1) ⊆ (-∞,1)` is obviously true.
+///
+/// Using `iv.difference(set).is_empty()` is equivalent and does not go through
+/// the buggy code path.  All interval-vs-interval containment checks must use
+/// this helper instead of calling `.contains` directly.
+fn interval_set_covers(set: &IntervalSet<Value>, iv: &Interval<Value>) -> bool {
+    iv.difference(set).is_empty()
+}
+
+/// Returns `true` if `v`'s runtime type is consistent with `extent`'s element type.
+///
+/// Used by [`Predicate::is_applicable_to`] to verify that scalar predicates
+/// ([`Predicate::LessThanEq`], [`Predicate::Intervals`]) are paired with a
+/// matching scalar extent.  `Unit` is excluded because predicates over a single-
+/// valued type are always `True`/`False` — no scalar predicate is ever created
+/// for a Unit column.
+fn value_matches_scalar_extent(v: &Value, extent: &Extent) -> bool {
+    use crate::ccl::BaseType;
+    matches!(
+        (v, extent),
+        (Value::Int(_), Extent::Base(BaseType::Int))
+            | (Value::UInt(_), Extent::Base(BaseType::UInt))
+            | (Value::UInt(_), Extent::UIntRange(_))
+            | (Value::Bool(_), Extent::Base(BaseType::Bool))
+            | (Value::String(_), Extent::Base(BaseType::String))
+    )
 }
 
 /// Converts a slice of values into a `Predicate::Intervals` with adjacent discrete values merged
@@ -1888,6 +2158,55 @@ mod tests {
         assert_eq!(p.as_bool(), None);
     }
 
+    #[test]
+    fn predicate_as_bool_nonempty_intervals_is_none() {
+        // A non-trivial interval set has no boolean representation.
+        let p = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3]));
+        assert_eq!(p.as_bool(), None);
+    }
+
+    #[test]
+    fn predicate_as_bool_empty_interval_set_is_false() {
+        // Directly constructing Intervals(∅): from_column_value on empty input
+        // produces Predicate::False, but interval arithmetic can produce Intervals(∅).
+        let empty: IntervalSet<Value> = IntervalSet::new(vec![]);
+        assert_eq!(Predicate::Intervals(empty).as_bool(), Some(false));
+    }
+
+    // ── Predicate::is_true / is_false ─────────────────────────────────────────
+
+    #[test]
+    fn predicate_is_true_for_true_variant() {
+        assert!(Predicate::True.is_true());
+    }
+
+    #[test]
+    fn predicate_is_true_false_for_false_variant() {
+        assert!(!Predicate::False.is_true());
+    }
+
+    #[test]
+    fn predicate_is_true_false_for_none_case() {
+        // LessThanEq has no boolean representation — is_true returns false.
+        assert!(!Predicate::LessThanEq(Value::Int(5)).is_true());
+    }
+
+    #[test]
+    fn predicate_is_false_for_false_variant() {
+        assert!(Predicate::False.is_false());
+    }
+
+    #[test]
+    fn predicate_is_false_false_for_true_variant() {
+        assert!(!Predicate::True.is_false());
+    }
+
+    #[test]
+    fn predicate_is_false_false_for_none_case() {
+        // LessThanEq has no boolean representation — is_false returns false.
+        assert!(!Predicate::LessThanEq(Value::Int(5)).is_false());
+    }
+
     // ── Predicate::intersect ──────────────────────────────────────────────────
 
     #[test]
@@ -2499,6 +2818,223 @@ mod tests {
         assert!(!Predicate::LessThanEq(Value::UInt(5)).subsumes(&or_pred));
     }
 
+    #[test]
+    fn subsumes_record_with_interval_and_true_field_subsumes_itself() {
+        // Record({"_0": Intervals((-∞,1)), "_1": True}) should subsume itself,
+        // and unioning it with itself should collapse back to the original predicate
+        // rather than producing Or([pred, pred]).
+        let pred = record_pred(&[
+            (
+                "_0",
+                Predicate::Intervals(IntervalSet::new(vec![Interval::unbound_open(Value::UInt(
+                    1,
+                ))])),
+            ),
+            ("_1", Predicate::True),
+        ]);
+        assert!(pred.subsumes(&pred), "a predicate must subsume itself");
+        let union_result = pred.union(&pred);
+        assert_eq!(
+            union_result, pred,
+            "unioning a predicate with itself should return the same predicate, got {union_result:?}"
+        );
+    }
+
+    // ── Predicate::minus ─────────────────────────────────────────────────────
+
+    // Identity / annihilator laws
+
+    #[test]
+    fn minus_p_minus_false_is_identity() {
+        let p = Predicate::LessThanEq(Value::UInt(5));
+        assert_eq!(p.minus(&Predicate::False), p.clone());
+        assert_eq!(Predicate::True.minus(&Predicate::False), Predicate::True);
+        assert_eq!(Predicate::False.minus(&Predicate::False), Predicate::False);
+    }
+
+    #[test]
+    fn minus_p_minus_true_is_false() {
+        assert_eq!(
+            Predicate::LessThanEq(Value::UInt(5)).minus(&Predicate::True),
+            Predicate::False
+        );
+        assert_eq!(Predicate::True.minus(&Predicate::True), Predicate::False);
+    }
+
+    #[test]
+    fn minus_false_minus_anything_is_false() {
+        assert_eq!(
+            Predicate::False.minus(&Predicate::LessThanEq(Value::UInt(5))),
+            Predicate::False
+        );
+        assert_eq!(Predicate::False.minus(&Predicate::True), Predicate::False);
+    }
+
+    // Intervals ∖ Intervals
+
+    #[test]
+    fn minus_intervals_minus_overlapping_intervals_removes_overlap() {
+        // {[1,5]} ∖ {[2,3]} = {[1,1]} ∪ {[4,5]}
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4, 5]));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![2, 3]));
+        let result = a.minus(&b);
+        assert!(result.contains(&Value::UInt(1)));
+        assert!(!result.contains(&Value::UInt(2)));
+        assert!(!result.contains(&Value::UInt(3)));
+        assert!(result.contains(&Value::UInt(4)));
+        assert!(result.contains(&Value::UInt(5)));
+    }
+
+    #[test]
+    fn minus_intervals_minus_superset_is_false() {
+        // {[1,2]} ∖ {[1,3]} = ∅
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2]));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3]));
+        assert_eq!(a.minus(&b), Predicate::False);
+    }
+
+    #[test]
+    fn minus_intervals_minus_disjoint_is_unchanged() {
+        // {[1,3]} ∖ {[5,7]} = {[1,3]}
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3]));
+        let b = Predicate::from_column_value(&ColumnValue::UInts(vec![5, 6, 7]));
+        let result = a.minus(&b);
+        assert!(result.contains(&Value::UInt(1)));
+        assert!(result.contains(&Value::UInt(3)));
+        assert!(!result.contains(&Value::UInt(5)));
+    }
+
+    // Intervals ∖ LessThanEq
+
+    #[test]
+    fn minus_intervals_minus_less_than_eq() {
+        // {[1,5]} ∖ (-∞,3] = {[4,5]}
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4, 5]));
+        let result = a.minus(&Predicate::LessThanEq(Value::UInt(3)));
+        assert!(!result.contains(&Value::UInt(1)));
+        assert!(!result.contains(&Value::UInt(3)));
+        assert!(result.contains(&Value::UInt(4)));
+        assert!(result.contains(&Value::UInt(5)));
+        assert!(!result.contains(&Value::UInt(6)));
+    }
+
+    // LessThanEq ∖ Intervals
+
+    #[test]
+    fn minus_less_than_eq_minus_intervals_removes_overlap() {
+        // (-∞,10] ∖ {[3,5]} = (-∞,2] ∪ {[6,10]}
+        let intervals = Predicate::from_column_value(&ColumnValue::UInts(vec![3, 4, 5]));
+        let result = Predicate::LessThanEq(Value::UInt(10)).minus(&intervals);
+        assert!(result.contains(&Value::UInt(1)));
+        assert!(!result.contains(&Value::UInt(3)));
+        assert!(!result.contains(&Value::UInt(5)));
+        assert!(result.contains(&Value::UInt(6)));
+        assert!(result.contains(&Value::UInt(10)));
+        assert!(!result.contains(&Value::UInt(11)));
+    }
+
+    // LessThanEq ∖ LessThanEq
+
+    #[test]
+    fn minus_less_than_eq_minus_same_is_false() {
+        // (-∞,5] ∖ (-∞,5] = ∅
+        let p = Predicate::LessThanEq(Value::UInt(5));
+        assert_eq!(p.minus(&p.clone()), Predicate::False);
+    }
+
+    #[test]
+    fn minus_less_than_eq_minus_smaller_is_open_interval() {
+        // (-∞,5] ∖ (-∞,3] = (3,5] — contains 4, 5 but not 3 or 6.
+        let result =
+            Predicate::LessThanEq(Value::UInt(5)).minus(&Predicate::LessThanEq(Value::UInt(3)));
+        assert!(!result.contains(&Value::UInt(3)));
+        assert!(result.contains(&Value::UInt(4)));
+        assert!(result.contains(&Value::UInt(5)));
+        assert!(!result.contains(&Value::UInt(6)));
+    }
+
+    #[test]
+    fn minus_less_than_eq_minus_larger_is_false() {
+        // (-∞,3] ∖ (-∞,5] = ∅
+        let result =
+            Predicate::LessThanEq(Value::UInt(3)).minus(&Predicate::LessThanEq(Value::UInt(5)));
+        assert_eq!(result, Predicate::False);
+    }
+
+    // True ∖ Intervals
+
+    #[test]
+    fn minus_true_minus_intervals_is_complement() {
+        // U ∖ {[0,5]} = (5,∞)
+        let s = Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1, 2, 3, 4, 5]));
+        let result = Predicate::True.minus(&s);
+        assert!(!result.contains(&Value::UInt(3)));
+        assert!(result.contains(&Value::UInt(100)));
+    }
+
+    // Record ∖ Record
+
+    #[test]
+    fn minus_record_minus_record_field_by_field() {
+        // Record({a:[1,2,3], b:True}) ∖ Record({a:[2], b:False}) = Record({a:[1,3], b:True})
+        let a = record_pred(&[
+            (
+                "a",
+                Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3])),
+            ),
+            ("b", Predicate::True),
+        ]);
+        let b = record_pred(&[
+            (
+                "a",
+                Predicate::from_column_value(&ColumnValue::UInts(vec![2])),
+            ),
+            ("b", Predicate::False),
+        ]);
+        let result = a.minus(&b);
+        let Predicate::Record(fields) = result else {
+            panic!("expected Record, got {result:?}");
+        };
+        assert!(fields["a"].contains(&Value::UInt(1)));
+        assert!(!fields["a"].contains(&Value::UInt(2)));
+        assert!(fields["a"].contains(&Value::UInt(3)));
+        assert_eq!(fields["b"], Predicate::True);
+    }
+
+    // Or ∖ p (distributive)
+
+    #[test]
+    fn minus_or_distributes_over_arms() {
+        // Or([{1,2}, {4,5}]) ∖ {2} = Or([{1}, {4,5}])
+        let or_pred = Predicate::Or(vec![
+            Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2])),
+            Predicate::from_column_value(&ColumnValue::UInts(vec![4, 5])),
+        ]);
+        let result = or_pred.minus(&Predicate::from_column_value(&ColumnValue::UInts(vec![2])));
+        assert!(result.contains(&Value::UInt(1)));
+        assert!(!result.contains(&Value::UInt(2)));
+        assert!(result.contains(&Value::UInt(4)));
+        assert!(result.contains(&Value::UInt(5)));
+    }
+
+    // p ∖ Or (iterative)
+
+    #[test]
+    fn minus_p_minus_or_subtracts_all_arms() {
+        // {[1,5]} ∖ Or([{2}, {4}]) = {1,3,5}
+        let a = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2, 3, 4, 5]));
+        let or_b = Predicate::Or(vec![
+            Predicate::from_column_value(&ColumnValue::UInts(vec![2])),
+            Predicate::from_column_value(&ColumnValue::UInts(vec![4])),
+        ]);
+        let result = a.minus(&or_b);
+        assert!(result.contains(&Value::UInt(1)));
+        assert!(!result.contains(&Value::UInt(2)));
+        assert!(result.contains(&Value::UInt(3)));
+        assert!(!result.contains(&Value::UInt(4)));
+        assert!(result.contains(&Value::UInt(5)));
+    }
+
     // ── helpers for merge / to_guard / remove_guarded tests ──────────────────
 
     /// A SealedFunction tile mapping `domain` ints to `codomain` ints.
@@ -2682,6 +3218,43 @@ mod tests {
     }
 
     #[test]
+    fn to_guard_curried_function_nonempty_domain_predicate_produces_or() {
+        // When domain_predicate is non-False it should appear as a second arm of an Or
+        // alongside the domain2-derived codomain guard.
+        let pred = Predicate::LessThanEq(Value::UInt(0));
+        let tile = cf_uint_int(vec![0], vec![0], vec![10, 11], vec![100, 110], pred.clone());
+        let guard = tile.to_guard();
+        // Expect Or([Codomain(Domain(domain2_pred)), Domain(pred)])
+        let TileGuard::Or(arms) = guard else {
+            panic!("expected Or guard when domain_predicate is non-False, got {guard:?}");
+        };
+        assert_eq!(arms.len(), 2);
+        // One arm covers domain1 (the released-region predicate).
+        assert!(arms
+            .iter()
+            .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Domain(_)))));
+        // One arm covers domain2 (the codomain inner guard).
+        assert!(arms
+            .iter()
+            .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Codomain(_)))));
+    }
+
+    #[test]
+    fn to_guard_curried_function_empty_domain2_filters_codomain_arm() {
+        // When domain2 is empty its guard is Predicate::False (empty).  flatten_or must
+        // filter it out, leaving only the domain1 predicate as a plain Domain guard — not
+        // wrapped in an Or.
+        let pred = Predicate::LessThanEq(Value::UInt(5));
+        let tile = cf_uint_int(vec![], vec![], vec![], vec![], pred.clone());
+        let guard = tile.to_guard();
+        // The codomain arm is empty → filtered; only the domain arm remains.
+        let TileGuard::Function(FunctionGuard::Domain(result_pred)) = guard else {
+            panic!("expected a single Domain guard, got {guard:?}");
+        };
+        assert_eq!(result_pred, pred);
+    }
+
+    #[test]
     fn to_guard_record_recurses() {
         let tile = Tile::Record(HashMap::from([
             ("a".to_string(), Tile::Scalar(ColumnValue::Ints(vec![1]))),
@@ -2778,6 +3351,25 @@ mod tests {
         );
         let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![10, 11]));
         tile.remove_guarded(cf_release_guard(pred));
+        assert_eq!(
+            tile,
+            cf_uint_int(vec![1], vec![0], vec![12], vec![120], Predicate::False)
+        );
+    }
+
+    #[test]
+    fn remove_guarded_curried_function_domain_removes_whole_group() {
+        // d1=[0,1], offsets=[0,2], d2=[10,11,12], cod=[100,110,120]
+        // Remove d1=0 (group 0: d2=[10,11]); group 1 (d2=[12]) survives.
+        let mut tile = cf_uint_int(
+            vec![0, 1],
+            vec![0, 2],
+            vec![10, 11, 12],
+            vec![100, 110, 120],
+            Predicate::False,
+        );
+        let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
+        tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(pred.clone())));
         assert_eq!(
             tile,
             cf_uint_int(vec![1], vec![0], vec![12], vec![120], Predicate::False)
@@ -2960,5 +3552,346 @@ mod tests {
                 Predicate::False
             )
         );
+    }
+
+    // ── TileGuard::check_from ─────────────────────────────────────────────────
+
+    fn domain_guard(p: Predicate) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(p))
+    }
+
+    fn codomain_guard(inner: TileGuard) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Codomain(Box::new(inner)))
+    }
+
+    fn agg_tiling() -> Tiling {
+        Tiling::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: int(),
+        }
+    }
+
+    #[test]
+    fn check_from_scalar_matches_scalar_tiling() {
+        assert!(TileGuard::Scalar(true).check_from(&Tiling::Scalar(int())));
+        assert!(TileGuard::Scalar(false).check_from(&Tiling::Scalar(int())));
+    }
+
+    #[test]
+    fn check_from_scalar_rejects_non_scalar_tiling() {
+        assert!(!TileGuard::Scalar(true).check_from(&sealed(int(), bool_ext())));
+        assert!(!TileGuard::Scalar(true).check_from(&agg_tiling()));
+    }
+
+    #[test]
+    fn check_from_aggregation_matches_aggregation_tiling() {
+        assert!(TileGuard::Aggregation(true).check_from(&agg_tiling()));
+        assert!(TileGuard::Aggregation(false).check_from(&agg_tiling()));
+    }
+
+    #[test]
+    fn check_from_aggregation_rejects_non_aggregation_tiling() {
+        assert!(!TileGuard::Aggregation(true).check_from(&Tiling::Scalar(int())));
+        assert!(!TileGuard::Aggregation(true).check_from(&sealed(int(), bool_ext())));
+    }
+
+    #[test]
+    fn check_from_function_domain_matches_sealed_function_tiling() {
+        assert!(domain_guard(Predicate::True).check_from(&sealed(int(), bool_ext())));
+        assert!(domain_guard(Predicate::False).check_from(&sealed(int(), bool_ext())));
+    }
+
+    #[test]
+    fn check_from_function_codomain_matches_sealed_function_tiling() {
+        // A Codomain(Domain(_)) guard is valid against a SealedFunction whose
+        // codomain is itself a function tiling.
+        let nested = sealed(int(), bool_ext());
+        let outer = Tiling::SealedFunction {
+            domain: int(),
+            codomain: Box::new(nested),
+        };
+        let g = codomain_guard(domain_guard(Predicate::True));
+        assert!(g.check_from(&outer));
+    }
+
+    #[test]
+    fn check_from_function_codomain_scalar_against_sealed_function_tiling() {
+        // Codomain(Scalar) is valid when the sealed function's codomain is a scalar.
+        let g = codomain_guard(TileGuard::Scalar(true));
+        assert!(g.check_from(&sealed(int(), bool_ext())));
+    }
+
+    #[test]
+    fn check_from_function_codomain_wrong_shape_against_sealed_function_tiling() {
+        // Codomain(Aggregation) against a sealed function with scalar codomain must fail.
+        let g = codomain_guard(TileGuard::Aggregation(true));
+        assert!(!g.check_from(&sealed(int(), bool_ext())));
+    }
+
+    #[test]
+    fn check_from_function_domain_matches_curried_function_tiling() {
+        assert!(domain_guard(Predicate::True).check_from(&curried(range(4), int(), int())));
+    }
+
+    #[test]
+    fn check_from_function_codomain_domain_matches_curried_function_tiling() {
+        // Codomain(Domain(_)) is the canonical way to address the inner domain of
+        // a CurriedFunction.
+        let g = codomain_guard(domain_guard(Predicate::True));
+        assert!(g.check_from(&curried(range(4), int(), int())));
+    }
+
+    #[test]
+    fn check_from_function_codomain_scalar_rejects_curried_function_tiling() {
+        // Codomain(Scalar) is not a valid guard shape for a CurriedFunction.
+        let g = codomain_guard(TileGuard::Scalar(true));
+        assert!(!g.check_from(&curried(range(4), int(), int())));
+    }
+
+    #[test]
+    fn check_from_function_guard_rejects_scalar_tiling() {
+        assert!(!domain_guard(Predicate::True).check_from(&Tiling::Scalar(int())));
+        assert!(!codomain_guard(domain_guard(Predicate::True)).check_from(&Tiling::Scalar(int())));
+    }
+
+    #[test]
+    fn check_from_record_matches_record_tiling_with_same_keys() {
+        let tiling = record_tiling(&[("x", Tiling::Scalar(int())), ("y", agg_tiling())]);
+        let guard = TileGuard::Record(
+            [
+                ("x".to_string(), TileGuard::Scalar(true)),
+                ("y".to_string(), TileGuard::Aggregation(false)),
+            ]
+            .into(),
+        );
+        assert!(guard.check_from(&tiling));
+    }
+
+    #[test]
+    fn check_from_record_rejects_missing_key() {
+        let tiling = record_tiling(&[("x", Tiling::Scalar(int())), ("y", Tiling::Scalar(int()))]);
+        // Guard only has "x", not "y".
+        let guard = TileGuard::Record([("x".to_string(), TileGuard::Scalar(true))].into());
+        assert!(!guard.check_from(&tiling));
+    }
+
+    #[test]
+    fn check_from_record_rejects_wrong_field_shape() {
+        let tiling = record_tiling(&[("x", Tiling::Scalar(int()))]);
+        // "x" field guard is Aggregation but tiling says Scalar.
+        let guard = TileGuard::Record([("x".to_string(), TileGuard::Aggregation(true))].into());
+        assert!(!guard.check_from(&tiling));
+    }
+
+    #[test]
+    fn check_from_record_rejects_extra_key() {
+        let tiling = record_tiling(&[("x", Tiling::Scalar(int()))]);
+        let guard = TileGuard::Record(
+            [
+                ("x".to_string(), TileGuard::Scalar(true)),
+                ("y".to_string(), TileGuard::Scalar(true)),
+            ]
+            .into(),
+        );
+        assert!(!guard.check_from(&tiling));
+    }
+
+    #[test]
+    fn check_from_or_all_arms_compatible() {
+        let tiling = Tiling::Scalar(int());
+        let guard = TileGuard::Or(vec![TileGuard::Scalar(true), TileGuard::Scalar(false)]);
+        assert!(guard.check_from(&tiling));
+    }
+
+    #[test]
+    fn check_from_or_rejects_when_any_arm_incompatible() {
+        let tiling = Tiling::Scalar(int());
+        // Second arm is an Aggregation guard, which does not match a Scalar tiling.
+        let guard = TileGuard::Or(vec![TileGuard::Scalar(true), TileGuard::Aggregation(true)]);
+        assert!(!guard.check_from(&tiling));
+    }
+
+    // ── Predicate::is_applicable_to ───────────────────────────────────────────
+
+    fn uint_ext() -> Extent {
+        Extent::Base(BaseType::UInt)
+    }
+
+    fn str_ext() -> Extent {
+        Extent::Base(BaseType::String)
+    }
+
+    fn unit_ext() -> Extent {
+        Extent::Base(BaseType::Unit)
+    }
+
+    fn record_ext(fields: &[(&str, Extent)]) -> Extent {
+        Extent::Record(
+            fields
+                .iter()
+                .map(|(k, e)| (k.to_string(), e.clone()))
+                .collect(),
+        )
+    }
+
+    fn int_intervals(values: &[i64]) -> Predicate {
+        Predicate::from_column_value(&ColumnValue::Ints(values.to_vec()))
+    }
+
+    fn uint_intervals(values: &[usize]) -> Predicate {
+        Predicate::from_column_value(&ColumnValue::UInts(values.to_vec()))
+    }
+
+    // True / False
+
+    #[test]
+    fn applicable_true_to_any_extent() {
+        assert!(Predicate::True.is_applicable_to(&int()));
+        assert!(Predicate::True.is_applicable_to(&bool_ext()));
+        assert!(Predicate::True.is_applicable_to(&str_ext()));
+        assert!(Predicate::True.is_applicable_to(&unit_ext()));
+        assert!(Predicate::True.is_applicable_to(&range(4)));
+        assert!(Predicate::True.is_applicable_to(&record_ext(&[("x", int())])));
+    }
+
+    #[test]
+    fn applicable_false_to_any_extent() {
+        assert!(Predicate::False.is_applicable_to(&int()));
+        assert!(Predicate::False.is_applicable_to(&unit_ext()));
+        assert!(Predicate::False.is_applicable_to(&record_ext(&[("x", int())])));
+    }
+
+    // LessThanEq
+
+    #[test]
+    fn applicable_less_than_eq_int_to_int_extent() {
+        assert!(Predicate::LessThanEq(Value::Int(5)).is_applicable_to(&int()));
+    }
+
+    #[test]
+    fn applicable_less_than_eq_uint_to_uint_extent() {
+        assert!(Predicate::LessThanEq(Value::UInt(5)).is_applicable_to(&uint_ext()));
+    }
+
+    #[test]
+    fn applicable_less_than_eq_uint_to_uint_range_extent() {
+        assert!(Predicate::LessThanEq(Value::UInt(3)).is_applicable_to(&range(10)));
+    }
+
+    #[test]
+    fn applicable_less_than_eq_bool_to_bool_extent() {
+        assert!(Predicate::LessThanEq(Value::Bool(true)).is_applicable_to(&bool_ext()));
+    }
+
+    #[test]
+    fn applicable_less_than_eq_string_to_string_extent() {
+        assert!(Predicate::LessThanEq(Value::String("z".into())).is_applicable_to(&str_ext()));
+    }
+
+    #[test]
+    fn applicable_less_than_eq_int_rejects_bool_extent() {
+        assert!(!Predicate::LessThanEq(Value::Int(5)).is_applicable_to(&bool_ext()));
+    }
+
+    #[test]
+    fn applicable_less_than_eq_int_rejects_uint_extent() {
+        assert!(!Predicate::LessThanEq(Value::Int(5)).is_applicable_to(&uint_ext()));
+    }
+
+    #[test]
+    fn applicable_less_than_eq_int_rejects_record_extent() {
+        assert!(
+            !Predicate::LessThanEq(Value::Int(5)).is_applicable_to(&record_ext(&[("x", int())]))
+        );
+    }
+
+    // Intervals
+
+    #[test]
+    fn applicable_int_intervals_to_int_extent() {
+        assert!(int_intervals(&[1, 2, 3]).is_applicable_to(&int()));
+    }
+
+    #[test]
+    fn applicable_uint_intervals_to_uint_extent() {
+        assert!(uint_intervals(&[0, 1]).is_applicable_to(&uint_ext()));
+    }
+
+    #[test]
+    fn applicable_uint_intervals_to_uint_range_extent() {
+        assert!(uint_intervals(&[0, 1]).is_applicable_to(&range(4)));
+    }
+
+    #[test]
+    fn applicable_int_intervals_rejects_bool_extent() {
+        assert!(!int_intervals(&[0, 1]).is_applicable_to(&bool_ext()));
+    }
+
+    #[test]
+    fn applicable_int_intervals_rejects_record_extent() {
+        assert!(!int_intervals(&[1]).is_applicable_to(&record_ext(&[("x", int())])));
+    }
+
+    #[test]
+    fn applicable_empty_intervals_to_any_extent() {
+        // False (empty intervals) is applicable everywhere.
+        assert_eq!(uint_intervals(&[]), Predicate::False);
+        assert!(Predicate::False.is_applicable_to(&int()));
+        assert!(Predicate::False.is_applicable_to(&record_ext(&[("x", int())])));
+    }
+
+    // Record
+
+    #[test]
+    fn applicable_record_predicate_to_matching_record_extent() {
+        let pred = Predicate::Record(
+            [
+                ("x".to_string(), Predicate::True),
+                ("y".to_string(), Predicate::False),
+            ]
+            .into(),
+        );
+        assert!(pred.is_applicable_to(&record_ext(&[("x", int()), ("y", bool_ext())])));
+    }
+
+    #[test]
+    fn applicable_record_predicate_with_typed_fields() {
+        let pred = Predicate::Record([("n".to_string(), int_intervals(&[1, 2]))].into());
+        assert!(pred.is_applicable_to(&record_ext(&[("n", int())])));
+    }
+
+    #[test]
+    fn applicable_record_predicate_rejects_missing_key() {
+        let pred = Predicate::Record([("x".to_string(), Predicate::True)].into());
+        // Record extent has "x" and "y" but the predicate only covers "x".
+        assert!(!pred.is_applicable_to(&record_ext(&[("x", int()), ("y", int())])));
+    }
+
+    #[test]
+    fn applicable_record_predicate_rejects_wrong_field_type() {
+        // "x" field predicate is an Int interval but the extent says Bool.
+        let pred = Predicate::Record([("x".to_string(), int_intervals(&[1]))].into());
+        assert!(!pred.is_applicable_to(&record_ext(&[("x", bool_ext())])));
+    }
+
+    #[test]
+    fn applicable_record_predicate_rejects_scalar_extent() {
+        let pred = Predicate::Record([("x".to_string(), Predicate::True)].into());
+        assert!(!pred.is_applicable_to(&int()));
+    }
+
+    // Or
+
+    #[test]
+    fn applicable_or_all_arms_compatible() {
+        let pred = Predicate::Or(vec![int_intervals(&[1]), int_intervals(&[3])]);
+        assert!(pred.is_applicable_to(&int()));
+    }
+
+    #[test]
+    fn applicable_or_rejects_when_any_arm_incompatible() {
+        // One arm is an Int interval, the other is a UInt interval — mismatch against int().
+        let pred = Predicate::Or(vec![int_intervals(&[1]), uint_intervals(&[2])]);
+        assert!(!pred.is_applicable_to(&int()));
     }
 }

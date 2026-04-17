@@ -752,6 +752,110 @@ fn test_inner_join(#[case] code: &str) {
     );
 }
 
+/// Simpler version of test_inner_join to make it easier to debug.
+#[rstest]
+#[case("[x + y for x in source1() for y in source2() if x == y]")]
+#[case("[x + y for x in source1() for y in source2() if x == y and True]")]
+fn test_incremental_join_simple(#[case] code: &str) {
+    let mut ctx = GlobalContext::default();
+
+    let src1 = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    let src2 = Rc::new(RefCell::new(TestDataSource::new(
+        "source2",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_test_source(src1.clone());
+    ctx.register_test_source(src2.clone());
+
+    src1.borrow_mut()
+        .add_data(&[(Value::UInt(1), Value::Int(100))]);
+    src1.borrow_mut()
+        .set_yield_predicate(Predicate::LessThanEq(Value::from(1usize)));
+    src2.borrow_mut()
+        .add_data(&[(Value::UInt(10), Value::Int(100))]);
+    src2.borrow_mut()
+        .set_yield_predicate(Predicate::LessThanEq(Value::from(10usize)));
+
+    let notified = Rc::new(RefCell::new(false));
+    let notified_clone = notified.clone();
+    let consumer: Box<dyn Consumer> = Box::new(move || {
+        *notified_clone.borrow_mut() = true;
+    });
+    let (_, _, mut producer) = compile_program(&mut ctx, code, consumer);
+    ctx.scheduler().check_for_notifications();
+    assert!(*notified.borrow());
+    let tile = producer.get(producer.tiling().universal_guard());
+    *notified.borrow_mut() = false;
+
+    // Unpack SealedFunction where:
+    //   domain   = Records { _0: UInts (src1 domain key), _1: UInts (src2 domain key) }
+    //   codomain = Record  { _0: Scalar(Ints src1 value), _1: Scalar(Ints src2 value) }
+    fn extract_rows(tile: Tile) -> Vec<((usize, usize), i64)> {
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("expected SealedFunction, got {tile:?}");
+        };
+        let ColumnValue::Records(mut df) = domain else {
+            panic!("expected Records domain, got {domain:?}");
+        };
+        let Tile::Scalar(ColumnValue::Ints(codomain)) = *codomain else {
+            panic!("expected Ints codomain");
+        };
+        let ColumnValue::UInts(d0) = df.remove("_0").unwrap() else {
+            panic!("domain._0 not UInts");
+        };
+        let ColumnValue::UInts(d1) = df.remove("_1").unwrap() else {
+            panic!("domain._1 not UInts");
+        };
+        let mut rows: Vec<((usize, usize), i64)> = d0.into_iter().zip(d1).zip(codomain).collect();
+        rows.sort_by_key(|(k, _)| *k);
+        rows
+    }
+
+    assert_eq!(extract_rows(tile), vec![((1, 10), 200)]);
+
+    // Phase 2: extend src1 with a second element; src2 is unchanged.
+    src2.borrow_mut()
+        .add_data(&[(Value::UInt(20), Value::Int(100))]);
+    src2.borrow_mut()
+        .set_yield_predicate(Predicate::LessThanEq(Value::from(20usize)));
+
+    ctx.scheduler().check_for_notifications();
+    assert!(*notified.borrow());
+    let tile = producer.get(producer.tiling().universal_guard());
+
+    // Cross-product of src1={10, 30} × src2={20}: two pairs.
+    assert_eq!(extract_rows(tile), vec![((1, 10), 200), ((1, 20), 200)]);
+
+    // Phase 3: extend src2 with a second element; src1 is unchanged.
+    src1.borrow_mut()
+        .add_data(&[(Value::UInt(2), Value::Int(100))]);
+    src1.borrow_mut()
+        .set_yield_predicate(Predicate::LessThanEq(Value::from(2usize)));
+
+    ctx.scheduler().check_for_notifications();
+    assert!(*notified.borrow());
+    let tile = producer.get(producer.tiling().universal_guard());
+
+    // Cross-product of src1={10, 30} × src2={20}: two pairs.
+    assert_eq!(
+        extract_rows(tile),
+        vec![
+            ((1, 10), 200),
+            ((1, 20), 200),
+            ((2, 10), 200),
+            ((2, 20), 200)
+        ]
+    );
+}
+
 /// `sum(source1())` accumulates values across batches and emits the final sum only
 /// once the data source signals that it is done producing output.
 #[test_log::test]

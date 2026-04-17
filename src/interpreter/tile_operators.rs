@@ -101,6 +101,34 @@ pub struct ProducerBase {
     pub id: usize,
     /// Output tiling for this producer.
     pub tiling: Tiling,
+    /// Obsolete region of the tiling
+    pub obsolete_guard: TileGuard,
+}
+
+impl ProducerBase {
+    fn new(id: usize, tiling: &Tiling) -> Self {
+        Self {
+            id,
+            tiling: tiling.clone(),
+            obsolete_guard: tiling.empty_guard(),
+        }
+    }
+}
+
+/// Implement [`TileProducer::base`] and [`TileProducer::base_mut`] for a concrete
+/// producer struct that stores its shared state in a field named `base: ProducerBase`.
+///
+/// Usage: place `impl_producer_base!();` inside the `impl TileProducer for Foo` block
+/// in place of the two boilerplate accessor methods.
+macro_rules! impl_producer_base {
+    () => {
+        fn base(&self) -> &ProducerBase {
+            &self.base
+        }
+        fn base_mut(&mut self) -> &mut ProducerBase {
+            &mut self.base
+        }
+    };
 }
 
 /// Live runtime counterpart of a [`TileOperator`].
@@ -109,9 +137,10 @@ pub struct ProducerBase {
 /// and accepts `release` notifications from its consumer.
 pub trait TileProducer {
     /// Return the shared identity/tiling state for this producer.
-    ///
-    /// Implement as `fn base(&self) -> &ProducerBase { &self.base }`.
     fn base(&self) -> &ProducerBase;
+
+    /// Return the shared identity/tiling state for this producer.
+    fn base_mut(&mut self) -> &mut ProducerBase;
 
     /// Return the [`Tiling`] that describes this producer's output shape.
     fn tiling(&self) -> &Tiling {
@@ -152,7 +181,13 @@ pub trait TileProducer {
         format!("{}#{}", base, self.producer_id())
     }
 
-    /// Fetch the current tile value.
+    /// Returns the current obsolete guard for this producer. The producer will
+    /// never return any more data in the guarded region via `get`.
+    fn obsolete_guard(&self) -> &TileGuard {
+        &self.base().obsolete_guard
+    }
+
+    /// Fetch the current tile value.  Contains generic logic for all producers
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
         let result = self.get_impl(projection_guard);
         trace!(
@@ -170,7 +205,7 @@ pub trait TileProducer {
         result
     }
 
-    /// Fetch the current tile value.
+    /// Fetch the current tile value.  Producer-specific logic
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile;
 
     /// Release interest in a region.
@@ -178,7 +213,23 @@ pub trait TileProducer {
     /// is no longer needed. Returns an expanded obsolete guard that may be
     /// larger if the producer has additional obsolescence information (e.g.,
     /// from variables with their own obsolete guards).
-    fn release(&mut self, obsolete_guard: TileGuard);
+    fn release(&mut self, obsolete_guard: TileGuard) {
+        trace!("{} release: {obsolete_guard:?}", self.name());
+        assert!(
+            obsolete_guard.check_from(self.tiling()),
+            "{obsolete_guard:?} vs {:?}",
+            self.tiling()
+        );
+        let new_guard = self.base().obsolete_guard.union(&obsolete_guard);
+        if new_guard != self.base().obsolete_guard {
+            self.base_mut().obsolete_guard = new_guard;
+            self.release_impl(obsolete_guard);
+        }
+    }
+
+    /// Release interest in a region.
+    /// Contains producer-specific release logic.
+    fn release_impl(&mut self, obsolete_guard: TileGuard);
 
     /// Inspect this producer as an [`InspectNode`] for visualization.
     ///
@@ -488,10 +539,7 @@ impl TileOperator for MapResult {
             scheduler,
         );
         Box::new(MapResultProducer {
-            base: ProducerBase {
-                id: MapResultProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(MapResultProducer::alloc_id(), &self.tiling),
             input: input_producer,
             function: function_producer,
         })
@@ -505,9 +553,7 @@ struct MapResultProducer {
 }
 
 impl TileProducer for MapResultProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("fn", self.function.inspect(opts))
@@ -539,7 +585,7 @@ impl TileProducer for MapResultProducer {
             offsets,
             domain2: f_domain2,
             codomain: f_codomain,
-            domain_predicate: _,
+            domain_predicate: f_domain_predicate,
         } = function_tile
         {
             let Tile::SealedFunction {
@@ -591,12 +637,16 @@ impl TileProducer for MapResultProducer {
             // TODO this is doing filtering implicitly here, but we should do it in a separate step.
             // in order to do this we need to be able to construct a filter based on the presence of domain
             // elements in another function, and we don't have that capability yet.
-            let mut new_domain =
-                ColumnValue::from_values(Vec::new(), &i_tiling.domain_extent().unwrap());
+            let domain_extent = i_tiling.domain_extent().unwrap();
+            let mut new_domain = ColumnValue::from_values(Vec::new(), &domain_extent);
             let mut new_offsets =
                 ColumnValue::from_values(Vec::new(), &Extent::Base(BaseType::UInt));
             let mut new_domain2 = ColumnValue::from_values(Vec::new(), &f_domain2_extent);
             let mut new_codomain = ColumnValue::from_values(Vec::new(), &f_codomain_extent);
+            // Collects `input`` domain values whose CurriedFunction mapping is incomplete.
+            // More precisely, this is the set of domain values of `input` such that the corresponding
+            // codomain value does not satisfy the the domain_predicate of `function`.
+            let mut incomplete_domain = ColumnValue::from_values(Vec::new(), &domain_extent);
 
             // Build an index from f_domain values to their first and last indices.
             // This avoids O(n*m) lookup by allowing O(1) range retrieval per value.
@@ -614,13 +664,19 @@ impl TileProducer for MapResultProducer {
                 let domain_value = sorted_domain.index_at(i);
                 let codomain_value = sorted_codomain_values.index_at(i);
 
+                // A domain value maps to an incomplete value when the domain_predicate of the
+                // `function` is false for the corresponding input codomain value.
+                if !f_domain_predicate.contains(&codomain_value) {
+                    incomplete_domain.append(ColumnValue::from_values(
+                        vec![domain_value.clone()],
+                        &domain_extent,
+                    ));
+                }
+
                 // Look up index range for this codomain_value in O(1) time.
                 if let Some(&(first, last)) = f_domain_index.get(&codomain_value) {
                     // Record this domain element and its starting offset
-                    new_domain.append(ColumnValue::from_values(
-                        vec![domain_value],
-                        &i_tiling.domain_extent().unwrap(),
-                    ));
+                    new_domain.append(ColumnValue::from_values(vec![domain_value], &domain_extent));
                     new_offsets.append(ColumnValue::from_values(
                         vec![Value::UInt(current_offset)],
                         &Extent::Base(BaseType::UInt),
@@ -652,13 +708,25 @@ impl TileProducer for MapResultProducer {
                 }
             }
 
+            // The output domain_predicate is the input's predicate minus the input domain values
+            // for which the CurriedFunction's mapping is not yet complete.
+            // We should exlude the obsolete portion of the domain from this logic since we don't
+            // have sufficient info to reason about that region.
+            let domain_obsolete = match self.input.obsolete_guard() {
+                g if g.is_universal() => Predicate::True,
+                TileGuard::Function(FunctionGuard::Domain(p)) => p.clone(),
+                _ => Predicate::False,
+            };
+            let incomplete_predicate =
+                Predicate::from_column_value(&incomplete_domain).minus(&domain_obsolete);
+            let output_domain_predicate = domain_predicate.minus(&incomplete_predicate);
             // Build new CurriedFunction with filtered domain and transformed codomain
             return Tile::CurriedFunction {
                 domain1: new_domain,
                 offsets: new_offsets,
                 domain2: new_domain2,
                 codomain: new_codomain,
-                domain_predicate,
+                domain_predicate: output_domain_predicate,
             };
         }
 
@@ -668,10 +736,20 @@ impl TileProducer for MapResultProducer {
         })
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // TODO once we have guards that express codomain predicates, handle them here
-        self.input.release(obsolete_guard);
+        let upstream_guard = match obsolete_guard {
+            g if g.is_empty() => self.function.tiling().empty_guard(),
+            g if g.is_universal() => self.input.tiling().universal_guard(),
+            TileGuard::Function(FunctionGuard::Domain(p)) => {
+                TileGuard::Function(FunctionGuard::Domain(p))
+            }
+            TileGuard::Function(FunctionGuard::Codomain(g)) => {
+                TileGuard::Function(FunctionGuard::Codomain(g))
+            }
+            g => todo!("Unimplemented guard in MapResultProducer: {g:?}"),
+        };
+        self.input.release(upstream_guard);
     }
 }
 
@@ -759,10 +837,7 @@ impl TileOperator for MapResultToConst {
             scheduler,
         );
         Box::new(MapToConstProducer {
-            base: ProducerBase {
-                id: MapToConstProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(MapToConstProducer::alloc_id(), &self.tiling),
             input: input_producer,
             constant: constant_producer,
             mode: self.mode,
@@ -778,9 +853,7 @@ struct MapToConstProducer {
 }
 
 impl TileProducer for MapToConstProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -819,8 +892,7 @@ impl TileProducer for MapToConstProducer {
         })
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // TODO once we have guards that express codomain predicates, handle them here
         self.input.release(obsolete_guard);
     }
@@ -885,11 +957,9 @@ impl TileOperator for IterateExtent {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let mut producer = Box::new(IterateExtentProducer {
-            base: ProducerBase {
-                id: IterateExtentProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(IterateExtentProducer::alloc_id(), &self.tiling),
             extent: self.extent.clone(),
+            released: Predicate::False,
         });
 
         let NotifyOrSubscribeResult { notify, subscribe } =
@@ -921,33 +991,33 @@ struct IterateExtentProducer {
     /// For `UIntRange` extents this is an `IntervalSet<usize>` that shrinks
     /// directly as sub-intervals are released.
     extent: Extent,
+    /// Accumulates every predicate that has been released so far.
+    ///
+    /// Used for pair-level filtering in `get_impl`: after `iterate_extent`
+    /// produces the cross-product, any row whose domain value satisfies this
+    /// predicate is removed before returning the tile.  This is necessary for
+    /// `Extent::Record` cross-products where individual source extents cannot
+    /// be safely shrunk (shrinking source2's key 0 would prevent future
+    /// cross-product pairs like (1, 0) from ever being produced).
+    released: Predicate,
 }
 
 fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
     match extent {
         Extent::DataSourceDomain(source) => source.borrow().get_yield_predicate(),
-        Extent::Record(fields) => {
-            let mut output = Predicate::False;
-            for (field, _) in fields.iter() {
-                let field_predicate = Predicate::Record(
-                    fields
-                        .iter()
-                        .map(|(f, extent)| {
-                            (
-                                f.clone(),
-                                if f == field {
-                                    get_iterate_extent_predicate(extent)
-                                } else {
-                                    Predicate::True
-                                },
-                            )
-                        })
-                        .collect(),
-                );
-                output = output.union(&field_predicate);
-            }
-            output
-        }
+        // For a cross-product, the domain_predicate must be the conjunction (AND / Record) of
+        // each field's predicate.  Only pairs where EVERY field's value has already been
+        // committed by its source can be guaranteed to have already been delivered; a pair
+        // where even one field comes from a source that can still grow might be new next time.
+        //
+        // An OR would over-claim: e.g. arm {_1:≤u0, _0:True} says "(x,0) for any x has
+        // already been seen", but if source0 later adds key 1 then (1,0) is genuinely new.
+        Extent::Record(fields) => Predicate::Record(
+            fields
+                .iter()
+                .map(|(f, e)| (f.clone(), get_iterate_extent_predicate(e)))
+                .collect(),
+        ),
         _ => Predicate::True,
     }
 }
@@ -1079,26 +1149,35 @@ fn iterate_record(fields: &HashMap<String, Extent>, producer: &str) -> ColumnVal
 }
 
 impl TileProducer for IterateExtentProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let values = iterate_extent(&self.extent, &self.name());
         let domain_predicate = get_iterate_extent_predicate(&self.extent);
-        Tile::SealedFunction {
+        let mut tile = Tile::SealedFunction {
             domain: values.clone(),
             codomain: Box::new(Tile::Scalar(values)),
             domain_predicate,
-        }
+        };
+        // Filter out any domain rows that have already been released.
+        // Values may also be removed from underlying sources for efficiency, but
+        // this filter here is ultimately responsible for not returning released data.
+        tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(
+            self.released.clone(),
+        )));
+        tile
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         let name = self.name();
-        trace!("{} release: {obsolete_guard:?}", name);
         let TileGuard::Function(FunctionGuard::Domain(pred)) = obsolete_guard else {
             panic!("IterateExtent::release expected Domain guard, got {obsolete_guard:?}")
         };
+        // Accumulate so get_impl can filter already-released rows.
+        self.released = self.released.union(&pred);
+        // Also propagate to sub-extents where safe (e.g. full-slice UIntRange
+        // shrinks, or single-dimension DataSourceDomain releases when all other
+        // dimensions are unconstrained).
         release_extent(&mut self.extent, &pred, &name);
     }
 }
@@ -1183,10 +1262,7 @@ impl MapResultWithSourceProducer {
         tiling: Tiling,
     ) -> Self {
         let result = Self {
-            base: ProducerBase {
-                id: MapResultWithSourceProducer::alloc_id(),
-                tiling,
-            },
+            base: ProducerBase::new(MapResultWithSourceProducer::alloc_id(), &tiling),
             input,
             source,
         };
@@ -1203,9 +1279,7 @@ impl MapResultWithSourceProducer {
 }
 
 impl TileProducer for MapResultWithSourceProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         InspectNode::new(self.name())
@@ -1222,8 +1296,7 @@ impl TileProducer for MapResultWithSourceProducer {
         })
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         match &obsolete_guard {
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
                 self.source.borrow_mut().release(&self.name(), pred.clone());
@@ -1387,10 +1460,7 @@ impl TileOperator for Zip {
             consumer.notify();
         }));
         Box::new(ZipProducer {
-            base: ProducerBase {
-                id: ZipProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(ZipProducer::alloc_id(), &self.tiling),
             inputs: self
                 .inputs
                 .iter_mut()
@@ -1414,9 +1484,7 @@ struct ZipProducer {
 }
 
 impl TileProducer for ZipProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
         for (i, input) in self.inputs.iter().enumerate() {
@@ -1445,13 +1513,11 @@ impl TileProducer for ZipProducer {
                             codomain,
                             domain_predicate,
                         } => {
-                            if let Some(ref prev) = domain_pred {
-                                assert_eq!(
-                                    prev, &domain_predicate,
-                                    "Zip: all inputs must have the same domain predicate"
-                                );
+                            if let Some(ref mut prev) = domain_pred {
+                                *prev = prev.intersect(&domain_predicate);
+                            } else {
+                                domain_pred = Some(domain_predicate.clone());
                             }
-                            domain_pred = Some(domain_predicate);
                             output_domain = Some(domain);
                             codomains.push(*codomain);
                         }
@@ -1507,16 +1573,14 @@ impl TileProducer for ZipProducer {
                                     "Zip: all inputs must have the same domain2"
                                 );
                             }
-                            if let Some(ref prev) = domain_pred {
-                                assert_eq!(
-                                    prev, &domain_predicate,
-                                    "Zip: all inputs must have the same domain predicate"
-                                );
+                            if let Some(ref mut prev) = domain_pred {
+                                *prev = prev.intersect(&domain_predicate);
+                            } else {
+                                domain_pred = Some(domain_predicate.clone());
                             }
                             domain1 = Some(d1);
                             offsets = Some(offs);
                             domain2 = Some(d2);
-                            domain_pred = Some(domain_predicate);
                             codomains.push(cod);
                         }
                         _ => panic!("Zip: cannot mix CurriedFunction and other tile types"),
@@ -1542,8 +1606,7 @@ impl TileProducer for ZipProducer {
         }
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         self.inputs.iter_mut().for_each(|i| {
             i.release(match &obsolete_guard {
                 g if g.is_universal() => i.tiling().universal_guard(),
@@ -1614,10 +1677,7 @@ impl TileOperator for ScalarTuple {
             consumer.notify();
         }));
         Box::new(ScalarTupleProducer {
-            base: ProducerBase {
-                id: ScalarTupleProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(ScalarTupleProducer::alloc_id(), &self.tiling),
             inputs: self
                 .inputs
                 .iter_mut()
@@ -1641,9 +1701,7 @@ struct ScalarTupleProducer {
 }
 
 impl TileProducer for ScalarTupleProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
         for (i, input) in self.inputs.iter().enumerate() {
@@ -1665,8 +1723,8 @@ impl TileProducer for ScalarTupleProducer {
         Tile::Record(fields)
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
+        // Nothing to do
     }
 }
 
@@ -1714,10 +1772,7 @@ impl TileOperator for Converse {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(ConverseProducer {
-            base: ProducerBase {
-                id: ConverseProducer::alloc_id(),
-                tiling: self.tiling().clone(),
-            },
+            base: ProducerBase::new(ConverseProducer::alloc_id(), self.tiling()),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
@@ -1774,9 +1829,7 @@ fn converse_group_by_key<K: PartialOrd>(
 }
 
 impl TileProducer for ConverseProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -1838,8 +1891,7 @@ impl TileProducer for ConverseProducer {
         }
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         match obsolete_guard {
             g if g.is_universal() => self.input.release(self.input.tiling().universal_guard()),
             TileGuard::Function(FunctionGuard::Codomain(g)) => {
@@ -1898,10 +1950,7 @@ impl TileOperator for MapDomain {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(MapDomainProducer {
-            base: ProducerBase {
-                id: MapDomainProducer::alloc_id(),
-                tiling: self.tiling().clone(),
-            },
+            base: ProducerBase::new(MapDomainProducer::alloc_id(), self.tiling()),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
@@ -1917,9 +1966,7 @@ struct MapDomainProducer {
 }
 
 impl TileProducer for MapDomainProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -1941,8 +1988,7 @@ impl TileProducer for MapDomainProducer {
         }
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -2005,10 +2051,7 @@ impl TileOperator for Uncurry {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(UncurryProducer {
-            base: ProducerBase {
-                id: UncurryProducer::alloc_id(),
-                tiling: self.tiling().clone(),
-            },
+            base: ProducerBase::new(UncurryProducer::alloc_id(), self.tiling()),
             input: self
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
@@ -2024,9 +2067,7 @@ struct UncurryProducer {
 }
 
 impl TileProducer for UncurryProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -2077,21 +2118,22 @@ impl TileProducer for UncurryProducer {
                 } else {
                     Predicate::False
                 };
-                Tile::SealedFunction {
+                let mut result = Tile::SealedFunction {
                     domain: pair_domain,
                     codomain: Box::new(Tile::Scalar(codomain)),
                     domain_predicate: Predicate::Record(HashMap::from([
                         (tuple_field(0), domain_predicate),
                         (tuple_field(1), inner_pred),
                     ])),
-                }
+                };
+                result.remove_guarded(self.base().obsolete_guard.clone());
+                result
             }
             _ => panic!("Uncurry expected CurriedFunction tile"),
         }
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         let input_guard = match &obsolete_guard {
             // Pass through empty and universal guards unchanged.
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -2105,26 +2147,17 @@ impl TileProducer for UncurryProducer {
                     _ => Box::new(iter::once(pred)),
                 };
 
-                let mut outer_guards = TileGuard::Function(FunctionGuard::Domain(Predicate::False));
-                let mut inner_guards = TileGuard::Function(FunctionGuard::Codomain(Box::new(
-                    TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
-                )));
+                let mut domain_guard = TileGuard::Function(FunctionGuard::Domain(Predicate::False));
                 for pred in preds {
                     let mut split_preds = pred.split_record(&pair_fields);
                     let outer_pred = split_preds.remove(&tuple_field(0)).unwrap();
                     let inner_pred = split_preds.remove(&tuple_field(1)).unwrap();
-                    let inner_guard = TileGuard::Function(FunctionGuard::Codomain(Box::new(
-                        TileGuard::Function(FunctionGuard::Domain(inner_pred)),
-                    )));
-                    let outer_guard = TileGuard::Function(FunctionGuard::Domain(outer_pred));
-                    trace!("Inner guard: {inner_guard:?}");
-                    trace!("Outer guard: {outer_guard:?}");
-                    outer_guards = outer_guards.union(&outer_guard);
-                    inner_guards = inner_guards.union(&inner_guard);
+                    if inner_pred.as_bool().is_some_and(|x| x) {
+                        domain_guard = domain_guard
+                            .union(&TileGuard::Function(FunctionGuard::Domain(outer_pred)));
+                    }
                 }
-                trace!("Inner guards: {inner_guards:?}");
-                trace!("Outer guards: {outer_guards:?}");
-                outer_guards.intersect(&inner_guards)
+                domain_guard
             }
             g => panic!("Unsupported obsolete guard: {g:?}"),
         };
@@ -2194,10 +2227,7 @@ impl TileOperator for Filter {
             scheduler,
         );
         Box::new(FilterProducer {
-            base: ProducerBase {
-                id: FilterProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(FilterProducer::alloc_id(), &self.tiling),
             input: input_producer,
             predicate: predicate_producer,
         })
@@ -2211,9 +2241,7 @@ struct FilterProducer {
 }
 
 impl TileProducer for FilterProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -2285,8 +2313,7 @@ impl TileProducer for FilterProducer {
         }
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         if matches!(self.predicate.tiling(), Tiling::SealedFunction { .. }) {
             // Both predicate and input share the same underlying domain source, so both
             // must be released together; releasing only one leaves the other's upstream
@@ -2355,10 +2382,7 @@ impl TileOperator for Restrict {
             scheduler,
         );
         Box::new(RestrictProducer {
-            base: ProducerBase {
-                id: RestrictProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(RestrictProducer::alloc_id(), &self.tiling),
             predicate: predicate_producer,
         })
     }
@@ -2370,9 +2394,7 @@ struct RestrictProducer {
 }
 
 impl TileProducer for RestrictProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("predicate", self.predicate.inspect(opts))
@@ -2404,8 +2426,7 @@ impl TileProducer for RestrictProducer {
         }
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         self.predicate.release(obsolete_guard);
     }
 }
@@ -2492,10 +2513,7 @@ impl AggregateProducer {
             other => panic!("AggregateProducer created with non-Aggregation tiling: {other:?}"),
         };
         Self {
-            base: ProducerBase {
-                id: Self::alloc_id(),
-                tiling,
-            },
+            base: ProducerBase::new(Self::alloc_id(), &tiling),
             input,
             kind,
             accumulator,
@@ -2504,9 +2522,7 @@ impl AggregateProducer {
 }
 
 impl TileProducer for AggregateProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -2515,24 +2531,18 @@ impl TileProducer for AggregateProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let i_tiling = self.input.tiling().clone();
         let input_result = self.input.get(i_tiling.universal_guard());
-        let is_terminal = input_result.is_terminal();
         let upstream_guard = input_result.to_guard();
-        let values = match input_result {
-            Tile::SealedFunction { codomain, .. } => {
-                self.input.release(upstream_guard);
-                scalar_tile_to_column_value(*codomain)
-            }
-            Tile::Scalar(ColumnValue::Variants(v)) if matches!(v[0], Value::Function(..)) => {
-                ColumnValue::from_values(
-                    v[0].as_function()
-                        .iter()
-                        .map(|b| b.output.clone())
-                        .collect(),
-                    &i_tiling.codomain().unwrap().extent(),
-                )
-            }
-            t => panic!("Aggregate expected function tiling, got {t:?}"),
+        let Tile::SealedFunction { codomain, .. } = input_result else {
+            panic!("Aggregate expected function tiling, got {input_result:?}");
         };
+        self.input.release(upstream_guard);
+        let values = scalar_tile_to_column_value(*codomain);
+
+        let is_terminal = self.input.obsolete_guard().is_universal();
+        trace!(
+            "Aggregate input is_terminal: {is_terminal} from guard {:?}",
+            self.input.obsolete_guard()
+        );
         let Tile::Aggregation {
             kind: _,
             ref mut accumulator,
@@ -2546,8 +2556,7 @@ impl TileProducer for AggregateProducer {
         self.accumulator.clone()
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
         // Nothing to do. We could consider sanity checking that get is not called
         // after a universal release.
     }
@@ -2592,10 +2601,7 @@ impl TileOperator for ExtractAggregate {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(ExtractAggregateProducer {
-            base: ProducerBase {
-                id: ExtractAggregateProducer::alloc_id(),
-                tiling: self.tiling().clone(),
-            },
+            base: ProducerBase::new(ExtractAggregateProducer::alloc_id(), self.tiling()),
             input: self
                 .input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
@@ -2613,9 +2619,7 @@ struct ExtractAggregateProducer {
 }
 
 impl TileProducer for ExtractAggregateProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -2645,8 +2649,7 @@ impl TileProducer for ExtractAggregateProducer {
         }
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         if obsolete_guard.is_universal() {
             self.input.release(self.input.tiling().universal_guard());
         }
@@ -2714,10 +2717,7 @@ impl TileOperator for MapExtractAggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapExtractAggregateProducer {
-            base: ProducerBase {
-                id: MapExtractAggregateProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(MapExtractAggregateProducer::alloc_id(), &self.tiling),
             input: input_producer,
             kind: self.kind.clone(),
         })
@@ -2734,9 +2734,7 @@ struct MapExtractAggregateProducer {
 }
 
 impl TileProducer for MapExtractAggregateProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -2773,8 +2771,7 @@ impl TileProducer for MapExtractAggregateProducer {
         output
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
@@ -2852,10 +2849,7 @@ impl TileOperator for MapAggregate {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapAggregateProducer {
-            base: ProducerBase {
-                id: MapAggregateProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(MapAggregateProducer::alloc_id(), &self.tiling),
             input: input_producer,
             kind: self.kind.clone(),
             accumulators: HashMap::new(),
@@ -2875,9 +2869,7 @@ struct MapAggregateProducer {
 }
 
 impl TileProducer for MapAggregateProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -2941,8 +2933,7 @@ impl TileProducer for MapAggregateProducer {
         }
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         if obsolete_guard.is_universal() {
             self.accumulators.clear();
             self.input.release(self.input.tiling().universal_guard());
@@ -3079,10 +3070,7 @@ impl TileOperator for Split {
         }
 
         Box::new(SplitProducer {
-            base: ProducerBase {
-                id: self.shared.borrow().id,
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(self.shared.borrow().id, &self.tiling),
             shared: self.shared.clone(),
             index,
         })
@@ -3098,9 +3086,7 @@ struct SplitProducer {
 }
 
 impl TileProducer for SplitProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         if self.index == 0 {
@@ -3138,7 +3124,7 @@ impl TileProducer for SplitProducer {
         result
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         let result = {
             let mut shared = self.shared.borrow_mut();
             // Union with the existing stored guard so that the accumulated set of
@@ -3194,10 +3180,7 @@ impl TileOperator for Memo {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         Box::new(MemoProducer {
-            base: ProducerBase {
-                id: MemoProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(MemoProducer::alloc_id(), &self.tiling),
             input: self.input.subscribe(intent_guard, consumer, scheduler),
             cached_tile: self.tiling().empty_tile(),
         })
@@ -3211,9 +3194,7 @@ struct MemoProducer {
 }
 
 impl TileProducer for MemoProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -3234,14 +3215,13 @@ impl TileProducer for MemoProducer {
         self.cached_tile.clone()
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("Release called on {}: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // Remove any released data from the cached tile since the consumer
         // is no longer interested.
         self.cached_tile.remove_guarded(obsolete_guard.clone());
         // Also release upstream to handle the case where the consumer releases
         // data that was never produced.
-        self.input.release(obsolete_guard);
+        self.input.release(obsolete_guard.clone());
         trace!("{} now has cached {:?}", self.name(), self.cached_tile);
     }
 }
@@ -3287,10 +3267,7 @@ impl TileOperator for Constant {
     ) -> Box<dyn TileProducer> {
         consumer.notify();
         Box::new(ConstantProducer {
-            base: ProducerBase {
-                id: ConstantProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(ConstantProducer::alloc_id(), &self.tiling),
             value: self.value.clone(),
             released: false,
         })
@@ -3304,9 +3281,7 @@ struct ConstantProducer {
 }
 
 impl TileProducer for ConstantProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
         node.annotate(format!("{}", self.value))
@@ -3320,8 +3295,7 @@ impl TileProducer for ConstantProducer {
         }
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         if obsolete_guard.is_universal() {
             self.released = true;
         }
@@ -3374,10 +3348,7 @@ impl TileOperator for ToScalar {
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(ToScalarProducer {
-            base: ProducerBase {
-                id: ToScalarProducer::alloc_id(),
-                tiling: self.tiling.clone(),
-            },
+            base: ProducerBase::new(ToScalarProducer::alloc_id(), &self.tiling),
             input: input_producer,
         })
     }
@@ -3390,9 +3361,7 @@ struct ToScalarProducer {
 }
 
 impl TileProducer for ToScalarProducer {
-    fn base(&self) -> &ProducerBase {
-        &self.base
-    }
+    impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         node.child("input", self.input.inspect(opts))
@@ -3412,8 +3381,7 @@ impl TileProducer for ToScalarProducer {
         *codomain
     }
 
-    fn release(&mut self, obsolete_guard: TileGuard) {
-        trace!("{} release: {obsolete_guard:?}", self.name());
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // The input is always read in full (universal guard), so only a universal
         // release can be propagated meaningfully.
         if obsolete_guard.is_universal() {
@@ -3557,8 +3525,9 @@ mod tests {
             codomain: Box::new(Tiling::Scalar(extent.clone())),
         };
         let mut producer = IterateExtentProducer {
-            base: ProducerBase { id: 0, tiling },
+            base: ProducerBase::new(0, &tiling),
             extent,
+            released: Predicate::False,
         };
         let tile = producer.get(producer.tiling().universal_guard());
         let Tile::SealedFunction { domain, .. } = tile else {
@@ -3580,19 +3549,14 @@ mod tests {
     impl TestTileProducer {
         fn new(tile: Tile, tiling: Tiling) -> Self {
             Self {
-                base: ProducerBase {
-                    id: Self::alloc_id(),
-                    tiling,
-                },
+                base: ProducerBase::new(Self::alloc_id(), &tiling),
                 tile,
             }
         }
     }
 
     impl TileProducer for TestTileProducer {
-        fn base(&self) -> &ProducerBase {
-            &self.base
-        }
+        impl_producer_base!();
 
         fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
             node
@@ -3602,7 +3566,7 @@ mod tests {
             self.tile.clone()
         }
 
-        fn release(&mut self, _obsolete_guard: TileGuard) {}
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
     }
 
     #[test]
@@ -3649,10 +3613,7 @@ mod tests {
         };
 
         let mut map_result = MapResultProducer {
-            base: ProducerBase {
-                id: MapResultProducer::alloc_id(),
-                tiling: output_tiling,
-            },
+            base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
             function: Box::new(function_producer),
         };
@@ -3716,6 +3677,130 @@ mod tests {
         }
     }
 
+    /// Verifies that the output `domain_predicate` of `MapResultProducer` (CurriedFunction
+    /// branch) is derived correctly from the input predicate.
+    ///
+    /// Setup:
+    ///   `input`: SealedFunction: domain=[0,1,2,3], codomain=[0,1,2,3], domain_predicate=True
+    ///   `function`: CurriedFunction:
+    ///     domain1=[0, 1]       –- no info for 2 and 3
+    ///     domain_predicate = Intervals covering only 0
+    ///
+    /// Expected output domain_predicate:
+    ///   Only 0 is true for `function`'s domain_predicate, so only the preimage of 0 in
+    ///   `input` (i.e. {0}), should be true in the output domain_predicate.
+    #[test]
+    fn map_result_producer_curried_function_domain_predicate() {
+        let f_pred = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
+        let curried_fn_tile = Tile::CurriedFunction {
+            domain1: ColumnValue::UInts(vec![0, 1]),
+            offsets: ColumnValue::UInts(vec![0, 1]),
+            domain2: ColumnValue::UInts(vec![10, 20]),
+            codomain: ColumnValue::UInts(vec![100, 200]),
+            domain_predicate: f_pred,
+        };
+        let function_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::UInt),
+            codomain: Extent::Base(BaseType::UInt),
+        };
+
+        let sealed_fn_tile = Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![0, 1, 2, 3]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1, 2, 3]))),
+            domain_predicate: Predicate::True,
+        };
+        let input_tiling = Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
+        };
+
+        let output_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::UInt),
+            codomain: Extent::Base(BaseType::UInt),
+        };
+        let mut map_result = MapResultProducer {
+            base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
+            input: Box::new(TestTileProducer::new(sealed_fn_tile, input_tiling)),
+            function: Box::new(TestTileProducer::new(curried_fn_tile, function_tiling)),
+        };
+
+        let result = map_result.get(map_result.tiling().universal_guard());
+
+        let Tile::CurriedFunction {
+            domain1,
+            domain_predicate: out_pred,
+            ..
+        } = result
+        else {
+            panic!("Expected CurriedFunction");
+        };
+
+        // Only x=0 and x=1 have entries in the output (y=2,3 absent from CurriedFunction).
+        let ColumnValue::UInts(d1_vals) = domain1 else {
+            panic!("domain1 should be UInts");
+        };
+        assert_eq!(d1_vals, vec![0, 1], "only x=0,1 should appear in domain1");
+
+        assert!(
+            out_pred.contains(&Value::UInt(0))
+                && !out_pred.contains(&Value::UInt(1))
+                && !out_pred.contains(&Value::UInt(2))
+                && !out_pred.contains(&Value::UInt(3)),
+            "Incorrect pred {out_pred:?}"
+        );
+    }
+
+    /// When f_domain_predicate is True the output domain_predicate should equal the input's.
+    #[test]
+    fn map_result_producer_curried_function_domain_predicate_both_true() {
+        let curried_fn_tile = Tile::CurriedFunction {
+            domain1: ColumnValue::UInts(vec![0, 1]),
+            offsets: ColumnValue::UInts(vec![0, 1]),
+            domain2: ColumnValue::UInts(vec![10, 20]),
+            codomain: ColumnValue::UInts(vec![100, 200]),
+            domain_predicate: Predicate::True,
+        };
+        let function_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::UInt),
+            codomain: Extent::Base(BaseType::UInt),
+        };
+        let sealed_fn_tile = Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1]))),
+            domain_predicate: Predicate::True,
+        };
+        let input_tiling = Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
+        };
+        let output_tiling = Tiling::CurriedFunction {
+            domain1: Extent::Base(BaseType::UInt),
+            domain2: Extent::Base(BaseType::UInt),
+            codomain: Extent::Base(BaseType::UInt),
+        };
+        let mut map_result = MapResultProducer {
+            base: ProducerBase::new(MapResultProducer::alloc_id(), &output_tiling),
+            input: Box::new(TestTileProducer::new(sealed_fn_tile, input_tiling)),
+            function: Box::new(TestTileProducer::new(curried_fn_tile, function_tiling)),
+        };
+        let result = map_result.get(map_result.tiling().universal_guard());
+        let Tile::CurriedFunction {
+            domain_predicate: out_pred,
+            ..
+        } = result
+        else {
+            panic!("Expected CurriedFunction");
+        };
+        assert_eq!(
+            out_pred,
+            Predicate::True,
+            "both predicates True → output should be True (terminal)"
+        );
+    }
+
     #[test]
     fn uncurry_producer_basic() {
         // Test UncurryProducer.get_impl with a simple CurriedFunction
@@ -3760,10 +3845,7 @@ mod tests {
         };
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase {
-                id: UncurryProducer::alloc_id(),
-                tiling: output_tiling,
-            },
+            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
         };
 
@@ -3872,10 +3954,7 @@ mod tests {
         };
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase {
-                id: UncurryProducer::alloc_id(),
-                tiling: output_tiling,
-            },
+            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
         };
 
@@ -3962,10 +4041,7 @@ mod tests {
         };
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase {
-                id: UncurryProducer::alloc_id(),
-                tiling: output_tiling,
-            },
+            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
         };
 
@@ -4086,10 +4162,7 @@ mod tests {
         };
 
         let mut uncurry = UncurryProducer {
-            base: ProducerBase {
-                id: UncurryProducer::alloc_id(),
-                tiling: output_tiling,
-            },
+            base: ProducerBase::new(UncurryProducer::alloc_id(), &output_tiling),
             input: Box::new(input_producer),
         };
 
