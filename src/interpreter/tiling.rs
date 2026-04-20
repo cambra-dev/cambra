@@ -967,7 +967,7 @@ impl Predicate {
     /// Builds a `Predicate` from a list of arms, flattening any nested `Or`
     /// variants.  Returns the single element directly when `arms` has length
     /// one to avoid gratuitous wrapping.
-    fn flatten_or(arms: Vec<Predicate>) -> Predicate {
+    pub fn flatten_or(arms: Vec<Predicate>) -> Predicate {
         let flat: Vec<Predicate> = arms
             .into_iter()
             .flat_map(|p| match p {

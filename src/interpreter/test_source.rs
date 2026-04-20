@@ -69,6 +69,15 @@ impl TestDataSource {
     pub fn output_type(&self) -> Type {
         self.output_type.clone()
     }
+
+    /// Returns a predicate corresponding to the data that has been entirely released from the source.
+    pub fn get_released_predicate(&self) -> Predicate {
+        let mut result = Predicate::True;
+        for pred in self.obsolete_predicates.values() {
+            result = result.intersect(pred);
+        }
+        result
+    }
 }
 
 impl DataSourceDomainExtentImpl for TestDataSource {

@@ -477,13 +477,7 @@ fn convert_impl(
             let input =
                 input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
             let source = ctx.get_source(name)?;
-            Ok(Box::new(MapResult::new(
-                input,
-                Box::new(MapResultWithSource::new(
-                    source,
-                    iterate_type(&Type::DataSource(name.clone()), ctx)?,
-                )),
-            )))
+            Ok(Box::new(MapResultWithSource::new(source, input)))
         }
 
         other => Err(ConversionError::Unsupported(format!(

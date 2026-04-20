@@ -736,11 +736,6 @@ fn test_inner_join(#[case] code: &str) {
     let tile = producer.get(producer.tiling().universal_guard());
     *notified.borrow_mut() = false;
 
-    // After release {_0:≤10, _1:≤10}: each source releases its bound independently.
-    // src1 releases key 10; src2 releases key 10.  The remaining cross-products
-    // are src1={20,30} × src2={20} = {(20,20),(30,20)}.  After the join filter
-    // x[0]==y[0]: src1[20]._0=200 ≠ src2[20]._0=100 (filtered out); src1[30]._0=100
-    // == src2[20]._0=100 (kept).
     assert_eq!(
         extract_join_rows(tile),
         vec![
@@ -904,6 +899,11 @@ fn test_incremental_global_aggregate() {
         Tile::Scalar(ColumnValue::Ints(vec![60])),
         "should emit final sum once source is terminal"
     );
+
+    assert_eq!(
+        test_source.borrow().get_released_predicate(),
+        Predicate::True
+    );
 }
 
 #[test_log::test]
@@ -970,6 +970,11 @@ fn test_incremental_aggregates() {
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 20, 30]))),
             domain_predicate: Predicate::True
         })
+    );
+
+    assert_eq!(
+        test_source.borrow().get_released_predicate(),
+        Predicate::True
     );
 }
 

@@ -26,8 +26,8 @@ use crate::{
     ccl::AggregateKind,
     interpreter::{
         bindings_are_list, transform_hashmap_values, tuple_field, validate_tile, BaseType,
-        ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult,
-        Scheduler, Value,
+        ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, FunctionDef,
+        NotifyOrSubscribeResult, Scheduler, Value,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -83,6 +83,16 @@ pub trait TileOperator {
     /// Hook for adding any children to the InspectNode.
     fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
         node
+    }
+
+    /// If Some, represents an equality constraint between all or part of the domain
+    /// and the result (i.e. the deepest codomain) of the output of this operator.
+    /// Individual operators should override this when they are able to automatically detect this constraint.
+    /// For example, [`IterateExtent`] always produces an identity function output, so it returns `Some([])`.
+    /// Other operators like [`Split`] and [`Memo`] preserve structure, so they pass the value through from their
+    /// input
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        None
     }
 }
 
@@ -245,6 +255,15 @@ pub trait TileProducer {
     fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
         node
     }
+}
+
+/// Represents a step on a path through a Tile structure
+#[derive(Debug, Eq, PartialEq)]
+pub enum TilePathStep {
+    /// A step into a specific field of a Record
+    Record(String),
+    /// A step into the codomain of a function
+    Codomain,
 }
 
 /// Repeat a scalar or record-of-scalars tile `len` times along the domain axis.
@@ -543,6 +562,16 @@ impl TileOperator for MapResult {
             input: input_producer,
             function: function_producer,
         })
+    }
+
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        if let Some(mut input_corr) = self.input.result_correlation() {
+            if let Some(transform) = self.function.result_correlation() {
+                input_corr.extend(transform);
+                return Some(input_corr);
+            }
+        }
+        None
     }
 }
 
@@ -981,6 +1010,10 @@ impl TileOperator for IterateExtent {
 
         producer
     }
+
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        Some(Vec::new())
+    }
 }
 
 /// Producer for [`IterateExtent`]: emits an identity sealed-function tile.
@@ -1243,6 +1276,9 @@ impl TileOperator for MapResultWithSource {
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
             self.source.clone(),
             self.tiling().clone(),
+            self.input
+                .result_correlation()
+                .expect("MapResultWithSource requires input result_correlation"),
         ))
     }
 }
@@ -1253,6 +1289,10 @@ struct MapResultWithSourceProducer {
     input: Box<dyn TileProducer>,
     /// The data source used for both domain enumeration and value lookup.
     source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+    /// A correlation between the result values and some piece of the domain of the input tile.
+    /// We need this in order to translate domain obsolete guards into releases of the underlying
+    /// source.
+    result_correlation: Vec<TilePathStep>,
 }
 
 impl MapResultWithSourceProducer {
@@ -1260,11 +1300,13 @@ impl MapResultWithSourceProducer {
         input: Box<dyn TileProducer>,
         source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
         tiling: Tiling,
+        result_correlation: Vec<TilePathStep>,
     ) -> Self {
         let result = Self {
             base: ProducerBase::new(MapResultWithSourceProducer::alloc_id(), &tiling),
             input,
             source,
+            result_correlation,
         };
         // Register this producer with the source by calling release with a false predicate.
         // This way the source knows about all producers that read it before execution starts.
@@ -1299,11 +1341,14 @@ impl TileProducer for MapResultWithSourceProducer {
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         match &obsolete_guard {
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
-                self.source.borrow_mut().release(&self.name(), pred.clone());
+                let extracted_pred = extract_predicate(pred, &self.result_correlation).clone();
+                self.source.borrow_mut().release(&self.name(), extracted_pred);
             }
-            TileGuard::Function(FunctionGuard::Codomain(g)) => {
+            TileGuard::Function(FunctionGuard::Codomain(g)) if matches!(**g, TileGuard::Function(FunctionGuard::Domain(_))) => {
                 if let TileGuard::Function(FunctionGuard::Domain(pred)) = &**g {
-                    self.source.borrow_mut().release(&self.name(), pred.clone());
+                    assert_eq!(self.result_correlation.first(), Some(&TilePathStep::Codomain));
+                    let extracted_pred = extract_predicate(pred, &self.result_correlation[1..]).clone();
+                    self.source.borrow_mut().release(&self.name(), extracted_pred);
                 }
             }
             g if g.is_universal() => {
@@ -1317,6 +1362,38 @@ impl TileProducer for MapResultWithSourceProducer {
             ),
         }
         self.input.release(obsolete_guard);
+    }
+}
+
+fn extract_predicate(pred: &Predicate, path: &[TilePathStep]) -> Predicate {
+    if path.is_empty() || pred.as_bool().is_some() {
+        return pred.clone();
+    };
+
+    if let Predicate::Or(arms) = pred {
+        return Predicate::flatten_or(
+            arms.iter()
+                .map(|arm| extract_predicate(arm, path))
+                .collect(),
+        );
+    }
+
+    match &path[0] {
+        TilePathStep::Record(f) => {
+            if let Predicate::Record(fields) = pred {
+                // If we see a Record predicate with our field where all other fields are false, then
+                // return our field.  Correlated predicates don't give us any information about the
+                // requested field in isolation, so return false.
+                if fields.iter().all(|(field, p)| field == f || p.is_true()) {
+                    extract_predicate(&fields[f], &path[1..])
+                } else {
+                    Predicate::False
+                }
+            } else {
+                panic!("Expected record predicate, got {pred:?}");
+            }
+        }
+        _ => todo!("We don't support correlated function preds yet"),
     }
 }
 
@@ -1778,6 +1855,10 @@ impl TileOperator for Converse {
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
         })
     }
+
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        Some(vec![TilePathStep::Codomain])
+    }
 }
 
 /// Producer for [`Converse`]: inverts a sealed-function tile into a lookup-function tile.
@@ -1955,6 +2036,10 @@ impl TileOperator for MapDomain {
                 .input
                 .subscribe(self.tiling().universal_guard(), consumer, scheduler),
         })
+    }
+
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        Some(Vec::new())
     }
 }
 
@@ -2232,6 +2317,10 @@ impl TileOperator for Filter {
             predicate: predicate_producer,
         })
     }
+
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        self.input.result_correlation()
+    }
 }
 
 struct FilterProducer {
@@ -2385,6 +2474,10 @@ impl TileOperator for Restrict {
             base: ProducerBase::new(RestrictProducer::alloc_id(), &self.tiling),
             predicate: predicate_producer,
         })
+    }
+
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        Some(Vec::new())
     }
 }
 
@@ -3075,6 +3168,10 @@ impl TileOperator for Split {
             index,
         })
     }
+
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        self.input.borrow().result_correlation()
+    }
 }
 
 struct SplitProducer {
@@ -3185,6 +3282,10 @@ impl TileOperator for Memo {
             cached_tile: self.tiling().empty_tile(),
         })
     }
+
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        self.input.result_correlation()
+    }
 }
 
 struct MemoProducer {
@@ -3271,6 +3372,17 @@ impl TileOperator for Constant {
             value: self.value.clone(),
             released: false,
         })
+    }
+
+    fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
+        if let Value::ComputableFunction(func) = &self.value {
+            match func {
+                FunctionDef::RecordField(f) => Some(vec![TilePathStep::Record(f.clone())]),
+                _ => None,
+            }
+        } else {
+            None
+        }
     }
 }
 
