@@ -2,15 +2,15 @@
 <html lang="en">
 
 <!-- Colors
- #0d263a Dark teal
- #0e4351 Medium teal
- #258da8 Teal
- #6cc3c8 Light Teal
- #c6e4dc Sea foam
- #d85b2f Orange
- #f38d41 Medium orange
- #f6a438 Light orange
- #fef0d3 Sand
+ #10253a Abyssal
+ #054350 Deep Sea
+ #1c88a7 Ocean
+ #6cc4c8 Lagoon
+ #c5e3db San Blas
+ #d75a2e Ember
+ #f18840 Coral
+ #f5a337 Amber
+ #fff0d1 Sand
 -->
 
 
@@ -20,38 +20,38 @@
     <style>
         :root {
             /* Brand colors */
-            --color-dark-teal: #0d263a;
-            --color-teal: #0e4351;
-            --color-bright-teal: #258da8;
-            --color-light-teal: #6cc3c8;
-            --color-sea-foam: #c6e4dc;
-            --color-orange: #d85b2f;
-            --color-bright-orange: #f38d41;
-            --color-light-orange: #f6a438;
-            --color-sand: #fef0d3;
+            --color-abyssal: #10253a;
+            --color-deep-sea: #054350;
+            --color-ocean: #1c88a7;
+            --color-lagoon: #6cc4c8;
+            --color-san-blas: #c5e3db;
+            --color-ember: #d75a2e;
+            --color-coral: #f18840;
+            --color-amber: #f5a337;
+            --color-sand: #fff0d1;
 
             /* Other colors */
             --color-dark-grey: #45475a;
 
             /* UI colors */
-            --color-bg-body: var(--color-dark-teal);
+            --color-bg-body: var(--color-abyssal);
             --color-text-primary: var(--color-sand);
-            --color-text-secondary: var(--color-orange);
-            --color-text-annotation: var(--color-light-teal);
-            --color-text-error: var(--color-light-orange);
-            --color-button-bg: var(--color-bright-teal);
-            --color-border-container: var(--color-teal);
+            --color-text-secondary: var(--color-ember);
+            --color-text-annotation: var(--color-lagoon);
+            --color-text-error: var(--color-amber);
+            --color-button-bg: var(--color-ocean);
+            --color-border-container: var(--color-deep-sea);
             --color-border-divider: var(--color-dark-grey);
 
             /* SVG/Graph colors */
-            --color-svg-bg: var(--color-dark-teal);
-            --color-node-fill: var(--color-teal);
+            --color-svg-bg: var(--color-abyssal);
+            --color-node-fill: var(--color-deep-sea);
             --color-node-border-default: var(--color-dark-grey);
-            --color-node-border-active: var(--color-light-orange);
+            --color-node-border-active: var(--color-amber);
             --color-edge-stroke: var(--color-dark-grey);
-            --color-edge-label-bg: var(--color-dark-teal);
-            --color-edge-label-text: var(--color-light-orange);
-            --color-node-title: var(--color-orange);
+            --color-edge-label-bg: var(--color-abyssal);
+            --color-edge-label-text: var(--color-amber);
+            --color-node-title: var(--color-ember);
             --color-node-tiling: var(--color-sand);
         }
 
@@ -403,7 +403,7 @@
                 s += `<rect x="${nx}" y="${ny}" width="${NODE_W}" height="${nodeHeight(n)}" rx="5" `
                     + `fill="${colors.nodeFill}" stroke="${borderColor}" stroke-width="1"/>`;
 
-                // Line 1: type name (before first '('), bold purple
+                // Line 1: type name (before first '(')
                 const parenIdx = n.label.indexOf('(');
                 // Line 1 title: type name + inline annotations (e.g. "(Sum)")
                 const typeName = parenIdx >= 0 ? n.label.slice(0, parenIdx) : n.label;
@@ -418,7 +418,7 @@
                     s += `<tspan fill="${colors.textAnnotation}" font-size="11">${esc(annInline)}</tspan>`;
                 s += `</text>`;
 
-                // Line 2+: tiling, wrapped, teal
+                // Line 2+: tiling, wrapped
                 const tlines = tilingLines(n.tiling || '');
                 for (let i = 0; i < tlines.length; i++) {
                     s += `<text x="${cx}" y="${ny + 35 + i * 13}" text-anchor="middle" `
