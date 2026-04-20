@@ -17,6 +17,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use bit_set::BitSet;
 use bit_vec::BitVec;
 use intervalsets::{ops::Difference, Bounding, Interval, IntervalSet};
 use log::trace;
@@ -416,9 +417,11 @@ fn process_tile_result(
             domain,
             codomain,
             domain_predicate,
+            deleted,
         } => Tile::SealedFunction {
             domain,
             domain_predicate,
+            deleted,
             codomain: Box::new(process_tile_result(
                 &input_tiling.codomain().unwrap_or_else(|| unreachable!()),
                 *codomain,
@@ -431,12 +434,14 @@ fn process_tile_result(
             domain2,
             codomain,
             domain_predicate,
+            deleted,
         } => Tile::CurriedFunction {
             domain1,
             offsets,
             domain2,
             codomain: transformation(codomain),
             domain_predicate,
+            deleted,
         },
         _ => panic!("Cannot apply Map to {input_tile:?}"),
     }
@@ -615,12 +620,14 @@ impl TileProducer for MapResultProducer {
             domain2: f_domain2,
             codomain: f_codomain,
             domain_predicate: f_domain_predicate,
+            ..
         } = function_tile
         {
             let Tile::SealedFunction {
                 domain,
                 codomain: input_codomain,
                 domain_predicate,
+                ..
             } = input_tile
             else {
                 panic!("Expected SealedFunction");
@@ -756,6 +763,7 @@ impl TileProducer for MapResultProducer {
                 domain2: new_domain2,
                 codomain: new_codomain,
                 domain_predicate: output_domain_predicate,
+                deleted: BitSet::new(),
             };
         }
 
@@ -1191,6 +1199,7 @@ impl TileProducer for IterateExtentProducer {
             domain: values.clone(),
             codomain: Box::new(Tile::Scalar(values)),
             domain_predicate,
+            deleted: BitSet::new(),
         };
         // Filter out any domain rows that have already been released.
         // Values may also be removed from underlying sources for efficiency, but
@@ -1589,6 +1598,7 @@ impl TileProducer for ZipProducer {
                             domain,
                             codomain,
                             domain_predicate,
+                            ..
                         } => {
                             if let Some(ref mut prev) = domain_pred {
                                 *prev = prev.intersect(&domain_predicate);
@@ -1613,6 +1623,7 @@ impl TileProducer for ZipProducer {
                     domain: output_domain.unwrap(),
                     codomain: Box::new(codomain_record),
                     domain_predicate: domain_pred.unwrap(),
+                    deleted: BitSet::new(),
                 }
             }
             Tile::CurriedFunction { .. } => {
@@ -1631,6 +1642,7 @@ impl TileProducer for ZipProducer {
                             domain2: d2,
                             codomain: cod,
                             domain_predicate,
+                            ..
                         } => {
                             if let Some(ref prev_d1) = domain1 {
                                 assert_eq!(
@@ -1677,6 +1689,7 @@ impl TileProducer for ZipProducer {
                     domain2: domain2.unwrap(),
                     codomain: codomain_record,
                     domain_predicate: domain_pred.unwrap(),
+                    deleted: BitSet::new(),
                 }
             }
             _ => panic!("Zip: all inputs must be SealedFunction or CurriedFunction tiles"),
@@ -1879,6 +1892,7 @@ fn converse_group_by_key<K: PartialOrd>(
     codomain: &ColumnValue,
     domain: &ColumnValue,
     domain_predicate: Predicate,
+    input_deleted: &BitSet,
 ) -> Tile {
     let n = keys.len();
     // Sort row indices by codomain key; equal keys will be adjacent.
@@ -1894,6 +1908,13 @@ fn converse_group_by_key<K: PartialOrd>(
     let num_groups = group_starts.len();
     // domain1: one codomain value per group (the key for the outer lookup).
     let domain1_col = codomain.select_indices(group_starts.iter().map(|&s| order[s]), num_groups);
+    // Remap deleted bits: output position j corresponds to input row order[j].
+    let output_deleted: BitSet = order
+        .iter()
+        .enumerate()
+        .filter(|(_, &src)| input_deleted.contains(src))
+        .map(|(j, _)| j)
+        .collect();
     // domain2/codomain_out: original domain values reordered to match sorted groups.
     let domain2_col = domain.select_indices(order.into_iter(), n);
     Tile::curried_function(
@@ -1906,6 +1927,7 @@ fn converse_group_by_key<K: PartialOrd>(
         } else {
             Predicate::False
         },
+        output_deleted,
     )
 }
 
@@ -1923,6 +1945,7 @@ impl TileProducer for ConverseProducer {
                 domain,
                 codomain,
                 domain_predicate,
+                deleted,
             } => match *codomain {
                 Tile::Scalar(codomain) => {
                     // Dispatch on the native element type of the codomain column so that
@@ -1932,32 +1955,50 @@ impl TileProducer for ConverseProducer {
                         ColumnValue::Units(n) => {
                             // All codomains are unit; create one group with all rows in order.
                             let keys = vec![(); *n];
-                            converse_group_by_key(&keys, &codomain, &domain, domain_predicate)
+                            converse_group_by_key(
+                                &keys,
+                                &codomain,
+                                &domain,
+                                domain_predicate,
+                                &deleted,
+                            )
                         }
                         ColumnValue::Ints(v) => {
-                            converse_group_by_key(v, &codomain, &domain, domain_predicate)
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate, &deleted)
                         }
                         ColumnValue::UInts(v) => {
-                            converse_group_by_key(v, &codomain, &domain, domain_predicate)
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate, &deleted)
                         }
                         ColumnValue::Strings(v) => {
-                            converse_group_by_key(v, &codomain, &domain, domain_predicate)
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate, &deleted)
                         }
                         ColumnValue::Bools(bv) => {
                             // Materialise as Vec<bool> so the element type is PartialOrd.
                             let v: Vec<bool> = bv.iter().collect();
-                            converse_group_by_key(&v, &codomain, &domain, domain_predicate)
+                            converse_group_by_key(
+                                &v,
+                                &codomain,
+                                &domain,
+                                domain_predicate,
+                                &deleted,
+                            )
                         }
                         ColumnValue::Variants(v) => {
                             // Value is PartialOrd; pass the inner vec directly.
-                            converse_group_by_key(v, &codomain, &domain, domain_predicate)
+                            converse_group_by_key(v, &codomain, &domain, domain_predicate, &deleted)
                         }
                         ColumnValue::Records(_) => {
                             // No native slice to borrow; materialise one Value per row for sorting.
                             // TODO: benchmark this and figure out a way to avoid if needed.
                             let n = codomain.len();
                             let keys: Vec<Value> = (0..n).map(|i| codomain.index_at(i)).collect();
-                            converse_group_by_key(&keys, &codomain, &domain, domain_predicate)
+                            converse_group_by_key(
+                                &keys,
+                                &codomain,
+                                &domain,
+                                domain_predicate,
+                                &deleted,
+                            )
                         }
                         ColumnValue::FunctionBindings { .. } => {
                             panic!(
@@ -2063,11 +2104,13 @@ impl TileProducer for MapDomainProducer {
             Tile::SealedFunction {
                 domain,
                 domain_predicate,
+                deleted,
                 ..
             } => Tile::SealedFunction {
                 codomain: Box::new(Tile::Scalar(domain.clone())),
                 domain,
                 domain_predicate,
+                deleted,
             },
             _ => panic!("MapDomain expected SealedFunction tile"),
         }
@@ -2167,6 +2210,7 @@ impl TileProducer for UncurryProducer {
                 domain2,
                 codomain,
                 domain_predicate,
+                ..
             } => {
                 // Extract offsets as a vec of usize.
                 let ColumnValue::UInts(offsets_vec) = offsets else {
@@ -2210,6 +2254,7 @@ impl TileProducer for UncurryProducer {
                         (tuple_field(0), domain_predicate),
                         (tuple_field(1), inner_pred),
                     ])),
+                    deleted: BitSet::new(),
                 };
                 result.remove_guarded(self.base().obsolete_guard.clone());
                 result
@@ -2351,6 +2396,7 @@ impl TileProducer for FilterProducer {
                     domain,
                     codomain,
                     domain_predicate,
+                    deleted,
                 },
             ) => match pred.as_single() {
                 Some(Value::ComputableFunction(f)) => {
@@ -2362,8 +2408,9 @@ impl TileProducer for FilterProducer {
                         domain,
                         codomain,
                         domain_predicate,
+                        deleted,
                     };
-                    output.retain(mask);
+                    output.mark_deleted(mask);
                     output
                 }
                 _ => panic!("Filter predicate is not a function"),
@@ -2379,6 +2426,7 @@ impl TileProducer for FilterProducer {
                     domain: i_inputs,
                     codomain: i_outputs,
                     domain_predicate,
+                    deleted,
                 },
             ) => {
                 // We rely on having the predicate and input sharing exactly the same domain
@@ -2394,6 +2442,7 @@ impl TileProducer for FilterProducer {
                     domain: i_inputs,
                     codomain: i_outputs,
                     domain_predicate,
+                    deleted,
                 };
                 output.retain(mask);
                 output
@@ -2501,6 +2550,7 @@ impl TileProducer for RestrictProducer {
                 domain,
                 codomain,
                 domain_predicate,
+                deleted,
             } => {
                 let pred_bools = scalar_tile_to_column_value(*codomain);
                 let mask = pred_bools
@@ -2511,8 +2561,9 @@ impl TileProducer for RestrictProducer {
                     codomain: Box::new(Tile::Scalar(domain.clone())),
                     domain,
                     domain_predicate,
+                    deleted,
                 };
-                output.retain(mask);
+                output.mark_deleted(mask);
                 output
             }
             _ => panic!("Restrict: predicate must produce a SealedFunction tile"),
@@ -2623,8 +2674,9 @@ impl TileProducer for AggregateProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let i_tiling = self.input.tiling().clone();
-        let input_result = self.input.get(i_tiling.universal_guard());
+        let mut input_result = self.input.get(i_tiling.universal_guard());
         let upstream_guard = input_result.to_guard();
+        input_result.compact();
         let Tile::SealedFunction { codomain, .. } = input_result else {
             panic!("Aggregate expected function tiling, got {input_result:?}");
         };
@@ -2839,6 +2891,7 @@ impl TileProducer for MapExtractAggregateProducer {
             domain,
             codomain,
             domain_predicate,
+            ..
         } = input_result
         else {
             panic!("MapExtractAggregate expected SealedFunction tile")
@@ -2859,6 +2912,7 @@ impl TileProducer for MapExtractAggregateProducer {
             domain,
             codomain: Box::new(Tile::Scalar(self.kind.extract(accumulator))),
             domain_predicate,
+            deleted: BitSet::new(),
         };
         output.retain(mask);
         output
@@ -2969,15 +3023,17 @@ impl TileProducer for MapAggregateProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
+        let mut input_tile = self.input.get(self.input.tiling().universal_guard());
         trace!("{} received {input_tile:?}", self.name());
         let upstream_guard = input_tile.to_guard();
+        input_tile.compact();
         let Tile::CurriedFunction {
             domain1,
             offsets,
             domain2: _,
             codomain,
             domain_predicate,
+            ..
         } = input_tile
         else {
             panic!("MapAggregate requires a CurriedFunction tile")
@@ -3023,6 +3079,7 @@ impl TileProducer for MapAggregateProducer {
                 terminal: ColumnValue::Bools(BitVec::from_elem(n, is_terminal)),
             }),
             domain_predicate,
+            deleted: BitSet::new(),
         }
     }
 
@@ -3302,9 +3359,10 @@ impl TileProducer for MemoProducer {
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let input = self.input.get(projection_guard);
+        let mut input = self.input.get(projection_guard);
         trace!("{} received {input:?}", self.name());
         let upstream_obsolete = input.to_guard();
+        input.compact();
         trace!("{} releasing {upstream_obsolete:?}", self.name());
         self.input.release(upstream_obsolete);
         trace!(
@@ -3320,6 +3378,8 @@ impl TileProducer for MemoProducer {
         // Remove any released data from the cached tile since the consumer
         // is no longer interested.
         self.cached_tile.remove_guarded(obsolete_guard.clone());
+        // Compact so that logically-deleted entries are physically gone.
+        self.cached_tile.compact();
         // Also release upstream to handle the case where the consumer releases
         // data that was never produced.
         self.input.release(obsolete_guard.clone());
@@ -3485,6 +3545,7 @@ impl TileProducer for ToScalarProducer {
             domain,
             codomain,
             domain_predicate: _,
+            ..
         } = input_result
         else {
             panic!("ToScalarProducer expected SealedFunction")
@@ -3693,6 +3754,7 @@ mod tests {
             domain2: ColumnValue::UInts(vec![10, 20, 30]),
             codomain: ColumnValue::UInts(vec![100, 200, 300]),
             domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
         };
 
         let function_tiling = Tiling::CurriedFunction {
@@ -3706,6 +3768,7 @@ mod tests {
             domain: ColumnValue::UInts(vec![2, 0, 1]),
             codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![1, 0, 1]))),
             domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
         };
 
         let input_tiling = Tiling::SealedFunction {
@@ -3810,6 +3873,7 @@ mod tests {
             domain2: ColumnValue::UInts(vec![10, 20]),
             codomain: ColumnValue::UInts(vec![100, 200]),
             domain_predicate: f_pred,
+            deleted: BitSet::new(),
         };
         let function_tiling = Tiling::CurriedFunction {
             domain1: Extent::Base(BaseType::UInt),
@@ -3821,6 +3885,7 @@ mod tests {
             domain: ColumnValue::UInts(vec![0, 1, 2, 3]),
             codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1, 2, 3]))),
             domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
         };
         let input_tiling = Tiling::SealedFunction {
             domain: Extent::Base(BaseType::UInt),
@@ -3873,6 +3938,7 @@ mod tests {
             domain2: ColumnValue::UInts(vec![10, 20]),
             codomain: ColumnValue::UInts(vec![100, 200]),
             domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
         };
         let function_tiling = Tiling::CurriedFunction {
             domain1: Extent::Base(BaseType::UInt),
@@ -3883,6 +3949,7 @@ mod tests {
             domain: ColumnValue::UInts(vec![0, 1]),
             codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1]))),
             domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
         };
         let input_tiling = Tiling::SealedFunction {
             domain: Extent::Base(BaseType::UInt),
@@ -3933,6 +4000,7 @@ mod tests {
             domain2: ColumnValue::UInts(vec![10, 20, 30]),
             codomain: ColumnValue::UInts(vec![100, 200, 300]),
             domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
         };
 
         let curried_tiling = Tiling::CurriedFunction {
@@ -3970,6 +4038,7 @@ mod tests {
                 domain,
                 codomain,
                 domain_predicate,
+                ..
             } => {
                 // Verify the domain is a Record with fields _0 and _1
                 match domain {
@@ -4043,6 +4112,7 @@ mod tests {
             domain2: ColumnValue::UInts(vec![10, 20, 30]),
             codomain: ColumnValue::UInts(vec![1, 2, 3]),
             domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
         };
 
         let curried_tiling = Tiling::CurriedFunction {
@@ -4077,6 +4147,7 @@ mod tests {
                 domain,
                 codomain: _,
                 domain_predicate,
+                ..
             } => {
                 match domain {
                     ColumnValue::Records(fields) => {
@@ -4130,6 +4201,7 @@ mod tests {
             domain2: ColumnValue::UInts(vec![10, 20, 30]),
             codomain: ColumnValue::UInts(vec![100, 200, 300]),
             domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
         };
 
         let curried_tiling = Tiling::CurriedFunction {
@@ -4251,6 +4323,7 @@ mod tests {
             domain2: ColumnValue::UInts(vec![10, 20]),
             codomain: ColumnValue::UInts(vec![100, 200]),
             domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
         };
 
         let curried_tiling = Tiling::CurriedFunction {
@@ -4296,5 +4369,133 @@ mod tests {
             }
             _ => panic!("Expected SealedFunction result"),
         }
+    }
+
+    /// Build a `ConverseProducer` wrapping the given input tile and call `get`.
+    fn run_converse(input_tile: Tile, input_tiling: Tiling) -> Tile {
+        let output_tiling = {
+            let (domain, codomain) = input_tiling.split_function_extent().unwrap();
+            Tiling::CurriedFunction {
+                domain1: codomain,
+                domain2: domain.clone(),
+                codomain: domain,
+            }
+        };
+        let mut producer = ConverseProducer {
+            base: ProducerBase::new(ConverseProducer::alloc_id(), &output_tiling),
+            input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
+        };
+        producer.get(producer.tiling().universal_guard())
+    }
+
+    fn sealed_fn_tiling() -> Tiling {
+        Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::Int),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        }
+    }
+
+    /// Basic converse: `{0→10, 1→20, 2→10}` groups by codomain value.
+    /// Expected output: domain1=[10,20], each group lists the domain values that map to it.
+    #[test]
+    fn converse_producer_basic_grouping() {
+        let tile = Tile::SealedFunction {
+            domain: ColumnValue::Ints(vec![0, 1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 10]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        };
+        let result = run_converse(tile, sealed_fn_tiling());
+        let Tile::CurriedFunction {
+            domain1,
+            offsets,
+            domain2,
+            domain_predicate,
+            deleted,
+            ..
+        } = result
+        else {
+            panic!("expected CurriedFunction");
+        };
+        // Two distinct codomain values: 10 and 20.
+        assert_eq!(domain1, ColumnValue::Ints(vec![10, 20]));
+        // Group for 10 starts at 0 (rows 0 and 2 map to 10); group for 20 starts at 2.
+        assert_eq!(offsets, ColumnValue::UInts(vec![0, 2]));
+        // domain2 is sorted by codomain key: [0, 2] for key 10, then [1] for key 20.
+        assert_eq!(domain2, ColumnValue::Ints(vec![0, 2, 1]));
+        assert_eq!(domain_predicate, Predicate::True);
+        assert!(deleted.is_empty(), "no deleted entries expected");
+    }
+
+    /// Converse with no deleted entries on a single-entry input is a trivial sanity check.
+    #[test]
+    fn converse_producer_single_entry_no_deleted() {
+        let tile = Tile::SealedFunction {
+            domain: ColumnValue::Ints(vec![42]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        };
+        let result = run_converse(tile, sealed_fn_tiling());
+        let Tile::CurriedFunction { deleted, .. } = result else {
+            panic!("expected CurriedFunction");
+        };
+        assert!(deleted.is_empty());
+    }
+
+    /// Deleted bit on an input row must appear at the correct remapped position in the output.
+    ///
+    /// Input: domain=[0,1,2], codomain=[20,10,20], deleted={0}  (row 0 is logically removed).
+    /// Sort order by codomain: [1(→10), 0(→20), 2(→20)].
+    /// After remapping, input row 0 lands at output position 1, so output deleted={1}.
+    #[test]
+    fn converse_producer_deleted_remapped_through_sort() {
+        let mut input_deleted = BitSet::new();
+        input_deleted.insert(0); // row 0 is logically removed
+        let tile = Tile::SealedFunction {
+            domain: ColumnValue::Ints(vec![0, 1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 10, 20]))),
+            domain_predicate: Predicate::True,
+            deleted: input_deleted,
+        };
+        let result = run_converse(tile, sealed_fn_tiling());
+        let Tile::CurriedFunction {
+            deleted, domain2, ..
+        } = result
+        else {
+            panic!("expected CurriedFunction");
+        };
+        // Sorted order: row 1 (key 10) first, then row 0 (key 20), then row 2 (key 20).
+        // Output position 1 holds original row 0, which was deleted.
+        assert_eq!(domain2, ColumnValue::Ints(vec![1, 0, 2]));
+        let mut expected = BitSet::new();
+        expected.insert(1);
+        assert_eq!(deleted, expected);
+    }
+
+    /// Multiple deleted rows are all remapped correctly.
+    ///
+    /// Input: domain=[0,1,2,3], codomain=[30,10,20,10], deleted={1,3}.
+    /// Sort order by codomain: [1(10), 3(10), 2(20), 0(30)].
+    /// Input rows 1 and 3 land at output positions 0 and 1, so output deleted={0,1}.
+    #[test]
+    fn converse_producer_multiple_deleted_remapped() {
+        let mut input_deleted = BitSet::new();
+        input_deleted.insert(1);
+        input_deleted.insert(3);
+        let tile = Tile::SealedFunction {
+            domain: ColumnValue::Ints(vec![0, 1, 2, 3]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 10, 20, 10]))),
+            domain_predicate: Predicate::True,
+            deleted: input_deleted,
+        };
+        let result = run_converse(tile, sealed_fn_tiling());
+        let Tile::CurriedFunction { deleted, .. } = result else {
+            panic!("expected CurriedFunction");
+        };
+        let mut expected = BitSet::new();
+        expected.insert(0);
+        expected.insert(1);
+        assert_eq!(deleted, expected);
     }
 }

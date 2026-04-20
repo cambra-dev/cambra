@@ -9,6 +9,7 @@ use std::{
     hash::Hash,
 };
 
+use bit_set::BitSet;
 use bit_vec::BitVec;
 use intervalsets::{
     numeric::Domain,
@@ -143,6 +144,7 @@ impl Tiling {
                 domain: ColumnValue::from_values(Vec::new(), domain),
                 codomain: Box::new(codomain.empty_tile()),
                 domain_predicate: Predicate::False,
+                deleted: BitSet::new(),
             },
             Tiling::CurriedFunction {
                 domain1: domain1_extent,
@@ -154,6 +156,7 @@ impl Tiling {
                 ColumnValue::from_values(Vec::new(), domain2_extent),
                 ColumnValue::from_values(Vec::new(), codomain_extent),
                 Predicate::False,
+                BitSet::new(),
             ),
             Tiling::Aggregation { kind, accumulator } => Tile::Aggregation {
                 kind: kind.clone(),
@@ -243,6 +246,11 @@ pub enum Tile {
         /// Calls to `get` can still return tiles with data in this region, but such data is guaranteed to
         /// be the same as data already observed.
         domain_predicate: Predicate,
+        /// Set of indices (into `domain`/`codomain`) that have been logically removed by
+        /// filtering.  1 = deleted; an empty set means all entries are present.  The full
+        /// physical arrays are preserved so that `to_guard` can report every domain value
+        /// that has ever been seen—not just the survivors—enabling complete source releasing.
+        deleted: BitSet,
     },
     /// A two-level curried function.
     ///
@@ -264,6 +272,11 @@ pub enum Tile {
         codomain: ColumnValue,
         /// Whether all domain keys and their value lists have been fully received.
         domain_predicate: Predicate,
+        /// Set of flat `domain2`/`codomain` row indices that have been logically removed by
+        /// filtering.  1 = deleted; empty means all rows are present.  Preserved for the
+        /// same reason as [`Tile::SealedFunction::deleted`]: so `to_guard` can report every
+        /// domain2 value ever seen, enabling complete source releasing.
+        deleted: BitSet,
     },
     /// A Tile representing the state of a scalar aggregation.
     Aggregation {
@@ -292,8 +305,12 @@ impl Tile {
         match self {
             Tile::Scalar(cv) => cv.len(),
             Tile::Record(m) => m.values().map(Tile::len).max().unwrap_or(0),
-            Tile::SealedFunction { domain, .. } => domain.len(),
-            Tile::CurriedFunction { domain1, .. } => domain1.len(),
+            Tile::SealedFunction {
+                domain, deleted, ..
+            } => domain.len() - deleted.len(),
+            Tile::CurriedFunction {
+                domain2, deleted, ..
+            } => domain2.len() - deleted.len(),
             Tile::Aggregation { accumulator, .. } => accumulator.len(),
         }
     }
@@ -377,16 +394,23 @@ impl Tile {
                     domain: s_domain,
                     codomain: s_codomain,
                     domain_predicate: s_pred,
+                    deleted: s_deleted,
                 },
                 Tile::SealedFunction {
                     domain: o_domain,
                     codomain: o_codomain,
                     domain_predicate: o_pred,
+                    deleted: o_deleted,
                 },
             ) => {
+                let s_domain_len = s_domain.len();
                 s_domain.append(o_domain);
                 s_codomain.merge(*o_codomain);
                 *s_pred = s_pred.union(&o_pred);
+                // Shift other's deleted indices into the combined physical array.
+                for idx in o_deleted.iter() {
+                    s_deleted.insert(idx + s_domain_len);
+                }
             }
             (
                 Tile::CurriedFunction {
@@ -395,6 +419,7 @@ impl Tile {
                     domain2: s_domain2,
                     codomain: s_codomain,
                     domain_predicate: s_pred,
+                    deleted: s_deleted,
                 },
                 Tile::CurriedFunction {
                     domain1: o_domain1,
@@ -402,6 +427,7 @@ impl Tile {
                     domain2: o_domain2,
                     codomain: o_codomain,
                     domain_predicate: o_pred,
+                    deleted: o_deleted,
                 },
             ) => {
                 // Shift o's offsets by the current size of s's domain2 so they index into
@@ -414,6 +440,10 @@ impl Tile {
                 s_domain2.append(o_domain2);
                 s_codomain.append(o_codomain);
                 *s_pred = s_pred.union(&o_pred);
+                // Shift other's deleted row indices into the combined flat array.
+                for idx in o_deleted.iter() {
+                    s_deleted.insert(idx + s_d2_len);
+                }
             }
             (Tile::Record(s_fields), Tile::Record(ref mut o_fields)) => {
                 assert_eq!(s_fields.len(), o_fields.len());
@@ -431,21 +461,37 @@ impl Tile {
     }
 
     /// Retain in-place only the elements at positions where `mask[i]` is true.
+    ///
+    /// After retention the physical arrays are compact and `deleted` is cleared —
+    /// every surviving entry is considered live.  Use [`Tile::compact`] to build
+    /// the mask automatically from the current `deleted` set.
     pub fn retain(&mut self, mask: &BitVec) {
         match self {
             Tile::Scalar(cv) => cv.retain(mask),
             Tile::Record(m) => m.values_mut().for_each(|t| t.retain(mask)),
             Tile::SealedFunction {
-                domain, codomain, ..
+                domain,
+                codomain,
+                deleted,
+                ..
             } => {
-                domain.retain(mask);
-                codomain.retain(mask);
+                // Combine the caller's mask with the logical-deletion bits:
+                // keep entry i only if mask[i] is true AND it is not logically deleted.
+                let effective_mask: BitVec = mask
+                    .iter()
+                    .enumerate()
+                    .map(|(i, keep)| keep && !deleted.contains(i))
+                    .collect();
+                domain.retain(&effective_mask);
+                codomain.retain(&effective_mask);
+                deleted.clear();
             }
             Tile::CurriedFunction {
                 domain1,
                 offsets,
                 domain2,
                 codomain,
+                deleted,
                 ..
             } => {
                 // The mask is over the flat domain2/codomain rows.
@@ -474,7 +520,10 @@ impl Tile {
                     } else {
                         domain2_total
                     };
-                    let group_kept: Vec<usize> = (start..end).filter(|&j| mask[j]).collect();
+                    // Keep flat row j if the caller's mask says keep AND j is not logically deleted.
+                    let group_kept: Vec<usize> = (start..end)
+                        .filter(|&j| mask[j] && !deleted.contains(j))
+                        .collect();
                     if !group_kept.is_empty() {
                         new_offsets.push(kept_indices.len());
                         new_domain1_keep.push(i);
@@ -487,9 +536,64 @@ impl Tile {
                 *offsets = ColumnValue::UInts(new_offsets);
                 *domain2 = domain2.select_indices(kept_indices.iter().cloned(), kept_len);
                 *codomain = codomain.select_indices(kept_indices.iter().cloned(), kept_len);
+                deleted.clear();
             }
             _ => panic!("retain not supported for {self:?}"),
         }
+    }
+
+    /// Logically remove entries at positions where `mask[i]` is false by setting bits in
+    /// `deleted`.  Physical arrays are untouched, so `to_guard` still reports every
+    /// domain value that was ever present.  Call [`Tile::compact`] to physically remove
+    /// deleted entries when iteration over only live entries is required.
+    pub fn mark_deleted(&mut self, mask: &BitVec) {
+        match self {
+            Tile::SealedFunction { deleted, .. } | Tile::CurriedFunction { deleted, .. } => {
+                for (i, keep) in mask.iter().enumerate() {
+                    if !keep {
+                        deleted.insert(i);
+                    }
+                }
+            }
+            _ => panic!("mark_deleted not supported for {self:?}"),
+        }
+    }
+
+    /// Physically remove all logically-deleted entries and clear `deleted`.
+    ///
+    /// After this call the tile is compact: every physical slot is live.
+    /// This is the counterpart to [`Tile::mark_deleted`] and is called before
+    /// operators iterate over tile data so they only process live entries.
+    pub fn compact(&mut self) {
+        let n = match self {
+            Tile::SealedFunction {
+                deleted, domain, ..
+            } => {
+                if deleted.is_empty() {
+                    return;
+                }
+                domain.len()
+            }
+            Tile::CurriedFunction {
+                deleted, domain2, ..
+            } => {
+                if deleted.is_empty() {
+                    return;
+                }
+                domain2.len()
+            }
+            _ => return,
+        };
+        // Build the keep-mask from the deleted set, then let retain() do the work
+        // (retain also clears deleted).
+        let deleted_clone = match self {
+            Tile::SealedFunction { deleted, .. } | Tile::CurriedFunction { deleted, .. } => {
+                deleted.clone()
+            }
+            _ => unreachable!(),
+        };
+        let mask: BitVec = (0..n).map(|i| !deleted_clone.contains(i)).collect();
+        self.retain(&mask);
     }
 
     /// Removes all data in this tile that is specified by the guard.
@@ -530,66 +634,56 @@ impl Tile {
                     tile.remove_guarded(arm);
                 }
             }
-            // SealedFunction: remove domain+codomain entries whose domain value is in the predicate.
+            // SealedFunction: mark domain entries whose value is in the predicate as deleted.
+            // Physical arrays are preserved so that to_guard() reports all ever-seen values.
             (
                 Tile::SealedFunction {
-                    domain,
-                    codomain,
-                    domain_predicate: _,
+                    domain, deleted, ..
                 },
                 TileGuard::Function(FunctionGuard::Domain(pred)),
             ) => {
-                let mask: BitVec = (0..domain.len())
-                    .map(|i| !pred.contains(&domain.index_at(i)))
-                    .collect();
-                domain.retain(&mask);
-                codomain.retain(&mask);
+                for i in 0..domain.len() {
+                    if pred.contains(&domain.index_at(i)) {
+                        deleted.insert(i);
+                    }
+                }
             }
-            // CurriedFunction + Domain: remove entire domain1 groups whose key matches the
-            // predicate, along with all their domain2/codomain rows.
+            // CurriedFunction + Domain: mark all flat rows belonging to matching domain1 groups.
             (
-                tile @ Tile::CurriedFunction { .. },
+                Tile::CurriedFunction {
+                    domain1,
+                    offsets,
+                    domain2,
+                    deleted,
+                    ..
+                },
                 TileGuard::Function(FunctionGuard::Domain(pred)),
             ) => {
-                // Borrow the tile to build a flat mask over domain2 rows, then release
-                // so that `retain` can take the mutable borrow.
-                let mask: BitVec = {
-                    let Tile::CurriedFunction {
-                        domain1,
-                        offsets,
-                        domain2,
-                        ..
-                    } = &*tile
-                    else {
-                        unreachable!()
-                    };
-                    let ColumnValue::UInts(offset_vec) = offsets else {
-                        panic!("CurriedFunction offsets must be UInts");
-                    };
-                    let n = domain1.len();
-                    let domain2_total = domain2.len();
-                    let mut mask = BitVec::from_elem(domain2_total, true);
-                    for i in 0..n {
-                        if pred.contains(&domain1.index_at(i)) {
-                            let start = offset_vec[i];
-                            let end = if i + 1 < n {
-                                offset_vec[i + 1]
-                            } else {
-                                domain2_total
-                            };
-                            for j in start..end {
-                                mask.set(j, false);
-                            }
+                let ColumnValue::UInts(offset_vec) = &*offsets else {
+                    panic!("CurriedFunction offsets must be UInts");
+                };
+                let offset_vec = offset_vec.clone();
+                let n = domain1.len();
+                let domain2_total = domain2.len();
+                for i in 0..n {
+                    if pred.contains(&domain1.index_at(i)) {
+                        let start = offset_vec[i];
+                        let end = if i + 1 < n {
+                            offset_vec[i + 1]
+                        } else {
+                            domain2_total
+                        };
+                        for j in start..end {
+                            deleted.insert(j);
                         }
                     }
-                    mask
-                };
-                tile.retain(&mask);
+                }
             }
-            // CurriedFunction: remove domain2+codomain entries whose domain2 value is in the predicate,
-            // and prune any domain1 groups that become empty.
+            // CurriedFunction + Codomain(Domain(pred)): mark flat rows whose domain2 value matches.
             (
-                tile @ Tile::CurriedFunction { .. },
+                Tile::CurriedFunction {
+                    domain2, deleted, ..
+                },
                 TileGuard::Function(FunctionGuard::Codomain(inner)),
             ) => {
                 let TileGuard::Function(FunctionGuard::Domain(pred)) = *inner else {
@@ -597,18 +691,11 @@ impl Tile {
                         "CurriedFunction remove_guarded only supports Codomain(Domain(pred))"
                     )
                 };
-                // Borrow domain2 only long enough to build the survival mask, then
-                // release so retain can take the mutable borrow.
-                let mask: BitVec = {
-                    let Tile::CurriedFunction { domain2, .. } = &*tile else {
-                        unreachable!()
-                    };
-                    (0..domain2.len())
-                        .map(|i| !pred.contains(&domain2.index_at(i)))
-                        .collect()
-                };
-                // domain_predicate tracks domain1 completeness and is not updated on removal.
-                tile.retain(&mask);
+                for j in 0..domain2.len() {
+                    if pred.contains(&domain2.index_at(j)) {
+                        deleted.insert(j);
+                    }
+                }
             }
             (s, g) => panic!("Incompatible tile and guard in remove_guarded: {s:?} and {g:?}"),
         }
@@ -619,6 +706,11 @@ impl Tile {
     /// For Aggregation: universal if terminal and empty otherwise
     /// For SealedFunction: Domain predicate for all domain values
     /// For CurriedFunction, Codomain(Domain(predicate)) for all domain2 values (TODO for now we assume unique domain2)
+    ///
+    /// Important note around logical deletes: we don't release eagerly when logically deleting rows via the
+    /// deleted bitsets, so `to_guard` includes logically-deleted rows when constructing the guards.
+    /// Doing it this way significantly reduces the fragmentation of the obsolete guards, which lets them use
+    /// smaller representations.
     pub fn to_guard(&self) -> TileGuard {
         match self {
             Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
@@ -632,9 +724,16 @@ impl Tile {
                 domain,
                 domain_predicate,
                 ..
-            } => TileGuard::Function(FunctionGuard::Domain(
-                Predicate::from_column_value(domain).union(domain_predicate),
-            )),
+            } => {
+                if domain_predicate.is_true() {
+                    TileGuard::Function(FunctionGuard::Domain(Predicate::True))
+                } else {
+                    // TODO include domain_predicate in from_column_value to avoid unnecessary work.
+                    TileGuard::Function(FunctionGuard::Domain(
+                        Predicate::from_column_value(domain).union(domain_predicate),
+                    ))
+                }
+            }
             Tile::CurriedFunction {
                 domain2,
                 domain_predicate,
@@ -648,13 +747,15 @@ impl Tile {
         }
     }
 
-    /// Creates a Tile::CurriedFunction and does dev-build-only validation for correct structure.
+    /// Creates a `Tile::CurriedFunction` and does dev-build-only validation for correct structure.
+    /// Pass `BitSet::new()` for `deleted` when no entries are logically removed.
     pub fn curried_function(
         domain1: ColumnValue,
         offsets: ColumnValue,
         domain2: ColumnValue,
         codomain: ColumnValue,
         domain_predicate: Predicate,
+        deleted: BitSet,
     ) -> Tile {
         let result = Tile::CurriedFunction {
             domain1,
@@ -662,6 +763,7 @@ impl Tile {
             domain2,
             codomain,
             domain_predicate,
+            deleted,
         };
         debug_assert!(
             validate_tile(&result),
@@ -679,6 +781,7 @@ pub fn validate_tile(tile: &Tile) -> bool {
             domain2,
             codomain,
             domain_predicate: _,
+            deleted: _,
         } => {
             let ColumnValue::UInts(offsets) = offsets else {
                 return false;
@@ -1529,6 +1632,7 @@ pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
             domain: mk_domain(sorted_d),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(sorted_c))),
             domain_predicate,
+            deleted: BitSet::new(),
         }
     }
 
@@ -1537,6 +1641,7 @@ pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
             domain,
             codomain,
             domain_predicate,
+            deleted,
         } => match (*codomain, domain) {
             (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Ints(dom)) => {
                 sort_and_rebuild(dom, cod_ints, domain_predicate, ColumnValue::Ints)
@@ -1564,6 +1669,7 @@ pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
                 domain,
                 codomain: Box::new(other_codomain),
                 domain_predicate,
+                deleted,
             },
         },
         other => other,
@@ -2419,6 +2525,7 @@ mod tests {
             domain: ColumnValue::Ints(vec![1]),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))),
             domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
         };
         assert!(tile.is_terminal());
     }
@@ -2429,6 +2536,7 @@ mod tests {
             domain: ColumnValue::Ints(vec![]),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
             domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
         };
         assert!(!tile.is_terminal());
     }
@@ -2634,6 +2742,7 @@ mod tests {
             domain2: ColumnValue::UInts(vec![]),
             codomain: ColumnValue::UInts(vec![]),
             domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
         };
         assert!(tile.is_terminal());
     }
@@ -3043,6 +3152,7 @@ mod tests {
             domain: ColumnValue::Ints(domain),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(codomain))),
             domain_predicate: pred,
+            deleted: BitSet::new(),
         }
     }
 
@@ -3060,6 +3170,7 @@ mod tests {
             ColumnValue::UInts(d2),
             ColumnValue::Ints(cod),
             pred,
+            BitSet::new(),
         )
     }
 
@@ -3285,21 +3396,30 @@ mod tests {
 
     #[test]
     fn remove_guarded_sealed_function_removes_matching_entries() {
-        // Remove only domain value 1; domain value 2 survives.
+        // Logically removes domain value 1 (index 0); physical arrays are unchanged.
         let pred = Predicate::from_column_value(&ColumnValue::Ints(vec![1]));
         let mut tile = sf_int(vec![1, 2], vec![10, 20], Predicate::True);
         tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(pred)));
+        // Logical length excludes deleted entries.
+        assert_eq!(tile.len(), 1);
         let Tile::SealedFunction {
-            domain, codomain, ..
+            domain,
+            codomain,
+            deleted,
+            ..
         } = &tile
         else {
             panic!("expected SealedFunction");
         };
-        assert_eq!(*domain, ColumnValue::Ints(vec![2]));
+        // Physical arrays are unchanged.
+        assert_eq!(*domain, ColumnValue::Ints(vec![1, 2]));
         assert_eq!(
             *codomain,
-            Box::new(Tile::Scalar(ColumnValue::Ints(vec![20])))
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20])))
         );
+        // Index 0 (domain value 1) is logically deleted.
+        assert!(deleted.contains(0), "index 0 should be deleted");
+        assert!(!deleted.contains(1), "index 1 should not be deleted");
     }
 
     #[test]
@@ -3307,16 +3427,14 @@ mod tests {
         let mut tile = sf_int(vec![1, 2], vec![10, 20], Predicate::True);
         let guard = tile.to_guard();
         tile.remove_guarded(guard);
-        let Tile::SealedFunction { domain, .. } = &tile else {
-            panic!("expected SealedFunction");
-        };
-        assert_eq!(domain.len(), 0);
+        // Physical arrays are unchanged; logical length is 0.
+        assert_eq!(tile.len(), 0);
     }
 
     #[test]
     fn remove_guarded_curried_function_removes_matching_domain2() {
         // d1=[0,1], offsets=[0,2], d2=[10,11,12], cod=[100,110,120]
-        // Remove d2=11; 10 and 12 survive.
+        // Logically removes d2=11 (flat index 1); physical arrays are unchanged.
         let mut tile = cf_uint_int(
             vec![0, 1],
             vec![0, 2],
@@ -3326,22 +3444,28 @@ mod tests {
         );
         let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![11]));
         tile.remove_guarded(cf_release_guard(pred));
-        assert_eq!(
-            tile,
-            cf_uint_int(
-                vec![0, 1],
-                vec![0, 1], // group 0: 1 entry at 0; group 1: 1 entry at 1
-                vec![10, 12],
-                vec![100, 120],
-                Predicate::False,
-            )
-        );
+        let Tile::CurriedFunction {
+            domain2,
+            codomain,
+            deleted,
+            ..
+        } = &tile
+        else {
+            panic!("expected CurriedFunction");
+        };
+        // Physical arrays unchanged.
+        assert_eq!(*domain2, ColumnValue::UInts(vec![10, 11, 12]));
+        assert_eq!(*codomain, ColumnValue::Ints(vec![100, 110, 120]));
+        // Only flat index 1 (d2=11) is logically deleted.
+        assert!(!deleted.contains(0));
+        assert!(deleted.contains(1));
+        assert!(!deleted.contains(2));
     }
 
     #[test]
     fn remove_guarded_curried_function_prunes_empty_group() {
         // d1=[0,1], offsets=[0,2], d2=[10,11,12], cod=[100,110,120]
-        // Remove d2=10 and d2=11 (the whole group 0); group 1 (d2=12) survives.
+        // Logically removes d2=10 (idx 0) and d2=11 (idx 1); physical arrays unchanged.
         let mut tile = cf_uint_int(
             vec![0, 1],
             vec![0, 2],
@@ -3351,16 +3475,18 @@ mod tests {
         );
         let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![10, 11]));
         tile.remove_guarded(cf_release_guard(pred));
-        assert_eq!(
-            tile,
-            cf_uint_int(vec![1], vec![0], vec![12], vec![120], Predicate::False)
-        );
+        let Tile::CurriedFunction { deleted, .. } = &tile else {
+            panic!("expected CurriedFunction");
+        };
+        assert!(deleted.contains(0));
+        assert!(deleted.contains(1));
+        assert!(!deleted.contains(2));
     }
 
     #[test]
     fn remove_guarded_curried_function_domain_removes_whole_group() {
         // d1=[0,1], offsets=[0,2], d2=[10,11,12], cod=[100,110,120]
-        // Remove d1=0 (group 0: d2=[10,11]); group 1 (d2=[12]) survives.
+        // Logically removes group 0 (flat indices 0,1) via domain guard on d1=0.
         let mut tile = cf_uint_int(
             vec![0, 1],
             vec![0, 2],
@@ -3369,11 +3495,13 @@ mod tests {
             Predicate::False,
         );
         let pred = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
-        tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(pred.clone())));
-        assert_eq!(
-            tile,
-            cf_uint_int(vec![1], vec![0], vec![12], vec![120], Predicate::False)
-        );
+        tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(pred)));
+        let Tile::CurriedFunction { deleted, .. } = &tile else {
+            panic!("expected CurriedFunction");
+        };
+        assert!(deleted.contains(0));
+        assert!(deleted.contains(1));
+        assert!(!deleted.contains(2));
     }
 
     #[test]
@@ -3408,6 +3536,8 @@ mod tests {
 
     #[test]
     fn round_trip_curried_function_full_release() {
+        // After logical deletion, to_guard() still sees all physical entries, so
+        // the guard is unchanged (including deleted entries for complete source releasing).
         let mut tile = cf_uint_int(
             vec![0, 1],
             vec![0, 2],
@@ -3416,8 +3546,10 @@ mod tests {
             Predicate::False,
         );
         let guard = tile.to_guard();
-        tile.remove_guarded(guard);
-        assert_eq!(tile.to_guard(), cf_release_guard(Predicate::False));
+        tile.remove_guarded(guard.clone());
+        assert_eq!(tile.to_guard(), guard);
+        // All entries are logically deleted.
+        assert_eq!(tile.len(), 0);
     }
 
     // ── Tile::retain (CurriedFunction) ────────────────────────────────────────

@@ -18,8 +18,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
+use bit_set::BitSet;
 use bit_vec::BitVec;
 use cambra::ccl::context::compile_program;
+use cambra::ccl::Expr;
 use cambra::ccl::{context::GlobalContext, Type};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
@@ -38,15 +40,21 @@ use smol_str::SmolStr;
 /// → `compile_ccl` → subscribe → get) and return the resulting [`ColumnValue`].
 fn run_pipeline(code: &str) -> Tile {
     let mut ctx = GlobalContext::default();
+    run_pipeline_with_ctx(&mut ctx, code).1
+}
+
+fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Expr, Tile) {
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let (_, _, mut producer) = compile_program(&mut ctx, code, consumer);
+    let (ccl, _, mut producer) = compile_program(ctx, code, consumer);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
-    producer.get(producer.tiling().universal_guard())
+    let mut result = producer.get(producer.tiling().universal_guard());
+    result.compact();
+    (ccl, result)
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +88,7 @@ fn make_int_list(v: &[i64]) -> Tile {
         domain: ColumnValue::UInts((0..v.len()).collect()),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(v.into()))),
         domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
     }
 }
 
@@ -106,7 +115,7 @@ fn test_literals(#[case] code: &str, #[case] expected: Value) {
 
 #[rstest]
 #[timeout(Duration::from_secs(1))]
-#[case("[]", Tile::SealedFunction { domain: ColumnValue::UInts(vec![]), codomain: Box::new(Tile::Scalar(ColumnValue::Units(0))), domain_predicate: Predicate::True })]
+#[case("[]", Tile::SealedFunction { domain: ColumnValue::UInts(vec![]), codomain: Box::new(Tile::Scalar(ColumnValue::Units(0))), domain_predicate: Predicate::True, deleted: BitSet::new() })]
 #[case("[1, 2]", make_int_list(&[1, 2]))]
 fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -275,6 +284,7 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
             (tuple_field(1), Tile::Scalar(ColumnValue::Ints(vec![100, 100]))),
         ]))),
         domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
     }
 )]
 fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: Tile) {
@@ -296,6 +306,7 @@ fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: Tile) {
         domain: ColumnValue::UInts(vec![1]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))),
         domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
     }
 )]
 #[case(
@@ -304,6 +315,7 @@ fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: Tile) {
         domain: ColumnValue::UInts(vec![1, 2, 3]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4]))),
         domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
     }
 )]
 fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
@@ -416,6 +428,7 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
         domain: ColumnValue::Ints(vec![1, 2]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 9]))),
         domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
     }
 )]
 #[case(
@@ -424,6 +437,7 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
         domain: ColumnValue::Ints(vec![6, 7]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![25, 29]))),
         domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
     }
 )]
 fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
@@ -535,13 +549,15 @@ fn test_source_filter_nonterminal() {
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
 
-    let tile = producer.get(producer.tiling().universal_guard());
+    let mut tile = producer.get(producer.tiling().universal_guard());
+    tile.compact();
     assert_eq!(
         sort_sealed_function_by_domain(tile),
         sort_sealed_function_by_domain(Tile::SealedFunction {
             domain: ColumnValue::UInts(vec![0, 1]),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
             domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
         })
     );
 }
@@ -940,7 +956,8 @@ fn test_incremental_aggregates() {
         Tile::SealedFunction {
             domain: ColumnValue::Ints(vec![]),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
-            domain_predicate: Predicate::False
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
         }
     );
 
@@ -954,7 +971,8 @@ fn test_incremental_aggregates() {
         Tile::SealedFunction {
             domain: ColumnValue::Ints(vec![]),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
-            domain_predicate: Predicate::False
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
         }
     );
 
@@ -968,7 +986,8 @@ fn test_incremental_aggregates() {
         sort_sealed_function_by_domain(Tile::SealedFunction {
             domain: ColumnValue::Ints(vec![1, 2, 3]),
             codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 20, 30]))),
-            domain_predicate: Predicate::True
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
         })
     );
 
@@ -1032,6 +1051,7 @@ fn test_no_splits(#[case] code: &str) {
         domain: ColumnValue::UInts(vec![1]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Bools(BitVec::from_elem(1, true)))),
         domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
     },
 )]
 #[case(
@@ -1041,6 +1061,7 @@ fn test_no_splits(#[case] code: &str) {
         domain: ColumnValue::UInts(vec![1]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![12]))),
         domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
     },
 )]
 #[case(
@@ -1055,7 +1076,8 @@ fn test_no_splits(#[case] code: &str) {
         domain_predicate: Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
-        ]))
+        ])),
+        deleted: BitSet::new(),
     }
 )]
 #[case(
@@ -1073,7 +1095,8 @@ fn test_no_splits(#[case] code: &str) {
         domain_predicate: Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
-        ]))
+        ])),
+        deleted: BitSet::new(),
     }
 )]
 #[case(
@@ -1088,7 +1111,8 @@ fn test_no_splits(#[case] code: &str) {
         domain_predicate: Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
-        ]))
+        ])),
+        deleted: BitSet::new(),
     }
 )]
 #[case(
@@ -1103,7 +1127,8 @@ fn test_no_splits(#[case] code: &str) {
         domain_predicate: Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
-        ]))
+        ])),
+        deleted: BitSet::new(),
     }
 )]
 #[case(
@@ -1132,6 +1157,7 @@ fn test_no_splits(#[case] code: &str) {
             ]))),
         ]))),
         domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
     }
 )]
 #[case(
@@ -1146,7 +1172,8 @@ fn test_no_splits(#[case] code: &str) {
         domain_predicate: Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
-        ]))
+        ])),
+        deleted: BitSet::new(),
     }
 )]
 #[case(
@@ -1162,6 +1189,7 @@ fn test_no_splits(#[case] code: &str) {
         domain: ColumnValue::Ints(vec![0, 1, 2]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))),
         domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
     })]
 #[case(
     "[x + y for x in [1,2,3] for y in [2,3,4,5] if x == y]",
@@ -1176,6 +1204,7 @@ fn test_no_splits(#[case] code: &str) {
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
         ])),
+        deleted: BitSet::new(),
     }
 )]
 #[case(
@@ -1191,6 +1220,7 @@ fn test_no_splits(#[case] code: &str) {
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
         ])),
+        deleted: BitSet::new(),
     }
 )]
 #[case(
@@ -1206,10 +1236,11 @@ fn test_no_splits(#[case] code: &str) {
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
         ])),
+        deleted: BitSet::new(),
     }
 )]
 fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expected_result: Tile) {
-    use cambra::ccl::{context::compile_program, symbolic::symbolic};
+    use cambra::ccl::symbolic::symbolic;
 
     let mut ctx = GlobalContext::default();
 
@@ -1229,17 +1260,8 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
         .set_yield_predicate(Predicate::True);
     ctx.register_test_source(data_source);
 
-    let notified = Rc::new(RefCell::new(false));
-    let notified_clone = notified.clone();
-    let consumer: Box<dyn Consumer> = Box::new(move || {
-        *notified_clone.borrow_mut() = true;
-    });
-    let (expr, _, mut producer) = compile_program(&mut ctx, code, consumer);
+    let (expr, result) = run_pipeline_with_ctx(&mut ctx, code);
     assert_eq!(format!("{}:{}", symbolic(&expr), expr.ty), expected_ccl);
-
-    ctx.scheduler().check_for_notifications();
-    assert!(*notified.borrow(), "expected notification (pipeline path)");
-    let result = producer.get(producer.tiling().universal_guard());
     assert_eq!(
         sort_sealed_function_by_domain(result),
         sort_sealed_function_by_domain(expected_result)
