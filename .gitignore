@@ -5,3 +5,5 @@
 !/.claude/settings.json
 !/.claude/hooks/
 docs/Scratch.md
+.devcontainer/.claude-token
+.credentials.json
