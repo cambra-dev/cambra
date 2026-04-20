@@ -5,6 +5,7 @@ use std::{
     thread,
 };
 
+use intervalsets::{ops::Difference, Bounding, Interval, IntervalSet};
 use log::{debug, trace};
 use smol_str::SmolStr;
 
@@ -170,6 +171,26 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
             .get(producer)
             .unwrap_or_else(|| panic!("Unknown producer: {}", producer));
         match filter {
+            Predicate::Intervals(intervals) => {
+                if self.start_idx >= self.ready_size {
+                    return ColumnValue::from_uints(Vec::new());
+                }
+                // Compute [start_idx, ready_size-1] \ intervals to get non-obsolete indices.
+                let window = IntervalSet::from(Interval::closed(
+                    Value::UInt(self.start_idx),
+                    Value::UInt(self.ready_size - 1),
+                ));
+                let mut values = Vec::new();
+                for iv in window.difference(intervals).intervals() {
+                    match (iv.lval(), iv.rval()) {
+                        (Some(Value::UInt(lo)), Some(Value::UInt(hi))) => {
+                            values.extend(*lo..=*hi);
+                        }
+                        _ => panic!("unexpected interval bounds in StdinDataSource::get_elements"),
+                    }
+                }
+                ColumnValue::from_uints(values)
+            }
             Predicate::LessThanEq(Value::UInt(i)) => {
                 let values: Vec<_> = ((*i + 1)..self.ready_size).collect();
                 ColumnValue::from_uints(values)
@@ -221,9 +242,103 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
 #[cfg(test)]
 mod tests {
     use crate::interpreter::{
-        stdio::StdinDataSource, tiling::Predicate, DataSourceDomainExtentImpl, Value,
+        stdio::StdinDataSource, tiling::Predicate, ColumnValue, DataSourceDomainExtentImpl, Value,
     };
     use test_log::test;
+
+    /// `Predicate::False` means nothing is obsolete: all indices in `start_idx..ready_size`.
+    #[test]
+    fn test_get_elements_false_returns_all_indices() {
+        let mut source = StdinDataSource::new();
+        source.add("a".into());
+        source.add("b".into());
+        source.add("c".into());
+        source
+            .obsolete_predicates
+            .insert("p".to_string(), Predicate::False);
+
+        let result = source.get_elements("p");
+        assert_eq!(result, ColumnValue::from_uints(vec![0, 1, 2]));
+    }
+
+    /// `Predicate::LessThanEq(i)` means indices `0..=i` are obsolete, so only
+    /// `(i+1)..ready_size` are returned.
+    #[test]
+    fn test_get_elements_less_than_eq_returns_tail() {
+        let mut source = StdinDataSource::new();
+        source.add("a".into());
+        source.add("b".into());
+        source.add("c".into());
+        source.add("d".into());
+        source
+            .obsolete_predicates
+            .insert("p".to_string(), Predicate::LessThanEq(Value::UInt(1)));
+
+        let result = source.get_elements("p");
+        assert_eq!(result, ColumnValue::from_uints(vec![2, 3]));
+    }
+
+    /// `Predicate::True` means all data is obsolete: the result is empty.
+    #[test]
+    fn test_get_elements_true_returns_empty() {
+        let mut source = StdinDataSource::new();
+        source.add("a".into());
+        source.add("b".into());
+        source
+            .obsolete_predicates
+            .insert("p".to_string(), Predicate::True);
+
+        let result = source.get_elements("p");
+        assert_eq!(result, ColumnValue::from_uints(vec![]));
+    }
+
+    /// `Predicate::Intervals` subtracts the obsolete set from the live window
+    /// `[start_idx, ready_size-1]`, returning only non-obsolete indices.
+    #[test]
+    fn test_get_elements_intervals_subtracts_obsolete() {
+        let mut source = StdinDataSource::new();
+        for line in ["a", "b", "c", "d", "e"] {
+            source.add(line.into());
+        }
+        // Mark indices 1 and 2 as obsolete; live window [0,4] minus {1,2} = {0,3,4}.
+        let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2]));
+        source.obsolete_predicates.insert("p".to_string(), filter);
+
+        let result = source.get_elements("p");
+        assert_eq!(result, ColumnValue::from_uints(vec![0, 3, 4]));
+    }
+
+    /// With `start_idx > 0` the interval subtraction still uses the correct
+    /// logical window `[start_idx, ready_size-1]`.
+    #[test]
+    fn test_get_elements_intervals_with_offset_start() {
+        let mut source = StdinDataSource::new();
+        for line in ["a", "b", "c", "d", "e"] {
+            source.add(line.into());
+        }
+        // Release indices 0 and 1 so start_idx == 2, ready_size == 5.
+        source.release_index(1);
+
+        // Mark index 3 as obsolete; live window [2,4] minus {3} = {2,4}.
+        let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![3]));
+        source.obsolete_predicates.insert("p".to_string(), filter);
+
+        let result = source.get_elements("p");
+        assert_eq!(result, ColumnValue::from_uints(vec![2, 4]));
+    }
+
+    /// When the buffer is empty the `Intervals` branch returns an empty vec
+    /// without panicking.
+    #[test]
+    fn test_get_elements_intervals_empty_buffer_returns_empty() {
+        let mut source = StdinDataSource::new();
+        // No lines added; start_idx == ready_size == 0.
+        let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
+        source.obsolete_predicates.insert("p".to_string(), filter);
+
+        let result = source.get_elements("p");
+        assert_eq!(result, ColumnValue::from_uints(vec![]));
+    }
 
     #[test]
     fn test_stdin_datasource() {
