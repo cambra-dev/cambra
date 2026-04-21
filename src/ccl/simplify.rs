@@ -532,12 +532,18 @@ fn try_const_apply(expr: &mut Expr) -> bool {
 /// Collapses a singleton prefix to a bare expression.
 ///
 /// Analogous to the function-type eta rule `λ x → f x  ⟹  f`.
+///
+/// Only sound when `f`'s codomain is a 2-tuple: `⟨.0, .1⟩` is the identity on a
+/// pair, but on a wider tuple it is a lossy projection that drops components
+/// `≥ 2`. The guard consults `lp.ty.domain()` (the tuple being projected from,
+/// i.e. the prefix's codomain) and bails out for non-pair codomains.
 fn try_product_eta(expr: &mut Expr) -> bool {
     let matched = as_zip(expr).is_some_and(|(left, right)| {
         compose_split_last(left).is_some_and(|(lpfx, lp)| {
             is_proj_idx(lp, 0)
                 && compose_split_last(right)
                     .is_some_and(|(rpfx, rp)| is_proj_idx(rp, 1) && lpfx == rpfx)
+                && matches!(lp.ty.domain(), Some(Type::Tuple(ts)) if ts.len() == 2)
         })
     });
     if matched {
@@ -942,6 +948,30 @@ mod tests {
         );
         let expected = typed_compose2(f, g);
         assert_eq!(simplify(expr), expected);
+    }
+
+    /// Product eta must not fire when the shared prefix's codomain is wider
+    /// than a pair: `⟨f ≫ .0, f ≫ .1⟩` on `f: (Int,Int,Int) → (Int,Int,Int)`
+    /// is a genuine projection (it drops component 2), not the identity, so
+    /// reducing to `f` would stamp an incoherent `(Int,Int,Int) → (Int,Int)`
+    /// type onto `f`.
+    ///
+    /// Uses a non-`id` prefix so that [`try_compose_identity`] does not
+    /// pre-reduce the inner composes and hide the eta redex from the rule
+    /// under test.
+    #[test]
+    fn product_eta_rejects_non_pair_codomain() {
+        let triple_ty = Type::Tuple(vec![int_ty(), int_ty(), int_ty()]);
+        let f_ty = fun_ty(triple_ty.clone(), triple_ty.clone());
+        let f = var("f").with_ty(f_ty);
+        let proj0_ty = fun_ty(triple_ty.clone(), int_ty());
+        let proj1_ty = fun_ty(triple_ty.clone(), int_ty());
+        let expr = zip_pair(
+            typed_compose2(f.clone(), proj_idx(0).with_ty(proj0_ty)),
+            typed_compose2(f, proj_idx(1).with_ty(proj1_ty)),
+        );
+        let before = expr.clone();
+        assert_eq!(simplify(expr), before);
     }
 
     /// Exponential beta: ⟨g, curry(h)⟩ ≫ apply  ⟹  ⟨id, g⟩ ≫ h  (flattened to n-ary Compose)
