@@ -23,3 +23,13 @@ else
     # which is bind-mounted into the container — no token injection needed.
     echo '{}' > "${SCRIPT_DIR}/.claude-token"
 fi
+
+# Extract a GitHub token from the host's gh CLI if available. Works regardless
+# of whether gh stores credentials in Keychain, config file, or env var.
+# git-spice and gh both pick up GITHUB_TOKEN, so one token covers both tools.
+if command -v gh >/dev/null 2>&1; then
+    gh auth token 2>/dev/null > "${SCRIPT_DIR}/.gh-token" || echo '' > "${SCRIPT_DIR}/.gh-token"
+else
+    echo "WARNING: gh CLI not found on host; container will not have GitHub auth." >&2
+    echo '' > "${SCRIPT_DIR}/.gh-token"
+fi

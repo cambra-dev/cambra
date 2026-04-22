@@ -39,6 +39,8 @@
     "source=claude-code-bashhistory-${devcontainerId},target=/commandhistory,type=volume",
     "source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind",
     "source=${localWorkspaceFolder}/.devcontainer/.claude-token,target=/run/secrets/claude-token,type=bind,readonly",
+    "source=${localWorkspaceFolder}/.devcontainer/.gh-token,target=/run/secrets/gh-token,type=bind,readonly",
+    "source=${localEnv:HOME}/.ssh,target=${localEnv:HOME}/.ssh,type=bind,readonly",
     "source=${localWorkspaceFolder}/../cambra/.git,target=${localWorkspaceFolder}/../cambra/.git,type=bind"
   ],
   "containerEnv": {
@@ -46,8 +48,8 @@
     "CLAUDE_CONFIG_DIR": "/home/node/.claude",
     "POWERLEVEL9K_DISABLE_GITSTATUS": "true"
   },
-  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=delegated",
-  "workspaceFolder": "/workspace",
-  "postStartCommand": "bash /workspace/.devcontainer/post-start.sh",
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind,consistency=delegated",
+  "workspaceFolder": "${localWorkspaceFolder}",
+  "postStartCommand": "bash ${containerWorkspaceFolder}/.devcontainer/post-start.sh",
   "waitFor": "postStartCommand"
 }

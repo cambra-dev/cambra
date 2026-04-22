@@ -6,4 +6,5 @@
 !/.claude/hooks/
 docs/Scratch.md
 .devcontainer/.claude-token
+.devcontainer/.gh-token
 .credentials.json

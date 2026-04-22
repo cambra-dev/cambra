@@ -3,12 +3,16 @@ set -euo pipefail
 
 CREDS=$(cat /run/secrets/claude-token 2>/dev/null || true)
 TOKEN=$(echo "${CREDS}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('accessToken',''))" 2>/dev/null || true)
+GH_TOKEN_VAL=$(cat /run/secrets/gh-token 2>/dev/null || true)
+
+# Rewrite .zshenv each start so tokens stay in sync with the host.
+{
+    [[ -n "${TOKEN}" ]] && echo "export CLAUDE_CODE_OAUTH_TOKEN=${TOKEN}"
+    [[ -n "${GH_TOKEN_VAL}" ]] && echo "export GITHUB_TOKEN=${GH_TOKEN_VAL}"
+    echo "alias claude='claude --dangerously-skip-permissions'"
+} > /home/node/.zshenv
 
 if [[ -n "${TOKEN}" ]]; then
-    {
-        echo "export CLAUDE_CODE_OAUTH_TOKEN=${TOKEN}"
-        echo "alias claude='claude --dangerously-skip-permissions'"
-    } > /home/node/.zshenv
 
     # Write full credentials so the extension's getAuthStatus finds all expected
     # fields (accessToken, scopes, subscriptionType, etc).

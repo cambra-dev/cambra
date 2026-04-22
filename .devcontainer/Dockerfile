@@ -50,6 +50,17 @@ RUN ARCH=$(dpkg --print-architecture) && \
   sudo dpkg -i "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb" && \
   rm "git-delta_${GIT_DELTA_VERSION}_${ARCH}.deb"
 
+ARG GIT_SPICE_VERSION=0.26.0
+RUN ARCH=$(dpkg --print-architecture) && \
+  case "${ARCH}" in \
+    amd64) GS_ARCH=x86_64 ;; \
+    arm64) GS_ARCH=aarch64 ;; \
+    *) echo "Unsupported architecture for git-spice: ${ARCH}" >&2; exit 1 ;; \
+  esac && \
+  curl -sSfL "https://github.com/abhinav/git-spice/releases/download/v${GIT_SPICE_VERSION}/git-spice.Linux-${GS_ARCH}.tar.gz" \
+    | tar -xz -C /usr/local/bin git-spice && \
+  mv /usr/local/bin/git-spice /usr/local/bin/gs
+
 USER node
 
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
