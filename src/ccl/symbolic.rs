@@ -337,18 +337,30 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
 
 /// Render `func` in the function position of an application.
 ///
-/// - [`Expr::Apply`] in func position: wrap in parens to avoid left-assoc
-///   confusion (`(x ▷ f) ▷ g` vs. `x ▷ f ▷ g`).
-/// - [`Expr::Lambda`] in func position: wrap in parens so its greedy `→ body`
-///   does not absorb the rest of the chain without parens.
-/// - Anything else: render at [`Precedence::Lowest`] (no extra wrapping needed).
+/// The RHS of an `Apply` must bind tighter than `▷` itself, otherwise the
+/// rendered string re-parses to a different AST. Concretely, anything whose
+/// rendered precedence is at or below [`Precedence::Apply`] needs parens:
+///
+/// - [`TypedExprNode::Apply`] in func position: same-prec on the right side
+///   of a left-associative `▷` would re-associate to the left, so wrap
+///   (`y ▷ (x ▷ f)` vs. the wrong `y ▷ x ▷ f` ≡ `(y ▷ x) ▷ f`).
+/// - Lower-precedence nodes (`Lambda`, `Compose`, `BinOp`, `Let`, `Case`, …):
+///   their top-level operator is looser than `▷`, so without parens the
+///   string parses with the wrong grouping.
+/// - Atomic nodes (`Var`, `Lit`, `Tuple`, `Record`, `List`, `Proj`, …):
+///   no wrapping needed.
+///
+/// The `Proj` case is kept specially by the caller ([`fmt_inner`] for
+/// `TypedExprNode::Apply`) so that `t ▷ .0` renders as postfix `t.0`; this
+/// function still renders a bare `Proj` unwrapped (it is [`Precedence::Atom`]),
+/// which is what that path needs.
+///
+/// Implementation: render at `Precedence::Apply.next_highest()` so that
+/// [`fmt`]'s built-in precedence handling inserts parens for every node at
+/// or below [`Precedence::Apply`] — including a nested `Apply` (same prec
+/// as outer `▷`), which would otherwise silently re-associate.
 fn fmt_apply_func(func: &Expr, opts: &SymbolicOpts) -> String {
-    match &func.node {
-        TypedExprNode::Apply { .. } | TypedExprNode::Lambda { .. } => {
-            format!("({})", fmt(func, Precedence::Lowest, opts))
-        }
-        _ => fmt(func, Precedence::Lowest, opts),
-    }
+    fmt(func, Precedence::Apply.next_highest(), opts)
 }
 
 /// Render a [`Lit`] as its CCL symbolic form.
@@ -519,6 +531,54 @@ mod tests {
     #[case(
         Expr::apply(Expr::var("v"), Expr::lambda("x", Type::infer(), Expr::var("x")),),
         "v ▷ (λ x → x)"
+    )]
+    // Apply: Compose in func position gets parens (Compose < Apply so the
+    // naked chain `x ▷ f ≫ g` would re-parse as `(x ▷ f) ≫ g`).
+    #[case(
+        Expr::apply(
+            Expr::var("x"),
+            Expr::compose(vec![Expr::var("f"), Expr::var("g")]),
+        ),
+        "x ▷ (f ≫ g)"
+    )]
+    // Apply: Compose-with-nested-Apply in func position — the motivating
+    // bug case. The inner `(mul, 1 ▷ const) ▷ zip` must stay inside the
+    // Compose, and the whole Compose must be parenthesised so the outer
+    // `▷` does not re-associate across the `≫`.
+    #[case(
+        Expr::apply(
+            Expr::tuple(vec![Expr::lit(Lit::Int(3)), Expr::lit(Lit::Int(4))]),
+            Expr::compose(vec![
+                Expr::apply(
+                    Expr::tuple(vec![
+                        Expr::var("mul"),
+                        Expr::apply(Expr::lit(Lit::Int(1)), Expr::var("const")),
+                    ]),
+                    Expr::var("zip"),
+                ),
+                Expr::var("add"),
+            ]),
+        ),
+        "(3, 4) ▷ ((mul, 1 ▷ const) ▷ zip ≫ add)"
+    )]
+    // Apply: BinOp in func position gets parens (Add/Mul/Cmp/And/Or/Not
+    // all sit below Apply, so `x ▷ f + g` without parens re-parses as
+    // `(x ▷ f) + g`).
+    #[case(
+        Expr::apply(
+            Expr::var("x"),
+            Expr::binop(
+                Expr::var("f"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                Expr::var("g"),
+            ),
+        ),
+        "x ▷ (f + g)"
+    )]
+    // Apply: Let in func position gets parens (Let is Lowest).
+    #[case(
+        Expr::apply(Expr::var("x"), Expr::let_bind("f", Expr::var("g"), Expr::var("f")),),
+        "x ▷ (let f = g\nin f)"
     )]
     // Lambda (unannotated)
     #[case(Expr::lambda("x", Type::infer(), Expr::var("x")), "λ x → x")]

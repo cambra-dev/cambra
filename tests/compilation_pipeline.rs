@@ -1267,3 +1267,79 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
         sort_sealed_function_by_domain(expected_result)
     );
 }
+
+// ---------------------------------------------------------------------------
+// User-defined functions (scalar UDFs via lambda)
+//
+// These tests validate the inline pass: scalar-typed `Let` bindings introduced
+// by lambda elimination are substituted at their call sites before operator
+// conversion, avoiding the "Attempted to iterate on infinite Extent" panic.
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case("inc = lambda x: x + 1\ninc(4)", Value::Int(5))]
+#[case("double = lambda x: x * 2\ndouble(7)", Value::Int(14))]
+#[case("neg = lambda x: -x\nneg(3)", Value::Int(-3))]
+#[case("identity = lambda x: x\nidentity(42)", Value::Int(42))]
+fn test_scalar_udf(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case("is_pos = lambda x: x > 0\nis_pos(5)", Value::Bool(true))]
+#[case("is_pos = lambda x: x > 0\nis_pos(-1)", Value::Bool(false))]
+fn test_udf_bool_codomain(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+// UDF called twice: body is duplicated at each call site (acceptable trade-off).
+#[case("f = lambda x: x + 1\nf(3) + f(4)", Value::Int(9))]
+fn test_udf_called_multiple_times(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+// Nested call: f(f(3)) → f(6) → 12
+#[case("f = lambda x: x * 2\nf(f(3))", Value::Int(12))]
+fn test_udf_nested_calls(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// Regression: collection and scalar lets should remain unaffected by the
+// inlining pass.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case("x = 4\nx + 1", Value::Int(5))]
+fn test_scalar_let_unaffected(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case("xs = [1, 2, 3]\n[x * 2 for x in xs]", make_int_list(&[2, 4, 6]))]
+fn test_collection_let_unaffected(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
+}
+
+// Multi-arg UDFs: lowering uncurries syntactic multi-arg lambdas into a
+// single tupled-domain function, and multi-arg calls into a single Apply on
+// a tupled argument. This keeps `curry` out of the tree for the common case.
+// The n-arm zip arm in operator_conversion dispatches between `ScalarTuple`
+// (scalar upstream) and `Zip` (function upstream), so bodies with nested
+// BinOps also compile cleanly under scalar call sites. Explicit currying
+// (`lambda x: lambda y: ...` or explicit `curry(f)`) is still tracked as
+// follow-up work.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case("add = lambda x, y: x + y\nadd(3, 4)", Value::Int(7))]
+#[case("combine = lambda a, b: a * b + 1\ncombine(3, 4)", Value::Int(13))]
+#[case("add3 = lambda x, y, z: x + y + z\nadd3(1, 2, 3)", Value::Int(6))]
+#[case("mix = lambda x, y, z: x * y - z\nmix(4, 5, 2)", Value::Int(18))]
+fn test_multi_arg_udf(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}

@@ -124,6 +124,21 @@ variant for the same reason as `TileGuard`.
 `True` or `False` (including uniform record predicates and `Or` predicates whose arms are all
 `False`).
 
+### CCL types vs. tilings
+
+CCL types and tilings describe a term at two different layers, and the relationship is one of the things that makes the tile pipeline tick.
+
+The CCL type layer is **pointwise**: `mul : (Int, Int) → Int`, `zip(f, g) : A → (B, C)`. A type describes an element-wise function — "given one input of type A, produce one output of type B." It says nothing about how many `A`s will arrive, in what order, or whether the result will be materialised as a single value or streamed.
+
+The tile layer chooses **how the runtime materialises that pointwise function**. The same pointwise morphism can be compiled to either:
+
+- **A scalar-tiled operator** — evaluate the function on a single input value. One `A` in, one `B` out. Used when the morphism sits at a scalar call site (e.g. a literal tuple fed into a multi-arg UDF).
+- **A function-tiled operator** (`SealedFunction` / `CurriedFunction`) — evaluate the function across a stream of inputs, essentially vectorising the pointwise definition. Used when the morphism sits downstream of an iteration or data source.
+
+Both compiled forms satisfy the same CCL type; which one a specific call site gets is determined at op-conversion by the upstream `input`'s tiling, which flows in from whatever sits above the operator in the dataflow graph. This is what makes UDFs like `lambda x: x + 1` compile cleanly whether they're called once on a literal or mapped over a source — no duplication at the CCL level, the tile layer specialises automatically.
+
+In practice this means tile operators need to be **tile-polymorphic in their inputs**: the same CCL-level combinator often needs two tile-level implementations, one per input tiling. The `MapResult` family handles this via `change_tiling_result`; fan-out is handled by [`Zip::fan_out`](./tile_operators.rs), which dispatches to [`Zip`] (function-tiled arms) or [`ScalarTuple`] (scalar arms) based on what the compiled arms ended up with. New combinators should assume the same pattern: don't commit to one tiling when the upstream context picks it.
+
 ---
 
 ## Tile Operators
@@ -137,8 +152,8 @@ during compilation; producers are created on demand at runtime.
 | `Constant` | None | `Scalar` | Produces a fixed scalar `Value`. |
 | `IterateExtent` | None | `SealedFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping sealed function (domain = codomain = extent) |
 | `MapSource` | `SealedFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `SealedFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a sealed function from keys to their output values. |
-| `Zip` | `N` inputs of `SealedFunction(shared_extent → *)` tilings |  `SealedFunction(shared_domain → Record(_0, … _N))` | Merges N sealed-function operators that share a domain into one sealed function whose codomain is a Record Tiling of all their codomains. |
-| `ScalarTuple` | `N` inputs with `Scalar` tilings | `Record(_0, … _N)` | Packs N scalar inputs into a single `Record` tiling where each field is a `Scalar` tiling . The scalar analogue of `Zip`. |
+| `Zip` | `N` inputs of `SealedFunction(shared_extent → *)` tilings |  `SealedFunction(shared_domain → Record(_0, … _N))` | Merges N sealed-function operators that share a domain into one sealed function whose codomain is a Record Tiling of all their codomains. Prefer `Zip::fan_out` at op-conversion call sites: it dispatches to `Zip` (function-tiled arms) or `ScalarTuple` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
+| `ScalarTuple` | `N` inputs with `Scalar` tilings | `Record(_0, … _N)` | Packs N scalar inputs into a single `Record` tiling where each field is a `Scalar` tiling. The scalar counterpart of `Zip`; reachable from op-conversion via `Zip::fan_out`. |
 | `MapApply` | Function: any tiling of type `A → B`<br>Data: `SealedFunction(extent → Scalar(A))` | `SealedFunction(extent → Scalar(B))` | Applies a function element-wise over a sealed-function input, transforming each codomain value. The function input can have many different tilings; currently supports `Scalar(ComputableFunction)`, `Scalar(Function)`, `CurriedFunction`, and `SealedFunction` tilings. |
 | `MapToConst` | `SealedFunction(extent → *)` | `SealedFunction(extent → Scalar)` | Replaces every codomain value of a sealed-function input with the same constant, preserving the domain. |
 | `ToScalar` | Constant: `Scalar`<br>Data: `SealedFunction(Unit → Scalar)` | `Scalar` | Unwraps a `SealedFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |

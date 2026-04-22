@@ -195,7 +195,7 @@ pub fn const_(c: Expr) -> Expr {
 ///
 /// A variable is free if it is referenced by [`TypedExprNode::Var`] and is not shadowed
 /// by an inner [`TypedExprNode::Lambda`] or [`TypedExprNode::Let`] that rebinds the same name.
-fn is_free(param: &str, expr: &Expr) -> bool {
+pub(crate) fn is_free(param: &str, expr: &Expr) -> bool {
     let is_free_in_type = is_free_in_type(param, &expr.ty);
 
     let is_free = match &expr.node {
@@ -307,7 +307,7 @@ fn is_free_in_type(param: &str, ty: &Type) -> bool {
 /// [`TypedExprNode::Let::binding`].  Does **not** perform capture-avoiding renaming of
 /// other binders; the caller is responsible for ensuring `replacement` does
 /// not contain free variables that would be captured.
-fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
+pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
     debug_typecheck(&expr);
     // Fast path: no allocation needed for atoms.
     match &expr.node {

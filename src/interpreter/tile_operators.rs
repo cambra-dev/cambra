@@ -1522,6 +1522,47 @@ impl Zip {
         };
         Self { tiling, inputs }
     }
+
+    /// Tile-polymorphic fan-out factory.
+    ///
+    /// Given N operators representing the arms of a CCL-level `zip(f₀, …, fₙ₋₁)`,
+    /// returns the correct tile-level combinator for the arms' runtime tilings:
+    ///
+    /// - If every arm has a scalar tiling (`Scalar` or a `Record` of scalars),
+    ///   the fan-out is just a record-of-values and [`ScalarTuple`] is returned.
+    /// - Otherwise the arms carry function tilings and [`Zip`] is returned,
+    ///   which fans the shared domain out into a record-codomain sealed/curried
+    ///   function.
+    ///
+    /// Callers at op-conversion can hand the compiled arms to this factory
+    /// without knowing what tiling the arms ended up with — the upstream
+    /// `input` at the zip call site determines that, and the factory picks
+    /// the right combinator. See the "CCL types vs. tilings" section of
+    /// [`design-operators.md`](./design-operators.md) for why the same
+    /// CCL-level `zip` compiles to two different tile operators.
+    pub fn fan_out(inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+        if inputs.iter().all(|op| is_scalar_tiling(op.tiling())) {
+            Box::new(ScalarTuple::new(inputs))
+        } else {
+            Box::new(Zip::new(inputs))
+        }
+    }
+}
+
+/// Returns `true` when `tiling` represents a fully-realised scalar value — a
+/// `Scalar` leaf, or a `Record` whose fields are all (recursively) scalar.
+///
+/// Function-valued tilings (`SealedFunction`, `CurriedFunction`) and
+/// `Aggregation` are not scalar. Used by [`Zip::fan_out`] to pick between
+/// the scalar and function combiners.
+pub(crate) fn is_scalar_tiling(tiling: &Tiling) -> bool {
+    match tiling {
+        Tiling::Scalar(_) => true,
+        Tiling::Record(fields) => fields.values().all(is_scalar_tiling),
+        Tiling::SealedFunction { .. }
+        | Tiling::CurriedFunction { .. }
+        | Tiling::Aggregation { .. } => false,
+    }
 }
 
 impl TileOperator for Zip {

@@ -11,7 +11,7 @@ use rustpython_parser::{ast as pyast, parser};
 use crate::{
     ccl::{
         infer::{check_fully_typed, infer, typecheck, TypeInferenceContext},
-        join_plan, lambda_elim,
+        inline, join_plan, lambda_elim,
         lower::{lower_stmts, LoweringContext},
         symbolic::{symbolic, symbolic_typed},
         BaseType, Expr, Type,
@@ -147,7 +147,13 @@ pub fn compile_program(
     check_fully_typed(&lambda_elim).expect("missing types");
     typecheck(&lambda_elim).expect("type error after lambda elimination");
 
-    let join_planned = join_plan::run(lambda_elim);
+    let inlined = inline::run(lambda_elim);
+    debug!("Inlined CCL:\n{}", symbolic(&inlined));
+    debug!("Inlined typed CCL:\n{}", symbolic_typed(&inlined));
+    check_fully_typed(&inlined).expect("missing types after inlining");
+    typecheck(&inlined).expect("type error after inlining");
+
+    let join_planned = join_plan::run(inlined);
 
     debug!("Join-planned CCL:\n{}", symbolic(&join_planned));
     debug!("Join-planned CCL:\n{}", symbolic_typed(&join_planned));

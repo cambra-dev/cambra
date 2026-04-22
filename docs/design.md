@@ -33,6 +33,7 @@ Python source
   → lower            (ccl/lower.rs: Python AST → CCL Expr)
   → infer            (ccl/infer.rs: type inference + check_fully_typed validation)
   → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators)
+  → inline           (ccl/inline.rs: inline scalar function-typed Let bindings)
   → join_plan        (ccl/join_plan.rs: hash-join and keyed aggregate optimization)
   → simplify         (ccl/simplify.rs: CCC algebraic rewrites to fixed point)
   → operator_conversion  (interpreter/operator_conversion.rs: λ-free CCL → tile operators)

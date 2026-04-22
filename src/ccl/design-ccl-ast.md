@@ -15,6 +15,7 @@ Python source
   → infer          (ccl/infer.rs: type inference, converts Hole→Infer and fills ty on every node)
   → resolve        (ccl/unify.rs: substitutes solved Infer vars with concrete types)
   → lambda_elim    (ccl/lambda_elim.rs: Lambda → point-free combinators)
+  → inline         (ccl/inline.rs: inline scalar function-typed Let bindings)
   → optimize       (tree rewrites on CCL AST, currently just join_plan.rs)
   → convert        (interpreter/operator_conversion.rs: CCL AST → tile operators)
   → subscribe()
@@ -47,13 +48,13 @@ The semantics are correct for sequential code — each `Let` evaluates its value
 
 Rationale: renaming every assignment to a fresh variable would over-normalize the tree for the same reasons strict ANF does, destroying structural information useful for optimization passes.
 
-### Curried application
+### Application shape
 
-Function application is curried: `Apply(Box<Expr>, Box<Expr>)`.
-There are no first-class n-ary functions: the Python syntax `f(x, y)` may be written as `f(x)(y)` in CCL but is typically represented as chained applications using `▷`.
-Multi-argument calls are represented as nested `Apply` nodes: `f(x)(y)` → `Apply(Apply(f, x), y)`.
+Function application is a single `Apply(Box<Expr>, Box<Expr>)` node. Single-argument Python calls `f(a)` lower to `Apply(a, Var(f))` directly. Multi-argument Python calls `f(a, b, ...)` lower to `Apply(Tuple([a, b, ...]), Var(f))` — the arguments are tupled so the call shape matches how multi-arg Python lambdas are uncurried at lowering time (see "Python `lambda` expressions" below).
 
-Rationale: uniform with the λ-calculus basis; multi-args can be supported via `Record`s.
+Partial / curried application in CCL itself is still represented by chained `Apply` nodes — `f(x)(y)` in source writes the curry explicitly and lowers to `Apply(Apply(Var(f), x), y)`. This path remains unsupported past operator conversion (no `curry` combinator case yet) and is tracked as follow-up work; in normal Python source, chained applications only arise when users nest lambdas explicitly.
+
+Rationale: keeping application a single-argument node preserves the uniform λ-calculus basis, while the tupled-lowering convention lets the common multi-arg case compile cleanly through `lambda_elim` and operator conversion without threading a curry/uncurry combinator through every pass.
 
 ### Lambda/Apply encoding of collection iteration
 
@@ -82,9 +83,15 @@ Python aggregate calls (`sum(xs)`, `max(xs)`) are lowered directly to `Expr::Agg
 
 `AggregateKind` enumerates the supported operations; each variant carries its own typing rule in `output_type`.
 
-### Python `lambda` expressions — curried `Expr::Lambda` chain
+### Python `lambda` expressions — single `Expr::Lambda` (tupled when multi-arg)
 
-Python `lambda` expressions are lowered to a curried chain of `Expr::Lambda` nodes. A multi-parameter `lambda x, y: body` becomes `λ x → λ y → body`. Single-parameter lambdas lower to a single `Expr::Lambda`. `param.ty` is left `Type::Hole` at lowering time; the inference pass converts it to a registered `Type::Infer` variable and fills in the concrete type where the call site provides type information.
+Python `lambda` expressions lower to a single `Expr::Lambda`. A single-parameter `lambda x: body` becomes `λ x → body`. A multi-parameter `lambda x, y, ...: body` is **uncurried at lowering**: it becomes `λ __arg_tuple_N → body[x := __arg_tuple_N.0, y := __arg_tuple_N.1, ...]`, a single-parameter lambda whose parameter is a synthetic tuple and whose body has each named argument replaced in-place by a projection of that tuple. `param.ty` starts as `Type::Hole`; inference resolves it (including the tuple arity for the multi-arg case) from the body's projection constraints and the call-site argument type.
+
+Each multi-arg lambda mints a fresh `N` from a counter on `LoweringContext`, so nested multi-arg lambdas (e.g. `lambda x, y: lambda a, b: x + a`) receive distinct tuple-parameter names. Without the unique suffix, an outer substitution that inserts `Var("__arg_tuple")` into an inner lambda's body would be captured by the inner binder; the fresh suffix plus the reserved `__arg_tuple_` prefix (user code cannot bind double-underscore names here) keeps the in-place substitution non-capture-avoiding yet correct.
+
+Rationale for uncurrying: a curried `λ x → λ y → body` lowering would trigger `lambda_elim`'s nested-lambda rule and produce `curry(body)`, which operator conversion cannot compile. Uncurrying at lowering pairs with the tupled call lowering above so that syntactic multi-arg functions compile without any `curry` combinator appearing in the tree. Users who want genuine partial application still write `lambda x: lambda y: ...` or `curry(f)` explicitly — those produce curried types and are tracked as follow-up work.
+
+In-place substitution (rather than wrapping the body in `let xi = __arg_tuple_N.i`) avoids introducing function-typed `Let` nodes that `lambda_elim`'s Let rule would lift to `ParamTy ⇒ T` and compile into zip-of-projections morphisms that current simplification cannot reduce back to a bare morphism.
 
 Restrictions not yet supported (lowering raises `LoweringError::Unsupported`): `*args`, `**kwargs`, keyword-only arguments, and default values.
 
@@ -557,6 +564,64 @@ There is no dedicated `Zip` AST node; it reuses the existing `Apply` + `Tuple` n
 When the lambda-elimination rule 7 rewrites a `Let` inside a lambda body, the
 bound variable changes type from `T` to `ParamTy ⇒ T`. The rewritten `Let` node
 has `bound_ty: None` because the old annotation is stale and would be incorrect.
+
+---
+
+## Inlining Pass (`ccl/inline.rs`)
+
+`inline::run` is a pass that runs after `lambda_elim` and before `join_plan`. It
+eliminates `Let` bindings whose bound expression has a scalar function type by
+substituting the body at every call site and dropping the `Let` wrapper.
+
+### Motivation
+
+Operator conversion compiles `Let`-bound expressions independently, with
+`input = None`. When the bound expression is a scalar-to-scalar function (domain
+`= Int`, `Bool`, etc.), this causes the operator graph to insert an `IterateExtent`
+for the domain — which panics at runtime ("Attempted to iterate on infinite Extent")
+because base types have no finite enumerable extent.
+
+Inlining at the CCL level threads the call-site argument as `input`, so
+`IterateExtent` is never constructed for the domain.
+
+### What is inlined
+
+A `Let { binding, bound_expr, body }` is inlined when `should_inline(bound_expr.ty)` returns `true`:
+
+- `bound_expr.ty` is `Fun(domain, codomain)`
+- `domain` has an **infinite** (non-enumerable) extent — i.e. `is_infinite_domain(domain)` is `true`
+- `codomain` is **not** itself `Fun` — a defensive narrowing for explicitly-curried UDFs, not a soundness requirement. Syntactic multi-arg Python lambdas are uncurried to tupled-domain functions at lowering, so they have non-Fun codomains and *do* get inlined here. See the comment on `should_inline` in `inline.rs` for the full rationale.
+
+`is_infinite_domain` returns `true` for:
+- `Base(_)` (Int, String, Bool, etc.)
+- `Tuple(ts)` where **any** component is infinite (e.g. `(UIntRange(3), Int)`)
+- `Record(fields)` where **any** field is infinite — same logic as tuples
+- `Refinement(inner, _)` inheriting the finiteness of `inner`
+
+And `false` for:
+- `UIntRange(_)`, `DataSource(_)` — finite, enumerable
+- `Fun(_, _)` as domain — collection/generator UDFs; treated as out-of-scope
+
+### Pipeline position
+
+```
+lambda_elim   →   inline   →   join_plan   →   operator_conversion
+```
+
+### Limitations
+
+- **Explicitly curried UDFs** (`lambda x: lambda y: body` in source, or explicit `curry(f)`
+  calls): their `bound_expr.ty` has a `Fun` codomain, so `should_inline` returns `false`
+  and the Let is left intact. Compilation fails cleanly at the bound expression with
+  "unrecognised Var(curry)" — fixing this requires wiring `curry` as a combinator in
+  `operator_conversion.rs` (follow-up work). Syntactic multi-arg UDFs (`add = lambda x, y:
+  x + y`) are **not** in this category; they're uncurried at lowering and inlined like
+  single-arg scalar UDFs.
+- **Collection UDFs** (domain `UIntRange` or `DataSource`): not inlined; they compile
+  correctly via `Memo + Splitter` and benefit from sharing.
+- **Body duplication**: a scalar UDF called N times has its body duplicated N times in the
+  operator graph. Acceptable; only collection-typed UDFs warrant caching.
+- **Recursive UDFs**: unsupported (already noted in `operator_conversion.rs`).
 
 ---
 

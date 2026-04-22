@@ -22,12 +22,13 @@
 //! | Assignment + expression blocks | nested [`Expr::Let`] |
 //! | Augmented assignment `x op= e` | desugared to [`Expr::Let`] via [`Expr::BinOp`] |
 //! | `sum(expr)` / `max(expr)` calls | [`Expr::Aggregate`] |
-//! | Lambda expressions `lambda x: body` | curried [`Expr::Lambda`] chain |
+//! | Lambda expressions `lambda x: body`, `lambda x, y: body` | single [`Expr::Lambda`] (tupled param when multi-arg) |
 //! | `groupby(collection, key)` calls | [`Expr::GroupBy`] |
 //! | Unary negation (`-x`) | [`Expr::UnaryOp`] with [`crate::ccl::UnaryOpKind::Neg`] |
 //! | Boolean negation (`not x`) | [`Expr::UnaryOp`] with [`crate::ccl::UnaryOpKind::Not`] |
 //! | Unary plus (`+x`) | identity — lowered to `x` directly |
-//! | General function call `f(a)`, `f(a, b, ...)` | left-to-right curried [`Expr::Apply`] chain |
+//! | Single-arg call `f(a)` | [`Expr::Apply`] |
+//! | Multi-arg call `f(a, b, ...)` | [`Expr::Apply`] with a tupled argument |
 //! | Annotated assignment `x: T = expr` | [`Expr::Let`] with [`crate::ccl::TypedBinding::user_annotation`] set |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
@@ -45,6 +46,7 @@
 //! This is intentional: the less-normalized representation preserves structure
 //! needed for optimization passes.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 
 use rustpython_parser::ast as pyast;
@@ -85,6 +87,13 @@ pub struct LoweringContext {
     /// Temporary option to choose between using the groupby node directly or
     /// the generic CCL equivalent
     pub use_ccl_for_groupby: bool,
+
+    /// Monotonic counter for minting unique synthetic names during lowering.
+    /// Currently used only for per-multi-arg-lambda tupled parameter names
+    /// (see [`LoweringContext::fresh_tuple_arg`]); a shared counter keeps
+    /// names globally unique across nested scopes so inner binders cannot
+    /// capture a reference inserted by an outer substitution.
+    next_synthetic_id: Cell<usize>,
 }
 
 impl LoweringContext {
@@ -93,7 +102,27 @@ impl LoweringContext {
     pub fn register_source(&mut self, name: &str) {
         self.known_sources.insert(name.to_string());
     }
+
+    /// Mint a fresh synthetic parameter name for a multi-arg lambda's tupled
+    /// domain, e.g. `__arg_tuple_0`, `__arg_tuple_1`, …
+    ///
+    /// Each multi-arg lambda gets a distinct name so that substitutions
+    /// performed in an outer lambda — which insert `Var(outer_name)` into
+    /// the body — do not get captured by an inner lambda's binder of the
+    /// same name. All minted names share the [`TUPLE_ARG_PREFIX`] prefix,
+    /// which user code cannot bind (double-underscore + synthetic suffix),
+    /// so the substitution helper can remain non-capture-avoiding.
+    fn fresh_tuple_arg(&self) -> String {
+        let id = self.next_synthetic_id.get();
+        self.next_synthetic_id.set(id + 1);
+        format!("{TUPLE_ARG_PREFIX}_{id}")
+    }
 }
+
+/// Prefix for synthetic parameter names representing the tupled domain of a
+/// multi-arg lambda. Each multi-arg lambda's name is this prefix followed by
+/// a unique id (see [`LoweringContext::fresh_tuple_arg`]).
+const TUPLE_ARG_PREFIX: &str = "__arg_tuple";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -441,12 +470,19 @@ fn lower_call(
                     "Unknown zero-argument function: {name}; register it as a data source"
                 )));
             }
-            // General function application: lower as a left-to-right curried Apply chain.
-            // f(a, b, c) becomes Apply(Apply(Apply(Var(f), a), b), c) in curried notation.
-            args.iter()
-                .try_fold(Expr::var(name.to_string()), |func, arg| {
-                    Ok(Expr::apply(lower_expr(arg, ctx)?, func))
-                })
+            // Single-arg call: direct application `f(a)` → `Apply(a, f)`.
+            if args.len() == 1 {
+                let arg = lower_expr(&args[0], ctx)?;
+                return Ok(Expr::apply(arg, Expr::var(name.to_string())));
+            }
+            // Multi-arg call: tuple the arguments and apply once,
+            // `f(a, b, ...)` → `Apply(Tuple([a, b, ...]), f)`. This pairs with
+            // the uncurried multi-arg lambda lowering in [`lower_lambda`] so
+            // that syntactic multi-arg functions compile without any `curry`
+            // combinator appearing in the tree.
+            let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
+            let arg_tuple = Expr::tuple(tupled?);
+            Ok(Expr::apply(arg_tuple, Expr::var(name.to_string())))
         }
     }
 }
@@ -587,10 +623,33 @@ fn lower_boolop(
     Ok(acc)
 }
 
-/// Lower a Python lambda expression to a curried [`Expr::Lambda`] chain.
+/// Lower a Python lambda expression to an [`Expr::Lambda`].
 ///
-/// Each positional parameter becomes one lambda layer, outermost-first, so
-/// `lambda x, y: x + y` lowers to `λ x → λ y → x + y`.
+/// A single-parameter `lambda x: body` lowers to `λ x → body`.
+///
+/// A multi-parameter `lambda x, y, ...: body` lowers to a single lambda whose
+/// parameter is a synthetic tuple `__arg_tuple_<N>`, with each named argument
+/// substituted in the body by its projection of the tuple:
+///
+/// ```text
+/// lambda x, y: body  ⟹  λ __arg_tuple_N → body[x := __arg_tuple_N.0,
+///                                               y := __arg_tuple_N.1]
+/// ```
+///
+/// Each multi-arg lambda mints a fresh `N` via
+/// [`LoweringContext::fresh_tuple_arg`] so that nested multi-arg lambdas
+/// cannot capture each other's tuple parameter; without the unique suffix,
+/// an outer substitution inserting `Var("__arg_tuple")` into an inner
+/// lambda's body would be captured by the inner binder of the same name.
+///
+/// This pairs with [`lower_call`]'s tupled lowering of multi-argument calls so
+/// that syntactic multi-arg functions never produce a curried `Expr::Lambda`
+/// chain. The downstream `lambda_elim` pass would otherwise fold such a chain
+/// into `curry(body)`, which operator conversion cannot compile. Users who
+/// want genuine currying still write it explicitly (`lambda x: lambda y: ...`
+/// or an explicit `curry(f)` call); those nest through the general Lambda
+/// rule and remain unsupported past operator conversion — tracked as
+/// follow-up work.
 ///
 /// Unsupported features (`*args`, `**kwargs`, default values, keyword-only
 /// arguments) return [`LoweringError::Unsupported`].
@@ -626,13 +685,180 @@ fn lower_lambda(
         ));
     }
 
-    // Lower the body once; then wrap it in one lambda per parameter,
-    // innermost-first (reverse order) to produce the curried chain.
     let body_expr = lower_expr(body, ctx)?;
-    let result = args.args.iter().rev().fold(body_expr, |acc, arg| {
-        Expr::lambda(&arg.node.arg, Type::Hole, acc)
-    });
-    Ok(result)
+
+    // Single-arg lambda: emit `λ x → body` directly.
+    if args.args.len() == 1 {
+        return Ok(Expr::lambda(&args.args[0].node.arg, Type::Hole, body_expr));
+    }
+
+    // Multi-arg lambda: substitute each named argument with its projection of
+    // a freshly-minted tuple parameter, producing a single-parameter lambda
+    // over the tuple. In-place substitution (rather than wrapping the body in
+    // `let`-bindings) avoids introducing function-typed `Let` nodes; when
+    // `lambda_elim` rewrites a `Let` under a lambda, the bound variable's
+    // type is lifted to `ParamTy ⇒ T`, producing `zip(.0, .1)`-shaped
+    // morphisms that downstream passes would then need to simplify back to
+    // `id` before operator conversion can compile them (simplify has no such
+    // rule today). Substitution sidesteps that whole rewrite chain.
+    //
+    // The tuple parameter's name is unique per multi-arg lambda — minted
+    // after `body_expr` is lowered so that inner multi-arg lambdas (which
+    // bump the counter during body lowering) receive strictly smaller ids
+    // than the outer lambda. Together with the prefix reservation
+    // (user code cannot bind `__arg_tuple_*`), this guarantees that the
+    // outer substitution's inserted `Var(outer_name)` never collides with
+    // an inner binder.
+    let tuple_name = ctx.fresh_tuple_arg();
+    let body_with_subs = args
+        .args
+        .iter()
+        .enumerate()
+        .fold(body_expr, |acc, (i, arg)| {
+            let proj = Expr::apply(Expr::var(&tuple_name), Expr::proj_index(i));
+            substitute_param_in_body(acc, &arg.node.arg, &proj)
+        });
+    Ok(Expr::lambda(&tuple_name, Type::Hole, body_with_subs))
+}
+
+/// Replace every free occurrence of `Var(name)` in `expr` with `replacement`,
+/// respecting binder shadowing introduced by inner `Lambda` and `Let` nodes.
+///
+/// Used during multi-arg lambda lowering to rewrite named Python parameters
+/// as projections of a synthetic pair variable. This is a pre-inference
+/// substitution, so unlike [`crate::ccl::lambda_elim::substitute`] it does
+/// not invoke `debug_typecheck`; callers can pass `Type::Hole`-typed trees.
+///
+/// Does **not** perform capture-avoiding renaming — the caller must ensure
+/// `replacement` contains no free variables that collide with binders in
+/// `expr`. For the [`lower_lambda`] call site this is guaranteed by two
+/// invariants: (1) the replacement `Var` uses the `__arg_tuple_` prefix
+/// that user code cannot bind, and (2) each multi-arg lambda mints a
+/// fresh unique id via [`LoweringContext::fresh_tuple_arg`], so no two
+/// nested multi-arg lambdas can share a tuple-parameter name.
+fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr {
+    // Fast path for atoms that need no traversal.
+    match &expr.node {
+        TypedExprNode::Var(n) if n == name => return replacement.clone(),
+        TypedExprNode::Var(_)
+        | TypedExprNode::Lit(_)
+        | TypedExprNode::Proj(_)
+        | TypedExprNode::Source(_) => return expr,
+        _ => {}
+    }
+
+    let Expr {
+        node,
+        ty,
+        user_annotation,
+    } = expr;
+
+    let recurse = |e: Expr| substitute_param_in_body(e, name, replacement);
+
+    let new_node = match node {
+        TypedExprNode::Lambda {
+            param,
+            body,
+            refinement,
+        } if param.name == name => {
+            // `name` is shadowed by this lambda's param; leave the body alone.
+            TypedExprNode::Lambda {
+                param,
+                body,
+                refinement,
+            }
+        }
+        TypedExprNode::Lambda {
+            param,
+            body,
+            refinement,
+        } => TypedExprNode::Lambda {
+            param,
+            body: Box::new(recurse(*body)),
+            refinement,
+        },
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            let new_bound = recurse(*bound_expr);
+            // Shadowing: if the Let rebinds `name`, leave its body alone.
+            let new_body = if binding.name == name {
+                *body
+            } else {
+                recurse(*body)
+            };
+            TypedExprNode::Let {
+                binding,
+                bound_expr: Box::new(new_bound),
+                body: Box::new(new_body),
+            }
+        }
+        TypedExprNode::Apply { function, argument } => TypedExprNode::Apply {
+            function: Box::new(recurse(*function)),
+            argument: Box::new(recurse(*argument)),
+        },
+        TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
+            left: Box::new(recurse(*left)),
+            op,
+            right: Box::new(recurse(*right)),
+        },
+        TypedExprNode::UnaryOp(op, inner) => TypedExprNode::UnaryOp(op, Box::new(recurse(*inner))),
+        TypedExprNode::Tuple(elts) => TypedExprNode::Tuple(elts.into_iter().map(recurse).collect()),
+        TypedExprNode::List(elts) => TypedExprNode::List(elts.into_iter().map(recurse).collect()),
+        TypedExprNode::Record(fields) => {
+            TypedExprNode::Record(fields.into_iter().map(|(k, e)| (k, recurse(e))).collect())
+        }
+        TypedExprNode::Case { branches } => TypedExprNode::Case {
+            branches: branches
+                .into_iter()
+                .map(|b| Branch {
+                    guard: recurse(b.guard),
+                    body: recurse(b.body),
+                })
+                .collect(),
+        },
+        TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
+            input: Box::new(recurse(*input)),
+            kind,
+        },
+        TypedExprNode::Compose(elts) => {
+            TypedExprNode::Compose(elts.into_iter().map(recurse).collect())
+        }
+        TypedExprNode::GroupBy { collection, key } => TypedExprNode::GroupBy {
+            collection: Box::new(recurse(*collection)),
+            key: Box::new(recurse(*key)),
+        },
+        // Leaves handled by the fast path above, but enumerate here so the
+        // match is exhaustive and future additions are caught at compile time.
+        node @ (TypedExprNode::Lit(_)
+        | TypedExprNode::Var(_)
+        | TypedExprNode::Proj(_)
+        | TypedExprNode::Source(_)) => node,
+        // Lowering does not produce Join/Jump, so passing through is safe.
+        TypedExprNode::Join {
+            name: n,
+            params,
+            loop_body,
+            outer_body,
+        } => TypedExprNode::Join {
+            name: n,
+            params,
+            loop_body: Box::new(recurse(*loop_body)),
+            outer_body: Box::new(recurse(*outer_body)),
+        },
+        TypedExprNode::Jump { target, args } => TypedExprNode::Jump {
+            target,
+            args: args.into_iter().map(recurse).collect(),
+        },
+    };
+
+    Expr {
+        node: new_node,
+        ty,
+        user_annotation,
+    }
 }
 
 /// Lower a Python list comprehension to the CCL Lambda/Apply encoding.
@@ -903,9 +1129,23 @@ mod tests {
     #[case("a or b or c", "a or b or c")]
     // Mixed: `x == 1 and y == 2`
     #[case("x == 1 and y == 2", "x == 1 and y == 2")]
-    // Lambdas
+    // Lambdas — single-arg emits `λ x → body` directly; multi-arg uncurries
+    // to a tupled-parameter lambda whose body binds each name to a
+    // projection, keeping the tree free of nested `Lambda` chains.
     #[case("lambda x: x + 1", "λ x → x + 1")]
-    #[case("lambda x, y: x + y", "λ x → λ y → x + y")]
+    #[case(
+        "lambda x, y: x + y",
+        "λ __arg_tuple_0 → __arg_tuple_0.0 + __arg_tuple_0.1"
+    )]
+    // Nested multi-arg lambdas: the outer lambda's substitution inserts a
+    // reference to its tuple parameter into the inner lambda's body.  Each
+    // multi-arg lambda mints a fresh `__arg_tuple_<N>` via `fresh_tuple_arg`,
+    // so the inserted reference does not collide with the inner binder.  The
+    // outer takes id 1 because the inner is lowered first and consumes id 0.
+    #[case(
+        "lambda x, y: lambda a, b: x + a",
+        "λ __arg_tuple_1 → λ __arg_tuple_0 → __arg_tuple_1.0 + __arg_tuple_0.0"
+    )]
     fn test_lower_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");

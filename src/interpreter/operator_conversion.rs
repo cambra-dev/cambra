@@ -312,7 +312,14 @@ fn convert_impl(
                 for elt in elts {
                     ops.push(convert_impl(elt, Some(split.split()), None, ctx)?);
                 }
-                Ok(Box::new(Zip::new(ops)))
+                // The arms' runtime tilings depend on the upstream `input` —
+                // scalar upstream (e.g. a literal tuple or a let-bound scalar
+                // fed into a multi-arg call) produces scalar arms, while a
+                // function upstream (iteration, composition) produces function
+                // arms. `Zip::fan_out` picks the matching combinator. See
+                // "CCL types vs. tilings" in `design-operators.md` for why
+                // the same CCL-level `zip` compiles to either tile shape.
+                Ok(Zip::fan_out(ops))
             }
         }
 

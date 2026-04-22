@@ -8,6 +8,7 @@
 
 pub mod context;
 pub mod infer;
+pub mod inline;
 pub mod join_plan;
 pub mod lambda_elim;
 pub mod lower;
