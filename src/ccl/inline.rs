@@ -36,7 +36,7 @@
 //! codomain — and are inlined by the same rule as single-arg scalar UDFs.
 //!
 //! Collection-typed functions (`Fun(UIntRange, _)`, `Fun(DataSource, _)`) are
-//! **not** inlined; they compile correctly with `Memo + Splitter` and benefit
+//! **not** inlined; they compile correctly with `Memo + FanOut` and benefit
 //! from sharing.
 //!
 //! # Limitations

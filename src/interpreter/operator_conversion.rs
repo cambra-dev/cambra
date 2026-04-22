@@ -7,10 +7,10 @@ use crate::{
     },
     interpreter::{
         tile_operators::{
-            Aggregate, Constant, Converse, ExtractAggregate, IterateExtent, MapAggregate,
-            MapDomain, MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
-            MapResultWithSource, Memo, Restrict, ScalarTuple, Splitter, TileOperator, Tiling,
-            Uncurry, Zip,
+            fan_in, Aggregate, Constant, Converse, ExtractAggregate, FanOut, IterateExtent,
+            MapAggregate, MapDomain, MapExtractAggregate, MapResult, MapResultToConst,
+            MapResultToConstMode, MapResultWithSource, Memo, Restrict, ScalarFanIn, TileOperator,
+            Tiling, Uncurry,
         },
         tuple_field, ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
         DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
@@ -42,13 +42,13 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 /// - Let-bindings of the above
 ///  
 /// For converting to operators, scalars and application of functions to scalars are turned into a dag
-/// of Constant, MapResult, and ScalarTuple operators.  Functions can only be combined via composition
+/// of Constant, MapResult, and ScalarFanIn operators.  Functions can only be combined via composition
 /// and zip, and every function is lifted over a domain with a Map-style operator (MapResult,
 /// MapResultToConst, or MapResultWithSource). The input to each lifted function is carried through
 /// conversion as the `input` argument, and when `input` is None for a function structure, an
 /// IterateExtent over the function's domain is automatically inserted.
 /// Let-bindings are compiled by converting the bound expression to an operator, memoising it, and
-/// pushing a Splitter into the scope to share it between uses.
+/// pushing a FanOut into the scope to share it between uses.
 ///
 /// Currently unsupported:
 /// - Recursion
@@ -80,7 +80,7 @@ pub enum ConversionError {
 #[derive(Default)]
 pub struct OpConversionContext {
     /// Variable bindings in scope, innermost scope last.
-    scopes: ScopeStack<Rc<Splitter>>,
+    scopes: ScopeStack<Rc<FanOut>>,
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
 }
@@ -151,12 +151,12 @@ impl OpConversionContext {
     }
 
     /// Bind `name` to `binding` in the innermost scope.
-    pub(crate) fn bind(&mut self, name: &str, binding: Rc<Splitter>) {
+    pub(crate) fn bind(&mut self, name: &str, binding: Rc<FanOut>) {
         self.scopes.bind(name, binding);
     }
 
     /// Look up `name` from innermost scope outward.
-    pub(crate) fn lookup(&self, name: &str) -> Option<&Rc<Splitter>> {
+    pub(crate) fn lookup(&self, name: &str) -> Option<&Rc<FanOut>> {
         self.scopes.lookup(name)
     }
 
@@ -216,8 +216,8 @@ impl OpConversionContext {
 /// an enclosing `Lambda`'s [`IterateExtent`] or a prior composition step).
 /// `None` means the expression is the start of the pipeline.
 ///
-/// Let-bound variables are stored in `ctx.scopes` as [`Splitter`]
-/// entries; each use produces a fresh [`Split`] handle via [`Splitter::split`].
+/// Let-bound variables are stored in `ctx.scopes` as [`FanOut`]
+/// entries; each use produces a fresh [`FanOutBranch`] handle via [`FanOut::branch`].
 fn convert_impl(
     expr: &Expr,
     input: Option<Box<dyn TileOperator>>,
@@ -260,9 +260,9 @@ fn convert_impl(
                 return Err(ConversionError::Unsupported("let expects no input".into()));
             }
             let bound_op = convert_impl(bound_expr, None, None, ctx)?;
-            let split = Rc::new(Splitter::new(Box::new(Memo::new(bound_op))));
+            let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
             let mut scope = ctx.enter_scope();
-            scope.bind(&binding.name, split);
+            scope.bind(&binding.name, fan_out);
             convert_impl(body, None, None, &mut scope)
         }
 
@@ -294,9 +294,9 @@ fn convert_impl(
             if elts.len() == 2 && consts.iter().any(Option::is_some) {
                 // Check for zip-with-const and optimize
                 let (const_idx, mode) = if consts[0].is_some() {
-                    (0, MapResultToConstMode::ZipLeft)
+                    (0, MapResultToConstMode::FanInLeft)
                 } else {
-                    (1, MapResultToConstMode::ZipRight)
+                    (1, MapResultToConstMode::FanInRight)
                 };
                 let non_const_arm = convert_impl(&elts[1 - const_idx], Some(input), None, ctx)?;
                 let const_arm = convert_impl(consts[const_idx].unwrap(), None, None, ctx)?;
@@ -306,20 +306,20 @@ fn convert_impl(
                     mode,
                 )))
             } else {
-                // Wrap input in Split so every branch shares the same upstream producer.
-                let split = Rc::new(Splitter::new(Box::new(Memo::new(input))));
+                // Wrap input in FanOut so every branch shares the same upstream producer.
+                let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
                 let mut ops = Vec::new();
                 for elt in elts {
-                    ops.push(convert_impl(elt, Some(split.split()), None, ctx)?);
+                    ops.push(convert_impl(elt, Some(fan_out.branch()), None, ctx)?);
                 }
                 // The arms' runtime tilings depend on the upstream `input` —
                 // scalar upstream (e.g. a literal tuple or a let-bound scalar
                 // fed into a multi-arg call) produces scalar arms, while a
                 // function upstream (iteration, composition) produces function
-                // arms. `Zip::fan_out` picks the matching combinator. See
+                // arms. `fan_in` picks the matching combinator. See
                 // "CCL types vs. tilings" in `design-operators.md` for why
                 // the same CCL-level `zip` compiles to either tile shape.
-                Ok(Zip::fan_out(ops))
+                Ok(fan_in(ops))
             }
         }
 
@@ -430,13 +430,13 @@ fn convert_impl(
                     )))
                 }
                 name if ctx.lookup(name).is_some() => {
-                    let Some(split) = ctx.lookup(name) else {
+                    let Some(fan_out) = ctx.lookup(name) else {
                         unreachable!();
                     };
                     if let Some(input) = input {
-                        Ok(Box::new(MapResult::new(input, split.split())))
+                        Ok(Box::new(MapResult::new(input, fan_out.branch())))
                     } else {
-                        Ok(split.split())
+                        Ok(fan_out.branch())
                     }
                 }
                 _ => Err(ConversionError::Unsupported(format!(
@@ -467,7 +467,7 @@ fn convert_impl(
                 .iter()
                 .map(|elt| convert_impl(elt, None, None, ctx))
                 .collect();
-            Ok(Box::new(ScalarTuple::new(ops?)))
+            Ok(Box::new(ScalarFanIn::new(ops?)))
         }
 
         // Literal constant: produce a scalar.
@@ -747,7 +747,7 @@ fn unaryop_output_extent(op: &UnaryOpKind) -> Extent {
 /// Return the value (codomain) [`Extent`] from a tiling.
 ///
 /// For `Scalar(e)` returns `e`; for `Record(fields)` returns `Extent::Record` over
-/// the field extents (arising when a non-constant tuple is compiled via [`ScalarTuple`]);
+/// the field extents (arising when a non-constant tuple is compiled via [`ScalarFanIn`]);
 /// for `SealedFunction { codomain, .. }` returns `codomain.extent()`.
 fn result_extent(tiling: &Tiling) -> Extent {
     match tiling {

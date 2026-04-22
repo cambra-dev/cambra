@@ -1004,10 +1004,10 @@ fn test_incremental_aggregates() {
 #[case("[(x, 0) for x in [1,2,3]]")]
 #[case("[x for x in [1,2,3] if x + 1 < 2]")]
 #[case("1 + 2 + 3")]
-fn test_no_splits(#[case] code: &str) {
+fn test_no_fan_outs(#[case] code: &str) {
     let op = compile_program(&mut GlobalContext::default(), code, Box::new(|| {})).1;
     let op_str = pretty_tile_operator(op.as_ref());
-    assert!(!op_str.contains("Split#"), "found split in {op_str}");
+    assert!(!op_str.contains("FanOut#"), "found fan-out in {op_str}");
 }
 
 #[rstest]
@@ -1329,8 +1329,8 @@ fn test_collection_let_unaffected(#[case] code: &str, #[case] expected: Tile) {
 // Multi-arg UDFs: lowering uncurries syntactic multi-arg lambdas into a
 // single tupled-domain function, and multi-arg calls into a single Apply on
 // a tupled argument. This keeps `curry` out of the tree for the common case.
-// The n-arm zip arm in operator_conversion dispatches between `ScalarTuple`
-// (scalar upstream) and `Zip` (function upstream), so bodies with nested
+// The n-arm zip arm in operator_conversion dispatches between `ScalarFanIn`
+// (scalar upstream) and `FanIn` (function upstream), so bodies with nested
 // BinOps also compile cleanly under scalar call sites. Explicit currying
 // (`lambda x: lambda y: ...` or explicit `curry(f)`) is still tracked as
 // follow-up work.

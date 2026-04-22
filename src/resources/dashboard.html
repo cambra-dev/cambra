@@ -165,14 +165,14 @@
                 .replace(/"/g, '&quot;');
         }
 
-        // ── Helpers for identifying back-reference split nodes ────────────────
-        // Primary split nodes have labels like   "Split#<hex>"
-        // Back-references have labels like       "→ Split#<hex>"
-        function isSplitRef(label) { return label.startsWith('\u2192 Split#'); }
-        function splitId(label) {
-            // Works for both "Split#<id>" and "→ Split#<id>"
-            const idx = label.indexOf('Split#');
-            return idx >= 0 ? label.slice(idx + 6) : null;
+        // ── Helpers for identifying back-reference fan-out nodes ──────────────
+        // Primary fan-out nodes have labels like  "FanOut#<hex>"
+        // Back-references have labels like        "→ FanOut#<hex>"
+        function isFanOutRef(label) { return label.startsWith('\u2192 FanOut#'); }
+        function fanOutId(label) {
+            // Works for both "FanOut#<id>" and "→ FanOut#<id>"
+            const idx = label.indexOf('FanOut#');
+            return idx >= 0 ? label.slice(idx + 7) : null;
         }
 
         // ── Layout constants ─────────────────────────────────────────────────
@@ -210,42 +210,42 @@
         }
 
         // ── Bottom-up: measure the minimum width each subtree needs ───────────
-        // Back-reference split nodes are collapsed into cross-edges, so they
+        // Back-reference fan-out nodes are collapsed into cross-edges, so they
         // don't contribute width to their parent's subtree.
         function subtreeWidth(node) {
-            const realChildren = (node.children || []).filter(c => !isSplitRef(c.node.label));
+            const realChildren = (node.children || []).filter(c => !isFanOutRef(c.node.label));
             if (realChildren.length === 0) return NODE_W;
             const childTotal = realChildren.reduce((sum, c) => sum + subtreeWidth(c.node), 0);
             const gaps = H_GAP * (realChildren.length - 1);
             return Math.max(NODE_W, childTotal + gaps);
         }
 
-        // ── Depth assignment (phase 1): DFS, ignoring split back-references ─────
+        // ── Depth assignment (phase 1): DFS, ignoring fan-out back-references ────
         function assignDepths(node, depth) {
             node._depth = Math.max(node._depth ?? 0, depth);
-            const realChildren = (node.children || []).filter(c => !isSplitRef(c.node.label));
+            const realChildren = (node.children || []).filter(c => !isFanOutRef(c.node.label));
             for (const c of realChildren) assignDepths(c.node, depth + 1);
         }
 
-        // ── Depth constraint (phase 2): push any consumer below its split ────
-        // A node that references Split#X must sit strictly deeper than Split#X,
+        // ── Depth constraint (phase 2): push any consumer below its fan-out ───
+        // A node that references FanOut#X must sit strictly deeper than FanOut#X,
         // otherwise the cross-edge would have to travel sideways or upward.
         function pushDown(node, delta) {
             node._depth += delta;
-            const realChildren = (node.children || []).filter(c => !isSplitRef(c.node.label));
+            const realChildren = (node.children || []).filter(c => !isFanOutRef(c.node.label));
             for (const c of realChildren) pushDown(c.node, delta);
         }
 
-        function enforceDepthConstraints(node, splitMap) {
+        function enforceDepthConstraints(node, fanOutMap) {
             for (const c of (node.children || [])) {
-                if (isSplitRef(c.node.label)) {
-                    const split = splitMap.get(splitId(c.node.label));
-                    if (split && split._depth <= node._depth)
-                        pushDown(split, node._depth - split._depth + 1);
+                if (isFanOutRef(c.node.label)) {
+                    const fanOut = fanOutMap.get(fanOutId(c.node.label));
+                    if (fanOut && fanOut._depth <= node._depth)
+                        pushDown(fanOut, node._depth - fanOut._depth + 1);
                 }
             }
-            const realChildren = (node.children || []).filter(c => !isSplitRef(c.node.label));
-            for (const c of realChildren) enforceDepthConstraints(c.node, splitMap);
+            const realChildren = (node.children || []).filter(c => !isFanOutRef(c.node.label));
+            for (const c of realChildren) enforceDepthConstraints(c.node, fanOutMap);
         }
 
         // ── Y assignment (phase 3): compute row tops from actual node heights ──
@@ -266,7 +266,7 @@
         // ── X assignment (phase 4): centre each node over its real children ──
         function assignX(node, cx) {
             node._cx = cx;
-            const realChildren = (node.children || []).filter(c => !isSplitRef(c.node.label));
+            const realChildren = (node.children || []).filter(c => !isFanOutRef(c.node.label));
             if (realChildren.length === 0) return;
 
             const widths = realChildren.map(c => subtreeWidth(c.node));
@@ -285,12 +285,12 @@
             nodes.push(node);
             if (!node.children) return;
             for (const c of node.children) {
-                if (isSplitRef(c.node.label)) {
-                    // Deferred cross-edge: target resolved after layout via split map
+                if (isFanOutRef(c.node.label)) {
+                    // Deferred cross-edge: target resolved after layout via fan-out map
                     edges.push({
                         from: node,
                         to: null,
-                        splitRefId: splitId(c.node.label),
+                        fanOutRefId: fanOutId(c.node.label),
                         label: c.edge || '',
                     });
                 } else {
@@ -311,18 +311,18 @@
             // 1. Assign initial tree depths
             assignDepths(root, 0);
 
-            // 2. Collect nodes so we can build the split map before layout
+            // 2. Collect nodes so we can build the fan-out map before layout
             const nodes = [], edges = [];
             collectAll(root, nodes, edges);
 
-            // 3. Build split map and enforce depth constraints so every consumer
-            //    sits strictly below the split node it references
-            const splitMap = new Map();
+            // 3. Build fan-out map and enforce depth constraints so every consumer
+            //    sits strictly below the fan-out node it references
+            const fanOutMap = new Map();
             for (const n of nodes) {
-                const id = splitId(n.label);
-                if (id && !isSplitRef(n.label)) splitMap.set(id, n);
+                const id = fanOutId(n.label);
+                if (id && !isFanOutRef(n.label)) fanOutMap.set(id, n);
             }
-            enforceDepthConstraints(root, splitMap);
+            enforceDepthConstraints(root, fanOutMap);
 
             // 4. Assign x positions and compute y from actual node heights
             const totalW = subtreeWidth(root);
@@ -331,7 +331,7 @@
 
             // 5. Resolve deferred cross-edges
             for (const e of edges) {
-                if (e.splitRefId) e.to = splitMap.get(e.splitRefId) ?? null;
+                if (e.fanOutRefId) e.to = fanOutMap.get(e.fanOutRefId) ?? null;
             }
 
             // 6. Compute canvas bounds
@@ -368,12 +368,12 @@
                 if (!e.to) continue;   // unresolvable cross-edge (shouldn't happen)
 
                 // Normal edges: bottom of parent → top of child.
-                // Split cross-edges: top of split node → bottom of consumer.
-                // (e.from = consumer, e.to = split for cross-edges)
-                const x1 = e.splitRefId ? e.to._cx + ox : e.from._cx + ox;
-                const y1 = e.splitRefId ? e.to._y + oy : e.from._y + oy + nodeHeight(e.from);
-                const x2 = e.splitRefId ? e.from._cx + ox : e.to._cx + ox;
-                const y2 = e.splitRefId ? e.from._y + oy + nodeHeight(e.from) : e.to._y + oy;
+                // Fan-out cross-edges: top of fan-out node → bottom of consumer.
+                // (e.from = consumer, e.to = fan-out for cross-edges)
+                const x1 = e.fanOutRefId ? e.to._cx + ox : e.from._cx + ox;
+                const y1 = e.fanOutRefId ? e.to._y + oy : e.from._y + oy + nodeHeight(e.from);
+                const x2 = e.fanOutRefId ? e.from._cx + ox : e.to._cx + ox;
+                const y2 = e.fanOutRefId ? e.from._y + oy + nodeHeight(e.from) : e.to._y + oy;
 
                 {
                     // Solid gray bezier with symmetric control points.

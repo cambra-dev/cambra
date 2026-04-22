@@ -90,7 +90,7 @@ pub trait TileOperator {
     /// and the result (i.e. the deepest codomain) of the output of this operator.
     /// Individual operators should override this when they are able to automatically detect this constraint.
     /// For example, [`IterateExtent`] always produces an identity function output, so it returns `Some([])`.
-    /// Other operators like [`Split`] and [`Memo`] preserve structure, so they pass the value through from their
+    /// Other operators like [`FanOut`] and [`Memo`] preserve structure, so they pass the value through from their
     /// input
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
         None
@@ -812,9 +812,9 @@ pub enum MapResultToConstMode {
     /// Replace the codomain with the constant
     Replace,
     /// Replace the codomain x with (constant, x)
-    ZipLeft,
+    FanInLeft,
     /// Replace the codomain x with (x, constant)
-    ZipRight,
+    FanInRight,
 }
 
 impl MapResultToConst {
@@ -828,10 +828,10 @@ impl MapResultToConst {
             MapResultToConstMode::Replace => {
                 change_tiling_result(input.tiling(), |_| constant.tiling().clone())
             }
-            MapResultToConstMode::ZipLeft => change_tiling_result(input.tiling(), |e| {
+            MapResultToConstMode::FanInLeft => change_tiling_result(input.tiling(), |e| {
                 Tiling::tuple(&[constant.tiling().clone(), Tiling::Scalar(e.clone())])
             }),
-            MapResultToConstMode::ZipRight => change_tiling_result(input.tiling(), |e| {
+            MapResultToConstMode::FanInRight => change_tiling_result(input.tiling(), |e| {
                 Tiling::tuple(&[Tiling::Scalar(e.clone()), constant.tiling().clone()])
             }),
         };
@@ -918,10 +918,10 @@ impl TileProducer for MapToConstProducer {
             let const_tile = repeat_tile(constant_tile, codomain.len());
             let result_tile = match mode {
                 MapResultToConstMode::Replace => const_tile,
-                MapResultToConstMode::ZipLeft => {
+                MapResultToConstMode::FanInLeft => {
                     Tile::tuple(vec![const_tile, Tile::Scalar(codomain)])
                 }
-                MapResultToConstMode::ZipRight => {
+                MapResultToConstMode::FanInRight => {
                     Tile::tuple(vec![Tile::Scalar(codomain), const_tile])
                 }
             };
@@ -1411,7 +1411,7 @@ fn extract_predicate(pred: &Predicate, path: &[TilePathStep]) -> Predicate {
 ///
 /// All inputs must have `SealedFunction` tilings with compatible domains.
 /// Output fields are named `_0`, `_1`, … matching the input order.
-pub struct Zip {
+pub struct FanIn {
     /// Output tiling: either a `SealedFunction { domain, codomain: Record { _0, _1, … } }`
     /// or a `CurriedFunction { domain1, domain2, codomain: Record { _0, _1, … } }`,
     /// depending on the input operators.
@@ -1420,8 +1420,8 @@ pub struct Zip {
     inputs: Vec<Box<dyn TileOperator>>,
 }
 
-impl Zip {
-    /// Create a new `Zip` operator over the given input operators.
+impl FanIn {
+    /// Create a new `FanIn` operator over the given input operators.
     ///
     /// All inputs must be either all `SealedFunction` tilings with the same domain,
     /// or all `CurriedFunction` tilings with the same domain1, offsets, and domain2.
@@ -1436,7 +1436,7 @@ impl Zip {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        assert!(!inputs.is_empty(), "Zip requires at least one input");
+        assert!(!inputs.is_empty(), "FanIn requires at least one input");
 
         let first_tiling = inputs[0].tiling();
         let tiling = match first_tiling {
@@ -1446,10 +1446,10 @@ impl Zip {
                     if let Tiling::SealedFunction { domain: d, .. } = op.tiling() {
                         assert_eq!(
                             domain, d,
-                            "Zip: all SealedFunction inputs must have the same domain"
+                            "FanIn: all SealedFunction inputs must have the same domain"
                         );
                     } else {
-                        panic!("Zip: all inputs must be the same type (all SealedFunction or all CurriedFunction)");
+                        panic!("FanIn: all inputs must be the same type (all SealedFunction or all CurriedFunction)");
                     }
                 }
                 Tiling::SealedFunction {
@@ -1488,14 +1488,14 @@ impl Zip {
                     {
                         assert_eq!(
                             domain1, d1,
-                            "Zip: all CurriedFunction inputs must have the same domain1"
+                            "FanIn: all CurriedFunction inputs must have the same domain1"
                         );
                         assert_eq!(
                             domain2, d2,
-                            "Zip: all CurriedFunction inputs must have the same domain2"
+                            "FanIn: all CurriedFunction inputs must have the same domain2"
                         );
                     } else {
-                        panic!("Zip: all inputs must be the same type (all SealedFunction or all CurriedFunction)");
+                        panic!("FanIn: all inputs must be the same type (all SealedFunction or all CurriedFunction)");
                     }
                 }
                 Tiling::CurriedFunction {
@@ -1517,35 +1517,35 @@ impl Zip {
                 }
             }
             _ => panic!(
-                "Zip: all inputs must have function tilings (SealedFunction or CurriedFunction)"
+                "FanIn: all inputs must have function tilings (SealedFunction or CurriedFunction)"
             ),
         };
         Self { tiling, inputs }
     }
+}
 
-    /// Tile-polymorphic fan-out factory.
-    ///
-    /// Given N operators representing the arms of a CCL-level `zip(f₀, …, fₙ₋₁)`,
-    /// returns the correct tile-level combinator for the arms' runtime tilings:
-    ///
-    /// - If every arm has a scalar tiling (`Scalar` or a `Record` of scalars),
-    ///   the fan-out is just a record-of-values and [`ScalarTuple`] is returned.
-    /// - Otherwise the arms carry function tilings and [`Zip`] is returned,
-    ///   which fans the shared domain out into a record-codomain sealed/curried
-    ///   function.
-    ///
-    /// Callers at op-conversion can hand the compiled arms to this factory
-    /// without knowing what tiling the arms ended up with — the upstream
-    /// `input` at the zip call site determines that, and the factory picks
-    /// the right combinator. See the "CCL types vs. tilings" section of
-    /// [`design-operators.md`](./design-operators.md) for why the same
-    /// CCL-level `zip` compiles to two different tile operators.
-    pub fn fan_out(inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
-        if inputs.iter().all(|op| is_scalar_tiling(op.tiling())) {
-            Box::new(ScalarTuple::new(inputs))
-        } else {
-            Box::new(Zip::new(inputs))
-        }
+/// Tile-polymorphic fan-in factory.
+///
+/// Given N operators representing the arms of a CCL-level `zip(f₀, …, fₙ₋₁)`,
+/// returns the correct tile-level combinator for the arms' runtime tilings:
+///
+/// - If every arm has a scalar tiling (`Scalar` or a `Record` of scalars),
+///   the fan-in is just a record-of-values and [`ScalarFanIn`] is returned.
+/// - Otherwise the arms carry function tilings and [`FanIn`] is returned,
+///   which fans the shared domain out into a record-codomain sealed/curried
+///   function.
+///
+/// Callers at op-conversion can hand the compiled arms to this factory
+/// without knowing what tiling the arms ended up with — the upstream
+/// `input` at the zip call site determines that, and the factory picks
+/// the right combinator. See the "CCL types vs. tilings" section of
+/// [`design-operators.md`](./design-operators.md) for why the same
+/// CCL-level `zip` compiles to two different tile operators.
+pub fn fan_in(inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    if inputs.iter().all(|op| is_scalar_tiling(op.tiling())) {
+        Box::new(ScalarFanIn::new(inputs))
+    } else {
+        Box::new(FanIn::new(inputs))
     }
 }
 
@@ -1553,7 +1553,7 @@ impl Zip {
 /// `Scalar` leaf, or a `Record` whose fields are all (recursively) scalar.
 ///
 /// Function-valued tilings (`SealedFunction`, `CurriedFunction`) and
-/// `Aggregation` are not scalar. Used by [`Zip::fan_out`] to pick between
+/// `Aggregation` are not scalar. Used by [`fan_in`] to pick between
 /// the scalar and function combiners.
 pub(crate) fn is_scalar_tiling(tiling: &Tiling) -> bool {
     match tiling {
@@ -1565,7 +1565,7 @@ pub(crate) fn is_scalar_tiling(tiling: &Tiling) -> bool {
     }
 }
 
-impl TileOperator for Zip {
+impl TileOperator for FanIn {
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1586,8 +1586,8 @@ impl TileOperator for Zip {
         let consumer_wrapper = Rc::new(RefCell::new(move || {
             consumer.notify();
         }));
-        Box::new(ZipProducer {
-            base: ProducerBase::new(ZipProducer::alloc_id(), &self.tiling),
+        Box::new(FanInProducer {
+            base: ProducerBase::new(FanInProducer::alloc_id(), &self.tiling),
             inputs: self
                 .inputs
                 .iter_mut()
@@ -1603,14 +1603,14 @@ impl TileOperator for Zip {
     }
 }
 
-/// Producer for [`Zip`]: pulls each input and assembles a record-codomain tile.
-struct ZipProducer {
+/// Producer for [`FanIn`]: pulls each input and assembles a record-codomain tile.
+struct FanInProducer {
     base: ProducerBase,
     /// Live input producers, in field order.
     inputs: Vec<Box<dyn TileProducer>>,
 }
 
-impl TileProducer for ZipProducer {
+impl TileProducer for FanInProducer {
     impl_producer_base!();
 
     fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
@@ -1649,7 +1649,7 @@ impl TileProducer for ZipProducer {
                             output_domain = Some(domain);
                             codomains.push(*codomain);
                         }
-                        _ => panic!("Zip: cannot mix SealedFunction and other tile types"),
+                        _ => panic!("FanIn: cannot mix SealedFunction and other tile types"),
                     }
                 }
 
@@ -1688,19 +1688,19 @@ impl TileProducer for ZipProducer {
                             if let Some(ref prev_d1) = domain1 {
                                 assert_eq!(
                                     prev_d1, &d1,
-                                    "Zip: all inputs must have the same domain1"
+                                    "FanIn: all inputs must have the same domain1"
                                 );
                             }
                             if let Some(ref prev_offs) = offsets {
                                 assert_eq!(
                                     prev_offs, &offs,
-                                    "Zip: all inputs must have the same offsets"
+                                    "FanIn: all inputs must have the same offsets"
                                 );
                             }
                             if let Some(ref prev_d2) = domain2 {
                                 assert_eq!(
                                     prev_d2, &d2,
-                                    "Zip: all inputs must have the same domain2"
+                                    "FanIn: all inputs must have the same domain2"
                                 );
                             }
                             if let Some(ref mut prev) = domain_pred {
@@ -1713,7 +1713,7 @@ impl TileProducer for ZipProducer {
                             domain2 = Some(d2);
                             codomains.push(cod);
                         }
-                        _ => panic!("Zip: cannot mix CurriedFunction and other tile types"),
+                        _ => panic!("FanIn: cannot mix CurriedFunction and other tile types"),
                     }
                 }
 
@@ -1733,7 +1733,7 @@ impl TileProducer for ZipProducer {
                     deleted: BitSet::new(),
                 }
             }
-            _ => panic!("Zip: all inputs must be SealedFunction or CurriedFunction tiles"),
+            _ => panic!("FanIn: all inputs must be SealedFunction or CurriedFunction tiles"),
         }
     }
 
@@ -1756,16 +1756,16 @@ impl TileProducer for ZipProducer {
 
 /// Pack N scalar inputs into a single scalar [`Tile::Record`] output.
 ///
-/// Analogous to [`Zip`] for function tiles, but operates entirely on scalars:
+/// Analogous to [`FanIn`] for function tiles, but operates entirely on scalars:
 /// each input must produce a `Tile::Scalar` and the output is a
 /// `Tile::Scalar(ColumnValue::Records)` keyed `_0`, `_1`, …, `_N-1`.
-pub struct ScalarTuple {
+pub struct ScalarFanIn {
     tiling: Tiling,
     inputs: Vec<Box<dyn TileOperator>>,
 }
 
-impl ScalarTuple {
-    /// Construct a `ScalarTuple` from N scalar input operators.
+impl ScalarFanIn {
+    /// Construct a `ScalarFanIn` from N scalar input operators.
     ///
     /// All inputs must have scalar tilings. The output `extent` and `tiling`
     /// are derived: each input's scalar extent becomes a field (`_0`, `_1`, …)
@@ -1773,7 +1773,7 @@ impl ScalarTuple {
     pub fn new(inputs: Vec<Box<dyn TileOperator>>) -> Self {
         assert!(
             !inputs.is_empty(),
-            "ScalarTuple requires at least one input"
+            "ScalarFanIn requires at least one input"
         );
         let tiling = Tiling::Record(
             inputs
@@ -1786,7 +1786,7 @@ impl ScalarTuple {
     }
 }
 
-impl TileOperator for ScalarTuple {
+impl TileOperator for ScalarFanIn {
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -1807,8 +1807,8 @@ impl TileOperator for ScalarTuple {
         let consumer_wrapper = Rc::new(RefCell::new(move || {
             consumer.notify();
         }));
-        Box::new(ScalarTupleProducer {
-            base: ProducerBase::new(ScalarTupleProducer::alloc_id(), &self.tiling),
+        Box::new(ScalarFanInProducer {
+            base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &self.tiling),
             inputs: self
                 .inputs
                 .iter_mut()
@@ -1824,14 +1824,14 @@ impl TileOperator for ScalarTuple {
     }
 }
 
-/// Producer for [`ScalarTuple`]: pulls each scalar input and combines them into
+/// Producer for [`ScalarFanIn`]: pulls each scalar input and combines them into
 /// a `Tile::Scalar(ColumnValue::Records)`.
-struct ScalarTupleProducer {
+struct ScalarFanInProducer {
     base: ProducerBase,
     inputs: Vec<Box<dyn TileProducer>>,
 }
 
-impl TileProducer for ScalarTupleProducer {
+impl TileProducer for ScalarFanInProducer {
     impl_producer_base!();
 
     fn add_inspect_children(&self, mut node: InspectNode, opts: &VizOptions) -> InspectNode {
@@ -2496,7 +2496,7 @@ impl TileProducer for FilterProducer {
         if matches!(self.predicate.tiling(), Tiling::SealedFunction { .. }) {
             // Both predicate and input share the same underlying domain source, so both
             // must be released together; releasing only one leaves the other's upstream
-            // SplitProducer release-guard stale, causing it to re-deliver already-consumed
+            // FanOutProducer release-guard stale, causing it to re-deliver already-consumed
             // data while the other side returns nothing on the next get().
             self.predicate.release(obsolete_guard.clone());
         }
@@ -3132,41 +3132,41 @@ impl TileProducer for MapAggregateProducer {
     }
 }
 
-/// Mutable state shared across all clones of the same [`Split`] and all
-/// [`SplitProducer`]s it creates.  Wrapping this in `Rc<RefCell<...>>` and
-/// creating it eagerly in [`Split::new`] ensures that every clone produced by
-/// [`Split::split`] shares the same object from the start — even before any
+/// Mutable state shared across all branches from the same [`FanOut`] and all
+/// [`FanOutProducer`]s it creates.  Wrapping this in `Rc<RefCell<...>>` and
+/// creating it eagerly in [`FanOut::new`] ensures that every branch produced by
+/// [`FanOut::branch`] shares the same object from the start — even before any
 /// [`TileOperator::subscribe`] call has initialised the inner producer.
-struct SplitShared {
-    /// Instance ID shared by all [`SplitProducer`]s from the same split group.
+struct FanOutShared {
+    /// Instance ID shared by all [`FanOutProducer`]s from the same fan-out group.
     id: usize,
-    /// Inner producer, set on the first [`Split::subscribe`] call.
+    /// Inner producer, set on the first [`FanOutBranch::subscribe`] call.
     producer: Option<Box<dyn TileProducer>>,
-    /// Every consumer registered via [`Split::subscribe`], in order.
+    /// Every consumer registered via [`FanOutBranch::subscribe`], in order.
     consumers: Vec<Box<dyn Consumer>>,
     /// Per-subscriber release guards; intersected before passing upstream.
     release_guards: Vec<TileGuard>,
 }
 
 /// Allows for creating multiple TileOperators that all point to the same
-/// underlying operator.  Call [`Split::split`] to get additional handles;
+/// underlying operator.  Call [`FanOut::branch`] to get additional handles;
 /// subscribing to any handle will reuse the same inner producer.
-pub struct Splitter {
+pub struct FanOut {
     input: Rc<RefCell<Box<dyn TileOperator>>>,
     tiling: Tiling,
-    /// All mutable shared state.  Created eagerly so that clones produced by
-    /// [`Split::split`] always share the same object.
-    shared: Rc<RefCell<SplitShared>>,
-    /// Whether any Splits have been created yet.
+    /// All mutable shared state.  Created eagerly so that branches produced by
+    /// [`FanOut::branch`] always share the same object.
+    shared: Rc<RefCell<FanOutShared>>,
+    /// Whether any branches have been created yet.
     used: RefCell<bool>,
 }
 
-impl Splitter {
-    /// Construct a new `Split` wrapping `input`.
+impl FanOut {
+    /// Construct a new `FanOut` wrapping `input`.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
         let tiling = input.tiling().clone();
-        let shared = Rc::new(RefCell::new(SplitShared {
-            id: SplitProducer::alloc_id(),
+        let shared = Rc::new(RefCell::new(FanOutShared {
+            id: FanOutProducer::alloc_id(),
             producer: None,
             consumers: Vec::new(),
             release_guards: Vec::new(),
@@ -3179,11 +3179,11 @@ impl Splitter {
         }
     }
 
-    /// Return a new handle to the same split.  All handles share the same
+    /// Return a new branch handle on this fan-out.  All branches share the same
     /// inner producer and consumer list; subscribing to any of them is
     /// equivalent.
-    pub fn split(&self) -> Box<dyn TileOperator> {
-        let result = Split {
+    pub fn branch(&self) -> Box<dyn TileOperator> {
+        let result = FanOutBranch {
             input: self.input.clone(),
             tiling: self.tiling.clone(),
             shared: self.shared.clone(), // shares the Rc — always connected
@@ -3198,18 +3198,18 @@ impl Splitter {
     }
 }
 
-struct Split {
+struct FanOutBranch {
     input: Rc<RefCell<Box<dyn TileOperator>>>,
     tiling: Tiling,
-    /// All mutable shared state.  Created eagerly so that clones produced by
-    /// [`Split::split`] always share the same object.
-    shared: Rc<RefCell<SplitShared>>,
-    /// True for the first handle returned by [`Splitter::split`], false for subsequent ones.
+    /// All mutable shared state.  Created eagerly so that branches produced by
+    /// [`FanOut::branch`] always share the same object.
+    shared: Rc<RefCell<FanOutShared>>,
+    /// True for the first handle returned by [`FanOut::branch`], false for subsequent ones.
     /// The primary renders its input subtree in inspect; copies emit a back-reference.
     primary: bool,
 }
 
-impl TileOperator for Split {
+impl TileOperator for FanOutBranch {
     fn tiling(&self) -> &Tiling {
         &self.tiling
     }
@@ -3217,11 +3217,11 @@ impl TileOperator for Split {
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         let id = self.shared.borrow().id;
         if self.primary {
-            InspectNode::new(format!("Split#{id}"))
+            InspectNode::new(format!("FanOut#{id}"))
                 .with_tiling(self.tiling().to_string())
                 .child("input", self.input.borrow().inspect(opts))
         } else {
-            InspectNode::leaf(format!("→ Split#{id}"))
+            InspectNode::leaf(format!("→ FanOut#{id}"))
         }
     }
 
@@ -3260,7 +3260,7 @@ impl TileOperator for Split {
             self.shared.borrow_mut().producer = Some(inner);
         }
 
-        Box::new(SplitProducer {
+        Box::new(FanOutProducer {
             base: ProducerBase::new(self.shared.borrow().id, &self.tiling),
             shared: self.shared.clone(),
             index,
@@ -3272,15 +3272,15 @@ impl TileOperator for Split {
     }
 }
 
-struct SplitProducer {
+struct FanOutProducer {
     base: ProducerBase,
     /// Shared state (consumers + release guards).
-    shared: Rc<RefCell<SplitShared>>,
+    shared: Rc<RefCell<FanOutShared>>,
     /// This producer's index into `shared.consumers` and `shared.release_guards`.
     index: usize,
 }
 
-impl TileProducer for SplitProducer {
+impl TileProducer for FanOutProducer {
     impl_producer_base!();
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
@@ -3324,7 +3324,7 @@ impl TileProducer for SplitProducer {
             let mut shared = self.shared.borrow_mut();
             // Union with the existing stored guard so that the accumulated set of
             // delivered data grows monotonically.  Replacing (instead of union-ing)
-            // would forget previously-released ranges, causing Split to re-deliver
+            // would forget previously-released ranges, causing FanOutBranch to re-deliver
             // data that a consumer has already released.
             let accumulated = shared.release_guards[self.index].union(&obsolete_guard);
             shared.release_guards[self.index] = accumulated;

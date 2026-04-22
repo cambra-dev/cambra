@@ -618,7 +618,7 @@ lambda_elim   →   inline   →   join_plan   →   operator_conversion
   x + y`) are **not** in this category; they're uncurried at lowering and inlined like
   single-arg scalar UDFs.
 - **Collection UDFs** (domain `UIntRange` or `DataSource`): not inlined; they compile
-  correctly via `Memo + Splitter` and benefit from sharing.
+  correctly via `Memo + FanOut` and benefit from sharing.
 - **Body duplication**: a scalar UDF called N times has its body duplicated N times in the
   operator graph. Acceptable; only collection-typed UDFs warrant caching.
 - **Recursive UDFs**: unsupported (already noted in `operator_conversion.rs`).
@@ -635,7 +635,7 @@ a 1:1 correspondence, with each type of object lifted up to apply within a chain
 | CCL form | Operator |
 |---|---|
 | `Compose([f, g, …])` | sequential pipeline: output of each feeds next |
-| `zip(f, g)` | `Zip` fan-out over a shared `Splitter`-wrapped domain |
+| `zip(f, g)` | `FanIn` over a shared `FanOut`-wrapped domain (via the `fan_in` factory) |
 | `id` | identity (pass-through) |
 | `const(c)` | `MapResultToConst` |
 | `map(g)` | `MapResult` |
@@ -644,10 +644,10 @@ a 1:1 correspondence, with each type of object lifted up to apply within a chain
 | `neg`, `not_fn` | `apply_unaryop` |
 | `restrict` | `Restrict` |
 | `Lit` | `Constant` scalar |
-| `Tuple([…])` | `ScalarTuple` |
+| `Tuple([…])` | `ScalarFanIn` |
 | `List([…])` | `MapResult` over index stream |
 | `Source(name)` | data-source operator |
-| `Let { binding, … }` | `Memo`-wrapped `Splitter` bound in scope |
+| `Let { binding, … }` | `Memo`-wrapped `FanOut` bound in scope |
 
 End-to-end pipeline tests live in `tests/compilation_pipeline.rs`.
 
