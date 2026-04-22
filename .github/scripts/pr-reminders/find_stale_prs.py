@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find open PRs with review requests pending for over 24 hours.
+"""Find open PRs with review requests pending for over 10 hours.
 
 Outputs JSONL to stdout: one JSON object per stale review, sorted by (reviewer, pr_number).
 

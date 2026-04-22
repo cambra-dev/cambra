@@ -238,7 +238,7 @@ def find_stale_reviews(
     prs: list[dict],
     get_review_dates: Callable[[int], dict[str, str]],
     now: Optional[datetime] = None,
-    threshold: timedelta = timedelta(hours=24),
+    threshold: timedelta = timedelta(hours=10),
 ) -> list[StaleReview]:
     """Find reviews that have been pending longer than threshold.
 

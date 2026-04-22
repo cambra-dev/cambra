@@ -6,7 +6,7 @@ Direct function calls against fixture data — no subprocess, no mock gh, no jq 
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from prreminder import (
     StaleReview,
@@ -91,7 +91,7 @@ def main() -> None:
 
     # --- Staleness logic tests ---
     print("Staleness logic:")
-    stale = find_stale_reviews(PRS, get_review_dates, now=REFERENCE_TIME)
+    stale = find_stale_reviews(PRS, get_review_dates, now=REFERENCE_TIME, threshold=timedelta(hours=24))
     stale_keys = [(r.reviewer, r.pr_number) for r in stale]
 
     check(
