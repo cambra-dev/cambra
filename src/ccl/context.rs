@@ -21,7 +21,7 @@ use crate::{
         tile_operators::{TileOperator, TileProducer},
         Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource, TestDataSource,
     },
-    pretty_graph::pretty_tile_producer,
+    pretty_graph::{pretty_tile_producer_with, VizOptions},
 };
 
 /// Bundles the per-stage registries needed to thread externally-managed data
@@ -155,7 +155,11 @@ pub fn compile_program(
 
     let join_planned = join_plan::run(inlined);
 
-    debug!("Join-planned CCL:\n{}", symbolic(&join_planned));
+    debug!(
+        "Join-planned CCL:\n{} : {}",
+        symbolic(&join_planned),
+        join_planned.ty
+    );
     debug!("Join-planned CCL:\n{}", symbolic_typed(&join_planned));
 
     let mut op = convert_to_operators(&join_planned, ctx.conversion_ctx())
@@ -163,7 +167,16 @@ pub fn compile_program(
 
     let producer = op.subscribe(op.tiling().universal_guard(), consumer, ctx.scheduler());
 
-    debug!("Producers:\n{}", pretty_tile_producer(producer.as_ref()));
+    debug!(
+        "Producers:\n{}",
+        pretty_tile_producer_with(
+            producer.as_ref(),
+            &VizOptions {
+                max_depth: Some(30),
+                ..Default::default()
+            }
+        )
+    );
 
     (join_planned, op, producer)
 }

@@ -43,8 +43,6 @@ use std::cell::RefCell;
 use std::mem::replace;
 use std::rc::Rc;
 
-use log::trace;
-
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
 use crate::ccl::{next_refinement_id, AggregateKind, Lit, Refinement};
@@ -460,11 +458,6 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
 /// Helper for `substitute` that recurses into any refined types where we also need to
 /// substitute the param.
 fn substitute_in_type(ty: &mut Type, name: &str, replacement: &Expr) {
-    trace!(
-        "Substituting {name} with {} in type {}",
-        symbolic(replacement),
-        ty
-    );
     match ty {
         Type::Refinement(base, refinement) => {
             substitute_in_type(base, name, replacement);
@@ -581,10 +574,6 @@ fn elim_lambda(
     param_ty: &Type,
     body: Expr,
 ) -> Result<Expr, LambdaElimError> {
-    trace!(
-        "elim_lambda: eliminating {param} from {} with param_ty={param_ty}",
-        symbolic(&body)
-    );
     debug_typecheck(&body);
     // Capture the body's type before consuming it; the result of eliminating
     // `λ param → body` is a morphism `param_ty → body_ty`.
@@ -882,7 +871,6 @@ fn elim_lambda(
 /// the result is recursed to handle any lambdas in sub-expressions.  Non-lambda
 /// nodes are recursed into to reach nested lambdas.
 fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimError> {
-    trace!("elim_lambdas: processing {}", symbolic(&expr));
     debug_typecheck(&expr);
     let TypedExpr {
         node,

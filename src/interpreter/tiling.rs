@@ -18,7 +18,7 @@ use intervalsets::{
 };
 
 use crate::{
-    ccl::AggregateKind,
+    ccl::{AggregateKind, BaseType},
     interpreter::{
         apply_binop_column, tuple_field, BinOpKind, ColumnValue, Extent, LogicKind, Value,
     },
@@ -1636,6 +1636,14 @@ pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
         }
     }
 
+    fn record_cv_to_extent(fields: &HashMap<String, ColumnValue>) -> Extent {
+        Extent::Record(transform_hashmap_values(fields, |cv| match cv {
+            ColumnValue::UInts(_) => Extent::Base(BaseType::UInt),
+            ColumnValue::Records(inner) => record_cv_to_extent(inner),
+            _ => todo!(),
+        }))
+    }
+
     match tile {
         Tile::SealedFunction {
             domain,
@@ -1656,14 +1664,7 @@ pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
                 r.clone().drain_to_value_iter().collect(),
                 cod_ints,
                 domain_predicate,
-                |v| {
-                    ColumnValue::from_values(
-                        v,
-                        &Extent::Record(transform_hashmap_values(fields, |_| {
-                            Extent::Base(crate::ccl::BaseType::UInt)
-                        })),
-                    )
-                },
+                |v| ColumnValue::from_values(v, &record_cv_to_extent(fields)),
             ),
             (other_codomain, domain) => Tile::SealedFunction {
                 domain,

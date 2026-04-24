@@ -691,6 +691,24 @@ fn typecheck_equal(a: &Type, b: &Type) -> bool {
         (Type::Fun(a_domain, a_codomain), Type::Fun(b_domain, b_codomain)) => {
             typecheck_equal(a_domain, b_domain) && typecheck_equal(a_codomain, b_codomain)
         }
+        (Type::Tuple(a_elems), Type::Tuple(b_elems)) => {
+            if a_elems.len() != b_elems.len() {
+                return false;
+            }
+            a_elems
+                .iter()
+                .zip(b_elems.iter())
+                .all(|(a, b)| typecheck_equal(a, b))
+        }
+        (Type::Record(a_fields), Type::Record(b_fields)) => {
+            if a_fields.len() != b_fields.len() {
+                return false;
+            }
+            a_fields
+                .iter()
+                .zip(b_fields.iter())
+                .all(|(a, b)| a.0 == b.0 && typecheck_equal(&a.1, &b.1))
+        }
         _ => a == b,
     }
 }

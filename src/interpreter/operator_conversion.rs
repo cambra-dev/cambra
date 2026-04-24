@@ -7,16 +7,15 @@ use crate::{
     },
     interpreter::{
         tile_operators::{
-            fan_in, Aggregate, Constant, Converse, ExtractAggregate, FanOut, IterateExtent,
-            MapAggregate, MapDomain, MapExtractAggregate, MapResult, MapResultToConst,
-            MapResultToConstMode, MapResultWithSource, Memo, Restrict, ScalarFanIn, TileOperator,
-            Tiling, Uncurry,
+            fan_in, Aggregate, Constant, Converse, ExtractAggregate, FanOut, FlattenTupleDomain,
+            IterateExtent, MapAggregate, MapDomain, MapExtractAggregate, MapResult,
+            MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo, PermuteRecordDomain,
+            Restrict, ScalarFanIn, TileOperator, Tiling, Uncurry,
         },
         tuple_field, ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
         DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
         Value,
     },
-    pretty_graph::pretty_tile_operator,
     util::ScopeStack,
 };
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
@@ -370,6 +369,18 @@ fn convert_impl(
             )?)))
         }
 
+        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "restrict") =>
+        {
+            if input.is_some() {
+                return Err(ConversionError::Unsupported(
+                    "restrict requires no input".into(),
+                ));
+            }
+            Ok(Box::new(Restrict::new(convert_impl(
+                argument, None, None, ctx,
+            )?)))
+        }
+
         // If we are applying an aggregate, then it is a global aggregate that should use the Aggregate operator.
         TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if agg_for_name(n).is_some()) =>
         {
@@ -383,6 +394,24 @@ fn convert_impl(
             };
             let input = convert_impl(argument, None, None, ctx)?;
             apply_aggregate(input, agg_for_name(name).unwrap())
+        }
+
+        TypedExprNode::Apply { function, argument } if is_applied_flatten_domain(function) => {
+            if input.is_some() {
+                return Err(ConversionError::Unsupported(
+                    "flatten_domain expects no input".into(),
+                ));
+            }
+            convert_flatten_domain(function, argument, ctx)
+        }
+
+        TypedExprNode::Apply { function, argument } if is_applied_permute_domain(function) => {
+            if input.is_some() {
+                return Err(ConversionError::Unsupported(
+                    "permute_domain expects no input".into(),
+                ));
+            }
+            convert_permute_domain(function, argument, ctx)
         }
 
         TypedExprNode::Apply { argument, function } => {
@@ -491,14 +520,6 @@ fn convert_impl(
             "CCL node {other:?} is not yet supported in operator_conversion"
         ))),
     };
-    if let Ok(op) = &result {
-        trace!(
-            "Converted {} : {} to\n{}",
-            symbolic(expr),
-            expr.ty,
-            pretty_tile_operator(op.as_ref())
-        );
-    }
     result
 }
 
@@ -781,4 +802,83 @@ fn is_const(expr: &Expr) -> Option<&Expr> {
         }
     }
     None
+}
+
+fn is_applied_permute_domain(expr: &Expr) -> bool {
+    if let TypedExprNode::Apply { function, .. } = &expr.node {
+        matches!(&function.node, TypedExprNode::Var(n) if n == "permute_domain")
+    } else {
+        false
+    }
+}
+
+fn extract_usize_list(expr: &Expr) -> Result<Vec<usize>, ConversionError> {
+    let TypedExprNode::List(list) = &expr.node else {
+        return Err(ConversionError::Unsupported(
+            "permute_domain requires literal list arg".into(),
+        ));
+    };
+
+    list.iter()
+        .map(|e| {
+            let TypedExprNode::Lit(Lit::Int(n)) = &e.node else {
+                return Err(ConversionError::Unsupported(
+                    "permute_domain requires literal list arg".into(),
+                ));
+            };
+            Ok(*n as usize)
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn convert_permute_domain(
+    function: &Expr,
+    argument: &Expr,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let TypedExprNode::Apply {
+        function: inner_func,
+        argument: inner_arg,
+    } = &function.node
+    else {
+        unreachable!();
+    };
+    assert!(matches!(&inner_func.node, TypedExprNode::Var(n) if n == "permute_domain"));
+
+    let permutation = extract_usize_list(inner_arg)?;
+
+    Ok(Box::new(PermuteRecordDomain::new(
+        convert_impl(argument, None, None, ctx)?,
+        permutation,
+    )))
+}
+
+fn is_applied_flatten_domain(expr: &Expr) -> bool {
+    if let TypedExprNode::Apply { function, .. } = &expr.node {
+        matches!(&function.node, TypedExprNode::Var(n) if n == "flatten_domain")
+    } else {
+        false
+    }
+}
+
+fn convert_flatten_domain(
+    function: &Expr,
+    argument: &Expr,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let TypedExprNode::Apply {
+        function: inner_func,
+        argument: inner_arg,
+    } = &function.node
+    else {
+        unreachable!();
+    };
+    assert!(matches!(&inner_func.node, TypedExprNode::Var(n) if n == "flatten_domain"));
+
+    let flatten_indices = extract_usize_list(inner_arg)?;
+
+    Ok(Box::new(FlattenTupleDomain::new(
+        convert_impl(argument, None, None, ctx)?,
+        flatten_indices,
+    )))
 }

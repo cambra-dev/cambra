@@ -1239,6 +1239,83 @@ fn test_no_fan_outs(#[case] code: &str) {
         deleted: BitSet::new(),
     }
 )]
+#[case(
+    "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == y and y == z]",
+    "([1] ≫ (([1, 2] ≫ [1, 2, 3] ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ≫ ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add:(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_1".into(), ColumnValue::UInts(vec![0])),
+            ("_2".into(), ColumnValue::UInts(vec![0])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+            ("_2".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+// x==z precedes y==z, so BFS visits z (arm 2) before y (arm 1), producing arm_order=[0,2,1].
+// The permute_domain step in convert_loop_join restores canonical domain order.
+#[case(
+    "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z]",
+    "([1] ≫ (([1, 2, 3] ≫ [1, 2] ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add:(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_1".into(), ColumnValue::UInts(vec![0])),
+            ("_2".into(), ColumnValue::UInts(vec![0])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+            ("_2".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y for x in [2] for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]",
+    "([2] ≫ (([1, 2] ≫ [1, 2, 3] ▷ converse) ▷ uncurry ▷ map_domain ≫ (.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add) ▷ converse) ▷ uncurry ▷ map_domain ≫ (.0 ≫ [2], .1 ≫ (.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add) ▷ zip ≫ add:(([0, 0], ([0, 1], [0, 2])) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_1".into(), ColumnValue::Records(HashMap::from([
+                ("_0".into(), ColumnValue::UInts(vec![0])),
+                ("_1".into(), ColumnValue::UInts(vec![0])),
+            ]))),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![4]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and x + 1 == y]",
+    "((([1] ≫ [1, 2, 3] ▷ converse) ▷ uncurry ▷ map_domain ≫ .1 ≫ [1, 2, 3] ≫ [1, 2] ▷ converse) ▷ uncurry ▷ ([0] ▷ flatten_domain) ▷ map_domain ≫ (.0 ≫ ([1], 1 ▷ const) ▷ zip ≫ add, .2 ≫ [1, 2]) ▷ zip ≫ eq) ▷ restrict ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add:(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![])),
+            ("_1".into(), ColumnValue::UInts(vec![])),
+            ("_2".into(), ColumnValue::UInts(vec![])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+            ("_2".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+// TODO add a more realistic join case like below.  Currently, our type inference isn't good enough.
+// [(x, z) for x in [1,2,3] for y in [(3, 30), (2, 20), (1, 10)] for z in [20, 10, 30] if z == y[1] and y[2] == x]
 fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expected_result: Tile) {
     use cambra::ccl::symbolic::symbolic;
 
