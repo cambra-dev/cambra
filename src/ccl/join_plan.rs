@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt::Debug;
 use std::mem::take;
 
@@ -377,51 +377,186 @@ fn extract_single_eq_condition(cond: &Expr) -> Option<(&Expr, &Expr)> {
     Some((&zip_args[0], &zip_args[1]))
 }
 
-/// Collects individual equality join conditions from a refinement predicate.
+/// Splits a conjunction predicate into equality join conditions and other predicates.
 ///
-/// Handles two forms:
-/// - Single: `(key_a, key_b) ▷ zip ≫ eq`
-/// - AND of N conditions: `(cond_1, …, cond_N) ▷ zip ≫ and` where each cond is the single form
-fn collect_join_conditions(refinement: &Expr) -> Option<Vec<(Expr, Expr)>> {
-    // Single condition
+/// Equality conditions take the form `(key_a, key_b) ▷ zip ≫ eq` where each key depends on
+/// exactly one arm.  AND chains `(cond_1, …, cond_N) ▷ zip ≫ and` are recursively split.
+/// Anything that does not match these patterns is collected as an "other" predicate to be
+/// pushed down to the lowest join node where all its required arms are available.
+fn split_join_conditions(refinement: &Expr) -> (Vec<(Expr, Expr)>, Vec<Expr>) {
+    let mut eq_conds = Vec::new();
+    let mut other_preds = Vec::new();
+    collect_conditions(refinement, &mut eq_conds, &mut other_preds);
+    (eq_conds, other_preds)
+}
+
+/// Recursive helper for [`split_join_conditions`].
+fn collect_conditions(
+    refinement: &Expr,
+    eq_conds: &mut Vec<(Expr, Expr)>,
+    other_preds: &mut Vec<Expr>,
+) {
+    // Single equality condition.
     if let Some((ka, kb)) = extract_single_eq_condition(refinement) {
-        return Some(vec![(ka.clone(), kb.clone())]);
+        eq_conds.push((ka.clone(), kb.clone()));
+        return;
     }
-    // AND of conditions: (cond1, ..., condN) ▷ zip ≫ and
-    // Conditions may themselves be nested ANDs (left-associative lowering of `a and b and c`).
+    // AND of conditions: `(cond_1, …, cond_N) ▷ zip ≫ and`.
     let TypedExprNode::Compose(elts) = &refinement.node else {
-        return None;
+        other_preds.push(refinement.clone());
+        return;
     };
-    if elts.len() != 2 {
-        return None;
-    }
-    if !matches!(&elts[1].node, TypedExprNode::Var(v) if v == "and") {
-        return None;
+    if elts.len() != 2 || !matches!(&elts[1].node, TypedExprNode::Var(v) if v == "and") {
+        other_preds.push(refinement.clone());
+        return;
     }
     let TypedExprNode::Apply {
         function: zip_fn,
         argument: args,
     } = &elts[0].node
     else {
-        return None;
+        other_preds.push(refinement.clone());
+        return;
     };
     if !matches!(&zip_fn.node, TypedExprNode::Var(v) if v == "zip") {
-        return None;
+        other_preds.push(refinement.clone());
+        return;
     }
     let TypedExprNode::Tuple(conds) = &args.node else {
-        return None;
+        other_preds.push(refinement.clone());
+        return;
     };
-    let mut result = Vec::new();
     for c in conds {
-        // Recursively flatten nested ANDs; otherwise expect a single eq condition.
-        if let Some(nested) = collect_join_conditions(c) {
-            result.extend(nested);
-        } else {
-            let (ka, kb) = extract_single_eq_condition(c)?;
-            result.push((ka.clone(), kb.clone()));
+        collect_conditions(c, eq_conds, other_preds);
+    }
+}
+
+/// Collects the original arm indices accessed by `expr` at domain-accessing positions.
+///
+/// Follows the same structural rules as [`is_function_of_single_tuple_arm`] but collects
+/// all arm indices rather than requiring exactly one.
+fn collect_arms_used(expr: &Expr, result: &mut BTreeSet<usize>) {
+    match &expr.node {
+        TypedExprNode::Proj(ProjKey::Index(i)) => {
+            result.insert(*i);
+        }
+        TypedExprNode::Compose(elts) => {
+            if let Some(first) = elts.first() {
+                collect_arms_used(first, result);
+            }
+        }
+        TypedExprNode::Apply { function, argument } if matches!(&function.node, TypedExprNode::Var(v) if v == "zip") =>
+        {
+            collect_arms_used(argument, result);
+        }
+        TypedExprNode::Tuple(elts) => {
+            for elt in elts {
+                if !is_constant(elt) {
+                    collect_arms_used(elt, result);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Rewrites domain-accessing Proj nodes in a predicate to match a new flat domain ordering.
+///
+/// `arm_order[j]` is the original arm index at position `j` in the new flat domain.
+/// Only rewrites positions that access the tuple domain (Proj at the start of Compose chains,
+/// arguments of `zip` applications, elements of domain-valued Tuples).  Domain types throughout
+/// the expression are updated to `new_domain_ty`; codomains are left unchanged.
+///
+/// Mirrors the structural traversal of [`replace_tuple_project_with_id`].
+fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]) {
+    // Constant expressions ignore their domain; just update the type.
+    if is_constant(expr) {
+        replace_constant_domain_type(expr, new_domain_ty);
+        return;
+    }
+    match &mut expr.node {
+        TypedExprNode::Proj(ProjKey::Index(i)) => {
+            *i = arm_order
+                .iter()
+                .position(|&a| a == *i)
+                .expect("arm index not in arm_order");
+            set_domain_ty(&mut expr.ty, new_domain_ty);
+        }
+        TypedExprNode::Compose(_) => {
+            set_domain_ty(&mut expr.ty, new_domain_ty);
+            if let TypedExprNode::Compose(elts) = &mut expr.node {
+                if let Some(first) = elts.first_mut() {
+                    reindex_for_domain(first, new_domain_ty, arm_order);
+                }
+            }
+        }
+        TypedExprNode::Apply { .. } => {
+            // Only zip applications appear at domain-accessing positions.
+            let mut output_ty = expr.ty.clone();
+            set_domain_ty(&mut output_ty, new_domain_ty);
+            let arg = if let TypedExprNode::Apply { function, argument } = &mut expr.node {
+                assert!(
+                    matches!(&function.node, TypedExprNode::Var(v) if v == "zip"),
+                    "unexpected Apply at domain position: {:?}",
+                    function.node
+                );
+                reindex_for_domain(argument, new_domain_ty, arm_order);
+                argument.clone()
+            } else {
+                unreachable!()
+            };
+            *expr = apply_primitive(*arg, "zip", output_ty);
+        }
+        TypedExprNode::Tuple(_) => {
+            if let Type::Tuple(tys) = &mut expr.ty {
+                for ty in tys.iter_mut() {
+                    if matches!(ty, Type::Fun(..)) {
+                        set_domain_ty(ty, new_domain_ty);
+                    }
+                }
+            }
+            if let TypedExprNode::Tuple(elts) = &mut expr.node {
+                for elt in elts.iter_mut() {
+                    if is_constant(elt) {
+                        replace_constant_domain_type(elt, new_domain_ty);
+                    } else {
+                        reindex_for_domain(elt, new_domain_ty, arm_order);
+                    }
+                }
+            }
+        }
+        _ => {
+            if matches!(expr.ty, Type::Fun(..)) {
+                set_domain_ty(&mut expr.ty, new_domain_ty);
+            }
         }
     }
-    Some(result)
+}
+
+/// Combines two optional predicates over the same flat domain with a logical AND.
+fn combine_predicates(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
+    match (a, b) {
+        (None, None) => None,
+        (Some(p), None) | (None, Some(p)) => Some(p),
+        (Some(pa), Some(pb)) => {
+            let flat_domain_ty = pa.ty.domain().unwrap().clone();
+            let bool_ty = Type::Base(BaseType::Bool);
+            let zip_input_ty = Type::Tuple(vec![pa.ty.clone(), pb.ty.clone()]);
+            let zip_out_ty = Type::fun(
+                flat_domain_ty.clone(),
+                Type::Tuple(vec![bool_ty.clone(), bool_ty.clone()]),
+            );
+            let preds_tuple = Expr::tuple(vec![pa, pb]).with_ty(zip_input_ty);
+            let zipped = apply_function(preds_tuple, Expr::var("zip"), zip_out_ty);
+            Some(typed_compose(vec![
+                zipped,
+                Expr::var("and").with_ty(Type::fun(
+                    Type::Tuple(vec![bool_ty.clone(), bool_ty.clone()]),
+                    bool_ty,
+                )),
+            ]))
+        }
+    }
 }
 
 /// Runs a BFS over the join condition graph and returns the spanning-tree children list.
@@ -637,6 +772,18 @@ fn build_residual_predicate(
 /// [`spanning_tree_children`]).  `conditions` is the full list of equality conditions
 /// `(arm_a, arm_b, key_expr_a, key_expr_b)`.  `arm_types[i]` is the type of arm `i`.
 ///
+/// Starting from `node`, each of its BFS children is joined onto the accumulated
+/// probe side in order, producing a left-deep sequence of hash joins.  For each
+/// child, ALL conditions straddling the current probe side and the child's subtree
+/// are identified: the first drives the hash join key, and any remaining ones become
+/// a residual predicate applied at this node.
+///
+/// `other_predicates` contains non-equality predicates (as original-domain expressions paired
+/// with their required arm sets) that should be pushed to the lowest join node where all
+/// required arms are present.  Predicates entirely within a child subtree are forwarded to
+/// that child's recursive call; predicates that straddle or depend on the current probe side
+/// are applied at the first hash join where all their arms are available.
+///
 /// Returns `(plan, arm_order)` where `arm_order[i]` is the canonical arm index at output
 /// position `i` of the plan's domain tuple, or `None` if any required condition is missing.
 fn build_join_plan(
@@ -644,19 +791,36 @@ fn build_join_plan(
     children: &[Vec<usize>],
     conditions: &[(usize, usize, Expr, Expr)],
     arm_types: &[Type],
+    other_predicates: &[(Expr, BTreeSet<usize>)],
 ) -> Option<(JoinPlan, Vec<usize>)> {
     let mut probe_plan = JoinPlan::Loop {
         arms: vec![node],
         predicate: None,
     };
     let mut probe_arms = vec![node];
+    let mut remaining_preds: Vec<(Expr, BTreeSet<usize>)> = other_predicates.to_vec();
 
     // Build a left-deep sequence of hash joins: for each BFS child, hash-join its subtree
     // (build side) onto the accumulated probe side.  The first straddling condition drives
     // the hash key; any remaining ones become a residual predicate at this node.
     for &child in &children[node] {
         let build_arms = subtree_arms(child, children);
-        let (build_plan, _) = build_join_plan(child, children, conditions, arm_types)?;
+
+        // Predicates whose required arms are entirely within the child subtree are pushed
+        // into the child's plan.  Constant predicates (empty arms_used) are kept at the
+        // current level so they can be applied once a flat domain exists.
+        let mut child_preds: Vec<(Expr, BTreeSet<usize>)> = Vec::new();
+        remaining_preds.retain(|(pred, arms_used)| {
+            if !arms_used.is_empty() && arms_used.iter().all(|a| build_arms.contains(a)) {
+                child_preds.push((pred.clone(), arms_used.clone()));
+                false
+            } else {
+                true
+            }
+        });
+
+        let (build_plan, _) =
+            build_join_plan(child, children, conditions, arm_types, &child_preds)?;
 
         // Collect all conditions straddling the current probe side and the child's subtree.
         let straddling: Vec<&(usize, usize, Expr, Expr)> = conditions
@@ -687,8 +851,32 @@ fn build_join_plan(
         // so that projections reference the correct positions in the flat domain.
         probe_arms.extend(build_arms.iter().copied());
 
-        // Any remaining straddling conditions become a residual predicate at this node.
-        let predicate = build_residual_predicate(&straddling[1..], &probe_arms, arm_types);
+        // Residual equality conditions beyond the first straddling one.
+        let mut predicate = build_residual_predicate(&straddling[1..], &probe_arms, arm_types);
+
+        // Apply any other predicates now that all their required arms are available.
+        // Build the flat domain type lazily — only when there are other predicates to adapt.
+        let applicable: Vec<Expr> = if remaining_preds.is_empty() {
+            Vec::new()
+        } else {
+            let flat_domain_ty =
+                Type::Tuple(probe_arms.iter().map(|&i| arm_types[i].clone()).collect());
+            let mut app = Vec::new();
+            remaining_preds.retain(|(pred, arms_used)| {
+                if arms_used.iter().all(|a| probe_arms.contains(a)) {
+                    let mut adapted = pred.clone();
+                    reindex_for_domain(&mut adapted, &flat_domain_ty, &probe_arms);
+                    app.push(adapted);
+                    false
+                } else {
+                    true
+                }
+            });
+            app
+        };
+        for adapted in applicable {
+            predicate = combine_predicates(predicate, Some(adapted));
+        }
 
         probe_plan = JoinPlan::Hash {
             probe: Box::new(probe_plan),
@@ -709,6 +897,39 @@ fn build_join_plan(
         };
     }
 
+    // For leaf nodes (no children were joined), remaining predicates whose arms are all within
+    // the current probe set can be applied directly to the loop plan's predicate field.  This
+    // covers the case where a predicate depends only on a single arm (e.g. `y < 2` for an arm
+    // `y`), and that arm is itself a leaf with no children to push it into.
+    if !remaining_preds.is_empty() {
+        let leaf_ty = arm_types[probe_arms[0]].clone();
+        let mut leaf_pred: Option<Expr> = None;
+        remaining_preds.retain(|(pred, arms_used)| {
+            if arms_used.iter().all(|a| probe_arms.contains(a)) {
+                let mut adapted = pred.clone();
+                replace_tuple_project_with_id(&mut adapted, &leaf_ty);
+                leaf_pred = combine_predicates(leaf_pred.take(), Some(adapted));
+                false
+            } else {
+                true
+            }
+        });
+        if let Some(p) = leaf_pred {
+            if let JoinPlan::Loop { predicate, .. } = &mut probe_plan {
+                *predicate = combine_predicates(predicate.take(), Some(p));
+            }
+        }
+    }
+
+    assert!(
+        remaining_preds.is_empty(),
+        "other predicates not placed: {:?}",
+        remaining_preds
+            .iter()
+            .map(|(p, _)| symbolic(p))
+            .collect::<Vec<_>>()
+    );
+
     Some((probe_plan, probe_arms))
 }
 
@@ -726,13 +947,18 @@ fn plan_loop_join(arm_types: &[Type], refinement: &Expr) -> Option<(JoinPlan, Ve
         return None;
     }
 
-    let conditions = collect_join_conditions(refinement)?;
+    let (eq_conditions_raw, other_preds_raw) = split_join_conditions(refinement);
 
-    // For each condition, determine which arms each side depends on and strip the
+    if eq_conditions_raw.is_empty() {
+        trace!("plan_loop_join: no equality conditions, cannot build hash join");
+        return None;
+    }
+
+    // For each equality condition, determine which arms each side depends on and strip the
     // tuple projection, leaving a function of just that arm's type.
     let mut processed: Vec<(usize, usize, Expr, Expr)> = Vec::new();
 
-    for (raw_a, raw_b) in &conditions {
+    for (raw_a, raw_b) in &eq_conditions_raw {
         let arm_a = is_function_of_single_tuple_arm(raw_a)?;
         let arm_b = is_function_of_single_tuple_arm(raw_b)?;
 
@@ -764,7 +990,23 @@ fn plan_loop_join(arm_types: &[Type], refinement: &Expr) -> Option<(JoinPlan, Ve
     }
 
     let children = spanning_tree_children(&processed, n)?;
-    build_join_plan(0, &children, &processed, arm_types)
+
+    // Pair each other predicate with the set of arms it depends on.
+    let other_predicates: Vec<(Expr, BTreeSet<usize>)> = other_preds_raw
+        .into_iter()
+        .map(|pred| {
+            let mut arms = BTreeSet::new();
+            collect_arms_used(&pred, &mut arms);
+            // TODO support constant predicates by constant-folding them away
+            assert!(
+                !arms.is_empty(),
+                "TODO support constant predicates in joins"
+            );
+            (pred, arms)
+        })
+        .collect();
+
+    build_join_plan(0, &children, &processed, arm_types, &other_predicates)
 }
 
 /// Concatenates two types into a single flat tuple type.
@@ -1094,6 +1336,14 @@ fn create_hash_joins(expr: &mut Expr) {
         symbolic(expr),
         expr.ty
     );
+
+    // We need to convert the innermost body of nested Lets, not the outer expr.
+    // This is because we need the let-bound variables to be defined for the execution
+    // of the hash joins.
+    if let TypedExprNode::Let { body, .. } = &mut expr.node {
+        return create_hash_joins(body);
+    }
+
     if let Type::Fun(domain, codomain) = expr.ty.clone() {
         if let Type::Refinement(base, refinement) = (*domain).clone() {
             if let RefinementKind::Predicate(pred_rc) = &refinement.kind {
@@ -2078,7 +2328,7 @@ mod tests {
     fn test_build_join_plan_two_arms_canonical_order() {
         let conditions = vec![cond(0, 1)];
         let children = vec![vec![1], vec![]];
-        let (plan, arm_order) = build_join_plan(0, &children, &conditions, &[]).unwrap();
+        let (plan, arm_order) = build_join_plan(0, &children, &conditions, &[], &[]).unwrap();
         assert_eq!(arm_order, vec![0, 1]);
         // Single join: no tuple projection needed on either side.
         let JoinPlan::Hash {
@@ -2098,7 +2348,7 @@ mod tests {
         // 0-1-2 chain; conditions x==y (0,1) then y==z (1,2).
         let conditions = vec![cond(0, 1), cond(1, 2)];
         let children = vec![vec![1], vec![2], vec![]];
-        let (plan, arm_order) = build_join_plan(0, &children, &conditions, &[]).unwrap();
+        let (plan, arm_order) = build_join_plan(0, &children, &conditions, &[], &[]).unwrap();
         assert_eq!(arm_order, vec![0, 1, 2]);
         // Outer join probes with Loop([0]) (single arm → probe_key_idx=None) against the
         // inner Hash{Loop([1]),Loop([2])}.  The join key is arm 1, which sits at position 0
@@ -2121,7 +2371,7 @@ mod tests {
         // arm_order must be [0,2,1], which triggers the permute_domain path.
         let conditions = vec![cond(0, 2), cond(0, 1)];
         let children = vec![vec![2, 1], vec![], vec![]];
-        let (_, arm_order) = build_join_plan(0, &children, &conditions, &[]).unwrap();
+        let (_, arm_order) = build_join_plan(0, &children, &conditions, &[], &[]).unwrap();
         assert_eq!(arm_order, vec![0, 2, 1]);
     }
 
@@ -2131,6 +2381,215 @@ mod tests {
         // no condition straddles the {0} / {1} split, so planning must fail.
         let conditions = vec![cond(0, 2)];
         let children = vec![vec![1], vec![], vec![]];
-        assert!(build_join_plan(0, &children, &conditions, &[]).is_none());
+        assert!(build_join_plan(0, &children, &conditions, &[], &[]).is_none());
+    }
+
+    // --- split_join_conditions ---
+
+    fn make_eq_cond(tup: &Type, scalar: &Type) -> Expr {
+        let args = Expr::tuple(vec![
+            proj_idx(0).with_ty(fun_ty(tup.clone(), scalar.clone())),
+            proj_idx(1).with_ty(fun_ty(tup.clone(), scalar.clone())),
+        ]);
+        let zip_out = fun_ty(tup.clone(), tuple_ty(vec![scalar.clone(), scalar.clone()]));
+        let zipped = Expr::apply(
+            args,
+            var("zip").with_ty(fun_ty(
+                tuple_ty(vec![scalar.clone(), scalar.clone()]),
+                tuple_ty(vec![scalar.clone(), scalar.clone()]),
+            )),
+        )
+        .with_ty(zip_out);
+        compose(vec![
+            zipped,
+            var("eq").with_ty(fun_ty(
+                tuple_ty(vec![scalar.clone(), scalar.clone()]),
+                scalar.clone(),
+            )),
+        ])
+        .with_ty(fun_ty(tup.clone(), scalar.clone()))
+    }
+
+    fn make_filter_pred(tup: &Type, scalar: &Type, arm: usize) -> Expr {
+        // proj(arm) ≫ filter_fn : tup -> scalar
+        compose(vec![
+            proj_idx(arm).with_ty(fun_ty(tup.clone(), scalar.clone())),
+            var("filter_fn").with_ty(fun_ty(scalar.clone(), scalar.clone())),
+        ])
+        .with_ty(fun_ty(tup.clone(), scalar.clone()))
+    }
+
+    #[test]
+    fn test_split_join_conditions_pure_eq() {
+        let i = int_ty();
+        let t = tuple_ty(vec![i.clone(), i.clone()]);
+        let refinement = make_eq_cond(&t, &i);
+        let (eq, other) = split_join_conditions(&refinement);
+        assert_eq!(eq.len(), 1);
+        assert!(other.is_empty());
+    }
+
+    #[test]
+    fn test_split_join_conditions_pure_non_eq() {
+        let i = int_ty();
+        let t = tuple_ty(vec![i.clone(), i.clone()]);
+        let refinement = make_filter_pred(&t, &i, 0);
+        let (eq, other) = split_join_conditions(&refinement);
+        assert!(eq.is_empty());
+        assert_eq!(other.len(), 1);
+    }
+
+    #[test]
+    fn test_split_join_conditions_mixed_and() {
+        let i = int_ty();
+        let t = tuple_ty(vec![i.clone(), i.clone()]);
+        let eq_cond = make_eq_cond(&t, &i);
+        let filter = make_filter_pred(&t, &i, 0);
+        // AND of eq + filter
+        let bool_ty_val = int_ty(); // using int as a stand-in
+        let and_args = Expr::tuple(vec![eq_cond, filter]).with_ty(tuple_ty(vec![
+            fun_ty(t.clone(), bool_ty_val.clone()),
+            fun_ty(t.clone(), bool_ty_val.clone()),
+        ]));
+        let and_zipped = Expr::apply(and_args, var("zip").with_ty(fun_ty(t.clone(), t.clone())))
+            .with_ty(fun_ty(t.clone(), t.clone()));
+        let refinement = compose(vec![
+            and_zipped,
+            var("and").with_ty(fun_ty(t.clone(), bool_ty_val.clone())),
+        ])
+        .with_ty(fun_ty(t.clone(), bool_ty_val));
+        let (eq, other) = split_join_conditions(&refinement);
+        assert_eq!(eq.len(), 1, "expected 1 equality condition");
+        assert_eq!(other.len(), 1, "expected 1 other predicate");
+    }
+
+    // --- collect_arms_used ---
+
+    #[test]
+    fn test_collect_arms_used_single_proj() {
+        let i = int_ty();
+        let t = tuple_ty(vec![i.clone(), i.clone()]);
+        let expr = proj_idx(1).with_ty(fun_ty(t, i));
+        let mut arms = BTreeSet::new();
+        collect_arms_used(&expr, &mut arms);
+        assert_eq!(arms, BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn test_collect_arms_used_compose() {
+        let i = int_ty();
+        let t = tuple_ty(vec![i.clone(), i.clone()]);
+        let expr = make_filter_pred(&t, &i, 0);
+        let mut arms = BTreeSet::new();
+        collect_arms_used(&expr, &mut arms);
+        assert_eq!(arms, BTreeSet::from([0]));
+    }
+
+    #[test]
+    fn test_collect_arms_used_zip_with_two_arms() {
+        let i = int_ty();
+        let t = tuple_ty(vec![i.clone(), i.clone()]);
+        let eq_cond = make_eq_cond(&t, &i);
+        // The eq condition uses arms 0 and 1 via the zip
+        let mut arms = BTreeSet::new();
+        collect_arms_used(&eq_cond, &mut arms);
+        assert_eq!(arms, BTreeSet::from([0, 1]));
+    }
+
+    // --- convert_loop_join with mixed predicate ---
+
+    #[test]
+    fn test_convert_loop_join_succeeds_with_eq_plus_filter_predicate() {
+        let i = int_ty();
+        let t = tuple_ty(vec![i.clone(), i.clone()]);
+        let bool_ty_val = Type::Base(BaseType::Bool);
+
+        // Build the eq join condition: zip(proj(0), proj(1)) ≫ eq
+        let eq_args = Expr::tuple(vec![
+            proj_idx(0).with_ty(fun_ty(t.clone(), i.clone())),
+            proj_idx(1).with_ty(fun_ty(t.clone(), i.clone())),
+        ]);
+        let eq_zipped = Expr::apply(
+            eq_args,
+            var("zip").with_ty(fun_ty(
+                tuple_ty(vec![i.clone(), i.clone()]),
+                tuple_ty(vec![i.clone(), i.clone()]),
+            )),
+        )
+        .with_ty(fun_ty(t.clone(), tuple_ty(vec![i.clone(), i.clone()])));
+        let eq_cond = compose(vec![
+            eq_zipped,
+            var("eq").with_ty(fun_ty(
+                tuple_ty(vec![i.clone(), i.clone()]),
+                bool_ty_val.clone(),
+            )),
+        ])
+        .with_ty(fun_ty(t.clone(), bool_ty_val.clone()));
+
+        // Build a filter predicate on arm 0: proj(0) ≫ some_filter
+        let filter = compose(vec![
+            proj_idx(0).with_ty(fun_ty(t.clone(), i.clone())),
+            var("some_filter").with_ty(fun_ty(i.clone(), bool_ty_val.clone())),
+        ])
+        .with_ty(fun_ty(t.clone(), bool_ty_val.clone()));
+
+        // AND: (eq_cond, filter) ▷ zip ≫ and
+        let and_args = Expr::tuple(vec![eq_cond, filter]).with_ty(tuple_ty(vec![
+            fun_ty(t.clone(), bool_ty_val.clone()),
+            fun_ty(t.clone(), bool_ty_val.clone()),
+        ]));
+        let and_zipped = Expr::apply(
+            and_args,
+            var("zip").with_ty(fun_ty(
+                tuple_ty(vec![bool_ty_val.clone(), bool_ty_val.clone()]),
+                tuple_ty(vec![bool_ty_val.clone(), bool_ty_val.clone()]),
+            )),
+        )
+        .with_ty(fun_ty(
+            t.clone(),
+            tuple_ty(vec![bool_ty_val.clone(), bool_ty_val.clone()]),
+        ));
+        let refinement = compose(vec![
+            and_zipped,
+            var("and").with_ty(fun_ty(
+                tuple_ty(vec![bool_ty_val.clone(), bool_ty_val.clone()]),
+                bool_ty_val.clone(),
+            )),
+        ])
+        .with_ty(fun_ty(t.clone(), bool_ty_val));
+
+        // Should succeed: eq condition drives the hash join, filter becomes a predicate.
+        let result = convert_loop_join(&t, &refinement);
+        assert!(
+            result.is_some(),
+            "convert_loop_join should succeed when eq conditions + extra filter are present"
+        );
+
+        // The output should contain "restrict" since the filter predicate is attached.
+        let sym = symbolic(&result.unwrap());
+        assert!(
+            sym.contains("restrict"),
+            "expected 'restrict' in output for pushed-down filter, got: {sym}"
+        );
+    }
+
+    #[test]
+    fn test_convert_loop_join_rejects_pure_non_eq_predicate() {
+        let i = int_ty();
+        let t = tuple_ty(vec![i.clone(), i.clone()]);
+        let bool_ty_val = Type::Base(BaseType::Bool);
+
+        // A pure filter predicate with no equality condition — cannot build hash join.
+        let filter = compose(vec![
+            proj_idx(0).with_ty(fun_ty(t.clone(), i.clone())),
+            var("some_filter").with_ty(fun_ty(i.clone(), bool_ty_val.clone())),
+        ])
+        .with_ty(fun_ty(t.clone(), bool_ty_val));
+
+        assert_eq!(
+            convert_loop_join(&t, &filter),
+            None,
+            "should return None when no equality conditions are present"
+        );
     }
 }

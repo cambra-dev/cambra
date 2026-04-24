@@ -489,11 +489,11 @@ For two arms the transformation is straightforward:
 
 For `n ≥ 3` arms `plan_loop_join` constructs a left-deep binary hash-join tree using a five-step algorithm:
 
-1. **Parse conditions** (`collect_join_conditions`): extract each `(key_a, key_b)` pair and strip the tuple projection from each key expression with `replace_tuple_project_with_id`, leaving a function of just the arm's own type.
+1. **Split conditions** (`split_join_conditions`): partition the conjunction predicate into equality join conditions of the form `(key_a, key_b) ▷ zip ≫ eq` — where each key depends on exactly one arm — and *other predicates* that don't match this form.  For each equality condition, `replace_tuple_project_with_id` strips the tuple projection, leaving a function of just the arm's own type.  Each non-equality predicate is paired with the set of arm indices it references (`collect_arms_used`), so it can be pushed to the right level later.
 
 2. **Build spanning tree** (`spanning_tree_children`): treat each equality condition as an undirected edge `(arm_a, arm_b)` and run BFS from arm 0 over this graph.  Returns `children: Vec<Vec<usize>>` — the BFS spanning tree as an adjacency list — or `None` if the graph is disconnected (some arm has no join path to arm 0).
 
-3. **Build left-deep plan** (`build_join_plan`): walk the BFS children recursively, starting from arm 0.  For each child subtree, find a condition that *straddles* the accumulated probe side and the child's subtree, orient it probe/build, and fold it into a `JoinPlan::Hash`.  Returns `(JoinPlan, arm_order)` where `arm_order[i]` is the canonical arm index at output position `i`.
+3. **Build left-deep plan with predicate pushdown** (`build_join_plan`): walk the BFS children recursively, starting from arm 0.  For each child subtree, find a condition that *straddles* the accumulated probe side and the child's subtree, orient it probe/build, and fold it into a `JoinPlan::Hash`.  Any remaining straddling equality conditions become residual predicates at that node.  Non-equality predicates are pushed down greedily: predicates whose required arms are entirely within a child subtree are forwarded into that child's recursive call; predicates whose required arms span the current probe side are applied at the first join node where all required arms are present, after reindexing (`reindex_for_domain`) to match the flat output domain of the current node.  Single-arm predicates that depend only on a leaf arm are pushed all the way into the `JoinPlan::Loop` node's `predicate` field.  Returns `(JoinPlan, arm_order)` where `arm_order[i]` is the canonical arm index at output position `i`.
 
 4. **Emit CCL** (`join_plan_to_expr`): convert the `JoinPlan` tree to a CCL expression bottom-up.
    - `Loop { arms }` → `id` on the tuple type of those arms (or the single arm type)
@@ -523,11 +523,10 @@ JoinPlan::Hash  { probe, build,
 The `predicate` fields correspond to extra predicates that aren't expressable as hash join conditions, and these will be applied using the `Restrict` operator after doing the join logic.
 
 Future work:
-1. Support non-equality predicates in planning (they already work in plan -> CCL conversion)
-2. Support loop joins inside hash joins (today the Loop nodes are always single-arm)
-3. Support hash joins inside loop joins.  This will require a new CartesianProduct operator, as currently the only thing that can
+1. Support loop joins inside hash joins (today the Loop nodes are always single-arm)
+2. Support hash joins inside loop joins.  This will require a new CartesianProduct operator, as currently the only thing that can
 do a cartesian product is iterating a type, and this needs to be downstream of nontrivial operators.
-4. Bloom filters to optimize joins.  Instead of doing traditional join ordering, we'll do runtime bloom-filter passing as described in in https://dl.acm.org/doi/pdf/10.1145/3725283
+3. Bloom filters to optimize joins.  Instead of doing traditional join ordering, we'll do runtime bloom-filter passing as described in https://dl.acm.org/doi/pdf/10.1145/3725283
 
 ### Keyed Aggregates
 

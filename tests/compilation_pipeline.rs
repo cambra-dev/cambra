@@ -344,12 +344,10 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     "[x + z + y for x in ['a', 'b'] for y in ['c', 'd'] for z in ['e', 'f']]",
     ColumnValue::strings(&["aec", "afc", "aed", "afd", "bec", "bfc", "bed", "bfd"])
 )]
-// TODO turn back to hash join
 #[case(
-    "[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'e'] if x == y and True]",
-    ColumnValue::strings(&["cc", "bb"])
+    "[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'e', 'f'] if x == y]",
+    ColumnValue::strings(&["bb", "cc"])
 )]
-// Loop join with non-equality predicate involving both generators
 #[case(
     "[x + y for x in [1, 1] for y in [2, 2, 3] if x + 1 == y]",
     ColumnValue::Ints(vec![3, 3, 3, 3])
@@ -390,7 +388,7 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     ColumnValue::Ints(vec![11, 21, 12, 22])
 )]
 #[case(
-    "a = [1,2]; b = [10, 20]; [x + y for x in a for y in b if x == y // 10 and True]",
+    "a = [1,2]; b = [10, 20]; [x + y for x in a for y in b if x == y // 10]",
     ColumnValue::Ints(vec![11, 22])
 )]
 fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
@@ -568,7 +566,7 @@ fn test_source_filter_nonterminal() {
 #[timeout(Duration::from_secs(1))]
 #[case("[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] == y[0]]")]
 #[case(
-    "[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] == y[0] and True]"
+    "[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] <= y[0] and x[0] >= y[0]]"
 )]
 fn test_inner_join(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
@@ -766,7 +764,7 @@ fn test_inner_join(#[case] code: &str) {
 /// Simpler version of test_inner_join to make it easier to debug.
 #[rstest]
 #[case("[x + y for x in source1() for y in source2() if x == y]")]
-#[case("[x + y for x in source1() for y in source2() if x == y and True]")]
+#[case("[x + y for x in source1() for y in source2() if x <= y and x >= y]")]
 fn test_incremental_join_simple(#[case] code: &str) {
     let mut ctx = GlobalContext::default();
 
@@ -1306,6 +1304,42 @@ fn test_no_fan_outs(#[case] code: &str) {
             ("_2".into(), ColumnValue::UInts(vec![])),
         ])),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+            ("_2".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and y < 2]",
+    "([1] ≫ (([1, 2, 3] ≫ ((([1, 2], 2 ▷ const) ▷ zip ≫ lt) ▷ restrict ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add:(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_1".into(), ColumnValue::UInts(vec![0])),
+            ("_2".into(), ColumnValue::UInts(vec![0])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+            ("_2".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and x + y == z + 1]",
+    "((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add:({([0, 0], [0, 1], [0, 2]) | Refined((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and)} ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_1".into(), ColumnValue::UInts(vec![0])),
+            ("_2".into(), ColumnValue::UInts(vec![0])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),
         domain_predicate: Predicate::Record(HashMap::from([
             ("_0".into(), Predicate::True),
             ("_1".into(), Predicate::True),
