@@ -323,6 +323,99 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
 }
 
 // ---------------------------------------------------------------------------
+// Generator expressions — equivalent to list comprehensions
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case("(x for x in [10, 20])", make_int_list(&[10, 20]))]
+#[case("(x + 2 for x in [10, 20])", make_int_list(&[12, 22]))]
+fn test_generator_expressions(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
+}
+
+// Filtered generator expression — parity with filtered list comp.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case(
+    "(x for x in [1, 2, 3, 4, 5] if x > 2)",
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![2, 3, 4]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3, 4, 5]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+fn test_generator_expression_filtered(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Regular function definitions — def f(x): body; f(arg)
+// ---------------------------------------------------------------------------
+
+// Scalar `def` calls (single- and multi-arg) work end-to-end via the
+// uncurried definition/call shape and the inline pass for scalar UDFs.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case("def inc(x):\n    x + 1\ninc(4)", Value::Int(5))]
+#[case("def add(x, y):\n    x + y\nadd(3, 4)", Value::Int(7))]
+fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Generator functions — def f(xs): for x in xs: yield expr
+// ---------------------------------------------------------------------------
+
+// Generator functions lower correctly to CCL (covered by unit tests in
+// `src/ccl/lower.rs`), but calling them end-to-end panics in type inference
+// with "Apply function must have function type, got ?N": the `Apply` of the
+// list-typed Let-bound lambda synthesised from the `for`/`yield` body doesn't
+// get a concrete function type before the check in `infer.rs`. Enable when
+// inference propagates through list-producing UDFs.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+// Simple map: yield x * 2
+#[ignore = "inference: Apply on list-typed UDF not yet resolved"]
+#[case(
+    "def doubles(xs):\n    for x in xs:\n        yield x * 2\ndoubles([1, 2, 3])",
+    make_int_list(&[2, 4, 6])
+)]
+// Map with captured parameter
+#[ignore = "inference: Apply on list-typed UDF not yet resolved"]
+#[case(
+    "def add_to(xs, n):\n    for x in xs:\n        yield x + n\nadd_to([1, 2, 3], 10)",
+    make_int_list(&[11, 12, 13])
+)]
+// Filter via if-guard
+#[ignore = "inference: Apply on list-typed UDF not yet resolved"]
+#[case(
+    "def positives(xs):\n    for x in xs:\n        if x > 0:\n            yield x\npositives([-1, 2, -3, 4])",
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![1, 3]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 4]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
+}
+
+// Generator function composed with aggregate: sum(doubles([1, 2, 3])) == 12
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[ignore = "inference: Apply on list-typed UDF not yet resolved"]
+#[case(
+    "def doubles(xs):\n    for x in xs:\n        yield x * 2\nsum(doubles([1, 2, 3]))",
+    Value::Int(12)
+)]
+fn test_generator_function_with_aggregate(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// ---------------------------------------------------------------------------
 // Multi-generator comprehensions / joins
 // ---------------------------------------------------------------------------
 //

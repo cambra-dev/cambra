@@ -30,6 +30,12 @@
 //! | Single-arg call `f(a)` | [`Expr::Apply`] |
 //! | Multi-arg call `f(a, b, ...)` | [`Expr::Apply`] with a tupled argument |
 //! | Annotated assignment `x: T = expr` | [`Expr::Let`] with [`crate::ccl::TypedBinding::user_annotation`] set |
+//! | Generator expressions `(expr for x in xs)` | `Lambda`/`Apply` encoding (same as list comp) |
+//! | Generator functions `def f(xs): for x in xs: yield expr` | [`Expr::Let`] + uncurried [`Expr::Lambda`] wrapping `Lambda`/`Apply` encoding |
+//! | Nested-for generator functions | same encoding as multi-generator list comprehensions |
+//! | Let-bindings in generator bodies `y = f(x); yield y` | [`Expr::Let`] interleaved in the `Lambda`/`Apply` chain |
+//! | Pre-loop lets before generator for-loop | [`Expr::Let`] wrapping the generator expression |
+//! | Regular functions `def f(x, y, ...): expr` | [`Expr::Let`] + single [`Expr::Lambda`] (tupled param when multi-arg) |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
 //!
@@ -54,7 +60,7 @@ use rustpython_parser::ast as pyast;
 use crate::ccl::BaseType;
 use crate::ccl::{
     AggregateKind, ArithmeticKind, BinOpKind, Branch, CompareKind, Expr, HashJoinSpec, Lit,
-    LogicKind, Type, TypedExprNode, UnaryOpKind,
+    LogicKind, RefinementKind, Type, TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -148,6 +154,7 @@ pub fn lower_expr(
             Ok(Expr::list(items?))
         }
         pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(elt, generators, ctx),
+        pyast::ExprKind::GeneratorExp { elt, generators } => lower_list_comp(elt, generators, ctx),
         pyast::ExprKind::Call {
             func,
             args,
@@ -201,78 +208,166 @@ pub fn lower_expr(
 /// Lower a block of Python statements to a nested CCL expression.
 ///
 /// All statements except the last must be simple name assignments
-/// (`x = expr`) or annotated assignments (`x: T = expr`); each becomes an
-/// [`Expr::Let`] binding wrapping the rest. Annotated assignments set
-/// [`crate::ccl::TypedBinding::user_annotation`] which inference validates against the
-/// inferred type and signals [`crate::ccl::infer::InferError::AnnotationMismatch`]
-/// on conflict.
+/// (`x = expr`), annotated assignments (`x: T = expr`), augmented
+/// assignments (`x op= expr`), or function definitions (`def f(...): ...`);
+/// each becomes an [`Expr::Let`] binding wrapping the rest. Function
+/// definitions are lowered via [`lower_function_body`], which detects
+/// generator functions (single `for`/`yield` body) and regular functions.
 ///
-/// The last statement must be a bare expression (`StmtKind::Expr`).
+/// The last statement must be a bare expression (`StmtKind::Expr`)
+/// or an `if`/`else` block.
 pub fn lower_stmts(stmts: &[pyast::Stmt], ctx: &LoweringContext) -> Result<Expr, LoweringError> {
+    lower_stmts_inner(stmts, &HashSet::new(), ctx)
+}
+
+/// Core implementation of [`lower_stmts`] that threads an `outer_bindings`
+/// set — names already in scope above this statement block (e.g., function
+/// parameters). The generator-lowering path uses this to detect mutation
+/// (reassignment of variables from enclosing scopes).
+fn lower_stmts_inner(
+    stmts: &[pyast::Stmt],
+    outer_bindings: &HashSet<String>,
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
     if stmts.is_empty() {
         return Err(LoweringError::Unsupported("Empty statement block".into()));
     }
 
     let (last, rest) = stmts.split_last().unwrap();
 
-    // The final statement must be a bare expression or an if/else block.
+    // The final statement must be a bare expression, an if/else block, or
+    // a for-loop that contains a yield chain (generator pattern).
     let final_expr = match &last.node {
         pyast::StmtKind::Expr { value } => lower_expr(value, ctx)?,
-        pyast::StmtKind::If { test, body, orelse } => lower_if(test, body, orelse, ctx)?,
+        pyast::StmtKind::If { test, body, orelse } => {
+            // Propagate outer bindings + rest names so that generator-fors
+            // inside the if branches can check for mutation correctly.
+            let mut scope = outer_bindings.clone();
+            collect_stmt_names(rest, &mut scope);
+            lower_if(test, body, orelse, &scope, ctx)?
+        }
+        pyast::StmtKind::For {
+            target,
+            iter,
+            body,
+            orelse,
+            ..
+        } => {
+            if !orelse.is_empty() {
+                return Err(LoweringError::Unsupported(
+                    "for/else is not supported".into(),
+                ));
+            }
+            // Build outer bindings: caller's bindings + all names from rest.
+            let mut scope = outer_bindings.clone();
+            collect_stmt_names(rest, &mut scope);
+            lower_generator_for(target, iter, body, &scope, ctx)?
+        }
         _ => {
             return Err(LoweringError::Unsupported(
-                "Last statement must be a bare expression or if/else".into(),
+                "Last statement must be a bare expression, if/else, or \
+                 for/yield generator loop"
+                    .into(),
             ))
         }
     };
 
-    // Wrap preceding assignments in Let bindings, innermost-first.
+    // Wrap preceding assignments and function definitions in Let bindings,
+    // innermost-first.
     rest.iter()
         .rev()
-        .try_fold(final_expr, |body, stmt| match &stmt.node {
-            pyast::StmtKind::Assign { targets, value, .. } => {
-                if targets.len() != 1 {
-                    return Err(LoweringError::Unsupported(
-                        "Multiple assignment targets not supported".into(),
-                    ));
+        .try_fold(final_expr, |acc, stmt| lower_let_binding(stmt, acc, ctx))
+}
+
+/// Lower a single statement as a Let binding wrapping `body`.
+///
+/// Shared between [`lower_stmts_inner`] (for rest-stmts) and
+/// [`lower_generator_chain`] (for per-generator let-steps).
+fn lower_let_binding(
+    stmt: &pyast::Stmt,
+    body: Expr,
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
+    match &stmt.node {
+        pyast::StmtKind::Assign { targets, value, .. } => {
+            if targets.len() != 1 {
+                return Err(LoweringError::Unsupported(
+                    "Multiple assignment targets not supported".into(),
+                ));
+            }
+            let name = extract_name_target(&targets[0], "assignment")?;
+            let val = lower_expr(value, ctx)?;
+            Ok(Expr::let_bind(name, val, body))
+        }
+        pyast::StmtKind::AnnAssign {
+            target,
+            annotation,
+            value: Some(value),
+            ..
+        } => {
+            let name = extract_name_target(target, "annotated assignment")?;
+            let annotation_ty = lower_type_annotation(annotation)?;
+            let val = lower_expr(value, ctx)?;
+            Ok(Expr::let_bind_annotated(name, val, body, annotation_ty))
+        }
+        pyast::StmtKind::AnnAssign { value: None, .. } => Err(LoweringError::Unsupported(
+            "Annotated assignment without a value is not supported".into(),
+        )),
+        // Desugar `x op= e` → `x = x op e` and lower as a Let binding.
+        //
+        // Only simple name targets are supported; subscript and attribute
+        // targets (e.g. `x[0] += 1`, `x.field += 1`) return Unsupported.
+        pyast::StmtKind::AugAssign { target, op, value } => {
+            let name = extract_name_target(target, "augmented assignment")?;
+            let val = lower_binop(target, op, value, ctx)?;
+            Ok(Expr::let_bind(name, val, body))
+        }
+        // Function definition → Let binding with curried lambda body.
+        pyast::StmtKind::FunctionDef {
+            name,
+            args,
+            body: fn_body,
+            decorator_list,
+            ..
+        } => {
+            if !decorator_list.is_empty() {
+                return Err(LoweringError::Unsupported(
+                    "Function decorators are not supported".into(),
+                ));
+            }
+            let func_expr = lower_function_body(args, fn_body, ctx)?;
+            Ok(Expr::let_bind(name.clone(), func_expr, body))
+        }
+        _ => Err(LoweringError::Unsupported(
+            "Only assignment and function definition statements are supported \
+             before the final expression"
+                .into(),
+        )),
+    }
+}
+
+/// Collect simple-name targets from assignment / function-def statements
+/// into `names`. Used to build `outer_bindings` for mutation checks.
+fn collect_stmt_names(stmts: &[pyast::Stmt], names: &mut HashSet<String>) {
+    for stmt in stmts {
+        match &stmt.node {
+            pyast::StmtKind::Assign { targets, .. } => {
+                if let Some(pyast::ExprKind::Name { id, .. }) = targets.first().map(|t| &t.node) {
+                    names.insert(id.clone());
                 }
-                let name = extract_name_target(&targets[0], "assignment")?;
-                let val = lower_expr(value, ctx)?;
-                Ok(Expr::let_bind(name, val, body))
             }
-            pyast::StmtKind::AnnAssign {
-                target,
-                annotation,
-                value: Some(value),
-                ..
-            } => {
-                let name = extract_name_target(target, "annotated assignment")?;
-                let annotation_ty = lower_type_annotation(annotation)?;
-                let val = lower_expr(value, ctx)?;
-                Ok(Expr::let_bind_annotated(name, val, body, annotation_ty))
+            pyast::StmtKind::AnnAssign { target, .. }
+            | pyast::StmtKind::AugAssign { target, .. } => {
+                if let pyast::ExprKind::Name { id, .. } = &target.node {
+                    names.insert(id.clone());
+                }
             }
-            pyast::StmtKind::AnnAssign { value: None, .. } => Err(LoweringError::Unsupported(
-                "Annotated assignment without a value is not supported".into(),
-            )),
-            // Desugar `x op= e` → `x = x op e` and lower as a Let binding.
-            //
-            // Only simple name targets are supported; subscript and attribute
-            // targets (e.g. `x[0] += 1`, `x.field += 1`) return Unsupported.
-            pyast::StmtKind::AugAssign { target, op, value } => {
-                let name = extract_name_target(target, "augmented assignment")?;
-                // Correctness: lower_binop calls lower_expr on `target`, which
-                // produces Expr::Var(name) because the Name-only guard above
-                // already rejected non-Name targets. If that guard were ever
-                // loosened, lower_binop would silently lower a complex target
-                // expression (e.g. subscript) as both the read and the binding
-                // destination — review this coupling before relaxing the guard.
-                let val = lower_binop(target, op, value, ctx)?;
-                Ok(Expr::let_bind(name, val, body))
+            pyast::StmtKind::FunctionDef { name, .. } => {
+                names.insert(name.clone());
             }
-            _ => Err(LoweringError::Unsupported(
-                "Only assignment statements are supported before the final expression".into(),
-            )),
-        })
+            _ => {}
+        }
+    }
 }
 
 /// Extract a simple variable name from a Python assignment target.
@@ -332,6 +427,7 @@ fn lower_if(
     test: &pyast::Expr,
     body: &[pyast::Stmt],
     orelse: &[pyast::Stmt],
+    outer_bindings: &HashSet<String>,
     ctx: &LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if orelse.is_empty() {
@@ -340,8 +436,8 @@ fn lower_if(
         ));
     }
     let guard = lower_expr(test, ctx)?;
-    let true_arm = lower_stmts(body, ctx)?;
-    let false_arm = lower_stmts(orelse, ctx)?;
+    let true_arm = lower_stmts_inner(body, outer_bindings, ctx)?;
+    let false_arm = lower_stmts_inner(orelse, outer_bindings, ctx)?;
     // Flatten elif chains: if the else branch is itself a Case, extend our
     // branches with its branches rather than nesting.
     let mut branches = vec![Branch {
@@ -623,92 +719,83 @@ fn lower_boolop(
     Ok(acc)
 }
 
-/// Lower a Python lambda expression to an [`Expr::Lambda`].
+/// Validate that function or lambda arguments use only supported features.
 ///
-/// A single-parameter `lambda x: body` lowers to `λ x → body`.
-///
-/// A multi-parameter `lambda x, y, ...: body` lowers to a single lambda whose
-/// parameter is a synthetic tuple `__arg_tuple_<N>`, with each named argument
-/// substituted in the body by its projection of the tuple:
-///
-/// ```text
-/// lambda x, y: body  ⟹  λ __arg_tuple_N → body[x := __arg_tuple_N.0,
-///                                               y := __arg_tuple_N.1]
-/// ```
-///
-/// Each multi-arg lambda mints a fresh `N` via
-/// [`LoweringContext::fresh_tuple_arg`] so that nested multi-arg lambdas
-/// cannot capture each other's tuple parameter; without the unique suffix,
-/// an outer substitution inserting `Var("__arg_tuple")` into an inner
-/// lambda's body would be captured by the inner binder of the same name.
-///
-/// This pairs with [`lower_call`]'s tupled lowering of multi-argument calls so
-/// that syntactic multi-arg functions never produce a curried `Expr::Lambda`
-/// chain. The downstream `lambda_elim` pass would otherwise fold such a chain
-/// into `curry(body)`, which operator conversion cannot compile. Users who
-/// want genuine currying still write it explicitly (`lambda x: lambda y: ...`
-/// or an explicit `curry(f)` call); those nest through the general Lambda
-/// rule and remain unsupported past operator conversion — tracked as
-/// follow-up work.
-///
-/// Unsupported features (`*args`, `**kwargs`, default values, keyword-only
-/// arguments) return [`LoweringError::Unsupported`].
-fn lower_lambda(
-    args: &pyast::Arguments,
-    body: &pyast::Located<pyast::ExprKind>,
-    ctx: &LoweringContext,
-) -> Result<Expr, LoweringError> {
+/// Rejects `*args`, `**kwargs`, keyword-only arguments, default values, and
+/// parameterless signatures. Shared between [`lower_lambda`] and
+/// [`lower_function_body`].
+fn validate_function_args(args: &pyast::Arguments) -> Result<(), LoweringError> {
     if args.vararg.is_some() {
         return Err(LoweringError::Unsupported(
-            "Lambda *args not supported".into(),
+            "Function/lambda *args not supported".into(),
         ));
     }
     if args.kwarg.is_some() {
         return Err(LoweringError::Unsupported(
-            "Lambda **kwargs not supported".into(),
+            "Function/lambda **kwargs not supported".into(),
         ));
     }
     if !args.kwonlyargs.is_empty() {
         return Err(LoweringError::Unsupported(
-            "Lambda keyword-only arguments not supported".into(),
+            "Function/lambda keyword-only arguments not supported".into(),
         ));
     }
     if !args.defaults.is_empty() {
         return Err(LoweringError::Unsupported(
-            "Lambda default arguments not supported".into(),
+            "Function/lambda default arguments not supported".into(),
         ));
     }
     if args.args.is_empty() {
-        // TODO do we need to support 0-arg lambdas?
         return Err(LoweringError::Unsupported(
-            "Lambda with no parameters not supported".into(),
+            "Function/lambda with no parameters not supported".into(),
         ));
     }
+    Ok(())
+}
 
-    let body_expr = lower_expr(body, ctx)?;
-
-    // Single-arg lambda: emit `λ x → body` directly.
+/// Wrap `body_expr` in a single uncurried lambda over `args`.
+///
+/// Single-arg `(x): body` → `λ x → body`.
+///
+/// Multi-arg `(x, y, ...): body` becomes a single lambda whose parameter is
+/// a synthetic tuple `__arg_tuple_<N>`, with each named argument substituted
+/// in the body by its projection of that tuple:
+///
+/// ```text
+/// (x, y): body  ⟹  λ __arg_tuple_N → body[x := __arg_tuple_N.0,
+///                                          y := __arg_tuple_N.1]
+/// ```
+///
+/// Each multi-arg call mints a fresh `N` via
+/// [`LoweringContext::fresh_tuple_arg`] so that nested multi-arg
+/// lambdas/defs cannot capture each other's tuple parameter; without the
+/// unique suffix, an outer substitution inserting `Var("__arg_tuple")` into
+/// an inner lambda's body would be captured by the inner binder of the same
+/// name.
+///
+/// In-place substitution (rather than wrapping the body in `let`-bindings)
+/// avoids introducing function-typed `Let` nodes; when `lambda_elim`
+/// rewrites a `Let` under a lambda, the bound variable's type is lifted to
+/// `ParamTy ⇒ T`, producing `zip(.0, .1)`-shaped morphisms that downstream
+/// passes would then need to simplify back to `id` before operator
+/// conversion can compile them (simplify has no such rule today).
+/// Substitution sidesteps that whole rewrite chain.
+///
+/// Shared between [`lower_lambda`] and [`lower_function_body`] so that both
+/// `lambda x, y: …` and `def f(x, y): …` pair with [`lower_call`]'s
+/// tupled-argument shape and never emit a curried `Expr::Lambda` chain that
+/// `lambda_elim` would fold into an unsupported `curry(body)`.
+fn uncurry_params(args: &pyast::Arguments, body_expr: Expr, ctx: &LoweringContext) -> Expr {
     if args.args.len() == 1 {
-        return Ok(Expr::lambda(&args.args[0].node.arg, Type::Hole, body_expr));
+        return Expr::lambda(&args.args[0].node.arg, Type::Hole, body_expr);
     }
-
-    // Multi-arg lambda: substitute each named argument with its projection of
-    // a freshly-minted tuple parameter, producing a single-parameter lambda
-    // over the tuple. In-place substitution (rather than wrapping the body in
-    // `let`-bindings) avoids introducing function-typed `Let` nodes; when
-    // `lambda_elim` rewrites a `Let` under a lambda, the bound variable's
-    // type is lifted to `ParamTy ⇒ T`, producing `zip(.0, .1)`-shaped
-    // morphisms that downstream passes would then need to simplify back to
-    // `id` before operator conversion can compile them (simplify has no such
-    // rule today). Substitution sidesteps that whole rewrite chain.
-    //
-    // The tuple parameter's name is unique per multi-arg lambda — minted
-    // after `body_expr` is lowered so that inner multi-arg lambdas (which
-    // bump the counter during body lowering) receive strictly smaller ids
-    // than the outer lambda. Together with the prefix reservation
-    // (user code cannot bind `__arg_tuple_*`), this guarantees that the
-    // outer substitution's inserted `Var(outer_name)` never collides with
-    // an inner binder.
+    // Mint the tuple name after `body_expr` is lowered so that inner
+    // multi-arg lambdas (which bump the counter during body lowering)
+    // receive strictly smaller ids than the outer lambda. Together with
+    // the reserved `__arg_tuple_` prefix (user code cannot bind
+    // double-underscore names here), this guarantees the outer
+    // substitution's inserted `Var(outer_name)` never collides with an
+    // inner binder.
     let tuple_name = ctx.fresh_tuple_arg();
     let body_with_subs = args
         .args
@@ -718,7 +805,27 @@ fn lower_lambda(
             let proj = Expr::apply(Expr::var(&tuple_name), Expr::proj_index(i));
             substitute_param_in_body(acc, &arg.node.arg, &proj)
         });
-    Ok(Expr::lambda(&tuple_name, Type::Hole, body_with_subs))
+    Expr::lambda(&tuple_name, Type::Hole, body_with_subs)
+}
+
+/// Lower a Python lambda expression to an [`Expr::Lambda`] via
+/// [`uncurry_params`].
+///
+/// Users who want genuine currying still write it explicitly
+/// (`lambda x: lambda y: ...` or an explicit `curry(f)` call); those nest
+/// through the general Lambda rule and remain unsupported past operator
+/// conversion — tracked as follow-up work.
+///
+/// Unsupported features (`*args`, `**kwargs`, default values, keyword-only
+/// arguments) return [`LoweringError::Unsupported`].
+fn lower_lambda(
+    args: &pyast::Arguments,
+    body: &pyast::Located<pyast::ExprKind>,
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
+    validate_function_args(args)?;
+    let body_expr = lower_expr(body, ctx)?;
+    Ok(uncurry_params(args, body_expr, ctx))
 }
 
 /// Replace every free occurrence of `Var(name)` in `expr` with `replacement`,
@@ -761,7 +868,8 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
             body,
             refinement,
         } if param.name == name => {
-            // `name` is shadowed by this lambda's param; leave the body alone.
+            // `name` is shadowed by this lambda's param; leave body and
+            // refinement alone (the refinement is in this lambda's scope too).
             TypedExprNode::Lambda {
                 param,
                 body,
@@ -772,11 +880,24 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
             param,
             body,
             refinement,
-        } => TypedExprNode::Lambda {
-            param,
-            body: Box::new(recurse(*body)),
-            refinement,
-        },
+        } => {
+            // Refinements may reference outer-scope names (e.g. list-comp
+            // guards that close over an enclosing function parameter), so
+            // substitute through the predicate expression as well. The
+            // `Rc<RefCell<>>` is freshly allocated during lowering and not
+            // yet shared, so mutating in place is safe.
+            if let Some(r) = &refinement {
+                if let RefinementKind::Predicate(pred) = &r.kind {
+                    let inner = pred.borrow().clone();
+                    *pred.borrow_mut() = substitute_param_in_body(inner, name, replacement);
+                }
+            }
+            TypedExprNode::Lambda {
+                param,
+                body: Box::new(recurse(*body)),
+                refinement,
+            }
+        }
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -859,6 +980,454 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
         ty,
         user_annotation,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Generator lowering — data structures
+// ---------------------------------------------------------------------------
+
+/// One generator clause in a flattened generator-function chain.
+///
+/// Each `for` loop in the chain produces one `GeneratorSpec`. The `steps`
+/// list captures let-bindings and if-guards encountered between this `for`
+/// and the next `for` (or the terminal `yield`), in source order.
+struct GeneratorSpec {
+    /// Loop variable name (always a simple `Name` target in supported
+    /// programs).
+    iter_var: String,
+    /// Lowered iterable expression.
+    source: Expr,
+    /// Interleaved let-bindings and guards, in source order.
+    steps: Vec<BodyStep>,
+    /// Names introduced at this frame: the iteration variable plus any
+    /// let-bound names. Used by the mutation check.
+    introduced: HashSet<String>,
+}
+
+/// A single step in a generator body between the enclosing `for` and the
+/// next nested `for` (or the terminal `yield`).
+enum BodyStep {
+    /// Let-binding from an Assign, AnnAssign, AugAssign, or FunctionDef
+    /// statement. The `value` is already lowered to CCL.
+    Let(LetStep),
+    /// Guard from `if cond:` (no else). The `cond` is already lowered; the
+    /// `desc` is a human-readable string for the refinement annotation.
+    Guard { cond: Expr, desc: String },
+}
+
+/// A single let-binding produced during generator chain walking.
+struct LetStep {
+    name: String,
+    value: Expr,
+    annotation: Option<Type>,
+}
+
+// ---------------------------------------------------------------------------
+// Generator lowering — chain walker
+// ---------------------------------------------------------------------------
+
+/// Walk a chain of nested `for` / `if` / `yield` / `let` statements,
+/// appending one [`GeneratorSpec`] per `for` to `chain` and returning a
+/// reference to the innermost yield value expression.
+///
+/// Each for-body is parsed as `chain ::= step* term` where:
+/// - `step` ∈ {Assign, AnnAssign, AugAssign, FunctionDef}
+/// - `term` ∈ {`yield expr`, `if cond: chain`, `for target in iter: chain`}
+///
+/// The mutation rule: an assignment `name = expr` is a let-binding iff
+/// `name` is either fresh (not previously bound) or in the current for's
+/// `introduced` set. If `name` is in an outer for-frame or in
+/// `outer_bindings` (function args + pre-loop lets), it's mutation and
+/// rejected.
+fn collect_chain<'ast>(
+    stmts: &'ast [pyast::Stmt],
+    chain: &mut Vec<GeneratorSpec>,
+    outer_bindings: &HashSet<String>,
+    ctx: &LoweringContext,
+) -> Result<&'ast pyast::Expr, LoweringError> {
+    if stmts.is_empty() {
+        return Err(LoweringError::Unsupported(
+            "Empty generator for-loop body".into(),
+        ));
+    }
+
+    let (last, rest) = stmts.split_last().unwrap();
+
+    // Process leading statements as let-binding steps.
+    for stmt in rest {
+        process_chain_step(stmt, chain, outer_bindings, ctx)?;
+    }
+
+    // Process the final statement as a chain terminator.
+    process_chain_terminator(last, chain, outer_bindings, ctx)
+}
+
+/// Process a non-terminal statement in a generator chain as a let-binding.
+fn process_chain_step(
+    stmt: &pyast::Stmt,
+    chain: &mut Vec<GeneratorSpec>,
+    outer_bindings: &HashSet<String>,
+    ctx: &LoweringContext,
+) -> Result<(), LoweringError> {
+    match &stmt.node {
+        pyast::StmtKind::Assign { targets, value, .. } => {
+            if targets.len() != 1 {
+                return Err(LoweringError::Unsupported(
+                    "Multiple assignment targets not supported".into(),
+                ));
+            }
+            let name = extract_name_target(&targets[0], "assignment")?;
+            check_generator_mutation(&name, chain, outer_bindings)?;
+            let val = lower_expr(value, ctx)?;
+            push_generator_let(chain, name, val, None);
+            Ok(())
+        }
+        pyast::StmtKind::AnnAssign {
+            target,
+            annotation,
+            value: Some(value),
+            ..
+        } => {
+            let name = extract_name_target(target, "annotated assignment")?;
+            check_generator_mutation(&name, chain, outer_bindings)?;
+            let ann = lower_type_annotation(annotation)?;
+            let val = lower_expr(value, ctx)?;
+            push_generator_let(chain, name, val, Some(ann));
+            Ok(())
+        }
+        pyast::StmtKind::AnnAssign { value: None, .. } => Err(LoweringError::Unsupported(
+            "Annotated assignment without a value is not supported".into(),
+        )),
+        pyast::StmtKind::AugAssign { target, op, value } => {
+            let name = extract_name_target(target, "augmented assignment")?;
+            // x op= e desugars to x = x op e. The RHS reads the OLD value
+            // of x, so x must already be in scope. If it's not in the
+            // current frame's introduced set, it's either from an outer
+            // scope (= mutation) or undefined.
+            let current = &chain.last().expect("chain non-empty").introduced;
+            if !current.contains(&name) {
+                return Err(LoweringError::Unsupported(format!(
+                    "Augmented assignment to `{name}` in generator: `{name}` is \
+                     not bound in this for-body. If it's from an outer scope, \
+                     this is mutation; if fresh, use `{name} = expr` instead.",
+                )));
+            }
+            let val = lower_binop(target, op, value, ctx)?;
+            push_generator_let(chain, name, val, None);
+            Ok(())
+        }
+        pyast::StmtKind::FunctionDef {
+            name,
+            args,
+            body: fn_body,
+            decorator_list,
+            ..
+        } => {
+            if !decorator_list.is_empty() {
+                return Err(LoweringError::Unsupported(
+                    "Function decorators are not supported".into(),
+                ));
+            }
+            check_generator_mutation(name, chain, outer_bindings)?;
+            let func_expr = lower_function_body(args, fn_body, ctx)?;
+            push_generator_let(chain, name.clone(), func_expr, None);
+            Ok(())
+        }
+        _ => Err(LoweringError::Unsupported(
+            "Only assignments and function definitions are supported as \
+             non-terminal statements in generator for-bodies"
+                .into(),
+        )),
+    }
+}
+
+/// Process the terminal statement in a generator chain (yield, nested for,
+/// or if-guard continuing the chain).
+fn process_chain_terminator<'ast>(
+    stmt: &'ast pyast::Stmt,
+    chain: &mut Vec<GeneratorSpec>,
+    outer_bindings: &HashSet<String>,
+    ctx: &LoweringContext,
+) -> Result<&'ast pyast::Expr, LoweringError> {
+    match &stmt.node {
+        pyast::StmtKind::Expr { value } => match &value.node {
+            pyast::ExprKind::Yield {
+                value: Some(yield_val),
+            } => Ok(yield_val.as_ref()),
+            pyast::ExprKind::Yield { value: None } => Err(LoweringError::Unsupported(
+                "yield without a value is not supported in generators".into(),
+            )),
+            _ => Err(LoweringError::Unsupported(
+                "Generator for-body must end in a yield expression, \
+                 nested for, or if-guard"
+                    .into(),
+            )),
+        },
+        pyast::StmtKind::If { test, body, orelse } => {
+            if !orelse.is_empty() {
+                return Err(LoweringError::Unsupported(
+                    "if/else inside generator for-loop is not supported; \
+                     use a list comprehension with an if-filter instead"
+                        .into(),
+                ));
+            }
+            let cond = lower_expr(test, ctx)?;
+            let desc = format!("{test}");
+            chain
+                .last_mut()
+                .expect("chain non-empty")
+                .steps
+                .push(BodyStep::Guard { cond, desc });
+            collect_chain(body, chain, outer_bindings, ctx)
+        }
+        pyast::StmtKind::For {
+            target,
+            iter,
+            body,
+            orelse,
+            ..
+        } => {
+            if !orelse.is_empty() {
+                return Err(LoweringError::Unsupported(
+                    "for/else is not supported inside generator functions".into(),
+                ));
+            }
+            let iter_var = extract_name_target(target, "for-loop target")?;
+            let source = lower_expr(iter, ctx)?;
+            let mut introduced = HashSet::new();
+            introduced.insert(iter_var.clone());
+            chain.push(GeneratorSpec {
+                iter_var,
+                source,
+                steps: vec![],
+                introduced,
+            });
+            collect_chain(body, chain, outer_bindings, ctx)
+        }
+        _ => Err(LoweringError::Unsupported(
+            "Generator for-body must end in a yield expression, \
+             nested for, or if-guard"
+                .into(),
+        )),
+    }
+}
+
+/// Check whether assigning `name` inside the current generator chain
+/// constitutes mutation (rejectable) or a let-binding (allowed).
+///
+/// A name is allowed if it's in the current frame's `introduced` set
+/// (shadowing) or if it's fresh (not in any frame or outer bindings).
+/// Anything else is mutation.
+fn check_generator_mutation(
+    name: &str,
+    chain: &[GeneratorSpec],
+    outer_bindings: &HashSet<String>,
+) -> Result<(), LoweringError> {
+    let current_idx = chain.len() - 1;
+    // Shadowing within current frame is always fine.
+    if chain[current_idx].introduced.contains(name) {
+        return Ok(());
+    }
+    // Name in an outer for-frame → mutation across iterations.
+    for outer_frame in &chain[..current_idx] {
+        if outer_frame.introduced.contains(name) {
+            return Err(LoweringError::Unsupported(format!(
+                "Assignment to `{name}` inside a nested for-body is mutation: \
+                 `{name}` was introduced by an enclosing for-loop",
+            )));
+        }
+    }
+    // Name in function scope → mutation of function arg or pre-loop let.
+    if outer_bindings.contains(name) {
+        return Err(LoweringError::Unsupported(format!(
+            "Assignment to `{name}` is mutation: `{name}` is bound outside \
+             the generator's for-loop (function argument or pre-loop binding)",
+        )));
+    }
+    // Fresh name — will be added to introduced by push_generator_let.
+    Ok(())
+}
+
+/// Push a let-binding step onto the innermost generator in the chain and
+/// record the name as introduced in the current frame.
+#[allow(clippy::ptr_arg)] // Vec is needed: callers also push/last_mut.
+fn push_generator_let(
+    chain: &mut Vec<GeneratorSpec>,
+    name: String,
+    value: Expr,
+    annotation: Option<Type>,
+) {
+    let frame = chain.last_mut().expect("chain non-empty");
+    frame.introduced.insert(name.clone());
+    frame.steps.push(BodyStep::Let(LetStep {
+        name,
+        value,
+        annotation,
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// Generator lowering — for-stmt entry point and chain → CCL conversion
+// ---------------------------------------------------------------------------
+
+/// Lower a `for` statement that terminates a statement block as a generator
+/// pattern: a chain of nested `for` / `if` / `yield` / `let` lowered to
+/// the Lambda/Apply encoding used for list comprehensions.
+///
+/// `outer_bindings` carries names in scope above this for (function args +
+/// preceding lets). The mutation check uses this to reject assignments to
+/// names from enclosing scopes.
+fn lower_generator_for(
+    target: &pyast::Located<pyast::ExprKind>,
+    iter: &pyast::Located<pyast::ExprKind>,
+    body: &[pyast::Stmt],
+    outer_bindings: &HashSet<String>,
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let iter_var = extract_name_target(target, "for-loop target")?;
+    let source = lower_expr(iter, ctx)?;
+    let mut introduced = HashSet::new();
+    introduced.insert(iter_var.clone());
+
+    let mut chain = vec![GeneratorSpec {
+        iter_var,
+        source,
+        steps: vec![],
+        introduced,
+    }];
+    let yield_expr_ast = collect_chain(body, &mut chain, outer_bindings, ctx)?;
+    let yield_expr = lower_expr(yield_expr_ast, ctx)?;
+
+    lower_generator_chain(chain, yield_expr)
+}
+
+/// Convert a fully-populated generator chain into a CCL expression.
+///
+/// Produces the same Lambda/Apply tiling encoding as [`lower_list_comp`]
+/// but with `Expr::Let` nodes interleaved for per-generator let-bindings,
+/// and a combined refinement closure when any guards are present.
+fn lower_generator_chain(
+    chain: Vec<GeneratorSpec>,
+    yield_expr: Expr,
+) -> Result<Expr, LoweringError> {
+    let outer_var = "__iter_record";
+    let single_gen = chain.len() == 1;
+
+    let make_idx_arg = |var: &str, i: usize| -> Expr {
+        let vref = Expr::var(var.to_string());
+        if single_gen {
+            vref
+        } else {
+            Expr::apply(vref, Expr::proj_index(i))
+        }
+    };
+
+    let any_guards = chain
+        .iter()
+        .any(|g| g.steps.iter().any(|s| matches!(s, BodyStep::Guard { .. })));
+
+    // ---- Build the body expression (innermost-first) ----
+    let mut body_expr = yield_expr.clone();
+    for (i, gen) in chain.iter().enumerate().rev() {
+        // Wrap body in this generator's lets (reverse source order so
+        // outermost let wraps everything inside).
+        for step in gen.steps.iter().rev() {
+            if let BodyStep::Let(ls) = step {
+                body_expr = match &ls.annotation {
+                    Some(ann) => Expr::let_bind_annotated(
+                        ls.name.clone(),
+                        ls.value.clone(),
+                        body_expr,
+                        ann.clone(),
+                    ),
+                    None => Expr::let_bind(ls.name.clone(), ls.value.clone(), body_expr),
+                };
+            }
+        }
+        body_expr = Expr::apply(
+            Expr::apply(make_idx_arg(outer_var, i), gen.source.clone()),
+            Expr::lambda(&gen.iter_var, Type::Hole, body_expr),
+        );
+    }
+
+    if !any_guards {
+        return Ok(Expr::lambda(outer_var, Type::Hole, body_expr));
+    }
+
+    // ---- Build the refinement closure ----
+    // Same structure as the body, but the innermost expression is the
+    // AND-conjunction of all guards (instead of the yield expression).
+    let restr_outer_var = "__iter_record_restr";
+
+    let mut all_guards: Vec<Expr> = Vec::new();
+    let mut guard_descs: Vec<String> = Vec::new();
+    for gen in &chain {
+        for step in &gen.steps {
+            if let BodyStep::Guard { cond, desc } = step {
+                all_guards.push(cond.clone());
+                guard_descs.push(desc.clone());
+            }
+        }
+    }
+    let pred_inner = all_guards
+        .into_iter()
+        .reduce(|acc, g| Expr::binop(acc, BinOpKind::BoolLogic(LogicKind::And), g))
+        .expect("any_guards is true");
+    let pred_desc = guard_descs.join(" and ");
+
+    let mut pred_expr = pred_inner;
+    for (i, gen) in chain.iter().enumerate().rev() {
+        for step in gen.steps.iter().rev() {
+            if let BodyStep::Let(ls) = step {
+                pred_expr = match &ls.annotation {
+                    Some(ann) => Expr::let_bind_annotated(
+                        ls.name.clone(),
+                        ls.value.clone(),
+                        pred_expr,
+                        ann.clone(),
+                    ),
+                    None => Expr::let_bind(ls.name.clone(), ls.value.clone(), pred_expr),
+                };
+            }
+        }
+        let restr_idx = {
+            let vref = Expr::var(restr_outer_var.to_string());
+            if single_gen {
+                vref
+            } else {
+                Expr::apply(vref, Expr::proj_index(i))
+            }
+        };
+        pred_expr = Expr::apply(
+            Expr::apply(restr_idx, gen.source.clone()),
+            Expr::lambda(&gen.iter_var, Type::Hole, pred_expr),
+        );
+    }
+
+    Ok(Expr::lambda_with_refinement(
+        outer_var,
+        Type::Hole,
+        body_expr,
+        Expr::lambda(restr_outer_var, Type::Hole, pred_expr),
+        &pred_desc,
+    ))
+}
+
+/// Lower a Python function definition body to a CCL expression.
+///
+/// Delegates entirely to [`lower_stmts_inner`] with the function's
+/// parameter names as `outer_bindings`. If the function body's final
+/// statement is a `for`-loop with a yield chain, it is lowered as a
+/// generator; otherwise it's a regular function body.
+fn lower_function_body(
+    args: &pyast::Arguments,
+    body: &[pyast::Stmt],
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
+    validate_function_args(args)?;
+    let outer_bindings: HashSet<String> = args.args.iter().map(|a| a.node.arg.clone()).collect();
+    let body_expr = lower_stmts_inner(body, &outer_bindings, ctx)?;
+    Ok(uncurry_params(args, body_expr, ctx))
 }
 
 /// Lower a Python list comprehension to the CCL Lambda/Apply encoding.
@@ -1296,6 +1865,388 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Generator expression tests
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    // Generator expression: identical output to equivalent list comp.
+    #[case(
+        "(x for x in [10, 20])",
+        "λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x)"
+    )]
+    #[case(
+        "(x + 2 for x in [10, 20])",
+        "λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + 2)"
+    )]
+    fn test_lower_generator_expr(#[case] code: &str, #[case] expected: &str) {
+        let expr = parse_expr(code);
+        let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");
+        assert_eq!(symbolic(&ccl), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Generator function tests
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    // Simple generator: map pattern.
+    #[case(
+        "\
+def doubles(xs):
+    for x in xs:
+        yield x * 2
+doubles",
+        "\
+let doubles : (_ ⇒ (_ ⇒ _)) = λ xs → λ __iter_record → __iter_record ▷ xs ▷ (λ x → x * 2)
+in doubles"
+    )]
+    // Multi-param generator: captures outer parameter. Uncurried params
+    // appear as projections of the synthetic `__arg_tuple_0`.
+    #[case(
+        "\
+def add_to(xs, n):
+    for x in xs:
+        yield x + n
+add_to",
+        "\
+let add_to : (_ ⇒ (_ ⇒ _)) = λ __arg_tuple_0 → λ __iter_record → __iter_record ▷ (__arg_tuple_0.0) ▷ (λ x → x + __arg_tuple_0.1)
+in add_to"
+    )]
+    // Generator with if-guard: filter pattern.
+    #[case(
+        "\
+def positives(xs):
+    for x in xs:
+        if x > 0:
+            yield x
+positives",
+        "\
+let positives : (_ ⇒ _) = λ xs → λ __iter_record : {??? | Refined((λ __iter_record_restr → __iter_record_restr ▷ xs ▷ (λ x → x > 0)))} → __iter_record ▷ xs ▷ (λ x → x)
+in positives"
+    )]
+    // Nested for-loops: inner iter independent of outer loop variable.
+    // Equivalent to `[x + y for x in xs for y in ys]`.
+    #[case(
+        "\
+def cross(xs, ys):
+    for x in xs:
+        for y in ys:
+            yield x + y
+cross",
+        "\
+let cross : (_ ⇒ (_ ⇒ _)) = λ __arg_tuple_0 → λ __iter_record → __iter_record.0 ▷ (__arg_tuple_0.0) ▷ (λ x → __iter_record.1 ▷ (__arg_tuple_0.1) ▷ (λ y → x + y))
+in cross"
+    )]
+    // Three-level cartesian product.
+    // Equivalent to `[x + y + z for x in xs for y in ys for z in zs]`.
+    #[case(
+        "\
+def triple(xs, ys, zs):
+    for x in xs:
+        for y in ys:
+            for z in zs:
+                yield x + y + z
+triple",
+        "\
+let triple : (_ ⇒ (_ ⇒ _)) = λ __arg_tuple_0 → λ __iter_record → __iter_record.0 ▷ (__arg_tuple_0.0) ▷ (λ x → __iter_record.1 ▷ (__arg_tuple_0.1) ▷ (λ y → __iter_record.2 ▷ (__arg_tuple_0.2) ▷ (λ z → x + y + z)))
+in triple"
+    )]
+    // Guard sits between the outer and inner `for`: filters `x` before
+    // entering the inner loop. Equivalent to `[y for x in xs if x > 0 for y in ys]`.
+    #[case(
+        "\
+def cross_filtered(xs, ys):
+    for x in xs:
+        if x > 0:
+            for y in ys:
+                yield y
+cross_filtered",
+        "\
+let cross_filtered : (_ ⇒ _) = λ __arg_tuple_0 → λ __iter_record : {??? | Refined((λ __iter_record_restr → __iter_record_restr.0 ▷ (__arg_tuple_0.0) ▷ (λ x → __iter_record_restr.1 ▷ (__arg_tuple_0.1) ▷ (λ y → x > 0))))} → __iter_record.0 ▷ (__arg_tuple_0.0) ▷ (λ x → __iter_record.1 ▷ (__arg_tuple_0.1) ▷ (λ y → y))
+in cross_filtered"
+    )]
+    // Let-binding in generator body: y is a fresh local per iteration.
+    #[case(
+        "\
+def with_let(xs):
+    for x in xs:
+        y = x + 1
+        yield y * 2
+with_let",
+        "\
+let with_let : (_ ⇒ (_ ⇒ _)) = λ xs → λ __iter_record → __iter_record ▷ xs ▷ (λ x → let y = x + 1
+in y * 2)
+in with_let"
+    )]
+    // Iter-var shadowing: x = x + 1 shadows the iter var.
+    #[case(
+        "\
+def shadow(xs):
+    for x in xs:
+        x = x + 1
+        yield x
+shadow",
+        "\
+let shadow : (_ ⇒ (_ ⇒ _)) = λ xs → λ __iter_record → __iter_record ▷ xs ▷ (λ x → let x = x + 1
+in x)
+in shadow"
+    )]
+    // Dependent inner iter: inner iter references outer iter var. Now
+    // supported (the inner source is in scope of the outer lambda).
+    #[case(
+        "\
+def dep(xss):
+    for xs in xss:
+        for x in xs:
+            yield x
+dep",
+        "\
+let dep : (_ ⇒ (_ ⇒ _)) = λ xss → λ __iter_record → __iter_record.0 ▷ xss ▷ (λ xs → __iter_record.1 ▷ xs ▷ (λ x → x))
+in dep"
+    )]
+    // Let inside an if-guard body.
+    #[case(
+        "\
+def guarded_let(xs):
+    for x in xs:
+        if x > 0:
+            y = x * 2
+            yield y
+guarded_let",
+        "\
+let guarded_let : (_ ⇒ _) = λ xs → λ __iter_record : {??? | Refined((λ __iter_record_restr → __iter_record_restr ▷ xs ▷ (λ x → let y = x * 2
+in x > 0)))} → __iter_record ▷ xs ▷ (λ x → let y = x * 2
+in y)
+in guarded_let"
+    )]
+    fn test_lower_generator_fn(#[case] code: &str, #[case] expected: &str) {
+        let stmts = parse_module(code);
+        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        assert_eq!(symbolic(&ccl), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regular function definition tests
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    // Simple function: body is a single expression.
+    #[case(
+        "\
+def inc(x):
+    x + 1
+inc",
+        "\
+let inc : (_ ⇒ _) = λ x → x + 1
+in inc"
+    )]
+    // Multi-param function: uncurried to a single tupled-parameter lambda.
+    #[case(
+        "\
+def add(x, y):
+    x + y
+add",
+        "\
+let add : (_ ⇒ _) = λ __arg_tuple_0 → __arg_tuple_0.0 + __arg_tuple_0.1
+in add"
+    )]
+    fn test_lower_function_def(#[case] code: &str, #[case] expected: &str) {
+        let stmts = parse_module(code);
+        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        assert_eq!(symbolic(&ccl), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Generator function negative tests
+    // -----------------------------------------------------------------------
+
+    /// Augmented assignment to iter var (shadowing) in a generator for-loop.
+    /// This is NOT a yield — the for-loop body ends in `bad` (the bare var),
+    /// which is not a yield, so this should still be rejected.
+    #[test]
+    fn test_generator_aug_assign_no_yield_rejected() {
+        let code = "\
+def bad(xs):
+    for x in xs:
+        x += 1
+bad";
+        let stmts = parse_module(code);
+        let err =
+            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        assert!(matches!(err, LoweringError::Unsupported(_)));
+    }
+
+    /// Mutation of a function argument inside a generator is rejected.
+    #[test]
+    fn test_generator_mutation_of_arg_rejected() {
+        let code = "\
+def bad(xs, n):
+    for x in xs:
+        n = n + 1
+        yield n
+bad";
+        let stmts = parse_module(code);
+        let err =
+            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        match &err {
+            LoweringError::Unsupported(msg) => {
+                assert!(
+                    msg.contains("mutation") && msg.contains("`n`"),
+                    "error should mention mutation of `n`: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Mutation of a pre-loop let inside a generator is rejected.
+    #[test]
+    fn test_generator_mutation_of_preloop_let_rejected() {
+        let code = "\
+def bad(xs):
+    total = 0
+    for x in xs:
+        total = total + x
+        yield total
+bad";
+        let stmts = parse_module(code);
+        let err =
+            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        match &err {
+            LoweringError::Unsupported(msg) => {
+                assert!(
+                    msg.contains("mutation") && msg.contains("`total`"),
+                    "error should mention mutation of `total`: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Mutation across nested for boundaries is rejected.
+    #[test]
+    fn test_generator_mutation_across_nested_for_rejected() {
+        let code = "\
+def bad(xs, ys):
+    for x in xs:
+        y = 0
+        for z in ys:
+            y = y + z
+            yield y
+bad";
+        let stmts = parse_module(code);
+        let err =
+            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        match &err {
+            LoweringError::Unsupported(msg) => {
+                assert!(
+                    msg.contains("mutation") || msg.contains("enclosing for-loop"),
+                    "error should mention mutation across for boundary: {msg}"
+                );
+            }
+        }
+    }
+
+    /// `yield` without a value is rejected.
+    #[test]
+    fn test_generator_yield_without_value_rejected() {
+        let code = "\
+def bad(xs):
+    for x in xs:
+        yield
+bad";
+        let stmts = parse_module(code);
+        let err =
+            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        assert!(matches!(err, LoweringError::Unsupported(_)));
+    }
+
+    /// Function decorators are rejected.
+    #[test]
+    fn test_function_decorators_rejected() {
+        let code = "\
+@some_decorator
+def f(x):
+    x + 1
+f";
+        let stmts = parse_module(code);
+        let err =
+            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        match &err {
+            LoweringError::Unsupported(msg) => {
+                assert!(
+                    msg.contains("decorator"),
+                    "error should mention decorators: {msg}"
+                );
+            }
+        }
+    }
+
+    /// `for/else` in a generator function is rejected.
+    #[test]
+    fn test_generator_for_else_rejected() {
+        let code = "\
+def bad(xs):
+    for x in xs:
+        yield x
+    else:
+        pass
+bad";
+        let stmts = parse_module(code);
+        let err =
+            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        match &err {
+            LoweringError::Unsupported(msg) => {
+                assert!(
+                    msg.contains("for/else"),
+                    "error should mention for/else: {msg}"
+                );
+            }
+        }
+    }
+
+    /// `if/else` inside a generator for-loop body is rejected.
+    #[test]
+    fn test_generator_if_else_in_body_rejected() {
+        let code = "\
+def bad(xs):
+    for x in xs:
+        if x > 0:
+            yield x
+        else:
+            yield 0
+bad";
+        let stmts = parse_module(code);
+        let err =
+            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        match &err {
+            LoweringError::Unsupported(msg) => {
+                assert!(
+                    msg.contains("if/else inside generator"),
+                    "error should mention if/else in generator: {msg}"
+                );
+            }
+        }
+    }
+
+    /// A for/yield loop preceded by assignments is supported: the preceding
+    /// lets wrap the generator expression.
+    #[test]
+    fn test_generator_with_preloop_let() {
+        let code = "\
+def f(xs):
+    a = 5
+    for x in xs:
+        yield x + a
+f";
+        let stmts = parse_module(code);
+        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        let s = symbolic(&ccl);
+        assert!(
+            s.contains("let a = 5") && s.contains("x + a"),
+            "should have pre-loop let and body referencing it: {s}"
+        );
     }
 
     // -----------------------------------------------------------------------

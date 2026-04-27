@@ -95,6 +95,28 @@ In-place substitution (rather than wrapping the body in `let xi = __arg_tuple_N.
 
 Restrictions not yet supported (lowering raises `LoweringError::Unsupported`): `*args`, `**kwargs`, keyword-only arguments, and default values.
 
+### Function definitions — `Let` + single `Expr::Lambda` (tupled when multi-arg)
+
+Python `def` statements are lowered to `Let` bindings whose value is a single `Expr::Lambda`, mirroring the `lambda`-expression shape above. `def f(x): body` becomes `let f = λ x → lower(body) in ...`; `def f(x, y, ...): body` uncurries to `let f = λ __arg_pair → lower(body)[x := __arg_pair.0, y := __arg_pair.1, ...] in ...`. The function name is bound via `Expr::let_bind`, and the body is lowered via `lower_stmts` (supporting assignments, nested function definitions, and a final expression).
+
+Pairing the definition shape with `lower_call`'s tupled multi-arg shape keeps the common multi-arg `def` path free of the curried-lambda chain that `lambda_elim` would fold into an unsupported `curry(body)`.
+
+### Generator functions — desugaring to Lambda + list-comp encoding
+
+Generator functions whose body ends in a `for` loop with a chain of nested `for` / `if` / `yield` statements are desugared at lowering time to named lambdas wrapping the Lambda/Apply tiling encoding used for list comprehensions. No new CCL AST nodes are required.
+
+`def f(params): for x in iter: yield expr` becomes `let f = uncurry(params, generator_chain(expr, [(x, iter, steps)]))`, where `uncurry(params, body)` is the same shape used by `lambda` and regular `def` lowering — a single-parameter lambda for one argument, and a tupled-parameter lambda with in-place projection substitution for multiple arguments.
+
+**Nested `for` loops** produce one generator per `for` in the chain. The inner iterable may reference outer loop variables (the inner source expression is in scope of the outer iteration lambda).
+
+**Let-bindings in generator bodies** (`y = f(x); yield y`) are lowered as `Expr::Let` nodes interleaved in the Lambda/Apply chain. Each let is placed after the enclosing `for`'s iteration lambda and before the next nested `for` (or the terminal yield), so the bound name is evaluated once per iteration of its enclosing loop. Lets are duplicated into the refinement closure so that if-guards can reference let-bound names.
+
+**Pre-loop lets** (assignments before the outer `for` in a function body) are handled generically by the `lower_stmts` machinery — they wrap the generator expression in `Expr::Let` nodes. Generator lowering itself only starts at the `for` loop.
+
+**Mutation rule**: an assignment inside a generator body is a let-binding (allowed) iff the target name is either fresh or was introduced in the same `for`-body. Assignments to names from an enclosing `for`-body, function arguments, or pre-loop lets are rejected as mutation — they would require the time-indexed mutation machinery from Phase 2. Function definitions inside generator bodies are treated identically to assignments.
+
+Generator expressions `(expr for x in xs)` are lowered identically to `ListComp` via the `lower_list_comp` function (separate from the generator-function path which uses `lower_generator_chain`).
+
 ### `GroupBy` — first-class grouping node
 
 `groupby(collection, key)` calls are lowered directly to `Expr::GroupBy` rather than kept as a nested `Apply`. This makes the grouping operation structurally distinct from ordinary calls, which simplifies:
