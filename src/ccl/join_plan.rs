@@ -9,8 +9,14 @@ use crate::ccl::{
     lambda_elim::{compose, id},
     simplify::simplify,
     symbolic::{symbolic, symbolic_typed},
-    BaseType, Expr, Lit, ProjKey, Refinement, RefinementKind, Type, TypedExprNode,
+    BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, ProjKey, Refinement,
+    RefinementKind, Type, TypedExprNode,
 };
+
+/// Returns `true` if `expr` directly references the given built-in primitive.
+fn is_builtin(expr: &Expr, b: Builtin) -> bool {
+    matches!(&expr.node, TypedExprNode::Builtin(x) if *x == b)
+}
 
 /// Looks for patterns in an expression that can be run more efficiently than the loop joins
 /// that come out of lambda elimination.
@@ -25,7 +31,7 @@ pub fn run(mut expr: Expr) -> Expr {
 fn replace_curried_correlated_refinements(expr: &mut Expr) {
     let new = match &mut expr.node {
         TypedExprNode::Apply { argument, function }
-            if matches!(&function.node, TypedExprNode::Var(n) if n == "curry")
+            if is_builtin(function, Builtin::Curry)
                 && matches!(&argument.ty, Type::Refinement(..)) =>
         {
             let Type::Refinement(
@@ -84,8 +90,8 @@ fn replace_curried_correlated_refinements(expr: &mut Expr) {
     }
 }
 
-fn apply_primitive(expr: Expr, primitive: &str, output_ty: Type) -> Expr {
-    apply_function(expr, Expr::var(primitive), output_ty)
+fn apply_primitive(expr: Expr, primitive: Builtin, output_ty: Type) -> Expr {
+    apply_function(expr, Expr::builtin(primitive), output_ty)
 }
 
 fn apply_function(expr: Expr, function: Expr, output_ty: Type) -> Expr {
@@ -125,7 +131,10 @@ fn convert_groupby(body: &Expr, body_ty: &Type, refinement: &Expr) -> Option<Exp
     if elts.len() != 2 {
         return None;
     }
-    if !matches!(&elts[1].node, TypedExprNode::Var(v) if v == "eq") {
+    if !is_builtin(
+        &elts[1],
+        Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)),
+    ) {
         return None;
     }
     let TypedExprNode::Apply {
@@ -135,7 +144,7 @@ fn convert_groupby(body: &Expr, body_ty: &Type, refinement: &Expr) -> Option<Exp
     else {
         return None;
     };
-    if zip.node != TypedExprNode::Var(String::from("zip")) {
+    if !is_builtin(zip, Builtin::Zip) {
         return None;
     }
     let TypedExprNode::Tuple(args) = &args.node else {
@@ -193,14 +202,14 @@ fn convert_groupby(body: &Expr, body_ty: &Type, refinement: &Expr) -> Option<Exp
         key_ty.clone(),
         Type::fun(value_idx_ty.clone(), value_idx_ty.clone()),
     );
-    let grouped = apply_primitive(keys.clone(), "converse", converse_ty);
+    let grouped = apply_primitive(keys.clone(), Builtin::Converse, converse_ty);
     typecheck(&grouped).expect("Bad group expr");
 
     trace!("Grouped: {} : {}", symbolic(&grouped), grouped.ty);
 
     let values_fn = apply_primitive(
         values.clone(),
-        "map",
+        Builtin::Map,
         Type::fun(
             Type::fun(value_idx_ty.clone(), value_idx_ty.clone()),
             Type::fun(value_idx_ty.clone(), value_ty.clone()),
@@ -226,7 +235,7 @@ fn convert_groupby(body: &Expr, body_ty: &Type, refinement: &Expr) -> Option<Exp
 // Returns whether the given expression is a constant, or a function of a constant.
 fn is_constant(expr: &Expr) -> bool {
     match &expr.node {
-        TypedExprNode::Apply { function, .. } if function.node == Expr::var("const").node => true,
+        TypedExprNode::Apply { function, .. } if is_builtin(function, Builtin::Const) => true,
         TypedExprNode::Compose(elts) => elts.first().is_some_and(is_constant),
         _ => false,
     }
@@ -240,13 +249,13 @@ fn replace_constant_domain_type(expr: &mut Expr, ty: &Type) {
         TypedExprNode::Apply { .. } => {
             let output_ty = expr.ty.clone();
             let arg = if let TypedExprNode::Apply { function, argument } = &mut expr.node {
-                assert_eq!(function.node, Expr::var("const").node);
+                assert!(is_builtin(function, Builtin::Const));
                 argument.clone()
             } else {
                 unreachable!()
             };
 
-            *expr = apply_primitive(*arg, "const", output_ty)
+            *expr = apply_primitive(*arg, Builtin::Const, output_ty)
         }
         TypedExprNode::Compose(elts) => {
             if let Some(e) = elts.first_mut() {
@@ -263,7 +272,7 @@ fn is_function_of_single_tuple_arm(expr: &Expr) -> Option<usize> {
     match &expr.node {
         TypedExprNode::Proj(ProjKey::Index(i)) => Some(*i),
         TypedExprNode::Compose(elts) => elts.first().and_then(is_function_of_single_tuple_arm),
-        TypedExprNode::Apply { function, argument } if function.node == Expr::var("zip").node => {
+        TypedExprNode::Apply { function, argument } if is_builtin(function, Builtin::Zip) => {
             is_function_of_single_tuple_arm(argument)
         }
         TypedExprNode::Tuple(elts) => {
@@ -316,13 +325,13 @@ fn replace_tuple_project_with_id(expr: &mut Expr, ty: &Type) {
             let mut output_ty = expr.ty.clone();
             set_domain_ty(&mut output_ty, ty);
             let arg = if let TypedExprNode::Apply { function, argument } = &mut expr.node {
-                assert_eq!(function.node, Expr::var("zip").node);
+                assert!(is_builtin(function, Builtin::Zip));
                 replace_tuple_project_with_id(argument, ty);
                 argument.clone()
             } else {
                 unreachable!()
             };
-            *expr = apply_primitive(*arg, "zip", output_ty);
+            *expr = apply_primitive(*arg, Builtin::Zip, output_ty);
         }
         TypedExprNode::Tuple(_) => {
             if let Type::Tuple(elts) = &mut expr.ty {
@@ -355,7 +364,10 @@ fn extract_single_eq_condition(cond: &Expr) -> Option<(&Expr, &Expr)> {
     if elts.len() != 2 {
         return None;
     }
-    if !matches!(&elts[1].node, TypedExprNode::Var(v) if v == "eq") {
+    if !is_builtin(
+        &elts[1],
+        Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)),
+    ) {
         return None;
     }
     let TypedExprNode::Apply {
@@ -365,7 +377,7 @@ fn extract_single_eq_condition(cond: &Expr) -> Option<(&Expr, &Expr)> {
     else {
         return None;
     };
-    if !matches!(&zip_fn.node, TypedExprNode::Var(v) if v == "zip") {
+    if !is_builtin(zip_fn, Builtin::Zip) {
         return None;
     }
     let TypedExprNode::Tuple(zip_args) = &args.node else {
@@ -406,7 +418,12 @@ fn collect_conditions(
         other_preds.push(refinement.clone());
         return;
     };
-    if elts.len() != 2 || !matches!(&elts[1].node, TypedExprNode::Var(v) if v == "and") {
+    if elts.len() != 2
+        || !is_builtin(
+            &elts[1],
+            Builtin::BinOp(BinOpKind::BoolLogic(LogicKind::And)),
+        )
+    {
         other_preds.push(refinement.clone());
         return;
     }
@@ -418,7 +435,7 @@ fn collect_conditions(
         other_preds.push(refinement.clone());
         return;
     };
-    if !matches!(&zip_fn.node, TypedExprNode::Var(v) if v == "zip") {
+    if !is_builtin(zip_fn, Builtin::Zip) {
         other_preds.push(refinement.clone());
         return;
     }
@@ -445,8 +462,7 @@ fn collect_arms_used(expr: &Expr, result: &mut BTreeSet<usize>) {
                 collect_arms_used(first, result);
             }
         }
-        TypedExprNode::Apply { function, argument } if matches!(&function.node, TypedExprNode::Var(v) if v == "zip") =>
-        {
+        TypedExprNode::Apply { function, argument } if is_builtin(function, Builtin::Zip) => {
             collect_arms_used(argument, result);
         }
         TypedExprNode::Tuple(elts) => {
@@ -496,7 +512,7 @@ fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]
             set_domain_ty(&mut output_ty, new_domain_ty);
             let arg = if let TypedExprNode::Apply { function, argument } = &mut expr.node {
                 assert!(
-                    matches!(&function.node, TypedExprNode::Var(v) if v == "zip"),
+                    is_builtin(function, Builtin::Zip),
                     "unexpected Apply at domain position: {:?}",
                     function.node
                 );
@@ -505,7 +521,7 @@ fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]
             } else {
                 unreachable!()
             };
-            *expr = apply_primitive(*arg, "zip", output_ty);
+            *expr = apply_primitive(*arg, Builtin::Zip, output_ty);
         }
         TypedExprNode::Tuple(_) => {
             if let Type::Tuple(tys) = &mut expr.ty {
@@ -547,13 +563,12 @@ fn combine_predicates(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
                 Type::Tuple(vec![bool_ty.clone(), bool_ty.clone()]),
             );
             let preds_tuple = Expr::tuple(vec![pa, pb]).with_ty(zip_input_ty);
-            let zipped = apply_function(preds_tuple, Expr::var("zip"), zip_out_ty);
+            let zipped = apply_function(preds_tuple, Expr::builtin(Builtin::Zip), zip_out_ty);
             Some(typed_compose(vec![
                 zipped,
-                Expr::var("and").with_ty(Type::fun(
-                    Type::Tuple(vec![bool_ty.clone(), bool_ty.clone()]),
-                    bool_ty,
-                )),
+                Expr::builtin(Builtin::BinOp(BinOpKind::BoolLogic(LogicKind::And))).with_ty(
+                    Type::fun(Type::Tuple(vec![bool_ty.clone(), bool_ty.clone()]), bool_ty),
+                ),
             ]))
         }
     }
@@ -730,14 +745,13 @@ fn build_residual_predicate(
                 Type::Tuple(vec![key_ty.clone(), key_ty.clone()]),
             );
             let zip_args = Expr::tuple(vec![lhs, rhs]).with_ty(zip_input_ty);
-            let zipped = apply_function(zip_args, Expr::var("zip"), zip_out_ty);
+            let zipped = apply_function(zip_args, Expr::builtin(Builtin::Zip), zip_out_ty);
 
             typed_compose(vec![
                 zipped,
-                Expr::var("eq").with_ty(Type::fun(
-                    Type::Tuple(vec![key_ty.clone(), key_ty]),
-                    bool_ty.clone(),
-                )),
+                Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals))).with_ty(
+                    Type::fun(Type::Tuple(vec![key_ty.clone(), key_ty]), bool_ty.clone()),
+                ),
             ])
         })
         .collect();
@@ -757,11 +771,12 @@ fn build_residual_predicate(
             Type::Tuple((0..n).map(|_| bool_ty.clone()).collect()),
         );
         let preds_tuple = Expr::tuple(preds).with_ty(preds_tuple_ty);
-        let zipped = apply_function(preds_tuple, Expr::var("zip"), zip_out_ty);
+        let zipped = apply_function(preds_tuple, Expr::builtin(Builtin::Zip), zip_out_ty);
         let bool_tuple_ty = Type::Tuple((0..n).map(|_| bool_ty.clone()).collect());
         Some(typed_compose(vec![
             zipped,
-            Expr::var("and").with_ty(Type::fun(bool_tuple_ty, bool_ty)),
+            Expr::builtin(Builtin::BinOp(BinOpKind::BoolLogic(LogicKind::And)))
+                .with_ty(Type::fun(bool_tuple_ty, bool_ty)),
         ]))
     }
 }
@@ -1052,18 +1067,18 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
                             }
                         }
                     }
-                    Expr::var("id")
+                    Expr::builtin(Builtin::Id)
                         .with_ty(Type::fun(types[arms[0]].clone(), types[arms[0]].clone()))
                 } else {
                     let ty = Type::Tuple(arms.iter().map(|&i| types[i].clone()).collect());
-                    Expr::var("id").with_ty(Type::fun(ty.clone(), ty))
+                    Expr::builtin(Builtin::Id).with_ty(Type::fun(ty.clone(), ty))
                 }
             })();
             if let Some(predicate) = predicate {
                 let result_ty = base_iteration.ty.clone();
                 apply_primitive(
                     typed_compose(vec![base_iteration, predicate.clone()]),
-                    "restrict",
+                    Builtin::Restrict,
                     result_ty,
                 )
             } else {
@@ -1122,7 +1137,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
                 key_ty.clone(),
                 Type::fun(build_output_ty.clone(), build_output_ty.clone()),
             );
-            let build_side = apply_primitive(build_key, "converse", converse_ty);
+            let build_side = apply_primitive(build_key, Builtin::Converse, converse_ty);
             typecheck(&build_side).expect("Bad build expr");
 
             trace!(
@@ -1160,7 +1175,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
             // uncurry: (probe_output_ty, build_output_ty) -> build_output_ty
             let uncurry = apply_primitive(
                 probe_expr,
-                "uncurry",
+                Builtin::Uncurry,
                 Type::fun(
                     Type::Tuple(vec![probe_output_ty.clone(), build_output_ty.clone()]),
                     build_output_ty.clone(),
@@ -1198,7 +1213,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
                         Type::UIntRange(indices_to_flatten.len()),
                         Type::Base(BaseType::Int),
                     )),
-                    "flatten_domain",
+                    Builtin::FlattenDomain,
                     Type::fun(
                         Type::fun(
                             Type::Tuple(vec![probe_output_ty.clone(), build_output_ty.clone()]),
@@ -1225,7 +1240,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
             // map_domain: replace the codomain with Scalar(domain), yielding flat_ty -> flat_ty.
             let map_domain = apply_primitive(
                 flattened,
-                "map_domain",
+                Builtin::MapDomain,
                 Type::fun(final_domain_ty.clone(), final_domain_ty.clone()),
             );
 
@@ -1233,7 +1248,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
                 let result_ty = map_domain.ty.clone();
                 apply_primitive(
                     typed_compose(vec![map_domain, predicate.clone()]),
-                    "restrict",
+                    Builtin::Restrict,
                     result_ty,
                 )
             } else {
@@ -1295,7 +1310,7 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
 
     let permute_func = apply_primitive(
         perm_arg,
-        "permute_domain",
+        Builtin::PermuteDomain,
         Type::fun(
             Type::fun(actual_ty.clone(), actual_ty.clone()),
             Type::fun(canonical_ty.clone(), actual_ty.clone()),
@@ -1308,7 +1323,7 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
     );
     let result = apply_primitive(
         permuted,
-        "map_domain",
+        Builtin::MapDomain,
         Type::fun(canonical_ty.clone(), canonical_ty.clone()),
     );
     typecheck(&result).expect("Bad permute_domain expr");
@@ -1472,7 +1487,7 @@ mod tests {
         let int_ty_val = int_ty();
         let expr = var("f").with_ty(int_ty_val.clone());
         let output_ty = fun_ty(int_ty_val.clone(), int_ty_val.clone());
-        let result = apply_primitive(expr, "map", output_ty.clone());
+        let result = apply_primitive(expr, Builtin::Map, output_ty.clone());
 
         // Check that result is an apply expression
         assert!(matches!(result.node, TypedExprNode::Apply { .. }));
@@ -1487,7 +1502,7 @@ mod tests {
         replace_tuple_project_with_id(&mut expr, &int_ty_val);
 
         // After replacement, should be identity function
-        assert!(matches!(expr.node, TypedExprNode::Var(ref v) if v == "id"));
+        assert!(matches!(expr.node, TypedExprNode::Builtin(Builtin::Id)));
         assert_eq!(expr.ty, fun_ty(int_ty_val.clone(), int_ty_val));
         typecheck(&expr).expect("Type checking failed after replacement");
     }
@@ -1506,7 +1521,7 @@ mod tests {
 
         // After replacement, first element should be identity
         if let TypedExprNode::Compose(elts) = &expr.node {
-            assert!(matches!(elts[0].node, TypedExprNode::Var(ref v) if v == "id"));
+            assert!(matches!(elts[0].node, TypedExprNode::Builtin(Builtin::Id)));
         } else {
             panic!("Expected Compose node");
         }
@@ -1547,7 +1562,7 @@ mod tests {
 
         let zip_applied = Expr::apply(
             args_tuple,
-            var("zip").with_ty(fun_ty(
+            Expr::builtin(Builtin::Zip).with_ty(fun_ty(
                 tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
                 tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
             )),
@@ -1557,8 +1572,11 @@ mod tests {
             tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
         ));
 
-        let refinement = compose(vec![zip_applied, var("eq").with_ty(eq_ty)])
-            .with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone()));
+        let refinement = compose(vec![
+            zip_applied,
+            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals))).with_ty(eq_ty),
+        ])
+        .with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone()));
 
         // Should successfully convert
         let result = convert_groupby(&body, &body_ty, &refinement);
@@ -1598,14 +1616,14 @@ mod tests {
         };
 
         assert!(
-            matches!(&grouped_fn.node, TypedExprNode::Var(v) if v == "converse"),
+            matches!(&grouped_fn.node, TypedExprNode::Builtin(Builtin::Converse)),
             "Expected first Apply to use 'converse' primitive"
         );
 
         // Verify grouped argument is the keys expression with id replacing the projection
         // Since the original expression is just a projection, it becomes just id
         assert!(
-            matches!(&grouped_arg.node, TypedExprNode::Var(v) if v == "id"),
+            matches!(&grouped_arg.node, TypedExprNode::Builtin(Builtin::Id)),
             "Expected keys to be 'id' (replaced projection), got {:?}",
             grouped_arg.node
         );
@@ -1624,14 +1642,14 @@ mod tests {
         };
 
         assert!(
-            matches!(&values_fn.node, TypedExprNode::Var(v) if v == "map"),
+            matches!(&values_fn.node, TypedExprNode::Builtin(Builtin::Map)),
             "Expected second Apply to use 'map' primitive"
         );
 
         // Verify values argument is the body expression with id replacing the projection
         // Since the original expression is just a projection, it becomes just id
         assert!(
-            matches!(&values_arg.node, TypedExprNode::Var(v) if v == "id"),
+            matches!(&values_arg.node, TypedExprNode::Builtin(Builtin::Id)),
             "Expected values to be 'id' (replaced projection), got {:?}",
             values_arg.node
         );
@@ -1682,7 +1700,8 @@ mod tests {
         let f_ty = fun_ty(tuple_ty_val.clone(), tuple_ty(vec![int_ty(), int_ty()]));
         let refinement = compose(vec![
             var("f").with_ty(f_ty),
-            var("neq").with_ty(fun_ty(tuple_ty(vec![int_ty(), int_ty()]), int_ty())),
+            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::NotEquals)))
+                .with_ty(fun_ty(tuple_ty(vec![int_ty(), int_ty()]), int_ty())),
         ])
         .with_ty(ref_ty);
 
@@ -1705,7 +1724,8 @@ mod tests {
                 tuple_ty_val.clone(),
                 tuple_ty(vec![int_ty(), int_ty()]),
             )),
-            var("eq").with_ty(fun_ty(tuple_ty(vec![int_ty(), int_ty()]), int_ty())),
+            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)))
+                .with_ty(fun_ty(tuple_ty(vec![int_ty(), int_ty()]), int_ty())),
         ])
         .with_ty(ref_ty);
 
@@ -1798,7 +1818,8 @@ mod tests {
         let ref_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
         let refinement = compose(vec![
             var("f").with_ty(f_ty),
-            var("eq").with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
+            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)))
+                .with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
         ])
         .with_ty(ref_ty);
 
@@ -1825,7 +1846,8 @@ mod tests {
         let ref_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
         let refinement = compose(vec![
             non_zip_apply,
-            var("eq").with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
+            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)))
+                .with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
         ])
         .with_ty(ref_ty);
 
@@ -1841,14 +1863,15 @@ mod tests {
         // Create an apply where argument is not a tuple
         let non_tuple_apply = Expr::apply(
             var("arg").with_ty(int_ty_val.clone()),
-            var("zip").with_ty(fun_ty(int_ty_val.clone(), tuple_ty_val.clone())),
+            Expr::builtin(Builtin::Zip).with_ty(fun_ty(int_ty_val.clone(), tuple_ty_val.clone())),
         )
         .with_ty(fun_ty(int_ty_val.clone(), tuple_ty_val.clone()));
 
         let ref_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
         let refinement = compose(vec![
             non_tuple_apply,
-            var("eq").with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
+            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)))
+                .with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
         ])
         .with_ty(ref_ty);
 
@@ -1865,14 +1888,15 @@ mod tests {
         let args_tuple = Expr::tuple(vec![proj_idx(0).with_ty(int_ty_val.clone())]);
         let zip_apply = Expr::apply(
             args_tuple,
-            var("zip").with_ty(fun_ty(int_ty_val.clone(), int_ty_val.clone())),
+            Expr::builtin(Builtin::Zip).with_ty(fun_ty(int_ty_val.clone(), int_ty_val.clone())),
         )
         .with_ty(fun_ty(int_ty_val.clone(), int_ty_val.clone()));
 
         let ref_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
         let refinement = compose(vec![
             zip_apply,
-            var("eq").with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
+            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)))
+                .with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
         ])
         .with_ty(ref_ty);
 
@@ -1892,7 +1916,7 @@ mod tests {
         ]);
         let zip_apply = Expr::apply(
             args_tuple,
-            var("zip").with_ty(fun_ty(
+            Expr::builtin(Builtin::Zip).with_ty(fun_ty(
                 tuple_ty_val.clone(),
                 tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
             )),
@@ -1905,7 +1929,8 @@ mod tests {
         let ref_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
         let refinement = compose(vec![
             zip_apply,
-            var("eq").with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
+            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)))
+                .with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
         ])
         .with_ty(ref_ty);
 
@@ -1925,7 +1950,7 @@ mod tests {
         ]);
         let ref_zip_apply = Expr::apply(
             ref_args_tuple,
-            var("zip").with_ty(fun_ty(
+            Expr::builtin(Builtin::Zip).with_ty(fun_ty(
                 tuple_ty_val.clone(),
                 tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
             )),
@@ -1938,7 +1963,8 @@ mod tests {
         let ref_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
         let refinement = compose(vec![
             ref_zip_apply,
-            var("eq").with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
+            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)))
+                .with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
         ])
         .with_ty(ref_ty);
 
@@ -1966,7 +1992,7 @@ mod tests {
         );
         // zip(proj(0), ...) should return 0
         let arg = proj_idx(0).with_ty(proj_ty);
-        let zip_app = Expr::apply(arg, var("zip").with_ty(zip_fn_ty));
+        let zip_app = Expr::apply(arg, Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty));
         assert_eq!(is_function_of_single_tuple_arm(&zip_app), Some(0));
     }
 
@@ -1980,7 +2006,7 @@ mod tests {
         );
         // zip(proj(1), ...) should return 1
         let arg = proj_idx(1).with_ty(proj_ty);
-        let zip_app = Expr::apply(arg, var("zip").with_ty(zip_fn_ty));
+        let zip_app = Expr::apply(arg, Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty));
         assert_eq!(is_function_of_single_tuple_arm(&zip_app), Some(1));
     }
 
@@ -1994,7 +2020,7 @@ mod tests {
         );
         // zip(f, ...) where f is not a projection should return None
         let arg = var("f").with_ty(f_ty);
-        let zip_app = Expr::apply(arg, var("zip").with_ty(zip_fn_ty));
+        let zip_app = Expr::apply(arg, Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty));
         assert_eq!(is_function_of_single_tuple_arm(&zip_app), None);
     }
 
@@ -2040,7 +2066,7 @@ mod tests {
         // A tuple with a projection and constant expressions should ignore constants
         let tuple_expr = Expr::tuple(vec![
             proj_idx(0).with_ty(proj_ty),
-            apply_primitive(var("c").with_ty(int_ty()), "const", const_fn_ty),
+            apply_primitive(var("c").with_ty(int_ty()), Builtin::Const, const_fn_ty),
         ]);
         assert_eq!(is_function_of_single_tuple_arm(&tuple_expr), Some(0));
     }
@@ -2058,15 +2084,22 @@ mod tests {
     #[test]
     fn test_is_constant_on_const_apply() {
         let int_ty_val = int_ty();
-        let const_expr = apply_primitive(var("c").with_ty(int_ty_val.clone()), "const", int_ty_val);
+        let const_expr = apply_primitive(
+            var("c").with_ty(int_ty_val.clone()),
+            Builtin::Const,
+            int_ty_val,
+        );
         assert!(is_constant(&const_expr));
     }
 
     #[test]
     fn test_is_constant_on_non_const_apply() {
         let int_ty_val = int_ty();
-        let non_const_expr =
-            apply_primitive(var("f").with_ty(int_ty_val.clone()), "map", int_ty_val);
+        let non_const_expr = apply_primitive(
+            var("f").with_ty(int_ty_val.clone()),
+            Builtin::Map,
+            int_ty_val,
+        );
         assert!(!is_constant(&non_const_expr));
     }
 
@@ -2076,8 +2109,11 @@ mod tests {
         let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
         let const_fn_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
         let g_ty = fun_ty(int_ty_val.clone(), int_ty_val.clone());
-        let const_expr =
-            apply_primitive(var("c").with_ty(int_ty_val.clone()), "const", const_fn_ty);
+        let const_expr = apply_primitive(
+            var("c").with_ty(int_ty_val.clone()),
+            Builtin::Const,
+            const_fn_ty,
+        );
         let compose_expr = compose(vec![const_expr, var("g").with_ty(g_ty)])
             .with_ty(fun_ty(tuple_ty_val, int_ty_val));
         // A compose where the first element is const is considered constant
@@ -2103,7 +2139,7 @@ mod tests {
 
         let mut expr = Expr::apply(
             proj_idx(0).with_ty(proj_ty),
-            var("zip").with_ty(zip_fn_ty.clone()),
+            Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty.clone()),
         )
         .with_ty(fun_ty(
             tuple_ty_val.clone(),
@@ -2163,7 +2199,7 @@ mod tests {
 
         let const_expr = apply_primitive(
             var("c").with_ty(int_ty_val.clone()),
-            "const",
+            Builtin::Const,
             const_fn_ty.clone(),
         );
 
@@ -2186,7 +2222,11 @@ mod tests {
         let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
         let const_fn_ty = fun_ty(tuple_ty_val, int_ty_val.clone());
 
-        let mut expr = apply_primitive(var("c").with_ty(int_ty_val.clone()), "const", const_fn_ty);
+        let mut expr = apply_primitive(
+            var("c").with_ty(int_ty_val.clone()),
+            Builtin::Const,
+            const_fn_ty,
+        );
 
         replace_constant_domain_type(&mut expr, &int_ty_val);
 
@@ -2205,8 +2245,11 @@ mod tests {
         let const_fn_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
         let g_ty = fun_ty(int_ty_val.clone(), int_ty_val.clone());
 
-        let const_expr =
-            apply_primitive(var("c").with_ty(int_ty_val.clone()), "const", const_fn_ty);
+        let const_expr = apply_primitive(
+            var("c").with_ty(int_ty_val.clone()),
+            Builtin::Const,
+            const_fn_ty,
+        );
 
         let mut expr = compose(vec![const_expr, var("g").with_ty(g_ty)])
             .with_ty(fun_ty(tuple_ty_val, int_ty_val.clone()));
@@ -2394,7 +2437,7 @@ mod tests {
         let zip_out = fun_ty(tup.clone(), tuple_ty(vec![scalar.clone(), scalar.clone()]));
         let zipped = Expr::apply(
             args,
-            var("zip").with_ty(fun_ty(
+            Expr::builtin(Builtin::Zip).with_ty(fun_ty(
                 tuple_ty(vec![scalar.clone(), scalar.clone()]),
                 tuple_ty(vec![scalar.clone(), scalar.clone()]),
             )),
@@ -2402,7 +2445,7 @@ mod tests {
         .with_ty(zip_out);
         compose(vec![
             zipped,
-            var("eq").with_ty(fun_ty(
+            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals))).with_ty(fun_ty(
                 tuple_ty(vec![scalar.clone(), scalar.clone()]),
                 scalar.clone(),
             )),
@@ -2451,11 +2494,15 @@ mod tests {
             fun_ty(t.clone(), bool_ty_val.clone()),
             fun_ty(t.clone(), bool_ty_val.clone()),
         ]));
-        let and_zipped = Expr::apply(and_args, var("zip").with_ty(fun_ty(t.clone(), t.clone())))
-            .with_ty(fun_ty(t.clone(), t.clone()));
+        let and_zipped = Expr::apply(
+            and_args,
+            Expr::builtin(Builtin::Zip).with_ty(fun_ty(t.clone(), t.clone())),
+        )
+        .with_ty(fun_ty(t.clone(), t.clone()));
         let refinement = compose(vec![
             and_zipped,
-            var("and").with_ty(fun_ty(t.clone(), bool_ty_val.clone())),
+            Expr::builtin(Builtin::BinOp(BinOpKind::BoolLogic(LogicKind::And)))
+                .with_ty(fun_ty(t.clone(), bool_ty_val.clone())),
         ])
         .with_ty(fun_ty(t.clone(), bool_ty_val));
         let (eq, other) = split_join_conditions(&refinement);
@@ -2511,7 +2558,7 @@ mod tests {
         ]);
         let eq_zipped = Expr::apply(
             eq_args,
-            var("zip").with_ty(fun_ty(
+            Expr::builtin(Builtin::Zip).with_ty(fun_ty(
                 tuple_ty(vec![i.clone(), i.clone()]),
                 tuple_ty(vec![i.clone(), i.clone()]),
             )),
@@ -2519,7 +2566,7 @@ mod tests {
         .with_ty(fun_ty(t.clone(), tuple_ty(vec![i.clone(), i.clone()])));
         let eq_cond = compose(vec![
             eq_zipped,
-            var("eq").with_ty(fun_ty(
+            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals))).with_ty(fun_ty(
                 tuple_ty(vec![i.clone(), i.clone()]),
                 bool_ty_val.clone(),
             )),
@@ -2540,7 +2587,7 @@ mod tests {
         ]));
         let and_zipped = Expr::apply(
             and_args,
-            var("zip").with_ty(fun_ty(
+            Expr::builtin(Builtin::Zip).with_ty(fun_ty(
                 tuple_ty(vec![bool_ty_val.clone(), bool_ty_val.clone()]),
                 tuple_ty(vec![bool_ty_val.clone(), bool_ty_val.clone()]),
             )),
@@ -2551,7 +2598,7 @@ mod tests {
         ));
         let refinement = compose(vec![
             and_zipped,
-            var("and").with_ty(fun_ty(
+            Expr::builtin(Builtin::BinOp(BinOpKind::BoolLogic(LogicKind::And))).with_ty(fun_ty(
                 tuple_ty(vec![bool_ty_val.clone(), bool_ty_val.clone()]),
                 bool_ty_val.clone(),
             )),

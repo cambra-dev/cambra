@@ -18,26 +18,27 @@
 //!
 //! # Primitive combinators
 //!
-//! The output uses the following built-in [`Expr::Var`] names and the new
-//! [`Expr::Proj`] node:
+//! The output uses [`TypedExprNode::Builtin`] for primitive functions and
+//! [`TypedExprNode::Proj`] for tuple/record projections:
 //!
-//! | Symbol | Var name | Meaning |
-//! |--------|----------|---------|
-//! | `id` | `"id"` | identity morphism |
+//! | Symbol | AST shape | Meaning |
+//! |--------|-----------|---------|
+//! | `id` | `Builtin(Id)` | identity morphism |
 //! | `.0`, `.1`, … | `Proj(Index(n))` | tuple projection |
 //! | `.field` | `Proj(Field(s))` | record field projection |
-//! | `f ≫ g` | `BinOp(f, Compose, g)` | left-to-right composition |
-//! | `⟨f, g⟩` | `Apply(Tuple([f,g]), Var("zip"))` | product/fanout |
-//! | `curry(f)` | `Apply(f, Var("curry"))` | curry |
-//! | `const(c)` | `Apply(c, Var("const"))` | constant lift |
-//! | `restrict` | `Var("restrict")` | domain restriction |
-//! | `apply` | `Var("apply")` | function application as morphism |
-//! | `map` | `Var("map")` | post-composition |
-//! | `aggregate` | `Var("aggregate")` | fold/reduce |
-//! | `converse` | `Var("converse")` | grouping by key |
-//! | `uncurry` | `Var("uncurry")` | uncurry |
-//! | `compose` | `Var("compose")` | composition as first-class morphism |
-//! | `zip` | `Var("zip")` | pointwise pairing of two functions |
+//! | `f ≫ g` | `Compose([f, g])` | left-to-right composition |
+//! | `⟨f, g⟩` | `Apply(Tuple([f, g]), Builtin(Zip))` | product/fanout |
+//! | `curry(f)` | `Apply(f, Builtin(Curry))` | curry |
+//! | `const(c)` | `Apply(c, Builtin(Const))` | constant lift |
+//! | `restrict` | `Builtin(Restrict)` | domain restriction |
+//! | `apply` | `Builtin(Apply)` | function application as morphism |
+//! | `map` | `Builtin(Map)` | post-composition |
+//! | `sum`, `max` | `Builtin(Sum)`, `Builtin(Max)` | fold/reduce |
+//! | `converse` | `Builtin(Converse)` | grouping by key |
+//! | `uncurry` | `Builtin(Uncurry)` | uncurry |
+//! | `compose` | `Builtin(Compose)` | composition as first-class morphism |
+//! | `add`/`sub`/… (and compares / logic) | `Builtin(BinOp(op))` for `op: BinOpKind` | binary scalar ops |
+//! | `neg`, `not_fn` | `Builtin(Neg)`, `Builtin(NotFn)` | unary scalar ops |
 
 use std::cell::RefCell;
 use std::mem::replace;
@@ -45,7 +46,7 @@ use std::rc::Rc;
 
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
-use crate::ccl::{next_refinement_id, AggregateKind, Lit, Refinement};
+use crate::ccl::{next_refinement_id, Builtin, Lit, Refinement};
 use crate::ccl::{
     symbolic::symbolic, BaseType, BinOpKind, Branch, Expr, RefinementKind, Type, TypedExpr,
     TypedExprNode,
@@ -119,9 +120,9 @@ impl ElimContext {
 // Primitive combinator constructors
 // ---------------------------------------------------------------------------
 
-/// Build `Var("id")`: the identity morphism.
+/// Build [`Builtin::Id`]: the identity morphism.
 pub(crate) fn id() -> Expr {
-    Expr::var("id")
+    Expr::builtin(Builtin::Id)
 }
 
 /// Build `Proj(Index(n))`: the tuple projection morphism `.n`.
@@ -144,22 +145,22 @@ pub(crate) fn typed_tuple(elts: Vec<Expr>) -> Expr {
     dbg_typecheck_mv(Expr::tuple(elts).with_ty(ty))
 }
 
-/// Build `⟨f, g⟩`: the product/fanout `zip(f, g)` using the `zip` built-in.
+/// Build `⟨f, g⟩`: the product/fanout `zip(f, g)` using the [`Builtin::Zip`]
+/// combinator.
 ///
-/// Represented as `Apply { argument: Tuple([f, g]), function: Var("zip") }`,
-/// i.e. `(f, g) ▷ zip`.  Annotates all nodes with concrete types when
-/// available.
+/// Represented as `Apply { argument: Tuple([f, g]), function: Builtin(Zip) }`,
+/// i.e. `(f, g) ▷ zip`.  Annotates all nodes with concrete types when available.
 pub(crate) fn zip_pair(f: Expr, g: Expr) -> Expr {
     let result_ty = zip_pair_ty(&f, &g);
     let inner_tuple = typed_tuple(vec![f, g]);
     let zip_fn_ty = fun_ty_or_hole(&inner_tuple.ty, &result_ty);
-    let zip_var = Expr::var("zip").with_ty(zip_fn_ty);
+    let zip_var = Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty);
     dbg_typecheck_mv(Expr::apply(inner_tuple, zip_var).with_ty(result_ty))
 }
 
-/// Build `curry(f)`: `f ▷ curry` = `Apply { argument: f, function: Var("curry") }`.
+/// Build `curry(f)`: `f ▷ curry` = `Apply { argument: f, function: Builtin(Curry) }`.
 ///
-/// Annotates the `curry` var with its type when `f` has a concrete function type.
+/// Annotates the curry built-in with its type when `f` has a concrete function type.
 pub(crate) fn curry(f: Expr) -> Expr {
     // If f: Tuple([A, B]) → C, then curry(f): A → (B → C)
     let curry_result = match &f.ty {
@@ -173,16 +174,16 @@ pub(crate) fn curry(f: Expr) -> Expr {
         _ => Type::Hole,
     };
     let curry_fn_ty = fun_ty_or_hole(&f.ty, &curry_result);
-    let curry_var = Expr::var("curry").with_ty(curry_fn_ty);
+    let curry_var = Expr::builtin(Builtin::Curry).with_ty(curry_fn_ty);
     Expr::apply(f, curry_var).with_ty(curry_result)
 }
 
-/// Build `const(c)`: `c ▷ const` = `Apply { argument: c, function: Var("const") }`.
+/// Build `const(c)`: `c ▷ const` = `Apply { argument: c, function: Builtin(Const) }`.
 ///
-/// Leaves the `const` var untyped; use the typed inline form in `elim_lambda`
+/// Leaves the const built-in untyped; use the typed inline form in `elim_lambda`
 /// when the result type (param domain) is known.
 pub fn const_(c: Expr) -> Expr {
-    Expr::apply(c, Expr::var("const"))
+    Expr::apply(c, Expr::builtin(Builtin::Const))
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +200,7 @@ pub(crate) fn is_free(param: &str, expr: &Expr) -> bool {
     let is_free = match &expr.node {
         TypedExprNode::Var(name) => name == param,
 
-        TypedExprNode::Lit(_) | TypedExprNode::Proj(_) => false,
+        TypedExprNode::Lit(_) | TypedExprNode::Proj(_) | TypedExprNode::Builtin(_) => false,
 
         TypedExprNode::Lambda {
             param: p,
@@ -310,7 +311,10 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
     // Fast path: no allocation needed for atoms.
     match &expr.node {
         TypedExprNode::Var(ref n) if n == name => return replacement.clone(),
-        TypedExprNode::Var(_) | TypedExprNode::Lit(_) | TypedExprNode::Proj(_) => return expr,
+        TypedExprNode::Var(_)
+        | TypedExprNode::Lit(_)
+        | TypedExprNode::Proj(_)
+        | TypedExprNode::Builtin(_) => return expr,
         _ => {}
     }
     if !is_free(name, &expr) {
@@ -498,32 +502,8 @@ fn substitute_in_type(ty: &mut Type, name: &str, replacement: &Expr) {
 // BinOp desugaring
 // ---------------------------------------------------------------------------
 
-/// Maps a non-[`BinOpKind::Compose`] operator to its built-in function name.
-///
-/// These names are used when desugaring `a op b` into
-/// `Apply { argument: Tuple([a, b]), function: Var(op_name) }`.
-fn op_function_name(op: &BinOpKind) -> &'static str {
-    use crate::ccl::{ArithmeticKind, CompareKind, LogicKind};
-    match op {
-        BinOpKind::Arithmetic(ArithmeticKind::Add) => "add",
-        BinOpKind::Arithmetic(ArithmeticKind::Sub) => "sub",
-        BinOpKind::Arithmetic(ArithmeticKind::Mul) => "mul",
-        BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => "floor_div",
-        BinOpKind::Concat => "concat",
-        BinOpKind::Compare(CompareKind::Equals) => "eq",
-        BinOpKind::Compare(CompareKind::NotEquals) => "neq",
-        BinOpKind::Compare(CompareKind::Less) => "lt",
-        BinOpKind::Compare(CompareKind::LessOrEq) => "le",
-        BinOpKind::Compare(CompareKind::Greater) => "gt",
-        BinOpKind::Compare(CompareKind::GreaterOrEq) => "ge",
-        BinOpKind::BoolLogic(LogicKind::And) => "and",
-        BinOpKind::BoolLogic(LogicKind::Nand) => "nand",
-        BinOpKind::BoolLogic(LogicKind::Or) => "or",
-        BinOpKind::BoolLogic(LogicKind::Nor) => "nor",
-        BinOpKind::BoolLogic(LogicKind::Xor) => "xor",
-        BinOpKind::BoolLogic(LogicKind::Xnor) => "xnor",
-    }
-}
+// `BinOpKind` and `UnaryOpKind` are mapped to the corresponding [`Builtin`]
+// variant via [`Builtin::for_binop`] / [`Builtin::for_unaryop`].
 
 /// Compute `Fun(domain, codomain)`, returning [`Type::Hole`] if either
 /// component is [`Type::Hole`] or [`Type::Infer`].
@@ -587,7 +567,7 @@ fn elim_lambda(
     if !is_free(param, &body) {
         // const: T → (A → T) where T = body.ty and result_ty = A → T
         let const_fn_ty = fun_ty_or_hole(&body.ty, &result_ty);
-        let const_var = Expr::var("const").with_ty(const_fn_ty);
+        let const_var = Expr::builtin(Builtin::Const).with_ty(const_fn_ty);
         let result = Expr::apply(body, const_var).with_ty(result_ty);
         debug_typecheck(&result);
         return Ok(result);
@@ -678,8 +658,8 @@ fn elim_lambda(
                     },
                 ));
 
-                let curry_var =
-                    Expr::var("curry").with_ty(Type::fun(inner_elim.ty.clone(), result_ty.clone()));
+                let curry_var = Expr::builtin(Builtin::Curry)
+                    .with_ty(Type::fun(inner_elim.ty.clone(), result_ty.clone()));
 
                 Ok(Expr::apply(inner_elim, curry_var).with_ty(result_ty))
             } else {
@@ -697,7 +677,7 @@ fn elim_lambda(
                 Type::Fun(_, cod) => fun_ty_or_hole(cod, &body_ty),
                 _ => Type::Hole,
             };
-            let apply_var = Expr::var("apply").with_ty(apply_ty);
+            let apply_var = Expr::builtin(Builtin::Apply).with_ty(apply_ty);
             Ok(compose(pair, apply_var).with_ty(result_ty))
         }
 
@@ -728,7 +708,7 @@ fn elim_lambda(
                     },
                     _ => Type::Hole,
                 };
-                let compose_var = Expr::var("compose").with_ty(compose_ty);
+                let compose_var = Expr::builtin(Builtin::Compose).with_ty(compose_ty);
                 acc = compose(pair, compose_var);
             }
             Ok(acc.with_ty(result_ty))
@@ -747,28 +727,24 @@ fn elim_lambda(
                 // Special case: string concatenation uses `concat` function, not `add`.
                 op = BinOpKind::Concat;
             }
-            let op_name = op_function_name(&op).to_string();
+            let op_builtin = Builtin::BinOp(op);
             // Annotate the intermediate nodes so that when the Apply rule
             // recurses into the argument Tuple, body_ty is concrete.
             let left = *left;
             let right = *right;
             let tuple = typed_tuple(vec![left, right]);
             let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
-            let fn_var = Expr::var(&op_name).with_ty(fn_ty);
+            let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
             elim_lambda(ctx, param, param_ty, desugared)
         }
 
         // UnaryOp — desugar to Apply, then apply the application rule.
         TypedExprNode::UnaryOp(op, inner) => {
-            use crate::ccl::UnaryOpKind;
-            let op_name = match op {
-                UnaryOpKind::Neg => "neg",
-                UnaryOpKind::Not => "not_fn",
-            };
+            let op_builtin = Builtin::for_unaryop(op);
             let inner = *inner;
             let fn_ty = fun_ty_or_hole(&inner.ty, &body_ty);
-            let fn_var = Expr::var(op_name).with_ty(fn_ty);
+            let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
             let desugared = Expr::apply(inner, fn_var).with_ty(body_ty);
             elim_lambda(ctx, param, param_ty, desugared)
         }
@@ -782,7 +758,7 @@ fn elim_lambda(
                 .collect::<Result<_, _>>()?;
             let inner_tuple = typed_tuple(elim_elts);
             let zip_fn_ty = fun_ty_or_hole(&inner_tuple.ty, &result_ty);
-            let zip_var = Expr::var("zip").with_ty(zip_fn_ty);
+            let zip_var = Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty);
             Ok(Expr::apply(inner_tuple, zip_var).with_ty(result_ty))
         }
 
@@ -839,13 +815,10 @@ fn elim_lambda(
 
         // Desugar to input ▷ agg(kind), then elim_lambda the result
         TypedExprNode::Aggregate { input, kind } => {
-            let kind_name = match kind {
-                AggregateKind::Sum => "sum",
-                AggregateKind::Max => "max",
-            };
+            let agg_builtin = Builtin::for_aggregate(kind);
             let input = *input;
             let agg_ty = fun_ty_or_hole(&input.ty, &body_ty);
-            let agg_var = Expr::var(kind_name).with_ty(agg_ty);
+            let agg_var = Expr::builtin(agg_builtin).with_ty(agg_ty);
             let desugared = Expr::apply(input, agg_var).with_ty(body_ty);
             elim_lambda(ctx, param, param_ty, desugared)
         }
@@ -955,13 +928,13 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
         // `a op b` ≡ `(a, b) ▷ op_fn` — mirrors what `elim_lambda` does for
         // the same pattern inside a lambda body, making the CCL uniform.
         TypedExprNode::BinOp { left, op, right } => {
-            let op_name = op_function_name(&op).to_string();
+            let op_builtin = Builtin::BinOp(op);
             let left_elim = elim_lambdas(ctx, *left)?;
             let right_elim = elim_lambdas(ctx, *right)?;
             let tuple_ty = Type::Tuple(vec![left_elim.ty.clone(), right_elim.ty.clone()]);
             let fn_ty = fun_ty_or_hole(&tuple_ty, &ty);
             let tuple = Expr::tuple(vec![left_elim, right_elim]).with_ty(tuple_ty);
-            let fn_var = Expr::var(&op_name).with_ty(fn_ty);
+            let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
             let mut desugared = Expr::apply(tuple, fn_var);
             desugared.ty = ty;
             debug_typecheck(&desugared);
@@ -971,14 +944,10 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
         // UnaryOp: desugar to function application form.
         // `op(x)` ≡ `x ▷ op_fn` — mirrors `elim_lambda`'s treatment.
         TypedExprNode::UnaryOp(op, inner) => {
-            use crate::ccl::UnaryOpKind;
-            let op_name = match op {
-                UnaryOpKind::Neg => "neg",
-                UnaryOpKind::Not => "not_fn",
-            };
+            let op_builtin = Builtin::for_unaryop(op);
             let inner_elim = elim_lambdas(ctx, *inner)?;
             let fn_ty = fun_ty_or_hole(&inner_elim.ty, &ty);
-            let fn_var = Expr::var(op_name).with_ty(fn_ty);
+            let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
             let mut desugared = Expr::apply(inner_elim, fn_var);
             desugared.ty = ty;
             debug_typecheck(&desugared);
@@ -1031,19 +1000,17 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
 
         TypedExprNode::Aggregate { input, kind } => {
             let input2 = elim_lambdas(ctx, *input)?;
-            let kind_name = match kind {
-                AggregateKind::Sum => "sum",
-                AggregateKind::Max => "max",
-            };
+            let agg_builtin = Builtin::for_aggregate(kind);
             let agg_ty = fun_ty_or_hole(&input2.ty, &ty);
             Ok(dbg_typecheck_mv(
-                Expr::apply(input2, Expr::var(kind_name).with_ty(agg_ty)).with_ty(ty),
+                Expr::apply(input2, Expr::builtin(agg_builtin).with_ty(agg_ty)).with_ty(ty),
             ))
         }
 
         // Atoms: no sub-expressions, return as-is.
         node @ (TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
+        | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)) => Ok(TypedExpr {
             node,
@@ -1070,7 +1037,7 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{symbolic::symbolic, BaseType, Expr, Lit, Type};
+    use crate::ccl::{symbolic::symbolic, ArithmeticKind, BaseType, BinOpKind, Expr, Lit, Type};
     use test_log::test;
 
     // -----------------------------------------------------------------------
@@ -1191,12 +1158,12 @@ mod tests {
         let apply_ty = fun_ty(Type::Tuple(vec![int_ty(), f_ty.clone()]), int_ty());
         // const(f) where f: Int → Int has type Int -> ((Int → Int) -> (Int → Int))
         let const_f_ty = fun_ty(f_ty.clone(), fun_ty(f_ty.clone(), f_ty.clone()));
-        let const_var = Expr::var("const").with_ty(const_f_ty);
+        let const_var = Expr::builtin(Builtin::Const).with_ty(const_f_ty);
         let const_f = Expr::apply(var("f").with_ty(f_ty.clone()), const_var)
             .with_ty(fun_ty(f_ty.clone(), f_ty.clone()));
         let expected = compose(
             zip_pair(id().with_ty(fun_ty(int_ty(), int_ty())), const_f),
-            var("apply").with_ty(apply_ty),
+            Expr::builtin(Builtin::Apply).with_ty(apply_ty),
         );
         assert_expr_eq(result, expected);
     }
@@ -1214,7 +1181,7 @@ mod tests {
         let result = elim_lambda(&mut ElimContext::new(), "x", &param_ty, body).unwrap();
         // const(f) where f: Int has type Int -> (Int -> Int)
         let const_f_ty = fun_ty(int_ty(), fun_ty(int_ty(), int_ty()));
-        let const_var = Expr::var("const").with_ty(const_f_ty);
+        let const_var = Expr::builtin(Builtin::Const).with_ty(const_f_ty);
         let const_f =
             Expr::apply(var("f").with_ty(int_ty()), const_var).with_ty(fun_ty(int_ty(), int_ty()));
         let expected = zip_pair(id().with_ty(fun_ty(int_ty(), int_ty())), const_f);
@@ -1332,7 +1299,12 @@ mod tests {
         let r1c2 = app(r1, var("c2").with_ty(c_ty.clone())).with_ty(int_ty());
         let tuple_result =
             Expr::tuple(vec![r0c1, r1c2]).with_ty(Type::Tuple(vec![int_ty(), int_ty()]));
-        let body = app(tuple_result, var("add").with_ty(add_ty.clone())).with_ty(int_ty());
+        let body = app(
+            tuple_result,
+            Expr::builtin(Builtin::BinOp(BinOpKind::Arithmetic(ArithmeticKind::Add)))
+                .with_ty(add_ty.clone()),
+        )
+        .with_ty(int_ty());
         let expr = Expr::lambda("r", r_ty.clone(), body);
         let result = run(expr).unwrap();
         // Expected: zip(.0 ≫ c1, .1 ≫ c2) ≫ add
@@ -1347,7 +1319,11 @@ mod tests {
             var("c2").with_ty(c_ty.clone()),
         )
         .with_ty(r_to_int.clone());
-        let expected = compose(zip_pair(proj0_c1, proj1_c2), var("add").with_ty(add_ty));
+        let expected = compose(
+            zip_pair(proj0_c1, proj1_c2),
+            Expr::builtin(Builtin::BinOp(BinOpKind::Arithmetic(ArithmeticKind::Add)))
+                .with_ty(add_ty),
+        );
         assert_expr_eq(result, expected);
     }
 
@@ -1370,7 +1346,7 @@ mod tests {
         let zip_result_ty = fun_ty(tuple_ty.clone(), int_ty());
         // const(c) where c: Int has type Int -> (Int -> Int)
         let const_c_ty = fun_ty(int_ty(), int_to_int.clone());
-        let const_var = Expr::var("const").with_ty(const_c_ty);
+        let const_var = Expr::builtin(Builtin::Const).with_ty(const_c_ty);
         let const_c =
             Expr::apply(var("c").with_ty(int_ty()), const_var).with_ty(int_to_int.clone());
         let expected = compose(

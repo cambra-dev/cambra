@@ -2646,7 +2646,7 @@ impl Aggregate {
             .map(|t| t.extent())
             .unwrap_or_else(err);
         let tiling = Tiling::Aggregation {
-            kind: kind.clone(),
+            kind,
             accumulator: kind.output_extent(&codomain_extent).unwrap_or_else(err),
         };
         Self { input, tiling }
@@ -2693,9 +2693,9 @@ impl AggregateProducer {
                 kind,
                 accumulator: acc_extent,
             } => (
-                kind.clone(),
+                *kind,
                 Tile::Aggregation {
-                    kind: kind.clone(),
+                    kind: *kind,
                     accumulator: kind.initial_accumulator(acc_extent),
                     terminal: ColumnValue::Bools(BitVec::from_elem(1, false)),
                 },
@@ -2796,7 +2796,7 @@ impl TileOperator for ExtractAggregate {
             input: self
                 .input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
-            kind: self.kind.clone(),
+            kind: self.kind,
             only_terminal: self.only_terminal,
         })
     }
@@ -2910,7 +2910,7 @@ impl TileOperator for MapExtractAggregate {
         Box::new(MapExtractAggregateProducer {
             base: ProducerBase::new(MapExtractAggregateProducer::alloc_id(), &self.tiling),
             input: input_producer,
-            kind: self.kind.clone(),
+            kind: self.kind,
         })
     }
 }
@@ -3011,7 +3011,7 @@ impl MapAggregate {
         let tiling = Tiling::SealedFunction {
             domain,
             codomain: Box::new(Tiling::Aggregation {
-                kind: kind.clone(),
+                kind,
                 accumulator: output_extent,
             }),
         };
@@ -3044,7 +3044,7 @@ impl TileOperator for MapAggregate {
         Box::new(MapAggregateProducer {
             base: ProducerBase::new(MapAggregateProducer::alloc_id(), &self.tiling),
             input: input_producer,
-            kind: self.kind.clone(),
+            kind: self.kind,
             accumulators: HashMap::new(),
         })
     }
@@ -3120,7 +3120,7 @@ impl TileProducer for MapAggregateProducer {
         Tile::SealedFunction {
             domain: ColumnValue::from_values(domain_values, &domain_extent),
             codomain: Box::new(Tile::Aggregation {
-                kind: self.kind.clone(),
+                kind: self.kind,
                 accumulator: ColumnValue::from_values(accumulator_values, &output_extent),
                 terminal: ColumnValue::Bools(BitVec::from_elem(n, is_terminal)),
             }),

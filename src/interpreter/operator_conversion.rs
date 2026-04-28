@@ -3,7 +3,7 @@ use log::{debug, trace};
 use crate::{
     ccl::{
         symbolic::{symbolic, symbolic_typed},
-        AggregateKind, Expr, Lit, ProjKey, RefinementKind, Type, TypedExprNode,
+        AggregateKind, Builtin, Expr, Lit, ProjKey, RefinementKind, Type, TypedExprNode,
     },
     interpreter::{
         tile_operators::{
@@ -266,7 +266,8 @@ fn convert_impl(
         }
 
         // const(c): maps every domain element to the constant value c.
-        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "const") =>
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::Const) =>
         {
             let input =
                 input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
@@ -279,7 +280,8 @@ fn convert_impl(
         }
 
         // zip(f, g, ...): fan-out — apply each morphism to the same inut.
-        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "zip") =>
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::Zip) =>
         {
             let TypedExprNode::Tuple(elts) = &argument.node else {
                 return Err(ConversionError::Unsupported(format!(
@@ -324,7 +326,8 @@ fn convert_impl(
 
         // Because MapResultToConst handles mapping at any depth of currying, map is a pass through and we just convert the argument
         // and feed the input to to it.
-        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "map") =>
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::Map) =>
         {
             if input.is_none() {
                 return Err(ConversionError::Unsupported("map requires an input".into()));
@@ -333,7 +336,8 @@ fn convert_impl(
         }
 
         // converse translates 1:1 to the Converse operator
-        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "converse") =>
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::Converse) =>
         {
             let converse = Box::new(Converse::new(convert_impl(argument, None, None, ctx)?));
             if let Some(input) = input {
@@ -344,7 +348,8 @@ fn convert_impl(
         }
 
         // map_domain transforms the codomain of its argument to a copy of the domain.
-        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "map_domain") =>
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::MapDomain) =>
         {
             if input.is_some() {
                 return Err(ConversionError::Unsupported(
@@ -357,7 +362,8 @@ fn convert_impl(
         }
 
         // uncurry flattens a curried function into a sealed function with a pair domain.
-        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "uncurry") =>
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::Uncurry) =>
         {
             if input.is_some() {
                 return Err(ConversionError::Unsupported(
@@ -369,7 +375,8 @@ fn convert_impl(
             )?)))
         }
 
-        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if n == "restrict") =>
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::Restrict) =>
         {
             if input.is_some() {
                 return Err(ConversionError::Unsupported(
@@ -382,18 +389,16 @@ fn convert_impl(
         }
 
         // If we are applying an aggregate, then it is a global aggregate that should use the Aggregate operator.
-        TypedExprNode::Apply { argument, function } if matches!(&function.node, TypedExprNode::Var(n) if agg_for_name(n).is_some()) =>
+        TypedExprNode::Apply { argument, function }
+            if let Some(kind) = as_builtin(function).and_then(builtin_to_aggregate) =>
         {
             if input.is_some() {
                 return Err(ConversionError::Unsupported(
                     "scalar aggregates expect no input".into(),
                 ));
             }
-            let TypedExprNode::Var(name) = &function.node else {
-                unreachable!()
-            };
             let input = convert_impl(argument, None, None, ctx)?;
-            apply_aggregate(input, agg_for_name(name).unwrap())
+            apply_aggregate(input, kind)
         }
 
         TypedExprNode::Apply { function, argument } if is_applied_flatten_domain(function) => {
@@ -438,38 +443,37 @@ fn convert_impl(
         )),
 
         TypedExprNode::Var(name) => {
+            if let Some(fan_out) = ctx.lookup(name) {
+                if let Some(input) = input {
+                    Ok(Box::new(MapResult::new(input, fan_out.branch())))
+                } else {
+                    Ok(fan_out.branch())
+                }
+            } else {
+                Err(ConversionError::Unsupported(format!(
+                    "unrecognised Var({name}) in λ-free CCL"
+                )))
+            }
+        }
+
+        // Standalone reference to a built-in primitive — composed with an
+        // input rather than applied directly.
+        TypedExprNode::Builtin(b) => {
             let mut get = |input: Option<Box<dyn TileOperator>>| {
                 Ok(input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?))
             };
-            match name.as_str() {
-                "id" => get(input),
-                "map_domain" => Ok(Box::new(MapDomain::new(get(input)?))),
-                name if binop_for_name(name).is_some() => {
-                    apply_binop(get(input)?, binop_for_name(name).unwrap())
-                }
-                name if unaryop_for_name(name).is_some() => {
-                    apply_unaryop(get(input)?, unaryop_for_name(name).unwrap())
-                }
+            match b {
+                Builtin::Id => get(input),
+                Builtin::MapDomain => Ok(Box::new(MapDomain::new(get(input)?))),
+                b if let Some(op) = builtin_to_binop(*b) => apply_binop(get(input)?, op),
+                b if let Some(op) = builtin_to_unaryop(*b) => apply_unaryop(get(input)?, op),
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
-                name if agg_for_name(name).is_some() => {
-                    let kind = agg_for_name(name).unwrap();
-                    Ok(Box::new(MapExtractAggregate::new(
-                        Box::new(MapAggregate::new(get(input)?, kind.clone())),
-                        kind,
-                    )))
-                }
-                name if ctx.lookup(name).is_some() => {
-                    let Some(fan_out) = ctx.lookup(name) else {
-                        unreachable!();
-                    };
-                    if let Some(input) = input {
-                        Ok(Box::new(MapResult::new(input, fan_out.branch())))
-                    } else {
-                        Ok(fan_out.branch())
-                    }
-                }
+                b if let Some(kind) = builtin_to_aggregate(*b) => Ok(Box::new(
+                    MapExtractAggregate::new(Box::new(MapAggregate::new(get(input)?, kind)), kind),
+                )),
                 _ => Err(ConversionError::Unsupported(format!(
-                    "unrecognised Var({name}) in λ-free CCL"
+                    "unsupported Builtin({}) in λ-free CCL",
+                    b.name()
                 ))),
             }
         }
@@ -695,53 +699,73 @@ fn apply_aggregate(
     op: AggregateKind,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     Ok(Box::new(ExtractAggregate::new(
-        Box::new(Aggregate::new(input, op.clone())),
+        Box::new(Aggregate::new(input, op)),
         op,
         true,
     )))
 }
 
-/// Map a lambda-elimination combinator name to an interpreter [`BinOpKind`].
+/// Returns the [`Builtin`] referenced by `expr`, if any.
 ///
-/// Returns `None` for names that are not binary operation combinators.
-fn binop_for_name(name: &str) -> Option<InterpreterBinOp> {
-    Some(match name {
-        "add" => InterpreterBinOp::Arithmetic(ArithmeticKind::Add),
-        "sub" => InterpreterBinOp::Arithmetic(ArithmeticKind::Sub),
-        "mul" => InterpreterBinOp::Arithmetic(ArithmeticKind::Mul),
-        "floor_div" => InterpreterBinOp::Arithmetic(ArithmeticKind::FloorDiv),
-        "concat" => InterpreterBinOp::Concat,
-        "eq" => InterpreterBinOp::Compare(CompareKind::Equals),
-        "neq" => InterpreterBinOp::Compare(CompareKind::NotEquals),
-        "lt" => InterpreterBinOp::Compare(CompareKind::Less),
-        "le" => InterpreterBinOp::Compare(CompareKind::LessOrEq),
-        "gt" => InterpreterBinOp::Compare(CompareKind::Greater),
-        "ge" => InterpreterBinOp::Compare(CompareKind::GreaterOrEq),
-        "and" => InterpreterBinOp::BoolLogic(LogicKind::And),
-        "nand" => InterpreterBinOp::BoolLogic(LogicKind::Nand),
-        "or" => InterpreterBinOp::BoolLogic(LogicKind::Or),
-        "nor" => InterpreterBinOp::BoolLogic(LogicKind::Nor),
-        "xor" => InterpreterBinOp::BoolLogic(LogicKind::Xor),
-        "xnor" => InterpreterBinOp::BoolLogic(LogicKind::Xnor),
+/// Used by the dispatch in [`convert_impl`] to recognise applications of
+/// individual primitives.
+fn as_builtin(expr: &Expr) -> Option<Builtin> {
+    if let TypedExprNode::Builtin(b) = &expr.node {
+        Some(*b)
+    } else {
+        None
+    }
+}
+
+/// Map a [`Builtin`] to an interpreter [`InterpreterBinOp`].
+///
+/// Returns `None` for built-ins that are not binary operation combinators.
+///
+/// The interpreter has its own `BinOpKind` separate from
+/// [`crate::ccl::BinOpKind`] (the architecture forbids `ccl` from depending
+/// upward on `interpreter`); the variants are structurally identical, so this
+/// is just an enum-to-enum copy.
+fn builtin_to_binop(b: Builtin) -> Option<InterpreterBinOp> {
+    use crate::ccl::{ArithmeticKind as A, BinOpKind as B, CompareKind as C, LogicKind as L};
+    let Builtin::BinOp(op) = b else {
+        return None;
+    };
+    Some(match op {
+        B::Arithmetic(A::Add) => InterpreterBinOp::Arithmetic(ArithmeticKind::Add),
+        B::Arithmetic(A::Sub) => InterpreterBinOp::Arithmetic(ArithmeticKind::Sub),
+        B::Arithmetic(A::Mul) => InterpreterBinOp::Arithmetic(ArithmeticKind::Mul),
+        B::Arithmetic(A::FloorDiv) => InterpreterBinOp::Arithmetic(ArithmeticKind::FloorDiv),
+        B::Concat => InterpreterBinOp::Concat,
+        B::Compare(C::Equals) => InterpreterBinOp::Compare(CompareKind::Equals),
+        B::Compare(C::NotEquals) => InterpreterBinOp::Compare(CompareKind::NotEquals),
+        B::Compare(C::Less) => InterpreterBinOp::Compare(CompareKind::Less),
+        B::Compare(C::LessOrEq) => InterpreterBinOp::Compare(CompareKind::LessOrEq),
+        B::Compare(C::Greater) => InterpreterBinOp::Compare(CompareKind::Greater),
+        B::Compare(C::GreaterOrEq) => InterpreterBinOp::Compare(CompareKind::GreaterOrEq),
+        B::BoolLogic(L::And) => InterpreterBinOp::BoolLogic(LogicKind::And),
+        B::BoolLogic(L::Nand) => InterpreterBinOp::BoolLogic(LogicKind::Nand),
+        B::BoolLogic(L::Or) => InterpreterBinOp::BoolLogic(LogicKind::Or),
+        B::BoolLogic(L::Nor) => InterpreterBinOp::BoolLogic(LogicKind::Nor),
+        B::BoolLogic(L::Xor) => InterpreterBinOp::BoolLogic(LogicKind::Xor),
+        B::BoolLogic(L::Xnor) => InterpreterBinOp::BoolLogic(LogicKind::Xnor),
+    })
+}
+
+fn builtin_to_aggregate(b: Builtin) -> Option<AggregateKind> {
+    Some(match b {
+        Builtin::Sum => AggregateKind::Sum,
+        Builtin::Max => AggregateKind::Max,
         _ => return None,
     })
 }
 
-fn agg_for_name(name: &str) -> Option<AggregateKind> {
-    Some(match name {
-        "sum" => AggregateKind::Sum,
-        "max" => AggregateKind::Max,
-        _ => return None,
-    })
-}
-
-/// Map a lambda-elimination combinator name to a [`UnaryOpKind`].
+/// Map a [`Builtin`] to a [`UnaryOpKind`].
 ///
-/// Returns `None` for names that are not unary operation combinators.
-fn unaryop_for_name(name: &str) -> Option<UnaryOpKind> {
-    Some(match name {
-        "neg" => UnaryOpKind::Neg,
-        "not_fn" => UnaryOpKind::Not,
+/// Returns `None` for built-ins that are not unary operation combinators.
+fn builtin_to_unaryop(b: Builtin) -> Option<UnaryOpKind> {
+    Some(match b {
+        Builtin::Neg => UnaryOpKind::Neg,
+        Builtin::NotFn => UnaryOpKind::Not,
         _ => return None,
     })
 }
@@ -797,7 +821,7 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
 // Returns x if the expr is x ▷ const, None otherwise
 fn is_const(expr: &Expr) -> Option<&Expr> {
     if let TypedExprNode::Apply { function, argument } = &expr.node {
-        if matches!(&function.node, TypedExprNode::Var(n) if n == "const") {
+        if as_builtin(function) == Some(Builtin::Const) {
             return Some(argument.as_ref());
         }
     }
@@ -806,7 +830,7 @@ fn is_const(expr: &Expr) -> Option<&Expr> {
 
 fn is_applied_permute_domain(expr: &Expr) -> bool {
     if let TypedExprNode::Apply { function, .. } = &expr.node {
-        matches!(&function.node, TypedExprNode::Var(n) if n == "permute_domain")
+        as_builtin(function) == Some(Builtin::PermuteDomain)
     } else {
         false
     }
@@ -843,7 +867,7 @@ fn convert_permute_domain(
     else {
         unreachable!();
     };
-    assert!(matches!(&inner_func.node, TypedExprNode::Var(n) if n == "permute_domain"));
+    assert_eq!(as_builtin(inner_func), Some(Builtin::PermuteDomain));
 
     let permutation = extract_usize_list(inner_arg)?;
 
@@ -855,7 +879,7 @@ fn convert_permute_domain(
 
 fn is_applied_flatten_domain(expr: &Expr) -> bool {
     if let TypedExprNode::Apply { function, .. } = &expr.node {
-        matches!(&function.node, TypedExprNode::Var(n) if n == "flatten_domain")
+        as_builtin(function) == Some(Builtin::FlattenDomain)
     } else {
         false
     }
@@ -873,7 +897,7 @@ fn convert_flatten_domain(
     else {
         unreachable!();
     };
-    assert!(matches!(&inner_func.node, TypedExprNode::Var(n) if n == "flatten_domain"));
+    assert_eq!(as_builtin(inner_func), Some(Builtin::FlattenDomain));
 
     let flatten_indices = extract_usize_list(inner_arg)?;
 

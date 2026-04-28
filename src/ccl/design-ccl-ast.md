@@ -253,6 +253,11 @@ enum ProjKey {
 enum TypedExprNode {
     Lit(Literal),
     Var(String),
+    /// Reference to a built-in primitive function (id, curry, zip, apply,
+    /// map, converse, the binops, the unary ops, sum/max, …). Introduced
+    /// post-inference by lambda elimination and join planning; matched on
+    /// directly by simplify, join_plan, and operator_conversion.
+    Builtin(Builtin),
     Proj(ProjKey),
     Apply{
       function: Box<TypedExpr>,
@@ -587,8 +592,8 @@ the Cartesian Closed Category (CCC) structure described in
 | `f ≫ g` | `BinOp { left: f, op: Compose, right: g }` |
 | `.n` (projection) | `Proj(ProjKey::Index(n))` |
 | `.field` | `Proj(ProjKey::Field("field"))` |
-| `a + b` (and other non-compose BinOps) | `Apply { argument: Tuple([a, b]), function: Var("add") }` |
-| `-x`, `not x` (UnaryOps) | `Apply { argument: x, function: Var("neg") }` |
+| `a + b` (and other non-compose BinOps) | `Apply { argument: Tuple([a, b]), function: Builtin(BinOp(op)) }` |
+| `-x`, `not x` (UnaryOps) | `Apply { argument: x, function: Builtin(Neg) }` |
 
 Non-compose `BinOp` and `UnaryOp` nodes are desugared uniformly to function
 application form so that operator conversion can treat all operations as
@@ -597,33 +602,40 @@ combinators.  This applies at all levels: inside lambda bodies (via
 
 ### Built-in combinators
 
-The output references the following `Var` names:
+The output references built-in primitives via the `Builtin` enum carried by
+`TypedExprNode::Builtin`. Each variant has a stable display name (matched by
+the symbolic printer and used in the historical `Var(...)` rendering):
 
-| Name | Meaning |
-|---|---|
-| `"id"` | identity morphism |
-| `"apply"` | function application as a morphism |
-| `"curry"` | currying |
-| `"uncurry"` | uncurrying |
-| `"const"` | constant lift: `const(c) = λ _ → c` |
-| `"zip"` | product/fanout: `zip(f, g) = λ x → (f(x), g(x))`, written `⟨f, g⟩` |
-| `"map"` | post-composition: `map(g)` applied to a curried function |
-| `"compose"` | composition as a first-class morphism |
-| `"restrict"` | domain restriction for filtered lambdas |
-| `"aggregate"` | fold/reduce |
-| `"converse"` | grouping by key |
-| `"add"`, `"sub"`, `"mul"`, `"floor_div"` | arithmetic operations |
-| `"eq"`, `"neq"`, `"lt"`, `"le"`, `"gt"`, `"ge"` | comparison operations |
-| `"and"`, `"or"`, `"xor"`, etc. | boolean operations |
-| `"neg"`, `"not_fn"` | unary operations |
+| Variant | Name | Meaning |
+|---|---|---|
+| `Builtin::Id` | `id` | identity morphism |
+| `Builtin::Apply` | `apply` | function application as a morphism |
+| `Builtin::Curry` | `curry` | currying |
+| `Builtin::Uncurry` | `uncurry` | uncurrying |
+| `Builtin::Const` | `const` | constant lift: `const(c) = λ _ → c` |
+| `Builtin::Zip` | `zip` | product/fanout: `zip(f, g) = λ x → (f(x), g(x))`, written `⟨f, g⟩` |
+| `Builtin::Map` | `map` | post-composition: `map(g)` applied to a curried function |
+| `Builtin::MapDomain` | `map_domain` | domain-to-domain identity stream |
+| `Builtin::Compose` | `compose` | composition as a first-class morphism |
+| `Builtin::Restrict` | `restrict` | domain restriction for filtered lambdas |
+| `Builtin::Converse` | `converse` | grouping by key |
+| `Builtin::PermuteDomain`, `Builtin::FlattenDomain` | `permute_domain`, `flatten_domain` | hash-join domain massaging |
+| `Builtin::BinOp(op)` for any `op: BinOpKind` | `add`, `sub`, `eq`, `lt`, `and`, `or`, `concat`, … | every arithmetic / compare / boolean-logic / string-concat binary op (one variant, parameterised by the existing `BinOpKind` so the operator enum has a single source of truth) |
+| `Builtin::{Neg,NotFn}` | `neg`, `not_fn` | unary operations |
+| `Builtin::{Sum,Max}` | `sum`, `max` | aggregations (fold/reduce) |
+
+Earlier passes encoded these with `TypedExprNode::Var("name")` against magic
+strings; downstream pattern matches (`simplify`, `join_plan`,
+`operator_conversion`) now switch directly on the `Builtin` variant.
 
 ### `zip` encoding
 
 `⟨f, g⟩` (pointwise function pairing) is encoded as:
 ```
-Apply { argument: Tuple([f, g]), function: Var("zip") }
+Apply { argument: Tuple([f, g]), function: Builtin(Zip) }
 ```
-There is no dedicated `Zip` AST node; it reuses the existing `Apply` + `Tuple` nodes.
+There is no dedicated `Zip` AST node; it reuses the existing `Apply` + `Tuple`
++ `Builtin` nodes.
 
 ### `Let` nodes after rule 7
 
@@ -679,7 +691,7 @@ lambda_elim   →   inline   →   join_plan   →   operator_conversion
 - **Explicitly curried UDFs** (`lambda x: lambda y: body` in source, or explicit `curry(f)`
   calls): their `bound_expr.ty` has a `Fun` codomain, so `should_inline` returns `false`
   and the Let is left intact. Compilation fails cleanly at the bound expression with
-  "unrecognised Var(curry)" — fixing this requires wiring `curry` as a combinator in
+  "unsupported Builtin(curry)" — fixing this requires wiring `curry` as a combinator in
   `operator_conversion.rs` (follow-up work). Syntactic multi-arg UDFs (`add = lambda x, y:
   x + y`) are **not** in this category; they're uncurried at lowering and inlined like
   single-arg scalar UDFs.

@@ -714,7 +714,7 @@ fn lower_boolop(
     // Fold left-to-right: `a and b and c` → `(a and b) and c`.
     let mut acc = lower_expr(&values[0], ctx)?;
     for value in &values[1..] {
-        acc = Expr::binop(acc, kind.clone(), lower_expr(value, ctx)?);
+        acc = Expr::binop(acc, kind, lower_expr(value, ctx)?);
     }
     Ok(acc)
 }
@@ -849,6 +849,7 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
         TypedExprNode::Var(n) if n == name => return replacement.clone(),
         TypedExprNode::Var(_)
         | TypedExprNode::Lit(_)
+        | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_) => return expr,
         _ => {}
@@ -955,6 +956,7 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
         // match is exhaustive and future additions are caught at compile time.
         node @ (TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
+        | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)) => node,
         // Lowering does not produce Join/Jump, so passing through is safe.

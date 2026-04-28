@@ -127,6 +127,8 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
 
         TypedExprNode::Var(name) => (Precedence::Atom, name.clone()),
 
+        TypedExprNode::Builtin(b) => (Precedence::Atom, b.name().to_string()),
+
         TypedExprNode::BinOp { left, op, right } => {
             let op_prec = binop_prec(op);
             let sym = op.sym();

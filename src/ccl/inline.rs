@@ -266,6 +266,7 @@ fn inline(expr: Expr) -> Expr {
         // Leaves — no sub-expressions to recurse into.
         node @ (TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
+        | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)) => node,
     };

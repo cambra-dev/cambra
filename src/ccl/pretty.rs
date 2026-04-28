@@ -34,6 +34,8 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
 
         TypedExprNode::Var(name) => InspectNode::leaf(format!("Var({name})")),
 
+        TypedExprNode::Builtin(b) => InspectNode::leaf(format!("Builtin({})", b.name())),
+
         TypedExprNode::Apply { function, argument } => InspectNode::new("Apply")
             .child("func", expr_to_node(function))
             .child("arg", expr_to_node(argument)),

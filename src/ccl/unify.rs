@@ -668,7 +668,10 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
             }
         }
         // Leaf nodes — no sub-expressions to recurse into.
-        TypedExprNode::Lit(_) | TypedExprNode::Var(_) | TypedExprNode::Source(_) => {}
+        TypedExprNode::Lit(_)
+        | TypedExprNode::Var(_)
+        | TypedExprNode::Builtin(_)
+        | TypedExprNode::Source(_) => {}
     }
 }
 

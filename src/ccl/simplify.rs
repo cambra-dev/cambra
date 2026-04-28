@@ -30,7 +30,12 @@
 
 use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
-use crate::ccl::{Expr, Lit, ProjKey, RefinementKind, Type, TypedExpr, TypedExprNode};
+use crate::ccl::{Builtin, Expr, Lit, ProjKey, RefinementKind, Type, TypedExpr, TypedExprNode};
+
+/// Returns `true` if `expr` directly references the given built-in primitive.
+fn is_builtin(expr: &Expr, b: Builtin) -> bool {
+    matches!(&expr.node, TypedExprNode::Builtin(x) if *x == b)
+}
 
 // ---------------------------------------------------------------------------
 // Simplification pass
@@ -96,6 +101,7 @@ fn recurse_simplify(expr: &mut Expr) -> bool {
         }
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
+        | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_) => false,
     }
@@ -164,10 +170,10 @@ fn flatten_compose_arm(expr: Expr) -> Vec<Expr> {
 // ---------------------------------------------------------------------------
 
 /// Returns `(f, g)` if `expr` is `zip_pair(f, g)` i.e.
-/// `Apply { argument: Tuple([f, g]), function: Var("zip") }`.
+/// `Apply { argument: Tuple([f, g]), function: Builtin(Zip) }`.
 fn as_zip(expr: &Expr) -> Option<(&Expr, &Expr)> {
     if let TypedExprNode::Apply { argument, function } = &expr.node {
-        if matches!(&function.node, TypedExprNode::Var(n) if n == "zip") {
+        if is_builtin(function, Builtin::Zip) {
             if let TypedExprNode::Tuple(elts) = &argument.node {
                 if elts.len() == 2 {
                     return Some((&elts[0], &elts[1]));
@@ -179,10 +185,10 @@ fn as_zip(expr: &Expr) -> Option<(&Expr, &Expr)> {
 }
 
 /// Returns the inner `f` if `expr` is `curry(f)` i.e.
-/// `Apply { argument: f, function: Var("curry") }`.
+/// `Apply { argument: f, function: Builtin(Curry) }`.
 fn as_curry(expr: &Expr) -> Option<&Expr> {
     if let TypedExprNode::Apply { argument, function } = &expr.node {
-        if matches!(&function.node, TypedExprNode::Var(n) if n == "curry") {
+        if is_builtin(function, Builtin::Curry) {
             return Some(argument);
         }
     }
@@ -190,10 +196,10 @@ fn as_curry(expr: &Expr) -> Option<&Expr> {
 }
 
 /// Returns the inner `c` if `expr` is `const_(c)` i.e.
-/// `Apply { argument: c, function: Var("const") }`.
+/// `Apply { argument: c, function: Builtin(Const) }`.
 fn as_const(expr: &Expr) -> Option<&Expr> {
     if let TypedExprNode::Apply { argument, function } = &expr.node {
-        if matches!(&function.node, TypedExprNode::Var(n) if n == "const") {
+        if is_builtin(function, Builtin::Const) {
             return Some(argument);
         }
     }
@@ -213,9 +219,9 @@ fn as_compose(expr: &Expr) -> Option<(&Expr, &Expr)> {
     None
 }
 
-/// Returns `true` if `expr` is `Var("id")`.
+/// Returns `true` if `expr` is the `id` built-in.
 fn is_id(expr: &Expr) -> bool {
-    matches!(&expr.node, TypedExprNode::Var(n) if n == "id")
+    is_builtin(expr, Builtin::Id)
 }
 
 /// Returns `true` if `expr` is `Proj(Index(n))` for the given `n`.
@@ -331,7 +337,7 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
 
             // Reconstruct g ▷ const with the new type
             let const_var_ty = fun_ty_or_hole(&g.ty, &new_const_ty);
-            let const_var = Expr::var("const").with_ty(const_var_ty);
+            let const_var = Expr::builtin(Builtin::Const).with_ty(const_var_ty);
             let new_const = Expr::apply(g.clone(), const_var).with_ty(new_const_ty);
 
             vec![new_const]
@@ -394,7 +400,7 @@ fn try_ccc_universal(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
         |left, right| {
-            matches!(&right.node, TypedExprNode::Var(n) if n == "apply")
+            is_builtin(right, Builtin::Apply)
                 && as_zip(left).is_some_and(|(l, r)| {
                     is_proj_idx(l, 1)
                         && as_compose(r)
@@ -442,7 +448,7 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
         |left, right| {
-            matches!(&right.node, TypedExprNode::Var(n) if n == "apply")
+            is_builtin(right, Builtin::Apply)
                 && as_zip(left).is_some_and(|(_, r)| as_curry(r).is_some())
         },
         |left, _apply| {
@@ -493,7 +499,7 @@ fn try_const_apply(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
         |left, right| {
-            matches!(&right.node, TypedExprNode::Var(n) if n == "apply")
+            is_builtin(right, Builtin::Apply)
                 && as_zip(left).is_some_and(|(_, r)| as_const(r).is_some())
         },
         |left, _apply| {
@@ -616,7 +622,7 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
             argument: _,
         } = &expr.node
         {
-            if matches!(&function.node, TypedExprNode::Var(n) if n == "const") {
+            if is_builtin(function, Builtin::Const) {
                 return true;
             }
         }
@@ -677,7 +683,7 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
 fn try_exponential_eta(expr: &mut Expr) -> bool {
     let matched = as_curry(expr).is_some_and(|uncurried| {
         as_compose(uncurried).is_some_and(|(zip, ap)| {
-            matches!(&ap.node, TypedExprNode::Var(n) if n == "apply")
+            is_builtin(ap, Builtin::Apply)
                 && as_zip(zip).is_some_and(|(proj1, proj0f)| {
                     is_proj_idx(proj1, 1)
                         && as_compose(proj0f).is_some_and(|(proj0, _)| is_proj_idx(proj0, 0))
@@ -778,7 +784,7 @@ mod tests {
     }
 
     fn id() -> Expr {
-        Expr::var("id")
+        Expr::builtin(Builtin::Id)
     }
 
     fn proj_idx(n: usize) -> Expr {
@@ -788,7 +794,7 @@ mod tests {
     fn typed_const(c: Expr, param_ty: Type) -> Expr {
         let result_ty = fun_ty(param_ty.clone(), c.ty.clone());
         let const_var_ty = fun_ty(c.ty.clone(), result_ty.clone());
-        Expr::apply(c, var("const").with_ty(const_var_ty)).with_ty(result_ty)
+        Expr::apply(c, Expr::builtin(Builtin::Const).with_ty(const_var_ty)).with_ty(result_ty)
     }
 
     fn int_ty() -> Type {
@@ -994,7 +1000,7 @@ mod tests {
             Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
             c_ty.clone(),
         );
-        let apply = var("apply").with_ty(apply_ty);
+        let apply = Expr::builtin(Builtin::Apply).with_ty(apply_ty);
 
         let expr = typed_compose2(zip, apply);
 
@@ -1030,7 +1036,7 @@ mod tests {
             Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
             c_ty.clone(),
         );
-        let apply = var("apply").with_ty(apply_ty);
+        let apply = Expr::builtin(Builtin::Apply).with_ty(apply_ty);
 
         let expr = typed_compose(vec![aa.clone(), zip, apply, bb.clone()]);
 
@@ -1059,7 +1065,7 @@ mod tests {
             Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
             c_ty.clone(),
         );
-        let apply = var("apply").with_ty(apply_ty);
+        let apply = Expr::builtin(Builtin::Apply).with_ty(apply_ty);
 
         let expr = typed_compose2(zip, apply);
         let expected = typed_compose2(f, g);
@@ -1092,7 +1098,7 @@ mod tests {
             Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
             c_ty.clone(),
         );
-        let apply = var("apply").with_ty(apply_ty);
+        let apply = Expr::builtin(Builtin::Apply).with_ty(apply_ty);
 
         let expr = typed_compose(vec![aa.clone(), zip, apply, bb.clone()]);
         let expected = typed_compose(vec![aa, f, g, bb]);
@@ -1116,13 +1122,14 @@ mod tests {
 
         let p0_f = typed_compose2(p0, f.clone());
         let zip = zip_pair(p1, p0_f);
-        let apply = var("apply").with_ty(fun_ty(
+        let apply = Expr::builtin(Builtin::Apply).with_ty(fun_ty(
             Type::Tuple(vec![b_ty.clone(), bc_ty.clone()]),
             c_ty.clone(),
         ));
         let inner_compose = typed_compose2(zip, apply);
 
-        let curry_var = var("curry").with_ty(fun_ty(inner_compose.ty.clone(), f_ty.clone()));
+        let curry_var =
+            Expr::builtin(Builtin::Curry).with_ty(fun_ty(inner_compose.ty.clone(), f_ty.clone()));
         let expr = Expr::apply(inner_compose, curry_var).with_ty(f_ty.clone());
 
         assert_eq!(simplify(expr), f);
@@ -1139,7 +1146,8 @@ mod tests {
         let f = var("f").with_ty(f_ty.clone());
 
         let curry_f_ty = fun_ty(a_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone()));
-        let curry_var = var("curry").with_ty(fun_ty(f_ty.clone(), curry_f_ty.clone()));
+        let curry_var =
+            Expr::builtin(Builtin::Curry).with_ty(fun_ty(f_ty.clone(), curry_f_ty.clone()));
         let curry_f = Expr::apply(f.clone(), curry_var).with_ty(curry_f_ty.clone());
 
         let ab_tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
@@ -1148,7 +1156,7 @@ mod tests {
 
         let p0_curry_f = typed_compose2(p0, curry_f);
         let zip = zip_pair(p1, p0_curry_f);
-        let apply = var("apply").with_ty(fun_ty(
+        let apply = Expr::builtin(Builtin::Apply).with_ty(fun_ty(
             Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
             c_ty.clone(),
         ));
@@ -1173,7 +1181,8 @@ mod tests {
         let bb = var("b").with_ty(bb_ty.clone());
 
         let curry_f_ty = fun_ty(a_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone()));
-        let curry_var = var("curry").with_ty(fun_ty(f_ty.clone(), curry_f_ty.clone()));
+        let curry_var =
+            Expr::builtin(Builtin::Curry).with_ty(fun_ty(f_ty.clone(), curry_f_ty.clone()));
         let curry_f = Expr::apply(f.clone(), curry_var).with_ty(curry_f_ty.clone());
 
         let ab_tup_ty = Type::Tuple(vec![a_ty.clone(), b_ty.clone()]);
@@ -1182,7 +1191,7 @@ mod tests {
 
         let p0_curry_f = typed_compose2(p0, curry_f);
         let zip = zip_pair(p1, p0_curry_f);
-        let apply = var("apply").with_ty(fun_ty(
+        let apply = Expr::builtin(Builtin::Apply).with_ty(fun_ty(
             Type::Tuple(vec![b_ty.clone(), fun_ty(b_ty.clone(), c_ty.clone())]),
             c_ty.clone(),
         ));

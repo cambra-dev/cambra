@@ -122,7 +122,7 @@ pub enum Lit {
 }
 
 /// Arithmetic sub-operations for [`BinOpKind::Arithmetic`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArithmeticKind {
     /// Integer addition (`+`).
     Add,
@@ -135,7 +135,7 @@ pub enum ArithmeticKind {
 }
 
 /// Comparison sub-operations for [`BinOpKind::Compare`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CompareKind {
     /// Equality (`==`).
     Equals,
@@ -152,7 +152,7 @@ pub enum CompareKind {
 }
 
 /// Boolean logic sub-operations for [`BinOpKind::BoolLogic`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LogicKind {
     /// Logical AND.
     And,
@@ -169,7 +169,7 @@ pub enum LogicKind {
 }
 
 /// Binary operation kinds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinOpKind {
     /// An arithmetic operation (add, sub, mul, floor-div).
     Arithmetic(ArithmeticKind),
@@ -208,15 +208,166 @@ impl BinOpKind {
             Self::BoolLogic(LogicKind::Xnor) => "xnor",
         }
     }
+
+    /// Returns the function-style name used when this operator is referenced as
+    /// a built-in primitive (e.g. `"add"`, `"lt"`, `"concat"`).
+    ///
+    /// Lambda elimination desugars `a op b` into
+    /// `Apply(Tuple([a, b]), Builtin(BinOp(op)))`; this is the printable name
+    /// of that built-in, used by [`Builtin::name`] and by the symbolic /
+    /// pretty printers.
+    pub fn fn_name(&self) -> &'static str {
+        match self {
+            Self::Arithmetic(ArithmeticKind::Add) => "add",
+            Self::Arithmetic(ArithmeticKind::Sub) => "sub",
+            Self::Arithmetic(ArithmeticKind::Mul) => "mul",
+            Self::Arithmetic(ArithmeticKind::FloorDiv) => "floor_div",
+            Self::Concat => "concat",
+            Self::Compare(CompareKind::Equals) => "eq",
+            Self::Compare(CompareKind::NotEquals) => "neq",
+            Self::Compare(CompareKind::Less) => "lt",
+            Self::Compare(CompareKind::LessOrEq) => "le",
+            Self::Compare(CompareKind::Greater) => "gt",
+            Self::Compare(CompareKind::GreaterOrEq) => "ge",
+            Self::BoolLogic(LogicKind::And) => "and",
+            Self::BoolLogic(LogicKind::Nand) => "nand",
+            Self::BoolLogic(LogicKind::Or) => "or",
+            Self::BoolLogic(LogicKind::Nor) => "nor",
+            Self::BoolLogic(LogicKind::Xor) => "xor",
+            Self::BoolLogic(LogicKind::Xnor) => "xnor",
+        }
+    }
 }
 
 /// Unary operation kinds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOpKind {
     /// Arithmetic negation (`-x`).
     Neg,
     /// Boolean negation (`not x`).
     Not,
+}
+
+/// Built-in primitive functions used by the lowered point-free CCL.
+///
+/// These are the named combinators that earlier passes used to refer to via
+/// [`TypedExprNode::Var`] with hard-coded magic strings.  Representing them as
+/// a dedicated enum makes it cheap and type-safe for downstream passes
+/// (simplify, join_plan, operator_conversion, …) to recognise primitives
+/// without string matching.
+///
+/// Built-in nodes are produced by [`crate::ccl::lambda_elim`] and
+/// [`crate::ccl::join_plan`]; they never appear in source-lowered CCL prior
+/// to lambda elimination, so type inference does not need to reason about
+/// them — types are stamped onto the surrounding [`TypedExpr`] at the point
+/// each built-in is emitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Builtin {
+    // Categorical combinators (introduced by lambda elimination).
+    /// `id : A → A` — identity morphism.
+    Id,
+    /// `curry : ((A, B) → C) → (A → (B → C))`.
+    Curry,
+    /// `const : A → (B → A)` — lift a value to a constant function.
+    Const,
+    /// `zip : ((A → B), (A → C)) → (A → (B, C))` — point-free product/fanout.
+    Zip,
+    /// `apply : (B, B → C) → C` — function application as a morphism.
+    Apply,
+    /// `map : (B → C) → ((A → B) → (A → C))` — post-composition.
+    Map,
+    /// `map_domain : (A → B) → (A → A)` — domain-to-domain identity stream.
+    MapDomain,
+    /// `compose : ((A → B), (B → C)) → (A → C)` — composition as a morphism.
+    Compose,
+    /// `converse : (A → K) → (K → (A → A))` — group-by-key combinator.
+    Converse,
+    /// `uncurry : (A → (B → C)) → ((A, B) → C)`.
+    Uncurry,
+    /// `restrict` — filter the domain of a function by a predicate.
+    Restrict,
+    /// `permute_domain` — reorder positions in a tuple-typed domain.
+    PermuteDomain,
+    /// `flatten_domain` — flatten selected nested-tuple positions in a domain.
+    FlattenDomain,
+
+    /// A binary scalar operation lifted to a function on a 2-tuple
+    /// (`(a, b) ▷ BinOp(op)`).
+    ///
+    /// Covers all arithmetic / string / comparison / boolean-logic operators;
+    /// the inner [`BinOpKind`] is the single source of truth for which one.
+    /// Lambda elimination desugars `a op b` into this form.
+    BinOp(BinOpKind),
+
+    // Unary scalar ops.
+    /// `neg : Int → Int`.
+    Neg,
+    /// `not_fn : Bool → Bool` — boolean negation as a morphism.
+    NotFn,
+
+    // Aggregations (codomain of a function-typed input → scalar).
+    /// `sum`.
+    Sum,
+    /// `max`.
+    Max,
+}
+
+impl Builtin {
+    /// Stable, source-style display name for this built-in.
+    ///
+    /// Used by [`crate::ccl::symbolic`] and [`crate::ccl::pretty`] for output
+    /// that mirrors the historical magic-string `Var(...)` rendering, so the
+    /// migration to a typed [`Builtin`] enum is invisible to downstream tools.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::Curry => "curry",
+            Self::Const => "const",
+            Self::Zip => "zip",
+            Self::Apply => "apply",
+            Self::Map => "map",
+            Self::MapDomain => "map_domain",
+            Self::Compose => "compose",
+            Self::Converse => "converse",
+            Self::Uncurry => "uncurry",
+            Self::Restrict => "restrict",
+            Self::PermuteDomain => "permute_domain",
+            Self::FlattenDomain => "flatten_domain",
+            Self::BinOp(op) => op.fn_name(),
+            Self::Neg => "neg",
+            Self::NotFn => "not_fn",
+            Self::Sum => "sum",
+            Self::Max => "max",
+        }
+    }
+
+    /// Built-in name for a unary [`UnaryOpKind`].
+    pub fn for_unaryop(op: UnaryOpKind) -> Self {
+        match op {
+            UnaryOpKind::Neg => Self::Neg,
+            UnaryOpKind::Not => Self::NotFn,
+        }
+    }
+
+    /// Built-in name for an [`AggregateKind`].
+    pub fn for_aggregate(kind: AggregateKind) -> Self {
+        match kind {
+            AggregateKind::Sum => Self::Sum,
+            AggregateKind::Max => Self::Max,
+        }
+    }
+}
+
+impl From<BinOpKind> for Builtin {
+    fn from(op: BinOpKind) -> Self {
+        Self::BinOp(op)
+    }
+}
+
+impl fmt::Display for Builtin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// The key identifying which field a [`TypedExprNode::Proj`] projects.
@@ -232,7 +383,7 @@ pub enum ProjKey {
 }
 
 /// Types of aggregations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AggregateKind {
     Sum,
     Max,
@@ -393,6 +544,18 @@ pub enum TypedExprNode {
 
     /// A variable reference by name.
     Var(String),
+
+    /// A reference to a built-in primitive function.
+    ///
+    /// Introduced by [`crate::ccl::lambda_elim`] (and [`crate::ccl::join_plan`])
+    /// to refer to combinators such as `id`, `zip`, `curry`, `apply`, the
+    /// arithmetic / comparison / logic operators, the unary operators, and the
+    /// aggregations.  Replaces the earlier convention of using
+    /// [`TypedExprNode::Var`] with magic strings.  The wrapping
+    /// [`TypedExpr::ty`] holds the (typically polymorphic, instantiated at the
+    /// emission site) function type of the primitive — analogous to how
+    /// `Var(name)` carried its type before.
+    Builtin(Builtin),
 
     /// Curried function application: `f(x)` written `x ▷ f` in pipeline style.
     ///
@@ -658,6 +821,16 @@ impl TypedExpr {
     /// Construct a variable reference expression.
     pub fn var(name: impl Into<String>) -> Self {
         Self::new(TypedExprNode::Var(name.into()))
+    }
+
+    /// Construct a [`TypedExprNode::Builtin`] reference.
+    ///
+    /// Callers are responsible for stamping the appropriate function type via
+    /// [`TypedExpr::with_ty`]; the constructor itself leaves [`TypedExpr::ty`]
+    /// as [`Type::Hole`], matching how the previous magic-string `Var`-based
+    /// emission worked.
+    pub fn builtin(b: Builtin) -> Self {
+        Self::new(TypedExprNode::Builtin(b))
     }
 
     /// Construct a list literal expression.

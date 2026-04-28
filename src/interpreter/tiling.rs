@@ -159,7 +159,7 @@ impl Tiling {
                 BitSet::new(),
             ),
             Tiling::Aggregation { kind, accumulator } => Tile::Aggregation {
-                kind: kind.clone(),
+                kind: *kind,
                 terminal: ColumnValue::Bools(BitVec::new()),
                 accumulator: ColumnValue::from_values(Vec::new(), accumulator),
             },

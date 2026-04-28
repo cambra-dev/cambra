@@ -291,7 +291,7 @@ pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
 fn collect_expr_errors(expr: &Expr, errors: &mut Vec<InferError>) {
     collect_type_errors(&expr.ty, &symbolic(expr), errors);
     match &expr.node {
-        TypedExprNode::Lit(_) | TypedExprNode::Var(_) => {}
+        TypedExprNode::Lit(_) | TypedExprNode::Var(_) | TypedExprNode::Builtin(_) => {}
         TypedExprNode::Apply { function, argument } => {
             collect_expr_errors(function, errors);
             collect_expr_errors(argument, errors);
@@ -494,6 +494,11 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
 
         // Variable references are resolved by the scope at inference time.
         TypedExprNode::Var(_) => {}
+
+        // Built-ins are introduced after type inference (in lambda elimination
+        // and join planning) with their type stamped at the emission site, so
+        // typecheck has nothing to verify here beyond the surrounding node.
+        TypedExprNode::Builtin(_) => {}
 
         TypedExprNode::BinOp { left, op, right } => {
             collect_typecheck_errors(left, errors);
@@ -941,6 +946,14 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
             .cloned()
             .ok_or_else(|| InferError::UnboundVariable(name.clone())),
 
+        // ----- Built-in primitive -----
+        // Built-ins are emitted post-inference (by lambda elimination and join
+        // planning) with their type already stamped onto the node, so they
+        // should not normally reach this pass.  If one does, fall back to the
+        // existing slot rather than raising — the slot was either pre-set by
+        // the caller or replaced by the fresh `Infer` variable above.
+        TypedExprNode::Builtin(_) => Ok(expr.ty.clone()),
+
         // ----- Lambda abstraction -----
         TypedExprNode::Lambda {
             param,
@@ -950,7 +963,7 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
 
         // ----- Aggregation -----
         TypedExprNode::Aggregate { input, kind } => {
-            let kind = kind.clone();
+            let kind = *kind;
             let input_type = infer_expr(input, ctx)?;
             let input_codomain = input_type
                 .codomain()
