@@ -26,8 +26,8 @@ use std::ops::{Deref, DerefMut};
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
 use crate::ccl::BaseType;
 use crate::ccl::{
-    unify::UnificationTable, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey, RefinementKind,
-    Type, TypedExprNode, UnaryOpKind,
+    unify::UnificationTable, AggregateKind, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey,
+    RefinementKind, Type, TypedExprNode, UnaryOpKind,
 };
 use crate::util::ScopeStack;
 
@@ -963,21 +963,21 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
 
         // ----- Aggregation -----
         TypedExprNode::Aggregate { input, kind } => {
-            let kind = *kind;
             let input_type = infer_expr(input, ctx)?;
-            let input_codomain = input_type
-                .codomain()
-                .ok_or_else(|| InferError::TypeMismatch {
-                    ctx: symbolic(expr),
-                    type_a: Type::Fun(
-                        Box::new(Type::Infer(ctx.fresh_infer_var())),
-                        Box::new(Type::Infer(ctx.fresh_infer_var())),
-                    ),
-                    type_b: input_type,
-                })?;
-            kind.output_type(&input_codomain).ok_or_else(|| {
-                InferError::Unsupported(format!("Cannot apply {kind:?} to {input_codomain}"))
-            })
+            // The input is collection-shaped — `Fun(domain, codomain)` — so
+            // refine `input_type` to that shape via unification before reading
+            // off the element type.  This propagates correctly even when
+            // `input_type` is still an unresolved `Infer` variable (e.g. inside
+            // a let-bound function whose call site has not yet been inferred).
+            let fresh_domain = Type::Infer(ctx.fresh_infer_var());
+            let fresh_codomain = Type::Infer(ctx.fresh_infer_var());
+            ctx.constrain_equal(
+                &input_type,
+                &Type::Fun(Box::new(fresh_domain), Box::new(fresh_codomain.clone())),
+            )?;
+            // Per-kind typing rule lives on AggregateKind so adding new
+            // variants (Count, Mean, …) does not require touching this branch.
+            kind.constrain_signature(ctx, &fresh_codomain)
         }
 
         // ----- Function application -----
@@ -1342,6 +1342,37 @@ fn collect_constraints(
     }
 }
 
+impl AggregateKind {
+    /// Apply this kind's per-variant typing rule and return the aggregation's
+    /// output type.
+    ///
+    /// `input_codomain` is the element type of the aggregated collection — i.e.
+    /// the codomain of the function-typed input passed to `Aggregate`.  Each
+    /// variant decides how the input element type relates to the output:
+    ///
+    /// - [`AggregateKind::Sum`]: requires `input_codomain = Int`, returns `Int`.
+    /// - [`AggregateKind::Max`]: returns `input_codomain` unchanged.
+    ///
+    /// Centralising this logic on `AggregateKind` keeps the relationship
+    /// per-variant: future kinds whose output type is independent of (or a
+    /// non-trivial function of) the element type — e.g. `Count: _ → Int`,
+    /// `Mean: Int → Float` — will add their rule here without touching the
+    /// `Aggregate` inference branch.
+    fn constrain_signature(
+        &self,
+        ctx: &mut TypeInferenceContext,
+        input_codomain: &Type,
+    ) -> Result<Type, InferError> {
+        match self {
+            AggregateKind::Sum => {
+                ctx.constrain_equal(input_codomain, &Type::Base(BaseType::Int))?;
+                Ok(Type::Base(BaseType::Int))
+            }
+            AggregateKind::Max => Ok(input_codomain.clone()),
+        }
+    }
+}
+
 /// Infer the type of a [`TypedExprNode::Apply`] node.
 ///
 /// If the function is an unannotated lambda, annotates its parameter type from
@@ -1423,6 +1454,26 @@ fn infer_apply(
                 ctx.constrain_equal(&codomain, &codomain_ty)?;
             }
             Ok(*codomain)
+        }
+        // The function's type is not yet a concrete `Fun`. This arises inside
+        // UDFs with function arguments: in
+        // `λ xs → λ __iter_record → __iter_record ▷ xs ▷ …`, the inner
+        // `Apply { function = Var("xs"), … }` infers `xs` to its bound
+        // inference variable rather than a `Fun(...)`.
+        //
+        // Standard HM refinement: constrain the function's Infer var to
+        // `Fun(arg_ty, fresh)` and return `fresh` as the codomain. Any later
+        // constraint on the Infer var (e.g. unifying `xs` with a concrete list
+        // type at the call site) flows through [`constrain_equal`]'s recursive
+        // case and resolves `fresh` in lockstep.
+        Type::Infer(id) => {
+            let fresh_codomain = Type::Infer(ctx.fresh_infer_var());
+            let fun_ty = Type::Fun(Box::new(arg_ty.clone()), Box::new(fresh_codomain.clone()));
+            ctx.constrain_equal(&Type::Infer(id), &fun_ty)?;
+            if let Some(codomain_ty) = maybe_codomain_ty {
+                ctx.constrain_equal(&fresh_codomain, &codomain_ty)?;
+            }
+            Ok(fresh_codomain)
         }
         ty => unreachable!("Apply function must have function type, got {ty}"),
     }
@@ -2330,8 +2381,9 @@ mod tests {
 
     /// `Sum` over a list of ints: `sum([1, 2, 3])` → `Int`.
     ///
-    /// The input list infers as `Fun(UIntRange(3), Int)`; the codomain is `Int`;
-    /// `Sum.output_type(Int)` → `Int`.
+    /// The input list infers as `Fun(UIntRange(3), Int)`; the constraint
+    /// `input = Fun(_, Int)` together with `Sum`'s fixed output type `Int`
+    /// resolves the result to `Int`.
     #[test]
     fn test_infer_aggregate_sum_int_list() {
         let mut ctx = TypeInferenceContext::new();
@@ -2348,7 +2400,8 @@ mod tests {
 
     /// `Max` over a list of ints: `max([10, 20])` → `Int`.
     ///
-    /// `Max.output_type` accepts any base type, returning it unchanged.
+    /// `Max` has no fixed output type; the result equals the input element
+    /// type (the codomain of the input function), which here is `Int`.
     #[test]
     fn test_infer_aggregate_max_int_list() {
         let mut ctx = TypeInferenceContext::new();
@@ -2375,10 +2428,10 @@ mod tests {
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::String)));
     }
 
-    /// `Sum` over a list of strings → `Unsupported`.
+    /// `Sum` over a list of strings → type error.
     ///
-    /// `Sum.output_type(String)` returns `None`; the aggregate arm converts
-    /// that to `InferError::Unsupported`.
+    /// `Sum` has a fixed output type of `Int`; the constraint approach catches
+    /// the mismatch as `TypeMismatch` (String ≠ Int) rather than `Unsupported`.
     #[test]
     fn test_infer_aggregate_sum_string_unsupported() {
         let mut ctx = TypeInferenceContext::new();
@@ -2390,9 +2443,10 @@ mod tests {
             AggregateKind::Sum,
         );
         assert!(
-            infer(&mut expr, &mut ctx)
-                .is_err_and(|errs| errs.iter().any(|e| matches!(e, InferError::Unsupported(_)))),
-            "Sum over String should be Unsupported"
+            infer(&mut expr, &mut ctx).is_err_and(|errs| errs
+                .iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. }))),
+            "Sum over String should be a type error"
         );
     }
 
@@ -2426,6 +2480,42 @@ mod tests {
             Expr::var("x"),
         );
         let mut expr = Expr::aggregate(comp, AggregateKind::Sum);
+        assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
+    }
+
+    /// `let total = λ xs → sum(xs) in total([1, 2, 3])` — aggregate in a let-bound function.
+    ///
+    /// The lambda is bound in a `Let` rather than immediately applied, so
+    /// `infer_apply`'s eager-annotation path (which sets `param.ty` from the
+    /// argument before descending into the body) does not fire when the lambda
+    /// body is first inferred. `xs` is therefore still an unresolved `Infer`
+    /// variable when the `Aggregate` node is visited.
+    ///
+    /// The old `resolve_type` approach failed here: `resolve_type` on an unsolved
+    /// `Infer` var is a no-op, leaving `Infer(_)`, whose `codomain()` is `None`,
+    /// which produced a `TypeMismatch` error.
+    ///
+    /// The `constrain_equal` approach records `xs = Fun(_, output)` and lets
+    /// unification fill in the concrete types when the call site `total([1,2,3])`
+    /// constrains `xs = Fun(UIntRange(3), Int)`.
+    #[test]
+    fn test_infer_aggregate_input_type_inferred_from_call_site() {
+        let mut ctx = TypeInferenceContext::new();
+        // let total = λ xs → sum(xs) in total([1, 2, 3])
+        let total_fn = Expr::lambda(
+            "xs",
+            Type::infer(),
+            Expr::aggregate(Expr::var("xs"), AggregateKind::Sum),
+        );
+        let call = Expr::apply(
+            Expr::list(vec![
+                Expr::lit(Lit::Int(1)),
+                Expr::lit(Lit::Int(2)),
+                Expr::lit(Lit::Int(3)),
+            ]),
+            Expr::var("total"),
+        );
+        let mut expr = Expr::let_bind("total", total_fn, call);
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
     }
 

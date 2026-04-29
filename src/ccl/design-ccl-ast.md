@@ -14,8 +14,8 @@ Python source
   → lower          (ccl/lower.rs: Python AST → CCL AST, structural only)
   → infer          (ccl/infer.rs: type inference, converts Hole→Infer and fills ty on every node)
   → resolve        (ccl/unify.rs: substitutes solved Infer vars with concrete types)
+  → inline         (ccl/inline.rs::inline_non_iterable_lambdas: inline UDF Let bindings with non-iterable domains; beta-reduce at call sites)
   → lambda_elim    (ccl/lambda_elim.rs: Lambda → point-free combinators)
-  → inline         (ccl/inline.rs: inline scalar function-typed Let bindings)
   → optimize       (tree rewrites on CCL AST, currently just join_plan.rs)
   → convert        (interpreter/operator_conversion.rs: CCL AST → tile operators)
   → subscribe()
@@ -78,10 +78,10 @@ The same distinction applies in CCL:
 
 Python aggregate calls (`sum(xs)`, `max(xs)`) are lowered directly to `Expr::Aggregate` rather than kept as `Apply(Var("sum"), xs)`. This makes aggregate operations structurally distinct from ordinary function calls, which simplifies:
 
-- Type inference: `infer` can derive the output type from `AggregateKind::output_type(input_element_type)` without needing built-in name resolution.
+- Type inference: `infer` constrains the input to `Fun(_, codomain)` via `constrain_equal` and dispatches to `AggregateKind::constrain_signature` for the per-variant element-vs-output-type relationship (`Sum`: requires `codomain = Int`, returns `Int`; `Max`: returns `codomain` unchanged).
 - Compilation: the compiler dispatches on `Expr::Aggregate` and emits the appropriate aggregate operator without scanning call-site variable names.
 
-`AggregateKind` enumerates the supported operations; each variant carries its own typing rule in `output_type`.
+`AggregateKind` enumerates the supported operations; each variant carries its own typing rule on `constrain_signature`. New variants (`Count: _ → Int`, `Mean: Int → Float`, …) add their rule there without touching the `Aggregate` inference branch.
 
 ### Python `lambda` expressions — single `Expr::Lambda` (tupled when multi-arg)
 
@@ -647,58 +647,81 @@ has `bound_ty: None` because the old annotation is stale and would be incorrect.
 
 ## Inlining Pass (`ccl/inline.rs`)
 
-`inline::run` is a pass that runs after `lambda_elim` and before `join_plan`. It
-eliminates `Let` bindings whose bound expression has a scalar function type by
-substituting the body at every call site and dropping the `Let` wrapper.
+`inline_non_iterable_lambdas` runs **after `infer`** and **before `lambda_elim`**.
+It eliminates `Let` bindings whose bound expression is a function over a
+non-iterable domain by substituting the body at every call site, beta-reducing
+each call site as the substitution produces it, and dropping the `Let` wrapper.
 
 ### Motivation
 
-Operator conversion compiles `Let`-bound expressions independently, with
-`input = None`. When the bound expression is a scalar-to-scalar function (domain
-`= Int`, `Bool`, etc.), this causes the operator graph to insert an `IterateExtent`
-for the domain — which panics at runtime ("Attempted to iterate on infinite Extent")
-because base types have no finite enumerable extent.
+Two related problems collapse into one pass:
 
-Inlining at the CCL level threads the call-site argument as `input`, so
-`IterateExtent` is never constructed for the domain.
+- **Scalar UDFs** (e.g. `Fun(Int, Int)`): operator conversion compiles `Let`-bound
+  expressions independently with `input = None`. For a function whose domain is
+  scalar, this causes the operator graph to insert an `IterateExtent` for the
+  domain — which panics at runtime ("Attempted to iterate on infinite Extent")
+  because base types have no finite enumerable extent.
+- **List-producing UDFs** (e.g. generator `def`s, `Fun(Fun(UIntRange, Int), Fun(UIntRange, Int))`):
+  these lower to `λ user_arg → λ __iter_record → body`. If that nested-lambda
+  shape reaches `lambda_elim` intact, the rule emits a `curry` combinator —
+  and `operator_conversion.rs` doesn't implement `curry`, so compilation fails
+  with `unrecognised Var(curry)`.
+
+Inlining at the CCL level threads the call-site argument as `input`, and
+beta-reducing the outer lambda strips the user-parameter layer, leaving a single
+`__iter_record`-wrapping lambda that matches the list-comprehension shape
+`lambda_elim` already handles.
 
 ### What is inlined
 
 A `Let { binding, bound_expr, body }` is inlined when `should_inline(bound_expr.ty)` returns `true`:
 
 - `bound_expr.ty` is `Fun(domain, codomain)`
-- `domain` has an **infinite** (non-enumerable) extent — i.e. `is_infinite_domain(domain)` is `true`
-- `codomain` is **not** itself `Fun` — a defensive narrowing for explicitly-curried UDFs, not a soundness requirement. Syntactic multi-arg Python lambdas are uncurried to tupled-domain functions at lowering, so they have non-Fun codomains and *do* get inlined here. See the comment on `should_inline` in `inline.rs` for the full rationale.
+- `domain` is **not** iterable — i.e. `is_iterable_domain(domain)` is `false`
 
-`is_infinite_domain` returns `true` for:
-- `Base(_)` (Int, String, Bool, etc.)
-- `Tuple(ts)` where **any** component is infinite (e.g. `(UIntRange(3), Int)`)
-- `Record(fields)` where **any** field is infinite — same logic as tuples
-- `Refinement(inner, _)` inheriting the finiteness of `inner`
+`is_iterable_domain` returns `true` for:
+- `UIntRange(_)`, `DataSource(_)` — finite, enumerable
+- `Tuple(ts)` where **all** components are iterable
+- `Record(fields)` where **all** fields are iterable
+- `Refinement(inner, _)` inheriting the iterability of `inner`
 
 And `false` for:
-- `UIntRange(_)`, `DataSource(_)` — finite, enumerable
-- `Fun(_, _)` as domain — collection/generator UDFs; treated as out-of-scope
+- `Base(_)` (Int, String, Bool, etc.) — no finite enumeration of all values
+- `Fun(_, _)` as domain — there are infinitely many possible functions of any
+  given function type, so it cannot be enumerated. This case covers
+  list-producing UDFs whose domain is itself a list-shaped function type.
+
+### Substitution and beta-reduction
+
+At each call site, substitution is paired with beta-reduction of the outer
+user-parameter lambda. Apply chains terminating in `Var(name)` participate in
+beta-reduction; unrelated `Apply(arg, Lambda)` patterns elsewhere in the tree
+are left intact so list-comprehension bodies and scalar BinOp desugaring keep
+the structure `lambda_elim` + `simplify` expect.
+
+Multi-arg call-site bodies contain `Apply(Tuple(…), Proj(Index(i)))` (from the
+uncurried `__arg_pair.i` references). Those literal-tuple projections are
+folded later by `simplify::try_literal_tuple_projection`; this pass leaves
+them in place.
 
 ### Pipeline position
 
 ```
-lambda_elim   →   inline   →   join_plan   →   operator_conversion
+infer   →   inline_non_iterable_lambdas   →   lambda_elim   →   join_plan   →   operator_conversion
 ```
 
 ### Limitations
 
-- **Explicitly curried UDFs** (`lambda x: lambda y: body` in source, or explicit `curry(f)`
-  calls): their `bound_expr.ty` has a `Fun` codomain, so `should_inline` returns `false`
-  and the Let is left intact. Compilation fails cleanly at the bound expression with
-  "unsupported Builtin(curry)" — fixing this requires wiring `curry` as a combinator in
-  `operator_conversion.rs` (follow-up work). Syntactic multi-arg UDFs (`add = lambda x, y:
-  x + y`) are **not** in this category; they're uncurried at lowering and inlined like
-  single-arg scalar UDFs.
+- **Explicitly curried UDFs used unapplied** (e.g. `let f = λ x → λ y → body in g(f)`):
+  `f` is inlined because its domain is non-iterable, but with no call site to
+  beta-reduce against the outer lambda survives, lambda-elim emits `curry`, and
+  compilation fails with "unsupported Builtin(curry)". Fully-applied curried calls
+  (`f(1)(2)`) are fine — beta-reduction collapses both layers. Wiring `curry` in
+  `operator_conversion.rs` is the follow-up that closes this gap entirely.
 - **Collection UDFs** (domain `UIntRange` or `DataSource`): not inlined; they compile
   correctly via `Memo + FanOut` and benefit from sharing.
-- **Body duplication**: a scalar UDF called N times has its body duplicated N times in the
-  operator graph. Acceptable; only collection-typed UDFs warrant caching.
+- **Body duplication**: a UDF called N times has its body duplicated N times in the
+  operator graph. Acceptable for now; only collection-typed UDFs warrant caching.
 - **Recursive UDFs**: unsupported (already noted in `operator_conversion.rs`).
 
 ---

@@ -368,28 +368,24 @@ fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
 // Generator functions — def f(xs): for x in xs: yield expr
 // ---------------------------------------------------------------------------
 
-// Generator functions lower correctly to CCL (covered by unit tests in
-// `src/ccl/lower.rs`), but calling them end-to-end panics in type inference
-// with "Apply function must have function type, got ?N": the `Apply` of the
-// list-typed Let-bound lambda synthesised from the `for`/`yield` body doesn't
-// get a concrete function type before the check in `infer.rs`. Enable when
-// inference propagates through list-producing UDFs.
+// End-to-end tests for calling list-producing user-defined functions (generator
+// `def`s). Lowering is covered by unit tests in `src/ccl/lower.rs`; these check
+// that inference, pre-lambda-elim inline
+// (`ccl::inline::inline_non_iterable_lambdas`), lambda elimination, and operator
+// conversion all compose correctly.
 #[rstest]
 #[timeout(Duration::from_secs(1))]
 // Simple map: yield x * 2
-#[ignore = "inference: Apply on list-typed UDF not yet resolved"]
 #[case(
     "def doubles(xs):\n    for x in xs:\n        yield x * 2\ndoubles([1, 2, 3])",
     make_int_list(&[2, 4, 6])
 )]
 // Map with captured parameter
-#[ignore = "inference: Apply on list-typed UDF not yet resolved"]
 #[case(
     "def add_to(xs, n):\n    for x in xs:\n        yield x + n\nadd_to([1, 2, 3], 10)",
     make_int_list(&[11, 12, 13])
 )]
 // Filter via if-guard
-#[ignore = "inference: Apply on list-typed UDF not yet resolved"]
 #[case(
     "def positives(xs):\n    for x in xs:\n        if x > 0:\n            yield x\npositives([-1, 2, -3, 4])",
     Tile::SealedFunction {
@@ -406,7 +402,6 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
 // Generator function composed with aggregate: sum(doubles([1, 2, 3])) == 12
 #[rstest]
 #[timeout(Duration::from_secs(1))]
-#[ignore = "inference: Apply on list-typed UDF not yet resolved"]
 #[case(
     "def doubles(xs):\n    for x in xs:\n        yield x * 2\nsum(doubles([1, 2, 3]))",
     Value::Int(12)

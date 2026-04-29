@@ -447,6 +447,16 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
                 .collect(),
         ),
 
+        TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
+            input: Box::new(substitute(*input, name, replacement)),
+            kind,
+        },
+
+        TypedExprNode::GroupBy { collection, key } => TypedExprNode::GroupBy {
+            collection: Box::new(substitute(*collection, name, replacement)),
+            key: Box::new(substitute(*key, name, replacement)),
+        },
+
         // Atoms handled above; these shouldn't be reached but return as-is for safety.
         other => other,
     };

@@ -390,16 +390,6 @@ pub enum AggregateKind {
 }
 
 impl AggregateKind {
-    /// Returns the output type of this aggregation given a specific input type.
-    /// If `input_type` is not a valid input type for this aggregation, returns None.
-    pub fn output_type(&self, input_type: &Type) -> Option<Type> {
-        match (self, input_type) {
-            (AggregateKind::Sum, Type::Base(BaseType::Int)) => Some(Type::Base(BaseType::Int)),
-            (AggregateKind::Max, Type::Base(b)) => Some(Type::Base(b.clone())),
-            _ => None,
-        }
-    }
-
     pub fn output_extent(&self, input_extent: &Extent) -> Option<Extent> {
         match (self, input_extent) {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => Some(Extent::Base(BaseType::Int)),

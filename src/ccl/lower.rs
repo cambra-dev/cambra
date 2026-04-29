@@ -635,6 +635,16 @@ fn lower_unaryop(
             ))
         }
     };
+    // Constant-fold `-Int(n)` to `Lit(Int(-n))`. Python's parser leaves negative
+    // numeric literals as `UnaryOp(USub, Lit(n))`, but downstream stages
+    // (`operator_conversion`'s list-literal path in particular) only accept
+    // concrete literals as list elements. Folding here keeps
+    // `[-1, 2, -3, 4]`-style programs in the supported subset.
+    if let UnaryOpKind::Neg = kind {
+        if let TypedExprNode::Lit(Lit::Int(n)) = &inner.node {
+            return Ok(Expr::lit(Lit::Int(-*n)));
+        }
+    }
     Ok(Expr::unary(kind, inner))
 }
 

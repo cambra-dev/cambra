@@ -140,20 +140,24 @@ pub fn compile_program(
     debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
     typecheck(&expr).expect("Inference created invalid expr");
 
-    let lambda_elim = lambda_elim::run(expr).expect("Lambda elim failed");
+    // Inline UDFs: substitute both scalar and list-producing UDF Let bindings
+    // and beta-reduce at each call site before lambda elimination.  This
+    // strips the outer user-parameter lambda from list-producing UDFs so the
+    // remaining Lambda layer matches the list-comprehension shape that
+    // lambda-elim handles, and avoids a runtime panic when operator conversion
+    // would otherwise try to iterate over a scalar's infinite domain.
+    let udfs_inlined = inline::inline_non_iterable_lambdas(expr);
+    debug!("UDFs inlined CCL:\n{}", symbolic(&udfs_inlined));
+    typecheck(&udfs_inlined).expect("type error after UDF inlining");
+
+    let lambda_elim = lambda_elim::run(udfs_inlined).expect("Lambda elim failed");
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
     debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
 
     check_fully_typed(&lambda_elim).expect("missing types");
     typecheck(&lambda_elim).expect("type error after lambda elimination");
 
-    let inlined = inline::run(lambda_elim);
-    debug!("Inlined CCL:\n{}", symbolic(&inlined));
-    debug!("Inlined typed CCL:\n{}", symbolic_typed(&inlined));
-    check_fully_typed(&inlined).expect("missing types after inlining");
-    typecheck(&inlined).expect("type error after inlining");
-
-    let join_planned = join_plan::run(inlined);
+    let join_planned = join_plan::run(lambda_elim);
 
     debug!(
         "Join-planned CCL:\n{} : {}",

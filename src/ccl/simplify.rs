@@ -20,6 +20,7 @@
 //! | Const reduce | `f ≫ g ▷ const` | `g ▷ const` |
 //! | Product beta (fst) | `⟨f, g⟩ ≫ .0` | `f` |
 //! | Product beta (snd) | `⟨f, g⟩ ≫ .1` | `g` |
+//! | Literal tuple projection | `(e₀, …, eₙ).i` | `eᵢ` |
 //! | CCC universal | `⟨.1, .0 ≫ curry(f)⟩ ≫ apply` | `f` |
 //! | Exponential beta | `⟨g, curry(h)⟩ ≫ apply` | `⟨id, g⟩ ≫ h` |
 //! | Exponential eta | `curry(⟨.1, .0 ≫ f⟩ ≫ apply)` | `f` |
@@ -133,6 +134,7 @@ fn apply_simplification_rules(expr: &mut Expr) -> bool {
     changed |= check(try_const_reduce(expr), expr);
     changed |= check(try_product_beta_fst(expr), expr);
     changed |= check(try_product_beta_snd(expr), expr);
+    changed |= check(try_literal_tuple_projection(expr), expr);
     changed |= check(try_ccc_universal(expr), expr);
     changed |= check(try_exponential_beta(expr), expr);
     changed |= check(try_exponential_eta(expr), expr);
@@ -368,6 +370,53 @@ fn try_product_beta_fst(expr: &mut Expr) -> bool {
             vec![elts.swap_remove(0)]
         },
     )
+}
+
+/// Literal tuple projection: `(e₀, …, eₙ).i  ⟹  eᵢ`
+///
+/// Sister rule to product-beta: where product-beta reduces a *zip* of
+/// morphisms followed by a projection, this reduces a *literal tuple value*
+/// followed by a projection.  The rewrite is pure constant folding —
+/// equationally sound anywhere the pattern appears.
+///
+/// In practice this fires on uncurried multi-arg UDF call sites: after
+/// `inline_non_iterable_lambdas` beta-reduces the outer user-parameter lambda,
+/// references like `__arg_pair.0` are left as `Apply(Tuple([list, n]),
+/// Proj(0))`.  Operator conversion's list-element path needs the projection
+/// folded, so this rule must fire before `operator_conversion` runs.
+///
+/// Out-of-range indices are intentionally a no-op: a later pass will surface
+/// the real error rather than silently dropping the access here.
+fn try_literal_tuple_projection(expr: &mut Expr) -> bool {
+    // Look-only check first; if it matches, take ownership and rewrite.
+    let matches = matches!(
+        &expr.node,
+        TypedExprNode::Apply { argument, function }
+            if matches!(&function.node, TypedExprNode::Proj(ProjKey::Index(i))
+                if matches!(&argument.node, TypedExprNode::Tuple(elts) if *i < elts.len()))
+    );
+    if !matches {
+        return false;
+    }
+    let TypedExpr {
+        node: TypedExprNode::Apply { argument, function },
+        ..
+    } = take(expr)
+    else {
+        unreachable!()
+    };
+    let TypedExprNode::Proj(ProjKey::Index(i)) = function.node else {
+        unreachable!()
+    };
+    let TypedExpr {
+        node: TypedExprNode::Tuple(mut elts),
+        ..
+    } = *argument
+    else {
+        unreachable!()
+    };
+    *expr = elts.swap_remove(i);
+    true
 }
 
 /// Product beta (second): `⟨f, g⟩ ≫ .1  ⟹  g`
@@ -887,6 +936,57 @@ mod tests {
         let expr = typed_compose(vec![a.clone(), zip, proj, b.clone()]);
         let expected = typed_compose(vec![a, f, b]);
         assert_eq!(simplify(expr), expected);
+    }
+
+    /// Literal tuple projection: `Apply(Tuple([1, 2]), Proj(.1))  ⟹  2`
+    #[test]
+    fn simplify_literal_tuple_projection_in_range() {
+        let lit1 = Expr::lit(Lit::Int(1)).with_ty(int_ty());
+        let lit2 = Expr::lit(Lit::Int(2)).with_ty(int_ty());
+        let tup_ty = Type::Tuple(vec![int_ty(), int_ty()]);
+        let tuple = Expr::tuple(vec![lit1, lit2.clone()]).with_ty(tup_ty.clone());
+        let proj = proj_idx(1).with_ty(fun_ty(tup_ty, int_ty()));
+        let expr = Expr::apply(tuple, proj).with_ty(int_ty());
+        assert_eq!(simplify(expr), lit2);
+    }
+
+    /// Out-of-range index is left alone — let a later pass surface the real error.
+    #[test]
+    fn simplify_literal_tuple_projection_out_of_range_is_noop() {
+        let lit1 = Expr::lit(Lit::Int(1)).with_ty(int_ty());
+        let tup_ty = Type::Tuple(vec![int_ty()]);
+        let tuple = Expr::tuple(vec![lit1]).with_ty(tup_ty.clone());
+        let proj = proj_idx(5).with_ty(fun_ty(tup_ty, int_ty()));
+        let expr = Expr::apply(tuple, proj).with_ty(int_ty());
+        assert_eq!(simplify(expr.clone()), expr);
+    }
+
+    /// Non-tuple argument: `Apply(Var("xs"), Proj(.0))` is *not* a literal-tuple
+    /// projection — the rule must leave it alone.
+    #[test]
+    fn simplify_literal_tuple_projection_non_tuple_argument_is_noop() {
+        let xs_ty = fun_ty(Type::UIntRange(3), int_ty());
+        let xs = var("xs").with_ty(xs_ty.clone());
+        let proj = proj_idx(0).with_ty(fun_ty(xs_ty, int_ty()));
+        let expr = Expr::apply(xs, proj).with_ty(int_ty());
+        assert_eq!(simplify(expr.clone()), expr);
+    }
+
+    /// Recurses through composition: a `Tuple(…).0` nested inside a Compose
+    /// arm gets folded just like any other simplifiable subterm.
+    #[test]
+    fn simplify_literal_tuple_projection_recurses_into_compose() {
+        let lit1 = Expr::lit(Lit::Int(1)).with_ty(int_ty());
+        let lit2 = Expr::lit(Lit::Int(2)).with_ty(int_ty());
+        let tup_ty = Type::Tuple(vec![int_ty(), int_ty()]);
+        let tuple = Expr::tuple(vec![lit1.clone(), lit2]).with_ty(tup_ty.clone());
+        let proj = proj_idx(0).with_ty(fun_ty(tup_ty, int_ty()));
+        let projection = Expr::apply(tuple, proj).with_ty(int_ty());
+        // Wrap the projection inside a const(...) so it appears as a sub-expression.
+        let wrapped = typed_const(projection, int_ty());
+        let simplified = simplify(wrapped);
+        let expected = typed_const(lit1, int_ty());
+        assert_eq!(simplified, expected);
     }
 
     /// Product beta (second): ⟨f, g⟩ ≫ .1  ⟹  g
