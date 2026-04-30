@@ -158,6 +158,9 @@ impl Extent {
                 Extent::record(field_extents)
             }
             Value::ComputableFunction(_) => todo!(),
+            // Union values carry only their inner value; the full union extent requires
+            // knowledge of all variant types, which is tracked at the operator level.
+            Value::Union { inner, .. } => Self::for_value(inner),
         }
     }
 
@@ -466,6 +469,11 @@ pub enum Value {
     /// A record value
     Record(HashMap<String, Value>),
     ComputableFunction(FunctionDef),
+    /// A tagged union value: `tag` identifies which variant, `inner` is the actual value.
+    Union {
+        tag: usize,
+        inner: Box<Value>,
+    },
 }
 
 impl Hash for Value {
@@ -488,6 +496,10 @@ impl Hash for Value {
                 }
             }
             Value::ComputableFunction(f) => f.hash(state),
+            Value::Union { tag, inner } => {
+                tag.hash(state);
+                inner.hash(state);
+            }
         }
     }
 }
@@ -547,6 +559,23 @@ impl PartialOrd for Value {
                     None
                 }
             }
+            Value::Union { tag, inner } => {
+                if let Value::Union {
+                    tag: o_tag,
+                    inner: o_inner,
+                } = other
+                {
+                    tag.partial_cmp(o_tag).and_then(|o| {
+                        if o.is_eq() {
+                            inner.partial_cmp(o_inner)
+                        } else {
+                            Some(o)
+                        }
+                    })
+                } else {
+                    None
+                }
+            }
             _ => todo!("Ordering not implemented yet: {self:?}"),
         }
     }
@@ -577,6 +606,7 @@ impl std::fmt::Display for Value {
             }
             Value::Record(fields) => fmt_record(f, fields),
             Value::ComputableFunction(fun) => write!(f, "{fun}"),
+            Value::Union { tag, inner } => write!(f, "Union[{tag}]({inner})"),
         }
     }
 }
@@ -729,6 +759,17 @@ pub enum ColumnValue {
         outputs: Box<ColumnValue>,
     },
     Records(HashMap<String, ColumnValue>),
+    /// A tagged union column: each element belongs to one of several typed variants.
+    ///
+    /// `tags[i]` is the 0-based variant index for element `i`.
+    /// `variants[j]` holds only the elements whose tag equals `j`, in the order
+    /// they appear in the overall sequence.  The total element count is `tags.len()`.
+    Union {
+        /// Variant index for each element.
+        tags: Vec<usize>,
+        /// Per-variant column; `variants[j].len()` equals the count of `j`s in `tags`.
+        variants: Vec<ColumnValue>,
+    },
 }
 
 impl ColumnValue {
@@ -757,6 +798,15 @@ impl ColumnValue {
             }
             ColumnValue::Records(r) => {
                 Value::Record(r.iter().map(|(k, v)| (k.clone(), v.index_at(i))).collect())
+            }
+            ColumnValue::Union { tags, variants } => {
+                let tag = tags[i];
+                // Count how many elements before index i belong to the same variant.
+                let variant_idx = tags[..i].iter().filter(|&&t| t == tag).count();
+                Value::Union {
+                    tag,
+                    inner: Box::new(variants[tag].index_at(variant_idx)),
+                }
             }
         }
     }
@@ -826,6 +876,25 @@ impl ColumnValue {
             Extent::DataSourceDomain(d) => {
                 ColumnValue::from_values(values, &d.borrow().element_extent())
             }
+            Extent::Union(sub_extents) => {
+                let mut tags: Vec<usize> = Vec::with_capacity(values.len());
+                let mut per_variant: Vec<Vec<Value>> = vec![Vec::new(); sub_extents.len()];
+                for v in values {
+                    let Value::Union { tag, inner } = v else {
+                        panic!("Expected Value::Union in from_values for Union extent, got {v:?}");
+                    };
+                    tags.push(tag);
+                    per_variant[tag].push(*inner);
+                }
+                ColumnValue::Union {
+                    tags,
+                    variants: per_variant
+                        .into_iter()
+                        .zip(sub_extents.iter())
+                        .map(|(vals, ext)| ColumnValue::from_values(vals, ext))
+                        .collect(),
+                }
+            }
             _ => ColumnValue::Variants(values),
         }
     }
@@ -883,6 +952,42 @@ impl ColumnValue {
                         .collect(),
                 )
             }
+            ColumnValue::Union { tags, variants } => {
+                let selected_indices: Vec<usize> = indices.collect();
+                // Build the new tags for selected elements.
+                let new_tags: Vec<usize> = selected_indices.iter().map(|&i| tags[i]).collect();
+                // Count per-variant totals in the original so we can map positions.
+                let mut variant_counts: Vec<usize> = vec![0; variants.len()];
+                for &t in tags.iter() {
+                    variant_counts[t] += 1;
+                }
+                // For each original position, record which variant-local index it is.
+                let mut running: Vec<usize> = vec![0; variants.len()];
+                let mut per_element_variant_idx: Vec<usize> = Vec::with_capacity(tags.len());
+                for &t in tags.iter() {
+                    per_element_variant_idx.push(running[t]);
+                    running[t] += 1;
+                }
+                // For each variant, collect the variant-local indices we want to keep.
+                let mut per_variant_selection: Vec<Vec<usize>> = vec![Vec::new(); variants.len()];
+                for &orig_idx in &selected_indices {
+                    let t = tags[orig_idx];
+                    per_variant_selection[t].push(per_element_variant_idx[orig_idx]);
+                }
+                let new_variants: Vec<ColumnValue> = variants
+                    .iter()
+                    .enumerate()
+                    .map(|(j, cv)| {
+                        let sel = &per_variant_selection[j];
+                        let len = sel.len();
+                        cv.select_indices(sel.iter().cloned(), len)
+                    })
+                    .collect();
+                ColumnValue::Union {
+                    tags: new_tags,
+                    variants: new_variants,
+                }
+            }
         }
     }
 
@@ -904,6 +1009,7 @@ impl ColumnValue {
                 result
             }
             ColumnValue::FunctionBindings { inputs, .. } => inputs.len(),
+            ColumnValue::Union { tags, .. } => tags.len(),
         }
     }
 
@@ -945,6 +1051,13 @@ impl ColumnValue {
                     })
             }
             (ColumnValue::FunctionBindings { .. }, Extent::Function { .. }) => true,
+            (ColumnValue::Union { variants, .. }, Extent::Union(ext_variants)) => {
+                variants.len() == ext_variants.len()
+                    && variants
+                        .iter()
+                        .zip(ext_variants.iter())
+                        .all(|(cv, e)| cv.is_compatible_with_extent(e))
+            }
             // Variants is the fallback used for Union, unknown, etc.
             (ColumnValue::Variants(_), _) => true,
             _ => false,
@@ -987,6 +1100,14 @@ impl ColumnValue {
                         .map(|e| (e.0.clone(), e.1.as_single().expect("Not single").clone()))
                         .collect(),
                 )),
+                ColumnValue::Union { tags, variants } => {
+                    let tag = tags[0];
+                    let inner = variants[tag].as_single()?;
+                    Some(Value::Union {
+                        tag,
+                        inner: Box::new(inner),
+                    })
+                }
             }
         } else {
             None
@@ -1040,6 +1161,23 @@ impl ColumnValue {
                 let n = m.values().next().map(|v| v.len()).unwrap_or(0);
                 Box::new((0..n).map(move |i| {
                     Value::Record(m.iter().map(|(k, v)| (k.clone(), v.index_at(i))).collect())
+                }))
+            }
+            ColumnValue::Union { tags, variants } => {
+                let tags = take(tags);
+                let n = tags.len();
+                // Snapshot the variants so the closure can own them.
+                let variants = variants.to_vec();
+                // Build per-variant running counts so we can derive variant-local indices.
+                let mut running: Vec<usize> = vec![0; variants.len()];
+                Box::new((0..n).map(move |i| {
+                    let tag = tags[i];
+                    let vi = running[tag];
+                    running[tag] += 1;
+                    Value::Union {
+                        tag,
+                        inner: Box::new(variants[tag].index_at(vi)),
+                    }
                 }))
             }
         }
@@ -1120,13 +1258,29 @@ impl ColumnValue {
                         .append(v);
                 }
             }
+            (
+                ColumnValue::Union {
+                    tags: st,
+                    variants: sv,
+                },
+                ColumnValue::Union {
+                    tags: ot,
+                    variants: ov,
+                },
+            ) => {
+                assert_eq!(sv.len(), ov.len(), "Union append: variant count mismatch");
+                st.extend(ot);
+                for (s, o) in sv.iter_mut().zip(ov) {
+                    s.append(o);
+                }
+            }
             _ => panic!("Mismatched ColumnValue variants in append"),
         }
     }
 
     /// Retain only elements where `mask[i]` is true, in-place.
     ///
-    /// Does not preserve element ordering; uses swap-remove to avoid shifting data.
+    /// Not guaranteed to preserve element ordering; when possible, uses swap-remove to avoid shifting data.
     pub fn retain(&mut self, mask: &BitVec) {
         assert_eq!(
             mask.len(),
@@ -1174,6 +1328,41 @@ impl ColumnValue {
             ColumnValue::Records(r) => {
                 for v in r.values_mut() {
                     v.retain(mask);
+                }
+            }
+            ColumnValue::Union { tags, variants } => {
+                // Build per-variant masks, then retain in each variant.
+                let mut per_variant_mask: Vec<BitVec> = variants
+                    .iter()
+                    .map(|v| BitVec::from_elem(v.len(), false))
+                    .collect();
+                let mut running: Vec<usize> = vec![0; variants.len()];
+                for (i, &t) in tags.iter().enumerate() {
+                    let vi = running[t];
+                    running[t] += 1;
+                    if mask[i] {
+                        per_variant_mask[t].set(vi, true);
+                    }
+                }
+                let new_tags: Vec<usize> = tags
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| mask[*i])
+                    .map(|(_, &t)| t)
+                    .collect();
+                *tags = new_tags;
+                for (v, m) in variants.iter_mut().zip(per_variant_mask.iter()) {
+                    // Use select_indices for a stable retain that preserves source order.
+                    // retain_vec is order-unstable: it swaps dropped slots with values from the
+                    // end, which would misalign variant values against the (stably-filtered) tags.
+                    let kept: Vec<usize> = m
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, b)| *b)
+                        .map(|(i, _)| i)
+                        .collect();
+                    let len = kept.len();
+                    *v = v.select_indices(kept.into_iter(), len);
                 }
             }
         }
@@ -1320,6 +1509,99 @@ mod tests {
         let mask = BitVec::from_elem(3, false);
         retain_vec(&mut v, &mask);
         assert!(v.is_empty());
+    }
+
+    // --- ColumnValue::Union retain tests ---
+
+    /// Helper: build a `ColumnValue::Union` from parallel tag/value slices.
+    ///
+    /// `rows` is `(tag, value)` in source order.  Values for a given tag must
+    /// be `Value::Int`; each variant column is `ColumnValue::Ints`.
+    fn make_union_cv(rows: &[(usize, i64)], n_variants: usize) -> ColumnValue {
+        let tags: Vec<usize> = rows.iter().map(|(t, _)| *t).collect();
+        let mut per_variant: Vec<Vec<i64>> = vec![Vec::new(); n_variants];
+        for (t, v) in rows {
+            per_variant[*t].push(*v);
+        }
+        ColumnValue::Union {
+            tags,
+            variants: per_variant.into_iter().map(ColumnValue::Ints).collect(),
+        }
+    }
+
+    fn mask(bits: &[bool]) -> BitVec {
+        let mut bv = BitVec::from_elem(bits.len(), false);
+        for (i, &b) in bits.iter().enumerate() {
+            bv.set(i, b);
+        }
+        bv
+    }
+
+    /// Keeping all rows leaves the column unchanged.
+    #[test]
+    fn retain_union_keep_all() {
+        // rows: tag0→1, tag1→10, tag0→2, tag1→20
+        let mut cv = make_union_cv(&[(0, 1), (1, 10), (0, 2), (1, 20)], 2);
+        cv.retain(&mask(&[true, true, true, true]));
+        assert_eq!(cv, make_union_cv(&[(0, 1), (1, 10), (0, 2), (1, 20)], 2));
+    }
+
+    /// Dropping all rows yields empty tags and empty variant columns.
+    #[test]
+    fn retain_union_drop_all() {
+        let mut cv = make_union_cv(&[(0, 1), (1, 10), (0, 2)], 2);
+        cv.retain(&mask(&[false, false, false]));
+        let ColumnValue::Union { tags, variants } = &cv else {
+            panic!("expected Union");
+        };
+        assert!(tags.is_empty());
+        assert!(variants.iter().all(|v| v.is_empty()));
+    }
+
+    /// Dropping a row from one variant removes only that variant's value,
+    /// leaving the other variant's values untouched.
+    #[test]
+    fn retain_union_drop_one_from_each_variant() {
+        // Source order: tag0→1, tag1→10, tag0→2, tag1→20
+        // Keep rows 0 and 3 (tag0→1, tag1→20); drop rows 1 and 2.
+        let mut cv = make_union_cv(&[(0, 1), (1, 10), (0, 2), (1, 20)], 2);
+        cv.retain(&mask(&[true, false, false, true]));
+        let ColumnValue::Union { tags, variants } = &cv else {
+            panic!("expected Union");
+        };
+        assert_eq!(tags, &[0, 1]);
+        assert_eq!(variants[0], ColumnValue::Ints(vec![1]));
+        assert_eq!(variants[1], ColumnValue::Ints(vec![20]));
+    }
+
+    /// Keeping only rows from one variant empties the other variant's column.
+    #[test]
+    fn retain_union_keep_only_one_variant() {
+        // Source order: tag0→1, tag1→10, tag0→2
+        // Keep only the two tag-0 rows.
+        let mut cv = make_union_cv(&[(0, 1), (1, 10), (0, 2)], 2);
+        cv.retain(&mask(&[true, false, true]));
+        let ColumnValue::Union { tags, variants } = &cv else {
+            panic!("expected Union");
+        };
+        assert_eq!(tags, &[0, 0]);
+        assert_eq!(variants[0], ColumnValue::Ints(vec![1, 2]));
+        assert_eq!(variants[1], ColumnValue::Ints(vec![]));
+    }
+
+    /// Retaining consecutive rows from the middle preserves source order within each variant.
+    #[test]
+    fn retain_union_preserves_variant_order() {
+        // Source order: tag0→10, tag0→20, tag1→100, tag0→30, tag1→200
+        // Keep rows 1,2,3 (tag0→20, tag1→100, tag0→30); drop first and last.
+        let mut cv = make_union_cv(&[(0, 10), (0, 20), (1, 100), (0, 30), (1, 200)], 2);
+        cv.retain(&mask(&[false, true, true, true, false]));
+        let ColumnValue::Union { tags, variants } = &cv else {
+            panic!("expected Union");
+        };
+        assert_eq!(tags, &[0, 1, 0]);
+        assert_eq!(variants[0], ColumnValue::Ints(vec![20, 30]));
+        assert_eq!(variants[1], ColumnValue::Ints(vec![100]));
     }
 
     // --- Display tests ---

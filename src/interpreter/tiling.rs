@@ -597,6 +597,8 @@ impl Tile {
     }
 
     /// Removes all data in this tile that is specified by the guard.
+    /// TODO: the index_at calls here aren't very efficient; we should optmize this by applying the
+    /// predicates in a more columnar way.
     pub fn remove_guarded(&mut self, guard: TileGuard) {
         match (&mut *self, guard) {
             // If the guard is empty, do nothing.
@@ -1064,6 +1066,15 @@ pub enum Predicate {
     /// Invariant: arms never directly nest another `Or` (always flattened by
     /// [`Predicate::flatten_or`]).
     Or(Vec<Predicate>),
+    /// Predicate over a discriminated-union domain.
+    ///
+    /// `variants[i]` is the predicate for elements whose tag equals `i`.
+    /// Admits a value `Union { tag, inner }` iff `variants[tag].contains(inner)`.
+    /// Semantically equivalent to `Or` of per-variant predicates, but preserving
+    /// the tag structure for efficient dispatch.
+    ///
+    /// Invariant: `variants.len()` matches the number of variants in the domain.
+    Union(Vec<Predicate>),
 }
 
 impl Predicate {
@@ -1121,6 +1132,16 @@ impl Predicate {
                 if arms.iter().any(|p| p.as_bool() == Some(true)) {
                     Some(true)
                 } else if arms.iter().all(|p| p.as_bool() == Some(false)) {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            // Union is true if every variant is true; false if every variant is false.
+            Predicate::Union(ps) => {
+                if ps.iter().all(|p| p.as_bool() == Some(true)) {
+                    Some(true)
+                } else if ps.iter().all(|p| p.as_bool() == Some(false)) {
                     Some(false)
                 } else {
                     None
@@ -1222,6 +1243,20 @@ impl Predicate {
             (_, Predicate::Or(arms)) => {
                 Predicate::flatten_or(arms.iter().map(|a| self.intersect(a)).collect())
             }
+            // Union: intersect per variant.
+            (Predicate::Union(ps), Predicate::Union(qs)) => {
+                assert_eq!(
+                    ps.len(),
+                    qs.len(),
+                    "Union intersect: variant count mismatch"
+                );
+                Predicate::Union(
+                    ps.iter()
+                        .zip(qs.iter())
+                        .map(|(p, q)| p.intersect(q))
+                        .collect(),
+                )
+            }
             _ => panic!("Cannot intersect incompatible predicates: {self:?} and {other:?}"),
         }
     }
@@ -1301,6 +1336,11 @@ impl Predicate {
                 }
                 res
             }
+            // Union: subtract per variant.
+            (Predicate::Union(ps), Predicate::Union(qs)) => {
+                assert_eq!(ps.len(), qs.len(), "Union minus: variant count mismatch");
+                Predicate::Union(ps.iter().zip(qs.iter()).map(|(p, q)| p.minus(q)).collect())
+            }
             _ => panic!("Cannot subtract incompatible predicates: {self:?} minus {other:?}"),
         }
     }
@@ -1344,6 +1384,11 @@ impl Predicate {
                 new_arms.extend(arms.iter().cloned());
                 Predicate::flatten_or(new_arms)
             }
+            // Union: union per variant.
+            (Predicate::Union(ps), Predicate::Union(qs)) => {
+                assert_eq!(ps.len(), qs.len(), "Union union: variant count mismatch");
+                Predicate::Union(ps.iter().zip(qs.iter()).map(|(p, q)| p.union(q)).collect())
+            }
             _ => panic!("Cannot union incompatible predicates: {self:?} and {other:?}"),
         }
     }
@@ -1366,6 +1411,11 @@ impl Predicate {
             },
             // Or: value is admitted if any arm admits it.
             Predicate::Or(arms) => arms.iter().any(|a| a.contains(value)),
+            // Union: value is admitted if the per-variant predicate for its tag admits its inner value.
+            Predicate::Union(ps) => match value {
+                Value::Union { tag, inner } => ps.get(*tag).is_some_and(|p| p.contains(inner)),
+                _ => false,
+            },
         }
     }
 
@@ -1417,6 +1467,11 @@ impl Predicate {
             (Predicate::Or(arms), _) => arms.iter().any(|a| a.subsumes(other)),
             // self subsumes a union iff it subsumes every arm.
             (_, Predicate::Or(arms)) => arms.iter().all(|a| self.subsumes(a)),
+            // Union: self ⊇ other iff every per-variant predicate of self subsumes
+            // the corresponding variant of other.
+            (Predicate::Union(ps), Predicate::Union(qs)) if ps.len() == qs.len() => {
+                ps.iter().zip(qs.iter()).all(|(p, q)| p.subsumes(q))
+            }
             // Incompatible variants (e.g. Record vs LessThanEq): conservative false.
             _ => false,
         }
@@ -1476,6 +1531,13 @@ impl Predicate {
             ColumnValue::FunctionBindings { .. } => {
                 panic!("Cannot build predicate from FunctionBindings")
             }
+            // Union domains: build one predicate per variant, tracking tags separately.
+            ColumnValue::Union { tags, variants } => {
+                if tags.is_empty() {
+                    return Predicate::False;
+                }
+                Predicate::Union(variants.iter().map(Predicate::from_column_value).collect())
+            }
         }
     }
 
@@ -1523,6 +1585,17 @@ impl Predicate {
             },
             // Every arm must be applicable to the same extent.
             Predicate::Or(arms) => arms.iter().all(|p| p.is_applicable_to(&extent)),
+            // Union: each per-variant predicate must be applicable to its variant extent.
+            Predicate::Union(ps) => match &extent {
+                Extent::Union(ext_variants) => {
+                    ps.len() == ext_variants.len()
+                        && ps
+                            .iter()
+                            .zip(ext_variants.iter())
+                            .all(|(p, e)| p.is_applicable_to(e))
+                }
+                _ => false,
+            },
         }
     }
 }
@@ -4026,5 +4099,249 @@ mod tests {
         // One arm is an Int interval, the other is a UInt interval — mismatch against int().
         let pred = Predicate::Or(vec![int_intervals(&[1]), uint_intervals(&[2])]);
         assert!(!pred.is_applicable_to(&int()));
+    }
+
+    // ── Predicate::Union ──────────────────────────────────────────────────────
+
+    fn union_ext() -> Extent {
+        Extent::Union(vec![int(), bool_ext()])
+    }
+
+    fn union_pred(p0: Predicate, p1: Predicate) -> Predicate {
+        Predicate::Union(vec![p0, p1])
+    }
+
+    fn union_val(tag: usize, inner: Value) -> Value {
+        Value::Union {
+            tag,
+            inner: Box::new(inner),
+        }
+    }
+
+    // from_column_value
+
+    #[test]
+    fn union_from_column_value_empty_tags_is_false() {
+        let cv = ColumnValue::Union {
+            tags: vec![],
+            variants: vec![ColumnValue::Ints(vec![]), ColumnValue::Bools(BitVec::new())],
+        };
+        assert_eq!(Predicate::from_column_value(&cv), Predicate::False);
+    }
+
+    #[test]
+    fn union_from_column_value_builds_per_variant_predicate() {
+        let cv = ColumnValue::Union {
+            tags: vec![0, 1, 0],
+            variants: vec![ColumnValue::Ints(vec![1, 3]), ColumnValue::Ints(vec![7])],
+        };
+        let pred = Predicate::from_column_value(&cv);
+        assert!(matches!(pred, Predicate::Union(ref ps) if ps.len() == 2));
+        // Tag-0 predicate admits 1 and 3 but not 7.
+        assert!(pred.contains(&union_val(0, Value::Int(1))));
+        assert!(pred.contains(&union_val(0, Value::Int(3))));
+        assert!(!pred.contains(&union_val(0, Value::Int(7))));
+        // Tag-1 predicate admits 7 but not 1.
+        assert!(pred.contains(&union_val(1, Value::Int(7))));
+        assert!(!pred.contains(&union_val(1, Value::Int(1))));
+    }
+
+    // as_bool
+
+    #[test]
+    fn union_as_bool_all_true_is_true() {
+        assert_eq!(
+            union_pred(Predicate::True, Predicate::True).as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn union_as_bool_all_false_is_false() {
+        assert_eq!(
+            union_pred(Predicate::False, Predicate::False).as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn union_as_bool_mixed_is_none() {
+        assert_eq!(
+            union_pred(Predicate::True, Predicate::False).as_bool(),
+            None
+        );
+    }
+
+    #[test]
+    fn union_as_bool_interval_variant_is_none() {
+        assert_eq!(
+            union_pred(Predicate::True, int_intervals(&[1])).as_bool(),
+            None
+        );
+    }
+
+    // contains
+
+    #[test]
+    fn union_contains_matching_tag_and_inner() {
+        let pred = union_pred(int_intervals(&[5]), Predicate::True);
+        assert!(pred.contains(&union_val(0, Value::Int(5))));
+    }
+
+    #[test]
+    fn union_contains_rejects_wrong_inner() {
+        let pred = union_pred(int_intervals(&[5]), Predicate::True);
+        assert!(!pred.contains(&union_val(0, Value::Int(9))));
+    }
+
+    #[test]
+    fn union_contains_dispatches_by_tag() {
+        // Tag 1 is Predicate::True so any inner is accepted; tag 0 is False so nothing is.
+        let pred = union_pred(Predicate::False, Predicate::True);
+        assert!(!pred.contains(&union_val(0, Value::Int(0))));
+        assert!(pred.contains(&union_val(1, Value::Int(99))));
+    }
+
+    #[test]
+    fn union_contains_rejects_non_union_value() {
+        let pred = union_pred(Predicate::True, Predicate::True);
+        assert!(!pred.contains(&Value::Int(0)));
+    }
+
+    // subsumes
+
+    #[test]
+    fn union_subsumes_element_wise_both_true() {
+        let broad = union_pred(Predicate::True, Predicate::True);
+        let narrow = union_pred(int_intervals(&[1, 2]), int_intervals(&[3]));
+        assert!(broad.subsumes(&narrow));
+        assert!(!narrow.subsumes(&broad));
+    }
+
+    #[test]
+    fn union_subsumes_identical_predicates() {
+        let pred = union_pred(int_intervals(&[1]), int_intervals(&[2]));
+        assert!(pred.subsumes(&pred));
+    }
+
+    #[test]
+    fn union_does_not_subsume_when_one_variant_larger() {
+        let a = union_pred(int_intervals(&[1]), Predicate::True);
+        let b = union_pred(Predicate::True, Predicate::True);
+        // a's tag-0 predicate is narrower than b's, so a does not subsume b.
+        assert!(!a.subsumes(&b));
+    }
+
+    // intersect
+
+    #[test]
+    fn union_intersect_element_wise() {
+        let a = union_pred(int_intervals(&[1, 2, 3]), int_intervals(&[10, 20]));
+        let b = union_pred(int_intervals(&[2, 3, 4]), int_intervals(&[20, 30]));
+        let result = a.intersect(&b);
+        // Tag-0: {1,2,3} ∩ {2,3,4} = {2,3}
+        assert!(result.contains(&union_val(0, Value::Int(2))));
+        assert!(result.contains(&union_val(0, Value::Int(3))));
+        assert!(!result.contains(&union_val(0, Value::Int(1))));
+        assert!(!result.contains(&union_val(0, Value::Int(4))));
+        // Tag-1: {10,20} ∩ {20,30} = {20}
+        assert!(result.contains(&union_val(1, Value::Int(20))));
+        assert!(!result.contains(&union_val(1, Value::Int(10))));
+    }
+
+    #[test]
+    fn union_intersect_with_false_variant_yields_false_variant() {
+        let a = union_pred(int_intervals(&[1]), Predicate::True);
+        let b = union_pred(Predicate::False, Predicate::True);
+        let result = a.intersect(&b);
+        assert!(!result.contains(&union_val(0, Value::Int(1))));
+        assert!(result.contains(&union_val(1, Value::Int(42))));
+    }
+
+    // minus
+
+    #[test]
+    fn union_minus_element_wise() {
+        let a = union_pred(int_intervals(&[1, 2, 3]), int_intervals(&[10, 20]));
+        let b = union_pred(int_intervals(&[2]), int_intervals(&[10]));
+        let result = a.minus(&b);
+        // Tag-0: {1,2,3} ∖ {2} = {1,3}
+        assert!(result.contains(&union_val(0, Value::Int(1))));
+        assert!(!result.contains(&union_val(0, Value::Int(2))));
+        assert!(result.contains(&union_val(0, Value::Int(3))));
+        // Tag-1: {10,20} ∖ {10} = {20}
+        assert!(!result.contains(&union_val(1, Value::Int(10))));
+        assert!(result.contains(&union_val(1, Value::Int(20))));
+    }
+
+    #[test]
+    fn union_minus_false_leaves_original() {
+        let a = union_pred(int_intervals(&[5]), int_intervals(&[6]));
+        let b = union_pred(Predicate::False, Predicate::False);
+        let result = a.minus(&b);
+        assert!(result.contains(&union_val(0, Value::Int(5))));
+        assert!(result.contains(&union_val(1, Value::Int(6))));
+    }
+
+    // union (method)
+
+    #[test]
+    fn union_method_element_wise() {
+        let a = union_pred(int_intervals(&[1, 2]), int_intervals(&[10]));
+        let b = union_pred(int_intervals(&[3, 4]), int_intervals(&[20]));
+        let result = a.union(&b);
+        // Tag-0: {1,2} ∪ {3,4} = {1,2,3,4}
+        for v in [1, 2, 3, 4] {
+            assert!(result.contains(&union_val(0, Value::Int(v))));
+        }
+        assert!(!result.contains(&union_val(0, Value::Int(5))));
+        // Tag-1: {10} ∪ {20} = {10,20}
+        assert!(result.contains(&union_val(1, Value::Int(10))));
+        assert!(result.contains(&union_val(1, Value::Int(20))));
+    }
+
+    #[test]
+    fn union_method_with_true_yields_true_per_variant() {
+        let a = union_pred(int_intervals(&[1]), Predicate::False);
+        let b = union_pred(Predicate::True, Predicate::False);
+        let result = a.union(&b);
+        assert!(result.contains(&union_val(0, Value::Int(999))));
+        assert!(!result.contains(&union_val(1, Value::Int(1))));
+    }
+
+    // is_applicable_to
+
+    #[test]
+    fn applicable_union_predicate_to_matching_union_extent() {
+        let pred = union_pred(Predicate::True, Predicate::False);
+        assert!(pred.is_applicable_to(&union_ext()));
+    }
+
+    #[test]
+    fn applicable_union_predicate_with_typed_variants() {
+        let pred = union_pred(int_intervals(&[1, 2]), Predicate::True);
+        assert!(pred.is_applicable_to(&union_ext()));
+    }
+
+    #[test]
+    fn applicable_union_predicate_rejects_scalar_extent() {
+        let pred = union_pred(Predicate::True, Predicate::True);
+        assert!(!pred.is_applicable_to(&int()));
+    }
+
+    #[test]
+    fn applicable_union_predicate_rejects_wrong_variant_count() {
+        // Predicate has 2 variants but the extent has 3.
+        let pred = union_pred(Predicate::True, Predicate::True);
+        let three_variant_ext = Extent::Union(vec![int(), bool_ext(), int()]);
+        assert!(!pred.is_applicable_to(&three_variant_ext));
+    }
+
+    #[test]
+    fn applicable_union_predicate_rejects_wrong_variant_type() {
+        // Tag-0 predicate is an Int interval but the extent says Bool for tag 0.
+        let pred = union_pred(int_intervals(&[1]), Predicate::True);
+        let swapped = Extent::Union(vec![bool_ext(), int()]);
+        assert!(!pred.is_applicable_to(&swapped));
     }
 }

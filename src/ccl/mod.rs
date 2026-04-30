@@ -190,6 +190,15 @@ pub enum BinOpKind {
     Concat,
     /// A comparison that produces a boolean result.
     Compare(CompareKind),
+    /// Collection union (`@`): merges two function-typed values into one.
+    ///
+    /// `Fun(A, B) @ Fun(C, D)` yields `Fun(Union(A, C), dedup(B, D))`.
+    /// The domain union is never deduplicated; the codomain union is.
+    ///
+    /// TODO the use of @ is temporary; it was just a convenient unused symbol
+    /// that we are unlikely to need soon for anything else.
+    /// Actual syntax TBD.
+    CollectionUnion,
 }
 
 impl BinOpKind {
@@ -217,6 +226,7 @@ impl BinOpKind {
             Self::BoolLogic(LogicKind::Nor) => "nor",
             Self::BoolLogic(LogicKind::Xor) => "xor",
             Self::BoolLogic(LogicKind::Xnor) => "xnor",
+            Self::CollectionUnion => "@",
         }
     }
 
@@ -246,6 +256,7 @@ impl BinOpKind {
             Self::BoolLogic(LogicKind::Nor) => "nor",
             Self::BoolLogic(LogicKind::Xor) => "xor",
             Self::BoolLogic(LogicKind::Xnor) => "xnor",
+            Self::CollectionUnion => "collection_union",
         }
     }
 }
@@ -321,6 +332,13 @@ pub enum Builtin {
     Sum,
     /// `max`.
     Max,
+
+    /// `collection_union : (Fun(A, B), Fun(C, D)) → Fun(Union(A, C), dedup(B, D))`
+    ///
+    /// Merges two function-typed (collection) values into a single collection whose
+    /// domain is the discriminated union of both input domains and whose codomain is
+    /// the deduplicated union of both input codomains.  Lowered from Python `a @ b`.
+    CollectionUnion,
 }
 
 impl Builtin {
@@ -349,6 +367,7 @@ impl Builtin {
             Self::NotFn => "not_fn",
             Self::Sum => "sum",
             Self::Max => "max",
+            Self::CollectionUnion => "collection_union",
         }
     }
 
@@ -1092,7 +1111,7 @@ pub struct Branch {
 /// |---|---|---|---|
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (hard error if survives) |
 /// | `Infer(id)` | Type checker only | "Inference variable N, tracked in table" | End of `resolve()` (ambiguous type if survives) |
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// A primitive base type.
     Base(BaseType),
@@ -1269,6 +1288,12 @@ impl PartialEq for Refinement {
 }
 
 impl Eq for Refinement {}
+
+impl std::hash::Hash for Refinement {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
 
 /// Distinguishes loop-join (predicate) refinements from hash-join refinements and carries join strategy metadata.
 #[derive(Debug, Clone, PartialEq)]

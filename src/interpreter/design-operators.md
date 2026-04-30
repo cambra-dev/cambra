@@ -116,6 +116,7 @@ signal in tiles and as a region specifier in guards.
 | `Intervals(IntervalSet<Value>)` | Arbitrary union of intervals. |
 | `Record(fields)` | Per-field predicates for record-typed extents. AND semantics: a value satisfies `Record(fields)` iff it satisfies every field predicate. |
 | `Or(arms)` | Union of multiple predicates; produced when two `Record` predicates are unioned, because OR cannot be pushed through the AND-conjunction of a `Record`. Arms are always flat (no nested `Or`). |
+| `Union(variants)` | Per-variant predicates for union-typed extents (`Extent::Union`). A value `Union { tag, inner }` satisfies `Union(variants)` iff `variants[tag].contains(inner)`. The length of `variants` must equal the number of union variants. Used as the domain predicate on tiles emitted by `UnionProducer`, and split by `UnionProducer::release_impl` to forward each per-variant predicate to the correct upstream input. |
 
 `Predicate::intersect()` computes the conjunction of two predicates.
 `Predicate::union()` computes the disjunction; for `Record` predicates this produces an `Or`
@@ -123,6 +124,9 @@ variant for the same reason as `TileGuard`.
 `Predicate::as_bool()` short-circuits to `Some(true/false)` when the predicate is trivially
 `True` or `False` (including uniform record predicates and `Or` predicates whose arms are all
 `False`).
+For `Union` predicates, `as_bool()` returns `Some(true)` when every variant predicate is `True`,
+and `Some(false)` when every variant predicate is `False`; otherwise `None`. All set operations
+(`intersect`, `minus`, `union`) are applied element-wise across the variant predicates.
 
 ### CCL types vs. tilings
 
@@ -169,6 +173,7 @@ during compilation; producers are created on demand at runtime.
 | `MapExtractAggregate` | `SealedFunction(extent → Aggregation)` | `SealedFunction(extent → Scalar)` | Extracts terminal per-key aggregation results from a `SealedFunction(D, Aggregation)`, producing `SealedFunction(D, Scalar)`. |
 | `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::branch()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across branches. |
 | `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Immediately releases data from its input upon receipt so that the input can clear out any state. |
+| `UnionOperator` | N inputs of `SealedFunction(dᵢ → Scalar(C))` tilings | `SealedFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))` | Merges N sealed-function operators into one by forming the discriminated union of their domains and deduplicating their codomains. The output domain is `Extent::Union` of all input domains; the codomain is shared when all inputs agree, or `Scalar(Union(…))` (deduplicated) otherwise. `UnionProducer::release_impl` splits an incoming `Predicate::Union` guard and forwards each per-variant predicate to the corresponding input, so release propagates correctly through the merge. |
 
 TODOs for implementing hash joins:
 

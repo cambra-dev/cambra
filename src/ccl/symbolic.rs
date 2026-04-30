@@ -418,6 +418,7 @@ fn binop_prec(op: &BinOpKind) -> Precedence {
             Precedence::Add
         }
         BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::FloorDiv) => Precedence::Mul,
+        BinOpKind::CollectionUnion => Precedence::And,
     }
 }
 

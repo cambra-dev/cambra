@@ -10,7 +10,7 @@ use crate::{
             fan_in, Aggregate, Constant, Converse, ExtractAggregate, FanOut, FlattenTupleDomain,
             IterateExtent, MapAggregate, MapDomain, MapExtractAggregate, MapResult,
             MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo, PermuteRecordDomain,
-            Restrict, ScalarFanIn, TileOperator, Tiling, Uncurry,
+            Restrict, ScalarFanIn, TileOperator, Tiling, Uncurry, UnionOperator,
         },
         tuple_field, ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
         DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
@@ -197,6 +197,10 @@ impl OpConversionContext {
                 domain: Box::new(self.extent_of(a)?),
                 codomain: Box::new(self.extent_of(b)?),
             }),
+            Type::Union(ts) => {
+                let extents: Result<Vec<_>, _> = ts.iter().map(|t| self.extent_of(t)).collect();
+                Ok(Extent::Union(extents?))
+            }
             // Leaf types — no refinements possible, handle inline.
             Type::Base(b) => Ok(Extent::Base(b.clone())),
             Type::UIntRange(n) => Ok(Extent::uint_range(*n)),
@@ -345,6 +349,34 @@ fn convert_impl(
             } else {
                 Ok(converse)
             }
+        }
+
+        // collection_union merges N SealedFunction operators into one.
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::CollectionUnion) =>
+        {
+            if input.is_some() {
+                return Err(ConversionError::Unsupported(
+                    "collection_union requires no input".into(),
+                ));
+            }
+            let TypedExprNode::Tuple(elts) = &argument.node else {
+                return Err(ConversionError::Unsupported(format!(
+                    "collection_union expects a Tuple argument, got {:?}",
+                    argument.node
+                )));
+            };
+            if elts.len() < 2 {
+                return Err(ConversionError::Unsupported(format!(
+                    "collection_union expects at least 2 inputs, got {}",
+                    elts.len()
+                )));
+            }
+            let ops = elts
+                .iter()
+                .map(|e| convert_impl(e, None, None, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Box::new(UnionOperator::new(ops)))
         }
 
         // map_domain transforms the codomain of its argument to a copy of the domain.
@@ -748,6 +780,9 @@ fn builtin_to_binop(b: Builtin) -> Option<InterpreterBinOp> {
         B::BoolLogic(L::Nor) => InterpreterBinOp::BoolLogic(LogicKind::Nor),
         B::BoolLogic(L::Xor) => InterpreterBinOp::BoolLogic(LogicKind::Xor),
         B::BoolLogic(L::Xnor) => InterpreterBinOp::BoolLogic(LogicKind::Xnor),
+        // CollectionUnion is a collection-level combinator handled separately; it
+        // cannot appear inside Builtin::BinOp, so this branch is unreachable.
+        B::CollectionUnion => unreachable!("CollectionUnion is not a scalar BinOp"),
     })
 }
 

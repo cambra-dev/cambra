@@ -20,7 +20,7 @@
 //! annotations are carried in [`TypedExpr::user_annotation`]; they are checked for
 //! compatibility with the inferred type at the end of each [`infer`] call.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
@@ -736,6 +736,30 @@ fn typecheck_equal(a: &Type, b: &Type) -> bool {
                 .zip(b_fields.iter())
                 .all(|(a, b)| a.0 == b.0 && typecheck_equal(&a.1, &b.1))
         }
+        // Nested unions are semantically flat: Union(Union(A,B),C) ≡ Union(A,B,C).
+        // Flatten both sides before comparing to handle rewriting passes that
+        // normalise the nesting level (e.g. collection-union flattening in simplify).
+        (Type::Union(a_variants), Type::Union(b_variants)) => {
+            fn flat_union(variants: &[Type]) -> Vec<&Type> {
+                variants
+                    .iter()
+                    .flat_map(|v| {
+                        if let Type::Union(sub) = v {
+                            flat_union(sub)
+                        } else {
+                            std::slice::from_ref(v).iter().collect()
+                        }
+                    })
+                    .collect()
+            }
+            let a_flat = flat_union(a_variants);
+            let b_flat = flat_union(b_variants);
+            a_flat.len() == b_flat.len()
+                && a_flat
+                    .iter()
+                    .zip(b_flat.iter())
+                    .all(|(a, b)| typecheck_equal(a, b))
+        }
         _ => a == b,
     }
 }
@@ -813,6 +837,25 @@ fn check_binop_types(
                         type_b: ty.clone(),
                     });
                 }
+            }
+        }
+        BinOpKind::CollectionUnion => {
+            // Both operands must be Fun types; result must be a Fun type.
+            for (ty, side) in [(&left.ty, "left"), (&right.ty, "right")] {
+                if !matches!(ty, Type::Fun(..)) {
+                    errors.push(InferError::TypeMismatch {
+                        ctx: format!("{side} operand of '@' must be a collection (Fun type)"),
+                        type_a: Type::fun(Type::Infer(InferVarId(0)), Type::Infer(InferVarId(0))),
+                        type_b: ty.clone(),
+                    });
+                }
+            }
+            if !matches!(node_ty, Type::Fun(..)) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: "result of '@' must be a collection (Fun type)".into(),
+                    type_a: Type::fun(Type::Infer(InferVarId(0)), Type::Infer(InferVarId(0))),
+                    type_b: node_ty.clone(),
+                });
             }
         }
     }
@@ -1686,6 +1729,45 @@ fn infer_binop(
             ctx.constrain_equal(&right_ty, &Type::Base(BaseType::Bool))?;
             Ok(Type::Base(BaseType::Bool))
         }
+        BinOpKind::CollectionUnion => {
+            // Both operands must be function (collection) types.
+            // Result: Fun(Union(left_domain, right_domain), dedup_union(left_cod, right_cod))
+            let (left_dom, left_cod) = require_fun(left_ty, left, ctx, "collection_union lhs")?;
+            let (right_dom, right_cod) = require_fun(right_ty, right, ctx, "collection_union rhs")?;
+            let domain = Type::Union(vec![left_dom, right_dom]);
+            let codomain = dedup_union_type(left_cod, right_cod);
+            Ok(Type::fun(domain, codomain))
+        }
+    }
+}
+
+/// Build a union of two types, deduplicating if identical.
+///
+/// Used by [`infer_binop`] for [`BinOpKind::CollectionUnion`] to compute the
+/// codomain of the result: identical codomains collapse to a single type.
+fn dedup_union_type(a: Type, b: Type) -> Type {
+    let mut variants = Vec::new();
+    collect_union_types(a, &mut variants);
+    collect_union_types(b, &mut variants);
+    #[allow(clippy::mutable_key_type)]
+    let mut seen = HashSet::new();
+    variants.retain(|v| seen.insert(v.clone()));
+    if variants.len() == 1 {
+        variants.remove(0)
+    } else {
+        Type::Union(variants)
+    }
+}
+
+/// Flatten a (possibly nested) [`Type::Union`] into a flat list.
+fn collect_union_types(ty: Type, out: &mut Vec<Type>) {
+    match ty {
+        Type::Union(ts) => {
+            for t in ts {
+                collect_union_types(t, out);
+            }
+        }
+        other => out.push(other),
     }
 }
 

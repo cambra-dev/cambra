@@ -1,17 +1,17 @@
 # CCL AST Design
 
-Design decisions for the Cambra Core Language (CCL) abstract syntax tree — the intermediate representation between Python source and the dataflow operator graph.
+Design decisions for the Cambra Core Language (CCL) abstract syntax tree — the intermediate representation between CHL source and the dataflow operator graph.
 
 ---
 
 ## Overview
 
-CCL is a λ-calculus–based IR. Python source is lowered into CCL, where it is type-inferred and optimized, then compiled to the operator graph for execution.
+CCL is a λ-calculus–based IR. CHL source is lowered into CCL, where it is type-inferred and optimized, then compiled to the operator graph for execution.
 
 ```
-Python source
-  → parse          (rustpython_parser)
-  → lower          (ccl/lower.rs: Python AST → CCL AST, structural only)
+CHL source
+  → parse          (rustCHL_parser)
+  → lower          (ccl/lower.rs: CHL AST → CCL AST, structural only)
   → infer          (ccl/infer.rs: type inference, converts Hole→Infer and fills ty on every node)
   → resolve        (ccl/unify.rs: substitutes solved Infer vars with concrete types)
   → inline         (ccl/inline.rs::inline_non_iterable_lambdas: inline UDF Let bindings with non-iterable domains; beta-reduce at call sites)
@@ -37,7 +37,7 @@ Rationale: strict ANF over-normalizes the tree, destroying structural informatio
 
 ### No α-renaming — name uniqueness not guaranteed
 
-CCL does not perform variable renaming (α-renaming) as ANF or SSA IRs do. Python reassignment of the same variable (`x = 1; x = 2`) produces nested `Let` bindings that shadow each other:
+CCL does not perform variable renaming (α-renaming) as ANF or SSA IRs do. CHL reassignment of the same variable (`x = 1; x = 2`) produces nested `Let` bindings that shadow each other:
 
 ```
 let x = 1
@@ -51,9 +51,9 @@ Rationale: renaming every assignment to a fresh variable would over-normalize th
 
 ### Application shape
 
-Function application is a single `Apply(Box<Expr>, Box<Expr>)` node. Single-argument Python calls `f(a)` lower to `Apply(a, Var(f))` directly. Multi-argument Python calls `f(a, b, ...)` lower to `Apply(Tuple([a, b, ...]), Var(f))` — the arguments are tupled so the call shape matches how multi-arg Python lambdas are uncurried at lowering time (see "Python `lambda` expressions" below).
+Function application is a single `Apply(Box<Expr>, Box<Expr>)` node. Single-argument CHL calls `f(a)` lower to `Apply(a, Var(f))` directly. Multi-argument CHL calls `f(a, b, ...)` lower to `Apply(Tuple([a, b, ...]), Var(f))` — the arguments are tupled so the call shape matches how multi-arg CHL lambdas are uncurried at lowering time (see "CHL `lambda` expressions" below).
 
-Partial / curried application in CCL itself is still represented by chained `Apply` nodes — `f(x)(y)` in source writes the curry explicitly and lowers to `Apply(Apply(Var(f), x), y)`. This path remains unsupported past operator conversion (no `curry` combinator case yet) and is tracked as follow-up work; in normal Python source, chained applications only arise when users nest lambdas explicitly.
+Partial / curried application in CCL itself is still represented by chained `Apply` nodes — `f(x)(y)` in source writes the curry explicitly and lowers to `Apply(Apply(Var(f), x), y)`. This path remains unsupported past operator conversion (no `curry` combinator case yet) and is tracked as follow-up work; in normal CHL source, chained applications only arise when users nest lambdas explicitly.
 
 Rationale: keeping application a single-argument node preserves the uniform λ-calculus basis, while the tupled-lowering convention lets the common multi-arg case compile cleanly through `lambda_elim` and operator conversion without threading a curry/uncurry combinator through every pass.
 
@@ -77,16 +77,16 @@ The same distinction applies in CCL:
 
 ### `Aggregate` — first-class aggregation node
 
-Python aggregate calls (`sum(xs)`, `max(xs)`) are lowered directly to `Expr::Aggregate` rather than kept as `Apply(Var("sum"), xs)`. This makes aggregate operations structurally distinct from ordinary function calls, which simplifies:
+CHL aggregate calls (`sum(xs)`, `max(xs)`) are lowered directly to `Expr::Aggregate` rather than kept as `Apply(Var("sum"), xs)`. This makes aggregate operations structurally distinct from ordinary function calls, which simplifies:
 
 - Type inference: `infer` constrains the input to `Fun(_, codomain)` via `constrain_equal` and dispatches to `AggregateKind::constrain_signature` for the per-variant element-vs-output-type relationship (`Sum`: requires `codomain = Int`, returns `Int`; `Max`: returns `codomain` unchanged).
 - Compilation: the compiler dispatches on `Expr::Aggregate` and emits the appropriate aggregate operator without scanning call-site variable names.
 
 `AggregateKind` enumerates the supported operations; each variant carries its own typing rule on `constrain_signature`. New variants (`Count: _ → Int`, `Mean: Int → Float`, …) add their rule there without touching the `Aggregate` inference branch.
 
-### Python `lambda` expressions — single `Expr::Lambda` (tupled when multi-arg)
+### CHL `lambda` expressions — single `Expr::Lambda` (tupled when multi-arg)
 
-Python `lambda` expressions lower to a single `Expr::Lambda`. A single-parameter `lambda x: body` becomes `λ x → body`. A multi-parameter `lambda x, y, ...: body` is **uncurried at lowering**: it becomes `λ __arg_tuple_N → body[x := __arg_tuple_N.0, y := __arg_tuple_N.1, ...]`, a single-parameter lambda whose parameter is a synthetic tuple and whose body has each named argument replaced in-place by a projection of that tuple. `param.ty` starts as `Type::Hole`; inference resolves it (including the tuple arity for the multi-arg case) from the body's projection constraints and the call-site argument type.
+CHL `lambda` expressions lower to a single `Expr::Lambda`. A single-parameter `lambda x: body` becomes `λ x → body`. A multi-parameter `lambda x, y, ...: body` is **uncurried at lowering**: it becomes `λ __arg_tuple_N → body[x := __arg_tuple_N.0, y := __arg_tuple_N.1, ...]`, a single-parameter lambda whose parameter is a synthetic tuple and whose body has each named argument replaced in-place by a projection of that tuple. `param.ty` starts as `Type::Hole`; inference resolves it (including the tuple arity for the multi-arg case) from the body's projection constraints and the call-site argument type.
 
 Each multi-arg lambda mints a fresh `N` from a counter on `LoweringContext`, so nested multi-arg lambdas (e.g. `lambda x, y: lambda a, b: x + a`) receive distinct tuple-parameter names. Without the unique suffix, an outer substitution that inserts `Var("__arg_tuple")` into an inner lambda's body would be captured by the inner binder; the fresh suffix plus the reserved `__arg_tuple_` prefix (user code cannot bind double-underscore names here) keeps the in-place substitution non-capture-avoiding yet correct.
 
@@ -98,7 +98,7 @@ Restrictions not yet supported (lowering raises `LoweringError::Unsupported`): `
 
 ### Function definitions — `Let` + single `Expr::Lambda` (tupled when multi-arg)
 
-Python `def` statements are lowered to `Let` bindings whose value is a single `Expr::Lambda`, mirroring the `lambda`-expression shape above. `def f(x): body` becomes `let f = λ x → lower(body) in ...`; `def f(x, y, ...): body` uncurries to `let f = λ __arg_pair → lower(body)[x := __arg_pair.0, y := __arg_pair.1, ...] in ...`. The function name is bound via `Expr::let_bind`, and the body is lowered via `lower_stmts` (supporting assignments, nested function definitions, and a final expression).
+CHL `def` statements are lowered to `Let` bindings whose value is a single `Expr::Lambda`, mirroring the `lambda`-expression shape above. `def f(x): body` becomes `let f = λ x → lower(body) in ...`; `def f(x, y, ...): body` uncurries to `let f = λ __arg_pair → lower(body)[x := __arg_pair.0, y := __arg_pair.1, ...] in ...`. The function name is bound via `Expr::let_bind`, and the body is lowered via `lower_stmts` (supporting assignments, nested function definitions, and a final expression).
 
 Pairing the definition shape with `lower_call`'s tupled multi-arg shape keeps the common multi-arg `def` path free of the curried-lambda chain that `lambda_elim` would fold into an unsupported `curry(body)`.
 
@@ -129,15 +129,15 @@ The result type is `Fun(K, Fun(UInt, V))` where `K` is the key type and `V` is t
 
 ### `Case` only — no `IfThenElse`
 
-Python `if/else`, `elif` chains, and ternary `if` expressions are all lowered to `Case` during Python → CCL lowering. There is no `IfThenElse` node in the CCL AST. `Case` subsumes all multi-way branching.
+CHL `if/else`, `elif` chains, and ternary `if` expressions are all lowered to `Case` during CHL → CCL lowering. There is no `IfThenElse` node in the CCL AST. `Case` subsumes all multi-way branching.
 
 `Case` holds an ordered list of `Branch { guard, body }` values. Guards are arbitrary `TypedExpr` nodes constrained to `Bool` at inference time; the first truthy guard wins. `elif` chains are **flattened** into a single `Case`: when `lower_if` recurses into the `orelse` block and the result is itself a `Case`, its branches are extended directly rather than nested, so `if c1: … elif c2: … else: …` produces `{ c1 → …; c2 → …; true → … }`. Structural pattern decomposition is represented as `Let` bindings in arm bodies; literal matching is an equality guard expression.
 
-Python `match` statements (planned) will desugar entirely at lowering time: the scrutinee is bound with a fresh `Let(__scrut)` node, then each arm produces a guard (`__scrut == lit` for literal patterns, `Lit(true)` for wildcard/structural) and a body (with `Let` bindings for any captured variable names). No IR changes are needed for `match` support.
+CHL `match` statements (planned) will desugar entirely at lowering time: the scrutinee is bound with a fresh `Let(__scrut)` node, then each arm produces a guard (`__scrut == lit` for literal patterns, `Lit(true)` for wildcard/structural) and a body (with `Let` bindings for any captured variable names). No IR changes are needed for `match` support.
 
 ### `Join`/`Jump` for loops
 
-Python `while` loops are lowered to explicit `Join`/`Jump` nodes rather than recursive `Lambda`/`Let` combinations.
+CHL `while` loops are lowered to explicit `Join`/`Jump` nodes rather than recursive `Lambda`/`Let` combinations.
 
 `Join` defines a labeled loop header with typed parameters (the loop variables). `Jump` is a tail call to a `Join` point, passing updated parameter values. The non-escaping property (jumps are always in tail position, join points cannot be stored or passed as arguments) is enforced by construction.
 
@@ -152,7 +152,7 @@ Rationale: encoding loops as recursive lambdas requires detecting recursive bind
 All binding sites — `Lambda`, `Join`, and `Let` — use `TypedBinding { name, ty, user_annotation }` rather than separate `name: String` / type fields.
 
 - `ty` starts as `Type::Hole` (lowering placeholder); the inference pass converts it to a registered `Type::Infer` variable at inference entry and fills in the concrete type before compilation.
-- `user_annotation` carries an optional user-written type annotation (e.g. from a Python `cast` expression). Inference validates the inferred type against it; if the body provides no usable constraint the annotation is used directly as the param type.
+- `user_annotation` carries an optional user-written type annotation (e.g. from a CHL `cast` expression). Inference validates the inferred type against it; if the body provides no usable constraint the annotation is used directly as the param type.
 
 `Type::Hole` and `Type::Infer(_)` have no runtime equivalents — all types must be resolved to concrete types before operator-graph compilation.
 
@@ -220,6 +220,11 @@ enum BinOpKind {
     /// Left-to-right function composition: `f ≫ g` means "apply f, then g".
     /// Introduced by `lambda_elim`; absent in source-level CCL.
     Compose,
+    /// Collection union (`@`): `Fun(A, B) @ Fun(C, D)` → `Fun(Union(A, C), dedup(B, D))`.
+    /// Lowered from CHL `a @ b`; lambda elimination desugars this to
+    /// `Apply(Tuple([a, b]), Builtin(CollectionUnion))` before operator conversion
+    /// produces a `UnionOperator` tile.
+    CollectionUnion,
 }
 
 enum UnaryOpKind {
@@ -289,7 +294,7 @@ enum TypedExprNode {
     },
     /// Multi-way conditional branching. Evaluates each `Branch` in order;
     /// the first branch whose guard evaluates to `true` wins. Guards must
-    /// have type `Bool`. Python `if/else`, `elif` chains (flattened), and
+    /// have type `Bool`. CHL `if/else`, `elif` chains (flattened), and
     /// ternary `if` are all lowered to this node.
     Case {
         branches: Vec<Branch>,  // Branch { guard: TypedExpr, body: TypedExpr }
@@ -515,6 +520,14 @@ concrete `Tuple` type.
 
 N-ary `Compose([f₀, f₁, …, fₙ₋₁])` is inferred by chaining: each morphism's codomain is constrained equal to the next morphism's domain. The overall type is `Fun(domain(f₀), codomain(fₙ₋₁))`. This case arises when `infer` is run over output from `simplify`, which can produce `Compose` nodes.
 
+### `Type::Union` semantic equality
+
+`typecheck_equal` treats nested union types as structurally flat: `Union(Union(A,B),C)` is equal to `Union(A,B,C)`. This is needed because the `simplify` pass flattens `CollectionUnion` chains (see §Union flattening below), rewriting the domain type from a nested `Union(Union(A,B),C)` to a flat `Union(A,B,C)`, while inference may have stamped the original nested form on surrounding `Let` nodes. The flat-equality rule prevents spurious type mismatches across this normalization.
+
+### Union flattening (`simplify.rs`)
+
+`a @ b @ c` in CHL lowers to right- or left-associated binary `CollectionUnion` applications. The `simplify` pass's `try_flatten_collection_union` rule detects any `CollectionUnion(tuple)` whose tuple contains a nested `CollectionUnion` element, and rewrites it to a flat N-ary `CollectionUnion(a, b, c)`. The domain type is also normalized from `Union(Union(A,B),C)` to `Union(A,B,C)` by `flatten_union_variants`. The rule fires repeatedly until no nested applications remain, so chains of arbitrary depth are fully flattened. `operator_conversion` then compiles the N-ary form directly to a single `UnionOperator` with N inputs.
+
 ### `check_fully_typed` validation
 
 After `resolve`, `infer` calls `check_fully_typed(expr)` to assert that every `ty` and every `TypedBinding::ty` in the tree is a concrete type — no `Type::Hole` or `Type::Infer(_)` anywhere, including inside compound types like `Fun` or `Tuple`. Returns `InferError::UnresolvedHole` or `InferError::UnresolvedInfer(id)` on failure, with the symbolic representation of the offending expression for debugging.
@@ -522,7 +535,7 @@ After `resolve`, `infer` calls `check_fully_typed(expr)` to assert that every `t
 ### TODOs
 
 - Infer `Let.ty` from the type of `value` (required before `Let` nodes can be compiled; see §Compilation).
-- Python `match` statement lowering: desugar at lowering time using `Let(__scrut)` + guard expressions (no IR changes needed).
+- CHL `match` statement lowering: desugar at lowering time using `Let(__scrut)` + guard expressions (no IR changes needed).
 
 ---
 
@@ -530,11 +543,11 @@ After `resolve`, `infer` calls `check_fully_typed(expr)` to assert that every `t
 
 `defer()`, `<<`, and `<<=` are CHL-level operators that let a block accumulate a result value progressively. They are reified as three CCL AST nodes (`Defer`, `Feed`, `Define`) during lowering, then **eliminated** before operator conversion by `remove_defers::run`.
 
-TODO: `x = defer()` should be replaced with `deferred x` once we implement a custom parser and aren't stuck with Python parsing rules. 
+TODO: `x = defer()` should be replaced with `deferred x` once we implement a custom parser and aren't stuck with CHL parsing rules. 
 
 ### CHL syntax
 
-| Python | Meaning |
+| CHL | Meaning |
 |---|---|
 | `x = defer()` | Declare `x` as a deferred accumulator |
 | `x << value` | Feed `value` into `x` (used in expression position; any number of feeds) |
@@ -724,6 +737,7 @@ the symbolic printer and used in the historical `Var(...)` rendering):
 | `Builtin::BinOp(op)` for any `op: BinOpKind` | `add`, `sub`, `eq`, `lt`, `and`, `or`, `concat`, … | every arithmetic / compare / boolean-logic / string-concat binary op (one variant, parameterised by the existing `BinOpKind` so the operator enum has a single source of truth) |
 | `Builtin::{Neg,NotFn}` | `neg`, `not_fn` | unary operations |
 | `Builtin::{Sum,Max}` | `sum`, `max` | aggregations (fold/reduce) |
+| `Builtin::CollectionUnion` | `collection_union` | discriminated-union of N collections; `a @ b` lowers to `Apply(Tuple([a, b]), Builtin(CollectionUnion))` and compiles to a `UnionOperator` tile. Chains like `a @ b @ c` produce nested binary applications; the `simplify` pass flattens these to a single N-ary `CollectionUnion(a, b, c)` with a flat `Type::Union` domain (see §Union flattening). |
 
 Earlier passes encoded these with `TypedExprNode::Var("name")` against magic
 strings; downstream pattern matches (`simplify`, `join_plan`,

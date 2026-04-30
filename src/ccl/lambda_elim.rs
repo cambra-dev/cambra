@@ -745,13 +745,16 @@ fn elim_lambda(
                 // Special case: string concatenation uses `concat` function, not `add`.
                 op = BinOpKind::Concat;
             }
-            let op_builtin = Builtin::BinOp(op);
-            // Annotate the intermediate nodes so that when the Apply rule
-            // recurses into the argument Tuple, body_ty is concrete.
             let left = *left;
             let right = *right;
             let tuple = typed_tuple(vec![left, right]);
             let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
+            // CollectionUnion is a collection-level combinator, not a scalar BinOp.
+            let op_builtin = if op == BinOpKind::CollectionUnion {
+                Builtin::CollectionUnion
+            } else {
+                Builtin::BinOp(op)
+            };
             let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
             elim_lambda(ctx, param, param_ty, desugared)
@@ -964,7 +967,12 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
         // `a op b` ≡ `(a, b) ▷ op_fn` — mirrors what `elim_lambda` does for
         // the same pattern inside a lambda body, making the CCL uniform.
         TypedExprNode::BinOp { left, op, right } => {
-            let op_builtin = Builtin::BinOp(op);
+            // CollectionUnion is a collection-level combinator, not a scalar BinOp.
+            let op_builtin = if op == BinOpKind::CollectionUnion {
+                Builtin::CollectionUnion
+            } else {
+                Builtin::BinOp(op)
+            };
             let left_elim = elim_lambdas(ctx, *left)?;
             let right_elim = elim_lambdas(ctx, *right)?;
             let tuple_ty = Type::Tuple(vec![left_elim.ty.clone(), right_elim.ty.clone()]);

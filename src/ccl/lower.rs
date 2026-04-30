@@ -627,6 +627,7 @@ fn lower_binop(
         pyast::Operator::Mult => BinOpKind::Arithmetic(ArithmeticKind::Mul),
         pyast::Operator::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
         pyast::Operator::BitAnd => BinOpKind::BoolLogic(LogicKind::And),
+        pyast::Operator::MatMult => BinOpKind::CollectionUnion,
         pyast::Operator::BitOr => BinOpKind::BoolLogic(LogicKind::Or),
         pyast::Operator::BitXor => BinOpKind::BoolLogic(LogicKind::Xor),
         _ => {
