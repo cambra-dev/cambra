@@ -550,7 +550,11 @@ fn resolve_type(ty: &mut Type, table: &mut UnificationTable) {
         // Resolve the base type inside a refinement; the predicate is a separate expression
         // and is resolved via the expression-level resolve() pass.
         Type::Refinement(inner, _) => resolve_type(inner, table),
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => {}
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::DeferredCollectionDomain(_)
+        | Type::Hole => {}
     };
 }
 
@@ -667,11 +671,19 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
                 resolve(e, table);
             }
         }
+        TypedExprNode::ExprStmt { expr, body } => {
+            resolve(expr, table);
+            resolve(body, table);
+        }
+        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
+            resolve(value, table)
+        }
         // Leaf nodes — no sub-expressions to recurse into.
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
-        | TypedExprNode::Source(_) => {}
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Defer => {}
     }
 }
 

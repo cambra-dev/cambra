@@ -28,6 +28,7 @@
 //! | Product eta | `⟨f ≫ .0, f ≫ .1⟩` | `f` |
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` |
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` |
+//! | Drop pure ExprStmt | `ExprStmt { expr, body }` (if `expr` has no `Feed`) | `body` |
 
 use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
@@ -100,11 +101,16 @@ fn recurse_simplify(expr: &mut Expr) -> bool {
         TypedExprNode::GroupBy { collection, key } => {
             simplify_once(collection) | simplify_once(key)
         }
+        TypedExprNode::ExprStmt { expr, body } => simplify_once(expr) | simplify_once(body),
+        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
+            simplify_once(value)
+        }
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_) => false,
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Defer => false,
     }
 }
 
@@ -114,6 +120,66 @@ fn recurse_simplify(expr: &mut Expr) -> bool {
 /// returning; the placeholder is never externally observable.
 fn take(expr: &mut Expr) -> Expr {
     std::mem::replace(expr, Expr::lit(Lit::Int(0)))
+}
+
+/// Returns `true` if `expr` or any of its sub-expressions is a [`TypedExprNode::Feed`].
+fn contains_feed(expr: &Expr) -> bool {
+    match &expr.node {
+        TypedExprNode::Feed { .. } | TypedExprNode::Define { .. } => true,
+        TypedExprNode::Let {
+            bound_expr, body, ..
+        } => contains_feed(bound_expr) || contains_feed(body),
+        TypedExprNode::Apply { function, argument } => {
+            contains_feed(function) || contains_feed(argument)
+        }
+        TypedExprNode::BinOp { left, right, .. } => contains_feed(left) || contains_feed(right),
+        TypedExprNode::UnaryOp(_, inner) => contains_feed(inner),
+        TypedExprNode::Lambda { body, .. } => contains_feed(body),
+        TypedExprNode::Aggregate { input, .. } => contains_feed(input),
+        TypedExprNode::Tuple(elts) | TypedExprNode::List(elts) | TypedExprNode::Compose(elts) => {
+            elts.iter().any(contains_feed)
+        }
+        TypedExprNode::Record(fields) => fields.iter().any(|(_, e)| contains_feed(e)),
+        TypedExprNode::Case { branches } => branches
+            .iter()
+            .any(|b| contains_feed(&b.guard) || contains_feed(&b.body)),
+        TypedExprNode::Join {
+            loop_body,
+            outer_body,
+            ..
+        } => contains_feed(loop_body) || contains_feed(outer_body),
+        TypedExprNode::Jump { args, .. } => args.iter().any(contains_feed),
+        TypedExprNode::GroupBy { collection, key } => {
+            contains_feed(collection) || contains_feed(key)
+        }
+        TypedExprNode::ExprStmt { expr, body } => contains_feed(expr) || contains_feed(body),
+        TypedExprNode::Lit(_)
+        | TypedExprNode::Var(_)
+        | TypedExprNode::Builtin(_)
+        | TypedExprNode::Proj(_)
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Defer => false,
+    }
+}
+
+/// Drop pure `ExprStmt`: `ExprStmt { expr, body }  ⟹  body` when `expr` contains no `Feed`.
+///
+/// An `ExprStmt` whose statement sub-expression has no side-effectful handle
+/// binding is a no-op: the expression is evaluated and discarded. Replacing the
+/// whole node with `body` is safe because nothing in the body depends on the
+/// discarded value.
+fn try_drop_pure_expr_stmt(expr: &mut Expr) -> bool {
+    let TypedExprNode::ExprStmt { expr: inner, .. } = &expr.node else {
+        return false;
+    };
+    if contains_feed(inner) {
+        return false;
+    }
+    let TypedExprNode::ExprStmt { body, .. } = take(expr).node else {
+        unreachable!()
+    };
+    *expr = *body;
+    true
 }
 
 /// Apply all simplification rules at the root of `expr`.
@@ -142,6 +208,7 @@ fn apply_simplification_rules(expr: &mut Expr) -> bool {
     changed |= check(try_product_eta(expr), expr);
     changed |= check(try_flatten_compose(expr), expr);
     changed |= check(try_zip_distribute_compose(expr), expr);
+    changed |= check(try_drop_pure_expr_stmt(expr), expr);
 
     changed
 }

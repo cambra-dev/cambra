@@ -325,6 +325,24 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
                 ProjKey::Field(s) => format!(".{s}"),
             },
         ),
+
+        TypedExprNode::ExprStmt { expr, body } => {
+            let expr_str = fmt(expr, Precedence::Lowest, opts);
+            let body_str = fmt(body, Precedence::Lowest, opts);
+            (Precedence::Lowest, format!("{expr_str}; {body_str}"))
+        }
+
+        TypedExprNode::Feed { name, value } => {
+            let val_str = fmt(value, Precedence::Lowest, opts);
+            (Precedence::Atom, format!("feed({name}, {val_str})"))
+        }
+
+        TypedExprNode::Define { name, value } => {
+            let val_str = fmt(value, Precedence::Lowest, opts);
+            (Precedence::Atom, format!("define({name}, {val_str})"))
+        }
+
+        TypedExprNode::Defer => (Precedence::Atom, "defer".to_string()),
     };
     if opts.show_types {
         (res.0, format!("{}:<{}>", res.1, expr.ty))

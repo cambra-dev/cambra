@@ -162,6 +162,20 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             ProjKey::Index(n) => format!(".{n}"),
             ProjKey::Field(s) => format!(".{s}"),
         }),
+
+        TypedExprNode::ExprStmt { expr, body } => InspectNode::new("ExprStmt")
+            .child("expr", expr_to_node(expr))
+            .child("body", expr_to_node(body)),
+
+        TypedExprNode::Feed { name, value } => {
+            InspectNode::new(format!("Bind({name})")).child("value", expr_to_node(value))
+        }
+
+        TypedExprNode::Define { name, value } => {
+            InspectNode::new(format!("Define({name})")).child("value", expr_to_node(value))
+        }
+
+        TypedExprNode::Defer => InspectNode::leaf("Defer"),
     }
 }
 

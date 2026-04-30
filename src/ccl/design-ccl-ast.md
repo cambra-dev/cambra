@@ -16,6 +16,7 @@ Python source
   → resolve        (ccl/unify.rs: substitutes solved Infer vars with concrete types)
   → inline         (ccl/inline.rs::inline_non_iterable_lambdas: inline UDF Let bindings with non-iterable domains; beta-reduce at call sites)
   → lambda_elim    (ccl/lambda_elim.rs: Lambda → point-free combinators)
+  → remove_defers  (ccl/remove_defers.rs: inline Defer/Feed/Define nodes; see §Defer)
   → optimize       (tree rewrites on CCL AST, currently just join_plan.rs)
   → convert        (interpreter/operator_conversion.rs: CCL AST → tile operators)
   → subscribe()
@@ -313,6 +314,42 @@ enum TypedExprNode {
     Record(Vec<(String, TypedExpr)>),
     // Built-in data source
     Source(String),
+
+    // --- Output operators (defer/feed/define) ---
+    // See §Defer for semantics and the remove_defers pass.
+
+    /// Placeholder for an output accumulator introduced by `x = defer()`.
+    /// The bound name is resolved by the surrounding `Let` binding.
+    /// Removed by `remove_defers::run` before operator conversion.
+    Defer,
+
+    /// Feed a value into a deferred output: `x << value`.
+    /// Lowers from the `<<` (LShift) binary operator when the LHS names a defer.
+    /// Has type `Unit`; the value is extracted by `remove_defers` and inlined
+    /// into the `Let` that introduced the defer.
+    Feed {
+        name: String,         // name of the defer binding being fed into
+        value: Box<Expr>,
+    },
+
+    /// Define a deferred output to a specific value: `x <<= value`.
+    /// Lowers from the `<<=` (AugAssign LShift) statement when the LHS names a defer.
+    /// Has type `Unit`; the value is extracted by `remove_defers` and replaces the
+    /// `Defer` in the surrounding `Let` binding.
+    Define {
+        name: String,         // name of the defer binding being defined
+        value: Box<Expr>,
+    },
+
+    /// A bare expression used as a statement, followed by the rest of the block.
+    /// `ExprStmt { expr, body }` evaluates `expr` for its side effects (e.g. a `Feed`
+    /// or `Define`), then continues to `body`. Introduced by `lower_middle_stmt` for
+    /// non-assignment, non-final statements. Dropped by `simplify` once any contained
+    /// `Feed`/`Define` nodes have been removed.
+    ExprStmt {
+        expr: Box<TypedExpr>,
+        body: Box<TypedExpr>,
+    },
 }
 
 enum Type {
@@ -329,6 +366,7 @@ enum Type {
     Error,                               // inference already failed here; suppresses cascades
     Refinement(Box<Type>, Refinement),   // refined base type; `Refinement.kind` carries join strategy
     DataSource(String),                  // opaque domain type of a source
+    HandleDomain(HandleId),              // synthetic domain type for a Defer's function type; see §Defer
     // Future:
     // Pi { param, param_ty, body_ty }  — dependent function type
 }
@@ -485,6 +523,69 @@ After `resolve`, `infer` calls `check_fully_typed(expr)` to assert that every `t
 
 - Infer `Let.ty` from the type of `value` (required before `Let` nodes can be compiled; see §Compilation).
 - Python `match` statement lowering: desugar at lowering time using `Let(__scrut)` + guard expressions (no IR changes needed).
+
+---
+
+## Defer / Feed / Define — Deferred Collection Operators (`ccl/remove_defers.rs`)
+
+`defer()`, `<<`, and `<<=` are CHL-level operators that let a block accumulate a result value progressively. They are reified as three CCL AST nodes (`Defer`, `Feed`, `Define`) during lowering, then **eliminated** before operator conversion by `remove_defers::run`.
+
+TODO: `x = defer()` should be replaced with `deferred x` once we implement a custom parser and aren't stuck with Python parsing rules. 
+
+### CHL syntax
+
+| Python | Meaning |
+|---|---|
+| `x = defer()` | Declare `x` as a deferred accumulator |
+| `x << value` | Feed `value` into `x` (used in expression position; any number of feeds) |
+| `x <<= value` | Define `x` to be exactly `value` (used as a statement; exactly one define) |
+
+A `defer` binding supports **either** feeds or exactly one define — mixing both is an error.
+
+Both the feed and define expressions evaluate to Unit.
+
+### Lowering
+
+`x = defer()` lowers to `let x = Defer in …`.
+
+`x << expr` in expression or statement position lowers to `Feed { name: "x", value: expr }`, wrapped in an `ExprStmt` when it appears as a non-final statement.
+
+`x <<= expr` lowers to `Define { name: "x", value: expr }`, also wrapped in an `ExprStmt`.
+
+The `ExprStmt { expr, body }` node chains a side-effecting statement before the rest of the block:
+```
+let x = defer
+in ExprStmt(Define(x, 1), x)    # x <<= 1; x
+```
+
+### Inference
+
+`Defer` gets a fresh `Fun(HandleDomain(id), ?)` type. `HandleDomain(id)` is a synthetic unique domain type created per defer site (via `next_handle_id()`), ensuring each defer's domain is distinct.
+
+`Feed { name, value }` resolves the type of `name` (must be `Fun(HandleDomain(_), cod)`), constrains `value`'s type against `cod`, and returns `Unit`.
+
+`Define { name, value }` constrains `value`'s type against `name`'s full type and returns `Unit`.
+
+`ExprStmt { expr, body }` infers `expr` for constraints, then returns the type of `body`.
+
+### `remove_defers::run` — the elimination pass
+
+The pass runs after `inline` and before `join_plan`. It performs three steps:
+
+1. **`inline_defers`**: walks the tree looking for `Let { bound_expr: Defer, binding, body }`. For each such binding it calls `inline_defer(body, binding.name)` to extract the feed or define value:
+   - A `Define(name, value)` for the target name is extracted as the define value; its site is replaced with the `__replaced` sentinel.
+   - A `Feed(name, value)` for the target name is extracted as a feed value; scalar values (no domain type) are lifted to `value ▷ const` so the result is always a function.
+   - The extracted value replaces `Defer` as the `Let`'s bound expression.
+
+2. **`substitute_types_in_expr`**: propagates any type-variable mappings collected during step 1 (the feed case maps the old `HandleDomain` variable to the inferred result domain).
+
+3. **`simplify`**: the `ExprStmt` nodes containing the now-replaced `Feed`/`Define` sentinels (`Var("__replaced")`) are dropped by `try_drop_pure_expr_stmt` since the sentinels contain no remaining `Feed` nodes.
+
+After the pass, no `Defer`, `Feed`, `Define`, or `ExprStmt` nodes should remain in the tree.
+
+### Current limitations
+
+- Only one feed per defer is supported. Multiple feeds will require merging the feed values with a union operator, which we don't have yet.  It also needs the ability to reference call sites deterministically to track the origin of different data.
 
 ---
 

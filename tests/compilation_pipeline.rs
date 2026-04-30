@@ -322,6 +322,40 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case("x = defer(); x <<= 1; x", Tile::Scalar(ColumnValue::Ints(vec![1])))]
+#[case("x = defer(); y = defer(); x <<= 1; y <<= 2; x + y", Tile::Scalar(ColumnValue::Ints(vec![3])))]
+#[case("x = defer(); x <<= [1,2,3]; x", make_int_list(&[1, 2, 3]))]
+#[case("x = defer(); x << 1; x", Tile::SealedFunction { domain: ColumnValue::Units(1), codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))), domain_predicate: Predicate::True, deleted: BitSet::new() })]
+#[case("x = defer(); [x << i for i in [1,2,3]]; x", make_int_list(&[1, 2, 3]))]
+#[case(
+r#"x = defer()
+for i in [1,2,3]:
+  x << i
+x"#, make_int_list(&[1, 2, 3]))]
+#[case(
+r#"x = defer()
+for i in [0,1,2,3]:
+  if i // 2 == 0:
+    x << i
+x"#, make_int_list(&[0, 1]))]
+#[case(
+r#"x = defer()
+y = defer()
+x <<= y
+y <<= [0, 1]
+x"#, make_int_list(&[0, 1]))]
+#[case(
+r#"x = defer()
+y = defer()
+x <<= [0, 1]
+y <<= x
+y"#, make_int_list(&[0, 1]))]
+fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
+}
+
 // ---------------------------------------------------------------------------
 // Generator expressions — equivalent to list comprehensions
 // ---------------------------------------------------------------------------

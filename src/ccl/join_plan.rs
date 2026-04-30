@@ -4,7 +4,9 @@ use std::mem::take;
 
 use log::trace;
 
+use crate::ccl::ccl_utils::{apply_function, typed_compose};
 use crate::ccl::{
+    ccl_utils::apply_primitive,
     infer::typecheck,
     lambda_elim::{compose, id},
     simplify::simplify,
@@ -88,25 +90,6 @@ fn replace_curried_correlated_refinements(expr: &mut Expr) {
     if let Some(new) = new {
         *expr = new;
     }
-}
-
-fn apply_primitive(expr: Expr, primitive: Builtin, output_ty: Type) -> Expr {
-    apply_function(expr, Expr::builtin(primitive), output_ty)
-}
-
-fn apply_function(expr: Expr, function: Expr, output_ty: Type) -> Expr {
-    let expr_ty = expr.ty.clone();
-    Expr::apply(
-        expr,
-        function.with_ty(Type::fun(expr_ty, output_ty.clone())),
-    )
-    .with_ty(output_ty)
-}
-
-fn typed_compose(elts: Vec<Expr>) -> Expr {
-    let d_ty = elts[0].ty.domain().unwrap().clone();
-    let c_ty = elts[elts.len() - 1].ty.codomain().unwrap().clone();
-    Expr::compose(elts).with_ty(Type::fun(d_ty, c_ty))
 }
 
 /// Look for an expression that corresponds to a group-by and rewrite it to use Converse

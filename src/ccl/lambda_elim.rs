@@ -267,6 +267,14 @@ pub(crate) fn is_free(param: &str, expr: &Expr) -> bool {
 
         // Source, Aggregate, GroupBy have no binding structure referencing free vars
         TypedExprNode::Source(_) | TypedExprNode::GroupBy { .. } => false,
+
+        TypedExprNode::ExprStmt { expr, body } => is_free(param, expr) || is_free(param, body),
+
+        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
+            is_free(param, value)
+        }
+
+        TypedExprNode::Defer => false,
     };
     is_free || is_free_in_type
 }
@@ -833,6 +841,24 @@ fn elim_lambda(
             elim_lambda(ctx, param, param_ty, desugared)
         }
 
+        TypedExprNode::Feed { name, value } => Ok(TypedExpr {
+            ty: result_ty,
+            node: TypedExprNode::Feed {
+                name,
+                value: Box::new(elim_lambda(ctx, param, param_ty, *value)?),
+            },
+            user_annotation: None,
+        }),
+
+        TypedExprNode::Define { name, value } => Ok(TypedExpr {
+            ty: result_ty,
+            node: TypedExprNode::Define {
+                name,
+                value: Box::new(elim_lambda(ctx, param, param_ty, *value)?),
+            },
+            user_annotation: None,
+        }),
+
         // Unsupported constructs.
         body => Err(LambdaElimError::Unsupported(format!(
             "unsupported body kind in lambda elimination for param '{param}' in body {body:?}"
@@ -1017,12 +1043,40 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
             ))
         }
 
+        TypedExprNode::ExprStmt { expr, body } => Ok(dbg_typecheck_mv(TypedExpr {
+            node: TypedExprNode::ExprStmt {
+                expr: Box::new(elim_lambdas(ctx, *expr)?),
+                body: Box::new(elim_lambdas(ctx, *body)?),
+            },
+            ty,
+            user_annotation,
+        })),
+
+        TypedExprNode::Feed { name, value } => Ok(dbg_typecheck_mv(TypedExpr {
+            node: TypedExprNode::Feed {
+                name,
+                value: Box::new(elim_lambdas(ctx, *value)?),
+            },
+            ty,
+            user_annotation,
+        })),
+
+        TypedExprNode::Define { name, value } => Ok(dbg_typecheck_mv(TypedExpr {
+            node: TypedExprNode::Define {
+                name,
+                value: Box::new(elim_lambdas(ctx, *value)?),
+            },
+            ty,
+            user_annotation,
+        })),
+
         // Atoms: no sub-expressions, return as-is.
         node @ (TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)) => Ok(TypedExpr {
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Defer) => Ok(TypedExpr {
             node,
             ty,
             user_annotation,

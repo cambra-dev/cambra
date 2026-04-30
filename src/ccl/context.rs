@@ -13,6 +13,7 @@ use crate::{
         infer::{check_fully_typed, infer, typecheck, TypeInferenceContext},
         inline, join_plan, lambda_elim,
         lower::{lower_stmts, LoweringContext},
+        remove_defers,
         symbolic::{symbolic, symbolic_typed},
         BaseType, Expr, Type,
     },
@@ -157,8 +158,16 @@ pub fn compile_program(
     check_fully_typed(&lambda_elim).expect("missing types");
     typecheck(&lambda_elim).expect("type error after lambda elimination");
 
-    let join_planned = join_plan::run(lambda_elim);
+    let defers_removed = remove_defers::run(lambda_elim).expect("remove_defers failed");
+    debug!("Defers removed CCL:\n{}", symbolic(&defers_removed));
+    debug!(
+        "Defers removed typed CCL:\n{}",
+        symbolic_typed(&defers_removed)
+    );
+    check_fully_typed(&defers_removed).expect("missing types after removing defers");
+    typecheck(&defers_removed).expect("type error after removing defers");
 
+    let join_planned = join_plan::run(defers_removed);
     debug!(
         "Join-planned CCL:\n{} : {}",
         symbolic(&join_planned),

@@ -34,6 +34,7 @@ Python source
   → infer            (ccl/infer.rs: type inference + check_fully_typed validation)
   → inline           (ccl/inline.rs: inline UDF Let bindings with non-iterable domains; beta-reduce at call sites)
   → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators)
+  → remove_defers    (ccl/remove_defers.rs: inline deferred collection definitions)
   → join_plan        (ccl/join_plan.rs: hash-join and keyed aggregate optimization)
   → simplify         (ccl/simplify.rs: CCC algebraic rewrites to fixed point)
   → operator_conversion  (interpreter/operator_conversion.rs: λ-free CCL → tile operators)

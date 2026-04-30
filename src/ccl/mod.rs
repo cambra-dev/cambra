@@ -6,6 +6,7 @@
 //!
 //! See `docs/design-ccl-ast.md` for the full design rationale.
 
+pub mod ccl_utils;
 pub mod context;
 pub mod infer;
 pub mod inline;
@@ -13,6 +14,7 @@ pub mod join_plan;
 pub mod lambda_elim;
 pub mod lower;
 pub mod pretty;
+pub mod remove_defers;
 pub mod simplify;
 pub mod symbolic;
 pub mod unify;
@@ -33,6 +35,15 @@ pub type RefinementId = u64;
 
 pub fn next_refinement_id() -> RefinementId {
     REFINEMENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Global counter for assigning unique IDs to [`DeferredCollectionDomain`] instances.
+static DEFER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+pub type DeferredCollectionId = u64;
+
+pub fn next_defer_id() -> DeferredCollectionId {
+    DEFER_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A unique identifier for an inference type variable.
@@ -743,6 +754,29 @@ pub enum TypedExprNode {
     /// Semantics: element `i` is applied before element `i+1`, so
     /// `Compose([f, g])` means "apply `f`, then pipe the result to `g`".
     Compose(Vec<TypedExpr>),
+
+    /// A plan expression, followed by another statement
+    ExprStmt {
+        expr: Box<TypedExpr>,
+        body: Box<TypedExpr>,
+    },
+
+    /// Feed a value into a deferred output: `x << value`.
+    /// Lowers from the `<<` (LShift) binary operator when the LHS names a defer.
+    /// Has type `Unit`; the value is extracted by `remove_defers` and inlined
+    /// into the `Let` that introduced the defer.
+    Feed { name: String, value: Box<Expr> },
+
+    /// Define a deferred output to a specific value: `x <<= value`.
+    /// Lowers from the `<<=` (AugAssign LShift) statement when the LHS names a defer.
+    /// Has type `Unit`; the value is extracted by `remove_defers` and replaces the
+    /// `Defer` in the surrounding `Let` binding.
+    Define { name: String, value: Box<Expr> },
+
+    /// Placeholder for an output accumulator introduced by `x = defer()`.
+    /// The bound name is resolved by the surrounding `Let` binding.
+    /// Removed by `remove_defers::run` before operator conversion.
+    Defer,
 }
 
 /// A CCL expression with a type slot on every node.
@@ -841,6 +875,30 @@ impl TypedExpr {
         Self::new(TypedExprNode::GroupBy {
             collection: Box::new(collection),
             key: Box::new(key),
+        })
+    }
+
+    /// Construct an ExprStmt expression.
+    pub fn expr_stmt(expr: Self, body: Self) -> Self {
+        Self::new(TypedExprNode::ExprStmt {
+            expr: Box::new(expr),
+            body: Box::new(body),
+        })
+    }
+
+    /// Construct a feed expression.
+    pub fn feed(name: String, value: Self) -> Self {
+        Self::new(TypedExprNode::Feed {
+            name,
+            value: Box::new(value),
+        })
+    }
+
+    /// Construct a define expression.
+    pub fn define(name: String, value: Self) -> Self {
+        Self::new(TypedExprNode::Define {
+            name,
+            value: Box::new(value),
         })
     }
 
@@ -1090,6 +1148,8 @@ pub enum Type {
     /// resolves this to a concrete `Extent::DataSourceDomain(rc)` at compilation time
     /// by looking the name up in its source-domain-extent registry.
     DataSource(String),
+    /// TODO
+    DeferredCollectionDomain(DeferredCollectionId),
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
     // Refinement { base: Box<Type>, predicate: Box<Expr> }
@@ -1144,6 +1204,7 @@ impl fmt::Display for Type {
             Type::Hole => write!(f, "_"),
             Type::Infer(id) => write!(f, "?{}", id.0),
             Type::DataSource(name) => write!(f, "source({name})"),
+            Type::DeferredCollectionDomain(id) => write!(f, "handle({id})"),
         }
     }
 }

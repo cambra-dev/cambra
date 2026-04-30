@@ -1151,6 +1151,7 @@ fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
             }
             _ => todo!("Got {pred:?} for UIntRange"),
         },
+        Extent::Base(BaseType::Unit) => {}
         _ => panic!("Unexpected extent: {extent:?}"),
     }
 }

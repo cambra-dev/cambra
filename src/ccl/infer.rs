@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
-use crate::ccl::BaseType;
+use crate::ccl::{next_defer_id, BaseType};
 use crate::ccl::{
     unify::UnificationTable, AggregateKind, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey,
     RefinementKind, Type, TypedExprNode, UnaryOpKind,
@@ -375,6 +375,14 @@ fn collect_expr_errors(expr: &Expr, errors: &mut Vec<InferError>) {
                 collect_expr_errors(m, errors);
             }
         }
+        TypedExprNode::ExprStmt { expr, body } => {
+            collect_expr_errors(expr, errors);
+            collect_expr_errors(body, errors);
+        }
+        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
+            collect_expr_errors(value, errors);
+        }
+        TypedExprNode::Defer => {}
     }
 }
 
@@ -429,7 +437,10 @@ fn collect_type_errors(ty: &Type, context_sym: &str, errors: &mut Vec<InferError
                 collect_type_errors(ty, context_sym, errors);
             }
         }
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {}
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::DeferredCollectionDomain(_) => {}
     }
 }
 
@@ -684,6 +695,17 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
             }
             check_compose_types(&expr.ty, morphisms, errors);
         }
+
+        TypedExprNode::ExprStmt { expr, body } => {
+            collect_typecheck_errors(expr, errors);
+            collect_typecheck_errors(body, errors);
+        }
+
+        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
+            collect_typecheck_errors(value, errors);
+        }
+
+        TypedExprNode::Defer => {}
     }
 }
 
@@ -1086,6 +1108,49 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
         // must equal the next morphism's domain; the result is `domain(f₀) →
         // codomain(fₙ₋₁)`.
         TypedExprNode::Compose(elts) => infer_compose(elts, ctx),
+
+        // Bare expression followed by other statements/exprs
+        // Infer the type of the inner expr to gather type constraints, but the type
+        // of the overall expression is just the type of the body.
+        TypedExprNode::ExprStmt { expr, body } => {
+            infer_expr(expr, ctx)?;
+            infer_expr(body, ctx)
+        }
+
+        // ----- Bind (prototype output operator) -----
+        //
+        // The type of a Bind node is always unit.
+        TypedExprNode::Feed { name, value } => {
+            let expr_ty = infer_expr(value, ctx)?;
+            let handle_ty = ctx
+                .lookup(name)
+                .cloned()
+                .ok_or(InferError::UnboundVariable(name.clone()))?;
+            let codomain_ty = Type::Infer(ctx.fresh_infer_var());
+            // TODO once we support multiple lexical bindings to the same handle, we need to
+            // not create a new ID each time.
+            ctx.constrain_equal(
+                &handle_ty,
+                &Type::fun(
+                    Type::DeferredCollectionDomain(next_defer_id()),
+                    codomain_ty.clone(),
+                ),
+            )?;
+            ctx.constrain_equal(&expr_ty, &codomain_ty)?;
+            Ok(Type::Base(BaseType::Unit))
+        }
+
+        TypedExprNode::Define { name, value } => {
+            let expr_ty = infer_expr(value, ctx)?;
+            let handle_ty = ctx
+                .lookup(name)
+                .ok_or(InferError::UnboundVariable(name.clone()))?
+                .clone();
+            ctx.constrain_equal(&expr_ty, &handle_ty)?;
+            Ok(Type::Base(BaseType::Unit))
+        }
+
+        TypedExprNode::Defer => Ok(Type::Infer(ctx.fresh_infer_var())),
     }?;
 
     // Check user_annotation compatibility. If the user provided an explicit annotation,
@@ -1140,7 +1205,10 @@ fn replace_holes(ty: &mut Type, ctx: &mut TypeInferenceContext) {
         Type::Refinement(inner, _) => replace_holes(inner, ctx),
         Type::PartialTuple(entries) => entries.iter_mut().for_each(|(_, t)| replace_holes(t, ctx)),
         Type::PartialRecord(entries) => entries.iter_mut().for_each(|(_, t)| replace_holes(t, ctx)),
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {}
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::DeferredCollectionDomain(_) => {}
     }
 }
 
@@ -1159,7 +1227,11 @@ fn type_has_infer(ty: &Type) -> bool {
         Type::PartialTuple(entries) => entries.iter().any(|(_, t)| type_has_infer(t)),
         Type::PartialRecord(entries) => entries.iter().any(|(_, t)| type_has_infer(t)),
         Type::Refinement(inner, _) => type_has_infer(inner),
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => false,
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::DeferredCollectionDomain(_)
+        | Type::Hole => false,
     }
 }
 

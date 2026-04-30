@@ -237,14 +237,34 @@ fn lower_stmts_inner(
 
     // The final statement must be a bare expression, an if/else block, or
     // a for-loop that contains a yield chain (generator pattern).
-    let final_expr = match &last.node {
-        pyast::StmtKind::Expr { value } => lower_expr(value, ctx)?,
+    let final_expr = lower_final_stmt(last, rest, outer_bindings, ctx)?;
+
+    // Wrap preceding assignments and function definitions in Let bindings,
+    // innermost-first.
+    rest.iter()
+        .enumerate()
+        .rev()
+        .try_fold(final_expr, |acc, (i, stmt)| {
+            lower_middle_stmt(stmt, &rest[..i], acc, outer_bindings, ctx)
+        })
+}
+
+/// Lower the final statement in a block, which must be a bare expression, an if/else block,
+/// or a for-loop with a yield chain (generator pattern).
+fn lower_final_stmt(
+    last: &pyast::Stmt,
+    preceding: &[pyast::Stmt],
+    outer_bindings: &HashSet<String>,
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
+    match &last.node {
+        pyast::StmtKind::Expr { value } => lower_expr(value, ctx),
         pyast::StmtKind::If { test, body, orelse } => {
             // Propagate outer bindings + rest names so that generator-fors
             // inside the if branches can check for mutation correctly.
             let mut scope = outer_bindings.clone();
-            collect_stmt_names(rest, &mut scope);
-            lower_if(test, body, orelse, &scope, ctx)?
+            collect_stmt_names(preceding, &mut scope);
+            lower_if(test, body, orelse, &scope, ctx)
         }
         pyast::StmtKind::For {
             target,
@@ -260,32 +280,29 @@ fn lower_stmts_inner(
             }
             // Build outer bindings: caller's bindings + all names from rest.
             let mut scope = outer_bindings.clone();
-            collect_stmt_names(rest, &mut scope);
-            lower_generator_for(target, iter, body, &scope, ctx)?
+            collect_stmt_names(preceding, &mut scope);
+            lower_generator_for(target, iter, body, &scope, ctx)
         }
-        _ => {
-            return Err(LoweringError::Unsupported(
-                "Last statement must be a bare expression, if/else, or \
+        _ => Err(LoweringError::Unsupported(
+            "Last statement must be a bare expression, if/else, or \
                  for/yield generator loop"
-                    .into(),
-            ))
-        }
-    };
-
-    // Wrap preceding assignments and function definitions in Let bindings,
-    // innermost-first.
-    rest.iter()
-        .rev()
-        .try_fold(final_expr, |acc, stmt| lower_let_binding(stmt, acc, ctx))
+                .into(),
+        )),
+    }
 }
 
-/// Lower a single statement as a Let binding wrapping `body`.
+/// Lower a single statement in the middle of a block.
+/// This is usually some sort of let-binding, but can also be a bare expression
 ///
-/// Shared between [`lower_stmts_inner`] (for rest-stmts) and
-/// [`lower_generator_chain`] (for per-generator let-steps).
-fn lower_let_binding(
+/// `stmt` is the current statement to be lowered
+/// `preceding` are the statements that come before `stmt` in the block
+/// `body` is the already-lowered expression for the rest of the block after `stmt`
+/// `outer_bindings` are the names already in scope above this block (e.g., function parameters)
+fn lower_middle_stmt(
     stmt: &pyast::Stmt,
+    preceding: &[pyast::Stmt],
     body: Expr,
+    outer_bindings: &HashSet<String>,
     ctx: &LoweringContext,
 ) -> Result<Expr, LoweringError> {
     match &stmt.node {
@@ -318,6 +335,9 @@ fn lower_let_binding(
         // Only simple name targets are supported; subscript and attribute
         // targets (e.g. `x[0] += 1`, `x.field += 1`) return Unsupported.
         pyast::StmtKind::AugAssign { target, op, value } => {
+            if *op == pyast::Operator::LShift {
+                return Ok(Expr::expr_stmt(lower_define(target, value, ctx)?, body));
+            }
             let name = extract_name_target(target, "augmented assignment")?;
             let val = lower_binop(target, op, value, ctx)?;
             Ok(Expr::let_bind(name, val, body))
@@ -337,6 +357,12 @@ fn lower_let_binding(
             }
             let func_expr = lower_function_body(args, fn_body, ctx)?;
             Ok(Expr::let_bind(name.clone(), func_expr, body))
+        }
+        pyast::StmtKind::Expr { .. } | pyast::StmtKind::If { .. } | pyast::StmtKind::For { .. } => {
+            Ok(Expr::expr_stmt(
+                lower_final_stmt(stmt, preceding, outer_bindings, ctx)?,
+                body,
+            ))
         }
         _ => Err(LoweringError::Unsupported(
             "Only assignment and function definition statements are supported \
@@ -556,6 +582,7 @@ fn lower_call(
             let input = lower_expr(&args[0], ctx)?;
             Ok(Expr::aggregate(input, kind))
         }
+        "defer" => Ok(Expr::new(TypedExprNode::Defer)),
         name if ctx.known_sources.contains(name) => {
             Ok(Expr::new(TypedExprNode::Source(name.to_string())))
         }
@@ -589,6 +616,9 @@ fn lower_binop(
     right: &pyast::Located<pyast::ExprKind>,
     ctx: &LoweringContext,
 ) -> Result<Expr, LoweringError> {
+    if *op == pyast::Operator::LShift {
+        return lower_feed(left, right, ctx);
+    }
     let left_expr = lower_expr(left, ctx)?;
     let right_expr = lower_expr(right, ctx)?;
     let kind = match op {
@@ -606,6 +636,24 @@ fn lower_binop(
         }
     };
     Ok(Expr::binop(left_expr, kind, right_expr))
+}
+
+fn lower_feed(
+    target: &pyast::Expr,
+    value: &pyast::Expr,
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let name = extract_name_target(target, "handle binding")?;
+    Ok(Expr::feed(name, lower_expr(value, ctx)?))
+}
+
+fn lower_define(
+    target: &pyast::Expr,
+    value: &pyast::Expr,
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let name = extract_name_target(target, "handle defining")?;
+    Ok(Expr::define(name, lower_expr(value, ctx)?))
 }
 
 /// Lower a Python unary expression to a CCL [`Expr::UnaryOp`].
@@ -962,6 +1010,19 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
             collection: Box::new(recurse(*collection)),
             key: Box::new(recurse(*key)),
         },
+        TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
+            expr: Box::new(recurse(*expr)),
+            body: Box::new(recurse(*body)),
+        },
+        TypedExprNode::Feed { name: id, value } => TypedExprNode::Feed {
+            name: id,
+            value: Box::new(recurse(*value)),
+        },
+        TypedExprNode::Define { name: id, value } => TypedExprNode::Define {
+            name: id,
+            value: Box::new(recurse(*value)),
+        },
+        TypedExprNode::Defer => TypedExprNode::Defer,
         // Leaves handled by the fast path above, but enumerate here so the
         // match is exhaustive and future additions are caught at compile time.
         node @ (TypedExprNode::Lit(_)
@@ -1111,6 +1172,9 @@ fn process_chain_step(
             "Annotated assignment without a value is not supported".into(),
         )),
         pyast::StmtKind::AugAssign { target, op, value } => {
+            if *op == pyast::Operator::LShift {
+                todo!();
+            }
             let name = extract_name_target(target, "augmented assignment")?;
             // x op= e desugars to x = x op e. The RHS reads the OLD value
             // of x, so x must already be in scope. If it's not in the
@@ -1127,6 +1191,10 @@ fn process_chain_step(
             let val = lower_binop(target, op, value, ctx)?;
             push_generator_let(chain, name, val, None);
             Ok(())
+        }
+        // Allow plain expressions as statements, since they may have side effects.
+        pyast::StmtKind::Expr { .. } => {
+            todo!();
         }
         pyast::StmtKind::FunctionDef {
             name,
@@ -1169,6 +1237,7 @@ fn process_chain_terminator<'ast>(
             pyast::ExprKind::Yield { value: None } => Err(LoweringError::Unsupported(
                 "yield without a value is not supported in generators".into(),
             )),
+            pyast::ExprKind::BinOp { op, .. } if *op == pyast::Operator::LShift => Ok(value),
             _ => Err(LoweringError::Unsupported(
                 "Generator for-body must end in a yield expression, \
                  nested for, or if-guard"
@@ -1831,6 +1900,60 @@ let x = 0
 in let x = x + 1
 in let x = x + 2
 in x"
+    )]
+    // defer() introduces a Defer node.
+    #[case(
+        "\
+x = defer()
+x",
+        "\
+let x = defer
+in x"
+    )]
+    // x <<= expr (AugAssign LShift) lowers to ExprStmt(Define(x, expr), body).
+    #[case(
+        "\
+x = defer()
+x <<= 1
+x",
+        "\
+let x = defer
+in define(x, 1); x"
+    )]
+    // x << expr as a middle statement lowers to ExprStmt(Feed(x, expr), body).
+    #[case(
+        "\
+x = defer()
+x << 1
+x",
+        "\
+let x = defer
+in feed(x, 1); x"
+    )]
+    // defer with an intervening let binding before the define.
+    #[case(
+        "\
+x = defer()
+y = 5
+x <<= y + 1
+x",
+        "\
+let x = defer
+in let y = 5
+in define(x, y + 1); x"
+    )]
+    // Two independent defers each get their own Let/Defer node.
+    #[case(
+        "\
+x = defer()
+y = defer()
+x <<= 1
+y <<= 2
+x",
+        "\
+let x = defer
+in let y = defer
+in define(x, 1); define(y, 2); x"
     )]
     fn test_lower_stmts(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);

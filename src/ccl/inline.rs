@@ -251,11 +251,28 @@ fn inline_impl(expr: Expr) -> Expr {
             key: Box::new(inline_impl(*key)),
         },
 
+        TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
+            expr: Box::new(inline_impl(*expr)),
+            body: Box::new(inline_impl(*body)),
+        },
+
+        TypedExprNode::Feed { name: id, value } => TypedExprNode::Feed {
+            name: id,
+            value: Box::new(inline_impl(*value)),
+        },
+
+        TypedExprNode::Define { name: id, value } => TypedExprNode::Define {
+            name: id,
+            value: Box::new(inline_impl(*value)),
+        },
+
+        // Leaves — no sub-expressions to recurse into.
         node @ (TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)) => node,
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Defer) => node,
     };
 
     Expr {
@@ -477,11 +494,28 @@ fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
             key: Box::new(inline_and_beta_reduce(*key, name, lambda)),
         },
 
+        TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
+            expr: Box::new(inline_and_beta_reduce(*expr, name, lambda)),
+            body: Box::new(inline_and_beta_reduce(*body, name, lambda)),
+        },
+
+        TypedExprNode::Feed { name: id, value } => TypedExprNode::Feed {
+            name: id,
+            value: Box::new(inline_and_beta_reduce(*value, name, lambda)),
+        },
+
+        TypedExprNode::Define { name: id, value } => TypedExprNode::Define {
+            name: id,
+            value: Box::new(inline_and_beta_reduce(*value, name, lambda)),
+        },
+
+        // Leaves — no sub-expressions to recurse into.
         node @ (TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)) => node,
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Defer) => node,
     };
 
     Expr {
