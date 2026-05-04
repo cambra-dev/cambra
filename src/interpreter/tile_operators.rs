@@ -1418,10 +1418,12 @@ fn extract_predicate(pred: &Predicate, path: &[TilePathStep]) -> Predicate {
 /// All inputs must have `SealedFunction` tilings with compatible domains.
 /// Output fields are named `_0`, `_1`, … matching the input order.
 pub struct FanIn {
-    /// Output tiling: either a `SealedFunction { domain, codomain: Record { _0, _1, … } }`
-    /// or a `CurriedFunction { domain1, domain2, codomain: Record { _0, _1, … } }`,
+    /// Output tiling: either a `SealedFunction { domain, codomain: Record { … } }`
+    /// or a `CurriedFunction { domain1, domain2, codomain: Record { … } }`,
     /// depending on the input operators.
     tiling: Tiling,
+    /// Field names in input order, used when producing the output Record tile.
+    names: Vec<String>,
     /// The input function operators to zip together (either all `SealedFunction` or all `CurriedFunction`).
     inputs: Vec<Box<dyn TileOperator>>,
 }
@@ -1443,12 +1445,25 @@ impl FanIn {
                 .join(", ")
         );
         assert!(!inputs.is_empty(), "FanIn requires at least one input");
+        let names = (0..inputs.len()).map(tuple_field).collect();
+        Self::new_impl(names, inputs)
+    }
 
-        let first_tiling = inputs[0].tiling();
+    /// Construct a `FanIn` with explicit named fields for record literals.
+    ///
+    /// Like [`Self::new`] but uses caller-supplied field names instead of
+    /// the synthetic `_0`, `_1`, … names used for tuples.
+    pub fn new_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Self {
+        assert!(!inputs.is_empty(), "FanIn requires at least one input");
+        let (names, ops) = inputs.into_iter().unzip();
+        Self::new_impl(names, ops)
+    }
+
+    fn new_impl(names: Vec<String>, ops: Vec<Box<dyn TileOperator>>) -> Self {
+        let first_tiling = ops[0].tiling();
         let tiling = match first_tiling {
             Tiling::SealedFunction { domain, .. } => {
-                // Verify all inputs are SealedFunction with the same domain
-                for op in inputs.iter() {
+                for op in ops.iter().skip(1) {
                     if let Tiling::SealedFunction { domain: d, .. } = op.tiling() {
                         assert_eq!(
                             domain, d,
@@ -1461,12 +1476,12 @@ impl FanIn {
                 Tiling::SealedFunction {
                     domain: domain.clone(),
                     codomain: Box::new(Tiling::Record(
-                        inputs
+                        names
                             .iter()
-                            .enumerate()
-                            .map(|(i, op)| {
+                            .zip(ops.iter())
+                            .map(|(name, op)| {
                                 (
-                                    tuple_field(i),
+                                    name.clone(),
                                     op.tiling()
                                         .codomain()
                                         .unwrap_or_else(|| {
@@ -1480,12 +1495,9 @@ impl FanIn {
                 }
             }
             Tiling::CurriedFunction {
-                domain1,
-                domain2,
-                codomain: _,
+                domain1, domain2, ..
             } => {
-                // Verify all inputs are CurriedFunction with the same domain1 and domain2
-                for op in inputs.iter() {
+                for op in ops.iter().skip(1) {
                     if let Tiling::CurriedFunction {
                         domain1: d1,
                         domain2: d2,
@@ -1508,15 +1520,15 @@ impl FanIn {
                     domain1: domain1.clone(),
                     domain2: domain2.clone(),
                     codomain: Extent::Record(
-                        inputs
+                        names
                             .iter()
-                            .enumerate()
-                            .map(|(i, op)| {
-                                if let Tiling::CurriedFunction { codomain: cod, .. } = op.tiling() {
-                                    (tuple_field(i), cod.clone())
-                                } else {
+                            .zip(ops.iter())
+                            .map(|(name, op)| {
+                                let Tiling::CurriedFunction { codomain: cod, .. } = op.tiling()
+                                else {
                                     panic!("Expected CurriedFunction, got {}", op.tiling())
-                                }
+                                };
+                                (name.clone(), cod.clone())
                             })
                             .collect(),
                     ),
@@ -1526,7 +1538,11 @@ impl FanIn {
                 "FanIn: all inputs must have function tilings (SealedFunction or CurriedFunction)"
             ),
         };
-        Self { tiling, inputs }
+        Self {
+            tiling,
+            names,
+            inputs: ops,
+        }
     }
 }
 
@@ -1552,6 +1568,16 @@ pub fn fan_in(inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
         Box::new(ScalarFanIn::new(inputs))
     } else {
         Box::new(FanIn::new(inputs))
+    }
+}
+
+/// Named-field variant of [`fan_in`]: like [`fan_in`] but uses caller-supplied
+/// field names instead of the synthetic `_0`, `_1`, … names.
+pub fn fan_in_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Box<dyn TileOperator> {
+    if inputs.iter().all(|(_, op)| is_scalar_tiling(op.tiling())) {
+        Box::new(ScalarFanIn::new_named(inputs))
+    } else {
+        Box::new(FanIn::new_named(inputs))
     }
 }
 
@@ -1594,6 +1620,7 @@ impl TileOperator for FanIn {
         }));
         Box::new(FanInProducer {
             base: ProducerBase::new(FanInProducer::alloc_id(), &self.tiling),
+            names: self.names.clone(),
             inputs: self
                 .inputs
                 .iter_mut()
@@ -1612,6 +1639,8 @@ impl TileOperator for FanIn {
 /// Producer for [`FanIn`]: pulls each input and assembles a record-codomain tile.
 struct FanInProducer {
     base: ProducerBase,
+    /// Field names in input order, used when producing the output Record tile.
+    names: Vec<String>,
     /// Live input producers, in field order.
     inputs: Vec<Box<dyn TileProducer>>,
 }
@@ -1659,11 +1688,12 @@ impl TileProducer for FanInProducer {
                     }
                 }
 
+                let names = &self.names;
                 let codomain_record = Tile::Record(
                     codomains
                         .into_iter()
                         .enumerate()
-                        .map(move |(i, cv)| (tuple_field(i), cv))
+                        .map(move |(i, cv)| (names[i].clone(), cv))
                         .collect(),
                 );
                 Tile::SealedFunction {
@@ -1723,11 +1753,12 @@ impl TileProducer for FanInProducer {
                     }
                 }
 
+                let names = &self.names;
                 let codomain_record = ColumnValue::Records(
                     codomains
                         .into_iter()
                         .enumerate()
-                        .map(move |(i, cv)| (tuple_field(i), cv))
+                        .map(move |(i, cv)| (names[i].clone(), cv))
                         .collect(),
                 );
                 Tile::CurriedFunction {
@@ -1767,6 +1798,8 @@ impl TileProducer for FanInProducer {
 /// `Tile::Scalar(ColumnValue::Records)` keyed `_0`, `_1`, …, `_N-1`.
 pub struct ScalarFanIn {
     tiling: Tiling,
+    /// Field names in input order, used when producing `Tile::Record` tiles.
+    names: Vec<String>,
     inputs: Vec<Box<dyn TileOperator>>,
 }
 
@@ -1781,14 +1814,36 @@ impl ScalarFanIn {
             !inputs.is_empty(),
             "ScalarFanIn requires at least one input"
         );
+        let names = (0..inputs.len()).map(tuple_field).collect();
+        Self::new_impl(names, inputs)
+    }
+
+    /// Construct a `ScalarFanIn` with explicit named fields for record literals.
+    ///
+    /// Like [`Self::new`] but uses the caller-supplied field names instead of
+    /// the synthetic `_0`, `_1`, … names used for tuples.
+    pub fn new_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Self {
+        assert!(
+            !inputs.is_empty(),
+            "ScalarFanIn requires at least one input"
+        );
+        let (names, ops) = inputs.into_iter().unzip();
+        Self::new_impl(names, ops)
+    }
+
+    fn new_impl(names: Vec<String>, inputs: Vec<Box<dyn TileOperator>>) -> Self {
         let tiling = Tiling::Record(
-            inputs
+            names
                 .iter()
-                .enumerate()
-                .map(|(i, op)| (tuple_field(i), op.tiling().clone()))
+                .zip(inputs.iter())
+                .map(|(name, op)| (name.clone(), op.tiling().clone()))
                 .collect(),
         );
-        Self { tiling, inputs }
+        Self {
+            tiling,
+            names,
+            inputs,
+        }
     }
 }
 
@@ -1815,6 +1870,7 @@ impl TileOperator for ScalarFanIn {
         }));
         Box::new(ScalarFanInProducer {
             base: ProducerBase::new(ScalarFanInProducer::alloc_id(), &self.tiling),
+            names: self.names.clone(),
             inputs: self
                 .inputs
                 .iter_mut()
@@ -1834,6 +1890,7 @@ impl TileOperator for ScalarFanIn {
 /// a `Tile::Scalar(ColumnValue::Records)`.
 struct ScalarFanInProducer {
     base: ProducerBase,
+    names: Vec<String>,
     inputs: Vec<Box<dyn TileProducer>>,
 }
 
@@ -1849,12 +1906,12 @@ impl TileProducer for ScalarFanInProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let fields: HashMap<String, Tile> = self
-            .inputs
-            .iter_mut()
-            .enumerate()
-            .map(|(i, input)| {
+            .names
+            .iter()
+            .zip(self.inputs.iter_mut())
+            .map(|(name, input)| {
                 let tile = input.get(input.tiling().universal_guard());
-                (tuple_field(i), tile)
+                (name.clone(), tile)
             })
             .collect();
         Tile::Record(fields)

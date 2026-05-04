@@ -731,10 +731,26 @@ fn typecheck_equal(a: &Type, b: &Type) -> bool {
             if a_fields.len() != b_fields.len() {
                 return false;
             }
-            a_fields
-                .iter()
-                .zip(b_fields.iter())
-                .all(|(a, b)| a.0 == b.0 && typecheck_equal(&a.1, &b.1))
+            // Compare by field name, not position — record field order is an artifact of
+            // how inference accumulates constraints and should not affect type equality.
+            let a_map: HashMap<&str, &Type> =
+                a_fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+            b_fields.iter().all(|(n, t)| {
+                a_map
+                    .get(n.as_str())
+                    .is_some_and(|a_t| typecheck_equal(a_t, t))
+            })
+        }
+        // A full Record satisfies a PartialRecord constraint if all named fields match.
+        (Type::Record(full), Type::PartialRecord(partial))
+        | (Type::PartialRecord(partial), Type::Record(full)) => {
+            let full_map: HashMap<&str, &Type> =
+                full.iter().map(|(n, t)| (n.as_str(), t)).collect();
+            partial.iter().all(|(n, t)| {
+                full_map
+                    .get(n.as_str())
+                    .is_some_and(|f_t| typecheck_equal(t, f_t))
+            })
         }
         // Nested unions are semantically flat: Union(Union(A,B),C) ≡ Union(A,B,C).
         // Flatten both sides before comparing to handle rewriting passes that

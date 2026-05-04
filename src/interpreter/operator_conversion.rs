@@ -7,10 +7,11 @@ use crate::{
     },
     interpreter::{
         tile_operators::{
-            fan_in, Aggregate, Constant, Converse, ExtractAggregate, FanOut, FlattenTupleDomain,
-            IterateExtent, MapAggregate, MapDomain, MapExtractAggregate, MapResult,
-            MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo, PermuteRecordDomain,
-            Restrict, ScalarFanIn, TileOperator, Tiling, Uncurry, UnionOperator,
+            fan_in, fan_in_named, Aggregate, Constant, Converse, ExtractAggregate, FanOut,
+            FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
+            MapResult, MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo,
+            PermuteRecordDomain, Restrict, ScalarFanIn, TileOperator, Tiling, Uncurry,
+            UnionOperator,
         },
         tuple_field, ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
         DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
@@ -283,48 +284,62 @@ fn convert_impl(
             )))
         }
 
-        // zip(f, g, ...): fan-out — apply each morphism to the same inut.
+        // zip(f, g, ...): fan-out — apply each morphism to the same input.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Zip) =>
         {
-            let TypedExprNode::Tuple(elts) = &argument.node else {
-                return Err(ConversionError::Unsupported(format!(
-                    "zip expects a Tuple argument, got {:?}",
-                    argument.node
-                )));
-            };
             let input =
                 input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
-            let consts: Vec<_> = elts.iter().map(is_const).collect();
-            if elts.len() == 2 && consts.iter().any(Option::is_some) {
-                // Check for zip-with-const and optimize
-                let (const_idx, mode) = if consts[0].is_some() {
-                    (0, MapResultToConstMode::FanInLeft)
-                } else {
-                    (1, MapResultToConstMode::FanInRight)
-                };
-                let non_const_arm = convert_impl(&elts[1 - const_idx], Some(input), None, ctx)?;
-                let const_arm = convert_impl(consts[const_idx].unwrap(), None, None, ctx)?;
-                Ok(Box::new(MapResultToConst::new(
-                    non_const_arm,
-                    const_arm,
-                    mode,
-                )))
-            } else {
-                // Wrap input in FanOut so every branch shares the same upstream producer.
-                let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
-                let mut ops = Vec::new();
-                for elt in elts {
-                    ops.push(convert_impl(elt, Some(fan_out.branch()), None, ctx)?);
+            match &argument.node {
+                TypedExprNode::Tuple(elts) => {
+                    let consts: Vec<_> = elts.iter().map(is_const).collect();
+                    if elts.len() == 2 && consts.iter().any(Option::is_some) {
+                        // Zip-with-const optimisation: avoid full FanOut when one arm is constant.
+                        let (const_idx, mode) = if consts[0].is_some() {
+                            (0, MapResultToConstMode::FanInLeft)
+                        } else {
+                            (1, MapResultToConstMode::FanInRight)
+                        };
+                        let non_const_arm =
+                            convert_impl(&elts[1 - const_idx], Some(input), None, ctx)?;
+                        let const_arm = convert_impl(consts[const_idx].unwrap(), None, None, ctx)?;
+                        Ok(Box::new(MapResultToConst::new(
+                            non_const_arm,
+                            const_arm,
+                            mode,
+                        )))
+                    } else {
+                        // Wrap input in FanOut so every branch shares the same upstream producer.
+                        let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+                        let mut ops = Vec::new();
+                        for elt in elts {
+                            ops.push(convert_impl(elt, Some(fan_out.branch()), None, ctx)?);
+                        }
+                        // The arms' runtime tilings depend on the upstream `input` —
+                        // scalar upstream produces scalar arms, function upstream produces
+                        // function arms. `fan_in` picks the matching combinator.
+                        Ok(fan_in(ops))
+                    }
                 }
-                // The arms' runtime tilings depend on the upstream `input` —
-                // scalar upstream (e.g. a literal tuple or a let-bound scalar
-                // fed into a multi-arg call) produces scalar arms, while a
-                // function upstream (iteration, composition) produces function
-                // arms. `fan_in` picks the matching combinator. See
-                // "CCL types vs. tilings" in `design-operators.md` for why
-                // the same CCL-level `zip` compiles to either tile shape.
-                Ok(fan_in(ops))
+                TypedExprNode::Record(fields) => {
+                    // zip(Record({f1: e1, ..., fn: en})) — produced by Record lambda elimination.
+                    // Fan the shared input out to each field morphism, then combine into a named Record.
+                    let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+                    let ops: Result<Vec<_>, _> = fields
+                        .iter()
+                        .map(|(name, elt)| {
+                            Ok((
+                                name.clone(),
+                                convert_impl(elt, Some(fan_out.branch()), None, ctx)?,
+                            ))
+                        })
+                        .collect();
+                    Ok(fan_in_named(ops?))
+                }
+                other => Err(ConversionError::Unsupported(format!(
+                    "zip expects a Tuple or Record argument, got {:?}",
+                    other
+                ))),
             }
         }
 
@@ -469,10 +484,11 @@ fn convert_impl(
             proj_field(input, *n)
         }
 
-        TypedExprNode::Proj(ProjKey::Field(_)) => Err(ConversionError::Unsupported(
-            "named field projection (Proj::Field) is not yet supported in operator_conversion"
-                .into(),
-        )),
+        TypedExprNode::Proj(ProjKey::Field(name)) => {
+            let input =
+                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
+            proj_named_field(input, name)
+        }
 
         TypedExprNode::Var(name) => {
             if let Some(fan_out) = ctx.lookup(name) {
@@ -533,6 +549,19 @@ fn convert_impl(
                 .map(|elt| convert_impl(elt, None, None, ctx))
                 .collect();
             Ok(Box::new(ScalarFanIn::new(ops?)))
+        }
+
+        TypedExprNode::Record(fields) => {
+            if input.is_some() {
+                return Err(ConversionError::Unsupported(
+                    "record literals expect no input".into(),
+                ));
+            }
+            let ops: Result<Vec<_>, _> = fields
+                .iter()
+                .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, None, ctx)?)))
+                .collect();
+            Ok(Box::new(ScalarFanIn::new_named(ops?)))
         }
 
         // Literal constant: produce a scalar.
@@ -642,6 +671,13 @@ fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
                 .collect();
             Ok(Value::Record(fields?))
         }
+        TypedExprNode::Record(fields) => {
+            let map: Result<HashMap<String, Value>, _> = fields
+                .iter()
+                .map(|(name, e)| Ok((name.clone(), expr_to_value(e)?)))
+                .collect();
+            Ok(Value::Record(map?))
+        }
         _ => Err(ConversionError::Unsupported(format!(
             "only literals and constant tuples are supported in list elements, got: {expr:?}"
         ))),
@@ -673,6 +709,26 @@ fn proj_field(
     let record_extent = result_extent(input.tiling());
     let field_extent = field_extent_of(&record_extent, &field_name)?;
     let fn_value = Value::ComputableFunction(FunctionDef::RecordField(field_name));
+    let fn_extent = Extent::Function {
+        domain: Box::new(record_extent),
+        codomain: Box::new(field_extent),
+    };
+    Ok(Box::new(MapResult::new(
+        input,
+        Box::new(Constant::new(fn_value, fn_extent)),
+    )))
+}
+
+/// Build an operator that extracts a named field from the record codomain of `input`.
+///
+/// Produces `MapResult(input, Constant(RecordField(name)))`.
+fn proj_named_field(
+    input: Box<dyn TileOperator>,
+    name: &str,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let record_extent = result_extent(input.tiling());
+    let field_extent = field_extent_of(&record_extent, name)?;
+    let fn_value = Value::ComputableFunction(FunctionDef::RecordField(name.to_string()));
     let fn_extent = Extent::Function {
         domain: Box::new(record_extent),
         codomain: Box::new(field_extent),
@@ -853,10 +909,12 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
     }
 }
 
-// Returns x if the expr is x ▷ const, None otherwise
+// Returns x if the expr is x ▷ const, None otherwise.
+// Only returns Some for scalar-typed constants; function-typed constants (e.g. Proj morphisms)
+// produce function tiles that MapResultToConst cannot combine via scalar_tile_to_column_value.
 fn is_const(expr: &Expr) -> Option<&Expr> {
     if let TypedExprNode::Apply { function, argument } = &expr.node {
-        if as_builtin(function) == Some(Builtin::Const) {
+        if as_builtin(function) == Some(Builtin::Const) && !matches!(argument.ty, Type::Fun(..)) {
             return Some(argument.as_ref());
         }
     }

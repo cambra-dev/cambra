@@ -783,17 +783,25 @@ fn elim_lambda(
             Ok(Expr::apply(inner_tuple, zip_var).with_ty(result_ty))
         }
 
-        // Record — analogous to Tuple, element-wise.
+        // Record: λ x → {f1: e1, ..., fn: en}  ⟹  zip({f1: λx→e1, ..., fn: λx→en})
+        // Mirrors the Tuple rule: build an inner Record of morphisms, then apply Zip.
+        // This keeps the same structural invariant: the Record node always has type
+        // Record([..., Fun(D, Ti), ...]) and the Fun wrapper lives on the Apply/Zip node.
         TypedExprNode::Record(fields) => {
-            let elim_fields: Result<Vec<_>, _> = fields
+            let elim_fields: Vec<(String, Expr)> = fields
                 .into_iter()
                 .map(|(k, e)| elim_lambda(ctx, param, param_ty, e).map(|r| (k, r)))
-                .collect();
-            Ok(TypedExpr {
-                node: TypedExprNode::Record(elim_fields?),
-                ty: result_ty,
-                user_annotation: None,
-            })
+                .collect::<Result<_, _>>()?;
+            let inner_ty = Type::Record(
+                elim_fields
+                    .iter()
+                    .map(|(k, e)| (k.clone(), e.ty.clone()))
+                    .collect(),
+            );
+            let inner_record = TypedExpr::new(TypedExprNode::Record(elim_fields)).with_ty(inner_ty);
+            let zip_fn_ty = fun_ty_or_hole(&inner_record.ty, &result_ty);
+            let zip_var = Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty);
+            Ok(Expr::apply(inner_record, zip_var).with_ty(result_ty))
         }
 
         // Let binding:

@@ -484,6 +484,36 @@ pass only constrains both operands to `String` and returns `String` as the resul
 
 For each `Branch { guard, body }`: the guard is constrained to `Type::Base(BaseType::Bool)`; body types across all branches are unified via `constrain_equal`. The overall `Case` type is the unified body type. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
 
+### Record literals and field access
+
+CHL record literals use Python dict syntax with **bare identifier keys**:
+
+```python
+r = {x: 1, y: "hello"}   # Record([("x", 1), ("y", "hello")])
+r.x                        # Apply(r, Proj(ProjKey::Field("x"))) → 1
+```
+
+**Lowering:**
+- `{k: v, ...}` (all keys must be bare `Name` nodes) → `TypedExprNode::Record([(k, v), ...])`.
+  Dict literals with non-identifier keys (e.g. string constants) are rejected with `LoweringError::Unsupported`.
+- `expr.field` (Python `Attribute`) → `Apply(lower(expr), Proj(ProjKey::Field("field")))`.
+
+**Type inference:** `Record([(k, e), ...])` infers to `Type::Record([(k, T), ...])` where each `T` is
+the inferred type of the corresponding value expression — identical in structure to `Tuple` inference.
+
+**Lambda elimination:** `Record(fields)` inside a lambda body is treated identically to `Tuple`:
+each field expression is recursively eliminated, producing `Apply(Record([…elim fields…]), Zip)`.
+The inner `Record` node carries type `Record([(k, Fun(D,T)), …])` — a record of morphisms — and
+the outer `Zip` application fuses them via a shared `FanOut`, producing a morphism to a record.
+This ensures `typecheck` invariants hold: a `Record` node always has a `Record` type.
+
+**Operator conversion:** At the `Apply(Record([…]), Zip)` node, the `Zip` handler dispatches on
+the argument shape. For a `Record` argument it uses `fan_in_named`, which selects `FanIn::new_named`
+(function-tiling inputs) or `ScalarFanIn::new_named` (scalar inputs) and preserves the declared
+field names in the output `Tile::Record`. `Proj(ProjKey::Field(name))` compiles to a
+`MapResult` using `FunctionDef::RecordField(name)`, extracting the named field from the upstream
+record tile — identical in mechanism to `Proj(ProjKey::Index(n))` for tuples.
+
 ### `Proj` inference — `PartialTuple` / `PartialRecord` domain types
 
 A bare `Proj(key)` node — i.e. the projection morphism, not an application of it — is
@@ -852,6 +882,7 @@ a 1:1 correspondence, with each type of object lifted up to apply within a chain
 |---|---|
 | `Compose([f, g, …])` | sequential pipeline: output of each feeds next |
 | `zip(f, g)` | `FanIn` over a shared `FanOut`-wrapped domain (via the `fan_in` factory) |
+| `zip({k: f, …})` | `fan_in_named` — record-of-morphisms fused via `FanIn::new_named` or `ScalarFanIn::new_named` |
 | `id` | identity (pass-through) |
 | `const(c)` | `MapResultToConst` |
 | `map(g)` | `MapResult` |

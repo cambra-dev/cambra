@@ -731,7 +731,10 @@ pub enum TypedExprNode {
     /// Introduced by lowering; absent in the higher-level design.
     Proj(ProjKey),
 
-    /// A record constructor. Lowering from Python syntax is not yet implemented.
+    /// A record constructor: `{field: expr, ...}`.
+    ///
+    /// Lowered from Python dict literals with bare identifier keys.
+    /// Field access `r.field` lowers to `Apply(r, Proj(ProjKey::Field("field")))`.
     Record(Vec<(String, TypedExpr)>),
 
     /// A grouping operation over a collection by a key extraction function.

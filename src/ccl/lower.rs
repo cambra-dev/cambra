@@ -36,6 +36,8 @@
 //! | Let-bindings in generator bodies `y = f(x); yield y` | [`Expr::Let`] interleaved in the `Lambda`/`Apply` chain |
 //! | Pre-loop lets before generator for-loop | [`Expr::Let`] wrapping the generator expression |
 //! | Regular functions `def f(x, y, ...): expr` | [`Expr::Let`] + single [`Expr::Lambda`] (tupled param when multi-arg) |
+//! | Record literals `{field: expr, ...}` (identifier keys only) | [`TypedExprNode::Record`] |
+//! | Field access `r.field` | [`Expr::Apply`] with [`TypedExprNode::Proj`]`(`[`ProjKey::Field`]`)` |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
 //!
@@ -178,6 +180,33 @@ pub fn lower_expr(
                 "Only integer subscripts are supported".into(),
             )),
         },
+        // Dict literal `{field: expr, ...}` — keys must be bare identifiers.
+        // Lowered to a `Record` constructor: `{x: 1, y: "foo"}` becomes
+        // `Record([("x", Lit(1)), ("y", Lit("foo"))])`.
+        pyast::ExprKind::Dict { keys, values } => {
+            let mut fields = Vec::with_capacity(keys.len());
+            for (key, value) in keys.iter().zip(values.iter()) {
+                let field_name = match &key.node {
+                    pyast::ExprKind::Name { id, .. } => id.clone(),
+                    _ => {
+                        return Err(LoweringError::Unsupported(
+                            "record literal keys must be bare identifiers".into(),
+                        ))
+                    }
+                };
+                if fields.iter().any(|(k, _)| k == &field_name) {
+                    return Err(LoweringError::Unsupported(format!(
+                        "duplicate key `{field_name}` in record literal"
+                    )));
+                }
+                fields.push((field_name, lower_expr(value, ctx)?));
+            }
+            Ok(Expr::new(TypedExprNode::Record(fields)))
+        }
+        // Attribute access `r.field` → `Apply(r, Proj(Field("field")))`.
+        pyast::ExprKind::Attribute { value, attr, .. } => {
+            Ok(Expr::apply(lower_expr(value, ctx)?, Expr::proj_field(attr)))
+        }
         pyast::ExprKind::Lambda { args, body } => lower_lambda(args, body, ctx),
         pyast::ExprKind::UnaryOp { op, operand } => lower_unaryop(op, operand, ctx),
         // Ternary `value if test else orelse` → Case { [guard → value, true → orelse] }
