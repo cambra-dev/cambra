@@ -180,10 +180,6 @@ fn inline_defers(
                 inline_defers(a, type_substitutions)?;
             }
         }
-        TypedExprNode::GroupBy { collection, key } => {
-            inline_defers(collection, type_substitutions)?;
-            inline_defers(key, type_substitutions)?;
-        }
         TypedExprNode::ExprStmt { expr: inner, body } => {
             inline_defers(inner, type_substitutions)?;
             inline_defers(body, type_substitutions)?;
@@ -247,9 +243,8 @@ fn substitute_types_in_expr(expr: &mut Expr, type_substitutions: &[(Type, Type)]
         } => {
             substitute_types(&mut param.ty, type_substitutions);
             if let Some(refinement) = refinement {
-                if let RefinementKind::Predicate(pred) = &mut refinement.kind {
-                    substitute_types_in_expr(&mut pred.borrow_mut(), type_substitutions);
-                }
+                let RefinementKind::Predicate(pred) = &mut refinement.kind;
+                substitute_types_in_expr(&mut pred.borrow_mut(), type_substitutions);
             }
             substitute_types_in_expr(body, type_substitutions);
         }
@@ -284,10 +279,6 @@ fn substitute_types_in_expr(expr: &mut Expr, type_substitutions: &[(Type, Type)]
             for a in args {
                 substitute_types_in_expr(a, type_substitutions);
             }
-        }
-        TypedExprNode::GroupBy { collection, key } => {
-            substitute_types_in_expr(collection, type_substitutions);
-            substitute_types_in_expr(key, type_substitutions);
         }
         TypedExprNode::ExprStmt { expr: inner, body } => {
             substitute_types_in_expr(inner, type_substitutions);
@@ -334,9 +325,8 @@ fn substitute_types(ty: &mut Type, type_substitutions: &[(Type, Type)]) {
         }
         Type::Refinement(base, pred) => {
             substitute_types(base, type_substitutions);
-            if let RefinementKind::Predicate(pred) = &mut pred.kind {
-                substitute_types_in_expr(&mut pred.borrow_mut(), type_substitutions);
-            }
+            let RefinementKind::Predicate(pred) = &mut pred.kind;
+            substitute_types_in_expr(&mut pred.borrow_mut(), type_substitutions);
         }
         _ => {}
     }

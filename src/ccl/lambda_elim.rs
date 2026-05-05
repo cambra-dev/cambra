@@ -214,7 +214,6 @@ pub(crate) fn is_free(param: &str, expr: &Expr) -> bool {
                 let free_in_body = is_free(param, body);
                 let free_in_refinement = refinement.as_ref().is_some_and(|r| match &r.kind {
                     RefinementKind::Predicate(pred_rc) => is_free(param, &pred_rc.borrow()),
-                    RefinementKind::HashJoin(_) => false,
                 });
                 free_in_body || free_in_refinement
             }
@@ -265,8 +264,7 @@ pub(crate) fn is_free(param: &str, expr: &Expr) -> bool {
 
         TypedExprNode::Aggregate { input, .. } => is_free(param, input),
 
-        // Source, Aggregate, GroupBy have no binding structure referencing free vars
-        TypedExprNode::Source(_) | TypedExprNode::GroupBy { .. } => false,
+        TypedExprNode::Source(_) => false,
 
         TypedExprNode::ExprStmt { expr, body } => is_free(param, expr) || is_free(param, body),
 
@@ -284,14 +282,12 @@ fn is_free_in_type(param: &str, ty: &Type) -> bool {
     match ty {
         Type::Refinement(base, refinement) => {
             let mut free = is_free_in_type(param, base);
-            if let Refinement {
+            let Refinement {
                 kind: RefinementKind::Predicate(pred_rc),
                 ..
-            } = &refinement
-            {
-                if let Ok(pred) = pred_rc.try_borrow() {
-                    free |= is_free(param, &pred);
-                }
+            } = &refinement;
+            if let Ok(pred) = pred_rc.try_borrow() {
+                free |= is_free(param, &pred);
             }
             free
         }
@@ -460,11 +456,6 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             kind,
         },
 
-        TypedExprNode::GroupBy { collection, key } => TypedExprNode::GroupBy {
-            collection: Box::new(substitute(*collection, name, replacement)),
-            key: Box::new(substitute(*key, name, replacement)),
-        },
-
         // Atoms handled above; these shouldn't be reached but return as-is for safety.
         other => other,
     };
@@ -483,19 +474,17 @@ fn substitute_in_type(ty: &mut Type, name: &str, replacement: &Expr) {
     match ty {
         Type::Refinement(base, refinement) => {
             substitute_in_type(base, name, replacement);
-            if let Refinement {
+            let Refinement {
                 kind: RefinementKind::Predicate(pred_rc),
                 ..
-            } = &mut *refinement
-            {
-                let t = Expr::lit(Lit::Unit);
-                // Substitute within the refinement, unless we are already inside that same refinement
-                // TODO: this probably simplifies once we remove the RefCell from the predicate.
-                if let Ok(mut pred) = pred_rc.try_borrow_mut() {
-                    let old_pred = replace(&mut *pred, t);
-                    let new_pred = substitute(old_pred, name, replacement);
-                    *pred = new_pred;
-                }
+            } = &mut *refinement;
+            let t = Expr::lit(Lit::Unit);
+            // Substitute within the refinement, unless we are already inside that same refinement
+            // TODO: this probably simplifies once we remove the RefCell from the predicate.
+            if let Ok(mut pred) = pred_rc.try_borrow_mut() {
+                let old_pred = replace(&mut *pred, t);
+                let new_pred = substitute(old_pred, name, replacement);
+                *pred = new_pred;
             }
         }
         Type::Fun(domain, codomain) => {
@@ -620,11 +609,6 @@ fn elim_lambda(
                         } else {
                             y_ty = Type::Refinement(Box::new(param_ty), r.clone());
                         };
-                    }
-                    RefinementKind::HashJoin(_) => {
-                        return Err(LambdaElimError::Unsupported(
-                            "HashJoin refinement on inner lambda in nested-lambda rule".to_string(),
-                        ));
                     }
                 }
             };
@@ -908,7 +892,6 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
         } if matches!(r.kind, RefinementKind::Predicate(_)) => {
             let mut pred = match &r.kind {
                 RefinementKind::Predicate(pred_rc) => pred_rc.borrow_mut(),
-                _ => unreachable!(),
             };
             *pred = elim_lambdas(ctx, pred.clone())?;
             // Desugar, preserving the lambda's type on the resulting Compose.
@@ -923,13 +906,6 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
             debug_typecheck(&desugared);
             elim_lambdas(ctx, desugared)
         }
-
-        TypedExprNode::Lambda {
-            refinement: Some(ref r),
-            ..
-        } if matches!(r.kind, RefinementKind::HashJoin(_)) => Err(LambdaElimError::Unsupported(
-            "HashJoin refinement in lambda elimination".to_string(),
-        )),
 
         // Plain lambda (no refinement): eliminate then continue.
         TypedExprNode::Lambda {
@@ -1324,11 +1300,8 @@ mod tests {
             ..
         } = &result.node
         {
-            if let RefinementKind::Predicate(pred_rc) = &r.kind {
-                pred_rc.borrow().clone()
-            } else {
-                panic!("Expected predicate refinement");
-            }
+            let RefinementKind::Predicate(pred_rc) = &r.kind;
+            pred_rc.borrow().clone()
         } else {
             panic!("Expected lambda with refinement");
         };

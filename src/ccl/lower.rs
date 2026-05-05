@@ -61,8 +61,8 @@ use rustpython_parser::ast as pyast;
 
 use crate::ccl::BaseType;
 use crate::ccl::{
-    AggregateKind, ArithmeticKind, BinOpKind, Branch, CompareKind, Expr, HashJoinSpec, Lit,
-    LogicKind, RefinementKind, Type, TypedExprNode, UnaryOpKind,
+    AggregateKind, ArithmeticKind, BinOpKind, Branch, CompareKind, Expr, Lit, LogicKind,
+    RefinementKind, Type, TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -91,10 +91,6 @@ pub enum LoweringError {
 #[derive(Default)]
 pub struct LoweringContext {
     known_sources: HashSet<String>,
-
-    /// Temporary option to choose between using the groupby node directly or
-    /// the generic CCL equivalent
-    pub use_ccl_for_groupby: bool,
 
     /// Monotonic counter for minting unique synthetic names during lowering.
     /// Currently used only for per-multi-arg-lambda tupled parameter names
@@ -574,9 +570,6 @@ fn lower_call(
             let collection = lower_expr(&args[0], ctx)?;
             let key_fn = lower_expr(&args[1], ctx)?;
 
-            if !ctx.use_ccl_for_groupby {
-                return Ok(Expr::groupby(collection, key_fn));
-            }
             Ok(Expr::lambda(
                 "__gb_k",
                 Type::Hole,
@@ -976,10 +969,9 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
             // `Rc<RefCell<>>` is freshly allocated during lowering and not
             // yet shared, so mutating in place is safe.
             if let Some(r) = &refinement {
-                if let RefinementKind::Predicate(pred) = &r.kind {
-                    let inner = pred.borrow().clone();
-                    *pred.borrow_mut() = substitute_param_in_body(inner, name, replacement);
-                }
+                let RefinementKind::Predicate(pred) = &r.kind;
+                let inner = pred.borrow().clone();
+                *pred.borrow_mut() = substitute_param_in_body(inner, name, replacement);
             }
             TypedExprNode::Lambda {
                 param,
@@ -1036,10 +1028,6 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
         TypedExprNode::Compose(elts) => {
             TypedExprNode::Compose(elts.into_iter().map(recurse).collect())
         }
-        TypedExprNode::GroupBy { collection, key } => TypedExprNode::GroupBy {
-            collection: Box::new(recurse(*collection)),
-            key: Box::new(recurse(*key)),
-        },
         TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
             expr: Box::new(recurse(*expr)),
             body: Box::new(recurse(*body)),
@@ -1624,32 +1612,22 @@ fn lower_list_comp(
         .map(|e| lower_expr(e, ctx))
         .collect::<Result<_, _>>()?;
 
-    // Detect a 2-generator equality join on the CCL AST: exactly 2 generators,
-    // 1 predicate, and the predicate is `lhs == rhs` where each side references
-    // a distinct generator variable.  Emit a hash-join refinement instead of a
-    // loop-join predicate.  Sources are cloned from the already-lowered
-    // `gen_sources`; key expressions are taken directly from the lowered predicate.
-    // TODO move this to a later phase of compilation.
-    let hash_join_spec: Option<HashJoinSpec> = None;
-
     // Combine all `if` guards into a single loop-join predicate (used when hash
     // join is not applicable — non-equality, 3+ generators, or multiple predicates).
     // Description strings are built from the original pyast Display output.
     let mut pred_op: Option<Expr> = None;
     let mut pred_desc = String::new();
-    if hash_join_spec.is_none() {
-        for (pyast_pred, lowered) in pyast_preds.iter().zip(lowered_preds) {
-            pred_op = Some(match pred_op {
-                Some(lhs) => {
-                    pred_desc.push_str(&format!(" and {pyast_pred}"));
-                    Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), lowered)
-                }
-                None => {
-                    pred_desc = format!("{pyast_pred}");
-                    lowered
-                }
-            });
-        }
+    for (pyast_pred, lowered) in pyast_preds.iter().zip(lowered_preds) {
+        pred_op = Some(match pred_op {
+            Some(lhs) => {
+                pred_desc.push_str(&format!(" and {pyast_pred}"));
+                Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), lowered)
+            }
+            None => {
+                pred_desc = format!("{pyast_pred}");
+                lowered
+            }
+        });
     }
 
     // Sources for the loop-join restriction lambda are cloned from the
@@ -1698,19 +1676,8 @@ fn lower_list_comp(
         );
     }
 
-    // ---- Phase 6: Attach restriction (hash join or loop-join predicate) ----------
-    if let Some(spec) = hash_join_spec {
-        // Equality join between two generators: emit a hash-join refinement.
-        // compile_ccl will construct the Converse/Lambda/Apply operator structure.
-        let desc = format!("{} == {}", spec.build_var_name, spec.probe_var_name);
-        Ok(Expr::lambda_with_hash_join(
-            outer_var,
-            Type::Hole,
-            body_expr,
-            spec,
-            &desc,
-        ))
-    } else if let Some(pred_op) = pred_op {
+    // ---- Phase 6: Attach restriction ----------
+    if let Some(pred_op) = pred_op {
         // Non-equality or multi-predicate: loop-join restriction lambda.
         // Uses an independent "__iter_record_restr" variable so it does not
         // recursively depend on a correlation vector.
@@ -2464,10 +2431,7 @@ f";
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ctx = LoweringContext {
-            use_ccl_for_groupby: true,
-            ..Default::default()
-        };
+        let ctx = LoweringContext::default();
         let ccl = lower_expr(&expr, &ctx).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }

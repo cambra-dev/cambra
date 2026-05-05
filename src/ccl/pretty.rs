@@ -65,13 +65,6 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
                     RefinementKind::Predicate(def) => {
                         node.child("refinement", expr_to_node(&def.borrow()))
                     }
-                    RefinementKind::HashJoin(spec) => node.child(
-                        "refinement",
-                        InspectNode::leaf(format!(
-                            "HashJoin({} == {})",
-                            spec.build_var_name, spec.probe_var_name
-                        )),
-                    ),
                 };
             }
             node.child("body", expr_to_node(body))
@@ -143,10 +136,6 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             }
             node
         }
-
-        TypedExprNode::GroupBy { collection, key } => InspectNode::new("GroupBy")
-            .child("collection", expr_to_node(collection))
-            .child("key", expr_to_node(key)),
 
         TypedExprNode::Source(name) => InspectNode::leaf(format!("Source({name})")),
 
@@ -390,35 +379,6 @@ Lambda(x) : Int
 "
     )]
     fn test_pretty_expr(#[case] expr: Expr, #[case] expected: &str) {
-        assert_eq!(pretty(&expr), expected);
-    }
-
-    #[test]
-    fn test_pretty_lambda_hash_join_refinement() {
-        use crate::ccl::{HashJoinSpec, Lit};
-        use std::rc::Rc;
-        let spec = HashJoinSpec {
-            build_gen_position: 0,
-            probe_gen_position: 1,
-            build_var_name: "x".to_string(),
-            probe_var_name: "y".to_string(),
-            build_key: Rc::new(Expr::var("x")),
-            probe_key: Rc::new(Expr::var("y")),
-            build_source: Rc::new(Expr::lit(Lit::Int(0))),
-            probe_source: Rc::new(Expr::lit(Lit::Int(0))),
-        };
-        let expr = Expr::lambda_with_hash_join(
-            "p",
-            Type::Base(BaseType::Int),
-            Expr::lit(Lit::Unit),
-            spec,
-            "x == y",
-        );
-        let expected = "\
-Lambda(p) : Int
-├── refinement: HashJoin(x == y)
-└── body: Lit(unit)
-";
         assert_eq!(pretty(&expr), expected);
     }
 

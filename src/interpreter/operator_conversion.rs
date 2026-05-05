@@ -614,11 +614,7 @@ fn iterate_type(
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     if let Type::Refinement(base, refinement) = ty {
-        let RefinementKind::Predicate(pred) = &refinement.kind else {
-            return Err(ConversionError::TypeError(format!(
-                "unsupported non-predicate refinement in function domain: {refinement:?}"
-            )));
-        };
+        let RefinementKind::Predicate(pred) = &refinement.kind;
         debug!("Converting predicate: {}", symbolic(&pred.borrow()));
         debug!("Converting predicate: {}", symbolic_typed(&pred.borrow()));
         Ok(Box::new(Restrict::new(convert_impl(

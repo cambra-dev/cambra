@@ -130,7 +130,6 @@ pub fn compile_program(
         pyast::Mod::Module { body, .. } => body,
         other => panic!("expected Module, got {other:?}"),
     };
-    ctx.lowering_ctx().use_ccl_for_groupby = true;
     let mut expr = lower_stmts(&stmts, ctx.lowering_ctx()).expect("ccl lowering failed");
 
     debug!("Lowered:\n{}", symbolic(&expr));

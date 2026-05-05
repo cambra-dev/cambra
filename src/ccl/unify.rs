@@ -599,9 +599,8 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
             resolve_type(&mut param.ty, table);
             resolve(body, table);
             if let Some(r) = refinement {
-                if let crate::ccl::RefinementKind::Predicate(def) = &r.kind {
-                    resolve(&mut def.borrow_mut(), table);
-                }
+                let crate::ccl::RefinementKind::Predicate(def) = &r.kind;
+                resolve(&mut def.borrow_mut(), table);
             }
         }
         TypedExprNode::Let {
@@ -630,10 +629,6 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
         }
         TypedExprNode::Proj(_) => {} // leaf: no sub-expressions to resolve
         TypedExprNode::Aggregate { input, .. } => resolve(input, table),
-        TypedExprNode::GroupBy { collection, key } => {
-            resolve(collection, table);
-            resolve(key, table);
-        }
         TypedExprNode::Case { branches } => {
             for Branch { guard, body } in branches {
                 resolve(guard, table);

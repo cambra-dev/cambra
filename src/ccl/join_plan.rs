@@ -1037,17 +1037,16 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
             let base_iteration = (|| {
                 if arms.len() == 1 {
                     if let Type::Refinement(base_ty, refinement) = &types[arms[0]] {
-                        if let RefinementKind::Predicate(pred_rc) = &refinement.kind {
-                            let pred = pred_rc.borrow().clone();
-                            trace!("Attempting loop join conversion inside iteration");
-                            if let Some(transformed) = convert_loop_join(base_ty, &pred) {
-                                trace!(
-                                    "Converted iteration to {} : {}",
-                                    symbolic(&transformed),
-                                    transformed.ty
-                                );
-                                return transformed;
-                            }
+                        let RefinementKind::Predicate(pred_rc) = &refinement.kind;
+                        let pred = pred_rc.borrow().clone();
+                        trace!("Attempting loop join conversion inside iteration");
+                        if let Some(transformed) = convert_loop_join(base_ty, &pred) {
+                            trace!(
+                                "Converted iteration to {} : {}",
+                                symbolic(&transformed),
+                                transformed.ty
+                            );
+                            return transformed;
                         }
                     }
                     Expr::builtin(Builtin::Id)
@@ -1344,21 +1343,20 @@ fn create_hash_joins(expr: &mut Expr) {
 
     if let Type::Fun(domain, codomain) = expr.ty.clone() {
         if let Type::Refinement(base, refinement) = (*domain).clone() {
-            if let RefinementKind::Predicate(pred_rc) = &refinement.kind {
-                let pred = pred_rc.borrow().clone();
-                trace!("Attempting loop join conversion for: {}", symbolic(expr));
-                if let Some(transformed) = convert_loop_join(&base, &pred) {
-                    trace!(
-                        "Successfully transformed to: {} : {}",
-                        symbolic(&transformed),
-                        transformed.ty
-                    );
-                    let result_ty =
-                        Type::fun(transformed.ty.domain().expect("non-function"), *codomain);
-                    *expr = compose(transformed, take(expr)).with_ty(result_ty);
-                } else {
-                    trace!("Loop join pattern did not match");
-                }
+            let RefinementKind::Predicate(pred_rc) = &refinement.kind;
+            let pred = pred_rc.borrow().clone();
+            trace!("Attempting loop join conversion for: {}", symbolic(expr));
+            if let Some(transformed) = convert_loop_join(&base, &pred) {
+                trace!(
+                    "Successfully transformed to: {} : {}",
+                    symbolic(&transformed),
+                    transformed.ty
+                );
+                let result_ty =
+                    Type::fun(transformed.ty.domain().expect("non-function"), *codomain);
+                *expr = compose(transformed, take(expr)).with_ty(result_ty);
+            } else {
+                trace!("Loop join pattern did not match");
             }
         }
     }

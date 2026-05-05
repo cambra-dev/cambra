@@ -57,9 +57,8 @@ fn simplify_once(expr: &mut Expr) -> bool {
     let mut changed = false;
     if let Type::Fun(domain, _) = &mut expr.ty {
         if let Type::Refinement(_, refinment) = &mut **domain {
-            if let RefinementKind::Predicate(pred) = &refinment.kind {
-                changed = simplify_once(&mut pred.borrow_mut())
-            }
+            let RefinementKind::Predicate(pred) = &refinment.kind;
+            changed = simplify_once(&mut pred.borrow_mut())
         }
     }
     changed |= recurse_simplify(expr);
@@ -99,9 +98,6 @@ fn recurse_simplify(expr: &mut Expr) -> bool {
             args.iter_mut().fold(false, |c, a| c | simplify_once(a))
         }
         TypedExprNode::Aggregate { input, .. } => simplify_once(input),
-        TypedExprNode::GroupBy { collection, key } => {
-            simplify_once(collection) | simplify_once(key)
-        }
         TypedExprNode::ExprStmt { expr, body } => simplify_once(expr) | simplify_once(body),
         TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
             simplify_once(value)
@@ -162,9 +158,6 @@ fn contains_feed(expr: &Expr) -> bool {
             ..
         } => contains_feed(loop_body) || contains_feed(outer_body),
         TypedExprNode::Jump { args, .. } => args.iter().any(contains_feed),
-        TypedExprNode::GroupBy { collection, key } => {
-            contains_feed(collection) || contains_feed(key)
-        }
         TypedExprNode::ExprStmt { expr, body } => contains_feed(expr) || contains_feed(body),
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)

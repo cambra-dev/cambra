@@ -246,11 +246,6 @@ fn inline_impl(expr: Expr) -> Expr {
             TypedExprNode::Compose(elts.into_iter().map(inline_impl).collect())
         }
 
-        TypedExprNode::GroupBy { collection, key } => TypedExprNode::GroupBy {
-            collection: Box::new(inline_impl(*collection)),
-            key: Box::new(inline_impl(*key)),
-        },
-
         TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
             expr: Box::new(inline_impl(*expr)),
             body: Box::new(inline_impl(*body)),
@@ -487,11 +482,6 @@ fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
                 .into_iter()
                 .map(|a| inline_and_beta_reduce(a, name, lambda))
                 .collect(),
-        },
-
-        TypedExprNode::GroupBy { collection, key } => TypedExprNode::GroupBy {
-            collection: Box::new(inline_and_beta_reduce(*collection, name, lambda)),
-            key: Box::new(inline_and_beta_reduce(*key, name, lambda)),
         },
 
         TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {

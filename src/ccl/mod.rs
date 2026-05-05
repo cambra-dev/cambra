@@ -737,27 +737,6 @@ pub enum TypedExprNode {
     /// Field access `r.field` lowers to `Apply(r, Proj(ProjKey::Field("field")))`.
     Record(Vec<(String, TypedExpr)>),
 
-    /// A grouping operation over a collection by a key extraction function.
-    ///
-    /// TODO this is temporary.  We should instead be representing grouping
-    /// purely with refinements and letting the optimizer insert Converse operations
-    /// as needed to efficiently compute those refinements.
-    ///
-    /// `groupby(collection, key)` partitions `collection` into groups, where
-    /// each element is assigned to the group identified by applying `key` to it.
-    ///
-    /// - `collection` is the data source (a function from index to element, i.e.
-    ///   the standard CCL list-as-function encoding).
-    /// - `key` is a function that extracts the grouping key from each element.
-    ///
-    /// The result type is `Fun(key_output_ty, Fun(Base(UInt), elem_ty))`
-    GroupBy {
-        /// The collection (function) whose elements are to be grouped.
-        collection: Box<TypedExpr>,
-        /// A function that computes the grouping key for each element.
-        key: Box<TypedExpr>,
-    },
-
     /// A reference to an externally-registered data source, identified by name.
     ///
     /// Emitted by [`crate::ccl::lower`] when a zero-argument call is recognised
@@ -889,14 +868,6 @@ impl TypedExpr {
         Self::new(TypedExprNode::Aggregate {
             input: Box::new(input),
             kind,
-        })
-    }
-
-    /// Construct a groupby expression.
-    pub fn groupby(collection: Self, key: Self) -> Self {
-        Self::new(TypedExprNode::GroupBy {
-            collection: Box::new(collection),
-            key: Box::new(key),
         })
     }
 
@@ -1059,29 +1030,6 @@ impl TypedExpr {
             }),
         })
     }
-
-    /// Build a [`TypedExprNode::Lambda`] with a hash-join [`Refinement`].
-    pub fn lambda_with_hash_join(
-        param: &str,
-        param_ty: Type,
-        body: TypedExpr,
-        spec: HashJoinSpec,
-        desc: &str,
-    ) -> Self {
-        Self::new(TypedExprNode::Lambda {
-            param: TypedBinding {
-                name: param.to_string(),
-                ty: param_ty,
-                user_annotation: None,
-            },
-            body: Box::new(body),
-            refinement: Some(Refinement {
-                id: next_refinement_id(),
-                description: desc.to_string(),
-                kind: RefinementKind::HashJoin(Box::new(spec)),
-            }),
-        })
-    }
 }
 
 // Implement Default so that we can use std::mem::take out of Exprs.
@@ -1220,7 +1168,6 @@ impl fmt::Display for Type {
                     RefinementKind::Predicate(p) => p
                         .try_borrow()
                         .map_or(r.description.clone(), |e| symbolic::symbolic(&e)),
-                    RefinementKind::HashJoin(_) => r.description.clone(),
                 }
             ),
             Type::Hole => write!(f, "_"),
@@ -1298,46 +1245,10 @@ impl std::hash::Hash for Refinement {
     }
 }
 
-/// Distinguishes loop-join (predicate) refinements from hash-join refinements and carries join strategy metadata.
+/// Carries the predicate of a refinement.
+/// TODO decide whether we need other types of predicates, or inline this away.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RefinementKind {
     /// Arbitrary boolean predicate; compiled as an element-wise loop join.
     Predicate(Rc<RefCell<TypedExpr>>),
-    /// Equality join between two generator key expressions; compiled as a hash join.
-    HashJoin(Box<HashJoinSpec>),
-}
-
-/// All data needed by [`crate::interpreter::compile_ccl`] to build a hash-join
-/// [`crate::interpreter::ComputeRestriction`].
-#[derive(Debug, Clone)]
-pub struct HashJoinSpec {
-    /// Position of the generator for the build side in the original list comp (always the earlier generator for now).
-    pub build_gen_position: usize,
-    /// Position of the generator for the build side in the original list com
-    pub probe_gen_position: usize,
-    /// Name of the build-side iterator variable (e.g. `"x"`).
-    pub build_var_name: String,
-    /// Name of the probe-side iterator variable (e.g. `"y"`).
-    pub probe_var_name: String,
-    /// CCL expression for the build-side join key; references `build_var_name` as a free variable.
-    pub build_key: Rc<TypedExpr>,
-    /// CCL expression for the probe-side join key; references `probe_var_name` as a free variable.
-    pub probe_key: Rc<TypedExpr>,
-    /// CCL expression for the build-side source list (no free generator variables).
-    pub build_source: Rc<TypedExpr>,
-    /// CCL expression for the probe-side source list (no free generator variables).
-    pub probe_source: Rc<TypedExpr>,
-}
-
-impl PartialEq for HashJoinSpec {
-    fn eq(&self, other: &Self) -> bool {
-        self.build_gen_position == other.build_gen_position
-            && self.probe_gen_position == other.probe_gen_position
-            && self.build_var_name == other.build_var_name
-            && self.probe_var_name == other.probe_var_name
-            && Rc::ptr_eq(&self.build_key, &other.build_key)
-            && Rc::ptr_eq(&self.probe_key, &other.probe_key)
-            && Rc::ptr_eq(&self.build_source, &other.build_source)
-            && Rc::ptr_eq(&self.probe_source, &other.probe_source)
-    }
 }
