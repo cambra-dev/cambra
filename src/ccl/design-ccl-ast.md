@@ -371,7 +371,7 @@ enum Type {
     Error,                               // inference already failed here; suppresses cascades
     Refinement(Box<Type>, Refinement),   // refined base type; `Refinement.kind` carries join strategy
     DataSource(String),                  // opaque domain type of a source
-    HandleDomain(HandleId),              // synthetic domain type for a Defer's function type; see §Defer
+    DeferredCollectionDomain(DeferredCollectionId),  // synthetic domain type for a Defer's function type; see §Defer
     // Future:
     // Pi { param, param_ty, body_ty }  — dependent function type
 }
@@ -603,9 +603,16 @@ in ExprStmt(Define(x, 1), x)    # x <<= 1; x
 
 ### Inference
 
-`Defer` gets a fresh `Fun(HandleDomain(id), ?)` type. `HandleDomain(id)` is a synthetic unique domain type created per defer site (via `next_handle_id()`), ensuring each defer's domain is distinct.
+`Defer` gets a fresh `Type::Infer(_)` type — just an unconstrained inference variable. No `DeferredCollectionDomain` is minted at the `Defer` site.
 
-`Feed { name, value }` resolves the type of `name` (must be `Fun(HandleDomain(_), cod)`), constrains `value`'s type against `cod`, and returns `Unit`.
+`Feed { name, value }` establishes the shape of the handle via unification:
+1. A fresh codomain inference variable `cod = Type::Infer(fresh)` is allocated.
+2. If a previous `Feed` on the same handle has already resolved the handle type to `Fun(DeferredCollectionDomain(existing_id), _)`, that `existing_id` is **reused** — the unification table is probed to check whether the handle's inference variable has already been solved. If so, the existing id is extracted; otherwise `next_defer_id()` mints a new one.
+3. `constrain_equal(handle_ty, Fun(DeferredCollectionDomain(id), cod))` imposes the function shape on the handle.
+4. `constrain_equal(value_ty, cod)` links the feed value's type to the codomain.
+5. Returns `Unit`.
+
+The id-reuse in step 2 is what allows multiple `Feed` sites on the same handle to unify correctly. Without it, each feed would mint a fresh `DeferredCollectionDomain(id_N)`, and the two constraints `Fun(DCD(id_0), cod)` and `Fun(DCD(id_1), cod)` would conflict during unification.
 
 `Define { name, value }` constrains `value`'s type against `name`'s full type and returns `Unit`.
 
@@ -618,17 +625,14 @@ The pass runs after `inline` and before `join_plan`. It performs three steps:
 1. **`inline_defers`**: walks the tree looking for `Let { bound_expr: Defer, binding, body }`. For each such binding it calls `inline_defer(body, binding.name)` to extract the feed or define value:
    - A `Define(name, value)` for the target name is extracted as the define value; its site is replaced with the `__replaced` sentinel.
    - A `Feed(name, value)` for the target name is extracted as a feed value; scalar values (no domain type) are lifted to `value ▷ const` so the result is always a function.
-   - The extracted value replaces `Defer` as the `Let`'s bound expression.
+   - **Single feed** (`N = 1`): the extracted value replaces `Defer` directly as the `Let`'s bound expression.
+   - **Multiple feeds** (`N > 1`): `construct_feed_result` merges them into `Apply(Tuple([v0, …, vN-1]), Builtin::CollectionUnion)` with result type `Fun(Union(dom0, …, domN-1), dedup(cod0, …, codN-1))`. This is the same shape `operator_conversion` consumes for `a @ b`, so it lowers to a `UnionOperator` without a raw `BinOp` node.
 
-2. **`substitute_types_in_expr`**: propagates any type-variable mappings collected during step 1 (the feed case maps the old `HandleDomain` variable to the inferred result domain).
+2. **`substitute_types_in_expr`**: propagates any type-variable mappings collected during step 1 (the feed case maps the old `DeferredCollectionDomain` variable to the inferred result domain).
 
 3. **`simplify`**: the `ExprStmt` nodes containing the now-replaced `Feed`/`Define` sentinels (`Var("__replaced")`) are dropped by `try_drop_pure_expr_stmt` since the sentinels contain no remaining `Feed` nodes.
 
 After the pass, no `Defer`, `Feed`, `Define`, or `ExprStmt` nodes should remain in the tree.
-
-### Current limitations
-
-- Only one feed per defer is supported. Multiple feeds will require merging the feed values with a union operator, which we don't have yet.  It also needs the ability to reference call sites deterministically to track the origin of different data.
 
 ---
 

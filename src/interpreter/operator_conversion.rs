@@ -2,20 +2,21 @@ use log::{debug, trace};
 
 use crate::{
     ccl::{
-        symbolic::{symbolic, symbolic_typed},
         AggregateKind, Builtin, Expr, Lit, ProjKey, RefinementKind, Type, TypedExprNode,
+        symbolic::{symbolic, symbolic_typed},
     },
     interpreter::{
-        tile_operators::{
-            fan_in, fan_in_named, Aggregate, Constant, Converse, ExtractAggregate, FanOut,
-            FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
-            MapResult, MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo,
-            PermuteRecordDomain, Restrict, ScalarFanIn, TileOperator, Tiling, Uncurry,
-            UnionOperator,
-        },
-        tuple_field, ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
+        ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
         DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
         Value,
+        tile_operators::{
+            Aggregate, Constant, Converse, ExtractAggregate, FanOut, FlattenTupleDomain,
+            IterateExtent, MapAggregate, MapDomain, MapExtractAggregate, MapResult,
+            MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo, PermuteRecordDomain,
+            Restrict, ScalarFanIn, TileOperator, Tiling, Uncurry, UnionOperator, fan_in,
+            fan_in_named,
+        },
+        tuple_field,
     },
     util::ScopeStack,
 };
@@ -468,10 +469,10 @@ fn convert_impl(
 
         TypedExprNode::Apply { argument, function } => {
             if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    format!("Only higher-order combinators (map, const, zip) can take an input operator; found input for non-combinator {}",
-                        symbolic(function)),
-                ));
+                return Err(ConversionError::Unsupported(format!(
+                    "Only higher-order combinators (map, const, zip) can take an input operator; found input for non-combinator {}",
+                    symbolic(function)
+                )));
             }
             let arg = convert_impl(argument, None, None, ctx)?;
             convert_impl(function, Some(arg), None, ctx)
@@ -909,10 +910,11 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
 // Only returns Some for scalar-typed constants; function-typed constants (e.g. Proj morphisms)
 // produce function tiles that MapResultToConst cannot combine via scalar_tile_to_column_value.
 fn is_const(expr: &Expr) -> Option<&Expr> {
-    if let TypedExprNode::Apply { function, argument } = &expr.node {
-        if as_builtin(function) == Some(Builtin::Const) && !matches!(argument.ty, Type::Fun(..)) {
-            return Some(argument.as_ref());
-        }
+    if let TypedExprNode::Apply { function, argument } = &expr.node
+        && as_builtin(function) == Some(Builtin::Const)
+        && !matches!(argument.ty, Type::Fun(..))
+    {
+        return Some(argument.as_ref());
     }
     None
 }

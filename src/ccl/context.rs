@@ -10,19 +10,19 @@ use rustpython_parser::{ast as pyast, parser};
 
 use crate::{
     ccl::{
-        infer::{check_fully_typed, infer, typecheck, TypeInferenceContext},
+        BaseType, Expr, Type,
+        infer::{TypeInferenceContext, check_fully_typed, infer, typecheck},
         inline, join_plan, lambda_elim,
-        lower::{lower_stmts, LoweringContext},
+        lower::{LoweringContext, lower_stmts},
         remove_defers,
         symbolic::{symbolic, symbolic_typed},
-        BaseType, Expr, Type,
     },
     interpreter::{
-        operator_conversion::{convert_to_operators, OpConversionContext},
-        tile_operators::{TileOperator, TileProducer},
         Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource, TestDataSource,
+        operator_conversion::{OpConversionContext, convert_to_operators},
+        tile_operators::{TileOperator, TileProducer},
     },
-    pretty_graph::{pretty_tile_producer_with, VizOptions},
+    pretty_graph::{VizOptions, pretty_tile_producer_with},
 };
 
 /// Bundles the per-stage registries needed to thread externally-managed data

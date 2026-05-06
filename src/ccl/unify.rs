@@ -13,7 +13,7 @@ use std::{collections::HashMap, fmt::Display};
 
 use log::trace;
 
-use crate::ccl::{infer::InferError, Branch, InferVarId, Type};
+use crate::ccl::{Branch, InferVarId, Type, infer::InferError};
 
 // ---------------------------------------------------------------------------
 // Internal entry type
@@ -161,7 +161,9 @@ impl UnificationTable {
 
             // Default: assert compatible (for equal types or Infer unification).
             (Some(existing_ty), ty) => {
-                trace!("UnificationTable::set: asserting equality of existing type {existing_ty} and new type {ty}");
+                trace!(
+                    "UnificationTable::set: asserting equality of existing type {existing_ty} and new type {ty}"
+                );
                 assert!(
                     self.constrain_equal(&existing_ty, &ty).is_ok(),
                     "UnificationTable::set: variable {root:?} already solved to a different type: \
@@ -414,7 +416,7 @@ impl UnificationTable {
                                 ctx: "unify".to_string(),
                                 type_a: a.clone(),
                                 type_b: b.clone(),
-                            })
+                            });
                         }
                     }
                 }
@@ -448,7 +450,7 @@ impl UnificationTable {
                                 ctx: "unify".to_string(),
                                 type_a: a.clone(),
                                 type_b: b.clone(),
-                            })
+                            });
                         }
                     }
                 }
@@ -642,10 +644,10 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
             ..
         } => {
             for p in params {
-                if let Type::Infer(id) = p.ty {
-                    if let Some(ty) = table.probe(id) {
-                        p.ty = ty;
-                    }
+                if let Type::Infer(id) = p.ty
+                    && let Some(ty) = table.probe(id)
+                {
+                    p.ty = ty;
                 }
             }
             resolve(loop_body, table);

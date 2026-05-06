@@ -5,7 +5,7 @@ use log::trace;
 
 use crate::{
     ccl::Type,
-    interpreter::{tiling::Predicate, ColumnValue, DataSourceDomainExtentImpl, Extent, Value},
+    interpreter::{ColumnValue, DataSourceDomainExtentImpl, Extent, Value, tiling::Predicate},
 };
 
 /// Handle for simulating an arbitrary source in a program.
@@ -166,7 +166,7 @@ fn key_matches_predicate(key: &Value, predicate: &Predicate) -> bool {
 mod tests {
     use super::*;
     use crate::ccl::Type;
-    use crate::interpreter::{tiling::Predicate, BaseType};
+    use crate::interpreter::{BaseType, tiling::Predicate};
     use test_log::test;
 
     #[test]

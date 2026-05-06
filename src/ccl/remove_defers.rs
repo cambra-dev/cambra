@@ -23,11 +23,12 @@ use std::fmt;
 use log::trace;
 
 use crate::ccl::{
+    BaseType, Branch, Builtin, Expr, RefinementKind, Type, TypedExprNode,
     ccl_utils::{apply_primitive, typed_compose},
+    infer::dedup_union_type,
     lambda_elim::{is_free, substitute},
     simplify::simplify,
     symbolic::symbolic,
-    BaseType, Branch, Expr, RefinementKind, Type, TypedExprNode,
 };
 
 /// Errors that can arise while eliminating `Defer`/`Feed`/`Define` nodes.
@@ -110,13 +111,10 @@ fn inline_defers(
                 let name = &binding.name;
                 match (feed_values.len(), define_value) {
                     (0, None) => return Err(DeferError::NoFeedOrDefine(name.clone())),
-                    (n, None) if n > 1 => {
-                        todo!("multiple feeds for defer '{}' not yet supported", name)
-                    }
                     (0, Some(define_value)) => {
                         **bound_expr = define_value;
                     }
-                    (1, None) => {
+                    (_, None) => {
                         let feed_result = construct_feed_result(feed_values);
                         let feed_result_domain_ty = feed_result
                             .ty
@@ -197,14 +195,43 @@ fn inline_defers(
     Ok(())
 }
 
-/// Merge the feed values collected for a single defer into one expression.
+/// Merge feed values collected for a single defer into one expression.
 ///
-/// Currently only a single feed per defer is supported; the caller guarantees
-/// exactly one value. Multiple feeds would require unioning together the
-/// individual feed values, which is future work.
-fn construct_feed_result(mut feed_values: Vec<Expr>) -> Expr {
-    debug_assert_eq!(feed_values.len(), 1);
-    feed_values.remove(0)
+/// A single feed is returned as-is. Multiple feeds are merged into a single
+/// `Apply(Tuple([v0, v1, ...]), Builtin(CollectionUnion))` — the same shape
+/// `operator_conversion` consumes for `a @ b`, so it lowers directly to a
+/// `UnionOperator` without seeing a raw `BinOp`.
+///
+/// TODO(diffing): the i-th feed site implicitly becomes the i-th variant of
+/// the resulting union, relying on `inline_defer`'s deterministic visit
+/// order to assign tags. Program diffing / cross-program state sharing will
+/// need an explicit tagged union keyed on a stable feed-site identity rather
+/// than visit order.
+fn construct_feed_result(feed_values: Vec<Expr>) -> Expr {
+    debug_assert!(!feed_values.is_empty());
+    if feed_values.len() == 1 {
+        return feed_values.into_iter().next().unwrap();
+    }
+    // Compute the union result type: Fun(Union(dom0, dom1, ...), dedup(cod0, cod1, ...)).
+    let mut domains = Vec::with_capacity(feed_values.len());
+    let mut codomain_acc: Option<Type> = None;
+    for v in &feed_values {
+        let (dom, cod) = match &v.ty {
+            Type::Fun(d, c) => (*d.clone(), *c.clone()),
+            _ => unreachable!("feed value must have function type, got {:?}", v.ty),
+        };
+        domains.push(dom);
+        codomain_acc = Some(match codomain_acc {
+            None => cod,
+            Some(prev) => dedup_union_type(prev, cod),
+        });
+    }
+    let result_ty = Type::fun(Type::Union(domains), codomain_acc.unwrap());
+    // Build Apply(Tuple([v0, v1, ...]), Builtin(CollectionUnion)) with correct types.
+    // This is the post-lambda-elim form that operator_conversion expects.
+    let tuple_tys: Vec<Type> = feed_values.iter().map(|v| v.ty.clone()).collect();
+    let tuple = Expr::tuple(feed_values).with_ty(Type::Tuple(tuple_tys));
+    apply_primitive(tuple, Builtin::CollectionUnion, result_ty)
 }
 
 /// Apply `type_substitutions` to every type slot in `expr`.
@@ -360,7 +387,7 @@ fn inline_defer(
             } else {
                 apply_primitive(
                     *value.clone(),
-                    super::Builtin::Const,
+                    Builtin::Const,
                     Type::fun(Type::Base(BaseType::Unit), value.ty.clone()),
                 )
             };
@@ -518,7 +545,7 @@ fn inline_defer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{symbolic::symbolic, BaseType, Lit};
+    use crate::ccl::{BaseType, Builtin, Lit, TypedExprNode, symbolic::symbolic};
     use test_log::test;
 
     // -----------------------------------------------------------------------
@@ -641,6 +668,102 @@ mod tests {
         );
         let err = inline_defer(&mut expr, "x").unwrap_err();
         assert_eq!(err, DeferError::MultipleDefinitions("x".into()));
+    }
+
+    // -----------------------------------------------------------------------
+    // construct_feed_result: shape and type assertions
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an `Expr` with `Fun(dom, cod)` type, carrying a literal payload.
+    fn fun_lit(dom: Type, cod: Type, n: i64) -> Expr {
+        Expr::lit(Lit::Int(n)).with_ty(Type::fun(dom, cod))
+    }
+
+    /// A single feed value is returned as-is — no wrapping.
+    #[test]
+    fn construct_feed_result_single_passthrough() {
+        let v = fun_lit(int_ty(), int_ty(), 1);
+        let result = construct_feed_result(vec![v.clone()]);
+        assert_eq!(result.ty, v.ty);
+        assert_eq!(symbolic(&result), symbolic(&v));
+    }
+
+    /// Two feeds with the same codomain produce `Apply(Tuple([v0, v1]), Builtin(CollectionUnion))`
+    /// and a `Fun(Union([dom0, dom1]), cod)` result type.
+    #[test]
+    fn construct_feed_result_two_feeds_shape_and_type() {
+        let unit = Type::Base(BaseType::Unit);
+        let v0 = fun_lit(unit.clone(), int_ty(), 1);
+        let v1 = fun_lit(unit.clone(), int_ty(), 2);
+        let result = construct_feed_result(vec![v0, v1]);
+
+        // Top-level node must be Apply(Tuple([..]), Builtin(CollectionUnion)).
+        // Expr::apply(argument, function) maps to Apply { argument, function }.
+        let TypedExprNode::Apply { function, argument } = &result.node else {
+            panic!("expected Apply, got {:?}", result.node);
+        };
+        assert!(
+            matches!(
+                &function.node,
+                TypedExprNode::Builtin(Builtin::CollectionUnion)
+            ),
+            "function must be Builtin(CollectionUnion), got {:?}",
+            function.node
+        );
+        assert!(
+            matches!(&argument.node, TypedExprNode::Tuple(_)),
+            "argument must be a Tuple, got {:?}",
+            argument.node
+        );
+
+        // Result type: Fun(Union([Unit, Unit]), Int) — identical domains stay as two variants.
+        let Type::Fun(dom, cod) = &result.ty else {
+            panic!("expected Fun result type, got {:?}", result.ty);
+        };
+        assert!(
+            matches!(dom.as_ref(), Type::Union(vs) if vs.len() == 2),
+            "expected Union of two domains, got {:?}",
+            dom
+        );
+        assert_eq!(cod.as_ref(), &int_ty(), "codomain must be Int");
+    }
+
+    /// Two feeds with *different* codomains produce a `Union` codomain via `dedup_union_type`.
+    #[test]
+    fn construct_feed_result_different_codomains_produce_union_codomain() {
+        let unit = Type::Base(BaseType::Unit);
+        let str_ty = Type::Base(BaseType::String);
+        let v0 = fun_lit(unit.clone(), int_ty(), 1);
+        let v1 = fun_lit(unit.clone(), str_ty.clone(), 2);
+        let result = construct_feed_result(vec![v0, v1]);
+
+        let Type::Fun(_, cod) = &result.ty else {
+            panic!("expected Fun result type, got {:?}", result.ty);
+        };
+        assert!(
+            matches!(cod.as_ref(), Type::Union(vs) if vs.len() == 2),
+            "different codomains must produce a Union codomain, got {:?}",
+            cod
+        );
+    }
+
+    /// Three feeds produce a 3-element domain union (N-ary tuple path).
+    #[test]
+    fn construct_feed_result_three_feeds_domain_union() {
+        let unit = Type::Base(BaseType::Unit);
+        let feeds: Vec<Expr> = (1..=3)
+            .map(|n| fun_lit(unit.clone(), int_ty(), n))
+            .collect();
+        let result = construct_feed_result(feeds);
+
+        let Type::Fun(dom, _) = &result.ty else {
+            panic!("expected Fun result type, got {:?}", result.ty);
+        };
+        assert!(
+            matches!(dom.as_ref(), Type::Union(vs) if vs.len() == 3),
+            "expected 3-element Union domain, got {:?}",
+            dom
+        );
     }
 
     /// Mixing feeds and a define for the same defer name is an error.

@@ -213,13 +213,14 @@ fn render_node(
     }
 
     // Check depth limit before rendering children.
-    if let Some(max) = max_depth {
-        if depth >= max && !node.children.is_empty() {
-            let n = count_descendants(node);
-            out.push_str(&format!(" ... ({n} more nodes)"));
-            out.push('\n');
-            return;
-        }
+    if let Some(max) = max_depth
+        && depth >= max
+        && !node.children.is_empty()
+    {
+        let n = count_descendants(node);
+        out.push_str(&format!(" ... ({n} more nodes)"));
+        out.push('\n');
+        return;
     }
 
     out.push('\n');

@@ -20,7 +20,7 @@ use std::fmt;
 
 use rustpython_parser::ast::{self, Constant, ExprKind, StmtKind};
 
-use crate::pretty_tree::{render, InspectNode};
+use crate::pretty_tree::{InspectNode, render};
 
 // ---------------------------------------------------------------------------
 // Generic wrapper & trait

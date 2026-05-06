@@ -11,7 +11,7 @@ use intervalsets::{Bounding, Interval, IntervalSet, MaybeEmpty, Side};
 use smol_str::SmolStr;
 
 use crate::interpreter::{
-    apply_binop_column, apply_unaryop_column, tuple_field, BinOpKind, Predicate, UnaryOpKind,
+    BinOpKind, Predicate, UnaryOpKind, apply_binop_column, apply_unaryop_column, tuple_field,
 };
 use crate::pretty_graph::fmt_binop;
 use crate::util::fmt_record;

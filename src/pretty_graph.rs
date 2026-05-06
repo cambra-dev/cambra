@@ -11,10 +11,10 @@
 //! ```
 
 use crate::interpreter::{
-    tile_operators::{TileOperator, TileProducer},
     ArithmeticKind, BaseType, BinOpKind, CompareKind, Extent, LogicKind,
+    tile_operators::{TileOperator, TileProducer},
 };
-pub use crate::pretty_tree::{render, render_with_max_depth, InspectNode};
+pub use crate::pretty_tree::{InspectNode, render, render_with_max_depth};
 
 /// Mode labels for variable subscription display.
 pub const MODE_ITERATION: &str = "iteration";

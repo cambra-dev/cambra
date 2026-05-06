@@ -187,7 +187,7 @@ pub fn lower_expr(
                     _ => {
                         return Err(LoweringError::Unsupported(
                             "record literal keys must be bare identifiers".into(),
-                        ))
+                        ));
                     }
                 };
                 if fields.iter().any(|(k, _)| k == &field_name) {
@@ -520,7 +520,7 @@ fn lower_constant(constant: &pyast::Constant) -> Result<Expr, LoweringError> {
         _ => {
             return Err(LoweringError::Unsupported(format!(
                 "Constant type not supported: {constant:?}"
-            )))
+            )));
         }
     };
     Ok(Expr::lit(lit))
@@ -554,7 +554,7 @@ fn lower_call(
         _ => {
             return Err(LoweringError::Unsupported(
                 "Only named function calls are supported".into(),
-            ))
+            ));
         }
     };
 
@@ -655,7 +655,7 @@ fn lower_binop(
         _ => {
             return Err(LoweringError::Unsupported(format!(
                 "Binary operator not supported: {op:?}"
-            )))
+            )));
         }
     };
     Ok(Expr::binop(left_expr, kind, right_expr))
@@ -698,12 +698,12 @@ fn lower_unaryop(
         pyast::Unaryop::UAdd => {
             return Err(LoweringError::Unsupported(
                 "Unary Add (+) is not supported".into(),
-            ))
+            ));
         }
         pyast::Unaryop::Invert => {
             return Err(LoweringError::Unsupported(
                 "Bitwise invert (~) is not supported".into(),
-            ))
+            ));
         }
     };
     // Constant-fold `-Int(n)` to `Lit(Int(-n))`. Python's parser leaves negative
@@ -711,10 +711,10 @@ fn lower_unaryop(
     // (`operator_conversion`'s list-literal path in particular) only accept
     // concrete literals as list elements. Folding here keeps
     // `[-1, 2, -3, 4]`-style programs in the supported subset.
-    if let UnaryOpKind::Neg = kind {
-        if let TypedExprNode::Lit(Lit::Int(n)) = &inner.node {
-            return Ok(Expr::lit(Lit::Int(-*n)));
-        }
+    if let UnaryOpKind::Neg = kind
+        && let TypedExprNode::Lit(Lit::Int(n)) = &inner.node
+    {
+        return Ok(Expr::lit(Lit::Int(-*n)));
     }
     Ok(Expr::unary(kind, inner))
 }
@@ -754,7 +754,7 @@ fn lower_compare(
             _ => {
                 return Err(LoweringError::Unsupported(format!(
                     "Comparison operator not supported: {op:?}"
-                )))
+                )));
             }
         };
         // Clone the shared middle operand so both adjacent pairs can own it.
@@ -1427,10 +1427,10 @@ fn lower_generator_chain(
 
     // ---- Build the body expression (innermost-first) ----
     let mut body_expr = yield_expr.clone();
-    for (i, gen) in chain.iter().enumerate().rev() {
+    for (i, generator) in chain.iter().enumerate().rev() {
         // Wrap body in this generator's lets (reverse source order so
         // outermost let wraps everything inside).
-        for step in gen.steps.iter().rev() {
+        for step in generator.steps.iter().rev() {
             if let BodyStep::Let(ls) = step {
                 body_expr = match &ls.annotation {
                     Some(ann) => Expr::let_bind_annotated(
@@ -1444,8 +1444,8 @@ fn lower_generator_chain(
             }
         }
         body_expr = Expr::apply(
-            Expr::apply(make_idx_arg(outer_var, i), gen.source.clone()),
-            Expr::lambda(&gen.iter_var, Type::Hole, body_expr),
+            Expr::apply(make_idx_arg(outer_var, i), generator.source.clone()),
+            Expr::lambda(&generator.iter_var, Type::Hole, body_expr),
         );
     }
 
@@ -1460,8 +1460,8 @@ fn lower_generator_chain(
 
     let mut all_guards: Vec<Expr> = Vec::new();
     let mut guard_descs: Vec<String> = Vec::new();
-    for gen in &chain {
-        for step in &gen.steps {
+    for generator in &chain {
+        for step in &generator.steps {
             if let BodyStep::Guard { cond, desc } = step {
                 all_guards.push(cond.clone());
                 guard_descs.push(desc.clone());
@@ -1475,8 +1475,8 @@ fn lower_generator_chain(
     let pred_desc = guard_descs.join(" and ");
 
     let mut pred_expr = pred_inner;
-    for (i, gen) in chain.iter().enumerate().rev() {
-        for step in gen.steps.iter().rev() {
+    for (i, generator) in chain.iter().enumerate().rev() {
+        for step in generator.steps.iter().rev() {
             if let BodyStep::Let(ls) = step {
                 pred_expr = match &ls.annotation {
                     Some(ann) => Expr::let_bind_annotated(
@@ -1498,8 +1498,8 @@ fn lower_generator_chain(
             }
         };
         pred_expr = Expr::apply(
-            Expr::apply(restr_idx, gen.source.clone()),
-            Expr::lambda(&gen.iter_var, Type::Hole, pred_expr),
+            Expr::apply(restr_idx, generator.source.clone()),
+            Expr::lambda(&generator.iter_var, Type::Hole, pred_expr),
         );
     }
 
@@ -1576,19 +1576,19 @@ fn lower_list_comp(
     let mut gen_sources: Vec<Expr> = Vec::new();
     let mut gen_iter_vars: Vec<String> = Vec::new();
 
-    for gen in generators.iter() {
-        if gen.is_async > 0 {
+    for generator in generators.iter() {
+        if generator.is_async > 0 {
             return Err(LoweringError::Unsupported(
                 "Async comprehensions are not supported".into(),
             ));
         }
-        let source = lower_expr(&gen.iter, ctx)?;
-        let var_name = match &gen.target.node {
+        let source = lower_expr(&generator.iter, ctx)?;
+        let var_name = match &generator.target.node {
             pyast::ExprKind::Name { id, .. } => id,
             _ => {
                 return Err(LoweringError::Unsupported(format!(
                     "Only simple variable targets are supported in comprehensions, got {:?}",
-                    gen.target.node
+                    generator.target.node
                 )));
             }
         };
@@ -2416,14 +2416,20 @@ f";
 
     #[rstest]
     // Variable collection and inline key lambda
-    #[case("groupby(xs, lambda x: x)", "λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ xs ▷ (λ x → x) == __gb_k))} → __gb_i ▷ xs")]
+    #[case(
+        "groupby(xs, lambda x: x)",
+        "λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ xs ▷ (λ x → x) == __gb_k))} → __gb_i ▷ xs"
+    )]
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], lambda x: x // 2)",
         "λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k))} → __gb_i ▷ [1, 2, 3]"
     )]
     // Key is a variable reference (pre-defined function)
-    #[case("groupby(xs, key_fn)", "λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k))} → __gb_i ▷ xs")]
+    #[case(
+        "groupby(xs, key_fn)",
+        "λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k))} → __gb_i ▷ xs"
+    )]
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",

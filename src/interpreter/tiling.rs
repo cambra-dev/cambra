@@ -12,15 +12,15 @@ use std::{
 use bit_set::BitSet;
 use bit_vec::BitVec;
 use intervalsets::{
+    Bounding, Interval, IntervalSet, MaybeEmpty, Side,
     numeric::Domain,
     ops::{Complement, Contains, Difference, Intersection, Union},
-    Bounding, Interval, IntervalSet, MaybeEmpty, Side,
 };
 
 use crate::{
     ccl::{AggregateKind, BaseType},
     interpreter::{
-        apply_binop_column, tuple_field, BinOpKind, ColumnValue, Extent, LogicKind, Value,
+        BinOpKind, ColumnValue, Extent, LogicKind, Value, apply_binop_column, tuple_field,
     },
     util::fmt_record,
 };
@@ -1861,9 +1861,11 @@ mod tests {
 
     #[test]
     fn universal_guard_lookup_function() {
-        assert!(curried(int(), int(), bool_ext())
-            .universal_guard()
-            .is_universal());
+        assert!(
+            curried(int(), int(), bool_ext())
+                .universal_guard()
+                .is_universal()
+        );
     }
 
     #[test]
@@ -3415,13 +3417,15 @@ mod tests {
         };
         assert_eq!(arms.len(), 2);
         // One arm covers domain1 (the released-region predicate).
-        assert!(arms
-            .iter()
-            .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Domain(_)))));
+        assert!(
+            arms.iter()
+                .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Domain(_))))
+        );
         // One arm covers domain2 (the codomain inner guard).
-        assert!(arms
-            .iter()
-            .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Codomain(_)))));
+        assert!(
+            arms.iter()
+                .any(|a| matches!(a, TileGuard::Function(FunctionGuard::Codomain(_))))
+        );
     }
 
     #[test]

@@ -6,13 +6,13 @@ use log::trace;
 
 use crate::ccl::ccl_utils::{apply_function, typed_compose};
 use crate::ccl::{
+    BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, ProjKey, Refinement,
+    RefinementKind, Type, TypedExprNode,
     ccl_utils::apply_primitive,
     infer::typecheck,
     lambda_elim::{compose, id},
     simplify::simplify,
     symbolic::{symbolic, symbolic_typed},
-    BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, ProjKey, Refinement,
-    RefinementKind, Type, TypedExprNode,
 };
 
 /// Returns `true` if `expr` directly references the given built-in primitive.
@@ -298,10 +298,10 @@ fn replace_tuple_project_with_id(expr: &mut Expr, ty: &Type) {
         }
         TypedExprNode::Compose(_) => {
             set_domain_ty(&mut expr.ty, ty);
-            if let TypedExprNode::Compose(elts) = &mut expr.node {
-                if let Some(first) = elts.first_mut() {
-                    replace_tuple_project_with_id(first, ty);
-                }
+            if let TypedExprNode::Compose(elts) = &mut expr.node
+                && let Some(first) = elts.first_mut()
+            {
+                replace_tuple_project_with_id(first, ty);
             }
         }
         TypedExprNode::Apply { .. } => {
@@ -483,10 +483,10 @@ fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]
         }
         TypedExprNode::Compose(_) => {
             set_domain_ty(&mut expr.ty, new_domain_ty);
-            if let TypedExprNode::Compose(elts) = &mut expr.node {
-                if let Some(first) = elts.first_mut() {
-                    reindex_for_domain(first, new_domain_ty, arm_order);
-                }
+            if let TypedExprNode::Compose(elts) = &mut expr.node
+                && let Some(first) = elts.first_mut()
+            {
+                reindex_for_domain(first, new_domain_ty, arm_order);
             }
         }
         TypedExprNode::Apply { .. } => {
@@ -912,10 +912,10 @@ fn build_join_plan(
                 true
             }
         });
-        if let Some(p) = leaf_pred {
-            if let JoinPlan::Loop { predicate, .. } = &mut probe_plan {
-                *predicate = combine_predicates(predicate.take(), Some(p));
-            }
+        if let Some(p) = leaf_pred
+            && let JoinPlan::Loop { predicate, .. } = &mut probe_plan
+        {
+            *predicate = combine_predicates(predicate.take(), Some(p));
         }
     }
 
@@ -1341,23 +1341,22 @@ fn create_hash_joins(expr: &mut Expr) {
         return create_hash_joins(body);
     }
 
-    if let Type::Fun(domain, codomain) = expr.ty.clone() {
-        if let Type::Refinement(base, refinement) = (*domain).clone() {
-            let RefinementKind::Predicate(pred_rc) = &refinement.kind;
-            let pred = pred_rc.borrow().clone();
-            trace!("Attempting loop join conversion for: {}", symbolic(expr));
-            if let Some(transformed) = convert_loop_join(&base, &pred) {
-                trace!(
-                    "Successfully transformed to: {} : {}",
-                    symbolic(&transformed),
-                    transformed.ty
-                );
-                let result_ty =
-                    Type::fun(transformed.ty.domain().expect("non-function"), *codomain);
-                *expr = compose(transformed, take(expr)).with_ty(result_ty);
-            } else {
-                trace!("Loop join pattern did not match");
-            }
+    if let Type::Fun(domain, codomain) = expr.ty.clone()
+        && let Type::Refinement(base, refinement) = (*domain).clone()
+    {
+        let RefinementKind::Predicate(pred_rc) = &refinement.kind;
+        let pred = pred_rc.borrow().clone();
+        trace!("Attempting loop join conversion for: {}", symbolic(expr));
+        if let Some(transformed) = convert_loop_join(&base, &pred) {
+            trace!(
+                "Successfully transformed to: {} : {}",
+                symbolic(&transformed),
+                transformed.ty
+            );
+            let result_ty = Type::fun(transformed.ty.domain().expect("non-function"), *codomain);
+            *expr = compose(transformed, take(expr)).with_ty(result_ty);
+        } else {
+            trace!("Loop join pattern did not match");
         }
     }
 

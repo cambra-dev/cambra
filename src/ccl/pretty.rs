@@ -13,7 +13,7 @@
 //! can pin expected tree strings directly.
 
 use crate::ccl::{Branch, Expr, Lit, ProjKey, RefinementKind, Type, TypedExprNode, UnaryOpKind};
-use crate::pretty_tree::{render, InspectNode};
+use crate::pretty_tree::{InspectNode, render};
 
 // ---------------------------------------------------------------------------
 // Public API

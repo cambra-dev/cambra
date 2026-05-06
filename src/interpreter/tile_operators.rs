@@ -19,16 +19,16 @@ use std::{
 
 use bit_set::BitSet;
 use bit_vec::BitVec;
-use intervalsets::{ops::Difference, Bounding, Interval, IntervalSet};
+use intervalsets::{Bounding, Interval, IntervalSet, ops::Difference};
 use log::trace;
 
 pub use crate::interpreter::tiling::{FunctionGuard, Predicate, Tile, TileGuard, Tiling};
 use crate::{
     ccl::AggregateKind,
     interpreter::{
-        bindings_are_list, transform_hashmap_values, tuple_field, validate_tile, BaseType,
-        ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, FunctionDef,
-        NotifyOrSubscribeResult, Scheduler, Value,
+        BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, FunctionDef,
+        NotifyOrSubscribeResult, Scheduler, Value, bindings_are_list, transform_hashmap_values,
+        tuple_field, validate_tile,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -352,7 +352,9 @@ fn column_value_to_tile(cv: ColumnValue, tiling: &Tiling) -> Tile {
         Tiling::Scalar(_) => Tile::Scalar(cv),
         Tiling::Record(fields) => {
             let ColumnValue::Records(mut cv_fields) = cv else {
-                panic!("column_value_to_tile: expected Records ColumnValue for Record tiling, got {cv:?}");
+                panic!(
+                    "column_value_to_tile: expected Records ColumnValue for Record tiling, got {cv:?}"
+                );
             };
             Tile::Record(
                 fields
@@ -479,7 +481,11 @@ impl MapResult {
         {
             let input_tiling = input.tiling();
             let input_domain = match input_tiling {
-                Tiling::SealedFunction { domain: d, codomain: c, .. } => {
+                Tiling::SealedFunction {
+                    domain: d,
+                    codomain: c,
+                    ..
+                } => {
                     // Verify the codomain matches the function's domain1
                     assert_eq!(
                         c.extent(),
@@ -488,7 +494,11 @@ impl MapResult {
                     );
                     d.clone()
                 }
-                Tiling::CurriedFunction { domain1: d, codomain: c, .. } => {
+                Tiling::CurriedFunction {
+                    domain1: d,
+                    codomain: c,
+                    ..
+                } => {
                     // Verify the codomain matches the function's domain1
                     assert_eq!(
                         c, fn_domain1,
@@ -575,11 +585,11 @@ impl TileOperator for MapResult {
     }
 
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
-        if let Some(mut input_corr) = self.input.result_correlation() {
-            if let Some(transform) = self.function.result_correlation() {
-                input_corr.extend(transform);
-                return Some(input_corr);
-            }
+        if let Some(mut input_corr) = self.input.result_correlation()
+            && let Some(transform) = self.function.result_correlation()
+        {
+            input_corr.extend(transform);
+            return Some(input_corr);
         }
         None
     }
@@ -1357,13 +1367,23 @@ impl TileProducer for MapResultWithSourceProducer {
         match &obsolete_guard {
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
                 let extracted_pred = extract_predicate(pred, &self.result_correlation).clone();
-                self.source.borrow_mut().release(&self.name(), extracted_pred);
+                self.source
+                    .borrow_mut()
+                    .release(&self.name(), extracted_pred);
             }
-            TileGuard::Function(FunctionGuard::Codomain(g)) if matches!(**g, TileGuard::Function(FunctionGuard::Domain(_))) => {
+            TileGuard::Function(FunctionGuard::Codomain(g))
+                if matches!(**g, TileGuard::Function(FunctionGuard::Domain(_))) =>
+            {
                 if let TileGuard::Function(FunctionGuard::Domain(pred)) = &**g {
-                    assert_eq!(self.result_correlation.first(), Some(&TilePathStep::Codomain));
-                    let extracted_pred = extract_predicate(pred, &self.result_correlation[1..]).clone();
-                    self.source.borrow_mut().release(&self.name(), extracted_pred);
+                    assert_eq!(
+                        self.result_correlation.first(),
+                        Some(&TilePathStep::Codomain)
+                    );
+                    let extracted_pred =
+                        extract_predicate(pred, &self.result_correlation[1..]).clone();
+                    self.source
+                        .borrow_mut()
+                        .release(&self.name(), extracted_pred);
                 }
             }
             g if g.is_universal() => {
@@ -1470,7 +1490,9 @@ impl FanIn {
                             "FanIn: all SealedFunction inputs must have the same domain"
                         );
                     } else {
-                        panic!("FanIn: all inputs must be the same type (all SealedFunction or all CurriedFunction)");
+                        panic!(
+                            "FanIn: all inputs must be the same type (all SealedFunction or all CurriedFunction)"
+                        );
                     }
                 }
                 Tiling::SealedFunction {
@@ -1513,7 +1535,9 @@ impl FanIn {
                             "FanIn: all CurriedFunction inputs must have the same domain2"
                         );
                     } else {
-                        panic!("FanIn: all inputs must be the same type (all SealedFunction or all CurriedFunction)");
+                        panic!(
+                            "FanIn: all inputs must be the same type (all SealedFunction or all CurriedFunction)"
+                        );
                     }
                 }
                 Tiling::CurriedFunction {
@@ -2016,7 +2040,7 @@ fn converse_group_by_key<K: PartialOrd>(
     let output_deleted: BitSet = order
         .iter()
         .enumerate()
-        .filter(|(_, &src)| input_deleted.contains(src))
+        .filter(|(_, src)| input_deleted.contains(**src))
         .map(|(j, _)| j)
         .collect();
     // domain2/codomain_out: original domain values reordered to match sorted groups.
@@ -4386,7 +4410,9 @@ impl TileProducer for UnionProducer {
                                 values.push(cv.index_at(i));
                             }
                         }
-                        other => panic!("UnionProducer: complex nested codomain tiles are not yet supported: {other:?}"),
+                        other => panic!(
+                            "UnionProducer: complex nested codomain tiles are not yet supported: {other:?}"
+                        ),
                     }
                 }
                 Tile::Scalar(ColumnValue::Variants(values))
@@ -4428,8 +4454,8 @@ impl TileProducer for UnionProducer {
 
 #[cfg(test)]
 mod tests {
-    use intervalsets::ops::Contains;
     use intervalsets::MaybeEmpty;
+    use intervalsets::ops::Contains;
 
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -4439,7 +4465,7 @@ mod tests {
 
     /// Helper: extract the `IntervalSet<usize>` from a `UIntRange` extent.
     fn uint_range_set(extent: &Extent) -> &IntervalSet<usize> {
-        let Extent::UIntRange(ref s) = extent else {
+        let Extent::UIntRange(s) = extent else {
             panic!("expected UIntRange, got {extent:?}");
         };
         s

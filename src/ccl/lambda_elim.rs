@@ -46,11 +46,11 @@ use std::rc::Rc;
 
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
-use crate::ccl::{next_refinement_id, Builtin, Lit, Refinement};
 use crate::ccl::{
-    symbolic::symbolic, BaseType, BinOpKind, Branch, Expr, RefinementKind, Type, TypedExpr,
-    TypedExprNode,
+    BaseType, BinOpKind, Branch, Expr, RefinementKind, Type, TypedExpr, TypedExprNode,
+    symbolic::symbolic,
 };
+use crate::ccl::{Builtin, Lit, Refinement, next_refinement_id};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -314,7 +314,7 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
     debug_typecheck(&expr);
     // Fast path: no allocation needed for atoms.
     match &expr.node {
-        TypedExprNode::Var(ref n) if n == name => return replacement.clone(),
+        TypedExprNode::Var(n) if n == name => return replacement.clone(),
         TypedExprNode::Var(_)
         | TypedExprNode::Lit(_)
         | TypedExprNode::Proj(_)
@@ -1093,7 +1093,7 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{symbolic::symbolic, ArithmeticKind, BaseType, BinOpKind, Expr, Lit, Type};
+    use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, Expr, Lit, Type, symbolic::symbolic};
     use test_log::test;
 
     // -----------------------------------------------------------------------
@@ -1296,7 +1296,7 @@ mod tests {
 
         // Extract the refinement predicate from the result to verify substitution occurred
         let pred_after_subst = if let TypedExprNode::Lambda {
-            refinement: Some(ref r),
+            refinement: Some(r),
             ..
         } = &result.node
         {
@@ -1518,7 +1518,7 @@ mod tests {
     /// `substitute` to silently skip the substitution.
     #[test]
     fn is_free_detects_var_in_partial_tuple_refinement() {
-        use crate::ccl::{next_refinement_id, Refinement, RefinementKind};
+        use crate::ccl::{Refinement, RefinementKind, next_refinement_id};
         use std::cell::RefCell;
         use std::rc::Rc;
 

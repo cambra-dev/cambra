@@ -24,11 +24,11 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
-use crate::ccl::{next_defer_id, BaseType};
 use crate::ccl::{
-    unify::UnificationTable, AggregateKind, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey,
-    RefinementKind, Type, TypedExprNode, UnaryOpKind,
+    AggregateKind, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey, RefinementKind, Type,
+    TypedExprNode, UnaryOpKind, unify::UnificationTable,
 };
+use crate::ccl::{BaseType, next_defer_id};
 use crate::util::ScopeStack;
 
 // ---------------------------------------------------------------------------
@@ -941,31 +941,31 @@ fn check_compose_types(node_ty: &Type, morphisms: &[Expr], errors: &mut Vec<Infe
     }
     // Adjacent codomain/domain must agree.
     for i in 0..fun_tys.len().saturating_sub(1) {
-        if let (Some((_, prev_cod)), Some((next_dom, _))) = (&fun_tys[i], &fun_tys[i + 1]) {
-            if !typecheck_equal(prev_cod, next_dom) {
-                errors.push(InferError::TypeMismatch {
-                    ctx: format!(
-                        "{} ≫ {}",
-                        symbolic(&morphisms[i]),
-                        symbolic(&morphisms[i + 1])
-                    ),
-                    type_a: prev_cod.clone(),
-                    type_b: next_dom.clone(),
-                });
-            }
+        if let (Some((_, prev_cod)), Some((next_dom, _))) = (&fun_tys[i], &fun_tys[i + 1])
+            && !typecheck_equal(prev_cod, next_dom)
+        {
+            errors.push(InferError::TypeMismatch {
+                ctx: format!(
+                    "{} ≫ {}",
+                    symbolic(&morphisms[i]),
+                    symbolic(&morphisms[i + 1])
+                ),
+                type_a: prev_cod.clone(),
+                type_b: next_dom.clone(),
+            });
         }
     }
     // Overall node type must be Fun(first_domain, last_codomain).
-    if let (Some(first), Some(last)) = (fun_tys.first(), fun_tys.last()) {
-        if let (Some((first_dom, _)), Some((_, last_cod))) = (first, last) {
-            let expected = Type::Fun(Box::new(first_dom.clone()), Box::new(last_cod.clone()));
-            if !typecheck_equal(node_ty, &expected) {
-                errors.push(InferError::TypeMismatch {
-                    ctx: "compose".to_string(),
-                    type_a: expected,
-                    type_b: node_ty.clone(),
-                });
-            }
+    if let (Some(first), Some(last)) = (fun_tys.first(), fun_tys.last())
+        && let (Some((first_dom, _)), Some((_, last_cod))) = (first, last)
+    {
+        let expected = Type::Fun(Box::new(first_dom.clone()), Box::new(last_cod.clone()));
+        if !typecheck_equal(node_ty, &expected) {
+            errors.push(InferError::TypeMismatch {
+                ctx: "compose".to_string(),
+                type_a: expected,
+                type_b: node_ty.clone(),
+            });
         }
     }
 }
@@ -1167,12 +1167,21 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
                 .cloned()
                 .ok_or(InferError::UnboundVariable(name.clone()))?;
             let codomain_ty = Type::Infer(ctx.fresh_infer_var());
-            // TODO once we support multiple lexical bindings to the same handle, we need to
-            // not create a new ID each time.
+            // If a previous feed already resolved the handle to Fun(DeferredCollectionDomain(id),
+            // ...), reuse that id. Creating a fresh id for each feed would cause a unification
+            // conflict between the two different DeferredCollectionDomain values.
+            let defer_domain_id = if let Type::Infer(id) = &handle_ty
+                && let Some(Type::Fun(dom, _)) = ctx.table.probe(*id)
+                && let Type::DeferredCollectionDomain(existing_id) = *dom
+            {
+                existing_id
+            } else {
+                next_defer_id()
+            };
             ctx.constrain_equal(
                 &handle_ty,
                 &Type::fun(
-                    Type::DeferredCollectionDomain(next_defer_id()),
+                    Type::DeferredCollectionDomain(defer_domain_id),
                     codomain_ty.clone(),
                 ),
             )?;
@@ -1211,10 +1220,10 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
 
     // Record the solved type in the unification table so the post-inference
     // resolution pass can substitute Infer placeholders in the tree.
-    if let Type::Infer(id) = expr.ty {
-        if !matches!(result_ty, Type::Infer(_)) {
-            ctx.table.set(id, result_ty.clone());
-        }
+    if let Type::Infer(id) = expr.ty
+        && !matches!(result_ty, Type::Infer(_))
+    {
+        ctx.table.set(id, result_ty.clone());
     }
 
     expr.ty = result_ty.clone();
@@ -1381,16 +1390,15 @@ fn collect_constraints(
                     function: proj_fn,
                     argument: proj_arg,
                 } => {
-                    if let TypedExprNode::Proj(ProjKey::Index(idx)) = &proj_fn.node {
-                        if matches!(&proj_arg.node, TypedExprNode::Var(v) if v == param) {
-                            if let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx) {
-                                ctx.constrain_equal(
-                                    param_ty,
-                                    &Type::PartialTuple(vec![(*idx, *domain.clone())]),
-                                )?;
-                                return Ok(());
-                            }
-                        }
+                    if let TypedExprNode::Proj(ProjKey::Index(idx)) = &proj_fn.node
+                        && matches!(&proj_arg.node, TypedExprNode::Var(v) if v == param)
+                        && let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx)
+                    {
+                        ctx.constrain_equal(
+                            param_ty,
+                            &Type::PartialTuple(vec![(*idx, *domain.clone())]),
+                        )?;
+                        return Ok(());
                     }
                 }
                 // infer failed or returned a non-Fun type; fall through to recursive search.
@@ -1505,13 +1513,13 @@ fn infer_apply(
             if matches!(param.ty, Type::Infer(_)) {
                 // If the function is a lambda with unresolved type, infer it from the argument.
                 // If a user annotation is present, verify it matches before accepting arg_ty.
-                if let Some(ref annotation) = param.user_annotation {
-                    if *annotation != arg_ty {
-                        return Err(InferError::AnnotationMismatch {
-                            annotation: annotation.clone(),
-                            inferred: arg_ty,
-                        });
-                    }
+                if let Some(ref annotation) = param.user_annotation
+                    && *annotation != arg_ty
+                {
+                    return Err(InferError::AnnotationMismatch {
+                        annotation: annotation.clone(),
+                        inferred: arg_ty,
+                    });
                 }
                 param.ty = arg_ty.clone();
             }
@@ -1530,10 +1538,9 @@ fn infer_apply(
                 }
             }
             (ProjKey::Index(idx), Type::PartialTuple(entries)) => {
-                maybe_codomain_ty =
-                    entries
-                        .iter()
-                        .find_map(|(i, t)| if i == idx { Some(t.clone()) } else { None });
+                maybe_codomain_ty = entries
+                    .iter()
+                    .find_map(|(i, t)| if i == idx { Some(t.clone()) } else { None });
             }
             (ProjKey::Field(field), Type::Record(types)) => {
                 let proj_ty = types
@@ -1549,10 +1556,9 @@ fn infer_apply(
                 }
             }
             (ProjKey::Field(field), Type::PartialRecord(entries)) => {
-                maybe_codomain_ty =
-                    entries
-                        .iter()
-                        .find_map(|(n, t)| if n == field { Some(t.clone()) } else { None });
+                maybe_codomain_ty = entries
+                    .iter()
+                    .find_map(|(n, t)| if n == field { Some(t.clone()) } else { None });
             }
             _ => {}
         },
@@ -1739,10 +1745,7 @@ fn infer_binop(
 }
 
 /// Build a union of two types, deduplicating if identical.
-///
-/// Used by [`infer_binop`] for [`BinOpKind::CollectionUnion`] to compute the
-/// codomain of the result: identical codomains collapse to a single type.
-fn dedup_union_type(a: Type, b: Type) -> Type {
+pub(crate) fn dedup_union_type(a: Type, b: Type) -> Type {
     let mut variants = Vec::new();
     collect_union_types(a, &mut variants);
     collect_union_types(b, &mut variants);
@@ -1849,8 +1852,8 @@ fn lit_type(lit: &Lit) -> Type {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::symbolic::symbolic;
     use crate::ccl::BaseType;
+    use crate::ccl::symbolic::symbolic;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, Branch, CompareKind, Expr, Lit, LogicKind, Type,
         TypedBinding, TypedExpr, TypedExprNode,
@@ -2661,9 +2664,10 @@ mod tests {
         );
         let mut ctx = TypeInferenceContext::new();
         // Body inference constrains p, but the And of Int and Bool is a type error.
-        assert!(infer(&mut expr, &mut ctx).is_err_and(|errs| errs
-            .iter()
-            .any(|e| matches!(e, InferError::TypeMismatch { .. }))));
+        assert!(infer(&mut expr, &mut ctx).is_err_and(|errs| {
+            errs.iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+        }));
     }
 
     /// `λ p → f(p._0) + g(p._0)` where f : Int → Int and g : String → String.
@@ -2685,9 +2689,10 @@ mod tests {
             ),
         );
         let mut ctx = TypeInferenceContext::new();
-        assert!(infer(&mut expr, &mut ctx).is_err_and(|errs| errs
-            .iter()
-            .any(|e| matches!(e, InferError::TypeMismatch { .. }))));
+        assert!(infer(&mut expr, &mut ctx).is_err_and(|errs| {
+            errs.iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+        }));
     }
 
     /// `λ p → p ► f` where f has domain `PartialTuple([(0, Int), (1, Bool)])`.
@@ -3370,9 +3375,10 @@ mod tests {
         let result = typecheck(&expr);
         assert!(result.is_err(), "expected typecheck to report an error");
         let errs = result.unwrap_err();
-        assert!(errs
-            .iter()
-            .any(|e| matches!(e, InferError::TypeMismatch { .. })));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+        );
     }
 
     /// Corrupting a `Compare` result type away from `Bool` is caught by `typecheck`.
@@ -3390,9 +3396,10 @@ mod tests {
         let result = typecheck(&expr);
         assert!(result.is_err());
         let errs = result.unwrap_err();
-        assert!(errs
-            .iter()
-            .any(|e| matches!(e, InferError::TypeMismatch { .. })));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+        );
     }
 
     /// Corrupting the `Not` operand to a non-Bool type is caught by `typecheck`.
@@ -3407,10 +3414,12 @@ mod tests {
         }
         let result = typecheck(&expr);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .iter()
-            .any(|e| matches!(e, InferError::TypeMismatch { .. })));
+        assert!(
+            result
+                .unwrap_err()
+                .iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+        );
     }
 
     /// A heterogeneous list — where element types differ — is caught by `typecheck`.
@@ -3434,9 +3443,10 @@ mod tests {
             "expected typecheck to catch heterogeneous list"
         );
         let errs = result.unwrap_err();
-        assert!(errs
-            .iter()
-            .any(|e| matches!(e, InferError::TypeMismatch { .. })));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+        );
     }
 
     /// A function application where the argument type does not match the
@@ -3470,9 +3480,10 @@ mod tests {
             "expected typecheck to catch domain mismatch"
         );
         let errs = result.unwrap_err();
-        assert!(errs
-            .iter()
-            .any(|e| matches!(e, InferError::TypeMismatch { .. })));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. }))
+        );
     }
 
     /// A valid lambda and application combination passes `typecheck` end-to-end.
@@ -3524,5 +3535,46 @@ mod tests {
         } else {
             panic!("expected Fun type for lambda");
         }
+    }
+
+    /// Two feeds on the same handle must resolve to the same `DeferredCollectionDomain` id.
+    ///
+    /// If each feed allocated a fresh id, the two `Fun(DCD(id_a), _)` and `Fun(DCD(id_b), _)`
+    /// constraints on the handle variable would conflict during unification, producing a
+    /// spurious error rather than successfully sharing the domain.
+    #[test]
+    fn two_feeds_on_same_handle_share_dcd_id() {
+        // Build: ExprStmt(Feed("h", 1), ExprStmt(Feed("h", 2), Var("h")))
+        // with "h" pre-bound to a fresh inference variable.
+        // Build: let h = Defer in ExprStmt(Feed("h", 1), ExprStmt(Feed("h", 2), Var("h")))
+        // The public `infer` runs resolve(), so all Infer vars are concretized.
+        let body = Expr::expr_stmt(
+            Expr::feed("h".into(), Expr::lit(Lit::Int(1))),
+            Expr::expr_stmt(
+                Expr::feed("h".into(), Expr::lit(Lit::Int(2))),
+                Expr::var("h"),
+            ),
+        );
+        let mut expr = Expr::let_bind("h", Expr::new(TypedExprNode::Defer), body);
+
+        let mut ctx = TypeInferenceContext::new();
+        infer(&mut expr, &mut ctx).expect("two feeds on the same handle must not error");
+
+        // After resolve(), the `h` binding must have a concrete Fun(DeferredCollectionDomain(_), Int) type.
+        let TypedExprNode::Let { binding, .. } = &expr.node else {
+            panic!("expected Let node");
+        };
+        let Type::Fun(dom, cod) = &binding.ty else {
+            panic!("handle binding must have Fun type, got {:?}", binding.ty);
+        };
+        assert!(
+            matches!(dom.as_ref(), Type::DeferredCollectionDomain(_)),
+            "handle domain must be DeferredCollectionDomain, got {dom:?}"
+        );
+        assert_eq!(
+            cod.as_ref(),
+            &Type::Base(BaseType::Int),
+            "handle codomain must be Int"
+        );
     }
 }

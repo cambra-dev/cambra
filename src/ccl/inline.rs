@@ -41,7 +41,7 @@
 //!   times in the operator graph. Acceptable for now; caching is only needed for
 //!   collection-typed UDFs (iterable domain), which are not inlined.
 
-use crate::ccl::{lambda_elim::substitute, Branch, Expr, Type, TypedExprNode};
+use crate::ccl::{Branch, Expr, Type, TypedExprNode, lambda_elim::substitute};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -296,66 +296,66 @@ fn inline_impl(expr: Expr) -> Expr {
 /// case surfaces where the surviving anon-lambda blocks downstream work.
 fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
     // Direct occurrence: replace the variable with the Lambda value.
-    if let TypedExprNode::Var(ref n) = expr.node {
-        if n == name {
-            return lambda.clone();
-        }
+    if let TypedExprNode::Var(ref n) = expr.node
+        && n == name
+    {
+        return lambda.clone();
     }
 
     // Apply chain ending in `Var(name)` — beta-reduce after recursively
     // substituting the argument and collapsing the function side.
-    if let TypedExprNode::Apply { function, .. } = &expr.node {
-        if is_name_in_function_position(function, name) {
-            let Expr {
-                node,
-                ty,
-                user_annotation,
-            } = expr;
-            let (function, argument) = match node {
-                TypedExprNode::Apply { function, argument } => (function, argument),
-                _ => unreachable!(),
-            };
-            let argument = inline_and_beta_reduce(*argument, name, lambda);
-            let function = inline_and_beta_reduce(*function, name, lambda);
-            match function.node {
-                TypedExprNode::Lambda {
-                    param,
-                    body,
-                    refinement,
-                } => {
-                    // A refinement on the outer user-parameter lambda would
-                    // encode a precondition `P(arg)` that must hold for the
-                    // beta-reduced form to be equivalent. Current lowering of
-                    // generator/list-returning `def`s produces no refinement on
-                    // the outer parameter — the only refinement-bearing lambda
-                    // in that shape is the inner `__iter_record` lambda (if-guard
-                    // predicate), which we never beta-reduce here. If a future
-                    // lowering pass attaches a refinement to the outer param,
-                    // this branch needs a principled lift (e.g. emit a
-                    // `restrict(pred)` guard around the substituted body) before
-                    // proceeding.
-                    assert!(
-                        refinement.is_none(),
-                        "inline_and_beta_reduce: outer lambda for `{name}` has a \
+    if let TypedExprNode::Apply { function, .. } = &expr.node
+        && is_name_in_function_position(function, name)
+    {
+        let Expr {
+            node,
+            ty,
+            user_annotation,
+        } = expr;
+        let (function, argument) = match node {
+            TypedExprNode::Apply { function, argument } => (function, argument),
+            _ => unreachable!(),
+        };
+        let argument = inline_and_beta_reduce(*argument, name, lambda);
+        let function = inline_and_beta_reduce(*function, name, lambda);
+        match function.node {
+            TypedExprNode::Lambda {
+                param,
+                body,
+                refinement,
+            } => {
+                // A refinement on the outer user-parameter lambda would
+                // encode a precondition `P(arg)` that must hold for the
+                // beta-reduced form to be equivalent. Current lowering of
+                // generator/list-returning `def`s produces no refinement on
+                // the outer parameter — the only refinement-bearing lambda
+                // in that shape is the inner `__iter_record` lambda (if-guard
+                // predicate), which we never beta-reduce here. If a future
+                // lowering pass attaches a refinement to the outer param,
+                // this branch needs a principled lift (e.g. emit a
+                // `restrict(pred)` guard around the substituted body) before
+                // proceeding.
+                assert!(
+                    refinement.is_none(),
+                    "inline_and_beta_reduce: outer lambda for `{name}` has a \
                          refinement; beta reduction would silently drop its \
                          precondition. Extend this branch if list-UDF lowering \
                          starts producing refined outer params."
-                    );
-                    return substitute(*body, &param.name, &argument);
-                }
-                // Not a Lambda (e.g. the bound expression is Var("id") rather
-                // than a literal lambda) — skip beta-reduction and reconstruct
-                // the Apply with the substituted subexpressions.
-                _ => {
-                    return Expr {
-                        node: TypedExprNode::Apply {
-                            function: Box::new(function),
-                            argument: Box::new(argument),
-                        },
-                        ty,
-                        user_annotation,
-                    };
-                }
+                );
+                return substitute(*body, &param.name, &argument);
+            }
+            // Not a Lambda (e.g. the bound expression is Var("id") rather
+            // than a literal lambda) — skip beta-reduction and reconstruct
+            // the Apply with the substituted subexpressions.
+            _ => {
+                return Expr {
+                    node: TypedExprNode::Apply {
+                        function: Box::new(function),
+                        argument: Box::new(argument),
+                    },
+                    ty,
+                    user_annotation,
+                };
             }
         }
     }
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn non_iterable_domain_refinement_wraps_non_iterable() {
-        use crate::ccl::{next_refinement_id, Refinement, RefinementKind};
+        use crate::ccl::{Refinement, RefinementKind, next_refinement_id};
         use std::cell::RefCell;
         use std::rc::Rc;
         let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));
@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn iterable_domain_refinement_wraps_iterable() {
-        use crate::ccl::{next_refinement_id, Refinement, RefinementKind};
+        use crate::ccl::{Refinement, RefinementKind, next_refinement_id};
         use std::cell::RefCell;
         use std::rc::Rc;
         let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));
@@ -679,7 +679,7 @@ mod tests {
     fn should_inline_refined_fun_codomain() {
         // Int → Refinement(Int → Int, pred): domain is non-iterable (Int),
         // so the function is inlined regardless of the refined codomain.
-        use crate::ccl::{next_refinement_id, Refinement, RefinementKind};
+        use crate::ccl::{Refinement, RefinementKind, next_refinement_id};
         use std::cell::RefCell;
         use std::rc::Rc;
         let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));

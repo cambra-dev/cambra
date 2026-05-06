@@ -12,9 +12,9 @@
 //! ```
 
 use cambra::ccl::{
-    infer::{infer, InferError, TypeInferenceContext},
-    lower::{lower_stmts, LoweringContext},
     Type,
+    infer::{InferError, TypeInferenceContext, infer},
+    lower::{LoweringContext, lower_stmts},
 };
 use cambra::interpreter::BaseType;
 use rustpython_parser::{ast as pyast, parser};

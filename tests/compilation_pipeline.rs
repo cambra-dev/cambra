@@ -20,13 +20,13 @@ use std::time::Duration;
 
 use bit_set::BitSet;
 use bit_vec::BitVec;
-use cambra::ccl::context::compile_program;
 use cambra::ccl::Expr;
-use cambra::ccl::{context::GlobalContext, Type};
+use cambra::ccl::context::compile_program;
+use cambra::ccl::{Type, context::GlobalContext};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
-    sort_sealed_function_by_domain, tuple_field, BaseType, ColumnValue, Consumer, Extent,
-    Predicate, TestDataSource, Tile, Value,
+    BaseType, ColumnValue, Consumer, Extent, Predicate, TestDataSource, Tile, Value,
+    sort_sealed_function_by_domain, tuple_field,
 };
 use cambra::pretty_graph::pretty_tile_operator;
 use rstest_log::rstest;
@@ -686,6 +686,79 @@ y = defer()
 x <<= [0, 1]
 y <<= x
 y"#, make_int_list(&[0, 1]))]
+#[case(
+r#"x = defer()
+x << 1
+x << 2
+x"#,
+    Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 1],
+            variants: vec![
+                ColumnValue::Units(1),
+                ColumnValue::Units(1),
+            ],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    })]
+#[case(
+r#"x = defer()
+x << 1
+for i in [1, 2, 3]:
+    x << i
+x"#,
+    Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 1, 1, 1],
+            variants: vec![
+                ColumnValue::Units(1),
+                ColumnValue::UInts(vec![0, 1, 2])
+            ],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 3]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    })]
+// Three feed sites: locks down N-ary union construction beyond N=2.
+#[case(
+r#"x = defer()
+x << 1
+x << 2
+x << 3
+x"#,
+    Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 1, 2],
+            variants: vec![
+                ColumnValue::Units(1),
+                ColumnValue::Units(1),
+                ColumnValue::Units(1),
+            ],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    })]
+// Identical feed values still produce distinct variant tags.
+#[case(
+r#"x = defer()
+x << 1
+x << 1
+x"#,
+    Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 1],
+            variants: vec![
+                ColumnValue::Units(1),
+                ColumnValue::Units(1),
+            ],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    })]
 fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }

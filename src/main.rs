@@ -1,11 +1,11 @@
 use cambra::{
     ccl::{
-        context::{compile_program, GlobalContext},
+        context::{GlobalContext, compile_program},
         symbolic::symbolic,
     },
     interpreter::{
-        tile_operators::{FunctionGuard, Tile, TileGuard},
         Consumer,
+        tile_operators::{FunctionGuard, Tile, TileGuard},
     },
     pretty_graph::pretty_tile_operator,
     web_inspector::WebInspector,

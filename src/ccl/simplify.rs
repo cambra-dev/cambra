@@ -55,11 +55,11 @@ pub fn simplify(mut expr: Expr) -> Expr {
 /// One bottom-up simplification pass. Returns `true` if any rule fired.
 fn simplify_once(expr: &mut Expr) -> bool {
     let mut changed = false;
-    if let Type::Fun(domain, _) = &mut expr.ty {
-        if let Type::Refinement(_, refinment) = &mut **domain {
-            let RefinementKind::Predicate(pred) = &refinment.kind;
-            changed = simplify_once(&mut pred.borrow_mut())
-        }
+    if let Type::Fun(domain, _) = &mut expr.ty
+        && let Type::Refinement(_, refinment) = &mut **domain
+    {
+        let RefinementKind::Predicate(pred) = &refinment.kind;
+        changed = simplify_once(&mut pred.borrow_mut())
     }
     changed |= recurse_simplify(expr);
     changed |= apply_simplification_rules(expr);
@@ -248,14 +248,12 @@ fn flatten_compose_arm(expr: Expr) -> Vec<Expr> {
 /// Returns `(f, g)` if `expr` is `zip_pair(f, g)` i.e.
 /// `Apply { argument: Tuple([f, g]), function: Builtin(Zip) }`.
 fn as_zip(expr: &Expr) -> Option<(&Expr, &Expr)> {
-    if let TypedExprNode::Apply { argument, function } = &expr.node {
-        if is_builtin(function, Builtin::Zip) {
-            if let TypedExprNode::Tuple(elts) = &argument.node {
-                if elts.len() == 2 {
-                    return Some((&elts[0], &elts[1]));
-                }
-            }
-        }
+    if let TypedExprNode::Apply { argument, function } = &expr.node
+        && is_builtin(function, Builtin::Zip)
+        && let TypedExprNode::Tuple(elts) = &argument.node
+        && elts.len() == 2
+    {
+        return Some((&elts[0], &elts[1]));
     }
     None
 }
@@ -263,10 +261,10 @@ fn as_zip(expr: &Expr) -> Option<(&Expr, &Expr)> {
 /// Returns the inner `f` if `expr` is `curry(f)` i.e.
 /// `Apply { argument: f, function: Builtin(Curry) }`.
 fn as_curry(expr: &Expr) -> Option<&Expr> {
-    if let TypedExprNode::Apply { argument, function } = &expr.node {
-        if is_builtin(function, Builtin::Curry) {
-            return Some(argument);
-        }
+    if let TypedExprNode::Apply { argument, function } = &expr.node
+        && is_builtin(function, Builtin::Curry)
+    {
+        return Some(argument);
     }
     None
 }
@@ -274,10 +272,10 @@ fn as_curry(expr: &Expr) -> Option<&Expr> {
 /// Returns the inner `c` if `expr` is `const_(c)` i.e.
 /// `Apply { argument: c, function: Builtin(Const) }`.
 fn as_const(expr: &Expr) -> Option<&Expr> {
-    if let TypedExprNode::Apply { argument, function } = &expr.node {
-        if is_builtin(function, Builtin::Const) {
-            return Some(argument);
-        }
+    if let TypedExprNode::Apply { argument, function } = &expr.node
+        && is_builtin(function, Builtin::Const)
+    {
+        return Some(argument);
     }
     None
 }
@@ -287,10 +285,10 @@ fn as_const(expr: &Expr) -> Option<&Expr> {
 /// Used for inner sub-composes that are always binary (e.g. `.0 ≫ curry(f)`).
 /// Top-level compose patterns use [`try_pairwise_in_compose`] instead.
 fn as_compose(expr: &Expr) -> Option<(&Expr, &Expr)> {
-    if let TypedExprNode::Compose(elts) = &expr.node {
-        if let [left, right] = elts.as_slice() {
-            return Some((left, right));
-        }
+    if let TypedExprNode::Compose(elts) = &expr.node
+        && let [left, right] = elts.as_slice()
+    {
+        return Some((left, right));
     }
     None
 }
@@ -309,12 +307,11 @@ fn is_proj_idx(expr: &Expr, n: usize) -> bool {
 ///
 /// Used by [`try_product_eta`] to match n-ary compose arms like `[f, .0]`.
 fn compose_split_last(expr: &Expr) -> Option<(&[Expr], &Expr)> {
-    if let TypedExprNode::Compose(elts) = &expr.node {
-        if let Some((last, prefix)) = elts.split_last() {
-            if !prefix.is_empty() {
-                return Some((prefix, last));
-            }
-        }
+    if let TypedExprNode::Compose(elts) = &expr.node
+        && let Some((last, prefix)) = elts.split_last()
+        && !prefix.is_empty()
+    {
+        return Some((prefix, last));
     }
     None
 }
@@ -744,22 +741,20 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
             function,
             argument: _,
         } = &expr.node
+            && is_builtin(function, Builtin::Const)
         {
-            if is_builtin(function, Builtin::Const) {
-                return true;
-            }
+            return true;
         }
         // Zip where both arms are simplifying
         if is_simplifying_zip(expr) {
             return true;
         }
         // Compose starting with projection (original behavior)
-        if let TypedExprNode::Compose(elts) = &expr.node {
-            if let Some(first) = elts.first() {
-                if is_simplifying(first) {
-                    return true;
-                }
-            }
+        if let TypedExprNode::Compose(elts) = &expr.node
+            && let Some(first) = elts.first()
+            && is_simplifying(first)
+        {
+            return true;
         }
         false
     }

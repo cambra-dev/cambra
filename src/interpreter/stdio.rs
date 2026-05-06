@@ -5,12 +5,12 @@ use std::{
     thread,
 };
 
-use intervalsets::{ops::Difference, Bounding, Interval, IntervalSet};
+use intervalsets::{Bounding, Interval, IntervalSet, ops::Difference};
 use log::{debug, trace};
 use smol_str::SmolStr;
 
 use crate::interpreter::{
-    tiling::Predicate, ColumnValue, DataSourceDomainExtentImpl, Extent, Value,
+    ColumnValue, DataSourceDomainExtentImpl, Extent, Value, tiling::Predicate,
 };
 
 /// Buffers and tracks lines available on stdin.
@@ -242,7 +242,7 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
 #[cfg(test)]
 mod tests {
     use crate::interpreter::{
-        stdio::StdinDataSource, tiling::Predicate, ColumnValue, DataSourceDomainExtentImpl, Value,
+        ColumnValue, DataSourceDomainExtentImpl, Value, stdio::StdinDataSource, tiling::Predicate,
     };
     use test_log::test;
 

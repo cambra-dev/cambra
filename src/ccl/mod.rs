@@ -457,16 +457,16 @@ impl AggregateKind {
         end: usize,
     ) {
         match (self, accumulator, values) {
-            (AggregateKind::Sum, ColumnValue::Ints(ref mut acc), ColumnValue::Ints(vs)) => {
+            (AggregateKind::Sum, ColumnValue::Ints(acc), ColumnValue::Ints(vs)) => {
                 acc[0] += vs[start..end].iter().sum::<i64>()
             }
-            (AggregateKind::Max, ColumnValue::Ints(ref mut acc), ColumnValue::Ints(vs)) => {
+            (AggregateKind::Max, ColumnValue::Ints(acc), ColumnValue::Ints(vs)) => {
                 accumulate_max(acc, &vs[start..end]);
             }
-            (AggregateKind::Max, ColumnValue::UInts(ref mut acc), ColumnValue::UInts(vs)) => {
+            (AggregateKind::Max, ColumnValue::UInts(acc), ColumnValue::UInts(vs)) => {
                 accumulate_max(acc, &vs[start..end]);
             }
-            (AggregateKind::Max, ColumnValue::Strings(ref mut acc), ColumnValue::Strings(vs)) => {
+            (AggregateKind::Max, ColumnValue::Strings(acc), ColumnValue::Strings(vs)) => {
                 accumulate_max(acc, &vs[start..end]);
             }
             _ => panic!("Invalid accumulate"),
@@ -488,10 +488,10 @@ impl AggregateKind {
 
 fn accumulate_max<T: Ord + Clone>(acc: &mut [T], values: &[T]) {
     let max = values.iter().max().cloned();
-    if let Some(max) = max {
-        if max > acc[0] {
-            acc[0] = max;
-        }
+    if let Some(max) = max
+        && max > acc[0]
+    {
+        acc[0] = max;
     }
 }
 
