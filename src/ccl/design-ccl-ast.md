@@ -620,7 +620,20 @@ The id-reuse in step 2 is what allows multiple `Feed` sites on the same handle t
 
 ### `remove_defers::run` — the elimination pass
 
-The pass runs after `inline` and before `join_plan`. It performs three steps:
+The pass runs after `inline` and `lambda_elim`, and before `join_plan`.
+
+**Preconditions on entry** (established by `inline`):
+
+- Every `Defer` is bound by exactly one `Let { bound_expr: Defer, binding, body }`.
+- There are no alias chains: any `let y = x` where `x` is a defer-bound name has
+  already been inlined by the alias-inlining step in `inline.rs`.
+- Nested defer scopes are already lifted: any `let y = (let x = Defer in …) in …`
+  has been flattened to `let y = Defer in …` by the defer-returning lift in `inline.rs`.
+- `Feed` and `Define` target strings already name the outer defer binding directly
+  (not a stale inner name), because `lambda_elim::substitute` renames them when a
+  `Var` replacement flows in.
+
+The pass performs three steps:
 
 1. **`inline_defers`**: walks the tree looking for `Let { bound_expr: Defer, binding, body }`. For each such binding it calls `inline_defer(body, binding.name)` to extract the feed or define value:
    - A `Define(name, value)` for the target name is extracted as the define value; its site is replaced with the `__replaced` sentinel.
@@ -786,6 +799,22 @@ Apply { argument: Tuple([f, g]), function: Builtin(Zip) }
 There is no dedicated `Zip` AST node; it reuses the existing `Apply` + `Tuple`
 + `Builtin` nodes.
 
+### Feed–Define rename in `substitute`
+
+`substitute(expr, name, replacement)` propagates renaming into `Feed` and `Define`
+target strings when the replacement is a `Var`:
+
+```
+substitute(Feed("x", v), "x", Var("y"))  →  Feed("y", substitute(v, "x", Var("y")))
+substitute(Define("x", v), "x", Var("y"))  →  Define("y", substitute(v, "x", Var("y")))
+```
+
+This is essential for the defer-returning lift in `inline.rs`: when the inner
+binding `x` is substituted with `Var(y)`, every `Feed("x", …)` and `Define("x", …)`
+in the inner body must be renamed to target `y`, or `remove_defers` would fail to
+find any feeds on the outer binding. The `is_free` check also accounts for the
+name field: `Feed("x", v)` counts `x` as a free variable for early-exit purposes.
+
 ### `Let` nodes after rule 7
 
 When the lambda-elimination rule 7 rewrites a `Let` inside a lambda body, the
@@ -797,31 +826,68 @@ has `bound_ty: None` because the old annotation is stale and would be incorrect.
 ## Inlining Pass (`ccl/inline.rs`)
 
 `inline_non_iterable_lambdas` runs **after `infer`** and **before `lambda_elim`**.
-It eliminates `Let` bindings whose bound expression is a function over a
-non-iterable domain by substituting the body at every call site, beta-reducing
-each call site as the substitution produces it, and dropping the `Let` wrapper.
+It performs three structural rewrites on `Let` bindings, in order:
+
+1. **Alias inlining** — eliminate `let y = x` pure α-renamings.
+2. **Defer-returning lift** — merge an inner defer scope into the outer one.
+3. **UDF inlining** — substitute call sites for functions over non-iterable domains.
 
 ### Motivation
 
-Two related problems collapse into one pass:
+**Scalar UDFs** (e.g. `Fun(Int, Int)`): operator conversion compiles `Let`-bound
+expressions independently with `input = None`. For a function whose domain is
+scalar, this causes the operator graph to insert an `IterateExtent` for the
+domain — which panics at runtime ("Attempted to iterate on infinite Extent")
+because base types have no finite enumerable extent.
 
-- **Scalar UDFs** (e.g. `Fun(Int, Int)`): operator conversion compiles `Let`-bound
-  expressions independently with `input = None`. For a function whose domain is
-  scalar, this causes the operator graph to insert an `IterateExtent` for the
-  domain — which panics at runtime ("Attempted to iterate on infinite Extent")
-  because base types have no finite enumerable extent.
-- **List-producing UDFs** (e.g. generator `def`s, `Fun(Fun(UIntRange, Int), Fun(UIntRange, Int))`):
-  these lower to `λ user_arg → λ __iter_record → body`. If that nested-lambda
-  shape reaches `lambda_elim` intact, the rule emits a `curry` combinator —
-  and `operator_conversion.rs` doesn't implement `curry`, so compilation fails
-  with `unrecognised Var(curry)`.
+**List-producing UDFs** (e.g. generator `def`s, `Fun(Fun(UIntRange, Int), Fun(UIntRange, Int))`):
+these lower to `λ user_arg → λ __iter_record → body`. If that nested-lambda
+shape reaches `lambda_elim` intact, the rule emits a `curry` combinator —
+and `operator_conversion.rs` doesn't implement `curry`, so compilation fails
+with `unrecognised Var(curry)`.
 
 Inlining at the CCL level threads the call-site argument as `input`, and
 beta-reducing the outer lambda strips the user-parameter layer, leaving a single
 `__iter_record`-wrapping lambda that matches the list-comprehension shape
 `lambda_elim` already handles.
 
-### What is inlined
+### Alias inlining
+
+When the right-hand side of a `Let` is a plain `Var(x)`, the binding is pure
+α-renaming. It is eliminated unconditionally by substituting `x` for the bound
+name throughout the body — *unless* `x` is rebound by an inner `let x = …`
+node inside that body, which would cause variable capture.
+
+Performing this before `lambda_elim` prevents the let-in-lambda rule from
+hoisting such bindings into `const(x)` wrappers that would need to be
+recognised and stripped by downstream passes.
+
+### Defer-returning lift
+
+When the right-hand side of a `Let { binding: y, bound_expr, body }` is (after
+peeling any leading `ExprStmt` nodes) a defer-returning expression —
+`let x = Defer in inner_body` where `inner_body` terminates in `Var(x)`, possibly
+via `ExprStmt` and nested `Let` nodes — the pass **lifts** the inner defer to the
+outer binding:
+
+```text
+let y = (ExprStmt*(let x = Defer in inner_body)) in outer_body
+  →  let y = Defer
+     in inner_body[x→y]
+        with terminal Var(y) replaced by (ExprStmt*(outer_body))
+```
+
+The substitution `x → Var(y)` — performed by `lambda_elim::substitute` — also
+renames every `Feed("x", …)` and `Define("x", …)` to `Feed("y", …)` and
+`Define("y", …)` (see §Lambda Elimination / Feed–Define rename). Any leading
+`ExprStmt(Feed("old_param", …))` wrappers produced by beta-reducing a
+defer-returning argument are similarly renamed to use `y`.
+
+This rewrite must happen before `lambda_elim` so that the single flattened
+`let y = Defer in …` shape enters `remove_defers` cleanly, without the nested
+defer scopes that the downstream alias map previously had to reconcile.
+
+### What is inlined (UDF step)
 
 A `Let { binding, bound_expr, body }` is inlined when `should_inline(bound_expr.ty)` returns `true`:
 
@@ -852,6 +918,10 @@ Multi-arg call-site bodies contain `Apply(Tuple(…), Proj(Index(i)))` (from the
 uncurried `__arg_pair.i` references). Those literal-tuple projections are
 folded later by `simplify::try_literal_tuple_projection`; this pass leaves
 them in place.
+
+After beta-reducing a UDF call, `inline_impl` is re-applied to the result so
+that any newly-created `Let` bindings (e.g. from a defer-returning argument)
+are also processed by the alias-inlining and lift steps.
 
 ### Pipeline position
 

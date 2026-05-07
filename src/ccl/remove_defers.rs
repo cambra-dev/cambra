@@ -17,6 +17,17 @@
 //! # Pipeline position
 //!
 //! Runs after [`crate::ccl::inline`] and before [`crate::ccl::join_plan`].
+//!
+//! # Invariants on entry
+//!
+//! By the time this pass runs, [`crate::ccl::inline`] has already:
+//! - Eliminated all `let y = x` aliases (α-renaming: Feed/Define targets follow).
+//! - Applied the defer-returning lift, merging any `let y = (let x = Defer in …) in …`
+//!   scope into `let y = Defer in …` with all Feed/Define targets consistently
+//!   naming `y`.
+//!
+//! As a result, every `Feed`/`Define` node for a given defer handle uses exactly
+//! the binding name of that handle — no alias tracking is required here.
 
 use std::fmt;
 
@@ -89,6 +100,11 @@ pub fn run(mut expr: Expr) -> Result<Expr, DeferError> {
 ///   `type_substitutions`, then replaces `Defer` with the result.
 ///
 /// Recurses into both the (now-updated) `bound_expr` and `body` for nested defers.
+///
+/// By the time this runs, [`crate::ccl::inline`] has already merged any
+/// defer-returning let scopes and α-renamed all `Feed`/`Define` targets, so
+/// every feed/define node for a given handle already carries its binding name
+/// and no alias tracking is needed.
 fn inline_defers(
     expr: &mut Expr,
     type_substitutions: &mut Vec<(Type, Type)>,
@@ -126,11 +142,15 @@ fn inline_defers(
                         ));
                         **bound_expr = feed_result;
                     }
-                    _ => unreachable!("FeedsAndDefinesMixed is caught inside inline_defer"),
+                    // inline_defer returns Err(FeedsAndDefinesMixed) when both feeds
+                    // and a define are present, so Ok(...) with non-empty feeds and
+                    // Some(define) cannot reach here.
+                    _ => unreachable!(),
                 }
             }
+            // body was already recursed above; only recurse into bound_expr here so
+            // we process any defers nested inside the newly-substituted value.
             inline_defers(bound_expr, type_substitutions)?;
-            // Note: body was already processed above; don't recurse into it again.
         }
         TypedExprNode::Apply { function, argument } => {
             inline_defers(function, type_substitutions)?;
@@ -340,6 +360,11 @@ fn substitute_types(ty: &mut Type, type_substitutions: &[(Type, Type)]) {
             substitute_types(arg, type_substitutions);
             substitute_types(func, type_substitutions);
         }
+        Type::Union(variants) => {
+            for v in variants {
+                substitute_types(v, type_substitutions);
+            }
+        }
         Type::Tuple(elts) => {
             for e in elts {
                 substitute_types(e, type_substitutions);
@@ -375,6 +400,11 @@ fn substitute_types(ty: &mut Type, type_substitutions: &[(Type, Type)]) {
 /// `Let` bindings that re-introduce `name_to_bind` stop the search in their body
 /// (shadowing semantics). `Feed` and `Define` nodes for *other* names are leaves
 /// unless `name_to_bind` appears free in their value expression.
+/// Other node types (`Lambda`, `Join`, `BinOp`, etc.) are not yet supported and
+/// will panic if encountered.
+///
+/// By the time this runs all aliases have been resolved by [`crate::ccl::inline`],
+/// so exact name equality is sufficient for matching.
 fn inline_defer(
     expr: &mut Expr,
     name_to_bind: &str,
@@ -466,14 +496,15 @@ fn inline_defer(
             (None, result, None)
         }
 
-        // Recurse through a nested Let binding. If the binding shadows name_to_bind
-        // (i.e. an inner defer reuses the same name), stop searching in the body.
+        // Recurse through a nested Let binding.  If the binding shadows name_to_bind
+        // (an inner defer reuses the same name), stop searching in the body.
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
         } => {
             let (be_feeds, be_define) = inline_defer(bound_expr.as_mut(), name_to_bind)?;
+
             let (body_feeds, body_define) = if binding.name == name_to_bind {
                 // The inner let shadows the name; don't search deeper.
                 (vec![], None)

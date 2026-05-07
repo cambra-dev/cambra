@@ -40,6 +40,33 @@
 //! - **Body duplication**: if a scalar UDF is called N times, its body appears N
 //!   times in the operator graph. Acceptable for now; caching is only needed for
 //!   collection-typed UDFs (iterable domain), which are not inlined.
+//!
+//! # Alias inlining and defer-returning lift
+//!
+//! In addition to UDF inlining, this pass also performs two structural rewrites
+//! that must happen before [`crate::ccl::lambda_elim`]:
+//!
+//! - **Alias inlining**: a `Let` binding whose right-hand side is a plain `Var`
+//!   is pure α-renaming and is eliminated unconditionally.  Running this before
+//!   lambda-elim prevents the let-in-lambda rule from hoisting such bindings into
+//!   `const(x)` wrappers, which would otherwise require [`strip_const_wrappers`]
+//!   recognition downstream.
+//!
+//! - **Defer-returning lift**: when a `Let` binding's right-hand side is a
+//!   defer-returning expression — `let x = Defer in body_x` where `body_x` ends in
+//!   `Var(x)`, possibly after `ExprStmt` and inner `Let` nodes — and possibly
+//!   preceded by `ExprStmt` wrappers, the pass merges the inner and outer feed
+//!   scopes:
+//!   ```text
+//!   let y = (let x = Defer in body_x) in body_y
+//!     →  let y = Defer in body_x[x→y] with Var(y) replaced by body_y
+//!   ```
+//!   Because [`substitute`] now renames `Feed`/`Define` target strings when the
+//!   replacement is a `Var`, the substitution `x → Var(y)` also rewrites every
+//!   `Feed("x", …)` to `Feed("y", …)`, making the alias map from the old
+//!   downstream implementation unnecessary.  Any `ExprStmt(Feed("c", …), …)`
+//!   prefix produced by a beta-reduction whose argument was defer-returning is
+//!   folded in by renaming the stale parameter-name feed targets to `y`.
 
 use crate::ccl::{Branch, Expr, Type, TypedExprNode, lambda_elim::substitute};
 
@@ -127,16 +154,234 @@ fn should_inline(bound_ty: &Type) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Alias and defer helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` if `name` appears as a `Let` binder anywhere in `expr`.
+///
+/// Used to guard alias inlining: substituting `y → x` in a body that rebinds
+/// `x` via an inner `let x = …` would cause the substituted `x` references to
+/// be captured by the shadowing binding, producing incorrect semantics.
+fn is_let_bound(name: &str, expr: &Expr) -> bool {
+    match &expr.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => binding.name == name || is_let_bound(name, bound_expr) || is_let_bound(name, body),
+        TypedExprNode::Lambda { body, .. } => is_let_bound(name, body),
+        TypedExprNode::Apply { function, argument } => {
+            is_let_bound(name, function) || is_let_bound(name, argument)
+        }
+        TypedExprNode::BinOp { left, right, .. } => {
+            is_let_bound(name, left) || is_let_bound(name, right)
+        }
+        TypedExprNode::UnaryOp(_, inner) => is_let_bound(name, inner),
+        TypedExprNode::Tuple(elts) | TypedExprNode::List(elts) | TypedExprNode::Compose(elts) => {
+            elts.iter().any(|e| is_let_bound(name, e))
+        }
+        TypedExprNode::Record(fields) => fields.iter().any(|(_, e)| is_let_bound(name, e)),
+        TypedExprNode::Case { branches } => branches
+            .iter()
+            .any(|b| is_let_bound(name, &b.guard) || is_let_bound(name, &b.body)),
+        TypedExprNode::Join {
+            loop_body,
+            outer_body,
+            ..
+        } => is_let_bound(name, loop_body) || is_let_bound(name, outer_body),
+        TypedExprNode::Jump { args, .. } => args.iter().any(|a| is_let_bound(name, a)),
+        TypedExprNode::ExprStmt { expr, body } => {
+            is_let_bound(name, expr) || is_let_bound(name, body)
+        }
+        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
+            is_let_bound(name, value)
+        }
+        TypedExprNode::Aggregate { input, .. } => is_let_bound(name, input),
+        TypedExprNode::Lit(_)
+        | TypedExprNode::Var(_)
+        | TypedExprNode::Builtin(_)
+        | TypedExprNode::Proj(_)
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Defer => false,
+    }
+}
+
+/// Returns `true` when `expr` ends in `Var(name)` through a chain of
+/// `ExprStmt` sequencings and `Let` bindings, i.e. the expression ultimately
+/// yields the named defer handle as its value.
+///
+/// Both `ExprStmt` (sequenced side-effects) and `Let` (intermediate bindings,
+/// e.g. `z = n + 1` before `return x`) are transparent.  A `Let` that rebinds
+/// `name` itself is opaque: the search stops and returns `false`.
+///
+/// Used by [`try_lift_defer`] to detect functions that return their own handle.
+pub(crate) fn is_defer_returning(expr: &Expr, name: &str) -> bool {
+    match &expr.node {
+        TypedExprNode::Var(v) => v == name,
+        TypedExprNode::ExprStmt { body, .. } => is_defer_returning(body, name),
+        TypedExprNode::Let { binding, body, .. } => {
+            binding.name != name && is_defer_returning(body, name)
+        }
+        _ => false,
+    }
+}
+
+/// Replace the trailing `Var` at the end of an `ExprStmt`/`Let` chain with
+/// `replacement`.
+///
+/// The caller guarantees (via [`is_defer_returning`]) that `expr` ends in a
+/// `Var` node; any other tail shape panics.
+pub(crate) fn replace_result_var(expr: Expr, replacement: Expr) -> Expr {
+    match expr.node {
+        TypedExprNode::Var(_) => replacement,
+        TypedExprNode::ExprStmt { expr: e, body } => {
+            let new_body = replace_result_var(*body, replacement);
+            let ty = new_body.ty.clone();
+            Expr {
+                ty,
+                node: TypedExprNode::ExprStmt {
+                    expr: e,
+                    body: Box::new(new_body),
+                },
+                user_annotation: None,
+            }
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            let new_body = replace_result_var(*body, replacement);
+            let ty = new_body.ty.clone();
+            Expr {
+                ty,
+                node: TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body: Box::new(new_body),
+                },
+                user_annotation: None,
+            }
+        }
+        _ => panic!("replace_result_var: expected a defer-returning expression"),
+    }
+}
+
+/// Attempt to apply the defer-returning lift to a `Let` binding.
+///
+/// Detects the pattern:
+/// ```text
+/// let y = (<prefix_stmts...> let x = Defer in body_x) in body_y
+/// ```
+/// where `body_x` ends in `Var(x)` (possibly through `ExprStmt`/`Let` chains),
+/// and rewrites it to:
+/// ```text
+/// let y = Defer in <prefix_stmts_renamed...> body_x[x→y][Var(y)→body_y]
+/// ```
+///
+/// The substitution `x → Var(y)` is performed via [`substitute`], which now
+/// also renames `Feed("x", …)` → `Feed("y", …)` (the α-renaming fix).  Any
+/// `ExprStmt(Feed("c", …), …)` prefix entries that were produced by beta-
+/// reducing a defer-returning argument into a surrounding function are folded in
+/// by renaming their stale feed targets to `y`.
+///
+/// Returns `None` when `bound_expr` does not match the liftable pattern.
+fn try_lift_defer(binding_name: String, bound_expr: Expr, body: Expr) -> Option<Expr> {
+    // Peel any leading ExprStmt layers off bound_expr.  The heads become the
+    // `prefix` that must be prepended (with feed-target renames) to the merged body.
+    let mut prefix: Vec<Expr> = Vec::new();
+    let mut current = bound_expr;
+    while let TypedExprNode::ExprStmt {
+        expr: head,
+        body: tail,
+    } = current.node
+    {
+        prefix.push(*head);
+        current = *tail;
+    }
+
+    // After peeling, check for `let x = Defer in body_x` with defer-returning body.
+    let (inner_name, defer_ty, inner_body) = match current.node {
+        TypedExprNode::Let {
+            binding: inner_binding,
+            bound_expr: inner_be,
+            body: inner_body,
+        } if inner_be.node == TypedExprNode::Defer
+            && is_defer_returning(&inner_body, &inner_binding.name) =>
+        {
+            (inner_binding.name, inner_be.ty.clone(), *inner_body)
+        }
+        _ => return None,
+    };
+
+    // Substitute x → Var(binding_name) in inner_body.  The fixed substitute
+    // renames Feed("x", …) → Feed(binding_name, …) since replacement is a Var.
+    let y_var = Expr::var(&binding_name).with_ty(defer_ty.clone());
+    let inner_subst = substitute(inner_body, &inner_name, &y_var);
+
+    // Build the outer-body replacement: prefix feeds (renamed to binding_name)
+    // wrapped around the original outer body.  Inserting them here — before `body`
+    // but inside `replace_result_var` — preserves execution order:
+    //   inner body feeds … prefix feeds … outer body feeds
+    // This mirrors the Python argument-first evaluation order: the inner function
+    // executes first (its feeds come first), then the outer wrapper's feeds.
+    let mut new_outer_body = body;
+    for head in prefix.into_iter().rev() {
+        // Rename Feed/Define targets to binding_name.  These orphaned labels came
+        // from lambda-parameter names that no longer exist after beta-reduction.
+        let renamed_head = match head.node {
+            TypedExprNode::Feed { name: _, value } => Expr {
+                ty: head.ty,
+                node: TypedExprNode::Feed {
+                    name: binding_name.clone(),
+                    value,
+                },
+                user_annotation: None,
+            },
+            TypedExprNode::Define { name: _, value } => Expr {
+                ty: head.ty,
+                node: TypedExprNode::Define {
+                    name: binding_name.clone(),
+                    value,
+                },
+                user_annotation: None,
+            },
+            _ => head,
+        };
+        let ty = new_outer_body.ty.clone();
+        new_outer_body = Expr {
+            ty,
+            node: TypedExprNode::ExprStmt {
+                expr: Box::new(renamed_head),
+                body: Box::new(new_outer_body),
+            },
+            user_annotation: None,
+        };
+    }
+
+    // Replace the trailing Var(y) in inner_subst with new_outer_body so
+    // inner body feeds appear before prefix feeds and outer body feeds.
+    let result = replace_result_var(inner_subst, new_outer_body);
+
+    // Build `let y = Defer in result`, preserving the type of `result` on the
+    // outer expression so downstream passes see a fully-typed tree.
+    let result_ty = result.ty.clone();
+    let defer_expr = Expr::new(TypedExprNode::Defer).with_ty(defer_ty);
+    Some(Expr::let_bind(binding_name, defer_expr, result).with_ty(result_ty))
+}
+
+// ---------------------------------------------------------------------------
 // Tree walk
 // ---------------------------------------------------------------------------
 
 /// Recursively inline `Let` bindings that pass [`should_inline`], beta-reducing
 /// each call site as the substitution produces it.
 ///
-/// Only call sites of the inlined name are beta-reduced — unrelated
-/// `Apply(arg, Lambda(x, body))` patterns elsewhere in the tree are left
-/// intact so later passes (lambda-elim + simplify) can apply their usual
-/// rewrites.
+/// Also applies alias inlining (eliminates `let y = x` via α-renaming) and the
+/// defer-returning lift before the UDF-inlining check.  Running these before
+/// [`crate::ccl::lambda_elim`] prevents the let-in-lambda rewrite from
+/// wrapping aliases in `const(…)` and ensures defer scope merging happens at the
+/// right level.
 fn inline_impl(expr: Expr) -> Expr {
     let Expr {
         node,
@@ -153,6 +398,28 @@ fn inline_impl(expr: Expr) -> Expr {
             let bound_expr = inline_impl(*bound_expr);
             let body = inline_impl(*body);
 
+            // Alias: `let y = x` is pure α-renaming — substitute y → x in body
+            // and drop the Let.  This must run before lambda_elim so that the
+            // let-in-lambda rule never wraps such aliases in `const(x)`.
+            //
+            // Guard: only safe when x is not re-bound inside body.  If body
+            // contains `let x = …` the substitution would capture those x
+            // references under the wrong binding (e.g. `x = 1; y = x; x += 4;
+            // y` must return 1, not 5).
+            if let TypedExprNode::Var(repl_name) = &bound_expr.node
+                && !is_let_bound(repl_name, &body)
+            {
+                return substitute(body, &binding.name, &bound_expr);
+            }
+
+            // Defer-returning lift: merge inner and outer feed scopes when the
+            // bound_expr is a defer-returning let (possibly with ExprStmt prefix).
+            if let Some(lifted) =
+                try_lift_defer(binding.name.clone(), bound_expr.clone(), body.clone())
+            {
+                return lifted;
+            }
+
             if should_inline(&bound_expr.ty) {
                 // Substitute the bound Lambda at every free occurrence of the
                 // binding name in the body, beta-reducing at each call site.
@@ -161,7 +428,12 @@ fn inline_impl(expr: Expr) -> Expr {
                 // safe here because lowering assigns unique binding names per
                 // scope — no free variable in `bound_expr` can shadow a binder
                 // introduced in `body`.
-                return inline_and_beta_reduce(body, &binding.name, &bound_expr);
+                //
+                // Re-run inline_impl after beta-reduction so that newly created
+                // Let bindings (e.g. `let y = (let x = Defer in …) in …` after
+                // expanding a defer-returning UDF) are eligible for the alias
+                // and lift rewrites on the second pass.
+                return inline_impl(inline_and_beta_reduce(body, &binding.name, &bound_expr));
             }
             TypedExprNode::Let {
                 binding,
@@ -794,16 +1066,19 @@ mod tests {
     }
 
     #[test]
-    fn collection_let_unchanged() {
+    fn collection_let_alias_is_inlined() {
         // let f: UIntRange(3) → Int = id in f
+        // Even though the domain is iterable (so should_inline returns false), the bound
+        // expression is a plain Var — alias inlining eliminates the let unconditionally.
         let domain = Type::UIntRange(3);
         let codomain = Type::Base(BaseType::Int);
         let fun_ty = Type::fun(domain.clone(), codomain.clone());
         let id_expr = TypedExpr::var("id").with_ty(fun_ty.clone());
         let body = TypedExpr::var("f").with_ty(fun_ty.clone());
-        let expr = TypedExpr::let_bind("f", id_expr, body);
-        let result = inline_non_iterable_lambdas(expr.clone());
-        assert_eq!(result, expr);
+        let expr = TypedExpr::let_bind("f", id_expr.clone(), body);
+        let result = inline_non_iterable_lambdas(expr);
+        // Alias `f → id` is substituted; result is just `id`.
+        assert_eq!(result, id_expr);
     }
 
     #[test]
@@ -1323,5 +1598,117 @@ mod tests {
         })
         .with_ty(int);
         assert_eq!(result, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // is_defer_returning
+    // -----------------------------------------------------------------------
+
+    fn int_ty() -> Type {
+        Type::Base(BaseType::Int)
+    }
+
+    fn lit(n: i64) -> TypedExpr {
+        TypedExpr::lit(Lit::Int(n)).with_ty(int_ty())
+    }
+
+    fn var(s: &str) -> TypedExpr {
+        TypedExpr::var(s)
+    }
+
+    /// `is_defer_returning` sees through a plain `Let` wrapper.
+    #[test]
+    fn is_defer_returning_through_let() {
+        let expr = TypedExpr::let_bind("z", lit(99), var("x"));
+        assert!(is_defer_returning(&expr, "x"));
+        assert!(!is_defer_returning(&expr, "z"));
+    }
+
+    /// A `Let` that rebinds the target name stops the search.
+    #[test]
+    fn is_defer_returning_stops_at_shadowing_let() {
+        let expr = TypedExpr::let_bind("x", lit(42), var("x"));
+        assert!(
+            !is_defer_returning(&expr, "x"),
+            "shadowing let must return false"
+        );
+        let outer = TypedExpr::let_bind("z", lit(1), expr);
+        assert!(
+            !is_defer_returning(&outer, "x"),
+            "false must propagate outward"
+        );
+    }
+
+    /// `is_defer_returning` sees through nested `Let` + `ExprStmt`.
+    #[test]
+    fn is_defer_returning_through_let_and_expr_stmt() {
+        let inner = TypedExpr::expr_stmt(
+            TypedExpr::new(TypedExprNode::Feed {
+                name: "y".into(),
+                value: Box::new(lit(2)),
+            }),
+            var("x"),
+        );
+        let expr = TypedExpr::let_bind("z", lit(1), inner);
+        assert!(is_defer_returning(&expr, "x"));
+    }
+
+    // -----------------------------------------------------------------------
+    // replace_result_var
+    // -----------------------------------------------------------------------
+
+    /// `replace_result_var` threads through a `Let` wrapper.
+    #[test]
+    fn replace_result_var_through_let() {
+        let expr = TypedExpr::let_bind("z", lit(99), var("x"));
+        let result = replace_result_var(expr, lit(42));
+        use crate::ccl::symbolic::symbolic;
+        let s = symbolic(&result);
+        assert!(s.contains("99") && s.contains("42"), "unexpected: {s}");
+        assert!(!s.contains(" x"), "Var(x) should be replaced: {s}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Alias inlining + defer-returning lift via inline_non_iterable_lambdas
+    // -----------------------------------------------------------------------
+
+    /// `inline_non_iterable_lambdas` lifts `let y = (let x = Defer in body_x) in y`
+    /// to `let y = Defer in body_x[x→y]`, enabling `remove_defers` to process it.
+    ///
+    /// Simulates `def f(): x = defer(); z = 42; x <<= z; x` assigned as `y = f()`.
+    #[test]
+    fn inline_lifts_defer_returning_nested_let() {
+        // let x = Defer[Int] in (let z = 42 in ExprStmt(Define("x", z), x))
+        let define_site = TypedExpr::expr_stmt(
+            TypedExpr::new(TypedExprNode::Define {
+                name: "x".into(),
+                value: Box::new(var("z")),
+            }),
+            var("x"),
+        );
+        let inner_body = TypedExpr::let_bind("z", lit(42), define_site);
+        let x_defer = TypedExpr::new(TypedExprNode::Defer).with_ty(int_ty());
+        let inner = TypedExpr::let_bind("x", x_defer, inner_body);
+
+        // let y = <inner> in y
+        let expr = TypedExpr::let_bind("y", inner, var("y"));
+        let result = inline_non_iterable_lambdas(expr);
+
+        use crate::ccl::symbolic::symbolic;
+        let s = symbolic(&result);
+        // The lift must have happened: the outer let binds Defer directly, not
+        // the whole nested-let expression.
+        assert!(
+            s.contains("let y") && s.contains("defer"),
+            "lift should have produced let y = defer: {s}"
+        );
+        assert!(
+            !s.contains("let x"),
+            "inner let x = Defer must be absorbed: {s}"
+        );
+        assert!(
+            s.contains("define(y"),
+            "Define target should be renamed to y: {s}"
+        );
     }
 }

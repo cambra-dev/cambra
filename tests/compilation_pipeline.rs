@@ -759,6 +759,133 @@ x"#,
         domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
         deleted: BitSet::new(),
     })]
+#[case(
+r#"
+x = defer()
+y = x
+for i in [1,2,3]:
+  y << i
+y"#, make_int_list(&[1, 2, 3]))]
+#[case(
+r#"
+x = defer()
+y = x
+z = y
+for i in [1,2,3]:
+  z << i
+z"#, make_int_list(&[1, 2, 3]))]
+#[case(
+r#"
+def f(n):
+  x = defer()
+  x
+y = f(10)
+for i in [1,2,3]:
+  y << i
+y"#, make_int_list(&[1, 2, 3]))]
+#[case(
+r#"
+def f(x):
+  x
+x = defer()
+for i in [1,2,3]:
+  y = f(f(x))
+  y << i
+x"#, make_int_list(&[1, 2, 3]))]
+#[case(
+r#"
+x = defer()
+for i in [1,2,3]:
+  y = x
+  y << i
+x"#, make_int_list(&[1, 2, 3]))]
+#[case(
+r#"
+def f(n):
+  x = defer()
+  x << n
+  x
+y = f(10)
+for i in [1,2,3]:
+  y << i
+y"#, Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 1, 1, 1],
+            variants: vec![
+                ColumnValue::Units(1),
+                ColumnValue::UInts(vec![0, 1, 2])
+            ],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 1, 2, 3]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    })]
+#[case(
+r#"
+def f(n):
+  x = defer()
+  x << n
+  x
+def g(c):
+  c << 100
+  c
+y = g(f(10))
+for i in [1,2,3]:
+  y << i
+y"#, Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 1, 2, 2, 2],
+            variants: vec![
+                ColumnValue::Units(1),
+                ColumnValue::Units(1),
+                ColumnValue::UInts(vec![0, 1, 2])
+            ],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    })]
+#[case(
+r#"
+def f(n):
+  x = defer()
+  x << n
+  x
+def g(c):
+  c << 100
+  c
+y = g(f(10))
+for i in [1,2,3]:
+  y << i
+y @ y"#, Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 1],
+            variants: vec![
+                ColumnValue::Union {
+                    tags: vec![0, 1, 2, 2, 2],
+                    variants: vec![
+                        ColumnValue::Units(1),
+                        ColumnValue::Units(1),
+                        ColumnValue::UInts(vec![0, 1, 2]),
+                    ],
+                },
+                ColumnValue::Union {
+                    tags: vec![0, 1, 2, 2, 2],
+                    variants: vec![
+                        ColumnValue::Units(1),
+                        ColumnValue::Units(1),
+                        ColumnValue::UInts(vec![0, 1, 2]),
+                    ],
+                },
+            ],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3, 10, 100, 1, 2, 3]))),
+        domain_predicate: Predicate::Union(vec![
+            Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
+            Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
+        ]),
+        deleted: BitSet::new(),
+    })]
 fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }

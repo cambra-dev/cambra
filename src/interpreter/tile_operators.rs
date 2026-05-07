@@ -4338,6 +4338,8 @@ impl TileProducer for UnionProducer {
         let mut domains: Vec<ColumnValue> = Vec::new();
         let mut codomains: Vec<Tile> = Vec::new();
         let mut domain_predicates: Vec<Predicate> = Vec::new();
+        let mut combined_deleted = BitSet::new();
+        let mut domain_offset: usize = 0;
 
         for tile in tiles {
             match tile {
@@ -4345,8 +4347,13 @@ impl TileProducer for UnionProducer {
                     domain,
                     codomain,
                     domain_predicate: dp,
-                    ..
+                    deleted,
                 } => {
+                    // Shift each deleted index into the combined domain's position space.
+                    for idx in deleted.iter() {
+                        combined_deleted.insert(idx + domain_offset);
+                    }
+                    domain_offset += domain.len();
                     domains.push(domain);
                     codomains.push(*codomain);
                     domain_predicates.push(dp);
@@ -4423,7 +4430,7 @@ impl TileProducer for UnionProducer {
             domain: union_domain,
             codomain: Box::new(codomain_tile),
             domain_predicate,
-            deleted: BitSet::new(),
+            deleted: combined_deleted,
         }
     }
 

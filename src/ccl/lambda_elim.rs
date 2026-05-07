@@ -268,8 +268,10 @@ pub(crate) fn is_free(param: &str, expr: &Expr) -> bool {
 
         TypedExprNode::ExprStmt { expr, body } => is_free(param, expr) || is_free(param, body),
 
-        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
-            is_free(param, value)
+        // The `name` field of Feed/Define is a use of the defer handle variable —
+        // `Feed("x", v)` is a write to the defer `x`, so `x` is free here.
+        TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
+            name == param || is_free(param, value)
         }
 
         TypedExprNode::Defer => false,
@@ -456,8 +458,62 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             kind,
         },
 
-        // Atoms handled above; these shouldn't be reached but return as-is for safety.
-        other => other,
+        TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
+            expr: Box::new(substitute(*expr, name, replacement)),
+            body: Box::new(substitute(*body, name, replacement)),
+        },
+
+        // Feed/Define: substitute into the value, and if the target name equals the
+        // variable being substituted and the replacement is a Var, rename the target
+        // string too.  This is α-renaming of the binding site: a Feed("x", v) is a
+        // use of the name "x" in the same way that Var("x") is, so when we rename
+        // x → y (replacement = Var("y")), the feed site must follow.  We only rename
+        // when the replacement is a plain Var because that is the only safe case —
+        // a non-Var replacement would require ANF'ing the feed target, which is a
+        // separate transform.
+        TypedExprNode::Feed {
+            name: feed_name,
+            value,
+        } => {
+            let new_feed_name = if feed_name == name {
+                match &replacement.node {
+                    TypedExprNode::Var(new_name) => new_name.clone(),
+                    _ => feed_name,
+                }
+            } else {
+                feed_name
+            };
+            TypedExprNode::Feed {
+                name: new_feed_name,
+                value: Box::new(substitute(*value, name, replacement)),
+            }
+        }
+
+        TypedExprNode::Define {
+            name: def_name,
+            value,
+        } => {
+            let new_def_name = if def_name == name {
+                match &replacement.node {
+                    TypedExprNode::Var(new_name) => new_name.clone(),
+                    _ => def_name,
+                }
+            } else {
+                def_name
+            };
+            TypedExprNode::Define {
+                name: new_def_name,
+                value: Box::new(substitute(*value, name, replacement)),
+            }
+        }
+
+        // Atoms — no sub-expressions to substitute into.
+        node @ (TypedExprNode::Lit(_)
+        | TypedExprNode::Var(_)
+        | TypedExprNode::Builtin(_)
+        | TypedExprNode::Proj(_)
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Defer) => node,
     };
     let result = TypedExpr {
         node: new_node,

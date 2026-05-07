@@ -1,9 +1,17 @@
 //! Union-Find unification table for CCL type inference.
 //!
-//! Provides [`UnificationTable`], a sparse union-find structure over [`InferVarId`]s.
-//! Each inference variable starts unregistered; callers call [`UnificationTable::register`]
-//! when they allocate a fresh variable, then optionally [`UnificationTable::set`] once its
-//! type is solved or [`UnificationTable::unify`] to equate two variables.
+//! Provides [`UnificationTable`], which maintains two parallel union-find structures:
+//!
+//! 1. A sparse union-find over [`InferVarId`]s for ordinary type inference variables.
+//!    Each inference variable starts unregistered; callers call [`UnificationTable::register`]
+//!    when they allocate a fresh variable, then optionally [`UnificationTable::set`] once its
+//!    type is solved or [`UnificationTable::unify`] to equate two variables.
+//!
+//! 2. A union-find over [`DeferredCollectionId`]s for deferred-collection domain IDs.
+//!    Two `DeferredCollectionDomain(a)` and `DeferredCollectionDomain(b)` types are considered
+//!    equal if `a` and `b` are in the same equivalence class. This enables a function that
+//!    takes a defer handle as a parameter and feeds into it to be called with any concrete
+//!    handle — the domain IDs are unified at the call site rather than requiring exact equality.
 //!
 //! The table is used by [`crate::ccl::infer::TypeInferenceContext`] to track solved inference
 //! variables across the typed-expression tree, and by a post-inference resolution pass to
@@ -13,7 +21,7 @@ use std::{collections::HashMap, fmt::Display};
 
 use log::trace;
 
-use crate::ccl::{Branch, InferVarId, Type, infer::InferError};
+use crate::ccl::{Branch, DeferredCollectionId, InferVarId, Type, infer::InferError};
 
 // ---------------------------------------------------------------------------
 // Internal entry type
@@ -49,21 +57,30 @@ impl Display for Entry {
 // UnificationTable
 // ---------------------------------------------------------------------------
 
-/// Sparse union-find table over [`InferVarId`]s.
+/// Sparse union-find table over [`InferVarId`]s, with a parallel union-find for
+/// [`DeferredCollectionId`]s.
 ///
-/// Indexed by `InferVarId.0`; entries that have never been registered are
-/// treated as absent (looked up as `None`). Supports:
+/// Supports:
 /// - [`register`](Self::register) — allocate a slot for a new variable
 /// - [`find`](Self::find) — path-compressing canonical-representative lookup
 /// - [`set`](Self::set) — solve a variable to a concrete type
 /// - [`probe`](Self::probe) — query the solved type if known
 /// - [`unify`](Self::unify) — equate two variables (union-by-root)
+/// - [`find_defer_domain`](Self::find_defer_domain) / [`unify_defer_domains`](Self::unify_defer_domains) — defer-ID union-find
 #[derive(Default)]
 pub struct UnificationTable {
     /// Sparse storage: index `i` holds the entry for variable `InferVarId(i)`.
     ///
     /// `None` at an index means that variable has never been registered.
     entries: Vec<Option<Entry>>,
+
+    /// Union-find for deferred-collection domain IDs.
+    ///
+    /// Maps each [`DeferredCollectionId`] to its canonical representative (the smallest
+    /// ID in its equivalence class). Absent entries are their own root. Used by
+    /// [`constrain_equal`](Self::constrain_equal) to unify two `DeferredCollectionDomain`
+    /// types, and by the resolve pass to canonicalize all domain IDs.
+    defer_domains: HashMap<DeferredCollectionId, DeferredCollectionId>,
 }
 
 impl Display for UnificationTable {
@@ -478,6 +495,16 @@ impl UnificationTable {
                 self.constrain_equal(inner, other)
             }
 
+            // DeferredCollectionDomain IDs are unified rather than compared for exact equality.
+            // This allows a function that takes a defer handle as a parameter (which was assigned
+            // a fresh domain ID during that function's body inference) to be called with any
+            // concrete handle — the two IDs are merged into the same equivalence class and
+            // canonicalized by the resolve pass.
+            (Type::DeferredCollectionDomain(a), Type::DeferredCollectionDomain(b)) => {
+                self.unify_defer_domains(*a, *b);
+                Ok(())
+            }
+
             (a, b) if a == b => Ok(()),
             (type_a, type_b) => Err(InferError::TypeMismatch {
                 ctx: "unify".to_string(),
@@ -500,6 +527,42 @@ impl UnificationTable {
         // Only initialise if not already present.
         if self.entries[idx].is_none() {
             self.entries[idx] = Some(Entry::Root(None));
+        }
+    }
+
+    /// Find the canonical representative for a deferred-collection domain ID.
+    ///
+    /// IDs absent from [`defer_domains`](Self::defer_domains) are their own root.
+    /// Applies path compression so future lookups are O(1).
+    pub fn find_defer_domain(&mut self, id: DeferredCollectionId) -> DeferredCollectionId {
+        let mut path = Vec::new();
+        let mut current = id;
+        loop {
+            let next = match self.defer_domains.get(&current).copied() {
+                None => break,
+                Some(x) if x == current => break,
+                Some(x) => x,
+            };
+            path.push(current);
+            current = next;
+        }
+        // Path compression: point every traversed node directly at the root.
+        for node in path {
+            self.defer_domains.insert(node, current);
+        }
+        current
+    }
+
+    /// Union two deferred-collection domain IDs into the same equivalence class.
+    ///
+    /// The canonical representative is the numerically smaller of the two roots,
+    /// matching the convention that `handle(N)` with the lowest `N` is the primary ID.
+    pub fn unify_defer_domains(&mut self, a: DeferredCollectionId, b: DeferredCollectionId) {
+        let ca = self.find_defer_domain(a);
+        let cb = self.find_defer_domain(b);
+        if ca != cb {
+            let (winner, loser) = if ca < cb { (ca, cb) } else { (cb, ca) };
+            self.defer_domains.insert(loser, winner);
         }
     }
 }
@@ -552,11 +615,12 @@ fn resolve_type(ty: &mut Type, table: &mut UnificationTable) {
         // Resolve the base type inside a refinement; the predicate is a separate expression
         // and is resolved via the expression-level resolve() pass.
         Type::Refinement(inner, _) => resolve_type(inner, table),
-        Type::Base(_)
-        | Type::UIntRange(_)
-        | Type::DataSource(_)
-        | Type::DeferredCollectionDomain(_)
-        | Type::Hole => {}
+        // Canonicalize defer domain IDs so that all IDs in the same equivalence class
+        // (unified by constrain_equal) are replaced by their canonical representative.
+        Type::DeferredCollectionDomain(id) => {
+            *id = table.find_defer_domain(*id);
+        }
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => {}
     };
 }
 
