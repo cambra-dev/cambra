@@ -774,17 +774,11 @@ fn elim_lambda(
 
         // BinOp — desugar to Apply + Tuple, then apply the application rule.
         // a op b  ≡  (a, b) ▷ op_fn
-        TypedExprNode::BinOp {
-            left,
-            mut op,
-            right,
-        } => {
-            if op == BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add)
-                && left.ty == Type::Base(BaseType::String)
-            {
-                // Special case: string concatenation uses `concat` function, not `add`.
-                op = BinOpKind::Concat;
-            }
+        //
+        // The `String + String → Concat` rewrite is handled by
+        // [`crate::ccl::simplify::try_string_add_to_concat`] (which runs after
+        // lambda elimination), so it's not duplicated here.
+        TypedExprNode::BinOp { left, op, right } => {
             let left = *left;
             let right = *right;
             let tuple = typed_tuple(vec![left, right]);

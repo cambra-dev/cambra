@@ -1,0 +1,9 @@
+get_reqs, get_resps = http_serve("8081", "GET", "/")
+
+for req in get_reqs:
+    get_resps << "<!doctype html>\n<html><title>Echo Server</title><body>GET</body></html>\n"
+
+post_reqs, post_resps = http_serve("8081", "POST", "/post")
+
+for req in post_reqs:
+    post_resps << "<!doctype html>\n<html><title>Echo Server</title><body>Post:" + req + "</body></html>\n"

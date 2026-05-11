@@ -71,15 +71,20 @@ impl WebInspector {
         WebInspector { snapshot }
     }
 
-    /// Update the snapshot with the current state of the producer graph.
-    /// Called from the main thread each scheduler tick.
-    pub fn update_snapshot(&self, tick: u64, producer: &dyn TileProducer) {
+    /// Update the snapshot with the current state of all producers.
+    ///
+    /// `collect` is called with an accumulator function; call the accumulator
+    /// once per producer to include it in the snapshot.  All producers are
+    /// rendered into a single JSON object `{"tick": N, "producers": [...]}`.
+    pub fn update_snapshot(
+        &self,
+        tick: u64,
+        collect: impl FnOnce(&mut dyn FnMut(&dyn TileProducer)),
+    ) {
         let opts = VizOptions::default();
-        let json = format!(
-            r#"{{"tick":{},"producer":{}}}"#,
-            tick,
-            producer.inspect(&opts).to_json(),
-        );
+        let mut jsons: Vec<String> = Vec::new();
+        collect(&mut |p: &dyn TileProducer| jsons.push(p.inspect(&opts).to_json()));
+        let json = format!(r#"{{"tick":{},"producers":[{}]}}"#, tick, jsons.join(","),);
         *self.snapshot.lock().unwrap() = json;
     }
 }

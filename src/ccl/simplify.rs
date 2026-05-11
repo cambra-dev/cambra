@@ -29,11 +29,15 @@
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` |
 //! | Flatten union | `(a @ b) @ c` | `CollectionUnion(a, b, c)` |
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` |
-//! | Drop pure ExprStmt | `ExprStmt { expr, body }` (if `expr` has no `Feed`) | `body` |
+//! | Sink ExprStmt to union | `ExprStmt { expr, body }` (if `expr` has no `Feed` but has a `Sink`) | `CollectionUnion(expr, body)` |
+//! | Drop pure ExprStmt | `ExprStmt { expr, body }` (if `expr` has no `Feed` and no `Sink`) | `body` |
 
 use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
-use crate::ccl::{Builtin, Expr, Lit, ProjKey, RefinementKind, Type, TypedExpr, TypedExprNode};
+use crate::ccl::{
+    ArithmeticKind, BaseType, BinOpKind, Builtin, Expr, Lit, ProjKey, RefinementKind, Type,
+    TypedExpr, TypedExprNode,
+};
 
 /// Returns `true` if `expr` directly references the given built-in primitive.
 fn is_builtin(expr: &Expr, b: Builtin) -> bool {
@@ -188,6 +192,44 @@ fn try_drop_pure_expr_stmt(expr: &mut Expr) -> bool {
     true
 }
 
+/// Rewrite `String + String` from `Arithmetic(Add)` to `Concat`.
+///
+/// Inference intentionally leaves the operator as `Add` (see
+/// [`crate::ccl::infer`]); this pass retargets the runtime dispatch.  Doing it
+/// here — rather than in [`crate::ccl::lambda_elim`] — guarantees every BinOp
+/// is visited regardless of how it ended up wrapped: a constant-body lambda
+/// lifted to `Apply(BinOp(...), Const)` no longer hides the operator from
+/// rewriting, and a BinOp inside a lambda body that has been desugared to
+/// `Apply(Tuple, Builtin(BinOp(Add)))` is rewritten via its `Builtin` head.
+fn try_string_add_to_concat(expr: &mut Expr) -> bool {
+    match &mut expr.node {
+        // Pre-lambda-elim form: a raw BinOp node still in the tree.
+        TypedExprNode::BinOp { left, op, .. }
+            if *op == BinOpKind::Arithmetic(ArithmeticKind::Add)
+                && left.ty == Type::Base(BaseType::String) =>
+        {
+            *op = BinOpKind::Concat;
+            true
+        }
+        // Post-lambda-elim form: `BinOp(Add, ...)` was desugared to
+        // `Apply(Tuple, Builtin(BinOp(Add)))`.  The function's type captures
+        // the operand types: `Fun(Tuple([String, String]), String)`.
+        TypedExprNode::Builtin(Builtin::BinOp(op))
+            if *op == BinOpKind::Arithmetic(ArithmeticKind::Add) =>
+        {
+            if let Type::Fun(arg_ty, _) = &expr.ty
+                && let Type::Tuple(elts) = arg_ty.as_ref()
+                && elts.first() == Some(&Type::Base(BaseType::String))
+            {
+                *op = BinOpKind::Concat;
+                return true;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 /// Apply all simplification rules at the root of `expr`.
 ///
 /// Rules are tried in a fixed order; each pass may enable earlier rules in the
@@ -216,6 +258,7 @@ fn apply_simplification_rules(expr: &mut Expr) -> bool {
     changed |= check(try_flatten_collection_union(expr), expr);
     changed |= check(try_zip_distribute_compose(expr), expr);
     changed |= check(try_drop_pure_expr_stmt(expr), expr);
+    changed |= check(try_string_add_to_concat(expr), expr);
 
     changed
 }
@@ -392,27 +435,18 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
 fn try_const_reduce(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
-        |_left, right| as_const(right).is_some(),
+        |_left, right| as_const(right).is_some() && !contains_feed(right),
         |left, right| {
             let Some(g) = as_const(&right) else {
                 unreachable!()
             };
-
-            // Compute the new type for g ▷ const
-            // Original: g ▷ const has type codomain(f) → codomain(g)
-            // New: should be domain(f) → codomain(g)
-            let new_const_ty = match (&left.ty, &right.ty) {
-                (Type::Fun(left_dom, _), Type::Fun(_, right_cod)) => {
-                    Type::fun(left_dom.as_ref().clone(), right_cod.as_ref().clone())
-                }
+            let new_const_ty = match (left.ty.domain(), right.ty.codomain()) {
+                (Some(dom), Some(cod)) => Type::fun(dom, cod),
                 _ => Type::Hole,
             };
-
-            // Reconstruct g ▷ const with the new type
             let const_var_ty = fun_ty_or_hole(&g.ty, &new_const_ty);
             let const_var = Expr::builtin(Builtin::Const).with_ty(const_var_ty);
             let new_const = Expr::apply(g.clone(), const_var).with_ty(new_const_ty);
-
             vec![new_const]
         },
     )
@@ -2057,5 +2091,51 @@ mod tests {
             );
         }
         assert_eq!(variants.len(), 3);
+    }
+
+    /// `String + String` as a raw `BinOp` is rewritten to `Concat`.  This is
+    /// the form left behind by lambda elimination's constant short-circuit
+    /// when the lambda body doesn't reference its parameter.
+    #[test]
+    fn simplify_string_add_to_concat_binop_form() {
+        let s_ty = Type::Base(BaseType::String);
+        let lhs = Expr::lit(Lit::String("a".into())).with_ty(s_ty.clone());
+        let rhs = Expr::lit(Lit::String("b".into())).with_ty(s_ty.clone());
+        let expr =
+            Expr::binop(lhs, BinOpKind::Arithmetic(ArithmeticKind::Add), rhs).with_ty(s_ty.clone());
+        let simplified = simplify(expr);
+        let TypedExprNode::BinOp { op, .. } = simplified.node else {
+            panic!("expected BinOp, got {:?}", simplified.node);
+        };
+        assert_eq!(op, BinOpKind::Concat);
+    }
+
+    /// `String + String` desugared to `Builtin(BinOp(Add))` (the form lambda
+    /// elimination produces inside lambda bodies that reference their
+    /// parameter) is also rewritten to `Concat`.
+    #[test]
+    fn simplify_string_add_to_concat_builtin_form() {
+        let s_ty = Type::Base(BaseType::String);
+        let arg_ty = Type::Tuple(vec![s_ty.clone(), s_ty.clone()]);
+        let fn_ty = fun_ty(arg_ty, s_ty);
+        let mut expr = Expr::builtin(Builtin::BinOp(BinOpKind::Arithmetic(ArithmeticKind::Add)))
+            .with_ty(fn_ty);
+        // simplify rewrites the inner op in place; call directly to avoid
+        // packing it into an enclosing Apply just for the test.
+        assert!(try_string_add_to_concat(&mut expr));
+        let TypedExprNode::Builtin(Builtin::BinOp(op)) = &expr.node else {
+            panic!("expected Builtin(BinOp), got {:?}", expr.node);
+        };
+        assert_eq!(*op, BinOpKind::Concat);
+    }
+
+    /// `Int + Int` as a `Builtin(BinOp(Add))` is left untouched.
+    #[test]
+    fn simplify_int_add_builtin_unchanged() {
+        let arg_ty = Type::Tuple(vec![int_ty(), int_ty()]);
+        let fn_ty = fun_ty(arg_ty, int_ty());
+        let mut expr = Expr::builtin(Builtin::BinOp(BinOpKind::Arithmetic(ArithmeticKind::Add)))
+            .with_ty(fn_ty);
+        assert!(!try_string_add_to_concat(&mut expr));
     }
 }

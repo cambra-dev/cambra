@@ -11,12 +11,14 @@
 //!   → Type          (test assertion here)
 //! ```
 
+use std::{cell::RefCell, rc::Rc};
+
 use cambra::ccl::{
     Type,
     infer::{InferError, TypeInferenceContext, infer},
     lower::{LoweringContext, lower_stmts},
 };
-use cambra::interpreter::BaseType;
+use cambra::interpreter::{BaseType, Extent, TestDataSource};
 use rustpython_parser::{ast as pyast, parser};
 
 // ---------------------------------------------------------------------------
@@ -35,7 +37,16 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
     for (name, elem_ty) in sources {
-        lctx.register_source(name);
+        let output_extent = match elem_ty {
+            Type::Base(bt) => Extent::Base(bt.clone()),
+            _ => panic!("infer_program_with_sources: unsupported elem_ty {elem_ty:?}"),
+        };
+        let stub = Rc::new(RefCell::new(TestDataSource::new(
+            name,
+            elem_ty.clone(),
+            output_extent,
+        )));
+        lctx.register_source(*name, stub);
         // Sources are registered with type Fun(DataSource(name), elem_ty).
         ictx.register_source_type(
             name,
@@ -46,16 +57,16 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
         );
     }
     let stmts = parse_module(code);
-    let mut expr = lower_stmts(&stmts, &lctx).expect("lowering failed");
+    let mut expr = lower_stmts(&stmts, &mut lctx).expect("lowering failed");
     infer(&mut expr, &mut ictx).expect("inference failed")
 }
 
 /// Like [`infer_program`] but expects inference to fail and returns all errors.
 fn infer_program_err(code: &str) -> Vec<InferError> {
-    let lctx = LoweringContext::default();
+    let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
     let stmts = parse_module(code);
-    let mut expr = lower_stmts(&stmts, &lctx).expect("lowering failed");
+    let mut expr = lower_stmts(&stmts, &mut lctx).expect("lowering failed");
     infer(&mut expr, &mut ictx).expect_err("expected inference error")
 }
 

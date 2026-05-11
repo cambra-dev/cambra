@@ -4,9 +4,12 @@
 //! Execution proceeds via the tile producer/consumer protocol using guards and tilings.
 
 mod binop;
+pub mod http_server;
 pub mod operator_conversion;
 mod scheduler;
+pub mod sinks;
 mod stdio;
+mod stream_buffer;
 mod test_source;
 pub mod tile_operators;
 pub mod tiling;
@@ -14,6 +17,7 @@ mod types;
 mod unary_op;
 
 pub use binop::*;
+pub use http_server::HttpServerDataSource;
 pub use scheduler::*;
 pub use stdio::*;
 pub use test_source::*;

@@ -229,6 +229,22 @@ fn inline_defers(
 /// than visit order.
 fn construct_feed_result(feed_values: Vec<Expr>) -> Expr {
     debug_assert!(!feed_values.is_empty());
+    // Const-wrap any scalar feed values that weren't inside a Compose context
+    // (where the domain would already have been fixed).
+    let feed_values: Vec<Expr> = feed_values
+        .into_iter()
+        .map(|v| {
+            if v.ty.domain().is_none() {
+                apply_primitive(
+                    v.clone(),
+                    Builtin::Const,
+                    Type::fun(Type::Base(BaseType::Unit), v.ty.clone()),
+                )
+            } else {
+                v
+            }
+        })
+        .collect();
     if feed_values.len() == 1 {
         return feed_values.into_iter().next().unwrap();
     }
@@ -411,22 +427,11 @@ fn inline_defer(
 ) -> Result<(Vec<Expr>, Option<Expr>), DeferError> {
     let ty = expr.ty.clone();
     let (replacement, feed_result, define_result) = match &mut expr.node {
-        TypedExprNode::Feed { name, value } if name == name_to_bind => {
-            let result = if value.ty.domain().is_some() {
-                *value.clone()
-            } else {
-                apply_primitive(
-                    *value.clone(),
-                    Builtin::Const,
-                    Type::fun(Type::Base(BaseType::Unit), value.ty.clone()),
-                )
-            };
-            (
-                Some(Expr::var("__replaced").with_ty(ty)),
-                vec![result],
-                None,
-            )
-        }
+        TypedExprNode::Feed { name, value } if name == name_to_bind => (
+            Some(Expr::var("__replaced").with_ty(ty)),
+            vec![*value.clone()],
+            None,
+        ),
 
         TypedExprNode::Define { name, value } if name == name_to_bind => (
             Some(Expr::var("__replaced").with_ty(ty)),
@@ -456,7 +461,19 @@ fn inline_defer(
                 if define_value.is_some() {
                     return Err(DeferError::NestedDefinition);
                 }
+                // Scalar feed values have no domain; wrap them in `const` with the
+                // expected domain taken from the compose-element's type here, where
+                // that domain is known.  Function-typed values are used as-is.
+                let expected_domain = elts[i].ty.domain();
                 for v in feed_value.drain(..) {
+                    let v = if v.ty.domain().is_none() {
+                        let dom = expected_domain
+                            .clone()
+                            .unwrap_or(Type::Base(BaseType::Unit));
+                        apply_primitive(v.clone(), Builtin::Const, Type::fun(dom, v.ty.clone()))
+                    } else {
+                        v
+                    };
                     let mut feed_value_with_ctx = elts[0..i].to_vec();
                     feed_value_with_ctx.push(v);
                     let mut composed = typed_compose(feed_value_with_ctx);
@@ -557,6 +574,19 @@ fn inline_defer(
             (None, feeds, define)
         }
 
+        // Record: recurse into each field value, same policy as Tuple.
+        TypedExprNode::Record(fields) => {
+            let mut result = Vec::new();
+            for (_, e) in fields.iter_mut() {
+                let (feeds, define) = inline_defer(e, name_to_bind)?;
+                if define.is_some() {
+                    return Err(DeferError::NestedDefinition);
+                }
+                result.extend(feeds);
+            }
+            (None, result, None)
+        }
+
         TypedExprNode::Defer
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
@@ -630,7 +660,8 @@ mod tests {
         );
     }
 
-    /// Scalar feed value (no domain type) is wrapped in `const`.
+    /// Scalar feed value (no domain type) is returned as-is; const-wrapping is
+    /// deferred to the Compose context or `construct_feed_result`.
     #[test]
     fn inline_defer_feed_scalar_wrapped_in_const() {
         let mut expr = Expr::feed("x".into(), lit(7));
@@ -639,8 +670,8 @@ mod tests {
         assert_eq!(feeds.len(), 1);
         assert_eq!(
             symbolic(&feeds[0]),
-            "7 ▷ const",
-            "scalar must be lifted via const"
+            "7",
+            "scalar must be returned as-is; const-wrapping happens downstream"
         );
         assert_eq!(symbolic(&expr), "__replaced");
     }

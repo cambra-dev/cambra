@@ -151,9 +151,7 @@
     </div>
     <div class="section">
         <div class="section-title">Producer Graph</div>
-        <div id="producer-container">
-            <div id="producer" class="producer-div"></div>
-        </div>
+        <div id="producer-container"></div>
     </div>
     <script>
         // ── XML escaping for SVG text content ────────────────────────────────
@@ -437,10 +435,18 @@
                 const r = await fetch('/api/snapshot');
                 const data = await r.json();
                 document.getElementById('tick').textContent = 'Tick: ' + data.tick;
-                document.getElementById('producer').innerHTML =
-                    data.producer
-                        ? buildSvgGraph(data.producer)
-                        : '<em class="none-text">none</em>';
+                const container = document.getElementById('producer-container');
+                const producers = data.producers || [];
+                if (producers.length === 0) {
+                    container.innerHTML = '<em class="none-text">none</em>';
+                } else {
+                    container.innerHTML = producers.map((p, i) => {
+                        const label = producers.length > 1
+                            ? `<div class="section-title" style="padding:4px 8px;border-bottom:none;">Producer ${i + 1}</div>`
+                            : '';
+                        return label + '<div class="producer-div">' + buildSvgGraph(p) + '</div>';
+                    }).join('');
+                }
                 document.getElementById('error').textContent = '';
             } catch (e) {
                 document.getElementById('error').textContent = 'Connection error: ' + e.message;

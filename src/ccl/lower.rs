@@ -54,15 +54,23 @@
 //! This is intentional: the less-normalized representation preserves structure
 //! needed for optimization passes.
 
-use std::cell::Cell;
-use std::collections::HashSet;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    sync::Arc,
+};
 
 use rustpython_parser::ast as pyast;
 
-use crate::ccl::BaseType;
-use crate::ccl::{
-    AggregateKind, ArithmeticKind, BinOpKind, Branch, CompareKind, Expr, Lit, LogicKind,
-    RefinementKind, Type, TypedExprNode, UnaryOpKind,
+use crate::{
+    ccl::{
+        AggregateKind, ArithmeticKind, BaseType, BinOpKind, Branch, CompareKind, Expr, Lit,
+        LogicKind, RefinementKind, Type, TypedExprNode, UnaryOpKind,
+    },
+    interpreter::{
+        DataSink, DataSourceDomainExtentImpl, HttpServerDataSource, http_server::SharedHttpServer,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -80,31 +88,80 @@ pub enum LoweringError {
 // Lowering context
 // ---------------------------------------------------------------------------
 
-/// Context for Python → CCL lowering that carries externally-registered source names.
+/// Context for Python → CCL lowering that carries registered data sources and sinks.
 ///
-/// Zero-argument function calls whose name is registered here are lowered to
+/// Zero-argument function calls whose name appears in `sources` are lowered to
 /// [`crate::ccl::Expr::Source`] nodes instead of failing with an
-/// [`LoweringError::Unsupported`] error. The caller is responsible for
-/// registering the matching type in [`crate::ccl::infer::TypeInferenceContext`]
-/// and operator factory in [`crate::interpreter::compile_ccl::CompileContext`]
-/// before running those passes.
+/// [`LoweringError::Unsupported`] error.  After `lower_stmts` returns, the
+/// caller should call [`take_sources`](Self::take_sources) and
+/// [`take_sink_bindings`](Self::take_sink_bindings) to drain both maps and
+/// register each entry with the appropriate downstream contexts.
 #[derive(Default)]
 pub struct LoweringContext {
-    known_sources: HashSet<String>,
+    /// All sources for this compilation: pre-registered (e.g. stdin, test sources)
+    /// plus any discovered during lowering (e.g. from `http_serve`).  Drained by
+    /// [`take_sources`](Self::take_sources) after `lower_stmts` returns so every
+    /// source is registered with inference and operator-conversion in one pass.
+    sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+
+    /// Sink bindings discovered during lowering, keyed by the CCL `Let`-binding name
+    /// that holds the deferred responses computation (e.g. `"responses"`).  Each entry
+    /// pairs the binding name with the [`DataSink`] that should receive the computed
+    /// tiles (e.g. [`HttpServerSharedState`]).  Drained by
+    /// [`take_sink_bindings`](Self::take_sink_bindings) after `lower_stmts` returns.
+    sink_bindings: HashMap<String, Arc<dyn DataSink>>,
+
+    /// One [`SharedHttpServer`] per TCP port, shared across all `http_serve` calls
+    /// that use the same port.  Created lazily on the first `http_serve` for a port
+    /// and reused for all subsequent ones, so only a single `tiny_http::Server`
+    /// binds each port.
+    shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
 
     /// Monotonic counter for minting unique synthetic names during lowering.
-    /// Currently used only for per-multi-arg-lambda tupled parameter names
-    /// (see [`LoweringContext::fresh_tuple_arg`]); a shared counter keeps
-    /// names globally unique across nested scopes so inner binders cannot
-    /// capture a reference inserted by an outer substitution.
-    next_synthetic_id: Cell<usize>,
+    /// Globally unique across nested scopes so inner binders cannot capture
+    /// a reference inserted by an outer substitution.
+    next_synthetic_id: usize,
 }
 
 impl LoweringContext {
-    /// Register `name` as a known data-source call (e.g. `"testsource1"`,
-    /// `"__stdinvalues"`).
-    pub fn register_source(&mut self, name: &str) {
-        self.known_sources.insert(name.to_string());
+    /// Register a data source so that `name()` lowers to `Source(name)`.
+    pub fn register_source(
+        &mut self,
+        name: impl Into<String>,
+        source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+    ) {
+        self.sources.insert(name.into(), source);
+    }
+
+    /// Drain all sources accumulated for this compilation.
+    ///
+    /// Returns every source that was either pre-registered (e.g. stdin, test
+    /// stubs) or discovered during lowering (e.g. from `http_serve`).  Call
+    /// after `lower_stmts` returns and pass each entry to
+    /// [`GlobalContext`](crate::ccl::context::GlobalContext) for uniform
+    /// registration with inference and operator-conversion.
+    pub fn take_sources(&mut self) -> HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>> {
+        std::mem::take(&mut self.sources)
+    }
+
+    /// Register a sink for the CCL binding named `name`.
+    ///
+    /// Called during `http_serve` lowering: the responses binding is assigned a
+    /// plain `Defer` in the CCL tree, and its [`DataSink`] is recorded here by
+    /// binding name so that the scheduler can subscribe an
+    /// `HttpServerSinkConsumer` to it after operator conversion.
+    pub fn register_sink_binding(&mut self, name: impl Into<String>, sink: Arc<dyn DataSink>) {
+        self.sink_bindings.insert(name.into(), sink);
+    }
+
+    /// Drain all sink bindings accumulated for this compilation.
+    ///
+    /// Returns every `(binding_name, DataSink)` pair discovered during lowering
+    /// (e.g. from `http_serve`).  Call after `lower_stmts` returns and pass
+    /// each entry to [`GlobalContext`](crate::ccl::context::GlobalContext) so
+    /// it can extract the corresponding expressions and subscribe them.
+    pub fn take_sink_bindings(&mut self) -> HashMap<String, Arc<dyn DataSink>> {
+        std::mem::take(&mut self.sink_bindings)
     }
 
     /// Mint a fresh synthetic parameter name for a multi-arg lambda's tupled
@@ -116,9 +173,9 @@ impl LoweringContext {
     /// same name. All minted names share the [`TUPLE_ARG_PREFIX`] prefix,
     /// which user code cannot bind (double-underscore + synthetic suffix),
     /// so the substitution helper can remain non-capture-avoiding.
-    fn fresh_tuple_arg(&self) -> String {
-        let id = self.next_synthetic_id.get();
-        self.next_synthetic_id.set(id + 1);
+    fn fresh_tuple_arg(&mut self) -> String {
+        let id = self.next_synthetic_id;
+        self.next_synthetic_id += 1;
         format!("{TUPLE_ARG_PREFIX}_{id}")
     }
 }
@@ -128,6 +185,15 @@ impl LoweringContext {
 /// a unique id (see [`LoweringContext::fresh_tuple_arg`]).
 const TUPLE_ARG_PREFIX: &str = "__arg_tuple";
 
+/// Return the canonical data-source name for the requests side of
+/// `http_serve(port, method, path)`.
+///
+pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String {
+    // Sanitise path for use inside a Rust/CCL identifier.
+    let path_id = path.replace(['/', '-', '.'], "_");
+    format!("__http_requests_{port}_{method}_{path_id}")
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -135,7 +201,7 @@ const TUPLE_ARG_PREFIX: &str = "__arg_tuple";
 /// Lower a single Python expression to a CCL expression.
 pub fn lower_expr(
     expr: &pyast::Located<pyast::ExprKind>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     match &expr.node {
         pyast::ExprKind::Constant { value, .. } => lower_constant(value),
@@ -241,18 +307,94 @@ pub fn lower_expr(
 ///
 /// The last statement must be a bare expression (`StmtKind::Expr`)
 /// or an `if`/`else` block.
-pub fn lower_stmts(stmts: &[pyast::Stmt], ctx: &LoweringContext) -> Result<Expr, LoweringError> {
-    lower_stmts_inner(stmts, &HashSet::new(), ctx)
+///
+/// When sink bindings are registered during lowering (e.g. from `http_serve`),
+/// the final expression is wrapped so the program ends in
+/// `ExprStmt(<body>, Record{sink: Var(sink), …})`.  The `Record` is the
+/// sink-binding contract; each field is the name that `remove_defers`
+/// resolves to the computed response morphism.  After `remove_defers`
+/// removes all `Feed` nodes, `simplify` drops the `ExprStmt`, leaving a clean
+/// `Let* Record{…}` shape for `compile_program`.
+pub fn lower_stmts(
+    stmts: &[pyast::Stmt],
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let inner = lower_stmts_inner(stmts, &HashSet::new(), ctx, true)?;
+    if ctx.sink_bindings.is_empty() {
+        return Ok(inner);
+    }
+    // Build a Record whose fields are the sink-bound names in sorted order
+    // (sort for determinism — HashMap iteration is unordered).
+    let mut sink_names: Vec<String> = ctx.sink_bindings.keys().cloned().collect();
+    sink_names.sort();
+    let record = Expr::new(TypedExprNode::Record(
+        sink_names
+            .iter()
+            .map(|n| (n.clone(), Expr::var(n)))
+            .collect(),
+    ));
+    // Place ExprStmt(body, record) at the innermost position of the Let* chain
+    // so the Record has the sink Var references in scope.
+    Ok(append_record_at_tail(inner, record))
+}
+
+/// Walk to the innermost non-`Let`/`ExprStmt` continuation and wrap it with
+/// `ExprStmt(current_tail, record)`.
+///
+/// Recurses through both `Let` and `ExprStmt` nodes: a for-loop in the middle
+/// of the program produces an `ExprStmt(effect, continuation)` where the
+/// continuation may contain further `Let` bindings from later `http_serve`
+/// calls.  Stopping at the first `ExprStmt` would place the `Record` outside
+/// those inner bindings, making their names unbound.
+///
+/// The `ExprStmt` node "drives the feed": `simplify` drops it once
+/// `remove_defers` has extracted all `Feed` nodes from the body, leaving a
+/// clean `Let* Record{…}` shape that `compile_program` can pattern-match on.
+fn append_record_at_tail(expr: Expr, record: Expr) -> Expr {
+    match expr.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            let new_body = append_record_at_tail(*body, record);
+            Expr {
+                node: TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body: Box::new(new_body),
+                },
+                ..expr
+            }
+        }
+        TypedExprNode::ExprStmt { expr: effect, body } => {
+            let new_body = append_record_at_tail(*body, record);
+            Expr {
+                node: TypedExprNode::ExprStmt {
+                    expr: effect,
+                    body: Box::new(new_body),
+                },
+                ..expr
+            }
+        }
+        // Terminal continuation: wrap with ExprStmt so simplify can drop it.
+        _ => Expr::expr_stmt(expr, record),
+    }
 }
 
 /// Core implementation of [`lower_stmts`] that threads an `outer_bindings`
 /// set — names already in scope above this statement block (e.g., function
 /// parameters). The generator-lowering path uses this to detect mutation
 /// (reassignment of variables from enclosing scopes).
+///
+/// `is_top_level` is `true` only for the outermost call from [`lower_stmts`].
+/// It is `false` for if/else arms and function bodies so that `http_serve`
+/// assignments are rejected outside the top-level program scope.
 fn lower_stmts_inner(
     stmts: &[pyast::Stmt],
     outer_bindings: &HashSet<String>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
+    is_top_level: bool,
 ) -> Result<Expr, LoweringError> {
     if stmts.is_empty() {
         return Err(LoweringError::Unsupported("Empty statement block".into()));
@@ -270,7 +412,7 @@ fn lower_stmts_inner(
         .enumerate()
         .rev()
         .try_fold(final_expr, |acc, (i, stmt)| {
-            lower_middle_stmt(stmt, &rest[..i], acc, outer_bindings, ctx)
+            lower_middle_stmt(stmt, &rest[..i], acc, outer_bindings, ctx, is_top_level)
         })
 }
 
@@ -280,7 +422,7 @@ fn lower_final_stmt(
     last: &pyast::Stmt,
     preceding: &[pyast::Stmt],
     outer_bindings: &HashSet<String>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     match &last.node {
         pyast::StmtKind::Expr { value } => lower_expr(value, ctx),
@@ -323,14 +465,78 @@ fn lower_final_stmt(
 /// `preceding` are the statements that come before `stmt` in the block
 /// `body` is the already-lowered expression for the rest of the block after `stmt`
 /// `outer_bindings` are the names already in scope above this block (e.g., function parameters)
+/// `is_top_level` is `false` inside if/else arms and function bodies; `http_serve` is only
+/// permitted at the top level of a program.
 fn lower_middle_stmt(
     stmt: &pyast::Stmt,
     preceding: &[pyast::Stmt],
     body: Expr,
     outer_bindings: &HashSet<String>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
+    is_top_level: bool,
 ) -> Result<Expr, LoweringError> {
     match &stmt.node {
+        // Special case: `requests, responses = http_serve(port, method, path)`.
+        //
+        // Lowers to:
+        //   let <requests> = Source("__http_requests_N") in
+        //   let <responses> = Defer              in
+        //   <body>
+        // TODO we shouldn't need to special-case this.  Instead, we should support multi-return
+        // in general.
+        pyast::StmtKind::Assign { targets, value, .. }
+            if targets.len() == 1 && is_http_serve_tuple_assign(&targets[0], value) =>
+        {
+            if !is_top_level {
+                return Err(LoweringError::Unsupported(
+                    "http_serve is only supported at the top level of a program, \
+                     not inside an if/else branch or function body"
+                        .into(),
+                ));
+            }
+            let (req_name, resp_name) = extract_http_serve_names(&targets[0])?;
+            let (port, method, path) = extract_http_serve_args(value)?;
+            // Create and register the source now; the caller drains new_sources
+            // via take_new_sources() after lower_stmts returns, before type inference.
+            let port_u16: u16 = port.parse().map_err(|_| {
+                LoweringError::Unsupported(format!("http_serve port must be a u16, got {port:?}"))
+            })?;
+            // Share one tiny_http::Server per port across all http_serve routes.
+            if let std::collections::hash_map::Entry::Vacant(e) = ctx.shared_servers.entry(port_u16)
+            {
+                let server = SharedHttpServer::new(port_u16).map_err(|e| {
+                    LoweringError::Unsupported(format!(
+                        "http_serve: failed to bind port {port_u16}: {e}"
+                    ))
+                })?;
+                e.insert(Arc::new(server));
+            }
+            let server = ctx.shared_servers[&port_u16].clone();
+            let source_name = http_requests_source_name(&port, &method, &path);
+            if ctx.sources.contains_key(&source_name) {
+                return Err(LoweringError::Unsupported(format!(
+                    "duplicate http_serve registration: port={port}, method={method}, path={path}"
+                )));
+            }
+            let source_obj = Rc::new(RefCell::new(HttpServerDataSource::new(
+                &server,
+                method.clone(),
+                path.clone(),
+                source_name.clone(),
+            )));
+            let sink: Arc<dyn DataSink> = source_obj.borrow().sink();
+            ctx.sources.insert(source_name.clone(), source_obj);
+            let requests_expr = Expr::new(TypedExprNode::Source(source_name.clone()));
+            // The responses binding is a plain Defer; the sink is registered by
+            // binding name so the scheduler can subscribe it independently.
+            let responses_expr = Expr::new(TypedExprNode::Defer);
+            ctx.register_sink_binding(resp_name.clone(), sink);
+            Ok(Expr::let_bind(
+                req_name,
+                requests_expr,
+                Expr::let_bind(resp_name, responses_expr, body),
+            ))
+        }
         pyast::StmtKind::Assign { targets, value, .. } => {
             if targets.len() != 1 {
                 return Err(LoweringError::Unsupported(
@@ -479,7 +685,7 @@ fn lower_if(
     body: &[pyast::Stmt],
     orelse: &[pyast::Stmt],
     outer_bindings: &HashSet<String>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if orelse.is_empty() {
         return Err(LoweringError::Unsupported(
@@ -487,8 +693,9 @@ fn lower_if(
         ));
     }
     let guard = lower_expr(test, ctx)?;
-    let true_arm = lower_stmts_inner(body, outer_bindings, ctx)?;
-    let false_arm = lower_stmts_inner(orelse, outer_bindings, ctx)?;
+    // http_serve is not permitted inside if/else arms.
+    let true_arm = lower_stmts_inner(body, outer_bindings, ctx, false)?;
+    let false_arm = lower_stmts_inner(orelse, outer_bindings, ctx, false)?;
     // Flatten elif chains: if the else branch is itself a Case, extend our
     // branches with its branches rather than nesting.
     let mut branches = vec![Branch {
@@ -542,7 +749,7 @@ fn lower_call(
     func: &pyast::Expr,
     args: &[pyast::Expr],
     keywords: &[pyast::Keyword],
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if !keywords.is_empty() {
         return Err(LoweringError::Unsupported(
@@ -605,7 +812,7 @@ fn lower_call(
             Ok(Expr::aggregate(input, kind))
         }
         "defer" => Ok(Expr::new(TypedExprNode::Defer)),
-        name if ctx.known_sources.contains(name) => {
+        name if ctx.sources.contains_key(name) => {
             Ok(Expr::new(TypedExprNode::Source(name.to_string())))
         }
         _ => {
@@ -636,7 +843,7 @@ fn lower_binop(
     left: &pyast::Located<pyast::ExprKind>,
     op: &pyast::Operator,
     right: &pyast::Located<pyast::ExprKind>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if *op == pyast::Operator::LShift {
         return lower_feed(left, right, ctx);
@@ -664,7 +871,7 @@ fn lower_binop(
 fn lower_feed(
     target: &pyast::Expr,
     value: &pyast::Expr,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let name = extract_name_target(target, "handle binding")?;
     Ok(Expr::feed(name, lower_expr(value, ctx)?))
@@ -673,7 +880,7 @@ fn lower_feed(
 fn lower_define(
     target: &pyast::Expr,
     value: &pyast::Expr,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let name = extract_name_target(target, "handle defining")?;
     Ok(Expr::define(name, lower_expr(value, ctx)?))
@@ -688,7 +895,7 @@ fn lower_define(
 fn lower_unaryop(
     op: &pyast::Unaryop,
     operand: &pyast::Located<pyast::ExprKind>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let inner = lower_expr(operand, ctx)?;
     let kind = match op {
@@ -731,7 +938,7 @@ fn lower_compare(
     left: &pyast::Located<pyast::ExprKind>,
     ops: &[pyast::Cmpop],
     comparators: &[pyast::Located<pyast::ExprKind>],
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // Lower all operands up-front. For a chain of n ops there are n+1 operands:
     // left, comparators[0], comparators[1], …
@@ -781,7 +988,7 @@ fn lower_compare(
 fn lower_boolop(
     op: &pyast::Boolop,
     values: &[pyast::Located<pyast::ExprKind>],
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if values.len() < 2 {
         return Err(LoweringError::Unsupported(
@@ -866,7 +1073,7 @@ fn validate_function_args(args: &pyast::Arguments) -> Result<(), LoweringError> 
 /// `lambda x, y: …` and `def f(x, y): …` pair with [`lower_call`]'s
 /// tupled-argument shape and never emit a curried `Expr::Lambda` chain that
 /// `lambda_elim` would fold into an unsupported `curry(body)`.
-fn uncurry_params(args: &pyast::Arguments, body_expr: Expr, ctx: &LoweringContext) -> Expr {
+fn uncurry_params(args: &pyast::Arguments, body_expr: Expr, ctx: &mut LoweringContext) -> Expr {
     if args.args.len() == 1 {
         return Expr::lambda(&args.args[0].node.arg, Type::Hole, body_expr);
     }
@@ -902,7 +1109,7 @@ fn uncurry_params(args: &pyast::Arguments, body_expr: Expr, ctx: &LoweringContex
 fn lower_lambda(
     args: &pyast::Arguments,
     body: &pyast::Located<pyast::ExprKind>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     validate_function_args(args)?;
     let body_expr = lower_expr(body, ctx)?;
@@ -1134,7 +1341,7 @@ fn collect_chain<'ast>(
     stmts: &'ast [pyast::Stmt],
     chain: &mut Vec<GeneratorSpec>,
     outer_bindings: &HashSet<String>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<&'ast pyast::Expr, LoweringError> {
     if stmts.is_empty() {
         return Err(LoweringError::Unsupported(
@@ -1158,7 +1365,7 @@ fn process_chain_step(
     stmt: &pyast::Stmt,
     chain: &mut Vec<GeneratorSpec>,
     outer_bindings: &HashSet<String>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<(), LoweringError> {
     match &stmt.node {
         pyast::StmtKind::Assign { targets, value, .. } => {
@@ -1245,7 +1452,7 @@ fn process_chain_terminator<'ast>(
     stmt: &'ast pyast::Stmt,
     chain: &mut Vec<GeneratorSpec>,
     outer_bindings: &HashSet<String>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<&'ast pyast::Expr, LoweringError> {
     match &stmt.node {
         pyast::StmtKind::Expr { value } => match &value.node {
@@ -1381,7 +1588,7 @@ fn lower_generator_for(
     iter: &pyast::Located<pyast::ExprKind>,
     body: &[pyast::Stmt],
     outer_bindings: &HashSet<String>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let iter_var = extract_name_target(target, "for-loop target")?;
     let source = lower_expr(iter, ctx)?;
@@ -1521,11 +1728,12 @@ fn lower_generator_chain(
 fn lower_function_body(
     args: &pyast::Arguments,
     body: &[pyast::Stmt],
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     validate_function_args(args)?;
     let outer_bindings: HashSet<String> = args.args.iter().map(|a| a.node.arg.clone()).collect();
-    let body_expr = lower_stmts_inner(body, &outer_bindings, ctx)?;
+    // http_serve is not permitted inside function bodies.
+    let body_expr = lower_stmts_inner(body, &outer_bindings, ctx, false)?;
     Ok(uncurry_params(args, body_expr, ctx))
 }
 
@@ -1567,7 +1775,7 @@ fn lower_function_body(
 fn lower_list_comp(
     elt: &pyast::Located<pyast::ExprKind>,
     generators: &[pyast::Comprehension],
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // ---- Phase 1: Lower each generator's source and register its loop variable ----
     // We keep the source operators and index extents for later use when building the
@@ -1707,6 +1915,93 @@ fn lower_list_comp(
 }
 
 // ---------------------------------------------------------------------------
+// http_serve helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when `target` is a 2-element name tuple and `value` is a
+/// call to `http_serve` with exactly 3 string-literal arguments.
+fn is_http_serve_tuple_assign(target: &pyast::Expr, value: &pyast::Expr) -> bool {
+    let pyast::ExprKind::Tuple { elts, .. } = &target.node else {
+        return false;
+    };
+    if elts.len() != 2 {
+        return false;
+    }
+    let all_names = elts
+        .iter()
+        .all(|e| matches!(e.node, pyast::ExprKind::Name { .. }));
+    if !all_names {
+        return false;
+    }
+    let pyast::ExprKind::Call {
+        func,
+        args,
+        keywords,
+    } = &value.node
+    else {
+        return false;
+    };
+    if !keywords.is_empty() || args.len() != 3 {
+        return false;
+    }
+    matches!(&func.node, pyast::ExprKind::Name { id, .. } if id == "http_serve")
+        && args.iter().all(|a| {
+            matches!(
+                &a.node,
+                pyast::ExprKind::Constant {
+                    value: pyast::Constant::Str(_),
+                    ..
+                }
+            )
+        })
+}
+
+/// Extract `(requests_var, responses_var)` from a 2-element name tuple target.
+fn extract_http_serve_names(target: &pyast::Expr) -> Result<(String, String), LoweringError> {
+    let pyast::ExprKind::Tuple { elts, .. } = &target.node else {
+        return Err(LoweringError::Unsupported(
+            "http_serve target must be a 2-tuple".into(),
+        ));
+    };
+    let name0 = match &elts[0].node {
+        pyast::ExprKind::Name { id, .. } => id.clone(),
+        _ => {
+            return Err(LoweringError::Unsupported(
+                "http_serve tuple elements must be simple names".into(),
+            ));
+        }
+    };
+    let name1 = match &elts[1].node {
+        pyast::ExprKind::Name { id, .. } => id.clone(),
+        _ => {
+            return Err(LoweringError::Unsupported(
+                "http_serve tuple elements must be simple names".into(),
+            ));
+        }
+    };
+    Ok((name0, name1))
+}
+
+/// Extract `(port, method, path)` string literals from the `http_serve(...)` call.
+fn extract_http_serve_args(value: &pyast::Expr) -> Result<(String, String, String), LoweringError> {
+    let pyast::ExprKind::Call { args, .. } = &value.node else {
+        return Err(LoweringError::Unsupported(
+            "Expected http_serve call".into(),
+        ));
+    };
+    let extract = |expr: &pyast::Expr| match &expr.node {
+        pyast::ExprKind::Constant {
+            value: pyast::Constant::Str(s),
+            ..
+        } => Ok(s.clone()),
+        _ => Err(LoweringError::Unsupported(
+            "http_serve arguments must be string literals".into(),
+        )),
+    };
+    Ok((extract(&args[0])?, extract(&args[1])?, extract(&args[2])?))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1725,6 +2020,16 @@ mod tests {
             pyast::Mod::Expression { body } => *body,
             other => panic!("expected Expression, got {other:?}"),
         }
+    }
+
+    /// Create a minimal registered source for tests that only care about name recognition.
+    fn stub_source(name: &str) -> Rc<RefCell<dyn DataSourceDomainExtentImpl>> {
+        use crate::interpreter::{BaseType, Extent, TestDataSource};
+        Rc::new(RefCell::new(TestDataSource::new(
+            name,
+            Type::Base(BaseType::String),
+            Extent::Base(BaseType::String),
+        )))
     }
 
     /// Parse a Python module and return the statement list.
@@ -1795,7 +2100,7 @@ mod tests {
     )]
     fn test_lower_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -1954,7 +2259,7 @@ in define(x, 1); define(y, 2); x"
     )]
     fn test_lower_stmts(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -1995,7 +2300,7 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     )]
     fn test_lower_list_comp(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2015,7 +2320,7 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     )]
     fn test_lower_generator_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2156,7 +2461,7 @@ in guarded_let"
     )]
     fn test_lower_generator_fn(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2187,7 +2492,7 @@ in add"
     )]
     fn test_lower_function_def(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2206,8 +2511,8 @@ def bad(xs):
         x += 1
 bad";
         let stmts = parse_module(code);
-        let err =
-            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         assert!(matches!(err, LoweringError::Unsupported(_)));
     }
 
@@ -2221,8 +2526,8 @@ def bad(xs, n):
         yield n
 bad";
         let stmts = parse_module(code);
-        let err =
-            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         match &err {
             LoweringError::Unsupported(msg) => {
                 assert!(
@@ -2244,8 +2549,8 @@ def bad(xs):
         yield total
 bad";
         let stmts = parse_module(code);
-        let err =
-            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         match &err {
             LoweringError::Unsupported(msg) => {
                 assert!(
@@ -2268,8 +2573,8 @@ def bad(xs, ys):
             yield y
 bad";
         let stmts = parse_module(code);
-        let err =
-            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         match &err {
             LoweringError::Unsupported(msg) => {
                 assert!(
@@ -2289,8 +2594,8 @@ def bad(xs):
         yield
 bad";
         let stmts = parse_module(code);
-        let err =
-            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         assert!(matches!(err, LoweringError::Unsupported(_)));
     }
 
@@ -2303,8 +2608,8 @@ def f(x):
     x + 1
 f";
         let stmts = parse_module(code);
-        let err =
-            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         match &err {
             LoweringError::Unsupported(msg) => {
                 assert!(
@@ -2326,8 +2631,8 @@ def bad(xs):
         pass
 bad";
         let stmts = parse_module(code);
-        let err =
-            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         match &err {
             LoweringError::Unsupported(msg) => {
                 assert!(
@@ -2350,8 +2655,8 @@ def bad(xs):
             yield 0
 bad";
         let stmts = parse_module(code);
-        let err =
-            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         match &err {
             LoweringError::Unsupported(msg) => {
                 assert!(
@@ -2373,7 +2678,7 @@ def f(xs):
         yield x + a
 f";
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
         let s = symbolic(&ccl);
         assert!(
             s.contains("let a = 5") && s.contains("x + a"),
@@ -2406,7 +2711,7 @@ f";
     )]
     fn test_lower_aggregate(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2437,8 +2742,8 @@ f";
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ctx = LoweringContext::default();
-        let ccl = lower_expr(&expr, &ctx).expect("lowering failed");
+        let mut ctx = LoweringContext::default();
+        let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2447,12 +2752,12 @@ f";
     fn test_lower_groupby_wrong_arity() {
         let one_arg = parse_expr("groupby(xs)");
         assert!(matches!(
-            lower_expr(&one_arg, &LoweringContext::default()),
+            lower_expr(&one_arg, &mut LoweringContext::default()),
             Err(LoweringError::Unsupported(_))
         ));
         let three_args = parse_expr("groupby(xs, f, extra)");
         assert!(matches!(
-            lower_expr(&three_args, &LoweringContext::default()),
+            lower_expr(&three_args, &mut LoweringContext::default()),
             Err(LoweringError::Unsupported(_))
         ));
     }
@@ -2462,8 +2767,8 @@ f";
     #[test]
     fn test_lower_unknown_function_single_arg() {
         let expr = parse_expr("foo(x)");
-        let ccl =
-            lower_expr(&expr, &LoweringContext::default()).expect("expected lowering to succeed");
+        let ccl = lower_expr(&expr, &mut LoweringContext::default())
+            .expect("expected lowering to succeed");
         // foo(x) == x ▷ foo in pipeline notation
         assert_eq!(symbolic(&ccl), "x ▷ foo");
     }
@@ -2472,8 +2777,8 @@ f";
     #[test]
     fn test_lower_unknown_zero_arg_fails() {
         let expr = parse_expr("foo()");
-        let err =
-            lower_expr(&expr, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_expr(&expr, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         assert!(
             matches!(err, LoweringError::Unsupported(_)),
             "expected Unsupported, got {err:?}"
@@ -2488,9 +2793,9 @@ f";
     #[test]
     fn test_lower_registered_source_becomes_source_node() {
         let mut ctx = LoweringContext::default();
-        ctx.register_source("mystream");
+        ctx.register_source("mystream", stub_source("mystream"));
         let expr = parse_expr("mystream()");
-        let ccl = lower_expr(&expr, &ctx).expect("lowering failed");
+        let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
         assert_eq!(symbolic(&ccl), "source(mystream)");
     }
 
@@ -2498,8 +2803,8 @@ f";
     #[test]
     fn test_lower_unregistered_zero_arg_call_fails() {
         let expr = parse_expr("unknown_source()");
-        let err =
-            lower_expr(&expr, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_expr(&expr, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         assert!(matches!(err, LoweringError::Unsupported(_)));
     }
 
@@ -2508,9 +2813,9 @@ f";
     #[test]
     fn test_lower_source_name_without_call_is_var() {
         let mut ctx = LoweringContext::default();
-        ctx.register_source("mystream");
+        ctx.register_source("mystream", stub_source("mystream"));
         let expr = parse_expr("mystream");
-        let ccl = lower_expr(&expr, &ctx).expect("lowering failed");
+        let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
         assert_eq!(symbolic(&ccl), "mystream");
     }
 
@@ -2518,9 +2823,9 @@ f";
     #[test]
     fn test_lower_source_in_list_comp() {
         let mut ctx = LoweringContext::default();
-        ctx.register_source("src");
+        ctx.register_source("src", stub_source("src"));
         let stmts = parse_module("[x for x in src()]");
-        let ccl = lower_stmts(&stmts, &ctx).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut ctx).expect("lowering failed");
         // The source node should appear in the symbolic output.
         assert!(
             symbolic(&ccl).contains("source(src)"),
@@ -2557,7 +2862,7 @@ else:
     result = tmp + 2
 result";
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
         // Non-final if/else with assignment desugaring: this test remains ignored.
         // When implemented, the expected structure is:
         // let result = { cond → let tmp = 1 in tmp + 1; true → let tmp = 2 in tmp + 2 } in result
@@ -2578,7 +2883,7 @@ result";
 x = (y := 5) + 1
 x";
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
         // Fill in the expected string when ExprKind::NamedExpr lowering is added.
         // Structure: let x = (let y = 5 in y) + 1 in x
         assert_eq!(symbolic(&ccl), "");
@@ -2614,7 +2919,7 @@ x";
     )]
     fn test_lower_if(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2624,7 +2929,7 @@ x";
     #[case("\"yes\" if flag else \"no\"", "{ flag → \"yes\"; true → \"no\" }")]
     fn test_lower_if_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr, &LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2637,7 +2942,7 @@ x";
     fn test_lower_non_tail_if() {
         let code = "x = 1\nif x > 0:\n    x = x + 1\nresult = x\nresult";
         let stmts = parse_module(code);
-        let _ccl = lower_stmts(&stmts, &LoweringContext::default()).expect("lowering failed");
+        let _ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
         // Expected once implemented:
         // let x = 1 in let x = { x > 0 → x + 1; true → x } in let result = x in result
     }
@@ -2645,8 +2950,8 @@ x";
     #[test]
     fn test_lower_if_without_else_rejected() {
         let stmts = parse_module("if x:\n    1");
-        let err =
-            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         assert!(matches!(err, LoweringError::Unsupported(_)));
     }
 
@@ -2655,8 +2960,8 @@ x";
     #[case("x = 0\nx.field += 1\nx")]
     fn test_augassign_non_name_target_rejected(#[case] code: &str) {
         let stmts = parse_module(code);
-        let err =
-            lower_stmts(&stmts, &LoweringContext::default()).expect_err("expected lowering error");
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
         assert!(matches!(err, LoweringError::Unsupported(_)));
     }
 }

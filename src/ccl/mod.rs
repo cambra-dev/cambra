@@ -557,6 +557,19 @@ impl TypedBinding {
 /// Application is curried: `f(x, y)` is `Apply(Apply(f, x), y)`. Compound
 /// expressions may appear inline as arguments — [`TypedExprNode::Let`] bindings are
 /// optional (unlike strict ANF).
+///
+/// # Purity invariant
+///
+/// **Every variant must denote a pure value.**  No variant may carry runtime
+/// behaviour that is executed by the CCL pipeline (type inference, lambda
+/// elimination, join planning, simplification).  Effects such as I/O or sink
+/// dispatch are modelled as data-source/sink registrations in
+/// [`crate::ccl::lower::LoweringContext`] and assembled at the program boundary
+/// in [`crate::ccl::context::compile_program`], not as AST nodes.
+///
+/// If you are considering a variant that "does something" rather than
+/// representing a value to be computed, model the effect at the boundary
+/// instead.  See `src/ccl/CLAUDE.md` for the full rationale.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedExprNode {
     /// A literal constant.

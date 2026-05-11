@@ -49,12 +49,16 @@ fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Expr, Tile) {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let (ccl, _, mut producer) = compile_program(ctx, code, consumer);
+    let mut compiled = compile_program(ctx, code, consumer);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
+    let producer = compiled
+        .main_mut()
+        .and_then(|o| o.producer.as_mut())
+        .expect("pipeline test expects a `main` output");
     let mut result = producer.get(producer.tiling().universal_guard());
     result.compact();
-    (ccl, result)
+    (compiled.ast, result)
 }
 
 // ---------------------------------------------------------------------------
@@ -490,8 +494,8 @@ fn test_datasource_named_record_join() {
         record_type,
         record_extent,
     )));
-    ctx.register_test_source(src1.clone());
-    ctx.register_test_source(src2.clone());
+    ctx.register_source(src1.clone());
+    ctx.register_source(src2.clone());
 
     src1.borrow_mut().add_data(&[
         (
@@ -536,11 +540,12 @@ fn test_datasource_named_record_join() {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let (_, _, mut producer) = compile_program(
+    let mut compiled = compile_program(
         &mut ctx,
         "[(x.label, y.label) for x in src1() for y in src2() if x.id == y.id]",
         consumer,
     );
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
 
@@ -1126,7 +1131,7 @@ fn test_test_source(#[case] code: &str) {
         Type::Base(BaseType::String),
         Extent::Base(BaseType::String),
     )));
-    ctx.register_test_source(data_source.clone());
+    ctx.register_source(data_source.clone());
 
     data_source.borrow_mut().add_data(&[
         (Value::UInt(10), Value::String("foo".into())),
@@ -1139,7 +1144,8 @@ fn test_test_source(#[case] code: &str) {
         *notified_clone.borrow_mut() = true;
     });
 
-    let (_, _, mut producer) = compile_program(&mut ctx, code, consumer);
+    let mut compiled = compile_program(&mut ctx, code, consumer);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
 
@@ -1191,7 +1197,7 @@ fn test_source_filter_nonterminal() {
         (Value::UInt(0), Value::Int(10)),
         (Value::UInt(1), Value::Int(20)),
     ]);
-    ctx.register_test_source(test_source.clone());
+    ctx.register_source(test_source.clone());
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
@@ -1199,7 +1205,8 @@ fn test_source_filter_nonterminal() {
         *notified_clone.borrow_mut() = true;
     });
     let code = "[s for s in source1() if s < 15]";
-    let (_, _, mut producer) = compile_program(&mut ctx, code, consumer);
+    let mut compiled = compile_program(&mut ctx, code, consumer);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
 
@@ -1244,8 +1251,8 @@ fn test_inner_join(#[case] code: &str) {
         record_type,
         record_extent,
     )));
-    ctx.register_test_source(data_source1.clone());
-    ctx.register_test_source(data_source2.clone());
+    ctx.register_source(data_source1.clone());
+    ctx.register_source(data_source2.clone());
 
     data_source1.borrow_mut().add_data(&[(
         Value::UInt(10),
@@ -1275,7 +1282,8 @@ fn test_inner_join(#[case] code: &str) {
     });
 
     // let mut producer = ctx.compile_program(code, consumer);
-    let mut producer = compile_program(&mut ctx, code, consumer).2;
+    let mut compiled = compile_program(&mut ctx, code, consumer);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
 
@@ -1434,8 +1442,8 @@ fn test_incremental_join_simple(#[case] code: &str) {
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    ctx.register_test_source(src1.clone());
-    ctx.register_test_source(src2.clone());
+    ctx.register_source(src1.clone());
+    ctx.register_source(src2.clone());
 
     src1.borrow_mut()
         .add_data(&[(Value::UInt(1), Value::Int(100))]);
@@ -1451,7 +1459,8 @@ fn test_incremental_join_simple(#[case] code: &str) {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let (_, _, mut producer) = compile_program(&mut ctx, code, consumer);
+    let mut compiled = compile_program(&mut ctx, code, consumer);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
     let tile = producer.get(producer.tiling().universal_guard());
@@ -1533,8 +1542,9 @@ fn test_incremental_global_aggregate() {
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    ctx.register_test_source(test_source.clone());
-    let (_, _, mut producer) = compile_program(&mut ctx, code, Box::new(|| {}));
+    ctx.register_source(test_source.clone());
+    let mut compiled = compile_program(&mut ctx, code, Box::new(|| {}));
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
     test_source.borrow_mut().add_data(&[
@@ -1586,14 +1596,15 @@ fn test_incremental_aggregates() {
         Type::Base(BaseType::Int),
         Extent::Base(BaseType::Int),
     )));
-    ctx.register_test_source(test_source.clone());
+    ctx.register_source(test_source.clone());
 
     let notified = Rc::new(RefCell::new(false));
     let notified_clone = notified.clone();
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let (_, _, mut producer) = compile_program(&mut ctx, code, consumer);
+    let mut compiled = compile_program(&mut ctx, code, consumer);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
@@ -1659,7 +1670,8 @@ fn test_incremental_aggregates() {
 #[case("[x for x in [1,2,3] if x + 1 < 2]")]
 #[case("1 + 2 + 3")]
 fn test_no_fan_outs(#[case] code: &str) {
-    let op = compile_program(&mut GlobalContext::default(), code, Box::new(|| {})).1;
+    let compiled = compile_program(&mut GlobalContext::default(), code, Box::new(|| {}));
+    let op = &compiled.main().unwrap().op;
     let op_str = pretty_tile_operator(op.as_ref());
     assert!(!op_str.contains("FanOut#"), "found fan-out in {op_str}");
 }
@@ -2025,7 +2037,7 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
     data_source
         .borrow_mut()
         .set_yield_predicate(Predicate::True);
-    ctx.register_test_source(data_source);
+    ctx.register_source(data_source);
 
     let (expr, result) = run_pipeline_with_ctx(&mut ctx, code);
     assert_eq!(format!("{}:{}", symbolic(&expr), expr.ty), expected_ccl);

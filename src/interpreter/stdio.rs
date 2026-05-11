@@ -1,16 +1,16 @@
 use std::{
-    collections::HashMap,
     io::BufRead,
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::mpsc::{self, Receiver},
     thread,
 };
 
-use intervalsets::{Bounding, Interval, IntervalSet, ops::Difference};
-use log::{debug, trace};
+use log::debug;
 use smol_str::SmolStr;
 
+use crate::ccl::Type;
 use crate::interpreter::{
-    ColumnValue, DataSourceDomainExtentImpl, Extent, Value, tiling::Predicate,
+    BaseType, ColumnValue, DataSourceDomainExtentImpl, Extent, stream_buffer::UIntStreamBuffer,
+    tiling::Predicate,
 };
 
 /// Buffers and tracks lines available on stdin.
@@ -18,25 +18,11 @@ use crate::interpreter::{
 /// Lines are read by a background thread so that `check_for_new_data` never
 /// blocks — it simply drains whatever the reader thread has buffered so far.
 pub struct StdinDataSource {
-    /// Currently available data.
-    buffer: Vec<SmolStr>,
-
-    /// Offset of indices in the buffer.  Indices less than this have been released.
-    start_idx: usize,
-
-    /// Logical size of the buffer, including released lines.
-    ready_size: usize,
-
-    /// Whether EOF has been observed on stdin.
-    eof_reached: bool,
-
-    /// Whether the source has been released with Universal.
-    closed: bool,
+    /// Shared buffer, indexing, and predicate bookkeeping.
+    buf: UIntStreamBuffer,
 
     /// Lines arriving from the background reader thread.  `None` signals EOF.
     receiver: Receiver<Option<SmolStr>>,
-
-    obsolete_predicates: HashMap<String, Predicate>,
 }
 
 impl StdinDataSource {
@@ -65,53 +51,13 @@ impl StdinDataSource {
             }
         });
         Self {
-            buffer: Vec::new(),
-            start_idx: 0,
-            ready_size: 0,
-            eof_reached: false,
-            closed: false,
+            buf: UIntStreamBuffer::new(),
             receiver,
-            obsolete_predicates: HashMap::new(),
         }
-    }
-
-    fn get_opt(&self, i: usize) -> Option<&SmolStr> {
-        if self.closed || self.start_idx > i || i >= self.ready_size {
-            None
-        } else {
-            Some(&self.buffer[i - self.start_idx])
-        }
-    }
-
-    /// Returns the line at the given index.
-    fn get(&self, i: usize) -> &SmolStr {
-        self.get_opt(i)
-            .unwrap_or_else(|| panic!("Invalid StdinDataSource::get({i})"))
     }
 
     fn add(&mut self, line: SmolStr) {
-        self.buffer.push(line);
-        self.ready_size += 1;
-    }
-
-    /// Releases all lines up to and including the given index.
-    fn release_index(&mut self, i: usize) {
-        if i < self.start_idx {
-            // Already released, do nothing
-            return;
-        }
-        if i >= self.ready_size {
-            panic!(
-                "Invalid StdinDataSource::release, {} vs {}, {}",
-                i, self.ready_size, self.start_idx
-            );
-        }
-        self.buffer.drain(0..(i - self.start_idx + 1));
-        self.start_idx = i + 1;
-    }
-
-    fn close(&mut self) {
-        self.closed = true;
+        self.buf.push(line);
     }
 }
 
@@ -131,7 +77,6 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
     /// Returns `true` if at least one new line (or EOF) was received, which
     /// tells the scheduler to re-notify consumers.  Never blocks.
     fn check_for_new_data(&mut self) -> bool {
-        trace!("Checking for new data on stdin");
         let mut got_data = false;
         loop {
             match self.receiver.try_recv() {
@@ -141,101 +86,47 @@ impl DataSourceDomainExtentImpl for StdinDataSource {
                 }
                 Ok(None) => {
                     debug!("EOF reached on stdin");
-                    self.eof_reached = true;
+                    self.buf.eof_reached = true;
                     got_data = true;
                     break;
                 }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+                Err(_) => break,
             }
         }
         got_data
     }
 
     fn get_yield_predicate(&self) -> Predicate {
-        let predicate = if self.eof_reached {
-            Predicate::True
-        } else if self.ready_size == 0 {
-            Predicate::False
-        } else {
-            Predicate::LessThanEq(Value::UInt(self.ready_size - 1))
-        };
-        trace!("StdinDataSource yielding {predicate:?}");
-        predicate
+        self.buf.get_yield_predicate()
     }
 
-    /// Returns the currently readable set of indices.
     fn get_elements(&self, producer: &str) -> ColumnValue {
-        let filter = self
-            .obsolete_predicates
-            .get(producer)
-            .unwrap_or_else(|| panic!("Unknown producer: {}", producer));
-        match filter {
-            Predicate::Intervals(intervals) => {
-                if self.start_idx >= self.ready_size {
-                    return ColumnValue::from_uints(Vec::new());
-                }
-                // Compute [start_idx, ready_size-1] \ intervals to get non-obsolete indices.
-                let window = IntervalSet::from(Interval::closed(
-                    Value::UInt(self.start_idx),
-                    Value::UInt(self.ready_size - 1),
-                ));
-                let mut values = Vec::new();
-                for iv in window.difference(intervals).intervals() {
-                    match (iv.lval(), iv.rval()) {
-                        (Some(Value::UInt(lo)), Some(Value::UInt(hi))) => {
-                            values.extend(*lo..=*hi);
-                        }
-                        _ => panic!("unexpected interval bounds in StdinDataSource::get_elements"),
-                    }
-                }
-                ColumnValue::from_uints(values)
-            }
-            Predicate::LessThanEq(Value::UInt(i)) => {
-                let values: Vec<_> = ((*i + 1)..self.ready_size).collect();
-                ColumnValue::from_uints(values)
-            }
-            Predicate::True => ColumnValue::from_uints(Vec::new()),
-            Predicate::False => {
-                let values: Vec<_> = (self.start_idx..self.ready_size).collect();
-                ColumnValue::from_uints(values)
-            }
-            _ => panic!("Unsupported predicate for StdinDataSource get_elements: {filter:?}"),
-        }
+        self.buf.get_elements(producer)
     }
 
     fn element_extent(&self) -> Extent {
-        Extent::Base(crate::interpreter::BaseType::UInt)
+        Extent::Base(BaseType::UInt)
     }
 
     fn get(&self, key: ColumnValue) -> ColumnValue {
         match key {
             ColumnValue::UInts(v) => {
-                ColumnValue::Strings(v.iter().map(|i| self.get(*i)).cloned().collect())
+                ColumnValue::Strings(v.iter().map(|i| self.buf.get(*i)).cloned().collect())
             }
             other => panic!("StdinDataSource::get expected UInt key, got {other:?}"),
         }
     }
 
     fn output_value_extent(&self) -> Extent {
-        Extent::Base(crate::interpreter::BaseType::String)
+        Extent::Base(BaseType::String)
     }
 
-    fn release(&mut self, producer: &str, mut obsolete: Predicate) {
-        let pred = self
-            .obsolete_predicates
-            .entry(producer.to_string())
-            .or_insert(Predicate::False);
-        *pred = pred.union(&obsolete);
-        for pred in self.obsolete_predicates.values() {
-            obsolete = obsolete.intersect(pred);
-        }
-        trace!("StdinDataSource::release: {obsolete:?}");
-        match &obsolete {
-            Predicate::LessThanEq(Value::UInt(i)) => self.release_index(*i),
-            Predicate::True => self.close(),
-            _ => {}
-        }
+    fn output_type(&self) -> Type {
+        Type::Base(BaseType::String)
+    }
+
+    fn release(&mut self, producer: &str, obsolete: Predicate) {
+        self.buf.release(producer, obsolete);
     }
 }
 
@@ -254,6 +145,7 @@ mod tests {
         source.add("b".into());
         source.add("c".into());
         source
+            .buf
             .obsolete_predicates
             .insert("p".to_string(), Predicate::False);
 
@@ -271,6 +163,7 @@ mod tests {
         source.add("c".into());
         source.add("d".into());
         source
+            .buf
             .obsolete_predicates
             .insert("p".to_string(), Predicate::LessThanEq(Value::UInt(1)));
 
@@ -285,6 +178,7 @@ mod tests {
         source.add("a".into());
         source.add("b".into());
         source
+            .buf
             .obsolete_predicates
             .insert("p".to_string(), Predicate::True);
 
@@ -302,7 +196,10 @@ mod tests {
         }
         // Mark indices 1 and 2 as obsolete; live window [0,4] minus {1,2} = {0,3,4}.
         let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![1, 2]));
-        source.obsolete_predicates.insert("p".to_string(), filter);
+        source
+            .buf
+            .obsolete_predicates
+            .insert("p".to_string(), filter);
 
         let result = source.get_elements("p");
         assert_eq!(result, ColumnValue::from_uints(vec![0, 3, 4]));
@@ -317,11 +214,14 @@ mod tests {
             source.add(line.into());
         }
         // Release indices 0 and 1 so start_idx == 2, ready_size == 5.
-        source.release_index(1);
+        source.buf.release_index(1);
 
         // Mark index 3 as obsolete; live window [2,4] minus {3} = {2,4}.
         let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![3]));
-        source.obsolete_predicates.insert("p".to_string(), filter);
+        source
+            .buf
+            .obsolete_predicates
+            .insert("p".to_string(), filter);
 
         let result = source.get_elements("p");
         assert_eq!(result, ColumnValue::from_uints(vec![2, 4]));
@@ -334,7 +234,10 @@ mod tests {
         let mut source = StdinDataSource::new();
         // No lines added; start_idx == ready_size == 0.
         let filter = Predicate::from_column_value(&ColumnValue::UInts(vec![0]));
-        source.obsolete_predicates.insert("p".to_string(), filter);
+        source
+            .buf
+            .obsolete_predicates
+            .insert("p".to_string(), filter);
 
         let result = source.get_elements("p");
         assert_eq!(result, ColumnValue::from_uints(vec![]));
@@ -346,45 +249,45 @@ mod tests {
         assert_eq!(Predicate::False, source.get_yield_predicate());
         source.add("a".into());
         source.add("b".into());
-        assert_eq!("a", source.get(0));
-        assert_eq!("b", source.get(1));
-        assert_eq!(None, source.get_opt(2));
+        assert_eq!("a", source.buf.get(0));
+        assert_eq!("b", source.buf.get(1));
+        assert_eq!(None, source.buf.get_opt(2));
         assert_eq!(
             Predicate::LessThanEq(Value::UInt(1)),
             source.get_yield_predicate()
         );
-        source.release_index(0);
+        source.buf.release_index(0);
         assert_eq!(
             Predicate::LessThanEq(Value::UInt(1)),
             source.get_yield_predicate()
         );
-        assert_eq!(None, source.get_opt(0));
-        assert_eq!("b", source.get(1));
+        assert_eq!(None, source.buf.get_opt(0));
+        assert_eq!("b", source.buf.get(1));
         source.add("c".into());
-        assert_eq!(None, source.get_opt(0));
-        assert_eq!("b", source.get(1));
-        assert_eq!("c", source.get(2));
+        assert_eq!(None, source.buf.get_opt(0));
+        assert_eq!("b", source.buf.get(1));
+        assert_eq!("c", source.buf.get(2));
         assert_eq!(
             Predicate::LessThanEq(Value::UInt(2)),
             source.get_yield_predicate()
         );
-        source.release_index(1);
+        source.buf.release_index(1);
         assert_eq!(
             Predicate::LessThanEq(Value::UInt(2)),
             source.get_yield_predicate()
         );
-        assert_eq!(None, source.get_opt(0));
-        assert_eq!(None, source.get_opt(1));
-        assert_eq!("c", source.get(2));
+        assert_eq!(None, source.buf.get_opt(0));
+        assert_eq!(None, source.buf.get_opt(1));
+        assert_eq!("c", source.buf.get(2));
         assert_eq!(
             Predicate::LessThanEq(Value::UInt(2)),
             source.get_yield_predicate()
         );
-        source.eof_reached = true;
-        source.close();
-        assert_eq!(None, source.get_opt(0));
-        assert_eq!(None, source.get_opt(1));
-        assert_eq!(None, source.get_opt(2));
+        source.buf.eof_reached = true;
+        source.buf.close();
+        assert_eq!(None, source.buf.get_opt(0));
+        assert_eq!(None, source.buf.get_opt(1));
+        assert_eq!(None, source.buf.get_opt(2));
         assert_eq!(Predicate::True, source.get_yield_predicate());
     }
 
@@ -409,7 +312,7 @@ mod tests {
 
         // Verify producer_a's predicate is recorded
         assert!(
-            source.obsolete_predicates.contains_key("producer_a"),
+            source.buf.obsolete_predicates.contains_key("producer_a"),
             "producer_a predicate should be stored"
         );
 
@@ -419,11 +322,11 @@ mod tests {
 
         // Verify both predicates are recorded
         assert!(
-            source.obsolete_predicates.contains_key("producer_a"),
+            source.buf.obsolete_predicates.contains_key("producer_a"),
             "producer_a predicate should still be stored"
         );
         assert!(
-            source.obsolete_predicates.contains_key("producer_b"),
+            source.buf.obsolete_predicates.contains_key("producer_b"),
             "producer_b predicate should be stored"
         );
 
@@ -450,6 +353,7 @@ mod tests {
 
         // Store the first predicate
         let pred_after_first = source
+            .buf
             .obsolete_predicates
             .get("producer_a")
             .cloned()
@@ -461,6 +365,7 @@ mod tests {
 
         // The predicate should now be an OR of the two
         let pred_after_second = source
+            .buf
             .obsolete_predicates
             .get("producer_a")
             .cloned()

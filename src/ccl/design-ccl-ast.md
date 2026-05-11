@@ -27,6 +27,16 @@ CHL source
 
 ## Key Design Decisions
 
+### Purity invariant: CCL is a pure value language
+
+**Every `TypedExprNode` variant must denote a pure value.  Effects belong at the program boundary, not inside the AST.**
+
+No `TypedExprNode` variant may carry runtime behaviour executed by the CCL pipeline (type inference, lambda elimination, join planning, simplification).  Side-effecting operations — I/O, network calls, sink dispatch — are modelled as data-source/sink registrations in `LoweringContext` and assembled at the boundary by `compile_program` in `ccl/context.rs`.
+
+Historical violation: `TypedExprNode::Sink(String)` embedded an I/O dispatch operation in the AST.  Optimization passes could duplicate or reorder the node, silently skipping or double-firing responses.  The fix was to remove `Sink` and replace the pattern with a `Defer` placeholder (pure) plus an out-of-band sink-binding registry in `LoweringContext`.  `compile_program` extracts the sink expression after the full pipeline runs and wires up the `SinkConsumer` at the boundary.
+
+If you find yourself adding a variant that "does something" rather than representing a value, model the effect at the boundary instead.
+
 ### Less normalized than ANF
 
 CCL is a λ-calculus IR, not strict A-Normal Form. In ANF every intermediate result must be named with a `Let` binding; in CCL compound expressions may appear inline. For example, `Apply(f, BinOp(x, Add, y))` is valid without an intermediate binding for `x + y`.
@@ -573,7 +583,7 @@ After `resolve`, `infer` calls `check_fully_typed(expr)` to assert that every `t
 
 `defer()`, `<<`, and `<<=` are CHL-level operators that let a block accumulate a result value progressively. They are reified as three CCL AST nodes (`Defer`, `Feed`, `Define`) during lowering, then **eliminated** before operator conversion by `remove_defers::run`.
 
-TODO: `x = defer()` should be replaced with `deferred x` once we implement a custom parser and aren't stuck with CHL parsing rules. 
+TODO: `x = defer()` should be replaced with `deferred x` once we implement a custom parser and aren't stuck with CHL parsing rules.
 
 ### CHL syntax
 
@@ -590,6 +600,15 @@ Both the feed and define expressions evaluate to Unit.
 ### Lowering
 
 `x = defer()` lowers to `let x = Defer in …`.
+
+`requests, responses = http_serve(port, method, path)` lowers to:
+```
+let requests = Source("__http_requests_N") in
+let responses = Defer in
+<user body>
+```
+
+The `DataSink` for responses (`HttpServerSharedState`) is registered in `LoweringContext::sink_bindings` keyed by the `responses` binding name.  After the full pipeline runs, `compile_program` extracts the responses binding expression via `extract_sink_bindings`, compiles it independently, and subscribes a `SinkConsumer` to it.  The main program output is replaced by a Unit placeholder; sink programs do not produce a primary output value.
 
 `x << expr` in expression or statement position lowers to `Feed { name: "x", value: expr }`, wrapped in an `ExprStmt` when it appears as a non-final statement.
 
@@ -614,6 +633,8 @@ in ExprStmt(Define(x, 1), x)    # x <<= 1; x
 
 The id-reuse in step 2 is what allows multiple `Feed` sites on the same handle to unify correctly. Without it, each feed would mint a fresh `DeferredCollectionDomain(id_N)`, and the two constraints `Fun(DCD(id_0), cod)` and `Fun(DCD(id_1), cod)` would conflict during unification.
 
+`Feed { name, value }` resolves the type of `name` (must be `Fun(HandleDomain(_), cod)`), constrains `value`'s type against `cod`, and returns `Unit`.
+
 `Define { name, value }` constrains `value`'s type against `name`'s full type and returns `Unit`.
 
 `ExprStmt { expr, body }` infers `expr` for constraints, then returns the type of `body`.
@@ -637,15 +658,21 @@ The pass performs three steps:
 
 1. **`inline_defers`**: walks the tree looking for `Let { bound_expr: Defer, binding, body }`. For each such binding it calls `inline_defer(body, binding.name)` to extract the feed or define value:
    - A `Define(name, value)` for the target name is extracted as the define value; its site is replaced with the `__replaced` sentinel.
-   - A `Feed(name, value)` for the target name is extracted as a feed value; scalar values (no domain type) are lifted to `value ▷ const` so the result is always a function.
-   - **Single feed** (`N = 1`): the extracted value replaces `Defer` directly as the `Let`'s bound expression.
-   - **Multiple feeds** (`N > 1`): `construct_feed_result` merges them into `Apply(Tuple([v0, …, vN-1]), Builtin::CollectionUnion)` with result type `Fun(Union(dom0, …, domN-1), dedup(cod0, …, codN-1))`. This is the same shape `operator_conversion` consumes for `a @ b`, so it lowers to a `UnionOperator` without a raw `BinOp` node.
+   - A `Feed(name, value)` for the target name is extracted as a feed value. The value is returned **as-is** at the extraction site; const-wrapping happens downstream:
+     - Inside a `Compose` context, `inline_defer` wraps scalar feed values in `const` using the domain of the compose element that contained the Feed, so the correct DataSource domain is captured.
+     - Outside a Compose context, `construct_feed_result` wraps remaining scalar values in `const` with a `Unit` domain.
+   - The assembled feed result replaces `Defer` as the `Let`'s bound expression.
 
 2. **`substitute_types_in_expr`**: propagates any type-variable mappings collected during step 1 (the feed case maps the old `DeferredCollectionDomain` variable to the inferred result domain).
 
-3. **`simplify`**: the `ExprStmt` nodes containing the now-replaced `Feed`/`Define` sentinels (`Var("__replaced")`) are dropped by `try_drop_pure_expr_stmt` since the sentinels contain no remaining `Feed` nodes.
+3. **`simplify`**: cleans up the residual tree:
+   - `ExprStmt` nodes containing the `__replaced` sentinel (no remaining `Feed`) are handled by `try_drop_pure_expr_stmt`, which drops `ExprStmt(inner, body)` when `inner` has no `Feed`.
 
 After the pass, no `Defer`, `Feed`, `Define`, or `ExprStmt` nodes should remain in the tree.
+
+### Why `try_const_reduce` is guarded by `!contains_feed`
+
+The `f ≫ g ▷ const  →  g ▷ const` rule in `simplify` must not fire while a compose still contains unprocessed `Feed` nodes.  Before `remove_defers` runs, a for-loop body produces a compose like `[requests, const(Feed("responses", "Hello!"))]`.  If `const_reduce` fired here it would produce `new_ty = DataSource → Unit` (the codomain of the `Feed`, which is `Unit`).  That incorrect type would propagate through `type_substitutions` and replace the `HandleDomain` placeholder with `Unit`, causing the responses binding to compile with `IterateExtent(Base(Unit))` — which does not register with the scheduler, so no HTTP notifications ever fire.  The `!contains_feed` guard prevents this premature firing.
 
 ---
 

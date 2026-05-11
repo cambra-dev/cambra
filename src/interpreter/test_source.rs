@@ -129,6 +129,10 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         self.output_extent.clone()
     }
 
+    fn output_type(&self) -> Type {
+        self.output_type.clone()
+    }
+
     fn get_yield_predicate(&self) -> Predicate {
         self.yield_predicate.clone()
     }

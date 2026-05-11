@@ -60,6 +60,46 @@ pub fn convert_to_operators(
     convert_impl(expr, None, None, ctx)
 }
 
+/// One compiled operator per field of a trailing record.
+pub type RecordFieldOperators = Vec<(String, Box<dyn TileOperator>)>;
+
+/// Compile a `Let* Record{…}` tree into one operator per record field, sharing
+/// scope (and thus the [`FanOut`]/[`Memo`] handles for upstream `Let` bindings)
+/// across every field.
+///
+/// Used by [`crate::ccl::context::compile_program`] when the program ends in a
+/// trailing `Record` of sink-bound names: every field's operator subgraph
+/// branches off the same memoised upstream operators rather than each sink
+/// re-compiling the shared prefix into a fresh, independent subgraph.
+///
+/// The expression must consist of zero or more `Let` bindings followed by a
+/// trailing `Record`; any other shape returns [`ConversionError::Unsupported`].
+pub fn convert_record_fields_to_operators(
+    expr: &Expr,
+    ctx: &mut OpConversionContext,
+) -> Result<RecordFieldOperators, ConversionError> {
+    match &expr.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            let bound_op = convert_impl(bound_expr, None, None, ctx)?;
+            let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
+            let mut scope = ctx.enter_scope();
+            scope.bind(&binding.name, fan_out);
+            convert_record_fields_to_operators(body, &mut scope)
+        }
+        TypedExprNode::Record(fields) => fields
+            .iter()
+            .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, None, ctx)?)))
+            .collect(),
+        other => Err(ConversionError::Unsupported(format!(
+            "convert_record_fields_to_operators: expected Let* Record, got {other:?}"
+        ))),
+    }
+}
+
 /// Errors that can occur during CCL → operator-graph compilation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConversionError {
@@ -142,6 +182,8 @@ impl OpConversionContext {
             .ok_or_else(|| ConversionError::TypeError(format!("Unknown data source: {name}")))
     }
 
+    /// Register an output sink under `name`.
+    ///
     /// Enter a fresh lexical scope, returning a guard that pops it on drop.
     ///
     /// The guard dereferences to `TileCompileContext`, so it can be passed as

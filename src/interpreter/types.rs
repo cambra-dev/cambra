@@ -11,7 +11,7 @@ use intervalsets::{Bounding, Interval, IntervalSet, MaybeEmpty, Side};
 use smol_str::SmolStr;
 
 use crate::interpreter::{
-    BinOpKind, Predicate, UnaryOpKind, apply_binop_column, apply_unaryop_column, tuple_field,
+    BinOpKind, Predicate, Tile, UnaryOpKind, apply_binop_column, apply_unaryop_column, tuple_field,
 };
 use crate::pretty_graph::fmt_binop;
 use crate::util::fmt_record;
@@ -251,7 +251,20 @@ impl Restriction {
     }
 }
 
-/// The Extent of the domain of a Data Source
+/// Abstraction for sending computed responses back to waiting clients.
+///
+/// Implemented by sink types (e.g. [`crate::interpreter::HttpServerSharedState`])
+/// that are paired with a [`DataSourceDomainExtentImpl`].  The default
+/// [`DataSourceDomainExtentImpl::get_sink`] returns `None`; sources with a
+/// corresponding output channel override it to expose their sink.
+///
+/// Receives a full [`Tile`] so the implementation can apply its own
+/// domain/codomain extraction and deduplication logic.
+pub trait DataSink: Send + Sync {
+    /// Dispatch any not-yet-sent responses contained in `tile`.
+    fn process(&self, tile: &Tile);
+}
+
 pub trait DataSourceDomainExtentImpl {
     fn get_id(&self) -> &str;
     fn check_for_new_data(&mut self) -> bool;
@@ -273,6 +286,11 @@ pub trait DataSourceDomainExtentImpl {
     /// Returns the [`Extent`] of each output value produced by this source.
     /// Used to type the codomain of [`crate::interpreter::tile_operators::MapSource`].
     fn output_value_extent(&self) -> Extent;
+    /// Returns the CCL element type produced by this source (the codomain of its
+    /// `Fun(DataSource(name), T)` type).  Used by
+    /// [`crate::ccl::context::GlobalContext::register_source`] to build the full
+    /// inference type without needing to know the concrete source type.
+    fn output_type(&self) -> crate::ccl::Type;
     /// Release the region described by `obsolete` for the given producer — those domain values no longer
     /// need to be retained by the source.
     fn release(&mut self, producer: &str, obsolete: Predicate);

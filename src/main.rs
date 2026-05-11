@@ -1,3 +1,5 @@
+use std::{thread, time::Duration};
+
 use cambra::{
     ccl::{
         context::{GlobalContext, compile_program},
@@ -24,45 +26,87 @@ fn run_program(code: &str, inspect_port: Option<u16>) {
     });
 
     let mut ctx = GlobalContext::default();
-    let (ast_tree, operator_tree, mut producer) = compile_program(&mut ctx, code, consumer);
+    let mut compiled = compile_program(&mut ctx, code, consumer);
 
     let inspector = inspect_port.map(|port| {
-        WebInspector::new(
-            port,
-            symbolic(&ast_tree),
-            pretty_tile_operator(operator_tree.as_ref()),
-        )
+        // Render every output's operator tree.  The AST shown is the full
+        // join-planned program (shared across all outputs).
+        let op_parts: Vec<String> = compiled
+            .outputs
+            .iter()
+            .map(|o| pretty_tile_operator(o.op.as_ref()))
+            .collect();
+        WebInspector::new(port, symbolic(&compiled.ast), op_parts.join("\n\n"))
     });
 
-    let mut tick = 0u64;
-    loop {
-        while !*new_data.borrow() {
-            debug!("Scheduler checking for notifications");
-            ctx.scheduler().check_for_notifications();
-        }
-        *new_data.borrow_mut() = false;
+    // Pull the main producer out of `compiled` so the rest of the outputs can
+    // be borrowed immutably during snapshot() while we drive the producer.
+    let mut main_producer = compiled.main_mut().and_then(|o| o.producer.take());
 
-        debug!("Main calling get");
-        let tile = producer.get(producer.tiling().universal_guard());
-
-        if let Some(ref insp) = inspector {
-            insp.update_snapshot(tick, producer.as_ref());
-            tick += 1;
-        }
-
-        let release_guard = match &tile {
-            Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
-            Tile::SealedFunction {
-                domain_predicate, ..
-            } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
-            other => panic!("Unexpected top-level tile shape: {other:?}"),
+    let snapshot =
+        |tick: u64,
+         main_producer: Option<&dyn cambra::interpreter::tile_operators::TileProducer>| {
+            if let Some(ref insp) = inspector {
+                insp.update_snapshot(tick, |add| {
+                    if let Some(p) = main_producer {
+                        add(p);
+                    }
+                    for output in compiled.sinks() {
+                        if let Some(ref c) = output.sink_consumer {
+                            c.borrow().with_producer(|p| add(p));
+                        }
+                    }
+                });
+            }
         };
-        debug!("Main releasing with {release_guard:?}");
-        let done = release_guard.is_universal();
-        producer.release(release_guard);
-        println!("Got value: {tile:#?}");
-        if done {
-            break;
+
+    let mut tick = 0u64;
+
+    // Drive the `main` output (if any) until it signals a universal release.
+    // For sink-only programs this loop is skipped entirely.
+    if let Some(producer) = main_producer.as_mut() {
+        loop {
+            while !*new_data.borrow() {
+                ctx.scheduler().check_for_notifications();
+            }
+            *new_data.borrow_mut() = false;
+
+            debug!("Main calling get");
+            let tile = producer.get(producer.tiling().universal_guard());
+            snapshot(tick, Some(producer.as_ref()));
+            tick += 1;
+
+            let release_guard = match &tile {
+                Tile::Scalar(cv) => TileGuard::Scalar(!cv.is_empty()),
+                Tile::SealedFunction {
+                    domain_predicate, ..
+                } => TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
+                other => panic!("Unexpected top-level tile shape: {other:?}"),
+            };
+            debug!("Main releasing with {release_guard:?}");
+            let done = release_guard.is_universal();
+            producer.release(release_guard);
+            println!("Got value: {tile:#?}");
+            if done {
+                break;
+            }
+        }
+    }
+
+    // If there are sinks, keep the scheduler running until they all signal
+    // completion.  Long-lived servers (e.g. http_serve) never signal, so this
+    // loop runs until the process exits.
+    if compiled.sinks().next().is_some() {
+        loop {
+            ctx.scheduler().check_for_notifications();
+            snapshot(tick, None);
+            tick += 1;
+            if compiled.done.try_recv().is_ok() {
+                break;
+            }
+            // TODO we shouldn't need to sleep here; we should come up with a better interface
+            // for check_for_notifications
+            thread::sleep(Duration::from_millis(10));
         }
     }
 }

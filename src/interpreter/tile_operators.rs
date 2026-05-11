@@ -3242,7 +3242,13 @@ struct FanOutShared {
     /// Inner producer, set on the first [`FanOutBranch::subscribe`] call.
     producer: Option<Box<dyn TileProducer>>,
     /// Every consumer registered via [`FanOutBranch::subscribe`], in order.
-    consumers: Vec<Box<dyn Consumer>>,
+    ///
+    /// Stored as `Rc<RefCell<...>>` so that the notification closure can clone the
+    /// handles, release the `shared` borrow, and then call each consumer without
+    /// holding `shared` across the notification.  This prevents a re-entrant panic
+    /// when a consumer (e.g. `SinkConsumer`) calls back into `FanOutProducer::get_impl`,
+    /// which itself needs `shared.borrow_mut()`.
+    consumers: Vec<Rc<RefCell<Box<dyn Consumer>>>>,
     /// Per-subscriber release guards; intersected before passing upstream.
     release_guards: Vec<TileGuard>,
 }
@@ -3334,7 +3340,7 @@ impl TileOperator for FanOutBranch {
         let index = {
             let mut shared = self.shared.borrow_mut();
             let index = shared.consumers.len();
-            shared.consumers.push(consumer);
+            shared.consumers.push(Rc::new(RefCell::new(consumer)));
             shared.release_guards.push(self.tiling.empty_guard());
             index
         }; // borrow released here before we might call input.subscribe
@@ -3348,11 +3354,15 @@ impl TileOperator for FanOutBranch {
             let inner = self.input.borrow_mut().subscribe(
                 intent_guard,
                 Box::new(move || {
-                    shared_rc
-                        .borrow_mut()
-                        .consumers
-                        .iter_mut()
-                        .for_each(|c| c.notify());
+                    // Clone the consumer handles while holding a short borrow,
+                    // then release the borrow before calling notify().  This
+                    // prevents a re-entrant panic when a consumer (e.g.
+                    // SinkConsumer) calls FanOutProducer::get_impl(), which
+                    // needs shared.borrow_mut() for the same Rc.
+                    let consumers = shared_rc.borrow().consumers.clone();
+                    for c in &consumers {
+                        c.borrow_mut().notify();
+                    }
                 }),
                 scheduler,
             );
