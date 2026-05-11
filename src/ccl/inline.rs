@@ -90,7 +90,33 @@ use crate::ccl::{Branch, Expr, Type, TypedExprNode, lambda_elim::substitute};
 /// are *not* folded here — `crate::ccl::simplify` handles that rewrite as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_non_iterable_lambdas(expr: Expr) -> Expr {
-    inline_impl(expr)
+    let mut ctx = InlineCtx::default();
+    inline_impl(expr, &mut ctx)
+}
+
+// ---------------------------------------------------------------------------
+// Inline context
+// ---------------------------------------------------------------------------
+
+/// Mutable state threaded through [`inline_impl`].
+///
+/// Holds a monotonically increasing counter for minting unique synthetic
+/// names that are introduced during inlining (e.g. ANF temporaries for
+/// defer-returning Compose sources).
+#[derive(Default)]
+struct InlineCtx {
+    /// Next suffix for `__for_src_N` ANF temporaries.
+    counter: u64,
+}
+
+impl InlineCtx {
+    /// Mint a unique `__for_src_N` name for ANF-ing a defer-returning
+    /// Compose source out of its position.
+    fn fresh_for_src_name(&mut self) -> String {
+        let n = self.counter;
+        self.counter += 1;
+        format!("__for_src_{n}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,11 +183,13 @@ fn should_inline(bound_ty: &Type) -> bool {
 // Alias and defer helpers
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if `name` appears as a `Let` binder anywhere in `expr`.
+/// Returns `true` if `name` is bound (shadowed) anywhere inside `expr` — by a
+/// `Let` binder or a `Lambda` parameter.
 ///
 /// Used to guard alias inlining: substituting `y → x` in a body that rebinds
-/// `x` via an inner `let x = …` would cause the substituted `x` references to
-/// be captured by the shadowing binding, producing incorrect semantics.
+/// `x` via an inner `let x = …` or `λ x → …` would cause the substituted `x`
+/// references to be captured by the shadowing binding, producing incorrect
+/// semantics.
 fn is_let_bound(name: &str, expr: &Expr) -> bool {
     match &expr.node {
         TypedExprNode::Let {
@@ -169,7 +197,9 @@ fn is_let_bound(name: &str, expr: &Expr) -> bool {
             bound_expr,
             body,
         } => binding.name == name || is_let_bound(name, bound_expr) || is_let_bound(name, body),
-        TypedExprNode::Lambda { body, .. } => is_let_bound(name, body),
+        // Lambda param shadows `name` inside the body — treat it as a binding
+        // site so we don't substitute through it.
+        TypedExprNode::Lambda { param, body, .. } => param.name == name || is_let_bound(name, body),
         TypedExprNode::Apply { function, argument } => {
             is_let_bound(name, function) || is_let_bound(name, argument)
         }
@@ -374,6 +404,28 @@ fn try_lift_defer(binding_name: String, bound_expr: Expr, body: Expr) -> Option<
 // Tree walk
 // ---------------------------------------------------------------------------
 
+/// Return `true` if `expr` is a liftable defer-returning expression — that is,
+/// after peeling any [`TypedExprNode::ExprStmt`] prefixes it is a
+/// `let name = Defer in body` where `body` ends in `Var(name)`.
+///
+/// Used by [`inline_impl`]'s Compose arm to detect when the first element of a
+/// Compose (the iteration source) contains an inner defer scope that should be
+/// ANF'd out so that [`try_lift_defer`] can merge it with the outer scope.
+fn is_liftable_defer(expr: &Expr) -> bool {
+    let mut current = expr;
+    while let TypedExprNode::ExprStmt { body, .. } = &current.node {
+        current = body;
+    }
+    match &current.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => bound_expr.node == TypedExprNode::Defer && is_defer_returning(body, &binding.name),
+        _ => false,
+    }
+}
+
 /// Recursively inline `Let` bindings that pass [`should_inline`], beta-reducing
 /// each call site as the substitution produces it.
 ///
@@ -382,7 +434,7 @@ fn try_lift_defer(binding_name: String, bound_expr: Expr, body: Expr) -> Option<
 /// [`crate::ccl::lambda_elim`] prevents the let-in-lambda rewrite from
 /// wrapping aliases in `const(…)` and ensures defer scope merging happens at the
 /// right level.
-fn inline_impl(expr: Expr) -> Expr {
+fn inline_impl(expr: Expr, ctx: &mut InlineCtx) -> Expr {
     let Expr {
         node,
         ty,
@@ -395,8 +447,8 @@ fn inline_impl(expr: Expr) -> Expr {
             bound_expr,
             body,
         } => {
-            let bound_expr = inline_impl(*bound_expr);
-            let body = inline_impl(*body);
+            let bound_expr = inline_impl(*bound_expr, ctx);
+            let body = inline_impl(*body, ctx);
 
             // Alias: `let y = x` is pure α-renaming — substitute y → x in body
             // and drop the Let.  This must run before lambda_elim so that the
@@ -433,7 +485,10 @@ fn inline_impl(expr: Expr) -> Expr {
                 // Let bindings (e.g. `let y = (let x = Defer in …) in …` after
                 // expanding a defer-returning UDF) are eligible for the alias
                 // and lift rewrites on the second pass.
-                return inline_impl(inline_and_beta_reduce(body, &binding.name, &bound_expr));
+                return inline_impl(
+                    inline_and_beta_reduce(body, &binding.name, &bound_expr),
+                    ctx,
+                );
             }
             TypedExprNode::Let {
                 binding,
@@ -443,18 +498,18 @@ fn inline_impl(expr: Expr) -> Expr {
         }
 
         TypedExprNode::Apply { function, argument } => TypedExprNode::Apply {
-            function: Box::new(inline_impl(*function)),
-            argument: Box::new(inline_impl(*argument)),
+            function: Box::new(inline_impl(*function, ctx)),
+            argument: Box::new(inline_impl(*argument, ctx)),
         },
 
         TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
-            left: Box::new(inline_impl(*left)),
+            left: Box::new(inline_impl(*left, ctx)),
             op,
-            right: Box::new(inline_impl(*right)),
+            right: Box::new(inline_impl(*right, ctx)),
         },
 
         TypedExprNode::UnaryOp(op, inner) => {
-            TypedExprNode::UnaryOp(op, Box::new(inline_impl(*inner)))
+            TypedExprNode::UnaryOp(op, Box::new(inline_impl(*inner, ctx)))
         }
 
         TypedExprNode::Lambda {
@@ -463,27 +518,27 @@ fn inline_impl(expr: Expr) -> Expr {
             refinement,
         } => TypedExprNode::Lambda {
             param,
-            body: Box::new(inline_impl(*body)),
+            body: Box::new(inline_impl(*body, ctx)),
             refinement,
         },
 
         TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
-            input: Box::new(inline_impl(*input)),
+            input: Box::new(inline_impl(*input, ctx)),
             kind,
         },
 
         TypedExprNode::Tuple(elts) => {
-            TypedExprNode::Tuple(elts.into_iter().map(inline_impl).collect())
+            TypedExprNode::Tuple(elts.into_iter().map(|e| inline_impl(e, ctx)).collect())
         }
 
         TypedExprNode::List(elts) => {
-            TypedExprNode::List(elts.into_iter().map(inline_impl).collect())
+            TypedExprNode::List(elts.into_iter().map(|e| inline_impl(e, ctx)).collect())
         }
 
         TypedExprNode::Record(fields) => TypedExprNode::Record(
             fields
                 .into_iter()
-                .map(|(name, e)| (name, inline_impl(e)))
+                .map(|(name, e)| (name, inline_impl(e, ctx)))
                 .collect(),
         ),
 
@@ -491,8 +546,8 @@ fn inline_impl(expr: Expr) -> Expr {
             branches: branches
                 .into_iter()
                 .map(|b| Branch {
-                    guard: inline_impl(b.guard),
-                    body: inline_impl(b.body),
+                    guard: inline_impl(b.guard, ctx),
+                    body: inline_impl(b.body, ctx),
                 })
                 .collect(),
         },
@@ -505,32 +560,54 @@ fn inline_impl(expr: Expr) -> Expr {
         } => TypedExprNode::Join {
             name,
             params,
-            loop_body: Box::new(inline_impl(*loop_body)),
-            outer_body: Box::new(inline_impl(*outer_body)),
+            loop_body: Box::new(inline_impl(*loop_body, ctx)),
+            outer_body: Box::new(inline_impl(*outer_body, ctx)),
         },
 
         TypedExprNode::Jump { target, args } => TypedExprNode::Jump {
             target,
-            args: args.into_iter().map(inline_impl).collect(),
+            args: args.into_iter().map(|a| inline_impl(a, ctx)).collect(),
         },
 
-        TypedExprNode::Compose(elts) => {
-            TypedExprNode::Compose(elts.into_iter().map(inline_impl).collect())
+        // ANF defer-returning Compose source: when the first element of a Compose
+        // (i.e. the for-loop iteration source) is itself a defer-returning
+        // expression, wrap it in a fresh `let __for_src_N = source` binding so
+        // that `try_lift_defer` can physically rename its inner defer handle,
+        // preventing two same-named `__result` defers from coexisting in
+        // `remove_defers`. Re-running `inline_impl` on the wrapping `Let`
+        // triggers `try_lift_defer` on the new binding.
+        TypedExprNode::Compose(terms) => {
+            let mut inlined: Vec<Expr> = terms.into_iter().map(|t| inline_impl(t, ctx)).collect();
+            if inlined.len() >= 2 && is_liftable_defer(&inlined[0]) {
+                let source = inlined.remove(0);
+                let source_ty = source.ty.clone();
+                let fresh = ctx.fresh_for_src_name();
+                // Preserve the original Compose type on the rebuilt Compose and
+                // the Let so that the typecheck after UDF inlining still holds.
+                let new_compose = Expr::compose(
+                    std::iter::once(Expr::var(&fresh).with_ty(source_ty))
+                        .chain(inlined)
+                        .collect(),
+                )
+                .with_ty(ty.clone());
+                return inline_impl(Expr::let_bind(fresh, source, new_compose).with_ty(ty), ctx);
+            }
+            TypedExprNode::Compose(inlined)
         }
 
         TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
-            expr: Box::new(inline_impl(*expr)),
-            body: Box::new(inline_impl(*body)),
+            expr: Box::new(inline_impl(*expr, ctx)),
+            body: Box::new(inline_impl(*body, ctx)),
         },
 
         TypedExprNode::Feed { name: id, value } => TypedExprNode::Feed {
             name: id,
-            value: Box::new(inline_impl(*value)),
+            value: Box::new(inline_impl(*value, ctx)),
         },
 
         TypedExprNode::Define { name: id, value } => TypedExprNode::Define {
             name: id,
-            value: Box::new(inline_impl(*value)),
+            value: Box::new(inline_impl(*value, ctx)),
         },
 
         // Leaves — no sub-expressions to recurse into.

@@ -22,6 +22,7 @@ bit-set = "0.8.0"
 bit-vec = "0.8.0"
 intervalsets = "0.1.0-alpha.2"
 smol_str = "0.3.6"
+stacker = "0.1"
 
 [profile.release]
 debug = "line-tables-only"

@@ -28,7 +28,7 @@ use crate::ccl::{
     AggregateKind, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey, RefinementKind, Type,
     TypedExprNode, UnaryOpKind, unify::UnificationTable,
 };
-use crate::ccl::{BaseType, next_defer_id};
+use crate::ccl::{BaseType, TypedBinding, next_defer_id};
 use crate::util::ScopeStack;
 
 // ---------------------------------------------------------------------------
@@ -1306,7 +1306,7 @@ fn type_has_infer(ty: &Type) -> bool {
 /// unresolved positions; unresolved positions are likewise deferred to
 /// [`check_fully_typed`].
 fn infer_lambda(
-    param: &mut crate::ccl::TypedBinding,
+    param: &mut TypedBinding,
     body: &mut Expr,
     refinement: &mut Option<crate::ccl::Refinement>,
     ctx: &mut TypeInferenceContext,
@@ -1602,7 +1602,7 @@ fn infer_apply(
 /// Infers the bound expression type, checks any user annotation on the binding
 /// site, fills `binding.ty`, then infers the body in a fresh scope.
 fn infer_let(
-    binding: &mut crate::ccl::TypedBinding,
+    binding: &mut TypedBinding,
     bound_expr: &mut Expr,
     body: &mut Expr,
     ctx: &mut TypeInferenceContext,

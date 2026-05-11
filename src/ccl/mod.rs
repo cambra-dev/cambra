@@ -908,6 +908,17 @@ impl TypedExpr {
         })
     }
 
+    /// Construct a for-loop expression.
+    ///
+    /// Desugars directly to `Compose([source, Lambda(iter_var, body)])`.
+    /// This is the canonical CCL representation for iteration: the source
+    /// morphism feeds elements to the per-element lambda, which is then
+    /// eliminated by lambda elimination into point-free form.
+    pub fn for_loop(iter_var: impl Into<String>, source: Self, body: Self) -> Self {
+        let lambda = Self::lambda(&iter_var.into(), Type::Hole, body);
+        Self::compose(vec![source, lambda])
+    }
+
     /// Construct a let binding expression.
     ///
     /// `binding.ty` mirrors `bound_expr.ty` at construction time so that callers

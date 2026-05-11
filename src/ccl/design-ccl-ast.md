@@ -112,21 +112,36 @@ CHL `def` statements are lowered to `Let` bindings whose value is a single `Expr
 
 Pairing the definition shape with `lower_call`'s tupled multi-arg shape keeps the common multi-arg `def` path free of the curried-lambda chain that `lambda_elim` would fold into an unsupported `curry(body)`.
 
-### Generator functions — desugaring to Lambda + list-comp encoding
+### Generator functions — `Compose+Lambda` with `defer`/`feed` desugaring
 
-Generator functions whose body ends in a `for` loop with a chain of nested `for` / `if` / `yield` statements are desugared at lowering time to named lambdas wrapping the Lambda/Apply tiling encoding used for list comprehensions. No new CCL AST nodes are required.
+Generator functions (functions whose body ends in a `for` loop containing `yield`) are lowered directly to `Compose([source, Lambda(x, body)])`, combined with the existing `defer`/`feed` operators. There is no separate `For` AST node — for-loops are desugared at lowering time to the same `Compose+Lambda` shape already used by list comprehensions and generator expressions.
 
-`def f(params): for x in iter: yield expr` becomes `let f = uncurry(params, generator_chain(expr, [(x, iter, steps)]))`, where `uncurry(params, body)` is the same shape used by `lambda` and regular `def` lowering — a single-parameter lambda for one argument, and a tupled-parameter lambda with in-place projection substitution for multiple arguments.
+**Yield desugaring** (lowering, `lower_generator_for`): a `yield expr` terminal is replaced with `feed(__result, expr)` and the whole loop is wrapped:
+```text
+def f(params):
+    for x in iter:
+        yield expr
+```
+becomes:
+```text
+let f = λ params →
+    let __result = defer
+    in (iter ≫ λx → feed(__result, expr)); __result
+```
 
-**Nested `for` loops** produce one generator per `for` in the chain. The inner iterable may reference outer loop variables (the inner source expression is in scope of the outer iteration lambda).
+**`<<` feeds inside for-loops** (no `yield`): a `for` whose body ends in `x << expr` lowers to a bare `Compose([source, Lambda(x, body)])` with `Unit` type — no `defer` wrapper is needed because the caller already holds the defer binding.
 
-**Let-bindings in generator bodies** (`y = f(x); yield y`) are lowered as `Expr::Let` nodes interleaved in the Lambda/Apply chain. Each let is placed after the enclosing `for`'s iteration lambda and before the next nested `for` (or the terminal yield), so the bound name is evaluated once per iteration of its enclosing loop. Lets are duplicated into the refinement closure so that if-guards can reference let-bound names.
+**Nested `for` loops** produce nested `Compose+Lambda` pairs. Lambda elimination converts each Lambda outward-in to a composition chain.
 
-**Pre-loop lets** (assignments before the outer `for` in a function body) are handled generically by the `lower_stmts` machinery — they wrap the generator expression in `Expr::Let` nodes. Generator lowering itself only starts at the `for` loop.
+**ANF-lifting of defer-returning sources** (`inline.rs`): when the first element of a `Compose` is a defer-returning expression (i.e. a source that terminates with `; __result_N`), the inline pass extracts it into a fresh `let __for_src_N = <source>` binding before the Compose. This ensures that when two nested generators share the same source expression, each is bound to a unique name and the outer `remove_defers` pass can substitute them independently without name collision.
 
-**Mutation rule**: an assignment inside a generator body is a let-binding (allowed) iff the target name is either fresh or was introduced in the same `for`-body. Assignments to names from an enclosing `for`-body, function arguments, or pre-loop lets are rejected as mutation — they would require the time-indexed mutation machinery from Phase 2. Function definitions inside generator bodies are treated identically to assignments.
+**Let-bindings in generator bodies** (`y = f(x); yield y`) lower to nested `Let` nodes inside the Lambda body, evaluated once per iteration of the enclosing loop.
 
-Generator expressions `(expr for x in xs)` are lowered identically to `ListComp` via the `lower_list_comp` function (separate from the generator-function path which uses `lower_generator_chain`).
+**Pre-loop lets** (assignments before the outer `for` in a function body) are handled by `lower_stmts` — they wrap the generator expression in `Let` nodes. The `for` lowering itself (`lower_generator_for`) only handles the loop and its body.
+
+**Mutation rule**: an assignment inside a for-loop body is a let-binding (allowed) iff the target name is fresh in the current frame or was introduced by the same `for`-body (including the iter-variable). Assignments to names from enclosing frames, function arguments, or pre-loop lets are rejected as mutation. Function definitions inside for-loop bodies are treated identically to assignments.
+
+Generator expressions `(expr for x in xs)` are lowered via `lower_list_comp` to the same `Compose+Lambda` encoding as generator functions.
 
 ### `GroupBy` — first-class grouping node
 
@@ -841,6 +856,19 @@ binding `x` is substituted with `Var(y)`, every `Feed("x", …)` and `Define("x"
 in the inner body must be renamed to target `y`, or `remove_defers` would fail to
 find any feeds on the outer binding. The `is_free` check also accounts for the
 name field: `Feed("x", v)` counts `x` as a free variable for early-exit purposes.
+
+### For-loop filter pattern in lambda elimination
+
+For-loops lower directly to `Compose([src, Lambda(x, body)])`. Lambda elimination handles them through the existing `Lambda` and `Compose` arms, with one special case for the filter pattern.
+
+**Filter pattern** (`elim_lambdas`, detected at the `Compose` level): a `Compose` whose last element is a `Lambda(x, Case { [guard → action, true → unit] })` (a two-branch filter case) is rewritten as a filtered composition:
+```text
+Compose([src, Lambda(x, { guard(x) → action(x); true → unit })])
+  ⟹  src_refined ≫ elim_lambda(x, action)
+```
+where `src_refined` is `src_elim` with its domain wrapped in `Type::Refinement` carrying `guard` as a `Predicate`. This causes `iterate_type` in operator conversion to emit a `Restrict` operator for the guard, equivalent to the refinement-lambda path used by list comprehensions.
+
+The filter check happens at the `Compose` level (rather than inside the `Lambda` arm) because the refinement must be attached to the source, which is only visible alongside the lambda at the compose level.
 
 ### `Let` nodes after rule 7
 

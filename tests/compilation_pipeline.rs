@@ -960,7 +960,13 @@ fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
 )]
 // Filter via if-guard
 #[case(
-    "def positives(xs):\n    for x in xs:\n        if x > 0:\n            yield x\npositives([-1, 2, -3, 4])",
+    r#"
+def positives(xs):
+    n = 0
+    for x in xs:
+        if x > n:
+            yield x
+positives([-1, 2, -3, 4])"#,
     Tile::SealedFunction {
         domain: ColumnValue::UInts(vec![1, 3]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 4]))),
@@ -981,6 +987,42 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
 )]
 fn test_generator_function_with_aggregate(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+// Nested generator calls: one generator feeds into another.
+// Exercises the ANF lift for defer-returning Compose sources introduced when
+// `For` was replaced with `Compose+Lambda`.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+// doubles(add_one([1,2,3])) == [4, 6, 8]
+#[case(
+    r#"def add_one(xs):
+    for x in xs:
+        yield x + 1
+def doubles(xs):
+    for x in xs:
+        yield x * 2
+doubles(add_one([1, 2, 3]))"#,
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![0, 1, 2]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6, 8]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+// sum(doubles(add_one([1,2,3]))) == 18
+#[case(
+    r#"def add_one(xs):
+    for x in xs:
+        yield x + 1
+def doubles(xs):
+    for x in xs:
+        yield x * 2
+sum(doubles(add_one([1, 2, 3])))"#,
+    Tile::Scalar(ColumnValue::Ints(vec![18]))
+)]
+fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
 }
 
 // ---------------------------------------------------------------------------

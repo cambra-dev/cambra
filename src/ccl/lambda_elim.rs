@@ -44,6 +44,7 @@ use std::cell::RefCell;
 use std::mem::replace;
 use std::rc::Rc;
 
+use crate::ccl::ccl_utils::typed_compose;
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
 use crate::ccl::{
@@ -447,11 +448,23 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
                 .collect(),
         },
 
-        TypedExprNode::Compose(elts) => TypedExprNode::Compose(
-            elts.into_iter()
+        TypedExprNode::Compose(elts) => {
+            let new_elts: Vec<Expr> = elts
+                .into_iter()
                 .map(|e| substitute(e, name, replacement))
-                .collect(),
-        ),
+                .collect();
+            // After substitution element types may change (e.g. a Var whose type carries
+            // a DeferredCollectionDomain handle gets replaced by a concrete expression with
+            // a resolved domain).  Recompute the outer Fun type so the invariant
+            // `Compose.ty == Fun(first_domain, last_codomain)` is maintained.
+            if let (Some(first), Some(last)) = (new_elts.first(), new_elts.last())
+                && let (Some(new_domain), Some(new_codomain)) =
+                    (first.ty.domain(), last.ty.codomain())
+            {
+                ty = Type::fun(new_domain, new_codomain);
+            }
+            TypedExprNode::Compose(new_elts)
+        }
 
         TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
             input: Box::new(substitute(*input, name, replacement)),
@@ -598,6 +611,43 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr) -> Type {
 }
 
 // ---------------------------------------------------------------------------
+// Filter-pattern helpers
+// ---------------------------------------------------------------------------
+
+/// Return `true` if `body` is a two-branch Case matching the filter pattern:
+/// `{ [guard → action, true → unit] }`.
+///
+/// Used by [`elim_lambdas_impl`] to detect `Compose([src, Lambda(x, filter_body)])`
+/// and lower it to a restricted source composition instead of a plain lambda elimination.
+///
+/// **Shape constraint**: the body must be exactly a `Case` at the top level.
+/// If the loop body has leading `Let` bindings (`let y = f(x) in Case { … }`),
+/// the Case is nested under a `Let` and this function returns `false`, so the
+/// loop compiles via the general path (correct but no `Restrict` operator).
+/// A follow-up could peel leading `Let` nodes before the pattern check.
+fn is_filter_case_body(body: &Expr) -> bool {
+    if let TypedExprNode::Case { branches } = &body.node {
+        branches.len() == 2
+            && matches!(&branches[1].guard.node, TypedExprNode::Lit(Lit::Bool(true)))
+            && matches!(&branches[1].body.node, TypedExprNode::Lit(Lit::Unit))
+    } else {
+        false
+    }
+}
+
+/// Extract `(guard, action)` from a two-branch filter-pattern Case body.
+///
+/// Panics if `body` is not a filter-pattern Case; call [`is_filter_case_body`] first.
+fn extract_filter_case(body: Expr) -> (Expr, Expr) {
+    if let TypedExprNode::Case { mut branches } = body.node {
+        let first = branches.remove(0);
+        (first.guard, first.body)
+    } else {
+        panic!("extract_filter_case: expected a filter-pattern Case body")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core: elim_lambda
 // ---------------------------------------------------------------------------
 
@@ -617,6 +667,18 @@ fn elim_lambda(
     param_ty: &Type,
     body: Expr,
 ) -> Result<Expr, LambdaElimError> {
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+        elim_lambda_impl(ctx, param, param_ty, body)
+    })
+}
+
+fn elim_lambda_impl(
+    ctx: &mut ElimContext,
+    param: &str,
+    param_ty: &Type,
+    body: Expr,
+) -> Result<Expr, LambdaElimError> {
+    log::trace!("elim_lambda: eliminating λ {param}: {}", symbolic(&body));
     debug_typecheck(&body);
     // Capture the body's type before consuming it; the result of eliminating
     // `λ param → body` is a morphism `param_ty → body_ty`.
@@ -925,6 +987,11 @@ fn elim_lambda(
 /// the result is recursed to handle any lambdas in sub-expressions.  Non-lambda
 /// nodes are recursed into to reach nested lambdas.
 fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimError> {
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || elim_lambdas_impl(ctx, expr))
+}
+
+fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimError> {
+    log::trace!("elim_lambdas: eliminating {}", symbolic(&expr));
     debug_typecheck(&expr);
     let TypedExpr {
         node,
@@ -985,6 +1052,61 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
             ty,
             user_annotation,
         })),
+
+        // Filter pattern: Compose([..src.., Lambda(x, Case([guard→action, true→unit]))])
+        // ⟹ src_restricted ≫ elim(x, action)
+        //
+        // Recognised here rather than inside the Lambda arm because the refinement
+        // must be attached to the source (the preceding compose elements), which is
+        // only visible at the Compose level.
+        // TODO once refinements are properly propagated everywhere, we should be able to remove
+        // this special case.
+        //
+        // Early return bypasses the original_ty == e.ty assertion because the
+        // Refinement added to the domain is not present in the inferred compose type.
+        TypedExprNode::Compose(mut terms)
+            if terms.len() >= 2
+                && matches!(
+                    terms.last(),
+                    Some(Expr {
+                        node: TypedExprNode::Lambda {
+                            body,
+                            refinement: None,
+                            ..
+                        },
+                        ..
+                    }) if is_filter_case_body(body)
+                ) =>
+        {
+            let lambda = terms.pop().unwrap();
+            let (param, filter_body) = match lambda.node {
+                TypedExprNode::Lambda { param, body, .. } => (param, *body),
+                _ => unreachable!(),
+            };
+            let (guard, true_body) = extract_filter_case(filter_body);
+            let raw_target = if terms.len() == 1 {
+                terms.remove(0)
+            } else {
+                Expr::compose(terms)
+            };
+            let target_elim = elim_lambdas(ctx, raw_target)?;
+            let pred_elem = elim_lambda(ctx, &param.name, &param.ty, guard)?;
+            let pred_elem = elim_lambdas(ctx, pred_elem)?;
+            let pred_on_source = typed_compose(vec![target_elim.clone(), pred_elem]);
+            let source_domain = target_elim.ty.domain().unwrap();
+            let source_codomain = target_elim.ty.codomain().unwrap();
+            let refinement = Refinement {
+                id: next_refinement_id(),
+                description: "for-filter".into(),
+                kind: RefinementKind::Predicate(Rc::new(RefCell::new(pred_on_source))),
+            };
+            let refined_domain = Type::Refinement(Box::new(source_domain), refinement);
+            let refined_source = target_elim.with_ty(Type::fun(refined_domain, source_codomain));
+            let body_elim = elim_lambda(ctx, &param.name, &param.ty, true_body)?;
+            let result = typed_compose(vec![refined_source, elim_lambdas(ctx, body_elim)?]);
+            debug_typecheck(&result);
+            return Ok(result);
+        }
 
         TypedExprNode::Compose(terms) => Ok(dbg_typecheck_mv(TypedExpr {
             node: TypedExprNode::Compose(

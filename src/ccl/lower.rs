@@ -178,6 +178,16 @@ impl LoweringContext {
         self.next_synthetic_id += 1;
         format!("{TUPLE_ARG_PREFIX}_{id}")
     }
+
+    /// Mint a unique `__result_N` name for the defer handle in generator functions.
+    ///
+    /// Counter-minted to avoid collisions when user code contains a binding
+    /// named `__result` inside the same generator body.
+    fn fresh_result_name(&mut self) -> String {
+        let id = self.next_synthetic_id;
+        self.next_synthetic_id += 1;
+        format!("__result_{id}")
+    }
 }
 
 /// Prefix for synthetic parameter names representing the tupled domain of a
@@ -1281,210 +1291,305 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
 }
 
 // ---------------------------------------------------------------------------
-// Generator lowering — data structures
+// For-loop lowering — For CCL node
 // ---------------------------------------------------------------------------
 
-/// One generator clause in a flattened generator-function chain.
+/// Return `true` if any statement in `stmts` contains a `yield` expression
+/// (checked recursively through `if` guards and nested `for` loops).
 ///
-/// Each `for` loop in the chain produces one `GeneratorSpec`. The `steps`
-/// list captures let-bindings and if-guards encountered between this `for`
-/// and the next `for` (or the terminal `yield`), in source order.
-struct GeneratorSpec {
-    /// Loop variable name (always a simple `Name` target in supported
-    /// programs).
-    iter_var: String,
-    /// Lowered iterable expression.
-    source: Expr,
-    /// Interleaved let-bindings and guards, in source order.
-    steps: Vec<BodyStep>,
-    /// Names introduced at this frame: the iteration variable plus any
-    /// let-bound names. Used by the mutation check.
-    introduced: HashSet<String>,
+/// Does not recurse into `with`/`try` blocks — those are rejected later by
+/// the "only assignments and function definitions" check in `lower_for_body_stmts`.
+fn for_body_has_yield(stmts: &[pyast::Stmt]) -> bool {
+    stmts.iter().any(stmt_has_yield)
 }
 
-/// A single step in a generator body between the enclosing `for` and the
-/// next nested `for` (or the terminal `yield`).
-enum BodyStep {
-    /// Let-binding from an Assign, AnnAssign, AugAssign, or FunctionDef
-    /// statement. The `value` is already lowered to CCL.
-    Let(LetStep),
-    /// Guard from `if cond:` (no else). The `cond` is already lowered; the
-    /// `desc` is a human-readable string for the refinement annotation.
-    Guard { cond: Expr, desc: String },
+fn stmt_has_yield(stmt: &pyast::Stmt) -> bool {
+    match &stmt.node {
+        pyast::StmtKind::Expr { value } => {
+            matches!(&value.node, pyast::ExprKind::Yield { .. })
+        }
+        pyast::StmtKind::If { body, orelse, .. } => {
+            for_body_has_yield(body) || for_body_has_yield(orelse)
+        }
+        pyast::StmtKind::For { body, .. } => for_body_has_yield(body),
+        _ => false,
+    }
 }
 
-/// A single let-binding produced during generator chain walking.
-struct LetStep {
-    name: String,
-    value: Expr,
-    annotation: Option<Type>,
-}
-
-// ---------------------------------------------------------------------------
-// Generator lowering — chain walker
-// ---------------------------------------------------------------------------
-
-/// Walk a chain of nested `for` / `if` / `yield` / `let` statements,
-/// appending one [`GeneratorSpec`] per `for` to `chain` and returning a
-/// reference to the innermost yield value expression.
+/// Lower a `for` statement to a `Compose([src, Lambda(x, body)])` CCL expression.
 ///
-/// Each for-body is parsed as `chain ::= step* term` where:
-/// - `step` ∈ {Assign, AnnAssign, AugAssign, FunctionDef}
-/// - `term` ∈ {`yield expr`, `if cond: chain`, `for target in iter: chain`}
+/// When the body contains `yield`, the loop is desugared:
+/// ```text
+/// for i in src:
+///     yield e
+/// ```
+/// becomes
+/// ```text
+/// let __result = defer() in
+///     (src ≫ λi → feed(__result, e)); __result
+/// ```
 ///
-/// The mutation rule: an assignment `name = expr` is a let-binding iff
-/// `name` is either fresh (not previously bound) or in the current for's
-/// `introduced` set. If `name` is in an outer for-frame or in
-/// `outer_bindings` (function args + pre-loop lets), it's mutation and
-/// rejected.
-fn collect_chain<'ast>(
-    stmts: &'ast [pyast::Stmt],
-    chain: &mut Vec<GeneratorSpec>,
+/// When the body uses `<<` directly (feeding into a pre-existing defer), the
+/// Compose+Lambda is returned with `Unit` type.
+///
+/// `outer_bindings` carries all names in scope above this loop (function args
+/// and preceding lets). Assignments to these names inside the body are rejected
+/// as mutation.
+fn lower_generator_for(
+    target: &pyast::Located<pyast::ExprKind>,
+    iter: &pyast::Located<pyast::ExprKind>,
+    body: &[pyast::Stmt],
     outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
-) -> Result<&'ast pyast::Expr, LoweringError> {
-    if stmts.is_empty() {
-        return Err(LoweringError::Unsupported(
-            "Empty generator for-loop body".into(),
-        ));
-    }
+) -> Result<Expr, LoweringError> {
+    let iter_var = extract_name_target(target, "for-loop target")?;
+    let source = lower_expr(iter, ctx)?;
 
+    // `outer_bindings` is the mutation scope — the iter_var is introduced by
+    // the for clause itself and may be shadowed (re-let) inside the body.
+    let frame_introduced = HashSet::from([iter_var.clone()]);
+
+    if for_body_has_yield(body) {
+        // Desugar yield → defer + feed.
+        let defer_name = ctx.fresh_result_name();
+        let for_body = lower_for_body_stmts(
+            body,
+            Some(&defer_name),
+            outer_bindings,
+            frame_introduced,
+            ctx,
+        )?;
+        let for_node = Expr::for_loop(iter_var, source, for_body);
+        let seq = Expr::expr_stmt(for_node, Expr::var(defer_name.clone()));
+        Ok(Expr::let_bind(
+            defer_name,
+            Expr::new(TypedExprNode::Defer),
+            seq,
+        ))
+    } else {
+        let for_body = lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)?;
+        Ok(Expr::for_loop(iter_var, source, for_body))
+    }
+}
+
+/// Lower the body statements of a `for`-loop to a single CCL expression.
+///
+/// Leading statements are lowered to nested [`TypedExprNode::Let`] bindings.
+/// The final statement is lowered by [`lower_for_body_terminal`].
+///
+/// `defer_name` — if `Some`, `yield e` terminals are replaced with
+/// `feed(defer_name, e)`. If `None`, a `yield` is an error.
+///
+/// `mutation_scope` — names that cannot be assigned to (function args,
+/// pre-loop lets, and enclosing for's iteration variables). Assignments to
+/// these produce a mutation error.
+///
+/// `frame_introduced` — names introduced by the current for clause (the
+/// iteration variable) and any let-bindings accumulated so far. These may
+/// be re-bound (shadowed) inside the body without triggering a mutation error.
+fn lower_for_body_stmts(
+    stmts: &[pyast::Stmt],
+    defer_name: Option<&str>,
+    mutation_scope: &HashSet<String>,
+    mut frame_introduced: HashSet<String>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    if stmts.is_empty() {
+        return Err(LoweringError::Unsupported("Empty for-loop body".into()));
+    }
     let (last, rest) = stmts.split_last().unwrap();
 
-    // Process leading statements as let-binding steps.
+    let mut bindings: Vec<(String, Expr, Option<Type>)> = Vec::new();
+
     for stmt in rest {
-        process_chain_step(stmt, chain, outer_bindings, ctx)?;
+        match &stmt.node {
+            pyast::StmtKind::Assign { targets, value, .. } => {
+                if targets.len() != 1 {
+                    return Err(LoweringError::Unsupported(
+                        "Multiple assignment targets not supported".into(),
+                    ));
+                }
+                let name = extract_name_target(&targets[0], "assignment")?;
+                if mutation_scope.contains(&name) {
+                    return Err(LoweringError::Unsupported(format!(
+                        "Assignment to `{name}` is mutation: `{name}` is bound \
+                         outside the for-loop body (function argument or \
+                         pre-loop binding)",
+                    )));
+                }
+                let val = lower_expr(value, ctx)?;
+                frame_introduced.insert(name.clone());
+                bindings.push((name, val, None));
+            }
+            pyast::StmtKind::AnnAssign {
+                target,
+                annotation,
+                value: Some(value),
+                ..
+            } => {
+                let name = extract_name_target(target, "annotated assignment")?;
+                if mutation_scope.contains(&name) {
+                    return Err(LoweringError::Unsupported(format!(
+                        "Assignment to `{name}` is mutation: `{name}` is bound \
+                         outside the for-loop body (function argument or \
+                         pre-loop binding)",
+                    )));
+                }
+                let ann = lower_type_annotation(annotation)?;
+                let val = lower_expr(value, ctx)?;
+                frame_introduced.insert(name.clone());
+                bindings.push((name, val, Some(ann)));
+            }
+            pyast::StmtKind::AnnAssign { value: None, .. } => {
+                return Err(LoweringError::Unsupported(
+                    "Annotated assignment without a value is not supported".into(),
+                ));
+            }
+            pyast::StmtKind::AugAssign { target, op, value } => {
+                if *op == pyast::Operator::LShift {
+                    return Err(LoweringError::Unsupported(
+                        "`<<=` as a non-terminal statement in a for-loop body \
+                         is not supported"
+                            .into(),
+                    ));
+                }
+                let name = extract_name_target(target, "augmented assignment")?;
+                if mutation_scope.contains(&name) {
+                    return Err(LoweringError::Unsupported(format!(
+                        "Assignment to `{name}` is mutation: `{name}` is bound \
+                         outside the for-loop body (function argument or \
+                         pre-loop binding)",
+                    )));
+                }
+                // x op= e is only valid if x was already introduced in this frame.
+                if !frame_introduced.contains(&name) {
+                    return Err(LoweringError::Unsupported(format!(
+                        "Augmented assignment to `{name}` in for-loop body: \
+                         `{name}` is not bound in this body. Use `{name} = expr` \
+                         for a fresh binding.",
+                    )));
+                }
+                let val = lower_binop(target, op, value, ctx)?;
+                bindings.push((name, val, None));
+            }
+            pyast::StmtKind::FunctionDef {
+                name,
+                args,
+                body: fn_body,
+                decorator_list,
+                ..
+            } => {
+                if !decorator_list.is_empty() {
+                    return Err(LoweringError::Unsupported(
+                        "Function decorators are not supported".into(),
+                    ));
+                }
+                if mutation_scope.contains(name.as_str()) {
+                    return Err(LoweringError::Unsupported(format!(
+                        "Assignment to `{name}` is mutation: `{name}` is bound \
+                         outside the for-loop body (function argument or \
+                         pre-loop binding)",
+                    )));
+                }
+                let func_expr = lower_function_body(args, fn_body, ctx)?;
+                frame_introduced.insert(name.clone());
+                bindings.push((name.clone(), func_expr, None));
+            }
+            _ => {
+                return Err(LoweringError::Unsupported(
+                    "Only assignments and function definitions are supported as \
+                     non-terminal statements in for-loop bodies"
+                        .into(),
+                ));
+            }
+        }
     }
 
-    // Process the final statement as a chain terminator.
-    process_chain_terminator(last, chain, outer_bindings, ctx)
+    let terminal =
+        lower_for_body_terminal(last, defer_name, mutation_scope, &frame_introduced, ctx)?;
+
+    // Fold let-bindings around the terminal from outermost to innermost.
+    Ok(bindings
+        .into_iter()
+        .rev()
+        .fold(terminal, |body, (name, val, ann)| match ann {
+            Some(a) => Expr::let_bind_annotated(name, val, body, a),
+            None => Expr::let_bind(name, val, body),
+        }))
 }
 
-/// Process a non-terminal statement in a generator chain as a let-binding.
-fn process_chain_step(
+/// Lower the terminal (last) statement of a for-loop body.
+///
+/// Valid terminals:
+/// - `yield e` — `Feed(defer_name, lower(e))` (requires `defer_name` to be set)
+/// - `r << e` — `Feed("r", lower(e))`
+/// - `if cond: body` (no else) — `Case` with `Unit` fallthrough
+/// - `for j in ys: body` — nested `Compose([ys, Lambda(j, body)])`
+///
+/// `mutation_scope` and `frame_introduced` carry the same semantics as in
+/// [`lower_for_body_stmts`]; they are threaded through for recursive calls.
+fn lower_for_body_terminal(
     stmt: &pyast::Stmt,
-    chain: &mut Vec<GeneratorSpec>,
-    outer_bindings: &HashSet<String>,
+    defer_name: Option<&str>,
+    mutation_scope: &HashSet<String>,
+    frame_introduced: &HashSet<String>,
     ctx: &mut LoweringContext,
-) -> Result<(), LoweringError> {
-    match &stmt.node {
-        pyast::StmtKind::Assign { targets, value, .. } => {
-            if targets.len() != 1 {
-                return Err(LoweringError::Unsupported(
-                    "Multiple assignment targets not supported".into(),
-                ));
-            }
-            let name = extract_name_target(&targets[0], "assignment")?;
-            check_generator_mutation(&name, chain, outer_bindings)?;
-            let val = lower_expr(value, ctx)?;
-            push_generator_let(chain, name, val, None);
-            Ok(())
-        }
-        pyast::StmtKind::AnnAssign {
-            target,
-            annotation,
-            value: Some(value),
-            ..
-        } => {
-            let name = extract_name_target(target, "annotated assignment")?;
-            check_generator_mutation(&name, chain, outer_bindings)?;
-            let ann = lower_type_annotation(annotation)?;
-            let val = lower_expr(value, ctx)?;
-            push_generator_let(chain, name, val, Some(ann));
-            Ok(())
-        }
-        pyast::StmtKind::AnnAssign { value: None, .. } => Err(LoweringError::Unsupported(
-            "Annotated assignment without a value is not supported".into(),
-        )),
-        pyast::StmtKind::AugAssign { target, op, value } => {
-            if *op == pyast::Operator::LShift {
-                todo!();
-            }
-            let name = extract_name_target(target, "augmented assignment")?;
-            // x op= e desugars to x = x op e. The RHS reads the OLD value
-            // of x, so x must already be in scope. If it's not in the
-            // current frame's introduced set, it's either from an outer
-            // scope (= mutation) or undefined.
-            let current = &chain.last().expect("chain non-empty").introduced;
-            if !current.contains(&name) {
-                return Err(LoweringError::Unsupported(format!(
-                    "Augmented assignment to `{name}` in generator: `{name}` is \
-                     not bound in this for-body. If it's from an outer scope, \
-                     this is mutation; if fresh, use `{name} = expr` instead.",
-                )));
-            }
-            let val = lower_binop(target, op, value, ctx)?;
-            push_generator_let(chain, name, val, None);
-            Ok(())
-        }
-        // Allow plain expressions as statements, since they may have side effects.
-        pyast::StmtKind::Expr { .. } => {
-            todo!();
-        }
-        pyast::StmtKind::FunctionDef {
-            name,
-            args,
-            body: fn_body,
-            decorator_list,
-            ..
-        } => {
-            if !decorator_list.is_empty() {
-                return Err(LoweringError::Unsupported(
-                    "Function decorators are not supported".into(),
-                ));
-            }
-            check_generator_mutation(name, chain, outer_bindings)?;
-            let func_expr = lower_function_body(args, fn_body, ctx)?;
-            push_generator_let(chain, name.clone(), func_expr, None);
-            Ok(())
-        }
-        _ => Err(LoweringError::Unsupported(
-            "Only assignments and function definitions are supported as \
-             non-terminal statements in generator for-bodies"
-                .into(),
-        )),
-    }
-}
-
-/// Process the terminal statement in a generator chain (yield, nested for,
-/// or if-guard continuing the chain).
-fn process_chain_terminator<'ast>(
-    stmt: &'ast pyast::Stmt,
-    chain: &mut Vec<GeneratorSpec>,
-    outer_bindings: &HashSet<String>,
-    ctx: &mut LoweringContext,
-) -> Result<&'ast pyast::Expr, LoweringError> {
+) -> Result<Expr, LoweringError> {
     match &stmt.node {
         pyast::StmtKind::Expr { value } => match &value.node {
-            pyast::ExprKind::Yield {
-                value: Some(yield_val),
-            } => Ok(yield_val.as_ref()),
+            pyast::ExprKind::Yield { value: Some(y) } => {
+                let name = defer_name.ok_or_else(|| {
+                    LoweringError::Unsupported("yield outside a generator for-loop context".into())
+                })?;
+                Ok(Expr::feed(name.to_string(), lower_expr(y, ctx)?))
+            }
             pyast::ExprKind::Yield { value: None } => Err(LoweringError::Unsupported(
                 "yield without a value is not supported in generators".into(),
             )),
-            pyast::ExprKind::BinOp { op, .. } if *op == pyast::Operator::LShift => Ok(value),
+            // `r << e` — direct feed into a named defer handle.
+            // Note: when inside a yield-bearing generator (defer_name is Some),
+            // `r` is not validated to equal defer_name; a mismatch would
+            // type-check via inference but could produce confusing behaviour.
+            // A future improvement could add a lowering-time error here.
+            pyast::ExprKind::BinOp { left, op, right } if *op == pyast::Operator::LShift => {
+                lower_feed(left, right, ctx)
+            }
             _ => Err(LoweringError::Unsupported(
-                "Generator for-body must end in a yield expression, \
-                 nested for, or if-guard"
+                "For-loop body must end in a yield, `<<` feed, nested for, \
+                 or if-guard"
                     .into(),
             )),
         },
         pyast::StmtKind::If { test, body, orelse } => {
             if !orelse.is_empty() {
                 return Err(LoweringError::Unsupported(
-                    "if/else inside generator for-loop is not supported; \
-                     use a list comprehension with an if-filter instead"
+                    "if/else inside generator for-loop body is not supported; \
+                     use a plain if-guard (no else branch)"
                         .into(),
                 ));
             }
             let cond = lower_expr(test, ctx)?;
-            let desc = format!("{test}");
-            chain
-                .last_mut()
-                .expect("chain non-empty")
-                .steps
-                .push(BodyStep::Guard { cond, desc });
-            collect_chain(body, chain, outer_bindings, ctx)
+            // Same frame: pass through mutation_scope and frame_introduced
+            // unchanged so that the iter_var remains shadowable inside the guard.
+            let true_arm = lower_for_body_stmts(
+                body,
+                defer_name,
+                mutation_scope,
+                frame_introduced.clone(),
+                ctx,
+            )?;
+            Ok(Expr::new(TypedExprNode::Case {
+                branches: vec![
+                    Branch {
+                        guard: cond,
+                        body: true_arm,
+                    },
+                    Branch {
+                        guard: Expr::lit(Lit::Bool(true)),
+                        body: Expr::lit(Lit::Unit),
+                    },
+                ],
+            }))
         }
         pyast::StmtKind::For {
             target,
@@ -1495,228 +1600,24 @@ fn process_chain_terminator<'ast>(
         } => {
             if !orelse.is_empty() {
                 return Err(LoweringError::Unsupported(
-                    "for/else is not supported inside generator functions".into(),
+                    "for/else is not supported inside generator for-loop bodies".into(),
                 ));
             }
-            let iter_var = extract_name_target(target, "for-loop target")?;
-            let source = lower_expr(iter, ctx)?;
-            let mut introduced = HashSet::new();
-            introduced.insert(iter_var.clone());
-            chain.push(GeneratorSpec {
-                iter_var,
-                source,
-                steps: vec![],
-                introduced,
-            });
-            collect_chain(body, chain, outer_bindings, ctx)
+            let inner_var = extract_name_target(target, "for-loop target")?;
+            let inner_source = lower_expr(iter, ctx)?;
+            // New frame: the outer frame's names (including iter_var) move into
+            // mutation_scope so that the inner body cannot mutate them.
+            let mut inner_mutation_scope = mutation_scope.clone();
+            inner_mutation_scope.extend(frame_introduced.iter().cloned());
+            let inner_frame = HashSet::from([inner_var.clone()]);
+            let inner_body =
+                lower_for_body_stmts(body, defer_name, &inner_mutation_scope, inner_frame, ctx)?;
+            Ok(Expr::for_loop(inner_var, inner_source, inner_body))
         }
         _ => Err(LoweringError::Unsupported(
-            "Generator for-body must end in a yield expression, \
-             nested for, or if-guard"
-                .into(),
+            "For-loop body must end in a yield, `<<` feed, nested for, or if-guard".into(),
         )),
     }
-}
-
-/// Check whether assigning `name` inside the current generator chain
-/// constitutes mutation (rejectable) or a let-binding (allowed).
-///
-/// A name is allowed if it's in the current frame's `introduced` set
-/// (shadowing) or if it's fresh (not in any frame or outer bindings).
-/// Anything else is mutation.
-fn check_generator_mutation(
-    name: &str,
-    chain: &[GeneratorSpec],
-    outer_bindings: &HashSet<String>,
-) -> Result<(), LoweringError> {
-    let current_idx = chain.len() - 1;
-    // Shadowing within current frame is always fine.
-    if chain[current_idx].introduced.contains(name) {
-        return Ok(());
-    }
-    // Name in an outer for-frame → mutation across iterations.
-    for outer_frame in &chain[..current_idx] {
-        if outer_frame.introduced.contains(name) {
-            return Err(LoweringError::Unsupported(format!(
-                "Assignment to `{name}` inside a nested for-body is mutation: \
-                 `{name}` was introduced by an enclosing for-loop",
-            )));
-        }
-    }
-    // Name in function scope → mutation of function arg or pre-loop let.
-    if outer_bindings.contains(name) {
-        return Err(LoweringError::Unsupported(format!(
-            "Assignment to `{name}` is mutation: `{name}` is bound outside \
-             the generator's for-loop (function argument or pre-loop binding)",
-        )));
-    }
-    // Fresh name — will be added to introduced by push_generator_let.
-    Ok(())
-}
-
-/// Push a let-binding step onto the innermost generator in the chain and
-/// record the name as introduced in the current frame.
-#[allow(clippy::ptr_arg)] // Vec is needed: callers also push/last_mut.
-fn push_generator_let(
-    chain: &mut Vec<GeneratorSpec>,
-    name: String,
-    value: Expr,
-    annotation: Option<Type>,
-) {
-    let frame = chain.last_mut().expect("chain non-empty");
-    frame.introduced.insert(name.clone());
-    frame.steps.push(BodyStep::Let(LetStep {
-        name,
-        value,
-        annotation,
-    }));
-}
-
-// ---------------------------------------------------------------------------
-// Generator lowering — for-stmt entry point and chain → CCL conversion
-// ---------------------------------------------------------------------------
-
-/// Lower a `for` statement that terminates a statement block as a generator
-/// pattern: a chain of nested `for` / `if` / `yield` / `let` lowered to
-/// the Lambda/Apply encoding used for list comprehensions.
-///
-/// `outer_bindings` carries names in scope above this for (function args +
-/// preceding lets). The mutation check uses this to reject assignments to
-/// names from enclosing scopes.
-fn lower_generator_for(
-    target: &pyast::Located<pyast::ExprKind>,
-    iter: &pyast::Located<pyast::ExprKind>,
-    body: &[pyast::Stmt],
-    outer_bindings: &HashSet<String>,
-    ctx: &mut LoweringContext,
-) -> Result<Expr, LoweringError> {
-    let iter_var = extract_name_target(target, "for-loop target")?;
-    let source = lower_expr(iter, ctx)?;
-    let mut introduced = HashSet::new();
-    introduced.insert(iter_var.clone());
-
-    let mut chain = vec![GeneratorSpec {
-        iter_var,
-        source,
-        steps: vec![],
-        introduced,
-    }];
-    let yield_expr_ast = collect_chain(body, &mut chain, outer_bindings, ctx)?;
-    let yield_expr = lower_expr(yield_expr_ast, ctx)?;
-
-    lower_generator_chain(chain, yield_expr)
-}
-
-/// Convert a fully-populated generator chain into a CCL expression.
-///
-/// Produces the same Lambda/Apply tiling encoding as [`lower_list_comp`]
-/// but with `Expr::Let` nodes interleaved for per-generator let-bindings,
-/// and a combined refinement closure when any guards are present.
-fn lower_generator_chain(
-    chain: Vec<GeneratorSpec>,
-    yield_expr: Expr,
-) -> Result<Expr, LoweringError> {
-    let outer_var = "__iter_record";
-    let single_gen = chain.len() == 1;
-
-    let make_idx_arg = |var: &str, i: usize| -> Expr {
-        let vref = Expr::var(var.to_string());
-        if single_gen {
-            vref
-        } else {
-            Expr::apply(vref, Expr::proj_index(i))
-        }
-    };
-
-    let any_guards = chain
-        .iter()
-        .any(|g| g.steps.iter().any(|s| matches!(s, BodyStep::Guard { .. })));
-
-    // ---- Build the body expression (innermost-first) ----
-    let mut body_expr = yield_expr.clone();
-    for (i, generator) in chain.iter().enumerate().rev() {
-        // Wrap body in this generator's lets (reverse source order so
-        // outermost let wraps everything inside).
-        for step in generator.steps.iter().rev() {
-            if let BodyStep::Let(ls) = step {
-                body_expr = match &ls.annotation {
-                    Some(ann) => Expr::let_bind_annotated(
-                        ls.name.clone(),
-                        ls.value.clone(),
-                        body_expr,
-                        ann.clone(),
-                    ),
-                    None => Expr::let_bind(ls.name.clone(), ls.value.clone(), body_expr),
-                };
-            }
-        }
-        body_expr = Expr::apply(
-            Expr::apply(make_idx_arg(outer_var, i), generator.source.clone()),
-            Expr::lambda(&generator.iter_var, Type::Hole, body_expr),
-        );
-    }
-
-    if !any_guards {
-        return Ok(Expr::lambda(outer_var, Type::Hole, body_expr));
-    }
-
-    // ---- Build the refinement closure ----
-    // Same structure as the body, but the innermost expression is the
-    // AND-conjunction of all guards (instead of the yield expression).
-    let restr_outer_var = "__iter_record_restr";
-
-    let mut all_guards: Vec<Expr> = Vec::new();
-    let mut guard_descs: Vec<String> = Vec::new();
-    for generator in &chain {
-        for step in &generator.steps {
-            if let BodyStep::Guard { cond, desc } = step {
-                all_guards.push(cond.clone());
-                guard_descs.push(desc.clone());
-            }
-        }
-    }
-    let pred_inner = all_guards
-        .into_iter()
-        .reduce(|acc, g| Expr::binop(acc, BinOpKind::BoolLogic(LogicKind::And), g))
-        .expect("any_guards is true");
-    let pred_desc = guard_descs.join(" and ");
-
-    let mut pred_expr = pred_inner;
-    for (i, generator) in chain.iter().enumerate().rev() {
-        for step in generator.steps.iter().rev() {
-            if let BodyStep::Let(ls) = step {
-                pred_expr = match &ls.annotation {
-                    Some(ann) => Expr::let_bind_annotated(
-                        ls.name.clone(),
-                        ls.value.clone(),
-                        pred_expr,
-                        ann.clone(),
-                    ),
-                    None => Expr::let_bind(ls.name.clone(), ls.value.clone(), pred_expr),
-                };
-            }
-        }
-        let restr_idx = {
-            let vref = Expr::var(restr_outer_var.to_string());
-            if single_gen {
-                vref
-            } else {
-                Expr::apply(vref, Expr::proj_index(i))
-            }
-        };
-        pred_expr = Expr::apply(
-            Expr::apply(restr_idx, generator.source.clone()),
-            Expr::lambda(&generator.iter_var, Type::Hole, pred_expr),
-        );
-    }
-
-    Ok(Expr::lambda_with_refinement(
-        outer_var,
-        Type::Hole,
-        body_expr,
-        Expr::lambda(restr_outer_var, Type::Hole, pred_expr),
-        &pred_desc,
-    ))
 }
 
 /// Lower a Python function definition body to a CCL expression.
@@ -2337,7 +2238,8 @@ def doubles(xs):
         yield x * 2
 doubles",
         "\
-let doubles : (_ ⇒ (_ ⇒ _)) = λ xs → λ __iter_record → __iter_record ▷ xs ▷ (λ x → x * 2)
+let doubles : (_ ⇒ _) = λ xs → let __result_0 = defer
+in xs ≫ (λ x → feed(__result_0, x * 2)); __result_0
 in doubles"
     )]
     // Multi-param generator: captures outer parameter. Uncurried params
@@ -2349,10 +2251,11 @@ def add_to(xs, n):
         yield x + n
 add_to",
         "\
-let add_to : (_ ⇒ (_ ⇒ _)) = λ __arg_tuple_0 → λ __iter_record → __iter_record ▷ (__arg_tuple_0.0) ▷ (λ x → x + __arg_tuple_0.1)
+let add_to : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
+in __arg_tuple_1.0 ≫ (λ x → feed(__result_0, x + __arg_tuple_1.1)); __result_0
 in add_to"
     )]
-    // Generator with if-guard: filter pattern.
+    // Generator with if-guard: guard becomes a Case in the For body.
     #[case(
         "\
 def positives(xs):
@@ -2361,11 +2264,11 @@ def positives(xs):
             yield x
 positives",
         "\
-let positives : (_ ⇒ _) = λ xs → λ __iter_record : {??? | Refined((λ __iter_record_restr → __iter_record_restr ▷ xs ▷ (λ x → x > 0)))} → __iter_record ▷ xs ▷ (λ x → x)
+let positives : (_ ⇒ _) = λ xs → let __result_0 = defer
+in xs ≫ (λ x → { x > 0 → feed(__result_0, x); true → unit }); __result_0
 in positives"
     )]
     // Nested for-loops: inner iter independent of outer loop variable.
-    // Equivalent to `[x + y for x in xs for y in ys]`.
     #[case(
         "\
 def cross(xs, ys):
@@ -2374,11 +2277,11 @@ def cross(xs, ys):
             yield x + y
 cross",
         "\
-let cross : (_ ⇒ (_ ⇒ _)) = λ __arg_tuple_0 → λ __iter_record → __iter_record.0 ▷ (__arg_tuple_0.0) ▷ (λ x → __iter_record.1 ▷ (__arg_tuple_0.1) ▷ (λ y → x + y))
+let cross : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
+in __arg_tuple_1.0 ≫ (λ x → __arg_tuple_1.1 ≫ (λ y → feed(__result_0, x + y))); __result_0
 in cross"
     )]
-    // Three-level cartesian product.
-    // Equivalent to `[x + y + z for x in xs for y in ys for z in zs]`.
+    // Three-level nested for.
     #[case(
         "\
 def triple(xs, ys, zs):
@@ -2388,11 +2291,11 @@ def triple(xs, ys, zs):
                 yield x + y + z
 triple",
         "\
-let triple : (_ ⇒ (_ ⇒ _)) = λ __arg_tuple_0 → λ __iter_record → __iter_record.0 ▷ (__arg_tuple_0.0) ▷ (λ x → __iter_record.1 ▷ (__arg_tuple_0.1) ▷ (λ y → __iter_record.2 ▷ (__arg_tuple_0.2) ▷ (λ z → x + y + z)))
+let triple : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
+in __arg_tuple_1.0 ≫ (λ x → __arg_tuple_1.1 ≫ (λ y → __arg_tuple_1.2 ≫ (λ z → feed(__result_0, x + y + z)))); __result_0
 in triple"
     )]
-    // Guard sits between the outer and inner `for`: filters `x` before
-    // entering the inner loop. Equivalent to `[y for x in xs if x > 0 for y in ys]`.
+    // Guard before inner for: Case wraps the nested For node.
     #[case(
         "\
 def cross_filtered(xs, ys):
@@ -2402,7 +2305,8 @@ def cross_filtered(xs, ys):
                 yield y
 cross_filtered",
         "\
-let cross_filtered : (_ ⇒ _) = λ __arg_tuple_0 → λ __iter_record : {??? | Refined((λ __iter_record_restr → __iter_record_restr.0 ▷ (__arg_tuple_0.0) ▷ (λ x → __iter_record_restr.1 ▷ (__arg_tuple_0.1) ▷ (λ y → x > 0))))} → __iter_record.0 ▷ (__arg_tuple_0.0) ▷ (λ x → __iter_record.1 ▷ (__arg_tuple_0.1) ▷ (λ y → y))
+let cross_filtered : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
+in __arg_tuple_1.0 ≫ (λ x → { x > 0 → __arg_tuple_1.1 ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
 in cross_filtered"
     )]
     // Let-binding in generator body: y is a fresh local per iteration.
@@ -2414,11 +2318,12 @@ def with_let(xs):
         yield y * 2
 with_let",
         "\
-let with_let : (_ ⇒ (_ ⇒ _)) = λ xs → λ __iter_record → __iter_record ▷ xs ▷ (λ x → let y = x + 1
-in y * 2)
+let with_let : (_ ⇒ _) = λ xs → let __result_0 = defer
+in xs ≫ (λ x → let y = x + 1
+in feed(__result_0, y * 2)); __result_0
 in with_let"
     )]
-    // Iter-var shadowing: x = x + 1 shadows the iter var.
+    // Iter-var shadowing: x = x + 1 re-binds x as a let inside the For body.
     #[case(
         "\
 def shadow(xs):
@@ -2427,12 +2332,12 @@ def shadow(xs):
         yield x
 shadow",
         "\
-let shadow : (_ ⇒ (_ ⇒ _)) = λ xs → λ __iter_record → __iter_record ▷ xs ▷ (λ x → let x = x + 1
-in x)
+let shadow : (_ ⇒ _) = λ xs → let __result_0 = defer
+in xs ≫ (λ x → let x = x + 1
+in feed(__result_0, x)); __result_0
 in shadow"
     )]
-    // Dependent inner iter: inner iter references outer iter var. Now
-    // supported (the inner source is in scope of the outer lambda).
+    // Dependent inner iter: inner source references the outer iter var.
     #[case(
         "\
 def dep(xss):
@@ -2441,7 +2346,8 @@ def dep(xss):
             yield x
 dep",
         "\
-let dep : (_ ⇒ (_ ⇒ _)) = λ xss → λ __iter_record → __iter_record.0 ▷ xss ▷ (λ xs → __iter_record.1 ▷ xs ▷ (λ x → x))
+let dep : (_ ⇒ _) = λ xss → let __result_0 = defer
+in xss ≫ (λ xs → xs ≫ (λ x → feed(__result_0, x))); __result_0
 in dep"
     )]
     // Let inside an if-guard body.
@@ -2454,9 +2360,9 @@ def guarded_let(xs):
             yield y
 guarded_let",
         "\
-let guarded_let : (_ ⇒ _) = λ xs → λ __iter_record : {??? | Refined((λ __iter_record_restr → __iter_record_restr ▷ xs ▷ (λ x → let y = x * 2
-in x > 0)))} → __iter_record ▷ xs ▷ (λ x → let y = x * 2
-in y)
+let guarded_let : (_ ⇒ _) = λ xs → let __result_0 = defer
+in xs ≫ (λ x → { x > 0 → let y = x * 2
+in feed(__result_0, y); true → unit }); __result_0
 in guarded_let"
     )]
     fn test_lower_generator_fn(#[case] code: &str, #[case] expected: &str) {
