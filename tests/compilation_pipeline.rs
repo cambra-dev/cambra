@@ -21,7 +21,7 @@ use std::time::Duration;
 use bit_set::BitSet;
 use bit_vec::BitVec;
 use cambra::ccl::Expr;
-use cambra::ccl::context::compile_program;
+use cambra::ccl::context::{CompileResultExt, compile_program};
 use cambra::ccl::{Type, context::GlobalContext};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
@@ -49,7 +49,7 @@ fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Expr, Tile) {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut compiled = compile_program(ctx, code, consumer);
+    let mut compiled = compile_program(ctx, code, consumer).unwrap_or_render("<test>", code);
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow(), "expected notification (pipeline path)");
     let producer = compiled
@@ -540,11 +540,8 @@ fn test_datasource_named_record_join() {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut compiled = compile_program(
-        &mut ctx,
-        "[(x.label, y.label) for x in src1() for y in src2() if x.id == y.id]",
-        consumer,
-    );
+    let code = "[(x.label, y.label) for x in src1() for y in src2() if x.id == y.id]";
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -1186,7 +1183,7 @@ fn test_test_source(#[case] code: &str) {
         *notified_clone.borrow_mut() = true;
     });
 
-    let mut compiled = compile_program(&mut ctx, code, consumer);
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -1247,7 +1244,7 @@ fn test_source_filter_nonterminal() {
         *notified_clone.borrow_mut() = true;
     });
     let code = "[s for s in source1() if s < 15]";
-    let mut compiled = compile_program(&mut ctx, code, consumer);
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -1323,8 +1320,8 @@ fn test_inner_join(#[case] code: &str) {
         *notified_clone.borrow_mut() = true;
     });
 
-    // let mut producer = ctx.compile_program(code, consumer);
-    let mut compiled = compile_program(&mut ctx, code, consumer);
+    // let mut producer = ctx.compile_program(code, consumer).unwrap_or_render("<test>", code);
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -1501,7 +1498,7 @@ fn test_incremental_join_simple(#[case] code: &str) {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut compiled = compile_program(&mut ctx, code, consumer);
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
     ctx.scheduler().check_for_notifications();
     assert!(*notified.borrow());
@@ -1585,7 +1582,8 @@ fn test_incremental_global_aggregate() {
         Extent::Base(BaseType::Int),
     )));
     ctx.register_source(test_source.clone());
-    let mut compiled = compile_program(&mut ctx, code, Box::new(|| {}));
+    let mut compiled =
+        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<test>", code);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
@@ -1645,7 +1643,7 @@ fn test_incremental_aggregates() {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut compiled = compile_program(&mut ctx, code, consumer);
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
     let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
 
     ctx.scheduler().check_for_notifications();
@@ -1712,7 +1710,8 @@ fn test_incremental_aggregates() {
 #[case("[x for x in [1,2,3] if x + 1 < 2]")]
 #[case("1 + 2 + 3")]
 fn test_no_fan_outs(#[case] code: &str) {
-    let compiled = compile_program(&mut GlobalContext::default(), code, Box::new(|| {}));
+    let compiled = compile_program(&mut GlobalContext::default(), code, Box::new(|| {}))
+        .unwrap_or_render("<test>", code);
     let op = &compiled.main().unwrap().op;
     let op_str = pretty_tile_operator(op.as_ref());
     assert!(!op_str.contains("FanOut#"), "found fan-out in {op_str}");

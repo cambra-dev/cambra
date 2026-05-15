@@ -14,8 +14,13 @@ use cambra::{
 };
 use log::debug;
 
-/// Runs a Cambra program given as a string of Python code.
-fn run_program(code: &str, inspect_port: Option<u16>) {
+/// Runs a Cambra program from a source string.
+///
+/// `src_name` is the label shown in error reports (typically the input
+/// file name). Returns `Err(())` if compilation failed; the error has
+/// already been rendered to stderr by [`CompileError::eprint`], so the
+/// caller's job is just to exit non-zero.
+fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<(), ()> {
     use std::{cell::RefCell, rc::Rc};
 
     let new_data = Rc::new(RefCell::new(false));
@@ -26,7 +31,13 @@ fn run_program(code: &str, inspect_port: Option<u16>) {
     });
 
     let mut ctx = GlobalContext::default();
-    let mut compiled = compile_program(&mut ctx, code, consumer);
+    let mut compiled = match compile_program(&mut ctx, code, consumer) {
+        Ok(c) => c,
+        Err(e) => {
+            e.eprint(src_name, code);
+            return Err(());
+        }
+    };
 
     let inspector = inspect_port.map(|port| {
         // Render every output's operator tree.  The AST shown is the full
@@ -109,6 +120,8 @@ fn run_program(code: &str, inspect_port: Option<u16>) {
             thread::sleep(Duration::from_millis(10));
         }
     }
+
+    Ok(())
 }
 
 /// Runs a given Cambra file, specified as the first command-line argument.
@@ -136,7 +149,9 @@ fn main() {
 
     let code = std::fs::read_to_string(&input_file).expect("Failed to read input file");
 
-    run_program(&code, inspect_port);
+    if run_program(&input_file, &code, inspect_port).is_err() {
+        std::process::exit(1);
+    }
 
     if let Some(port) = inspect_port {
         eprintln!("Program finished. Inspector at http://localhost:{port} — press Ctrl+C to exit.");
@@ -153,6 +168,6 @@ mod tests {
 
     #[test]
     fn test_run_program() {
-        run_program("x = 1; x", None);
+        run_program("<test>", "x = 1; x", None).unwrap();
     }
 }

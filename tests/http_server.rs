@@ -15,13 +15,13 @@ use std::{
 
 use cambra::{
     ccl::{
-        context::{GlobalContext, compile_program},
+        context::{CompileResultExt, GlobalContext, compile_program},
         lower::{LoweringContext, LoweringError, lower_stmts},
     },
+    chl_parser,
     interpreter::Consumer,
 };
 use rstest_log::rstest;
-use rustpython_parser::{ast as pyast, parser};
 use test_log::test;
 
 // ---------------------------------------------------------------------------
@@ -135,7 +135,7 @@ fn test_http_serve_echo() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer);
+    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
 
     // Give tiny_http a moment to bind the port before the client connects.
     thread::sleep(Duration::from_millis(50));
@@ -164,7 +164,7 @@ fn test_http_serve_const() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer);
+    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
 
     // Give tiny_http a moment to bind the port before the client connects.
     thread::sleep(Duration::from_millis(50));
@@ -195,7 +195,7 @@ fn test_http_serve_two_sequential_requests() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer);
+    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
 
     thread::sleep(Duration::from_millis(50));
 
@@ -232,7 +232,7 @@ fn test_http_serve_two_paths() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer);
+    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
 
     thread::sleep(Duration::from_millis(50));
 
@@ -270,7 +270,7 @@ fn test_http_serve_two_paths_shared_outer_let() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer);
+    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
 
     thread::sleep(Duration::from_millis(50));
 
@@ -301,7 +301,7 @@ fn test_http_serve_echo_with_outer_let() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer);
+    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
 
     thread::sleep(Duration::from_millis(50));
 
@@ -326,11 +326,10 @@ fn test_http_serve_in_if_branch_is_error() {
          \t\tresponses << req\n"
     );
     let mut ctx = LoweringContext::default();
-    let parsed = parser::parse(&code, parser::Mode::Module, "<test>").unwrap();
-    let stmts = match parsed {
-        pyast::Mod::Module { body, .. } => body,
-        other => panic!("unexpected: {other:?}"),
-    };
+    let stmts = chl_parser::parse_module(&code)
+        .into_result()
+        .expect("parse failed")
+        .body;
     let result = lower_stmts(&stmts, &mut ctx);
     assert!(
         matches!(result, Err(LoweringError::Unsupported(_))),
@@ -350,11 +349,10 @@ fn test_http_serve_in_function_body_is_error() {
          handler()\n"
     );
     let mut ctx = LoweringContext::default();
-    let parsed = parser::parse(&code, parser::Mode::Module, "<test>").unwrap();
-    let stmts = match parsed {
-        pyast::Mod::Module { body, .. } => body,
-        other => panic!("unexpected: {other:?}"),
-    };
+    let stmts = chl_parser::parse_module(&code)
+        .into_result()
+        .expect("parse failed")
+        .body;
     let result = lower_stmts(&stmts, &mut ctx);
     assert!(
         matches!(result, Err(LoweringError::Unsupported(_))),
@@ -375,7 +373,7 @@ fn test_http_serve_wrong_path_gets_404() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
 
     let mut ctx = GlobalContext::default();
-    let _ = compile_program(&mut ctx, &code, consumer);
+    let _ = compile_program(&mut ctx, &code, consumer).unwrap_or_render("<test>", &code);
 
     thread::sleep(Duration::from_millis(50));
 

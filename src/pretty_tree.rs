@@ -10,8 +10,7 @@
 //! ```
 //!
 //! This module has no dependencies on interpreter or domain types — it is
-//! purely a tree renderer used by both [`crate::pretty_graph`] and
-//! [`crate::pretty_ast`].
+//! purely a tree renderer used by [`crate::pretty_graph`].
 
 // Box-drawing connector strings, used by render_node.
 const CONNECTOR_LAST: &str = "└── ";

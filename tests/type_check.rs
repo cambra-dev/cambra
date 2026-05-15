@@ -18,8 +18,8 @@ use cambra::ccl::{
     infer::{InferError, TypeInferenceContext, infer},
     lower::{LoweringContext, lower_stmts},
 };
+use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
-use rustpython_parser::{ast as pyast, parser};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -70,14 +70,12 @@ fn infer_program_err(code: &str) -> Vec<InferError> {
     infer(&mut expr, &mut ictx).expect_err("expected inference error")
 }
 
-/// Parse a Python module string into its statement list.
-fn parse_module(code: &str) -> Vec<pyast::Stmt> {
-    let result =
-        parser::parse(code, parser::Mode::Module, "<test>").expect("Failed to parse module");
-    match result {
-        pyast::Mod::Module { body, .. } => body,
-        other => panic!("expected Module, got {other:?}"),
-    }
+/// Parse a CHL module string into its statement list.
+fn parse_module(code: &str) -> Vec<chl_ast::Spanned<chl_ast::Stmt>> {
+    chl_parser::parse_module(code)
+        .into_result()
+        .expect("Failed to parse module")
+        .body
 }
 
 /// Convenience alias for `Type::Base(BaseType::Int)`.

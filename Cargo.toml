@@ -12,9 +12,7 @@ rstest-log = "0.2.0"
 test-log = "0.2.19"
 
 [dependencies]
-rustpython-ast = { version = "0.2.0", features = ["unparse"] }
-rustpython-parser = "0.2.0"
-# New CHL parser stack (replacing rustpython_parser; see docs/design-chl-parser.md).
+# CHL parser stack. See src/chl_parser/design-chl-parser.md.
 chumsky = "1.0.0-alpha.8"
 logos = "0.14"
 ariadne = "0.4"

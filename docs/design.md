@@ -28,9 +28,9 @@ See [docs/operational-semantics/summary.md](operational-semantics/summary.md) fo
 ## Program Execution Pipeline
 
 ```
-Python source
-  → parse            (rustpython_parser today; being replaced by chl_parser — see src/chl_parser/design-chl-parser.md)
-  → lower            (ccl/lower.rs: Python AST → CCL Expr)
+CHL source
+  → parse            (chl_parser, see src/chl_parser/design-chl-parser.md)
+  → lower            (ccl/lower.rs: CHL AST → CCL Expr)
   → infer            (ccl/infer.rs: type inference + check_fully_typed validation)
   → inline           (ccl/inline.rs: inline UDF Let bindings with non-iterable domains; beta-reduce at call sites)
   → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators)

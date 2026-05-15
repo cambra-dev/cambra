@@ -5,28 +5,200 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+use crate::chl_parser;
 use log::debug;
-use rustpython_parser::{ast as pyast, parser};
 
 use crate::{
     ccl::{
         Expr, Type,
-        infer::{TypeInferenceContext, check_fully_typed, infer, typecheck},
+        infer::{InferError, TypeInferenceContext, check_fully_typed, infer, typecheck},
         inline, join_plan, lambda_elim,
-        lower::{LoweringContext, lower_stmts},
+        lower::{LoweringContext, LoweringError, lower_stmts},
         remove_defers,
         symbolic::{symbolic, symbolic_typed},
     },
     interpreter::{
         Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
         operator_conversion::{
-            OpConversionContext, convert_record_fields_to_operators, convert_to_operators,
+            ConversionError, OpConversionContext, convert_record_fields_to_operators,
+            convert_to_operators,
         },
         sinks::{DoneNotifier, SinkConsumer},
         tile_operators::{TileOperator, TileProducer},
     },
     pretty_graph::{VizOptions, pretty_tile_producer_with},
 };
+
+// ---------------------------------------------------------------------------
+// CompileError
+// ---------------------------------------------------------------------------
+
+/// Errors a user can hit when compiling a CHL program.
+///
+/// Bundles every pipeline stage that can fail on bad *user input*: parsing,
+/// lowering (unsupported construct), type inference, and operator-graph
+/// conversion. Stage-internal consistency checks (`typecheck`,
+/// `check_fully_typed` between passes, lambda-elim of a typed tree) are
+/// invariants — they panic with `.expect` because firing them indicates a
+/// compiler bug, not user error.
+///
+/// Use [`Self::eprint`] for source-context rendering: parser errors get
+/// ariadne reports with red/yellow underlines; the other variants render
+/// as plain `error: …` lines. Source-aware spans for lowering/inference
+/// errors are future work.
+#[derive(Debug)]
+pub enum CompileError {
+    /// The parser rejected the input.
+    Parse(Vec<chl_parser::ParseError>),
+    /// The (parseable) AST uses a construct the lowering pass does not
+    /// support yet.
+    Lower(LoweringError),
+    /// Type inference failed.
+    Infer(Vec<InferError>),
+    /// Lambda elimination failed.
+    LambdaElim(lambda_elim::LambdaElimError),
+    /// Defer/feed resolution failed (e.g. multiple definitions for one
+    /// deferred output).
+    RemoveDefers(remove_defers::DeferError),
+    /// Operator-graph conversion failed.
+    Conversion(ConversionError),
+}
+
+impl CompileError {
+    /// Render this error as a plain-ASCII string with source-code context.
+    ///
+    /// - [`CompileError::Parse`] is rendered via ariadne with colour
+    ///   disabled (gutter, source line, underlines, labels — all rendered
+    ///   in Unicode box-drawing). Suitable for inclusion in panic
+    ///   messages, log files, snapshots, or piping through grep.
+    /// - The other variants render as plain `error: …` lines because
+    ///   they don't yet carry source spans.
+    pub fn render(&self, src_name: &str, src: &str) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        match self {
+            CompileError::Parse(errs) => {
+                for e in errs {
+                    e.to_report_with_config(src_name, ariadne::Config::default().with_color(false))
+                        .write((src_name, ariadne::Source::from(src)), &mut buf)
+                        .expect("ariadne write should not fail on Vec<u8>");
+                }
+            }
+            CompileError::Lower(LoweringError::Unsupported(msg)) => {
+                buf.extend_from_slice(
+                    format!("error: lowering rejected this program: {msg}\n").as_bytes(),
+                );
+            }
+            CompileError::Infer(errs) => {
+                for e in errs {
+                    buf.extend_from_slice(format!("error: type inference: {e:?}\n").as_bytes());
+                }
+            }
+            CompileError::LambdaElim(e) => {
+                buf.extend_from_slice(format!("error: lambda elimination: {e:?}\n").as_bytes());
+            }
+            CompileError::RemoveDefers(e) => {
+                buf.extend_from_slice(format!("error: defer/feed resolution: {e:?}\n").as_bytes());
+            }
+            CompileError::Conversion(e) => {
+                buf.extend_from_slice(
+                    format!("error: operator-graph conversion: {e:?}\n").as_bytes(),
+                );
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Render and print this error to stderr.
+    ///
+    /// [`CompileError::Parse`] uses ariadne's coloured `eprint` (so
+    /// terminal output is pretty); the other variants use plain
+    /// `eprintln!`. For tests that want the rendering in a panic
+    /// message (so cargo test groups it with the failing test's
+    /// output), see [`CompileResultExt::unwrap_or_render`] which uses
+    /// [`Self::render`] instead.
+    pub fn eprint(&self, src_name: &str, src: &str) {
+        match self {
+            CompileError::Parse(errs) => {
+                for e in errs {
+                    e.to_report(src_name)
+                        .eprint((src_name, ariadne::Source::from(src)))
+                        .expect("ariadne eprint should not fail on stderr");
+                }
+            }
+            other => eprint!("{}", other.render(src_name, src)),
+        }
+    }
+}
+
+impl From<Vec<chl_parser::ParseError>> for CompileError {
+    fn from(v: Vec<chl_parser::ParseError>) -> Self {
+        Self::Parse(v)
+    }
+}
+
+impl From<LoweringError> for CompileError {
+    fn from(e: LoweringError) -> Self {
+        Self::Lower(e)
+    }
+}
+
+impl From<Vec<InferError>> for CompileError {
+    fn from(v: Vec<InferError>) -> Self {
+        Self::Infer(v)
+    }
+}
+
+impl From<lambda_elim::LambdaElimError> for CompileError {
+    fn from(e: lambda_elim::LambdaElimError) -> Self {
+        Self::LambdaElim(e)
+    }
+}
+
+impl From<remove_defers::DeferError> for CompileError {
+    fn from(e: remove_defers::DeferError) -> Self {
+        Self::RemoveDefers(e)
+    }
+}
+
+impl From<ConversionError> for CompileError {
+    fn from(e: ConversionError) -> Self {
+        Self::Conversion(e)
+    }
+}
+
+/// Extension trait for `Result<T, CompileError>`.
+///
+/// Lets test code (or any non-prod caller) collapse the
+/// `compile_program` result to its `T` while still getting ariadne-rendered
+/// error output on failure. Use sparingly outside tests — production code
+/// should match on the error variant and decide what to do.
+///
+/// ```ignore
+/// use cambra::ccl::context::{compile_program, CompileResultExt};
+/// let compiled = compile_program(&mut ctx, code, consumer)
+///     .unwrap_or_render("<test>", code);
+/// ```
+pub trait CompileResultExt<T> {
+    /// Return `Ok` payload, or pretty-print the error via
+    /// [`CompileError::eprint`] (so it shows up in the test runner's
+    /// captured stderr) and panic.
+    fn unwrap_or_render(self, src_name: &str, src: &str) -> T;
+}
+
+impl<T> CompileResultExt<T> for Result<T, CompileError> {
+    fn unwrap_or_render(self, src_name: &str, src: &str) -> T {
+        self.unwrap_or_else(|e| {
+            // Bundle the rendered output into the panic message rather
+            // than writing to stderr directly: ariadne's `eprint` writes
+            // raw to file-descriptor 2, which bypasses cargo test's
+            // per-test output capture, so the error would show up
+            // *outside* the failing test's output block. Putting it in
+            // the panic message means cargo test groups it with the
+            // test's `---- TEST stdout ----` section as expected.
+            panic!("compilation failed:\n{}", e.render(src_name, src))
+        })
+    }
+}
 
 /// Bundles the per-stage registries needed to thread externally-managed data
 /// sources through the full CCL pipeline (lowering → type inference → compilation).
@@ -180,14 +352,18 @@ pub fn compile_program(
     ctx: &mut GlobalContext,
     code: &str,
     main_consumer: Box<dyn Consumer>,
-) -> CompiledProgram {
-    let result =
-        parser::parse(code, parser::Mode::Module, "<test>").expect("Failed to parse Python module");
-    let stmts = match result {
-        pyast::Mod::Module { body, .. } => body,
-        other => panic!("expected Module, got {other:?}"),
-    };
-    let mut expr = lower_stmts(&stmts, ctx.lowering_ctx()).expect("ccl lowering failed");
+) -> Result<CompiledProgram, CompileError> {
+    // ---- User-facing failure points ----
+    //
+    // The four `?` returns below correspond to the four ways a user can
+    // hand us a program we can't compile: a parse error, an unsupported
+    // construct (lowering), a type error (inference), and a shape the
+    // operator-graph builder can't realise (conversion). Stage-internal
+    // consistency checks (`typecheck`, `check_fully_typed`) keep their
+    // `.expect` because firing them means the compiler itself is wrong,
+    // not the user's input.
+    let module = chl_parser::parse_module(code).into_result()?;
+    let mut expr = lower_stmts(&module.body, ctx.lowering_ctx())?;
 
     // Drain sink bindings discovered during lowering before taking sources.
     let sink_bindings_registry = ctx.lowering_ctx().take_sink_bindings();
@@ -210,7 +386,7 @@ pub fn compile_program(
     debug!("Lowered:\n{}", symbolic(&expr));
 
     let infer_ctx = ctx.inference_ctx();
-    infer(&mut expr, infer_ctx).expect("type inference failed");
+    infer(&mut expr, infer_ctx)?;
     debug!("Inferred:\n{}", symbolic(&expr));
     debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
     typecheck(&expr).expect("Inference created invalid expr");
@@ -225,14 +401,14 @@ pub fn compile_program(
     debug!("UDFs inlined CCL:\n{}", symbolic(&udfs_inlined));
     typecheck(&udfs_inlined).expect("type error after UDF inlining");
 
-    let lambda_elim = lambda_elim::run(udfs_inlined).expect("Lambda elim failed");
+    let lambda_elim = lambda_elim::run(udfs_inlined)?;
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
     debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
 
     check_fully_typed(&lambda_elim).expect("missing types");
     typecheck(&lambda_elim).expect("type error after lambda elimination");
 
-    let defers_removed = remove_defers::run(lambda_elim).expect("remove_defers failed");
+    let defers_removed = remove_defers::run(lambda_elim)?;
     debug!("Defers removed CCL:\n{}", symbolic(&defers_removed));
     debug!(
         "Defers removed typed CCL:\n{}",
@@ -255,12 +431,10 @@ pub fn compile_program(
     // `("main", op)` entry for them so the rest of the function operates
     // uniformly on `Vec<(name, op)>`.
     let per_field_ops = if sink_bindings_registry.is_empty() {
-        let op = convert_to_operators(&join_planned, ctx.conversion_ctx())
-            .expect("Operator conversion failed");
+        let op = convert_to_operators(&join_planned, ctx.conversion_ctx())?;
         vec![("main".to_string(), op)]
     } else {
-        convert_record_fields_to_operators(&join_planned, ctx.conversion_ctx())
-            .unwrap_or_else(|e| panic!("Operator conversion failed: {e:?}"))
+        convert_record_fields_to_operators(&join_planned, ctx.conversion_ctx())?
     };
 
     let sink_count = per_field_ops
@@ -326,9 +500,9 @@ pub fn compile_program(
         }
     }
 
-    CompiledProgram {
+    Ok(CompiledProgram {
         ast: join_planned,
         outputs,
         done: done_rx,
-    }
+    })
 }

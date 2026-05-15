@@ -1,13 +1,13 @@
-//! Python AST → CCL lowering.
+//! CHL AST → CCL lowering.
 //!
-//! Translates [`rustpython_parser`] AST nodes into [`crate::ccl::Expr`] trees.
+//! Translates [`crate::chl_parser::ast`] nodes into [`crate::ccl::Expr`] trees.
 //! This is a structural lowering only — no type inference, no operator-graph
 //! construction, and no subscription. The resulting CCL tree can be inspected
 //! and tested independently before being type-checked and compiled.
 //!
 //! # Supported constructs
 //!
-//! | Python syntax | CCL output |
+//! | CHL syntax | CCL output |
 //! |--------------|-----------|
 //! | Integer / string / bool / None literals | [`Expr::Lit`] |
 //! | Variable references | [`Expr::Var`] |
@@ -43,7 +43,7 @@
 //!
 //! # Name uniqueness
 //!
-//! This pass does not guarantee unique binding names. Python reassignment of the
+//! This pass does not guarantee unique binding names. Reassignment of the
 //! same variable (`x = 1; x = 2`) produces nested [`Expr::Let`] nodes that shadow
 //! each other (`let x = 1 in let x = 2 in ...`). The semantics are correct for
 //! sequential code — the inner `let` evaluates its value expression in the outer
@@ -61,12 +61,15 @@ use std::{
     sync::Arc,
 };
 
-use rustpython_parser::ast as pyast;
-
 use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, Branch, CompareKind, Expr, Lit,
         LogicKind, RefinementKind, Type, TypedExprNode, UnaryOpKind,
+    },
+    chl_parser::ast::{
+        AssignTarget, AugOp, BinOp as ChlBinOp, BoolOp, CmpOp, CompClause, Comprehension,
+        Expr as ChlExpr, IfBranch, Lit as ChlLit, Param, RecordField, Spanned, Stmt as ChlStmt,
+        UnaryOp,
     },
     interpreter::{
         DataSink, DataSourceDomainExtentImpl, HttpServerDataSource, http_server::SharedHttpServer,
@@ -77,7 +80,7 @@ use crate::{
 // Error type
 // ---------------------------------------------------------------------------
 
-/// Errors that can occur during Python → CCL lowering.
+/// Errors that can occur during CHL → CCL lowering.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoweringError {
     /// The AST node or construct is not yet supported by this lowering pass.
@@ -88,7 +91,7 @@ pub enum LoweringError {
 // Lowering context
 // ---------------------------------------------------------------------------
 
-/// Context for Python → CCL lowering that carries registered data sources and sinks.
+/// Context for CHL → CCL lowering that carries registered data sources and sinks.
 ///
 /// Zero-argument function calls whose name appears in `sources` are lowered to
 /// [`crate::ccl::Expr::Source`] nodes instead of failing with an
@@ -208,84 +211,79 @@ pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Lower a single Python expression to a CCL expression.
+/// Lower a single CHL expression to a CCL expression.
 pub fn lower_expr(
-    expr: &pyast::Located<pyast::ExprKind>,
+    expr: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     match &expr.node {
-        pyast::ExprKind::Constant { value, .. } => lower_constant(value),
-        pyast::ExprKind::Name { id, .. } => Ok(Expr::var(id.clone())),
-        pyast::ExprKind::BinOp { left, op, right } => lower_binop(left, op, right, ctx),
-        pyast::ExprKind::Compare {
+        ChlExpr::Lit(lit) => lower_constant(lit),
+        ChlExpr::Name(id) => Ok(Expr::var(id.as_str().to_string())),
+        ChlExpr::BinOp { left, op, right } => lower_binop(left, *op, right, ctx),
+        ChlExpr::Compare {
             left,
             ops,
             comparators,
         } => lower_compare(left, ops, comparators, ctx),
-        pyast::ExprKind::BoolOp { op, values } => lower_boolop(op, values, ctx),
-        pyast::ExprKind::List { elts, .. } => {
+        ChlExpr::BoolOp { op, operands } => lower_boolop(*op, operands, ctx),
+        ChlExpr::List(elts) => {
             let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
             Ok(Expr::list(items?))
         }
-        pyast::ExprKind::ListComp { elt, generators } => lower_list_comp(elt, generators, ctx),
-        pyast::ExprKind::GeneratorExp { elt, generators } => lower_list_comp(elt, generators, ctx),
-        pyast::ExprKind::Call {
-            func,
-            args,
-            keywords,
-        } => lower_call(func, args, keywords, ctx),
-        pyast::ExprKind::Tuple { elts, .. } => {
+        ChlExpr::ListComp(comp) => lower_list_comp(comp, ctx),
+        ChlExpr::GenExp(comp) => lower_list_comp(comp, ctx),
+        ChlExpr::Call { func, args } => lower_call(func, args, ctx),
+        ChlExpr::Tuple(elts) => {
             let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
             Ok(Expr::tuple(items?))
         }
-        pyast::ExprKind::Subscript { value, slice, .. } => match &slice.node {
-            pyast::ExprKind::Constant {
-                value: pyast::Constant::Int(n),
-                ..
-            } => {
-                let idx: usize = n.try_into().map_err(|_| {
+        ChlExpr::Subscript { target, index } => match &index.node {
+            ChlExpr::Lit(ChlLit::Int(n)) => {
+                let idx: usize = (*n).try_into().map_err(|_| {
                     LoweringError::Unsupported("Tuple index must be non-negative".into())
                 })?;
-                Ok(Expr::apply(lower_expr(value, ctx)?, Expr::proj_index(idx)))
+                Ok(Expr::apply(lower_expr(target, ctx)?, Expr::proj_index(idx)))
             }
             _ => Err(LoweringError::Unsupported(
                 "Only integer subscripts are supported".into(),
             )),
         },
-        // Dict literal `{field: expr, ...}` — keys must be bare identifiers.
+        // Record literal `{field: expr, ...}` — keys are bare identifiers.
         // Lowered to a `Record` constructor: `{x: 1, y: "foo"}` becomes
         // `Record([("x", Lit(1)), ("y", Lit("foo"))])`.
-        pyast::ExprKind::Dict { keys, values } => {
-            let mut fields = Vec::with_capacity(keys.len());
-            for (key, value) in keys.iter().zip(values.iter()) {
-                let field_name = match &key.node {
-                    pyast::ExprKind::Name { id, .. } => id.clone(),
-                    _ => {
-                        return Err(LoweringError::Unsupported(
-                            "record literal keys must be bare identifiers".into(),
-                        ));
-                    }
-                };
-                if fields.iter().any(|(k, _)| k == &field_name) {
+        ChlExpr::Record(fields) => {
+            let mut out = Vec::with_capacity(fields.len());
+            for RecordField { name, value, .. } in fields {
+                let field_name = name.as_str().to_string();
+                if out.iter().any(|(k, _)| k == &field_name) {
                     return Err(LoweringError::Unsupported(format!(
                         "duplicate key `{field_name}` in record literal"
                     )));
                 }
-                fields.push((field_name, lower_expr(value, ctx)?));
+                out.push((field_name, lower_expr(value, ctx)?));
             }
-            Ok(Expr::new(TypedExprNode::Record(fields)))
+            Ok(Expr::new(TypedExprNode::Record(out)))
         }
+        // Dict literal with expression keys is not supported as a record.
+        ChlExpr::Dict(_) => Err(LoweringError::Unsupported(
+            "dict literals (with non-identifier keys) are not yet supported".into(),
+        )),
         // Attribute access `r.field` → `Apply(r, Proj(Field("field")))`.
-        pyast::ExprKind::Attribute { value, attr, .. } => {
-            Ok(Expr::apply(lower_expr(value, ctx)?, Expr::proj_field(attr)))
-        }
-        pyast::ExprKind::Lambda { args, body } => lower_lambda(args, body, ctx),
-        pyast::ExprKind::UnaryOp { op, operand } => lower_unaryop(op, operand, ctx),
-        // Ternary `value if test else orelse` → Case { [guard → value, true → orelse] }
-        pyast::ExprKind::IfExp { test, body, orelse } => {
-            let guard = lower_expr(test, ctx)?;
-            let true_arm = lower_expr(body, ctx)?;
-            let false_arm = lower_expr(orelse, ctx)?;
+        ChlExpr::Attribute { target, attr, .. } => Ok(Expr::apply(
+            lower_expr(target, ctx)?,
+            Expr::proj_field(attr.as_str()),
+        )),
+        ChlExpr::Lambda { params, body } => lower_lambda(params, body, ctx),
+        ChlExpr::UnaryOp { op, operand } => lower_unaryop(*op, operand, ctx),
+        // Ternary `then_expr if cond else else_expr` → Case { [guard → value, true → orelse] }
+        ChlExpr::IfExp {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            let guard = lower_expr(cond, ctx)?;
+            let true_arm = lower_expr(then_expr, ctx)?;
+            let false_arm = lower_expr(else_expr, ctx)?;
             Ok(Expr::new(TypedExprNode::Case {
                 branches: vec![
                     Branch {
@@ -299,14 +297,19 @@ pub fn lower_expr(
                 ],
             }))
         }
-        _ => Err(LoweringError::Unsupported(format!(
-            "Expression type not supported: {:?}",
-            expr.node
-        ))),
+        // `target << value` — feed into a deferred output.
+        ChlExpr::Feed { target, value } => lower_feed(target, value, ctx),
+        // `yield e` is only valid in a generator-for body; reject elsewhere.
+        ChlExpr::Yield(_) => Err(LoweringError::Unsupported(
+            "yield outside a generator for-loop context".into(),
+        )),
+        ChlExpr::Error => Err(LoweringError::Unsupported(
+            "encountered parse-error recovery placeholder".into(),
+        )),
     }
 }
 
-/// Lower a block of Python statements to a nested CCL expression.
+/// Lower a block of CHL statements to a nested CCL expression.
 ///
 /// All statements except the last must be simple name assignments
 /// (`x = expr`), annotated assignments (`x: T = expr`), augmented
@@ -315,7 +318,7 @@ pub fn lower_expr(
 /// definitions are lowered via [`lower_function_body`], which detects
 /// generator functions (single `for`/`yield` body) and regular functions.
 ///
-/// The last statement must be a bare expression (`StmtKind::Expr`)
+/// The last statement must be a bare expression ([`ChlStmt::Expr`])
 /// or an `if`/`else` block.
 ///
 /// When sink bindings are registered during lowering (e.g. from `http_serve`),
@@ -326,7 +329,7 @@ pub fn lower_expr(
 /// removes all `Feed` nodes, `simplify` drops the `ExprStmt`, leaving a clean
 /// `Let* Record{…}` shape for `compile_program`.
 pub fn lower_stmts(
-    stmts: &[pyast::Stmt],
+    stmts: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let inner = lower_stmts_inner(stmts, &HashSet::new(), ctx, true)?;
@@ -401,7 +404,7 @@ fn append_record_at_tail(expr: Expr, record: Expr) -> Expr {
 /// It is `false` for if/else arms and function bodies so that `http_serve`
 /// assignments are rejected outside the top-level program scope.
 fn lower_stmts_inner(
-    stmts: &[pyast::Stmt],
+    stmts: &[Spanned<ChlStmt>],
     outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
     is_top_level: bool,
@@ -429,32 +432,24 @@ fn lower_stmts_inner(
 /// Lower the final statement in a block, which must be a bare expression, an if/else block,
 /// or a for-loop with a yield chain (generator pattern).
 fn lower_final_stmt(
-    last: &pyast::Stmt,
-    preceding: &[pyast::Stmt],
+    last: &Spanned<ChlStmt>,
+    preceding: &[Spanned<ChlStmt>],
     outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     match &last.node {
-        pyast::StmtKind::Expr { value } => lower_expr(value, ctx),
-        pyast::StmtKind::If { test, body, orelse } => {
+        ChlStmt::Expr(value) => lower_expr(value, ctx),
+        ChlStmt::If {
+            branches,
+            else_body,
+        } => {
             // Propagate outer bindings + rest names so that generator-fors
             // inside the if branches can check for mutation correctly.
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
-            lower_if(test, body, orelse, &scope, ctx)
+            lower_if(branches, else_body.as_deref(), &scope, ctx)
         }
-        pyast::StmtKind::For {
-            target,
-            iter,
-            body,
-            orelse,
-            ..
-        } => {
-            if !orelse.is_empty() {
-                return Err(LoweringError::Unsupported(
-                    "for/else is not supported".into(),
-                ));
-            }
+        ChlStmt::For { target, iter, body } => {
             // Build outer bindings: caller's bindings + all names from rest.
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
@@ -478,8 +473,8 @@ fn lower_final_stmt(
 /// `is_top_level` is `false` inside if/else arms and function bodies; `http_serve` is only
 /// permitted at the top level of a program.
 fn lower_middle_stmt(
-    stmt: &pyast::Stmt,
-    preceding: &[pyast::Stmt],
+    stmt: &Spanned<ChlStmt>,
+    preceding: &[Spanned<ChlStmt>],
     body: Expr,
     outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
@@ -494,9 +489,7 @@ fn lower_middle_stmt(
         //   <body>
         // TODO we shouldn't need to special-case this.  Instead, we should support multi-return
         // in general.
-        pyast::StmtKind::Assign { targets, value, .. }
-            if targets.len() == 1 && is_http_serve_tuple_assign(&targets[0], value) =>
-        {
+        ChlStmt::Assign { target, value } if is_http_serve_tuple_assign(target, value) => {
             if !is_top_level {
                 return Err(LoweringError::Unsupported(
                     "http_serve is only supported at the top level of a program, \
@@ -504,7 +497,7 @@ fn lower_middle_stmt(
                         .into(),
                 ));
             }
-            let (req_name, resp_name) = extract_http_serve_names(&targets[0])?;
+            let (req_name, resp_name) = extract_http_serve_names(target)?;
             let (port, method, path) = extract_http_serve_args(value)?;
             // Create and register the source now; the caller drains new_sources
             // via take_new_sources() after lower_stmts returns, before type inference.
@@ -547,64 +540,47 @@ fn lower_middle_stmt(
                 Expr::let_bind(resp_name, responses_expr, body),
             ))
         }
-        pyast::StmtKind::Assign { targets, value, .. } => {
-            if targets.len() != 1 {
-                return Err(LoweringError::Unsupported(
-                    "Multiple assignment targets not supported".into(),
-                ));
-            }
-            let name = extract_name_target(&targets[0], "assignment")?;
+        ChlStmt::Assign { target, value } => {
+            let name = extract_name_target(target, "assignment")?;
             let val = lower_expr(value, ctx)?;
             Ok(Expr::let_bind(name, val, body))
         }
-        pyast::StmtKind::AnnAssign {
+        ChlStmt::AnnAssign {
             target,
             annotation,
-            value: Some(value),
-            ..
+            value,
         } => {
             let name = extract_name_target(target, "annotated assignment")?;
             let annotation_ty = lower_type_annotation(annotation)?;
             let val = lower_expr(value, ctx)?;
             Ok(Expr::let_bind_annotated(name, val, body, annotation_ty))
         }
-        pyast::StmtKind::AnnAssign { value: None, .. } => Err(LoweringError::Unsupported(
-            "Annotated assignment without a value is not supported".into(),
-        )),
         // Desugar `x op= e` → `x = x op e` and lower as a Let binding.
         //
-        // Only simple name targets are supported; subscript and attribute
-        // targets (e.g. `x[0] += 1`, `x.field += 1`) return Unsupported.
-        pyast::StmtKind::AugAssign { target, op, value } => {
-            if *op == pyast::Operator::LShift {
-                return Ok(Expr::expr_stmt(lower_define(target, value, ctx)?, body));
-            }
+        // Only simple name targets are supported; tuple-destructuring
+        // augmented assignment (e.g. `(a, b) += ...`) returns Unsupported.
+        ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
-            let val = lower_binop(target, op, value, ctx)?;
+            let val = lower_aug_binop(&name, *op, value, ctx)?;
             Ok(Expr::let_bind(name, val, body))
         }
+        // `x <<= e` — defer-define statement, distinct from AugAssign.
+        ChlStmt::Define { target, value } => {
+            Ok(Expr::expr_stmt(lower_define(target, value, ctx)?, body))
+        }
         // Function definition → Let binding with curried lambda body.
-        pyast::StmtKind::FunctionDef {
+        ChlStmt::FunctionDef {
             name,
-            args,
+            params,
             body: fn_body,
-            decorator_list,
-            ..
         } => {
-            if !decorator_list.is_empty() {
-                return Err(LoweringError::Unsupported(
-                    "Function decorators are not supported".into(),
-                ));
-            }
-            let func_expr = lower_function_body(args, fn_body, ctx)?;
-            Ok(Expr::let_bind(name.clone(), func_expr, body))
+            let func_expr = lower_function_body(params, fn_body, ctx)?;
+            Ok(Expr::let_bind(name.as_str().to_string(), func_expr, body))
         }
-        pyast::StmtKind::Expr { .. } | pyast::StmtKind::If { .. } | pyast::StmtKind::For { .. } => {
-            Ok(Expr::expr_stmt(
-                lower_final_stmt(stmt, preceding, outer_bindings, ctx)?,
-                body,
-            ))
-        }
+        ChlStmt::Expr(_) | ChlStmt::If { .. } | ChlStmt::For { .. } => Ok(Expr::expr_stmt(
+            lower_final_stmt(stmt, preceding, outer_bindings, ctx)?,
+            body,
+        )),
         _ => Err(LoweringError::Unsupported(
             "Only assignment and function definition statements are supported \
              before the final expression"
@@ -615,37 +591,38 @@ fn lower_middle_stmt(
 
 /// Collect simple-name targets from assignment / function-def statements
 /// into `names`. Used to build `outer_bindings` for mutation checks.
-fn collect_stmt_names(stmts: &[pyast::Stmt], names: &mut HashSet<String>) {
+fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet<String>) {
     for stmt in stmts {
         match &stmt.node {
-            pyast::StmtKind::Assign { targets, .. } => {
-                if let Some(pyast::ExprKind::Name { id, .. }) = targets.first().map(|t| &t.node) {
-                    names.insert(id.clone());
+            ChlStmt::Assign { target, .. }
+            | ChlStmt::AnnAssign { target, .. }
+            | ChlStmt::AugAssign { target, .. }
+            | ChlStmt::Define { target, .. } => {
+                if let AssignTarget::Name(id) = &target.node {
+                    names.insert(id.as_str().to_string());
                 }
             }
-            pyast::StmtKind::AnnAssign { target, .. }
-            | pyast::StmtKind::AugAssign { target, .. } => {
-                if let pyast::ExprKind::Name { id, .. } = &target.node {
-                    names.insert(id.clone());
-                }
-            }
-            pyast::StmtKind::FunctionDef { name, .. } => {
-                names.insert(name.clone());
+            ChlStmt::FunctionDef { name, .. } => {
+                names.insert(name.as_str().to_string());
             }
             _ => {}
         }
     }
 }
 
-/// Extract a simple variable name from a Python assignment target.
+/// Extract a simple variable name from a CHL assignment target.
 ///
-/// Returns the name as a [`String`] when the target is an [`ExprKind::Name`],
-/// or [`LoweringError::Unsupported`] for destructuring, subscript, or attribute
-/// targets.
-fn extract_name_target(target: &pyast::Expr, context: &str) -> Result<String, LoweringError> {
+/// Returns the name when the target is an [`AssignTarget::Name`], or
+/// [`LoweringError::Unsupported`] for tuple-destructuring patterns (which
+/// lowering does not yet support — the `http_serve` 2-tuple case is handled
+/// separately via [`extract_http_serve_names`]).
+fn extract_name_target(
+    target: &Spanned<AssignTarget>,
+    context: &str,
+) -> Result<String, LoweringError> {
     match &target.node {
-        pyast::ExprKind::Name { id, .. } => Ok(id.clone()),
-        _ => Err(LoweringError::Unsupported(format!(
+        AssignTarget::Name(id) => Ok(id.as_str().to_string()),
+        AssignTarget::Tuple(_) => Err(LoweringError::Unsupported(format!(
             "{context}: only simple name targets are supported"
         ))),
     }
@@ -655,13 +632,13 @@ fn extract_name_target(target: &pyast::Expr, context: &str) -> Result<String, Lo
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Lower a Python type annotation expression to a CCL [`Type`].
+/// Lower a CHL type annotation expression to a CCL [`Type`].
 ///
 /// Handles the primitive type names: `int` → [`Type::Base`]([`BaseType::Int`]),
 /// `str` → `String`, `bool` → `Bool`, and `None` (the constant) → `Unit`.
-fn lower_type_annotation(annotation: &pyast::Expr) -> Result<Type, LoweringError> {
+fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
     match &annotation.node {
-        pyast::ExprKind::Name { id, .. } => match id.as_str() {
+        ChlExpr::Name(id) => match id.as_str() {
             "int" => Ok(Type::Base(BaseType::Int)),
             "str" => Ok(Type::Base(BaseType::String)),
             "bool" => Ok(Type::Base(BaseType::Bool)),
@@ -669,10 +646,7 @@ fn lower_type_annotation(annotation: &pyast::Expr) -> Result<Type, LoweringError
                 "Unknown type annotation: {id}"
             ))),
         },
-        pyast::ExprKind::Constant {
-            value: pyast::Constant::None,
-            ..
-        } => Ok(Type::Base(BaseType::Unit)),
+        ChlExpr::Lit(ChlLit::None) => Ok(Type::Base(BaseType::Unit)),
         _ => Err(LoweringError::Unsupported(format!(
             "Unsupported type annotation form: {:?}",
             &annotation.node
@@ -680,94 +654,72 @@ fn lower_type_annotation(annotation: &pyast::Expr) -> Result<Type, LoweringError
     }
 }
 
-/// Lower a `StmtKind::If` (or `elif` chain) to a [`TypedExprNode::Case`] expression.
+/// Lower a [`ChlStmt::If`] (a flattened `if`/`elif`/`else` chain) to a
+/// [`TypedExprNode::Case`] expression.
 ///
-/// The condition becomes the first branch guard and the `then` block becomes its
-/// body. `elif` chains are **flattened**: when `orelse` lowers to a [`TypedExprNode::Case`],
-/// its branches are appended directly rather than nested, producing a single flat
-/// `Case` with one [`Branch`] per condition. A plain `else` block becomes the
-/// final branch with an always-`true` guard.
+/// Each [`IfBranch`] becomes one [`Branch`] (with the branch's `cond` as guard
+/// and `body` lowered as a nested statement block). A trailing `else_body`
+/// becomes the final branch with an always-`true` guard.
 ///
 /// A bare `if` without an `else` clause is not value-returning and is rejected
 /// with [`LoweringError::Unsupported`].
 fn lower_if(
-    test: &pyast::Expr,
-    body: &[pyast::Stmt],
-    orelse: &[pyast::Stmt],
+    branches: &[IfBranch],
+    else_body: Option<&[Spanned<ChlStmt>]>,
     outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    if orelse.is_empty() {
+    let Some(else_body) = else_body else {
         return Err(LoweringError::Unsupported(
             "if without else is not supported as a value-returning expression".into(),
         ));
-    }
-    let guard = lower_expr(test, ctx)?;
+    };
     // http_serve is not permitted inside if/else arms.
-    let true_arm = lower_stmts_inner(body, outer_bindings, ctx, false)?;
-    let false_arm = lower_stmts_inner(orelse, outer_bindings, ctx, false)?;
-    // Flatten elif chains: if the else branch is itself a Case, extend our
-    // branches with its branches rather than nesting.
-    let mut branches = vec![Branch {
-        guard,
-        body: true_arm,
-    }];
-    if let TypedExprNode::Case { branches: inner } = false_arm.node {
-        branches.extend(inner);
-    } else {
-        branches.push(Branch {
-            guard: Expr::lit(Lit::Bool(true)),
-            body: false_arm,
-        });
+    let mut out_branches = Vec::with_capacity(branches.len() + 1);
+    for branch in branches {
+        let guard = lower_expr(&branch.cond, ctx)?;
+        let body = lower_stmts_inner(&branch.body, outer_bindings, ctx, false)?;
+        out_branches.push(Branch { guard, body });
     }
-    Ok(Expr::new(TypedExprNode::Case { branches }))
+    let else_expr = lower_stmts_inner(else_body, outer_bindings, ctx, false)?;
+    out_branches.push(Branch {
+        guard: Expr::lit(Lit::Bool(true)),
+        body: else_expr,
+    });
+    Ok(Expr::new(TypedExprNode::Case {
+        branches: out_branches,
+    }))
 }
 
-fn lower_constant(constant: &pyast::Constant) -> Result<Expr, LoweringError> {
+fn lower_constant(constant: &ChlLit) -> Result<Expr, LoweringError> {
     let lit = match constant {
-        pyast::Constant::Int(n) => {
-            let n_i64: i64 = n
-                .try_into()
-                .map_err(|_| LoweringError::Unsupported("Integer too large for i64".into()))?;
-            Lit::Int(n_i64)
-        }
-        pyast::Constant::Str(s) => Lit::String(s.clone()),
-        pyast::Constant::Bool(b) => Lit::Bool(*b),
-        pyast::Constant::None => Lit::Unit,
-        _ => {
-            return Err(LoweringError::Unsupported(format!(
-                "Constant type not supported: {constant:?}"
-            )));
-        }
+        ChlLit::Int(n) => Lit::Int(*n),
+        ChlLit::String(s) => Lit::String(s.clone()),
+        ChlLit::Bool(b) => Lit::Bool(*b),
+        ChlLit::None => Lit::Unit,
     };
     Ok(Expr::lit(lit))
 }
 
-/// Lower a Python function call to a CCL built-in expression.
+/// Lower a CHL function call to a CCL built-in expression.
 ///
 /// Supported built-ins:
 ///
-/// | Python call | CCL node | Arity |
+/// | CHL call | CCL node | Arity |
 /// |---|---|---|
 /// | `sum(expr)` | [`Expr::Aggregate`] (`Sum`) | 1 |
 /// | `max(expr)` | [`Expr::Aggregate`] (`Max`) | 1 |
 /// | `groupby(collection, key)` | [`Expr::GroupBy`] | 2 |
 ///
-/// Keyword arguments and unknown function names return
-/// [`LoweringError::Unsupported`].
+/// Unknown function names return [`LoweringError::Unsupported`]. (CHL has no
+/// keyword-argument syntax, so the parser already rejects those.)
 fn lower_call(
-    func: &pyast::Expr,
-    args: &[pyast::Expr],
-    keywords: &[pyast::Keyword],
+    func: &Spanned<ChlExpr>,
+    args: &[Spanned<ChlExpr>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    if !keywords.is_empty() {
-        return Err(LoweringError::Unsupported(
-            "Keyword arguments not supported in function calls".into(),
-        ));
-    }
     let name = match &func.node {
-        pyast::ExprKind::Name { id, .. } => id.as_str(),
+        ChlExpr::Name(id) => id.as_str(),
         _ => {
             return Err(LoweringError::Unsupported(
                 "Only named function calls are supported".into(),
@@ -850,84 +802,108 @@ fn lower_call(
 }
 
 fn lower_binop(
-    left: &pyast::Located<pyast::ExprKind>,
-    op: &pyast::Operator,
-    right: &pyast::Located<pyast::ExprKind>,
+    left: &Spanned<ChlExpr>,
+    op: ChlBinOp,
+    right: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    if *op == pyast::Operator::LShift {
-        return lower_feed(left, right, ctx);
-    }
     let left_expr = lower_expr(left, ctx)?;
     let right_expr = lower_expr(right, ctx)?;
+    let kind = chl_binop_to_ccl(op);
+    Ok(Expr::binop(left_expr, kind, right_expr))
+}
+
+/// Map a CHL [`ChlBinOp`] to its CCL [`BinOpKind`] counterpart.
+///
+/// The mapping mirrors the variant set on `chl_ast::BinOp`, which only
+/// enumerates the operators CHL accepts (`/`, `%`, `**`, `>>`, `~` are
+/// rejected at parse time and never appear here). `LogicalAnd/Or/Xor` map
+/// to CCL boolean logic — CHL reuses the `&`/`|`/`^` tokens for logical
+/// (not bitwise) operations. `CollectionUnion` maps to CCL's same-named
+/// kind — CHL reuses the `@` token for collection union rather than
+/// matrix multiplication.
+fn chl_binop_to_ccl(op: ChlBinOp) -> BinOpKind {
+    match op {
+        ChlBinOp::Add => BinOpKind::Arithmetic(ArithmeticKind::Add),
+        ChlBinOp::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
+        ChlBinOp::Mul => BinOpKind::Arithmetic(ArithmeticKind::Mul),
+        ChlBinOp::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
+        ChlBinOp::LogicalAnd => BinOpKind::BoolLogic(LogicKind::And),
+        ChlBinOp::LogicalOr => BinOpKind::BoolLogic(LogicKind::Or),
+        ChlBinOp::LogicalXor => BinOpKind::BoolLogic(LogicKind::Xor),
+        ChlBinOp::CollectionUnion => BinOpKind::CollectionUnion,
+    }
+}
+
+/// Lower an augmented assignment `name op= value` to the equivalent
+/// `name op value` binary operation. The caller has already extracted the
+/// target name via [`extract_name_target`].
+fn lower_aug_binop(
+    target_name: &str,
+    op: AugOp,
+    value: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let left_expr = Expr::var(target_name.to_string());
+    let right_expr = lower_expr(value, ctx)?;
     let kind = match op {
-        pyast::Operator::Add => BinOpKind::Arithmetic(ArithmeticKind::Add),
-        pyast::Operator::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
-        pyast::Operator::Mult => BinOpKind::Arithmetic(ArithmeticKind::Mul),
-        pyast::Operator::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
-        pyast::Operator::BitAnd => BinOpKind::BoolLogic(LogicKind::And),
-        pyast::Operator::MatMult => BinOpKind::CollectionUnion,
-        pyast::Operator::BitOr => BinOpKind::BoolLogic(LogicKind::Or),
-        pyast::Operator::BitXor => BinOpKind::BoolLogic(LogicKind::Xor),
-        _ => {
-            return Err(LoweringError::Unsupported(format!(
-                "Binary operator not supported: {op:?}"
-            )));
-        }
+        AugOp::Add => BinOpKind::Arithmetic(ArithmeticKind::Add),
+        AugOp::Sub => BinOpKind::Arithmetic(ArithmeticKind::Sub),
+        AugOp::Mul => BinOpKind::Arithmetic(ArithmeticKind::Mul),
+        AugOp::FloorDiv => BinOpKind::Arithmetic(ArithmeticKind::FloorDiv),
     };
     Ok(Expr::binop(left_expr, kind, right_expr))
 }
 
 fn lower_feed(
-    target: &pyast::Expr,
-    value: &pyast::Expr,
+    target: &Spanned<ChlExpr>,
+    value: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let name = extract_name_target(target, "handle binding")?;
+    // `x << v` is an expression form, so the LHS is parsed as an `Expr`
+    // rather than an `AssignTarget`. Semantically we still require a bare
+    // identifier here.
+    let name = match &target.node {
+        ChlExpr::Name(id) => id.as_str().to_string(),
+        _ => {
+            return Err(LoweringError::Unsupported(
+                "handle binding: only simple name targets are supported".into(),
+            ));
+        }
+    };
     Ok(Expr::feed(name, lower_expr(value, ctx)?))
 }
 
 fn lower_define(
-    target: &pyast::Expr,
-    value: &pyast::Expr,
+    target: &Spanned<AssignTarget>,
+    value: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let name = extract_name_target(target, "handle defining")?;
     Ok(Expr::define(name, lower_expr(value, ctx)?))
 }
 
-/// Lower a Python unary expression to a CCL [`Expr::UnaryOp`].
+/// Lower a CHL unary expression to a CCL [`Expr::UnaryOp`].
 ///
-/// - `USub` (`-x`) lowers to [`UnaryOpKind::Neg`].
+/// - `Neg` (`-x`) lowers to [`UnaryOpKind::Neg`].
 /// - `Not` (`not x`) lowers to [`UnaryOpKind::Not`].
-/// - `UAdd` (`+x`) is a no-op identity and unsuppored; returns [`LoweringError::Unsupported`].
-/// - `Invert` (`~x`) is unsupported and returns [`LoweringError::Unsupported`].
+///
+/// The CHL parser already rejects `+x` and `~x`, so they need no special
+/// handling here.
 fn lower_unaryop(
-    op: &pyast::Unaryop,
-    operand: &pyast::Located<pyast::ExprKind>,
+    op: UnaryOp,
+    operand: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let inner = lower_expr(operand, ctx)?;
     let kind = match op {
-        pyast::Unaryop::USub => UnaryOpKind::Neg,
-        pyast::Unaryop::Not => UnaryOpKind::Not,
-        // Unary plus is a no-op identity in Python; we don't support it.
-        pyast::Unaryop::UAdd => {
-            return Err(LoweringError::Unsupported(
-                "Unary Add (+) is not supported".into(),
-            ));
-        }
-        pyast::Unaryop::Invert => {
-            return Err(LoweringError::Unsupported(
-                "Bitwise invert (~) is not supported".into(),
-            ));
-        }
+        UnaryOp::Neg => UnaryOpKind::Neg,
+        UnaryOp::Not => UnaryOpKind::Not,
     };
-    // Constant-fold `-Int(n)` to `Lit(Int(-n))`. Python's parser leaves negative
-    // numeric literals as `UnaryOp(USub, Lit(n))`, but downstream stages
+    // Constant-fold `-Int(n)` to `Lit(Int(-n))`. Downstream stages
     // (`operator_conversion`'s list-literal path in particular) only accept
-    // concrete literals as list elements. Folding here keeps
-    // `[-1, 2, -3, 4]`-style programs in the supported subset.
+    // concrete literals as list elements; without this fold, programs like
+    // `[-1, 2, -3, 4]` fall out of the supported subset.
     if let UnaryOpKind::Neg = kind
         && let TypedExprNode::Lit(Lit::Int(n)) = &inner.node
     {
@@ -936,18 +912,15 @@ fn lower_unaryop(
     Ok(Expr::unary(kind, inner))
 }
 
-/// Lower a Python comparison expression to a CCL [`Expr::BinOp`] chain.
+/// Lower a CHL comparison expression to a CCL [`Expr::BinOp`] chain.
 ///
-/// Python comparison expressions may chain multiple operators, e.g. `a < b < c`
+/// CHL comparison expressions may chain multiple operators, e.g. `a < b < c`
 /// desugars to `a < b and b < c`. Each consecutive pair of operands is compared
 /// with its corresponding operator and the results are combined with logical AND.
-///
-/// Unsupported operators (`is`, `is not`, `in`, `not in`) return
-/// [`LoweringError::Unsupported`].
 fn lower_compare(
-    left: &pyast::Located<pyast::ExprKind>,
-    ops: &[pyast::Cmpop],
-    comparators: &[pyast::Located<pyast::ExprKind>],
+    left: &Spanned<ChlExpr>,
+    ops: &[CmpOp],
+    comparators: &[Spanned<ChlExpr>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // Lower all operands up-front. For a chain of n ops there are n+1 operands:
@@ -962,17 +935,12 @@ fn lower_compare(
     let mut comparisons: Vec<Expr> = Vec::with_capacity(ops.len());
     for (i, op) in ops.iter().enumerate() {
         let kind = match op {
-            pyast::Cmpop::Eq => CompareKind::Equals,
-            pyast::Cmpop::NotEq => CompareKind::NotEquals,
-            pyast::Cmpop::Lt => CompareKind::Less,
-            pyast::Cmpop::LtE => CompareKind::LessOrEq,
-            pyast::Cmpop::Gt => CompareKind::Greater,
-            pyast::Cmpop::GtE => CompareKind::GreaterOrEq,
-            _ => {
-                return Err(LoweringError::Unsupported(format!(
-                    "Comparison operator not supported: {op:?}"
-                )));
-            }
+            CmpOp::Eq => CompareKind::Equals,
+            CmpOp::NotEq => CompareKind::NotEquals,
+            CmpOp::Lt => CompareKind::Less,
+            CmpOp::LtE => CompareKind::LessOrEq,
+            CmpOp::Gt => CompareKind::Greater,
+            CmpOp::GtE => CompareKind::GreaterOrEq,
         };
         // Clone the shared middle operand so both adjacent pairs can own it.
         comparisons.push(Expr::binop(
@@ -983,67 +951,49 @@ fn lower_compare(
     }
 
     // Single comparison: return it directly.
-    // Chained comparisons: fold with logical AND (mirrors Python semantics).
+    // Chained comparisons: fold with logical AND. CHL's chained-comparison
+    // semantics match Python's (`a < b < c` ≡ `a < b and b < c`).
     Ok(comparisons
         .into_iter()
         .reduce(|acc, cmp| Expr::binop(acc, BinOpKind::BoolLogic(LogicKind::And), cmp))
         .expect("ops is non-empty"))
 }
 
-/// Lower a Python boolean operator expression to a left-folded [`Expr::BinOp`] chain.
+/// Lower a CHL boolean operator expression to a left-folded [`Expr::BinOp`] chain.
 ///
-/// Python `BoolOp` carries a list of two or more operands sharing a single
+/// `BoolOp` carries a list of two or more operands sharing a single
 /// operator (`and` / `or`). For example, `a and b and c` becomes
 /// `(a and b) and c` — two nested [`BinOpKind::BoolLogic`] nodes.
 fn lower_boolop(
-    op: &pyast::Boolop,
-    values: &[pyast::Located<pyast::ExprKind>],
+    op: BoolOp,
+    operands: &[Spanned<ChlExpr>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    if values.len() < 2 {
+    if operands.len() < 2 {
         return Err(LoweringError::Unsupported(
             "Boolean operator must have at least two operands".into(),
         ));
     }
     let kind = match op {
-        pyast::Boolop::And => BinOpKind::BoolLogic(LogicKind::And),
-        pyast::Boolop::Or => BinOpKind::BoolLogic(LogicKind::Or),
+        BoolOp::And => BinOpKind::BoolLogic(LogicKind::And),
+        BoolOp::Or => BinOpKind::BoolLogic(LogicKind::Or),
     };
     // Fold left-to-right: `a and b and c` → `(a and b) and c`.
-    let mut acc = lower_expr(&values[0], ctx)?;
-    for value in &values[1..] {
+    let mut acc = lower_expr(&operands[0], ctx)?;
+    for value in &operands[1..] {
         acc = Expr::binop(acc, kind, lower_expr(value, ctx)?);
     }
     Ok(acc)
 }
 
-/// Validate that function or lambda arguments use only supported features.
+/// Validate that the function or lambda has at least one parameter.
 ///
-/// Rejects `*args`, `**kwargs`, keyword-only arguments, default values, and
-/// parameterless signatures. Shared between [`lower_lambda`] and
-/// [`lower_function_body`].
-fn validate_function_args(args: &pyast::Arguments) -> Result<(), LoweringError> {
-    if args.vararg.is_some() {
-        return Err(LoweringError::Unsupported(
-            "Function/lambda *args not supported".into(),
-        ));
-    }
-    if args.kwarg.is_some() {
-        return Err(LoweringError::Unsupported(
-            "Function/lambda **kwargs not supported".into(),
-        ));
-    }
-    if !args.kwonlyargs.is_empty() {
-        return Err(LoweringError::Unsupported(
-            "Function/lambda keyword-only arguments not supported".into(),
-        ));
-    }
-    if !args.defaults.is_empty() {
-        return Err(LoweringError::Unsupported(
-            "Function/lambda default arguments not supported".into(),
-        ));
-    }
-    if args.args.is_empty() {
+/// The CHL parser already rejects `*args`, `**kwargs`, keyword-only and
+/// default arguments at the syntactic level, so the only remaining check
+/// is that there is at least one positional parameter. Shared between
+/// [`lower_lambda`] and [`lower_function_body`].
+fn validate_function_params(params: &[Param]) -> Result<(), LoweringError> {
+    if params.is_empty() {
         return Err(LoweringError::Unsupported(
             "Function/lambda with no parameters not supported".into(),
         ));
@@ -1083,9 +1033,9 @@ fn validate_function_args(args: &pyast::Arguments) -> Result<(), LoweringError> 
 /// `lambda x, y: …` and `def f(x, y): …` pair with [`lower_call`]'s
 /// tupled-argument shape and never emit a curried `Expr::Lambda` chain that
 /// `lambda_elim` would fold into an unsupported `curry(body)`.
-fn uncurry_params(args: &pyast::Arguments, body_expr: Expr, ctx: &mut LoweringContext) -> Expr {
-    if args.args.len() == 1 {
-        return Expr::lambda(&args.args[0].node.arg, Type::Hole, body_expr);
+fn uncurry_params(params: &[Param], body_expr: Expr, ctx: &mut LoweringContext) -> Expr {
+    if params.len() == 1 {
+        return Expr::lambda(params[0].name.as_str(), Type::Hole, body_expr);
     }
     // Mint the tuple name after `body_expr` is lowered so that inner
     // multi-arg lambdas (which bump the counter during body lowering)
@@ -1095,18 +1045,14 @@ fn uncurry_params(args: &pyast::Arguments, body_expr: Expr, ctx: &mut LoweringCo
     // substitution's inserted `Var(outer_name)` never collides with an
     // inner binder.
     let tuple_name = ctx.fresh_tuple_arg();
-    let body_with_subs = args
-        .args
-        .iter()
-        .enumerate()
-        .fold(body_expr, |acc, (i, arg)| {
-            let proj = Expr::apply(Expr::var(&tuple_name), Expr::proj_index(i));
-            substitute_param_in_body(acc, &arg.node.arg, &proj)
-        });
+    let body_with_subs = params.iter().enumerate().fold(body_expr, |acc, (i, arg)| {
+        let proj = Expr::apply(Expr::var(&tuple_name), Expr::proj_index(i));
+        substitute_param_in_body(acc, arg.name.as_str(), &proj)
+    });
     Expr::lambda(&tuple_name, Type::Hole, body_with_subs)
 }
 
-/// Lower a Python lambda expression to an [`Expr::Lambda`] via
+/// Lower a CHL lambda expression to an [`Expr::Lambda`] via
 /// [`uncurry_params`].
 ///
 /// Users who want genuine currying still write it explicitly
@@ -1114,22 +1060,23 @@ fn uncurry_params(args: &pyast::Arguments, body_expr: Expr, ctx: &mut LoweringCo
 /// through the general Lambda rule and remain unsupported past operator
 /// conversion — tracked as follow-up work.
 ///
-/// Unsupported features (`*args`, `**kwargs`, default values, keyword-only
-/// arguments) return [`LoweringError::Unsupported`].
+/// `validate_function_params` only checks for at least one parameter; the
+/// CHL parser already rejects `*args`, `**kwargs`, defaults, and keyword-only
+/// arguments at parse time.
 fn lower_lambda(
-    args: &pyast::Arguments,
-    body: &pyast::Located<pyast::ExprKind>,
+    params: &[Param],
+    body: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    validate_function_args(args)?;
+    validate_function_params(params)?;
     let body_expr = lower_expr(body, ctx)?;
-    Ok(uncurry_params(args, body_expr, ctx))
+    Ok(uncurry_params(params, body_expr, ctx))
 }
 
 /// Replace every free occurrence of `Var(name)` in `expr` with `replacement`,
 /// respecting binder shadowing introduced by inner `Lambda` and `Let` nodes.
 ///
-/// Used during multi-arg lambda lowering to rewrite named Python parameters
+/// Used during multi-arg lambda lowering to rewrite named CHL parameters
 /// as projections of a synthetic pair variable. This is a pre-inference
 /// substitution, so unlike [`crate::ccl::lambda_elim::substitute`] it does
 /// not invoke `debug_typecheck`; callers can pass `Type::Hole`-typed trees.
@@ -1299,19 +1246,21 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
 ///
 /// Does not recurse into `with`/`try` blocks — those are rejected later by
 /// the "only assignments and function definitions" check in `lower_for_body_stmts`.
-fn for_body_has_yield(stmts: &[pyast::Stmt]) -> bool {
+fn for_body_has_yield(stmts: &[Spanned<ChlStmt>]) -> bool {
     stmts.iter().any(stmt_has_yield)
 }
 
-fn stmt_has_yield(stmt: &pyast::Stmt) -> bool {
+fn stmt_has_yield(stmt: &Spanned<ChlStmt>) -> bool {
     match &stmt.node {
-        pyast::StmtKind::Expr { value } => {
-            matches!(&value.node, pyast::ExprKind::Yield { .. })
+        ChlStmt::Expr(value) => matches!(&value.node, ChlExpr::Yield(_)),
+        ChlStmt::If {
+            branches,
+            else_body,
+        } => {
+            branches.iter().any(|b| for_body_has_yield(&b.body))
+                || else_body.as_deref().is_some_and(for_body_has_yield)
         }
-        pyast::StmtKind::If { body, orelse, .. } => {
-            for_body_has_yield(body) || for_body_has_yield(orelse)
-        }
-        pyast::StmtKind::For { body, .. } => for_body_has_yield(body),
+        ChlStmt::For { body, .. } => for_body_has_yield(body),
         _ => false,
     }
 }
@@ -1336,9 +1285,9 @@ fn stmt_has_yield(stmt: &pyast::Stmt) -> bool {
 /// and preceding lets). Assignments to these names inside the body are rejected
 /// as mutation.
 fn lower_generator_for(
-    target: &pyast::Located<pyast::ExprKind>,
-    iter: &pyast::Located<pyast::ExprKind>,
-    body: &[pyast::Stmt],
+    target: &Spanned<AssignTarget>,
+    iter: &Spanned<ChlExpr>,
+    body: &[Spanned<ChlStmt>],
     outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
@@ -1388,7 +1337,7 @@ fn lower_generator_for(
 /// iteration variable) and any let-bindings accumulated so far. These may
 /// be re-bound (shadowed) inside the body without triggering a mutation error.
 fn lower_for_body_stmts(
-    stmts: &[pyast::Stmt],
+    stmts: &[Spanned<ChlStmt>],
     defer_name: Option<&str>,
     mutation_scope: &HashSet<String>,
     mut frame_introduced: HashSet<String>,
@@ -1403,13 +1352,8 @@ fn lower_for_body_stmts(
 
     for stmt in rest {
         match &stmt.node {
-            pyast::StmtKind::Assign { targets, value, .. } => {
-                if targets.len() != 1 {
-                    return Err(LoweringError::Unsupported(
-                        "Multiple assignment targets not supported".into(),
-                    ));
-                }
-                let name = extract_name_target(&targets[0], "assignment")?;
+            ChlStmt::Assign { target, value } => {
+                let name = extract_name_target(target, "assignment")?;
                 if mutation_scope.contains(&name) {
                     return Err(LoweringError::Unsupported(format!(
                         "Assignment to `{name}` is mutation: `{name}` is bound \
@@ -1421,11 +1365,10 @@ fn lower_for_body_stmts(
                 frame_introduced.insert(name.clone());
                 bindings.push((name, val, None));
             }
-            pyast::StmtKind::AnnAssign {
+            ChlStmt::AnnAssign {
                 target,
                 annotation,
-                value: Some(value),
-                ..
+                value,
             } => {
                 let name = extract_name_target(target, "annotated assignment")?;
                 if mutation_scope.contains(&name) {
@@ -1440,19 +1383,7 @@ fn lower_for_body_stmts(
                 frame_introduced.insert(name.clone());
                 bindings.push((name, val, Some(ann)));
             }
-            pyast::StmtKind::AnnAssign { value: None, .. } => {
-                return Err(LoweringError::Unsupported(
-                    "Annotated assignment without a value is not supported".into(),
-                ));
-            }
-            pyast::StmtKind::AugAssign { target, op, value } => {
-                if *op == pyast::Operator::LShift {
-                    return Err(LoweringError::Unsupported(
-                        "`<<=` as a non-terminal statement in a for-loop body \
-                         is not supported"
-                            .into(),
-                    ));
-                }
+            ChlStmt::AugAssign { target, op, value } => {
                 let name = extract_name_target(target, "augmented assignment")?;
                 if mutation_scope.contains(&name) {
                     return Err(LoweringError::Unsupported(format!(
@@ -1469,31 +1400,32 @@ fn lower_for_body_stmts(
                          for a fresh binding.",
                     )));
                 }
-                let val = lower_binop(target, op, value, ctx)?;
+                let val = lower_aug_binop(&name, *op, value, ctx)?;
                 bindings.push((name, val, None));
             }
-            pyast::StmtKind::FunctionDef {
+            ChlStmt::Define { .. } => {
+                return Err(LoweringError::Unsupported(
+                    "`<<=` as a non-terminal statement in a for-loop body \
+                     is not supported"
+                        .into(),
+                ));
+            }
+            ChlStmt::FunctionDef {
                 name,
-                args,
+                params,
                 body: fn_body,
-                decorator_list,
-                ..
             } => {
-                if !decorator_list.is_empty() {
-                    return Err(LoweringError::Unsupported(
-                        "Function decorators are not supported".into(),
-                    ));
-                }
-                if mutation_scope.contains(name.as_str()) {
+                let name_str = name.as_str().to_string();
+                if mutation_scope.contains(&name_str) {
                     return Err(LoweringError::Unsupported(format!(
-                        "Assignment to `{name}` is mutation: `{name}` is bound \
+                        "Assignment to `{name_str}` is mutation: `{name_str}` is bound \
                          outside the for-loop body (function argument or \
                          pre-loop binding)",
                     )));
                 }
-                let func_expr = lower_function_body(args, fn_body, ctx)?;
-                frame_introduced.insert(name.clone());
-                bindings.push((name.clone(), func_expr, None));
+                let func_expr = lower_function_body(params, fn_body, ctx)?;
+                frame_introduced.insert(name_str.clone());
+                bindings.push((name_str, func_expr, None));
             }
             _ => {
                 return Err(LoweringError::Unsupported(
@@ -1529,50 +1461,56 @@ fn lower_for_body_stmts(
 /// `mutation_scope` and `frame_introduced` carry the same semantics as in
 /// [`lower_for_body_stmts`]; they are threaded through for recursive calls.
 fn lower_for_body_terminal(
-    stmt: &pyast::Stmt,
+    stmt: &Spanned<ChlStmt>,
     defer_name: Option<&str>,
     mutation_scope: &HashSet<String>,
     frame_introduced: &HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     match &stmt.node {
-        pyast::StmtKind::Expr { value } => match &value.node {
-            pyast::ExprKind::Yield { value: Some(y) } => {
+        ChlStmt::Expr(value) => match &value.node {
+            ChlExpr::Yield(y) => {
                 let name = defer_name.ok_or_else(|| {
                     LoweringError::Unsupported("yield outside a generator for-loop context".into())
                 })?;
                 Ok(Expr::feed(name.to_string(), lower_expr(y, ctx)?))
             }
-            pyast::ExprKind::Yield { value: None } => Err(LoweringError::Unsupported(
-                "yield without a value is not supported in generators".into(),
-            )),
             // `r << e` — direct feed into a named defer handle.
             // Note: when inside a yield-bearing generator (defer_name is Some),
             // `r` is not validated to equal defer_name; a mismatch would
             // type-check via inference but could produce confusing behaviour.
             // A future improvement could add a lowering-time error here.
-            pyast::ExprKind::BinOp { left, op, right } if *op == pyast::Operator::LShift => {
-                lower_feed(left, right, ctx)
-            }
+            ChlExpr::Feed { target, value } => lower_feed(target, value, ctx),
             _ => Err(LoweringError::Unsupported(
                 "For-loop body must end in a yield, `<<` feed, nested for, \
                  or if-guard"
                     .into(),
             )),
         },
-        pyast::StmtKind::If { test, body, orelse } => {
-            if !orelse.is_empty() {
+        ChlStmt::If {
+            branches,
+            else_body,
+        } => {
+            if else_body.is_some() {
                 return Err(LoweringError::Unsupported(
                     "if/else inside generator for-loop body is not supported; \
                      use a plain if-guard (no else branch)"
                         .into(),
                 ));
             }
-            let cond = lower_expr(test, ctx)?;
+            if branches.len() != 1 {
+                return Err(LoweringError::Unsupported(
+                    "if/elif inside generator for-loop body is not supported; \
+                     use a plain if-guard (no elif/else branches)"
+                        .into(),
+                ));
+            }
+            let branch = &branches[0];
+            let cond = lower_expr(&branch.cond, ctx)?;
             // Same frame: pass through mutation_scope and frame_introduced
             // unchanged so that the iter_var remains shadowable inside the guard.
             let true_arm = lower_for_body_stmts(
-                body,
+                &branch.body,
                 defer_name,
                 mutation_scope,
                 frame_introduced.clone(),
@@ -1591,18 +1529,7 @@ fn lower_for_body_terminal(
                 ],
             }))
         }
-        pyast::StmtKind::For {
-            target,
-            iter,
-            body,
-            orelse,
-            ..
-        } => {
-            if !orelse.is_empty() {
-                return Err(LoweringError::Unsupported(
-                    "for/else is not supported inside generator for-loop bodies".into(),
-                ));
-            }
+        ChlStmt::For { target, iter, body } => {
             let inner_var = extract_name_target(target, "for-loop target")?;
             let inner_source = lower_expr(iter, ctx)?;
             // New frame: the outer frame's names (including iter_var) move into
@@ -1620,25 +1547,26 @@ fn lower_for_body_terminal(
     }
 }
 
-/// Lower a Python function definition body to a CCL expression.
+/// Lower a CHL function definition body to a CCL expression.
 ///
 /// Delegates entirely to [`lower_stmts_inner`] with the function's
 /// parameter names as `outer_bindings`. If the function body's final
 /// statement is a `for`-loop with a yield chain, it is lowered as a
 /// generator; otherwise it's a regular function body.
 fn lower_function_body(
-    args: &pyast::Arguments,
-    body: &[pyast::Stmt],
+    params: &[Param],
+    body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    validate_function_args(args)?;
-    let outer_bindings: HashSet<String> = args.args.iter().map(|a| a.node.arg.clone()).collect();
+    validate_function_params(params)?;
+    let outer_bindings: HashSet<String> =
+        params.iter().map(|p| p.name.as_str().to_string()).collect();
     // http_serve is not permitted inside function bodies.
     let body_expr = lower_stmts_inner(body, &outer_bindings, ctx, false)?;
-    Ok(uncurry_params(args, body_expr, ctx))
+    Ok(uncurry_params(params, body_expr, ctx))
 }
 
-/// Lower a Python list comprehension to the CCL Lambda/Apply encoding.
+/// Lower a CHL list comprehension to the CCL Lambda/Apply encoding.
 ///
 /// Handles three cases based on the number of generators and predicates:
 ///
@@ -1673,11 +1601,13 @@ fn lower_function_body(
 /// TODO this currently has an assumption that all generator variables have distinct names.
 /// This might be a reasonable assumption that we should enforce, or we should fix scoping to
 /// handle that case.
-fn lower_list_comp(
-    elt: &pyast::Located<pyast::ExprKind>,
-    generators: &[pyast::Comprehension],
-    ctx: &mut LoweringContext,
-) -> Result<Expr, LoweringError> {
+fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Expr, LoweringError> {
+    // CHL's comprehension stores clauses (`for ... in ...` and `if ...`) in a
+    // single flat list, interleaved in source order. Regroup into one
+    // generator per `for`, each followed by any adjacent `if`s, so the rest
+    // of this routine can operate on (target, iter, [guards]) triples.
+    let generators = group_comp_clauses(&comp.clauses)?;
+
     // ---- Phase 1: Lower each generator's source and register its loop variable ----
     // We keep the source operators and index extents for later use when building the
     // Apply/Lambda chains.  Each loop variable is pushed onto the lowering scope so
@@ -1685,55 +1615,43 @@ fn lower_list_comp(
     let mut gen_sources: Vec<Expr> = Vec::new();
     let mut gen_iter_vars: Vec<String> = Vec::new();
 
-    for generator in generators.iter() {
-        if generator.is_async > 0 {
-            return Err(LoweringError::Unsupported(
-                "Async comprehensions are not supported".into(),
-            ));
-        }
-        let source = lower_expr(&generator.iter, ctx)?;
-        let var_name = match &generator.target.node {
-            pyast::ExprKind::Name { id, .. } => id,
-            _ => {
-                return Err(LoweringError::Unsupported(format!(
-                    "Only simple variable targets are supported in comprehensions, got {:?}",
-                    generator.target.node
-                )));
-            }
-        };
-        let iter_var = var_name;
-        gen_iter_vars.push(iter_var.to_string());
+    for (target, iter, _) in generators.iter() {
+        let source = lower_expr(iter, ctx)?;
+        let var_name = extract_name_target(target, "comprehension target")?;
+        gen_iter_vars.push(var_name);
         gen_sources.push(source);
     }
 
     // ---- Phase 2: Lower body and all predicates to CCL -------------------------
-    let body = lower_expr(elt, ctx)?;
+    let body = lower_expr(&comp.element, ctx)?;
 
     // Lower every `if` guard from each generator to CCL.  We hold on to the
-    // original pyast nodes only to build human-readable description strings;
+    // original CHL nodes only to build human-readable description strings;
     // all detection logic operates on the lowered CCL expressions.
-    let pyast_preds: Vec<&pyast::Expr> = generators
+    let chl_preds: Vec<&Spanned<ChlExpr>> = generators
         .iter()
-        .flat_map(|g| g.ifs.iter().map(|e| e as &pyast::Expr))
+        .flat_map(|(_, _, ifs)| ifs.iter().copied())
         .collect();
-    let lowered_preds: Vec<Expr> = pyast_preds
+    let lowered_preds: Vec<Expr> = chl_preds
         .iter()
         .map(|e| lower_expr(e, ctx))
         .collect::<Result<_, _>>()?;
 
     // Combine all `if` guards into a single loop-join predicate (used when hash
     // join is not applicable — non-equality, 3+ generators, or multiple predicates).
-    // Description strings are built from the original pyast Display output.
+    // Description strings come from `chl_expr_to_string`; the format is a
+    // pretty-printed-ish rendering used downstream for refinement labels.
     let mut pred_op: Option<Expr> = None;
     let mut pred_desc = String::new();
-    for (pyast_pred, lowered) in pyast_preds.iter().zip(lowered_preds) {
+    for (chl_pred, lowered) in chl_preds.iter().zip(lowered_preds) {
+        let pred_str = chl_expr_to_string(&chl_pred.node);
         pred_op = Some(match pred_op {
             Some(lhs) => {
-                pred_desc.push_str(&format!(" and {pyast_pred}"));
+                pred_desc.push_str(&format!(" and {pred_str}"));
                 Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), lowered)
             }
             None => {
-                pred_desc = format!("{pyast_pred}");
+                pred_desc = pred_str;
                 lowered
             }
         });
@@ -1816,85 +1734,199 @@ fn lower_list_comp(
 }
 
 // ---------------------------------------------------------------------------
+// Comprehension regrouping
+// ---------------------------------------------------------------------------
+
+/// One generator clause regrouped from a CHL comprehension's flat clause list:
+/// `(target, iter, ifs)`, where `ifs` is the sequence of `if`-guards that
+/// followed this `for` in source order before the next `for`.
+type CompGenerator<'a> = (
+    &'a Spanned<AssignTarget>,
+    &'a Spanned<ChlExpr>,
+    Vec<&'a Spanned<ChlExpr>>,
+);
+
+/// Regroup the flat CHL comprehension clause list into one [`CompGenerator`]
+/// per `for` clause.
+///
+/// CHL stores comprehension clauses (`for ... in ...` and `if ...`) in a
+/// single list in source order; the downstream lowering logic expects each
+/// generator's guards bundled with it, so we walk the clauses and attach each
+/// `If` to its most recent `For`. A leading `If` (before any `For`) is a
+/// parse-level error category but is defensively rejected here too.
+fn group_comp_clauses(clauses: &[CompClause]) -> Result<Vec<CompGenerator<'_>>, LoweringError> {
+    let mut out: Vec<CompGenerator<'_>> = Vec::new();
+    for clause in clauses {
+        match clause {
+            CompClause::For { target, iter } => out.push((target, iter, Vec::new())),
+            CompClause::If(guard) => {
+                let Some(last) = out.last_mut() else {
+                    return Err(LoweringError::Unsupported(
+                        "comprehension `if` clause must follow a `for` clause".into(),
+                    ));
+                };
+                last.2.push(guard);
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(LoweringError::Unsupported(
+            "comprehension must contain at least one `for` clause".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// Render a CHL expression to roughly source-like text.
+///
+/// Downstream lowering uses this string only as a label embedded in
+/// refinement descriptions; precise formatting does not affect correctness,
+/// just readability of generated names. Only the operator and literal forms
+/// that actually appear inside comprehension guards are handled in detail;
+/// anything else falls through to a `{:?}` debug dump.
+fn chl_expr_to_string(expr: &ChlExpr) -> String {
+    match expr {
+        ChlExpr::Lit(ChlLit::Int(n)) => n.to_string(),
+        ChlExpr::Lit(ChlLit::String(s)) => format!("{s:?}"),
+        ChlExpr::Lit(ChlLit::Bool(true)) => "True".into(),
+        ChlExpr::Lit(ChlLit::Bool(false)) => "False".into(),
+        ChlExpr::Lit(ChlLit::None) => "None".into(),
+        ChlExpr::Name(id) => id.as_str().to_string(),
+        ChlExpr::Attribute { target, attr, .. } => {
+            format!("{}.{}", chl_expr_to_string(&target.node), attr)
+        }
+        ChlExpr::Compare {
+            left,
+            ops,
+            comparators,
+        } => {
+            let mut s = chl_expr_to_string(&left.node);
+            for (op, comp) in ops.iter().zip(comparators.iter()) {
+                let op_str = match op {
+                    CmpOp::Eq => "==",
+                    CmpOp::NotEq => "!=",
+                    CmpOp::Lt => "<",
+                    CmpOp::LtE => "<=",
+                    CmpOp::Gt => ">",
+                    CmpOp::GtE => ">=",
+                };
+                s.push(' ');
+                s.push_str(op_str);
+                s.push(' ');
+                s.push_str(&chl_expr_to_string(&comp.node));
+            }
+            s
+        }
+        ChlExpr::BinOp { left, op, right } => {
+            let op_str = match op {
+                ChlBinOp::Add => "+",
+                ChlBinOp::Sub => "-",
+                ChlBinOp::Mul => "*",
+                ChlBinOp::FloorDiv => "//",
+                ChlBinOp::LogicalAnd => "&",
+                ChlBinOp::LogicalOr => "|",
+                ChlBinOp::LogicalXor => "^",
+                ChlBinOp::CollectionUnion => "@",
+            };
+            format!(
+                "{} {} {}",
+                chl_expr_to_string(&left.node),
+                op_str,
+                chl_expr_to_string(&right.node)
+            )
+        }
+        ChlExpr::BoolOp { op, operands } => {
+            let sep = match op {
+                BoolOp::And => " and ",
+                BoolOp::Or => " or ",
+            };
+            operands
+                .iter()
+                .map(|e| chl_expr_to_string(&e.node))
+                .collect::<Vec<_>>()
+                .join(sep)
+        }
+        ChlExpr::UnaryOp { op, operand } => {
+            let op_str = match op {
+                UnaryOp::Neg => "-",
+                UnaryOp::Not => "not ",
+            };
+            format!("{}{}", op_str, chl_expr_to_string(&operand.node))
+        }
+        ChlExpr::Call { func, args } => {
+            let args_str = args
+                .iter()
+                .map(|a| chl_expr_to_string(&a.node))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({})", chl_expr_to_string(&func.node), args_str)
+        }
+        ChlExpr::Subscript { target, index } => format!(
+            "{}[{}]",
+            chl_expr_to_string(&target.node),
+            chl_expr_to_string(&index.node)
+        ),
+        other => format!("{other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // http_serve helpers
 // ---------------------------------------------------------------------------
 
 /// Returns `true` when `target` is a 2-element name tuple and `value` is a
 /// call to `http_serve` with exactly 3 string-literal arguments.
-fn is_http_serve_tuple_assign(target: &pyast::Expr, value: &pyast::Expr) -> bool {
-    let pyast::ExprKind::Tuple { elts, .. } = &target.node else {
+fn is_http_serve_tuple_assign(target: &Spanned<AssignTarget>, value: &Spanned<ChlExpr>) -> bool {
+    let AssignTarget::Tuple(elts) = &target.node else {
         return false;
     };
     if elts.len() != 2 {
         return false;
     }
-    let all_names = elts
-        .iter()
-        .all(|e| matches!(e.node, pyast::ExprKind::Name { .. }));
-    if !all_names {
+    if !elts.iter().all(|e| matches!(e.node, AssignTarget::Name(_))) {
         return false;
     }
-    let pyast::ExprKind::Call {
-        func,
-        args,
-        keywords,
-    } = &value.node
-    else {
+    let ChlExpr::Call { func, args } = &value.node else {
         return false;
     };
-    if !keywords.is_empty() || args.len() != 3 {
+    if args.len() != 3 {
         return false;
     }
-    matches!(&func.node, pyast::ExprKind::Name { id, .. } if id == "http_serve")
-        && args.iter().all(|a| {
-            matches!(
-                &a.node,
-                pyast::ExprKind::Constant {
-                    value: pyast::Constant::Str(_),
-                    ..
-                }
-            )
-        })
+    matches!(&func.node, ChlExpr::Name(id) if id == "http_serve")
+        && args
+            .iter()
+            .all(|a| matches!(&a.node, ChlExpr::Lit(ChlLit::String(_))))
 }
 
 /// Extract `(requests_var, responses_var)` from a 2-element name tuple target.
-fn extract_http_serve_names(target: &pyast::Expr) -> Result<(String, String), LoweringError> {
-    let pyast::ExprKind::Tuple { elts, .. } = &target.node else {
+fn extract_http_serve_names(
+    target: &Spanned<AssignTarget>,
+) -> Result<(String, String), LoweringError> {
+    let AssignTarget::Tuple(elts) = &target.node else {
         return Err(LoweringError::Unsupported(
             "http_serve target must be a 2-tuple".into(),
         ));
     };
-    let name0 = match &elts[0].node {
-        pyast::ExprKind::Name { id, .. } => id.clone(),
-        _ => {
-            return Err(LoweringError::Unsupported(
-                "http_serve tuple elements must be simple names".into(),
-            ));
-        }
+    let extract = |t: &Spanned<AssignTarget>| match &t.node {
+        AssignTarget::Name(id) => Ok(id.as_str().to_string()),
+        _ => Err(LoweringError::Unsupported(
+            "http_serve tuple elements must be simple names".into(),
+        )),
     };
-    let name1 = match &elts[1].node {
-        pyast::ExprKind::Name { id, .. } => id.clone(),
-        _ => {
-            return Err(LoweringError::Unsupported(
-                "http_serve tuple elements must be simple names".into(),
-            ));
-        }
-    };
-    Ok((name0, name1))
+    Ok((extract(&elts[0])?, extract(&elts[1])?))
 }
 
 /// Extract `(port, method, path)` string literals from the `http_serve(...)` call.
-fn extract_http_serve_args(value: &pyast::Expr) -> Result<(String, String, String), LoweringError> {
-    let pyast::ExprKind::Call { args, .. } = &value.node else {
+fn extract_http_serve_args(
+    value: &Spanned<ChlExpr>,
+) -> Result<(String, String, String), LoweringError> {
+    let ChlExpr::Call { args, .. } = &value.node else {
         return Err(LoweringError::Unsupported(
             "Expected http_serve call".into(),
         ));
     };
-    let extract = |expr: &pyast::Expr| match &expr.node {
-        pyast::ExprKind::Constant {
-            value: pyast::Constant::Str(s),
-            ..
-        } => Ok(s.clone()),
+    let extract = |expr: &Spanned<ChlExpr>| match &expr.node {
+        ChlExpr::Lit(ChlLit::String(s)) => Ok(s.clone()),
         _ => Err(LoweringError::Unsupported(
             "http_serve arguments must be string literals".into(),
         )),
@@ -1911,16 +1943,12 @@ mod tests {
     use super::*;
     use crate::ccl::symbolic::symbolic;
     use rstest::rstest;
-    use rustpython_parser::parser;
 
-    /// Parse a Python expression and return the AST node.
-    fn parse_expr(code: &str) -> pyast::Expr {
-        let result = parser::parse(code, parser::Mode::Expression, "<test>")
-            .expect("Failed to parse expression");
-        match result {
-            pyast::Mod::Expression { body } => *body,
-            other => panic!("expected Expression, got {other:?}"),
-        }
+    /// Parse a CHL expression and return the AST node.
+    fn parse_expr(code: &str) -> Spanned<ChlExpr> {
+        crate::chl_parser::parse_expression(code)
+            .into_result()
+            .expect("Failed to parse expression")
     }
 
     /// Create a minimal registered source for tests that only care about name recognition.
@@ -1933,14 +1961,12 @@ mod tests {
         )))
     }
 
-    /// Parse a Python module and return the statement list.
-    fn parse_module(code: &str) -> Vec<pyast::Stmt> {
-        let result =
-            parser::parse(code, parser::Mode::Module, "<test>").expect("Failed to parse module");
-        match result {
-            pyast::Mod::Module { body, .. } => body,
-            other => panic!("expected Module, got {other:?}"),
-        }
+    /// Parse a CHL module and return the statement list.
+    fn parse_module(code: &str) -> Vec<Spanned<ChlStmt>> {
+        crate::chl_parser::parse_module(code)
+            .into_result()
+            .expect("Failed to parse module")
+            .body
     }
 
     // -----------------------------------------------------------------------
@@ -2492,60 +2518,32 @@ bad";
     }
 
     /// `yield` without a value is rejected.
+    /// Constructs that CHL deliberately doesn't support. Each used to be
+    /// rejected by lowering (since `rustpython_parser` accepted them all);
+    /// the new CHL parser rejects them at parse time — bare `yield`,
+    /// decorators, and `for/else` because they aren't in the grammar, and
+    /// subscript / attribute assignment targets because `AssignTarget` is
+    /// restricted to bare names and tuple patterns.
     #[test]
-    fn test_generator_yield_without_value_rejected() {
-        let code = "\
-def bad(xs):
-    for x in xs:
-        yield
-bad";
-        let stmts = parse_module(code);
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        assert!(matches!(err, LoweringError::Unsupported(_)));
-    }
-
-    /// Function decorators are rejected.
-    #[test]
-    fn test_function_decorators_rejected() {
-        let code = "\
-@some_decorator
-def f(x):
-    x + 1
-f";
-        let stmts = parse_module(code);
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        match &err {
-            LoweringError::Unsupported(msg) => {
-                assert!(
-                    msg.contains("decorator"),
-                    "error should mention decorators: {msg}"
-                );
-            }
-        }
-    }
-
-    /// `for/else` in a generator function is rejected.
-    #[test]
-    fn test_generator_for_else_rejected() {
-        let code = "\
-def bad(xs):
-    for x in xs:
-        yield x
-    else:
-        pass
-bad";
-        let stmts = parse_module(code);
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        match &err {
-            LoweringError::Unsupported(msg) => {
-                assert!(
-                    msg.contains("for/else"),
-                    "error should mention for/else: {msg}"
-                );
-            }
+    fn parser_rejects_constructs_outside_chl_grammar() {
+        let cases: &[&str] = &[
+            // Bare `yield` (no value).
+            "def bad(xs):\n    for x in xs:\n        yield\nbad",
+            // Function decorators.
+            "@some_decorator\ndef f(x):\n    x + 1\nf",
+            // `for/else`.
+            "def bad(xs):\n    for x in xs:\n        yield x\n    else:\n        pass\nbad",
+            // Subscript augmented-assignment target.
+            "x = [1]\nx[0] += 1\nx",
+            // Attribute augmented-assignment target.
+            "x = 0\nx.field += 1\nx",
+        ];
+        for code in cases {
+            let result = crate::chl_parser::parse_module(code);
+            assert!(
+                !result.errors.is_empty(),
+                "expected parse error for:\n{code}"
+            );
         }
     }
 
@@ -2783,15 +2781,15 @@ result";
     /// the post-value scope (not parent_scope) to value_op.subscribe() before
     /// this can run end-to-end.
     #[test]
-    #[ignore = "walrus operator (:=) not yet implemented (ExprKind::NamedExpr unsupported)"]
+    #[ignore = "walrus operator (:=) not yet in the CHL grammar"]
     fn test_lower_walrus_let_in_value_position() {
         let code = "\
 x = (y := 5) + 1
 x";
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
-        // Fill in the expected string when ExprKind::NamedExpr lowering is added.
-        // Structure: let x = (let y = 5 in y) + 1 in x
+        // Fill in the expected string when `:=` is added to the CHL grammar
+        // and lowering. Structure: let x = (let y = 5 in y) + 1 in x.
         assert_eq!(symbolic(&ccl), "");
     }
 
@@ -2813,7 +2811,8 @@ x";
         "x = 5\nif x > 3:\n    10\nelse:\n    0",
         "let x = 5\nin { x > 3 → 10; true → 0 }"
     )]
-    // elif chain: orelse is itself a StmtKind::If; branches are flattened into a single Case.
+    // elif chain: CHL's flat `Stmt::If { branches, else_body }` lowers to a single Case
+    // with one branch per `if`/`elif` plus a true-guard for the `else`.
     #[case(
         "if c1:\n    1\nelif c2:\n    2\nelse:\n    3",
         "{ c1 → 1; c2 → 2; true → 3 }"
@@ -2856,16 +2855,6 @@ x";
     #[test]
     fn test_lower_if_without_else_rejected() {
         let stmts = parse_module("if x:\n    1");
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        assert!(matches!(err, LoweringError::Unsupported(_)));
-    }
-
-    #[rstest]
-    #[case("x = [1]\nx[0] += 1\nx")]
-    #[case("x = 0\nx.field += 1\nx")]
-    fn test_augassign_non_name_target_rejected(#[case] code: &str) {
-        let stmts = parse_module(code);
         let err = lower_stmts(&stmts, &mut LoweringContext::default())
             .expect_err("expected lowering error");
         assert!(matches!(err, LoweringError::Unsupported(_)));
