@@ -75,7 +75,7 @@ use std::{
 };
 
 use cambra::{
-    ccl::context::{GlobalContext, compile_program},
+    ccl::context::{CompileResultExt, GlobalContext, compile_program},
     interpreter::{
         ColumnValue, Consumer, FuncBinding, Tile, Value, bindings_are_list,
         tile_operators::scalar_tile_to_column_value,
@@ -241,7 +241,7 @@ pub fn expect_stdin_program(program_name: &str, stdin_input: &str, expected_subs
 pub fn compile_sink(source: &str) -> GlobalContext {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let _ = compile_program(&mut ctx, source, consumer);
+    let _ = compile_program(&mut ctx, source, consumer).unwrap_or_render("<test>", source);
     ctx
 }
 
@@ -337,7 +337,8 @@ fn run_to_tile(source: &str) -> Tile {
     let consumer: Box<dyn Consumer> = Box::new(move || {
         *notified_clone.borrow_mut() = true;
     });
-    let mut compiled = compile_program(&mut ctx, source, consumer);
+    let mut compiled =
+        compile_program(&mut ctx, source, consumer).unwrap_or_render("<test>", source);
     ctx.scheduler().check_for_notifications();
     assert!(
         *notified.borrow(),

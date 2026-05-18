@@ -1,1 +1,0 @@
-[s + i for s in __stdinvalues() if s <= '9' for i in ['-a','-b'] if s >= '0']

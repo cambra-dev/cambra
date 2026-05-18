@@ -110,10 +110,9 @@ Expected output once unblocked:
 Programs we want eventually but haven't written yet — these are good seeds for
 when you go to add more.
 
-- **Echo server with state** — extend `examples/echo_server.cambra` to keep a
-  hit counter and serve it on a `/stats` endpoint.  Needs: shared mutable state
-  across HTTP handlers, which presumably builds on the for-loop-carried-state
-  work above.
+- **Echo server with state** — extend `http_greeter` to keep a hit counter and
+  serve it on a `/stats` endpoint.  Needs: shared mutable state across HTTP
+  handlers, which presumably builds on the for-loop-carried-state work above.
 - **Streaming word count** — `stdin()` → split → `sum` per word group.  Needs:
   `split`/tokenize built-in, group-by aggregate, and a sink that writes to
   stdout.
@@ -125,3 +124,7 @@ when you go to add more.
   HTTP *client* source (not just server).
 - **Real-time leaderboard** — sliding-window aggregate over an HTTP-fed stream.
   Needs: time-windowed aggregates and incremental sum.
+- **Deep nested-loop perf demo** — triple-nested for-comprehension over
+  large literal lists (replacement for the deleted `examples/slow.cambra`).
+  Measures how cross-product compilation scales; ideally paired with a
+  benchmark harness.
