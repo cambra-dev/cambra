@@ -290,19 +290,9 @@ pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// Recursively collect all type errors from `expr` into `errors`.
 fn collect_expr_errors(expr: &Expr, errors: &mut Vec<InferError>) {
     collect_type_errors(&expr.ty, &symbolic(expr), errors);
+    // Binder-bearing variants emit per-binding type errors before descending
+    // into their children; everything else just visits its direct children.
     match &expr.node {
-        TypedExprNode::Lit(_) | TypedExprNode::Var(_) | TypedExprNode::Builtin(_) => {}
-        TypedExprNode::Apply { function, argument } => {
-            collect_expr_errors(function, errors);
-            collect_expr_errors(argument, errors);
-        }
-        TypedExprNode::BinOp { left, right, .. } => {
-            collect_expr_errors(left, errors);
-            collect_expr_errors(right, errors);
-        }
-        TypedExprNode::UnaryOp(_, operand) => {
-            collect_expr_errors(operand, errors);
-        }
         TypedExprNode::Lambda { param, body, .. } => {
             if type_has_infer(&param.ty) {
                 // TODO: A future "errored table" tracking covered Infer IDs could suppress
@@ -314,70 +304,17 @@ fn collect_expr_errors(expr: &Expr, errors: &mut Vec<InferError>) {
             }
             collect_expr_errors(body, errors);
         }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
+        TypedExprNode::Let { binding, .. } => {
             collect_type_errors(&binding.ty, &binding.name, errors);
-            collect_expr_errors(bound_expr, errors);
-            collect_expr_errors(body, errors);
+            expr.walk_children(|e| collect_expr_errors(e, errors));
         }
-        TypedExprNode::Tuple(elems) => {
-            for elem in elems {
-                collect_expr_errors(elem, errors);
-            }
-        }
-        TypedExprNode::Record(fields) => {
-            for (_, val) in fields {
-                collect_expr_errors(val, errors);
-            }
-        }
-        TypedExprNode::List(elems) => {
-            for elem in elems {
-                collect_expr_errors(elem, errors);
-            }
-        }
-        TypedExprNode::Proj(_) => {}
-        TypedExprNode::Case { branches } => {
-            for branch in branches {
-                collect_expr_errors(&branch.guard, errors);
-                collect_expr_errors(&branch.body, errors);
-            }
-        }
-        TypedExprNode::Aggregate { input, .. } => {
-            collect_expr_errors(input, errors);
-        }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-            ..
-        } => {
+        TypedExprNode::Loop { params, .. } => {
             for p in params {
                 collect_type_errors(&p.ty, &p.name, errors);
             }
-            for init in init_args {
-                collect_expr_errors(init, errors);
-            }
-            collect_expr_errors(source, errors);
-            collect_expr_errors(loop_body, errors);
+            expr.walk_children(|e| collect_expr_errors(e, errors));
         }
-        TypedExprNode::Source(_) => {}
-        TypedExprNode::Compose(morphisms) => {
-            for m in morphisms {
-                collect_expr_errors(m, errors);
-            }
-        }
-        TypedExprNode::ExprStmt { expr, body } => {
-            collect_expr_errors(expr, errors);
-            collect_expr_errors(body, errors);
-        }
-        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
-            collect_expr_errors(value, errors);
-        }
-        TypedExprNode::Defer => {}
+        _ => expr.walk_children(|e| collect_expr_errors(e, errors)),
     }
 }
 
@@ -484,6 +421,36 @@ pub fn dbg_typecheck_mv(expr: Expr) -> Expr {
 
 /// Recursively collect semantic type errors from `expr` into `errors`.
 fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
+    // Case interleaves per-branch recursion with per-branch type checks, so it
+    // doesn't fit the "recurse all children, then check this node" template
+    // used by every other variant — handle it inline.
+    if let TypedExprNode::Case { branches } = &expr.node {
+        let bool_ty = Type::Base(BaseType::Bool);
+        for Branch { guard, body } in branches {
+            collect_typecheck_errors(guard, errors);
+            collect_typecheck_errors(body, errors);
+            if !typecheck_equal(&guard.ty, &bool_ty) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: symbolic(expr),
+                    type_a: bool_ty.clone(),
+                    type_b: guard.ty.clone(),
+                });
+            }
+            if !typecheck_equal(&body.ty, &expr.ty) {
+                errors.push(InferError::TypeMismatch {
+                    ctx: symbolic(expr),
+                    type_a: expr.ty.clone(),
+                    type_b: body.ty.clone(),
+                });
+            }
+        }
+        return;
+    }
+
+    // Standard pattern: recurse into children first, then run any per-node
+    // type-relationship check.
+    expr.walk_children(|e| collect_typecheck_errors(e, errors));
+
     match &expr.node {
         // Literal: node type must match the concrete base type of the literal.
         TypedExprNode::Lit(lit) => {
@@ -497,75 +464,55 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
             }
         }
 
-        // Variable references are resolved by the scope at inference time.
-        TypedExprNode::Var(_) => {}
-
-        // Built-ins are introduced after type inference (in lambda elimination
-        // and join planning) with their type stamped at the emission site, so
-        // typecheck has nothing to verify here beyond the surrounding node.
-        TypedExprNode::Builtin(_) => {}
-
         TypedExprNode::BinOp { left, op, right } => {
-            collect_typecheck_errors(left, errors);
-            collect_typecheck_errors(right, errors);
             check_binop_types(&expr.ty, left, op, right, errors);
         }
 
         TypedExprNode::UnaryOp(op, inner) => {
-            collect_typecheck_errors(inner, errors);
             check_unaryop_types(&expr.ty, op, inner, errors);
         }
 
-        TypedExprNode::Apply { function, argument } => {
-            collect_typecheck_errors(function, errors);
-            collect_typecheck_errors(argument, errors);
-            match &function.ty {
-                Type::Fun(domain, codomain) => {
-                    if !typecheck_equal(&argument.ty, domain) {
-                        errors.push(InferError::TypeMismatch {
-                            ctx: format!("domain of {}", symbolic(expr)),
-                            type_a: (**domain).clone(),
-                            type_b: argument.ty.clone(),
-                        });
-                    }
-                    if !typecheck_equal(&expr.ty, codomain) {
-                        errors.push(InferError::TypeMismatch {
-                            ctx: format!("codomain of {}", symbolic(expr)),
-                            type_a: (**codomain).clone(),
-                            type_b: expr.ty.clone(),
-                        });
-                    }
+        TypedExprNode::Apply { function, argument } => match &function.ty {
+            Type::Fun(domain, codomain) => {
+                if !typecheck_equal(&argument.ty, domain) {
+                    errors.push(InferError::TypeMismatch {
+                        ctx: format!("domain of {}", symbolic(expr)),
+                        type_a: (**domain).clone(),
+                        type_b: argument.ty.clone(),
+                    });
                 }
-                _ => errors.push(InferError::ExpectedFunction(function.ty.clone())),
+                if !typecheck_equal(&expr.ty, codomain) {
+                    errors.push(InferError::TypeMismatch {
+                        ctx: format!("codomain of {}", symbolic(expr)),
+                        type_a: (**codomain).clone(),
+                        type_b: expr.ty.clone(),
+                    });
+                }
             }
-        }
+            _ => errors.push(InferError::ExpectedFunction(function.ty.clone())),
+        },
 
-        TypedExprNode::Lambda { body, .. } => {
-            collect_typecheck_errors(body, errors);
-            // Node type must be Fun; its codomain must match the body type.
-            // The domain may be a Refinement-wrapped version of param.ty — we
-            // do not recheck that here; the inference pass already validates it.
-            match &expr.ty {
-                Type::Fun(_, codomain) => {
-                    if !typecheck_equal(codomain, &body.ty) {
-                        errors.push(InferError::TypeMismatch {
-                            ctx: symbolic(body),
-                            type_a: body.ty.clone(),
-                            type_b: (**codomain).clone(),
-                        });
-                    }
+        // Node type must be Fun; its codomain must match the body type. The
+        // domain may be a Refinement-wrapped version of param.ty — we do not
+        // recheck that here; the inference pass already validates it.
+        TypedExprNode::Lambda { body, .. } => match &expr.ty {
+            Type::Fun(_, codomain) => {
+                if !typecheck_equal(codomain, &body.ty) {
+                    errors.push(InferError::TypeMismatch {
+                        ctx: symbolic(body),
+                        type_a: body.ty.clone(),
+                        type_b: (**codomain).clone(),
+                    });
                 }
-                _ => errors.push(InferError::ExpectedFunction(expr.ty.clone())),
             }
-        }
+            _ => errors.push(InferError::ExpectedFunction(expr.ty.clone())),
+        },
 
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
         } => {
-            collect_typecheck_errors(bound_expr, errors);
-            collect_typecheck_errors(body, errors);
             if !typecheck_equal(&binding.ty, &bound_expr.ty) {
                 errors.push(InferError::TypeMismatch {
                     ctx: symbolic(bound_expr),
@@ -582,39 +529,9 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
             }
         }
 
-        TypedExprNode::Case { branches } => {
-            let bool_ty = Type::Base(BaseType::Bool);
-            for Branch { guard, body } in branches {
-                collect_typecheck_errors(guard, errors);
-                collect_typecheck_errors(body, errors);
-                if !typecheck_equal(&guard.ty, &bool_ty) {
-                    errors.push(InferError::TypeMismatch {
-                        ctx: symbolic(expr),
-                        type_a: bool_ty.clone(),
-                        type_b: guard.ty.clone(),
-                    });
-                }
-                if !typecheck_equal(&body.ty, &expr.ty) {
-                    errors.push(InferError::TypeMismatch {
-                        ctx: symbolic(expr),
-                        type_a: expr.ty.clone(),
-                        type_b: body.ty.clone(),
-                    });
-                }
-            }
-        }
-
-        TypedExprNode::List(elts) => {
-            for elt in elts.iter() {
-                collect_typecheck_errors(elt, errors);
-            }
-            check_list_types(&expr.ty, elts, errors);
-        }
+        TypedExprNode::List(elts) => check_list_types(&expr.ty, elts, errors),
 
         TypedExprNode::Tuple(elts) => {
-            for elt in elts.iter() {
-                collect_typecheck_errors(elt, errors);
-            }
             let elem_tys: Vec<Type> = elts.iter().map(|e| e.ty.clone()).collect();
             let expected = Type::Tuple(elem_tys);
             if !typecheck_equal(&expr.ty, &expected) {
@@ -627,9 +544,6 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
         }
 
         TypedExprNode::Record(fields) => {
-            for (_, val) in fields.iter() {
-                collect_typecheck_errors(val, errors);
-            }
             let field_tys: Vec<(String, Type)> = fields
                 .iter()
                 .map(|(n, e)| (n.clone(), e.ty.clone()))
@@ -644,51 +558,30 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
             }
         }
 
-        // First-class projection morphisms: shape is determined by inference.
-        TypedExprNode::Proj(_) => {}
-
         TypedExprNode::Aggregate { input, .. } => {
-            collect_typecheck_errors(input, errors);
             if !matches!(input.ty, Type::Fun(..)) {
                 errors.push(InferError::ExpectedFunction(input.ty.clone()));
             }
         }
 
-        // Loop is recognized only in the mutation-loop shape; this arm
-        // is the structural fallback that still descends into sub-exprs
-        // so other arms' typecheck errors aren't lost.
-        TypedExprNode::Loop {
-            init_args,
-            source,
-            loop_body,
-            ..
-        } => {
-            for init in init_args.iter() {
-                collect_typecheck_errors(init, errors);
-            }
-            collect_typecheck_errors(source, errors);
-            collect_typecheck_errors(loop_body, errors);
-        }
+        TypedExprNode::Compose(morphisms) => check_compose_types(&expr.ty, morphisms, errors),
 
-        TypedExprNode::Source(_) => {}
+        // Variants with no per-node check: Var/Builtin/Proj (resolved at
+        // inference time), Source/Defer (no shape constraints), Loop (only
+        // recognised in the mutation-loop shape; sub-expr errors already
+        // collected via walk_children above), ExprStmt/Feed/Define
+        // (transparent).  Case is handled by the early-return above.
+        TypedExprNode::Var(_)
+        | TypedExprNode::Builtin(_)
+        | TypedExprNode::Proj(_)
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Defer
+        | TypedExprNode::Loop { .. }
+        | TypedExprNode::ExprStmt { .. }
+        | TypedExprNode::Feed { .. }
+        | TypedExprNode::Define { .. } => {}
 
-        TypedExprNode::Compose(morphisms) => {
-            for m in morphisms.iter() {
-                collect_typecheck_errors(m, errors);
-            }
-            check_compose_types(&expr.ty, morphisms, errors);
-        }
-
-        TypedExprNode::ExprStmt { expr, body } => {
-            collect_typecheck_errors(expr, errors);
-            collect_typecheck_errors(body, errors);
-        }
-
-        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
-            collect_typecheck_errors(value, errors);
-        }
-
-        TypedExprNode::Defer => {}
+        TypedExprNode::Case { .. } => unreachable!("Case handled by early-return above"),
     }
 }
 

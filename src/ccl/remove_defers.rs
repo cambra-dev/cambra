@@ -315,84 +315,27 @@ fn construct_feed_result(feed_values: Vec<Expr>) -> Expr {
 /// occurrences to the concrete domain type recorded by [`inline_defers`].
 fn substitute_types_in_expr(expr: &mut Expr, type_substitutions: &[(Type, Type)]) {
     substitute_types(&mut expr.ty, type_substitutions);
+
+    // Binder-bearing variants carry types in fields that `walk_children_mut`
+    // doesn't visit; rewrite those (and the Lambda's refinement predicate)
+    // here before descending into the structural children.
     match &mut expr.node {
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
+        TypedExprNode::Let { binding, .. } => {
             substitute_types(&mut binding.ty, type_substitutions);
-            substitute_types_in_expr(bound_expr, type_substitutions);
-            substitute_types_in_expr(body, type_substitutions);
-        }
-        TypedExprNode::Apply { function, argument } => {
-            substitute_types_in_expr(function, type_substitutions);
-            substitute_types_in_expr(argument, type_substitutions);
-        }
-        TypedExprNode::BinOp { left, right, .. } => {
-            substitute_types_in_expr(left, type_substitutions);
-            substitute_types_in_expr(right, type_substitutions);
-        }
-        TypedExprNode::UnaryOp(_, inner) => {
-            substitute_types_in_expr(inner, type_substitutions);
         }
         TypedExprNode::Lambda {
-            body,
-            param,
-            refinement,
+            param, refinement, ..
         } => {
             substitute_types(&mut param.ty, type_substitutions);
             if let Some(refinement) = refinement {
                 let RefinementKind::Predicate(pred) = &mut refinement.kind;
                 substitute_types_in_expr(&mut pred.borrow_mut(), type_substitutions);
             }
-            substitute_types_in_expr(body, type_substitutions);
         }
-        TypedExprNode::Aggregate { input, .. } => {
-            substitute_types_in_expr(input, type_substitutions);
-        }
-        TypedExprNode::Tuple(elts) | TypedExprNode::List(elts) | TypedExprNode::Compose(elts) => {
-            for e in elts {
-                substitute_types_in_expr(e, type_substitutions);
-            }
-        }
-        TypedExprNode::Record(fields) => {
-            for (_, e) in fields {
-                substitute_types_in_expr(e, type_substitutions);
-            }
-        }
-        TypedExprNode::Case { branches } => {
-            for Branch { guard, body } in branches {
-                substitute_types_in_expr(guard, type_substitutions);
-                substitute_types_in_expr(body, type_substitutions);
-            }
-        }
-        TypedExprNode::Loop {
-            init_args,
-            source,
-            loop_body,
-            ..
-        } => {
-            for a in init_args {
-                substitute_types_in_expr(a, type_substitutions);
-            }
-            substitute_types_in_expr(source, type_substitutions);
-            substitute_types_in_expr(loop_body, type_substitutions);
-        }
-        TypedExprNode::ExprStmt { expr: inner, body } => {
-            substitute_types_in_expr(inner, type_substitutions);
-            substitute_types_in_expr(body, type_substitutions);
-        }
-        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
-            substitute_types_in_expr(value, type_substitutions);
-        }
-        TypedExprNode::Lit(_)
-        | TypedExprNode::Var(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer => {}
+        _ => {}
     }
+
+    expr.walk_children_mut(|e| substitute_types_in_expr(e, type_substitutions));
 }
 
 /// Recursively replace types in `ty` according to `type_substitutions`.

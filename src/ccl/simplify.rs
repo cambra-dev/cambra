@@ -74,49 +74,7 @@ fn simplify_once(expr: &mut Expr) -> bool {
 ///
 /// Returns `true` if any child was modified.
 fn recurse_simplify(expr: &mut Expr) -> bool {
-    let mut changed = match &mut expr.node {
-        TypedExprNode::Apply { function, argument } => {
-            simplify_once(function) | simplify_once(argument)
-        }
-        TypedExprNode::BinOp { left, right, .. } => simplify_once(left) | simplify_once(right),
-        TypedExprNode::UnaryOp(_, inner) => simplify_once(inner),
-        TypedExprNode::Lambda { body, .. } => simplify_once(body),
-        TypedExprNode::Let {
-            bound_expr, body, ..
-        } => simplify_once(bound_expr) | simplify_once(body),
-        TypedExprNode::Tuple(elts) | TypedExprNode::List(elts) | TypedExprNode::Compose(elts) => {
-            elts.iter_mut().fold(false, |c, e| c | simplify_once(e))
-        }
-        TypedExprNode::Record(fields) => fields
-            .iter_mut()
-            .fold(false, |c, (_, e)| c | simplify_once(e)),
-        TypedExprNode::Case { branches } => branches.iter_mut().fold(false, |c, b| {
-            c | simplify_once(&mut b.guard) | simplify_once(&mut b.body)
-        }),
-        TypedExprNode::Loop {
-            init_args,
-            source,
-            loop_body,
-            ..
-        } => {
-            init_args
-                .iter_mut()
-                .fold(false, |c, a| c | simplify_once(a))
-                | simplify_once(source)
-                | simplify_once(loop_body)
-        }
-        TypedExprNode::Aggregate { input, .. } => simplify_once(input),
-        TypedExprNode::ExprStmt { expr, body } => simplify_once(expr) | simplify_once(body),
-        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
-            simplify_once(value)
-        }
-        TypedExprNode::Lit(_)
-        | TypedExprNode::Var(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer => false,
-    };
+    let mut changed = expr.fold_children_mut(false, |c, e| c | simplify_once(e));
     // After simplifying children, propagate the Let body's type up to the Let
     // itself. Simplification can change the body's type (e.g., union flattening
     // rewrites Fun(Union(Union(A,B),C), D) → Fun(Union(A,B,C), D)); the Let
@@ -141,41 +99,10 @@ fn take(expr: &mut Expr) -> Expr {
 
 /// Returns `true` if `expr` or any of its sub-expressions is a [`TypedExprNode::Feed`].
 fn contains_feed(expr: &Expr) -> bool {
-    match &expr.node {
-        TypedExprNode::Feed { .. } | TypedExprNode::Define { .. } => true,
-        TypedExprNode::Let {
-            bound_expr, body, ..
-        } => contains_feed(bound_expr) || contains_feed(body),
-        TypedExprNode::Apply { function, argument } => {
-            contains_feed(function) || contains_feed(argument)
-        }
-        TypedExprNode::BinOp { left, right, .. } => contains_feed(left) || contains_feed(right),
-        TypedExprNode::UnaryOp(_, inner) => contains_feed(inner),
-        TypedExprNode::Lambda { body, .. } => contains_feed(body),
-        TypedExprNode::Aggregate { input, .. } => contains_feed(input),
-        TypedExprNode::Tuple(elts) | TypedExprNode::List(elts) | TypedExprNode::Compose(elts) => {
-            elts.iter().any(contains_feed)
-        }
-        TypedExprNode::Record(fields) => fields.iter().any(|(_, e)| contains_feed(e)),
-        TypedExprNode::Case { branches } => branches
-            .iter()
-            .any(|b| contains_feed(&b.guard) || contains_feed(&b.body)),
-        TypedExprNode::Loop {
-            init_args,
-            source,
-            loop_body,
-            ..
-        } => {
-            init_args.iter().any(contains_feed) || contains_feed(source) || contains_feed(loop_body)
-        }
-        TypedExprNode::ExprStmt { expr, body } => contains_feed(expr) || contains_feed(body),
-        TypedExprNode::Lit(_)
-        | TypedExprNode::Var(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer => false,
-    }
+    matches!(
+        expr.node,
+        TypedExprNode::Feed { .. } | TypedExprNode::Define { .. }
+    ) || expr.any_child(contains_feed)
 }
 
 /// Drop pure `ExprStmt`: `ExprStmt { expr, body }  ⟹  body` when `expr` contains no `Feed`.

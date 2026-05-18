@@ -1217,6 +1217,281 @@ impl TypedExpr {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Structural traversal helpers
+// ---------------------------------------------------------------------------
+
+impl TypedExpr {
+    /// Invoke `f` on each direct child [`TypedExpr`] of this node.
+    ///
+    /// "Direct child" means an Expr reachable through this node's value fields
+    /// — `function`/`argument`, `left`/`right`, `Case` branch guard/body,
+    /// `Lambda` body, `Let` `bound_expr`/`body`, list/tuple/record/compose
+    /// elements, and so on.  It does **not** descend through type refinement
+    /// predicates or any expression reachable only through [`Type`]; passes
+    /// that need those (e.g. [`crate::ccl::lambda_elim::is_free`]) must visit
+    /// them explicitly.
+    ///
+    /// Use this to write structural recursion over the tree without
+    /// enumerating every variant.  Binder-aware passes that need to handle
+    /// shadowing (e.g. stopping at a [`TypedExprNode::Lambda`] whose param
+    /// matches a target name) must still handle the binder variants
+    /// explicitly rather than relying on this method.
+    pub fn walk_children(&self, mut f: impl FnMut(&TypedExpr)) {
+        match &self.node {
+            TypedExprNode::Lit(_)
+            | TypedExprNode::Var(_)
+            | TypedExprNode::Builtin(_)
+            | TypedExprNode::Proj(_)
+            | TypedExprNode::Source(_)
+            | TypedExprNode::Defer => {}
+            TypedExprNode::Apply { function, argument } => {
+                f(function);
+                f(argument);
+            }
+            TypedExprNode::BinOp { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            TypedExprNode::UnaryOp(_, inner) => f(inner),
+            TypedExprNode::Lambda { body, .. } => f(body),
+            TypedExprNode::Aggregate { input, .. } => f(input),
+            TypedExprNode::Let {
+                bound_expr, body, ..
+            } => {
+                f(bound_expr);
+                f(body);
+            }
+            TypedExprNode::List(elts)
+            | TypedExprNode::Tuple(elts)
+            | TypedExprNode::Compose(elts) => {
+                for e in elts {
+                    f(e);
+                }
+            }
+            TypedExprNode::Case { branches } => {
+                for b in branches {
+                    f(&b.guard);
+                    f(&b.body);
+                }
+            }
+            TypedExprNode::Record(fields) => {
+                for (_, e) in fields {
+                    f(e);
+                }
+            }
+            TypedExprNode::Loop {
+                source,
+                init_args,
+                loop_body,
+                ..
+            } => {
+                f(source);
+                for a in init_args {
+                    f(a);
+                }
+                f(loop_body);
+            }
+            TypedExprNode::ExprStmt { expr, body } => {
+                f(expr);
+                f(body);
+            }
+            TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => f(value),
+        }
+    }
+
+    /// Return `true` if `f` returns `true` for any direct child Expr.
+    ///
+    /// Short-circuits the recursive predicate cheaply: once a match is found,
+    /// `walk_children` still finishes iterating remaining siblings but does
+    /// not invoke `f` on them.
+    pub fn any_child(&self, mut f: impl FnMut(&TypedExpr) -> bool) -> bool {
+        let mut found = false;
+        self.walk_children(|e| {
+            if !found && f(e) {
+                found = true;
+            }
+        });
+        found
+    }
+
+    /// Return `true` if `f` returns `true` for every direct child Expr.  Vacuously true at leaves.
+    pub fn all_children(&self, mut f: impl FnMut(&TypedExpr) -> bool) -> bool {
+        let mut all = true;
+        self.walk_children(|e| {
+            if all && !f(e) {
+                all = false;
+            }
+        });
+        all
+    }
+
+    /// Fold `f` left-to-right over the direct child Exprs, starting from `init`.
+    ///
+    /// Useful for value-returning recursions that combine per-child results —
+    /// counts, max-depth, set unions, `Option<&Expr>` finders.  For a recursive
+    /// helper that returns `T`, the call pattern is:
+    ///
+    /// ```ignore
+    /// fn count_foo(e: &Expr) -> usize {
+    ///     let here = if is_foo(e) { 1 } else { 0 };
+    ///     here + e.fold_children(0, |acc, child| acc + count_foo(child))
+    /// }
+    /// ```
+    ///
+    /// Short-circuit is possible by making `f` skip work when the accumulator
+    /// already represents a "done" state (e.g. `acc.or_else(|| find(child))`
+    /// for an `Option<&Expr>` finder).  The closure is only invoked for direct
+    /// children of the current node; structural recursion is the caller's job.
+    pub fn fold_children<T>(&self, init: T, mut f: impl FnMut(T, &TypedExpr) -> T) -> T {
+        // Threaded via `Option` so we can move `acc` through a `FnMut` closure
+        // without requiring `T: Default`.  Both `take`/`expect` pairs are safe:
+        // `walk_children` calls the closure synchronously and `acc` is always
+        // refilled before returning from it.
+        let mut acc = Some(init);
+        self.walk_children(|e| {
+            let val = acc
+                .take()
+                .expect("fold_children: closure invoked re-entrantly");
+            acc = Some(f(val, e));
+        });
+        acc.expect("fold_children: walk_children dropped accumulator")
+    }
+
+    /// Mutable analog of [`walk_children`](Self::walk_children).
+    ///
+    /// Invokes `f` on each direct child Expr by mutable reference, in the same
+    /// order as `walk_children`.  Same caveats apply: does not descend through
+    /// type refinement predicates and does not visit binder name/type fields.
+    /// Pure-mutator passes that need to mutate `Lambda.param.ty`,
+    /// `Let.binding.ty`, or the refinement predicate must handle those
+    /// explicitly before (or after) calling this method.
+    pub fn walk_children_mut(&mut self, mut f: impl FnMut(&mut TypedExpr)) {
+        match &mut self.node {
+            TypedExprNode::Lit(_)
+            | TypedExprNode::Var(_)
+            | TypedExprNode::Builtin(_)
+            | TypedExprNode::Proj(_)
+            | TypedExprNode::Source(_)
+            | TypedExprNode::Defer => {}
+            TypedExprNode::Apply { function, argument } => {
+                f(function);
+                f(argument);
+            }
+            TypedExprNode::BinOp { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            TypedExprNode::UnaryOp(_, inner) => f(inner),
+            TypedExprNode::Lambda { body, .. } => f(body),
+            TypedExprNode::Aggregate { input, .. } => f(input),
+            TypedExprNode::Let {
+                bound_expr, body, ..
+            } => {
+                f(bound_expr);
+                f(body);
+            }
+            TypedExprNode::List(elts)
+            | TypedExprNode::Tuple(elts)
+            | TypedExprNode::Compose(elts) => {
+                for e in elts {
+                    f(e);
+                }
+            }
+            TypedExprNode::Case { branches } => {
+                for b in branches {
+                    f(&mut b.guard);
+                    f(&mut b.body);
+                }
+            }
+            TypedExprNode::Record(fields) => {
+                for (_, e) in fields {
+                    f(e);
+                }
+            }
+            TypedExprNode::Loop {
+                source,
+                init_args,
+                loop_body,
+                ..
+            } => {
+                f(source);
+                for a in init_args {
+                    f(a);
+                }
+                f(loop_body);
+            }
+            TypedExprNode::ExprStmt { expr, body } => {
+                f(expr);
+                f(body);
+            }
+            TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => f(value),
+        }
+    }
+
+    /// Mutable analog of [`fold_children`](Self::fold_children).
+    ///
+    /// Threads `init` through `f` while visiting each direct child by mutable
+    /// reference.  Useful for bottom-up rewrites that want to OR a "changed"
+    /// flag across children:
+    ///
+    /// ```ignore
+    /// let changed = expr.fold_children_mut(false, |c, e| c | rewrite_once(e));
+    /// ```
+    pub fn fold_children_mut<T>(
+        &mut self,
+        init: T,
+        mut f: impl FnMut(T, &mut TypedExpr) -> T,
+    ) -> T {
+        let mut acc = Some(init);
+        self.walk_children_mut(|e| {
+            let val = acc
+                .take()
+                .expect("fold_children_mut: closure invoked re-entrantly");
+            acc = Some(f(val, e));
+        });
+        acc.expect("fold_children_mut: walk_children_mut dropped accumulator")
+    }
+
+    /// By-value transform of each direct child Expr.
+    ///
+    /// Moves each child out via [`std::mem::take`], passes it to `f`, and
+    /// stores the returned value back in its slot.  Useful as the structural
+    /// recursion step in by-value transformers like
+    /// [`crate::ccl::lambda_elim::substitute`] — the caller writes
+    /// `expr.map_children(|c| transform(c, args))` instead of plumbing
+    /// `mem::take` and `walk_children_mut` by hand.
+    pub fn map_children(&mut self, mut f: impl FnMut(TypedExpr) -> TypedExpr) {
+        self.walk_children_mut(|child| {
+            *child = f(std::mem::take(child));
+        });
+    }
+
+    /// Fallible by-value transform of each direct child Expr.
+    ///
+    /// Like [`map_children`](Self::map_children), but `f` may return `Err`.
+    /// On the first `Err`, the walk stops invoking `f` (remaining siblings
+    /// still pass through `walk_children_mut`, but cheaply — just an `is_ok`
+    /// check), and the error is returned from this method.  Children
+    /// transformed before the failure remain in place.
+    pub fn try_map_children<E>(
+        &mut self,
+        mut f: impl FnMut(TypedExpr) -> Result<TypedExpr, E>,
+    ) -> Result<(), E> {
+        let mut err: Result<(), E> = Ok(());
+        self.walk_children_mut(|child| {
+            if err.is_err() {
+                return;
+            }
+            match f(std::mem::take(child)) {
+                Ok(new) => *child = new,
+                Err(e) => err = Err(e),
+            }
+        });
+        err
+    }
+}
+
 // Implement Default so that we can use std::mem::take out of Exprs.
 impl Default for TypedExpr {
     fn default() -> Self {

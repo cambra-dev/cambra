@@ -50,12 +50,6 @@ pub fn count_free(name: &str, expr: &Expr) -> usize {
     let in_node = match &expr.node {
         TypedExprNode::Var(n) => (n == name) as usize,
 
-        TypedExprNode::Lit(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer => 0,
-
         TypedExprNode::Lambda {
             param,
             body,
@@ -98,29 +92,6 @@ pub fn count_free(name: &str, expr: &Expr) -> usize {
                 }
         }
 
-        TypedExprNode::Apply { function, argument } => {
-            count_free(name, function) + count_free(name, argument)
-        }
-
-        TypedExprNode::BinOp { left, right, .. } => {
-            count_free(name, left) + count_free(name, right)
-        }
-
-        TypedExprNode::UnaryOp(_, inner) | TypedExprNode::Aggregate { input: inner, .. } => {
-            count_free(name, inner)
-        }
-
-        TypedExprNode::Tuple(elts) | TypedExprNode::List(elts) | TypedExprNode::Compose(elts) => {
-            elts.iter().map(|e| count_free(name, e)).sum()
-        }
-
-        TypedExprNode::Record(fields) => fields.iter().map(|(_, e)| count_free(name, e)).sum(),
-
-        TypedExprNode::Case { branches } => branches
-            .iter()
-            .map(|b| count_free(name, &b.guard) + count_free(name, &b.body))
-            .sum(),
-
         TypedExprNode::Loop {
             params,
             init_args,
@@ -143,8 +114,6 @@ pub fn count_free(name: &str, expr: &Expr) -> usize {
                 + init_args.iter().map(|a| count_free(name, a)).sum::<usize>()
         }
 
-        TypedExprNode::ExprStmt { expr, body } => count_free(name, expr) + count_free(name, body),
-
         // The `name` field of Feed/Define is a *use* of the defer handle
         // variable — `Feed("x", v)` is a write to the defer `x`, so `x`
         // is free here in addition to any free uses inside `value`.
@@ -156,6 +125,11 @@ pub fn count_free(name: &str, expr: &Expr) -> usize {
             name: handle,
             value,
         } => (handle == name) as usize + count_free(name, value),
+
+        // All remaining variants: just sum counts across the direct
+        // children.  Atoms (Lit/Proj/Builtin/Source/Defer) have no
+        // children, so the fold returns 0.
+        _ => expr.fold_children(0, |acc, e| acc + count_free(name, e)),
     };
     in_node + in_type
 }

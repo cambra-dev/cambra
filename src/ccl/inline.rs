@@ -68,7 +68,7 @@
 //!   prefix produced by a beta-reduction whose argument was defer-returning is
 //!   folded in by renaming the stale parameter-name feed targets to `y`.
 
-use crate::ccl::{Branch, Expr, Type, TypedExprNode, lambda_elim::substitute};
+use crate::ccl::{Expr, Type, TypedExprNode, lambda_elim::substitute};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -192,51 +192,12 @@ fn should_inline(bound_ty: &Type) -> bool {
 /// semantics.
 fn is_let_bound(name: &str, expr: &Expr) -> bool {
     match &expr.node {
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => binding.name == name || is_let_bound(name, bound_expr) || is_let_bound(name, body),
-        // Lambda param shadows `name` inside the body — treat it as a binding
+        // A Let whose binding matches `name` is a definitive bind site.
+        TypedExprNode::Let { binding, .. } if binding.name == name => true,
+        // A Lambda param shadows `name` inside the body — treat it as a binding
         // site so we don't substitute through it.
-        TypedExprNode::Lambda { param, body, .. } => param.name == name || is_let_bound(name, body),
-        TypedExprNode::Apply { function, argument } => {
-            is_let_bound(name, function) || is_let_bound(name, argument)
-        }
-        TypedExprNode::BinOp { left, right, .. } => {
-            is_let_bound(name, left) || is_let_bound(name, right)
-        }
-        TypedExprNode::UnaryOp(_, inner) => is_let_bound(name, inner),
-        TypedExprNode::Tuple(elts) | TypedExprNode::List(elts) | TypedExprNode::Compose(elts) => {
-            elts.iter().any(|e| is_let_bound(name, e))
-        }
-        TypedExprNode::Record(fields) => fields.iter().any(|(_, e)| is_let_bound(name, e)),
-        TypedExprNode::Case { branches } => branches
-            .iter()
-            .any(|b| is_let_bound(name, &b.guard) || is_let_bound(name, &b.body)),
-        TypedExprNode::Loop {
-            init_args,
-            source,
-            loop_body,
-            ..
-        } => {
-            is_let_bound(name, source)
-                || init_args.iter().any(|a| is_let_bound(name, a))
-                || is_let_bound(name, loop_body)
-        }
-        TypedExprNode::ExprStmt { expr, body } => {
-            is_let_bound(name, expr) || is_let_bound(name, body)
-        }
-        TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
-            is_let_bound(name, value)
-        }
-        TypedExprNode::Aggregate { input, .. } => is_let_bound(name, input),
-        TypedExprNode::Lit(_)
-        | TypedExprNode::Var(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer => false,
+        TypedExprNode::Lambda { param, .. } if param.name == name => true,
+        _ => expr.any_child(|e| is_let_bound(name, e)),
     }
 }
 
@@ -501,78 +462,6 @@ fn inline_impl(expr: Expr, ctx: &mut InlineCtx) -> Expr {
             }
         }
 
-        TypedExprNode::Apply { function, argument } => TypedExprNode::Apply {
-            function: Box::new(inline_impl(*function, ctx)),
-            argument: Box::new(inline_impl(*argument, ctx)),
-        },
-
-        TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
-            left: Box::new(inline_impl(*left, ctx)),
-            op,
-            right: Box::new(inline_impl(*right, ctx)),
-        },
-
-        TypedExprNode::UnaryOp(op, inner) => {
-            TypedExprNode::UnaryOp(op, Box::new(inline_impl(*inner, ctx)))
-        }
-
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => TypedExprNode::Lambda {
-            param,
-            body: Box::new(inline_impl(*body, ctx)),
-            refinement,
-        },
-
-        TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
-            input: Box::new(inline_impl(*input, ctx)),
-            kind,
-        },
-
-        TypedExprNode::Tuple(elts) => {
-            TypedExprNode::Tuple(elts.into_iter().map(|e| inline_impl(e, ctx)).collect())
-        }
-
-        TypedExprNode::List(elts) => {
-            TypedExprNode::List(elts.into_iter().map(|e| inline_impl(e, ctx)).collect())
-        }
-
-        TypedExprNode::Record(fields) => TypedExprNode::Record(
-            fields
-                .into_iter()
-                .map(|(name, e)| (name, inline_impl(e, ctx)))
-                .collect(),
-        ),
-
-        TypedExprNode::Case { branches } => TypedExprNode::Case {
-            branches: branches
-                .into_iter()
-                .map(|b| Branch {
-                    guard: inline_impl(b.guard, ctx),
-                    body: inline_impl(b.body, ctx),
-                })
-                .collect(),
-        },
-
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-            body_taps,
-        } => crate::ccl::walk_loop_children(
-            params,
-            init_args,
-            source,
-            loop_body,
-            body_taps,
-            // Structural traversal — no specific name being substituted.
-            None,
-            |e| inline_impl(e, ctx),
-        ),
-
         // ANF defer-returning Compose source: when the first element of a Compose
         // (i.e. the for-loop iteration source) is itself a defer-returning
         // expression, wrap it in a fresh `let __for_src_N = source` binding so
@@ -599,28 +488,17 @@ fn inline_impl(expr: Expr, ctx: &mut InlineCtx) -> Expr {
             TypedExprNode::Compose(inlined)
         }
 
-        TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
-            expr: Box::new(inline_impl(*expr, ctx)),
-            body: Box::new(inline_impl(*body, ctx)),
-        },
-
-        TypedExprNode::Feed { name: id, value } => TypedExprNode::Feed {
-            name: id,
-            value: Box::new(inline_impl(*value, ctx)),
-        },
-
-        TypedExprNode::Define { name: id, value } => TypedExprNode::Define {
-            name: id,
-            value: Box::new(inline_impl(*value, ctx)),
-        },
-
-        // Leaves — no sub-expressions to recurse into.
-        node @ (TypedExprNode::Lit(_)
-        | TypedExprNode::Var(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer) => node,
+        // All remaining variants: pure structural recursion.  Atoms have
+        // no children, so this is a no-op for them.
+        node => {
+            let mut expr = Expr {
+                node,
+                ty,
+                user_annotation,
+            };
+            expr.map_children(|child| inline_impl(child, ctx));
+            return expr;
+        }
     };
 
     Expr {
@@ -762,61 +640,10 @@ fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
             }
         }
 
-        TypedExprNode::Apply { function, argument } => TypedExprNode::Apply {
-            function: Box::new(inline_and_beta_reduce(*function, name, lambda)),
-            argument: Box::new(inline_and_beta_reduce(*argument, name, lambda)),
-        },
-
-        TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
-            left: Box::new(inline_and_beta_reduce(*left, name, lambda)),
-            op,
-            right: Box::new(inline_and_beta_reduce(*right, name, lambda)),
-        },
-
-        TypedExprNode::UnaryOp(op, inner) => {
-            TypedExprNode::UnaryOp(op, Box::new(inline_and_beta_reduce(*inner, name, lambda)))
-        }
-
-        TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
-            input: Box::new(inline_and_beta_reduce(*input, name, lambda)),
-            kind,
-        },
-
-        TypedExprNode::Tuple(elts) => TypedExprNode::Tuple(
-            elts.into_iter()
-                .map(|e| inline_and_beta_reduce(e, name, lambda))
-                .collect(),
-        ),
-
-        TypedExprNode::List(elts) => TypedExprNode::List(
-            elts.into_iter()
-                .map(|e| inline_and_beta_reduce(e, name, lambda))
-                .collect(),
-        ),
-
-        TypedExprNode::Record(fields) => TypedExprNode::Record(
-            fields
-                .into_iter()
-                .map(|(n, e)| (n, inline_and_beta_reduce(e, name, lambda)))
-                .collect(),
-        ),
-
-        TypedExprNode::Case { branches } => TypedExprNode::Case {
-            branches: branches
-                .into_iter()
-                .map(|b| Branch {
-                    guard: inline_and_beta_reduce(b.guard, name, lambda),
-                    body: inline_and_beta_reduce(b.body, name, lambda),
-                })
-                .collect(),
-        },
-
-        TypedExprNode::Compose(elts) => TypedExprNode::Compose(
-            elts.into_iter()
-                .map(|e| inline_and_beta_reduce(e, name, lambda))
-                .collect(),
-        ),
-
+        // Loop param shadowing matters here — we're substituting `name`
+        // throughout, but if the loop's params bind `name`, the body sees
+        // the param's value, not the substituted one.  walk_children_mut
+        // would visit `loop_body` unconditionally, so handle Loop explicitly.
         TypedExprNode::Loop {
             params,
             init_args,
@@ -829,35 +656,21 @@ fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
             source,
             loop_body,
             body_taps,
-            // Param shadowing matters here — we're substituting `name`
-            // throughout, but if the loop's param binds `name`, the body
-            // sees the param's value, not the substituted one.
             Some(name),
             |e| inline_and_beta_reduce(e, name, lambda),
         ),
 
-        TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
-            expr: Box::new(inline_and_beta_reduce(*expr, name, lambda)),
-            body: Box::new(inline_and_beta_reduce(*body, name, lambda)),
-        },
-
-        TypedExprNode::Feed { name: id, value } => TypedExprNode::Feed {
-            name: id,
-            value: Box::new(inline_and_beta_reduce(*value, name, lambda)),
-        },
-
-        TypedExprNode::Define { name: id, value } => TypedExprNode::Define {
-            name: id,
-            value: Box::new(inline_and_beta_reduce(*value, name, lambda)),
-        },
-
-        // Leaves — no sub-expressions to recurse into.
-        node @ (TypedExprNode::Lit(_)
-        | TypedExprNode::Var(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer) => node,
+        // All remaining variants: pure structural recursion.  Atoms have
+        // no children, so this is a no-op for them.
+        node => {
+            let mut expr = Expr {
+                node,
+                ty,
+                user_annotation,
+            };
+            expr.map_children(|child| inline_and_beta_reduce(child, name, lambda));
+            return expr;
+        }
     };
 
     Expr {

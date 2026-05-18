@@ -48,8 +48,7 @@ use crate::ccl::ccl_utils::{is_free, typed_compose};
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
 use crate::ccl::{
-    BaseType, BinOpKind, Branch, Expr, RefinementKind, Type, TypedExpr, TypedExprNode,
-    symbolic::symbolic,
+    BaseType, BinOpKind, Expr, RefinementKind, Type, TypedExpr, TypedExprNode, symbolic::symbolic,
 };
 use crate::ccl::{Builtin, Lit, Refinement, next_refinement_id};
 
@@ -273,50 +272,10 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             }
         }
 
-        TypedExprNode::Apply { function, argument } => TypedExprNode::Apply {
-            function: Box::new(substitute(*function, name, replacement)),
-            argument: Box::new(substitute(*argument, name, replacement)),
-        },
-
-        TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
-            left: Box::new(substitute(*left, name, replacement)),
-            op,
-            right: Box::new(substitute(*right, name, replacement)),
-        },
-
-        TypedExprNode::UnaryOp(op, inner) => {
-            TypedExprNode::UnaryOp(op, Box::new(substitute(*inner, name, replacement)))
-        }
-
-        TypedExprNode::Tuple(elts) => TypedExprNode::Tuple(
-            elts.into_iter()
-                .map(|e| substitute(e, name, replacement))
-                .collect(),
-        ),
-
-        TypedExprNode::List(elts) => TypedExprNode::List(
-            elts.into_iter()
-                .map(|e| substitute(e, name, replacement))
-                .collect(),
-        ),
-
-        TypedExprNode::Record(fields) => TypedExprNode::Record(
-            fields
-                .into_iter()
-                .map(|(k, e)| (k, substitute(e, name, replacement)))
-                .collect(),
-        ),
-
-        TypedExprNode::Case { branches } => TypedExprNode::Case {
-            branches: branches
-                .into_iter()
-                .map(|b| Branch {
-                    guard: substitute(b.guard, name, replacement),
-                    body: substitute(b.body, name, replacement),
-                })
-                .collect(),
-        },
-
+        // Loop params shadow `name` inside `loop_body`, so we can't fall
+        // through to the generic structural recursion below — that would
+        // substitute into the body unconditionally.  Delegate to the
+        // shared shadowing-aware helper.
         TypedExprNode::Loop {
             params,
             init_args,
@@ -350,16 +309,6 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             }
             TypedExprNode::Compose(new_elts)
         }
-
-        TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
-            input: Box::new(substitute(*input, name, replacement)),
-            kind,
-        },
-
-        TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
-            expr: Box::new(substitute(*expr, name, replacement)),
-            body: Box::new(substitute(*body, name, replacement)),
-        },
 
         // Feed/Define: substitute into the value, and if the target name equals the
         // variable being substituted and the replacement is a Var, rename the target
@@ -405,13 +354,19 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             }
         }
 
-        // Atoms — no sub-expressions to substitute into.
-        node @ (TypedExprNode::Lit(_)
-        | TypedExprNode::Var(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer) => node,
+        // All remaining variants: pure structural recursion, using the
+        // type-substituted `ty`.  Atoms have no children, so this is a
+        // no-op for them.
+        node => {
+            let mut expr = TypedExpr {
+                node,
+                ty,
+                user_annotation,
+            };
+            expr.map_children(|child| substitute(child, name, replacement));
+            debug_typecheck(&expr);
+            return expr;
+        }
     };
     let result = TypedExpr {
         node: new_node,
@@ -975,16 +930,6 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             elim_lambdas(ctx, result)
         }
 
-        // Recurse into all sub-expressions of non-lambda nodes, preserving ty.
-        TypedExprNode::Apply { function, argument } => Ok(dbg_typecheck_mv(TypedExpr {
-            node: TypedExprNode::Apply {
-                function: Box::new(elim_lambdas(ctx, *function)?),
-                argument: Box::new(elim_lambdas(ctx, *argument)?),
-            },
-            ty,
-            user_annotation,
-        })),
-
         // Filter pattern: Compose([..src.., Lambda(x, Case([guard→action, true→unit]))])
         // ⟹ src_restricted ≫ elim(x, action)
         //
@@ -1040,17 +985,6 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             return Ok(result);
         }
 
-        TypedExprNode::Compose(terms) => Ok(dbg_typecheck_mv(TypedExpr {
-            node: TypedExprNode::Compose(
-                terms
-                    .into_iter()
-                    .map(|t| elim_lambdas(ctx, t))
-                    .collect::<Result<_, _>>()?,
-            ),
-            ty,
-            user_annotation,
-        })),
-
         // BinOp (non-Compose): desugar to function application form.
         // `a op b` ≡ `(a, b) ▷ op_fn` — mirrors what `elim_lambda` does for
         // the same pattern inside a lambda body, making the CCL uniform.
@@ -1086,50 +1020,6 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             Ok(desugared)
         }
 
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => Ok(dbg_typecheck_mv(TypedExpr {
-            node: TypedExprNode::Let {
-                binding,
-                bound_expr: Box::new(elim_lambdas(ctx, *bound_expr)?),
-                body: Box::new(elim_lambdas(ctx, *body)?),
-            },
-            ty,
-            user_annotation,
-        })),
-
-        TypedExprNode::Tuple(elts) => {
-            let elts2: Result<Vec<_>, _> = elts.into_iter().map(|e| elim_lambdas(ctx, e)).collect();
-            Ok(dbg_typecheck_mv(TypedExpr {
-                node: TypedExprNode::Tuple(elts2?),
-                ty,
-                user_annotation,
-            }))
-        }
-
-        TypedExprNode::Record(fields) => {
-            let fields2: Result<Vec<_>, _> = fields
-                .into_iter()
-                .map(|(k, e)| elim_lambdas(ctx, e).map(|r| (k, r)))
-                .collect();
-            Ok(dbg_typecheck_mv(TypedExpr {
-                node: TypedExprNode::Record(fields2?),
-                ty,
-                user_annotation,
-            }))
-        }
-
-        TypedExprNode::List(elts) => {
-            let elts2: Result<Vec<_>, _> = elts.into_iter().map(|e| elim_lambdas(ctx, e)).collect();
-            Ok(dbg_typecheck_mv(TypedExpr {
-                node: TypedExprNode::List(elts2?),
-                ty,
-                user_annotation,
-            }))
-        }
-
         TypedExprNode::Aggregate { input, kind } => {
             let input2 = elim_lambdas(ctx, *input)?;
             let agg_builtin = Builtin::for_aggregate(kind);
@@ -1139,81 +1029,22 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             ))
         }
 
-        TypedExprNode::ExprStmt { expr, body } => Ok(dbg_typecheck_mv(TypedExpr {
-            node: TypedExprNode::ExprStmt {
-                expr: Box::new(elim_lambdas(ctx, *expr)?),
-                body: Box::new(elim_lambdas(ctx, *body)?),
-            },
-            ty,
-            user_annotation,
-        })),
-
-        TypedExprNode::Feed { name, value } => Ok(dbg_typecheck_mv(TypedExpr {
-            node: TypedExprNode::Feed {
-                name,
-                value: Box::new(elim_lambdas(ctx, *value)?),
-            },
-            ty,
-            user_annotation,
-        })),
-
-        TypedExprNode::Define { name, value } => Ok(dbg_typecheck_mv(TypedExpr {
-            node: TypedExprNode::Define {
-                name,
-                value: Box::new(elim_lambdas(ctx, *value)?),
-            },
-            ty,
-            user_annotation,
-        })),
-
-        // Loop (mutation-loop pattern from
-        // [`crate::ccl::lower::lower_mutation_loop`]).  Source and
-        // init_args are independent expressions outside the loop's
-        // parameter scope; the body is a `Lambda(p, …)` that takes the
-        // per-iteration tuple `(acc_var, item)` as input and projects
-        // each component out via explicit `Proj` morphisms.  All
-        // children get eliminated to point-free form like any other
-        // expression — `acc_var` is bound by an explicit projection of
-        // `p`, not a free variable captured from outer scope, so
-        // lambda-elim handles it through its standard let / proj rules
-        // without needing a `const`-lift or cyclic-tile detection.
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-            body_taps,
-        } => Ok(dbg_typecheck_mv(TypedExpr {
-            node: crate::ccl::try_walk_loop_children(
-                params,
-                init_args,
-                source,
-                loop_body,
-                body_taps,
-                // Structural recursion — no shadowing concern.
-                None,
-                |e| elim_lambdas(ctx, e),
-            )?,
-            ty,
-            user_annotation,
-        })),
-
-        // Atoms: no sub-expressions, return as-is.
-        node @ (TypedExprNode::Lit(_)
-        | TypedExprNode::Var(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer) => Ok(TypedExpr {
-            node,
-            ty,
-            user_annotation,
-        }),
-
         // Control-flow constructs not yet supported.
-        node => Err(LambdaElimError::Unsupported(format!(
+        node @ TypedExprNode::Case { .. } => Err(LambdaElimError::Unsupported(format!(
             "unsupported node kind in lambda elimination: {node:?}"
         ))),
+
+        // Pure structural recursion: Apply, plain Compose, Let, Tuple, Record,
+        // List, ExprStmt, Feed, Define, and the atoms (no children to walk).
+        node => {
+            let mut expr = TypedExpr {
+                node,
+                ty,
+                user_annotation,
+            };
+            expr.try_map_children(|child| elim_lambdas(ctx, child))?;
+            Ok(dbg_typecheck_mv(expr))
+        }
     };
     if let Ok(e) = &result {
         debug_typecheck(e);

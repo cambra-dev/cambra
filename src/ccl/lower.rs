@@ -1162,14 +1162,15 @@ fn lower_lambda(
 /// fresh unique id via [`LoweringContext::fresh_tuple_arg`], so no two
 /// nested multi-arg lambdas can share a tuple-parameter name.
 fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr {
-    // Fast path for atoms that need no traversal.
+    // Fast path: substitute Var hits, return atoms unchanged without traversal.
     match &expr.node {
         TypedExprNode::Var(n) if n == name => return replacement.clone(),
         TypedExprNode::Var(_)
         | TypedExprNode::Lit(_)
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_) => return expr,
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Defer => return expr,
         _ => {}
     }
 
@@ -1178,8 +1179,6 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
         ty,
         user_annotation,
     } = expr;
-
-    let recurse = |e: Expr| substitute_param_in_body(e, name, replacement);
 
     let new_node = match node {
         TypedExprNode::Lambda {
@@ -1212,7 +1211,7 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
             }
             TypedExprNode::Lambda {
                 param,
-                body: Box::new(recurse(*body)),
+                body: Box::new(substitute_param_in_body(*body, name, replacement)),
                 refinement,
             }
         }
@@ -1221,12 +1220,12 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
             bound_expr,
             body,
         } => {
-            let new_bound = recurse(*bound_expr);
+            let new_bound = substitute_param_in_body(*bound_expr, name, replacement);
             // Shadowing: if the Let rebinds `name`, leave its body alone.
             let new_body = if binding.name == name {
                 *body
             } else {
-                recurse(*body)
+                substitute_param_in_body(*body, name, replacement)
             };
             TypedExprNode::Let {
                 binding,
@@ -1234,60 +1233,9 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
                 body: Box::new(new_body),
             }
         }
-        TypedExprNode::Apply { function, argument } => TypedExprNode::Apply {
-            function: Box::new(recurse(*function)),
-            argument: Box::new(recurse(*argument)),
-        },
-        TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
-            left: Box::new(recurse(*left)),
-            op,
-            right: Box::new(recurse(*right)),
-        },
-        TypedExprNode::UnaryOp(op, inner) => TypedExprNode::UnaryOp(op, Box::new(recurse(*inner))),
-        TypedExprNode::Tuple(elts) => TypedExprNode::Tuple(elts.into_iter().map(recurse).collect()),
-        TypedExprNode::List(elts) => TypedExprNode::List(elts.into_iter().map(recurse).collect()),
-        TypedExprNode::Record(fields) => {
-            TypedExprNode::Record(fields.into_iter().map(|(k, e)| (k, recurse(e))).collect())
-        }
-        TypedExprNode::Case { branches } => TypedExprNode::Case {
-            branches: branches
-                .into_iter()
-                .map(|b| Branch {
-                    guard: recurse(b.guard),
-                    body: recurse(b.body),
-                })
-                .collect(),
-        },
-        TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
-            input: Box::new(recurse(*input)),
-            kind,
-        },
-        TypedExprNode::Compose(elts) => {
-            TypedExprNode::Compose(elts.into_iter().map(recurse).collect())
-        }
-        TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
-            expr: Box::new(recurse(*expr)),
-            body: Box::new(recurse(*body)),
-        },
-        TypedExprNode::Feed { name: id, value } => TypedExprNode::Feed {
-            name: id,
-            value: Box::new(recurse(*value)),
-        },
-        TypedExprNode::Define { name: id, value } => TypedExprNode::Define {
-            name: id,
-            value: Box::new(recurse(*value)),
-        },
-        TypedExprNode::Defer => TypedExprNode::Defer,
-        // Leaves handled by the fast path above, but enumerate here so the
-        // match is exhaustive and future additions are caught at compile time.
-        node @ (TypedExprNode::Lit(_)
-        | TypedExprNode::Var(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)) => node,
-        // Loop (lowered from mutation accumulation loops): recurse via
-        // the shared `walk_loop_children` helper so param shadowing is
-        // handled identically across substitute / inline / lambda-elim.
+        // Loop params shadow `name` inside `loop_body`, so we can't fall
+        // through to the generic structural recursion below.  Delegate to
+        // the shared shadowing-aware helper.
         TypedExprNode::Loop {
             params,
             init_args,
@@ -1301,8 +1249,19 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
             loop_body,
             body_taps,
             Some(name),
-            recurse,
+            |e| substitute_param_in_body(e, name, replacement),
         ),
+
+        // All remaining variants: pure structural recursion.
+        node => {
+            let mut expr = Expr {
+                node,
+                ty,
+                user_annotation,
+            };
+            expr.map_children(|child| substitute_param_in_body(child, name, replacement));
+            return expr;
+        }
     };
 
     Expr {
