@@ -348,7 +348,15 @@ fn run_to_tile(source: &str) -> Tile {
         .main_mut()
         .and_then(|o| o.producer.as_mut())
         .expect("program has no `main` output — use `compile_sink` for sink programs");
-    let mut result = producer.get(producer.tiling().universal_guard());
+    let mut result = producer.tiling().empty_tile();
+    for _ in 0..100 {
+        result = producer.get(producer.tiling().universal_guard());
+        if result.is_terminal() {
+            break;
+        }
+        ctx.scheduler().check_for_notifications();
+    }
+
     result.compact();
     result
 }
@@ -376,7 +384,7 @@ pub fn tile_to_canonical(tile: Tile) -> String {
         Tile::Scalar(cv) => {
             let v = cv
                 .as_single()
-                .expect("scalar tile must hold exactly one element");
+                .unwrap_or_else(|| panic!("scalar tile must hold exactly one element, got {cv:?}"));
             format!("{v}")
         }
         Tile::SealedFunction {

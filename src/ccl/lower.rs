@@ -63,8 +63,8 @@ use std::{
 
 use crate::{
     ccl::{
-        AggregateKind, ArithmeticKind, BaseType, BinOpKind, Branch, CompareKind, Expr, Lit,
-        LogicKind, RefinementKind, Type, TypedExprNode, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BaseType, BinOpKind, Branch, Builtin, CompareKind, Expr,
+        Lit, LogicKind, RefinementKind, Type, TypedExprNode, UnaryOpKind,
     },
     chl_parser::ast::{
         AssignTarget, AugOp, BinOp as ChlBinOp, BoolOp, CmpOp, CompClause, Comprehension,
@@ -190,6 +190,17 @@ impl LoweringContext {
         let id = self.next_synthetic_id;
         self.next_synthetic_id += 1;
         format!("__result_{id}")
+    }
+
+    /// Mint a unique `__acc_stream_N` binding name for the
+    /// Record-bodied Join's stream output in a feed-containing mutation
+    /// loop.  The surrounding let-binding projects `.step ▷ Last` for
+    /// the scalar accumulator and `.tap_<k>_<defer>` for each per-feed
+    /// stream from this one Join.
+    fn fresh_acc_stream_name(&mut self) -> String {
+        let id = self.next_synthetic_id;
+        self.next_synthetic_id += 1;
+        format!("__acc_stream_{id}")
     }
 }
 
@@ -577,7 +588,57 @@ fn lower_middle_stmt(
             let func_expr = lower_function_body(params, fn_body, ctx)?;
             Ok(Expr::let_bind(name.as_str().to_string(), func_expr, body))
         }
-        ChlStmt::Expr(_) | ChlStmt::If { .. } | ChlStmt::For { .. } => Ok(Expr::expr_stmt(
+        // For a for-loop in the middle of a block, check whether it is a mutation
+        // accumulation loop (lowered to `Loop`) or a side-effecting streaming
+        // loop (lowered to Compose + expr_stmt).
+        ChlStmt::For {
+            target,
+            iter,
+            body: for_body,
+            ..
+        } => {
+            let mut scope = outer_bindings.clone();
+            collect_stmt_names(preceding, &mut scope);
+
+            // Detect a mutation loop: at least one top-level assignment to
+            // a variable from the outer scope.  Yields are not a barrier
+            // — a generator with loop-carried state (brainstorm §4b's
+            // `running_totals` shape) is just a mutation loop whose body
+            // also feeds an auto-generated defer.  The surrounding `body`
+            // (the continuation) is threaded into `lower_mutation_loop`
+            // so it can lift post-mutation feeds outside the loop and
+            // wrap the continuation in the right sequence of `Let` /
+            // `ExprStmt(Feed(...))` nodes.
+            let acc_names = find_mutation_loop_vars(for_body, &scope);
+            if !acc_names.is_empty() {
+                return lower_generator_or_mutation_loop(
+                    target, iter, for_body, &acc_names, body, ctx,
+                );
+            }
+            // Top-level scan found nothing, but a *nested* `if` or
+            // `for` may still mutate an outer-scope variable — we
+            // don't yet support either of those (nested-for is
+            // future work; mutations under `if` need refinement
+            // propagation).  Reject early with a specific message
+            // so users don't see the generic "must end in yield"
+            // error from the generator-for fallback below.
+            if let Some(nested) = find_nested_mutation_var(for_body, &scope) {
+                return Err(LoweringError::Unsupported(format!(
+                    "Mutation of `{nested}` is nested inside an `if` or \
+                     inner `for` in this for-loop body; only top-level \
+                     mutations of outer-scope variables are supported \
+                     today.  Move the mutation to the top of the loop \
+                     body, or rewrite using a generator expression."
+                )));
+            }
+
+            // Otherwise treat as a side-effecting for loop.
+            Ok(Expr::expr_stmt(
+                lower_generator_for(target, iter, for_body, &scope, ctx)?,
+                body,
+            ))
+        }
+        ChlStmt::Expr { .. } | ChlStmt::If { .. } => Ok(Expr::expr_stmt(
             lower_final_stmt(stmt, preceding, outer_bindings, ctx)?,
             body,
         )),
@@ -625,6 +686,18 @@ fn extract_name_target(
         AssignTarget::Tuple(_) => Err(LoweringError::Unsupported(format!(
             "{context}: only simple name targets are supported"
         ))),
+    }
+}
+
+/// Infallible variant of [`extract_name_target`]: returns the name when
+/// `target` is an [`AssignTarget::Name`], or [`None`] for tuple-destructuring
+/// patterns.  Used by predicates that want to detect a "simple assignment
+/// to a particular name" without producing an error message.
+fn name_target_as_name(target: &Spanned<AssignTarget>) -> Option<&str> {
+    if let AssignTarget::Name(id) = &target.node {
+        Some(id.as_str())
+    } else {
+        None
     }
 }
 
@@ -1212,22 +1285,24 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)) => node,
-        // Lowering does not produce Join/Jump, so passing through is safe.
-        TypedExprNode::Join {
-            name: n,
+        // Loop (lowered from mutation accumulation loops): recurse via
+        // the shared `walk_loop_children` helper so param shadowing is
+        // handled identically across substitute / inline / lambda-elim.
+        TypedExprNode::Loop {
             params,
+            init_args,
+            source,
             loop_body,
-            outer_body,
-        } => TypedExprNode::Join {
-            name: n,
+            body_taps,
+        } => crate::ccl::walk_loop_children(
             params,
-            loop_body: Box::new(recurse(*loop_body)),
-            outer_body: Box::new(recurse(*outer_body)),
-        },
-        TypedExprNode::Jump { target, args } => TypedExprNode::Jump {
-            target,
-            args: args.into_iter().map(recurse).collect(),
-        },
+            init_args,
+            source,
+            loop_body,
+            body_taps,
+            Some(name),
+            recurse,
+        ),
     };
 
     Expr {
@@ -1292,14 +1367,38 @@ fn lower_generator_for(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let iter_var = extract_name_target(target, "for-loop target")?;
-    let source = lower_expr(iter, ctx)?;
-
-    // `outer_bindings` is the mutation scope — the iter_var is introduced by
-    // the for clause itself and may be shadowed (re-let) inside the body.
-    let frame_introduced = HashSet::from([iter_var.clone()]);
 
     if for_body_has_yield(body) {
-        // Desugar yield → defer + feed.
+        // A generator with loop-carried state (brainstorm §4b) — yield
+        // alongside mutation of an outer-scope variable — routes through
+        // the same `Loop` lowering as a plain mutation loop, with the
+        // yield-defer wired in as an extra `tap_*` field on the body
+        // Record.  Detect mutation first so we can dispatch on it.
+        let acc_names = find_mutation_loop_vars(body, outer_bindings);
+        if !acc_names.is_empty() {
+            // The generator's defer is bound around the mutation loop
+            // and used as the continuation — same shape as the plain
+            // yield-only path below.
+            let defer_name = ctx.fresh_result_name();
+            let inner = lower_mutation_loop(
+                target,
+                iter,
+                body,
+                &acc_names,
+                Expr::var(defer_name.clone()),
+                Some(&defer_name),
+                ctx,
+            )?;
+            return Ok(Expr::let_bind(
+                defer_name,
+                Expr::new(TypedExprNode::Defer),
+                inner,
+            ));
+        }
+
+        let source = lower_expr(iter, ctx)?;
+        let frame_introduced = HashSet::from([iter_var.clone()]);
+        // Plain yield without loop-carried mutation: desugar yield → defer + feed.
         let defer_name = ctx.fresh_result_name();
         let for_body = lower_for_body_stmts(
             body,
@@ -1316,6 +1415,8 @@ fn lower_generator_for(
             seq,
         ))
     } else {
+        let source = lower_expr(iter, ctx)?;
+        let frame_introduced = HashSet::from([iter_var.clone()]);
         let for_body = lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)?;
         Ok(Expr::for_loop(iter_var, source, for_body))
     }
@@ -1392,8 +1493,8 @@ fn lower_for_body_stmts(
                          pre-loop binding)",
                     )));
                 }
-                // x op= e is only valid if x was already introduced in this frame.
                 if !frame_introduced.contains(&name) {
+                    // x op= e is only valid if x was already introduced in this frame.
                     return Err(LoweringError::Unsupported(format!(
                         "Augmented assignment to `{name}` in for-loop body: \
                          `{name}` is not bound in this body. Use `{name} = expr` \
@@ -1547,7 +1648,466 @@ fn lower_for_body_terminal(
     }
 }
 
-/// Lower a CHL function definition body to a CCL expression.
+// ---------------------------------------------------------------------------
+// Mutation loop lowering — `Loop` CCL nodes
+// ---------------------------------------------------------------------------
+
+/// If `stmt` is an assignment to a simple name that *could* be a mutation
+/// of an existing binding, return that name.
+///
+/// `Assign` and `AugAssign` to a bare name qualify.  `<<=` is a
+/// [`ChlStmt::Define`] (deferred-collection define, not a mutation) and is
+/// rejected here automatically because it isn't an `Assign` or `AugAssign`.
+fn mutation_target_name(stmt: &Spanned<ChlStmt>) -> Option<&str> {
+    match &stmt.node {
+        ChlStmt::Assign { target, .. } => name_target_as_name(target),
+        ChlStmt::AugAssign { target, .. } => name_target_as_name(target),
+        _ => None,
+    }
+}
+
+/// Scan a for-loop body for assignments that mutate names already
+/// bound in `mutation_scope`.  Returns every such name in first-mention
+/// order, deduplicated, so the loop can be lowered to a
+/// [`TypedExprNode::Loop`] whose `params` cover *all* loop-carried
+/// accumulators.
+///
+/// Used by [`lower_middle_stmt`] both as a predicate ("is this for-loop a
+/// mutation accumulator loop?" — non-empty result) and as the canonical
+/// param list for [`lower_mutation_loop`].  The body's own sequential
+/// walk in [`lower_mutation_loop_body`] handles every individual
+/// mutation; this just decides which names are loop-carried.
+///
+/// `o <<= x` is a [`ChlStmt::Define`] (deferred-collection define), not a
+/// mutation — [`mutation_target_name`] filters those out.
+fn find_mutation_loop_vars(
+    body: &[Spanned<ChlStmt>],
+    mutation_scope: &HashSet<String>,
+) -> Vec<String> {
+    let mut vars = Vec::new();
+    let mut seen = HashSet::new();
+    for stmt in body {
+        if let Some(name) = mutation_target_name(stmt)
+            && mutation_scope.contains(name)
+            && seen.insert(name.to_string())
+        {
+            vars.push(name.to_string());
+        }
+    }
+    vars
+}
+
+/// Recursively search `stmts` for any assignment that mutates a name
+/// in `mutation_scope`, descending into the bodies of nested `if` /
+/// `for` statements.  Returns the first such name found.
+///
+/// Used by [`lower_middle_stmt`] to distinguish "this for-body has no
+/// supported mutation pattern" from "this for-body has a mutation
+/// pattern we don't yet support (nested inside control flow)", so the
+/// latter can produce a targeted error rather than the generic
+/// generator-for fallback's "must end in yield" message.
+fn find_nested_mutation_var(
+    stmts: &[Spanned<ChlStmt>],
+    mutation_scope: &HashSet<String>,
+) -> Option<String> {
+    for stmt in stmts {
+        if let Some(name) = mutation_target_name(stmt)
+            && mutation_scope.contains(name)
+        {
+            return Some(name.to_string());
+        }
+        match &stmt.node {
+            ChlStmt::If {
+                branches,
+                else_body,
+            } => {
+                for branch in branches {
+                    if let Some(n) = find_nested_mutation_var(&branch.body, mutation_scope) {
+                        return Some(n);
+                    }
+                }
+                if let Some(else_body) = else_body
+                    && let Some(n) = find_nested_mutation_var(else_body, mutation_scope)
+                {
+                    return Some(n);
+                }
+            }
+            ChlStmt::For { body, .. } => {
+                if let Some(n) = find_nested_mutation_var(body, mutation_scope) {
+                    return Some(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Dispatch wrapper for [`lower_mutation_loop`] that allocates a generator
+/// defer when the body contains a `yield`.
+///
+/// A mutation loop body may also contain `yield e` statements (the
+/// brainstorm §4b `running_totals` shape: `total += item; yield total`).
+/// In that case the surrounding generator-function context needs a fresh
+/// defer to collect the yielded values, and the mutation loop's body
+/// records `yield e` as a feed into that defer alongside any explicit
+/// `<<` feeds.
+///
+/// When yield is present this builds:
+/// ```text
+/// let __result = Defer in
+///   <lower_mutation_loop result, with yield-defer wired in as one more tap>
+/// ```
+/// — the same wrapping the plain generator-for path uses, except the
+/// surrounding continuation flows through unchanged (the `__result`
+/// defer is bound but never directly referenced in user-visible code;
+/// `remove_defers` substitutes the collected feed values and `simplify`
+/// drops any unused binding).
+///
+/// When yield is absent this is just [`lower_mutation_loop`].
+fn lower_generator_or_mutation_loop(
+    target: &Spanned<AssignTarget>,
+    iter: &Spanned<ChlExpr>,
+    body_stmts: &[Spanned<ChlStmt>],
+    acc_names: &[String],
+    continuation: Expr,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    if for_body_has_yield(body_stmts) {
+        let yield_defer = ctx.fresh_result_name();
+        let inner = lower_mutation_loop(
+            target,
+            iter,
+            body_stmts,
+            acc_names,
+            continuation,
+            Some(&yield_defer),
+            ctx,
+        )?;
+        Ok(Expr::let_bind(
+            yield_defer,
+            Expr::new(TypedExprNode::Defer),
+            inner,
+        ))
+    } else {
+        lower_mutation_loop(target, iter, body_stmts, acc_names, continuation, None, ctx)
+    }
+}
+
+/// Lower a mutation accumulation for-loop to a [`TypedExprNode::Loop`]
+/// node, threading the surrounding `continuation` through the structure.
+///
+/// The lowered shape is uniform across accumulator count and feed
+/// presence: the Loop always emits a `Fun(D, Record({step: <step_shape>,
+/// tap_*: T_*}))` stream, with `tap_*` possibly empty and `<step_shape>`
+/// being the scalar accumulator type (n == 1) or a `Tuple(T_0, …,
+/// T_{n-1})` packing every accumulator (n > 1).  Op-conversion always
+/// cycles on `.step` and exposes the body fan-out directly; the
+/// surrounding lowering picks each accumulator off via `Proj("step")
+/// [▷ Proj(i)] ▷ Last` and each feed via `Proj("tap_*")`.
+///
+/// The lifted shape (single-accumulator example shown — for multi-var
+/// each post-loop `let acc_i = …` additionally projects `Proj(i)` off
+/// `.step`):
+///
+/// ```text
+/// let acc_stream = Loop {
+///   loop_body: λp → let acc = p.0 in let i = p.1 in
+///                   <body-chain> Record({
+///                     step: <full chain> Var(acc),
+///                     tap_0_<defer_0>: <chain-at-feed-0> <feed_value_0>,
+///                     …,
+///                   }),
+///   body_taps: ["tap_0_<defer_0>", …],  // possibly empty
+/// } in
+/// let acc_name = acc_stream ▷ Proj("step") ▷ Last in
+/// ExprStmt(Feed(defer_0, acc_stream ▷ Proj("tap_0_<defer_0>")),
+/// ExprStmt(Feed(defer_1, acc_stream ▷ Proj("tap_1_<defer_1>")),
+///   continuation))
+/// ```
+///
+/// Each feed expression captures its own let-chain prefix in the body,
+/// so feeds before / between / after the mutation see the SSA-style
+/// scope the Python source intended: pre-mutation feeds capture the
+/// empty chain (their `acc` refers to `p.0`, the previous-iteration
+/// value), and post-mutation feeds capture the chain up to and
+/// including the mutation.  The Record's `step` field captures the
+/// full chain ending in `Var(acc_name)` (or a tuple of all accumulators
+/// for multi-var).
+///
+/// `yield_defer` — if `Some(name)`, `yield e` statements in the body
+/// are accepted and lowered as feeds to that defer (one more `tap_*`
+/// field on the Record).  The caller is responsible for binding the
+/// defer outside this call; [`lower_generator_or_mutation_loop`] is
+/// the usual entry point that arranges that.  If `None`, a `yield`
+/// in the body is rejected.
+fn lower_mutation_loop(
+    target: &Spanned<AssignTarget>,
+    iter: &Spanned<ChlExpr>,
+    body_stmts: &[Spanned<ChlStmt>],
+    acc_names: &[String],
+    continuation: Expr,
+    yield_defer: Option<&str>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    assert!(
+        !acc_names.is_empty(),
+        "lower_mutation_loop: empty acc_names"
+    );
+    let iter_var_name = extract_name_target(target, "for-loop target")?;
+    let source = lower_expr(iter, ctx)?;
+    let MutationLoopBody { step, feeds } =
+        lower_mutation_loop_body(body_stmts, acc_names, yield_defer, ctx)?;
+
+    // Build the body lambda's outer let-chain `let acc_i = p.i in … let
+    // iter_var = p.n in <inner>` for an (n+1)-tuple param `p` whose
+    // components are the n previous-iteration accumulator values followed
+    // by the source element.  Shared between the no-feeds and feeds
+    // paths.
+    let build_body_lambda = |inner: Expr, ctx: &mut LoweringContext| -> Expr {
+        let p_name = ctx.fresh_tuple_arg();
+        let item_idx = acc_names.len();
+        let mut wrapped = Expr::let_bind(
+            &iter_var_name,
+            Expr::apply(Expr::var(&p_name), Expr::proj_index(item_idx)),
+            inner,
+        );
+        for (i, name) in acc_names.iter().enumerate().rev() {
+            wrapped = Expr::let_bind(
+                name.clone(),
+                Expr::apply(Expr::var(&p_name), Expr::proj_index(i)),
+                wrapped,
+            );
+        }
+        Expr::lambda(&p_name, Type::Hole, wrapped)
+    };
+
+    // Initial-accumulator values, one per loop-carried variable, in
+    // declaration order.  Evaluated outside the loop's param scope.
+    let init_args: Vec<Expr> = acc_names.iter().map(|n| Expr::var(n.clone())).collect();
+
+    // Build the body's Record codomain: one mandatory `step` field
+    // carrying the recurrence, plus one `tap_<k>_<defer>` field per
+    // feed.  Each tap field's expression IS the captured-let-chain
+    // feed value from `lower_mutation_loop_body` — no external
+    // `Compose([zip, λ])` wrapping is needed because the body's own
+    // lambda provides the per-iteration `acc` / `iter_var` scope.
+    let tap_fields: Vec<(String, Expr)> = feeds
+        .iter()
+        .enumerate()
+        .map(|(k, (defer_name, feed_value))| {
+            let field_name = format!("tap_{k}_{defer_name}");
+            (field_name, feed_value.clone())
+        })
+        .collect();
+    let tap_field_names: Vec<String> = tap_fields.iter().map(|(n, _)| n.clone()).collect();
+
+    let mut record_fields: Vec<(String, Expr)> = Vec::with_capacity(1 + tap_fields.len());
+    record_fields.push(("step".to_string(), step));
+    record_fields.extend(tap_fields);
+    let record_body = Expr::new(TypedExprNode::Record(record_fields));
+
+    let step_lambda = build_body_lambda(record_body, ctx);
+    let loop_expr = Expr::loop_with_taps(
+        acc_names.to_vec(),
+        init_args,
+        source,
+        step_lambda,
+        tap_field_names.clone(),
+    );
+
+    // Wrap the continuation in:
+    //   let acc_stream = Loop {…} in
+    //   let acc_i = acc_stream ▷ Proj("step") [▷ Proj(i)] ▷ Last in …
+    //   ExprStmt(Feed(d_k, acc_stream ▷ Proj("tap_k_<d_k>")), …)
+    //
+    // For a single accumulator the inner `▷ Proj(i)` is omitted —
+    // `.step` is already the scalar value.  For multi-var, `.step`
+    // carries a `Tuple` and each accumulator is reached by an
+    // additional positional projection.  Each `.tap_<k>` projection
+    // is a `Fun(D, T_<k>)` stream the surrounding defer's
+    // `inline_defer` collects via the standard feed-result
+    // construction.
+    let acc_stream_name = ctx.fresh_acc_stream_name();
+    let mut wrapped = continuation;
+    for (k, (defer_name, _)) in feeds.into_iter().enumerate().rev() {
+        let field_name = &tap_field_names[k];
+        let tap_stream = Expr::compose(vec![
+            Expr::var(&acc_stream_name),
+            Expr::proj_field(field_name),
+        ]);
+        wrapped = Expr::expr_stmt(Expr::feed(defer_name, tap_stream), wrapped);
+    }
+    let multi_acc = acc_names.len() > 1;
+    for (i, name) in acc_names.iter().enumerate().rev() {
+        let mut chain = vec![Expr::var(&acc_stream_name), Expr::proj_field("step")];
+        if multi_acc {
+            chain.push(Expr::proj_index(i));
+        }
+        // `LastOrDefault(stream, default)` extracts the body's final
+        // step value, or returns `default` when the source domain is
+        // empty (the loop body ran zero times).  We pass the pre-loop
+        // value of the accumulator (`Var(name)`, which resolves to the
+        // outer-scope binding because the let we're building below
+        // shadows it only inside `wrapped`) as the default.
+        let scalar = Expr::apply(
+            Expr::tuple(vec![Expr::compose(chain), Expr::var(name.clone())]),
+            Expr::builtin(Builtin::LastOrDefault),
+        );
+        wrapped = Expr::let_bind(name.clone(), scalar, wrapped);
+    }
+    Ok(Expr::let_bind(acc_stream_name, loop_expr, wrapped))
+}
+
+/// Lower the body statements of a mutation accumulation loop to a single
+/// step expression plus a list of feed snapshots.
+///
+/// The body is walked sequentially.  Each statement is classified:
+/// - **Assignment** (mutation `x = …`, augmented mutation `x op= …`, or any
+///   ordinary `y = …` let-binding) — appended to the running let-chain.
+///   Mutations of `acc_name` shadow the existing `acc_name` binding via the
+///   chain's lexical scoping; ordinary lets introduce fresh names.
+/// - **Feed `o << e`** — snapshotted: a lambda body is built as the
+///   *current* let-chain (every assignment seen so far in body order)
+///   wrapped around the lowered `e`.  This captures the SSA-style scope
+///   that `e` was written in: pre-mutation feeds see the Loop's
+///   accumulator param directly (an empty / pre-mutation prefix chain),
+///   in-between-mutation feeds see the chain up to that point, and
+///   post-mutation feeds see the full chain.  The feeds list contains
+///   one such snapshot per `<<`.
+/// - **`yield e`** — equivalent to `<<` against a synthesised generator
+///   defer.  When `yield_defer` is `Some(name)`, the yield is recorded
+///   as a feed into that name using the same let-chain snapshotting
+///   rules; when `None`, a `yield` is rejected.  This lets a generator
+///   with loop-carried state (brainstorm §4b's `running_totals`) reuse
+///   the same `Loop` lowering as a plain mutation loop — the yield's
+///   defer simply becomes one more `tap_*` field on the body Record.
+///
+/// The Loop's `loop_body` step expression is the full let-chain ending in
+/// `Var(acc_name)` — the final accumulator value after every mutation in
+/// the body has been applied.
+///
+/// Feeds anywhere in the body are supported.  [`lower_mutation_loop`]
+/// wraps each captured lambda body in `λp → let acc_name = p ▷ Proj(0)
+/// in let iter_var = p ▷ Proj(1) in <body>`, where `p` is the
+/// per-iteration tuple `(prev_acc, item)`.  The outer let-bindings
+/// shadow the per-iteration values into the names the body's let-chain
+/// expects, so pre-mutation references to `acc_name` resolve to `p.0`
+/// (the previous-iteration accumulator — the value `Recurse` emits at
+/// the corresponding domain position), and post-mutation references
+/// resolve to the most recent mutation binding in the chain.
+fn lower_mutation_loop_body(
+    stmts: &[Spanned<ChlStmt>],
+    acc_names: &[String],
+    yield_defer: Option<&str>,
+    ctx: &mut LoweringContext,
+) -> Result<MutationLoopBody, LoweringError> {
+    let mut let_chain: Vec<(String, Expr)> = Vec::new();
+    let mut feeds: Vec<(String, Expr)> = Vec::new();
+
+    let wrap_chain = |chain: &[(String, Expr)], tail: Expr| {
+        chain.iter().rev().fold(tail, |body, (name, val)| {
+            Expr::let_bind(name.clone(), val.clone(), body)
+        })
+    };
+
+    for stmt in stmts {
+        match &stmt.node {
+            // Simple `name = value` — either a mutation of one of the
+            // loop-carried accumulators (when `name` is in `acc_names`)
+            // or an ordinary let-binding.  Both get appended to the chain
+            // in body order; the chain's lexical scoping does the rest.
+            ChlStmt::Assign { target, value } => {
+                let name = extract_name_target(target, "assignment")?;
+                let val = lower_expr(value, ctx)?;
+                let_chain.push((name, val));
+            }
+            // Augmented assignment `x op= value` — desugars to `x = x op value`.
+            // CHL's `AugOp` doesn't include `<<` (that's its own statement,
+            // `ChlStmt::Define`, which falls through to the catch-all below).
+            ChlStmt::AugAssign { target, op, value } => {
+                let name = extract_name_target(target, "augmented assignment")?;
+                let val = lower_aug_binop(&name, *op, value, ctx)?;
+                let_chain.push((name, val));
+            }
+            // `o << value` — captured as a feed.  Snapshot the current
+            // let-chain and wrap the lowered feed value in it.
+            ChlStmt::Expr(value)
+                if let ChlExpr::Feed {
+                    target: feed_target,
+                    value: feed_value,
+                } = &value.node =>
+            {
+                let defer_name = match &feed_target.node {
+                    ChlExpr::Name(id) => id.as_str().to_string(),
+                    _ => {
+                        return Err(LoweringError::Unsupported(
+                            "feed target: only simple name targets are supported".into(),
+                        ));
+                    }
+                };
+                let lowered = lower_expr(feed_value, ctx)?;
+                let wrapped = wrap_chain(&let_chain, lowered);
+                feeds.push((defer_name, wrapped));
+            }
+            // `yield value` — treated as a feed into the surrounding
+            // generator's synthesised defer.  Same let-chain snapshotting
+            // as `<<` so that pre/in/post-mutation yields see the right
+            // SSA-style scope.
+            ChlStmt::Expr(value) if let ChlExpr::Yield(y) = &value.node => {
+                let defer_name = yield_defer.ok_or_else(|| {
+                    LoweringError::Unsupported("yield outside a generator for-loop context".into())
+                })?;
+                let feed_value = lower_expr(y, ctx)?;
+                let wrapped = wrap_chain(&let_chain, feed_value);
+                feeds.push((defer_name.to_string(), wrapped));
+            }
+            _ => {
+                return Err(LoweringError::Unsupported(
+                    "Only assignments (`x = …`, `x op= …`), `<<` feeds, and \
+                     `yield` are supported inside a mutation loop body"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    // The cycle's step expression: the full let-chain wrapped around the
+    // step terminator.  For a single accumulator the terminator is just
+    // `Var(acc_name)`; for multiple it is a `Tuple([Var(acc_0), …])` so
+    // op-conversion can expose every loop-carried value through one Join
+    // and the surrounding lowering picks each off via positional `Proj ▷
+    // Last`.
+    let step_terminator = if acc_names.len() == 1 {
+        Expr::var(acc_names[0].clone())
+    } else {
+        Expr::tuple(acc_names.iter().map(|n| Expr::var(n.clone())).collect())
+    };
+    let step = wrap_chain(&let_chain, step_terminator);
+
+    Ok(MutationLoopBody { step, feeds })
+}
+
+/// The split of a mutation loop body: the per-iteration step expression
+/// (the full assignment let-chain, ending in `Var(acc_name)` — the final
+/// accumulator value), and a list of feed snapshots taken at each `<<`
+/// statement in body order.  See [`lower_mutation_loop_body`] for the
+/// per-statement rules.
+struct MutationLoopBody {
+    /// The Join's per-iteration step expression — the entire body's
+    /// let-chain (every `x = …`, `x op= …`, and ordinary `y = …`) ending
+    /// in `Var(acc_name)`.  The Join's `loop_body` codomain equals the
+    /// accumulator type.
+    step: Expr,
+    /// `(defer_name, wrapped_feed_value)` for each `<<` statement in the
+    /// body.  Each `wrapped_feed_value` is the lowered RHS wrapped in the
+    /// let-chain up to (but not including) the feed itself — so its
+    /// references to `acc_name` resolve in the same SSA-style scope the
+    /// original Python source intended.
+    feeds: Vec<(String, Expr)>,
+}
+
+/// Lower a Python function definition body to a CCL expression.
 ///
 /// Delegates entirely to [`lower_stmts_inner`] with the function's
 /// parameter names as `outer_bindings`. If the function body's final
@@ -2448,9 +3008,47 @@ bad";
         assert!(matches!(err, LoweringError::Unsupported(_)));
     }
 
-    /// Mutation of a function argument inside a generator is rejected.
+    /// Brainstorm §4b — a generator with loop-carried state lowers to a
+    /// `Loop` whose body Record has both `step` (the accumulator
+    /// recurrence) and a `tap_*` field for the yielded values, with the
+    /// surrounding `let __result = defer` collecting the yields.
     #[test]
-    fn test_generator_mutation_of_arg_rejected() {
+    fn test_generator_with_loop_carried_mutation_lowers() {
+        let code = "\
+def running_totals(items):
+    total = 0
+    for item in items:
+        total += item
+        yield total
+running_totals";
+        let stmts = parse_module(code);
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect("running_totals should lower as a mutation loop with a yield-tap");
+        let s = symbolic(&ccl);
+        assert!(
+            s.contains("__result_") && s.contains("defer"),
+            "should bind a defer for the generator's yields: {s}"
+        );
+        assert!(
+            s.contains("loop total") || s.contains("loop (total"),
+            "should produce a Loop carrying `total`: {s}"
+        );
+        assert!(
+            s.contains("step: ") && s.contains("tap_0"),
+            "Loop body Record should expose both `step` and a yield tap: {s}"
+        );
+        assert!(
+            s.contains("feed(__result_"),
+            "should feed the yield-defer from the tap stream: {s}"
+        );
+    }
+
+    /// Generator with a directly-mutated argument: same shape as
+    /// `running_totals` but the accumulator is a function parameter
+    /// rather than a pre-loop local.  Verifies that the `acc_names`
+    /// scan walks the function-parameter scope, not just pre-loop lets.
+    #[test]
+    fn test_generator_mutation_of_arg_lowers() {
         let code = "\
 def bad(xs, n):
     for x in xs:
@@ -2458,42 +3056,20 @@ def bad(xs, n):
         yield n
 bad";
         let stmts = parse_module(code);
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        match &err {
-            LoweringError::Unsupported(msg) => {
-                assert!(
-                    msg.contains("mutation") && msg.contains("`n`"),
-                    "error should mention mutation of `n`: {msg}"
-                );
-            }
-        }
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect("generator mutating an argument should lower as a mutation loop");
+        let s = symbolic(&ccl);
+        assert!(
+            s.contains("loop n") && s.contains("tap_0"),
+            "should be a `Loop` over `n` with a yield-tap field: {s}"
+        );
     }
 
-    /// Mutation of a pre-loop let inside a generator is rejected.
-    #[test]
-    fn test_generator_mutation_of_preloop_let_rejected() {
-        let code = "\
-def bad(xs):
-    total = 0
-    for x in xs:
-        total = total + x
-        yield total
-bad";
-        let stmts = parse_module(code);
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        match &err {
-            LoweringError::Unsupported(msg) => {
-                assert!(
-                    msg.contains("mutation") && msg.contains("`total`"),
-                    "error should mention mutation of `total`: {msg}"
-                );
-            }
-        }
-    }
-
-    /// Mutation across nested for boundaries is rejected.
+    /// Mutation of an outer-frame variable from inside a *nested* generator
+    /// for-loop is still rejected.  The outer for-body has a yield (via the
+    /// inner loop), so the mutation-loop path doesn't fire; the generator
+    /// path then sees `y = y + z` as an assignment to a name bound outside
+    /// the inner for's own frame and rejects it.
     #[test]
     fn test_generator_mutation_across_nested_for_rejected() {
         let code = "\
@@ -2507,14 +3083,52 @@ bad";
         let stmts = parse_module(code);
         let err = lower_stmts(&stmts, &mut LoweringContext::default())
             .expect_err("expected lowering error");
-        match &err {
-            LoweringError::Unsupported(msg) => {
-                assert!(
-                    msg.contains("mutation") || msg.contains("enclosing for-loop"),
-                    "error should mention mutation across for boundary: {msg}"
-                );
-            }
-        }
+        let LoweringError::Unsupported(msg) = &err;
+        assert!(
+            msg.contains("mutation") && msg.contains("`y`"),
+            "error should mention mutation of `y`: {msg}"
+        );
+    }
+
+    /// Mutation of an outer-scope variable nested inside an `if` in a
+    /// for-loop body is rejected with a targeted message that names the
+    /// variable and points at the nesting, rather than falling through
+    /// to the generator-for fallback's generic "must end in yield".
+    #[test]
+    fn test_mutation_nested_in_if_rejected() {
+        let code = "\
+x = 0
+for i in [1, 2]:
+    if i > 0:
+        x = x + i
+x";
+        let stmts = parse_module(code);
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
+        let LoweringError::Unsupported(msg) = &err;
+        assert!(
+            msg.contains("nested") && msg.contains("`x`"),
+            "error should call out nested mutation of `x`: {msg}"
+        );
+    }
+
+    /// Same shape but mutation nested in an inner `for` rather than `if`.
+    #[test]
+    fn test_mutation_nested_in_for_rejected() {
+        let code = "\
+x = 0
+for i in [1, 2]:
+    for j in [10, 20]:
+        x = x + i + j
+x";
+        let stmts = parse_module(code);
+        let err = lower_stmts(&stmts, &mut LoweringContext::default())
+            .expect_err("expected lowering error");
+        let LoweringError::Unsupported(msg) = &err;
+        assert!(
+            msg.contains("nested") && msg.contains("`x`"),
+            "error should call out nested mutation of `x`: {msg}"
+        );
     }
 
     /// `yield` without a value is rejected.

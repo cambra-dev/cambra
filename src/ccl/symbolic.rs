@@ -254,39 +254,42 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Lowest, format!("{{ {} }}", arms.join("; ")))
         }
 
-        TypedExprNode::Join {
-            name,
+        TypedExprNode::Loop {
             params,
+            init_args,
+            source,
             loop_body,
-            outer_body,
             ..
         } => {
-            let param_strs: Vec<_> = params
+            // Render each loop-carried slot as `name = init`, with the
+            // accumulator's type shown after the name when known.  Single
+            // accumulator: bare `x = 0`.  Multiple: parenthesised
+            // `(x = 0, y = 1)` so the slot list reads as a single chunk.
+            // The loop's debug `name` is intentionally omitted — symbolic
+            // is the readable surface form; pretty-printed AST dumps
+            // still show the label.  Taps don't get a separate header —
+            // they appear in the body's Record literal directly.
+            let slot_strs: Vec<_> = params
                 .iter()
-                .map(|p| match &p.ty {
-                    Type::Hole | Type::Infer(_) => p.name.clone(),
-                    t => format!("{}: {t}", p.name),
+                .zip(init_args.iter())
+                .map(|(p, init)| {
+                    let init_str = fmt(init, Precedence::Lowest, opts);
+                    match &p.ty {
+                        Type::Hole | Type::Infer(_) => format!("{} = {init_str}", p.name),
+                        t => format!("{}: {t} = {init_str}", p.name),
+                    }
                 })
                 .collect();
+            let slots = if slot_strs.len() == 1 {
+                slot_strs.into_iter().next().unwrap()
+            } else {
+                format!("({})", slot_strs.join(", "))
+            };
+            let source_str = fmt(source, Precedence::Lowest, opts);
             let body_str = fmt(loop_body, Precedence::Lowest, opts);
-            let rest_str = fmt(outer_body, Precedence::Lowest, opts);
             (
                 Precedence::Lowest,
-                format!(
-                    "let rec {name}({}) = {body_str}\nin {rest_str}",
-                    param_strs.join(", ")
-                ),
-            )
-        }
-
-        TypedExprNode::Jump { target, args } => {
-            let arg_strs: Vec<_> = args
-                .iter()
-                .map(|a| fmt(a, Precedence::Lowest, opts))
-                .collect();
-            (
-                Precedence::Atom,
-                format!("{target}({})", arg_strs.join(", ")),
+                format!("loop {slots} over {source_str} do {body_str}"),
             )
         }
 
@@ -683,23 +686,30 @@ in x"
     )]
     // Aggregate
     #[case(Expr::aggregate(Expr::var("xs"), AggregateKind::Max), "Max(xs)")]
-    // Join + Jump
+    // Loop, single accumulator
     #[case(
-        TypedExpr::new(TypedExprNode::Join {
-            name: "k".to_string(),
+        TypedExpr::new(TypedExprNode::Loop {
             params: vec![TypedBinding::new_unannotated("i")],
-            loop_body: Box::new(TypedExpr::new(TypedExprNode::Jump {
-                target: "k".to_string(),
-                args: vec![Expr::var("i")],
-            })),
-            outer_body: Box::new(TypedExpr::new(TypedExprNode::Jump {
-                target: "k".to_string(),
-                args: vec![Expr::lit(Lit::Int(0))],
-            })),
+            init_args: vec![Expr::lit(Lit::Int(0))],
+            source: Box::new(Expr::var("xs")),
+            loop_body: Box::new(Expr::var("i")),
+            body_taps: Vec::new(),
         }),
-        "\
-let rec k(i) = k(i)
-in k(0)"
+        "loop i = 0 over xs do i"
+    )]
+    // Loop, multi-accumulator: slots are parenthesised
+    #[case(
+        TypedExpr::new(TypedExprNode::Loop {
+            params: vec![
+                TypedBinding::new_unannotated("x"),
+                TypedBinding::new_unannotated("y"),
+            ],
+            init_args: vec![Expr::lit(Lit::Int(0)), Expr::lit(Lit::Int(1))],
+            source: Box::new(Expr::var("xs")),
+            loop_body: Box::new(Expr::tuple(vec![Expr::var("x"), Expr::var("y")])),
+            body_taps: Vec::new(),
+        }),
+        "loop (x = 0, y = 1) over xs do (x, y)"
     )]
     fn test_symbolic_expr(#[case] expr: Expr, #[case] expected: &str) {
         assert_eq!(symbolic(&expr), expected);

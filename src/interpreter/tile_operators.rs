@@ -10,7 +10,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::Hash,
     iter,
     rc::Rc,
@@ -1480,6 +1480,11 @@ impl FanIn {
     }
 
     fn new_impl(names: Vec<String>, ops: Vec<Box<dyn TileOperator>>) -> Self {
+        // The [`fan_in`] dispatcher guarantees all inputs are function-typed
+        // (otherwise it routes to [`ScalarFanIn`]).  Inputs may still have
+        // *different* tile-level presence at runtime — e.g. one branch has
+        // emitted positions 0..3 while another has only 0..2 — which is
+        // handled by an intersection step in `FanInProducer::get_impl`.
         let first_tiling = ops[0].tiling();
         let tiling = match first_tiling {
             Tiling::SealedFunction { domain, .. } => {
@@ -1588,7 +1593,7 @@ impl FanIn {
 /// [`design-operators.md`](./design-operators.md) for why the same
 /// CCL-level `zip` compiles to two different tile operators.
 pub fn fan_in(inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
-    if inputs.iter().all(|op| is_scalar_tiling(op.tiling())) {
+    if inputs.iter().all(|op| op.tiling().is_scalar()) {
         Box::new(ScalarFanIn::new(inputs))
     } else {
         Box::new(FanIn::new(inputs))
@@ -1598,26 +1603,10 @@ pub fn fan_in(inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
 /// Named-field variant of [`fan_in`]: like [`fan_in`] but uses caller-supplied
 /// field names instead of the synthetic `_0`, `_1`, … names.
 pub fn fan_in_named(inputs: Vec<(String, Box<dyn TileOperator>)>) -> Box<dyn TileOperator> {
-    if inputs.iter().all(|(_, op)| is_scalar_tiling(op.tiling())) {
+    if inputs.iter().all(|(_, op)| op.tiling().is_scalar()) {
         Box::new(ScalarFanIn::new_named(inputs))
     } else {
         Box::new(FanIn::new_named(inputs))
-    }
-}
-
-/// Returns `true` when `tiling` represents a fully-realised scalar value — a
-/// `Scalar` leaf, or a `Record` whose fields are all (recursively) scalar.
-///
-/// Function-valued tilings (`SealedFunction`, `CurriedFunction`) and
-/// `Aggregation` are not scalar. Used by [`fan_in`] to pick between
-/// the scalar and function combiners.
-pub(crate) fn is_scalar_tiling(tiling: &Tiling) -> bool {
-    match tiling {
-        Tiling::Scalar(_) => true,
-        Tiling::Record(fields) => fields.values().all(is_scalar_tiling),
-        Tiling::SealedFunction { .. }
-        | Tiling::CurriedFunction { .. }
-        | Tiling::Aggregation { .. } => false,
     }
 }
 
@@ -1680,6 +1669,16 @@ impl TileProducer for FanInProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        // Cost note: the presence-intersection path below runs
+        // unconditionally on every pull — N predicate intersections, N
+        // `to_remove` minuses, and one `remove_guarded` per input.  Non-
+        // cyclic FanIns over well-aligned inputs pay the same per-pull
+        // cost as the mutation-loop body's lagging-branch case (where the
+        // recursive_input legitimately trails the source branch).  If
+        // profiling later shows this on a hot path, consider gating the
+        // intersection on a `cyclic: bool` constructor flag (mirroring
+        // `FanOut::new` vs `FanOut::new_cyclic`) and keeping the simpler
+        // "all inputs agree" path for fan-ins that can't lag.
         let tiles: Vec<Tile> = self
             .inputs
             .iter_mut()
@@ -1688,28 +1687,83 @@ impl TileProducer for FanInProducer {
 
         match &tiles[0] {
             Tile::SealedFunction { .. } => {
-                // All inputs are SealedFunction tiles
+                // All inputs are SealedFunction tiles, but they may differ in
+                // which *actual rows* are present — one branch may have
+                // emitted positions 0..3 while another has only 0..2 (or one
+                // input's upstream release shrank its known region).  We
+                // compute the intersection of every input's actually-present
+                // positions (a `Predicate` built from each tile's `domain`
+                // column), filter every tile down to it, and only then build
+                // the combined codomain record.
+                //
+                // We separately intersect the inputs' `domain_predicate`s for
+                // the *output* tile's predicate — that's purely forward-
+                // looking finality, not what governs which rows to keep,
+                // because a non-terminal input (e.g. an incremental data
+                // source) carries `domain_predicate: False` alongside
+                // fully-valid concrete rows.
+                let mut presence: Option<Predicate> = None;
                 let mut domain_pred: Option<Predicate> = None;
+                for t in tiles.iter() {
+                    let Tile::SealedFunction {
+                        domain,
+                        domain_predicate,
+                        ..
+                    } = t
+                    else {
+                        panic!("FanIn: cannot mix SealedFunction and other tile types")
+                    };
+                    let p = Predicate::from_column_value(domain);
+                    presence = Some(match presence {
+                        None => p,
+                        Some(prev) => prev.intersect(&p),
+                    });
+                    domain_pred = Some(match domain_pred {
+                        None => domain_predicate.clone(),
+                        Some(prev) => prev.intersect(domain_predicate),
+                    });
+                }
+                let presence = presence.unwrap();
+                let intersect_pred = domain_pred.unwrap();
+
+                // Filter each tile to the intersection of present positions
+                // (compute "to_remove" as that tile's domain minus the
+                // intersection, then drop those rows).
                 let mut output_domain: Option<ColumnValue> = None;
-                let mut codomains = Vec::new();
+                let mut codomains: Vec<Tile> = Vec::with_capacity(tiles.len());
                 for t in tiles.into_iter() {
-                    match t {
-                        Tile::SealedFunction {
-                            domain,
-                            codomain,
-                            domain_predicate,
-                            ..
-                        } => {
-                            if let Some(ref mut prev) = domain_pred {
-                                *prev = prev.intersect(&domain_predicate);
-                            } else {
-                                domain_pred = Some(domain_predicate.clone());
-                            }
-                            output_domain = Some(domain);
-                            codomains.push(*codomain);
-                        }
-                        _ => panic!("FanIn: cannot mix SealedFunction and other tile types"),
+                    let Tile::SealedFunction {
+                        domain: tile_domain,
+                        codomain,
+                        domain_predicate,
+                        deleted,
+                    } = t
+                    else {
+                        unreachable!()
+                    };
+                    let domain_presence = Predicate::from_column_value(&tile_domain);
+                    let to_remove = domain_presence.minus(&presence);
+                    let mut filtered = Tile::SealedFunction {
+                        domain: tile_domain,
+                        codomain,
+                        domain_predicate,
+                        deleted,
+                    };
+                    if to_remove.as_bool() != Some(false) {
+                        filtered
+                            .remove_guarded(TileGuard::Function(FunctionGuard::Domain(to_remove)));
                     }
+                    filtered.compact();
+                    let Tile::SealedFunction {
+                        domain, codomain, ..
+                    } = filtered
+                    else {
+                        unreachable!()
+                    };
+                    if output_domain.is_none() {
+                        output_domain = Some(domain);
+                    }
+                    codomains.push(*codomain);
                 }
 
                 let names = &self.names;
@@ -1723,7 +1777,7 @@ impl TileProducer for FanInProducer {
                 Tile::SealedFunction {
                     domain: output_domain.unwrap(),
                     codomain: Box::new(codomain_record),
-                    domain_predicate: domain_pred.unwrap(),
+                    domain_predicate: intersect_pred,
                     deleted: BitSet::new(),
                 }
             }
@@ -3231,6 +3285,35 @@ impl TileProducer for MapAggregateProducer {
     }
 }
 
+/// Re-entrancy bookkeeping for cyclic op graphs.  Stored in
+/// [`FanOutShared::reentrancy`] only for fan-outs constructed via
+/// [`FanOut::new_cyclic`]; non-cyclic fan-outs leave it `None` and pay
+/// none of the cyclic-mode overhead.
+///
+/// A fan-out is "cyclic" iff one of its branches feeds (transitively)
+/// back into its own input.  In practice this is only the mutation-loop
+/// body fan-out: one branch is wired into `Recurse::recursive_input` and
+/// the body's `acc_var` reads close the cycle.  In that setup,
+/// subscribing or pulling one branch can synchronously trigger the same
+/// operation on a sibling branch — the re-entrancy state below catches
+/// that and serves from the cache instead of recursively re-entering the
+/// inner producer.
+struct FanOutReentrancy {
+    /// Cache of the most-recently-returned tile from the inner producer,
+    /// used to serve re-entrant `FanOutProducer::get_impl` calls.
+    ///
+    /// **Replace, not merge**: typical inner producers ([`Memo`] in
+    /// particular) already return cumulative tiles, so each non-reentrant
+    /// pull supplants the previous cache rather than appending to it.
+    cached_tile: Tile,
+    /// Re-entrancy guard for the inner subscribe path.  `FanOutBranch::subscribe`
+    /// of one branch can transitively trigger `subscribe` on a sibling
+    /// (e.g. the loop body's `acc_var` reads close back through `Recurse`).
+    /// The re-entrant call sees this set, skips the inner subscribe (the
+    /// outer call is doing it), and just returns a `FanOutProducer`.
+    subscribing_inner: bool,
+}
+
 /// Mutable state shared across all branches from the same [`FanOut`] and all
 /// [`FanOutProducer`]s it creates.  Wrapping this in `Rc<RefCell<...>>` and
 /// creating it eagerly in [`FanOut::new`] ensures that every branch produced by
@@ -3240,6 +3323,11 @@ struct FanOutShared {
     /// Instance ID shared by all [`FanOutProducer`]s from the same fan-out group.
     id: usize,
     /// Inner producer, set on the first [`FanOutBranch::subscribe`] call.
+    ///
+    /// In cyclic mode (see [`FanOutReentrancy`]), this is also **taken out**
+    /// during the inner pull in `FanOutProducer::get_impl` so that
+    /// re-entrant calls from cyclic op graphs can detect re-entrance by
+    /// finding `None` and fall back to the cached tile.
     producer: Option<Box<dyn TileProducer>>,
     /// Every consumer registered via [`FanOutBranch::subscribe`], in order.
     ///
@@ -3251,6 +3339,49 @@ struct FanOutShared {
     consumers: Vec<Rc<RefCell<Box<dyn Consumer>>>>,
     /// Per-subscriber release guards; intersected before passing upstream.
     release_guards: Vec<TileGuard>,
+    /// Re-entrancy bookkeeping for cyclic op graphs.  `None` for non-cyclic
+    /// fan-outs (the overwhelming majority); `Some` only when constructed
+    /// via [`FanOut::new_cyclic`].
+    reentrancy: Option<FanOutReentrancy>,
+}
+
+/// RAII guard for the cyclic `FanOut` `subscribing_inner` flag.  Created
+/// when we set the flag `true` to drive the inner `subscribe`; its `Drop`
+/// resets the flag to `false`.  This makes the path panic-safe — if
+/// `input.subscribe(...)` unwinds, the flag is still reset so a later
+/// (re-)subscribe attempt doesn't get silently skipped.
+struct SubscribingInnerGuard<'a> {
+    shared: &'a Rc<RefCell<FanOutShared>>,
+}
+
+impl<'a> Drop for SubscribingInnerGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(re) = self.shared.borrow_mut().reentrancy.as_mut() {
+            re.subscribing_inner = false;
+        }
+    }
+}
+
+/// RAII guard for the cyclic `FanOut`'s "producer taken out" pattern in
+/// `FanOutProducer::get_impl`.  Owns the temporarily-extracted inner
+/// producer and on `Drop` puts it back into `shared.producer`, so a
+/// panic from the inner `producer.get(...)` doesn't leave
+/// `shared.producer = None` forever (which would break every later
+/// pull on this fan-out).
+struct TakenProducerGuard<'a> {
+    shared: &'a Rc<RefCell<FanOutShared>>,
+    /// Wrapped in `Option` so the destructor can `take()` the producer
+    /// and move it back into `shared` (you can't move out of `&mut self`
+    /// fields in `Drop`, but `Option::take` swaps the value).
+    producer: Option<Box<dyn TileProducer>>,
+}
+
+impl<'a> Drop for TakenProducerGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(producer) = self.producer.take() {
+            self.shared.borrow_mut().producer = Some(producer);
+        }
+    }
 }
 
 /// Allows for creating multiple TileOperators that all point to the same
@@ -3267,14 +3398,44 @@ pub struct FanOut {
 }
 
 impl FanOut {
-    /// Construct a new `FanOut` wrapping `input`.
+    /// Construct a new `FanOut` wrapping `input`.  Use this for ordinary
+    /// (non-cyclic) op graphs; the resulting fan-out doesn't pay any
+    /// cyclic-mode overhead.  If a branch of this fan-out ends up
+    /// feeding back into its own input (e.g. via `Recurse::recursive_input`),
+    /// use [`FanOut::new_cyclic`] instead.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
+        Self::new_with_reentrancy(input, None)
+    }
+
+    /// Construct a cyclic [`FanOut`].  Sets up the re-entrancy bookkeeping
+    /// (a cached tile snapshot + a subscribe-in-progress flag) needed when
+    /// a branch of this fan-out transitively feeds back into its own input.
+    ///
+    /// The cost relative to [`FanOut::new`] is one `Tile` clone per pull
+    /// (to refresh the cache).  The mutation-loop body fan-out is the only
+    /// caller today; non-cyclic users should stick with `new`.
+    pub fn new_cyclic(input: Box<dyn TileOperator>) -> Self {
+        let cached_tile = input.tiling().empty_tile();
+        Self::new_with_reentrancy(
+            input,
+            Some(FanOutReentrancy {
+                cached_tile,
+                subscribing_inner: false,
+            }),
+        )
+    }
+
+    fn new_with_reentrancy(
+        input: Box<dyn TileOperator>,
+        reentrancy: Option<FanOutReentrancy>,
+    ) -> Self {
         let tiling = input.tiling().clone();
         let shared = Rc::new(RefCell::new(FanOutShared {
             id: FanOutProducer::alloc_id(),
             producer: None,
             consumers: Vec::new(),
             release_guards: Vec::new(),
+            reentrancy,
         }));
         Self {
             input: Rc::new(RefCell::new(input)),
@@ -3345,11 +3506,42 @@ impl TileOperator for FanOutBranch {
             index
         }; // borrow released here before we might call input.subscribe
 
-        // Create the inner producer on the first subscription only.
+        // Decide whether *this* call should drive the inner subscribe.
+        // `producer.is_none()` is the standard "first subscription" check;
+        // in cyclic mode, `!reentrancy.subscribing_inner` makes the path
+        // re-entrancy-safe: a sibling-branch subscribe triggered from
+        // inside the inner subscribe call sees the flag set and just
+        // returns a producer (the outer call will populate `producer`
+        // before anyone pulls).
+        let should_subscribe = {
+            let mut shared = self.shared.borrow_mut();
+            if shared.producer.is_some() {
+                false
+            } else if let Some(re) = shared.reentrancy.as_mut() {
+                if re.subscribing_inner {
+                    false
+                } else {
+                    re.subscribing_inner = true;
+                    true
+                }
+            } else {
+                true
+            }
+        };
+
+        // Drive the inner subscribe (first non-reentrant subscriber only).
         // We must not hold a borrow of `shared` during `input.subscribe`
         // because that call may synchronously fire the notification closure,
         // which itself borrows `shared`.
-        if self.shared.borrow().producer.is_none() {
+        if should_subscribe {
+            // RAII: any path out of this block (success or panic) resets
+            // `subscribing_inner` to `false`.  Without the guard, a panic
+            // from `input.subscribe(...)` would leave the flag set
+            // forever and silently skip every future subscribe attempt
+            // on this fan-out.
+            let _guard = SubscribingInnerGuard {
+                shared: &self.shared,
+            };
             let shared_rc = self.shared.clone();
             let inner = self.input.borrow_mut().subscribe(
                 intent_guard,
@@ -3367,6 +3559,7 @@ impl TileOperator for FanOutBranch {
                 scheduler,
             );
             self.shared.borrow_mut().producer = Some(inner);
+            // `_guard` drops here, resetting `subscribing_inner`.
         }
 
         Box::new(FanOutProducer {
@@ -3411,13 +3604,62 @@ impl TileProducer for FanOutProducer {
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let mut result = self
-            .shared
-            .borrow_mut()
-            .producer
-            .as_mut()
-            .unwrap()
-            .get(projection_guard);
+        // In cyclic mode, take the inner producer out during the pull so
+        // sibling-branch re-entrance can detect re-entrance by finding
+        // `producer == None` and serve from the cached tile.  In
+        // non-cyclic mode, the producer stays in `shared` and we pull
+        // through a regular borrow.
+        let cyclic = self.shared.borrow().reentrancy.is_some();
+        let mut result = if cyclic {
+            let producer_opt = self.shared.borrow_mut().producer.take();
+            if let Some(producer) = producer_opt {
+                // RAII: put the producer back into `shared` on any exit
+                // path (success or panic).  Without this guard, a panic
+                // from `producer.get(...)` would leave `shared.producer
+                // = None` forever, silently breaking every subsequent
+                // pull on this fan-out.
+                let mut guard = TakenProducerGuard {
+                    shared: &self.shared,
+                    producer: Some(producer),
+                };
+                let tile = guard.producer.as_mut().unwrap().get(projection_guard);
+                trace!("{} received {tile:?}", self.name());
+                // Refresh the re-entrancy cache before the guard drops.
+                // We replace (not merge) — inner producers like `Memo`
+                // already return cumulative tiles, so each pull
+                // supplants the previous cached snapshot.
+                self.shared
+                    .borrow_mut()
+                    .reentrancy
+                    .as_mut()
+                    .unwrap()
+                    .cached_tile = tile.clone();
+                tile
+                // `guard` drops here, restoring `shared.producer`.
+            } else {
+                // Re-entrant pull: another branch's outer `get_impl` is
+                // currently holding the producer.  Serve the latest known
+                // emission instead of re-entering the inner producer (which
+                // would alias `&mut`).
+                let cached = self
+                    .shared
+                    .borrow()
+                    .reentrancy
+                    .as_ref()
+                    .unwrap()
+                    .cached_tile
+                    .clone();
+                trace!("{} serving cached (re-entrant): {cached:?}", self.name());
+                cached
+            }
+        } else {
+            self.shared
+                .borrow_mut()
+                .producer
+                .as_mut()
+                .unwrap()
+                .get(projection_guard)
+        };
 
         // Filter by the stored obsolete guard. Because upstream retains data according to the
         // intersection of all obsolete guards, it may have more data than this specific consumer
@@ -3429,26 +3671,30 @@ impl TileProducer for FanOutProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        let result = {
-            let mut shared = self.shared.borrow_mut();
-            // Union with the existing stored guard so that the accumulated set of
-            // delivered data grows monotonically.  Replacing (instead of union-ing)
-            // would forget previously-released ranges, causing FanOutBranch to re-deliver
-            // data that a consumer has already released.
-            let accumulated = shared.release_guards[self.index].union(&obsolete_guard);
-            shared.release_guards[self.index] = accumulated;
-            shared
-                .release_guards
-                .iter()
-                .fold(self.tiling().universal_guard(), |acc, g| acc.intersect(g))
-        };
-        trace!("{} releasing: {result:?}", self.name());
-        self.shared
-            .borrow_mut()
-            .producer
-            .as_mut()
-            .unwrap()
-            .release(result);
+        let mut shared = self.shared.borrow_mut();
+        // Union with the existing stored guard so that the accumulated set of
+        // delivered data grows monotonically.  Replacing (instead of union-ing)
+        // would forget previously-released ranges, causing FanOutBranch to
+        // re-deliver data that a consumer has already released.
+        let accumulated = shared.release_guards[self.index].union(&obsolete_guard);
+        shared.release_guards[self.index] = accumulated;
+        let intersection = shared
+            .release_guards
+            .iter()
+            .fold(self.tiling().universal_guard(), |acc, g| acc.intersect(g));
+        trace!("{} releasing: {intersection:?}", self.name());
+        // In cyclic mode the inner producer can be temporarily taken out
+        // by a sibling-branch `get_impl`; skip the inner release in that
+        // case (the next non-reentrant release will recompute and
+        // forward).  Non-cyclic mode always has `producer = Some(_)`.
+        if let Some(producer) = shared.producer.as_mut() {
+            producer.release(intersection);
+        } else {
+            debug_assert!(
+                shared.reentrancy.is_some(),
+                "non-cyclic FanOut's producer should never be absent during release"
+            );
+        }
     }
 }
 
@@ -4206,6 +4452,762 @@ fn extract_hashmap_values<K: Clone + Eq + Hash, InputV, V, F: Fn(InputV) -> V>(
     f: F,
 ) -> HashMap<K, V> {
     source.into_iter().map(|(k, v)| (k.clone(), f(v))).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Recurse  (mutation-loop driver, single output port)
+// ---------------------------------------------------------------------------
+
+/// Loop driver for mutation accumulation.  Takes three inputs (init,
+/// domain, recursive_input) and is itself a `TileOperator` whose
+/// emitted tile is the *previous-accumulator* stream — `init` at
+/// position 0, `recursive_input[i-1]` at position `i` for `i > 0`.
+///
+/// Op-conversion wraps `Recurse` in a `FanOut`; one branch is read by
+/// the loop body as `acc_var`, and another branch is the loop's
+/// external prev-acc stream.  The loop body itself is always a
+/// `Record({step, tap_*})` and is wrapped in `FanOut(Memo(...))`: one
+/// branch is projected to `.step` and feeds back into `recursive_input`
+/// (closing the cycle), the other is the external output (exposed
+/// directly as the running Record stream).  The body fan-out's
+/// re-entrancy support ([`FanOutShared`]) lets the cyclic subscribe
+/// and pull paths close back through it without `RefCell` aliasing.
+///
+/// **Inputs:**
+/// 1. **init** — any tiling.  `Scalar(T)` for single-accumulator
+///    loops, `Record({f_i: Scalar(T_i)})` for multi-accumulator loops
+///    (the per-variable inits combined via `ScalarFanIn` by
+///    op-conversion).  The codomain tiling of this `Recurse` mirrors
+///    `init.tiling()` exactly.
+/// 2. **domain** — a `SealedFunction(D, Scalar(D_elem))` (typically an
+///    [`IterateExtent`]) whose codomain values enumerate the iteration
+///    positions in canonical order.
+/// 3. **recursive_input** — a `SealedFunction(D, init.tiling)`
+///    carrying the new accumulator value at each position.  Wired in
+///    after construction via the closure returned by
+///    [`Recurse::recursive_input_setter`], since the body has to be
+///    compiled around our output port before it's available.
+///
+/// **Output**: the *prev-acc* stream `SealedFunction(D, init.tiling)`
+/// — `init` at position 0, `recursive_input[i-1]` at position
+/// `i > 0`.  `acc_var` reads inside the loop body resolve to this
+/// stream; surrounding lowering composes against this stream and
+/// inlines any pending mutations to recover the right per-iteration
+/// accumulator view (see [`crate::ccl::lower::lower_mutation_loop`]).
+///
+/// The body's external `Fun(D, Record({step, tap_*}))` output is
+/// exposed directly; downstream lowering picks each accumulator off
+/// via `Proj("step") [▷ Proj(i)] ▷ Last` and each feed via
+/// `Proj("tap_*")`.
+///
+/// **Wiring order** (see `interpreter::operator_conversion`'s `Loop` arm):
+/// ```text
+/// 1. Construct Recurse with init and domain inputs.
+/// 2. Grab `recursive_input_setter` BEFORE moving Recurse into a Box —
+///    this is the only way to wire recursive_input later, since the
+///    body needs Recurse already wrapped as a TileOperator.
+/// 3. Wrap Recurse in `FanOut`; use one of its branches as acc_var.
+/// 4. Compile loop_body in a scope where `acc_var` resolves to that
+///    FanOut branch — its output is the new-accumulator Record stream.
+/// 5. Wrap the body in `FanOut(Memo(...))`; call the setter from step 2
+///    with the `.step` projection of one branch (closing the cycle).
+///    Use another branch as the external output (exposed directly).
+/// ```
+///
+/// **Cycle convergence.**  `RecurseProducer::get_impl` drives the cycle
+/// by pulling `recursive_input` once per call.  Because `Recurse` is
+/// wrapped in a `FanOut`, only one `RecurseProducer` is ever
+/// constructed; the body's `acc_var` reads close back through that
+/// fan-out, not through a fresh call into `get_impl`, so there's no
+/// in-process re-entrance into the producer.  The body fan-out's own
+/// re-entrancy support makes the re-entrant pull on `recursive_input`
+/// itself safe: the outer call has the inner producer taken out, so
+/// the inner pull sees `producer = None` and serves from the
+/// fan-out's `cached_tile` (which is the body's prior emission —
+/// exactly what `recurse_step` needs to record into `known` to
+/// advance the cycle).
+pub struct Recurse {
+    /// Init operator, set at construction and subscribed on `subscribe`.
+    init_op: Box<dyn TileOperator>,
+    /// Domain operator, set at construction and subscribed on `subscribe`.
+    domain_op: Box<dyn TileOperator>,
+    /// Recursive input — the body fan-out's branch back into us.  Wired
+    /// in by the closure returned from [`Recurse::recursive_input_setter`]
+    /// after the loop body has been compiled.  Behind `Rc<RefCell<...>>`
+    /// so the setter can mutate it after `self` has been moved into a
+    /// `Box<dyn TileOperator>` — the body lives downstream of us in
+    /// the op graph and can only be wired in once we've been boxed for
+    /// use as a `TileOperator`.
+    recursive_input_op: Rc<RefCell<Option<Box<dyn TileOperator>>>>,
+    output_tiling: Tiling,
+    domain_extent: Extent,
+    /// The tiling of the accumulator (mirrors `init.tiling()`).  Drives
+    /// the codomain shape of emitted tiles: a [`Tiling::Scalar`] codomain
+    /// emits `Tile::Scalar`, a [`Tiling::Record`] codomain emits
+    /// `Tile::Record` with per-field scalar sub-tiles built by
+    /// [`build_codomain_tile_from_values`].  See [`Recurse::new`].
+    codomain_tiling: Tiling,
+}
+
+impl Recurse {
+    /// Construct a new `Recurse` with `init` and `domain` inputs wired.
+    /// The recursive input is wired in later via the closure returned
+    /// from [`Recurse::recursive_input_setter`], once the loop body
+    /// has been compiled around our output port.
+    ///
+    /// The codomain tiling of this `Recurse` mirrors `init.tiling()`
+    /// exactly, so a `Tiling::Scalar(T)` init produces a `SealedFunction(D,
+    /// Scalar(T))` output (single-accumulator scalar Joins) while a
+    /// `Tiling::Record({f_i: Scalar(T_i)})` init produces `SealedFunction(D,
+    /// Record({f_i: Scalar(T_i)}))` — the shape used by multi-accumulator
+    /// mutation loops where op-conversion combines the per-variable inits
+    /// into a single `ScalarFanIn` so one `Recurse` drives every cycle.
+    pub fn new(init: Box<dyn TileOperator>, domain: Box<dyn TileOperator>) -> Self {
+        let domain_extent = match domain.tiling() {
+            Tiling::SealedFunction { domain, .. } => domain.clone(),
+            other => panic!("Recurse domain must have SealedFunction tiling, got {other}"),
+        };
+        let codomain_tiling = init.tiling().clone();
+        // `Recurse`'s codomain mirrors `init.tiling()`, and downstream
+        // [`build_codomain_tile_from_values`] only knows how to construct
+        // `Tile::Scalar` and `Tile::Record` codomains from value vectors —
+        // anything else (SealedFunction, CurriedFunction, Aggregation)
+        // panics deep inside the producer.  Catch the misuse here, where
+        // the failure points at the `Recurse::new` caller (op-conversion's
+        // `Loop` arm or a future caller) rather than at a per-tile
+        // construction failure many iterations later.
+        debug_assert!(
+            codomain_tiling.is_scalar(),
+            "Recurse init must have a scalar or scalar-record tiling, got {codomain_tiling}",
+        );
+        let output_tiling = Tiling::SealedFunction {
+            domain: domain_extent.clone(),
+            codomain: Box::new(codomain_tiling.clone()),
+        };
+        Self {
+            init_op: init,
+            domain_op: domain,
+            recursive_input_op: Rc::new(RefCell::new(None)),
+            output_tiling,
+            domain_extent,
+            codomain_tiling,
+        }
+    }
+
+    /// Return a closure that wires the recursive input — typically the
+    /// compiled loop body's `FanOut` branch, after the body has been
+    /// built around `Recurse`.
+    ///
+    /// Returned as a setter rather than a `&self` method so that
+    /// op-conversion can hold onto the setter after `Recurse` itself
+    /// has been moved into a `Box<dyn TileOperator>` (and from there
+    /// into the `FanOut` that splits the prev-acc stream to its
+    /// consumers).  The body can't be compiled until `Recurse` is a
+    /// `TileOperator` (it reads `acc_var` = our output port), so this
+    /// construction-time ordering is the natural one.
+    pub fn recursive_input_setter(&self) -> impl FnOnce(Box<dyn TileOperator>) + use<> {
+        let slot = self.recursive_input_op.clone();
+        move |op| {
+            *slot.borrow_mut() = Some(op);
+        }
+    }
+}
+
+impl TileOperator for Recurse {
+    fn tiling(&self) -> &Tiling {
+        &self.output_tiling
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        mut consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        // Kick the body chain immediately: the value at position 0 (the
+        // `init` value) is always available, so this port has data to
+        // serve as soon as it is subscribed.  This is what lets the
+        // surrounding drain loop make progress on its first iteration —
+        // without this notify, the body's subscription would idle until
+        // something else notified it.
+        consumer.notify();
+        let init_guard = self.init_op.tiling().universal_guard();
+        let init_producer = self
+            .init_op
+            .subscribe(init_guard, Box::new(|| {}), scheduler);
+        let domain_guard = self.domain_op.tiling().universal_guard();
+        let domain_producer = self
+            .domain_op
+            .subscribe(domain_guard, Box::new(|| {}), scheduler);
+        let mut recursive_input_op = self
+            .recursive_input_op
+            .borrow_mut()
+            .take()
+            .expect("Recurse: recursive_input not wired (call recursive_input_setter)");
+        let recursive_input_guard = recursive_input_op.tiling().universal_guard();
+        let recursive_input_producer =
+            recursive_input_op.subscribe(recursive_input_guard, Box::new(|| {}), scheduler);
+        Box::new(RecurseProducer {
+            base: ProducerBase::new(RecurseProducer::alloc_id(), &self.output_tiling),
+            init_producer,
+            domain_producer,
+            recursive_input_producer,
+            init_value: None,
+            domain_values: Vec::new(),
+            known: HashMap::new(),
+            recorded_positions: HashSet::new(),
+            domain_extent: self.domain_extent.clone(),
+            codomain_tiling: self.codomain_tiling.clone(),
+            released_cycle_positions: Predicate::False,
+            recursive_input_released: Predicate::False,
+        })
+    }
+}
+
+struct RecurseProducer {
+    base: ProducerBase,
+    init_producer: Box<dyn TileProducer>,
+    domain_producer: Box<dyn TileProducer>,
+    recursive_input_producer: Box<dyn TileProducer>,
+    /// Cached `init` value — fetched once on the first iteration step
+    /// (`init` may itself be a previous loop's scalar Join, which
+    /// can take several pulls to resolve under the single-step model).
+    /// For multi-accumulator loops this is a [`Value::Record`] packing
+    /// every accumulator's initial value; for scalar loops it is a
+    /// primitive value.  Mirrors the body's per-iteration emission shape.
+    init_value: Option<Value>,
+    /// Cached `domain` codomain values, in canonical order.  Maintained
+    /// *cumulatively*: old positions stay even after the body has
+    /// released them, so the index-based prev-acc lookup below
+    /// (`init` at index 0, `known[domain_values[i-1]]` at index `i`)
+    /// stays stable as the source frontier advances.
+    domain_values: Vec<Value>,
+    /// Recorded `recursive_input` values, indexed by domain value.
+    /// Each `recurse_step` records observed (domain, codomain) pairs
+    /// here so the next prev-acc tile emission can serve them.  Each
+    /// value matches `codomain_tiling`'s shape (scalar primitive or
+    /// `Value::Record` for multi-accumulator loops).
+    known: HashMap<Value, Value>,
+    /// Set of domain values whose `recursive_input` value has been
+    /// observed at some point.  Grows monotonically — never shrinks,
+    /// even when [`Self::release_impl`] drops the corresponding entry
+    /// from `known` after downstream consumers release their successor
+    /// positions.  The `fully_drained` check (in [`Self::get_impl`])
+    /// uses this to detect convergence; using `known.contains_key` for
+    /// that purpose would break once incremental release starts
+    /// freeing entries before terminal.
+    recorded_positions: HashSet<Value>,
+    domain_extent: Extent,
+    /// Tiling of the codomain.  Drives the per-pull tile construction
+    /// in [`Self::get_impl`] via [`build_codomain_tile_from_values`].
+    codomain_tiling: Tiling,
+    /// Cumulative predicate over cycle output positions that downstream
+    /// consumers have released.  Each release call unions the new
+    /// guard into this set; [`Self::release_impl`] uses it both as the
+    /// release predicate to forward to `domain_producer` (cycle and
+    /// source share a domain) and — shifted by one position — as the
+    /// predicate to forward to `recursive_input_producer` and to drop
+    /// from `known`.  Streaming sources rely on this to free upstream
+    /// state as positions are consumed, rather than holding everything
+    /// until source convergence.
+    released_cycle_positions: Predicate,
+    /// Cumulative predicate already forwarded to
+    /// `recursive_input_producer` (the *shifted* form of
+    /// `released_cycle_positions`).  Tracked so each `release_impl`
+    /// call only forwards the *new* shifted positions rather than the
+    /// whole cumulative set every time.  `release` is idempotent so
+    /// double-release would be safe, just wasteful for long-running
+    /// streams.
+    recursive_input_released: Predicate,
+}
+
+impl RecurseProducer {
+    /// Pull `init_producer` (once it converges to a single scalar) and
+    /// cache the result.  Returns `None` if `init` is still un-resolved
+    /// — happens when `init` is itself a previous loop's scalar Join
+    /// (a sequential `for` chain) which can take several pulls to
+    /// converge.  Callers handle `None` by bailing out with a
+    /// non-terminal empty tile; the outer consumer's pull loop will
+    /// retry.
+    fn ensure_init_value(&mut self) -> Option<Value> {
+        if let Some(v) = &self.init_value {
+            return Some(v.clone());
+        }
+        let tile = self
+            .init_producer
+            .get(self.init_producer.tiling().universal_guard());
+        let resolved = scalar_tile_to_column_value(tile).as_single();
+        if let Some(v) = &resolved {
+            self.init_value = Some(v.clone());
+        }
+        resolved
+    }
+
+    /// Pull `domain_producer` and append any newly-seen positions to
+    /// `domain_values` (cumulatively — old positions stay even after
+    /// the body has released them, so index-based prev-acc lookup
+    /// stays stable).  Returns whether the domain is now terminal.
+    fn refresh_domain_values(&mut self) -> bool {
+        let tile = self
+            .domain_producer
+            .get(self.domain_producer.tiling().universal_guard());
+        let domain_terminal = tile.is_terminal();
+        let Tile::SealedFunction { codomain, .. } = tile else {
+            panic!("Recurse: domain must produce a SealedFunction tile");
+        };
+        let cv = scalar_tile_to_column_value(*codomain);
+        // Append any positions we haven't already seen.  Domain emits in
+        // canonical order and positions never disappear from our
+        // cumulative list, so an O(N) "is this already present" check
+        // is fine — a HashSet would just trade one allocation for another.
+        for i in 0..cv.len() {
+            let v = cv.index_at(i);
+            if !self.domain_values.contains(&v) {
+                self.domain_values.push(v);
+            }
+        }
+        domain_terminal
+    }
+
+    /// Pull `recursive_input_producer` once and record any newly-observed
+    /// positions into `known`.  This is a *re-entrant* pull through the
+    /// body fan-out: the outer caller (a `FanOut` branch on this
+    /// `Recurse`) has the inner producer taken out, so this pull serves
+    /// from the body fan-out's cached tile (the body's prior emission)
+    /// rather than re-driving body.
+    ///
+    /// **Release happens out-of-band in [`Self::release_impl`].**
+    /// `recurse_step` only records.  When a downstream consumer
+    /// releases cycle positions, `release_impl` forwards a
+    /// shifted-by-one release into `recursive_input_producer` (so the
+    /// body fan-out's recursive-input branch can advance its
+    /// per-branch release predicate, eventually freeing the body's
+    /// cached tile and the source).  The universal release on
+    /// `fully_drained` (in `get_impl`) catches anything left at
+    /// convergence.
+    fn recurse_step(&mut self) {
+        let universal = self.recursive_input_producer.tiling().universal_guard();
+        let mut tile = self.recursive_input_producer.get(universal);
+        tile.compact();
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("Recurse: recursive_input must produce SealedFunction tiles");
+        };
+        let cv = scalar_tile_to_column_value(*codomain);
+        for i in 0..domain.len() {
+            let dval = domain.index_at(i);
+            if self.recorded_positions.contains(&dval) {
+                continue;
+            }
+            self.recorded_positions.insert(dval.clone());
+            self.known.insert(dval, cv.index_at(i));
+        }
+    }
+}
+
+impl TileProducer for RecurseProducer {
+    impl_producer_base!();
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        // `init` may be a previous loop's scalar Join — under the
+        // single-step model, that producer may need several pulls to
+        // converge.  Bail out early with a non-terminal empty tile if
+        // so; the outer consumer's loop will keep calling `get` until
+        // everything is terminal.
+        let Some(init_value) = self.ensure_init_value() else {
+            // `Tiling::empty_tile` produces the structurally-valid empty
+            // SealedFunction with `Predicate::False` we want as the
+            // "not ready yet" signal.  The outer consumer's loop will
+            // retry on the next pull.
+            return self.tiling().empty_tile();
+        };
+        let domain_terminal = self.refresh_domain_values();
+        self.recurse_step();
+
+        // Emit the full prev_acc tile (every domain position we've seen
+        // with a known prev-acc value).  We don't filter by what
+        // consumers have released — the surrounding `FanOut` does
+        // per-branch release filtering on the way out, so each branch
+        // sees only what its own consumer still cares about.
+        let mut domain_out: Vec<Value> = Vec::new();
+        let mut codomain_out: Vec<Value> = Vec::new();
+        for (i, dval) in self.domain_values.iter().enumerate() {
+            let value = if i == 0 {
+                init_value.clone()
+            } else {
+                let prev_dval = &self.domain_values[i - 1];
+                match self.known.get(prev_dval) {
+                    Some(v) => v.clone(),
+                    None => continue, // Not yet computed — skip until it's filled in.
+                }
+            };
+            domain_out.push(dval.clone());
+            codomain_out.push(value);
+        }
+        let domain = ColumnValue::from_values(domain_out, &self.domain_extent);
+        let codomain_tile = build_codomain_tile_from_values(codomain_out, &self.codomain_tiling);
+        // The shifted prev_acc stream is fully drained iff the source's
+        // `domain` operator declared its tile terminal *and* every
+        // announced position has a `known` entry (i.e. `recursive_input`
+        // delivered a value for it).  At that point we can advertise
+        // `Predicate::True` so downstream operators (FanIn, ExtractLast,
+        // etc.) see the tile as terminal.  Otherwise we fall back to the
+        // explicit position list — which signals "these positions are
+        // present, more may arrive".
+        // Convergence: every announced position has had its
+        // `recursive_input` value recorded.  We track this against
+        // `recorded_positions` rather than `known` because
+        // `release_impl` may have already evicted entries from `known`
+        // whose successor cycle positions were released by downstream
+        // — those positions were still seen, just no longer needed
+        // for emission.
+        let fully_drained = domain_terminal
+            && self
+                .domain_values
+                .iter()
+                .all(|v| self.recorded_positions.contains(v));
+        let domain_predicate = if fully_drained {
+            Predicate::True
+        } else if domain.is_empty() {
+            Predicate::False
+        } else {
+            Predicate::from_column_value(&domain)
+        };
+        // On convergence, universally release both internal subscriptions
+        // so the source sees a `Predicate::True` release from this
+        // `Recurse` group.  A `DataSource`'s released-predicate is the
+        // intersection across every subscriber; if `domain_producer`
+        // (our own `IterateExtent` over the source) and
+        // `recursive_input_producer` (the body fan-out's branch back to
+        // us) don't both reach universal, the source's intersection
+        // stays narrower than `True`.  We do it here — not in
+        // `release_impl` — because the public consumer (e.g. `ExtractLast`
+        // wrapping the body fan-out's other branch) doesn't necessarily
+        // release us when the cycle finishes.  Release is idempotent, so
+        // doing it on every post-convergence pull is fine.
+        if fully_drained {
+            self.domain_producer
+                .release(self.domain_producer.tiling().universal_guard());
+            self.recursive_input_producer
+                .release(self.recursive_input_producer.tiling().universal_guard());
+        }
+        Tile::SealedFunction {
+            domain_predicate,
+            domain,
+            codomain: Box::new(codomain_tile),
+            deleted: BitSet::new(),
+        }
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // Universal release: forward universally to both upstream subs.
+        // (Idempotent with the `fully_drained` path in `get_impl`, which
+        // also fires universal releases on convergence.)
+        if obsolete_guard.is_universal() {
+            self.released_cycle_positions = Predicate::True;
+            self.recursive_input_released = Predicate::True;
+            self.domain_producer
+                .release(self.domain_producer.tiling().universal_guard());
+            self.recursive_input_producer
+                .release(self.recursive_input_producer.tiling().universal_guard());
+            self.known.clear();
+            return;
+        }
+
+        // Per-position release: a downstream consumer has signalled
+        // that some cycle positions are no longer needed.  Three things
+        // to do:
+        //
+        //   1. Forward the release to `domain_producer` directly —
+        //      we and the source share a domain, so the cycle release
+        //      and the source release are the same predicate.
+        //
+        //   2. Forward a *shifted* release to `recursive_input_producer`:
+        //      cycle position `i` was emitted using
+        //      `known[domain_values[i-1]]`, so releasing cycle
+        //      position `i` makes `recursive_input` at
+        //      `domain_values[i-1]` obsolete (for `i > 0`; the very
+        //      first position uses `init_value`, not a recursive_input
+        //      value).
+        //
+        //   3. Drop the corresponding entries from `known`, since
+        //      those values are no longer needed for prev-acc lookup
+        //      of any unreleased cycle position.
+        let new_pred = match &obsolete_guard {
+            TileGuard::Function(FunctionGuard::Domain(p)) => p.clone(),
+            other => panic!("Recurse: unsupported release guard {other:?}"),
+        };
+        self.released_cycle_positions = self.released_cycle_positions.union(&new_pred);
+        self.domain_producer
+            .release(TileGuard::Function(FunctionGuard::Domain(new_pred)));
+
+        // Compute the shifted predicate over `domain_values`:
+        // predecessors of positions newly released as cycle outputs
+        // and not yet released as recursive_input positions.  Done by
+        // walking `domain_values` rather than by a generic predicate
+        // shift because the "shift" depends on the source's actual
+        // emission order, which lives in this Vec.
+        let mut new_shifted: Vec<Value> = Vec::new();
+        for i in 1..self.domain_values.len() {
+            let dval = &self.domain_values[i];
+            if !self.released_cycle_positions.contains(dval) {
+                continue;
+            }
+            let pred_dval = &self.domain_values[i - 1];
+            if self.recursive_input_released.contains(pred_dval) {
+                continue;
+            }
+            new_shifted.push(pred_dval.clone());
+        }
+        if !new_shifted.is_empty() {
+            let cv = ColumnValue::from_values(new_shifted.clone(), &self.domain_extent);
+            let shifted_pred = Predicate::from_column_value(&cv);
+            self.recursive_input_released = self.recursive_input_released.union(&shifted_pred);
+            self.recursive_input_producer
+                .release(TileGuard::Function(FunctionGuard::Domain(shifted_pred)));
+            for v in new_shifted {
+                self.known.remove(&v);
+            }
+        }
+    }
+}
+
+/// Build a codomain [`Tile`] from a stream of accumulator values laid out
+/// in domain-position order, mirroring `tiling`'s shape.
+///
+/// - For [`Tiling::Scalar`], emit `Tile::Scalar(ColumnValue::from_values(…))` —
+///   the existing scalar-Recurse path.
+/// - For [`Tiling::Record`], split each [`Value::Record`] into per-field
+///   value columns and recurse, producing `Tile::Record({field: Tile::Scalar(…)})`
+///   that matches what [`FanIn`] emits for the body of a multi-accumulator
+///   mutation loop (so `recursive_input` feeds back tile-shape-compatibly
+///   with our output).
+///
+/// Panics on tilings we don't currently produce as a `Recurse` codomain.
+fn build_codomain_tile_from_values(values: Vec<Value>, tiling: &Tiling) -> Tile {
+    match tiling {
+        Tiling::Scalar(extent) => Tile::Scalar(ColumnValue::from_values(values, extent)),
+        Tiling::Record(fields) => {
+            let mut field_tiles: HashMap<String, Tile> = HashMap::with_capacity(fields.len());
+            for (field_name, field_tiling) in fields {
+                let field_values: Vec<Value> = values
+                    .iter()
+                    .map(|v| match v {
+                        Value::Record(r) => r
+                            .get(field_name)
+                            .cloned()
+                            .expect("Record value missing expected field"),
+                        other => panic!(
+                            "build_codomain_tile_from_values: expected Value::Record, got {other:?}"
+                        ),
+                    })
+                    .collect();
+                field_tiles.insert(
+                    field_name.clone(),
+                    build_codomain_tile_from_values(field_values, field_tiling),
+                );
+            }
+            Tile::Record(field_tiles)
+        }
+        other => panic!("Recurse: unsupported codomain tiling {other}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExtractLast / ExtractLastProducer
+// ---------------------------------------------------------------------------
+
+/// Extracts the last value from a [`Recurse`] (or any `SealedFunction`) output,
+/// converting the accumulated `SealedFunction` tiling back to a `Scalar`.
+///
+/// When the source becomes terminal but emits no values (the empty-source
+/// case, e.g. `for i in []: x += 1`), the `default` operator's scalar value
+/// is emitted instead.  This keeps mutation loops total: the post-loop
+/// accumulator always has a defined value, equal to the loop's initial
+/// value when the body never ran.
+///
+/// Used as the terminal stage of a loop: `ExtractLast(body.step, init)`.
+pub struct ExtractLast {
+    /// Operator producing the `SealedFunction` tiling to extract from.
+    source: Box<dyn TileOperator>,
+    /// Fallback scalar operator, pulled when `source` is terminal and
+    /// emits zero values.  Must have a `Scalar` tiling whose extent
+    /// matches `source`'s codomain extent.
+    default: Box<dyn TileOperator>,
+    /// Output tiling — the codomain of the source SealedFunction (always `Scalar`).
+    tiling: Tiling,
+}
+
+impl ExtractLast {
+    /// Construct a new `ExtractLast` wrapping `source`, with `default`
+    /// as the fallback for the empty-source case.
+    ///
+    /// `source` must have a `SealedFunction` tiling and `default` must
+    /// have a `Scalar` tiling with the same extent as `source`'s codomain.
+    /// The output tiling becomes that scalar codomain.
+    pub fn new(source: Box<dyn TileOperator>, default: Box<dyn TileOperator>) -> Self {
+        let tiling = match source.tiling() {
+            Tiling::SealedFunction { codomain, .. } => *codomain.clone(),
+            other => panic!("ExtractLast source must have SealedFunction tiling, got {other}"),
+        };
+        debug_assert_eq!(
+            default.tiling(),
+            &tiling,
+            "ExtractLast default tiling must match source codomain tiling",
+        );
+        Self {
+            source,
+            default,
+            tiling,
+        }
+    }
+}
+
+impl TileOperator for ExtractLast {
+    fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("source", self.source.inspect(opts))
+            .child("default", self.default.inspect(opts))
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        // Both branches need their own notification path: any progress on
+        // either side may unblock the consumer (source becoming terminal,
+        // default resolving its scalar value).  We give source the shared
+        // consumer handle since it's the primary trigger; default uses a
+        // no-op notifier because its readiness only matters at the moment
+        // we discover an empty source — by then we're already in `get_impl`
+        // and will pull it directly.
+        let source_producer =
+            self.source
+                .subscribe(self.source.tiling().universal_guard(), consumer, scheduler);
+        let default_producer = self.default.subscribe(
+            self.default.tiling().universal_guard(),
+            Box::new(|| {}),
+            scheduler,
+        );
+        Box::new(ExtractLastProducer {
+            base: ProducerBase::new(ExtractLastProducer::alloc_id(), &self.tiling),
+            source: source_producer,
+            default: default_producer,
+            final_value: None,
+            released: false,
+        })
+    }
+}
+
+struct ExtractLastProducer {
+    base: ProducerBase,
+    source: Box<dyn TileProducer>,
+    /// Default-value producer, pulled when `source` becomes terminal
+    /// and emits zero values.  Subscribed eagerly alongside `source`;
+    /// `get` is deferred until we know we need it.
+    default: Box<dyn TileProducer>,
+    /// Cached final scalar value.  `None` until the source becomes
+    /// terminal; `Some(_)` thereafter.  Every subsequent `get` returns
+    /// this same value until the consumer releases us with a universal
+    /// guard — which then sets [`Self::released`] and we go quiet.
+    /// Same emit-until-released protocol as [`Constant`], so consumers
+    /// that pull repeatedly (e.g. sibling `Last` projections off a
+    /// shared multi-accumulator mutation-loop) see a stable value
+    /// instead of an empty source after the first terminal pull.
+    final_value: Option<Value>,
+    /// Set to `true` by [`Self::release_impl`] on a universal release.
+    /// Returns an empty scalar from every subsequent `get`.  The
+    /// surrounding `Memo` normally issues this universal release as
+    /// soon as it has merged the value into its own cache, so
+    /// post-release emissions are rare in normal data flow.
+    released: bool,
+}
+
+impl TileProducer for ExtractLastProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("source", self.source.inspect(opts))
+            .child("default", self.default.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let empty = Tile::Scalar(ColumnValue::from_values(vec![], &self.tiling().extent()));
+        if self.released {
+            return empty;
+        }
+        // Already extracted: keep re-emitting the same scalar until we
+        // are released.  Downstream `Memo` typically releases on first
+        // sight of a non-empty tile, so this branch only stays active
+        // across pulls when the consumer doesn't release immediately
+        // (e.g. while a sibling pipeline is still converging).
+        if let Some(v) = &self.final_value {
+            return Tile::Scalar(ColumnValue::single(v.clone()));
+        }
+        let source_tiling = self.source.tiling().clone();
+        let source_tile = self.source.get(source_tiling.universal_guard());
+        if !source_tile.is_terminal() {
+            // Source hasn't converged yet — emit an empty scalar of the
+            // correct extent.  Our own tiling *is* the source's codomain
+            // (always `Scalar`), so its extent gives us the value-space
+            // directly without going through `Tiling::codomain` (which
+            // would return `None` for a `Scalar`).
+            return empty;
+        }
+        // Source is terminal — we've seen the final tile, so we'll
+        // never need more data from it.  Release universally so
+        // upstream chains (`FanOut`, `Memo`, mutation-loop body
+        // sub-graphs) can in turn release their inputs and ultimately
+        // reach the underlying data source.  Release is idempotent, so
+        // a repeated call from the consumer's outer pull loop is fine.
+        self.source.release(source_tiling.universal_guard());
+        let Tile::SealedFunction {
+            codomain, deleted, ..
+        } = source_tile
+        else {
+            panic!("ExtractLast source must be a SealedFunction tile");
+        };
+        let cv = scalar_tile_to_column_value(*codomain);
+        let n = cv.len();
+        // Try to extract the last non-deleted value from the source.
+        // TODO don't assume sorting; we need to sort by the domain value instead.
+        if let Some(last_idx) = (0..n).rev().find(|&i| !deleted.contains(i)) {
+            let value = cv.index_at(last_idx);
+            self.final_value = Some(value.clone());
+            return Tile::Scalar(ColumnValue::single(value));
+        }
+        // Source is terminal *and* empty (the loop body ran zero
+        // times).  Pull the default scalar and emit that instead, then
+        // release the default so its upstream chain can release too.
+        let default_tiling = self.default.tiling().clone();
+        let default_tile = self.default.get(default_tiling.universal_guard());
+        match scalar_tile_to_column_value(default_tile).as_single() {
+            Some(value) => {
+                self.default.release(default_tiling.universal_guard());
+                self.final_value = Some(value.clone());
+                Tile::Scalar(ColumnValue::single(value))
+            }
+            // Default hasn't converged yet — emit empty.  Outer pull
+            // loop will retry; once default resolves, we'll cache it.
+            None => empty,
+        }
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        if obsolete_guard.is_universal() {
+            self.released = true;
+            self.source.release(self.source.tiling().universal_guard());
+            self.default
+                .release(self.default.tiling().universal_guard());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6170,6 +7172,99 @@ mod tests {
             l1[0],
             TileGuard::Function(FunctionGuard::Domain(pred1)),
             "input 1 should receive pred1"
+        );
+    }
+
+    // ── FanInProducer: asymmetric per-branch presence ────────────────────────
+    //
+    // Regression for the per-branch presence-intersection added to
+    // `FanInProducer::get_impl` for cyclic mutation loops, where one branch
+    // (the body) can have emitted more positions than another (a still-
+    // converging `recursive_input`).  Before the intersection step, the
+    // output tile carried whichever branch happened to be at index 0 of
+    // the inputs vec — fine for branches that always advance in lockstep,
+    // wrong as soon as they don't.
+    //
+    // We construct two `SealedFunction` test tiles over the same domain
+    // type but with *different actual positions present* (branch A has
+    // positions [0, 1, 2]; branch B has only [0, 1]) and a `FanInProducer`
+    // directly over them, then check that the merged output is restricted
+    // to the intersection [0, 1].
+
+    /// Two `SealedFunction` inputs with different sets of present positions.
+    /// The output should restrict to the intersection of those positions.
+    #[test]
+    fn fan_in_producer_intersects_branch_presence() {
+        let input_tiling = Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Scalar(Extent::Base(BaseType::UInt))),
+        };
+        let tile_a = Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![0, 1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 11, 12]))),
+            // Non-terminal: branch A has emitted [0, 1, 2] but its
+            // upstream hasn't yet signaled "no more".
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+        };
+        let tile_b = Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::UInts(vec![20, 21]))),
+            domain_predicate: Predicate::False,
+            deleted: BitSet::new(),
+        };
+
+        let output_tiling = Tiling::SealedFunction {
+            domain: Extent::Base(BaseType::UInt),
+            codomain: Box::new(Tiling::Record(HashMap::from([
+                (
+                    "a".to_string(),
+                    Tiling::Scalar(Extent::Base(BaseType::UInt)),
+                ),
+                (
+                    "b".to_string(),
+                    Tiling::Scalar(Extent::Base(BaseType::UInt)),
+                ),
+            ]))),
+        };
+        let mut fan_in = FanInProducer {
+            base: ProducerBase::new(FanInProducer::alloc_id(), &output_tiling),
+            names: vec!["a".to_string(), "b".to_string()],
+            inputs: vec![
+                Box::new(TestTileProducer::new(tile_a, input_tiling.clone())),
+                Box::new(TestTileProducer::new(tile_b, input_tiling)),
+            ],
+        };
+
+        let result = fan_in.get(fan_in.tiling().universal_guard());
+        let Tile::SealedFunction {
+            domain, codomain, ..
+        } = result
+        else {
+            panic!("expected SealedFunction output, got {result:?}");
+        };
+        // Intersection of [0, 1, 2] and [0, 1] is [0, 1].
+        let ColumnValue::UInts(domain_vals) = domain else {
+            panic!("expected UInts domain, got {domain:?}");
+        };
+        assert_eq!(
+            domain_vals,
+            vec![0, 1],
+            "output domain should be the intersection of input presences"
+        );
+
+        let Tile::Record(field_tiles) = *codomain else {
+            panic!("expected Record codomain");
+        };
+        assert_eq!(
+            scalar_tile_to_column_value(field_tiles.get("a").unwrap().clone()),
+            ColumnValue::UInts(vec![10, 11]),
+            "branch a's codomain should be filtered to positions [0, 1]",
+        );
+        assert_eq!(
+            scalar_tile_to_column_value(field_tiles.get("b").unwrap().clone()),
+            ColumnValue::UInts(vec![20, 21]),
+            "branch b's codomain should remain [0, 1] (already its full presence)",
         );
     }
 }

@@ -56,7 +56,24 @@ fn run_pipeline_with_ctx(ctx: &mut GlobalContext, code: &str) -> (Expr, Tile) {
         .main_mut()
         .and_then(|o| o.producer.as_mut())
         .expect("pipeline test expects a `main` output");
-    let mut result = producer.get(producer.tiling().universal_guard());
+    // A single `get` is not always enough to fully drain a producer.  Some
+    // tile operators advance their internal state by one step per pull
+    // (notably the mutation-loop `Recurse` cycle, where each pull of the
+    // body op records one more position into the recurrence cache).
+    // Loop until the producer reports a terminal tile, with a generous
+    // iteration cap to catch the regression where the cycle stops making
+    // progress without converging.
+    let universal = producer.tiling().universal_guard();
+    let mut result = producer.get(universal.clone());
+    let mut iterations = 0usize;
+    while !result.is_terminal() {
+        iterations += 1;
+        assert!(
+            iterations < 1024,
+            "pipeline path: producer did not converge within 1024 iterations"
+        );
+        result = producer.get(universal.clone());
+    }
     result.compact();
     (compiled.ast, result)
 }
@@ -888,6 +905,29 @@ y @ y"#, Tile::SealedFunction {
         ]),
         deleted: BitSet::new(),
     })]
+#[ignore] // TODO this should work, but our filters on supported exprs in loops are too restrictive
+#[case(
+    r#"
+o = defer()
+for i in [1, 2, 3]:
+    x = i
+    o << x
+    x = x + i
+    o << x * 10
+o"#,
+    Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 0, 0, 1, 1, 1],
+            variants: vec![
+                ColumnValue::UInts(vec![0, 1, 2]),
+                ColumnValue::UInts(vec![0, 1, 2]),
+            ],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 3, 10, 30, 60]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    }
+)]
 fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
@@ -975,6 +1015,27 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
+// Brainstorm §4b — generator with loop-carried mutable state.  The body
+// mutates a pre-loop variable (`total += item`) and yields its updated
+// value each iteration, producing a running-total stream.  This routes
+// through the cyclic `Loop` lowering with the yield-defer wired in as a
+// `tap_*` field on the body Record.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case(
+    r#"
+def running_totals(items):
+    total = 0
+    for item in items:
+        total += item
+        yield total
+running_totals([1, 2, 3, 4])"#,
+    make_int_list(&[1, 3, 6, 10])
+)]
+fn test_generator_with_loop_carried_mutation(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
+}
+
 // Generator function composed with aggregate: sum(doubles([1, 2, 3])) == 12
 #[rstest]
 #[timeout(Duration::from_secs(1))]
@@ -1022,6 +1083,231 @@ fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+#[case(
+    r#"
+x = 0
+for i in [1, 2, 3]:
+    x += i
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![6]))
+)]
+#[case(
+    r#"
+x = 0
+for i in []:
+    x += 1
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![0]))
+)]
+#[case(
+    r#"
+x = 0
+for i in [1, 2, 3]:
+    x = x + i + 1
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![9]))
+)]
+#[case(
+    r#"
+x = 0
+o = defer()
+for i in [1, 2, 3]:
+    x = x + i
+    o << x
+o"#,
+    make_int_list(&[1,3,6])
+)]
+#[case(
+    r#"
+x = 0
+o = defer()
+o << x
+for i in [1, 2, 3]:
+    x = x + i
+    o << x
+for j in [4, 5]:
+    x = x + j
+    o << x
+o"#,
+    Tile::SealedFunction {
+        // Tags map each domain entry to its source variant: index 0 (pre-loop
+        // feed of `x = 0`) → variant 0; indices 1-3 (loop1 running sums) →
+        // variant 1; indices 4-5 (loop2 running sums) → variant 2.
+        domain: ColumnValue::Union {
+            tags: vec![0, 1, 1, 1, 2, 2],
+            variants: vec![
+                ColumnValue::Units(1),
+                ColumnValue::UInts(vec![0, 1, 2]),
+                ColumnValue::UInts(vec![0, 1]),
+            ],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 3, 6, 10, 15]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    })]
+// Pre-mutation let `y = x + 1` introduces a non-trivial let that survives
+// lambda_elim as `(let y = … in …) ▷ const` (the loop body doesn't depend
+// on `i`).  This exercises the const-of-function shortcut in op-conversion
+// — without it, op-conversion tries to const-lift a function-tiled value.
+#[case(
+    r#"
+x = 0
+for i in [1, 2, 3]:
+    y = x + 1
+    x = y * 2
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![14]))
+)]
+// As above, but `y` depends on `i` so the source list survives.  This
+// gives a Compose `[1,2,3] ≫ (let y = … in (y, 2) ▷ mul)` — the let is
+// nested inside the iteration, and its `bound_expr` `(x, i) ▷ add`
+// captures both the cyclic accumulator (function-tiled) and the per-i
+// stream.
+#[case(
+    r#"
+x = 0
+for i in [1, 2, 3]:
+    y = x + i
+    x = y * 2
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![22]))
+)]
+#[case(
+    r#"
+x = 1
+y = 0
+for i in [1, 2, 3]:
+    y = y + i
+    x = x * i
+(x, y, x + y)"#,
+    Tile::Record(HashMap::from([
+        ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
+        ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
+        ("_2".into(), Tile::Scalar(ColumnValue::Ints(vec![12]))),
+    ]))
+)]
+// Multi-accumulator mutation loop combined with a feed.  Per-iter values:
+//   iter 0 (i=1): y=0+1=1, x=1*1=1, feed: 1+1=2
+//   iter 1 (i=2): y=1+2=3, x=1*2=2, feed: 2+3=5
+//   iter 2 (i=3): y=3+3=6, x=2*3=6, feed: 6+6=12
+#[case(
+    r#"
+x = 1
+y = 0
+o = defer()
+for i in [1, 2, 3]:
+    y = y + i
+    x = x * i
+    o << x + y
+o"#,
+    make_int_list(&[2, 5, 12])
+)]
+// Multi-accumulator loop with a pre-mutation feed that observes both
+// previous-iteration accumulator values.  Per-iter values:
+//   iter 0 (i=1): feed prev: 1+10=11; x=1+1=2, y=10*1=10
+//   iter 1 (i=2): feed prev: 2+10=12; x=2+2=4, y=10*2=20
+//   iter 2 (i=3): feed prev: 4+20=24; x=4+3=7, y=20*3=60
+#[case(
+    r#"
+x = 1
+y = 10
+o = defer()
+for i in [1, 2, 3]:
+    o << x + y
+    x = x + i
+    y = y * i
+o"#,
+    make_int_list(&[11, 12, 24])
+)]
+// Two feeds to the same defer within a single mutation loop — exercises
+// the lifted-feed lowering in `lower_mutation_loop`.  Each feed must be
+// computed against the per-iteration accumulator value, *not* used as the
+// accumulator update itself.  Per-iter values:
+//   iter 0: x = 0+1 = 1, feeds: 1, 1+100 = 101
+//   iter 1: x = 1+2 = 3, feeds: 3, 103
+//   iter 2: x = 3+3 = 6, feeds: 6, 106
+// The two feeds form variants 0 and 1 of the resulting union.
+#[case(
+    r#"
+x = 0
+o = defer()
+for i in [1, 2, 3]:
+    x = x + i
+    o << x
+    o << x + 100
+o"#,
+    Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 0, 0, 1, 1, 1],
+            variants: vec![
+                ColumnValue::UInts(vec![0, 1, 2]),
+                ColumnValue::UInts(vec![0, 1, 2]),
+            ],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6, 101, 103, 106]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    }
+)]
+// Feeds in every part of the loop body: a pre-loop feed, an in-loop
+// pre-mutation feed (which sees the previous-iteration accumulator
+// value), and an in-loop post-mutation feed (which sees the freshly
+// updated accumulator).  Per-iter values:
+//   iter 0 (i=1): prev_x=0 → feed_pre=0; x=0+1=1; feed_post=1*10=10
+//   iter 1 (i=2): prev_x=1 → feed_pre=1; x=1+2=3; feed_post=3*10=30
+//   iter 2 (i=3): prev_x=3 → feed_pre=3; x=3+3=6; feed_post=6*10=60
+#[case(
+    r#"
+x = 0
+o = defer()
+o << x
+for i in [1, 2, 3]:
+    o << x
+    x = x + i
+    o << x * 10
+o"#,
+    Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 1, 1, 1, 2, 2, 2],
+            variants: vec![
+                ColumnValue::Units(1),
+                ColumnValue::UInts(vec![0, 1, 2]),
+                ColumnValue::UInts(vec![0, 1, 2]),
+            ],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0, 1, 3, 10, 30, 60]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    }
+)]
+#[ignore] // TODO support nested loops with mutations.
+#[case(
+    r#"
+x = 0
+for i in [1, 2]:
+    for j in [10, 20]:
+        x = x + i + j
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![33]))
+)]
+#[ignore] // TODO support nested loops with mutations.
+#[case(
+    r#"
+x = 0
+o = defer()
+for i in [1, 2]:
+    for j in [10, 20]:
+        x = x + i + j
+        o << x
+o"#,
+    Tile::Scalar(ColumnValue::Strings(vec!["TODO".into()]))
+)]
+fn test_mutability(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
+}
+
 // ---------------------------------------------------------------------------
 // Multi-generator comprehensions / joins
 // ---------------------------------------------------------------------------
@@ -1058,7 +1344,7 @@ fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'd'] if x < y]",
-    ColumnValue::strings(&["ab", "ac", "ad","cd", "bc", "bd"])
+    ColumnValue::strings(&["ab", "ac", "ad", "bc", "bd", "cd"])
 )]
 #[case(
     "[x + y for x in ['a', 'b'] for y in ['c', 'd'] if x == y]",
@@ -1066,7 +1352,7 @@ fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y + z for x in ['a', 'b'] for y in ['b', 'c'] for z in ['b', 'c'] if x != y if y == z]",
-    ColumnValue::strings(&["abb", "bcc", "acc"])
+    ColumnValue::strings(&["abb", "acc", "bcc"])
 )]
 #[case(
     "[x + y for x in ['a', 'b', 'c'] for y in ['a', 'b', 'c'] if x == y if x < 'c']",
@@ -1620,6 +1906,107 @@ fn test_incremental_global_aggregate() {
         "should emit final sum once source is terminal"
     );
 
+    assert_eq!(
+        test_source.borrow().get_released_predicate(),
+        Predicate::True
+    );
+}
+
+/// Mutation loop summing values from an incremental source, semantically
+/// equivalent to `sum(source1())` but exercising `Recurse` instead of
+/// `MapAggregate`.  Verifies that `Recurse` correctly:
+/// - Re-reads its `domain` input as the source grows in batches.
+/// - Holds back the final emission until the source signals it's done.
+/// - Fires notifications when each batch arrives and again on terminal.
+/// - Releases positions back through `recursive_input` so the source is
+///   marked as fully consumed at the end.
+#[test_log::test]
+fn test_incremental_mutation_loop() {
+    let code = "\
+x = 0
+for i in source1():
+    x = x + i
+x";
+    let mut ctx = GlobalContext::default();
+
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+
+    let notified = Rc::new(RefCell::new(false));
+    let notified_clone = notified.clone();
+    let consumer: Box<dyn Consumer> = Box::new(move || {
+        *notified_clone.borrow_mut() = true;
+    });
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+
+    // Pull a few times between batches to verify the loop doesn't emit
+    // anything before the source is terminal.  Done with a fixed cap
+    // rather than a single pull because the cycle's pull granularity is
+    // an internal detail — what we care about is "no premature output",
+    // which any number of pre-terminal pulls should satisfy.
+    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+
+    // First batch: 10 + 20 = 30 accumulated so far, but source is not done.
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(10)),
+        (Value::UInt(1), Value::Int(20)),
+    ]);
+    ctx.scheduler().check_for_notifications();
+    assert!(*notified.borrow(), "first batch should fire a notification");
+    for _ in 0..3 {
+        let result = producer.get(producer.tiling().universal_guard());
+        assert_eq!(
+            result, empty,
+            "after first batch: should produce no output yet"
+        );
+    }
+    *notified.borrow_mut() = false;
+
+    // Second batch: adds 30; running total 60, still not terminal.
+    test_source
+        .borrow_mut()
+        .add_data(&[(Value::UInt(2), Value::Int(30))]);
+    ctx.scheduler().check_for_notifications();
+    assert!(
+        *notified.borrow(),
+        "second batch should fire a notification"
+    );
+    for _ in 0..3 {
+        let result = producer.get(producer.tiling().universal_guard());
+        assert_eq!(
+            result, empty,
+            "after second batch: should produce no output yet"
+        );
+    }
+    *notified.borrow_mut() = false;
+
+    // Signal that the source is exhausted; the loop's final accumulator
+    // (10 + 20 + 30 = 60) should now be emitted.  Pull until the cycle
+    // converges to a non-empty scalar (capped to catch regressions).
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+    let mut result = empty.clone();
+    for _ in 0..3 {
+        result = producer.get(producer.tiling().universal_guard());
+        if result != empty {
+            break;
+        }
+    }
+    assert_eq!(
+        result,
+        Tile::Scalar(ColumnValue::Ints(vec![60])),
+        "should emit final accumulator once source is terminal"
+    );
+
+    // The mutation loop should have released every position back to the
+    // source by the end, mirroring `sum(source1())`'s release behaviour.
     assert_eq!(
         test_source.borrow().get_released_predicate(),
         Predicate::True

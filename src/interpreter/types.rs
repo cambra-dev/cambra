@@ -729,37 +729,34 @@ pub struct FuncBinding {
     pub output: Value,
 }
 
-/// Retain elements of `v` where the corresponding `mask` bit is true.
+/// Retain elements of `v` where the corresponding `mask` bit is true,
+/// preserving the relative order of kept elements.
 ///
-/// Uses a two-pointer swap to avoid shifting: a left cursor finds positions to
-/// drop while a right cursor finds positions to keep; they swap and advance
-/// toward each other. Surviving elements appear in unspecified order.
+/// Order-stable: walks `v` with a write cursor, swapping each kept element
+/// into the next write slot.  A faster two-pointer swap-with-end algorithm
+/// (similar to the one used for the `Bools` variant of `ColumnValue::retain`)
+/// would not preserve order, which is incompatible with how mutation-loop
+/// outputs land in a `Tile::SealedFunction` with a `Union`-domain: the
+/// `Union` variants in `ColumnValue::retain` use a stable `select_indices`
+/// filter (their order has to match the stably-filtered `tags`), so the
+/// codomain — retained via this function — must also stay in source order
+/// to keep domain/codomain entries aligned position-by-position.
 fn retain_vec<T>(v: &mut Vec<T>, mask: &BitVec) {
-    let n = v.len();
-    if n == 0 {
-        return;
+    debug_assert_eq!(
+        mask.len(),
+        v.len(),
+        "retain_vec: mask length must match vector length"
+    );
+    let mut write = 0usize;
+    for read in 0..v.len() {
+        if mask[read] {
+            if write != read {
+                v.swap(write, read);
+            }
+            write += 1;
+        }
     }
-    let mut left = 0usize;
-    let mut right = n - 1;
-    loop {
-        // Advance left past positions that are already kept.
-        while left < right && mask[left] {
-            left += 1;
-        }
-        // Retreat right past positions that are already dropped.
-        while right > left && !mask[right] {
-            right -= 1;
-        }
-        if left >= right {
-            break;
-        }
-        // mask[left]==false and mask[right]==true: swap so the kept value moves left.
-        v.swap(left, right);
-        left += 1;
-        right -= 1;
-    }
-    let count = mask.iter().filter(|b| *b).count();
-    v.truncate(count);
+    v.truncate(write);
 }
 
 /// Columnar data for vectorized execution.
@@ -1370,9 +1367,10 @@ impl ColumnValue {
                     .collect();
                 *tags = new_tags;
                 for (v, m) in variants.iter_mut().zip(per_variant_mask.iter()) {
-                    // Use select_indices for a stable retain that preserves source order.
-                    // retain_vec is order-unstable: it swaps dropped slots with values from the
-                    // end, which would misalign variant values against the (stably-filtered) tags.
+                    // Use select_indices for a stable retain.  Like `retain_vec`,
+                    // this preserves source order — required because `tags` above
+                    // is filtered stably, and each variant column has to stay
+                    // aligned with the tag occurrences of its variant.
                     let kept: Vec<usize> = m
                         .iter()
                         .enumerate()

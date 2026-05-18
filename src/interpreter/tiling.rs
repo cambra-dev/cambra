@@ -1739,6 +1739,43 @@ pub fn sort_sealed_function_by_domain(tile: Tile) -> Tile {
                 domain_predicate,
                 |v| ColumnValue::from_values(v, &record_cv_to_extent(fields)),
             ),
+            // Union domain: each entry has (tag, position-within-tag).
+            // Sort entries lexicographically by that pair so two tiles
+            // representing the same multiset of `(tag, var_value) → cod`
+            // entries canonicalize to the same form regardless of the
+            // order each variant happened to be drained.  The variants
+            // themselves stay in their pre-existing order; only the
+            // top-level `tags`/`codomain` parallel vectors get
+            // re-permuted.
+            (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Union { tags, variants }) => {
+                // For each entry, count how many earlier entries shared
+                // its tag — that's the index of this entry into its
+                // variant's value list.  Pair `((tag, var_pos), cod)`
+                // for sorting.
+                let mut tag_counts: HashMap<usize, usize> = HashMap::new();
+                let mut pairs: Vec<((usize, usize), i64)> = tags
+                    .iter()
+                    .zip(cod_ints)
+                    .map(|(&tag, cod)| {
+                        let counter = tag_counts.entry(tag).or_insert(0);
+                        let pos = *counter;
+                        *counter += 1;
+                        ((tag, pos), cod)
+                    })
+                    .collect();
+                pairs.sort_by_key(|((tag, pos), _)| (*tag, *pos));
+                let sorted_tags: Vec<usize> = pairs.iter().map(|((t, _), _)| *t).collect();
+                let sorted_cod: Vec<i64> = pairs.into_iter().map(|(_, c)| c).collect();
+                Tile::SealedFunction {
+                    domain: ColumnValue::Union {
+                        tags: sorted_tags,
+                        variants,
+                    },
+                    codomain: Box::new(Tile::Scalar(ColumnValue::Ints(sorted_cod))),
+                    domain_predicate,
+                    deleted: BitSet::new(),
+                }
+            }
             (other_codomain, domain) => Tile::SealedFunction {
                 domain,
                 codomain: Box::new(other_codomain),

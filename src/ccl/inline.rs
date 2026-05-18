@@ -214,12 +214,16 @@ fn is_let_bound(name: &str, expr: &Expr) -> bool {
         TypedExprNode::Case { branches } => branches
             .iter()
             .any(|b| is_let_bound(name, &b.guard) || is_let_bound(name, &b.body)),
-        TypedExprNode::Join {
+        TypedExprNode::Loop {
+            init_args,
+            source,
             loop_body,
-            outer_body,
             ..
-        } => is_let_bound(name, loop_body) || is_let_bound(name, outer_body),
-        TypedExprNode::Jump { args, .. } => args.iter().any(|a| is_let_bound(name, a)),
+        } => {
+            is_let_bound(name, source)
+                || init_args.iter().any(|a| is_let_bound(name, a))
+                || is_let_bound(name, loop_body)
+        }
         TypedExprNode::ExprStmt { expr, body } => {
             is_let_bound(name, expr) || is_let_bound(name, body)
         }
@@ -552,22 +556,22 @@ fn inline_impl(expr: Expr, ctx: &mut InlineCtx) -> Expr {
                 .collect(),
         },
 
-        TypedExprNode::Join {
-            name,
+        TypedExprNode::Loop {
             params,
+            init_args,
+            source,
             loop_body,
-            outer_body,
-        } => TypedExprNode::Join {
-            name,
+            body_taps,
+        } => crate::ccl::walk_loop_children(
             params,
-            loop_body: Box::new(inline_impl(*loop_body, ctx)),
-            outer_body: Box::new(inline_impl(*outer_body, ctx)),
-        },
-
-        TypedExprNode::Jump { target, args } => TypedExprNode::Jump {
-            target,
-            args: args.into_iter().map(|a| inline_impl(a, ctx)).collect(),
-        },
+            init_args,
+            source,
+            loop_body,
+            body_taps,
+            // Structural traversal — no specific name being substituted.
+            None,
+            |e| inline_impl(e, ctx),
+        ),
 
         // ANF defer-returning Compose source: when the first element of a Compose
         // (i.e. the for-loop iteration source) is itself a defer-returning
@@ -813,25 +817,24 @@ fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
                 .collect(),
         ),
 
-        TypedExprNode::Join {
-            name: join_name,
+        TypedExprNode::Loop {
             params,
+            init_args,
+            source,
             loop_body,
-            outer_body,
-        } => TypedExprNode::Join {
-            name: join_name,
+            body_taps,
+        } => crate::ccl::walk_loop_children(
             params,
-            loop_body: Box::new(inline_and_beta_reduce(*loop_body, name, lambda)),
-            outer_body: Box::new(inline_and_beta_reduce(*outer_body, name, lambda)),
-        },
-
-        TypedExprNode::Jump { target, args } => TypedExprNode::Jump {
-            target,
-            args: args
-                .into_iter()
-                .map(|a| inline_and_beta_reduce(a, name, lambda))
-                .collect(),
-        },
+            init_args,
+            source,
+            loop_body,
+            body_taps,
+            // Param shadowing matters here — we're substituting `name`
+            // throughout, but if the loop's param binds `name`, the body
+            // sees the param's value, not the substituted one.
+            Some(name),
+            |e| inline_and_beta_reduce(e, name, lambda),
+        ),
 
         TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
             expr: Box::new(inline_and_beta_reduce(*expr, name, lambda)),

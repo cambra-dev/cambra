@@ -321,6 +321,23 @@ impl UnificationTable {
                 self.constrain_equal(&ty_a, &ty_b)?;
                 self.entries[root_a.0 as usize] = Some(Entry::Link(root_b));
             }
+            // A partial structure unified with a fully-resolved one of the same
+            // family: constrain_equal validates the partial's known entries
+            // against the full type (and propagates any inner Infer vars), and
+            // we link the two roots so subsequent probes on the partial side
+            // return the more-refined full type.  Without the link, the
+            // partial form remains as the stored solution on its root and
+            // surfaces later as an unresolved-partial error.
+            (Some(ty_a @ Type::Tuple(_)), Some(ty_b @ Type::PartialTuple(_)))
+            | (Some(ty_a @ Type::Record(_)), Some(ty_b @ Type::PartialRecord(_))) => {
+                self.constrain_equal(&ty_a, &ty_b)?;
+                self.entries[root_b.0 as usize] = Some(Entry::Link(root_a));
+            }
+            (Some(ty_a @ Type::PartialTuple(_)), Some(ty_b @ Type::Tuple(_)))
+            | (Some(ty_a @ Type::PartialRecord(_)), Some(ty_b @ Type::Record(_))) => {
+                self.constrain_equal(&ty_a, &ty_b)?;
+                self.entries[root_a.0 as usize] = Some(Entry::Link(root_b));
+            }
             (Some(ty_a), Some(ty_b)) => {
                 if ty_a != ty_b {
                     return self.constrain_equal(&ty_a, &ty_b);
@@ -701,10 +718,11 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
                 resolve(body, table);
             }
         }
-        TypedExprNode::Join {
+        TypedExprNode::Loop {
             params,
+            init_args,
+            source,
             loop_body,
-            outer_body,
             ..
         } => {
             for p in params {
@@ -714,13 +732,11 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
                     p.ty = ty;
                 }
             }
-            resolve(loop_body, table);
-            resolve(outer_body, table);
-        }
-        TypedExprNode::Jump { args, .. } => {
-            for a in args {
+            for a in init_args {
                 resolve(a, table);
             }
+            resolve(source, table);
+            resolve(loop_body, table);
         }
         TypedExprNode::Record(fields) => {
             for (_, e) in fields {

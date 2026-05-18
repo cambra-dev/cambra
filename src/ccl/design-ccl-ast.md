@@ -135,6 +135,81 @@ let f = λ params →
 
 **ANF-lifting of defer-returning sources** (`inline.rs`): when the first element of a `Compose` is a defer-returning expression (i.e. a source that terminates with `; __result_N`), the inline pass extracts it into a fresh `let __for_src_N = <source>` binding before the Compose. This ensures that when two nested generators share the same source expression, each is bound to a unique name and the outer `remove_defers` pass can substitute them independently without name collision.
 
+**Mutation accumulation loops** (`x = 0; for i in src: x += i; x`) are detected in `lower.rs` and lowered to a [`TypedExprNode::Loop`] node rather than a `For` node.  `lower_middle_stmt` calls `find_mutation_loop_vars` (which scans the body for *every* outer-scope name that gets mutated, in first-mention order — handles `x = x + i; o << x` shapes and multi-accumulator bodies like `y = y + i; x = x * i`), then `lower_mutation_loop` builds:
+
+```text
+let x = Loop {
+  params: [x],
+  init_args: [Var(x)],          // outer x's pre-loop value
+  source: <iteration source>,
+  loop_body: λ p → let x = p ▷ Proj(0) in
+                   let i = p ▷ Proj(1) in
+                   step,
+} in body
+```
+
+`lower_mutation_loop_body` walks the for-body sequentially, building a flat let-chain of every assignment and snapshotting each `<<` feed value with the let-chain that preceded it.  Feeds anywhere in the body are supported — pre-mutation, between mutations, or post-mutation — and each captures exactly the SSA-style scope its Python source intended.  See "Record-bodied loops with feeds" below for how feeds are surfaced.
+
+Operator conversion realises the loop as a `Recurse` operator wrapped in a `FanOut`.  All dataflow stays in `Tile`s — no shared cache is exposed across operator boundaries.
+
+```text
+              ┌──────────────────────────────────────────────────────────┐
+              │                                                          │
+init ──┐      ▼                                                          │
+        ├──→ Recurse ──→ FanOut ──┬──→ FanIn ──→ body ──→ FanOut(Memo) ──┤
+domain ─┘                         │                  │                   │
+                                  │   source ────────┘                   │
+                                  │                                      │
+                                  └── (acc_var reads from this branch)   │
+                                                                         │
+                                            .step ◀────────── (cycle) ───┘
+                                                                         │
+                                       external Record stream ◀──────────┘
+                                       ((Proj("step"), init) ▷ LastOrDefault
+                                        + Proj("tap_*"))
+```
+
+- **Inputs**: `init` carries the accumulator's starting value (scalar for one param, packed `Record({_i: Scalar(T_i)})` via `ScalarFanIn` for multi-var); `domain` is an `IterateExtent` over the source's domain; `recursive_input` is the body fan-out's `.step` branch back into the cycle, wired in by `recursive_input_setter` after body compilation.
+- **`Recurse` output**: emits the accumulator *shifted forward by one in the domain* — `init` at position 0, `recursive_input[i-1]` at position `i > 0`.  Wrapped in a `FanOut` so that the body's tuple input (the first arm of a `fan_in(prev_acc, source)`) and the loop's external output can share the stream.
+- **Loop body** is compiled with `Some(fan_in([prev_acc_fan.branch(), source_op]))` as its input — a `SealedFunction(D, Record{_0: AccType, _1: item_ty})` matching the body's CCL type `Fun(Tuple(AccType, item_ty), Record({step, tap_*}))`.  The body's lambda projects `acc_var` and `iter_var` out of the input record.  Its codomain is always `Record({step: <step_shape>, tap_*: T_*})` (with `tap_*` possibly empty).  The body's output is wrapped in `FanOut(Memo(…))`: one branch is projected to `.step` and closes the cycle via `recursive_input_setter`, the other is the Loop's external output exposed directly as the body Record stream.
+- **External output**: the body fan-out's external branch is exposed directly as the body Record stream.  Downstream lowering picks each accumulator off via `(Proj("step") [▷ Proj(i)], init_arg) ▷ LastOrDefault` (so an empty source yields `init_arg`, not a panic) and each tap stream via `Proj("tap_*")`.
+
+#### Record body shape
+
+`lower_mutation_loop` always emits one Loop whose codomain is `Record({step, tap_*})`, regardless of accumulator count or feed presence:
+
+```text
+let acc_stream = Loop {
+  params: [acc_name],
+  init_args: [Var(acc_name)],   // pre-loop value
+  loop_body: λp →
+    let acc = p ▷ Proj(0) in
+    let i = p ▷ Proj(1) in
+    Record({
+      step: <full let-chain> Var(acc_name),
+      tap_0_<defer_0>: <chain-at-feed-0> <lowered feed value 0>,
+      …,
+      tap_k_<defer_k>: <chain-at-feed-k> <lowered feed value k>,
+    }),
+  body_taps: ["tap_0_<defer_0>", …],   // possibly empty
+} in
+let acc_name = (acc_stream ▷ Proj("step"), Var(acc_name)) ▷ LastOrDefault in
+ExprStmt(Feed(defer_0, acc_stream ▷ Proj("tap_0_<defer_0>")),
+ExprStmt(Feed(defer_1, acc_stream ▷ Proj("tap_1_<defer_1>")),
+  continuation))
+```
+
+- **`step`**'s type is the scalar accumulator type for a single param, or a positional `Tuple(T_0, …, T_{n-1})` for multi-var.  Multi-var lowering finishes each accumulator's chain with an extra `▷ Proj(i)` before the `LastOrDefault` pair.
+- **`body_taps`** is the list of tap field names; `infer_mutation_loop` uses it to construct the expected body codomain `Record({step: <step_shape>, tap_*: T_*})` (each `T_*` is a fresh inference variable that resolves from the feed value's actual type).
+- **`Builtin::LastOrDefault`** is the explicit stream-to-scalar primitive (`Tuple(Fun(D, T), T) → T`) used for the post-loop accumulator extraction.  Compiles directly to `ExtractLast`, which receives both the stream and the default operator and falls back to the default when the source domain is empty (the loop body ran zero times).  The default at each accumulator's call site is the pre-loop binding `Var(acc_name)`, which resolves to the outer scope because the surrounding `let acc_name = …` shadows it only inside its own body.  It is *not* an `AggregateKind` because there is no fold / identity element; lambda-elim handles it via the polymorphic-builtin Apply rule, mirroring `Zip`.
+- **Op-conversion**: the Loop arm always projects `.step` from a fan-out branch of the body's output before feeding to `recursive_input_setter` so the cycle carries only the recurrence value; the full Record stream is exposed as the Loop's external output.
+
+This shape compiles to **exactly one `Recurse`** per source-level mutation loop, regardless of how many feeds the body contains or whether the after-loop scalar accumulator is also consumed.  Multiple sequential mutation loops sharing one defer still build up a Union-domain `SealedFunction` via `CollectionUnion` — `remove_defers` collects every `Feed(defer_k, …)` for a given defer and unions their stream values at the defer's resolution site.  The `let acc_stream = Loop` binding is multi-referenced (the scalar `LastOrDefault` extraction plus every tap projection), so `remove_defers::inline_defer` preserves it via the `PendingLet` machinery rather than substituting it away.
+
+Each feed's value lives inside the body's lambda scope, so its references to `acc` and `iter_var` resolve against the body's per-iteration projections — exactly what the original `o << e` meant.  Pre-mutation feeds capture the empty let-chain (acc = `p.0`, the prev-iteration value); post-mutation feeds capture the chain up to the mutation.
+
+**Generators with loop-carried state** (brainstorm §4b's `running_totals`: `total = 0; for x in xs: total += x; yield total`) reuse this same `Loop` lowering — `yield e` is just `<<` against a synthesised generator defer.  `lower_generator_or_mutation_loop` allocates `__result_N = Defer` outside the loop, passes its name into `lower_mutation_loop_body` as `yield_defer`, and each `yield e` becomes one more `tap_*` field on the body Record with the same let-chain snapshotting as an explicit `<<`.  The surrounding generator-function context already wraps the loop in `let __result_N = Defer in …` so the collected yields surface as the function's stream return value.  Both `lower_generator_for` (final-statement path) and `lower_middle_stmt` (middle-statement path) detect mutation independently of `yield` and dispatch through this same helper — they only differ in what continuation is passed in (`Var(__result_N)` for the final-statement case, the surrounding `body` for the middle case).
+
 **Let-bindings in generator bodies** (`y = f(x); yield y`) lower to nested `Let` nodes inside the Lambda body, evaluated once per iteration of the enclosing loop.
 
 **Pre-loop lets** (assignments before the outer `for` in a function body) are handled by `lower_stmts` — they wrap the generator expression in `Let` nodes. The `for` lowering itself (`lower_generator_for`) only handles the loop and its body.
@@ -160,13 +235,15 @@ CHL `if/else`, `elif` chains, and ternary `if` expressions are all lowered to `C
 
 CHL `match` statements (planned) will desugar entirely at lowering time: the scrutinee is bound with a fresh `Let(__scrut)` node, then each arm produces a guard (`__scrut == lit` for literal patterns, `Lit(true)` for wildcard/structural) and a body (with `Let` bindings for any captured variable names). No IR changes are needed for `match` support.
 
-### `Join`/`Jump` for loops
+### `Loop` for mutation-accumulation iteration
 
-CHL `while` loops are lowered to explicit `Join`/`Jump` nodes rather than recursive `Lambda`/`Let` combinations.
+CHL mutation-accumulation `for` loops are lowered to an explicit `Loop` node rather than recursive `Lambda`/`Let` combinations or a dedicated fold node.
 
-`Join` defines a labeled loop header with typed parameters (the loop variables). `Jump` is a tail call to a `Join` point, passing updated parameter values. The non-escaping property (jumps are always in tail position, join points cannot be stored or passed as arguments) is enforced by construction.
+`Loop` is a bounded iteration with explicit loop-carried accumulators: `params` lists the accumulator slots (one or more), `init_args` supplies their starting values in declaration order, `source` drives the iteration, and `loop_body` computes each new accumulator value from `(prev_acc_0, …, prev_acc_{n-1}, item)`.  The accumulator slots are only in scope inside `loop_body`; `init_args` is evaluated outside the loop's param scope.  There is no `Jump` node: the loop has a single entry (`init_args`) and the runtime iterates the body until the source is exhausted, so labelled tail-calls aren't needed.  `continue`-style "skip the rest of this iteration" semantics fall out as conditional `Case`-on-old-vs-new in the body, again without an AST extension.  General `while` loops with explicit restart/break would need a richer encoding (a body-tail-call form for `continue`, runtime support in `Recurse` for `break`), but those are future work.
 
-Rationale: encoding loops as recursive lambdas requires detecting recursive bindings by scanning the tree for forward references. `Join`/`Jump` makes the loop structure explicit, simplifying both the lowering pass and optimization passes targeting iterate/feedback operators.
+The mutation-loop pattern emitted by `lower_mutation_loop` (see "Mutation accumulation loops" above) is currently the only `Loop` shape consumed end-to-end: `infer.rs::infer_mutation_loop` and `operator_conversion`'s `Loop` arm both pattern-match on `Loop { params: [acc_0…], init_args: [init_0…], source: Fun(D, item_ty), loop_body: Lambda(p, …), body_taps }` with `params.len() == init_args.len()`, and reject anything else.  Any combination of accumulator count and tap count is supported: single- or multi-accumulator, with or without feeds.  Future work (general `while` loops, generators with internal mutable state) will extend these passes to handle additional shapes.
+
+Rationale: encoding loops as recursive lambdas requires detecting recursive bindings by scanning the tree for forward references. `Loop` makes the loop structure explicit, simplifying both the lowering pass and optimization passes targeting iterate/feedback operators.
 
 ### Shared literal and operator types
 
@@ -174,7 +251,7 @@ Rationale: encoding loops as recursive lambdas requires detecting recursive bind
 
 ### Typed binding sites — `TypedBinding`
 
-All binding sites — `Lambda`, `Join`, and `Let` — use `TypedBinding { name, ty, user_annotation }` rather than separate `name: String` / type fields.
+All binding sites — `Lambda`, `Loop`, and `Let` — use `TypedBinding { name, ty, user_annotation }` rather than separate `name: String` / type fields.
 
 - `ty` starts as `Type::Hole` (lowering placeholder); the inference pass converts it to a registered `Type::Infer` variable at inference entry and fills in the concrete type before compilation.
 - `user_annotation` carries an optional user-written type annotation (e.g. from a CHL `cast` expression). Inference validates the inferred type against it; if the body provides no usable constraint the annotation is used directly as the param type.
@@ -324,15 +401,12 @@ enum TypedExprNode {
     Case {
         branches: Vec<Branch>,  // Branch { guard: TypedExpr, body: TypedExpr }
     },
-    Join {
-        name: String,       // join-point label
-        params: Vec<TypedBinding>,
-        loop_body: Box<TypedExpr>,            // loop body; may contain Jump back to this Join
-        outer_body: Box<TypedExpr>,           // evaluated first; contains the initial Jump
-    },
-    Jump {
-        target: String,                       // must name an enclosing Join
-        args: Vec<TypedExpr>,
+    Loop {
+        params: Vec<TypedBinding>,            // loop-carried accumulator slots
+        init_args: Vec<TypedExpr>,            // one init per param, evaluated outside the loop
+        source: Box<TypedExpr>,               // iteration source: Fun(D, item_ty)
+        loop_body: Box<TypedExpr>,            // per-iteration step: Fun(Tuple(params…, item), codomain)
+        body_taps: Vec<String>,               // tap field names (see body codomain docs in mod.rs)
     },
     GroupBy {
         collection: Box<TypedExpr>,           // the collection (function) whose elements are grouped

@@ -5,12 +5,9 @@
 //! variables → iterate/recurse combinator".  Flip this test green by
 //! switching to `expect_scalar(..., "15")` once the feature ships.
 
-use super::common::expect_compile_error;
+use super::common::expect_scalar;
 
 #[test]
 fn for_accumulator_currently_fails_at_lowering() {
-    expect_compile_error(
-        include_str!("program.cambra"),
-        "For-loop body must end in a yield",
-    );
+    expect_scalar(include_str!("program.cambra"), "15");
 }

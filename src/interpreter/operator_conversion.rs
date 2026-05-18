@@ -10,11 +10,11 @@ use crate::{
         DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
         Value,
         tile_operators::{
-            Aggregate, Constant, Converse, ExtractAggregate, FanOut, FlattenTupleDomain,
-            IterateExtent, MapAggregate, MapDomain, MapExtractAggregate, MapResult,
-            MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo, PermuteRecordDomain,
-            Restrict, ScalarFanIn, TileOperator, Tiling, Uncurry, UnionOperator, fan_in,
-            fan_in_named,
+            Aggregate, Constant, Converse, ExtractAggregate, ExtractLast, FanOut,
+            FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
+            MapResult, MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo,
+            PermuteRecordDomain, Recurse, Restrict, TileOperator, Tiling, Uncurry, UnionOperator,
+            fan_in, fan_in_named,
         },
         tuple_field,
     },
@@ -87,7 +87,9 @@ pub fn convert_record_fields_to_operators(
             let bound_op = convert_impl(bound_expr, None, None, ctx)?;
             let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
             let mut scope = ctx.enter_scope();
-            scope.bind(&binding.name, fan_out);
+            // No surrounding iteration here (this entry point compiles a
+            // Let* Record* chain from the top); every binding is free.
+            scope.bind(&binding.name, fan_out, BindingKind::Free);
             convert_record_fields_to_operators(body, &mut scope)
         }
         TypedExprNode::Record(fields) => fields
@@ -113,6 +115,76 @@ pub enum ConversionError {
 // Context types
 // ---------------------------------------------------------------------------
 
+/// Whether a let-bound name was bound *inside* an iteration scope (its op
+/// already varies in lockstep with the surrounding stream — read it
+/// through) or *outside* one (it's a free function — apply it via
+/// `MapResult` at each use site).
+///
+/// The distinction is made structurally at bind time: a `Let` compiled
+/// with `Some(input)` is iteration-aligned; one compiled with `None` is
+/// free.  Op-conversion stores this with the binding so that
+/// [`TypedExprNode::Var`] lookups don't have to re-derive it from
+/// tile-domain comparison at use sites.
+///
+/// TODO(nested-mutation): this encoding is one bit per binding — was it
+/// compiled with `Some(input)` or not — and the [`TypedExprNode::Var`]
+/// arm only checks whether there *is* currently an input.  That collapses
+/// "aligned to which iteration" into a yes/no, which is fine for the
+/// current surface area (mutation-loop body has exactly one iteration
+/// depth via the `Recurse` cycle; multi-generator comprehensions flatten
+/// to a single domain via hash-join / loop-join before any nested lets
+/// appear) but breaks down once a binding made at one iteration depth is
+/// referenced at another.  Concretely:
+///
+/// ```python
+/// for x in xs:
+///     a = x * 2          # Aligned to outer iteration
+///     for y in ys:
+///         z = a + y      # referenced inside inner iteration
+/// ```
+///
+/// After lowering and lambda-elim, `a`'s op is compiled with the outer
+/// iteration's stream as input (`Aligned`).  When `Var(a)` is referenced
+/// inside the inner iteration, the current input is the inner stream;
+/// the Var arm sees `(Aligned, Some(_))` and passes through — but `a`'s
+/// tile is keyed by the outer domain, not the inner one.  Domain
+/// mismatch at the consumer.
+///
+/// Generalisation needed before Phase 5 (the `#[ignore]`d nested-mutation
+/// tests in `compilation_pipeline.rs`): tag each binding with the
+/// iteration stack active at its bind site — an ordered prefix of the
+/// surrounding iterations, not a free-form set, because loops nest
+/// linearly.  At Var time, compare to the current iteration stack:
+///
+/// * `bind_stack == current_stack` → passthrough.
+/// * `bind_stack` is a proper prefix of `current_stack` (current is
+///   deeper than bind site) → wrap with one lift adapter per extra
+///   level: for a depth-N binding referenced at depth N+k, a chain of
+///   k `MapResult`s, each one against the projection of the
+///   corresponding deeper stream onto its outer-domain key.
+/// * `bind_stack` is not a prefix of `current_stack` (current is
+///   shallower, or sits in a sibling iteration chain that does not
+///   share ancestry) → ill-formed.
+///
+/// In the common single-chain case (no sibling iterations active
+/// simultaneously), iteration identity is redundant and the rule
+/// reduces to a depth comparison.  The identity check only matters when
+/// multiple iteration scopes can coexist (e.g. one for-loop closes and
+/// another opens at the same depth, both with bindings still
+/// statically in scope).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BindingKind {
+    /// The binding's op was compiled with an input stream — its tile-domain
+    /// matches the surrounding iteration.  References inside that
+    /// iteration compile as passthrough (return the FanOut branch
+    /// directly).
+    Aligned,
+    /// The binding's op was compiled without an input — it's a free
+    /// function.  References under an iteration compile as
+    /// `MapResult(input, op)` to apply it pointwise.
+    Free,
+}
+
 /// Compilation context for tile compilation.
 ///
 /// Bundles the variable scope stack with the data-source registry needed to
@@ -120,8 +192,10 @@ pub enum ConversionError {
 /// at compile time.
 #[derive(Default)]
 pub struct OpConversionContext {
-    /// Variable bindings in scope, innermost scope last.
-    scopes: ScopeStack<Rc<FanOut>>,
+    /// Variable bindings in scope, innermost scope last.  Each binding
+    /// carries a [`BindingKind`] so [`TypedExprNode::Var`] lookups can
+    /// dispatch on it without inspecting tile-level types.
+    scopes: ScopeStack<(Rc<FanOut>, BindingKind)>,
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
 }
@@ -194,12 +268,17 @@ impl OpConversionContext {
     }
 
     /// Bind `name` to `binding` in the innermost scope.
-    pub(crate) fn bind(&mut self, name: &str, binding: Rc<FanOut>) {
-        self.scopes.bind(name, binding);
+    ///
+    /// `kind` records whether the binding was compiled inside an iteration
+    /// scope ([`BindingKind::Aligned`]) or outside one ([`BindingKind::Free`]);
+    /// [`Self::lookup`] returns this alongside the [`FanOut`] so the
+    /// [`TypedExprNode::Var`] arm can dispatch without inspecting tile types.
+    pub(crate) fn bind(&mut self, name: &str, binding: Rc<FanOut>, kind: BindingKind) {
+        self.scopes.bind(name, (binding, kind));
     }
 
     /// Look up `name` from innermost scope outward.
-    pub(crate) fn lookup(&self, name: &str) -> Option<&Rc<FanOut>> {
+    pub(crate) fn lookup(&self, name: &str) -> Option<&(Rc<FanOut>, BindingKind)> {
         self.scopes.lookup(name)
     }
 
@@ -298,19 +377,47 @@ fn convert_impl(
         }
 
         // let name = value in body: compile value, push a scope, compile body.
+        //
+        // After lambda-elim's `λx → let v = def in body  ⟹
+        //   let v = (λx→def) in (λx→body[v ↦ x ▷ v])` transformation,
+        // `bound_expr` may reference the lambda's parameter (via the
+        // point-free `id` builtin) and so needs the surrounding
+        // iteration's input stream.  We fan the surrounding `input` out
+        // to *both* `bound_expr` and `body` so each can consume it.
+        //
+        // When `v` is used 0/1 times in `body`, this materialises the
+        // iteration twice instead of inlining — a runtime cost we accept
+        // for correctness simplicity.  See the matching comment in
+        // [`crate::ccl::lambda_elim`]'s let-in-lambda rule.
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
         } => {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported("let expects no input".into()));
-            }
-            let bound_op = convert_impl(bound_expr, None, None, ctx)?;
+            let (bound_input, body_input) = match input {
+                Some(input) => {
+                    let fan_out = Rc::new(FanOut::new(input));
+                    (Some(fan_out.branch()), Some(fan_out.branch()))
+                }
+                None => (None, None),
+            };
+            // `kind` captures whether this binding was created inside an
+            // iteration scope: an iteration-aligned binding (compiled with
+            // `Some(input)`) yields an op whose tile-domain matches the
+            // surrounding stream, so Var lookups must passthrough rather
+            // than re-apply via `MapResult`.  A free binding (no input)
+            // is a standalone function; references under an iteration must
+            // wrap it in `MapResult` to look up at each position.
+            let kind = if bound_input.is_some() {
+                BindingKind::Aligned
+            } else {
+                BindingKind::Free
+            };
+            let bound_op = convert_impl(bound_expr, bound_input, input_ty.clone(), ctx)?;
             let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
             let mut scope = ctx.enter_scope();
-            scope.bind(&binding.name, fan_out);
-            convert_impl(body, None, None, &mut scope)
+            scope.bind(&binding.name, fan_out, kind);
+            convert_impl(body, body_input, input_ty, &mut scope)
         }
 
         // const(c): maps every domain element to the constant value c.
@@ -336,33 +443,36 @@ fn convert_impl(
             match &argument.node {
                 TypedExprNode::Tuple(elts) => {
                     let consts: Vec<_> = elts.iter().map(is_const).collect();
-                    if elts.len() == 2 && consts.iter().any(Option::is_some) {
-                        // Zip-with-const optimisation: avoid full FanOut when one arm is constant.
-                        let (const_idx, mode) = if consts[0].is_some() {
-                            (0, MapResultToConstMode::FanInLeft)
+                    // Zip-with-const fast path: avoid the FanOut+FanIn dance
+                    // when exactly one arm of a 2-arm zip is a const-lift.
+                    if elts.len() == 2
+                        && let Some(const_idx) = consts.iter().position(|c| c.is_some())
+                    {
+                        let const_arm = convert_impl(consts[const_idx].unwrap(), None, None, ctx)?;
+                        let mode = if const_idx == 0 {
+                            MapResultToConstMode::FanInLeft
                         } else {
-                            (1, MapResultToConstMode::FanInRight)
+                            MapResultToConstMode::FanInRight
                         };
                         let non_const_arm =
                             convert_impl(&elts[1 - const_idx], Some(input), None, ctx)?;
-                        let const_arm = convert_impl(consts[const_idx].unwrap(), None, None, ctx)?;
-                        Ok(Box::new(MapResultToConst::new(
+                        return Ok(Box::new(MapResultToConst::new(
                             non_const_arm,
                             const_arm,
                             mode,
-                        )))
-                    } else {
-                        // Wrap input in FanOut so every branch shares the same upstream producer.
-                        let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
-                        let mut ops = Vec::new();
-                        for elt in elts {
-                            ops.push(convert_impl(elt, Some(fan_out.branch()), None, ctx)?);
-                        }
-                        // The arms' runtime tilings depend on the upstream `input` —
-                        // scalar upstream produces scalar arms, function upstream produces
-                        // function arms. `fan_in` picks the matching combinator.
-                        Ok(fan_in(ops))
+                        )));
                     }
+                    // Generic path: fan_out the input so every branch shares the
+                    // same upstream producer.  The arms' runtime tilings depend
+                    // on the upstream `input` — scalar upstream produces scalar
+                    // arms, function upstream produces function arms.  `fan_in`
+                    // picks the matching combinator.
+                    let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
+                    let mut ops = Vec::new();
+                    for elt in elts {
+                        ops.push(convert_impl(elt, Some(fan_out.branch()), None, ctx)?);
+                    }
+                    Ok(fan_in(ops))
                 }
                 TypedExprNode::Record(fields) => {
                     // zip(Record({f1: e1, ..., fn: en})) — produced by Record lambda elimination.
@@ -491,6 +601,36 @@ fn convert_impl(
             apply_aggregate(input, kind)
         }
 
+        // `LastOrDefault` is the stream-to-scalar primitive that extracts the
+        // codomain value at the final position of an iteration stream, falling
+        // back to a default scalar when the stream is empty.  Argument is a
+        // 2-element `Tuple([stream, default])`; compiles directly to the
+        // `ExtractLast` tile operator (which takes both ops).
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::LastOrDefault) =>
+        {
+            if input.is_some() {
+                return Err(ConversionError::Unsupported(
+                    "LastOrDefault expects no input (it composes a function-typed argument)".into(),
+                ));
+            }
+            let TypedExprNode::Tuple(elts) = &argument.node else {
+                return Err(ConversionError::Unsupported(format!(
+                    "LastOrDefault expects a 2-element Tuple argument, got {:?}",
+                    argument.node
+                )));
+            };
+            if elts.len() != 2 {
+                return Err(ConversionError::Unsupported(format!(
+                    "LastOrDefault expects a 2-element Tuple argument, got {} elements",
+                    elts.len()
+                )));
+            }
+            let stream_op = convert_impl(&elts[0], None, None, ctx)?;
+            let default_op = convert_impl(&elts[1], None, None, ctx)?;
+            Ok(Box::new(ExtractLast::new(stream_op, default_op)))
+        }
+
         TypedExprNode::Apply { function, argument } if is_applied_flatten_domain(function) => {
             if input.is_some() {
                 return Err(ConversionError::Unsupported(
@@ -534,11 +674,16 @@ fn convert_impl(
         }
 
         TypedExprNode::Var(name) => {
-            if let Some(fan_out) = ctx.lookup(name) {
-                if let Some(input) = input {
-                    Ok(Box::new(MapResult::new(input, fan_out.branch())))
-                } else {
-                    Ok(fan_out.branch())
+            if let Some((fan_out, kind)) = ctx.lookup(name) {
+                let kind = *kind;
+                let op = fan_out.branch();
+                // Aligned bindings already vary in lockstep with the
+                // surrounding iteration — return the FanOut branch directly.
+                // Free bindings are standalone functions; under an
+                // iteration we apply them pointwise via `MapResult`.
+                match (kind, input) {
+                    (BindingKind::Aligned, _) | (BindingKind::Free, None) => Ok(op),
+                    (BindingKind::Free, Some(input)) => Ok(Box::new(MapResult::new(input, op))),
                 }
             } else {
                 Err(ConversionError::Unsupported(format!(
@@ -579,7 +724,14 @@ fn convert_impl(
         }
 
         // Tuple: compile to a record.
-        // Zipped tuples are handled by the zip rule earlier, so only tuples of scalars hit this case.
+        //
+        // Zipped tuples are handled by the zip rule earlier; this case
+        // fires when a `Tuple` appears as the argument of a non-Zip Apply
+        // (e.g. `Apply(Tuple([acc, i]), Builtin(BinOp(Add)))` after
+        // lambda-elim of `acc + i`).  Element tilings can be either all
+        // scalar or all function-tiled (when the elements are
+        // mutation-loop projections like `Var(acc)`); `fan_in` dispatches
+        // between `ScalarFanIn` and `FanIn` accordingly.
         TypedExprNode::Tuple(elts) => {
             if input.is_some() {
                 return Err(ConversionError::Unsupported(
@@ -591,7 +743,7 @@ fn convert_impl(
                 .iter()
                 .map(|elt| convert_impl(elt, None, None, ctx))
                 .collect();
-            Ok(Box::new(ScalarFanIn::new(ops?)))
+            Ok(fan_in(ops?))
         }
 
         TypedExprNode::Record(fields) => {
@@ -604,7 +756,7 @@ fn convert_impl(
                 .iter()
                 .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, None, ctx)?)))
                 .collect();
-            Ok(Box::new(ScalarFanIn::new_named(ops?)))
+            Ok(fan_in_named(ops?))
         }
 
         // Literal constant: produce a scalar.
@@ -622,6 +774,99 @@ fn convert_impl(
                 input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
             let source = ctx.get_source(name)?;
             Ok(Box::new(MapResultWithSource::new(source, input)))
+        }
+
+        // Mutation-loop-shaped Loop: compile the cyclic op-graph.
+        //
+        // Every Loop has body codomain `Record({step: <step_shape>,
+        // tap_*: T_*})` (see [`infer_mutation_loop`]):
+        // - `step_shape` is the scalar accumulator type for a single
+        //   accumulator, or `Tuple(T_0, …, T_{n-1})` for multi-var.
+        //   The cycle is closed on `.step` — op-conversion projects it
+        //   before feeding back to `recursive_input`.
+        // - `tap_*` is one field per `o <<` feed inside the body
+        //   (possibly empty).  These ride along on the same body
+        //   fan-out; surrounding lowering picks each off via
+        //   `Proj("tap_*")`.
+        //
+        // The Loop's external output is always the running body stream
+        // (the `Fun(D, Record(...))`); surrounding lowering finishes
+        // with `Proj("step") [▷ Proj(i)] ▷ Last` to land on each
+        // accumulator's final scalar value.  See [`Recurse`] for the
+        // runtime mechanics.
+        TypedExprNode::Loop { .. } => {
+            let shape = expr.as_mutation_loop().ok_or_else(|| {
+                ConversionError::Unsupported(
+                    "Loop is not in the supported mutation-loop shape \
+                     (≥1 accumulator params with one matching init_arg per param)"
+                        .into(),
+                )
+            })?;
+            let n_accs = shape.acc_vars.len();
+            // The iteration domain comes from `source`'s `Fun(D, item_ty)` type.
+            let domain_ty = shape.source.ty.domain().ok_or_else(|| {
+                ConversionError::TypeError(format!(
+                    "mutation-loop source must have function type, got {}",
+                    shape.source.ty
+                ))
+            })?;
+            let source_domain_extent = ctx.extent_of(&domain_ty)?;
+            // Build the packed init.  For a single accumulator we just
+            // compile its init expression; for multiple, every init is
+            // compiled to a scalar op and then combined via `ScalarFanIn`
+            // into a single Record (`_0`, `_1`, …) so that `Recurse`'s
+            // codomain is one packed tile rather than N parallel cycles.
+            let init_op: Box<dyn TileOperator> = if n_accs == 1 {
+                convert_impl(&shape.init_args[0], None, None, ctx)?
+            } else {
+                let arms: Vec<Box<dyn TileOperator>> = shape
+                    .init_args
+                    .iter()
+                    .map(|init| convert_impl(init, None, None, ctx))
+                    .collect::<Result<_, _>>()?;
+                fan_in(arms)
+            };
+            let domain_op: Box<dyn TileOperator> =
+                Box::new(IterateExtent::new(source_domain_extent));
+            let recurse = Recurse::new(init_op, domain_op);
+            let set_recursive_input = recurse.recursive_input_setter();
+            let prev_acc_fan = Rc::new(FanOut::new_cyclic(Box::new(recurse)));
+            let source_op = convert_impl(shape.source, None, None, ctx)?;
+            // Wire the body's input.  For a single accumulator the input
+            // is `fan_in(prev_acc, source)` — a 2-arm record `(_0, _1)`
+            // matching the body's `let acc = p.0 in let item = p.1`
+            // shape.  For multiple accumulators we *unpack* the packed
+            // prev-acc record into its `_0..=_{n-1}` fields first, then
+            // fan-in all N+1 streams together, so the body's `let acc_i
+            // = p.i` projections line up positionally.
+            let body_input = if n_accs == 1 {
+                fan_in(vec![prev_acc_fan.branch(), source_op])
+            } else {
+                let mut arms: Vec<Box<dyn TileOperator>> = Vec::with_capacity(n_accs + 1);
+                for i in 0..n_accs {
+                    arms.push(proj_field(prev_acc_fan.branch(), i)?);
+                }
+                arms.push(source_op);
+                fan_in(arms)
+            };
+            let body_op = convert_impl(shape.loop_body, Some(body_input), None, ctx)?;
+            let body_fan = Rc::new(FanOut::new_cyclic(Box::new(Memo::new(body_op))));
+            // Always cycle on `.step`; the external output is the
+            // running body Record stream.  Surrounding lowering
+            // projects `step` (and per-accumulator indices, for
+            // multi-var) and applies `Last` to land on the final
+            // scalar accumulator value(s).
+            let cycle_branch = proj_named_field(body_fan.branch(), "step")?;
+            let loop_op: Box<dyn TileOperator> = body_fan.branch();
+            set_recursive_input(cycle_branch);
+            // A Loop's output is always a SealedFunction whose domain is
+            // the iteration extent; any surrounding `input` is the same
+            // iteration stream, so the Loop is already aligned and we
+            // pass it through unchanged.  (Wrapping in `MapResult` would
+            // re-apply it as a per-position lookup function and panic on
+            // missing positions, the same way let-bound aligned scalars
+            // would.)
+            Ok(loop_op)
         }
 
         other => Err(ConversionError::Unsupported(format!(
@@ -948,9 +1193,13 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
     }
 }
 
-// Returns x if the expr is x ▷ const, None otherwise.
-// Only returns Some for scalar-typed constants; function-typed constants (e.g. Proj morphisms)
-// produce function tiles that MapResultToConst cannot combine via scalar_tile_to_column_value.
+// Returns `Some(x)` if `expr` is `x ▷ const` where `x` has scalar CCL type.
+//
+// Function-typed `x` (e.g. a `Proj` morphism) is excluded: compiling
+// `Proj(...) ▷ const` would yield a function-tiled `const_arm` that the
+// zip-with-const path's [`MapResultToConst`] caller can't combine via
+// `scalar_tile_to_column_value` later in the pipeline.  Filtering here
+// keeps that caller from ever seeing a function-typed argument.
 fn is_const(expr: &Expr) -> Option<&Expr> {
     if let TypedExprNode::Apply { function, argument } = &expr.node
         && as_builtin(function) == Some(Builtin::Const)

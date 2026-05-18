@@ -44,7 +44,7 @@ use std::cell::RefCell;
 use std::mem::replace;
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::typed_compose;
+use crate::ccl::ccl_utils::{is_free, typed_compose};
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
 use crate::ccl::{
@@ -61,7 +61,7 @@ use crate::ccl::{Builtin, Lit, Refinement, next_refinement_id};
 #[derive(Debug, Clone, PartialEq)]
 pub enum LambdaElimError {
     /// A node kind inside a lambda body is not yet handled by the elimination
-    /// rules.  Currently: `Case`, `Join`, `Jump`, and `HashJoin` refinements.
+    /// rules.  Currently: `Case`, `Loop`, and `HashJoin` refinements.
     Unsupported(String),
 }
 
@@ -187,121 +187,10 @@ pub fn const_(c: Expr) -> Expr {
     Expr::apply(c, Expr::builtin(Builtin::Const))
 }
 
-// ---------------------------------------------------------------------------
-// Free-variable check
-// ---------------------------------------------------------------------------
-
-/// Returns `true` if `param` appears free in `expr`.
-///
-/// A variable is free if it is referenced by [`TypedExprNode::Var`] and is not shadowed
-/// by an inner [`TypedExprNode::Lambda`] or [`TypedExprNode::Let`] that rebinds the same name.
-pub(crate) fn is_free(param: &str, expr: &Expr) -> bool {
-    let is_free_in_type = is_free_in_type(param, &expr.ty);
-
-    let is_free = match &expr.node {
-        TypedExprNode::Var(name) => name == param,
-
-        TypedExprNode::Lit(_) | TypedExprNode::Proj(_) | TypedExprNode::Builtin(_) => false,
-
-        TypedExprNode::Lambda {
-            param: p,
-            body,
-            refinement,
-        } => {
-            if p.name == param {
-                // param is shadowed inside this lambda
-                false
-            } else {
-                let free_in_body = is_free(param, body);
-                let free_in_refinement = refinement.as_ref().is_some_and(|r| match &r.kind {
-                    RefinementKind::Predicate(pred_rc) => is_free(param, &pred_rc.borrow()),
-                });
-                free_in_body || free_in_refinement
-            }
-        }
-
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            let free_in_value = is_free(param, bound_expr);
-            // `binding.name` shadows `param` inside `body` only
-            let free_in_body = if binding.name == param {
-                false
-            } else {
-                is_free(param, body)
-            };
-            free_in_value || free_in_body
-        }
-
-        TypedExprNode::Apply { function, argument } => {
-            is_free(param, function) || is_free(param, argument)
-        }
-
-        TypedExprNode::BinOp { left, right, .. } => is_free(param, left) || is_free(param, right),
-
-        TypedExprNode::UnaryOp(_, inner) => is_free(param, inner),
-
-        TypedExprNode::Tuple(elts) | TypedExprNode::List(elts) => {
-            elts.iter().any(|e| is_free(param, e))
-        }
-
-        TypedExprNode::Record(fields) => fields.iter().any(|(_, e)| is_free(param, e)),
-
-        TypedExprNode::Case { branches } => branches
-            .iter()
-            .any(|b| is_free(param, &b.guard) || is_free(param, &b.body)),
-
-        TypedExprNode::Join {
-            loop_body,
-            outer_body,
-            ..
-        } => is_free(param, loop_body) || is_free(param, outer_body),
-
-        TypedExprNode::Jump { args, .. } => args.iter().any(|a| is_free(param, a)),
-
-        TypedExprNode::Compose(elts) => elts.iter().any(|e| is_free(param, e)),
-
-        TypedExprNode::Aggregate { input, .. } => is_free(param, input),
-
-        TypedExprNode::Source(_) => false,
-
-        TypedExprNode::ExprStmt { expr, body } => is_free(param, expr) || is_free(param, body),
-
-        // The `name` field of Feed/Define is a use of the defer handle variable —
-        // `Feed("x", v)` is a write to the defer `x`, so `x` is free here.
-        TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
-            name == param || is_free(param, value)
-        }
-
-        TypedExprNode::Defer => false,
-    };
-    is_free || is_free_in_type
-}
-
-// Look for any instances of the param in any refinements inside of `ty`
-fn is_free_in_type(param: &str, ty: &Type) -> bool {
-    match ty {
-        Type::Refinement(base, refinement) => {
-            let mut free = is_free_in_type(param, base);
-            let Refinement {
-                kind: RefinementKind::Predicate(pred_rc),
-                ..
-            } = &refinement;
-            if let Ok(pred) = pred_rc.try_borrow() {
-                free |= is_free(param, &pred);
-            }
-            free
-        }
-        Type::Fun(domain, codomain) => {
-            is_free_in_type(param, domain) || is_free_in_type(param, codomain)
-        }
-        Type::Tuple(elts) => elts.iter().any(|e| is_free_in_type(param, e)),
-        Type::Record(elts) => elts.iter().any(|(_, e)| is_free_in_type(param, e)),
-        _ => false,
-    }
-}
+// Free-variable check lives in [`crate::ccl::ccl_utils`]: `is_free` is a
+// thin wrapper around `count_free`, which counts occurrences across the
+// AST and inside refinement predicates carried by types.  Imported at the
+// top of this module.
 
 // ---------------------------------------------------------------------------
 // Substitution
@@ -428,25 +317,21 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
                 .collect(),
         },
 
-        TypedExprNode::Join {
-            name: join_name,
+        TypedExprNode::Loop {
             params,
+            init_args,
+            source,
             loop_body,
-            outer_body,
-        } => TypedExprNode::Join {
-            name: join_name,
+            body_taps,
+        } => crate::ccl::walk_loop_children(
             params,
-            loop_body: Box::new(substitute(*loop_body, name, replacement)),
-            outer_body: Box::new(substitute(*outer_body, name, replacement)),
-        },
-
-        TypedExprNode::Jump { target, args } => TypedExprNode::Jump {
-            target,
-            args: args
-                .into_iter()
-                .map(|a| substitute(a, name, replacement))
-                .collect(),
-        },
+            init_args,
+            source,
+            loop_body,
+            body_taps,
+            Some(name),
+            |e| substitute(e, name, replacement),
+        ),
 
         TypedExprNode::Compose(elts) => {
             let new_elts: Vec<Expr> = elts
@@ -903,6 +788,14 @@ fn elim_lambda_impl(
         // Let binding:
         // λ x → let v = def in body  ⟹
         //   let v = (λx→def) in (λx→body[v ↦ x ▷ v])
+        //
+        // Op-conversion's `Let` arm handles the resulting let-in-Compose
+        // shape generically by fanning the surrounding input out to both
+        // `bound_expr` and `body`.  For 0/1-use `v` this materialises the
+        // input twice instead of inlining — a runtime cost that we accept
+        // for simplicity.  A future optimization could inline `def` directly
+        // when `v` appears at most once in `body` and keep the lift only
+        // when sharing actually matters.
         TypedExprNode::Let {
             binding,
             bound_expr: def,
@@ -963,6 +856,45 @@ fn elim_lambda_impl(
                 name,
                 value: Box::new(elim_lambda(ctx, param, param_ty, *value)?),
             },
+            user_annotation: None,
+        }),
+
+        // ExprStmt: λx → (e; b)  ⟹  λx→e ; λx→b — both sub-expressions are
+        // independently lifted over the lambda's parameter.  Used by
+        // [`crate::ccl::lower::lower_mutation_loop_body`] to interleave
+        // per-iteration feeds (`o << x`) with the new accumulator value.
+        TypedExprNode::ExprStmt { expr, body } => Ok(TypedExpr {
+            ty: result_ty,
+            node: TypedExprNode::ExprStmt {
+                expr: Box::new(elim_lambda(ctx, param, param_ty, *expr)?),
+                body: Box::new(elim_lambda(ctx, param, param_ty, *body)?),
+            },
+            user_annotation: None,
+        }),
+
+        // Loop: eliminate `param` from sub-expressions, respecting shadowing
+        // by the Loop's own params.  The mutation-loop-shaped Loop produced
+        // by [`crate::ccl::lower::lower_mutation_loop`] uses `Compose` and
+        // `Lambda` inside its `loop_body`; standard recursion handles those.
+        // `init_args` and `source` sit outside the loop's param scope and
+        // are always recursed into via `walk_loop_children`.
+        TypedExprNode::Loop {
+            params,
+            init_args,
+            source,
+            loop_body,
+            body_taps,
+        } => Ok(TypedExpr {
+            ty: result_ty,
+            node: crate::ccl::try_walk_loop_children(
+                params,
+                init_args,
+                source,
+                loop_body,
+                body_taps,
+                Some(param),
+                |e| elim_lambda(ctx, param, param_ty, e),
+            )?,
             user_annotation: None,
         }),
 
@@ -1234,6 +1166,38 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             user_annotation,
         })),
 
+        // Loop (mutation-loop pattern from
+        // [`crate::ccl::lower::lower_mutation_loop`]).  Source and
+        // init_args are independent expressions outside the loop's
+        // parameter scope; the body is a `Lambda(p, …)` that takes the
+        // per-iteration tuple `(acc_var, item)` as input and projects
+        // each component out via explicit `Proj` morphisms.  All
+        // children get eliminated to point-free form like any other
+        // expression — `acc_var` is bound by an explicit projection of
+        // `p`, not a free variable captured from outer scope, so
+        // lambda-elim handles it through its standard let / proj rules
+        // without needing a `const`-lift or cyclic-tile detection.
+        TypedExprNode::Loop {
+            params,
+            init_args,
+            source,
+            loop_body,
+            body_taps,
+        } => Ok(dbg_typecheck_mv(TypedExpr {
+            node: crate::ccl::try_walk_loop_children(
+                params,
+                init_args,
+                source,
+                loop_body,
+                body_taps,
+                // Structural recursion — no shadowing concern.
+                None,
+                |e| elim_lambdas(ctx, e),
+            )?,
+            ty,
+            user_annotation,
+        })),
+
         // Atoms: no sub-expressions, return as-is.
         node @ (TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
@@ -1427,7 +1391,10 @@ mod tests {
         assert_expr_eq(result, curry(proj_idx(0)));
     }
 
-    /// Let binding: λ x → let v = x in v  ⟹  let v = id in v  (after simplification)
+    /// Let binding: λ x → let v = x in v  ⟹  let v = id in v.
+    ///
+    /// elim_lambda produces `let v = id in ⟨id, const(v)⟩ ≫ apply`,
+    /// which simplifies to `let v = id in v` via const-apply.
     #[test]
     fn let_binding() {
         // Typed: x: Int, v: Int
@@ -1440,10 +1407,12 @@ mod tests {
         .with_ty(int_ty());
         let expr = Expr::lambda("x", param_ty, let_expr);
         let result = run(expr).unwrap();
-        // elim_lambda produces: let v = id in ⟨id, const(v)⟩ ≫ apply
-        // const-apply simplifies the body to: id ≫ v → v
-        // The binding acquires type Int → Int because new_def = id : Int → Int.
-        let expected = Expr::let_bind("v", id().with_ty(fun_ty(int_ty(), int_ty())), var("v"));
+        let expected = Expr::let_bind(
+            "v",
+            id().with_ty(fun_ty(int_ty(), int_ty())),
+            var("v").with_ty(fun_ty(int_ty(), int_ty())),
+        )
+        .with_ty(fun_ty(int_ty(), int_ty()));
         assert_expr_eq(result, expected);
     }
 

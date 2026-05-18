@@ -34,13 +34,34 @@ use std::fmt;
 use log::trace;
 
 use crate::ccl::{
-    BaseType, Branch, Builtin, Expr, RefinementKind, Type, TypedExprNode,
-    ccl_utils::{apply_primitive, typed_compose},
+    BaseType, Branch, Builtin, Expr, RefinementKind, Type, TypedBinding, TypedExprNode,
+    ccl_utils::{apply_primitive, count_free, is_free, typed_compose},
     infer::dedup_union_type,
-    lambda_elim::{is_free, substitute},
+    lambda_elim::substitute,
     simplify::simplify,
     symbolic::symbolic,
 };
+
+/// A let-binding lifted out of inline_defer's body recursion because it is
+/// referenced by more than one extracted feed/define value.  These bindings
+/// are wrapped around `construct_feed_result` at the top so the shared
+/// expression compiles to a single operator instead of being substituted
+/// (and duplicated) into every feed.
+///
+/// The motivating case is the Record-bodied mutation-loop encoding:
+/// lowering binds the loop's body stream via `let __acc_stream_N = Loop {…} in …`,
+/// and every per-feed `ExprStmt(Feed(d_k, __acc_stream_N ▷ Proj("tap_<k>_<d_k>")), …)`
+/// references it.  Substituting the binding away into each projection
+/// would compile N copies of the underlying `Recurse` op; preserving it
+/// here keeps the single shared `Recurse` in the operator graph.
+#[derive(Debug)]
+struct PendingLet {
+    binding: TypedBinding,
+    bound_expr: Expr,
+}
+
+/// Convenience type alias for the inline_defer return shape.
+type InlineDeferResult = (Vec<Expr>, Option<Expr>, Vec<PendingLet>);
 
 /// Errors that can arise while eliminating `Defer`/`Feed`/`Define` nodes.
 #[derive(Debug, PartialEq)]
@@ -123,13 +144,11 @@ fn inline_defers(
 
             if bound_expr.node == TypedExprNode::Defer {
                 trace!("Inlining defer {} in {}", binding.name, symbolic(body));
-                let (feed_values, define_value) = inline_defer(body, &binding.name)?;
+                let (feed_values, define_value, pending_lets) = inline_defer(body, &binding.name)?;
                 let name = &binding.name;
-                match (feed_values.len(), define_value) {
+                let extracted = match (feed_values.len(), define_value) {
                     (0, None) => return Err(DeferError::NoFeedOrDefine(name.clone())),
-                    (0, Some(define_value)) => {
-                        **bound_expr = define_value;
-                    }
+                    (0, Some(define_value)) => define_value,
                     (_, None) => {
                         let feed_result = construct_feed_result(feed_values);
                         let feed_result_domain_ty = feed_result
@@ -140,13 +159,32 @@ fn inline_defers(
                             bound_expr.ty.domain().unwrap().clone(),
                             feed_result_domain_ty,
                         ));
-                        **bound_expr = feed_result;
+                        feed_result
                     }
                     // inline_defer returns Err(FeedsAndDefinesMixed) when both feeds
                     // and a define are present, so Ok(...) with non-empty feeds and
                     // Some(define) cannot reach here.
                     _ => unreachable!(),
+                };
+                // Wrap the extracted result in any preserved let-bindings
+                // that the body referenced.  `pending_lets` was pushed
+                // bottom-up during recursion (inner lets first, outer
+                // lets last), and each wrap iteration makes the current
+                // plet the new outer.  So iterating *in order* preserves
+                // the original lexical nesting: an inner pending_let's
+                // bound_expr that references an outer pending_let's
+                // binding stays correctly bound.
+                let mut wrapped = extracted;
+                for plet in pending_lets.into_iter() {
+                    let wrapped_ty = wrapped.ty.clone();
+                    wrapped = Expr::new(TypedExprNode::Let {
+                        binding: plet.binding,
+                        bound_expr: Box::new(plet.bound_expr),
+                        body: Box::new(wrapped),
+                    })
+                    .with_ty(wrapped_ty);
                 }
+                **bound_expr = wrapped;
             }
             // body was already recursed above; only recurse into bound_expr here so
             // we process any defers nested inside the newly-substituted value.
@@ -185,18 +223,17 @@ fn inline_defers(
                 inline_defers(body, type_substitutions)?;
             }
         }
-        TypedExprNode::Join {
+        TypedExprNode::Loop {
+            init_args,
+            source,
             loop_body,
-            outer_body,
             ..
         } => {
-            inline_defers(loop_body, type_substitutions)?;
-            inline_defers(outer_body, type_substitutions)?;
-        }
-        TypedExprNode::Jump { args, .. } => {
-            for a in args {
+            for a in init_args {
                 inline_defers(a, type_substitutions)?;
             }
+            inline_defers(source, type_substitutions)?;
+            inline_defers(loop_body, type_substitutions)?;
         }
         TypedExprNode::ExprStmt { expr: inner, body } => {
             inline_defers(inner, type_substitutions)?;
@@ -330,18 +367,17 @@ fn substitute_types_in_expr(expr: &mut Expr, type_substitutions: &[(Type, Type)]
                 substitute_types_in_expr(body, type_substitutions);
             }
         }
-        TypedExprNode::Join {
+        TypedExprNode::Loop {
+            init_args,
+            source,
             loop_body,
-            outer_body,
             ..
         } => {
-            substitute_types_in_expr(loop_body, type_substitutions);
-            substitute_types_in_expr(outer_body, type_substitutions);
-        }
-        TypedExprNode::Jump { args, .. } => {
-            for a in args {
+            for a in init_args {
                 substitute_types_in_expr(a, type_substitutions);
             }
+            substitute_types_in_expr(source, type_substitutions);
+            substitute_types_in_expr(loop_body, type_substitutions);
         }
         TypedExprNode::ExprStmt { expr: inner, body } => {
             substitute_types_in_expr(inner, type_substitutions);
@@ -421,46 +457,63 @@ fn substitute_types(ty: &mut Type, type_substitutions: &[(Type, Type)]) {
 ///
 /// By the time this runs all aliases have been resolved by [`crate::ccl::inline`],
 /// so exact name equality is sufficient for matching.
-fn inline_defer(
-    expr: &mut Expr,
-    name_to_bind: &str,
-) -> Result<(Vec<Expr>, Option<Expr>), DeferError> {
+fn inline_defer(expr: &mut Expr, name_to_bind: &str) -> Result<InlineDeferResult, DeferError> {
     let ty = expr.ty.clone();
-    let (replacement, feed_result, define_result) = match &mut expr.node {
+    let (replacement, feed_result, define_result, pending_lets): (
+        Option<Expr>,
+        Vec<Expr>,
+        Option<Expr>,
+        Vec<PendingLet>,
+    ) = match &mut expr.node {
         TypedExprNode::Feed { name, value } if name == name_to_bind => (
             Some(Expr::var("__replaced").with_ty(ty)),
             vec![*value.clone()],
             None,
+            Vec::new(),
         ),
 
         TypedExprNode::Define { name, value } if name == name_to_bind => (
             Some(Expr::var("__replaced").with_ty(ty)),
             Vec::new(),
             Some(*value.clone()),
+            Vec::new(),
         ),
 
         TypedExprNode::ExprStmt { expr, body } => {
             let mut result_feeds = Vec::new();
-            let (expr_feeds, expr_define) = inline_defer(expr.as_mut(), name_to_bind)?;
-            let (body_feeds, body_define) = inline_defer(body.as_mut(), name_to_bind)?;
+            let mut result_pending = Vec::new();
+            let (expr_feeds, expr_define, mut expr_pending) =
+                inline_defer(expr.as_mut(), name_to_bind)?;
+            let (body_feeds, body_define, mut body_pending) =
+                inline_defer(body.as_mut(), name_to_bind)?;
             result_feeds.extend(expr_feeds);
             result_feeds.extend(body_feeds);
+            result_pending.append(&mut expr_pending);
+            result_pending.append(&mut body_pending);
             if expr_define.is_some() && body_define.is_some() {
                 return Err(DeferError::MultipleDefinitions(name_to_bind.into()));
             }
             if (expr_define.is_some() || body_define.is_some()) && !result_feeds.is_empty() {
                 return Err(DeferError::FeedsAndDefinesMixed(name_to_bind.into()));
             }
-            (None, result_feeds, expr_define.or(body_define))
+            (
+                None,
+                result_feeds,
+                expr_define.or(body_define),
+                result_pending,
+            )
         }
 
         TypedExprNode::Compose(elts) => {
             let mut result = Vec::new();
+            let mut result_pending = Vec::new();
             for i in 0..elts.len() {
-                let (mut feed_value, define_value) = inline_defer(&mut elts[i], name_to_bind)?;
+                let (mut feed_value, define_value, mut pending) =
+                    inline_defer(&mut elts[i], name_to_bind)?;
                 if define_value.is_some() {
                     return Err(DeferError::NestedDefinition);
                 }
+                result_pending.append(&mut pending);
                 // Scalar feed values have no domain; wrap them in `const` with the
                 // expected domain taken from the compose-element's type here, where
                 // that domain is known.  Function-typed values are used as-is.
@@ -483,12 +536,14 @@ fn inline_defer(
                     result.push(composed);
                 }
             }
-            (None, result, None)
+            (None, result, None, result_pending)
         }
 
         TypedExprNode::Apply { function, argument } => {
-            let (mut func_feeds, func_define) = inline_defer(function.as_mut(), name_to_bind)?;
-            let (mut arg_feeds, arg_define) = inline_defer(argument.as_mut(), name_to_bind)?;
+            let (mut func_feeds, func_define, mut func_pending) =
+                inline_defer(function.as_mut(), name_to_bind)?;
+            let (mut arg_feeds, arg_define, mut arg_pending) =
+                inline_defer(argument.as_mut(), name_to_bind)?;
             if func_define.is_some() && arg_define.is_some() {
                 return Err(DeferError::MultipleDefinitions(name_to_bind.into()));
             }
@@ -498,50 +553,89 @@ fn inline_defer(
                 return Err(DeferError::FeedsAndDefinesMixed(name_to_bind.into()));
             }
             func_feeds.append(&mut arg_feeds);
-            (None, func_feeds, func_define.or(arg_define))
+            func_pending.append(&mut arg_pending);
+            (None, func_feeds, func_define.or(arg_define), func_pending)
         }
 
         TypedExprNode::Tuple(elts) => {
             let mut result = Vec::new();
+            let mut result_pending = Vec::new();
             for e in elts {
-                let (mut feeds, define) = inline_defer(e, name_to_bind)?;
+                let (mut feeds, define, mut pending) = inline_defer(e, name_to_bind)?;
                 if define.is_some() {
                     return Err(DeferError::NestedDefinition);
                 }
                 result.append(&mut feeds);
+                result_pending.append(&mut pending);
             }
-            (None, result, None)
+            (None, result, None, result_pending)
         }
 
         // Recurse through a nested Let binding.  If the binding shadows name_to_bind
         // (an inner defer reuses the same name), stop searching in the body.
+        //
+        // When the binding is *referenced* by extracted feed/define values, we
+        // defer the let to wrap the eventual feed-result instead of substituting
+        // it away — this preserves sharing for bindings like the mutation-loop
+        // acc-stream Join that are intentionally shared across multiple feeds.
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
         } => {
-            let (be_feeds, be_define) = inline_defer(bound_expr.as_mut(), name_to_bind)?;
+            let (be_feeds, be_define, mut be_pending) =
+                inline_defer(bound_expr.as_mut(), name_to_bind)?;
 
-            let (body_feeds, body_define) = if binding.name == name_to_bind {
+            let (body_feeds, body_define, mut body_pending) = if binding.name == name_to_bind {
                 // The inner let shadows the name; don't search deeper.
-                (vec![], None)
+                (vec![], None, vec![])
             } else {
                 inline_defer(body.as_mut(), name_to_bind)?
             };
 
-            // Values extracted from the body may reference binding.name as a free
-            // variable, since they were written in its scope.  Substitute it out now
-            // so the lifted value is self-contained.  `inline_defers` processes lets
-            // bottom-up, so bound_expr is already a concrete value by the time we get
-            // here.
-            let bound_val = &**bound_expr;
-            let body_feeds: Vec<Expr> = body_feeds
-                .into_iter()
-                .map(|val| substitute(val, &binding.name, bound_val))
-                .collect();
-            let body_define = body_define.map(|val| substitute(val, &binding.name, bound_val));
+            // Count free references to binding.name across every extracted
+            // value (feeds + define).  When there are ≥2 references the
+            // substitute path would duplicate the bound expression, so we
+            // preserve the let-binding as a `PendingLet` and let the
+            // caller wrap the combined feed result with it once — sharing
+            // a single op-graph subexpression across all references (used
+            // by the multi-feed acc-stream Join binding).
+            //
+            // For 0 references the let is irrelevant.  For exactly 1
+            // reference there is no duplication to avoid, and substituting
+            // also keeps the bound expression's *type* information flowing
+            // into the extracted value (the substituted value gets
+            // `bound_expr.ty`, whereas a still-Hole `Var` in the body
+            // wouldn't have that type filled in).
+            let ref_count: usize = body_feeds
+                .iter()
+                .map(|v| count_free(&binding.name, v))
+                .sum::<usize>()
+                + body_define
+                    .as_ref()
+                    .map(|v| count_free(&binding.name, v))
+                    .unwrap_or(0);
 
-            // After substitution, if name_to_bind is still free in any extracted
+            let (body_feeds, body_define) = if ref_count >= 2 {
+                // Hoist: leave the binding in place by pushing it onto
+                // pending_lets so the caller can wrap it around the
+                // feed-result at the defer site.
+                body_pending.push(PendingLet {
+                    binding: binding.clone(),
+                    bound_expr: (**bound_expr).clone(),
+                });
+                (body_feeds, body_define)
+            } else {
+                let bound_val = &**bound_expr;
+                let body_feeds: Vec<Expr> = body_feeds
+                    .into_iter()
+                    .map(|val| substitute(val, &binding.name, bound_val))
+                    .collect();
+                let body_define = body_define.map(|val| substitute(val, &binding.name, bound_val));
+                (body_feeds, body_define)
+            };
+
+            // After the above, if name_to_bind is still free in any extracted
             // value, the two defers are mutually recursive (x depends on y which
             // depends on x).  We detect this here so we fail with a clear message
             // rather than producing an invalid operator plan downstream.
@@ -559,32 +653,35 @@ fn inline_defer(
 
             let mut result_feeds = be_feeds;
             result_feeds.extend(body_feeds);
+            be_pending.append(&mut body_pending);
             if be_define.is_some() && body_define.is_some() {
                 return Err(DeferError::MultipleDefinitions(name_to_bind.into()));
             }
             if (be_define.is_some() || body_define.is_some()) && !result_feeds.is_empty() {
                 return Err(DeferError::FeedsAndDefinesMixed(name_to_bind.into()));
             }
-            (None, result_feeds, be_define.or(body_define))
+            (None, result_feeds, be_define.or(body_define), be_pending)
         }
 
         // Recurse into the value to collect any nested feed/define nodes.
         TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => {
-            let (feeds, define) = inline_defer(value.as_mut(), name_to_bind)?;
-            (None, feeds, define)
+            let (feeds, define, pending) = inline_defer(value.as_mut(), name_to_bind)?;
+            (None, feeds, define, pending)
         }
 
         // Record: recurse into each field value, same policy as Tuple.
         TypedExprNode::Record(fields) => {
             let mut result = Vec::new();
+            let mut result_pending = Vec::new();
             for (_, e) in fields.iter_mut() {
-                let (feeds, define) = inline_defer(e, name_to_bind)?;
+                let (feeds, define, mut pending) = inline_defer(e, name_to_bind)?;
                 if define.is_some() {
                     return Err(DeferError::NestedDefinition);
                 }
                 result.extend(feeds);
+                result_pending.append(&mut pending);
             }
-            (None, result, None)
+            (None, result, None, result_pending)
         }
 
         TypedExprNode::Defer
@@ -593,14 +690,73 @@ fn inline_defer(
         | TypedExprNode::Lit(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)
-        | TypedExprNode::List(_) => (None, vec![], None),
+        | TypedExprNode::List(_) => (None, vec![], None, Vec::new()),
+
+        // Loop (mutation loop) — by the time this pass runs, the
+        // lowering in [`crate::ccl::lower::lower_mutation_loop`] has
+        // already absorbed every `<<` feed from the loop body into the
+        // Loop's body Record (one `tap_<k>_<defer>` field per feed) and
+        // emitted an outer
+        // `ExprStmt(Feed(defer_k, acc_stream ▷ Proj("tap_<k>_<defer>")), …)`
+        // for each tap.  So a Loop's `loop_body` should never contain a
+        // `Feed` for our `name_to_bind`; the recursion is purely a
+        // safety walk, asserted via `debug_assert!` below.
+        //
+        // `init_args` sit outside the loop and *can* legitimately
+        // contain feeds — the surrounding lowering threads pre-loop
+        // defer-fed expressions in here.
+        TypedExprNode::Loop {
+            init_args,
+            source,
+            loop_body,
+            ..
+        } => {
+            let (loop_feeds, loop_define, loop_pending) =
+                inline_defer(loop_body.as_mut(), name_to_bind)?;
+            if loop_define.is_some() {
+                return Err(DeferError::NestedDefinition);
+            }
+            debug_assert!(
+                loop_feeds.is_empty(),
+                "Loop's loop_body should not contain feeds for `{name_to_bind}`; \
+                 lower_mutation_loop is supposed to hoist them outside the loop"
+            );
+            debug_assert!(
+                loop_pending.is_empty(),
+                "Loop's loop_body should not contain pending lets for `{name_to_bind}`"
+            );
+            let (source_feeds, source_define, source_pending) =
+                inline_defer(source.as_mut(), name_to_bind)?;
+            if source_define.is_some() {
+                return Err(DeferError::NestedDefinition);
+            }
+            debug_assert!(
+                source_feeds.is_empty(),
+                "Loop's source should not contain feeds for `{name_to_bind}`"
+            );
+            debug_assert!(
+                source_pending.is_empty(),
+                "Loop's source should not contain pending lets for `{name_to_bind}`"
+            );
+            let mut result = Vec::new();
+            let mut result_pending = Vec::new();
+            for init in init_args.iter_mut() {
+                let (feeds, define, mut pending) = inline_defer(init, name_to_bind)?;
+                if define.is_some() {
+                    return Err(DeferError::NestedDefinition);
+                }
+                result.extend(feeds);
+                result_pending.append(&mut pending);
+            }
+            (None, result, None, result_pending)
+        }
 
         e => todo!("inline_defer: unhandled node type {:?}", e),
     };
     if let Some(replacement) = replacement {
         *expr = replacement;
     }
-    Ok((feed_result, define_result))
+    Ok((feed_result, define_result, pending_lets))
 }
 
 #[cfg(test)]
@@ -634,7 +790,7 @@ mod tests {
     fn inline_defer_define_extracts_value() {
         // ExprStmt(Define("x", 42), Var("x"))
         let mut expr = Expr::expr_stmt(Expr::define("x".into(), lit(42)), var("x"));
-        let (feeds, define) = inline_defer(&mut expr, "x").unwrap();
+        let (feeds, define, _) = inline_defer(&mut expr, "x").unwrap();
         assert!(feeds.is_empty());
         assert_eq!(symbolic(define.as_ref().unwrap()), "42");
         // The Define site must be replaced with the sentinel.
@@ -650,7 +806,7 @@ mod tests {
     fn inline_defer_define_wrong_name_unchanged() {
         let mut expr = Expr::expr_stmt(Expr::define("y".into(), lit(42)), var("x"));
         let original = symbolic(&expr);
-        let (feeds, define) = inline_defer(&mut expr, "x").unwrap();
+        let (feeds, define, _) = inline_defer(&mut expr, "x").unwrap();
         assert!(feeds.is_empty());
         assert!(define.is_none());
         assert_eq!(
@@ -665,7 +821,7 @@ mod tests {
     #[test]
     fn inline_defer_feed_scalar_wrapped_in_const() {
         let mut expr = Expr::feed("x".into(), lit(7));
-        let (feeds, define) = inline_defer(&mut expr, "x").unwrap();
+        let (feeds, define, _) = inline_defer(&mut expr, "x").unwrap();
         assert!(define.is_none());
         assert_eq!(feeds.len(), 1);
         assert_eq!(
@@ -681,7 +837,7 @@ mod tests {
     fn inline_defer_feed_function_passed_through() {
         let fn_ty = Type::fun(int_ty(), int_ty());
         let mut expr = Expr::feed("x".into(), var("f").with_ty(fn_ty));
-        let (feeds, define) = inline_defer(&mut expr, "x").unwrap();
+        let (feeds, define, _) = inline_defer(&mut expr, "x").unwrap();
         assert!(define.is_none());
         assert_eq!(feeds.len(), 1);
         assert_eq!(
@@ -696,7 +852,7 @@ mod tests {
     fn inline_defer_feed_wrong_name_unchanged() {
         let mut expr = Expr::expr_stmt(Expr::feed("y".into(), lit(1)), var("x"));
         let original = symbolic(&expr);
-        let (feeds, define) = inline_defer(&mut expr, "x").unwrap();
+        let (feeds, define, _) = inline_defer(&mut expr, "x").unwrap();
         assert!(feeds.is_empty());
         assert!(define.is_none());
         assert_eq!(symbolic(&expr), original);
@@ -709,7 +865,7 @@ mod tests {
         // let x = 0 in Feed("x", 1) — the inner let shadows the outer defer for "x".
         let inner_body = Expr::feed("x".into(), lit(1));
         let mut expr = Expr::let_bind("x", lit(0), inner_body);
-        let (feeds, define) = inline_defer(&mut expr, "x").unwrap();
+        let (feeds, define, _) = inline_defer(&mut expr, "x").unwrap();
         assert!(
             feeds.is_empty(),
             "feed inside shadowing let must not be extracted"

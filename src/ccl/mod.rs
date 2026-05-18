@@ -332,6 +332,29 @@ pub enum Builtin {
     Sum,
     /// `max`.
     Max,
+    /// `last_or_default : Tuple(Fun(D, T), T) → T` — extract the
+    /// codomain value at the final position of an iteration stream, or
+    /// fall back to the default scalar when the stream's domain is
+    /// empty.  Compiles directly to the `ExtractLast` tile operator
+    /// (which receives both the stream and the default operator); not
+    /// an aggregate fold (no identity element), so it does not
+    /// participate in `AggregateKind`.
+    ///
+    /// Used by `lower_mutation_loop` to expose the scalar final
+    /// accumulator of a Record-bodied loop, whose external type is
+    /// `Fun(D, Record({step, tap_*}))`: the after-loop scalar acc is
+    /// `(acc_stream ▷ Proj("step"), init) ▷ LastOrDefault`.  The
+    /// default is the pre-loop accumulator binding, so an
+    /// empty-source loop (`for i in []: x += 1; x`) yields `init`
+    /// rather than panicking or returning empty.
+    ///
+    /// TODO: Make the ordering requirement on this explicit.  Right now
+    /// all of our types can be implicitly ordered, but that might not
+    /// hold forever, and the implicit ordering might be wrong.  Tracked
+    /// jointly with the `.rev().find(…)` in `ExtractLastProducer` —
+    /// both assume the source's last position by emission order, not
+    /// by sorted domain value.
+    LastOrDefault,
 
     /// `collection_union : (Fun(A, B), Fun(C, D)) → Fun(Union(A, C), dedup(B, D))`
     ///
@@ -342,11 +365,9 @@ pub enum Builtin {
 }
 
 impl Builtin {
-    /// Stable, source-style display name for this built-in.
-    ///
-    /// Used by [`crate::ccl::symbolic`] and [`crate::ccl::pretty`] for output
-    /// that mirrors the historical magic-string `Var(...)` rendering, so the
-    /// migration to a typed [`Builtin`] enum is invisible to downstream tools.
+    /// Stable, source-style display name for this built-in, used by
+    /// [`crate::ccl::symbolic`] and [`crate::ccl::pretty`] when rendering
+    /// applied primitives.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Id => "id",
@@ -367,6 +388,7 @@ impl Builtin {
             Self::NotFn => "not_fn",
             Self::Sum => "sum",
             Self::Max => "max",
+            Self::LastOrDefault => "last_or_default",
             Self::CollectionUnion => "collection_union",
         }
     }
@@ -497,7 +519,7 @@ fn accumulate_max<T: Ord + Clone>(acc: &mut [T], values: &[T]) {
 
 /// A typed binding site: a named variable together with its type.
 ///
-/// Used in [`TypedExprNode::Lambda`], [`TypedExprNode::Join`], and [`TypedExprNode::Let`] to carry
+/// Used in [`TypedExprNode::Lambda`], [`TypedExprNode::Loop`], and [`TypedExprNode::Let`] to carry
 /// both the inferred type and any user-written annotation at each binding site.
 ///
 /// `ty` starts as [`Type::Hole`] (lowering placeholder) and is converted to a
@@ -693,42 +715,67 @@ pub enum TypedExprNode {
         branches: Vec<Branch>,
     },
 
-    /// A loop join point.
+    /// A bounded iteration loop with explicit loop-carried accumulators.
     ///
-    /// Defines a named, parameterized loop header. `outer_body` is evaluated
-    /// first and must contain the initial [`TypedExprNode::Jump`] that enters the loop.
-    /// The loop body (`loop_body`) runs on each iteration; it may
-    /// [`TypedExprNode::Jump`] back to this point with updated parameter values, or
-    /// fall through to produce the loop's final value.
+    /// Each iteration:
+    /// 1. The `source` morphism produces the next element from its domain.
+    /// 2. `loop_body` is invoked with a tuple `(param_0, …, param_{n-1}, item)`,
+    ///    where `param_k` are the previous-iteration accumulator values and
+    ///    `item` is the source element.  Its result is a
+    ///    `Record({step, tap_*})` whose `step` field carries the next
+    ///    accumulator value(s).
+    /// 3. The Loop's value is the running body stream `Fun(D,
+    ///    Record({step, tap_*}))`; surrounding lowering picks each
+    ///    accumulator off with `Proj("step") [▷ Proj(i)] ▷ Last` and
+    ///    each tap with `Proj("tap_*")`.
     ///
-    /// Join points are non-escaping: they cannot be stored in variables or
-    /// passed as arguments. All jumps to this point must be tail calls within
-    /// `loop_body`.
+    /// The accumulator slots in `params` are only in scope inside `loop_body`;
+    /// they are *not* visible from `init_args` (which sits outside the loop
+    /// scope and supplies their starting values).  Surrounding `Let`
+    /// bindings name the loop's result.
     ///
-    /// Compiles to iterate/feedback operators in the dataflow graph.
-    Join {
-        /// The join point's label, referenced by [`TypedExprNode::Jump`].
-        name: String,
-        /// The loop variables with their names and inferred/annotated types.
+    /// Compiles to iterate/feedback operators in the dataflow graph: a
+    /// `Recurse` over `source`'s domain whose `recursive_input` is the
+    /// `.step` projection of the body fed by `zip(Recurse, source)`.
+    Loop {
+        /// The loop-carried variable slots, in declaration order.  Each
+        /// is bound inside `loop_body` to the previous iteration's value
+        /// (or the corresponding `init_args[i]` on the first iteration).
         params: Vec<TypedBinding>,
-        /// The loop body; evaluated on each iteration. May contain a
-        /// [`TypedExprNode::Jump`] back to this join point.
+        /// Initial accumulator values, one per `params` entry.  Evaluated
+        /// once before the loop starts; not in the scope where `params`
+        /// are bound.
+        init_args: Vec<TypedExpr>,
+        /// Iteration source — a `Fun(D, item_ty)` whose domain `D` drives the
+        /// loop and whose codomain values are passed to `loop_body` alongside
+        /// the loop-carried params.
+        source: Box<TypedExpr>,
+        /// The per-iteration step — a `Fun(Tuple(param_tys…, item_ty), Codomain)`
+        /// taking a tuple of the current loop params and the source element
+        /// and returning the next param value(s).  See `body_taps` for how
+        /// `Codomain` depends on the loop shape.
+        ///
+        /// Building the params into the input tuple (rather than capturing
+        /// them as free variables from outer scope) keeps op-conversion
+        /// straightforward: `acc_var` is just `p ▷ Proj(0)`, with no
+        /// special "scalar-CCL-type but function-tiled-op" detection
+        /// needed.
         loop_body: Box<TypedExpr>,
-        /// Evaluated first; must contain the initial [`TypedExprNode::Jump`] into this
-        /// join point.
-        outer_body: Box<TypedExpr>,
-    },
-
-    /// A tail call to a [`TypedExprNode::Join`] point.
-    ///
-    /// Transfers control to the named join point, passing `args` as updated
-    /// values for its parameters (in declaration order). Must appear in tail
-    /// position within the enclosing [`TypedExprNode::Join`] body.
-    Jump {
-        /// Name of the target [`TypedExprNode::Join`].
-        target: String,
-        /// Updated values for the join point's parameters, in order.
-        args: Vec<TypedExpr>,
+        /// Per-iteration tap field names exposed alongside the
+        /// recurrence — one entry per `<<` feed in the source-level
+        /// loop body, possibly empty.
+        ///
+        /// The Loop's body codomain is always `Record({step: <step_shape>,
+        /// tap_*: T_*})`, and the Loop's outer type is always `Fun(D,
+        /// Record({step, tap_*}))`.  The `step` field carries the
+        /// recurrence (a scalar for `params.len() == 1`, a positional
+        /// `Tuple(T_0, …, T_{n-1})` for multi-var); each `body_taps`
+        /// entry names a tap field that rides along on the same body
+        /// fan-out.  Op-conversion always cycles on `.step` and exposes
+        /// the body stream as the external output; surrounding lowering
+        /// finishes with `Proj("step") [▷ Proj(i)] ▷ Last` per
+        /// accumulator and `Proj("tap_*")` per feed.
+        body_taps: Vec<String>,
     },
 
     /// A tuple constructor: `(e0, e1, ...)`.
@@ -908,6 +955,120 @@ impl TypedExpr {
         })
     }
 
+    /// Construct a [`TypedExprNode::Loop`] header with a Record-typed
+    /// body codomain.
+    ///
+    /// `param_names` become the loop-carried bindings (each stamped with
+    /// [`Type::Hole`]; inference fills in the type).  `init_args`
+    /// supplies the starting value for each param, in declaration order.
+    /// `source` is the iteration source (`Fun(D, item_ty)`).  `loop_body`
+    /// is the per-iteration step
+    /// (`Fun(Tuple(param_tys…, item_ty), Record({step, tap_*}))`).
+    /// The body always returns `Record({step: <step_shape>, <tap_0>: T_0,
+    /// …, <tap_k>: T_k})` — the `step` field carries the recurrence (a
+    /// scalar for one param, a positional `Tuple` for multiple), and
+    /// `body_taps` lists the tap field names in declaration order
+    /// (possibly empty when the loop body contains no `<<` feeds).
+    pub fn loop_with_taps(
+        param_names: Vec<String>,
+        init_args: Vec<Self>,
+        source: Self,
+        loop_body: Self,
+        body_taps: Vec<String>,
+    ) -> Self {
+        assert_eq!(
+            param_names.len(),
+            init_args.len(),
+            "Loop: param_names and init_args must have the same length",
+        );
+        Self::new(TypedExprNode::Loop {
+            params: param_names
+                .into_iter()
+                .map(|n| TypedBinding {
+                    name: n,
+                    ty: Type::Hole,
+                    user_annotation: None,
+                })
+                .collect(),
+            init_args,
+            source: Box::new(source),
+            loop_body: Box::new(loop_body),
+            body_taps,
+        })
+    }
+
+    /// If this expression is a [`TypedExprNode::Loop`] in the
+    /// mutation-loop shape (at least one loop-carried accumulator with a
+    /// matching count of `init_args`), return a borrowed view of its
+    /// fields.  Otherwise return [`None`].
+    ///
+    /// This is the **single source of truth** for the mutation-loop shape
+    /// contract.  [`crate::ccl::lower::lower_mutation_loop`] is the only
+    /// producer of this shape; [`crate::ccl::infer`] and
+    /// [`crate::interpreter::operator_conversion`] are the two consumers
+    /// that pattern-match it.  Both consumers call this helper (or the
+    /// mutable [`Self::as_mutation_loop_mut`] sibling) to keep the shape
+    /// definition in one place — anyone changing the lowering shape only
+    /// has to update these matchers and the callers will fall out of sync
+    /// visibly (no silent acceptance of malformed ASTs).
+    ///
+    /// The matcher does *not* assert that `loop_body` is a particular
+    /// pre-/post-lambda-elim form, since different passes see it at
+    /// different stages of point-free reduction.  Callers that depend on
+    /// the pre-lambda-elim `Compose([source, Lambda(...)])` shape must
+    /// validate that separately.
+    pub fn as_mutation_loop(&self) -> Option<MutationLoopShape<'_>> {
+        let TypedExprNode::Loop {
+            params,
+            init_args,
+            source,
+            loop_body,
+            body_taps,
+        } = &self.node
+        else {
+            return None;
+        };
+        if params.is_empty() || params.len() != init_args.len() {
+            return None;
+        }
+        Some(MutationLoopShape {
+            acc_vars: params,
+            init_args,
+            source,
+            loop_body,
+            body_taps,
+        })
+    }
+
+    /// Mutable companion to [`Self::as_mutation_loop`].
+    ///
+    /// Inference calls `infer_expr(&mut ...)` on the source, each init
+    /// arg, and the body; returning `&mut` borrows lets it do that
+    /// through the same shape check the immutable variant performs.
+    /// The shape contract is identical.
+    pub fn as_mutation_loop_mut(&mut self) -> Option<MutationLoopShapeMut<'_>> {
+        let TypedExprNode::Loop {
+            params,
+            init_args,
+            source,
+            loop_body,
+            body_taps,
+        } = &mut self.node
+        else {
+            return None;
+        };
+        if params.is_empty() || params.len() != init_args.len() {
+            return None;
+        }
+        Some(MutationLoopShapeMut {
+            acc_vars: params.as_mut_slice(),
+            init_args: init_args.as_mut_slice(),
+            source,
+            loop_body,
+            body_taps,
+        })
+    }
+
     /// Construct a for-loop expression.
     ///
     /// Desugars directly to `Compose([source, Lambda(iter_var, body)])`.
@@ -1063,6 +1224,119 @@ impl Default for TypedExpr {
     }
 }
 
+/// Reconstruct a [`TypedExprNode::Loop`] by recursing into its children
+/// via `recurse`, respecting `params` shadowing of `shadowed_name`.
+///
+/// If `shadowed_name` is `Some(n)` and `n` matches a name in `params`,
+/// `loop_body` is returned unchanged — the param's binding shadows `n`
+/// inside the body, so substitution-style passes must not recurse into
+/// it.  `source` and `init_args` are evaluated outside the loop's
+/// parameter scope and are always recursed into.
+///
+/// Pass `None` for `shadowed_name` when the recursion is structural
+/// (i.e. not driven by a substitution of a specific name).
+///
+/// This helper is the single source of truth for the Loop walk rule —
+/// the substitute / inline / lambda-elim passes all delegate here so a
+/// shadow-check fix lands in one place.
+#[allow(clippy::too_many_arguments)]
+pub fn walk_loop_children<F>(
+    params: Vec<TypedBinding>,
+    init_args: Vec<TypedExpr>,
+    source: Box<TypedExpr>,
+    loop_body: Box<TypedExpr>,
+    body_taps: Vec<String>,
+    shadowed_name: Option<&str>,
+    mut recurse: F,
+) -> TypedExprNode
+where
+    F: FnMut(TypedExpr) -> TypedExpr,
+{
+    let shadowed = shadowed_name.is_some_and(|n| params.iter().any(|p| p.name == n));
+    TypedExprNode::Loop {
+        // `source` and `init_args` sit *outside* the loop's parameter
+        // scope, so they always get recursed into.  Only `loop_body`
+        // is gated by the shadow check.
+        source: Box::new(recurse(*source)),
+        init_args: init_args.into_iter().map(&mut recurse).collect(),
+        loop_body: if shadowed {
+            loop_body
+        } else {
+            Box::new(recurse(*loop_body))
+        },
+        params,
+        body_taps,
+    }
+}
+
+/// Fallible variant of [`walk_loop_children`] for passes whose recursion
+/// function returns a `Result`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_walk_loop_children<F, E>(
+    params: Vec<TypedBinding>,
+    init_args: Vec<TypedExpr>,
+    source: Box<TypedExpr>,
+    loop_body: Box<TypedExpr>,
+    body_taps: Vec<String>,
+    shadowed_name: Option<&str>,
+    mut recurse: F,
+) -> Result<TypedExprNode, E>
+where
+    F: FnMut(TypedExpr) -> Result<TypedExpr, E>,
+{
+    let shadowed = shadowed_name.is_some_and(|n| params.iter().any(|p| p.name == n));
+    let new_source = Box::new(recurse(*source)?);
+    let new_init_args: Vec<TypedExpr> = init_args
+        .into_iter()
+        .map(&mut recurse)
+        .collect::<Result<_, _>>()?;
+    let new_loop_body = if shadowed {
+        loop_body
+    } else {
+        Box::new(recurse(*loop_body)?)
+    };
+    Ok(TypedExprNode::Loop {
+        source: new_source,
+        init_args: new_init_args,
+        loop_body: new_loop_body,
+        params,
+        body_taps,
+    })
+}
+
+/// Borrowed view of a mutation-loop-shaped [`TypedExprNode::Loop`].  See
+/// [`TypedExpr::as_mutation_loop`] for the matching rules.
+pub struct MutationLoopShape<'a> {
+    /// The loop-carried accumulator bindings, in declaration order.
+    /// Mirrors the order of `init_args`.
+    pub acc_vars: &'a [TypedBinding],
+    /// The initial accumulator values, one per [`Self::acc_vars`] entry.
+    /// Evaluated outside the loop's param scope.
+    pub init_args: &'a [Expr],
+    /// The iteration source (`Fun(D, item_ty)` once inference has run).
+    pub source: &'a Expr,
+    /// The per-iteration step.  For `n` accumulators, the body's
+    /// `Fun(Tuple(acc_ty_1, …, acc_ty_n, item_ty), <step or Record>)`.
+    /// At inference time this is `Lambda(p, let acc_1 = p.0 in … let
+    /// iter_var = p.n in step)`; after lambda elimination it is the same
+    /// in point-free form.
+    pub loop_body: &'a Expr,
+    /// Per-iteration tap field names; see [`TypedExprNode::Loop::body_taps`].
+    pub body_taps: &'a [String],
+}
+
+/// Mutable companion to [`MutationLoopShape`].  Returned by
+/// [`TypedExpr::as_mutation_loop_mut`] for passes that need to mutate
+/// the matched sub-expressions in place (e.g. inference filling in
+/// the `ty` slots).
+pub struct MutationLoopShapeMut<'a> {
+    pub acc_vars: &'a mut [TypedBinding],
+    pub init_args: &'a mut [Expr],
+    pub source: &'a mut Expr,
+    pub loop_body: &'a mut Expr,
+    pub body_taps: &'a [String],
+}
+
 /// A single conditional branch in a [`TypedExprNode::Case`] expression.
 ///
 /// Holds a `guard` (a boolean expression) and a `body` (the value produced
@@ -1163,6 +1437,9 @@ impl fmt::Display for Type {
                     BaseType::Unit => "Unit",
                 }
             ),
+            // `n == 0` means an empty range (e.g. the domain of `[]`); render
+            // it as `∅` instead of computing `n - 1` and underflowing.
+            Type::UIntRange(0) => write!(f, "∅"),
             Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
             Type::Fun(a, b) => write!(f, "({a} ⇒ {b})"),
             Type::Tuple(ts) => {

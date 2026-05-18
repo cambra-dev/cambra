@@ -1,6 +1,7 @@
 {
   "permissions": {
     "allow": [
+      "Bash(awk *)",
       "Bash(cargo build)",
       "Bash(cargo build *)",
       "Bash(cargo test)",
@@ -8,8 +9,10 @@
       "Bash(cargo clippy *)",
       "Bash(cargo fmt)",
       "Bash(cargo fmt *)",
+      "Bash(cat *)",
       "Bash(./ci.sh)",
       "Bash(./ci.sh *)",
+      "Bash(head *)",
       "Bash(git add *)",
       "Bash(git commit *)",
       "Bash(git diff)",
@@ -38,6 +41,9 @@
       "Bash(gh run *)",
       "Bash(gh api *)",
       "Bash(gh cache *)",
+      "Bash(grep *)",
+      "Bash(sed *)",
+      "Bash(tail *)",
       "WebSearch"
     ]
   }

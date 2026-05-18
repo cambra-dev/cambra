@@ -120,21 +120,18 @@ fn expr_to_node(expr: &Expr) -> InspectNode {
             node
         }
 
-        TypedExprNode::Join {
-            name,
+        TypedExprNode::Loop {
+            init_args,
+            source,
             loop_body,
-            outer_body,
             ..
-        } => InspectNode::new(format!("Join({name})"))
-            .child("loop_body", expr_to_node(loop_body))
-            .child("outer_body", expr_to_node(outer_body)),
-
-        TypedExprNode::Jump { target, args } => {
-            let mut node = InspectNode::new(format!("Jump({target})"));
-            for (i, arg) in args.iter().enumerate() {
-                node = node.child(format!("arg_{i}"), expr_to_node(arg));
+        } => {
+            let mut node = InspectNode::new("Loop".to_string());
+            for (i, init) in init_args.iter().enumerate() {
+                node = node.child(format!("init_{i}"), expr_to_node(init));
             }
-            node
+            node.child("source", expr_to_node(source))
+                .child("loop_body", expr_to_node(loop_body))
         }
 
         TypedExprNode::Source(name) => InspectNode::leaf(format!("Source({name})")),
@@ -321,38 +318,20 @@ Case
 └── arm_0: Lit(0)
 "
     )]
-    // Join + Jump: loop_body (non-last) has a child → triggers │   continuation prefix
+    // Loop: pretty-printed children include init_args, source, and loop_body
     #[case(
-        TypedExpr::new(TypedExprNode::Join {
-            name: "k".to_string(),
+        TypedExpr::new(TypedExprNode::Loop {
             params: vec![TypedBinding::new_unannotated("i")],
-            loop_body: Box::new(TypedExpr::new(TypedExprNode::Jump {
-                target: "k".to_string(),
-                args: vec![Expr::var("i")],
-            })),
-            outer_body: Box::new(TypedExpr::new(TypedExprNode::Jump {
-                target: "k".to_string(),
-                args: vec![Expr::lit(Lit::Int(0))],
-            })),
+            init_args: vec![Expr::lit(Lit::Int(0))],
+            source: Box::new(Expr::var("xs")),
+            loop_body: Box::new(Expr::var("i")),
+            body_taps: Vec::new(),
         }),
         "\
-Join(k)
-├── loop_body: Jump(k)
-│   └── arg_0: Var(i)
-└── outer_body: Jump(k)
-    └── arg_0: Lit(0)
-"
-    )]
-    // Jump with two args
-    #[case(
-        TypedExpr::new(TypedExprNode::Jump {
-            target: "k".to_string(),
-            args: vec![Expr::lit(Lit::Int(1)), Expr::lit(Lit::Int(2))],
-        }),
-        "\
-Jump(k)
-├── arg_0: Lit(1)
-└── arg_1: Lit(2)
+Loop
+├── init_0: Lit(0)
+├── source: Var(xs)
+└── loop_body: Var(i)
 "
     )]
     // Aggregate

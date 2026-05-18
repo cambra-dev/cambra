@@ -25,8 +25,8 @@ use std::ops::{Deref, DerefMut};
 
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
 use crate::ccl::{
-    AggregateKind, BinOpKind, Branch, Expr, InferVarId, Lit, ProjKey, RefinementKind, Type,
-    TypedExprNode, UnaryOpKind, unify::UnificationTable,
+    AggregateKind, BinOpKind, Branch, Builtin, Expr, InferVarId, Lit, MutationLoopShapeMut,
+    ProjKey, RefinementKind, Type, TypedExprNode, UnaryOpKind, unify::UnificationTable,
 };
 use crate::ccl::{BaseType, TypedBinding, next_defer_id};
 use crate::util::ScopeStack;
@@ -348,22 +348,21 @@ fn collect_expr_errors(expr: &Expr, errors: &mut Vec<InferError>) {
         TypedExprNode::Aggregate { input, .. } => {
             collect_expr_errors(input, errors);
         }
-        TypedExprNode::Join {
+        TypedExprNode::Loop {
             params,
+            init_args,
+            source,
             loop_body,
-            outer_body,
             ..
         } => {
             for p in params {
                 collect_type_errors(&p.ty, &p.name, errors);
             }
-            collect_expr_errors(loop_body, errors);
-            collect_expr_errors(outer_body, errors);
-        }
-        TypedExprNode::Jump { args, .. } => {
-            for arg in args {
-                collect_expr_errors(arg, errors);
+            for init in init_args {
+                collect_expr_errors(init, errors);
             }
+            collect_expr_errors(source, errors);
+            collect_expr_errors(loop_body, errors);
         }
         TypedExprNode::Source(_) => {}
         TypedExprNode::Compose(morphisms) => {
@@ -655,20 +654,20 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
             }
         }
 
-        // Join and Jump are not yet fully handled by inference; skip detailed checks.
-        TypedExprNode::Join {
+        // Loop is recognized only in the mutation-loop shape; this arm
+        // is the structural fallback that still descends into sub-exprs
+        // so other arms' typecheck errors aren't lost.
+        TypedExprNode::Loop {
+            init_args,
+            source,
             loop_body,
-            outer_body,
             ..
         } => {
-            collect_typecheck_errors(loop_body, errors);
-            collect_typecheck_errors(outer_body, errors);
-        }
-
-        TypedExprNode::Jump { args, .. } => {
-            for arg in args.iter() {
-                collect_typecheck_errors(arg, errors);
+            for init in init_args.iter() {
+                collect_typecheck_errors(init, errors);
             }
+            collect_typecheck_errors(source, errors);
+            collect_typecheck_errors(loop_body, errors);
         }
 
         TypedExprNode::Source(_) => {}
@@ -1114,10 +1113,11 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
 
         // ----- Join / Jump -----
         //
-        // Not yet handled by this pass; sub-expressions are not visited.
-        TypedExprNode::Join { .. } | TypedExprNode::Jump { .. } => {
-            Ok(Type::Infer(ctx.fresh_infer_var()))
-        }
+        // The only Loop shape currently produced by lowering is the
+        // mutation-loop pattern emitted by
+        // [`crate::ccl::lower::lower_mutation_loop`]; any other shape is
+        // rejected here.  See [`infer_mutation_loop`] for the rules.
+        TypedExprNode::Loop { .. } => infer_mutation_loop(expr, ctx),
 
         // ----- Record constructor -----
         //
@@ -1185,7 +1185,31 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
                     codomain_ty.clone(),
                 ),
             )?;
-            ctx.constrain_equal(&expr_ty, &codomain_ty)?;
+            // A feed's value may be either:
+            //   - scalar `codomain_ty` — the typical `o << x` shape, used
+            //     inside an iter-lambda where `x` is a per-iteration scalar
+            //     value; `remove_defers` later wraps these in a Compose with
+            //     the surrounding source to lift them into a stream, or
+            //   - a pre-lifted stream `Fun(_, codomain_ty)` — produced by
+            //     [`crate::ccl::lower::lower_mutation_loop`] when the
+            //     post-mutation feeds of a mutation loop are hoisted out of
+            //     the loop body and re-expressed as compositions of the
+            //     loop's accumulator stream.
+            //
+            // The match happens after `infer_expr(value)` has flowed
+            // available constraints into `expr_ty`, so already-Fun-shaped
+            // values (e.g. a `Compose`) are correctly disambiguated.  When
+            // `expr_ty` is still an unresolved `Infer`, we default to the
+            // scalar rule — every Fun-shaped feed produced today carries a
+            // concrete function type by this point.
+            match &expr_ty {
+                Type::Fun(_, feed_codomain) => {
+                    ctx.constrain_equal(feed_codomain, &codomain_ty)?;
+                }
+                _ => {
+                    ctx.constrain_equal(&expr_ty, &codomain_ty)?;
+                }
+            }
             Ok(Type::Base(BaseType::Unit))
         }
 
@@ -1524,6 +1548,32 @@ fn infer_apply(
                 param.ty = arg_ty.clone();
             }
         }
+        // Polymorphic `Zip` applied to a Tuple/Record of morphisms — same
+        // pattern as the `Proj` / `Lambda` special cases below: builtins
+        // and projection morphisms have no standalone schema for
+        // inference to instantiate, so we recover the result type from
+        // the argument's shape at the application site.
+        TypedExprNode::Builtin(Builtin::Zip) => {
+            if let Some(zip_out_ty) = infer_zip_codomain(&arg_ty, ctx)? {
+                maybe_codomain_ty = Some(zip_out_ty);
+            }
+        }
+        // `LastOrDefault : Tuple(Fun(D, T), T) → T` — polymorphic
+        // stream-to-scalar with a fallback for the empty-source case.
+        // Recover the result type from the argument's tuple shape and
+        // unify the stream's codomain with the default.
+        TypedExprNode::Builtin(Builtin::LastOrDefault) => {
+            let fresh_domain = Type::Infer(ctx.fresh_infer_var());
+            let fresh_codomain = Type::Infer(ctx.fresh_infer_var());
+            ctx.constrain_equal(
+                &arg_ty,
+                &Type::Tuple(vec![
+                    Type::Fun(Box::new(fresh_domain), Box::new(fresh_codomain.clone())),
+                    fresh_codomain.clone(),
+                ]),
+            )?;
+            maybe_codomain_ty = Some(fresh_codomain);
+        }
         // For projections, if the argument type is known (concrete or partial),
         // directly look up the projected element type to improve inference.
         TypedExprNode::Proj(key) => match (key, &arg_ty) {
@@ -1660,6 +1710,174 @@ fn infer_list(elts: &mut [Expr], ctx: &mut TypeInferenceContext) -> Result<Type,
     }
     let n = elts.len();
     Ok(Type::Fun(Box::new(Type::UIntRange(n)), Box::new(elem_ty)))
+}
+
+/// Infer the type of a mutation-loop-shaped [`TypedExprNode::Loop`] node.
+///
+/// [`crate::ccl::lower::lower_mutation_loop`] is the only producer of
+/// [`TypedExprNode::Loop`].  It emits a single uniform shape regardless
+/// of accumulator count or feed presence:
+///
+/// ```text
+/// Loop {
+///   params: [acc_0, …, acc_{n-1}],
+///   init_args: [init_0, …, init_{n-1}],
+///   source: Fun(D, item_ty),
+///   loop_body: Lambda(p, let acc_0 = p.0 in … let acc_{n-1} = p.{n-1} in
+///                        let iter_var = p.n in
+///                        Record({step: <step>, tap_*: <tap_*>})),
+///   body_taps: ["tap_0_<defer_0>", …],  // possibly empty
+/// }
+/// ```
+///
+/// Inference rules:
+/// - Each `acc_vars[i].ty` unifies with the corresponding `init_args[i].ty`.
+/// - `source.ty` is constrained to `Fun(D, item_ty)`.
+/// - Body input is `Tuple(acc_0.ty, …, acc_{n-1}.ty, item_ty)` — n+1
+///   positional fields, in declaration order.
+/// - Body codomain is `Record({step: <step shape>, tap_*: T_*})` where
+///   the "step shape" carries the recurrence value: `acc_vars[0].ty` for
+///   a single accumulator, `Tuple([acc_0.ty, …, acc_{n-1}.ty])` for
+///   multi-var.  Each `T_*` is a fresh inference variable.  The cycle
+///   flows through `.step`; op-conversion projects it before feeding
+///   back to `recursive_input`.
+/// - The Loop expression's overall type is always `Fun(D, body_codomain)`
+///   — the running body stream, which the surrounding lowering picks
+///   apart with `Proj("step") [▷ Proj(i)] ▷ Last` per accumulator and
+///   `Proj("tap_*")` per feed.
+fn infer_mutation_loop(
+    expr: &mut Expr,
+    ctx: &mut TypeInferenceContext,
+) -> Result<Type, InferError> {
+    // The shape matcher in `ccl/mod.rs` is the single source of truth for
+    // what mutation-loop-shaped Loops look like.  All sub-expression
+    // mutation goes through the borrows it returns — no parallel
+    // `match &mut expr.node` re-destructuring.
+    let shape = expr.as_mutation_loop_mut().ok_or_else(|| {
+        InferError::Unsupported(
+            "Loop is not in the supported mutation-loop shape \
+             (≥1 accumulator params with one matching init_arg per param)"
+                .into(),
+        )
+    })?;
+    let MutationLoopShapeMut {
+        acc_vars,
+        init_args,
+        source,
+        loop_body,
+        body_taps,
+        ..
+    } = shape;
+    for acc in acc_vars.iter_mut() {
+        replace_holes(&mut acc.ty, ctx);
+    }
+
+    // Infer each init expression and unify with the corresponding
+    // accumulator's type.  Init args sit outside the loop's param scope.
+    for (acc, init) in acc_vars.iter().zip(init_args.iter_mut()) {
+        let init_ty = infer_expr(init, ctx)?;
+        ctx.constrain_equal(&acc.ty, &init_ty)?;
+    }
+
+    // Infer the source.  Constrain it to `Fun(D, item_ty)` so we can
+    // extract D and item_ty for the body's tuple-input shape.
+    let source_ty = infer_expr(source, ctx)?;
+    let domain_var = Type::Infer(ctx.fresh_infer_var());
+    let item_var = Type::Infer(ctx.fresh_infer_var());
+    ctx.constrain_equal(&source_ty, &Type::fun(domain_var.clone(), item_var.clone()))?;
+
+    let acc_tys: Vec<Type> = acc_vars.iter().map(|v| v.ty.clone()).collect();
+    // The "step shape" is the codomain field that carries the
+    // accumulator recurrence value.  A single accumulator just uses its
+    // own scalar type; multiple accumulators are packed into a
+    // positional `Tuple` so the cycle has one value to feed back per
+    // iteration.
+    let step_shape = if acc_tys.len() == 1 {
+        acc_tys[0].clone()
+    } else {
+        Type::Tuple(acc_tys.clone())
+    };
+    // Body codomain is always `Record({step: <step shape>, tap_*: T_*})`,
+    // with `tap_*` possibly empty.  The single uniform shape lets
+    // op-conversion handle every Loop the same way (always cycle on
+    // `.step`, always expose the body fan-out as a running stream);
+    // surrounding lowering finishes with `Proj("step") [▷ Proj(i)] ▷
+    // Last` to land on the final scalar accumulator(s).
+    let mut fields: Vec<(String, Type)> = Vec::with_capacity(1 + body_taps.len());
+    fields.push(("step".to_string(), step_shape));
+    for tap in body_taps {
+        fields.push((tap.clone(), Type::Infer(ctx.fresh_infer_var())));
+    }
+    let body_codomain = Type::Record(fields);
+    let body_ty = infer_expr(loop_body, ctx)?;
+    // Body input: positional tuple of (acc_0.ty, …, acc_{n-1}.ty, item_ty).
+    let mut body_input_fields = acc_tys.clone();
+    body_input_fields.push(item_var.clone());
+    let expected_body_ty = Type::fun(Type::Tuple(body_input_fields), body_codomain.clone());
+    ctx.constrain_equal(&body_ty, &expected_body_ty)?;
+
+    Ok(Type::fun(domain_var, body_codomain))
+}
+
+/// Given the `arg_ty` of `Apply(arg, Builtin(Zip))`, infer the codomain of
+/// the zip morphism.
+///
+/// - `Tuple([Fun(D, T_0), …, Fun(D, T_n)])` → `Some(Fun(D, Tuple([T_0, …, T_n])))`.
+/// - `Record({name_i: Fun(D, T_i)})` → `Some(Fun(D, Record({name_i: T_i})))`.
+/// - Anything else → `None` (the caller falls back to the generic Apply
+///   rule, which produces an unconstrained codomain).
+///
+/// Each tuple/record element's type is constrained to `Fun(?D, ?T)` via
+/// [`TypeInferenceContext::constrain_equal`] (with `?D` shared across all
+/// elements), so callers can pass element types that are still inference
+/// variables — they get refined here.
+fn infer_zip_codomain(
+    arg_ty: &Type,
+    ctx: &mut TypeInferenceContext,
+) -> Result<Option<Type>, InferError> {
+    fn unify_elt(
+        elt_ty: &Type,
+        shared_domain: &mut Option<Type>,
+        ctx: &mut TypeInferenceContext,
+    ) -> Result<Type, InferError> {
+        let d_var = Type::Infer(ctx.fresh_infer_var());
+        let c_var = Type::Infer(ctx.fresh_infer_var());
+        ctx.constrain_equal(elt_ty, &Type::fun(d_var.clone(), c_var.clone()))?;
+        match shared_domain {
+            None => *shared_domain = Some(d_var),
+            Some(prev) => ctx.constrain_equal(prev, &d_var)?,
+        }
+        Ok(c_var)
+    }
+
+    match arg_ty {
+        Type::Tuple(elt_tys) => {
+            let mut shared_domain: Option<Type> = None;
+            let codomain_tys = elt_tys
+                .iter()
+                .map(|elt_ty| unify_elt(elt_ty, &mut shared_domain, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(Type::fun(
+                shared_domain.unwrap_or(Type::Hole),
+                Type::Tuple(codomain_tys),
+            )))
+        }
+        Type::Record(fields) => {
+            let mut shared_domain: Option<Type> = None;
+            let codomain_fields = fields
+                .iter()
+                .map(|(name, ty)| {
+                    let c = unify_elt(ty, &mut shared_domain, ctx)?;
+                    Ok((name.clone(), c))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(Type::fun(
+                shared_domain.unwrap_or(Type::Hole),
+                Type::Record(codomain_fields),
+            )))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Destructure `ty` as a function type `(domain, codomain)`.

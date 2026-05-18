@@ -93,13 +93,17 @@ fn recurse_simplify(expr: &mut Expr) -> bool {
         TypedExprNode::Case { branches } => branches.iter_mut().fold(false, |c, b| {
             c | simplify_once(&mut b.guard) | simplify_once(&mut b.body)
         }),
-        TypedExprNode::Join {
+        TypedExprNode::Loop {
+            init_args,
+            source,
             loop_body,
-            outer_body,
             ..
-        } => simplify_once(loop_body) | simplify_once(outer_body),
-        TypedExprNode::Jump { args, .. } => {
-            args.iter_mut().fold(false, |c, a| c | simplify_once(a))
+        } => {
+            init_args
+                .iter_mut()
+                .fold(false, |c, a| c | simplify_once(a))
+                | simplify_once(source)
+                | simplify_once(loop_body)
         }
         TypedExprNode::Aggregate { input, .. } => simplify_once(input),
         TypedExprNode::ExprStmt { expr, body } => simplify_once(expr) | simplify_once(body),
@@ -156,12 +160,14 @@ fn contains_feed(expr: &Expr) -> bool {
         TypedExprNode::Case { branches } => branches
             .iter()
             .any(|b| contains_feed(&b.guard) || contains_feed(&b.body)),
-        TypedExprNode::Join {
+        TypedExprNode::Loop {
+            init_args,
+            source,
             loop_body,
-            outer_body,
             ..
-        } => contains_feed(loop_body) || contains_feed(outer_body),
-        TypedExprNode::Jump { args, .. } => args.iter().any(contains_feed),
+        } => {
+            init_args.iter().any(contains_feed) || contains_feed(source) || contains_feed(loop_body)
+        }
         TypedExprNode::ExprStmt { expr, body } => contains_feed(expr) || contains_feed(body),
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
