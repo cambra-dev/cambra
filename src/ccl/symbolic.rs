@@ -175,18 +175,10 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
                 (Type::Hole | Type::Infer(_), None) => format!("λ {}", param.name),
                 (ty, None) => format!("λ {} : {ty}", param.name),
                 (Type::Hole | Type::Infer(_), Some(r)) => {
-                    format!(
-                        "λ {} : {{??? | Refined({})}}",
-                        param.name,
-                        fmt_refinement(r, opts)
-                    )
+                    format!("λ {} : {{??? | {}}}", param.name, fmt_refinement(r, opts))
                 }
                 (ty, Some(r)) => {
-                    format!(
-                        "λ {} : {{{ty} | Refined({})}}",
-                        param.name,
-                        fmt_refinement(r, opts)
-                    )
+                    format!("λ {} : {{{ty} | {}}}", param.name, fmt_refinement(r, opts))
                 }
             };
             let body_str = fmt(body, Precedence::Lowest, opts);
@@ -671,7 +663,7 @@ in x"
             Expr::lit(Lit::Bool(true)),
             "x > 0",
         ),
-        "λ x : {??? | Refined(true)} → x"
+        "λ x : {??? | true} → x"
     )]
     // Lambda with predicate refinement and type annotation
     #[case(
@@ -682,7 +674,7 @@ in x"
             Expr::lit(Lit::Bool(true)),
             "x > 0",
         ),
-        "λ x : {Int | Refined(true)} → x"
+        "λ x : {Int | true} → x"
     )]
     // Aggregate
     #[case(Expr::aggregate(Expr::var("xs"), AggregateKind::Max), "Max(xs)")]

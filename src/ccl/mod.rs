@@ -1738,7 +1738,7 @@ impl fmt::Display for Type {
             }
             Type::Refinement(t, r) => write!(
                 f,
-                "{{{t} | Refined({})}}",
+                "{{{t} | {}}}",
                 match &r.kind {
                     RefinementKind::Predicate(p) => p
                         .try_borrow()

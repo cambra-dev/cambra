@@ -33,6 +33,38 @@ Prefer a short clarifying question over a best-guess implementation. Getting it 
 ### Code Comments
 Comment all objects (modules, structures and their fields, functions, etc) thoroughly, but concisely, in accordance with rustdoc best practices. For internal comments (for example, inside functions), strongly prefer commenting the _why_ of things, only commenting _what_ if the code is confusing and cannot be reasonably simplified.
 
+### Rendering CCL ASTs in conversation
+When showing a CCL AST in chat or when writing code comments — walking through an example, illustrating what a pass sees, comparing before/after a rewrite — **render it in symbolic form** (the output shape of `ccl::symbolic::symbolic` / `symbolic_typed`). The whole reasoning surface here is the algebra; symbolic notation makes that legible at a glance.
+
+Vocabulary, matching `src/ccl/symbolic.rs`:
+
+- **Apply**: `arg ▷ func` (left-assoc; `a ▷ f ▷ g` means `(a ▷ f) ▷ g`).
+- **Apply with `Proj` as function**: postfix dot-access. `t ▷ .0` → `t.0`, `rec ▷ .name` → `rec.name`.
+- **Compose**: `f ≫ g ≫ h`.
+- **Lambda**: `λ x → body`. With annotated param: `λ x : T → body`. With refinement: `λ x : {T | predicate} → body` (or `{??? | predicate}` when the param type is `Hole`/`Infer`). After our cleanup of the `Refined(...)` wrapper, the predicate appears bare inside the braces — do not write `{T | Refined(p)}`.
+- **Let**: `let x = e in body`.
+- **Aggregate**: `Sum(input)`, `Max(input)`, etc. — the kind name then parens.
+- **Loop**: `loop i = 0 over xs do body` (single accumulator), `loop (x = 0, y = 1) over xs do (x, y)` (multi).
+- **Literals**: `1`, `true`/`false`, `"str"`, `unit`.
+- **Binops**: standard infix with precedence parens (`a + b`, `x == y`, `p and q`, etc.).
+- **Unary**: `-x`, `not x`.
+- **Tuples / lists / records**: `(a, b)`, `[a, b, c]`, `{name: a, age: b}`.
+- **List mappings** (in lowered list literals): `[0 ↦ e0, 1 ↦ e1]`.
+
+Types (from `Display for Type` in `src/ccl/mod.rs`):
+
+- **Function**: `(T ⇒ U)`.
+- **Refinement**: `{T | predicate}` — predicate is rendered via `symbolic`.
+- **UIntRange**: `[0, N]`, or `∅` when empty.
+- **Hole**: `_`.
+- **Infer**: `?N` (where `N` is the variable id).
+- **DataSource**: `source(name)`.
+- **Union**: `T1 | T2`.
+
+Do **not** write `Apply { function: ..., argument: ... }`, `Apply(f, x)`, `Compose([f, g])`, or other constructor-style forms — those are AST node names, not the rendering. Do **not** fall back to source syntax when the point is what the *AST* looks like. Only deviate if explicitly asked (e.g. "show me the Debug form", "give me the source").
+
+When the type matters to the point being made (e.g. showing a domain refinement that triggers operator dispatch), include type annotations via `symbolic_typed`-style suffixes: `expr:type`.
+
 ### Workflow
 After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds, then progress to CI.
 

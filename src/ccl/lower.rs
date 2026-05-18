@@ -2098,7 +2098,7 @@ fn lower_function_body(
 /// The outer lambda carries a [`RefinementKind::Predicate`] with the combined
 /// guard expression; the runtime filters via a correlation vector:
 /// ```text
-/// λ __iter_record : {T | Refined(pred)} →
+/// λ __iter_record : {T | pred} →
 ///   __iter_record[0] ▷ lower(source0) ▷ (λ var0 →
 ///     __iter_record[1] ▷ lower(source1) ▷ (λ var1 → lower(body)))
 /// ```
@@ -2108,7 +2108,7 @@ fn lower_function_body(
 /// The outer lambda carries a [`RefinementKind::HashJoin`]; `compile_ccl`
 /// translates it to an O(N+M) hash-join-based restriction:
 /// ```text
-/// λ __iter_record : {T | Refined(build_var == probe_var)} →
+/// λ __iter_record : {T | build_var == probe_var} →
 ///   __iter_record[0] ▷ lower(source0) ▷ (λ var0 →
 ///     __iter_record[1] ▷ lower(source1) ▷ (λ var1 → lower(body)))
 /// ```
@@ -3200,22 +3200,22 @@ f";
     // Variable collection and inline key lambda
     #[case(
         "groupby(xs, lambda x: x)",
-        "λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ xs ▷ (λ x → x) == __gb_k))} → __gb_i ▷ xs"
+        "λ __gb_k → λ __gb_i : {??? | (λ __gb_r → __gb_r ▷ xs ▷ (λ x → x) == __gb_k)} → __gb_i ▷ xs"
     )]
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], lambda x: x // 2)",
-        "λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k))} → __gb_i ▷ [1, 2, 3]"
+        "λ __gb_k → λ __gb_i : {??? | (λ __gb_r → __gb_r ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k)} → __gb_i ▷ [1, 2, 3]"
     )]
     // Key is a variable reference (pre-defined function)
     #[case(
         "groupby(xs, key_fn)",
-        "λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k))} → __gb_i ▷ xs"
+        "λ __gb_k → λ __gb_i : {??? | (λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k)} → __gb_i ▷ xs"
     )]
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "λ __iter_record → __iter_record ▷ (λ __gb_k → λ __gb_i : {??? | Refined((λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k))} → __gb_i ▷ xs) ▷ (λ x → Sum(x))"
+        "λ __iter_record → __iter_record ▷ (λ __gb_k → λ __gb_i : {??? | (λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k)} → __gb_i ▷ xs) ▷ (λ x → Sum(x))"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
