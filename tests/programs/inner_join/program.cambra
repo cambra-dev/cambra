@@ -1,0 +1,23 @@
+# The hash-join planner notices `if u.id == o.user_id` and lowers the
+# cross-product comprehension to a keyed lookup; orders whose user_id has
+# no matching user (e.g. user_id=99) are dropped from the output.
+
+users = [
+    {id: 1, name: "alice"},
+    {id: 2, name: "bob"},
+    {id: 3, name: "carol"},
+]
+
+orders = [
+    {user_id: 1, amount: 50},
+    {user_id: 2, amount: 75},
+    {user_id: 1, amount: 100},
+    {user_id: 99, amount: 999},
+]
+
+[
+    {customer: u.name, total: o.amount}
+    for u in users
+    for o in orders
+    if u.id == o.user_id
+]

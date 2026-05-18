@@ -1,0 +1,7 @@
+users = [
+    {name: "alice", age: 30, score: 85},
+    {name: "bob",   age: 17, score: 92},
+    {name: "carol", age: 25, score: 78},
+    {name: "dave",  age: 45, score: 90},
+]
+sum([u.score for u in users if u.age >= 18])

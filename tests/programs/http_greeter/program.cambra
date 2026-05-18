@@ -1,0 +1,22 @@
+# Manual smoke test (replace {PORT} with a literal of your choice):
+#
+#     cargo run -- tests/programs/http_greeter/program.cambra
+#     # in another terminal:
+#     curl localhost:8080/greet
+#     curl -X POST -d hello localhost:8080/echo
+#     curl -X POST -d world localhost:8080/shout
+
+prefix = "Hello, "
+
+greet_reqs, greet_resps = http_serve("{PORT}", "GET", "/greet")
+echo_reqs, echo_resps = http_serve("{PORT}", "POST", "/echo")
+shout_reqs, shout_resps = http_serve("{PORT}", "POST", "/shout")
+
+for req in greet_reqs:
+    greet_resps << prefix + "stranger!\n"
+
+for req in echo_reqs:
+    echo_resps << "You said: " + req + "\n"
+
+for req in shout_reqs:
+    shout_resps << prefix + req + "!!!\n"

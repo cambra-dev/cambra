@@ -1,0 +1,8 @@
+sales = [
+    {region: "west",  amount: 100},
+    {region: "east",  amount: 50},
+    {region: "west",  amount: 200},
+    {region: "south", amount: 75},
+    {region: "east",  amount: 150},
+]
+[sum([s.amount for s in g]) for g in groupby(sales, lambda r: r.region)]

@@ -1,0 +1,10 @@
+def positives(xs):
+    for x in xs:
+        if x > 0:
+            yield x
+
+def squared(xs):
+    for x in xs:
+        yield x * x
+
+max(squared(positives([-3, 4, -1, 2, 5, -7])))
