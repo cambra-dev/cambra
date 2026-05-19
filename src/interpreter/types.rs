@@ -121,6 +121,21 @@ impl Extent {
             // Restricted extents behave like their base record, but also set up the
             // restriction producer so it can compute correlation vectors at runtime.
             Extent::Restricted { base, .. } => base.subscribe_to_iteration_action(),
+            // Union extents iterate each variant in turn; we are ready iff every
+            // variant is ready, and we subscribe iff any variant requires it.
+            Extent::Union(variants) => variants
+                .iter()
+                .map(|variant| variant.subscribe_to_iteration_action())
+                .fold(
+                    NotifyOrSubscribeResult {
+                        notify: true,
+                        subscribe: false,
+                    },
+                    |acc, value| NotifyOrSubscribeResult {
+                        notify: acc.notify && value.notify,
+                        subscribe: acc.subscribe || value.subscribe,
+                    },
+                ),
             // Other Extents cannot be iterated, so nothing to do
             _ => NotifyOrSubscribeResult {
                 notify: false,

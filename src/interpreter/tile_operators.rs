@@ -991,6 +991,11 @@ impl IterateExtent {
             Extent::Restricted { base, .. } => {
                 Self::add_all_source_handles(base, consumer, scheduler);
             }
+            Extent::Union(extents) => {
+                for extent in extents {
+                    Self::add_all_source_handles(extent, consumer.clone(), scheduler);
+                }
+            }
             // Nothing to do for other extents since they all complete from the start of the program
             _ => {}
         }
@@ -1074,6 +1079,12 @@ fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
                 .map(|(f, e)| (f.clone(), get_iterate_extent_predicate(e)))
                 .collect(),
         ),
+        // For a disjoint union, each variant contributes its own predicate over
+        // its own tag; combine them positionally so downstream consumers can
+        // split per-variant releases back to their source sub-extents.
+        Extent::Union(variants) => {
+            Predicate::Union(variants.iter().map(get_iterate_extent_predicate).collect())
+        }
         _ => Predicate::True,
     }
 }
@@ -1162,6 +1173,26 @@ fn release_extent(extent: &mut Extent, pred: &Predicate, releaser: &str) {
             _ => todo!("Got {pred:?} for UIntRange"),
         },
         Extent::Base(BaseType::Unit) => {}
+        Extent::Union(variants) => match pred {
+            p if p.as_bool().is_some_and(|p| p) => {
+                for v in variants.iter_mut() {
+                    release_extent(v, &Predicate::True, releaser);
+                }
+            }
+            p if p.as_bool().is_some_and(|p| !p) => {
+                for v in variants.iter_mut() {
+                    release_extent(v, &Predicate::False, releaser);
+                }
+            }
+            // A Union predicate aligns positionally with the variants: each
+            // arm releases its corresponding sub-extent.
+            Predicate::Union(arms) if arms.len() == variants.len() => {
+                for (v, arm) in variants.iter_mut().zip(arms.iter()) {
+                    release_extent(v, arm, releaser);
+                }
+            }
+            _ => todo!("Got {pred:?} for Union extent"),
+        },
         _ => panic!("Unexpected extent: {extent:?}"),
     }
 }
@@ -1190,10 +1221,29 @@ fn iterate_extent(extent: &Extent, producer: &str) -> ColumnValue {
         }
         Extent::DataSourceDomain(source_impl) => source_impl.borrow_mut().get_elements(producer),
         Extent::Record(fields) => iterate_record(fields, producer),
+        Extent::Union(variants) => iterate_union(variants, producer),
         Extent::Restricted { .. } => {
             panic!("Iterating over restricted extents not supported; use Filter operators instead")
         }
         _ => panic!("Attempted to iterate on infinite Extent"),
+    }
+}
+
+/// Iterate a [`Extent::Union`] by enumerating each variant in turn and
+/// stitching the results into a single [`ColumnValue::Union`] column with
+/// per-variant tags assigned in order.
+fn iterate_union(variants: &[Extent], producer: &str) -> ColumnValue {
+    let columns: Vec<ColumnValue> = variants
+        .iter()
+        .map(|v| iterate_extent(v, producer))
+        .collect();
+    let mut tags: Vec<usize> = Vec::with_capacity(columns.iter().map(|c| c.len()).sum());
+    for (i, c) in columns.iter().enumerate() {
+        tags.extend(iter::repeat_n(i, c.len()));
+    }
+    ColumnValue::Union {
+        tags,
+        variants: columns,
     }
 }
 

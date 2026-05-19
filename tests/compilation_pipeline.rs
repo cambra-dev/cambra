@@ -245,6 +245,8 @@ fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
         domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
         deleted: BitSet::new(),
     })]
+#[case("sum([1] @ [2])", Tile::Scalar(ColumnValue::Ints(vec![3])))]
+#[case("sum([1 for y in [1] @ [2]])", Tile::Scalar(ColumnValue::Ints(vec![2])))]
 fn test_unions(#[case] code: &str, #[case] expected: Tile) {
     let result = run_pipeline(code);
     assert_eq!(result, expected);
