@@ -350,33 +350,13 @@ fn substitute_types(ty: &mut Type, type_substitutions: &[(Type, Type)]) {
             return;
         }
     }
-    match ty {
-        Type::Fun(arg, func) => {
-            substitute_types(arg, type_substitutions);
-            substitute_types(func, type_substitutions);
-        }
-        Type::Union(variants) => {
-            for v in variants {
-                substitute_types(v, type_substitutions);
-            }
-        }
-        Type::Tuple(elts) => {
-            for e in elts {
-                substitute_types(e, type_substitutions);
-            }
-        }
-        Type::Record(fields) => {
-            for (_, ty) in fields {
-                substitute_types(ty, type_substitutions);
-            }
-        }
-        Type::Refinement(base, pred) => {
-            substitute_types(base, type_substitutions);
-            let RefinementKind::Predicate(pred) = &mut pred.kind;
-            substitute_types_in_expr(&mut pred.borrow_mut(), type_substitutions);
-        }
-        _ => {}
+    // Refinement predicates are sub-expressions, not sub-types — recurse
+    // into the predicate before falling through to the structural walk.
+    if let Type::Refinement(_, refinement) = ty {
+        let RefinementKind::Predicate(pred) = &mut refinement.kind;
+        substitute_types_in_expr(&mut pred.borrow_mut(), type_substitutions);
     }
+    ty.walk_children_mut(|child| substitute_types(child, type_substitutions));
 }
 
 /// Search `expr` for all `Feed` and `Define` nodes that reference `name_to_bind`,

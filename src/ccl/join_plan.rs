@@ -31,65 +31,54 @@ pub fn run(mut expr: Expr) -> Expr {
 /// Identifies constructs corresponding to partitioning by key and swaps from the key
 /// being the outer variable to the collection being the outer variable.
 fn replace_curried_correlated_refinements(expr: &mut Expr) {
-    let new = match &mut expr.node {
-        TypedExprNode::Apply { argument, function }
-            if is_builtin(function, Builtin::Curry)
-                && matches!(&argument.ty, Type::Refinement(..)) =>
-        {
-            let Type::Refinement(
-                inner_ty,
-                Refinement {
-                    kind: RefinementKind::Predicate(p),
-                    ..
-                },
-            ) = &argument.ty
-            else {
-                unreachable!();
-            };
-            convert_groupby(argument, inner_ty, &p.borrow())
-        }
-
-        TypedExprNode::Apply { function, argument } => {
-            replace_curried_correlated_refinements(function);
-            replace_curried_correlated_refinements(argument);
-            None
-        }
-        TypedExprNode::Aggregate { input, .. } => {
-            replace_curried_correlated_refinements(input);
-            None
-        }
-        TypedExprNode::Compose(elts) => {
-            elts.iter_mut()
-                .for_each(replace_curried_correlated_refinements);
-            None
-        }
-        TypedExprNode::Lambda {
-            body, refinement, ..
-        } => {
-            replace_curried_correlated_refinements(body);
-            if let Some(Refinement {
+    // Special case: detected groupby pattern at this node.  Either rewrite
+    // and stop, or — if conversion fails — also stop, since the pattern's
+    // internals have already been inspected by `convert_groupby` and
+    // descending into them won't reveal anything new.
+    //
+    // The `Option<Option<Expr>>` layering distinguishes "pattern didn't
+    // match" (outer `None`, fall through to structural recursion) from
+    // "pattern matched but conversion failed" (outer `Some(None)`, stop
+    // here without rewriting).  Computing the result inside the `if-let`
+    // and then matching on it outside lets the immutable borrow of
+    // `expr.node` end before we attempt to overwrite `*expr`.
+    let groupby = if let TypedExprNode::Apply { argument, function } = &expr.node
+        && is_builtin(function, Builtin::Curry)
+        && matches!(&argument.ty, Type::Refinement(..))
+    {
+        let Type::Refinement(
+            inner_ty,
+            Refinement {
                 kind: RefinementKind::Predicate(p),
                 ..
-            }) = refinement
-            {
-                replace_curried_correlated_refinements(&mut p.borrow_mut());
-            }
-            None
-        }
-        TypedExprNode::Let {
-            binding: _,
-            bound_expr,
-            body,
-        } => {
-            replace_curried_correlated_refinements(bound_expr);
-            replace_curried_correlated_refinements(body);
-            None
-        }
-        _ => None,
+            },
+        ) = &argument.ty
+        else {
+            unreachable!();
+        };
+        Some(convert_groupby(argument, inner_ty, &p.borrow()))
+    } else {
+        None
     };
-    if let Some(new) = new {
-        *expr = new;
+    if let Some(maybe_new) = groupby {
+        if let Some(new) = maybe_new {
+            *expr = new;
+        }
+        return;
     }
+    // Lambdas also carry a refinement *predicate* that `walk_children_mut`
+    // doesn't visit (it's not a structural child of the lambda node).
+    // Walk into it explicitly before falling through to the generic
+    // structural recursion.
+    if let TypedExprNode::Lambda {
+        refinement: Some(refinement),
+        ..
+    } = &mut expr.node
+    {
+        let RefinementKind::Predicate(p) = &refinement.kind;
+        replace_curried_correlated_refinements(&mut p.borrow_mut());
+    }
+    expr.walk_children_mut(replace_curried_correlated_refinements);
 }
 
 /// Look for an expression that corresponds to a group-by and rewrite it to use Converse
@@ -1365,38 +1354,14 @@ fn create_hash_joins(expr: &mut Expr) {
 
 /// Helper to explore the expression tree for convertible loop joins.
 fn create_hash_joins_recurse(expr: &mut Expr) {
-    let new = match &mut expr.node {
-        TypedExprNode::Apply { argument, function } => {
-            create_hash_joins_recurse(argument);
-            create_hash_joins_recurse(function);
-            None
-        }
-        TypedExprNode::Aggregate { .. } => {
-            create_hash_joins(expr);
-            None
-        }
-        TypedExprNode::Compose(elts) => {
-            elts.iter_mut().for_each(create_hash_joins_recurse);
-            None
-        }
-        TypedExprNode::Tuple(elts) => {
-            elts.iter_mut().for_each(create_hash_joins_recurse);
-            None
-        }
-        TypedExprNode::Let {
-            binding: _,
-            bound_expr,
-            body,
-        } => {
-            create_hash_joins_recurse(bound_expr);
-            create_hash_joins_recurse(body);
-            None
-        }
-        _ => None,
-    };
-    if let Some(new) = new {
-        *expr = new;
+    // An `Aggregate` is a boundary where a hash-join conversion may be
+    // available — dispatch to the entry-point checker and stop, since
+    // `create_hash_joins` itself recurses into the aggregate's input.
+    if matches!(&expr.node, TypedExprNode::Aggregate { .. }) {
+        create_hash_joins(expr);
+        return;
     }
+    expr.walk_children_mut(create_hash_joins_recurse);
 }
 
 #[cfg(test)]

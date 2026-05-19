@@ -1789,6 +1789,105 @@ impl Type {
     pub fn infer() -> Self {
         Type::Infer(fresh_infer_var_id())
     }
+
+    /// Invoke `f` on each direct child [`Type`] of this type.
+    ///
+    /// "Direct child" means a `Type` reachable through this type's value
+    /// fields — the domain and codomain of a `Fun`, the elements of a
+    /// `Tuple` / `Record` / `PartialTuple` / `PartialRecord`, the arms of
+    /// a `Union`, and the base of a `Refinement`.
+    ///
+    /// Does **not** descend into the refinement *predicate* (which is a
+    /// [`TypedExpr`], not a `Type`).  Callers that need to walk a
+    /// refinement's predicate must handle [`Type::Refinement`] explicitly
+    /// — e.g. by matching on it before calling this helper.
+    pub fn walk_children(&self, mut f: impl FnMut(&Type)) {
+        match self {
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::Hole
+            | Type::Infer(_)
+            | Type::DataSource(_)
+            | Type::DeferredCollectionDomain(_) => {}
+            Type::Fun(domain, codomain) => {
+                f(domain);
+                f(codomain);
+            }
+            Type::Tuple(ts) | Type::Union(ts) => {
+                for t in ts {
+                    f(t);
+                }
+            }
+            Type::Record(fields) => {
+                for (_, t) in fields {
+                    f(t);
+                }
+            }
+            Type::PartialTuple(entries) => {
+                for (_, t) in entries {
+                    f(t);
+                }
+            }
+            Type::PartialRecord(entries) => {
+                for (_, t) in entries {
+                    f(t);
+                }
+            }
+            Type::Refinement(base, _) => f(base),
+        }
+    }
+
+    /// Mutable analog of [`walk_children`](Self::walk_children).
+    ///
+    /// Same caveats apply: does not descend into the refinement predicate.
+    pub fn walk_children_mut(&mut self, mut f: impl FnMut(&mut Type)) {
+        match self {
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::Hole
+            | Type::Infer(_)
+            | Type::DataSource(_)
+            | Type::DeferredCollectionDomain(_) => {}
+            Type::Fun(domain, codomain) => {
+                f(domain);
+                f(codomain);
+            }
+            Type::Tuple(ts) | Type::Union(ts) => {
+                for t in ts {
+                    f(t);
+                }
+            }
+            Type::Record(fields) => {
+                for (_, t) in fields {
+                    f(t);
+                }
+            }
+            Type::PartialTuple(entries) => {
+                for (_, t) in entries {
+                    f(t);
+                }
+            }
+            Type::PartialRecord(entries) => {
+                for (_, t) in entries {
+                    f(t);
+                }
+            }
+            Type::Refinement(base, _) => f(base),
+        }
+    }
+
+    /// Fold `f` left-to-right over the direct child [`Type`]s, starting
+    /// from `init`.  Mirrors [`TypedExpr::fold_children`].
+    pub fn fold_children<T>(&self, init: T, mut f: impl FnMut(T, &Type) -> T) -> T {
+        let mut acc = Some(init);
+        self.walk_children(|t| {
+            let v = acc
+                .take()
+                .expect("Type::fold_children: closure invoked re-entrantly");
+            acc = Some(f(v, t));
+        });
+        acc.expect("Type::fold_children: walk_children dropped accumulator")
+    }
 }
 
 /// Represents a type refinement carried by a [`TypedExprNode::Lambda`] parameter.

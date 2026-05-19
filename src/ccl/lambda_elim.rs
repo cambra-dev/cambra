@@ -380,38 +380,23 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
 /// Helper for `substitute` that recurses into any refined types where we also need to
 /// substitute the param.
 fn substitute_in_type(ty: &mut Type, name: &str, replacement: &Expr) {
-    match ty {
-        Type::Refinement(base, refinement) => {
-            substitute_in_type(base, name, replacement);
-            let Refinement {
-                kind: RefinementKind::Predicate(pred_rc),
-                ..
-            } = &mut *refinement;
-            let t = Expr::lit(Lit::Unit);
-            // Substitute within the refinement, unless we are already inside that same refinement
-            // TODO: this probably simplifies once we remove the RefCell from the predicate.
-            if let Ok(mut pred) = pred_rc.try_borrow_mut() {
-                let old_pred = replace(&mut *pred, t);
-                let new_pred = substitute(old_pred, name, replacement);
-                *pred = new_pred;
-            }
+    // Refinement predicates are sub-expressions, not sub-types — handle
+    // the predicate explicitly, then recurse into structural type children.
+    if let Type::Refinement(_, refinement) = ty {
+        let Refinement {
+            kind: RefinementKind::Predicate(pred_rc),
+            ..
+        } = &mut *refinement;
+        let t = Expr::lit(Lit::Unit);
+        // Substitute within the refinement, unless we are already inside that same refinement
+        // TODO: this probably simplifies once we remove the RefCell from the predicate.
+        if let Ok(mut pred) = pred_rc.try_borrow_mut() {
+            let old_pred = replace(&mut *pred, t);
+            let new_pred = substitute(old_pred, name, replacement);
+            *pred = new_pred;
         }
-        Type::Fun(domain, codomain) => {
-            substitute_in_type(domain, name, replacement);
-            substitute_in_type(codomain, name, replacement);
-        }
-        Type::Tuple(elts) => {
-            for e in elts {
-                substitute_in_type(e, name, replacement);
-            }
-        }
-        Type::Record(elts) => {
-            for (_, e) in elts {
-                substitute_in_type(e, name, replacement);
-            }
-        }
-        _ => {}
     }
+    ty.walk_children_mut(|child| substitute_in_type(child, name, replacement));
 }
 
 // ---------------------------------------------------------------------------

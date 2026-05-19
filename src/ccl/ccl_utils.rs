@@ -153,35 +153,31 @@ pub fn is_free(name: &str, expr: &Expr) -> bool {
 /// source type whose predicate references `y`), and those occurrences
 /// are just as much "uses of `name`" as occurrences in the term itself.
 fn count_free_in_type(name: &str, ty: &Type) -> usize {
-    match ty {
-        Type::Refinement(base, refinement) => {
-            let base_count = count_free_in_type(name, base);
-            let RefinementKind::Predicate(pred_rc) = &refinement.kind;
-            // `try_borrow().ok()` silently treats a failed borrow as
-            // "zero occurrences."  This is intentional: callers
-            // (`remove_defers::inline_defer`, etc.) run *between* CCL
-            // passes when no refinement predicate is being mutated, so
-            // a `borrow_mut` from somewhere else in the call stack
-            // shouldn't happen.  We still use `try_borrow` defensively
-            // — under-counting is a soundness issue only if a caller
-            // relies on `>= 2` to gate a substitute-vs-preserve
-            // decision, and a missed count would mean we substitute
-            // away a shared binding.  If you add a caller that walks
-            // an actively-mutating refinement, switch this to
-            // `borrow()` so the mistake panics rather than
-            // miscompiling.
-            let pred_count = pred_rc
-                .try_borrow()
-                .ok()
-                .map(|p| count_free(name, &p))
-                .unwrap_or(0);
-            base_count + pred_count
-        }
-        Type::Fun(domain, codomain) => {
-            count_free_in_type(name, domain) + count_free_in_type(name, codomain)
-        }
-        Type::Tuple(elts) => elts.iter().map(|e| count_free_in_type(name, e)).sum(),
-        Type::Record(elts) => elts.iter().map(|(_, e)| count_free_in_type(name, e)).sum(),
-        _ => 0,
-    }
+    // Refinement predicates are sub-expressions, not sub-types, so
+    // `walk_children` does not descend into them — handle the predicate
+    // here, then fold over the structural type children.
+    let here = if let Type::Refinement(_, refinement) = ty {
+        let RefinementKind::Predicate(pred_rc) = &refinement.kind;
+        // `try_borrow().ok()` silently treats a failed borrow as
+        // "zero occurrences."  This is intentional: callers
+        // (`remove_defers::inline_defer`, etc.) run *between* CCL
+        // passes when no refinement predicate is being mutated, so
+        // a `borrow_mut` from somewhere else in the call stack
+        // shouldn't happen.  We still use `try_borrow` defensively
+        // — under-counting is a soundness issue only if a caller
+        // relies on `>= 2` to gate a substitute-vs-preserve
+        // decision, and a missed count would mean we substitute
+        // away a shared binding.  If you add a caller that walks
+        // an actively-mutating refinement, switch this to
+        // `borrow()` so the mistake panics rather than
+        // miscompiling.
+        pred_rc
+            .try_borrow()
+            .ok()
+            .map(|p| count_free(name, &p))
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    here + ty.fold_children(0, |acc, child| acc + count_free_in_type(name, child))
 }
