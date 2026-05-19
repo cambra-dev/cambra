@@ -27,11 +27,31 @@ Stop and ask before proceeding when:
 
 Prefer a short clarifying question over a best-guess implementation. Getting it wrong wastes more time than pausing to confirm.
 
+### How to think about changes to this codebase
+
+Cambra is a language and database substrate, not product code. Two things follow:
+
+**The substrate quality compounds.** In a language/type-system/database every piece interacts with every other piece, so complexity multiplies rather than adds. Tradeoffs that are fine in product code (a small special case here, a bit of duplication there) compound non-linearly here. Default toward simpler primitives even when the local diff is slightly larger.
+
+**Abstractions are first-class deliverables.** Your task is to make Cambra better, not just to complete the current session's instructions. Cambra is a deliberately-constructed framework of abstractions; introducing well-justified ones is often the work itself, not something to avoid. An abstraction is justified if it either (a) makes a concept that is currently implicit in the code or semantics *explicit*, or (b) collapses a recurring shape that is already being duplicated. It is **not** justified by "this would be cleaner" or "we might need this later" — the signal has to come from the existing code or the existing semantics, not from aesthetics or speculation.
+
+Specific decision points where this matters:
+
+- **Adding a special case.** Before adding `if foo == X { ... } else { normal path }` or its equivalent, pause and ask whether the existing abstraction is wrong — whether `X` is revealing internal structure of the type/operation/concept that hasn't been named yet. The special case is sometimes right; the bar is "I noticed and decided," not "I noticed and didn't think about it."
+
+- **Recurring shapes.** When the same structural pattern appears across what should be unrelated constructs, flag it — even if you are not going to refactor it as part of the current task. A comment, a note in the PR, or a question to the user is what keeps the signal from being lost. Silently leaving it for the third or fourth duplication is how complexity compounds.
+
+- **New concepts threaded through layers.** When a task requires adding a new concept or special case across several layers (parse → lower → type-check → eval, say), stop and ask whether the concept is real or whether you are papering over a missing distinction. Threading something widely is expensive and hard to undo; a clarifying question first is usually worth it.
+
+- **Bug fixes that reveal structural problems.** If a bug is a symptom of a structural confusion (a missing distinction, a wrong abstraction, a leaky boundary), the surface fix paves over it. If the structural fix is too big to fold into the current task, flag it as a separate change — neither silently widen the scope nor silently ignore it.
+
+- **Defensive checks at internal boundaries.** Add `debug_assert!`, `unreachable!`, and explicit invariant checks at pass boundaries and between modules where load-bearing assumptions live. Don't go overboard — assertions that just restate what the type system already enforces are noise. Add them where the invariant is real but not type-enforced: pass output shapes, module-boundary preconditions, post-conditions on internal helpers. Name what the invariant *is* in the assertion message.
+
 ### Skills
 - `/pyast` — Quick reference for `rustpython_parser` AST types (ExprKind, StmtKind, Operator, Constant, etc.)
 
 ### Code Comments
-Comment all objects (modules, structures and their fields, functions, etc) thoroughly, but concisely, in accordance with rustdoc best practices. For internal comments (for example, inside functions), strongly prefer commenting the _why_ of things, only commenting _what_ if the code is confusing and cannot be reasonably simplified.
+Comment when the *why* is non-obvious — a hidden constraint, a load-bearing invariant, an unusual choice, behavior that would surprise a reader. Skip comments when a good name and a clear signature already convey the intent. Follow rustdoc best practices for public items; don't manufacture docstrings to hit a coverage target.
 
 ### Rendering CCL ASTs in conversation
 When showing a CCL AST in chat or when writing code comments — walking through an example, illustrating what a pass sees, comparing before/after a rewrite — **render it in symbolic form** (the output shape of `ccl::symbolic::symbolic` / `symbolic_typed`). The whole reasoning surface here is the algebra; symbolic notation makes that legible at a glance.
