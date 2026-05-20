@@ -329,6 +329,8 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         }
 
         TypedExprNode::Defer => (Precedence::Atom, "defer".to_string()),
+
+        TypedExprNode::Error => (Precedence::Atom, "<error>".to_string()),
     };
     if opts.show_types {
         (res.0, format!("{}:<{}>", res.1, expr.ty))

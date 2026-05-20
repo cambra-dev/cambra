@@ -197,6 +197,7 @@ fn is_let_bound(name: &str, expr: &Expr) -> bool {
         // A Lambda param shadows `name` inside the body — treat it as a binding
         // site so we don't substitute through it.
         TypedExprNode::Lambda { param, .. } if param.name == name => true,
+        TypedExprNode::Error => crate::unexpected_error_node!(),
         _ => expr.any_child(|e| is_let_bound(name, e)),
     }
 }
@@ -488,6 +489,8 @@ fn inline_impl(expr: Expr, ctx: &mut InlineCtx) -> Expr {
             TypedExprNode::Compose(inlined)
         }
 
+        TypedExprNode::Error => crate::unexpected_error_node!(),
+
         // All remaining variants: pure structural recursion.  Atoms have
         // no children, so this is a no-op for them.
         node => {
@@ -659,6 +662,8 @@ fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
             Some(name),
             |e| inline_and_beta_reduce(e, name, lambda),
         ),
+
+        TypedExprNode::Error => crate::unexpected_error_node!(),
 
         // All remaining variants: pure structural recursion.  Atoms have
         // no children, so this is a no-op for them.

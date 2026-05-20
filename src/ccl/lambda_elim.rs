@@ -354,6 +354,8 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             }
         }
 
+        TypedExprNode::Error => crate::unexpected_error_node!(),
+
         // All remaining variants: pure structural recursion, using the
         // type-substituted `ty`.  Atoms have no children, so this is a
         // no-op for them.
@@ -1013,6 +1015,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                 Expr::apply(input2, Expr::builtin(agg_builtin).with_ty(agg_ty)).with_ty(ty),
             ))
         }
+
+        TypedExprNode::Error => crate::unexpected_error_node!(),
 
         // Control-flow constructs not yet supported.
         node @ TypedExprNode::Case { .. } => Err(LambdaElimError::Unsupported(format!(

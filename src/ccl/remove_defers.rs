@@ -248,6 +248,7 @@ fn inline_defers(
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)
         | TypedExprNode::Defer => {}
+        TypedExprNode::Error => crate::unexpected_error_node!(),
     }
     Ok(())
 }
@@ -332,6 +333,7 @@ fn substitute_types_in_expr(expr: &mut Expr, type_substitutions: &[(Type, Type)]
                 substitute_types_in_expr(&mut pred.borrow_mut(), type_substitutions);
             }
         }
+        TypedExprNode::Error => crate::unexpected_error_node!(),
         _ => {}
     }
 
@@ -673,6 +675,8 @@ fn inline_defer(expr: &mut Expr, name_to_bind: &str) -> Result<InlineDeferResult
             }
             (None, result, None, result_pending)
         }
+
+        TypedExprNode::Error => crate::unexpected_error_node!(),
 
         e => todo!("inline_defer: unhandled node type {:?}", e),
     };

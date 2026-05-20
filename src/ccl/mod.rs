@@ -837,6 +837,19 @@ pub enum TypedExprNode {
     /// The bound name is resolved by the surrounding `Let` binding.
     /// Removed by `remove_defers::run` before operator conversion.
     Defer,
+
+    /// Recovery placeholder inserted by lowering when a sub-expression or
+    /// statement could not be lowered (either because it came from a parser
+    /// recovery hole — [`crate::chl_parser::ast::Expr::Error`] /
+    /// [`crate::chl_parser::ast::Stmt::Error`] — or because lowering itself
+    /// failed with a [`crate::ccl::lower::LoweringError`]).
+    ///
+    /// **Contract.** This variant exists *only* while there are pending
+    /// [`crate::ccl::lower::LoweringError`]s in the `LoweringResult`. Callers
+    /// must inspect `errors` before consuming the lowered tree and abort the
+    /// pipeline (no inference, no operator conversion) if non-empty.
+    /// Downstream passes treat this variant as unreachable.
+    Error,
 }
 
 /// A CCL expression with a type slot on every node.
@@ -1068,6 +1081,17 @@ impl TypedExpr {
         })
     }
 
+    /// Construct a lowering-error placeholder.
+    ///
+    /// Used by [`crate::ccl::lower`] to fill in slots where a sub-expression
+    /// could not be produced (parse-recovery hole or local lowering failure)
+    /// while letting the surrounding tree keep being lowered. The placeholder
+    /// is only valid while the accompanying error list is non-empty; see the
+    /// [`TypedExprNode::Error`] doc for the contract.
+    pub fn error() -> Self {
+        Self::new(TypedExprNode::Error)
+    }
+
     /// Construct a for-loop expression.
     ///
     /// Desugars directly to `Compose([source, Lambda(iter_var, body)])`.
@@ -1243,7 +1267,8 @@ impl TypedExpr {
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
-            | TypedExprNode::Defer => {}
+            | TypedExprNode::Defer
+            | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
                 f(function);
                 f(argument);
@@ -1372,7 +1397,8 @@ impl TypedExpr {
             | TypedExprNode::Builtin(_)
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(_)
-            | TypedExprNode::Defer => {}
+            | TypedExprNode::Defer
+            | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
                 f(function);
                 f(argument);
@@ -1925,4 +1951,15 @@ impl std::hash::Hash for Refinement {
 pub enum RefinementKind {
     /// Arbitrary boolean predicate; compiled as an element-wise loop join.
     Predicate(Rc<RefCell<TypedExpr>>),
+}
+
+/// Convenience for the [`TypedExprNode::Error`] match arm in passes that run
+/// only after the lowering-error check in
+/// [`crate::ccl::context::compile_program`] — i.e. anywhere the placeholder
+/// shouldn't be observable.
+#[macro_export]
+macro_rules! unexpected_error_node {
+    () => {
+        unreachable!("Unexpected <error>")
+    };
 }

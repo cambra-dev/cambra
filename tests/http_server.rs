@@ -332,8 +332,12 @@ fn test_http_serve_in_if_branch_is_error() {
         .body;
     let result = lower_stmts(&stmts, &mut ctx);
     assert!(
-        matches!(result, Err(LoweringError::Unsupported(_))),
-        "expected Unsupported error, got: {result:?}"
+        result
+            .errors
+            .iter()
+            .any(|e| matches!(e, LoweringError::Unsupported { .. })),
+        "expected Unsupported error, got: {:?}",
+        result.errors,
     );
 }
 
@@ -355,8 +359,12 @@ fn test_http_serve_in_function_body_is_error() {
         .body;
     let result = lower_stmts(&stmts, &mut ctx);
     assert!(
-        matches!(result, Err(LoweringError::Unsupported(_))),
-        "expected Unsupported error, got: {result:?}"
+        result
+            .errors
+            .iter()
+            .any(|e| matches!(e, LoweringError::Unsupported { .. })),
+        "expected Unsupported error, got: {:?}",
+        result.errors,
     );
 }
 

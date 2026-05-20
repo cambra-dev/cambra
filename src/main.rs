@@ -2,7 +2,7 @@ use std::{thread, time::Duration};
 
 use cambra::{
     ccl::{
-        context::{GlobalContext, compile_program},
+        context::{GlobalContext, compile_program, eprint_errors},
         symbolic::symbolic,
     },
     interpreter::{
@@ -17,9 +17,9 @@ use log::debug;
 /// Runs a Cambra program from a source string.
 ///
 /// `src_name` is the label shown in error reports (typically the input
-/// file name). Returns `Err(())` if compilation failed; the error has
-/// already been rendered to stderr by [`CompileError::eprint`], so the
-/// caller's job is just to exit non-zero.
+/// file name). Returns `Err(())` if compilation failed; the errors have
+/// already been rendered to stderr by [`eprint_errors`], so the caller's
+/// job is just to exit non-zero.
 fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<(), ()> {
     use std::{cell::RefCell, rc::Rc};
 
@@ -33,8 +33,8 @@ fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<
     let mut ctx = GlobalContext::default();
     let mut compiled = match compile_program(&mut ctx, code, consumer) {
         Ok(c) => c,
-        Err(e) => {
-            e.eprint(src_name, code);
+        Err(errs) => {
+            eprint_errors(&errs, src_name, code);
             return Err(());
         }
     };

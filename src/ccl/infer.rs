@@ -314,6 +314,7 @@ fn collect_expr_errors(expr: &Expr, errors: &mut Vec<InferError>) {
             }
             expr.walk_children(|e| collect_expr_errors(e, errors));
         }
+        TypedExprNode::Error => crate::unexpected_error_node!(),
         _ => expr.walk_children(|e| collect_expr_errors(e, errors)),
     }
 }
@@ -582,6 +583,8 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
         | TypedExprNode::Define { .. } => {}
 
         TypedExprNode::Case { .. } => unreachable!("Case handled by early-return above"),
+
+        TypedExprNode::Error => crate::unexpected_error_node!(),
     }
 }
 
@@ -1117,6 +1120,8 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
         }
 
         TypedExprNode::Defer => Ok(Type::Infer(ctx.fresh_infer_var())),
+
+        TypedExprNode::Error => crate::unexpected_error_node!(),
     }?;
 
     // Check user_annotation compatibility. If the user provided an explicit annotation,

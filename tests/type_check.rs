@@ -57,7 +57,9 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
         );
     }
     let stmts = parse_module(code);
-    let mut expr = lower_stmts(&stmts, &mut lctx).expect("lowering failed");
+    let mut expr = lower_stmts(&stmts, &mut lctx)
+        .into_result()
+        .expect("lowering failed");
     infer(&mut expr, &mut ictx).expect("inference failed")
 }
 
@@ -66,7 +68,9 @@ fn infer_program_err(code: &str) -> Vec<InferError> {
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
     let stmts = parse_module(code);
-    let mut expr = lower_stmts(&stmts, &mut lctx).expect("lowering failed");
+    let mut expr = lower_stmts(&stmts, &mut lctx)
+        .into_result()
+        .expect("lowering failed");
     infer(&mut expr, &mut ictx).expect_err("expected inference error")
 }
 

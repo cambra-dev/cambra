@@ -68,8 +68,8 @@ use crate::{
     },
     chl_parser::ast::{
         AssignTarget, AugOp, BinOp as ChlBinOp, BoolOp, CmpOp, CompClause, Comprehension,
-        Expr as ChlExpr, IfBranch, Lit as ChlLit, Param, RecordField, Spanned, Stmt as ChlStmt,
-        UnaryOp,
+        Expr as ChlExpr, IfBranch, Lit as ChlLit, Param, RecordField, Span, Spanned,
+        Stmt as ChlStmt, UnaryOp,
     },
     interpreter::{
         DataSink, DataSourceDomainExtentImpl, HttpServerDataSource, http_server::SharedHttpServer,
@@ -81,10 +81,119 @@ use crate::{
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur during CHL → CCL lowering.
+///
+/// Carries the source span of the offending construct so the error can be
+/// rendered with ariadne via [`LoweringError::to_report`] / the
+/// [`crate::ccl::context::CompileError::Lower`] dispatch in
+/// [`crate::ccl::context::CompileError::render`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoweringError {
     /// The AST node or construct is not yet supported by this lowering pass.
-    Unsupported(String),
+    Unsupported {
+        /// Span of the offending construct (the [`Spanned<ChlExpr>`] /
+        /// [`Spanned<ChlStmt>`] / sub-node that triggered the rejection).
+        span: Span,
+        /// Human-readable description of why the construct is unsupported.
+        message: String,
+    },
+}
+
+impl LoweringError {
+    /// Construct an `Unsupported` lowering error at the given span.
+    ///
+    /// Convenience over the struct-init form so call sites read
+    /// `LoweringError::unsupported(span, "...")` rather than the verbose
+    /// `LoweringError::Unsupported { span, message: "...".into() }`.
+    pub fn unsupported(span: Span, message: impl Into<String>) -> Self {
+        LoweringError::Unsupported {
+            span,
+            message: message.into(),
+        }
+    }
+
+    /// Primary source span of this error.
+    pub fn span(&self) -> Span {
+        match self {
+            LoweringError::Unsupported { span, .. } => *span,
+        }
+    }
+
+    /// Build an ariadne [`Report`](ariadne::Report) with default (colour-on)
+    /// configuration.
+    pub fn to_report<'a>(
+        &self,
+        src_name: &'a str,
+    ) -> ariadne::Report<'a, (&'a str, std::ops::Range<usize>)> {
+        self.to_report_with_config(src_name, ariadne::Config::default())
+    }
+
+    /// Build an ariadne [`Report`](ariadne::Report) using the supplied
+    /// [`Config`](ariadne::Config). Use this to disable colour for snapshot
+    /// or log output; interactive callers should use [`Self::to_report`].
+    pub fn to_report_with_config<'a>(
+        &self,
+        src_name: &'a str,
+        config: ariadne::Config,
+    ) -> ariadne::Report<'a, (&'a str, std::ops::Range<usize>)> {
+        use ariadne::{Color, Label, Report, ReportKind};
+        match self {
+            LoweringError::Unsupported { span, message } => {
+                Report::build(ReportKind::Error, src_name, span.start)
+                    .with_config(config)
+                    .with_message("lowering error")
+                    .with_label(
+                        Label::new((src_name, (*span).into()))
+                            .with_message(message)
+                            .with_color(Color::Red),
+                    )
+                    .finish()
+            }
+        }
+    }
+}
+
+/// Output of [`lower_stmts`].
+///
+/// Mirrors the shape of [`crate::chl_parser::parser::ParseResult`]: a (possibly
+/// partial) lowered expression is returned alongside every error encountered,
+/// so callers can surface every diagnostic in one pass.  Failed sub-trees are
+/// filled with [`TypedExprNode::Error`] placeholders — these are only valid
+/// while `errors` is non-empty; callers must check `errors` before passing the
+/// tree to inference or any downstream stage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoweringResult {
+    /// The lowered expression. `Some` even on error if recovery produced
+    /// anything usable; `None` only when there is nothing structural to
+    /// return at all (e.g. an empty top-level statement list).
+    pub value: Option<Expr>,
+    /// Errors collected during lowering.  Non-empty implies `value` (if
+    /// `Some`) contains [`TypedExprNode::Error`] placeholders.
+    pub errors: Vec<LoweringError>,
+}
+
+impl LoweringResult {
+    /// `true` iff lowering succeeded with no errors at all.
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty() && self.value.is_some()
+    }
+
+    /// Collapse into a `Result`, treating any errors as failure. Convenient
+    /// for call sites that don't care about partial output (e.g. tests).
+    ///
+    /// Panics if the invariant `value.is_some() || !errors.is_empty()` is
+    /// violated. [`lower_stmts`] guarantees that invariant — either it
+    /// produces an `Expr` (possibly with `Error` placeholders) or it records
+    /// at least one error. The panic only fires on manually-constructed
+    /// `LoweringResult { value: None, errors: vec![] }`.
+    pub fn into_result(self) -> Result<Expr, Vec<LoweringError>> {
+        if !self.errors.is_empty() {
+            Err(self.errors)
+        } else {
+            Ok(self
+                .value
+                .expect("LoweringResult: empty errors but no value (invariant violation)"))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +345,7 @@ pub fn lower_expr(
             ops,
             comparators,
         } => lower_compare(left, ops, comparators, ctx),
-        ChlExpr::BoolOp { op, operands } => lower_boolop(*op, operands, ctx),
+        ChlExpr::BoolOp { op, operands } => lower_boolop(expr.span, *op, operands, ctx),
         ChlExpr::List(elts) => {
             let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
             Ok(Expr::list(items?))
@@ -251,12 +360,13 @@ pub fn lower_expr(
         ChlExpr::Subscript { target, index } => match &index.node {
             ChlExpr::Lit(ChlLit::Int(n)) => {
                 let idx: usize = (*n).try_into().map_err(|_| {
-                    LoweringError::Unsupported("Tuple index must be non-negative".into())
+                    LoweringError::unsupported(index.span, "tuple index must be non-negative")
                 })?;
                 Ok(Expr::apply(lower_expr(target, ctx)?, Expr::proj_index(idx)))
             }
-            _ => Err(LoweringError::Unsupported(
-                "Only integer subscripts are supported".into(),
+            _ => Err(LoweringError::unsupported(
+                index.span,
+                "only integer subscripts are supported",
             )),
         },
         // Record literal `{field: expr, ...}` — keys are bare identifiers.
@@ -264,27 +374,34 @@ pub fn lower_expr(
         // `Record([("x", Lit(1)), ("y", Lit("foo"))])`.
         ChlExpr::Record(fields) => {
             let mut out = Vec::with_capacity(fields.len());
-            for RecordField { name, value, .. } in fields {
+            for RecordField {
+                name,
+                name_span,
+                value,
+            } in fields
+            {
                 let field_name = name.as_str().to_string();
                 if out.iter().any(|(k, _)| k == &field_name) {
-                    return Err(LoweringError::Unsupported(format!(
-                        "duplicate key `{field_name}` in record literal"
-                    )));
+                    return Err(LoweringError::unsupported(
+                        *name_span,
+                        format!("duplicate key `{field_name}` in record literal"),
+                    ));
                 }
                 out.push((field_name, lower_expr(value, ctx)?));
             }
             Ok(Expr::new(TypedExprNode::Record(out)))
         }
         // Dict literal with expression keys is not supported as a record.
-        ChlExpr::Dict(_) => Err(LoweringError::Unsupported(
-            "dict literals (with non-identifier keys) are not yet supported".into(),
+        ChlExpr::Dict(_) => Err(LoweringError::unsupported(
+            expr.span,
+            "dict literals (with non-identifier keys) are not yet supported",
         )),
         // Attribute access `r.field` → `Apply(r, Proj(Field("field")))`.
         ChlExpr::Attribute { target, attr, .. } => Ok(Expr::apply(
             lower_expr(target, ctx)?,
             Expr::proj_field(attr.as_str()),
         )),
-        ChlExpr::Lambda { params, body } => lower_lambda(params, body, ctx),
+        ChlExpr::Lambda { params, body } => lower_lambda(expr.span, params, body, ctx),
         ChlExpr::UnaryOp { op, operand } => lower_unaryop(*op, operand, ctx),
         // Ternary `then_expr if cond else else_expr` → Case { [guard → value, true → orelse] }
         ChlExpr::IfExp {
@@ -311,12 +428,17 @@ pub fn lower_expr(
         // `target << value` — feed into a deferred output.
         ChlExpr::Feed { target, value } => lower_feed(target, value, ctx),
         // `yield e` is only valid in a generator-for body; reject elsewhere.
-        ChlExpr::Yield(_) => Err(LoweringError::Unsupported(
-            "yield outside a generator for-loop context".into(),
+        ChlExpr::Yield(_) => Err(LoweringError::unsupported(
+            expr.span,
+            "yield outside a generator for-loop context",
         )),
-        ChlExpr::Error => Err(LoweringError::Unsupported(
-            "encountered parse-error recovery placeholder".into(),
-        )),
+        // Parse-recovery placeholder: silently substitute a CCL placeholder so
+        // we keep lowering the rest of the tree. The parse error itself has
+        // already been reported via [`crate::chl_parser::ParseResult::errors`];
+        // adding a redundant lowering error would just clutter the diagnostic
+        // output. [`crate::ccl::context::compile_program`] guards against this
+        // placeholder ever reaching inference.
+        ChlExpr::Error => Ok(Expr::error()),
     }
 }
 
@@ -339,14 +461,78 @@ pub fn lower_expr(
 /// resolves to the computed response morphism.  After `remove_defers`
 /// removes all `Feed` nodes, `simplify` drops the `ExprStmt`, leaving a clean
 /// `Let* Record{…}` shape for `compile_program`.
-pub fn lower_stmts(
+pub fn lower_stmts(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) -> LoweringResult {
+    let mut errors: Vec<LoweringError> = Vec::new();
+    let value = lower_stmts_recovering(stmts, ctx, &mut errors);
+    LoweringResult { value, errors }
+}
+
+/// Top-level statement-iteration with per-statement error recovery.
+///
+/// Differs from [`lower_stmts_inner`] (used by nested blocks) in that an error
+/// on any single statement is recorded into `errors`, a placeholder
+/// [`TypedExprNode::Error`] is substituted, and lowering continues on the
+/// remaining statements. The result is therefore a best-effort tree whose
+/// validity depends on `errors` being empty.
+///
+/// The sink-bindings record-wrap from the original `lower_stmts` is still
+/// applied around the recovered tree.
+fn lower_stmts_recovering(
     stmts: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
-) -> Result<Expr, LoweringError> {
-    let inner = lower_stmts_inner(stmts, &HashSet::new(), ctx, true)?;
-    if ctx.sink_bindings.is_empty() {
-        return Ok(inner);
+    errors: &mut Vec<LoweringError>,
+) -> Option<Expr> {
+    if stmts.is_empty() {
+        // Defensive catch-all for callers that bypass [`compile_program`]'s
+        // empty-program short-circuit (which emits a properly-spanned error).
+        // We cannot synthesise a meaningful span here because we don't see the
+        // source string — the file's only feature is its emptiness.
+        errors.push(LoweringError::unsupported(
+            Span::new(0, 0),
+            "empty program: file contains no top-level statements",
+        ));
+        return None;
     }
+    let outer_bindings = HashSet::new();
+    let (last, rest) = stmts.split_last().unwrap();
+
+    // Final statement: recover by substituting Expr::error() on failure.
+    let final_expr = match lower_final_stmt(last, rest, &outer_bindings, ctx) {
+        Ok(e) => e,
+        Err(e) => {
+            errors.push(e);
+            Expr::error()
+        }
+    };
+
+    // Middle statements: each call takes ownership of `acc` (the continuation
+    // we've built so far), so when one fails we need a snapshot to fall back
+    // to. Cloning unconditionally is fine — lowering isn't a hot path and
+    // errors are exceptional.
+    let body = rest
+        .iter()
+        .enumerate()
+        .rev()
+        .fold(final_expr, |acc, (i, stmt)| {
+            let backup = acc.clone();
+            match lower_middle_stmt(stmt, &rest[..i], acc, &outer_bindings, ctx, true) {
+                Ok(e) => e,
+                Err(e) => {
+                    errors.push(e);
+                    // Wrap with a placeholder ExprStmt so the continuation
+                    // (`backup`) and any later siblings remain reachable in
+                    // the partial tree. The tree is not consumed past
+                    // lowering when errors are present, so the placeholder's
+                    // role is purely structural.
+                    Expr::expr_stmt(Expr::error(), backup)
+                }
+            }
+        });
+
+    if ctx.sink_bindings.is_empty() {
+        return Some(body);
+    }
+
     // Build a Record whose fields are the sink-bound names in sorted order
     // (sort for determinism — HashMap iteration is unordered).
     let mut sink_names: Vec<String> = ctx.sink_bindings.keys().cloned().collect();
@@ -359,7 +545,7 @@ pub fn lower_stmts(
     ));
     // Place ExprStmt(body, record) at the innermost position of the Let* chain
     // so the Record has the sink Var references in scope.
-    Ok(append_record_at_tail(inner, record))
+    Some(append_record_at_tail(body, record))
 }
 
 /// Walk to the innermost non-`Let`/`ExprStmt` continuation and wrap it with
@@ -420,9 +606,12 @@ fn lower_stmts_inner(
     ctx: &mut LoweringContext,
     is_top_level: bool,
 ) -> Result<Expr, LoweringError> {
-    if stmts.is_empty() {
-        return Err(LoweringError::Unsupported("Empty statement block".into()));
-    }
+    // The CHL `block` parser uses `.at_least(1)`, so nested blocks always have
+    // at least one statement by the time they reach us.
+    assert!(
+        !stmts.is_empty(),
+        "lower_stmts_inner: empty nested block (parser invariant violated)"
+    );
 
     let (last, rest) = stmts.split_last().unwrap();
 
@@ -458,7 +647,7 @@ fn lower_final_stmt(
             // inside the if branches can check for mutation correctly.
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
-            lower_if(branches, else_body.as_deref(), &scope, ctx)
+            lower_if(last.span, branches, else_body.as_deref(), &scope, ctx)
         }
         ChlStmt::For { target, iter, body } => {
             // Build outer bindings: caller's bindings + all names from rest.
@@ -466,10 +655,12 @@ fn lower_final_stmt(
             collect_stmt_names(preceding, &mut scope);
             lower_generator_for(target, iter, body, &scope, ctx)
         }
-        _ => Err(LoweringError::Unsupported(
-            "Last statement must be a bare expression, if/else, or \
-                 for/yield generator loop"
-                .into(),
+        // Parse-recovery placeholder: silently substitute. See `ChlExpr::Error`.
+        ChlStmt::Error => Ok(Expr::error()),
+        _ => Err(LoweringError::unsupported(
+            last.span,
+            "last statement must be a bare expression, if/else, or \
+                 for/yield generator loop",
         )),
     }
 }
@@ -502,10 +693,10 @@ fn lower_middle_stmt(
         // in general.
         ChlStmt::Assign { target, value } if is_http_serve_tuple_assign(target, value) => {
             if !is_top_level {
-                return Err(LoweringError::Unsupported(
+                return Err(LoweringError::unsupported(
+                    stmt.span,
                     "http_serve is only supported at the top level of a program, \
-                     not inside an if/else branch or function body"
-                        .into(),
+                     not inside an if/else branch or function body",
                 ));
             }
             let (req_name, resp_name) = extract_http_serve_names(target)?;
@@ -513,24 +704,31 @@ fn lower_middle_stmt(
             // Create and register the source now; the caller drains new_sources
             // via take_new_sources() after lower_stmts returns, before type inference.
             let port_u16: u16 = port.parse().map_err(|_| {
-                LoweringError::Unsupported(format!("http_serve port must be a u16, got {port:?}"))
+                LoweringError::unsupported(
+                    value.span,
+                    format!("http_serve port must be a u16, got {port:?}"),
+                )
             })?;
             // Share one tiny_http::Server per port across all http_serve routes.
             if let std::collections::hash_map::Entry::Vacant(e) = ctx.shared_servers.entry(port_u16)
             {
                 let server = SharedHttpServer::new(port_u16).map_err(|e| {
-                    LoweringError::Unsupported(format!(
-                        "http_serve: failed to bind port {port_u16}: {e}"
-                    ))
+                    LoweringError::unsupported(
+                        value.span,
+                        format!("http_serve: failed to bind port {port_u16}: {e}"),
+                    )
                 })?;
                 e.insert(Arc::new(server));
             }
             let server = ctx.shared_servers[&port_u16].clone();
             let source_name = http_requests_source_name(&port, &method, &path);
             if ctx.sources.contains_key(&source_name) {
-                return Err(LoweringError::Unsupported(format!(
-                    "duplicate http_serve registration: port={port}, method={method}, path={path}"
-                )));
+                return Err(LoweringError::unsupported(
+                    value.span,
+                    format!(
+                        "duplicate http_serve registration: port={port}, method={method}, path={path}"
+                    ),
+                ));
             }
             let source_obj = Rc::new(RefCell::new(HttpServerDataSource::new(
                 &server,
@@ -585,7 +783,7 @@ fn lower_middle_stmt(
             params,
             body: fn_body,
         } => {
-            let func_expr = lower_function_body(params, fn_body, ctx)?;
+            let func_expr = lower_function_body(stmt.span, params, fn_body, ctx)?;
             Ok(Expr::let_bind(name.as_str().to_string(), func_expr, body))
         }
         // For a for-loop in the middle of a block, check whether it is a mutation
@@ -623,13 +821,16 @@ fn lower_middle_stmt(
             // so users don't see the generic "must end in yield"
             // error from the generator-for fallback below.
             if let Some(nested) = find_nested_mutation_var(for_body, &scope) {
-                return Err(LoweringError::Unsupported(format!(
-                    "Mutation of `{nested}` is nested inside an `if` or \
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    format!(
+                        "mutation of `{nested}` is nested inside an `if` or \
                      inner `for` in this for-loop body; only top-level \
                      mutations of outer-scope variables are supported \
                      today.  Move the mutation to the top of the loop \
                      body, or rewrite using a generator expression."
-                )));
+                    ),
+                ));
             }
 
             // Otherwise treat as a side-effecting for loop.
@@ -642,10 +843,13 @@ fn lower_middle_stmt(
             lower_final_stmt(stmt, preceding, outer_bindings, ctx)?,
             body,
         )),
-        _ => Err(LoweringError::Unsupported(
-            "Only assignment and function definition statements are supported \
-             before the final expression"
-                .into(),
+        // Parse-recovery placeholder: silently drop the broken statement and
+        // pass the continuation through. See `ChlExpr::Error`.
+        ChlStmt::Error => Ok(body),
+        _ => Err(LoweringError::unsupported(
+            stmt.span,
+            "only assignment and function definition statements are supported \
+             before the final expression",
         )),
     }
 }
@@ -683,9 +887,10 @@ fn extract_name_target(
 ) -> Result<String, LoweringError> {
     match &target.node {
         AssignTarget::Name(id) => Ok(id.as_str().to_string()),
-        AssignTarget::Tuple(_) => Err(LoweringError::Unsupported(format!(
-            "{context}: only simple name targets are supported"
-        ))),
+        AssignTarget::Tuple(_) => Err(LoweringError::unsupported(
+            target.span,
+            format!("{context}: only simple name targets are supported"),
+        )),
     }
 }
 
@@ -715,15 +920,16 @@ fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, Lowering
             "int" => Ok(Type::Base(BaseType::Int)),
             "str" => Ok(Type::Base(BaseType::String)),
             "bool" => Ok(Type::Base(BaseType::Bool)),
-            _ => Err(LoweringError::Unsupported(format!(
-                "Unknown type annotation: {id}"
-            ))),
+            _ => Err(LoweringError::unsupported(
+                annotation.span,
+                format!("unknown type annotation: {id}"),
+            )),
         },
         ChlExpr::Lit(ChlLit::None) => Ok(Type::Base(BaseType::Unit)),
-        _ => Err(LoweringError::Unsupported(format!(
-            "Unsupported type annotation form: {:?}",
-            &annotation.node
-        ))),
+        _ => Err(LoweringError::unsupported(
+            annotation.span,
+            format!("unsupported type annotation form: {:?}", &annotation.node),
+        )),
     }
 }
 
@@ -737,14 +943,16 @@ fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, Lowering
 /// A bare `if` without an `else` clause is not value-returning and is rejected
 /// with [`LoweringError::Unsupported`].
 fn lower_if(
+    if_span: Span,
     branches: &[IfBranch],
     else_body: Option<&[Spanned<ChlStmt>]>,
     outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let Some(else_body) = else_body else {
-        return Err(LoweringError::Unsupported(
-            "if without else is not supported as a value-returning expression".into(),
+        return Err(LoweringError::unsupported(
+            if_span,
+            "if without else is not supported as a value-returning expression",
         ));
     };
     // http_serve is not permitted inside if/else arms.
@@ -794,8 +1002,9 @@ fn lower_call(
     let name = match &func.node {
         ChlExpr::Name(id) => id.as_str(),
         _ => {
-            return Err(LoweringError::Unsupported(
-                "Only named function calls are supported".into(),
+            return Err(LoweringError::unsupported(
+                func.span,
+                "only named function calls are supported",
             ));
         }
     };
@@ -805,8 +1014,9 @@ fn lower_call(
         // λ k → λ i :(I | key_fn(c(i)) == k) → c(i)
         "groupby" => {
             if args.len() != 2 {
-                return Err(LoweringError::Unsupported(
-                    "groupby requires exactly two arguments".into(),
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    "groupby requires exactly two arguments",
                 ));
             }
             let collection = lower_expr(&args[0], ctx)?;
@@ -834,8 +1044,9 @@ fn lower_call(
         }
         "sum" | "max" => {
             if args.len() != 1 {
-                return Err(LoweringError::Unsupported(
-                    "Aggregate functions require exactly one argument".into(),
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    "aggregate functions require exactly one argument",
                 ));
             }
             let kind = match name {
@@ -853,9 +1064,10 @@ fn lower_call(
         _ => {
             // For zero-argument calls, only registered sources are allowed.
             if args.is_empty() {
-                return Err(LoweringError::Unsupported(format!(
-                    "Unknown zero-argument function: {name}; register it as a data source"
-                )));
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    format!("unknown zero-argument function: {name}; register it as a data source"),
+                ));
             }
             // Single-arg call: direct application `f(a)` → `Apply(a, f)`.
             if args.len() == 1 {
@@ -939,8 +1151,9 @@ fn lower_feed(
     let name = match &target.node {
         ChlExpr::Name(id) => id.as_str().to_string(),
         _ => {
-            return Err(LoweringError::Unsupported(
-                "handle binding: only simple name targets are supported".into(),
+            return Err(LoweringError::unsupported(
+                target.span,
+                "handle binding: only simple name targets are supported",
             ));
         }
     };
@@ -1038,13 +1251,15 @@ fn lower_compare(
 /// operator (`and` / `or`). For example, `a and b and c` becomes
 /// `(a and b) and c` — two nested [`BinOpKind::BoolLogic`] nodes.
 fn lower_boolop(
+    bool_span: Span,
     op: BoolOp,
     operands: &[Spanned<ChlExpr>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if operands.len() < 2 {
-        return Err(LoweringError::Unsupported(
-            "Boolean operator must have at least two operands".into(),
+        return Err(LoweringError::unsupported(
+            bool_span,
+            "boolean operator must have at least two operands",
         ));
     }
     let kind = match op {
@@ -1065,10 +1280,11 @@ fn lower_boolop(
 /// default arguments at the syntactic level, so the only remaining check
 /// is that there is at least one positional parameter. Shared between
 /// [`lower_lambda`] and [`lower_function_body`].
-fn validate_function_params(params: &[Param]) -> Result<(), LoweringError> {
+fn validate_function_params(fn_span: Span, params: &[Param]) -> Result<(), LoweringError> {
     if params.is_empty() {
-        return Err(LoweringError::Unsupported(
-            "Function/lambda with no parameters not supported".into(),
+        return Err(LoweringError::unsupported(
+            fn_span,
+            "function/lambda with no parameters not supported",
         ));
     }
     Ok(())
@@ -1137,11 +1353,12 @@ fn uncurry_params(params: &[Param], body_expr: Expr, ctx: &mut LoweringContext) 
 /// CHL parser already rejects `*args`, `**kwargs`, defaults, and keyword-only
 /// arguments at parse time.
 fn lower_lambda(
+    lambda_span: Span,
     params: &[Param],
     body: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    validate_function_params(params)?;
+    validate_function_params(lambda_span, params)?;
     let body_expr = lower_expr(body, ctx)?;
     Ok(uncurry_params(params, body_expr, ctx))
 }
@@ -1252,7 +1469,8 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
             |e| substitute_param_in_body(e, name, replacement),
         ),
 
-        // All remaining variants: pure structural recursion.
+        // All remaining variants (including the lowering-recovery `Error`
+        // placeholder, which has no children): pure structural recursion.
         node => {
             let mut expr = Expr {
                 node,
@@ -1403,9 +1621,13 @@ fn lower_for_body_stmts(
     mut frame_introduced: HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    if stmts.is_empty() {
-        return Err(LoweringError::Unsupported("Empty for-loop body".into()));
-    }
+    // Reached via `lower_for_body_stmts` from a parsed for-loop body, which
+    // goes through the CHL `block` parser (`.at_least(1)`). Empty here means
+    // a caller has bypassed the parser.
+    assert!(
+        !stmts.is_empty(),
+        "lower_for_body_stmts: empty body (parser invariant violated)"
+    );
     let (last, rest) = stmts.split_last().unwrap();
 
     let mut bindings: Vec<(String, Expr, Option<Type>)> = Vec::new();
@@ -1415,11 +1637,14 @@ fn lower_for_body_stmts(
             ChlStmt::Assign { target, value } => {
                 let name = extract_name_target(target, "assignment")?;
                 if mutation_scope.contains(&name) {
-                    return Err(LoweringError::Unsupported(format!(
-                        "Assignment to `{name}` is mutation: `{name}` is bound \
+                    return Err(LoweringError::unsupported(
+                        stmt.span,
+                        format!(
+                            "assignment to `{name}` is mutation: `{name}` is bound \
                          outside the for-loop body (function argument or \
                          pre-loop binding)",
-                    )));
+                        ),
+                    ));
                 }
                 let val = lower_expr(value, ctx)?;
                 frame_introduced.insert(name.clone());
@@ -1432,11 +1657,14 @@ fn lower_for_body_stmts(
             } => {
                 let name = extract_name_target(target, "annotated assignment")?;
                 if mutation_scope.contains(&name) {
-                    return Err(LoweringError::Unsupported(format!(
-                        "Assignment to `{name}` is mutation: `{name}` is bound \
+                    return Err(LoweringError::unsupported(
+                        stmt.span,
+                        format!(
+                            "assignment to `{name}` is mutation: `{name}` is bound \
                          outside the for-loop body (function argument or \
                          pre-loop binding)",
-                    )));
+                        ),
+                    ));
                 }
                 let ann = lower_type_annotation(annotation)?;
                 let val = lower_expr(value, ctx)?;
@@ -1446,28 +1674,34 @@ fn lower_for_body_stmts(
             ChlStmt::AugAssign { target, op, value } => {
                 let name = extract_name_target(target, "augmented assignment")?;
                 if mutation_scope.contains(&name) {
-                    return Err(LoweringError::Unsupported(format!(
-                        "Assignment to `{name}` is mutation: `{name}` is bound \
+                    return Err(LoweringError::unsupported(
+                        stmt.span,
+                        format!(
+                            "assignment to `{name}` is mutation: `{name}` is bound \
                          outside the for-loop body (function argument or \
                          pre-loop binding)",
-                    )));
+                        ),
+                    ));
                 }
                 if !frame_introduced.contains(&name) {
                     // x op= e is only valid if x was already introduced in this frame.
-                    return Err(LoweringError::Unsupported(format!(
-                        "Augmented assignment to `{name}` in for-loop body: \
+                    return Err(LoweringError::unsupported(
+                        stmt.span,
+                        format!(
+                            "augmented assignment to `{name}` in for-loop body: \
                          `{name}` is not bound in this body. Use `{name} = expr` \
                          for a fresh binding.",
-                    )));
+                        ),
+                    ));
                 }
                 let val = lower_aug_binop(&name, *op, value, ctx)?;
                 bindings.push((name, val, None));
             }
             ChlStmt::Define { .. } => {
-                return Err(LoweringError::Unsupported(
+                return Err(LoweringError::unsupported(
+                    stmt.span,
                     "`<<=` as a non-terminal statement in a for-loop body \
-                     is not supported"
-                        .into(),
+                     is not supported",
                 ));
             }
             ChlStmt::FunctionDef {
@@ -1477,21 +1711,24 @@ fn lower_for_body_stmts(
             } => {
                 let name_str = name.as_str().to_string();
                 if mutation_scope.contains(&name_str) {
-                    return Err(LoweringError::Unsupported(format!(
-                        "Assignment to `{name_str}` is mutation: `{name_str}` is bound \
+                    return Err(LoweringError::unsupported(
+                        stmt.span,
+                        format!(
+                            "assignment to `{name_str}` is mutation: `{name_str}` is bound \
                          outside the for-loop body (function argument or \
                          pre-loop binding)",
-                    )));
+                        ),
+                    ));
                 }
-                let func_expr = lower_function_body(params, fn_body, ctx)?;
+                let func_expr = lower_function_body(stmt.span, params, fn_body, ctx)?;
                 frame_introduced.insert(name_str.clone());
                 bindings.push((name_str, func_expr, None));
             }
             _ => {
-                return Err(LoweringError::Unsupported(
-                    "Only assignments and function definitions are supported as \
-                     non-terminal statements in for-loop bodies"
-                        .into(),
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    "only assignments and function definitions are supported as \
+                     non-terminal statements in for-loop bodies",
                 ));
             }
         }
@@ -1531,7 +1768,10 @@ fn lower_for_body_terminal(
         ChlStmt::Expr(value) => match &value.node {
             ChlExpr::Yield(y) => {
                 let name = defer_name.ok_or_else(|| {
-                    LoweringError::Unsupported("yield outside a generator for-loop context".into())
+                    LoweringError::unsupported(
+                        stmt.span,
+                        "yield outside a generator for-loop context",
+                    )
                 })?;
                 Ok(Expr::feed(name.to_string(), lower_expr(y, ctx)?))
             }
@@ -1541,10 +1781,10 @@ fn lower_for_body_terminal(
             // type-check via inference but could produce confusing behaviour.
             // A future improvement could add a lowering-time error here.
             ChlExpr::Feed { target, value } => lower_feed(target, value, ctx),
-            _ => Err(LoweringError::Unsupported(
-                "For-loop body must end in a yield, `<<` feed, nested for, \
-                 or if-guard"
-                    .into(),
+            _ => Err(LoweringError::unsupported(
+                value.span,
+                "for-loop body must end in a yield, `<<` feed, nested for, \
+                 or if-guard",
             )),
         },
         ChlStmt::If {
@@ -1552,17 +1792,17 @@ fn lower_for_body_terminal(
             else_body,
         } => {
             if else_body.is_some() {
-                return Err(LoweringError::Unsupported(
+                return Err(LoweringError::unsupported(
+                    stmt.span,
                     "if/else inside generator for-loop body is not supported; \
-                     use a plain if-guard (no else branch)"
-                        .into(),
+                     use a plain if-guard (no else branch)",
                 ));
             }
             if branches.len() != 1 {
-                return Err(LoweringError::Unsupported(
+                return Err(LoweringError::unsupported(
+                    stmt.span,
                     "if/elif inside generator for-loop body is not supported; \
-                     use a plain if-guard (no elif/else branches)"
-                        .into(),
+                     use a plain if-guard (no elif/else branches)",
                 ));
             }
             let branch = &branches[0];
@@ -1601,8 +1841,9 @@ fn lower_for_body_terminal(
                 lower_for_body_stmts(body, defer_name, &inner_mutation_scope, inner_frame, ctx)?;
             Ok(Expr::for_loop(inner_var, inner_source, inner_body))
         }
-        _ => Err(LoweringError::Unsupported(
-            "For-loop body must end in a yield, `<<` feed, nested for, or if-guard".into(),
+        _ => Err(LoweringError::unsupported(
+            stmt.span,
+            "for-loop body must end in a yield, `<<` feed, nested for, or if-guard",
         )),
     }
 }
@@ -2000,8 +2241,9 @@ fn lower_mutation_loop_body(
                 let defer_name = match &feed_target.node {
                     ChlExpr::Name(id) => id.as_str().to_string(),
                     _ => {
-                        return Err(LoweringError::Unsupported(
-                            "feed target: only simple name targets are supported".into(),
+                        return Err(LoweringError::unsupported(
+                            feed_target.span,
+                            "feed target: only simple name targets are supported",
                         ));
                     }
                 };
@@ -2015,17 +2257,20 @@ fn lower_mutation_loop_body(
             // SSA-style scope.
             ChlStmt::Expr(value) if let ChlExpr::Yield(y) = &value.node => {
                 let defer_name = yield_defer.ok_or_else(|| {
-                    LoweringError::Unsupported("yield outside a generator for-loop context".into())
+                    LoweringError::unsupported(
+                        value.span,
+                        "yield outside a generator for-loop context",
+                    )
                 })?;
                 let feed_value = lower_expr(y, ctx)?;
                 let wrapped = wrap_chain(&let_chain, feed_value);
                 feeds.push((defer_name.to_string(), wrapped));
             }
             _ => {
-                return Err(LoweringError::Unsupported(
-                    "Only assignments (`x = …`, `x op= …`), `<<` feeds, and \
-                     `yield` are supported inside a mutation loop body"
-                        .into(),
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    "only assignments (`x = …`, `x op= …`), `<<` feeds, and \
+                     `yield` are supported inside a mutation loop body",
                 ));
             }
         }
@@ -2073,11 +2318,12 @@ struct MutationLoopBody {
 /// statement is a `for`-loop with a yield chain, it is lowered as a
 /// generator; otherwise it's a regular function body.
 fn lower_function_body(
+    fn_span: Span,
     params: &[Param],
     body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    validate_function_params(params)?;
+    validate_function_params(fn_span, params)?;
     let outer_bindings: HashSet<String> =
         params.iter().map(|p| p.name.as_str().to_string()).collect();
     // http_serve is not permitted inside function bodies.
@@ -2280,19 +2526,21 @@ fn group_comp_clauses(clauses: &[CompClause]) -> Result<Vec<CompGenerator<'_>>, 
             CompClause::For { target, iter } => out.push((target, iter, Vec::new())),
             CompClause::If(guard) => {
                 let Some(last) = out.last_mut() else {
-                    return Err(LoweringError::Unsupported(
-                        "comprehension `if` clause must follow a `for` clause".into(),
+                    return Err(LoweringError::unsupported(
+                        guard.span,
+                        "comprehension `if` clause must follow a `for` clause",
                     ));
                 };
                 last.2.push(guard);
             }
         }
     }
-    if out.is_empty() {
-        return Err(LoweringError::Unsupported(
-            "comprehension must contain at least one `for` clause".into(),
-        ));
-    }
+    // The CHL `comp_clauses` parser uses `.at_least(1)`, so the input list is
+    // never empty in a parsed comprehension.
+    assert!(
+        !out.is_empty(),
+        "group_comp_clauses: empty clause list (parser invariant violated)"
+    );
     Ok(out)
 }
 
@@ -2422,14 +2670,16 @@ fn extract_http_serve_names(
     target: &Spanned<AssignTarget>,
 ) -> Result<(String, String), LoweringError> {
     let AssignTarget::Tuple(elts) = &target.node else {
-        return Err(LoweringError::Unsupported(
-            "http_serve target must be a 2-tuple".into(),
+        return Err(LoweringError::unsupported(
+            target.span,
+            "http_serve target must be a 2-tuple",
         ));
     };
     let extract = |t: &Spanned<AssignTarget>| match &t.node {
         AssignTarget::Name(id) => Ok(id.as_str().to_string()),
-        _ => Err(LoweringError::Unsupported(
-            "http_serve tuple elements must be simple names".into(),
+        _ => Err(LoweringError::unsupported(
+            t.span,
+            "http_serve tuple elements must be simple names",
         )),
     };
     Ok((extract(&elts[0])?, extract(&elts[1])?))
@@ -2440,14 +2690,16 @@ fn extract_http_serve_args(
     value: &Spanned<ChlExpr>,
 ) -> Result<(String, String, String), LoweringError> {
     let ChlExpr::Call { args, .. } = &value.node else {
-        return Err(LoweringError::Unsupported(
-            "Expected http_serve call".into(),
+        return Err(LoweringError::unsupported(
+            value.span,
+            "expected http_serve call",
         ));
     };
     let extract = |expr: &Spanned<ChlExpr>| match &expr.node {
         ChlExpr::Lit(ChlLit::String(s)) => Ok(s.clone()),
-        _ => Err(LoweringError::Unsupported(
-            "http_serve arguments must be string literals".into(),
+        _ => Err(LoweringError::unsupported(
+            expr.span,
+            "http_serve arguments must be string literals",
         )),
     };
     Ok((extract(&args[0])?, extract(&args[1])?, extract(&args[2])?))
@@ -2486,6 +2738,24 @@ mod tests {
             .into_result()
             .expect("Failed to parse module")
             .body
+    }
+
+    /// Lower `stmts`, expect exactly one lowering error, and return it.
+    ///
+    /// Test-only convenience: most negative-path tests want to check the
+    /// single error they expect against a pattern, so we unpack the `Vec`
+    /// here once instead of at every call site.
+    fn expect_one_lowering_error(stmts: &[Spanned<ChlStmt>]) -> LoweringError {
+        let errs = lower_stmts(stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect_err("expected lowering error");
+        assert_eq!(
+            errs.len(),
+            1,
+            "expected exactly one lowering error, got {}: {errs:?}",
+            errs.len()
+        );
+        errs.into_iter().next().unwrap()
     }
 
     // -----------------------------------------------------------------------
@@ -2705,7 +2975,9 @@ in define(x, 1); define(y, 2); x"
     )]
     fn test_lower_stmts(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2746,7 +3018,9 @@ in λ __iter_record → __iter_record ▷ [10, 20] ▷ (λ x → x + y)"
     )]
     fn test_lower_list_comp(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2912,7 +3186,9 @@ in guarded_let"
     )]
     fn test_lower_generator_fn(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2943,7 +3219,9 @@ in add"
     )]
     fn test_lower_function_def(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -2962,9 +3240,8 @@ def bad(xs):
         x += 1
 bad";
         let stmts = parse_module(code);
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        assert!(matches!(err, LoweringError::Unsupported(_)));
+        let err = expect_one_lowering_error(&stmts);
+        assert!(matches!(err, LoweringError::Unsupported { .. }));
     }
 
     /// Brainstorm §4b — a generator with loop-carried state lowers to a
@@ -2982,6 +3259,7 @@ def running_totals(items):
 running_totals";
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
             .expect("running_totals should lower as a mutation loop with a yield-tap");
         let s = symbolic(&ccl);
         assert!(
@@ -3016,6 +3294,7 @@ def bad(xs, n):
 bad";
         let stmts = parse_module(code);
         let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
             .expect("generator mutating an argument should lower as a mutation loop");
         let s = symbolic(&ccl);
         assert!(
@@ -3040,9 +3319,8 @@ def bad(xs, ys):
             yield y
 bad";
         let stmts = parse_module(code);
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        let LoweringError::Unsupported(msg) = &err;
+        let err = expect_one_lowering_error(&stmts);
+        let LoweringError::Unsupported { message: msg, .. } = &err;
         assert!(
             msg.contains("mutation") && msg.contains("`y`"),
             "error should mention mutation of `y`: {msg}"
@@ -3062,9 +3340,8 @@ for i in [1, 2]:
         x = x + i
 x";
         let stmts = parse_module(code);
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        let LoweringError::Unsupported(msg) = &err;
+        let err = expect_one_lowering_error(&stmts);
+        let LoweringError::Unsupported { message: msg, .. } = &err;
         assert!(
             msg.contains("nested") && msg.contains("`x`"),
             "error should call out nested mutation of `x`: {msg}"
@@ -3081,9 +3358,8 @@ for i in [1, 2]:
         x = x + i + j
 x";
         let stmts = parse_module(code);
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        let LoweringError::Unsupported(msg) = &err;
+        let err = expect_one_lowering_error(&stmts);
+        let LoweringError::Unsupported { message: msg, .. } = &err;
         assert!(
             msg.contains("nested") && msg.contains("`x`"),
             "error should call out nested mutation of `x`: {msg}"
@@ -3132,10 +3408,9 @@ def bad(xs):
             yield 0
 bad";
         let stmts = parse_module(code);
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
+        let err = expect_one_lowering_error(&stmts);
         match &err {
-            LoweringError::Unsupported(msg) => {
+            LoweringError::Unsupported { message: msg, .. } => {
                 assert!(
                     msg.contains("if/else inside generator"),
                     "error should mention if/else in generator: {msg}"
@@ -3155,7 +3430,9 @@ def f(xs):
         yield x + a
 f";
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
         let s = symbolic(&ccl);
         assert!(
             s.contains("let a = 5") && s.contains("x + a"),
@@ -3230,12 +3507,12 @@ f";
         let one_arg = parse_expr("groupby(xs)");
         assert!(matches!(
             lower_expr(&one_arg, &mut LoweringContext::default()),
-            Err(LoweringError::Unsupported(_))
+            Err(LoweringError::Unsupported { .. })
         ));
         let three_args = parse_expr("groupby(xs, f, extra)");
         assert!(matches!(
             lower_expr(&three_args, &mut LoweringContext::default()),
-            Err(LoweringError::Unsupported(_))
+            Err(LoweringError::Unsupported { .. })
         ));
     }
 
@@ -3257,7 +3534,7 @@ f";
         let err = lower_expr(&expr, &mut LoweringContext::default())
             .expect_err("expected lowering error");
         assert!(
-            matches!(err, LoweringError::Unsupported(_)),
+            matches!(err, LoweringError::Unsupported { .. }),
             "expected Unsupported, got {err:?}"
         );
     }
@@ -3282,7 +3559,7 @@ f";
         let expr = parse_expr("unknown_source()");
         let err = lower_expr(&expr, &mut LoweringContext::default())
             .expect_err("expected lowering error");
-        assert!(matches!(err, LoweringError::Unsupported(_)));
+        assert!(matches!(err, LoweringError::Unsupported { .. }));
     }
 
     /// A registered source name used as a non-call expression (plain variable)
@@ -3302,7 +3579,9 @@ f";
         let mut ctx = LoweringContext::default();
         ctx.register_source("src", stub_source("src"));
         let stmts = parse_module("[x for x in src()]");
-        let ccl = lower_stmts(&stmts, &mut ctx).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut ctx)
+            .into_result()
+            .expect("lowering failed");
         // The source node should appear in the symbolic output.
         assert!(
             symbolic(&ccl).contains("source(src)"),
@@ -3339,7 +3618,9 @@ else:
     result = tmp + 2
 result";
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
         // Non-final if/else with assignment desugaring: this test remains ignored.
         // When implemented, the expected structure is:
         // let result = { cond → let tmp = 1 in tmp + 1; true → let tmp = 2 in tmp + 2 } in result
@@ -3360,7 +3641,9 @@ result";
 x = (y := 5) + 1
 x";
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
         // Fill in the expected string when `:=` is added to the CHL grammar
         // and lowering. Structure: let x = (let y = 5 in y) + 1 in x.
         assert_eq!(symbolic(&ccl), "");
@@ -3397,7 +3680,9 @@ x";
     )]
     fn test_lower_if(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
-        let ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -3420,7 +3705,9 @@ x";
     fn test_lower_non_tail_if() {
         let code = "x = 1\nif x > 0:\n    x = x + 1\nresult = x\nresult";
         let stmts = parse_module(code);
-        let _ccl = lower_stmts(&stmts, &mut LoweringContext::default()).expect("lowering failed");
+        let _ccl = lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("lowering failed");
         // Expected once implemented:
         // let x = 1 in let x = { x > 0 → x + 1; true → x } in let result = x in result
     }
@@ -3428,8 +3715,7 @@ x";
     #[test]
     fn test_lower_if_without_else_rejected() {
         let stmts = parse_module("if x:\n    1");
-        let err = lower_stmts(&stmts, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        assert!(matches!(err, LoweringError::Unsupported(_)));
+        let err = expect_one_lowering_error(&stmts);
+        assert!(matches!(err, LoweringError::Unsupported { .. }));
     }
 }

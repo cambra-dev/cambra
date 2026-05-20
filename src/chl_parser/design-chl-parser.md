@@ -212,6 +212,33 @@ This is what makes recovery useful: a caller that just wants Result-style
 wants to surface diagnostics on a partial parse can use both fields
 directly.
 
+### Threading partial ASTs through to lowering
+
+[`compile_program`](../ccl/context.rs) now runs the **lowering** stage even
+when the parser reported errors, so users see parse + lowering diagnostics
+in one pass instead of having to fix parse errors before any lowering
+problem becomes visible.
+
+The handshake is:
+
+- `parse_module` returns a `ParseResult` that may carry an `Expr::Error` /
+  `Stmt::Error` placeholder for each region that hit recovery.
+- [`crate::ccl::lower`] silently maps those placeholders to the analogous
+  `TypedExprNode::Error` in CCL (no second error is reported for a parse
+  hole — it's already in the user's diagnostic list).
+- `lower_stmts` itself returns a `LoweringResult { value, errors }` shaped
+  like `ParseResult`. Statement-level recovery means an unsupported
+  construct in one top-level statement doesn't shadow lowering errors in
+  other statements.
+- [`compile_program`] returns `Result<_, Vec<CompileError>>`. Each
+  `CompileError` is single-stage (`Parse(ParseError)`, `Lower(LoweringError)`,
+  …); the `Vec` is the union of every error collected before bailing.
+- Inference and downstream stages **do not run** if any parse or lowering
+  error was recorded, because the CCL tree may contain `Error`
+  placeholders. Every pass past lowering panics via
+  `unexpected_error_node!()` if it ever encounters one, which makes a
+  forgotten-guard regression loud rather than producing silent corruption.
+
 ### Error message quality
 
 Three layers, each independent and each pulling its weight:

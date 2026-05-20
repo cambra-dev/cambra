@@ -761,6 +761,7 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Source(_)
         | TypedExprNode::Defer => {}
+        TypedExprNode::Error => crate::unexpected_error_node!(),
     }
 }
 
