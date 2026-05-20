@@ -11,11 +11,10 @@ use log::debug;
 
 use crate::{
     ccl::{
-        Expr, Type,
+        Expr, Type, desugar_defers,
         infer::{InferError, TypeInferenceContext, check_fully_typed, infer, typecheck},
         inline, join_plan, lambda_elim,
         lower::{LoweringContext, LoweringError, lower_stmts},
-        remove_defers,
         symbolic::{symbolic, symbolic_typed},
     },
     interpreter::{
@@ -65,13 +64,14 @@ pub enum CompileError {
     /// The (parseable) AST uses a construct the lowering pass does not
     /// support yet.
     Lower(LoweringError),
+    /// Defer/Feed/Define desugaring rejected the program (e.g. a defer
+    /// binding with no feeds, mixed `<<`/`<<=` on the same handle, or a
+    /// `<<=` inside a non-top-level scope).
+    DesugarDefers(desugar_defers::DeferError),
     /// Type inference rejected one expression.
     Infer(InferError),
     /// Lambda elimination failed.
     LambdaElim(lambda_elim::LambdaElimError),
-    /// Defer/feed resolution failed (e.g. multiple definitions for one
-    /// deferred output).
-    RemoveDefers(remove_defers::DeferError),
     /// Operator-graph conversion failed.
     Conversion(ConversionError),
 }
@@ -101,14 +101,14 @@ impl CompileError {
                     .write((src_name, ariadne::Source::from(src)), &mut buf)
                     .expect("ariadne write should not fail on Vec<u8>");
             }
+            CompileError::DesugarDefers(e) => {
+                buf.extend_from_slice(format!("error: deferred collection: {e}\n").as_bytes());
+            }
             CompileError::Infer(e) => {
                 buf.extend_from_slice(format!("error: type inference: {e:?}\n").as_bytes());
             }
             CompileError::LambdaElim(e) => {
                 buf.extend_from_slice(format!("error: lambda elimination: {e:?}\n").as_bytes());
-            }
-            CompileError::RemoveDefers(e) => {
-                buf.extend_from_slice(format!("error: defer/feed resolution: {e:?}\n").as_bytes());
             }
             CompileError::Conversion(e) => {
                 buf.extend_from_slice(
@@ -170,9 +170,9 @@ impl From<lambda_elim::LambdaElimError> for CompileError {
     }
 }
 
-impl From<remove_defers::DeferError> for CompileError {
-    fn from(e: remove_defers::DeferError) -> Self {
-        Self::RemoveDefers(e)
+impl From<desugar_defers::DeferError> for CompileError {
+    fn from(e: desugar_defers::DeferError) -> Self {
+        Self::DesugarDefers(e)
     }
 }
 
@@ -205,9 +205,9 @@ impl IntoCompileErrors for lambda_elim::LambdaElimError {
     }
 }
 
-impl IntoCompileErrors for remove_defers::DeferError {
+impl IntoCompileErrors for desugar_defers::DeferError {
     fn into_compile_errors(self) -> Vec<CompileError> {
-        vec![CompileError::RemoveDefers(self)]
+        vec![CompileError::DesugarDefers(self)]
     }
 }
 
@@ -469,6 +469,15 @@ pub fn compile_program(
     // Drain sink bindings discovered during lowering before taking sources.
     let sink_bindings_registry = ctx.lowering_ctx().take_sink_bindings();
 
+    debug!("Lowered (pre-desugar):\n{}", symbolic(&expr));
+
+    // Desugar Defer/Feed/Define before inference: every `let d = Defer in body`
+    // gets rewritten so the body publishes its contribution to d via a
+    // `Record({result, to_d})` at the body's terminal, with the defer-bind
+    // site consuming the `to_d` projection.  After this, no Defer/Feed/Define
+    // nodes remain.
+    expr = desugar_defers::run(expr).errs()?;
+
     // Register every source (pre-registered + discovered during lowering) with
     // inference and operator-conversion now that the full source set is known.
     for (_name, source) in ctx.lowering_ctx().take_sources() {
@@ -509,16 +518,7 @@ pub fn compile_program(
     check_fully_typed(&lambda_elim).expect("missing types");
     typecheck(&lambda_elim).expect("type error after lambda elimination");
 
-    let defers_removed = remove_defers::run(lambda_elim).errs()?;
-    debug!("Defers removed CCL:\n{}", symbolic(&defers_removed));
-    debug!(
-        "Defers removed typed CCL:\n{}",
-        symbolic_typed(&defers_removed)
-    );
-    check_fully_typed(&defers_removed).expect("missing types after removing defers");
-    typecheck(&defers_removed).expect("type error after removing defers");
-
-    let join_planned = join_plan::run(defers_removed);
+    let join_planned = join_plan::run(lambda_elim);
     debug!(
         "Join-planned CCL:\n{} : {}",
         symbolic(&join_planned),

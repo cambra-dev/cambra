@@ -687,7 +687,6 @@ in x"
             init_args: vec![Expr::lit(Lit::Int(0))],
             source: Box::new(Expr::var("xs")),
             loop_body: Box::new(Expr::var("i")),
-            body_taps: Vec::new(),
         }),
         "loop i = 0 over xs do i"
     )]
@@ -701,7 +700,6 @@ in x"
             init_args: vec![Expr::lit(Lit::Int(0)), Expr::lit(Lit::Int(1))],
             source: Box::new(Expr::var("xs")),
             loop_body: Box::new(Expr::tuple(vec![Expr::var("x"), Expr::var("y")])),
-            body_taps: Vec::new(),
         }),
         "loop (x = 0, y = 1) over xs do (x, y)"
     )]

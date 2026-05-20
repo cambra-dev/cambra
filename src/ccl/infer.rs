@@ -28,7 +28,7 @@ use crate::ccl::{
     AggregateKind, BinOpKind, Branch, Builtin, Expr, InferVarId, Lit, MutationLoopShapeMut,
     ProjKey, RefinementKind, Type, TypedExprNode, UnaryOpKind, unify::UnificationTable,
 };
-use crate::ccl::{BaseType, TypedBinding, next_defer_id};
+use crate::ccl::{BaseType, TypedBinding};
 use crate::util::ScopeStack;
 
 // ---------------------------------------------------------------------------
@@ -279,7 +279,8 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Ve
 /// TODO fold this into [`typecheck`]
 pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
     let mut errors = Vec::new();
-    collect_expr_errors(expr, &mut errors);
+    let mut seen: HashSet<crate::ccl::RefinementId> = HashSet::new();
+    collect_expr_errors(expr, &mut errors, &mut seen);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -288,8 +289,18 @@ pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
 }
 
 /// Recursively collect all type errors from `expr` into `errors`.
-fn collect_expr_errors(expr: &Expr, errors: &mut Vec<InferError>) {
-    collect_type_errors(&expr.ty, &symbolic(expr), errors);
+///
+/// `seen_refinements` tracks already-visited `RefinementId`s to break
+/// cycles when a refinement's predicate expression has a type slot
+/// containing the same refinement (post-inference, this happens when
+/// a Lambda param's refinement embeds a predicate that mentions the
+/// param — e.g. filter-feed inside a defer-mediating UDF body).
+fn collect_expr_errors(
+    expr: &Expr,
+    errors: &mut Vec<InferError>,
+    seen_refinements: &mut HashSet<crate::ccl::RefinementId>,
+) {
+    collect_type_errors(&expr.ty, &symbolic(expr), errors, seen_refinements);
     // Binder-bearing variants emit per-binding type errors before descending
     // into their children; everything else just visits its direct children.
     match &expr.node {
@@ -300,22 +311,22 @@ fn collect_expr_errors(expr: &Expr, errors: &mut Vec<InferError>) {
                 // of this param.
                 errors.push(InferError::CannotInferParam(param.name.clone()));
             } else {
-                collect_type_errors(&param.ty, &param.name, errors);
+                collect_type_errors(&param.ty, &param.name, errors, seen_refinements);
             }
-            collect_expr_errors(body, errors);
+            collect_expr_errors(body, errors, seen_refinements);
         }
         TypedExprNode::Let { binding, .. } => {
-            collect_type_errors(&binding.ty, &binding.name, errors);
-            expr.walk_children(|e| collect_expr_errors(e, errors));
+            collect_type_errors(&binding.ty, &binding.name, errors, seen_refinements);
+            expr.walk_children(|e| collect_expr_errors(e, errors, seen_refinements));
         }
         TypedExprNode::Loop { params, .. } => {
             for p in params {
-                collect_type_errors(&p.ty, &p.name, errors);
+                collect_type_errors(&p.ty, &p.name, errors, seen_refinements);
             }
-            expr.walk_children(|e| collect_expr_errors(e, errors));
+            expr.walk_children(|e| collect_expr_errors(e, errors, seen_refinements));
         }
         TypedExprNode::Error => crate::unexpected_error_node!(),
-        _ => expr.walk_children(|e| collect_expr_errors(e, errors)),
+        _ => expr.walk_children(|e| collect_expr_errors(e, errors, seen_refinements)),
     }
 }
 
@@ -323,33 +334,57 @@ fn collect_expr_errors(expr: &Expr, errors: &mut Vec<InferError>) {
 ///
 /// `context_sym` is the symbolic representation of the expression whose type
 /// is being checked, used as the context string in any error pushed.
-fn collect_type_errors(ty: &Type, context_sym: &str, errors: &mut Vec<InferError>) {
+///
+/// `seen_refinements` breaks cycles through `Type::Refinement` predicates
+/// whose expression type slots contain the same refinement.
+fn collect_type_errors(
+    ty: &Type,
+    context_sym: &str,
+    errors: &mut Vec<InferError>,
+    seen_refinements: &mut HashSet<crate::ccl::RefinementId>,
+) {
     match ty {
         Type::Hole => errors.push(InferError::UnresolvedHole(context_sym.to_string())),
         Type::Infer(id) => errors.push(InferError::UnresolvedInfer(*id, context_sym.to_string())),
         Type::Fun(domain, codomain) => {
-            collect_type_errors(domain, context_sym, errors);
-            collect_type_errors(codomain, context_sym, errors);
+            collect_type_errors(domain, context_sym, errors, seen_refinements);
+            collect_type_errors(codomain, context_sym, errors, seen_refinements);
         }
         Type::Tuple(elems) => {
             for elem in elems {
-                collect_type_errors(elem, context_sym, errors);
+                collect_type_errors(elem, context_sym, errors, seen_refinements);
             }
         }
         Type::Record(fields) => {
             for (_, ty) in fields {
-                collect_type_errors(ty, context_sym, errors);
+                collect_type_errors(ty, context_sym, errors, seen_refinements);
             }
         }
         Type::Union(variants) => {
             for variant in variants {
-                collect_type_errors(variant, context_sym, errors);
+                collect_type_errors(variant, context_sym, errors, seen_refinements);
             }
         }
         Type::Refinement(inner, refinement) => {
-            let RefinementKind::Predicate(def) = &refinement.kind;
-            collect_expr_errors(&def.borrow(), errors);
-            collect_type_errors(inner, context_sym, errors);
+            // Walk the predicate only once per RefinementId to break
+            // cycles that arise post-inference when the predicate's
+            // expressions have type slots containing the same refinement.
+            //
+            // The same visited-set cycle-handling pattern lives in
+            // [`crate::ccl::ccl_utils::count_free_in_type_with_visited`],
+            // [`crate::ccl::lambda_elim::elim_lambdas_in_type`] (both
+            // via [`crate::ccl::ccl_utils::walk_refined_predicates`]),
+            // and a try_borrow_mut fallback variant in
+            // [`crate::ccl::unify::resolve_type`] and
+            // [`crate::ccl::simplify::simplify_once`].  This site
+            // doesn't share the helper because it mixes per-node
+            // error checks with the refinement walk; if drift makes
+            // the cycle logic important here, sync with those sites.
+            if seen_refinements.insert(refinement.id) {
+                let RefinementKind::Predicate(def) = &refinement.kind;
+                collect_expr_errors(&def.borrow(), errors, seen_refinements);
+            }
+            collect_type_errors(inner, context_sym, errors, seen_refinements);
         }
         Type::PartialTuple(entries) => {
             errors.push(InferError::UnresolvedPartial(
@@ -357,7 +392,7 @@ fn collect_type_errors(ty: &Type, context_sym: &str, errors: &mut Vec<InferError
                 context_sym.to_string(),
             ));
             for (_, ty) in entries {
-                collect_type_errors(ty, context_sym, errors);
+                collect_type_errors(ty, context_sym, errors, seen_refinements);
             }
         }
         Type::PartialRecord(entries) => {
@@ -366,13 +401,10 @@ fn collect_type_errors(ty: &Type, context_sym: &str, errors: &mut Vec<InferError
                 context_sym.to_string(),
             ));
             for (_, ty) in entries {
-                collect_type_errors(ty, context_sym, errors);
+                collect_type_errors(ty, context_sym, errors, seen_refinements);
             }
         }
-        Type::Base(_)
-        | Type::UIntRange(_)
-        | Type::DataSource(_)
-        | Type::DeferredCollectionDomain(_) => {}
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {}
     }
 }
 
@@ -1045,81 +1077,18 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
         // codomain(fₙ₋₁)`.
         TypedExprNode::Compose(elts) => infer_compose(elts, ctx),
 
-        // Bare expression followed by other statements/exprs
-        // Infer the type of the inner expr to gather type constraints, but the type
-        // of the overall expression is just the type of the body.
-        TypedExprNode::ExprStmt { expr, body } => {
-            infer_expr(expr, ctx)?;
-            infer_expr(body, ctx)
+        // `Defer`, `Feed`, `Define`, and `ExprStmt` are eliminated by
+        // [`crate::ccl::desugar_defers`] before inference runs, so the
+        // type system never sees them.  These arms are unreachable.
+        TypedExprNode::Feed { .. }
+        | TypedExprNode::Define { .. }
+        | TypedExprNode::Defer
+        | TypedExprNode::ExprStmt { .. } => {
+            unreachable!(
+                "Defer/Feed/Define/ExprStmt survived desugar_defers and reached type inference: {:?}",
+                expr.node
+            )
         }
-
-        // ----- Bind (prototype output operator) -----
-        //
-        // The type of a Bind node is always unit.
-        TypedExprNode::Feed { name, value } => {
-            let expr_ty = infer_expr(value, ctx)?;
-            let handle_ty = ctx
-                .lookup(name)
-                .cloned()
-                .ok_or(InferError::UnboundVariable(name.clone()))?;
-            let codomain_ty = Type::Infer(ctx.fresh_infer_var());
-            // If a previous feed already resolved the handle to Fun(DeferredCollectionDomain(id),
-            // ...), reuse that id. Creating a fresh id for each feed would cause a unification
-            // conflict between the two different DeferredCollectionDomain values.
-            let defer_domain_id = if let Type::Infer(id) = &handle_ty
-                && let Some(Type::Fun(dom, _)) = ctx.table.probe(*id)
-                && let Type::DeferredCollectionDomain(existing_id) = *dom
-            {
-                existing_id
-            } else {
-                next_defer_id()
-            };
-            ctx.constrain_equal(
-                &handle_ty,
-                &Type::fun(
-                    Type::DeferredCollectionDomain(defer_domain_id),
-                    codomain_ty.clone(),
-                ),
-            )?;
-            // A feed's value may be either:
-            //   - scalar `codomain_ty` — the typical `o << x` shape, used
-            //     inside an iter-lambda where `x` is a per-iteration scalar
-            //     value; `remove_defers` later wraps these in a Compose with
-            //     the surrounding source to lift them into a stream, or
-            //   - a pre-lifted stream `Fun(_, codomain_ty)` — produced by
-            //     [`crate::ccl::lower::lower_mutation_loop`] when the
-            //     post-mutation feeds of a mutation loop are hoisted out of
-            //     the loop body and re-expressed as compositions of the
-            //     loop's accumulator stream.
-            //
-            // The match happens after `infer_expr(value)` has flowed
-            // available constraints into `expr_ty`, so already-Fun-shaped
-            // values (e.g. a `Compose`) are correctly disambiguated.  When
-            // `expr_ty` is still an unresolved `Infer`, we default to the
-            // scalar rule — every Fun-shaped feed produced today carries a
-            // concrete function type by this point.
-            match &expr_ty {
-                Type::Fun(_, feed_codomain) => {
-                    ctx.constrain_equal(feed_codomain, &codomain_ty)?;
-                }
-                _ => {
-                    ctx.constrain_equal(&expr_ty, &codomain_ty)?;
-                }
-            }
-            Ok(Type::Base(BaseType::Unit))
-        }
-
-        TypedExprNode::Define { name, value } => {
-            let expr_ty = infer_expr(value, ctx)?;
-            let handle_ty = ctx
-                .lookup(name)
-                .ok_or(InferError::UnboundVariable(name.clone()))?
-                .clone();
-            ctx.constrain_equal(&expr_ty, &handle_ty)?;
-            Ok(Type::Base(BaseType::Unit))
-        }
-
-        TypedExprNode::Defer => Ok(Type::Infer(ctx.fresh_infer_var())),
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
     }?;
@@ -1130,14 +1099,27 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
     // Note: we always infer the full subtree before checking user_annotation.
     // Skipping recursion when an annotation is present would leave sub-node `ty`
     // fields as Infer and miss lambda-param mutations at Apply/GroupBy sites.
-    if let Some(ref annotation) = expr.user_annotation {
-        ctx.constrain_equal(annotation, &result_ty)?;
+    if let Some(annotation) = expr.user_annotation.as_mut() {
+        // Replace any `Type::Hole` placeholders inside the annotation
+        // with fresh inference variables so structural unification can
+        // fill them in.  This supports patterns where a pass (e.g.
+        // `crate::ccl::desugar_defers`'s filter-feed rewrite) inserts a
+        // `Refinement(Hole, …)` user annotation to add a constraint
+        // without knowing the surrounding concrete type.
+        replace_holes(annotation, ctx);
+        // Type-check any `Refinement` predicates nested inside the
+        // annotation so their sub-expressions get inference variables
+        // assigned — otherwise `check_fully_typed` would later flag
+        // them as unresolved.
+        infer_annotation_refinements(annotation, ctx)?;
+        let annotation_clone = annotation.clone();
+        ctx.constrain_equal(&annotation_clone, &result_ty)?;
         // Record the solution in the table if this node started with an Infer var.
         if let Type::Infer(id) = expr.ty {
-            ctx.table.set(id, annotation.clone());
+            ctx.table.set(id, annotation_clone.clone());
         }
-        expr.ty = annotation.clone();
-        return Ok(annotation.clone());
+        expr.ty = annotation_clone.clone();
+        return Ok(annotation_clone);
     }
 
     // Record the solved type in the unification table so the post-inference
@@ -1156,6 +1138,31 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
 // Non-trivial match-arm helpers
 // ---------------------------------------------------------------------------
 
+/// Walk `ty` and infer the predicate expression of every nested
+/// `Type::Refinement` so the predicate's sub-expressions get type
+/// inference variables assigned.
+///
+/// Used by [`infer_expr`] when a user-supplied type annotation carries
+/// a `Refinement(_, pred)` — without this, the predicate's sub-trees
+/// would never visit `infer_expr` and `check_fully_typed` would flag
+/// every node inside as having an unresolved type hole.
+fn infer_annotation_refinements(
+    ty: &mut Type,
+    ctx: &mut TypeInferenceContext,
+) -> Result<(), InferError> {
+    if let Type::Refinement(_, refinement) = ty {
+        let RefinementKind::Predicate(def) = &refinement.kind;
+        infer_expr(&mut def.borrow_mut(), ctx)?;
+    }
+    let mut err = Ok(());
+    ty.walk_children_mut(|child| {
+        if err.is_ok() {
+            err = infer_annotation_refinements(child, ctx);
+        }
+    });
+    err
+}
+
 /// Replace every [`Type::Hole`] in `ty` (recursively) with a fresh inference
 /// variable, assigning one stable [`Type::Infer`] ID per structural position.
 ///
@@ -1164,23 +1171,14 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
 /// [`Type::infer`] test helper) so they participate in unification correctly.
 fn replace_holes(ty: &mut Type, ctx: &mut TypeInferenceContext) {
     match ty {
-        Type::Hole => *ty = Type::Infer(ctx.fresh_infer_var()),
-        Type::Infer(id) => ctx.table.register(*id),
-        Type::Fun(domain, codomain) => {
-            replace_holes(domain, ctx);
-            replace_holes(codomain, ctx);
+        Type::Hole => {
+            *ty = Type::Infer(ctx.fresh_infer_var());
+            return;
         }
-        Type::Tuple(elems) => elems.iter_mut().for_each(|t| replace_holes(t, ctx)),
-        Type::Record(fields) => fields.iter_mut().for_each(|(_, t)| replace_holes(t, ctx)),
-        Type::Union(variants) => variants.iter_mut().for_each(|t| replace_holes(t, ctx)),
-        Type::Refinement(inner, _) => replace_holes(inner, ctx),
-        Type::PartialTuple(entries) => entries.iter_mut().for_each(|(_, t)| replace_holes(t, ctx)),
-        Type::PartialRecord(entries) => entries.iter_mut().for_each(|(_, t)| replace_holes(t, ctx)),
-        Type::Base(_)
-        | Type::UIntRange(_)
-        | Type::DataSource(_)
-        | Type::DeferredCollectionDomain(_) => {}
+        Type::Infer(id) => ctx.table.register(*id),
+        _ => {}
     }
+    ty.walk_children_mut(|child| replace_holes(child, ctx));
 }
 
 /// Return `true` if `ty` contains any [`Type::Infer`] node.
@@ -1189,21 +1187,8 @@ fn replace_holes(ty: &mut Type, ctx: &mut TypeInferenceContext) {
 /// variable has already been substituted, so any remaining [`Type::Infer`] is
 /// genuinely unresolved.
 fn type_has_infer(ty: &Type) -> bool {
-    match ty {
-        Type::Infer(_) => true,
-        Type::Fun(a, b) => type_has_infer(a) || type_has_infer(b),
-        Type::Tuple(elems) => elems.iter().any(type_has_infer),
-        Type::Record(fields) => fields.iter().any(|(_, t)| type_has_infer(t)),
-        Type::Union(variants) => variants.iter().any(type_has_infer),
-        Type::PartialTuple(entries) => entries.iter().any(|(_, t)| type_has_infer(t)),
-        Type::PartialRecord(entries) => entries.iter().any(|(_, t)| type_has_infer(t)),
-        Type::Refinement(inner, _) => type_has_infer(inner),
-        Type::Base(_)
-        | Type::UIntRange(_)
-        | Type::DataSource(_)
-        | Type::DeferredCollectionDomain(_)
-        | Type::Hole => false,
-    }
+    matches!(ty, Type::Infer(_))
+        || ty.fold_children(false, |acc, child| acc || type_has_infer(child))
 }
 
 /// Infer the type of a [`TypedExprNode::Lambda`] node.
@@ -1623,8 +1608,7 @@ fn infer_list(elts: &mut [Expr], ctx: &mut TypeInferenceContext) -> Result<Type,
 ///   source: Fun(D, item_ty),
 ///   loop_body: Lambda(p, let acc_0 = p.0 in … let acc_{n-1} = p.{n-1} in
 ///                        let iter_var = p.n in
-///                        Record({step: <step>, tap_*: <tap_*>})),
-///   body_taps: ["tap_0_<defer_0>", …],  // possibly empty
+///                        Record({step: <step>, to_<defer_*>: <feed_*>})),
 /// }
 /// ```
 ///
@@ -1633,16 +1617,18 @@ fn infer_list(elts: &mut [Expr], ctx: &mut TypeInferenceContext) -> Result<Type,
 /// - `source.ty` is constrained to `Fun(D, item_ty)`.
 /// - Body input is `Tuple(acc_0.ty, …, acc_{n-1}.ty, item_ty)` — n+1
 ///   positional fields, in declaration order.
-/// - Body codomain is `Record({step: <step shape>, tap_*: T_*})` where
-///   the "step shape" carries the recurrence value: `acc_vars[0].ty` for
-///   a single accumulator, `Tuple([acc_0.ty, …, acc_{n-1}.ty])` for
-///   multi-var.  Each `T_*` is a fresh inference variable.  The cycle
-///   flows through `.step`; op-conversion projects it before feeding
-///   back to `recursive_input`.
+/// - Body codomain is `Record({step: <step shape>, to_<defer_*>: T_*})`
+///   where the "step shape" carries the recurrence value:
+///   `acc_vars[0].ty` for a single accumulator,
+///   `Tuple([acc_0.ty, …, acc_{n-1}.ty])` for multi-var.  Each `T_*`
+///   field is added by [`crate::ccl::desugar_defers`] for each `<<`
+///   feed inside the body and the type falls out of inference on the
+///   Record literal.  The cycle flows through `.step`; op-conversion
+///   projects it before feeding back to `recursive_input`.
 /// - The Loop expression's overall type is always `Fun(D, body_codomain)`
 ///   — the running body stream, which the surrounding lowering picks
 ///   apart with `Proj("step") [▷ Proj(i)] ▷ Last` per accumulator and
-///   `Proj("tap_*")` per feed.
+///   `Proj("to_<defer>")` per feed.
 fn infer_mutation_loop(
     expr: &mut Expr,
     ctx: &mut TypeInferenceContext,
@@ -1663,7 +1649,6 @@ fn infer_mutation_loop(
         init_args,
         source,
         loop_body,
-        body_taps,
         ..
     } = shape;
     for acc in acc_vars.iter_mut() {
@@ -1695,26 +1680,27 @@ fn infer_mutation_loop(
     } else {
         Type::Tuple(acc_tys.clone())
     };
-    // Body codomain is always `Record({step: <step shape>, tap_*: T_*})`,
-    // with `tap_*` possibly empty.  The single uniform shape lets
-    // op-conversion handle every Loop the same way (always cycle on
-    // `.step`, always expose the body fan-out as a running stream);
-    // surrounding lowering finishes with `Proj("step") [▷ Proj(i)] ▷
-    // Last` to land on the final scalar accumulator(s).
-    let mut fields: Vec<(String, Type)> = Vec::with_capacity(1 + body_taps.len());
-    fields.push(("step".to_string(), step_shape));
-    for tap in body_taps {
-        fields.push((tap.clone(), Type::Infer(ctx.fresh_infer_var())));
-    }
-    let body_codomain = Type::Record(fields);
+    // Body codomain is `Record({step: <step shape>, to_*: T_*})` —
+    // `step` carries the recurrence, and the desugar-defers pass has
+    // already absorbed every `<<` feed inside the body into a
+    // `to_<defer>` field on the same Record.  We constrain via
+    // `PartialRecord({step: step_shape})` so the body's full set of
+    // fields (which depends on the program's defers) determines the
+    // codomain naturally; the `step` field is unified with the
+    // expected accumulator shape.
     let body_ty = infer_expr(loop_body, ctx)?;
     // Body input: positional tuple of (acc_0.ty, …, acc_{n-1}.ty, item_ty).
     let mut body_input_fields = acc_tys.clone();
     body_input_fields.push(item_var.clone());
-    let expected_body_ty = Type::fun(Type::Tuple(body_input_fields), body_codomain.clone());
+    let body_codomain_var = Type::Infer(ctx.fresh_infer_var());
+    let expected_body_ty = Type::fun(Type::Tuple(body_input_fields), body_codomain_var.clone());
     ctx.constrain_equal(&body_ty, &expected_body_ty)?;
+    ctx.constrain_equal(
+        &body_codomain_var,
+        &Type::PartialRecord(vec![("step".to_string(), step_shape)]),
+    )?;
 
-    Ok(Type::fun(domain_var, body_codomain))
+    Ok(Type::fun(domain_var, body_codomain_var))
 }
 
 /// Given the `arg_ty` of `Apply(arg, Builtin(Zip))`, infer the codomain of
@@ -3651,46 +3637,5 @@ mod tests {
         } else {
             panic!("expected Fun type for lambda");
         }
-    }
-
-    /// Two feeds on the same handle must resolve to the same `DeferredCollectionDomain` id.
-    ///
-    /// If each feed allocated a fresh id, the two `Fun(DCD(id_a), _)` and `Fun(DCD(id_b), _)`
-    /// constraints on the handle variable would conflict during unification, producing a
-    /// spurious error rather than successfully sharing the domain.
-    #[test]
-    fn two_feeds_on_same_handle_share_dcd_id() {
-        // Build: ExprStmt(Feed("h", 1), ExprStmt(Feed("h", 2), Var("h")))
-        // with "h" pre-bound to a fresh inference variable.
-        // Build: let h = Defer in ExprStmt(Feed("h", 1), ExprStmt(Feed("h", 2), Var("h")))
-        // The public `infer` runs resolve(), so all Infer vars are concretized.
-        let body = Expr::expr_stmt(
-            Expr::feed("h".into(), Expr::lit(Lit::Int(1))),
-            Expr::expr_stmt(
-                Expr::feed("h".into(), Expr::lit(Lit::Int(2))),
-                Expr::var("h"),
-            ),
-        );
-        let mut expr = Expr::let_bind("h", Expr::new(TypedExprNode::Defer), body);
-
-        let mut ctx = TypeInferenceContext::new();
-        infer(&mut expr, &mut ctx).expect("two feeds on the same handle must not error");
-
-        // After resolve(), the `h` binding must have a concrete Fun(DeferredCollectionDomain(_), Int) type.
-        let TypedExprNode::Let { binding, .. } = &expr.node else {
-            panic!("expected Let node");
-        };
-        let Type::Fun(dom, cod) = &binding.ty else {
-            panic!("handle binding must have Fun type, got {:?}", binding.ty);
-        };
-        assert!(
-            matches!(dom.as_ref(), Type::DeferredCollectionDomain(_)),
-            "handle domain must be DeferredCollectionDomain, got {dom:?}"
-        );
-        assert_eq!(
-            cod.as_ref(),
-            &Type::Base(BaseType::Int),
-            "handle codomain must be Int"
-        );
     }
 }

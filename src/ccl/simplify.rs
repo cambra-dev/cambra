@@ -29,8 +29,6 @@
 //! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` |
 //! | Flatten union | `(a @ b) @ c` | `CollectionUnion(a, b, c)` |
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` |
-//! | Sink ExprStmt to union | `ExprStmt { expr, body }` (if `expr` has no `Feed` but has a `Sink`) | `CollectionUnion(expr, body)` |
-//! | Drop pure ExprStmt | `ExprStmt { expr, body }` (if `expr` has no `Feed` and no `Sink`) | `body` |
 
 use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
@@ -63,7 +61,29 @@ fn simplify_once(expr: &mut Expr) -> bool {
         && let Type::Refinement(_, refinment) = &mut **domain
     {
         let RefinementKind::Predicate(pred) = &refinment.kind;
-        changed = simplify_once(&mut pred.borrow_mut())
+        // A refinement's predicate is itself an `Expr` whose own
+        // subexpressions may carry the same refinement on their `ty`
+        // (inference shares the `Rc<RefCell<Expr>>` across all places
+        // the refined type surfaces).  If we're already simplifying
+        // this predicate higher up the call stack, `borrow_mut` would
+        // panic.  Skipping the inner attempt is sound: the outer
+        // recursion is already simplifying this predicate, and we
+        // walk to a fixed point in [`simplify`], so any rule that
+        // could fire will fire on a later pass.
+        //
+        // This try_borrow_mut fallback is the same cycle-handling
+        // mechanism used by [`crate::ccl::unify::resolve_type`].  A
+        // related visited-set variant lives in
+        // [`crate::ccl::ccl_utils::walk_refined_predicates`] and is
+        // used by [`crate::ccl::ccl_utils::count_free`],
+        // [`crate::ccl::infer::check_fully_typed`], and
+        // [`crate::ccl::lambda_elim::elim_lambdas_in_type`].  This
+        // site doesn't use the helper because it only targets the
+        // domain refinement on `Fun(...)` (Lambda's refinement slot
+        // shape) rather than every refinement reachable from the type.
+        if let Ok(mut p) = pred.try_borrow_mut() {
+            changed = simplify_once(&mut p);
+        }
     }
     changed |= recurse_simplify(expr);
     changed |= apply_simplification_rules(expr);
@@ -95,34 +115,6 @@ fn recurse_simplify(expr: &mut Expr) -> bool {
 /// returning; the placeholder is never externally observable.
 fn take(expr: &mut Expr) -> Expr {
     std::mem::replace(expr, Expr::lit(Lit::Int(0)))
-}
-
-/// Returns `true` if `expr` or any of its sub-expressions is a [`TypedExprNode::Feed`].
-fn contains_feed(expr: &Expr) -> bool {
-    matches!(
-        expr.node,
-        TypedExprNode::Feed { .. } | TypedExprNode::Define { .. }
-    ) || expr.any_child(contains_feed)
-}
-
-/// Drop pure `ExprStmt`: `ExprStmt { expr, body }  ⟹  body` when `expr` contains no `Feed`.
-///
-/// An `ExprStmt` whose statement sub-expression has no side-effectful handle
-/// binding is a no-op: the expression is evaluated and discarded. Replacing the
-/// whole node with `body` is safe because nothing in the body depends on the
-/// discarded value.
-fn try_drop_pure_expr_stmt(expr: &mut Expr) -> bool {
-    let TypedExprNode::ExprStmt { expr: inner, .. } = &expr.node else {
-        return false;
-    };
-    if contains_feed(inner) {
-        return false;
-    }
-    let TypedExprNode::ExprStmt { body, .. } = take(expr).node else {
-        unreachable!()
-    };
-    *expr = *body;
-    true
 }
 
 /// Rewrite `String + String` from `Arithmetic(Add)` to `Concat`.
@@ -190,7 +182,6 @@ fn apply_simplification_rules(expr: &mut Expr) -> bool {
     changed |= check(try_flatten_compose(expr), expr);
     changed |= check(try_flatten_collection_union(expr), expr);
     changed |= check(try_zip_distribute_compose(expr), expr);
-    changed |= check(try_drop_pure_expr_stmt(expr), expr);
     changed |= check(try_string_add_to_concat(expr), expr);
 
     changed
@@ -368,7 +359,7 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
 fn try_const_reduce(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
-        |_left, right| as_const(right).is_some() && !contains_feed(right),
+        |_left, right| as_const(right).is_some(),
         |left, right| {
             let Some(g) = as_const(&right) else {
                 unreachable!()

@@ -304,8 +304,9 @@ impl LoweringContext {
     /// Mint a unique `__acc_stream_N` binding name for the
     /// Record-bodied Join's stream output in a feed-containing mutation
     /// loop.  The surrounding let-binding projects `.step ▷ Last` for
-    /// the scalar accumulator and `.tap_<k>_<defer>` for each per-feed
-    /// stream from this one Join.
+    /// the scalar accumulator and `.to_<defer>` for each per-feed
+    /// stream from this one Join (the multi-feed-per-defer subcase
+    /// suffixes those as `.to_<defer>_<k>`).
     fn fresh_acc_stream_name(&mut self) -> String {
         let id = self.next_synthetic_id;
         self.next_synthetic_id += 1;
@@ -457,9 +458,9 @@ pub fn lower_expr(
 /// When sink bindings are registered during lowering (e.g. from `http_serve`),
 /// the final expression is wrapped so the program ends in
 /// `ExprStmt(<body>, Record{sink: Var(sink), …})`.  The `Record` is the
-/// sink-binding contract; each field is the name that `remove_defers`
-/// resolves to the computed response morphism.  After `remove_defers`
-/// removes all `Feed` nodes, `simplify` drops the `ExprStmt`, leaving a clean
+/// sink-binding contract; each field is the name that [`crate::ccl::desugar_defers`]
+/// resolves to the computed response morphism.  After `desugar_defers` removes
+/// all `Feed` nodes, `simplify` drops the `ExprStmt`, leaving a clean
 /// `Let* Record{…}` shape for `compile_program`.
 pub fn lower_stmts(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) -> LoweringResult {
     let mut errors: Vec<LoweringError> = Vec::new();
@@ -558,8 +559,8 @@ fn lower_stmts_recovering(
 /// those inner bindings, making their names unbound.
 ///
 /// The `ExprStmt` node "drives the feed": `simplify` drops it once
-/// `remove_defers` has extracted all `Feed` nodes from the body, leaving a
-/// clean `Let* Record{…}` shape that `compile_program` can pattern-match on.
+/// [`crate::ccl::desugar_defers`] has extracted all `Feed` nodes from the body,
+/// leaving a clean `Let* Record{…}` shape that `compile_program` can pattern-match on.
 fn append_record_at_tail(expr: Expr, record: Expr) -> Expr {
     match expr.node {
         TypedExprNode::Let {
@@ -1458,16 +1459,11 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
             init_args,
             source,
             loop_body,
-            body_taps,
-        } => crate::ccl::walk_loop_children(
-            params,
-            init_args,
-            source,
-            loop_body,
-            body_taps,
-            Some(name),
-            |e| substitute_param_in_body(e, name, replacement),
-        ),
+        } => {
+            crate::ccl::walk_loop_children(params, init_args, source, loop_body, Some(name), |e| {
+                substitute_param_in_body(e, name, replacement)
+            })
+        }
 
         // All remaining variants (including the lowering-recovery `Error`
         // placeholder, which has no children): pure structural recursion.
@@ -1549,8 +1545,9 @@ fn lower_generator_for(
         // A generator with loop-carried state (brainstorm §4b) — yield
         // alongside mutation of an outer-scope variable — routes through
         // the same `Loop` lowering as a plain mutation loop, with the
-        // yield-defer wired in as an extra `tap_*` field on the body
-        // Record.  Detect mutation first so we can dispatch on it.
+        // yield-defer's per-iteration feed picked up by `desugar_defers`
+        // as another `to_<defer>` field on the body Record.  Detect
+        // mutation first so we can dispatch on it.
         let acc_names = find_mutation_loop_vars(body, outer_bindings);
         if !acc_names.is_empty() {
             // The generator's defer is bound around the mutation loop
@@ -1961,8 +1958,8 @@ fn find_nested_mutation_var(
 /// — the same wrapping the plain generator-for path uses, except the
 /// surrounding continuation flows through unchanged (the `__result`
 /// defer is bound but never directly referenced in user-visible code;
-/// `remove_defers` substitutes the collected feed values and `simplify`
-/// drops any unused binding).
+/// [`crate::ccl::desugar_defers`] substitutes the collected feed values
+/// and `simplify` drops any unused binding).
 ///
 /// When yield is absent this is just [`lower_mutation_loop`].
 fn lower_generator_or_mutation_loop(
@@ -1997,14 +1994,12 @@ fn lower_generator_or_mutation_loop(
 /// Lower a mutation accumulation for-loop to a [`TypedExprNode::Loop`]
 /// node, threading the surrounding `continuation` through the structure.
 ///
-/// The lowered shape is uniform across accumulator count and feed
-/// presence: the Loop always emits a `Fun(D, Record({step: <step_shape>,
-/// tap_*: T_*}))` stream, with `tap_*` possibly empty and `<step_shape>`
-/// being the scalar accumulator type (n == 1) or a `Tuple(T_0, …,
-/// T_{n-1})` packing every accumulator (n > 1).  Op-conversion always
-/// cycles on `.step` and exposes the body fan-out directly; the
-/// surrounding lowering picks each accumulator off via `Proj("step")
-/// [▷ Proj(i)] ▷ Last` and each feed via `Proj("tap_*")`.
+/// The Loop's body lambda emits raw `Feed(d, V)` nodes inline at the
+/// positions where each `<<` appears in the source body.  Each feed's
+/// `V` is captured with its prefix let-chain (via
+/// [`lower_mutation_loop_body`]) so the value is self-contained and can
+/// be hoisted to the body's terminal Record by
+/// [`crate::ccl::desugar_defers`] without disturbing scope.
 ///
 /// The lifted shape (single-accumulator example shown — for multi-var
 /// each post-loop `let acc_i = …` additionally projects `Proj(i)` off
@@ -2013,18 +2008,19 @@ fn lower_generator_or_mutation_loop(
 /// ```text
 /// let acc_stream = Loop {
 ///   loop_body: λp → let acc = p.0 in let i = p.1 in
-///                   <body-chain> Record({
-///                     step: <full chain> Var(acc),
-///                     tap_0_<defer_0>: <chain-at-feed-0> <feed_value_0>,
-///                     …,
-///                   }),
-///   body_taps: ["tap_0_<defer_0>", …],  // possibly empty
+///                   <body-chain>
+///                   ExprStmt(Feed(defer_0, <feed_value_0>),
+///                   ExprStmt(Feed(defer_1, <feed_value_1>),
+///                     Record({step: <full chain> Var(acc)}))),
 /// } in
 /// let acc_name = acc_stream ▷ Proj("step") ▷ Last in
-/// ExprStmt(Feed(defer_0, acc_stream ▷ Proj("tap_0_<defer_0>")),
-/// ExprStmt(Feed(defer_1, acc_stream ▷ Proj("tap_1_<defer_1>")),
-///   continuation))
+///   continuation
 /// ```
+///
+/// `desugar_defers` then absorbs each `Feed(defer_k, V)` into a
+/// `to_<defer_k>` field on the body's terminal Record and exposes
+/// `acc_stream ▷ Proj("to_<defer_k>")` to the enclosing defer-bind's
+/// channelization.
 ///
 /// Each feed expression captures its own let-chain prefix in the body,
 /// so feeds before / between / after the mutation see the SSA-style
@@ -2036,8 +2032,9 @@ fn lower_generator_or_mutation_loop(
 /// for multi-var).
 ///
 /// `yield_defer` — if `Some(name)`, `yield e` statements in the body
-/// are accepted and lowered as feeds to that defer (one more `tap_*`
-/// field on the Record).  The caller is responsible for binding the
+/// are accepted and lowered as feeds to that defer (which `desugar_defers`
+/// then absorbs into a `to_<defer>` field on the body Record alongside
+/// any explicit `<<` feeds).  The caller is responsible for binding the
 /// defer outside this call; [`lower_generator_or_mutation_loop`] is
 /// the usual entry point that arranges that.  If `None`, a `yield`
 /// in the body is rejected.
@@ -2062,8 +2059,7 @@ fn lower_mutation_loop(
     // Build the body lambda's outer let-chain `let acc_i = p.i in … let
     // iter_var = p.n in <inner>` for an (n+1)-tuple param `p` whose
     // components are the n previous-iteration accumulator values followed
-    // by the source element.  Shared between the no-feeds and feeds
-    // paths.
+    // by the source element.
     let build_body_lambda = |inner: Expr, ctx: &mut LoweringContext| -> Expr {
         let p_name = ctx.fresh_tuple_arg();
         let item_idx = acc_names.len();
@@ -2086,58 +2082,30 @@ fn lower_mutation_loop(
     // declaration order.  Evaluated outside the loop's param scope.
     let init_args: Vec<Expr> = acc_names.iter().map(|n| Expr::var(n.clone())).collect();
 
-    // Build the body's Record codomain: one mandatory `step` field
-    // carrying the recurrence, plus one `tap_<k>_<defer>` field per
-    // feed.  Each tap field's expression IS the captured-let-chain
-    // feed value from `lower_mutation_loop_body` — no external
-    // `Compose([zip, λ])` wrapping is needed because the body's own
-    // lambda provides the per-iteration `acc` / `iter_var` scope.
-    let tap_fields: Vec<(String, Expr)> = feeds
-        .iter()
-        .enumerate()
-        .map(|(k, (defer_name, feed_value))| {
-            let field_name = format!("tap_{k}_{defer_name}");
-            (field_name, feed_value.clone())
-        })
-        .collect();
-    let tap_field_names: Vec<String> = tap_fields.iter().map(|(n, _)| n.clone()).collect();
+    // Build the body's terminal: a Record({step: recurrence}).  Feeds are
+    // prepended as `ExprStmt(Feed(defer_k, value_k), …)` wrappers in
+    // *source order*; desugar_defers will absorb them into the Record as
+    // `to_<defer_k>` fields.
+    let record_body = Expr::new(TypedExprNode::Record(vec![("step".to_string(), step)]));
+    let mut inner = record_body;
+    for (defer_name, feed_value) in feeds.into_iter().rev() {
+        inner = Expr::expr_stmt(Expr::feed(defer_name, feed_value), inner);
+    }
 
-    let mut record_fields: Vec<(String, Expr)> = Vec::with_capacity(1 + tap_fields.len());
-    record_fields.push(("step".to_string(), step));
-    record_fields.extend(tap_fields);
-    let record_body = Expr::new(TypedExprNode::Record(record_fields));
-
-    let step_lambda = build_body_lambda(record_body, ctx);
-    let loop_expr = Expr::loop_with_taps(
-        acc_names.to_vec(),
-        init_args,
-        source,
-        step_lambda,
-        tap_field_names.clone(),
-    );
+    let step_lambda = build_body_lambda(inner, ctx);
+    let loop_expr = Expr::loop_node(acc_names.to_vec(), init_args, source, step_lambda);
 
     // Wrap the continuation in:
     //   let acc_stream = Loop {…} in
     //   let acc_i = acc_stream ▷ Proj("step") [▷ Proj(i)] ▷ Last in …
-    //   ExprStmt(Feed(d_k, acc_stream ▷ Proj("tap_k_<d_k>")), …)
+    //     continuation
     //
     // For a single accumulator the inner `▷ Proj(i)` is omitted —
     // `.step` is already the scalar value.  For multi-var, `.step`
     // carries a `Tuple` and each accumulator is reached by an
-    // additional positional projection.  Each `.tap_<k>` projection
-    // is a `Fun(D, T_<k>)` stream the surrounding defer's
-    // `inline_defer` collects via the standard feed-result
-    // construction.
+    // additional positional projection.
     let acc_stream_name = ctx.fresh_acc_stream_name();
     let mut wrapped = continuation;
-    for (k, (defer_name, _)) in feeds.into_iter().enumerate().rev() {
-        let field_name = &tap_field_names[k];
-        let tap_stream = Expr::compose(vec![
-            Expr::var(&acc_stream_name),
-            Expr::proj_field(field_name),
-        ]);
-        wrapped = Expr::expr_stmt(Expr::feed(defer_name, tap_stream), wrapped);
-    }
     let multi_acc = acc_names.len() > 1;
     for (i, name) in acc_names.iter().enumerate().rev() {
         let mut chain = vec![Expr::var(&acc_stream_name), Expr::proj_field("step")];
@@ -2181,7 +2149,8 @@ fn lower_mutation_loop(
 ///   rules; when `None`, a `yield` is rejected.  This lets a generator
 ///   with loop-carried state (brainstorm §4b's `running_totals`) reuse
 ///   the same `Loop` lowering as a plain mutation loop — the yield's
-///   defer simply becomes one more `tap_*` field on the body Record.
+///   defer is collected by `desugar_defers` as another `to_<defer>`
+///   field on the body Record.
 ///
 /// The Loop's `loop_body` step expression is the full let-chain ending in
 /// `Var(acc_name)` — the final accumulator value after every mutation in
@@ -3245,9 +3214,11 @@ bad";
     }
 
     /// Brainstorm §4b — a generator with loop-carried state lowers to a
-    /// `Loop` whose body Record has both `step` (the accumulator
-    /// recurrence) and a `tap_*` field for the yielded values, with the
-    /// surrounding `let __result = defer` collecting the yields.
+    /// `Loop` whose body contains a raw `Feed(__result_*, …)` followed by
+    /// a `(step: …)` Record, with the surrounding `let __result = defer`
+    /// collecting the yields.  [`crate::ccl::desugar_defers`] absorbs
+    /// the raw `Feed` into a `to_<defer>` field on the same Record
+    /// before inference.
     #[test]
     fn test_generator_with_loop_carried_mutation_lowers() {
         let code = "\
@@ -3271,12 +3242,13 @@ running_totals";
             "should produce a Loop carrying `total`: {s}"
         );
         assert!(
-            s.contains("step: ") && s.contains("tap_0"),
-            "Loop body Record should expose both `step` and a yield tap: {s}"
+            s.contains("step: "),
+            "Loop body Record should expose `step`: {s}"
         );
         assert!(
             s.contains("feed(__result_"),
-            "should feed the yield-defer from the tap stream: {s}"
+            "should emit a raw `Feed(__result_*, …)` inside the loop body \
+             (desugar_defers turns this into a `to_<defer>` Record field): {s}"
         );
     }
 
@@ -3298,8 +3270,8 @@ bad";
             .expect("generator mutating an argument should lower as a mutation loop");
         let s = symbolic(&ccl);
         assert!(
-            s.contains("loop n") && s.contains("tap_0"),
-            "should be a `Loop` over `n` with a yield-tap field: {s}"
+            s.contains("loop n") && s.contains("feed(__result_"),
+            "should be a `Loop` over `n` whose body emits a yield-feed: {s}"
         );
     }
 

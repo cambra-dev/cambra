@@ -4516,7 +4516,7 @@ fn extract_hashmap_values<K: Clone + Eq + Hash, InputV, V, F: Fn(InputV) -> V>(
 /// Op-conversion wraps `Recurse` in a `FanOut`; one branch is read by
 /// the loop body as `acc_var`, and another branch is the loop's
 /// external prev-acc stream.  The loop body itself is always a
-/// `Record({step, tap_*})` and is wrapped in `FanOut(Memo(...))`: one
+/// `Record({step, to_<defer>*})` and is wrapped in `FanOut(Memo(...))`: one
 /// branch is projected to `.step` and feeds back into `recursive_input`
 /// (closing the cycle), the other is the external output (exposed
 /// directly as the running Record stream).  The body fan-out's
@@ -4545,10 +4545,10 @@ fn extract_hashmap_values<K: Clone + Eq + Hash, InputV, V, F: Fn(InputV) -> V>(
 /// inlines any pending mutations to recover the right per-iteration
 /// accumulator view (see [`crate::ccl::lower::lower_mutation_loop`]).
 ///
-/// The body's external `Fun(D, Record({step, tap_*}))` output is
+/// The body's external `Fun(D, Record({step, to_<defer>*}))` output is
 /// exposed directly; downstream lowering picks each accumulator off
-/// via `Proj("step") [▷ Proj(i)] ▷ Last` and each feed via
-/// `Proj("tap_*")`.
+/// via `Proj("step") [▷ Proj(i)] ▷ Last` and each per-iteration channel
+/// via `Proj("to_<defer>")`.
 ///
 /// **Wiring order** (see `interpreter::operator_conversion`'s `Loop` arm):
 /// ```text

@@ -1,6 +1,8 @@
 //! Miscellaneous utilities for working with CCL.
 
-use crate::ccl::{Builtin, Expr, RefinementKind, Type, TypedExprNode};
+use std::collections::HashSet;
+
+use crate::ccl::{Builtin, Expr, RefinementId, RefinementKind, Type, TypedExprNode};
 
 /// Builds an application of a primitive combinator, setting the types based on
 /// the input expression's type and the provided output type.
@@ -41,12 +43,25 @@ pub fn typed_compose(elts: Vec<Expr>) -> Expr {
 ///
 /// Used by:
 /// - [`is_free`] — the bool wrapper for "does `name` appear at all?"
-/// - [`crate::ccl::remove_defers`]'s `inline_defer` — to decide whether
-///   a let-binding can be substituted away (≤1 occurrence across the
-///   extracted values, no duplication risk) or should be preserved as a
-///   `PendingLet` so the shared op-graph subexpression isn't duplicated.
+/// - [`crate::ccl::desugar_defers`] — to detect when a defer's value
+///   references another defer in the same cluster, and to decide
+///   whether feed values reference other channels (cluster membership).
+/// - [`crate::ccl::lambda_elim`] — to decide whether a lambda's body
+///   captures its parameter (`const`-lift if not) and to test refinement
+///   predicate occurrences for the let-in-lambda hoisting rules.
 pub fn count_free(name: &str, expr: &Expr) -> usize {
-    let in_type = count_free_in_type(name, &expr.ty);
+    count_free_with_visited(name, expr, &mut HashSet::new())
+}
+
+/// Recursive worker for [`count_free`].  Threads a `visited` set of
+/// already-walked [`crate::ccl::RefinementId`]s so that self-referential
+/// refinements (a Lambda param `xs` whose type contains a refinement
+/// whose predicate references `xs`) terminate cleanly.  Each refinement
+/// is walked at most once per top-level [`count_free`] call — its
+/// predicate's free-var count is collected on first encounter and
+/// short-circuited on subsequent encounters.
+fn count_free_with_visited(name: &str, expr: &Expr, visited: &mut HashSet<RefinementId>) -> usize {
+    let in_type = count_free_in_type_with_visited(name, &expr.ty, visited);
     let in_node = match &expr.node {
         TypedExprNode::Var(n) => (n == name) as usize,
 
@@ -57,14 +72,19 @@ pub fn count_free(name: &str, expr: &Expr) -> usize {
         } => {
             // `try_borrow().ok()` silently under-counts when a
             // refinement predicate is currently mutably borrowed.  See
-            // the matching note on [`count_free_in_type`] for why this
-            // is OK with today's callers and what to change if you
-            // add one that runs mid-mutation.
+            // the matching note on [`count_free_in_type_with_visited`]
+            // for why this is OK with today's callers.
             let in_refinement = refinement
                 .as_ref()
                 .and_then(|r| {
+                    if !visited.insert(r.id) {
+                        return Some(0);
+                    }
                     let RefinementKind::Predicate(pred_rc) = &r.kind;
-                    pred_rc.try_borrow().ok().map(|p| count_free(name, &p))
+                    pred_rc
+                        .try_borrow()
+                        .ok()
+                        .map(|p| count_free_with_visited(name, &p, visited))
                 })
                 .unwrap_or(0);
             // `param.name` shadows `name` inside the lambda body, but
@@ -73,7 +93,7 @@ pub fn count_free(name: &str, expr: &Expr) -> usize {
             let in_body = if param.name == name {
                 0
             } else {
-                count_free(name, body)
+                count_free_with_visited(name, body, visited)
             };
             in_body + in_refinement
         }
@@ -84,11 +104,11 @@ pub fn count_free(name: &str, expr: &Expr) -> usize {
             body,
         } => {
             // `binding.name` shadows `name` inside `body` only.
-            count_free(name, bound_expr)
+            count_free_with_visited(name, bound_expr, visited)
                 + if binding.name == name {
                     0
                 } else {
-                    count_free(name, body)
+                    count_free_with_visited(name, body, visited)
                 }
         }
 
@@ -107,11 +127,14 @@ pub fn count_free(name: &str, expr: &Expr) -> usize {
             let in_body = if shadowed {
                 0
             } else {
-                count_free(name, loop_body)
+                count_free_with_visited(name, loop_body, visited)
             };
             in_body
-                + count_free(name, source)
-                + init_args.iter().map(|a| count_free(name, a)).sum::<usize>()
+                + count_free_with_visited(name, source, visited)
+                + init_args
+                    .iter()
+                    .map(|a| count_free_with_visited(name, a, visited))
+                    .sum::<usize>()
         }
 
         // The `name` field of Feed/Define is a *use* of the defer handle
@@ -124,12 +147,16 @@ pub fn count_free(name: &str, expr: &Expr) -> usize {
         | TypedExprNode::Define {
             name: handle,
             value,
-        } => (handle == name) as usize + count_free(name, value),
+        } => (handle == name) as usize + count_free_with_visited(name, value, visited),
 
         // All remaining variants: just sum counts across the direct
         // children.  Atoms (Lit/Proj/Builtin/Source/Defer) have no
         // children, so the fold returns 0.
-        _ => expr.fold_children(0, |acc, e| acc + count_free(name, e)),
+        _ => {
+            let mut sum = 0;
+            expr.walk_children(|e| sum += count_free_with_visited(name, e, visited));
+            sum
+        }
     };
     in_node + in_type
 }
@@ -143,41 +170,89 @@ pub fn is_free(name: &str, expr: &Expr) -> bool {
     count_free(name, expr) > 0
 }
 
-/// Count free occurrences of `name` inside any [`crate::ccl::Refinement`]
-/// predicates carried by `ty`.  Walks structurally through `Fun`, `Tuple`,
-/// and `Record` so that a refined leaf type nested anywhere inside still
-/// contributes its predicate's occurrences.
+/// Recursive worker for the type-walking side of [`count_free`].  Same
+/// `visited` set is threaded through to break self-referential
+/// refinement cycles.
 ///
-/// This is needed because predicate refinements can name lambda
-/// parameters (e.g. `[x for x in xs if x < y]` puts a refinement on the
-/// source type whose predicate references `y`), and those occurrences
-/// are just as much "uses of `name`" as occurrences in the term itself.
-fn count_free_in_type(name: &str, ty: &Type) -> usize {
-    // Refinement predicates are sub-expressions, not sub-types, so
-    // `walk_children` does not descend into them — handle the predicate
-    // here, then fold over the structural type children.
-    let here = if let Type::Refinement(_, refinement) = ty {
+/// `try_borrow().ok()` in [`walk_refined_predicates`] silently treats a
+/// failed borrow as "zero occurrences."  This is intentional: callers
+/// run *between* CCL passes when no refinement predicate is being
+/// mutated, so a `borrow_mut` from elsewhere in the call stack
+/// shouldn't happen.  We still use `try_borrow` defensively —
+/// under-counting is a soundness issue only if a caller relies on
+/// `>= 2` to gate a substitute-vs-preserve decision, and a missed
+/// count would mean we substitute away a shared binding.  If you add
+/// a caller that walks an actively-mutating refinement, switch the
+/// helper to `borrow()` so the mistake panics rather than
+/// miscompiling.
+fn count_free_in_type_with_visited(
+    name: &str,
+    ty: &Type,
+    visited: &mut HashSet<RefinementId>,
+) -> usize {
+    let mut count = 0;
+    walk_refined_predicates(ty, visited, &mut |pred, vis| {
+        count += count_free_with_visited(name, pred, vis);
+    });
+    count
+}
+
+/// Walk every [`Type::Refinement`] reachable from `ty` and invoke `f`
+/// on its predicate expression by *shared* reference.  Each refinement
+/// is visited at most once per call (keyed by [`RefinementId`] in
+/// `visited`) — this breaks cycles that arise when a refinement's
+/// predicate has type slots referencing the same refinement
+/// (e.g. inference sharing the `Rc<RefCell<Expr>>` across all places
+/// the refined value surfaces).
+///
+/// If the predicate is currently mutably borrowed higher up the call
+/// stack, the visit is silently skipped — the outer borrow is already
+/// processing it.
+///
+/// The callback receives `visited` so it can recurse back into
+/// [`walk_refined_predicates`] (or its `_mut` variant) when the
+/// predicate's own subexpressions carry types that contain further
+/// refinements.
+///
+/// This helper is the single source of truth for the
+/// type-walk + visited-set cycle-handling pattern used by
+/// [`count_free_in_type_with_visited`], [`crate::ccl::infer::check_fully_typed`],
+/// and [`crate::ccl::lambda_elim`]'s post-pass type-refinement walk.
+/// See [`walk_refined_predicates_mut`] for the mutable variant used by
+/// [`crate::ccl::lambda_elim`] and [`crate::ccl::unify::resolve`].
+/// A related dual-mechanism (try_borrow_mut fallback without an
+/// explicit visited set) lives in [`crate::ccl::simplify::simplify_once`]
+/// — see the note there for why that site can't use this helper today.
+pub fn walk_refined_predicates<F>(ty: &Type, visited: &mut HashSet<RefinementId>, f: &mut F)
+where
+    F: FnMut(&Expr, &mut HashSet<RefinementId>),
+{
+    if let Type::Refinement(_, refinement) = ty
+        && visited.insert(refinement.id)
+    {
         let RefinementKind::Predicate(pred_rc) = &refinement.kind;
-        // `try_borrow().ok()` silently treats a failed borrow as
-        // "zero occurrences."  This is intentional: callers
-        // (`remove_defers::inline_defer`, etc.) run *between* CCL
-        // passes when no refinement predicate is being mutated, so
-        // a `borrow_mut` from somewhere else in the call stack
-        // shouldn't happen.  We still use `try_borrow` defensively
-        // — under-counting is a soundness issue only if a caller
-        // relies on `>= 2` to gate a substitute-vs-preserve
-        // decision, and a missed count would mean we substitute
-        // away a shared binding.  If you add a caller that walks
-        // an actively-mutating refinement, switch this to
-        // `borrow()` so the mistake panics rather than
-        // miscompiling.
-        pred_rc
-            .try_borrow()
-            .ok()
-            .map(|p| count_free(name, &p))
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    here + ty.fold_children(0, |acc, child| acc + count_free_in_type(name, child))
+        if let Ok(p) = pred_rc.try_borrow() {
+            f(&p, visited);
+        }
+    }
+    ty.walk_children(|child| walk_refined_predicates(child, visited, f));
+}
+
+/// Mutable analog of [`walk_refined_predicates`].  Uses
+/// `try_borrow_mut`; silently skips refinements whose predicate is
+/// already mutably borrowed elsewhere in the call stack (the outer
+/// pass is processing the same predicate).
+pub fn walk_refined_predicates_mut<F>(ty: &mut Type, visited: &mut HashSet<RefinementId>, f: &mut F)
+where
+    F: FnMut(&mut Expr, &mut HashSet<RefinementId>),
+{
+    if let Type::Refinement(_, refinement) = ty
+        && visited.insert(refinement.id)
+    {
+        let RefinementKind::Predicate(pred_rc) = &refinement.kind;
+        if let Ok(mut p) = pred_rc.try_borrow_mut() {
+            f(&mut p, visited);
+        }
+    }
+    ty.walk_children_mut(|child| walk_refined_predicates_mut(child, visited, f));
 }

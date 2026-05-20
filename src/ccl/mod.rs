@@ -8,12 +8,12 @@
 
 pub mod ccl_utils;
 pub mod context;
+pub mod desugar_defers;
 pub mod infer;
 pub mod inline;
 pub mod join_plan;
 pub mod lambda_elim;
 pub mod lower;
-pub mod remove_defers;
 pub mod simplify;
 pub mod symbolic;
 pub mod unify;
@@ -34,15 +34,6 @@ pub type RefinementId = u64;
 
 pub fn next_refinement_id() -> RefinementId {
     REFINEMENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Global counter for assigning unique IDs to [`DeferredCollectionDomain`] instances.
-static DEFER_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-pub type DeferredCollectionId = u64;
-
-pub fn next_defer_id() -> DeferredCollectionId {
-    DEFER_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A unique identifier for an inference type variable.
@@ -341,7 +332,7 @@ pub enum Builtin {
     ///
     /// Used by `lower_mutation_loop` to expose the scalar final
     /// accumulator of a Record-bodied loop, whose external type is
-    /// `Fun(D, Record({step, tap_*}))`: the after-loop scalar acc is
+    /// `Fun(D, Record({step, to_<defer>*}))`: the after-loop scalar acc is
     /// `(acc_stream ▷ Proj("step"), init) ▷ LastOrDefault`.  The
     /// default is the pre-loop accumulator binding, so an
     /// empty-source loop (`for i in []: x += 1; x`) yields `init`
@@ -721,12 +712,14 @@ pub enum TypedExprNode {
     /// 2. `loop_body` is invoked with a tuple `(param_0, …, param_{n-1}, item)`,
     ///    where `param_k` are the previous-iteration accumulator values and
     ///    `item` is the source element.  Its result is a
-    ///    `Record({step, tap_*})` whose `step` field carries the next
-    ///    accumulator value(s).
+    ///    `Record({step, to_<defer>*})` whose `step` field carries the next
+    ///    accumulator value(s) and whose `to_<defer>` fields (one per
+    ///    `<<` feed inside the body, emitted by `desugar_defers`) carry
+    ///    the per-iteration channel values.
     /// 3. The Loop's value is the running body stream `Fun(D,
-    ///    Record({step, tap_*}))`; surrounding lowering picks each
+    ///    Record({step, to_<defer>*}))`; surrounding lowering picks each
     ///    accumulator off with `Proj("step") [▷ Proj(i)] ▷ Last` and
-    ///    each tap with `Proj("tap_*")`.
+    ///    each channel with `Proj("to_<defer>")`.
     ///
     /// The accumulator slots in `params` are only in scope inside `loop_body`;
     /// they are *not* visible from `init_args` (which sits outside the loop
@@ -751,8 +744,19 @@ pub enum TypedExprNode {
         source: Box<TypedExpr>,
         /// The per-iteration step — a `Fun(Tuple(param_tys…, item_ty), Codomain)`
         /// taking a tuple of the current loop params and the source element
-        /// and returning the next param value(s).  See `body_taps` for how
-        /// `Codomain` depends on the loop shape.
+        /// and returning the next param value(s).
+        ///
+        /// The Loop's body codomain is always
+        /// `Record({step: <step_shape>, to_<defer>: T_*})` (with any
+        /// number of `to_<defer>` fields, possibly zero).  The `step`
+        /// field carries the recurrence (a scalar for `params.len() ==
+        /// 1`, a positional `Tuple(T_0, …, T_{n-1})` for multi-var);
+        /// each `to_<defer>` field carries a per-iteration `<<` feed
+        /// value picked up by [`crate::ccl::desugar_defers`].
+        /// Op-conversion always cycles on `.step` and exposes the body
+        /// stream as the external output; surrounding lowering
+        /// finishes with `Proj("step") [▷ Proj(i)] ▷ Last` per
+        /// accumulator and `Proj("to_<defer>")` per feed.
         ///
         /// Building the params into the input tuple (rather than capturing
         /// them as free variables from outer scope) keeps op-conversion
@@ -760,21 +764,6 @@ pub enum TypedExprNode {
         /// special "scalar-CCL-type but function-tiled-op" detection
         /// needed.
         loop_body: Box<TypedExpr>,
-        /// Per-iteration tap field names exposed alongside the
-        /// recurrence — one entry per `<<` feed in the source-level
-        /// loop body, possibly empty.
-        ///
-        /// The Loop's body codomain is always `Record({step: <step_shape>,
-        /// tap_*: T_*})`, and the Loop's outer type is always `Fun(D,
-        /// Record({step, tap_*}))`.  The `step` field carries the
-        /// recurrence (a scalar for `params.len() == 1`, a positional
-        /// `Tuple(T_0, …, T_{n-1})` for multi-var); each `body_taps`
-        /// entry names a tap field that rides along on the same body
-        /// fan-out.  Op-conversion always cycles on `.step` and exposes
-        /// the body stream as the external output; surrounding lowering
-        /// finishes with `Proj("step") [▷ Proj(i)] ▷ Last` per
-        /// accumulator and `Proj("tap_*")` per feed.
-        body_taps: Vec<String>,
     },
 
     /// A tuple constructor: `(e0, e1, ...)`.
@@ -823,19 +812,19 @@ pub enum TypedExprNode {
 
     /// Feed a value into a deferred output: `x << value`.
     /// Lowers from the `<<` (LShift) binary operator when the LHS names a defer.
-    /// Has type `Unit`; the value is extracted by `remove_defers` and inlined
-    /// into the `Let` that introduced the defer.
+    /// Has type `Unit`; the value is collected by [`crate::ccl::desugar_defers`]
+    /// and unioned into the source channel that resolves the defer.
     Feed { name: String, value: Box<Expr> },
 
     /// Define a deferred output to a specific value: `x <<= value`.
     /// Lowers from the `<<=` (AugAssign LShift) statement when the LHS names a defer.
-    /// Has type `Unit`; the value is extracted by `remove_defers` and replaces the
-    /// `Defer` in the surrounding `Let` binding.
+    /// Has type `Unit`; the value is collected by [`crate::ccl::desugar_defers`]
+    /// and replaces the surrounding `Defer` binding.
     Define { name: String, value: Box<Expr> },
 
     /// Placeholder for an output accumulator introduced by `x = defer()`.
     /// The bound name is resolved by the surrounding `Let` binding.
-    /// Removed by `remove_defers::run` before operator conversion.
+    /// Eliminated by [`crate::ccl::desugar_defers`] before type inference.
     Defer,
 
     /// Recovery placeholder inserted by lowering when a sub-expression or
@@ -967,26 +956,25 @@ impl TypedExpr {
         })
     }
 
-    /// Construct a [`TypedExprNode::Loop`] header with a Record-typed
-    /// body codomain.
+    /// Construct a [`TypedExprNode::Loop`] header.
     ///
     /// `param_names` become the loop-carried bindings (each stamped with
     /// [`Type::Hole`]; inference fills in the type).  `init_args`
     /// supplies the starting value for each param, in declaration order.
     /// `source` is the iteration source (`Fun(D, item_ty)`).  `loop_body`
     /// is the per-iteration step
-    /// (`Fun(Tuple(param_tys…, item_ty), Record({step, tap_*}))`).
-    /// The body always returns `Record({step: <step_shape>, <tap_0>: T_0,
-    /// …, <tap_k>: T_k})` — the `step` field carries the recurrence (a
-    /// scalar for one param, a positional `Tuple` for multiple), and
-    /// `body_taps` lists the tap field names in declaration order
-    /// (possibly empty when the loop body contains no `<<` feeds).
-    pub fn loop_with_taps(
+    /// (`Fun(Tuple(param_tys…, item_ty), Record({step, to_<defer>*}))`).
+    /// The body always returns `Record({step: <step_shape>,
+    /// to_<defer_0>: T_0, …, to_<defer_k>: T_k})` — the `step` field
+    /// carries the recurrence (a scalar for one param, a positional
+    /// `Tuple` for multiple); `to_<defer>` fields are added by
+    /// [`crate::ccl::desugar_defers`] for each `<<` feed inside the
+    /// loop body (zero if there are no feeds).
+    pub fn loop_node(
         param_names: Vec<String>,
         init_args: Vec<Self>,
         source: Self,
         loop_body: Self,
-        body_taps: Vec<String>,
     ) -> Self {
         assert_eq!(
             param_names.len(),
@@ -1005,7 +993,6 @@ impl TypedExpr {
             init_args,
             source: Box::new(source),
             loop_body: Box::new(loop_body),
-            body_taps,
         })
     }
 
@@ -1035,7 +1022,6 @@ impl TypedExpr {
             init_args,
             source,
             loop_body,
-            body_taps,
         } = &self.node
         else {
             return None;
@@ -1048,7 +1034,6 @@ impl TypedExpr {
             init_args,
             source,
             loop_body,
-            body_taps,
         })
     }
 
@@ -1064,7 +1049,6 @@ impl TypedExpr {
             init_args,
             source,
             loop_body,
-            body_taps,
         } = &mut self.node
         else {
             return None;
@@ -1077,7 +1061,6 @@ impl TypedExpr {
             init_args: init_args.as_mut_slice(),
             source,
             loop_body,
-            body_taps,
         })
     }
 
@@ -1539,13 +1522,11 @@ impl Default for TypedExpr {
 /// This helper is the single source of truth for the Loop walk rule —
 /// the substitute / inline / lambda-elim passes all delegate here so a
 /// shadow-check fix lands in one place.
-#[allow(clippy::too_many_arguments)]
 pub fn walk_loop_children<F>(
     params: Vec<TypedBinding>,
     init_args: Vec<TypedExpr>,
     source: Box<TypedExpr>,
     loop_body: Box<TypedExpr>,
-    body_taps: Vec<String>,
     shadowed_name: Option<&str>,
     mut recurse: F,
 ) -> TypedExprNode
@@ -1565,19 +1546,16 @@ where
             Box::new(recurse(*loop_body))
         },
         params,
-        body_taps,
     }
 }
 
 /// Fallible variant of [`walk_loop_children`] for passes whose recursion
 /// function returns a `Result`.
-#[allow(clippy::too_many_arguments)]
 pub fn try_walk_loop_children<F, E>(
     params: Vec<TypedBinding>,
     init_args: Vec<TypedExpr>,
     source: Box<TypedExpr>,
     loop_body: Box<TypedExpr>,
-    body_taps: Vec<String>,
     shadowed_name: Option<&str>,
     mut recurse: F,
 ) -> Result<TypedExprNode, E>
@@ -1600,7 +1578,6 @@ where
         init_args: new_init_args,
         loop_body: new_loop_body,
         params,
-        body_taps,
     })
 }
 
@@ -1621,8 +1598,6 @@ pub struct MutationLoopShape<'a> {
     /// iter_var = p.n in step)`; after lambda elimination it is the same
     /// in point-free form.
     pub loop_body: &'a Expr,
-    /// Per-iteration tap field names; see [`TypedExprNode::Loop::body_taps`].
-    pub body_taps: &'a [String],
 }
 
 /// Mutable companion to [`MutationLoopShape`].  Returned by
@@ -1634,7 +1609,6 @@ pub struct MutationLoopShapeMut<'a> {
     pub init_args: &'a mut [Expr],
     pub source: &'a mut Expr,
     pub loop_body: &'a mut Expr,
-    pub body_taps: &'a [String],
 }
 
 /// A single conditional branch in a [`TypedExprNode::Case`] expression.
@@ -1716,8 +1690,6 @@ pub enum Type {
     /// resolves this to a concrete `Extent::DataSourceDomain(rc)` at compilation time
     /// by looking the name up in its source-domain-extent registry.
     DataSource(String),
-    /// TODO
-    DeferredCollectionDomain(DeferredCollectionId),
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
     // Refinement { base: Box<Type>, predicate: Box<Expr> }
@@ -1774,7 +1746,6 @@ impl fmt::Display for Type {
             Type::Hole => write!(f, "_"),
             Type::Infer(id) => write!(f, "?{}", id.0),
             Type::DataSource(name) => write!(f, "source({name})"),
-            Type::DeferredCollectionDomain(id) => write!(f, "handle({id})"),
         }
     }
 }
@@ -1833,8 +1804,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
-            | Type::DataSource(_)
-            | Type::DeferredCollectionDomain(_) => {}
+            | Type::DataSource(_) => {}
             Type::Fun(domain, codomain) => {
                 f(domain);
                 f(codomain);
@@ -1872,8 +1842,7 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
-            | Type::DataSource(_)
-            | Type::DeferredCollectionDomain(_) => {}
+            | Type::DataSource(_) => {}
             Type::Fun(domain, codomain) => {
                 f(domain);
                 f(codomain);

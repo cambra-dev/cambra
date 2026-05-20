@@ -10,13 +10,13 @@ CCL is a λ-calculus–based IR. CHL source is lowered into CCL, where it is typ
 
 ```
 CHL source
-  → parse          (rustCHL_parser)
+  → parse          (chl_parser)
   → lower          (ccl/lower.rs: CHL AST → CCL AST, structural only)
-  → infer          (ccl/infer.rs: type inference, converts Hole→Infer and fills ty on every node)
-  → resolve        (ccl/unify.rs: substitutes solved Infer vars with concrete types)
+  → desugar_defers (ccl/desugar_defers.rs: eliminate Defer/Feed/Define nodes; see §Defer)
+  → infer          (ccl/infer.rs: type inference; fills ty on every node and calls
+                    ccl/unify.rs::resolve to substitute solved Infer vars before returning)
   → inline         (ccl/inline.rs::inline_non_iterable_lambdas: inline UDF Let bindings with non-iterable domains; beta-reduce at call sites)
   → lambda_elim    (ccl/lambda_elim.rs: Lambda → point-free combinators)
-  → remove_defers  (ccl/remove_defers.rs: inline Defer/Feed/Define nodes; see §Defer)
   → optimize       (tree rewrites on CCL AST, currently just join_plan.rs)
   → convert        (interpreter/operator_conversion.rs: CCL AST → tile operators)
   → subscribe()
@@ -133,8 +133,6 @@ let f = λ params →
 
 **Nested `for` loops** produce nested `Compose+Lambda` pairs. Lambda elimination converts each Lambda outward-in to a composition chain.
 
-**ANF-lifting of defer-returning sources** (`inline.rs`): when the first element of a `Compose` is a defer-returning expression (i.e. a source that terminates with `; __result_N`), the inline pass extracts it into a fresh `let __for_src_N = <source>` binding before the Compose. This ensures that when two nested generators share the same source expression, each is bound to a unique name and the outer `remove_defers` pass can substitute them independently without name collision.
-
 **Mutation accumulation loops** (`x = 0; for i in src: x += i; x`) are detected in `lower.rs` and lowered to a [`TypedExprNode::Loop`] node rather than a `For` node.  `lower_middle_stmt` calls `find_mutation_loop_vars` (which scans the body for *every* outer-scope name that gets mutated, in first-mention order — handles `x = x + i; o << x` shapes and multi-accumulator bodies like `y = y + i; x = x * i`), then `lower_mutation_loop` builds:
 
 ```text
@@ -166,17 +164,17 @@ domain ─┘                         │                  │                  
                                                                          │
                                        external Record stream ◀──────────┘
                                        ((Proj("step"), init) ▷ LastOrDefault
-                                        + Proj("tap_*"))
+                                        + Proj("to_<defer>*"))
 ```
 
 - **Inputs**: `init` carries the accumulator's starting value (scalar for one param, packed `Record({_i: Scalar(T_i)})` via `ScalarFanIn` for multi-var); `domain` is an `IterateExtent` over the source's domain; `recursive_input` is the body fan-out's `.step` branch back into the cycle, wired in by `recursive_input_setter` after body compilation.
 - **`Recurse` output**: emits the accumulator *shifted forward by one in the domain* — `init` at position 0, `recursive_input[i-1]` at position `i > 0`.  Wrapped in a `FanOut` so that the body's tuple input (the first arm of a `fan_in(prev_acc, source)`) and the loop's external output can share the stream.
-- **Loop body** is compiled with `Some(fan_in([prev_acc_fan.branch(), source_op]))` as its input — a `SealedFunction(D, Record{_0: AccType, _1: item_ty})` matching the body's CCL type `Fun(Tuple(AccType, item_ty), Record({step, tap_*}))`.  The body's lambda projects `acc_var` and `iter_var` out of the input record.  Its codomain is always `Record({step: <step_shape>, tap_*: T_*})` (with `tap_*` possibly empty).  The body's output is wrapped in `FanOut(Memo(…))`: one branch is projected to `.step` and closes the cycle via `recursive_input_setter`, the other is the Loop's external output exposed directly as the body Record stream.
-- **External output**: the body fan-out's external branch is exposed directly as the body Record stream.  Downstream lowering picks each accumulator off via `(Proj("step") [▷ Proj(i)], init_arg) ▷ LastOrDefault` (so an empty source yields `init_arg`, not a panic) and each tap stream via `Proj("tap_*")`.
+- **Loop body** is compiled with `Some(fan_in([prev_acc_fan.branch(), source_op]))` as its input — a `SealedFunction(D, Record{_0: AccType, _1: item_ty})` matching the body's CCL type `Fun(Tuple(AccType, item_ty), Record({step, to_<defer>*}))`.  The body's lambda projects `acc_var` and `iter_var` out of the input record.  Its codomain is always `Record({step: <step_shape>, to_<defer>*: T_*})` (with the `to_<defer>` fields possibly empty).  The body's output is wrapped in `FanOut(Memo(…))`: one branch is projected to `.step` and closes the cycle via `recursive_input_setter`, the other is the Loop's external output exposed directly as the body Record stream.
+- **External output**: the body fan-out's external branch is exposed directly as the body Record stream.  Downstream lowering picks each accumulator off via `(Proj("step") [▷ Proj(i)], init_arg) ▷ LastOrDefault` (so an empty source yields `init_arg`, not a panic) and each per-iteration channel via `Proj("to_<defer>")`.
 
 #### Record body shape
 
-`lower_mutation_loop` always emits one Loop whose codomain is `Record({step, tap_*})`, regardless of accumulator count or feed presence:
+`lower_mutation_loop` emits one Loop whose body terminates in a Record carrying the recurrence value, with feeds left as `ExprStmt(Feed(d, V), …)` wrappers around the Record:
 
 ```text
 let acc_stream = Loop {
@@ -185,30 +183,25 @@ let acc_stream = Loop {
   loop_body: λp →
     let acc = p ▷ Proj(0) in
     let i = p ▷ Proj(1) in
-    Record({
-      step: <full let-chain> Var(acc_name),
-      tap_0_<defer_0>: <chain-at-feed-0> <lowered feed value 0>,
-      …,
-      tap_k_<defer_k>: <chain-at-feed-k> <lowered feed value k>,
-    }),
-  body_taps: ["tap_0_<defer_0>", …],   // possibly empty
+    ExprStmt(Feed(defer_0, <feed_value_0>),
+    ExprStmt(Feed(defer_1, <feed_value_1>),
+      Record({ step: <full let-chain> Var(acc_name) }))),
 } in
 let acc_name = (acc_stream ▷ Proj("step"), Var(acc_name)) ▷ LastOrDefault in
-ExprStmt(Feed(defer_0, acc_stream ▷ Proj("tap_0_<defer_0>")),
-ExprStmt(Feed(defer_1, acc_stream ▷ Proj("tap_1_<defer_1>")),
-  continuation))
+continuation
 ```
 
+`desugar_defers` then absorbs each `Feed(defer_k, V)` into a `to_<defer_k>` field on the body's terminal Record, drops the `ExprStmt` wrappers, and binds the per-iteration channel via `let defer_k = Var(acc_stream) ▷ Proj("to_<defer_k>")` in the surrounding cluster.  No `body_taps` field is needed — the Record's field set is the source of truth.
+
 - **`step`**'s type is the scalar accumulator type for a single param, or a positional `Tuple(T_0, …, T_{n-1})` for multi-var.  Multi-var lowering finishes each accumulator's chain with an extra `▷ Proj(i)` before the `LastOrDefault` pair.
-- **`body_taps`** is the list of tap field names; `infer_mutation_loop` uses it to construct the expected body codomain `Record({step: <step_shape>, tap_*: T_*})` (each `T_*` is a fresh inference variable that resolves from the feed value's actual type).
 - **`Builtin::LastOrDefault`** is the explicit stream-to-scalar primitive (`Tuple(Fun(D, T), T) → T`) used for the post-loop accumulator extraction.  Compiles directly to `ExtractLast`, which receives both the stream and the default operator and falls back to the default when the source domain is empty (the loop body ran zero times).  The default at each accumulator's call site is the pre-loop binding `Var(acc_name)`, which resolves to the outer scope because the surrounding `let acc_name = …` shadows it only inside its own body.  It is *not* an `AggregateKind` because there is no fold / identity element; lambda-elim handles it via the polymorphic-builtin Apply rule, mirroring `Zip`.
 - **Op-conversion**: the Loop arm always projects `.step` from a fan-out branch of the body's output before feeding to `recursive_input_setter` so the cycle carries only the recurrence value; the full Record stream is exposed as the Loop's external output.
 
-This shape compiles to **exactly one `Recurse`** per source-level mutation loop, regardless of how many feeds the body contains or whether the after-loop scalar accumulator is also consumed.  Multiple sequential mutation loops sharing one defer still build up a Union-domain `SealedFunction` via `CollectionUnion` — `remove_defers` collects every `Feed(defer_k, …)` for a given defer and unions their stream values at the defer's resolution site.  The `let acc_stream = Loop` binding is multi-referenced (the scalar `LastOrDefault` extraction plus every tap projection), so `remove_defers::inline_defer` preserves it via the `PendingLet` machinery rather than substituting it away.
+This shape compiles to **exactly one `Recurse`** per source-level mutation loop, regardless of how many feeds the body contains or whether the after-loop scalar accumulator is also consumed.  Multiple sequential mutation loops sharing one defer still build up a Union-domain `SealedFunction` via `CollectionUnion` — `desugar_defers` collects every `Feed(defer_k, …)` for a given defer and unions their stream values at the defer's resolution site.  Because the desugaring runs pre-inference, the `let acc_stream = Loop` binding stays as a plain shared `Let` and gets normal scope-sharing via inference and lambda-elim, with no per-pass duplication-preservation machinery.
 
 Each feed's value lives inside the body's lambda scope, so its references to `acc` and `iter_var` resolve against the body's per-iteration projections — exactly what the original `o << e` meant.  Pre-mutation feeds capture the empty let-chain (acc = `p.0`, the prev-iteration value); post-mutation feeds capture the chain up to the mutation.
 
-**Generators with loop-carried state** (brainstorm §4b's `running_totals`: `total = 0; for x in xs: total += x; yield total`) reuse this same `Loop` lowering — `yield e` is just `<<` against a synthesised generator defer.  `lower_generator_or_mutation_loop` allocates `__result_N = Defer` outside the loop, passes its name into `lower_mutation_loop_body` as `yield_defer`, and each `yield e` becomes one more `tap_*` field on the body Record with the same let-chain snapshotting as an explicit `<<`.  The surrounding generator-function context already wraps the loop in `let __result_N = Defer in …` so the collected yields surface as the function's stream return value.  Both `lower_generator_for` (final-statement path) and `lower_middle_stmt` (middle-statement path) detect mutation independently of `yield` and dispatch through this same helper — they only differ in what continuation is passed in (`Var(__result_N)` for the final-statement case, the surrounding `body` for the middle case).
+**Generators with loop-carried state** (brainstorm §4b's `running_totals`: `total = 0; for x in xs: total += x; yield total`) reuse this same `Loop` lowering — `yield e` is just `<<` against a synthesised generator defer.  `lower_generator_or_mutation_loop` allocates `__result_N = Defer` outside the loop, passes its name into `lower_mutation_loop_body` as `yield_defer`, and each `yield e` is emitted as a raw `Feed(__result_N, …)` inline at the yield site with the same let-chain snapshotting as an explicit `<<`.  `desugar_defers` then absorbs every such feed into a `to_<defer>` field on the body Record.  The surrounding generator-function context already wraps the loop in `let __result_N = Defer in …` so the collected yields surface as the function's stream return value.  Both `lower_generator_for` (final-statement path) and `lower_middle_stmt` (middle-statement path) detect mutation independently of `yield` and dispatch through this same helper — they only differ in what continuation is passed in (`Var(__result_N)` for the final-statement case, the surrounding `body` for the middle case).
 
 **Let-bindings in generator bodies** (`y = f(x); yield y`) lower to nested `Let` nodes inside the Lambda body, evaluated once per iteration of the enclosing loop.
 
@@ -241,7 +234,7 @@ CHL mutation-accumulation `for` loops are lowered to an explicit `Loop` node rat
 
 `Loop` is a bounded iteration with explicit loop-carried accumulators: `params` lists the accumulator slots (one or more), `init_args` supplies their starting values in declaration order, `source` drives the iteration, and `loop_body` computes each new accumulator value from `(prev_acc_0, …, prev_acc_{n-1}, item)`.  The accumulator slots are only in scope inside `loop_body`; `init_args` is evaluated outside the loop's param scope.  There is no `Jump` node: the loop has a single entry (`init_args`) and the runtime iterates the body until the source is exhausted, so labelled tail-calls aren't needed.  `continue`-style "skip the rest of this iteration" semantics fall out as conditional `Case`-on-old-vs-new in the body, again without an AST extension.  General `while` loops with explicit restart/break would need a richer encoding (a body-tail-call form for `continue`, runtime support in `Recurse` for `break`), but those are future work.
 
-The mutation-loop pattern emitted by `lower_mutation_loop` (see "Mutation accumulation loops" above) is currently the only `Loop` shape consumed end-to-end: `infer.rs::infer_mutation_loop` and `operator_conversion`'s `Loop` arm both pattern-match on `Loop { params: [acc_0…], init_args: [init_0…], source: Fun(D, item_ty), loop_body: Lambda(p, …), body_taps }` with `params.len() == init_args.len()`, and reject anything else.  Any combination of accumulator count and tap count is supported: single- or multi-accumulator, with or without feeds.  Future work (general `while` loops, generators with internal mutable state) will extend these passes to handle additional shapes.
+The mutation-loop pattern emitted by `lower_mutation_loop` (see "Mutation accumulation loops" above) is currently the only `Loop` shape consumed end-to-end: `infer.rs::infer_mutation_loop` and `operator_conversion`'s `Loop` arm both pattern-match on `Loop { params: [acc_0…], init_args: [init_0…], source: Fun(D, item_ty), loop_body: Lambda(p, …) }` with `params.len() == init_args.len()`, and reject anything else.  Any combination of accumulator count and per-iteration channel count is supported: single- or multi-accumulator, with or without feeds (the body Record's field set is the source of truth).  Future work (general `while` loops, generators with internal mutable state) will extend these passes to handle additional shapes.
 
 Rationale: encoding loops as recursive lambdas requires detecting recursive bindings by scanning the tree for forward references. `Loop` makes the loop structure explicit, simplifying both the lowering pass and optimization passes targeting iterate/feedback operators.
 
@@ -405,8 +398,7 @@ enum TypedExprNode {
         params: Vec<TypedBinding>,            // loop-carried accumulator slots
         init_args: Vec<TypedExpr>,            // one init per param, evaluated outside the loop
         source: Box<TypedExpr>,               // iteration source: Fun(D, item_ty)
-        loop_body: Box<TypedExpr>,            // per-iteration step: Fun(Tuple(params…, item), codomain)
-        body_taps: Vec<String>,               // tap field names (see body codomain docs in mod.rs)
+        loop_body: Box<TypedExpr>,            // per-iteration step: Fun(Tuple(params…, item), Record{step, to_<defer>*})
     },
     GroupBy {
         collection: Box<TypedExpr>,           // the collection (function) whose elements are grouped
@@ -420,17 +412,17 @@ enum TypedExprNode {
     Source(String),
 
     // --- Output operators (defer/feed/define) ---
-    // See §Defer for semantics and the remove_defers pass.
+    // See §Defer for semantics and the desugar_defers pass.
 
     /// Placeholder for an output accumulator introduced by `x = defer()`.
     /// The bound name is resolved by the surrounding `Let` binding.
-    /// Removed by `remove_defers::run` before operator conversion.
+    /// Eliminated by `desugar_defers::run` before type inference.
     Defer,
 
     /// Feed a value into a deferred output: `x << value`.
     /// Lowers from the `<<` (LShift) binary operator when the LHS names a defer.
-    /// Has type `Unit`; the value is extracted by `remove_defers` and inlined
-    /// into the `Let` that introduced the defer.
+    /// Has type `Unit`; the value is collected by `desugar_defers` and unioned
+    /// into the source channel that resolves the defer.
     Feed {
         name: String,         // name of the defer binding being fed into
         value: Box<Expr>,
@@ -438,8 +430,8 @@ enum TypedExprNode {
 
     /// Define a deferred output to a specific value: `x <<= value`.
     /// Lowers from the `<<=` (AugAssign LShift) statement when the LHS names a defer.
-    /// Has type `Unit`; the value is extracted by `remove_defers` and replaces the
-    /// `Defer` in the surrounding `Let` binding.
+    /// Has type `Unit`; the value is collected by `desugar_defers` and replaces
+    /// the surrounding `Defer` binding.
     Define {
         name: String,         // name of the defer binding being defined
         value: Box<Expr>,
@@ -470,7 +462,6 @@ enum Type {
     Error,                               // inference already failed here; suppresses cascades
     Refinement(Box<Type>, Refinement),   // refined base type; `Refinement.kind` carries join strategy
     DataSource(String),                  // opaque domain type of a source
-    DeferredCollectionDomain(DeferredCollectionId),  // synthetic domain type for a Defer's function type; see §Defer
     // Future:
     // Pi { param, param_ty, body_ty }  — dependent function type
 }
@@ -668,9 +659,9 @@ After `resolve`, `infer` calls `check_fully_typed(expr)` to assert that every `t
 
 ---
 
-## Defer / Feed / Define — Deferred Collection Operators (`ccl/remove_defers.rs`)
+## Defer / Feed / Define — Deferred Collection Operators (`ccl/desugar_defers.rs`)
 
-`defer()`, `<<`, and `<<=` are CHL-level operators that let a block accumulate a result value progressively. They are reified as three CCL AST nodes (`Defer`, `Feed`, `Define`) during lowering, then **eliminated** before operator conversion by `remove_defers::run`.
+`defer()`, `<<`, and `<<=` are CHL-level operators that let a block accumulate a result value progressively. They are reified as three CCL AST nodes (`Defer`, `Feed`, `Define`) during lowering, then **eliminated** before type inference by `desugar_defers::run`.
 
 TODO: `x = defer()` should be replaced with `deferred x` once we implement a custom parser and aren't stuck with CHL parsing rules.
 
@@ -709,59 +700,46 @@ let x = defer
 in ExprStmt(Define(x, 1), x)    # x <<= 1; x
 ```
 
+### `desugar_defers::run` — the elimination pass
+
+The pass runs **after** `lower` and **before** `infer`.  Because it runs
+pre-inference, `Defer`/`Feed`/`Define`/`ExprStmt` nodes never reach any
+later pass — those passes can treat the variants as `unreachable!`.
+
+In broad strokes, for each cluster of consecutive `let d_i = Defer in …`
+bindings the pass walks the cluster body to extract every `Feed(d_i, V)`
+and the (at most one) `Define(d_i, V)`, combines the extracted values via
+`@` (`BinOpKind::CollectionUnion`), and emits the cluster's bindings at
+the body's terminal in topological order so cross-defer references
+(`x ≪= y; y ≪= …`) resolve without `letrec`.  Special handling exists
+for per-iteration feeds (Compose/Apply with iteration lambda), Loop
+bodies (per-iteration `to_<defer>` Record fields), filter-feed Cases,
+defer-mediating UDF calls (`y = f(arg)` where `f` introduces or
+manipulates a defer), and a handful of structural rewrites (defer-
+returning let lift, alias inlining for defer handles).
+
+The full mechanism — the two-phase structure (chain rewriter + cluster
+walker), the smart-walker for defer-mediating UDF calls, the shadow-
+renaming step, error modes, known gaps, and a navigation map for the
+source — lives in **[design-desugar-defers.md](design-desugar-defers.md)**.
+
 ### Inference
 
-`Defer` gets a fresh `Type::Infer(_)` type — just an unconstrained inference variable. No `DeferredCollectionDomain` is minted at the `Defer` site.
+Because `desugar_defers` runs first, the inference pass never sees
+`Defer`/`Feed`/`Define` nodes.  Channel values appear as ordinary
+expressions (Apply/Compose/Loop), and the resolved defer is just a
+`Let` binding whose `bound_expr` is the assembled channel.  No special
+`DeferredCollectionDomain` type or per-feed unification step is needed
+— standard inference does the job.
 
-`Feed { name, value }` establishes the shape of the handle via unification:
-1. A fresh codomain inference variable `cod = Type::Infer(fresh)` is allocated.
-2. If a previous `Feed` on the same handle has already resolved the handle type to `Fun(DeferredCollectionDomain(existing_id), _)`, that `existing_id` is **reused** — the unification table is probed to check whether the handle's inference variable has already been solved. If so, the existing id is extracted; otherwise `next_defer_id()` mints a new one.
-3. `constrain_equal(handle_ty, Fun(DeferredCollectionDomain(id), cod))` imposes the function shape on the handle.
-4. `constrain_equal(value_ty, cod)` links the feed value's type to the codomain.
-5. Returns `Unit`.
-
-The id-reuse in step 2 is what allows multiple `Feed` sites on the same handle to unify correctly. Without it, each feed would mint a fresh `DeferredCollectionDomain(id_N)`, and the two constraints `Fun(DCD(id_0), cod)` and `Fun(DCD(id_1), cod)` would conflict during unification.
-
-`Feed { name, value }` resolves the type of `name` (must be `Fun(HandleDomain(_), cod)`), constrains `value`'s type against `cod`, and returns `Unit`.
-
-`Define { name, value }` constrains `value`'s type against `name`'s full type and returns `Unit`.
-
-`ExprStmt { expr, body }` infers `expr` for constraints, then returns the type of `body`.
-
-### `remove_defers::run` — the elimination pass
-
-The pass runs after `inline` and `lambda_elim`, and before `join_plan`.
-
-**Preconditions on entry** (established by `inline`):
-
-- Every `Defer` is bound by exactly one `Let { bound_expr: Defer, binding, body }`.
-- There are no alias chains: any `let y = x` where `x` is a defer-bound name has
-  already been inlined by the alias-inlining step in `inline.rs`.
-- Nested defer scopes are already lifted: any `let y = (let x = Defer in …) in …`
-  has been flattened to `let y = Defer in …` by the defer-returning lift in `inline.rs`.
-- `Feed` and `Define` target strings already name the outer defer binding directly
-  (not a stale inner name), because `lambda_elim::substitute` renames them when a
-  `Var` replacement flows in.
-
-The pass performs three steps:
-
-1. **`inline_defers`**: walks the tree looking for `Let { bound_expr: Defer, binding, body }`. For each such binding it calls `inline_defer(body, binding.name)` to extract the feed or define value:
-   - A `Define(name, value)` for the target name is extracted as the define value; its site is replaced with the `__replaced` sentinel.
-   - A `Feed(name, value)` for the target name is extracted as a feed value. The value is returned **as-is** at the extraction site; const-wrapping happens downstream:
-     - Inside a `Compose` context, `inline_defer` wraps scalar feed values in `const` using the domain of the compose element that contained the Feed, so the correct DataSource domain is captured.
-     - Outside a Compose context, `construct_feed_result` wraps remaining scalar values in `const` with a `Unit` domain.
-   - The assembled feed result replaces `Defer` as the `Let`'s bound expression.
-
-2. **`substitute_types_in_expr`**: propagates any type-variable mappings collected during step 1 (the feed case maps the old `DeferredCollectionDomain` variable to the inferred result domain).
-
-3. **`simplify`**: cleans up the residual tree:
-   - `ExprStmt` nodes containing the `__replaced` sentinel (no remaining `Feed`) are handled by `try_drop_pure_expr_stmt`, which drops `ExprStmt(inner, body)` when `inner` has no `Feed`.
-
-After the pass, no `Defer`, `Feed`, `Define`, or `ExprStmt` nodes should remain in the tree.
-
-### Why `try_const_reduce` is guarded by `!contains_feed`
-
-The `f ≫ g ▷ const  →  g ▷ const` rule in `simplify` must not fire while a compose still contains unprocessed `Feed` nodes.  Before `remove_defers` runs, a for-loop body produces a compose like `[requests, const(Feed("responses", "Hello!"))]`.  If `const_reduce` fired here it would produce `new_ty = DataSource → Unit` (the codomain of the `Feed`, which is `Unit`).  That incorrect type would propagate through `type_substitutions` and replace the `HandleDomain` placeholder with `Unit`, causing the responses binding to compile with `IterateExtent(Base(Unit))` — which does not register with the scheduler, so no HTTP notifications ever fire.  The `!contains_feed` guard prevents this premature firing.
+Mutation-loop inference (`infer_mutation_loop`) leverages
+`Type::PartialRecord` to learn the loop body's full Record codomain
+from the body itself: the constraint
+`body_codomain ≡ PartialRecord({step: <step_shape>})` pins the `step`
+field while letting unification add whatever `to_<defer>` fields the
+body's Record literal carries.  This is the right pattern for any
+"shape with a known core plus an open set of additional fields" inference
+goal — see `Type::PartialRecord` in the type table above.
 
 ---
 
@@ -915,22 +893,6 @@ Apply { argument: Tuple([f, g]), function: Builtin(Zip) }
 There is no dedicated `Zip` AST node; it reuses the existing `Apply` + `Tuple`
 + `Builtin` nodes.
 
-### Feed–Define rename in `substitute`
-
-`substitute(expr, name, replacement)` propagates renaming into `Feed` and `Define`
-target strings when the replacement is a `Var`:
-
-```
-substitute(Feed("x", v), "x", Var("y"))  →  Feed("y", substitute(v, "x", Var("y")))
-substitute(Define("x", v), "x", Var("y"))  →  Define("y", substitute(v, "x", Var("y")))
-```
-
-This is essential for the defer-returning lift in `inline.rs`: when the inner
-binding `x` is substituted with `Var(y)`, every `Feed("x", …)` and `Define("x", …)`
-in the inner body must be renamed to target `y`, or `remove_defers` would fail to
-find any feeds on the outer binding. The `is_free` check also accounts for the
-name field: `Feed("x", v)` counts `x` as a free variable for early-exit purposes.
-
 ### For-loop filter pattern in lambda elimination
 
 For-loops lower directly to `Compose([src, Lambda(x, body)])`. Lambda elimination handles them through the existing `Lambda` and `Compose` arms, with one special case for the filter pattern.
@@ -955,11 +917,10 @@ has `bound_ty: None` because the old annotation is stale and would be incorrect.
 ## Inlining Pass (`ccl/inline.rs`)
 
 `inline_non_iterable_lambdas` runs **after `infer`** and **before `lambda_elim`**.
-It performs three structural rewrites on `Let` bindings, in order:
+It performs two structural rewrites on `Let` bindings, in order:
 
 1. **Alias inlining** — eliminate `let y = x` pure α-renamings.
-2. **Defer-returning lift** — merge an inner defer scope into the outer one.
-3. **UDF inlining** — substitute call sites for functions over non-iterable domains.
+2. **UDF inlining** — substitute call sites for functions over non-iterable domains.
 
 ### Motivation
 
@@ -990,31 +951,6 @@ node inside that body, which would cause variable capture.
 Performing this before `lambda_elim` prevents the let-in-lambda rule from
 hoisting such bindings into `const(x)` wrappers that would need to be
 recognised and stripped by downstream passes.
-
-### Defer-returning lift
-
-When the right-hand side of a `Let { binding: y, bound_expr, body }` is (after
-peeling any leading `ExprStmt` nodes) a defer-returning expression —
-`let x = Defer in inner_body` where `inner_body` terminates in `Var(x)`, possibly
-via `ExprStmt` and nested `Let` nodes — the pass **lifts** the inner defer to the
-outer binding:
-
-```text
-let y = (ExprStmt*(let x = Defer in inner_body)) in outer_body
-  →  let y = Defer
-     in inner_body[x→y]
-        with terminal Var(y) replaced by (ExprStmt*(outer_body))
-```
-
-The substitution `x → Var(y)` — performed by `lambda_elim::substitute` — also
-renames every `Feed("x", …)` and `Define("x", …)` to `Feed("y", …)` and
-`Define("y", …)` (see §Lambda Elimination / Feed–Define rename). Any leading
-`ExprStmt(Feed("old_param", …))` wrappers produced by beta-reducing a
-defer-returning argument are similarly renamed to use `y`.
-
-This rewrite must happen before `lambda_elim` so that the single flattened
-`let y = Defer in …` shape enters `remove_defers` cleanly, without the nested
-defer scopes that the downstream alias map previously had to reconcile.
 
 ### What is inlined (UDF step)
 

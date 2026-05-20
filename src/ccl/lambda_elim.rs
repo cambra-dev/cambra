@@ -44,7 +44,7 @@ use std::cell::RefCell;
 use std::mem::replace;
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::{is_free, typed_compose};
+use crate::ccl::ccl_utils::{is_free, typed_compose, walk_refined_predicates_mut};
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
 use crate::ccl::{
@@ -84,9 +84,62 @@ impl std::fmt::Display for LambdaElimError {
 /// Returns `Ok(point_free_expr)` where the result contains no `Lambda` nodes.
 pub fn run(expr: Expr) -> Result<Expr, LambdaElimError> {
     let mut ctx = ElimContext::new();
-    let point_free = elim_lambdas(&mut ctx, expr)?;
+    let mut point_free = elim_lambdas(&mut ctx, expr)?;
+    // Walk the result tree for `Refinement` predicates embedded in type
+    // slots (e.g. user-annotation-derived filter refinements introduced
+    // by [`crate::ccl::desugar_defers`]) and eliminate lambdas inside
+    // them too — the main walk only visits expressions, so predicates
+    // sitting in type positions wouldn't otherwise be touched.
+    let mut seen_refinements: std::collections::HashSet<crate::ccl::RefinementId> =
+        std::collections::HashSet::new();
+    elim_lambdas_in_type_refinements(&mut point_free, &mut ctx, &mut seen_refinements)?;
     let simplified = simplify(point_free);
     Ok(simplified)
+}
+
+/// Walk `expr` and every nested `Type::Refinement` predicate, running
+/// [`elim_lambdas`] on the predicate so it becomes point-free.  Tracks
+/// already-visited [`Refinement::id`]s in `seen` so shared refinement
+/// instances (e.g. duplicated by [`substitute`] cloning a type with
+/// `Rc`-shared predicates) are processed only once.
+fn elim_lambdas_in_type_refinements(
+    expr: &mut Expr,
+    ctx: &mut ElimContext,
+    seen: &mut std::collections::HashSet<crate::ccl::RefinementId>,
+) -> Result<(), LambdaElimError> {
+    elim_lambdas_in_type(&mut expr.ty, ctx, seen)?;
+    // `Defer`/`Feed`/`Define`/`ExprStmt` are eliminated by
+    // `desugar_defers` before inference; the catch-all here relies on
+    // `walk_children_mut` not visiting their children either (those
+    // variants are unreachable by the time `lambda_elim` runs).
+    let mut err = Ok(());
+    expr.walk_children_mut(|child| {
+        if err.is_ok() {
+            err = elim_lambdas_in_type_refinements(child, ctx, seen);
+        }
+    });
+    err
+}
+
+/// Walk `ty` and run [`elim_lambdas`] on every `Refinement` predicate
+/// nested inside.  Skips refinements whose ID is already in `seen`.
+fn elim_lambdas_in_type(
+    ty: &mut Type,
+    ctx: &mut ElimContext,
+    seen: &mut std::collections::HashSet<crate::ccl::RefinementId>,
+) -> Result<(), LambdaElimError> {
+    let mut err = Ok(());
+    walk_refined_predicates_mut(ty, seen, &mut |pred, _vis| {
+        if err.is_ok() {
+            let placeholder = Expr::lit(Lit::Unit);
+            let old_pred = replace(pred, placeholder);
+            match elim_lambdas(ctx, old_pred) {
+                Ok(new_pred) => *pred = new_pred,
+                Err(e) => err = Err(e),
+            }
+        }
+    });
+    err
 }
 
 // ---------------------------------------------------------------------------
@@ -281,26 +334,23 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             init_args,
             source,
             loop_body,
-            body_taps,
-        } => crate::ccl::walk_loop_children(
-            params,
-            init_args,
-            source,
-            loop_body,
-            body_taps,
-            Some(name),
-            |e| substitute(e, name, replacement),
-        ),
+        } => {
+            crate::ccl::walk_loop_children(params, init_args, source, loop_body, Some(name), |e| {
+                substitute(e, name, replacement)
+            })
+        }
 
         TypedExprNode::Compose(elts) => {
             let new_elts: Vec<Expr> = elts
                 .into_iter()
                 .map(|e| substitute(e, name, replacement))
                 .collect();
-            // After substitution element types may change (e.g. a Var whose type carries
-            // a DeferredCollectionDomain handle gets replaced by a concrete expression with
-            // a resolved domain).  Recompute the outer Fun type so the invariant
-            // `Compose.ty == Fun(first_domain, last_codomain)` is maintained.
+            // After substitution element types may change (e.g. a Var
+            // whose type was an unresolved Infer placeholder gets
+            // replaced by a concrete expression with a fully-typed
+            // domain).  Recompute the outer Fun type so the invariant
+            // `Compose.ty == Fun(first_domain, last_codomain)` is
+            // maintained.
             if let (Some(first), Some(last)) = (new_elts.first(), new_elts.last())
                 && let (Some(new_domain), Some(new_codomain)) =
                     (first.ty.domain(), last.ty.codomain())
@@ -310,48 +360,14 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             TypedExprNode::Compose(new_elts)
         }
 
-        // Feed/Define: substitute into the value, and if the target name equals the
-        // variable being substituted and the replacement is a Var, rename the target
-        // string too.  This is α-renaming of the binding site: a Feed("x", v) is a
-        // use of the name "x" in the same way that Var("x") is, so when we rename
-        // x → y (replacement = Var("y")), the feed site must follow.  We only rename
-        // when the replacement is a plain Var because that is the only safe case —
-        // a non-Var replacement would require ANF'ing the feed target, which is a
-        // separate transform.
-        TypedExprNode::Feed {
-            name: feed_name,
-            value,
-        } => {
-            let new_feed_name = if feed_name == name {
-                match &replacement.node {
-                    TypedExprNode::Var(new_name) => new_name.clone(),
-                    _ => feed_name,
-                }
-            } else {
-                feed_name
-            };
-            TypedExprNode::Feed {
-                name: new_feed_name,
-                value: Box::new(substitute(*value, name, replacement)),
-            }
-        }
-
-        TypedExprNode::Define {
-            name: def_name,
-            value,
-        } => {
-            let new_def_name = if def_name == name {
-                match &replacement.node {
-                    TypedExprNode::Var(new_name) => new_name.clone(),
-                    _ => def_name,
-                }
-            } else {
-                def_name
-            };
-            TypedExprNode::Define {
-                name: new_def_name,
-                value: Box::new(substitute(*value, name, replacement)),
-            }
+        // `Defer`, `Feed`, `Define`, and `ExprStmt` are eliminated by
+        // `desugar_defers` before inference; `substitute` only runs on
+        // post-desugar trees.
+        TypedExprNode::Feed { .. }
+        | TypedExprNode::Define { .. }
+        | TypedExprNode::Defer
+        | TypedExprNode::ExprStmt { .. } => {
+            unreachable!("Defer/Feed/Define/ExprStmt eliminated by desugar_defers before inference")
         }
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
@@ -783,36 +799,11 @@ fn elim_lambda_impl(
             elim_lambda(ctx, param, param_ty, desugared)
         }
 
-        TypedExprNode::Feed { name, value } => Ok(TypedExpr {
-            ty: result_ty,
-            node: TypedExprNode::Feed {
-                name,
-                value: Box::new(elim_lambda(ctx, param, param_ty, *value)?),
-            },
-            user_annotation: None,
-        }),
-
-        TypedExprNode::Define { name, value } => Ok(TypedExpr {
-            ty: result_ty,
-            node: TypedExprNode::Define {
-                name,
-                value: Box::new(elim_lambda(ctx, param, param_ty, *value)?),
-            },
-            user_annotation: None,
-        }),
-
-        // ExprStmt: λx → (e; b)  ⟹  λx→e ; λx→b — both sub-expressions are
-        // independently lifted over the lambda's parameter.  Used by
-        // [`crate::ccl::lower::lower_mutation_loop_body`] to interleave
-        // per-iteration feeds (`o << x`) with the new accumulator value.
-        TypedExprNode::ExprStmt { expr, body } => Ok(TypedExpr {
-            ty: result_ty,
-            node: TypedExprNode::ExprStmt {
-                expr: Box::new(elim_lambda(ctx, param, param_ty, *expr)?),
-                body: Box::new(elim_lambda(ctx, param, param_ty, *body)?),
-            },
-            user_annotation: None,
-        }),
+        // `Defer`, `Feed`, and `Define` are eliminated by `desugar_defers`
+        // before inference; by the time `lambda_elim` runs they cannot appear.
+        TypedExprNode::Feed { .. } | TypedExprNode::Define { .. } | TypedExprNode::Defer => {
+            unreachable!("Defer/Feed/Define eliminated by desugar_defers before inference")
+        }
 
         // Loop: eliminate `param` from sub-expressions, respecting shadowing
         // by the Loop's own params.  The mutation-loop-shaped Loop produced
@@ -825,7 +816,6 @@ fn elim_lambda_impl(
             init_args,
             source,
             loop_body,
-            body_taps,
         } => Ok(TypedExpr {
             ty: result_ty,
             node: crate::ccl::try_walk_loop_children(
@@ -833,7 +823,6 @@ fn elim_lambda_impl(
                 init_args,
                 source,
                 loop_body,
-                body_taps,
                 Some(param),
                 |e| elim_lambda(ctx, param, param_ty, e),
             )?,

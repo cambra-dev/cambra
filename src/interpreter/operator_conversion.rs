@@ -779,15 +779,15 @@ fn convert_impl(
         // Mutation-loop-shaped Loop: compile the cyclic op-graph.
         //
         // Every Loop has body codomain `Record({step: <step_shape>,
-        // tap_*: T_*})` (see [`infer_mutation_loop`]):
+        // to_<defer>*: T_*})` (see [`infer_mutation_loop`]):
         // - `step_shape` is the scalar accumulator type for a single
         //   accumulator, or `Tuple(T_0, …, T_{n-1})` for multi-var.
         //   The cycle is closed on `.step` — op-conversion projects it
         //   before feeding back to `recursive_input`.
-        // - `tap_*` is one field per `o <<` feed inside the body
-        //   (possibly empty).  These ride along on the same body
-        //   fan-out; surrounding lowering picks each off via
-        //   `Proj("tap_*")`.
+        // - `to_<defer>` is one field per `<<` feed inside the body
+        //   (possibly empty), emitted by [`desugar_defers`].  These
+        //   ride along on the same body fan-out; surrounding lowering
+        //   picks each off via `Proj("to_<defer>")`.
         //
         // The Loop's external output is always the running body stream
         // (the `Fun(D, Record(...))`); surrounding lowering finishes

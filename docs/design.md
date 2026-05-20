@@ -31,10 +31,10 @@ See [docs/operational-semantics/summary.md](operational-semantics/summary.md) fo
 CHL source
   → parse            (chl_parser, see src/chl_parser/design-chl-parser.md)
   → lower            (ccl/lower.rs: CHL AST → CCL Expr)
+  → desugar_defers   (ccl/desugar_defers.rs: Defer/Feed/Define → let-chain + Record channels)
   → infer            (ccl/infer.rs: type inference + check_fully_typed validation)
   → inline           (ccl/inline.rs: inline UDF Let bindings with non-iterable domains; beta-reduce at call sites)
   → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators)
-  → remove_defers    (ccl/remove_defers.rs: inline deferred collection definitions)
   → join_plan        (ccl/join_plan.rs: hash-join and keyed aggregate optimization)
   → simplify         (ccl/simplify.rs: CCC algebraic rewrites to fixed point)
   → operator_conversion  (interpreter/operator_conversion.rs: λ-free CCL → tile operators)
