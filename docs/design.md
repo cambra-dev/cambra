@@ -43,3 +43,28 @@ CHL source
 ```
 
 For source layout and design doc locations, see [src/design.md](/src/design.md).
+
+## Notation conventions
+
+Design docs that mix CCL syntax with meta-theoretic variables (placeholders for any specific term, type, or predicate) italicize the placeholders using Unicode mathematical italic characters:
+
+- Single-letter term/value metas: `𝑎` `𝑏` `𝑐` `𝑑` `𝑒` `𝑓` `𝑔` `ℎ` `𝑖` `𝑗` `𝑘` `𝑙` `𝑚` `𝑛` `𝑜` `𝑝` `𝑞` `𝑟` `𝑠` `𝑡` `𝑢` `𝑣` `𝑤` `𝑥` `𝑦` `𝑧` (U+1D44E–U+1D467, with `ℎ` at the legacy U+210E).
+- Single-letter type metas: `𝐴` `𝐵` `𝐶` `𝐷` `𝐸` `𝐹` `𝐺` `𝐻` `𝐼` `𝐽` `𝐾` `𝐿` `𝑀` `𝑁` `𝑂` `𝑃` `𝑄` `𝑅` `𝑆` `𝑇` `𝑈` `𝑉` `𝑊` `𝑋` `𝑌` `𝑍` (U+1D434–U+1D44D).
+- Digit subscripts: `₀` `₁` `₂` `₃` `₄` `₅` `₆` `₇` `₈` `₉` (U+2080–U+2089) for indexed variants like `𝐷₁`, `𝐶₂`.
+
+Multi-character placeholders (`body`, `arg`, `param`, `predicate`, ...) and concrete identifiers (`xs`, `__gb_k`, `key_fn`, ...) stay upright. The convention applies to inline pseudo-code in backticks and to prose mentions; fenced code blocks (which represent literal source) stay in regular characters. String literals (`"x"`, `"k"`) are also literal, not metavariables, and stay upright.
+
+Stars/underscores for italics don't work inside backticks — CommonMark skips emphasis parsing inside code spans. The Unicode math italic characters are pre-rendered italic glyphs that render correctly in any modern Markdown viewer (GitHub, VS Code, browsers) without needing markup.
+
+### Function types and terms
+
+Cambra's `Type::Fun` has an optional binder name; the symbolic form distinguishes the two cases:
+
+- `(𝑥: 𝐴) ⇒ 𝐵` — function type with named binder. `𝑥` is bound in `𝐵` and may be referenced by refinements or other types nested there.
+- `𝐴 ⇒ 𝐵` — function type with no named binder. The codomain is independent of the argument value.
+
+Refinement types use the standard subset-type notation `{𝑥: 𝑇 | 𝑝(𝑥)}`. The function-type arrow `⇒` is right-associative: `𝐴 ⇒ 𝐵 ⇒ 𝐶` parses as `𝐴 ⇒ (𝐵 ⇒ 𝐶)`.
+
+At the term level: `λ 𝑥 → body` is a lambda (the `→` separates the binder from the body); `𝑎 ▷ 𝑓` is forward apply (`𝑓(𝑎)` with the argument first); `𝑓 ≫ 𝑔` is forward compose (`λ 𝑥 → 𝑔(𝑓(𝑥))`).
+
+The two arrows are deliberately distinct: `⇒` is the type arrow, `→` is the term-level lambda separator. Don't mix them.

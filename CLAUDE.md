@@ -85,6 +85,23 @@ Do **not** write `Apply { function: ..., argument: ... }`, `Apply(f, x)`, `Compo
 
 When the type matters to the point being made (e.g. showing a domain refinement that triggers operator dispatch), include type annotations via `symbolic_typed`-style suffixes: `expr:type`.
 
+### Metavariable notation in design docs
+When design-doc prose and inline pseudo-code mix CCL syntax with meta-theoretic placeholders (stand-ins for any specific term, type, or predicate), italicize the placeholders using Unicode mathematical italic characters. Single-letter Latin: `𝑎`–`𝑧` (U+1D44E–U+1D467, lowercase, for term/value metas) and `𝐴`–`𝑍` (U+1D434–U+1D44D, uppercase, for type metas). One gotcha — italic lowercase `ℎ` lives at the legacy codepoint U+210E, not in the contiguous range. Digit subscripts: `₀`–`₉` (U+2080–U+2089) for indexed variants (`𝐷₁`, `𝐶₂`). Multi-character placeholders (`body`, `arg`, `param`, `predicate`, ...) and concrete identifiers (`xs`, `__gb_k`, `key_fn`, ...) stay upright. The convention applies to inline pseudo-code in backticks and to prose mentions, **not** to fenced code blocks — those represent literal source and stay in regular characters throughout. String literals (`"x"`, `"k"`) are also literal, not metavariables, and stay upright. Stars/underscores for italics don't work inside backticks; the Unicode math characters are pre-rendered italic glyphs that render correctly in any modern Markdown viewer.
+
+### Symbolic notation for types and terms
+Use the symbolic forms below in prose and inline pseudo-code (not in fenced code blocks, which represent literal source):
+
+- **Function type with named binder** (`Type::Fun` with `name: Some(_)`): `(𝑥: 𝐴) ⇒ 𝐵`. `𝑥` is bound in `𝐵`.
+- **Function type with no named binder** (`Type::Fun` with `name: None`): `𝐴 ⇒ 𝐵`.
+- **Refinement type**: `{𝑥: 𝑇 | 𝑝(𝑥)}` — standard subset-type notation.
+- **Lambda** (term): `λ 𝑥 → body`. The `→` after the binder separates the parameter from the body.
+- **Forward apply** (term level): `𝑎 ▷ 𝑓` means `𝑓(𝑎)`.
+- **Forward compose** (term level): `𝑓 ≫ 𝑔` means `λ 𝑥 → 𝑔(𝑓(𝑥))`.
+
+Both `⇒` and `→` are right-associative. They are distinct: `⇒` is for *types*, `→` is for *terms* (lambda body separator and similar). Don't mix them.
+
+Do not render type information as Rust struct syntax (e.g., `Fun { name: Some("k"), domain: K, codomain: ... }`) when prose calls for symbolic notation — the struct form is appropriate inside fenced ` ```rust ` blocks that show actual Rust source, but in symbolic positions use the arrow / refinement-bracket notation above.
+
 ### Workflow
 After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds, then progress to CI.
 
