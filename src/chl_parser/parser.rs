@@ -362,7 +362,7 @@ const CATEGORIES: &[(&str, &[Token])] = &[
             Token::Amp,
             Token::Pipe,
             Token::Caret,
-            Token::At,
+            Token::PlusPlus,
         ],
     ),
     (
@@ -553,7 +553,7 @@ type PErr<'src> = extra::Err<Rich<'src, Token, Span>>;
 /// 8. `|`
 /// 9. `^`
 /// 10. `&`
-/// 11. `@`
+/// 11. `++`
 /// 12. `+`, `-`
 /// 13. `*`, `//`
 /// 14. unary `-`
@@ -869,7 +869,7 @@ where
         let collection_union = sum
             .clone()
             .foldl_with(
-                just(Token::At)
+                just(Token::PlusPlus)
                     .to(BinOp::CollectionUnion)
                     .then(sum.clone())
                     .repeated(),
@@ -1545,7 +1545,7 @@ mod tests {
 
     #[test]
     fn collection_union_operator() {
-        let e = parse_e("[1, 2] @ [3, 4]").node;
+        let e = parse_e("[1, 2] ++ [3, 4]").node;
         assert!(matches!(
             e,
             Expr::BinOp {

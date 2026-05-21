@@ -2,7 +2,7 @@
 //!
 //! Replaces the historical `rustpython_parser` front end. CHL has Python-like
 //! indentation-significant syntax but diverges from Python where convenient
-//! for Cambra's data-flow domain (e.g. `<<` / `<<=` feed operators, `@` for
+//! for Cambra's data-flow domain (e.g. `<<` / `<<=` feed operators, `++` for
 //! collection union, no `is`/`in`/`while`/`with`/`try`).
 //!
 //! Pipeline:

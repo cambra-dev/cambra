@@ -116,10 +116,10 @@ fn tuples_and_subscript() {
 
 #[test]
 fn collection_union() {
-    let _ = must_parse_expr("[1, 2, 3] @ [4, 5]");
+    let _ = must_parse_expr("[1, 2, 3] ++ [4, 5]");
     must_parse_module(indoc! {"
         x = [1, 2]
-        x @ x @ x
+        x ++ x ++ x
     "});
 }
 

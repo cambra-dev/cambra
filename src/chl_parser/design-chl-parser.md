@@ -11,9 +11,9 @@ Python. This was expedient but constraining:
 
 1. **Strict Python compatibility is no longer a goal.** CHL has already
    diverged from Python at the operator level (`<<` is the feed operator,
-   `<<=` defines a deferred output, `@` is collection union) and we want to
-   add more CHL-specific syntax in future without coercing it into Python's
-   grammar.
+   `<<=` defines a deferred output, `++` is collection union) and we want
+   to add more CHL-specific syntax in future without coercing it into
+   Python's grammar.
 
 2. **Error recovery is weak.** `rustpython_parser` aborts on the first
    syntax error, surfacing one diagnostic per parse. For an interactive UX
@@ -105,7 +105,7 @@ highest precedence:
 8. `|`
 9. `^`
 10. `&`
-11. `@`
+11. `++`
 12. `+`, `-`
 13. `*`, `//`
 14. unary `-`
@@ -174,7 +174,7 @@ progress" diagnostic). With `.at_least(1)`, recovery cleanly declines at
 those positions and the outer `repeated()` terminates normally.
 
 **Load-bearing detail #2:** every precedence layer inside `expression()`
-(`product`, `sum`, `matmul`, `bitand`, `bitxor`, `bitor`, `bool_not`,
+(`product`, `sum`, `collection_union`, `bitand`, `bitxor`, `bitor`, `bool_not`,
 `bool_and`, `bool_or`, `ternary`, `feed`, plus `atom`, `postfix`, `unary`)
 ends in `.boxed()`. Without that, the 15-layer precedence chain
 monomorphises into nested generic combinator types, and each `expr.clone()`

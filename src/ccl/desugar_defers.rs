@@ -25,7 +25,7 @@
 //! resolves a deferred binding: the value the cluster's let-wrap
 //! ultimately binds to `d_i`.  For a single `<<` feed the channel is
 //! that feed's value (possibly `Unit`-lifted to `Fun(Unit, T)` at
-//! top level); for multiple feeds it is their `@`-union; for feeds
+//! top level); for multiple feeds it is their `++`-union; for feeds
 //! inside an iteration scope it is the companion `Apply`/`Compose`/
 //! `Loop` that mirrors the iteration shape and yields the feed value
 //! instead of `Unit`.
@@ -40,8 +40,8 @@
 //!    they sit in (Compose/Apply/Loop/Case), producing a channel
 //!    expression for each `d_i`.
 //! 2. **Channel assembly.**  Combine multiple feeds per defer via
-//!    `@` ([`BinOpKind::CollectionUnion`]); lift scalar feeds to
-//!    `Fun(Unit, T)`; emit refined-source channels for filter-feed
+//!    `++` ([`TypedExprNode::CollectionUnion`]); lift scalar feeds
+//!    to `Fun(Unit, T)`; emit refined-source channels for filter-feed
 //!    Case shapes.
 //! 3. **α-renaming downstream of the cluster wrap.**  When a channel
 //!    captures a free variable whose name is rebound by a `Let`
@@ -83,8 +83,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, BinOpKind, Branch, Expr, Lit, Refinement, RefinementKind, Type, TypedExpr,
-    TypedExprNode, ccl_utils::count_free, next_refinement_id, walk_loop_children,
+    BaseType, Branch, Expr, Lit, Refinement, RefinementKind, Type, TypedExpr, TypedExprNode,
+    ccl_utils::count_free, next_refinement_id, walk_loop_children,
 };
 
 /// Errors that can arise while desugaring `Defer`/`Feed`/`Define` nodes.
@@ -838,6 +838,11 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
                 .map(|e| rewrite_chains_in_scope(e, ctx))
                 .collect(),
         ),
+        TypedExprNode::CollectionUnion(elts) => TypedExprNode::CollectionUnion(
+            elts.into_iter()
+                .map(|e| rewrite_chains_in_scope(e, ctx))
+                .collect(),
+        ),
         TypedExprNode::Record(fields) => TypedExprNode::Record(
             fields
                 .into_iter()
@@ -1045,6 +1050,11 @@ fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
                 .collect(),
         ),
         TypedExprNode::Compose(elts) => TypedExprNode::Compose(
+            elts.into_iter()
+                .map(|e| pre_infer_substitute(e, name, replacement))
+                .collect(),
+        ),
+        TypedExprNode::CollectionUnion(elts) => TypedExprNode::CollectionUnion(
             elts.into_iter()
                 .map(|e| pre_infer_substitute(e, name, replacement))
                 .collect(),
@@ -1307,6 +1317,9 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         TypedExprNode::Compose(elts) => {
             TypedExprNode::Compose(elts.into_iter().map(drop_expr_stmts).collect())
         }
+        TypedExprNode::CollectionUnion(elts) => {
+            TypedExprNode::CollectionUnion(elts.into_iter().map(drop_expr_stmts).collect())
+        }
         TypedExprNode::Record(fields) => TypedExprNode::Record(
             fields
                 .into_iter()
@@ -1376,9 +1389,10 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
             assert_no_defer_residue(inner)
         }
         TypedExprNode::Lambda { body, .. } => assert_no_defer_residue(body),
-        TypedExprNode::Tuple(elts) | TypedExprNode::List(elts) | TypedExprNode::Compose(elts) => {
-            elts.iter().try_for_each(assert_no_defer_residue)
-        }
+        TypedExprNode::Tuple(elts)
+        | TypedExprNode::List(elts)
+        | TypedExprNode::Compose(elts)
+        | TypedExprNode::CollectionUnion(elts) => elts.iter().try_for_each(assert_no_defer_residue),
         TypedExprNode::Record(fields) => fields
             .iter()
             .try_for_each(|(_, e)| assert_no_defer_residue(e)),
@@ -1415,12 +1429,15 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
 /// inlines the define value directly (define path).  All other nodes are
 /// recursed into structurally.
 fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
+    if matches!(expr.node, TypedExprNode::Error) {
+        crate::unexpected_error_node!();
+    }
     let TypedExpr {
         node,
         ty,
         user_annotation,
     } = expr;
-    let node = match node {
+    match node {
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -1462,7 +1479,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // non-clustered defers (inner `let d = Defer in ...`
             // separated from this cluster by other lets).
             let body_rewritten = desugar(current_body, ctx)?;
-            return channelize_cluster(&defer_names, body_rewritten, ctx);
+            channelize_cluster(&defer_names, body_rewritten, ctx)
         }
         TypedExprNode::Let {
             binding,
@@ -1611,122 +1628,30 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 let substituted = pre_infer_substitute(body, &binding.name, &bound_expr);
                 return Ok(substituted);
             }
-            TypedExprNode::Let {
-                binding,
-                bound_expr: Box::new(bound_expr),
-                body: Box::new(body),
-            }
+            Ok(TypedExpr {
+                node: TypedExprNode::Let {
+                    binding,
+                    bound_expr: Box::new(bound_expr),
+                    body: Box::new(body),
+                },
+                ty,
+                user_annotation,
+            })
         }
-        TypedExprNode::Apply { function, argument } => TypedExprNode::Apply {
-            function: Box::new(desugar(*function, ctx)?),
-            argument: Box::new(desugar(*argument, ctx)?),
-        },
-        TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
-            left: Box::new(desugar(*left, ctx)?),
-            op,
-            right: Box::new(desugar(*right, ctx)?),
-        },
-        TypedExprNode::UnaryOp(op, inner) => {
-            TypedExprNode::UnaryOp(op, Box::new(desugar(*inner, ctx)?))
+        // All other variants (Apply/BinOp/Lambda/Loop/…, leaves, and the
+        // Feed/Define pass-through that gets caught by
+        // [`assert_no_defer_residue`] if it survives) just recurse
+        // structurally into every child.
+        other => {
+            let mut expr = TypedExpr {
+                node: other,
+                ty,
+                user_annotation,
+            };
+            expr.try_map_children(|c| desugar(c, ctx))?;
+            Ok(expr)
         }
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => TypedExprNode::Lambda {
-            param,
-            body: Box::new(desugar(*body, ctx)?),
-            refinement,
-        },
-        TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
-            input: Box::new(desugar(*input, ctx)?),
-            kind,
-        },
-        TypedExprNode::Tuple(elts) => TypedExprNode::Tuple(
-            elts.into_iter()
-                .map(|e| desugar(e, ctx))
-                .collect::<Result<_, _>>()?,
-        ),
-        TypedExprNode::List(elts) => TypedExprNode::List(
-            elts.into_iter()
-                .map(|e| desugar(e, ctx))
-                .collect::<Result<_, _>>()?,
-        ),
-        TypedExprNode::Compose(elts) => TypedExprNode::Compose(
-            elts.into_iter()
-                .map(|e| desugar(e, ctx))
-                .collect::<Result<_, _>>()?,
-        ),
-        TypedExprNode::Record(fields) => {
-            let mut new_fields = Vec::with_capacity(fields.len());
-            for (n, e) in fields {
-                new_fields.push((n, desugar(e, ctx)?));
-            }
-            TypedExprNode::Record(new_fields)
-        }
-        TypedExprNode::Case { branches } => {
-            let mut new_branches = Vec::with_capacity(branches.len());
-            for Branch { guard, body } in branches {
-                new_branches.push(Branch {
-                    guard: desugar(guard, ctx)?,
-                    body: desugar(body, ctx)?,
-                });
-            }
-            TypedExprNode::Case {
-                branches: new_branches,
-            }
-        }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            let new_init: Vec<Expr> = init_args
-                .into_iter()
-                .map(|e| desugar(e, ctx))
-                .collect::<Result<_, _>>()?;
-            let new_source = Box::new(desugar(*source, ctx)?);
-            let new_body = Box::new(desugar(*loop_body, ctx)?);
-            TypedExprNode::Loop {
-                params,
-                init_args: new_init,
-                source: new_source,
-                loop_body: new_body,
-            }
-        }
-        TypedExprNode::ExprStmt { expr: e, body } => TypedExprNode::ExprStmt {
-            expr: Box::new(desugar(*e, ctx)?),
-            body: Box::new(desugar(*body, ctx)?),
-        },
-        // Leaf nodes (no sub-expressions).
-        node @ (TypedExprNode::Lit(_)
-        | TypedExprNode::Var(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer) => node,
-        // Feed/Define for some defer name not yet bound at this point in the
-        // walk: pass through.  When the enclosing `let d = Defer in body`
-        // arm above processes the body, [`extract_for_defer`] will extract
-        // these and replace them with `Unit`.  If a stray Feed/Define
-        // remains after the full desugar pass it is caught by
-        // [`assert_no_defer_residue`] below.
-        TypedExprNode::Feed { name, value } => TypedExprNode::Feed {
-            name,
-            value: Box::new(desugar(*value, ctx)?),
-        },
-        TypedExprNode::Define { name, value } => TypedExprNode::Define {
-            name,
-            value: Box::new(desugar(*value, ctx)?),
-        },
-        TypedExprNode::Error => crate::unexpected_error_node!(),
-    };
-    Ok(TypedExpr {
-        node,
-        ty,
-        user_annotation,
-    })
+    }
 }
 
 /// Process a cluster of consecutive `let d_i = Defer in …` bindings.
@@ -1740,9 +1665,9 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
 ///
 /// Each defer's channel is built using the same rules as
 /// [`channelize_defer`]: a single feed passes through, multiple feeds
-/// union via [`BinOpKind::CollectionUnion`], a `Define` value is used
-/// directly, and top-level scalar feeds are lifted to `Fun(Unit, T)`
-/// via the `λ __unused → V` wrap inside `extract_for_defer`.
+/// union via [`TypedExprNode::CollectionUnion`], a `Define` value is
+/// used directly, and top-level scalar feeds are lifted to `Fun(Unit,
+/// T)` via the `λ __unused → V` wrap inside `extract_for_defer`.
 fn channelize_cluster(
     defer_names: &[String],
     body: Expr,
@@ -2180,7 +2105,8 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<String> {
             }
             TypedExprNode::Tuple(elts)
             | TypedExprNode::List(elts)
-            | TypedExprNode::Compose(elts) => {
+            | TypedExprNode::Compose(elts)
+            | TypedExprNode::CollectionUnion(elts) => {
                 for e in elts {
                     rec(e, bound, out);
                 }
@@ -2440,19 +2366,16 @@ fn build_contributions_record(
     Ok(ContributionsRecord { body, targets })
 }
 
-/// A single feed value passes through unchanged.  Multiple feed values are
-/// merged via `BinOpKind::CollectionUnion` (i.e. `v_0 @ v_1 @ …`), which
-/// infer/lambda_elim will later compile to the `CollectionUnion` builtin.
+/// A single feed value passes through unchanged.  Multiple feed values
+/// are merged via [`TypedExprNode::CollectionUnion`] — the dedicated
+/// N-ary collection-union node — which compiles to a `UnionOperator`
+/// downstream.
 fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
     debug_assert!(!feeds.is_empty());
     if feeds.len() == 1 {
         return feeds.pop().unwrap();
     }
-    let mut iter = feeds.into_iter();
-    let first = iter.next().unwrap();
-    iter.fold(first, |acc, next| {
-        Expr::binop(acc, BinOpKind::CollectionUnion, next)
-    })
+    Expr::collection_union(feeds)
 }
 
 /// Synthesize the per-target Feed contributions for a defer-mediating
@@ -3201,6 +3124,11 @@ fn extract_for_defer(
             }
             TypedExprNode::Compose(new_elts)
         }
+        TypedExprNode::CollectionUnion(elts) => TypedExprNode::CollectionUnion(
+            elts.into_iter()
+                .map(|e| extract_for_defer(e, defer_name, feeds, define, in_inner_scope, ctx))
+                .collect::<Result<_, _>>()?,
+        ),
         TypedExprNode::Record(fields) => {
             let mut new_fields = Vec::with_capacity(fields.len());
             for (n, e) in fields {
@@ -3550,7 +3478,7 @@ fn process_loop_for_defer(
     }
     // Each feed-site inside the loop body contributes a separate
     // per-iteration stream over the loop's domain.  We can't combine the
-    // raw scalar values inside the body via `@` (collection union expects
+    // raw scalar values inside the body via `++` (collection union expects
     // function-typed operands), so we emit one `to_<defer>_<k>` field per
     // feed site and union the resulting outer projections instead.
     let n_feeds = body_feeds.len();
@@ -3570,7 +3498,7 @@ fn process_loop_for_defer(
         user_annotation,
     };
     // Build the outer channel: one `Var(binding) ▷ Proj("to_<d>_<k>")`
-    // projection per feed, unioned via `@`.  When there's no binding to
+    // projection per feed, unioned via `++`.  When there's no binding to
     // reference the loop by, we clone the loop into each projection —
     // this duplicates the recurrence cycle but [`lower_mutation_loop`]
     // always binds the loop to a fresh name in practice.
@@ -3690,7 +3618,7 @@ fn augment_loop_body_record_named(
 /// `i`, build a refined source whose predicate is
 /// `¬g_0 ∧ ¬g_1 ∧ … ∧ ¬g_{i-1} ∧ g_i`, and contribute
 /// `refined_source ≫ (λ p → feed_value)` to the cluster channel
-/// via `@`.  Arms without feeds contribute nothing — no empty
+/// via `++`.  Arms without feeds contribute nothing — no empty
 /// placeholder needed.  Both the typecheck and the runtime gap
 /// vanish together.
 ///
@@ -3712,7 +3640,7 @@ fn empty_channel() -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{Lit, symbolic::symbolic};
+    use crate::ccl::{BinOpKind, Lit, symbolic::symbolic};
 
     fn lit(n: i64) -> Expr {
         Expr::lit(Lit::Int(n))
@@ -4128,7 +4056,7 @@ mod tests {
         let result = run(expr).unwrap();
         let s = symbolic(&result);
         assert!(
-            s.contains("@") || s.contains("Union"),
+            s.contains("⊎") || s.contains("Union"),
             "should use union: {s}"
         );
     }

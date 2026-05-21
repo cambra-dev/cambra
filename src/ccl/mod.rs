@@ -180,15 +180,6 @@ pub enum BinOpKind {
     Concat,
     /// A comparison that produces a boolean result.
     Compare(CompareKind),
-    /// Collection union (`@`): merges two function-typed values into one.
-    ///
-    /// `Fun(A, B) @ Fun(C, D)` yields `Fun(Union(A, C), dedup(B, D))`.
-    /// The domain union is never deduplicated; the codomain union is.
-    ///
-    /// TODO the use of @ is temporary; it was just a convenient unused symbol
-    /// that we are unlikely to need soon for anything else.
-    /// Actual syntax TBD.
-    CollectionUnion,
 }
 
 impl BinOpKind {
@@ -216,7 +207,6 @@ impl BinOpKind {
             Self::BoolLogic(LogicKind::Nor) => "nor",
             Self::BoolLogic(LogicKind::Xor) => "xor",
             Self::BoolLogic(LogicKind::Xnor) => "xnor",
-            Self::CollectionUnion => "@",
         }
     }
 
@@ -246,7 +236,6 @@ impl BinOpKind {
             Self::BoolLogic(LogicKind::Nor) => "nor",
             Self::BoolLogic(LogicKind::Xor) => "xor",
             Self::BoolLogic(LogicKind::Xnor) => "xnor",
-            Self::CollectionUnion => "collection_union",
         }
     }
 }
@@ -804,6 +793,38 @@ pub enum TypedExprNode {
     /// `Compose([f, g])` means "apply `f`, then pipe the result to `g`".
     Compose(Vec<TypedExpr>),
 
+    /// N-ary collection union: `c0 ++ c1 ++ … ++ c{n-1}`.
+    ///
+    /// Each operand must have a function (collection) type
+    /// `Fun(D_i, C_i)`; the result type is
+    /// `Fun(Union(D_0, …, D_{n-1}), dedup_union(C_0, …, C_{n-1}))` —
+    /// the domain union is never deduplicated, the codomain union is.
+    ///
+    /// Lowered from the CHL `++` operator.  The parser produces
+    /// pairwise nesting; [`TypedExpr::collection_union`] flattens at
+    /// construction time so every `CollectionUnion` node in the tree
+    /// satisfies the invariant **"no operand is itself a
+    /// `CollectionUnion`"**.  Inference, lambda elimination, and
+    /// operator conversion all rely on this — they never need to look
+    /// through nested `CollectionUnion` AST nodes.  (Type-level
+    /// nesting via `Var` references to let-bound unions is a separate
+    /// concern, preserved by design: the runtime `UnionOperator` has
+    /// one input per operand, so a `Var(y)` whose type is itself
+    /// `Fun(Union(...), …)` correctly becomes one nested-tagged
+    /// variant of the outer union.)
+    ///
+    /// **Position invariant.** This node represents a *value* — the
+    /// merged collection — and only appears where collections appear:
+    /// in let bindings, as elements of a `Compose` chain (source
+    /// position), as a program output, etc.  Inside a lambda body
+    /// where the operands reference the surrounding parameter,
+    /// [`crate::ccl::lambda_elim`] rewrites it to
+    /// `Apply(Tuple(ops), Builtin::CollectionUnion)` so the function
+    /// can be lifted out point-free.  After lambda elimination, both
+    /// shapes (this node and the `Builtin` form) may appear and both
+    /// compile to the same `UnionOperator`.
+    CollectionUnion(Vec<TypedExpr>),
+
     /// A plan expression, followed by another statement
     ExprStmt {
         expr: Box<TypedExpr>,
@@ -1160,6 +1181,37 @@ impl TypedExpr {
         Self::new(TypedExprNode::Compose(exprs))
     }
 
+    /// Construct an n-ary [`TypedExprNode::CollectionUnion`] expression.
+    ///
+    /// `operands` must contain at least two collections.  Any operand
+    /// that is itself a [`TypedExprNode::CollectionUnion`] is spliced
+    /// in-place — this is the **construction-time flattening**
+    /// that makes `(a ++ b) ++ c` and `a ++ (b ++ c)` and `a ++ b ++ c`
+    /// all produce the same flat 3-ary node, which inference and every
+    /// downstream pass then see as canonical.
+    ///
+    /// The splicing drops the inner wrapper's `ty` / `user_annotation`
+    /// fields.  That is safe because the constructor is only used in
+    /// positions where either (a) inference has not yet run, so types
+    /// are still [`Type::Hole`], or (b) the input is already flat by
+    /// invariant (lambda elimination doesn't introduce nesting; it
+    /// either preserves a top-level node or rewrites the whole thing
+    /// to the point-free `Apply(Tuple, Builtin)` form).
+    pub fn collection_union(operands: Vec<Self>) -> Self {
+        let flat: Vec<Self> = operands
+            .into_iter()
+            .flat_map(|op| match op.node {
+                TypedExprNode::CollectionUnion(inner) => inner,
+                _ => vec![op],
+            })
+            .collect();
+        debug_assert!(
+            flat.len() >= 2,
+            "CollectionUnion requires at least two operands after flattening",
+        );
+        Self::new(TypedExprNode::CollectionUnion(flat))
+    }
+
     /// Construct a binary operation expression.
     pub fn binop(left: Self, op: BinOpKind, right: Self) -> Self {
         Self::new(TypedExprNode::BinOp {
@@ -1271,7 +1323,8 @@ impl TypedExpr {
             }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
-            | TypedExprNode::Compose(elts) => {
+            | TypedExprNode::Compose(elts)
+            | TypedExprNode::CollectionUnion(elts) => {
                 for e in elts {
                     f(e);
                 }
@@ -1401,7 +1454,8 @@ impl TypedExpr {
             }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
-            | TypedExprNode::Compose(elts) => {
+            | TypedExprNode::Compose(elts)
+            | TypedExprNode::CollectionUnion(elts) => {
                 for e in elts {
                     f(e);
                 }
@@ -1931,4 +1985,87 @@ macro_rules! unexpected_error_node {
     () => {
         unreachable!("Unexpected <error>")
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leaf(name: &str) -> TypedExpr {
+        TypedExpr::var(name)
+    }
+
+    /// `CollectionUnion([a, b])` with no nested operands is preserved as-is.
+    #[test]
+    fn collection_union_flat_input_is_unchanged() {
+        let result = TypedExpr::collection_union(vec![leaf("a"), leaf("b")]);
+        let TypedExprNode::CollectionUnion(ops) = result.node else {
+            panic!("expected CollectionUnion node");
+        };
+        assert_eq!(ops.len(), 2);
+        assert!(
+            !ops.iter()
+                .any(|e| matches!(&e.node, TypedExprNode::CollectionUnion(_))),
+            "operands must be flat"
+        );
+    }
+
+    /// `((a ++ b) ++ c)` (left-nested) flattens to a flat 3-ary node.
+    #[test]
+    fn collection_union_flattens_left_nested() {
+        let ab = TypedExpr::collection_union(vec![leaf("a"), leaf("b")]);
+        let abc = TypedExpr::collection_union(vec![ab, leaf("c")]);
+        let TypedExprNode::CollectionUnion(ops) = abc.node else {
+            panic!("expected CollectionUnion node");
+        };
+        assert_eq!(ops.len(), 3);
+        assert!(
+            !ops.iter()
+                .any(|e| matches!(&e.node, TypedExprNode::CollectionUnion(_))),
+            "operands must be flat"
+        );
+        let names: Vec<&str> = ops
+            .iter()
+            .map(|e| match &e.node {
+                TypedExprNode::Var(n) => n.as_str(),
+                _ => panic!("expected Var operand"),
+            })
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    /// `(a ++ (b ++ c))` (right-nested) flattens to a flat 3-ary node.
+    #[test]
+    fn collection_union_flattens_right_nested() {
+        let bc = TypedExpr::collection_union(vec![leaf("b"), leaf("c")]);
+        let abc = TypedExpr::collection_union(vec![leaf("a"), bc]);
+        let TypedExprNode::CollectionUnion(ops) = abc.node else {
+            panic!("expected CollectionUnion node");
+        };
+        assert_eq!(ops.len(), 3);
+        let names: Vec<&str> = ops
+            .iter()
+            .map(|e| match &e.node {
+                TypedExprNode::Var(n) => n.as_str(),
+                _ => panic!("expected Var operand"),
+            })
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    /// `(((a ++ b) ++ c) ++ d)` (two levels of left nesting) flattens to 4.
+    #[test]
+    fn collection_union_flattens_double_nested() {
+        let ab = TypedExpr::collection_union(vec![leaf("a"), leaf("b")]);
+        let abc = TypedExpr::collection_union(vec![ab, leaf("c")]);
+        let abcd = TypedExpr::collection_union(vec![abc, leaf("d")]);
+        let TypedExprNode::CollectionUnion(ops) = abcd.node else {
+            panic!("expected CollectionUnion node");
+        };
+        assert_eq!(ops.len(), 4);
+        assert!(
+            !ops.iter()
+                .any(|e| matches!(&e.node, TypedExprNode::CollectionUnion(_))),
+        );
+    }
 }

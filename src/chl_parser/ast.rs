@@ -433,9 +433,10 @@ pub enum CompClause {
 /// rejects them at the syntactic level.
 ///
 /// CHL reuses several Python tokens with different semantics: `&`, `|`, `^`
-/// denote logical (not bitwise) and/or/xor, and `@` denotes collection union
-/// (not matrix multiplication). The variant names below reflect CHL's
-/// semantics rather than the source token spellings.
+/// denote logical (not bitwise) and/or/xor. `++` denotes collection union
+/// (CHL has no string-concatenation operator — `+` on strings handles that).
+/// The variant names below reflect CHL's semantics rather than the source
+/// token spellings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     Add,
@@ -448,7 +449,7 @@ pub enum BinOp {
     LogicalOr,
     /// `^` — logical xor (CHL reuses Python's bitwise-xor token).
     LogicalXor,
-    /// `@` — collection union (CHL reuses Python's matmul token).
+    /// `++` — collection union.
     CollectionUnion,
 }
 

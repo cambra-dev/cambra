@@ -315,12 +315,16 @@ enum BinOpKind {
     /// Left-to-right function composition: `f ≫ g` means "apply f, then g".
     /// Introduced by `lambda_elim`; absent in source-level CCL.
     Compose,
-    /// Collection union (`@`): `Fun(A, B) @ Fun(C, D)` → `Fun(Union(A, C), dedup(B, D))`.
-    /// Lowered from CHL `a @ b`; lambda elimination desugars this to
-    /// `Apply(Tuple([a, b]), Builtin(CollectionUnion))` before operator conversion
-    /// produces a `UnionOperator` tile.
-    CollectionUnion,
 }
+
+// Collection union is a *value-level* construct, not a binary op — it has
+// its own top-level node `TypedExprNode::CollectionUnion(Vec<TypedExpr>)`
+// (N-ary natively, rendered `c₀ ⊎ c₁ ⊎ …` by `symbolic`). Lowered from
+// CHL `a ++ b`; lambda elimination preserves the top-level node when
+// recursing into operands and falls back to
+// `Apply(Tuple([a, b]), Builtin(CollectionUnion))` only when the operands
+// reference a surrounding lambda parameter. Both shapes compile to a
+// `UnionOperator` tile.
 
 enum UnaryOpKind {
     Neg,  // unary -
@@ -642,11 +646,11 @@ N-ary `Compose([f₀, f₁, …, fₙ₋₁])` is inferred by chaining: each mor
 
 ### `Type::Union` semantic equality
 
-`typecheck_equal` treats nested union types as structurally flat: `Union(Union(A,B),C)` is equal to `Union(A,B,C)`. This is needed because the `simplify` pass flattens `CollectionUnion` chains (see §Union flattening below), rewriting the domain type from a nested `Union(Union(A,B),C)` to a flat `Union(A,B,C)`, while inference may have stamped the original nested form on surrounding `Let` nodes. The flat-equality rule prevents spurious type mismatches across this normalization.
+`typecheck_equal` treats nested union types as structurally flat: `Union(Union(A,B),C)` is equal to `Union(A,B,C)`. This handles the let-bound-union case — a `Var(y)` whose type is itself a `Type::Union` appearing as one variant of an outer `CollectionUnion` produces a nested domain that may need to compare equal to a flattened equivalent stamped elsewhere by inference.
 
-### Union flattening (`simplify.rs`)
+### Union flattening (construction-time)
 
-`a @ b @ c` in CHL lowers to right- or left-associated binary `CollectionUnion` applications. The `simplify` pass's `try_flatten_collection_union` rule detects any `CollectionUnion(tuple)` whose tuple contains a nested `CollectionUnion` element, and rewrites it to a flat N-ary `CollectionUnion(a, b, c)`. The domain type is also normalized from `Union(Union(A,B),C)` to `Union(A,B,C)` by `flatten_union_variants`. The rule fires repeatedly until no nested applications remain, so chains of arbitrary depth are fully flattened. `operator_conversion` then compiles the N-ary form directly to a single `UnionOperator` with N inputs.
+`a ++ b ++ c` in CHL parses to right- or left-associated binary AST nodes. **`TypedExpr::collection_union` flattens at construction time**: any operand that is itself a `TypedExprNode::CollectionUnion` is spliced into the outer operand list, so the constructor always returns a flat N-ary node. This makes the invariant **"no operand of a `CollectionUnion` is itself a `CollectionUnion`"** hold from lowering onward — inference, lambda elimination, and operator conversion never need to look through nested AST. The flat AST flows naturally into a flat `Type::Union` domain (each operand contributes one variant; type-level nesting only arises from indirect-through-`Var` references to let-bound unions, which the runtime models exactly). `operator_conversion` compiles the N-ary node directly to a single `UnionOperator` with N inputs.
 
 ### `check_fully_typed` validation
 
@@ -709,8 +713,8 @@ later pass — those passes can treat the variants as `unreachable!`.
 In broad strokes, for each cluster of consecutive `let d_i = Defer in …`
 bindings the pass walks the cluster body to extract every `Feed(d_i, V)`
 and the (at most one) `Define(d_i, V)`, combines the extracted values via
-`@` (`BinOpKind::CollectionUnion`), and emits the cluster's bindings at
-the body's terminal in topological order so cross-defer references
+`++` (`TypedExprNode::CollectionUnion`), and emits the cluster's bindings
+at the body's terminal in topological order so cross-defer references
 (`x ≪= y; y ≪= …`) resolve without `letrec`.  Special handling exists
 for per-iteration feeds (Compose/Apply with iteration lambda), Loop
 bodies (per-iteration `to_<defer>` Record fields), filter-feed Cases,
@@ -878,7 +882,7 @@ the symbolic printer and used in the historical `Var(...)` rendering):
 | `Builtin::BinOp(op)` for any `op: BinOpKind` | `add`, `sub`, `eq`, `lt`, `and`, `or`, `concat`, … | every arithmetic / compare / boolean-logic / string-concat binary op (one variant, parameterised by the existing `BinOpKind` so the operator enum has a single source of truth) |
 | `Builtin::{Neg,NotFn}` | `neg`, `not_fn` | unary operations |
 | `Builtin::{Sum,Max}` | `sum`, `max` | aggregations (fold/reduce) |
-| `Builtin::CollectionUnion` | `collection_union` | discriminated-union of N collections; `a @ b` lowers to `Apply(Tuple([a, b]), Builtin(CollectionUnion))` and compiles to a `UnionOperator` tile. Chains like `a @ b @ c` produce nested binary applications; the `simplify` pass flattens these to a single N-ary `CollectionUnion(a, b, c)` with a flat `Type::Union` domain (see §Union flattening). |
+| `Builtin::CollectionUnion` | `collection_union` | point-free function form of N-ary collection union, emitted only by lambda elimination when an inside-a-lambda `TypedExprNode::CollectionUnion` needs to be lifted out: `Apply(Tuple([a, b]), Builtin(CollectionUnion))`. The value-form node (top-level `TypedExprNode::CollectionUnion`) is the canonical shape; both compile to a `UnionOperator` tile. Surface `a ++ b ++ c` lowers directly to a flat N-ary value-form node — see §Union flattening for the construction-time invariant. |
 
 Earlier passes encoded these with `TypedExprNode::Var("name")` against magic
 strings; downstream pattern matches (`simplify`, `join_plan`,

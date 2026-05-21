@@ -1095,6 +1095,13 @@ fn lower_binop(
 ) -> Result<Expr, LoweringError> {
     let left_expr = lower_expr(left, ctx)?;
     let right_expr = lower_expr(right, ctx)?;
+    // CollectionUnion lowers to a dedicated N-ary CCL node — it denotes a
+    // value-level collection merge rather than a scalar binary op.
+    // The parser produces 2-ary trees; `simplify` flattens nested
+    // `a ++ b ++ c` into a single N-ary `CollectionUnion` later.
+    if op == ChlBinOp::CollectionUnion {
+        return Ok(Expr::collection_union(vec![left_expr, right_expr]));
+    }
     let kind = chl_binop_to_ccl(op);
     Ok(Expr::binop(left_expr, kind, right_expr))
 }
@@ -1105,9 +1112,9 @@ fn lower_binop(
 /// enumerates the operators CHL accepts (`/`, `%`, `**`, `>>`, `~` are
 /// rejected at parse time and never appear here). `LogicalAnd/Or/Xor` map
 /// to CCL boolean logic — CHL reuses the `&`/`|`/`^` tokens for logical
-/// (not bitwise) operations. `CollectionUnion` maps to CCL's same-named
-/// kind — CHL reuses the `@` token for collection union rather than
-/// matrix multiplication.
+/// (not bitwise) operations. `CollectionUnion` is excluded: it lowers
+/// to a dedicated [`TypedExprNode::CollectionUnion`] node, not a
+/// [`BinOpKind`], and is handled directly in [`lower_binop`].
 fn chl_binop_to_ccl(op: ChlBinOp) -> BinOpKind {
     match op {
         ChlBinOp::Add => BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -1117,7 +1124,9 @@ fn chl_binop_to_ccl(op: ChlBinOp) -> BinOpKind {
         ChlBinOp::LogicalAnd => BinOpKind::BoolLogic(LogicKind::And),
         ChlBinOp::LogicalOr => BinOpKind::BoolLogic(LogicKind::Or),
         ChlBinOp::LogicalXor => BinOpKind::BoolLogic(LogicKind::Xor),
-        ChlBinOp::CollectionUnion => BinOpKind::CollectionUnion,
+        ChlBinOp::CollectionUnion => unreachable!(
+            "ChlBinOp::CollectionUnion is handled directly in lower_binop and never reaches this function"
+        ),
     }
 }
 
@@ -2562,7 +2571,7 @@ fn chl_expr_to_string(expr: &ChlExpr) -> String {
                 ChlBinOp::LogicalAnd => "&",
                 ChlBinOp::LogicalOr => "|",
                 ChlBinOp::LogicalXor => "^",
-                ChlBinOp::CollectionUnion => "@",
+                ChlBinOp::CollectionUnion => "++",
             };
             format!(
                 "{} {} {}",

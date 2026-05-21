@@ -29,7 +29,7 @@ The output is a plain CCL expression in which:
   (typically `Fun(D, T)`) and `body'` is `body` with every `Feed(d,
   V)` / `Define(d, V)` extracted into the channel.
 - Multiple `Feed`s for the same defer are combined via
-  `BinOpKind::CollectionUnion` (the surface `@` operator).
+  `TypedExprNode::CollectionUnion` (the surface `++` operator).
 - Cross-defer references resolve through topological ordering of
   cluster bindings.
 - Defer-mediating UDF calls (`y = f(x)` where `f` takes/returns a
@@ -191,9 +191,9 @@ For each defer in the cluster (innermost first):
    - If `feeds` is empty and `define` is `None`: `DeferError::NoFeedOrDefine`
    - If both are present: `DeferError::FeedsAndDefinesMixed`
    - If only `define`: the channel is the define value verbatim
-   - If only `feeds`: combine via [`combine_feed_values`] (`@`-chain
-     of `BinOpKind::CollectionUnion` for multiple feeds; pass-through
-     for a single feed)
+   - If only `feeds`: combine via [`combine_feed_values`] (a single
+     N-ary [`TypedExprNode::CollectionUnion`] for multiple feeds;
+     pass-through for a single feed)
 
 3. Stash the channel under `name` in a `HashMap<String, Expr>`.
 
@@ -285,7 +285,7 @@ feeds for `defer_name`:
 - The body's terminal `Record({step, …})` is augmented with one
   `to_<defer>_<k>` field per feed site ([`augment_loop_body_record_multi`]).
 - The outer channel contribution becomes `Var(acc_stream) ▷
-  Proj("to_<defer>_<k>")`, unioned via `@` across `k`.
+  Proj("to_<defer>_<k>")`, unioned via `++` across `k`.
 
 Without the let-binding wrap, the loop expression would have to be
 cloned into each channel projection — duplicating the recurrence

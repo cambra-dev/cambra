@@ -599,6 +599,10 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
 
         TypedExprNode::Compose(morphisms) => check_compose_types(&expr.ty, morphisms, errors),
 
+        TypedExprNode::CollectionUnion(operands) => {
+            check_collection_union_types(&expr.ty, operands, errors);
+        }
+
         // Variants with no per-node check: Var/Builtin/Proj (resolved at
         // inference time), Source/Defer (no shape constraints), Loop (only
         // recognised in the mutation-loop shape; sub-expr errors already
@@ -766,25 +770,32 @@ fn check_binop_types(
                 }
             }
         }
-        BinOpKind::CollectionUnion => {
-            // Both operands must be Fun types; result must be a Fun type.
-            for (ty, side) in [(&left.ty, "left"), (&right.ty, "right")] {
-                if !matches!(ty, Type::Fun(..)) {
-                    errors.push(InferError::TypeMismatch {
-                        ctx: format!("{side} operand of '@' must be a collection (Fun type)"),
-                        type_a: Type::fun(Type::Infer(InferVarId(0)), Type::Infer(InferVarId(0))),
-                        type_b: ty.clone(),
-                    });
-                }
-            }
-            if !matches!(node_ty, Type::Fun(..)) {
-                errors.push(InferError::TypeMismatch {
-                    ctx: "result of '@' must be a collection (Fun type)".into(),
-                    type_a: Type::fun(Type::Infer(InferVarId(0)), Type::Infer(InferVarId(0))),
-                    type_b: node_ty.clone(),
-                });
-            }
+    }
+}
+
+/// Check [`TypedExprNode::CollectionUnion`] type rules and push any errors
+/// into `errors`.
+///
+/// Every operand must have a function (collection) type; the node type
+/// must also be a function type.  Domain/codomain shape (union of
+/// domains, deduplicated union of codomains) is enforced during
+/// inference proper — this is the post-hoc structural check.
+fn check_collection_union_types(node_ty: &Type, operands: &[Expr], errors: &mut Vec<InferError>) {
+    for (i, op) in operands.iter().enumerate() {
+        if !matches!(op.ty, Type::Fun(..)) {
+            errors.push(InferError::TypeMismatch {
+                ctx: format!("operand {i} of '++' must be a collection (Fun type)"),
+                type_a: Type::fun(Type::Infer(InferVarId(0)), Type::Infer(InferVarId(0))),
+                type_b: op.ty.clone(),
+            });
         }
+    }
+    if !matches!(node_ty, Type::Fun(..)) {
+        errors.push(InferError::TypeMismatch {
+            ctx: "result of '++' must be a collection (Fun type)".into(),
+            type_a: Type::fun(Type::Infer(InferVarId(0)), Type::Infer(InferVarId(0))),
+            type_b: node_ty.clone(),
+        });
     }
 }
 
@@ -1076,6 +1087,14 @@ fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, I
         // must equal the next morphism's domain; the result is `domain(f₀) →
         // codomain(fₙ₋₁)`.
         TypedExprNode::Compose(elts) => infer_compose(elts, ctx),
+
+        // ----- N-ary collection union -----
+        //
+        // Each operand must have function (collection) type `Fun(D_i, C_i)`.
+        // The result is `Fun(Union(D_0, …, D_{n-1}), dedup_union(C_0, …, C_{n-1}))`:
+        // the domain union is kept as-is (each operand becomes a distinct
+        // variant), and the codomain union is deduplicated.
+        TypedExprNode::CollectionUnion(operands) => infer_collection_union(operands, ctx),
 
         // `Defer`, `Feed`, `Define`, and `ExprStmt` are eliminated by
         // [`crate::ccl::desugar_defers`] before inference runs, so the
@@ -1834,16 +1853,49 @@ fn infer_binop(
             ctx.constrain_equal(&right_ty, &Type::Base(BaseType::Bool))?;
             Ok(Type::Base(BaseType::Bool))
         }
-        BinOpKind::CollectionUnion => {
-            // Both operands must be function (collection) types.
-            // Result: Fun(Union(left_domain, right_domain), dedup_union(left_cod, right_cod))
-            let (left_dom, left_cod) = require_fun(left_ty, left, ctx, "collection_union lhs")?;
-            let (right_dom, right_cod) = require_fun(right_ty, right, ctx, "collection_union rhs")?;
-            let domain = Type::Union(vec![left_dom, right_dom]);
-            let codomain = dedup_union_type(left_cod, right_cod);
-            Ok(Type::fun(domain, codomain))
-        }
     }
+}
+
+/// Infer the type of a [`TypedExprNode::CollectionUnion`] node.
+///
+/// Each operand must be a function (collection) type `Fun(D_i, C_i)`.
+/// The result type is
+/// `Fun(Union(D_0, …, D_{n-1}), dedup_union(C_0, …, C_{n-1}))`:
+/// the domain union is kept positionally (each operand becomes a
+/// distinct variant), and the codomain union is deduplicated via
+/// [`dedup_union_type`].
+///
+/// **Flat-AST invariant.** No operand is itself a `CollectionUnion`
+/// (the constructor in [`TypedExpr::collection_union`] splices nested
+/// nodes at construction time), so this function never needs to
+/// recurse through nested unions to compute the result type.  When
+/// `D_i` is itself a `Type::Union` — possible when an operand is a
+/// `Var` pointing at a let-bound union — the result type carries
+/// that nesting; it matches the runtime shape (one outer
+/// `UnionOperator` input per operand).
+fn infer_collection_union(
+    operands: &mut [Expr],
+    ctx: &mut TypeInferenceContext,
+) -> Result<Type, InferError> {
+    assert!(
+        operands.len() >= 2,
+        "CollectionUnion requires at least two operands",
+    );
+    let mut domains = Vec::with_capacity(operands.len());
+    let mut codomain: Option<Type> = None;
+    for (i, op) in operands.iter_mut().enumerate() {
+        let op_ty = infer_expr(op, ctx)?;
+        let (dom, cod) = require_fun(op_ty, op, ctx, &format!("collection_union[{i}]"))?;
+        domains.push(dom);
+        codomain = Some(match codomain.take() {
+            None => cod,
+            Some(prev) => dedup_union_type(prev, cod),
+        });
+    }
+    Ok(Type::fun(
+        Type::Union(domains),
+        codomain.expect("non-empty operand list"),
+    ))
 }
 
 /// Build a union of two types, deduplicating if identical.

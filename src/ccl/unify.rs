@@ -666,7 +666,9 @@ pub fn resolve(expr: &mut crate::ccl::TypedExpr, table: &mut UnificationTable) {
             resolve(right, table);
         }
         TypedExprNode::UnaryOp(_, inner) => resolve(inner, table),
-        TypedExprNode::List(elts) | TypedExprNode::Tuple(elts) => {
+        TypedExprNode::List(elts)
+        | TypedExprNode::Tuple(elts)
+        | TypedExprNode::CollectionUnion(elts) => {
             for e in elts {
                 resolve(e, table);
             }

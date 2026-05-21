@@ -304,6 +304,27 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Compose, format!("{first} ≫ {rest}"))
         }
 
+        // N-ary collection union: render as `c₀ ⊎ c₁ ⊎ … ⊎ cₙ₋₁`.
+        // We use `⊎` (multiset union) in the symbolic form rather than the
+        // CHL surface `++` to disambiguate from `Concat` (which also uses
+        // `++`); the two operate on disjoint type domains (collection vs.
+        // string) but a single symbol would still confuse readers of dumps.
+        // Precedence matches `And` so that arithmetic and comparisons bind
+        // tighter — same level used by the historical `BinOp` form.
+        TypedExprNode::CollectionUnion(operands) => {
+            let mut it = operands.iter();
+            let first = fmt(
+                it.next().expect("CollectionUnion is non-empty"),
+                Precedence::And,
+                opts,
+            );
+            let rest = it
+                .map(|e| fmt(e, Precedence::And.next_highest(), opts))
+                .collect::<Vec<_>>()
+                .join(" ⊎ ");
+            (Precedence::And, format!("{first} ⊎ {rest}"))
+        }
+
         TypedExprNode::Proj(key) => (
             Precedence::Atom,
             match key {
@@ -405,7 +426,6 @@ fn binop_prec(op: &BinOpKind) -> Precedence {
             Precedence::Add
         }
         BinOpKind::Arithmetic(ArithmeticKind::Mul | ArithmeticKind::FloorDiv) => Precedence::Mul,
-        BinOpKind::CollectionUnion => Precedence::And,
     }
 }
 

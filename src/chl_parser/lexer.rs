@@ -95,6 +95,8 @@ pub enum Token {
     LtE,
     #[token(">=")]
     GtE,
+    #[token("++")]
+    PlusPlus,
     #[token("+=")]
     PlusEq,
     #[token("-=")]
@@ -119,8 +121,6 @@ pub enum Token {
     Pipe,
     #[token("^")]
     Caret,
-    #[token("@")]
-    At,
     #[token("=")]
     Eq,
     #[token("<")]
@@ -209,6 +209,7 @@ impl fmt::Display for Token {
             Token::NotEq => "!=",
             Token::LtE => "<=",
             Token::GtE => ">=",
+            Token::PlusPlus => "++",
             Token::PlusEq => "+=",
             Token::MinusEq => "-=",
             Token::StarEq => "*=",
@@ -220,7 +221,6 @@ impl fmt::Display for Token {
             Token::Amp => "&",
             Token::Pipe => "|",
             Token::Caret => "^",
-            Token::At => "@",
             Token::Eq => "=",
             Token::Lt => "<",
             Token::Gt => ">",

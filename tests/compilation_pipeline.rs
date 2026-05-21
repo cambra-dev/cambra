@@ -193,14 +193,14 @@ fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
 }
 
 // ---------------------------------------------------------------------------
-// Collection union (`@`)
+// Collection union (`++`)
 // ---------------------------------------------------------------------------
 
-/// `[1, 2, 3] @ [4, 5]` produces a SealedFunction with a discriminated-union
+/// `[1, 2, 3] ++ [4, 5]` produces a SealedFunction with a discriminated-union
 /// domain and the concatenated integer codomains.
 #[rstest]
 #[case(
-    "[1, 2, 3] @ [4, 5]",
+    "[1, 2, 3] ++ [4, 5]",
     Tile::SealedFunction {
         domain: ColumnValue::Union {
             tags: vec![0, 0, 0, 1, 1],
@@ -214,7 +214,7 @@ fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
         deleted: BitSet::new(),
     })]
 #[case(
-    "x = [1, 2]; x @ x @ x",
+    "x = [1, 2]; x ++ x ++ x",
     Tile::SealedFunction {
         domain: ColumnValue::Union {
             tags: vec![0, 0, 1, 1, 2, 2],
@@ -230,7 +230,7 @@ fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
         deleted: BitSet::new(),
     })]
 #[case(
-    "x = [1, 2]; y = x @ x @ x; y",
+    "x = [1, 2]; y = x ++ x ++ x; y",
     Tile::SealedFunction {
         domain: ColumnValue::Union {
             tags: vec![0, 0, 1, 1, 2, 2],
@@ -245,8 +245,8 @@ fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
         domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True, Predicate::True]),
         deleted: BitSet::new(),
     })]
-#[case("sum([1] @ [2])", Tile::Scalar(ColumnValue::Ints(vec![3])))]
-#[case("sum([1 for y in [1] @ [2]])", Tile::Scalar(ColumnValue::Ints(vec![2])))]
+#[case("sum([1] ++ [2])", Tile::Scalar(ColumnValue::Ints(vec![3])))]
+#[case("sum([1 for y in [1] ++ [2]])", Tile::Scalar(ColumnValue::Ints(vec![2])))]
 fn test_unions(#[case] code: &str, #[case] expected: Tile) {
     let result = run_pipeline(code);
     assert_eq!(result, expected);
@@ -897,7 +897,7 @@ def g(c):
 y = g(f(10))
 for i in [1,2,3]:
   y << i
-y @ y"#, Tile::SealedFunction {
+y ++ y"#, Tile::SealedFunction {
         domain: ColumnValue::Union {
             tags: vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 1],
             variants: vec![
@@ -995,7 +995,7 @@ fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
 /// `¬g_0 ∧ ¬g_1 ∧ … ∧ ¬g_{i-1} ∧ g_i` (encoding Case's "first
 /// matching guard wins" semantics).  Each arm contributes
 /// `refined_source ≫ (λ p → feed_value)` to the cluster channel
-/// via `@`.  Arms without feeds contribute nothing.  This makes
+/// via `++`.  Arms without feeds contribute nothing.  This makes
 /// gaps (2) and (3) disappear together — no empty-channel
 /// placeholder is needed because empty arms don't produce a
 /// contribution at all.

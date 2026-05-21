@@ -48,7 +48,7 @@ use crate::ccl::ccl_utils::{is_free, typed_compose, walk_refined_predicates_mut}
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
 use crate::ccl::{
-    BaseType, BinOpKind, Expr, RefinementKind, Type, TypedExpr, TypedExprNode, symbolic::symbolic,
+    BaseType, Expr, RefinementKind, Type, TypedExpr, TypedExprNode, symbolic::symbolic,
 };
 use crate::ccl::{Builtin, Lit, Refinement, next_refinement_id};
 
@@ -688,13 +688,22 @@ fn elim_lambda_impl(
             let right = *right;
             let tuple = typed_tuple(vec![left, right]);
             let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
-            // CollectionUnion is a collection-level combinator, not a scalar BinOp.
-            let op_builtin = if op == BinOpKind::CollectionUnion {
-                Builtin::CollectionUnion
-            } else {
-                Builtin::BinOp(op)
-            };
-            let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
+            let fn_var = Expr::builtin(Builtin::BinOp(op)).with_ty(fn_ty);
+            let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
+            elim_lambda(ctx, param, param_ty, desugared)
+        }
+
+        // CollectionUnion inside a lambda body: lift via the
+        // `Apply(Tuple(ops), Builtin::CollectionUnion)` point-free form.
+        // This mirrors the BinOp rule — the tuple of operands gets zipped
+        // through the lambda parameter and the binary `CollectionUnion`
+        // builtin closes the loop.  At the top level (outside any
+        // lambda being eliminated) the dedicated arm in [`elim_lambdas`]
+        // keeps the N-ary value-form intact.
+        TypedExprNode::CollectionUnion(ops) => {
+            let tuple = typed_tuple(ops);
+            let fn_ty = fun_ty_or_hole(&tuple.ty, &body_ty);
+            let fn_var = Expr::builtin(Builtin::CollectionUnion).with_ty(fn_ty);
             let desugared = Expr::apply(tuple, fn_var).with_ty(body_ty);
             elim_lambda(ctx, param, param_ty, desugared)
         }
@@ -965,22 +974,33 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         // `a op b` ≡ `(a, b) ▷ op_fn` — mirrors what `elim_lambda` does for
         // the same pattern inside a lambda body, making the CCL uniform.
         TypedExprNode::BinOp { left, op, right } => {
-            // CollectionUnion is a collection-level combinator, not a scalar BinOp.
-            let op_builtin = if op == BinOpKind::CollectionUnion {
-                Builtin::CollectionUnion
-            } else {
-                Builtin::BinOp(op)
-            };
             let left_elim = elim_lambdas(ctx, *left)?;
             let right_elim = elim_lambdas(ctx, *right)?;
             let tuple_ty = Type::Tuple(vec![left_elim.ty.clone(), right_elim.ty.clone()]);
             let fn_ty = fun_ty_or_hole(&tuple_ty, &ty);
             let tuple = Expr::tuple(vec![left_elim, right_elim]).with_ty(tuple_ty);
-            let fn_var = Expr::builtin(op_builtin).with_ty(fn_ty);
+            let fn_var = Expr::builtin(Builtin::BinOp(op)).with_ty(fn_ty);
             let mut desugared = Expr::apply(tuple, fn_var);
             desugared.ty = ty;
             debug_typecheck(&desugared);
             Ok(desugared)
+        }
+
+        // CollectionUnion at top level: an N-ary value-form node that
+        // represents the eager merge of N collections.  Recurse into each
+        // operand (each may itself contain lambdas to eliminate) and keep
+        // the node — operator conversion compiles it directly to a
+        // `UnionOperator`.  No need to lift through `Apply`/`Tuple`/`Builtin`
+        // since there is no surrounding lambda parameter to thread through.
+        TypedExprNode::CollectionUnion(ops) => {
+            let elim_ops: Vec<Expr> = ops
+                .into_iter()
+                .map(|o| elim_lambdas(ctx, o))
+                .collect::<Result<_, _>>()?;
+            let mut result = Expr::collection_union(elim_ops);
+            result.ty = ty;
+            debug_typecheck(&result);
+            Ok(result)
         }
 
         // UnaryOp: desugar to function application form.

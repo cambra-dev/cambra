@@ -519,7 +519,34 @@ fn convert_impl(
             }
         }
 
-        // collection_union merges N SealedFunction operators into one.
+        // N-ary collection union — the value-form node produced by lowering
+        // and preserved through lambda elimination (top-level path).
+        // Compiles directly to a `UnionOperator` over the N operand
+        // collections.
+        TypedExprNode::CollectionUnion(operands) => {
+            if input.is_some() {
+                return Err(ConversionError::Unsupported(
+                    "collection_union requires no input".into(),
+                ));
+            }
+            if operands.len() < 2 {
+                return Err(ConversionError::Unsupported(format!(
+                    "collection_union expects at least 2 inputs, got {}",
+                    operands.len()
+                )));
+            }
+            let ops = operands
+                .iter()
+                .map(|e| convert_impl(e, None, None, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Box::new(UnionOperator::new(ops)))
+        }
+
+        // `Apply(Tuple(ops), Builtin::CollectionUnion)` — the point-free
+        // function-form, produced by lambda elimination when a
+        // `CollectionUnion` appears inside a lambda body whose operands
+        // reference the lambda parameter.  Same `UnionOperator` output as
+        // the top-level node above.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::CollectionUnion) =>
         {
@@ -1120,9 +1147,6 @@ fn builtin_to_binop(b: Builtin) -> Option<InterpreterBinOp> {
         B::BoolLogic(L::Nor) => InterpreterBinOp::BoolLogic(LogicKind::Nor),
         B::BoolLogic(L::Xor) => InterpreterBinOp::BoolLogic(LogicKind::Xor),
         B::BoolLogic(L::Xnor) => InterpreterBinOp::BoolLogic(LogicKind::Xnor),
-        // CollectionUnion is a collection-level combinator handled separately; it
-        // cannot appear inside Builtin::BinOp, so this branch is unreachable.
-        B::CollectionUnion => unreachable!("CollectionUnion is not a scalar BinOp"),
     })
 }
 
