@@ -10,13 +10,15 @@ pub mod ccl_utils;
 pub mod context;
 pub mod desugar_defers;
 pub mod infer;
+pub mod infer_simple_sub;
 pub mod inline;
 pub mod join_plan;
 pub mod lambda_elim;
 pub mod lower;
+pub mod simple_sub;
 pub mod simplify;
 pub mod symbolic;
-pub mod unify;
+pub mod type_saturate;
 
 use std::{
     cell::RefCell,
@@ -36,6 +38,23 @@ pub fn next_refinement_id() -> RefinementId {
     REFINEMENT_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Reset the refinement ID counter to zero. Test-only — used by harnesses
+/// that re-run lowering and need stable IDs across runs. Not safe to call
+/// concurrently.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reset_refinement_id_counter() {
+    REFINEMENT_ID_COUNTER.store(0, Ordering::Relaxed);
+}
+
+/// Reset all IDs allocated by ccl module counters. Test-only convenience for
+/// differential harnesses that re-run lowering + inference and need stable
+/// IDs across the runs. Not safe to call concurrently.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reset_all_id_counters() {
+    reset_infer_var_counter();
+    reset_refinement_id_counter();
+}
+
 /// A unique identifier for an inference type variable.
 ///
 /// Every [`Type::Infer`] carries one of these, assigned monotonically by
@@ -43,8 +62,7 @@ pub fn next_refinement_id() -> RefinementId {
 /// variables created in different parts of the tree never alias.
 ///
 /// The inner `u32` is `pub(crate)` to prevent external code from constructing
-/// arbitrary `InferVarId` values. Use
-/// [`crate::ccl::infer::TypeInferenceContext::fresh_infer_var`] instead.
+/// arbitrary `InferVarId` values. Use [`fresh_infer_var_id`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InferVarId(pub(crate) u32);
 
@@ -59,11 +77,10 @@ static INFER_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Allocate a fresh, globally-unique [`InferVarId`].
 ///
-/// Called only by [`Type::infer`] (test helper) and
-/// [`crate::ccl::infer::TypeInferenceContext::fresh_infer_var`]
-/// (which also registers the variable in the
-/// [`crate::ccl::unify::UnificationTable`]).
-fn fresh_infer_var_id() -> InferVarId {
+/// Called by [`Type::infer`] (test helper) and
+/// [`crate::ccl::simple_sub::coalesce`] (which mints fresh ids for
+/// any inference variable that survives simplification).
+pub(crate) fn fresh_infer_var_id() -> InferVarId {
     InferVarId(INFER_VAR_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
@@ -72,7 +89,7 @@ fn fresh_infer_var_id() -> InferVarId {
 /// For use in tests that need predictable `InferVarId` values in output.
 /// Not safe to call concurrently — run such tests with `--test-threads=1`
 /// or use `serial_test` if order matters.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn reset_infer_var_counter() {
     INFER_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
@@ -83,7 +100,7 @@ use crate::interpreter::{ColumnValue, Extent};
 ///
 /// Defined here (in `ccl`) and re-exported by the interpreter so that
 /// `ccl` does not depend upward on `interpreter`. See `interpreter/types.rs`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BaseType {
     /// Signed 64-bit integer.
     Int,
@@ -621,8 +638,9 @@ pub enum TypedExprNode {
     ///
     /// The bound parameter and its type are carried by a [`TypedBinding`].
     /// `param.ty` starts as [`Type::Hole`] on unannotated lambdas from
-    /// lowering; [`infer::infer`] converts each `Hole` to a registered
-    /// [`Type::Infer`] variable and resolves it before compilation.
+    /// lowering; [`infer::infer`] (via simple-sub) fills it with the
+    /// inferred concrete type or a `Type::Infer` variable before
+    /// compilation.
     ///
     /// Note: `crate::interpreter::Lambda` is an unrelated operator struct.
     Lambda {
@@ -1686,8 +1704,8 @@ pub struct Branch {
 ///
 /// | Variant | Owner | Meaning | Must be eliminated by |
 /// |---|---|---|---|
-/// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (hard error if survives) |
-/// | `Infer(id)` | Type checker only | "Inference variable N, tracked in table" | End of `resolve()` (ambiguous type if survives) |
+/// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
+/// | `Infer(id)` | Type checker only | "Inference variable N from simple-sub coalesce" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// A primitive base type.
@@ -1727,15 +1745,26 @@ pub enum Type {
     Refinement(Box<Type>, Refinement),
     /// Pre-inference placeholder stamped by lowering on every new node.
     ///
+    /// Invariant: every `Hole` must be eliminated by the end of inference.
+    /// `Hole` carries no identity — it's a structural "fill this in later"
+    /// marker. The simple-sub pass replaces it either with a concrete type
+    /// or with a `Type::Infer` variable. A surviving `Hole` means inference
+    /// never visited the node, and is reported by `collect_type_errors` as
+    /// `UnresolvedHole` (treat as a compiler bug, not a user-facing error).
     /// Created exclusively by [`TypedExpr::new`] and [`TypedBinding::new_unannotated`].
-    /// The inference pass converts each `Hole` to a registered [`Type::Infer`] variable
-    /// before type-checking begins. A `Hole` surviving past inference is a compiler bug.
     Hole,
     /// Unresolved type variable, identified by a unique [`InferVarId`].
     ///
-    /// Created exclusively by [`crate::ccl::infer::TypeInferenceContext::fresh_infer_var`]
-    /// during inference. Variables are registered in the [`crate::ccl::unify::UnificationTable`]
-    /// and resolved by the post-inference [`crate::ccl::unify::resolve`] pass.
+    /// Created during inference by the simple-sub pass
+    /// ([`crate::ccl::infer_simple_sub`]) when coalescing a constraint
+    /// variable whose bounds left it genuinely unconstrained (e.g. an
+    /// identity lambda's parameter with no call-site usage).
+    ///
+    /// Invariant: any `Infer` reachable from the program's root output
+    /// type is an *ambiguous-type* error, reported by `collect_type_errors`
+    /// as `UnresolvedInfer`. `Infer` survivals are permitted only inside
+    /// sub-expressions whose output type is not exercised (e.g. a top-level
+    /// `f = lambda x: x` that is never applied).
     Infer(InferVarId),
     /// The opaque domain type of an externally-registered data source.
     ///
@@ -1828,14 +1857,12 @@ impl Type {
         }
     }
 
-    /// Create a fresh, unregistered [`Type::Infer`] variable for use in tests.
+    /// Create a fresh [`Type::Infer`] variable for use in tests.
     ///
-    /// The created variable is **not** registered in any
-    /// [`crate::ccl::unify::UnificationTable`], so it cannot be solved by the
-    /// resolution pass. Use this only when constructing expressions in tests
-    /// that will not be run through inference (e.g. to exercise pretty-printing
-    /// or symbolic output). Production inference code must call
-    /// [`crate::ccl::infer::TypeInferenceContext::fresh_infer_var`] instead.
+    /// Use this only when constructing expressions in tests that will not be
+    /// run through inference (e.g. to exercise pretty-printing or symbolic
+    /// output), or to provide an unannotated parameter type that inference
+    /// will fill in.
     #[cfg(test)]
     pub fn infer() -> Self {
         Type::Infer(fresh_infer_var_id())

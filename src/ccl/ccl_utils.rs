@@ -219,7 +219,7 @@ fn count_free_in_type_with_visited(
 /// [`count_free_in_type_with_visited`], [`crate::ccl::infer::check_fully_typed`],
 /// and [`crate::ccl::lambda_elim`]'s post-pass type-refinement walk.
 /// See [`walk_refined_predicates_mut`] for the mutable variant used by
-/// [`crate::ccl::lambda_elim`] and [`crate::ccl::unify::resolve`].
+/// [`crate::ccl::lambda_elim`].
 /// A related dual-mechanism (try_borrow_mut fallback without an
 /// explicit visited set) lives in [`crate::ccl::simplify::simplify`]
 /// — see the note there for why that site can't use this helper today.

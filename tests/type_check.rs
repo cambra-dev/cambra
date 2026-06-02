@@ -20,6 +20,7 @@ use cambra::ccl::{
 };
 use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
+use rstest::rstest;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -97,104 +98,52 @@ fn bool_ty() -> Type {
     Type::Base(BaseType::Bool)
 }
 
-/// Convenience alias for `Type::Base(BaseType::Unit)`.
-fn unit() -> Type {
-    Type::Base(BaseType::Unit)
-}
-
 // ---------------------------------------------------------------------------
 // Literal tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_literal_int() {
-    assert_eq!(infer_program("2"), int());
-}
-
-#[test]
-fn test_literal_string() {
-    assert_eq!(infer_program(r#""hi""#), string());
-}
-
-#[test]
-fn test_literal_bool() {
-    assert_eq!(infer_program("True"), bool_ty());
-}
-
-#[test]
-fn test_literal_none() {
-    assert_eq!(infer_program("None"), unit());
+#[rstest]
+#[case::int("2", BaseType::Int)]
+#[case::string(r#""hi""#, BaseType::String)]
+#[case::bool_lit("True", BaseType::Bool)]
+#[case::none("None", BaseType::Unit)]
+fn test_literal(#[case] code: &str, #[case] expected: BaseType) {
+    assert_eq!(infer_program(code), Type::Base(expected));
 }
 
 // ---------------------------------------------------------------------------
 // Arithmetic / comparison / boolean operator tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_add_int_int() {
-    assert_eq!(infer_program("2 + 3"), int());
-}
-
-#[test]
-fn test_compare_int() {
-    assert_eq!(infer_program("2 > 1"), bool_ty());
-}
-
-#[test]
-fn test_bool_and() {
-    assert_eq!(infer_program("True and False"), bool_ty());
-}
-
-#[test]
-fn test_concat_strings() {
-    assert_eq!(infer_program(r#""a" + "b""#), string());
+#[rstest]
+#[case::add_int("2 + 3", BaseType::Int)]
+#[case::compare("2 > 1", BaseType::Bool)]
+#[case::bool_and("True and False", BaseType::Bool)]
+#[case::concat_strings(r#""a" + "b""#, BaseType::String)]
+fn test_binary_op(#[case] code: &str, #[case] expected: BaseType) {
+    assert_eq!(infer_program(code), Type::Base(expected));
 }
 
 // ---------------------------------------------------------------------------
 // Let binding / scoping tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_let_simple() {
-    assert_eq!(
-        infer_program(
-            r#"
-x = 2
-x
-"#
-            .trim()
-        ),
-        int()
-    );
-}
-
-#[test]
-fn test_let_chain() {
-    assert_eq!(
-        infer_program(
-            r#"
-x = 2
-y = x
-y + x
-"#
-            .trim()
-        ),
-        int()
-    );
+#[rstest]
+#[case::simple("x = 2\nx", BaseType::Int)]
+#[case::chain("x = 2\ny = x\ny + x", BaseType::Int)]
+fn test_let(#[case] code: &str, #[case] expected: BaseType) {
+    assert_eq!(infer_program(code), Type::Base(expected));
 }
 
 // ---------------------------------------------------------------------------
 // Unary operator tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_unary_neg() {
-    assert_eq!(infer_program("-2"), int());
-}
-
-#[test]
-fn test_unary_not() {
-    assert_eq!(infer_program("not True"), bool_ty());
+#[rstest]
+#[case::neg("-2", BaseType::Int)]
+#[case::not("not True", BaseType::Bool)]
+fn test_unary_op(#[case] code: &str, #[case] expected: BaseType) {
+    assert_eq!(infer_program(code), Type::Base(expected));
 }
 
 // ---------------------------------------------------------------------------
@@ -229,12 +178,15 @@ fn test_list_comp_arithmetic_body() {
 
 #[test]
 fn test_list_comp_two_gens() {
-    // [x + y for x in [1, 2] for y in [10, 20]] — codomain is Int
+    // [x + y for x in [1, 2] for y in [10, 20]] — assert the full type.
     let ty = infer_program("[x + y for x in [1, 2] for y in [10, 20]]");
     assert_eq!(
-        ty.codomain(),
-        Some(int()),
-        "expected codomain Int, got {ty}"
+        ty,
+        Type::Fun(
+            Box::new(Type::Tuple(vec![Type::UIntRange(2), Type::UIntRange(2)])),
+            Box::new(int())
+        ),
+        "got {ty}"
     );
 }
 
@@ -253,14 +205,11 @@ fn test_list_comp_with_filter() {
 // Aggregate tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_sum() {
-    assert_eq!(infer_program("sum([1, 2, 3])"), int());
-}
-
-#[test]
-fn test_max() {
-    assert_eq!(infer_program("max([1, 2, 3])"), int());
+#[rstest]
+#[case::sum("sum([1, 2, 3])", BaseType::Int)]
+#[case::max("max([1, 2, 3])", BaseType::Int)]
+fn test_aggregate(#[case] code: &str, #[case] expected: BaseType) {
+    assert_eq!(infer_program(code), Type::Base(expected));
 }
 
 // ---------------------------------------------------------------------------
@@ -284,34 +233,23 @@ fn test_tuple_index() {
 // Type annotation tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_ann_assign_int_ok() {
-    // x: int = 2; x — annotation matches inferred Int
-    assert_eq!(
-        infer_program(
-            r#"
+#[rstest]
+#[case::literal(
+    r"
 x: int = 2
 x
-"#
-            .trim()
-        ),
-        int()
-    );
-}
-
-#[test]
-fn test_ann_assign_compatible_expr() {
-    // x: int = 1 + 2; x — annotation-compatible with inferred Int
-    assert_eq!(
-        infer_program(
-            r#"
+",
+    BaseType::Int
+)]
+#[case::expr(
+    r"
 x: int = 1 + 2
 x
-"#
-            .trim()
-        ),
-        int()
-    );
+",
+    BaseType::Int
+)]
+fn test_ann_assign_ok(#[case] code: &str, #[case] expected: BaseType) {
+    assert_eq!(infer_program(code), Type::Base(expected));
 }
 
 #[test]
@@ -374,82 +312,55 @@ sum(g)
 // Case / if expression tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn test_if_else_int() {
-    assert_eq!(
-        infer_program(
-            r#"
+#[rstest]
+#[case::int(
+    r"
 if True:
     1
 else:
     0
-"#
-            .trim()
-        ),
-        int()
-    );
-}
-
-#[test]
-fn test_if_else_string() {
-    assert_eq!(
-        infer_program(
-            r#"
+",
+    BaseType::Int
+)]
+#[case::string(
+    r#"
 if True:
     "yes"
 else:
     "no"
-"#
-            .trim()
-        ),
-        string()
-    );
-}
-
-#[test]
-fn test_if_else_with_let() {
-    // let binding in scope for the condition
-    assert_eq!(
-        infer_program(
-            r#"
+"#,
+    BaseType::String
+)]
+#[case::with_let(
+    r"
 x = 5
 if x > 3:
     10
 else:
     0
-"#
-            .trim()
-        ),
-        int()
-    );
-}
-
-#[test]
-fn test_elif_chain() {
-    assert_eq!(
-        infer_program(
-            r#"
+",
+    BaseType::Int
+)]
+#[case::elif_chain(
+    r"
 if True:
     1
 elif False:
     2
 else:
     3
-"#
-            .trim()
-        ),
-        int()
-    );
+",
+    BaseType::Int
+)]
+fn test_if_else(#[case] code: &str, #[case] expected: BaseType) {
+    assert_eq!(infer_program(code), Type::Base(expected));
 }
 
-#[test]
-fn test_ternary_int() {
-    assert_eq!(infer_program("1 if True else 0"), int());
-}
-
-#[test]
-fn test_ternary_string() {
-    assert_eq!(infer_program(r#""yes" if True else "no""#), string());
+#[rstest]
+#[case::int("1 if True else 0", BaseType::Int)]
+#[case::string(r#""yes" if True else "no""#, BaseType::String)]
+fn test_ternary(#[case] code: &str, #[case] expected: BaseType) {
+    assert_eq!(infer_program(code), Type::Base(expected));
 }
 
 #[test]
@@ -469,4 +380,98 @@ else:
             .any(|e| matches!(e, InferError::TypeMismatch { .. })),
         "expected TypeMismatch, got {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Edge cases: Recursive types, unapplied lambdas, etc.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_recursive_type_rejection() {
+    // lambda x: x(x) -> Recursive type error
+    let err = infer_program_err("lambda x: x(x)");
+    assert!(
+        err.iter().any(|e| {
+            if let InferError::Unsupported(msg) = e {
+                msg.contains("recursive type")
+            } else {
+                false
+            }
+        }),
+        "expected Unsupported recursive type error, got {err:?}"
+    );
+}
+
+#[rstest]
+#[case::comparison(
+    r"
+f = lambda x: x > 1
+f
+",
+    Type::Fun(Box::new(int()), Box::new(bool_ty()))
+)]
+#[case::arithmetic(
+    r"
+f = lambda x: x + 1
+f
+",
+    Type::Fun(Box::new(int()), Box::new(int()))
+)]
+fn test_lambda_unapplied(#[case] code: &str, #[case] expected: Type) {
+    assert_eq!(infer_program(code), expected);
+}
+
+#[test]
+fn test_generic_identity() {
+    // f = lambda x: x; f -> Fun(?a, ?b)
+    // simple-sub allows unconstrained parameters to remain unresolved.
+    let ty = infer_program("f = lambda x: x\nf");
+    if let Type::Fun(dom, cod) = ty {
+        assert!(matches!(*dom, Type::Infer(_)));
+        assert!(matches!(*cod, Type::Infer(_)));
+    } else {
+        panic!("expected Fun type, got {ty}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Subtyping / variance coverage
+// ---------------------------------------------------------------------------
+
+/// Tuple index propagation: `t[0]` flows the element's type out of a
+/// heterogeneous tuple, exercising the partial-tuple / projection rule.
+#[test]
+fn test_tuple_index_heterogeneous() {
+    assert_eq!(infer_program(r#"(1, "a")[0]"#), int());
+    assert_eq!(infer_program(r#"(1, "a")[1]"#), string());
+}
+
+/// An unconstrained identity applied to a concrete value must resolve all
+/// inference variables — no `Type::Infer` should survive in the result.
+#[test]
+fn test_unconstrained_identity_applied_resolves() {
+    // bind via Let so `f(5)` is a named call (lowering doesn't yet
+    // support a lambda-literal in call position).
+    let ty = infer_program("f = lambda x: x\nf(5)");
+    assert_eq!(ty, int());
+}
+
+/// A refined comprehension carries its filter predicate as a refinement on
+/// the inferred function's domain (the predicate is `__iter_record_restr`-
+/// bound). This pins down the post-§1.3 shape: the refinement is sourced
+/// from the AST node and reapplied by `type_saturate`, so the inferred type
+/// still surfaces it — what changed is the *source of truth*, not the type
+/// shape.
+#[test]
+fn test_filtered_comprehension_has_refinement_on_domain() {
+    let ty = infer_program("[x for x in [1, 2, 3] if x > 1]");
+    if let Type::Fun(dom, cod) = &ty {
+        assert!(
+            matches!(&**dom, Type::Refinement(_, _)),
+            "expected Refinement-wrapped domain, got {ty}"
+        );
+        assert_eq!(**cod, int(), "expected codomain Int, got {ty}");
+    } else {
+        panic!("expected Fun type, got {ty}");
+    }
 }

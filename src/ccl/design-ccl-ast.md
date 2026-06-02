@@ -13,8 +13,7 @@ CHL source
   → parse          (chl_parser)
   → lower          (ccl/lower.rs: CHL AST → CCL AST, structural only)
   → desugar_defers (ccl/desugar_defers.rs: eliminate Defer/Feed/Define nodes; see §Defer)
-  → infer          (ccl/infer.rs: type inference; fills ty on every node and calls
-                    ccl/unify.rs::resolve to substitute solved Infer vars before returning)
+  → infer          (ccl/infer.rs: type inference via simple-sub; delegates to ccl/infer_simple_sub.rs)
   → inline         (ccl/inline.rs::inline_non_iterable_lambdas: inline UDF Let bindings with non-iterable domains; beta-reduce at call sites)
   → lambda_elim    (ccl/lambda_elim.rs: Lambda → point-free combinators)
   → optimize       (tree rewrites on CCL AST, currently just join_plan.rs)
@@ -268,24 +267,13 @@ The type system uses two distinct pre-/post-inference placeholders with strict o
 | Variant | Owner | Meaning | Must be eliminated by |
 |---|---|---|---|
 | `Type::Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (debug assertion if survives) |
-| `Type::Infer(id)` | Type checker only | "Inference variable N, tracked in table" | End of `resolve()` (ambiguous type if survives) |
+| `Type::Infer(id)` | Type checker only | "Inference variable N, produced by simple-sub" | End of inference (ambiguous type if survives) |
 
-**`Type::Hole`** is stamped by `TypedExpr::new()` and `TypedBinding::new_unannotated()`. It is a structural placeholder that carries no identity — it is not registered in the `UnificationTable`. The inference pass (`infer::infer`) converts every `Hole` to a registered `Type::Infer` variable at the top of the `infer()` function (before the main dispatch). `fresh_infer_var_id()` must not be called from lowering code; use `Type::Hole` instead.
+**`Type::Hole`** is stamped by `TypedExpr::new()` and `TypedBinding::new_unannotated()`. It is a structural placeholder that carries no identity. The simple-sub inference pass (`infer_simple_sub`) eliminates all `Hole` placeholders and replaces them with concrete types or `Type::Infer` variables. `fresh_infer_var_id()` must not be called from lowering code; use `Type::Hole` instead.
 
-**`Type::Infer(id)`** is created exclusively by `TypeInferenceContext::fresh_infer_var()`. Each variable is registered in the `UnificationTable` immediately, giving it an identity that can participate in unification and be resolved by `unify::resolve`. This strict ownership means every `Infer(id)` that reaches `resolve()` is a known, tracked variable — never an accidentally-unregistered orphan.
+**`Type::Infer(id)`** is produced by the simple-sub pass (`ccl/infer_simple_sub.rs`) when a type cannot yet be determined. Any `Infer` remaining after inference represents an ambiguous type. The simple-sub pass is the sole creator of `Infer` variables during inference; lowering always uses `Type::Hole`.
 
 This separation makes test expression construction straightforward: tests that build expressions without running inference use `Type::Hole` (via `TypedExpr::new()`) and never need to synthesize `InferVarId` values.
-
-**Path to full HM**: the current inference pass still mutates `param.ty` and `binding.ty` directly (two sources of truth alongside the `UnificationTable`). The intended follow-up is to move inference toward writing only to the table and having `resolve()` be the single materialization pass — eliminating the two-sources-of-truth problem. Once BinOp/UnaryOp unification rules are added, `collect_param_constraint` can also be removed.
-
-### Union-find unification table (`ccl::unify`)
-
-`ccl::unify::UnificationTable` is a sparse union-find structure over `InferVarId`s, stored in `TypeInferenceContext`. It tracks solved inference variables across the typed-expression tree.
-
-- Each fresh variable is `register`ed when created by `TypeInferenceContext::fresh_infer_var()`.
-- `set(id, ty)` records a concrete solution; `probe(id)` retrieves it (with path compression via `find`).
-- `unify(a, b)` merges two variables into the same equivalence class, preferring a solved root when one exists.
-- After the main inference walk, `unify::resolve(expr, table)` replaces remaining `Type::Infer(id)` placeholders with their solved types. Any `Infer` left after resolution represents an ambiguous type. `resolve` is now called automatically inside the public `infer()` wrapper, so callers no longer need to invoke it explicitly.
 
 ---
 
@@ -462,7 +450,7 @@ enum Type {
     PartialRecord(Vec<(String, Type)>),  // partial record: only listed fields constrained; domain of Proj(Field("x"))
     Union(Vec<Type>),
     Hole,                                // lowering placeholder; converted to Infer at inference entry
-    Infer(InferVarId),                   // type-checker variable; registered in UnificationTable
+    Infer(InferVarId),                   // residual type variable after simple-sub coalesce
     Error,                               // inference already failed here; suppresses cascades
     Refinement(Box<Type>, Refinement),   // refined base type; `Refinement.kind` carries join strategy
     DataSource(String),                  // opaque domain type of a source
@@ -498,39 +486,39 @@ same source.
 
 ## Type inference
 
-`ccl::infer` currently implements a "limited" type inference pass that sits between
-lowering and the full bidirectional type checker. It handles enough to make
-the existing list-comprehension pipeline work end-to-end. The pass now includes
-a full union-find unification table (`UnificationTable` in `ccl::unify`) and records
-solved types into it as inference proceeds; a post-inference `resolve` pass replaces
-remaining `Infer(id)` placeholders with their solved types.
+`ccl::infer` runs simple-sub algebraic subtyping (Parreaux 2020, ICFP). The
+full algorithm description — motivation, data structures, constraint rules,
+polarity, let-polymorphism, the coalesce pipeline — lives in
+`docs/brainstorm/2026-05-06_simple_sub_prototype_status.md`. This section
+covers only the CCL-specific wiring.
 
-### `collect_param_constraint`
+### Pass structure
 
-Used for standalone lambdas (not in `Apply(lambda, arg)` position). Walks the
-entire lambda body collecting every `Apply(func, Var(param))` pattern and records
-the domain of `func`'s inferred `Fun` type as a constraint. All constraints must
-agree; conflicting constraints produce a `TypeMismatch` error.
+```
+Lowering → TypedExpr (all nodes carry Type::Hole)
+                │
+          emit_node (src/ccl/infer_simple_sub.rs)
+                │  walks the AST, calling constrain() for each structural rule
+                ▼
+          SimpleType constraint graph (VarState.lower/upper bound lists)
+                │
+          coalesce_pass   (compact_type → coalesce_compact per node)
+                │  turns constraint graph back into ccl::Type values
+                ▼
+          TypedExpr (nodes carry concrete Type, some Type::Infer residuals)
+                │
+          saturate (src/ccl/type_saturate.rs)
+                │  fixes up SimpleType-blind slots: Var scoping, refinements,
+                │  Let splicing, CollectionUnion. Temporary pass — see that
+                │  module's doc for removal conditions.
+                ▼
+          TypedExpr (fully typed; Type::Hole eliminated)
+```
 
-### Comparison with bidirectional type checking and Hindley-Milner
-
-| | Our limited pass | Bidirectional | Full HM |
-|---|---|---|---|
-| `Apply(Λ x. b, arg)` | special-case Apply rule | elegant check-mode push-down | same |
-| Standalone `Λ x. b` | `collect_param_constraint` heuristic | fails in synth mode; needs annotation | type variable + unify |
-| Multi-use params | first constraint only | same limitation | unification solves all |
-| Needs unification | `UnificationTable` (union-find) present; BinOp/UnaryOp rules implemented via `constrain_equal` | full | Yes |
-| Type error reporting | limited | at check sites | at unification failure |
-
-**Delta from our pass to bidirectional**: add a `check(expr, expected, ctx)`
-function alongside `infer`; rewrite the Apply rule to check the argument against
-the domain. `collect_param_constraint` is still needed for standalone lambdas.
-Gains type-mismatch error detection at Apply sites.
-
-**Delta from bidirectional to HM**: `Type::Infer(InferVarId)` already acts as type
-variables, and `UnificationTable` is already in place. BinOp and UnaryOp unification rules
-are implemented via `constrain_equal`. Remaining steps: an occurs check and removing
-`collect_param_constraint` once type variables unify across all use sites.
+`Type::Infer(id)` after inference means the coalesce pass left a constraint
+variable genuinely unconstrained (e.g. the parameter of an unapplied identity
+lambda). It is not a UnificationTable entry — the old HM solver (`unify.rs`)
+and its `UnificationTable` have been removed.
 
 ### `GroupBy` inference
 
@@ -539,20 +527,7 @@ When inferring `Expr::GroupBy { collection, key }`:
 1. Infer the type of `collection`.
 2. If the collection type has a codomain (i.e. it is a `Fun(_, elem_ty)`), write `elem_ty` into the key lambda's `param.ty` when `param.ty` is still `Type::Hole` or `Type::Infer(_)`. This mirrors the `Apply` rule where the argument type is pushed onto the lambda parameter.
 3. Infer the type of `key` (now annotated); take its codomain as `key_output_ty`.
-4. Return `Fun(key_output_ty, Fun(Base(UInt), elem_ty))`. Falls back to `Infer(fresh_var)` if either codomain cannot be determined.
-
-### `constrain_equal` — constraint propagation via the UnificationTable
-
-`TypeInferenceContext::constrain_equal(a, b)` unifies two types through the `UnificationTable`:
-
-- Both `Infer`: union the two variables.
-- One `Infer`, one concrete: set the variable to the concrete type.
-- Either `Error`: no-op (suppress cascades).
-- Both concrete and equal: no-op.
-- Both concrete and different: `InferError::TypeMismatch`.
-
-This is used by the BinOp and UnaryOp inference rules to propagate constraints across
-operands without requiring explicit type annotations.
+4. Return `Fun(key_output_ty, Fun(Base(UInt), elem_ty))`. Falls back to a fresh variable if either codomain cannot be determined.
 
 ### BinOp type rules
 
@@ -635,14 +610,12 @@ length ≥ n+1, constraining `?a` to the element type at that index.
 **Multi-projection accumulation**: `UnificationTable::set` merges `PartialTuple`/`PartialRecord`
 entries when called on a variable that is already solved to one of those types. Overlapping
 indices/fields are validated via `constrain_equal`; non-overlapping entries are appended.
-Additionally, `collect_constraints_into` detects single-entry `PartialTuple` domains from
-projection morphisms and emits `TypeConstraint::TupleField` rather than `TypeConstraint::Type`,
-so `reconcile_constraints` can merge multiple projections of the same parameter into a
-concrete `Tuple` type.
+Multiple projections of the same parameter (e.g. `x[0]` and `x[1]`) each call `set`, which
+merges the `PartialTuple` entries, so the final `probe()` returns the complete tuple structure.
 
 ### `Compose` inference
 
-N-ary `Compose([f₀, f₁, …, fₙ₋₁])` is inferred by chaining: each morphism's codomain is constrained equal to the next morphism's domain. The overall type is `Fun(domain(f₀), codomain(fₙ₋₁))`. This case arises when `infer` is run over output from `simplify`, which can produce `Compose` nodes.
+N-ary `Compose([f₀, f₁, …, fₙ₋₁])` is inferred by chaining: each morphism's codomain is constrained as a **subtype** of the next morphism's domain (`constrain_subtype(prev_codomain, d_i)`). This allows a refined codomain (e.g. `Refinement(T, pred)`) to feed into a base-typed domain (`T`) without a type error. The overall type is `Fun(domain(f₀), codomain(fₙ₋₁))`. This case arises when `infer` is run over output from `simplify`, which can produce `Compose` nodes.
 
 ### `Type::Union` semantic equality
 

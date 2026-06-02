@@ -71,7 +71,8 @@ fn simplify_once(expr: &mut Expr) -> bool {
         // could fire will fire on a later pass.
         //
         // This try_borrow_mut fallback is the same cycle-handling
-        // mechanism used by [`crate::ccl::unify::resolve_type`].  A
+        // mechanism used by [`crate::ccl::infer_simple_sub::coalesce_node`]
+        // and [`crate::ccl::type_saturate::saturate_node`].  A
         // related visited-set variant lives in
         // [`crate::ccl::ccl_utils::walk_refined_predicates`] and is
         // used by [`crate::ccl::ccl_utils::count_free`],

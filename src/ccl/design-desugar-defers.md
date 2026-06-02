@@ -19,7 +19,7 @@ don't denote pure values, and the type system has no rules for them.
 eliminates all four variants.  After it returns, no `Defer`/`Feed`/
 `Define`/`ExprStmt` nodes remain anywhere in the tree, and every
 downstream pass (`infer`, `inline`, `lambda_elim`, `simplify`,
-`unify::resolve`, `operator_conversion`) treats those variants as
+`operator_conversion`) treats those variants as
 `unreachable!`.
 
 The output is a plain CCL expression in which:

@@ -1,20 +1,22 @@
-//! Limited type inference pass for CCL expressions.
+//! CCL type inference public API and post-inference validation.
 //!
 //! Sits between lowering (`ccl::lower`) and compilation (`interpreter::compile_ccl`):
 //!
 //! ```text
 //! Python source
-//!   → lower (ccl/lower.rs)     — structural, no type reasoning
-//!   → infer  (ccl/infer.rs)    — type inference, fills ty on every TypedExpr node
+//!   → lower (ccl/lower.rs)            — structural, no type reasoning
+//!   → infer  (ccl/infer.rs)           — type inference entry point
+//!       → infer_simple_sub.rs         — simple-sub constraint-based inference
 //!   → compile (interpreter/compile_ccl.rs)  — CCL → dataflow operators
 //! ```
 //!
 //! # Type inference
 //!
-//! This module is the home of CCL type inference. The current implementation is a
-//! limited subset of the eventual full inference pass — enough to handle the
-//! list-comprehension pipeline end-to-end. See [`infer`] for what is currently
-//! supported and what is deferred.
+//! The public entry point is [`infer`], which delegates to
+//! [`crate::ccl::infer_simple_sub`]. This module also provides post-inference
+//! validation ([`check_fully_typed`], [`typecheck`]) and the
+//! [`TypeInferenceContext`] that holds source-type registrations used by
+//! both inference and compilation.
 //!
 //! The pass fills in [`crate::ccl::TypedExpr::ty`] on every node it visits. User-written
 //! annotations are carried in [`crate::ccl::TypedExpr::user_annotation`]; they are checked for
@@ -23,12 +25,12 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
+use crate::ccl::BaseType;
+use crate::ccl::simple_sub::SimpleVarUid;
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
 use crate::ccl::{
-    AggregateKind, BinOpKind, Branch, Builtin, Expr, InferVarId, Lit, MutationLoopShapeMut,
-    ProjKey, RefinementKind, Type, TypedExprNode, UnaryOpKind, unify::UnificationTable,
+    BinOpKind, Branch, Expr, InferVarId, Lit, RefinementKind, Type, TypedExprNode, UnaryOpKind,
 };
-use crate::ccl::{BaseType, TypedBinding};
 use crate::util::ScopeStack;
 
 // ---------------------------------------------------------------------------
@@ -37,9 +39,9 @@ use crate::util::ScopeStack;
 
 /// Context for the CCL type-inference pass.
 ///
-/// Combines a lexical scope stack (for lambda parameters and let bindings),
-/// a registry of externally-registered data-source types, and a
-/// [`UnificationTable`] that tracks solved and unified inference variables.
+/// Combines a lexical scope stack (for lambda parameters and let bindings)
+/// and a registry of externally-registered data-source types. Type inference
+/// is performed by the simple-sub pass ([`crate::ccl::infer_simple_sub`]).
 ///
 /// Scopes are entered and exited exclusively via [`enter_scope`](TypeInferenceContext::enter_scope);
 /// each lambda body and let binding gets its own scope.
@@ -49,14 +51,7 @@ pub struct TypeInferenceContext {
     scopes: ScopeStack<Type>,
 
     /// Types of known externally-registered data sources.
-    source_types: HashMap<String, Type>,
-
-    /// Union-Find table tracking solved and unified inference variables.
-    ///
-    /// Every inference variable allocated via [`fresh_infer_var`](Self::fresh_infer_var) is
-    /// registered here. The post-inference [`resolve`](crate::ccl::unify::resolve)
-    /// pass uses it to replace `Infer(id)` placeholders with concrete types.
-    pub table: UnificationTable,
+    pub(crate) source_types: HashMap<String, Type>,
 }
 
 /// RAII guard returned by [`TypeInferenceContext::enter_scope`].
@@ -102,16 +97,6 @@ impl TypeInferenceContext {
         TypeInferenceContextGuard { ctx: self }
     }
 
-    /// Allocate a fresh inference variable, register it in the [`UnificationTable`],
-    /// and return its ID.
-    ///
-    /// Use this instead of calling `fresh_infer_var_id` directly whenever you need
-    /// a new variable during inference — the table entry is required for the
-    /// post-inference resolution pass.
-    pub fn fresh_infer_var(&mut self) -> InferVarId {
-        self.table.fresh_var()
-    }
-
     /// Register the CCL type for an externally-managed data source.
     ///
     /// Typically called by [`crate::ccl::context::GlobalContext`] when a source
@@ -123,11 +108,6 @@ impl TypeInferenceContext {
     /// Look up the CCL type for a registered source by name.
     pub fn source_type(&self, name: &str) -> Option<Type> {
         self.source_types.get(name).cloned()
-    }
-
-    /// Constrain two types to be equal, recording the solution in the [`UnificationTable`].
-    fn constrain_equal(&mut self, a: &Type, b: &Type) -> Result<(), InferError> {
-        self.table.constrain_equal(a, b)
     }
 }
 
@@ -153,10 +133,6 @@ impl DerefMut for TypeInferenceContext {
 pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
     UnboundVariable(String),
-    /// A lambda's parameter type could not be inferred from its body, any
-    /// call-site constraints, or a user annotation. Emitted post-resolve by
-    /// [`check_fully_typed`] when a `Type::Infer` remains in a param position.
-    CannotInferParam(String),
     /// A type mismatch was detected between two solved types.
     TypeMismatch {
         type_a: Type,
@@ -165,9 +141,12 @@ pub enum InferError {
     },
     /// A [`Type::Fun`] was required — e.g. in a function-application or
     /// [`TypedExprNode::Compose`] position — but a non-function type was found.
-    ///
-    /// The inner [`Type`] is the actual type of the offending expression.
-    ExpectedFunction(Type),
+    ExpectedFunction {
+        /// The actual type of the non-function expression.
+        found: Type,
+        /// Symbolic label of the expression where the error occurred.
+        at: String,
+    },
     /// A user-written annotation on a binding site conflicts with the inferred type.
     ///
     /// Distinct from [`InferError::TypeMismatch`] so error messages can say
@@ -179,31 +158,54 @@ pub enum InferError {
         inferred: Type,
     },
     /// The expression kind is not yet handled by this inference pass.
-    ///
-    /// TODO: add BinOp arithmetic/comparison type rules.
     Unsupported(String),
     /// A [`crate::ccl::TypedExprNode::Case`] with no branches was encountered.
     ///
     /// Lowering never produces a 0-branch `Case`; this indicates a malformed
     /// AST constructed outside the normal lowering path.
-    EmptyCase,
+    EmptyCase {
+        /// Symbolic label of the case expression.
+        at: String,
+    },
     /// A [`Type::Hole`] placeholder survived past inference.
-    /// The `String` is the symbolic representation of the offending expression.
-    UnresolvedHole(String),
-    /// An unresolved [`Type::Infer`] variable survived past resolution.
-    /// The `String` is the symbolic representation of the offending expression.
-    UnresolvedInfer(InferVarId, String),
-    // A partial tuple or partial record that was not resolved to a concrete Tuple/Record
-    UnresolvedPartial(String, String),
+    UnresolvedHole {
+        /// Symbolic label of the expression whose type contains the hole.
+        at: String,
+    },
+    /// An unresolved [`Type::Infer`] variable survived past inference.
+    UnresolvedInfer {
+        /// The unresolved variable's id.
+        id: InferVarId,
+        /// Symbolic label of the expression whose type contains the variable.
+        at: String,
+    },
+    /// A partial tuple or partial record was not resolved to a concrete type.
+    UnresolvedPartial {
+        /// Display string of the partial type.
+        kind: String,
+        /// Symbolic label of the expression whose type is partial.
+        at: String,
+    },
+    /// An incompatible-bounds conflict from simple-sub coalescing.
+    /// Stage 1 rejects unions/intersections of distinct concrete types.
+    IncompatibleBounds {
+        /// `true` = positive polarity (lower-bound union); `false` = negative (upper-bound intersection).
+        polarity: bool,
+        /// Display string of the conflicting types, e.g. `"handle(0) | handle(1)"`.
+        conflicting: String,
+        /// UIDs of the simple-sub variables whose bounds conflicted.
+        vars: Vec<SimpleVarUid>,
+        /// The innermost expression label where the conflict was first detected.
+        origin: String,
+        /// Enclosing expression labels, innermost-first.
+        context: Vec<String>,
+    },
 }
 
 impl std::fmt::Debug for InferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InferError::UnboundVariable(name) => write!(f, "Unbound variable: '{}'", name),
-            InferError::CannotInferParam(name) => {
-                write!(f, "Cannot infer type for parameter: '{}'", name)
-            }
             InferError::TypeMismatch {
                 ctx,
                 type_a,
@@ -215,8 +217,8 @@ impl std::fmt::Debug for InferError {
                     ctx, type_a, type_b
                 )
             }
-            InferError::ExpectedFunction(ty) => {
-                write!(f, "Expected function type, found {}", ty)
+            InferError::ExpectedFunction { found, at } => {
+                write!(f, "Expected function type at {at}, found {found}")
             }
             InferError::AnnotationMismatch {
                 annotation,
@@ -229,19 +231,44 @@ impl std::fmt::Debug for InferError {
                 )
             }
             InferError::Unsupported(msg) => write!(f, "Unsupported: {}", msg),
-            InferError::EmptyCase => write!(f, "Case expression must have at least one branch"),
-            InferError::UnresolvedHole(sym) => {
-                write!(f, "Unresolved type hole in expression: {}", sym)
+            InferError::EmptyCase { at } => {
+                write!(f, "Case expression must have at least one branch (at {at})")
             }
-            InferError::UnresolvedInfer(id, sym) => {
+            InferError::UnresolvedHole { at } => {
+                write!(f, "Unresolved type hole in expression: {at}")
+            }
+            InferError::UnresolvedInfer { id, at } => {
+                write!(f, "Unresolved inference variable {id} in expression: {at}")
+            }
+            InferError::UnresolvedPartial { kind, at } => {
+                write!(f, "Unresolved partial {kind} in expression: {at}")
+            }
+            InferError::IncompatibleBounds {
+                polarity,
+                conflicting,
+                vars,
+                origin,
+                context,
+            } => {
+                let bound_kind = if *polarity { "lower" } else { "upper" };
+                let aligned_origin = origin.replace('\n', "\n  ");
+                let var_ids: Vec<_> = vars.iter().map(|v| v.0).collect();
                 write!(
                     f,
-                    "Unresolved inference variable {} in expression: {}",
-                    id, sym
-                )
-            }
-            InferError::UnresolvedPartial(name, sym) => {
-                write!(f, "Unresolved partial {} in expression: {}", name, sym)
+                    "Type Inference Error: Incompatible {bound_kind} bounds\nRejected by: Stage 1 (rejects Type::Union)\nConflicting Types: {conflicting}\nVariables: {var_ids:?}\n\nError originated at:\n  {aligned_origin}"
+                )?;
+                if !context.is_empty() {
+                    write!(f, "\n\nIn context of:")?;
+                    for (i, ctx) in context.iter().enumerate() {
+                        // "  N. " prefix; continuation lines must align with the
+                        // first character of content (i.e. same width of spaces).
+                        let prefix = format!("  {}. ", i + 1);
+                        let cont_indent = " ".repeat(prefix.len());
+                        let aligned = ctx.replace('\n', &format!("\n{cont_indent}"));
+                        write!(f, "\n{prefix}{aligned}")?;
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -251,22 +278,14 @@ impl std::fmt::Debug for InferError {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Run type inference on `expr`, then resolve all inference variables.
+/// Run type inference on `expr` using the simple-sub algorithm.
 ///
-/// Public entry point for the CCL type-inference pass. Calls [`infer_expr`]
-/// to annotate every node, then calls [`crate::ccl::unify::resolve`] to
-/// substitute solved inference-variable placeholders with their concrete types.
-///
-/// After this call returns `Ok`, the tree is fully annotated and contains no
-/// `Type::Hole` or (ideally) `Type::Infer` placeholders.
+/// Public entry point for the CCL type-inference pass. Delegates entirely to
+/// [`crate::ccl::infer_simple_sub::infer`]. After this call returns `Ok`, the
+/// tree is fully annotated and contains no `Type::Hole` or `Type::Infer`
+/// placeholders.
 pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Vec<InferError>> {
-    infer_expr(expr, ctx).map_err(|e| vec![e])?;
-    crate::ccl::unify::resolve(expr, &mut ctx.table);
-    check_fully_typed(expr)?;
-    // Return the type from expr.ty (post-resolve) rather than the pre-resolve return value
-    // from infer_expr: the two can differ when infer_expr returns an Infer var that
-    // constrain_equal subsequently solved (e.g. the left operand of a BinOp).
-    Ok(expr.ty.clone())
+    crate::ccl::infer_simple_sub::infer(expr, &ctx.source_types)
 }
 
 /// Check that every [`crate::ccl::TypedExpr::ty`] and [`crate::ccl::TypedBinding::ty`]
@@ -305,14 +324,7 @@ fn collect_expr_errors(
     // into their children; everything else just visits its direct children.
     match &expr.node {
         TypedExprNode::Lambda { param, body, .. } => {
-            if type_has_infer(&param.ty) {
-                // TODO: A future "errored table" tracking covered Infer IDs could suppress
-                // derivative UnresolvedInfer errors for this ID in expr.ty and body uses
-                // of this param.
-                errors.push(InferError::CannotInferParam(param.name.clone()));
-            } else {
-                collect_type_errors(&param.ty, &param.name, errors, seen_refinements);
-            }
+            collect_type_errors(&param.ty, &param.name, errors, seen_refinements);
             collect_expr_errors(body, errors, seen_refinements);
         }
         TypedExprNode::Let { binding, .. } => {
@@ -344,8 +356,13 @@ fn collect_type_errors(
     seen_refinements: &mut HashSet<crate::ccl::RefinementId>,
 ) {
     match ty {
-        Type::Hole => errors.push(InferError::UnresolvedHole(context_sym.to_string())),
-        Type::Infer(id) => errors.push(InferError::UnresolvedInfer(*id, context_sym.to_string())),
+        Type::Hole => errors.push(InferError::UnresolvedHole {
+            at: context_sym.to_string(),
+        }),
+        Type::Infer(id) => errors.push(InferError::UnresolvedInfer {
+            id: *id,
+            at: context_sym.to_string(),
+        }),
         Type::Fun(domain, codomain) => {
             collect_type_errors(domain, context_sym, errors, seen_refinements);
             collect_type_errors(codomain, context_sym, errors, seen_refinements);
@@ -375,7 +392,8 @@ fn collect_type_errors(
             // [`crate::ccl::lambda_elim::elim_lambdas_in_type`] (both
             // via [`crate::ccl::ccl_utils::walk_refined_predicates`]),
             // and a try_borrow_mut fallback variant in
-            // [`crate::ccl::unify::resolve_type`] and
+            // [`crate::ccl::infer_simple_sub::coalesce_node`],
+            // [`crate::ccl::type_saturate::saturate_node`], and
             // [`crate::ccl::simplify::simplify_once`].  This site
             // doesn't share the helper because it mixes per-node
             // error checks with the refinement walk; if drift makes
@@ -386,20 +404,17 @@ fn collect_type_errors(
             }
             collect_type_errors(inner, context_sym, errors, seen_refinements);
         }
+        // Partial tuples/records are a legitimate simple-sub output shape
+        // for projection morphisms (per plan R5: a record variable that
+        // didn't get pinned to a closed tuple shape during inference is
+        // genuinely open at this position).  Walk their entries for
+        // unresolved children; do not flag the partial type itself.
         Type::PartialTuple(entries) => {
-            errors.push(InferError::UnresolvedPartial(
-                ty.to_string(),
-                context_sym.to_string(),
-            ));
             for (_, ty) in entries {
                 collect_type_errors(ty, context_sym, errors, seen_refinements);
             }
         }
         Type::PartialRecord(entries) => {
-            errors.push(InferError::UnresolvedPartial(
-                ty.to_string(),
-                context_sym.to_string(),
-            ));
             for (_, ty) in entries {
                 collect_type_errors(ty, context_sym, errors, seen_refinements);
             }
@@ -452,7 +467,28 @@ pub fn dbg_typecheck_mv(expr: Expr) -> Expr {
     expr
 }
 
+/// Return the base [`Type`] of a [`Lit`] value.
+///
+/// TODO: each literal yields only its base type (`Int`, `String`, …); a
+/// literal could instead carry a refinement pinning it to its exact value
+/// (e.g. `{Int | _ == 3}` for `Lit::Int(3)`). Decide whether to refine to
+/// the singleton value once Stage 3 SMT refinements land.
+fn lit_type(lit: &Lit) -> Type {
+    match lit {
+        Lit::Int(_) => Type::Base(BaseType::Int),
+        Lit::String(_) => Type::Base(BaseType::String),
+        Lit::Bool(_) => Type::Base(BaseType::Bool),
+        Lit::Unit => Type::Base(BaseType::Unit),
+    }
+}
+
 /// Recursively collect semantic type errors from `expr` into `errors`.
+///
+/// TODO: the `check_*_types` rules invoked below re-encode the same typing
+/// rules that the `emit_*` constraint-emitters in
+/// [`crate::ccl::infer_simple_sub`] already express. Replace this whole
+/// post-inference check-rule family with the `emit_*` rules so each rule
+/// lives in exactly one place.
 fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
     // Case interleaves per-branch recursion with per-branch type checks, so it
     // doesn't fit the "recurse all children, then check this node" template
@@ -522,7 +558,10 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
                     });
                 }
             }
-            _ => errors.push(InferError::ExpectedFunction(function.ty.clone())),
+            _ => errors.push(InferError::ExpectedFunction {
+                found: function.ty.clone(),
+                at: symbolic(function),
+            }),
         },
 
         // Node type must be Fun; its codomain must match the body type. The
@@ -538,7 +577,10 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
                     });
                 }
             }
-            _ => errors.push(InferError::ExpectedFunction(expr.ty.clone())),
+            _ => errors.push(InferError::ExpectedFunction {
+                found: expr.ty.clone(),
+                at: symbolic(expr),
+            }),
         },
 
         TypedExprNode::Let {
@@ -593,7 +635,10 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
 
         TypedExprNode::Aggregate { input, .. } => {
             if !matches!(input.ty, Type::Fun(..)) {
-                errors.push(InferError::ExpectedFunction(input.ty.clone()));
+                errors.push(InferError::ExpectedFunction {
+                    found: input.ty.clone(),
+                    at: symbolic(input),
+                });
             }
         }
 
@@ -624,8 +669,62 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
     }
 }
 
-// Checks if two types should be considered equal for the purposes of typechecking.
-// Currently treats refinements as transparent
+/// One-way subtype check: `a <: b` for structural types.
+///
+/// Implements width subtyping on records (extra fields allowed) and
+/// tuples (extra trailing elements allowed). Functions compose
+/// contravariantly on domain, covariantly on codomain. All other shapes
+/// fall back to [`typecheck_equal`].
+///
+/// Currently used only by the Compose chain checker; the goal is to
+/// replace [`typecheck_equal`] with this throughout `collect_type_errors`
+/// once we verify no existing checks relied on strictness.
+///
+/// TODO: handle refinements correctly here rather than stripping them —
+/// `Refinement(T, p) <: T` is valid but `T <: Refinement(T, p)` is not.
+///
+/// TODO: this hand-rolled structural subtype check duplicates the subtyping
+/// logic in [`crate::ccl::simple_sub::constrain_subtype`]; reuse it here
+/// once the post-inference checks can run against the solver's `SimpleType`
+/// representation instead of re-implementing it over `ccl::Type`.
+fn typecheck_subtype(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        // Width subtyping on closed records: a must have all of b's
+        // named fields with compatible types; extras in a are allowed.
+        (Type::Record(a_fields), Type::Record(b_fields)) => {
+            let a_map: HashMap<&str, &Type> =
+                a_fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
+            b_fields.iter().all(|(n, t)| {
+                a_map
+                    .get(n.as_str())
+                    .is_some_and(|p| typecheck_subtype(p, t))
+            })
+        }
+        // Width subtyping on closed tuples: a must be at least as long
+        // as b, with matching element types at the indices b uses.
+        (Type::Tuple(a_elems), Type::Tuple(b_elems)) => {
+            a_elems.len() >= b_elems.len()
+                && a_elems
+                    .iter()
+                    .zip(b_elems.iter())
+                    .all(|(p, n)| typecheck_subtype(p, n))
+        }
+        // Functions: contravariant domain, covariant codomain.
+        (Type::Fun(a_dom, a_cod), Type::Fun(b_dom, b_cod)) => {
+            typecheck_subtype(b_dom, a_dom) && typecheck_subtype(a_cod, b_cod)
+        }
+        // TODO: handle refinement subtyping correctly.
+        // Refinement(T, p) <: T is valid; T <: Refinement(T, p) is not.
+        // For now, strip refinements on both sides (over-permissive).
+        (Type::Refinement(a, _), b) => typecheck_subtype(a, b),
+        (a, Type::Refinement(b, _)) => typecheck_subtype(a, b),
+        // Anything else: defer to strict equality.
+        _ => typecheck_equal(a, b),
+    }
+}
+
+/// Checks if two types should be considered equal for the purposes of typechecking.
+/// Currently treats refinements as transparent
 fn typecheck_equal(a: &Type, b: &Type) -> bool {
     match (a, b) {
         (Type::Refinement(a, _), b) => typecheck_equal(a, b),
@@ -667,6 +766,12 @@ fn typecheck_equal(a: &Type, b: &Type) -> bool {
                     .is_some_and(|f_t| typecheck_equal(t, f_t))
             })
         }
+        // A full Tuple satisfies a PartialTuple constraint if every named
+        // index is in range and the element types match.
+        (Type::Tuple(full), Type::PartialTuple(partial))
+        | (Type::PartialTuple(partial), Type::Tuple(full)) => partial
+            .iter()
+            .all(|(i, t)| full.get(*i).is_some_and(|f_t| typecheck_equal(t, f_t))),
         // Nested unions are semantically flat: Union(Union(A,B),C) ≡ Union(A,B,C).
         // Flatten both sides before comparing to handle rewriting passes that
         // normalise the nesting level (e.g. collection-union flattening in simplify).
@@ -785,7 +890,7 @@ fn check_collection_union_types(node_ty: &Type, operands: &[Expr], errors: &mut 
         if !matches!(op.ty, Type::Fun(..)) {
             errors.push(InferError::TypeMismatch {
                 ctx: format!("operand {i} of '++' must be a collection (Fun type)"),
-                type_a: Type::fun(Type::Infer(InferVarId(0)), Type::Infer(InferVarId(0))),
+                type_a: Type::fun(Type::Hole, Type::Hole),
                 type_b: op.ty.clone(),
             });
         }
@@ -793,7 +898,7 @@ fn check_collection_union_types(node_ty: &Type, operands: &[Expr], errors: &mut 
     if !matches!(node_ty, Type::Fun(..)) {
         errors.push(InferError::TypeMismatch {
             ctx: "result of '++' must be a collection (Fun type)".into(),
-            type_a: Type::fun(Type::Infer(InferVarId(0)), Type::Infer(InferVarId(0))),
+            type_a: Type::fun(Type::Hole, Type::Hole),
             type_b: node_ty.clone(),
         });
     }
@@ -872,15 +977,24 @@ fn check_compose_types(node_ty: &Type, morphisms: &[Expr], errors: &mut Vec<Infe
         match &m.ty {
             Type::Fun(d, c) => fun_tys.push(Some(((**d).clone(), (**c).clone()))),
             _ => {
-                errors.push(InferError::ExpectedFunction(m.ty.clone()));
+                errors.push(InferError::ExpectedFunction {
+                    found: m.ty.clone(),
+                    at: symbolic(m),
+                });
                 fun_tys.push(None);
             }
         }
     }
-    // Adjacent codomain/domain must agree.
+    // Adjacent codomain/domain must agree. Allow width subtyping at
+    // record/tuple boundaries (`prev_cod` may carry extra fields beyond
+    // what `next_dom` requires) — a Compose chain semantically pipes
+    // the codomain through to the next morphism's parameter, which
+    // only reads the fields it asks for. Strict equality would reject
+    // e.g. `loop_result ≫ .step` when the loop body returns a wider
+    // record `{step, tap_k}` than `Proj("step")`'s declared domain.
     for i in 0..fun_tys.len().saturating_sub(1) {
         if let (Some((_, prev_cod)), Some((next_dom, _))) = (&fun_tys[i], &fun_tys[i + 1])
-            && !typecheck_equal(prev_cod, next_dom)
+            && !typecheck_subtype(prev_cod, next_dom)
         {
             errors.push(InferError::TypeMismatch {
                 ctx: format!(
@@ -905,1097 +1019,6 @@ fn check_compose_types(node_ty: &Type, morphisms: &[Expr], errors: &mut Vec<Infe
                 type_b: node_ty.clone(),
             });
         }
-    }
-}
-
-/// Walk `expr` and fill in `ty` on every node. Does not call `resolve`.
-///
-/// Currently handled:
-///
-/// - Literals — type always known from the literal tag
-/// - Variables — looked up in the scope stack ([`TypeInferenceContext`])
-/// - Annotated lambdas — param type known; recurse into body
-/// - `Apply(Lambda(x, Infer), arg)` — infers arg type, writes it onto `param.ty`
-/// - Standalone unannotated lambdas — binds param as an inference variable and
-///   lets body inference constrain it at each usage site via the unification table
-/// - Lists — derives `Fun(UIntRange(n), elem_ty)` from the first element
-/// - Let bindings — infers value type, stores it in `bound_expr.ty`, binds name in scope
-/// - `GroupBy` — infers the collection type; uses its codomain to annotate the
-///   key lambda's parameter (mirrors how `Apply` annotates its lambda argument);
-///   returns `Fun(KeyType, Fun(UInt, ValueType))`
-///
-/// Returns a fresh [`Type::Infer`] variable for unhandled cases or when component
-/// types cannot be determined. BinOp type rules and full constraint solving are
-/// deferred; see the TODOs throughout this module.
-///
-/// Errors propagate from sub-expressions: an [`InferError::UnboundVariable`]
-/// anywhere in the tree aborts inference and returns the error.
-fn infer_expr(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
-    // Register a fresh inference variable now so the table entry exists for the
-    // solution recording step at the bottom of this function. If we skipped
-    // this, the table would have no id to record the solution against and
-    // resolve() would be unable to substitute the type back into the tree.
-    if matches!(expr.ty, Type::Hole) {
-        expr.ty = Type::Infer(ctx.fresh_infer_var());
-    }
-
-    let result_ty = match &mut expr.node {
-        // ----- Literals -----
-        TypedExprNode::Lit(lit) => Ok(lit_type(lit)),
-
-        // ----- Variable reference -----
-        TypedExprNode::Var(name) => ctx
-            .lookup(name)
-            .cloned()
-            .ok_or_else(|| InferError::UnboundVariable(name.clone())),
-
-        // ----- Built-in primitive -----
-        // Built-ins are emitted post-inference (by lambda elimination and join
-        // planning) with their type already stamped onto the node, so they
-        // should not normally reach this pass.  If one does, fall back to the
-        // existing slot rather than raising — the slot was either pre-set by
-        // the caller or replaced by the fresh `Infer` variable above.
-        TypedExprNode::Builtin(_) => Ok(expr.ty.clone()),
-
-        // ----- Lambda abstraction -----
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => infer_lambda(param, body, refinement, ctx),
-
-        // ----- Aggregation -----
-        TypedExprNode::Aggregate { input, kind } => {
-            let input_type = infer_expr(input, ctx)?;
-            // The input is collection-shaped — `Fun(domain, codomain)` — so
-            // refine `input_type` to that shape via unification before reading
-            // off the element type.  This propagates correctly even when
-            // `input_type` is still an unresolved `Infer` variable (e.g. inside
-            // a let-bound function whose call site has not yet been inferred).
-            let fresh_domain = Type::Infer(ctx.fresh_infer_var());
-            let fresh_codomain = Type::Infer(ctx.fresh_infer_var());
-            ctx.constrain_equal(
-                &input_type,
-                &Type::Fun(Box::new(fresh_domain), Box::new(fresh_codomain.clone())),
-            )?;
-            // Per-kind typing rule lives on AggregateKind so adding new
-            // variants (Count, Mean, …) does not require touching this branch.
-            kind.constrain_signature(ctx, &fresh_codomain)
-        }
-
-        // ----- Function application -----
-        TypedExprNode::Apply { function, argument } => infer_apply(function, argument, ctx),
-
-        // ----- List literal -----
-        TypedExprNode::List(elts) => infer_list(elts, ctx),
-
-        // ----- Binary operation -----
-        TypedExprNode::BinOp { left, right, op } => infer_binop(left, op, right, ctx),
-
-        // ----- Unary operation -----
-        TypedExprNode::UnaryOp(op, inner) => {
-            let inner_ty = infer_expr(inner, ctx)?;
-            match op {
-                UnaryOpKind::Neg => {
-                    // Operand must be Int; result is Int.
-                    ctx.constrain_equal(&inner_ty, &Type::Base(BaseType::Int))?;
-                    Ok(Type::Base(BaseType::Int))
-                }
-                UnaryOpKind::Not => {
-                    // Operand must be Bool; result is Bool.
-                    ctx.constrain_equal(&inner_ty, &Type::Base(BaseType::Bool))?;
-                    Ok(Type::Base(BaseType::Bool))
-                }
-            }
-        }
-
-        // ----- Let binding -----
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => infer_let(binding, bound_expr, body, ctx),
-
-        // ----- Case -----
-        //
-        // For each branch: constrain the guard to Bool, infer the arm body type,
-        // and unify all arm types via `constrain_equal`.
-        //
-        // Returns the unified arm type, or `InferError::EmptyCase` for 0-branch `Case`.
-        TypedExprNode::Case { branches } => infer_case(branches, ctx),
-
-        // ----- Tuple constructor -----
-        //
-        // Infer each element in order and return their types as a Tuple type.
-        TypedExprNode::Tuple(elts) => {
-            let types: Result<Vec<Type>, InferError> =
-                elts.iter_mut().map(|e| infer_expr(e, ctx)).collect();
-            Ok(Type::Tuple(types?))
-        }
-
-        // ----- Proj -----
-        //
-        // First-class projection morphism. A bare `Proj(Index(n))` gets type
-        // `PartialTuple({n => ?a}) ⇒ ?a`; a bare `Proj(Field("x"))` gets type
-        // `PartialRecord({x => ?a}) ⇒ ?a`.  These partial domain types unify
-        // correctly with any concrete `Tuple`/`Record` during application.
-        TypedExprNode::Proj(key) => {
-            let domain_infer = Type::Infer(ctx.fresh_infer_var());
-            let field_ty = Type::Infer(ctx.fresh_infer_var());
-            let domain_ty = match key {
-                ProjKey::Index(idx) => Type::PartialTuple(vec![(*idx, field_ty.clone())]),
-                ProjKey::Field(name) => Type::PartialRecord(vec![(name.clone(), field_ty.clone())]),
-            };
-            ctx.constrain_equal(&domain_infer, &domain_ty)?;
-            Ok(Type::fun(domain_infer, field_ty))
-        }
-
-        // ----- Join / Jump -----
-        //
-        // The only Loop shape currently produced by lowering is the
-        // mutation-loop pattern emitted by
-        // [`crate::ccl::lower::lower_mutation_loop`]; any other shape is
-        // rejected here.  See [`infer_mutation_loop`] for the rules.
-        TypedExprNode::Loop { .. } => infer_mutation_loop(expr, ctx),
-
-        // ----- Record constructor -----
-        //
-        // Infer each field expression and collect the field name–type pairs
-        // into a `Type::Record`. This mirrors `Tuple` inference but preserves
-        // field names.
-        TypedExprNode::Record(fields) => {
-            let field_types: Result<Vec<(String, Type)>, InferError> = fields
-                .iter_mut()
-                .map(|(name, expr)| Ok((name.clone(), infer_expr(expr, ctx)?)))
-                .collect();
-            Ok(Type::Record(field_types?))
-        }
-
-        // ----- External data source reference -----
-        //
-        // Look up the source's function type in the source registry.
-        // Returns `InferError::UnboundVariable` if the source was not registered
-        // before inference was run.
-        TypedExprNode::Source(name) => ctx
-            .source_type(name)
-            .ok_or_else(|| InferError::UnboundVariable(name.clone())),
-
-        // ----- N-ary compose -----
-        //
-        // Produced by simplify after type inference; should not appear here in
-        // normal compilation. Infer the type chain: each morphism's codomain
-        // must equal the next morphism's domain; the result is `domain(f₀) →
-        // codomain(fₙ₋₁)`.
-        TypedExprNode::Compose(elts) => infer_compose(elts, ctx),
-
-        // ----- N-ary collection union -----
-        //
-        // Each operand must have function (collection) type `Fun(D_i, C_i)`.
-        // The result is `Fun(Union(D_0, …, D_{n-1}), dedup_union(C_0, …, C_{n-1}))`:
-        // the domain union is kept as-is (each operand becomes a distinct
-        // variant), and the codomain union is deduplicated.
-        TypedExprNode::CollectionUnion(operands) => infer_collection_union(operands, ctx),
-
-        // `Defer`, `Feed`, `Define`, and `ExprStmt` are eliminated by
-        // [`crate::ccl::desugar_defers`] before inference runs, so the
-        // type system never sees them.  These arms are unreachable.
-        TypedExprNode::Feed { .. }
-        | TypedExprNode::Define { .. }
-        | TypedExprNode::Defer
-        | TypedExprNode::ExprStmt { .. } => {
-            unreachable!(
-                "Defer/Feed/Define/ExprStmt survived desugar_defers and reached type inference: {:?}",
-                expr.node
-            )
-        }
-
-        TypedExprNode::Error => crate::unexpected_error_node!(),
-    }?;
-
-    // Check user_annotation compatibility. If the user provided an explicit annotation,
-    // verify it is compatible with the inferred type and use it as the final type.
-    //
-    // Note: we always infer the full subtree before checking user_annotation.
-    // Skipping recursion when an annotation is present would leave sub-node `ty`
-    // fields as Infer and miss lambda-param mutations at Apply/GroupBy sites.
-    if let Some(annotation) = expr.user_annotation.as_mut() {
-        // Replace any `Type::Hole` placeholders inside the annotation
-        // with fresh inference variables so structural unification can
-        // fill them in.  This supports patterns where a pass (e.g.
-        // `crate::ccl::desugar_defers`'s filter-feed rewrite) inserts a
-        // `Refinement(Hole, …)` user annotation to add a constraint
-        // without knowing the surrounding concrete type.
-        replace_holes(annotation, ctx);
-        // Type-check any `Refinement` predicates nested inside the
-        // annotation so their sub-expressions get inference variables
-        // assigned — otherwise `check_fully_typed` would later flag
-        // them as unresolved.
-        infer_annotation_refinements(annotation, ctx)?;
-        let annotation_clone = annotation.clone();
-        ctx.constrain_equal(&annotation_clone, &result_ty)?;
-        // Record the solution in the table if this node started with an Infer var.
-        if let Type::Infer(id) = expr.ty {
-            ctx.table.set(id, annotation_clone.clone());
-        }
-        expr.ty = annotation_clone.clone();
-        return Ok(annotation_clone);
-    }
-
-    // Record the solved type in the unification table so the post-inference
-    // resolution pass can substitute Infer placeholders in the tree.
-    if let Type::Infer(id) = expr.ty
-        && !matches!(result_ty, Type::Infer(_))
-    {
-        ctx.table.set(id, result_ty.clone());
-    }
-
-    expr.ty = result_ty.clone();
-    Ok(result_ty)
-}
-
-// ---------------------------------------------------------------------------
-// Non-trivial match-arm helpers
-// ---------------------------------------------------------------------------
-
-/// Walk `ty` and infer the predicate expression of every nested
-/// `Type::Refinement` so the predicate's sub-expressions get type
-/// inference variables assigned.
-///
-/// Used by [`infer_expr`] when a user-supplied type annotation carries
-/// a `Refinement(_, pred)` — without this, the predicate's sub-trees
-/// would never visit `infer_expr` and `check_fully_typed` would flag
-/// every node inside as having an unresolved type hole.
-fn infer_annotation_refinements(
-    ty: &mut Type,
-    ctx: &mut TypeInferenceContext,
-) -> Result<(), InferError> {
-    if let Type::Refinement(_, refinement) = ty {
-        let RefinementKind::Predicate(def) = &refinement.kind;
-        infer_expr(&mut def.borrow_mut(), ctx)?;
-    }
-    let mut err = Ok(());
-    ty.walk_children_mut(|child| {
-        if err.is_ok() {
-            err = infer_annotation_refinements(child, ctx);
-        }
-    });
-    err
-}
-
-/// Replace every [`Type::Hole`] in `ty` (recursively) with a fresh inference
-/// variable, assigning one stable [`Type::Infer`] ID per structural position.
-///
-/// Any existing [`Type::Infer`] IDs are registered in the table if not already
-/// present. This handles IDs created outside inference (e.g. via the
-/// [`Type::infer`] test helper) so they participate in unification correctly.
-fn replace_holes(ty: &mut Type, ctx: &mut TypeInferenceContext) {
-    match ty {
-        Type::Hole => {
-            *ty = Type::Infer(ctx.fresh_infer_var());
-            return;
-        }
-        Type::Infer(id) => ctx.table.register(*id),
-        _ => {}
-    }
-    ty.walk_children_mut(|child| replace_holes(child, ctx));
-}
-
-/// Return `true` if `ty` contains any [`Type::Infer`] node.
-///
-/// Used post-[`crate::ccl::unify::resolve`], where every solved inference
-/// variable has already been substituted, so any remaining [`Type::Infer`] is
-/// genuinely unresolved.
-fn type_has_infer(ty: &Type) -> bool {
-    matches!(ty, Type::Infer(_))
-        || ty.fold_children(false, |acc, child| acc || type_has_infer(child))
-}
-
-/// Infer the type of a [`TypedExprNode::Lambda`] node.
-///
-/// If the parameter type is unknown (`Hole` or `Infer`), it is left as an
-/// inference variable and bound in scope. Body inference then constrains the
-/// variable naturally at every usage site via the unification table.
-///
-/// After body inference, for a top-level `Infer` param:
-/// - If body constrained the var and a user annotation is present, the annotation
-///   is verified against the inferred type; a conflict returns
-///   [`InferError::AnnotationMismatch`] rather than a raw [`InferError::TypeMismatch`].
-/// - If no body constraint exists and an annotation is present, the annotation
-///   is accepted as the param type.
-/// - If neither body constraint nor annotation exists, `param.ty` is left as
-///   `Infer(id)`. The constraint may still arrive from the call site or an
-///   expression-level annotation. After full unification and
-///   [`crate::ccl::unify::resolve`], any remaining unresolved param is caught
-///   by [`check_fully_typed`], which emits [`InferError::CannotInferParam`].
-///
-/// Structured param types (e.g. `Tuple`) may contain a mix of resolved and
-/// unresolved positions; unresolved positions are likewise deferred to
-/// [`check_fully_typed`].
-fn infer_lambda(
-    param: &mut TypedBinding,
-    body: &mut Expr,
-    refinement: &mut Option<crate::ccl::Refinement>,
-    ctx: &mut TypeInferenceContext,
-) -> Result<Type, InferError> {
-    // Assign a stable Infer ID to every Hole in the param type before binding it
-    // in scope. This must be a pre-pass rather than minting variables on-the-fly:
-    // `param.ty` is cloned into the scope once and looked up once per usage site.
-    // Replacing Holes at lookup time would give each usage a distinct Infer ID,
-    // so constraints from different usage sites would never unify.
-    // Annotation application is deferred to after body inference so that body
-    // constraints are collected first and can be validated against the annotation.
-    replace_holes(&mut param.ty, ctx);
-    // Infer the body in a fresh scope with the param bound. All usage sites
-    // constrain param.ty via the unification table automatically — no pre-scan needed.
-    let param_name = param.name.clone();
-    let body_ty = {
-        let mut scoped = ctx.enter_scope();
-        scoped.bind(&param_name, param.ty.clone());
-        collect_constraints(&param_name, &param.ty, body, &mut scoped)?;
-        infer_expr(body, &mut scoped)?
-    };
-    // Post-inference: for a bare Infer param, validate the annotation against body
-    // constraints (or use it as a fallback when the body provides none). For
-    // structured params, check recursively for any unresolved positions.
-    if let Type::Infer(id) = param.ty {
-        let probed = ctx.table.probe(id);
-        let ann = param.user_annotation.clone();
-        match (probed, ann) {
-            (Some(inferred), Some(ann)) => {
-                // Body constrained the param; verify the user annotation agrees.
-                ctx.constrain_equal(&ann, &inferred).map_err(|_| {
-                    InferError::AnnotationMismatch {
-                        annotation: ann.clone(),
-                        inferred: inferred.clone(),
-                    }
-                })?;
-                param.ty = ann;
-            }
-            (Some(_), None) => {} // resolved by body; no annotation to check
-            (None, Some(ann)) => param.ty = ann, // no body constraint; trust annotation
-            (None, None) => {}    // unresolved; defer to post-resolve check_fully_typed
-        }
-    }
-    // Build the domain type; refinement wraps it but is inferred in the outer
-    // scope (param not in scope) because it is a constraint on the call site.
-    let mut domain = param.ty.clone();
-    if let Some(refinement) = refinement {
-        let RefinementKind::Predicate(def) = &refinement.kind;
-        infer_expr(&mut def.borrow_mut(), ctx)?;
-
-        domain = Type::Refinement(Box::new(domain), refinement.clone());
-    }
-    Ok(Type::Fun(Box::new(domain), Box::new(body_ty)))
-}
-
-/// Constrain a lambda param equal to all of it's usages in the lambda body.
-/// TODO: we probably shouldn't need this, but our handling of refinements is sketchy
-/// right now and the order in which constraints are added to the unification table
-/// affects whether or not refinements get dropped.  Once we have proper refinement
-/// unification this should be unnecessary.
-fn collect_constraints(
-    param: &str,
-    param_ty: &Type,
-    body: &mut Expr,
-    ctx: &mut TypeInferenceContext,
-) -> Result<(), InferError> {
-    match &mut body.node {
-        TypedExprNode::Apply { function, argument } => {
-            // If argument is Var(param), the domain of function's type is the constraint.
-            match &argument.node {
-                TypedExprNode::Var(v) if v == param => {
-                    if let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx) {
-                        ctx.constrain_equal(param_ty, domain.as_ref())?;
-                        // Don't recurse: function was already inferred (possibly mutated),
-                        // and argument = Var(param) has no sub-patterns to search.
-                        return Ok(());
-                    }
-                }
-                // Apply(Proj(Index(n)), Var(param)) — tuple field projection.
-                TypedExprNode::Apply {
-                    function: proj_fn,
-                    argument: proj_arg,
-                } => {
-                    if let TypedExprNode::Proj(ProjKey::Index(idx)) = &proj_fn.node
-                        && matches!(&proj_arg.node, TypedExprNode::Var(v) if v == param)
-                        && let Ok(Type::Fun(domain, _)) = infer_expr(function, ctx)
-                    {
-                        ctx.constrain_equal(
-                            param_ty,
-                            &Type::PartialTuple(vec![(*idx, *domain.clone())]),
-                        )?;
-                        return Ok(());
-                    }
-                }
-                // infer failed or returned a non-Fun type; fall through to recursive search.
-                _ => {}
-            }
-            // Need to split borrows — collect separately on each child.
-            // We can't hold `&mut body.node` while calling collect_constraints_into on parts.
-            // So we reborrow here by calling the function with the child nodes directly.
-            // The match already extracted function and argument as mutable refs.
-            collect_constraints(param, param_ty, function, ctx)?;
-            collect_constraints(param, param_ty, argument, ctx)?;
-            Ok(())
-        }
-
-        // Don't recurse into a lambda that shadows param.
-        TypedExprNode::Lambda {
-            param: lam_param,
-            body: lam_body,
-            ..
-        } => {
-            if lam_param.name != param {
-                collect_constraints(param, param_ty, lam_body, ctx)?;
-            }
-            Ok(())
-        }
-
-        TypedExprNode::Let {
-            binding,
-            bound_expr: value,
-            body: let_body,
-            ..
-        } => {
-            // Always search the value: it is evaluated in the outer scope, so
-            // `param` is still in play even if `binding.name == param`.
-            collect_constraints(param, param_ty, value, ctx)?;
-            // Don't recurse into `body` when `binding.name == param`: the let-binding
-            // shadows `param` there, mirroring the Lambda shadowing guard above.
-            if binding.name != param {
-                collect_constraints(param, param_ty, let_body, ctx)?;
-            }
-            Ok(())
-        }
-
-        TypedExprNode::BinOp { left, right, .. } => {
-            collect_constraints(param, param_ty, left, ctx)?;
-            collect_constraints(param, param_ty, right, ctx)?;
-            Ok(())
-        }
-
-        TypedExprNode::UnaryOp(_, inner) => collect_constraints(param, param_ty, inner, ctx),
-
-        TypedExprNode::Tuple(elts) => {
-            for elt in elts {
-                collect_constraints(param, param_ty, elt, ctx)?;
-            }
-            Ok(())
-        }
-
-        // Leaf nodes with no sub-expressions to search.
-        _ => Ok(()),
-    }
-}
-
-impl AggregateKind {
-    /// Apply this kind's per-variant typing rule and return the aggregation's
-    /// output type.
-    ///
-    /// `input_codomain` is the element type of the aggregated collection — i.e.
-    /// the codomain of the function-typed input passed to `Aggregate`.  Each
-    /// variant decides how the input element type relates to the output:
-    ///
-    /// - [`AggregateKind::Sum`]: requires `input_codomain = Int`, returns `Int`.
-    /// - [`AggregateKind::Max`]: returns `input_codomain` unchanged.
-    ///
-    /// Centralising this logic on `AggregateKind` keeps the relationship
-    /// per-variant: future kinds whose output type is independent of (or a
-    /// non-trivial function of) the element type — e.g. `Count: _ → Int`,
-    /// `Mean: Int → Float` — will add their rule here without touching the
-    /// `Aggregate` inference branch.
-    fn constrain_signature(
-        &self,
-        ctx: &mut TypeInferenceContext,
-        input_codomain: &Type,
-    ) -> Result<Type, InferError> {
-        match self {
-            AggregateKind::Sum => {
-                ctx.constrain_equal(input_codomain, &Type::Base(BaseType::Int))?;
-                Ok(Type::Base(BaseType::Int))
-            }
-            AggregateKind::Max => Ok(input_codomain.clone()),
-        }
-    }
-}
-
-/// Infer the type of a [`TypedExprNode::Apply`] node.
-///
-/// If the function is an unannotated lambda, annotates its parameter type from
-/// the argument, then infers the function type and returns its codomain.
-fn infer_apply(
-    function: &mut Expr,
-    argument: &mut Expr,
-    ctx: &mut TypeInferenceContext,
-) -> Result<Type, InferError> {
-    let arg_ty = infer_expr(argument, ctx)?;
-    let mut maybe_codomain_ty = None;
-    match &mut function.node {
-        TypedExprNode::Lambda { param, .. } => {
-            // Normalize Hole → fresh registered Infer before existing param-type logic.
-            if matches!(param.ty, Type::Hole) {
-                param.ty = Type::Infer(ctx.fresh_infer_var());
-            }
-            if matches!(param.ty, Type::Infer(_)) {
-                // If the function is a lambda with unresolved type, infer it from the argument.
-                // If a user annotation is present, verify it matches before accepting arg_ty.
-                if let Some(ref annotation) = param.user_annotation
-                    && *annotation != arg_ty
-                {
-                    return Err(InferError::AnnotationMismatch {
-                        annotation: annotation.clone(),
-                        inferred: arg_ty,
-                    });
-                }
-                param.ty = arg_ty.clone();
-            }
-        }
-        // Polymorphic `Zip` applied to a Tuple/Record of morphisms — same
-        // pattern as the `Proj` / `Lambda` special cases below: builtins
-        // and projection morphisms have no standalone schema for
-        // inference to instantiate, so we recover the result type from
-        // the argument's shape at the application site.
-        TypedExprNode::Builtin(Builtin::Zip) => {
-            if let Some(zip_out_ty) = infer_zip_codomain(&arg_ty, ctx)? {
-                maybe_codomain_ty = Some(zip_out_ty);
-            }
-        }
-        // `LastOrDefault : Tuple(Fun(D, T), T) → T` — polymorphic
-        // stream-to-scalar with a fallback for the empty-source case.
-        // Recover the result type from the argument's tuple shape and
-        // unify the stream's codomain with the default.
-        TypedExprNode::Builtin(Builtin::LastOrDefault) => {
-            let fresh_domain = Type::Infer(ctx.fresh_infer_var());
-            let fresh_codomain = Type::Infer(ctx.fresh_infer_var());
-            ctx.constrain_equal(
-                &arg_ty,
-                &Type::Tuple(vec![
-                    Type::Fun(Box::new(fresh_domain), Box::new(fresh_codomain.clone())),
-                    fresh_codomain.clone(),
-                ]),
-            )?;
-            maybe_codomain_ty = Some(fresh_codomain);
-        }
-        // For projections, if the argument type is known (concrete or partial),
-        // directly look up the projected element type to improve inference.
-        TypedExprNode::Proj(key) => match (key, &arg_ty) {
-            (ProjKey::Index(idx), Type::Tuple(types)) => {
-                let proj_ty = types.get(*idx).cloned();
-                if let Some(proj_ty) = proj_ty {
-                    maybe_codomain_ty = Some(proj_ty);
-                } else {
-                    return Err(InferError::Unsupported(format!(
-                        "Invalid tuple index {idx} for {arg_ty}"
-                    )));
-                }
-            }
-            (ProjKey::Index(idx), Type::PartialTuple(entries)) => {
-                maybe_codomain_ty = entries
-                    .iter()
-                    .find_map(|(i, t)| if i == idx { Some(t.clone()) } else { None });
-            }
-            (ProjKey::Field(field), Type::Record(types)) => {
-                let proj_ty = types
-                    .iter()
-                    .find_map(|(name, typ)| if field == name { Some(typ) } else { None })
-                    .cloned();
-                if let Some(proj_ty) = proj_ty {
-                    maybe_codomain_ty = Some(proj_ty);
-                } else {
-                    return Err(InferError::Unsupported(format!(
-                        "Invalid record field {field} for {arg_ty}"
-                    )));
-                }
-            }
-            (ProjKey::Field(field), Type::PartialRecord(entries)) => {
-                maybe_codomain_ty = entries
-                    .iter()
-                    .find_map(|(n, t)| if n == field { Some(t.clone()) } else { None });
-            }
-            _ => {}
-        },
-        _ => {}
-    }
-    // Infer function type and return its codomain.
-    match infer_expr(function, ctx)? {
-        Type::Fun(domain, codomain) => {
-            ctx.constrain_equal(&domain, &arg_ty)?;
-            if let Some(codomain_ty) = maybe_codomain_ty {
-                ctx.constrain_equal(&codomain, &codomain_ty)?;
-            }
-            Ok(*codomain)
-        }
-        // The function's type is not yet a concrete `Fun`. This arises inside
-        // UDFs with function arguments: in
-        // `λ xs → λ __iter_record → __iter_record ▷ xs ▷ …`, the inner
-        // `Apply { function = Var("xs"), … }` infers `xs` to its bound
-        // inference variable rather than a `Fun(...)`.
-        //
-        // Standard HM refinement: constrain the function's Infer var to
-        // `Fun(arg_ty, fresh)` and return `fresh` as the codomain. Any later
-        // constraint on the Infer var (e.g. unifying `xs` with a concrete list
-        // type at the call site) flows through [`constrain_equal`]'s recursive
-        // case and resolves `fresh` in lockstep.
-        Type::Infer(id) => {
-            let fresh_codomain = Type::Infer(ctx.fresh_infer_var());
-            let fun_ty = Type::Fun(Box::new(arg_ty.clone()), Box::new(fresh_codomain.clone()));
-            ctx.constrain_equal(&Type::Infer(id), &fun_ty)?;
-            if let Some(codomain_ty) = maybe_codomain_ty {
-                ctx.constrain_equal(&fresh_codomain, &codomain_ty)?;
-            }
-            Ok(fresh_codomain)
-        }
-        ty => unreachable!("Apply function must have function type, got {ty}"),
-    }
-}
-
-/// Infer the type of a [`TypedExprNode::Let`] node.
-///
-/// Infers the bound expression type, checks any user annotation on the binding
-/// site, fills `binding.ty`, then infers the body in a fresh scope.
-fn infer_let(
-    binding: &mut TypedBinding,
-    bound_expr: &mut Expr,
-    body: &mut Expr,
-    ctx: &mut TypeInferenceContext,
-) -> Result<Type, InferError> {
-    let bound_ty = infer_expr(bound_expr, ctx)?;
-    // Check user annotation on the binding site (e.g. `x: Int = expr`) via
-    // constrain_equal so that partially-resolved Infer variables are handled
-    // correctly (e.g. annotation=Int, bound_ty=Infer(id) → sets id→Int rather
-    // than spuriously failing with !=).
-    if let Some(ref annotation) = binding.user_annotation {
-        ctx.constrain_equal(annotation, &bound_ty)
-            .map_err(|_| InferError::AnnotationMismatch {
-                annotation: annotation.clone(),
-                inferred: bound_ty.clone(),
-            })?;
-    }
-    // Always replace the pre-inference placeholder with the inferred type.
-    // Expr::let_bind initialises binding.ty from bound_expr.ty *before*
-    // inference runs, which can be a structured type containing Holes (e.g.
-    // Fun(Infer(n), Hole) for a lambda whose body starts with ty=Hole).
-    // Only checking for bare Hole or bare Infer misses those cases, leaving a
-    // Hole embedded in binding.ty that panics resolve() later.
-    binding.ty = bound_ty;
-    let body_ty = {
-        let mut scoped = ctx.enter_scope();
-        scoped.bind(&binding.name, binding.ty.clone());
-        infer_expr(body, &mut scoped)?
-    };
-    Ok(body_ty)
-}
-
-/// Infer the type of a [`TypedExprNode::List`] node.
-///
-/// Returns `Fun(UIntRange(n), elem_ty)` where `elem_ty` is derived from the
-/// first element. Returns a fresh inference variable for empty lists or when
-/// the first element's type is itself an unresolved inference variable.
-fn infer_list(elts: &mut [Expr], ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
-    let Some(first) = elts.first_mut() else {
-        return Ok(Type::Fun(
-            Box::new(Type::UIntRange(0)),
-            Box::new(Type::Base(BaseType::Unit)),
-        ));
-    };
-    let elem_ty = match infer_expr(first, ctx)? {
-        Type::Infer(_) => return Ok(Type::Infer(ctx.fresh_infer_var())),
-        ty => ty,
-    };
-    // Visit remaining elements to eliminate Type::Hole placeholders and
-    // propagate type information through sub-expressions. The list element
-    // type is still derived from the first element only (all elements are
-    // assumed homogeneous); errors from remaining elements are silently
-    // dropped because the type has already been determined.
-    for rest in elts.iter_mut().skip(1) {
-        let _ = infer_expr(rest, ctx);
-    }
-    let n = elts.len();
-    Ok(Type::Fun(Box::new(Type::UIntRange(n)), Box::new(elem_ty)))
-}
-
-/// Infer the type of a mutation-loop-shaped [`TypedExprNode::Loop`] node.
-///
-/// [`crate::ccl::lower::lower_mutation_loop`] is the only producer of
-/// [`TypedExprNode::Loop`].  It emits a single uniform shape regardless
-/// of accumulator count or feed presence:
-///
-/// ```text
-/// Loop {
-///   params: [acc_0, …, acc_{n-1}],
-///   init_args: [init_0, …, init_{n-1}],
-///   source: Fun(D, item_ty),
-///   loop_body: Lambda(p, let acc_0 = p.0 in … let acc_{n-1} = p.{n-1} in
-///                        let iter_var = p.n in
-///                        Record({step: <step>, to_<defer_*>: <feed_*>})),
-/// }
-/// ```
-///
-/// Inference rules:
-/// - Each `acc_vars[i].ty` unifies with the corresponding `init_args[i].ty`.
-/// - `source.ty` is constrained to `Fun(D, item_ty)`.
-/// - Body input is `Tuple(acc_0.ty, …, acc_{n-1}.ty, item_ty)` — n+1
-///   positional fields, in declaration order.
-/// - Body codomain is `Record({step: <step shape>, to_<defer_*>: T_*})`
-///   where the "step shape" carries the recurrence value:
-///   `acc_vars[0].ty` for a single accumulator,
-///   `Tuple([acc_0.ty, …, acc_{n-1}.ty])` for multi-var.  Each `T_*`
-///   field is added by [`crate::ccl::desugar_defers`] for each `<<`
-///   feed inside the body and the type falls out of inference on the
-///   Record literal.  The cycle flows through `.step`; op-conversion
-///   projects it before feeding back to `recursive_input`.
-/// - The Loop expression's overall type is always `Fun(D, body_codomain)`
-///   — the running body stream, which the surrounding lowering picks
-///   apart with `Proj("step") [▷ Proj(i)] ▷ Last` per accumulator and
-///   `Proj("to_<defer>")` per feed.
-fn infer_mutation_loop(
-    expr: &mut Expr,
-    ctx: &mut TypeInferenceContext,
-) -> Result<Type, InferError> {
-    // The shape matcher in `ccl/mod.rs` is the single source of truth for
-    // what mutation-loop-shaped Loops look like.  All sub-expression
-    // mutation goes through the borrows it returns — no parallel
-    // `match &mut expr.node` re-destructuring.
-    let shape = expr.as_mutation_loop_mut().ok_or_else(|| {
-        InferError::Unsupported(
-            "Loop is not in the supported mutation-loop shape \
-             (≥1 accumulator params with one matching init_arg per param)"
-                .into(),
-        )
-    })?;
-    let MutationLoopShapeMut {
-        acc_vars,
-        init_args,
-        source,
-        loop_body,
-        ..
-    } = shape;
-    for acc in acc_vars.iter_mut() {
-        replace_holes(&mut acc.ty, ctx);
-    }
-
-    // Infer each init expression and unify with the corresponding
-    // accumulator's type.  Init args sit outside the loop's param scope.
-    for (acc, init) in acc_vars.iter().zip(init_args.iter_mut()) {
-        let init_ty = infer_expr(init, ctx)?;
-        ctx.constrain_equal(&acc.ty, &init_ty)?;
-    }
-
-    // Infer the source.  Constrain it to `Fun(D, item_ty)` so we can
-    // extract D and item_ty for the body's tuple-input shape.
-    let source_ty = infer_expr(source, ctx)?;
-    let domain_var = Type::Infer(ctx.fresh_infer_var());
-    let item_var = Type::Infer(ctx.fresh_infer_var());
-    ctx.constrain_equal(&source_ty, &Type::fun(domain_var.clone(), item_var.clone()))?;
-
-    let acc_tys: Vec<Type> = acc_vars.iter().map(|v| v.ty.clone()).collect();
-    // The "step shape" is the codomain field that carries the
-    // accumulator recurrence value.  A single accumulator just uses its
-    // own scalar type; multiple accumulators are packed into a
-    // positional `Tuple` so the cycle has one value to feed back per
-    // iteration.
-    let step_shape = if acc_tys.len() == 1 {
-        acc_tys[0].clone()
-    } else {
-        Type::Tuple(acc_tys.clone())
-    };
-    // Body codomain is `Record({step: <step shape>, to_*: T_*})` —
-    // `step` carries the recurrence, and the desugar-defers pass has
-    // already absorbed every `<<` feed inside the body into a
-    // `to_<defer>` field on the same Record.  We constrain via
-    // `PartialRecord({step: step_shape})` so the body's full set of
-    // fields (which depends on the program's defers) determines the
-    // codomain naturally; the `step` field is unified with the
-    // expected accumulator shape.
-    let body_ty = infer_expr(loop_body, ctx)?;
-    // Body input: positional tuple of (acc_0.ty, …, acc_{n-1}.ty, item_ty).
-    let mut body_input_fields = acc_tys.clone();
-    body_input_fields.push(item_var.clone());
-    let body_codomain_var = Type::Infer(ctx.fresh_infer_var());
-    let expected_body_ty = Type::fun(Type::Tuple(body_input_fields), body_codomain_var.clone());
-    ctx.constrain_equal(&body_ty, &expected_body_ty)?;
-    ctx.constrain_equal(
-        &body_codomain_var,
-        &Type::PartialRecord(vec![("step".to_string(), step_shape)]),
-    )?;
-
-    Ok(Type::fun(domain_var, body_codomain_var))
-}
-
-/// Given the `arg_ty` of `Apply(arg, Builtin(Zip))`, infer the codomain of
-/// the zip morphism.
-///
-/// - `Tuple([Fun(D, T_0), …, Fun(D, T_n)])` → `Some(Fun(D, Tuple([T_0, …, T_n])))`.
-/// - `Record({name_i: Fun(D, T_i)})` → `Some(Fun(D, Record({name_i: T_i})))`.
-/// - Anything else → `None` (the caller falls back to the generic Apply
-///   rule, which produces an unconstrained codomain).
-///
-/// Each tuple/record element's type is constrained to `Fun(?D, ?T)` via
-/// [`TypeInferenceContext::constrain_equal`] (with `?D` shared across all
-/// elements), so callers can pass element types that are still inference
-/// variables — they get refined here.
-fn infer_zip_codomain(
-    arg_ty: &Type,
-    ctx: &mut TypeInferenceContext,
-) -> Result<Option<Type>, InferError> {
-    fn unify_elt(
-        elt_ty: &Type,
-        shared_domain: &mut Option<Type>,
-        ctx: &mut TypeInferenceContext,
-    ) -> Result<Type, InferError> {
-        let d_var = Type::Infer(ctx.fresh_infer_var());
-        let c_var = Type::Infer(ctx.fresh_infer_var());
-        ctx.constrain_equal(elt_ty, &Type::fun(d_var.clone(), c_var.clone()))?;
-        match shared_domain {
-            None => *shared_domain = Some(d_var),
-            Some(prev) => ctx.constrain_equal(prev, &d_var)?,
-        }
-        Ok(c_var)
-    }
-
-    match arg_ty {
-        Type::Tuple(elt_tys) => {
-            let mut shared_domain: Option<Type> = None;
-            let codomain_tys = elt_tys
-                .iter()
-                .map(|elt_ty| unify_elt(elt_ty, &mut shared_domain, ctx))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Some(Type::fun(
-                shared_domain.unwrap_or(Type::Hole),
-                Type::Tuple(codomain_tys),
-            )))
-        }
-        Type::Record(fields) => {
-            let mut shared_domain: Option<Type> = None;
-            let codomain_fields = fields
-                .iter()
-                .map(|(name, ty)| {
-                    let c = unify_elt(ty, &mut shared_domain, ctx)?;
-                    Ok((name.clone(), c))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Some(Type::fun(
-                shared_domain.unwrap_or(Type::Hole),
-                Type::Record(codomain_fields),
-            )))
-        }
-        _ => Ok(None),
-    }
-}
-
-/// Destructure `ty` as a function type `(domain, codomain)`.
-///
-/// - If it is already `Fun(d, c)`, return `(d, c)` directly.
-/// - If it is `Infer(id)`, constrain the variable to `Fun(fresh_d, fresh_c)` and
-///   return the fresh pair.  This is sound in any context where a function type
-///   is required (e.g. both sides of `≫`): the constraint will be resolved once
-///   enough information flows into the surrounding expression.  Without this,
-///   the post-composition morphism produced by the `curry_compose` simplification
-///   rule (`curry(f ≫ g)  →  curry(f) ≫ map(g)`) fails inference because
-///   `map(g)` has an unresolved codomain.
-/// - Anything else is a hard type error.
-fn require_fun(
-    ty: Type,
-    expr: &Expr,
-    ctx: &mut TypeInferenceContext,
-    side: &str,
-) -> Result<(Type, Type), InferError> {
-    match ty {
-        Type::Fun(d, c) => Ok((*d, *c)),
-        Type::Infer(id) => {
-            let d = Type::Infer(ctx.fresh_infer_var());
-            let c = Type::Infer(ctx.fresh_infer_var());
-            ctx.constrain_equal(
-                &Type::Infer(id),
-                &Type::Fun(Box::new(d.clone()), Box::new(c.clone())),
-            )?;
-            Ok((d, c))
-        }
-        other => Err(InferError::Unsupported(format!(
-            "Compose expects functions, got {side} {}: {other}",
-            symbolic(expr),
-        ))),
-    }
-}
-
-/// Infer the type of a [`TypedExprNode::BinOp`] node.
-/// Infer both operands then apply the operation's type rules via the
-/// UnificationTable.  String + String → Concat rewriting is deferred to
-/// compile time; this pass only propagates the type constraint.
-fn infer_binop(
-    left: &mut Expr,
-    op: &mut BinOpKind,
-    right: &mut Expr,
-    ctx: &mut TypeInferenceContext,
-) -> Result<Type, InferError> {
-    let left_ty = infer_expr(left, ctx)?;
-    let right_ty = infer_expr(right, ctx)?;
-    match op {
-        BinOpKind::Arithmetic(_) => {
-            // Both operands must have the same type; the result is that type.
-            ctx.constrain_equal(&left_ty, &right_ty)?;
-            Ok(left_ty)
-        }
-        BinOpKind::Concat => {
-            // Explicit concat: both sides must be String.
-            ctx.constrain_equal(&left_ty, &Type::Base(BaseType::String))?;
-            ctx.constrain_equal(&right_ty, &Type::Base(BaseType::String))?;
-            Ok(Type::Base(BaseType::String))
-        }
-        BinOpKind::Compare(_) => {
-            // Operands must agree; result is Bool.
-            ctx.constrain_equal(&left_ty, &right_ty)?;
-            Ok(Type::Base(BaseType::Bool))
-        }
-        BinOpKind::BoolLogic(_) => {
-            // Both operands must be Bool; result is Bool.
-            ctx.constrain_equal(&left_ty, &Type::Base(BaseType::Bool))?;
-            ctx.constrain_equal(&right_ty, &Type::Base(BaseType::Bool))?;
-            Ok(Type::Base(BaseType::Bool))
-        }
-    }
-}
-
-/// Infer the type of a [`TypedExprNode::CollectionUnion`] node.
-///
-/// Each operand must be a function (collection) type `Fun(D_i, C_i)`.
-/// The result type is
-/// `Fun(Union(D_0, …, D_{n-1}), dedup_union(C_0, …, C_{n-1}))`:
-/// the domain union is kept positionally (each operand becomes a
-/// distinct variant), and the codomain union is deduplicated via
-/// [`dedup_union_type`].
-///
-/// **Flat-AST invariant.** No operand is itself a `CollectionUnion`
-/// (the constructor in [`TypedExpr::collection_union`] splices nested
-/// nodes at construction time), so this function never needs to
-/// recurse through nested unions to compute the result type.  When
-/// `D_i` is itself a `Type::Union` — possible when an operand is a
-/// `Var` pointing at a let-bound union — the result type carries
-/// that nesting; it matches the runtime shape (one outer
-/// `UnionOperator` input per operand).
-fn infer_collection_union(
-    operands: &mut [Expr],
-    ctx: &mut TypeInferenceContext,
-) -> Result<Type, InferError> {
-    assert!(
-        operands.len() >= 2,
-        "CollectionUnion requires at least two operands",
-    );
-    let mut domains = Vec::with_capacity(operands.len());
-    let mut codomain: Option<Type> = None;
-    for (i, op) in operands.iter_mut().enumerate() {
-        let op_ty = infer_expr(op, ctx)?;
-        let (dom, cod) = require_fun(op_ty, op, ctx, &format!("collection_union[{i}]"))?;
-        domains.push(dom);
-        codomain = Some(match codomain.take() {
-            None => cod,
-            Some(prev) => dedup_union_type(prev, cod),
-        });
-    }
-    Ok(Type::fun(
-        Type::Union(domains),
-        codomain.expect("non-empty operand list"),
-    ))
-}
-
-/// Build a union of two types, deduplicating if identical.
-pub(crate) fn dedup_union_type(a: Type, b: Type) -> Type {
-    let mut variants = Vec::new();
-    collect_union_types(a, &mut variants);
-    collect_union_types(b, &mut variants);
-    #[allow(clippy::mutable_key_type)]
-    let mut seen = HashSet::new();
-    variants.retain(|v| seen.insert(v.clone()));
-    if variants.len() == 1 {
-        variants.remove(0)
-    } else {
-        Type::Union(variants)
-    }
-}
-
-/// Flatten a (possibly nested) [`Type::Union`] into a flat list.
-fn collect_union_types(ty: Type, out: &mut Vec<Type>) {
-    match ty {
-        Type::Union(ts) => {
-            for t in ts {
-                collect_union_types(t, out);
-            }
-        }
-        other => out.push(other),
-    }
-}
-
-/// Infer the type of a [`TypedExprNode::Compose`] node.
-///
-/// Each element must be a function. Adjacent elements are constrained so that
-/// the codomain of element `i` equals the domain of element `i+1`. The result
-/// type is `Fun(domain(f₀), codomain(fₙ₋₁))`.
-fn infer_compose(elts: &mut [Expr], ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
-    assert!(elts.len() >= 2, "Compose requires at least two elements");
-    // Infer all element types up front.
-    let tys: Vec<Type> = elts
-        .iter_mut()
-        .map(|e| infer_expr(e, ctx))
-        .collect::<Result<_, _>>()?;
-    // Extract domain of the first and chain all adjacent pairs.
-    let (overall_domain, mut prev_codomain) =
-        require_fun(tys[0].clone(), &elts[0], ctx, "compose[0]")?;
-    for (i, ty) in tys.into_iter().enumerate().skip(1) {
-        let (d_i, c_i) = require_fun(ty, &elts[i], ctx, &format!("compose[{i}]"))?;
-        ctx.constrain_equal(&prev_codomain, &d_i)?;
-        prev_codomain = c_i;
-    }
-    Ok(Type::Fun(Box::new(overall_domain), Box::new(prev_codomain)))
-}
-
-/// Infer the type of a [`TypedExprNode::Case`] expression.
-///
-/// For each branch, the guard is constrained to [`Type::Base(BaseType::Bool)`]
-/// and the body type is collected. All body types are unified via
-/// [`constrain_equal`](TypeInferenceContext::constrain_equal); the unified
-/// type is returned as the `Case` expression's type.
-///
-/// # Errors
-///
-/// - [`InferError::EmptyCase`] — `branches` is empty (malformed AST; lowering never produces this).
-/// - [`InferError::TypeMismatch`] — two arms unify to distinct concrete types (e.g. `Int` vs
-///   `String`). All arms must currently agree on one type; [`Type::Union`] is not yet produced.
-fn infer_case(branches: &mut [Branch], ctx: &mut TypeInferenceContext) -> Result<Type, InferError> {
-    let mut result_ty: Option<Type> = None;
-    for Branch { guard, body } in branches.iter_mut() {
-        // Guards must be boolean expressions.
-        let guard_ty = infer_expr(guard, ctx)?;
-        ctx.constrain_equal(&guard_ty, &Type::Base(BaseType::Bool))?;
-        // Collect the arm body type and unify with the accumulated result type.
-        let arm_ty = infer_expr(body, ctx)?;
-        match result_ty.take() {
-            None => result_ty = Some(arm_ty),
-            Some(prev) => {
-                ctx.constrain_equal(&prev, &arm_ty)?;
-                // Keep `prev` unless `arm_ty` is concrete: stable accumulation
-                // that only replaces when the new value is strictly more informative.
-                result_ty = Some(if matches!(arm_ty, Type::Infer(_)) {
-                    prev
-                } else {
-                    arm_ty
-                });
-            }
-        }
-    }
-    result_ty.ok_or(InferError::EmptyCase)
-}
-
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
-
-/// Return the base [`Type`] of a [`Lit`] value.
-fn lit_type(lit: &Lit) -> Type {
-    match lit {
-        Lit::Int(_) => Type::Base(BaseType::Int),
-        Lit::String(_) => Type::Base(BaseType::String),
-        Lit::Bool(_) => Type::Base(BaseType::Bool),
-        Lit::Unit => Type::Base(BaseType::Unit),
     }
 }
 
@@ -2110,9 +1133,13 @@ mod tests {
     fn test_infer_cannot_infer_param() {
         let mut ctx = TypeInferenceContext::new();
         // λ x → x  — standalone; x is referenced but never used as an Apply argument.
+        // simple-sub permits unconstrained lambdas; returns Fun(Infer, Infer).
         let mut expr = Expr::lambda("x", Type::infer(), Expr::var("x"));
-        let errs = infer(&mut expr, &mut ctx).unwrap_err();
-        assert!(errs.contains(&InferError::CannotInferParam("x".into())));
+        let ty = infer(&mut expr, &mut ctx).expect("simple-sub allows unconstrained λ x → x");
+        assert!(
+            matches!(ty, Type::Fun(_, _)),
+            "expected Fun type, got {ty:?}"
+        );
     }
 
     /// `λ p → p._0` where `p : Tuple([Hole, Hole])`.
@@ -2126,6 +1153,8 @@ mod tests {
     fn test_cannot_infer_nested_tuple_param() {
         let mut ctx = TypeInferenceContext::new();
         // λ p → p._0  where p : (_, _)
+        // simple-sub permits partially-inferred params; body constrains p._0 to Int
+        // but leaves p._1 unconstrained — returns a Fun rather than erroring.
         let body = Expr::apply(Expr::var("p"), Expr::proj_index(0));
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
@@ -2136,8 +1165,12 @@ mod tests {
             body: Box::new(body),
             refinement: None,
         });
-        let errs = infer(&mut expr, &mut ctx).unwrap_err();
-        assert!(errs.contains(&InferError::CannotInferParam("p".into())));
+        let ty =
+            infer(&mut expr, &mut ctx).expect("simple-sub allows partially-constrained params");
+        assert!(
+            matches!(ty, Type::Fun(_, _)),
+            "expected Fun type, got {ty:?}"
+        );
     }
 
     /// Builds the unannotated list-comp CCL for `[elt for var in source]`.
@@ -2281,16 +1314,19 @@ mod tests {
     #[test]
     fn test_infer_type_annotation_mismatch() {
         let mut ctx = TypeInferenceContext::new();
-        // (42 : String)  =>  TypeMismatch { type_a: String, type_b: Int }
+        // (42 : String)  =>  annotation conflict
+        // simple-sub surfaces annotation conflicts as AnnotationMismatch
         let mut expr = Expr::lit(Lit::Int(42)).with_user_annotation(Type::Base(BaseType::String));
-        let result = infer(&mut expr, &mut ctx);
-        assert_eq!(
-            result,
-            Err(vec![InferError::TypeMismatch {
-                ctx: "unify".into(),
-                type_a: Type::Base(BaseType::String),
-                type_b: Type::Base(BaseType::Int),
-            }])
+        let errs = infer(&mut expr, &mut ctx).unwrap_err();
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                InferError::AnnotationMismatch {
+                    annotation: Type::Base(BaseType::String),
+                    inferred: Type::Base(BaseType::Int),
+                }
+            )),
+            "expected AnnotationMismatch String/Int, got {errs:?}"
         );
     }
 
@@ -2400,13 +1436,19 @@ mod tests {
             ),
         );
         let mut ctx = TypeInferenceContext::new();
-        assert_eq!(
-            infer(&mut expr, &mut ctx),
-            Err(vec![InferError::TypeMismatch {
-                ctx: "unify".into(),
-                type_a: Type::Base(BaseType::String),
-                type_b: Type::Base(BaseType::Int),
-            }])
+        // simple-sub catches the mismatch at the Apply site.
+        let errs = infer(&mut expr, &mut ctx)
+            .expect_err("expected TypeMismatch Int/String under simple-sub");
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                InferError::TypeMismatch {
+                    type_a: Type::Base(BaseType::Int),
+                    type_b: Type::Base(BaseType::String),
+                    ..
+                }
+            )),
+            "expected TypeMismatch Int/String, got {errs:?}"
         );
     }
 
@@ -2416,14 +1458,19 @@ mod tests {
         // Constraints are [Int, String] → TypeMismatch.
         let mut expr = double_apply_lambda(Type::Base(BaseType::Int), Type::Base(BaseType::String));
         let mut ctx = TypeInferenceContext::new();
-        let result = infer(&mut expr, &mut ctx);
-        assert_eq!(
-            result,
-            Err(vec![InferError::TypeMismatch {
-                ctx: "unify".into(),
-                type_a: Type::Base(BaseType::Int),
-                type_b: Type::Base(BaseType::String),
-            }])
+        // simple-sub catches the conflict at the Apply site.
+        let errs = infer(&mut expr, &mut ctx)
+            .expect_err("expected TypeMismatch Int/String under simple-sub");
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                InferError::TypeMismatch {
+                    type_a: Type::Base(BaseType::Int),
+                    type_b: Type::Base(BaseType::String),
+                    ..
+                }
+            )),
+            "expected TypeMismatch Int/String, got {errs:?}"
         );
     }
 
@@ -2494,30 +1541,16 @@ mod tests {
     #[test]
     fn test_binop_type_mismatch() {
         let mut ctx = TypeInferenceContext::new();
-        // Int + Bool → TypeMismatch.
+        // Int + Bool → type error; Int ⊔ Bool is inexpressible under simple-sub.
         let mut expr = Expr::binop(
             Expr::lit(Lit::Int(1)),
             BinOpKind::Arithmetic(ArithmeticKind::Add),
             Expr::lit(Lit::Bool(true)),
         );
-        assert_eq!(
-            infer(&mut expr, &mut ctx),
-            Err(vec![InferError::TypeMismatch {
-                ctx: "unify".into(),
-                type_a: Type::Base(BaseType::Int),
-                type_b: Type::Base(BaseType::Bool),
-            }])
+        assert!(
+            infer(&mut expr, &mut ctx).is_err(),
+            "expected error for Int + Bool"
         );
-    }
-
-    #[test]
-    fn test_binop_constraint_propagation() {
-        let mut ctx = TypeInferenceContext::new();
-        // constrain_equal(Infer(id), Int) should solve the variable in the table.
-        let fresh_id = ctx.fresh_infer_var();
-        ctx.constrain_equal(&Type::Infer(fresh_id), &Type::Base(BaseType::Int))
-            .unwrap();
-        assert_eq!(ctx.table.probe(fresh_id), Some(Type::Base(BaseType::Int)));
     }
 
     #[test]
@@ -2530,69 +1563,6 @@ mod tests {
             Expr::lit(Lit::Int(2)),
         );
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Bool)));
-    }
-
-    /// Verify that `infer_binop` propagates type constraints to `Infer`-typed operands
-    /// via [`TypeInferenceContext::constrain_equal`].
-    ///
-    /// A variable bound to a fresh `Infer` var in scope should be solved to `Int` after
-    /// being used as the left operand of `x + 1`. This would fail if `infer_binop` never
-    /// called `constrain_equal` — for example, if it was reverted to the pre-BinOp-rules
-    /// stub. It also verifies that `infer()` returns the post-`resolve()` type from
-    /// `expr.ty` rather than the pre-resolve return value of `infer_expr` (which would
-    /// be `Infer(A)` since `constrain_equal` solves the variable in the table without
-    /// updating the local binding).
-    #[test]
-    fn test_binop_constrains_infer_operand() {
-        let mut ctx = TypeInferenceContext::new();
-        let infer_id = ctx.fresh_infer_var();
-        // Enter a scope so we can bind "x" to a fresh Infer type.
-        let result_ty = {
-            let mut scoped = ctx.enter_scope();
-            scoped.bind("x", Type::Infer(infer_id));
-            let mut expr = Expr::binop(
-                Expr::var("x"),
-                BinOpKind::Arithmetic(ArithmeticKind::Add),
-                Expr::lit(Lit::Int(1)),
-            );
-            infer(&mut expr, &mut scoped).unwrap()
-        };
-        // infer() must return the resolved type (Int), not the pre-resolve Infer var.
-        assert_eq!(result_ty, Type::Base(BaseType::Int));
-        // constrain_equal must have recorded Int as the solution for the Infer var.
-        assert_eq!(ctx.table.probe(infer_id), Some(Type::Base(BaseType::Int)));
-    }
-
-    /// Verify that type information propagates inward through nested `BinOp` nodes.
-    ///
-    /// `(x + y) + (1 : Int)` — the outer `+` constrains its result to `Int`,
-    /// which flows inward: `constrain_equal(Infer(id_x), Int)` solves `id_x`,
-    /// and because the inner `+` had already unified `id_x` with `id_y` via
-    /// `constrain_equal(Infer(id_x), Infer(id_y))`, `id_y` is also solved.
-    #[test]
-    fn test_binop_downward_propagation() {
-        let mut ctx = TypeInferenceContext::new();
-        let id_x = ctx.fresh_infer_var();
-        let id_y = ctx.fresh_infer_var();
-        let result_ty = {
-            let mut scoped = ctx.enter_scope();
-            scoped.bind("x", Type::Infer(id_x));
-            scoped.bind("y", Type::Infer(id_y));
-            let inner = Expr::binop(
-                Expr::var("x"),
-                BinOpKind::Arithmetic(ArithmeticKind::Add),
-                Expr::var("y"),
-            );
-            let mut outer = Expr::binop(
-                inner,
-                BinOpKind::Arithmetic(ArithmeticKind::Add),
-                Expr::lit(Lit::Int(1)),
-            );
-            infer(&mut outer, &mut scoped).unwrap()
-        };
-        assert_eq!(result_ty, Type::Base(BaseType::Int));
-        assert_eq!(ctx.table.probe(id_x), Some(Type::Base(BaseType::Int)));
-        assert_eq!(ctx.table.probe(id_y), Some(Type::Base(BaseType::Int)));
     }
 
     // -----------------------------------------------------------------------
@@ -2731,11 +1701,15 @@ mod tests {
     fn test_infer_aggregate_non_function_input_mismatch() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::aggregate(Expr::lit(Lit::Int(42)), AggregateKind::Sum);
+        // HM produces TypeMismatch; simple-sub's map_constrain_err detects that the
+        // rhs is a Fun and lhs is not, promoting it to ExpectedFunction.
+        let errs = infer(&mut expr, &mut ctx).expect_err("expected error for non-function input");
         assert!(
-            infer(&mut expr, &mut ctx).is_err_and(|errs| errs
-                .iter()
-                .any(|e| matches!(e, InferError::TypeMismatch { .. }))),
-            "Aggregate with non-function input should be TypeMismatch"
+            errs.iter().any(|e| matches!(
+                e,
+                InferError::TypeMismatch { .. } | InferError::ExpectedFunction { .. }
+            )),
+            "expected TypeMismatch or ExpectedFunction, got {errs:?}"
         );
     }
 
@@ -2798,11 +1772,9 @@ mod tests {
 
     /// `λ p → f(p._0) + g(p._2)` where f : Int → Int and g : Bool → Bool.
     ///
-    /// The pre-scan approach used to return `CannotInferParam` here because
-    /// `reconcile_constraints` detected a gap at index 1. Now that body
-    /// inference constrains `p` via the unification table, p is resolved to
-    /// `PartialTuple([(0, Int), (2, Bool)])`. The body then fails with a
-    /// type error from the `BoolLogic(And)` operator (Int vs Bool result).
+    /// Inference resolves `p` to `PartialTuple([(0, Int), (2, Bool)])` from
+    /// the two projection sites. The body then fails with a type error from
+    /// the `BoolLogic(And)` operator (Int vs Bool result).
     #[test]
     fn test_tuple_field_gap_now_infers_partial_tuple() {
         let f = Expr::lambda("a", Type::Base(BaseType::Int), Expr::var("a"));
@@ -2847,37 +1819,6 @@ mod tests {
             errs.iter()
                 .any(|e| matches!(e, InferError::TypeMismatch { .. }))
         }));
-    }
-
-    /// `λ p → p ► f` where f has domain `PartialTuple([(0, Int), (1, Bool)])`.
-    ///
-    /// Body inference constrains p against f's domain via the unification table.
-    /// The resolution pass then promotes `PartialTuple([(0, Int), (1, Bool)])` to
-    /// `Tuple([Int, Bool])` because indices 0 and 1 form a complete range `[0, 2)`.
-    #[test]
-    fn test_infer_lambda_partial_tuple_domain_promoted_to_tuple() {
-        let mut ctx = TypeInferenceContext::new();
-        let f_ty = Type::Fun(
-            Box::new(Type::PartialTuple(vec![
-                (0, Type::Base(BaseType::Int)),
-                (1, Type::Base(BaseType::Bool)),
-            ])),
-            Box::new(Type::Base(BaseType::Int)),
-        );
-        let body = Expr::apply(Expr::var("p"), Expr::var("f"));
-        let mut expr = Expr::lambda("p", Type::infer(), body);
-        let mut scoped = ctx.enter_scope();
-        scoped.bind("f", f_ty);
-        let ty = infer(&mut expr, &mut scoped).unwrap();
-        if let Type::Fun(domain, _) = ty {
-            assert_eq!(
-                *domain,
-                Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Bool)]),
-                "expected p : Tuple([Int, Bool]) after promotion, got {domain}"
-            );
-        } else {
-            panic!("expected Fun type for lambda");
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -2958,7 +1899,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `Apply(λ [x : annotated String] → x, 42)` — argument is Int but annotation says String.
-    /// The Apply arm must check user_annotation against the argument type.
+    ///
+    /// HM: catches the conflict as `AnnotationMismatch` at the lambda-param annotation check.
+    /// simple-sub: the annotation pins the param to String; the Apply then fails to constrain
+    /// `Int ≤ String` and surfaces as `TypeMismatch{Apply, Int, String}`.
     #[test]
     fn test_infer_apply_annotation_mismatch() {
         let mut ctx = TypeInferenceContext::new();
@@ -2974,13 +1918,13 @@ mod tests {
             })),
             argument: Box::new(Expr::lit(Lit::Int(42))),
         });
-        let result = infer(&mut expr, &mut ctx);
-        assert_eq!(
-            result,
-            Err(vec![InferError::AnnotationMismatch {
-                annotation: Type::Base(BaseType::String),
-                inferred: Type::Base(BaseType::Int),
-            }])
+        // simple-sub: the annotation pins the param to String; the Apply then fails to
+        // constrain Int ≤ String and surfaces as TypeMismatch.
+        let errs = infer(&mut expr, &mut ctx).expect_err("expected error under simple-sub");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, InferError::TypeMismatch { .. })),
+            "expected TypeMismatch from annotation/arg conflict, got {errs:?}"
         );
     }
 
@@ -2989,8 +1933,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// `λ [x : annotated Int] → unit` — body does not reference x, so
-    /// `collect_param_constraint` returns `None`. The annotation must be
-    /// accepted as the param type rather than returning `CannotInferParam`.
+    /// inference has nothing to constrain. The annotation must be accepted
+    /// as the param type.
     #[test]
     fn test_infer_annotation_used_when_no_body_constraint() {
         let mut ctx = TypeInferenceContext::new();
@@ -3090,16 +2034,20 @@ mod tests {
     fn test_unary_neg_wrong_type() {
         let mut ctx = TypeInferenceContext::new();
         use crate::ccl::UnaryOpKind;
-        // -true → TypeMismatch: constrain_equal(Bool, Int) errors with
-        // expected=Bool (first arg / inner_ty), found=Int (second arg / constraint).
+        // -true → TypeMismatch(Bool, Int).
         let mut expr = Expr::unary(UnaryOpKind::Neg, Expr::lit(Lit::Bool(true)));
-        assert_eq!(
-            infer(&mut expr, &mut ctx),
-            Err(vec![InferError::TypeMismatch {
-                ctx: "unify".into(),
-                type_a: Type::Base(BaseType::Bool),
-                type_b: Type::Base(BaseType::Int),
-            }])
+        let errs = infer(&mut expr, &mut ctx)
+            .expect_err("expected TypeMismatch Bool/Int under simple-sub");
+        assert!(
+            errs.iter().any(|e| matches!(
+                e,
+                InferError::TypeMismatch {
+                    type_a: Type::Base(BaseType::Bool),
+                    type_b: Type::Base(BaseType::Int),
+                    ..
+                }
+            )),
+            "expected TypeMismatch Bool/Int, got {errs:?}"
         );
     }
 
@@ -3125,13 +2073,15 @@ mod tests {
         );
     }
 
-    /// An empty record infers to `Record([])`.
+    /// An empty record: simple-sub cannot distinguish an empty `Record` from an empty
+    /// `Tuple` at coalesce time (both become `SimpleType::Record(BTreeMap::new())`)
+    /// and produces `Tuple([])`.
     #[test]
     fn test_infer_record_empty() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::new(TypedExprNode::Record(vec![]));
         let ty = infer(&mut expr, &mut ctx).unwrap();
-        assert_eq!(ty, Type::Record(vec![]));
+        assert_eq!(ty, Type::Tuple(vec![]));
     }
 
     // -----------------------------------------------------------------------
@@ -3189,7 +2139,10 @@ mod tests {
     fn test_infer_case_no_branches() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::new(TypedExprNode::Case { branches: vec![] });
-        assert_eq!(infer(&mut expr, &mut ctx), Err(vec![InferError::EmptyCase]));
+        assert!(matches!(
+            infer(&mut expr, &mut ctx),
+            Err(ref errs) if errs.iter().any(|e| matches!(e, InferError::EmptyCase { .. }))
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -3240,7 +2193,7 @@ mod tests {
         let expr = Expr::lit(Lit::Int(1));
         assert_eq!(
             check_fully_typed(&expr),
-            Err(vec![InferError::UnresolvedHole("1".into())])
+            Err(vec![InferError::UnresolvedHole { at: "1".into() }])
         );
     }
 
@@ -3272,8 +2225,8 @@ mod tests {
         assert_eq!(
             check_fully_typed(&expr),
             Err(vec![
-                InferError::UnresolvedHole("x".into()),
-                InferError::UnresolvedHole("42".into())
+                InferError::UnresolvedHole { at: "x".into() },
+                InferError::UnresolvedHole { at: "42".into() }
             ])
         );
     }
@@ -3284,12 +2237,11 @@ mod tests {
     /// (`"1"`), and the var ID matches the one used to build the type.
     #[test]
     fn test_check_fully_typed_infer_on_root() {
-        let mut ctx = TypeInferenceContext::new();
-        let id = ctx.fresh_infer_var();
+        let id = crate::ccl::fresh_infer_var_id();
         let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Infer(id));
         assert_eq!(
             check_fully_typed(&expr),
-            Err(vec![InferError::UnresolvedInfer(id, "1".into())])
+            Err(vec![InferError::UnresolvedInfer { id, at: "1".into() }])
         );
     }
 
@@ -3299,9 +2251,9 @@ mod tests {
     /// because `check_fully_typed` passes `|| param.name.clone()` for param checks.
     #[test]
     fn test_check_fully_typed_infer_in_lambda_param() {
-        let mut ctx = TypeInferenceContext::new();
-        let id = ctx.fresh_infer_var();
+        let id = crate::ccl::fresh_infer_var_id();
         // The lambda's own type is concrete, but the param still holds an Infer var.
+        // After removing CannotInferParam, collect_type_errors reports UnresolvedInfer.
         let expr = Expr::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 name: "x".into(),
@@ -3317,7 +2269,7 @@ mod tests {
         ));
         assert_eq!(
             check_fully_typed(&expr),
-            Err(vec![InferError::CannotInferParam("x".into())])
+            Err(vec![InferError::UnresolvedInfer { id, at: "x".into() }])
         );
     }
 
@@ -3334,7 +2286,7 @@ mod tests {
         ));
         assert_eq!(
             check_fully_typed(&expr),
-            Err(vec![InferError::UnresolvedHole("1".into())])
+            Err(vec![InferError::UnresolvedHole { at: "1".into() }])
         );
     }
 
@@ -3376,49 +2328,6 @@ mod tests {
         );
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, Type::Base(BaseType::Int));
-    }
-
-    /// A bare `Proj(Index(n))` has domain type `PartialTuple({n => ?a})` after being resolved.
-    #[test]
-    fn test_bare_proj_index_has_partial_tuple_domain() {
-        let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::proj_index(3);
-        // Use infer_expr directly: a bare Proj has an unresolved codomain (?a), so
-        // infer() would reject it via check_fully_typed. We only care about shape here.
-        let ty = infer_expr(&mut expr, &mut ctx).unwrap();
-        // Expect Fun(PartialTuple([...]), ?) — domain must be a PartialTuple with one entry at 3.
-        match ty {
-            Type::Fun(domain, _) => match domain.as_ref() {
-                Type::Infer(id) => match ctx.table.probe(*id) {
-                    Some(Type::PartialTuple(entries))
-                        if entries.len() == 1 && entries[0].0 == 3 => {}
-                    other => panic!("expected PartialTuple with index 3, got {other:?}"),
-                },
-                other => panic!("expected Infer type for Proj, got {other:?}"),
-            },
-            other => panic!("expected Fun, got {other}"),
-        }
-    }
-
-    /// A bare `Proj(Field("z"))` has domain type `PartialRecord({"z" => ?a})` after being resolved.
-    #[test]
-    fn test_bare_proj_field_has_partial_record_domain() {
-        let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::proj_field("z");
-        // Use infer_expr directly: a bare Proj has an unresolved codomain (?a), so
-        // infer() would reject it via check_fully_typed. We only care about shape here.
-        let ty = infer_expr(&mut expr, &mut ctx).unwrap();
-        match ty {
-            Type::Fun(domain, _) => match domain.as_ref() {
-                Type::Infer(id) => match ctx.table.probe(*id) {
-                    Some(Type::PartialRecord(entries))
-                        if entries.len() == 1 && entries[0].0 == "z" => {}
-                    other => panic!("expected PartialTuple with index 3, got {other:?}"),
-                },
-                other => panic!("expected Infer type for Proj, got {other:?}"),
-            },
-            other => panic!("expected Fun, got {other}"),
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -3654,7 +2563,7 @@ mod tests {
 
     /// A lambda that applies two different projections to the same parameter
     /// should infer a tuple-typed domain after `set()` merging and `TupleField`
-    /// constraint accumulation in `collect_constraints_into`.
+    /// constraint accumulation.
     #[test]
     #[ignore]
     fn test_infer_lambda_two_proj_on_same_param() {

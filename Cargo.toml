@@ -5,6 +5,12 @@ edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+# Expose test-only helpers (counter resets, etc.) to integration tests that
+# link against the compiled library. Add `cambra = { features = ["test-helpers"] }`
+# to a crate's dev-dependencies to enable.
+test-helpers = []
+
 [dev-dependencies]
 microbench = "0.5.0"
 rstest = { version = "0.26.1", features = ["async-timeout"] }
