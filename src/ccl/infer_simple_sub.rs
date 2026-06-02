@@ -1334,4 +1334,44 @@ mod tests {
         let ty = run_simple_sub(&mut e).expect("inference succeeds");
         assert_eq!(ty, Type::Base(BaseType::Int));
     }
+
+    /// TRIPWIRE — documents a known soundness gap, NOT desired behavior.
+    ///
+    /// `Max` has scheme `∀α γ. (α ⇒ γ) ⇒ γ` (see `aggregate_max`), so its
+    /// codomain `γ` is wholly unconstrained and it type-checks over *any*
+    /// codomain. But `Max` is only *defined* at eval for orderable base types
+    /// (`Int`/`UInt`/`String` — see merge/identity in `ccl/mod.rs`). So `max`
+    /// over a function with a tuple codomain type-checks and infers
+    /// `Tuple([Int, Int])`, even though it has no defined runtime behavior.
+    ///
+    /// `Max` *should* require an orderable codomain. The correct long-term fix
+    /// is a first-class comparability bound, which arrives with traits — there
+    /// is no value in a stopgap validation now. When that lands, inference will
+    /// start rejecting this program and this test will fail loudly; whoever
+    /// lands traits should flip it to assert rejection.
+    ///
+    /// Tracked by `type-checker-traits-comparability` (P3) in the project vault.
+    #[test]
+    fn max_over_non_orderable_codomain_is_unsoundly_accepted() {
+        // Aggregate { input: λx → (1, 2), kind: Max }
+        let lam = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "x".to_string(),
+                ty: Type::Hole,
+                user_annotation: None,
+            },
+            body: Box::new(TypedExpr::new(TypedExprNode::Tuple(vec![
+                lit_int(1),
+                lit_int(2),
+            ]))),
+            refinement: None,
+        });
+        let mut e = TypedExpr::aggregate(lam, AggregateKind::Max);
+        let ty = run_simple_sub(&mut e).expect("inference succeeds (the bug under test)");
+        // Buggy current behavior: the non-orderable tuple codomain is accepted.
+        assert_eq!(
+            ty,
+            Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)])
+        );
+    }
 }
