@@ -88,10 +88,10 @@ The same distinction applies in CCL:
 
 CHL aggregate calls (`sum(xs)`, `max(xs)`) are lowered directly to `Expr::Aggregate` rather than kept as `Apply(Var("sum"), xs)`. This makes aggregate operations structurally distinct from ordinary function calls, which simplifies:
 
-- Type inference: `infer` constrains the input to `Fun(_, codomain)` via `constrain_equal` and dispatches to `AggregateKind::constrain_signature` for the per-variant element-vs-output-type relationship (`Sum`: requires `codomain = Int`, returns `Int`; `Max`: returns `codomain` unchanged).
+- Type inference: each variant has a full operator scheme in `OperatorSchemes` that captures its element-vs-output-type relationship — `Sum : ∀α. (α ⇒ Int) ⇒ Int` (requires an `Int` codomain, returns `Int`) and `Max : ∀α γ. (α ⇒ γ) ⇒ γ` (returns the codomain unchanged). `emit_aggregate` infers the input type and applies the scheme directly to it via `apply_unary_scheme`; the scheme's own domain shape `(α ⇒ γ)` enforces that the input is a function and folds its codomain, so no separate "input must be a function" check is needed.
 - Compilation: the compiler dispatches on `Expr::Aggregate` and emits the appropriate aggregate operator without scanning call-site variable names.
 
-`AggregateKind` enumerates the supported operations; each variant carries its own typing rule on `constrain_signature`. New variants (`Count: _ → Int`, `Mean: Int → Float`, …) add their rule there without touching the `Aggregate` inference branch.
+`AggregateKind` enumerates the supported operations; each variant's typing rule is the operator scheme selected by `OperatorSchemes::aggregate`. New variants (`Count : ∀α. (α ⇒ γ) ⇒ Int`, `Mean : ∀α. (α ⇒ Int) ⇒ Float`, …) add a scheme there without touching the `Aggregate` inference branch.
 
 ### CHL `lambda` expressions — single `Expr::Lambda` (tupled when multi-arg)
 

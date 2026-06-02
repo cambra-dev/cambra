@@ -22,7 +22,7 @@
 //! No let-generalization (`let` is monomorphic). The
 //! [`OperatorSchemes`] registry contains [`PolyScheme`]s only for the
 //! handful of operator/projection cases that are inherently polymorphic
-//! (`Compare : ∀α. α → α → Bool`, `Max : ∀α. α → α`, etc.). Each scheme
+//! (`Compare : ∀α. α → α → Bool`, `Max : ∀α γ. (α → γ) → γ`, etc.). Each scheme
 //! is `instantiate`d at every use site, minting fresh vars per use.
 //!
 //! Most `Builtin` nodes are introduced post-inference by
@@ -77,9 +77,13 @@ pub struct OperatorSchemes {
     neg: PolyScheme,
     /// `Bool → Bool`.
     not_op: PolyScheme,
-    /// `Int → Int` — applied to the codomain of the input function.
+    /// `∀α. (α → Int) → Int` — the full Sum operator type, applied
+    /// directly to the input collection (function), folding its Int
+    /// codomain to an Int.
     aggregate_sum: PolyScheme,
-    /// `∀α. α → α` — applied to the codomain of the input function.
+    /// `∀α γ. (α → γ) → γ` — the full Max operator type, applied directly
+    /// to the input collection (function), folding its codomain γ to a
+    /// result of the same type.
     aggregate_max: PolyScheme,
     /// `∀α β. ((α → β), β) → β` — extract the last value from a
     /// function-typed stream, falling back to the default scalar when the
@@ -130,12 +134,22 @@ impl OperatorSchemes {
         // Not: Bool → Bool
         let not_op = PolyScheme::mono(fun(prim(BaseType::Bool), prim(BaseType::Bool)));
 
-        // Sum: Int → Int (codomain → result)
-        let aggregate_sum = PolyScheme::mono(fun(prim(BaseType::Int), prim(BaseType::Int)));
-
-        // Max: ∀α. α → α
+        // Sum: ∀α. (α → Int) → Int. The full operator type: consumes a
+        // collection (a function whose domain α is unconstrained) and folds
+        // its Int codomain to an Int. Inline-built so α gets its own fresh
+        // var even though it's unconstrained.
         let alpha = fresh_var(BODY_LEVEL);
-        let aggregate_max = PolyScheme::poly(SCHEME_LEVEL, fun(Rc::clone(&alpha), alpha));
+        let aggregate_sum = PolyScheme::poly(
+            SCHEME_LEVEL,
+            fun(fun(alpha, prim(BaseType::Int)), prim(BaseType::Int)),
+        );
+
+        // Max: ∀α γ. (α → γ) → γ. Consumes a collection and folds its
+        // codomain γ to a result of the same type.
+        let alpha = fresh_var(BODY_LEVEL);
+        let gamma = fresh_var(BODY_LEVEL);
+        let aggregate_max =
+            PolyScheme::poly(SCHEME_LEVEL, fun(fun(alpha, Rc::clone(&gamma)), gamma));
 
         // LastOrDefault: ∀α β. ((α → β), β) → β
         // Inline-built (not via `type_to_simple`) so the codomain of the
@@ -351,8 +365,9 @@ fn apply_binary_scheme(
     Ok(result)
 }
 
-/// Apply a unary scheme. Used for UnaryOp and Aggregate (latter passes
-/// the codomain of its function-typed input as the operand).
+/// Apply a unary scheme. Used for UnaryOp and Aggregate. For an
+/// aggregate the scheme is the full operator type `(α → γ) → γ`, so the
+/// operand is the input collection (function) itself.
 fn apply_unary_scheme(
     ctx: &mut SimpleSubContext,
     scheme: &PolyScheme,
@@ -770,17 +785,11 @@ fn emit_aggregate(
     ctx: &mut SimpleSubContext,
 ) -> Result<Rc<SimpleType>, InferError> {
     let input_ty = emit_node(input, ctx)?;
-    // Input must be a function (collection) type.
-    let domain = fresh_var(ctx.level);
-    let codomain = fresh_var(ctx.level);
-    constrain_subtype(
-        &input_ty,
-        &fun(Rc::clone(&domain), Rc::clone(&codomain)),
-        &mut ctx.cache,
-    )
-    .map_err(|e| map_constrain_err(e, "Aggregate input"))?;
+    // The scheme is the full operator type `(α → γ) → γ`, so apply it
+    // directly to the input collection (function). The scheme's own domain
+    // shape enforces that the input is a function and folds its codomain.
     let scheme = ctx.schemes.aggregate(kind).clone();
-    apply_unary_scheme(ctx, &scheme, &codomain).map_err(|e| map_constrain_err(e, "Aggregate"))
+    apply_unary_scheme(ctx, &scheme, &input_ty).map_err(|e| map_constrain_err(e, "Aggregate"))
 }
 
 fn emit_let(
