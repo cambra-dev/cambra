@@ -253,7 +253,7 @@ impl Extent {
 
 /// Placeholder restriction handle for [`Extent::Restricted`].
 ///
-/// Restriction computation is handled by [`Filter`] operators in the tile path.
+/// Restriction computation is handled by [`crate::interpreter::tile_operators::Filter`] operators in the tile path.
 /// This struct exists only to satisfy the [`Extent::Restricted`] variant's type requirement
 /// and will panic if any computation method is called.
 #[derive(Debug, Default)]
@@ -268,10 +268,10 @@ impl Restriction {
 
 /// Abstraction for sending computed responses back to waiting clients.
 ///
-/// Implemented by sink types (e.g. [`crate::interpreter::HttpServerSharedState`])
-/// that are paired with a [`DataSourceDomainExtentImpl`].  The default
-/// [`DataSourceDomainExtentImpl::get_sink`] returns `None`; sources with a
-/// corresponding output channel override it to expose their sink.
+/// Implemented by sink types (e.g. [`crate::interpreter::http_server::HttpServerSharedState`])
+/// that are paired with a [`DataSourceDomainExtentImpl`].  Sources without an
+/// output channel do not implement this trait; sources with a
+/// corresponding output channel implement it to dispatch responses.
 ///
 /// Receives a full [`Tile`] so the implementation can apply its own
 /// domain/codomain extraction and deduplication logic.
@@ -294,12 +294,12 @@ pub trait DataSourceDomainExtentImpl {
     fn element_extent(&self) -> Extent;
     /// Returns the output value for a given domain key.
     ///
-    /// Used by [`crate::interpreter::tile_operators::MapSource`] to map each domain
+    /// Used by [`crate::interpreter::tile_operators::MapResultWithSource`] to map each domain
     /// element to its corresponding output value when building a
     /// `SealedFunction { domain, codomain: Scalar(output_values) }` tile.
     fn get(&self, keys: ColumnValue) -> ColumnValue;
     /// Returns the [`Extent`] of each output value produced by this source.
-    /// Used to type the codomain of [`crate::interpreter::tile_operators::MapSource`].
+    /// Used to type the codomain of [`crate::interpreter::tile_operators::MapResultWithSource`].
     fn output_value_extent(&self) -> Extent;
     /// Returns the CCL element type produced by this source (the codomain of its
     /// `Fun(DataSource(name), T)` type).  Used by
@@ -408,12 +408,12 @@ impl Extent {
         Extent::Record(fields)
     }
 
-    /// Create a restricted record extent: a [`Restricted`] wrapping a [`Record`].
+    /// Create a restricted record extent: an [`Extent::Restricted`] wrapping an [`Extent::Record`].
     pub fn restricted_record(fields: HashMap<String, Extent>) -> Self {
         Extent::restricted(Extent::Record(fields))
     }
 
-    /// Wrap any extent in a [`Restricted`] with a fresh [`Restriction`].
+    /// Wrap any extent in an [`Extent::Restricted`] with a fresh [`Restriction`].
     pub fn restricted(base: Extent) -> Self {
         Extent::Restricted {
             base: Box::new(base),
@@ -421,7 +421,7 @@ impl Extent {
         }
     }
 
-    /// Return the restriction handle if this is a [`Restricted`] extent.
+    /// Return the restriction handle if this is an [`Extent::Restricted`] extent.
     pub fn restriction(&mut self) -> Option<Rc<RefCell<Restriction>>> {
         match self {
             Extent::Restricted { restriction, .. } => Some(restriction.clone()),
@@ -429,7 +429,7 @@ impl Extent {
         }
     }
 
-    /// Return the field map if this extent is a [`Record`], or a [`Restricted`] wrapping one.
+    /// Return the field map if this extent is an [`Extent::Record`], or an [`Extent::Restricted`] wrapping one.
     pub fn record_fields(&self) -> Option<&HashMap<String, Extent>> {
         match self {
             Extent::Record(fields) => Some(fields),

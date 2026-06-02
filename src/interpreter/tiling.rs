@@ -1,4 +1,4 @@
-//! Core tiling types: [`Tiling`], [`Tile`], [`TileGuard`], [`SealedFunctionGuard`], [`Predicate`].
+//! Core tiling types: [`Tiling`], [`Tile`], [`TileGuard`], [`FunctionGuard`], [`Predicate`].
 //!
 //! These types describe the shape, data, and region-tracking for the tile-based
 //! dataflow evaluation model.
@@ -950,7 +950,7 @@ impl TileGuard {
     /// A guard is compatible when its variant matches the shape of the tiling
     /// it was derived from — e.g., a [`TileGuard::Scalar`] guard belongs to a
     /// [`Tiling::Scalar`] tiling.  Used to assert that a guard passed to
-    /// [`TileProducer::release`] is well-formed.
+    /// [`crate::interpreter::tile_operators::TileProducer::release`] is well-formed.
     pub fn check_from(&self, tiling: &Tiling) -> bool {
         match (self, tiling) {
             (TileGuard::Scalar(_), Tiling::Scalar(_)) => true,

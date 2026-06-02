@@ -236,7 +236,7 @@ impl OpConversionContext {
 
     /// Register a data-source implementation under `name`.
     ///
-    /// After registration, [`Type::DataSource(name)`] resolves to
+    /// After registration, [`Type::DataSource`] resolves to
     /// [`Extent::DataSourceDomain`] in [`Self::extent_of`].
     pub fn register_source(
         &mut self,
@@ -284,11 +284,11 @@ impl OpConversionContext {
 
     /// Convert a CCL [`Type`] to an interpreter [`Extent`].
     ///
-    /// Refinements are enforced at runtime by [`Filter`] operators and are
+    /// Refinements are enforced at runtime by [`crate::interpreter::tile_operators::Filter`] operators and are
     /// never materialised as [`Extent::Restricted`] in the tile-operator path.
     /// Every [`Type::Refinement`] wrapper — at any nesting depth — is stripped
     /// so that compound types such as `Tuple([Refinement(...), Refinement(...)])`
-    /// never produce empty, unsubscribed [`Restriction`] objects that would
+    /// never produce empty, unsubscribed [`crate::interpreter::Restriction`] objects that would
     /// panic when iterated.
     pub fn extent_of(&self, ty: &Type) -> Result<Extent, ConversionError> {
         match ty {

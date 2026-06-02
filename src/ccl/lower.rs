@@ -9,42 +9,42 @@
 //!
 //! | CHL syntax | CCL output |
 //! |--------------|-----------|
-//! | Integer / string / bool / None literals | [`Expr::Lit`] |
-//! | Variable references | [`Expr::Var`] |
-//! | Binary arithmetic (`+`, `-`, `*`, `//`) | [`Expr::BinOp`] |
-//! | Comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) | [`Expr::BinOp`] |
-//! | Chained comparisons (`a < b < c`) | nested [`Expr::BinOp`] with `and` |
-//! | Boolean operators (`and`, `or`) | left-folded [`Expr::BinOp`] chain |
-//! | List literals `[e0, e1, ...]` | [`Expr::List`] |
+//! | Integer / string / bool / None literals | [`TypedExprNode::Lit`] |
+//! | Variable references | [`TypedExprNode::Var`] |
+//! | Binary arithmetic (`+`, `-`, `*`, `//`) | [`TypedExprNode::BinOp`] |
+//! | Comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) | [`TypedExprNode::BinOp`] |
+//! | Chained comparisons (`a < b < c`) | nested [`TypedExprNode::BinOp`] with `and` |
+//! | Boolean operators (`and`, `or`) | left-folded [`TypedExprNode::BinOp`] chain |
+//! | List literals `[e0, e1, ...]` | [`TypedExprNode::List`] |
 //! | Single-generator list comprehensions (no `if`) | `Lambda`/`Apply` encoding |
-//! | 2-gen equality-join comprehensions (`if x.k == y.k`) | hash-join [`crate::ccl::RefinementKind::HashJoin`] |
+//! | 2-gen equality-join comprehensions (`if x.k == y.k`) | hash-join [`crate::ccl::RefinementKind::Predicate`] |
 //! | Multi-gen filtered comprehensions (non-equality or 3+ generators) | loop-join [`crate::ccl::RefinementKind::Predicate`] |
-//! | Assignment + expression blocks | nested [`Expr::Let`] |
-//! | Augmented assignment `x op= e` | desugared to [`Expr::Let`] via [`Expr::BinOp`] |
-//! | `sum(expr)` / `max(expr)` calls | [`Expr::Aggregate`] |
-//! | Lambda expressions `lambda x: body`, `lambda x, y: body` | single [`Expr::Lambda`] (tupled param when multi-arg) |
-//! | `groupby(collection, key)` calls | [`Expr::GroupBy`] |
-//! | Unary negation (`-x`) | [`Expr::UnaryOp`] with [`crate::ccl::UnaryOpKind::Neg`] |
-//! | Boolean negation (`not x`) | [`Expr::UnaryOp`] with [`crate::ccl::UnaryOpKind::Not`] |
+//! | Assignment + expression blocks | nested [`TypedExprNode::Let`] |
+//! | Augmented assignment `x op= e` | desugared to [`TypedExprNode::Let`] via [`TypedExprNode::BinOp`] |
+//! | `sum(expr)` / `max(expr)` calls | [`TypedExprNode::Aggregate`] |
+//! | Lambda expressions `lambda x: body`, `lambda x, y: body` | single [`TypedExprNode::Lambda`] (tupled param when multi-arg) |
+//! | `groupby(collection, key)` calls | `Lambda`/`Apply` encoding with a refinement predicate |
+//! | Unary negation (`-x`) | [`TypedExprNode::UnaryOp`] with [`crate::ccl::UnaryOpKind::Neg`] |
+//! | Boolean negation (`not x`) | [`TypedExprNode::UnaryOp`] with [`crate::ccl::UnaryOpKind::Not`] |
 //! | Unary plus (`+x`) | identity — lowered to `x` directly |
-//! | Single-arg call `f(a)` | [`Expr::Apply`] |
-//! | Multi-arg call `f(a, b, ...)` | [`Expr::Apply`] with a tupled argument |
-//! | Annotated assignment `x: T = expr` | [`Expr::Let`] with [`crate::ccl::TypedBinding::user_annotation`] set |
+//! | Single-arg call `f(a)` | [`TypedExprNode::Apply`] |
+//! | Multi-arg call `f(a, b, ...)` | [`TypedExprNode::Apply`] with a tupled argument |
+//! | Annotated assignment `x: T = expr` | [`TypedExprNode::Let`] with [`crate::ccl::TypedBinding::user_annotation`] set |
 //! | Generator expressions `(expr for x in xs)` | `Lambda`/`Apply` encoding (same as list comp) |
-//! | Generator functions `def f(xs): for x in xs: yield expr` | [`Expr::Let`] + uncurried [`Expr::Lambda`] wrapping `Lambda`/`Apply` encoding |
+//! | Generator functions `def f(xs): for x in xs: yield expr` | [`TypedExprNode::Let`] + uncurried [`TypedExprNode::Lambda`] wrapping `Lambda`/`Apply` encoding |
 //! | Nested-for generator functions | same encoding as multi-generator list comprehensions |
-//! | Let-bindings in generator bodies `y = f(x); yield y` | [`Expr::Let`] interleaved in the `Lambda`/`Apply` chain |
-//! | Pre-loop lets before generator for-loop | [`Expr::Let`] wrapping the generator expression |
-//! | Regular functions `def f(x, y, ...): expr` | [`Expr::Let`] + single [`Expr::Lambda`] (tupled param when multi-arg) |
+//! | Let-bindings in generator bodies `y = f(x); yield y` | [`TypedExprNode::Let`] interleaved in the `Lambda`/`Apply` chain |
+//! | Pre-loop lets before generator for-loop | [`TypedExprNode::Let`] wrapping the generator expression |
+//! | Regular functions `def f(x, y, ...): expr` | [`TypedExprNode::Let`] + single [`TypedExprNode::Lambda`] (tupled param when multi-arg) |
 //! | Record literals `{field: expr, ...}` (identifier keys only) | [`TypedExprNode::Record`] |
-//! | Field access `r.field` | [`Expr::Apply`] with [`TypedExprNode::Proj`]`(`[`ProjKey::Field`]`)` |
+//! | Field access `r.field` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Field`]`)` |
 //!
 //! Everything else returns [`LoweringError::Unsupported`].
 //!
 //! # Name uniqueness
 //!
 //! This pass does not guarantee unique binding names. Reassignment of the
-//! same variable (`x = 1; x = 2`) produces nested [`Expr::Let`] nodes that shadow
+//! same variable (`x = 1; x = 2`) produces nested [`TypedExprNode::Let`] nodes that shadow
 //! each other (`let x = 1 in let x = 2 in ...`). The semantics are correct for
 //! sequential code — the inner `let` evaluates its value expression in the outer
 //! scope before the shadowing takes effect — but the same name may appear at
@@ -203,7 +203,7 @@ impl LoweringResult {
 /// Context for CHL → CCL lowering that carries registered data sources and sinks.
 ///
 /// Zero-argument function calls whose name appears in `sources` are lowered to
-/// [`crate::ccl::Expr::Source`] nodes instead of failing with an
+/// [`TypedExprNode::Source`] nodes instead of failing with an
 /// [`LoweringError::Unsupported`] error.  After `lower_stmts` returns, the
 /// caller should call [`take_sources`](Self::take_sources) and
 /// [`take_sink_bindings`](Self::take_sink_bindings) to drain both maps and
@@ -448,7 +448,7 @@ pub fn lower_expr(
 /// All statements except the last must be simple name assignments
 /// (`x = expr`), annotated assignments (`x: T = expr`), augmented
 /// assignments (`x op= expr`), or function definitions (`def f(...): ...`);
-/// each becomes an [`Expr::Let`] binding wrapping the rest. Function
+/// each becomes an [`TypedExprNode::Let`] binding wrapping the rest. Function
 /// definitions are lowered via [`lower_function_body`], which detects
 /// generator functions (single `for`/`yield` body) and regular functions.
 ///
@@ -989,9 +989,9 @@ fn lower_constant(constant: &ChlLit) -> Result<Expr, LoweringError> {
 ///
 /// | CHL call | CCL node | Arity |
 /// |---|---|---|
-/// | `sum(expr)` | [`Expr::Aggregate`] (`Sum`) | 1 |
-/// | `max(expr)` | [`Expr::Aggregate`] (`Max`) | 1 |
-/// | `groupby(collection, key)` | [`Expr::GroupBy`] | 2 |
+/// | `sum(expr)` | [`TypedExprNode::Aggregate`] (`Sum`) | 1 |
+/// | `max(expr)` | [`TypedExprNode::Aggregate`] (`Max`) | 1 |
+/// | `groupby(collection, key)` | `Lambda`/`Apply` encoding with refinement | 2 |
 ///
 /// Unknown function names return [`LoweringError::Unsupported`]. (CHL has no
 /// keyword-argument syntax, so the parser already rejects those.)

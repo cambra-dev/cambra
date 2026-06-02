@@ -221,7 +221,7 @@ fn count_free_in_type_with_visited(
 /// See [`walk_refined_predicates_mut`] for the mutable variant used by
 /// [`crate::ccl::lambda_elim`] and [`crate::ccl::unify::resolve`].
 /// A related dual-mechanism (try_borrow_mut fallback without an
-/// explicit visited set) lives in [`crate::ccl::simplify::simplify_once`]
+/// explicit visited set) lives in [`crate::ccl::simplify::simplify`]
 /// — see the note there for why that site can't use this helper today.
 pub fn walk_refined_predicates<F>(ty: &Type, visited: &mut HashSet<RefinementId>, f: &mut F)
 where

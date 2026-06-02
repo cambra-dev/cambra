@@ -1,6 +1,6 @@
 //! Lambda elimination pass for CCL.
 //!
-//! Rewrites all [`Expr::Lambda`] nodes in a CCL expression into a point-free
+//! Rewrites all [`TypedExprNode::Lambda`] nodes in a CCL expression into a point-free
 //! composition of primitive combinators, following the Cartesian Closed Category
 //! (CCC) structure described in `docs/operational-semantics/lowering.md`.
 //!
@@ -76,7 +76,7 @@ impl std::fmt::Display for LambdaElimError {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Eliminate all [`Expr::Lambda`] nodes and simplify the result to a fixed point.
+/// Eliminate all [`TypedExprNode::Lambda`] nodes and simplify the result to a fixed point.
 ///
 /// The input must be a well-formed, fully type-inferred CCL expression
 /// (as produced by [`crate::ccl::infer::infer`]).

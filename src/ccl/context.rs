@@ -353,7 +353,7 @@ pub struct CompiledOutput {
     /// sink outputs, whose producer is owned by the [`SinkConsumer`].
     pub producer: Option<Box<dyn TileProducer>>,
     /// `Some` for sink outputs — the [`SinkConsumer`] subscribed to the
-    /// operator that dispatches to the registered [`DataSink`].
+    /// operator that dispatches to the registered [`crate::interpreter::DataSink`].
     pub sink_consumer: Option<Rc<RefCell<SinkConsumer>>>,
 }
 

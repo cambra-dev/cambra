@@ -14,8 +14,8 @@
 //!   unary `+`, `is`, `in`) are simply absent. This makes lowering exhaustive
 //!   without an `unimplemented!()` branch per operator.
 //! - **`if`/`elif` flattens.** A chain of `if`/`elif`/`else` produces a single
-//!   [`Stmt::If`] with one [`If::branches`] entry per `if`/`elif` and one
-//!   optional [`If::else_body`], rather than `rustpython_ast`'s nested
+//!   [`Stmt::If`] with one `branches` entry per `if`/`elif` and one
+//!   optional `else_body`, rather than `rustpython_ast`'s nested
 //!   `else: [If(...)]` representation.
 //! - **Records vs. dicts are syntactically distinct.** `{x: 1, y: 2}` (bare
 //!   identifier keys) parses as [`Expr::Record`]; `{"name": "alice"}`
@@ -178,7 +178,7 @@ pub enum Stmt {
 
     /// Defer-define statement: `target <<= value`.
     ///
-    /// Distinct from [`AugAssign`] because it has no corresponding plain
+    /// Distinct from [`Stmt::AugAssign`] because it has no corresponding plain
     /// binary operator — it always defines a previously-deferred output.
     Define {
         target: Spanned<AssignTarget>,

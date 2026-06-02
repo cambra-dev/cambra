@@ -9,6 +9,10 @@ ci_fmt() {
 # --all-targets lints test code too and warms the cache for cargo test
 ci_clippy() { cargo clippy --all-targets -- -D warnings; }
 ci_test() { cargo test -q; }
+ci_doc() {
+  RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
+    cargo doc --no-deps
+}
 ci_shellcheck() { find . -name '*.sh' -not -path './.git/*' -exec shellcheck -a -o all {} +; }
 
 ci_all() {
@@ -22,6 +26,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_clippy || failed=1
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_doc || failed=1
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_test || failed=1

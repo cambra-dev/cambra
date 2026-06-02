@@ -4543,7 +4543,7 @@ fn extract_hashmap_values<K: Clone + Eq + Hash, InputV, V, F: Fn(InputV) -> V>(
 /// `i > 0`.  `acc_var` reads inside the loop body resolve to this
 /// stream; surrounding lowering composes against this stream and
 /// inlines any pending mutations to recover the right per-iteration
-/// accumulator view (see [`crate::ccl::lower::lower_mutation_loop`]).
+/// accumulator view (see `lower_mutation_loop` in [`crate::ccl::lower`]).
 ///
 /// The body's external `Fun(D, Record({step, to_<defer>*}))` output is
 /// exposed directly; downstream lowering picks each accumulator off

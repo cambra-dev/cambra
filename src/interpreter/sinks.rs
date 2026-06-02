@@ -19,7 +19,7 @@ use crate::interpreter::{Consumer, DataSink, tile_operators::TileProducer};
 /// Shared slot for injecting the producer after `subscribe` returns.
 ///
 /// [`SinkConsumer::new`] hands one clone to the consumer and returns the other
-/// to the caller so it can be filled once [`TileOperator::subscribe`] completes.
+/// to the caller so it can be filled once [`crate::interpreter::tile_operators::TileOperator::subscribe`] completes.
 pub type ProducerSlot = Rc<RefCell<Option<Box<dyn TileProducer>>>>;
 
 // ---------------------------------------------------------------------------
@@ -69,7 +69,7 @@ impl DoneNotifier {
 /// [`DoneNotifier`] when a terminal tile is received.
 ///
 /// The producer reference is held in an `Option` that starts as `None` and is
-/// filled after [`TileOperator::subscribe`] returns (solving the chicken-and-egg:
+/// filled after [`crate::interpreter::tile_operators::TileOperator::subscribe`] returns (solving the chicken-and-egg:
 /// the consumer must exist before subscribe is called, but subscribe is what
 /// creates the producer).
 pub struct SinkConsumer {
@@ -86,7 +86,7 @@ impl SinkConsumer {
     ///
     /// The returned consumer holds a shared handle to the `producer` slot; the
     /// caller should fill that slot with the `TileProducer` returned by
-    /// [`TileOperator::subscribe`] before the first notification fires.
+    /// [`crate::interpreter::tile_operators::TileOperator::subscribe`] before the first notification fires.
     pub fn new(sink: Arc<dyn DataSink>, done: DoneNotifier) -> (Self, ProducerSlot) {
         let slot: ProducerSlot = Rc::new(RefCell::new(None));
         (

@@ -137,7 +137,7 @@ impl SharedHttpServer {
 // Shared state
 // ---------------------------------------------------------------------------
 
-/// State shared between [`HttpServerDataSource`] and [`HttpServerResponseWriter`].
+/// State shared between [`HttpServerDataSource`] and the [`crate::interpreter::DataSink`] response dispatch.
 ///
 /// Holds the live `tiny_http::Request` objects (one per pending request) until
 /// the CCL program produces a response for them.

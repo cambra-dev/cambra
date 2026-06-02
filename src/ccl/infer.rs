@@ -16,8 +16,8 @@
 //! list-comprehension pipeline end-to-end. See [`infer`] for what is currently
 //! supported and what is deferred.
 //!
-//! The pass fills in [`TypedExpr::ty`] on every node it visits. User-written
-//! annotations are carried in [`TypedExpr::user_annotation`]; they are checked for
+//! The pass fills in [`crate::ccl::TypedExpr::ty`] on every node it visits. User-written
+//! annotations are carried in [`crate::ccl::TypedExpr::user_annotation`]; they are checked for
 //! compatibility with the inferred type at the end of each [`infer`] call.
 
 use std::collections::{HashMap, HashSet};
@@ -105,7 +105,7 @@ impl TypeInferenceContext {
     /// Allocate a fresh inference variable, register it in the [`UnificationTable`],
     /// and return its ID.
     ///
-    /// Use this instead of calling [`fresh_infer_var_id`] directly whenever you need
+    /// Use this instead of calling `fresh_infer_var_id` directly whenever you need
     /// a new variable during inference — the table entry is required for the
     /// post-inference resolution pass.
     pub fn fresh_infer_var(&mut self) -> InferVarId {
@@ -170,7 +170,7 @@ pub enum InferError {
     ExpectedFunction(Type),
     /// A user-written annotation on a binding site conflicts with the inferred type.
     ///
-    /// Distinct from [`TypeMismatch`] so error messages can say
+    /// Distinct from [`InferError::TypeMismatch`] so error messages can say
     /// "you annotated X as T but it has type U" vs. "expected T found U".
     AnnotationMismatch {
         /// The type the user wrote in the annotation.

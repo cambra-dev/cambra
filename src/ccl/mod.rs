@@ -43,7 +43,7 @@ pub fn next_refinement_id() -> RefinementId {
 /// variables created in different parts of the tree never alias.
 ///
 /// The inner `u32` is `pub(crate)` to prevent external code from constructing
-/// arbitrary `InferVarId` values. Use [`Type::infer`] or
+/// arbitrary `InferVarId` values. Use
 /// [`crate::ccl::infer::TypeInferenceContext::fresh_infer_var`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InferVarId(pub(crate) u32);
@@ -345,7 +345,7 @@ pub enum Builtin {
 
 impl Builtin {
     /// Stable, source-style display name for this built-in, used by
-    /// [`crate::ccl::symbolic`] and [`crate::ccl::pretty`] when rendering
+    /// [`crate::ccl::symbolic`] and the pretty-printer when rendering
     /// applied primitives.
     pub fn name(&self) -> &'static str {
         match self {
@@ -678,7 +678,7 @@ pub enum TypedExprNode {
     /// Multi-way conditional branching.
     ///
     /// Evaluates each [`Branch`] in order; the first branch whose guard evaluates
-    /// to `true` wins. Guards must have type [`Type::Base(BaseType::Bool)`].
+    /// to `true` wins. Guards must have type [`Type::Base`]`(`[`BaseType::Bool`]`)`.
     ///
     /// `if`/`elif`/`else` chains are flattened into a single `Case` with one
     /// [`Branch`] per condition. Ternary `if` expressions produce a 2-branch
@@ -757,7 +757,7 @@ pub enum TypedExprNode {
 
     /// A tuple constructor: `(e0, e1, ...)`.
     ///
-    /// Compiles to a [`crate::interpreter::ConstructRecord`] with fields
+    /// Compiles to a [`crate::interpreter::tile_operators::FanIn`] record with fields
     /// named `_0`, `_1`, … (via [`crate::interpreter::tuple_field`]).
     Tuple(Vec<TypedExpr>),
 
@@ -779,7 +779,7 @@ pub enum TypedExprNode {
     /// Emitted by [`crate::ccl::lower`] when a zero-argument call is recognised
     /// as a registered source (e.g. `testsource1()` or `__stdinvalues()`).
     /// [`crate::ccl::infer`] resolves it to a `Fun(DataSource(name), output_type)`
-    /// via the source registry; [`crate::interpreter::compile_ccl`] compiles it to
+    /// via the source registry; [`crate::interpreter::operator_conversion`] compiles it to
     /// the appropriate reader operator.
     Source(String),
 
@@ -1023,7 +1023,7 @@ impl TypedExpr {
     /// fields.  Otherwise return [`None`].
     ///
     /// This is the **single source of truth** for the mutation-loop shape
-    /// contract.  [`crate::ccl::lower::lower_mutation_loop`] is the only
+    /// contract.  `lower_mutation_loop` in [`crate::ccl::lower`] is the only
     /// producer of this shape; [`crate::ccl::infer`] and
     /// [`crate::interpreter::operator_conversion`] are the two consumers
     /// that pattern-match it.  Both consumers call this helper (or the
@@ -1112,7 +1112,7 @@ impl TypedExpr {
     /// `binding.ty` mirrors `bound_expr.ty` at construction time so that callers
     /// who pre-set the expression type via [`TypedExpr::with_ty`] (e.g. tests that
     /// bypass inference) do not need to set the binding type separately. After
-    /// inference both fields hold the same type; [`compile_ccl::compile`] reads
+    /// inference both fields hold the same type; [`crate::ccl::context::compile_program`] reads
     /// `binding.ty` as the authoritative slot. In normal lowering both start as
     /// [`Type::Infer`] and inference fills them together.
     pub fn let_bind(name: impl Into<String>, bound_expr: Self, body: Self) -> Self {
@@ -1130,7 +1130,7 @@ impl TypedExpr {
 
     /// Construct an annotated let binding expression.
     ///
-    /// Like [`let_bind`] but sets [`TypedBinding::user_annotation`] to `annotation`.
+    /// Like [`Self::let_bind`] but sets [`TypedBinding::user_annotation`] to `annotation`.
     /// Inference validates that the inferred type of `bound_expr` is compatible with
     /// `annotation` and raises [`infer::InferError::AnnotationMismatch`] on conflict.
     pub fn let_bind_annotated(
@@ -1287,7 +1287,7 @@ impl TypedExpr {
     /// `Lambda` body, `Let` `bound_expr`/`body`, list/tuple/record/compose
     /// elements, and so on.  It does **not** descend through type refinement
     /// predicates or any expression reachable only through [`Type`]; passes
-    /// that need those (e.g. [`crate::ccl::lambda_elim::is_free`]) must visit
+    /// that need those (e.g. [`crate::ccl::ccl_utils::is_free`]) must visit
     /// them explicitly.
     ///
     /// Use this to write structural recursion over the tree without
@@ -1672,7 +1672,7 @@ pub struct MutationLoopShapeMut<'a> {
 /// order and returns the first body whose guard is satisfied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Branch {
-    /// Boolean guard; constrained to [`Type::Base(BaseType::Bool)`] during inference.
+    /// Boolean guard; constrained to [`Type::Base`]`(`[`BaseType::Bool`]`)` during inference.
     pub guard: TypedExpr,
     /// Value expression; evaluated when `guard` is `true`.
     pub body: TypedExpr,
@@ -1740,7 +1740,7 @@ pub enum Type {
     /// The opaque domain type of an externally-registered data source.
     ///
     /// Used as the domain in `Fun(DataSource(name), output_type)` types emitted
-    /// by the source registry.  [`crate::interpreter::compile_ccl::CompileContext`]
+    /// by the source registry.  [`crate::interpreter::operator_conversion::OpConversionContext`]
     /// resolves this to a concrete `Extent::DataSourceDomain(rc)` at compilation time
     /// by looking the name up in its source-domain-extent registry.
     DataSource(String),
@@ -1944,7 +1944,7 @@ impl Type {
 pub struct Refinement {
     /// Unique ID assigned at construction time.
     ///
-    /// Used by [`crate::interpreter::compile_ccl::CompileContext`] as a cache key
+    /// Used by [`crate::interpreter::operator_conversion::OpConversionContext`] as a cache key
     /// so that the same restriction [`crate::interpreter::Extent`] is shared across
     /// all uses of the same refinement.
     pub id: RefinementId,

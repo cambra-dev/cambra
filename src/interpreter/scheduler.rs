@@ -4,7 +4,7 @@ use crate::interpreter::{Consumer, DataSourceDomainExtentImpl};
 
 /// Basic scheduler implementation.
 ///
-/// Tracks [`IterateExtentHandle`]s that generate data from external sources (e.g.
+/// Tracks [`IterateExtent`](crate::interpreter::tile_operators::IterateExtent)s that generate data from external sources (e.g.
 /// data sources) and need to be polled for new data each tick.
 #[derive(Default)]
 pub struct Scheduler {
