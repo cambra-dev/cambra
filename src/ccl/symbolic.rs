@@ -232,19 +232,64 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Atom, format!("({})", items.join(", ")))
         }
 
-        TypedExprNode::Case { branches } => {
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
             let arms: Vec<_> = branches
                 .iter()
-                .map(|Branch { guard, body }| {
-                    format!(
-                        "{} → {}",
-                        fmt(guard, Precedence::Lowest, opts),
-                        fmt(body, Precedence::Lowest, opts)
-                    )
-                })
+                .map(
+                    |Branch {
+                         pattern,
+                         guard,
+                         body,
+                     }| {
+                        // A literal-`true` guard on a pattern branch is the
+                        // "no secondary filter" sentinel; suppress it so a bare
+                        // `case .Tag(x):` doesn't render a spurious `if true`.
+                        let is_true_guard =
+                            matches!(&guard.node, TypedExprNode::Lit(Lit::Bool(true)));
+                        match pattern {
+                            Some(p) => {
+                                let guard_str = if is_true_guard {
+                                    String::new()
+                                } else {
+                                    format!(" if {}", fmt(guard, Precedence::Lowest, opts))
+                                };
+                                format!(
+                                    ".{}({}){} → {}",
+                                    p.tag,
+                                    p.binding.name,
+                                    guard_str,
+                                    fmt(body, Precedence::Lowest, opts)
+                                )
+                            }
+                            None => format!(
+                                "{} → {}",
+                                fmt(guard, Precedence::Lowest, opts),
+                                fmt(body, Precedence::Lowest, opts)
+                            ),
+                        }
+                    },
+                )
                 .collect();
-            (Precedence::Lowest, format!("{{ {} }}", arms.join("; ")))
+            match scrutinee {
+                Some(s) => (
+                    Precedence::Lowest,
+                    format!(
+                        "match {} {{ {} }}",
+                        fmt(s, Precedence::Lowest, opts),
+                        arms.join("; ")
+                    ),
+                ),
+                None => (Precedence::Lowest, format!("{{ {} }}", arms.join("; "))),
+            }
         }
+
+        TypedExprNode::VariantCtor { tag, payload } => (
+            Precedence::Atom,
+            format!(".{tag}({})", fmt(payload, Precedence::Lowest, opts)),
+        ),
 
         TypedExprNode::Loop {
             params,
@@ -662,16 +707,18 @@ in x"
     // Case: single always-true guard
     #[case(
         TypedExpr::new(TypedExprNode::Case {
-            branches: vec![Branch { guard: Expr::lit(Lit::Bool(true)), body: Expr::lit(Lit::Int(0)) }],
+            scrutinee: None,
+            branches: vec![Branch { pattern: None, guard: Expr::lit(Lit::Bool(true)), body: Expr::lit(Lit::Int(0)) }],
         }),
         "{ true → 0 }"
     )]
     // Case: two guards (if/else pattern)
     #[case(
         TypedExpr::new(TypedExprNode::Case {
+            scrutinee: None,
             branches: vec![
-                Branch { guard: Expr::var("x"), body: Expr::lit(Lit::Int(1)) },
-                Branch { guard: Expr::lit(Lit::Bool(true)), body: Expr::lit(Lit::Int(0)) },
+                Branch { pattern: None, guard: Expr::var("x"), body: Expr::lit(Lit::Int(1)) },
+                Branch { pattern: None, guard: Expr::lit(Lit::Bool(true)), body: Expr::lit(Lit::Int(0)) },
             ],
         }),
         "{ x → 1; true → 0 }"

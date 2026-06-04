@@ -17,6 +17,7 @@ use cambra::ccl::{
     Type,
     infer::{InferError, TypeInferenceContext, infer},
     lower::{LoweringContext, lower_stmts},
+    simple_sub::FieldKey,
 };
 use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
@@ -68,6 +69,36 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
 fn infer_program_err(code: &str) -> Vec<InferError> {
     let mut lctx = LoweringContext::default();
     let mut ictx = TypeInferenceContext::new();
+    let stmts = parse_module(code);
+    let mut expr = lower_stmts(&stmts, &mut lctx)
+        .into_result()
+        .expect("lowering failed");
+    infer(&mut expr, &mut ictx).expect_err("expected inference error")
+}
+
+/// Like [`infer_program_with_sources`] but expects inference to fail.
+fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<InferError> {
+    let mut lctx = LoweringContext::default();
+    let mut ictx = TypeInferenceContext::new();
+    for (name, elem_ty) in sources {
+        let output_extent = match elem_ty {
+            Type::Base(bt) => Extent::Base(bt.clone()),
+            _ => panic!("infer_program_with_sources_err: unsupported elem_ty {elem_ty:?}"),
+        };
+        let stub = Rc::new(RefCell::new(TestDataSource::new(
+            name,
+            elem_ty.clone(),
+            output_extent,
+        )));
+        lctx.register_source(*name, stub);
+        ictx.register_source_type(
+            name,
+            Type::Fun(
+                Box::new(Type::DataSource(name.to_string())),
+                Box::new(elem_ty.clone()),
+            ),
+        );
+    }
     let stmts = parse_module(code);
     let mut expr = lower_stmts(&stmts, &mut lctx)
         .into_result()
@@ -284,6 +315,67 @@ fn test_source_list_comp_element_type() {
         ty.codomain(),
         Some(string()),
         "expected codomain String, got {ty}"
+    );
+}
+
+/// `a ++ b` (CollectionUnion) infers its domain as
+/// `Type::Variant({_0: …, _1: …})` (the runtime genuinely
+/// discriminates by operand) and its codomain as the *join* of branch
+/// element types. For homogeneous unions the join collapses to the
+/// common element type so consumers like `Sum` can constrain it
+/// directly; heterogeneous unions surface `IncompatibleBounds` at
+/// coalesce time (see `test_collection_union_heterogeneous_rejected`).
+/// Pretty-printing flattens the synthetic `_N` domain tags so the
+/// surface still reads as a bare union.
+#[test]
+fn test_collection_union_produces_variant_typed_domain() {
+    let ty = infer_program_with_sources(
+        "src1() ++ src2()",
+        &[
+            ("src1", Type::Base(BaseType::Int)),
+            ("src2", Type::Base(BaseType::Int)),
+        ],
+    );
+    let Type::Fun(dom, cod) = &ty else {
+        panic!("expected Fun, got {ty}");
+    };
+    // Domain is a Variant with two anonymous positional (Index) tags.
+    if let Type::Variant(tags) = &**dom {
+        assert_eq!(tags.len(), 2, "expected 2-tag variant domain, got {ty}");
+        assert!(
+            tags.iter().all(|(k, _)| matches!(k, FieldKey::Index(_))),
+            "expected anonymous positional Index tags, got {tags:?}"
+        );
+    } else {
+        panic!("expected Variant domain, got {ty}");
+    }
+    // Codomain is the joined element type — Int, not a Variant.
+    assert_eq!(
+        **cod,
+        Type::Base(BaseType::Int),
+        "expected Int codomain (join of two Int branches), got {ty}"
+    );
+}
+
+/// Heterogeneous CollectionUnion (`Int ++ String`) leaves the codomain
+/// join with two incompatible lower-bound atoms, which
+/// `coalesce_compact` rejects with `IncompatibleBounds`. Pinning this
+/// behavior makes the rule explicit: there is no trait machinery yet
+/// for "summable / joinable across distinct base types", so
+/// heterogeneous unions are not value-typeable.
+#[test]
+fn test_collection_union_heterogeneous_rejected() {
+    let errs = infer_program_with_sources_err(
+        "src1() ++ src2()",
+        &[
+            ("src1", Type::Base(BaseType::Int)),
+            ("src2", Type::Base(BaseType::String)),
+        ],
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, InferError::IncompatibleBounds { .. })),
+        "expected IncompatibleBounds error, got {errs:?}"
     );
 }
 

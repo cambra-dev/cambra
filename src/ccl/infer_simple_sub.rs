@@ -3,7 +3,7 @@
 //! The canonical type inference implementation, invoked via
 //! [`crate::ccl::infer::infer`].
 //!
-//! # Design (Stage 1, monomorphic let)
+//! # Design (monomorphic let)
 //!
 //! Two passes over the expression tree:
 //!
@@ -228,6 +228,11 @@ impl Default for OperatorSchemes {
 /// captured at recording time stays valid through the second pass.
 /// If a future refactor starts replacing nodes mid-inference, this keying
 /// silently breaks.
+///
+/// **Short-term workaround.** Removed by the planned `SimpleType` ↔
+/// `ccl::Type` unification — once inference writes directly into
+/// `expr.ty`, no pointer-keyed side-tables (and so no `NodeId`) are
+/// needed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct NodeId(usize);
 
@@ -248,8 +253,8 @@ type SideTable = HashMap<NodeId, Rc<SimpleType>>;
 /// HM-style unification table.
 struct SimpleSubContext {
     /// Lexical scope: name → SimpleType for in-scope variables and
-    /// let-bound names. Stage 1 stores monotypes; Stage 2's let-poly
-    /// will widen this to `PolyScheme` schemes.
+    /// let-bound names. We currently store monotypes; a future let-poly
+    /// extension will widen this to `PolyScheme` schemes.
     scopes: ScopeStack<Rc<SimpleType>>,
     /// Externally-registered data sources (set by
     /// `TypeInferenceContext::register_source_type`). Stored as
@@ -259,6 +264,10 @@ struct SimpleSubContext {
     cache: ConstrainCache,
     /// Side table: each node's inferred SimpleType, populated as the
     /// emitter walks down and consumed by the coalesce pass.
+    ///
+    /// **Short-term workaround.** Removed when `SimpleType` and
+    /// `ccl::Type` are unified — inference will then write directly
+    /// into `expr.ty` and the pointer-keyed indirection goes away.
     side: SideTable,
     /// Per-Loop accumulator-slot SimpleTypes, in `params` order.
     ///
@@ -266,11 +275,30 @@ struct SimpleSubContext {
     /// via the init / recurrence / body-domain edges; the coalesce pass
     /// reads these out to fill in `Loop::params[i].ty`, which `lambda_elim`
     /// and `check_fully_typed` require be concrete (no `Type::Hole`).
+    ///
+    /// **Short-term workaround.** Removed alongside [`Self::side`] by
+    /// the `SimpleType`/`ccl::Type` unification — `Loop::params[i].ty`
+    /// will then be written in place during emission.
     loop_param_tys: HashMap<NodeId, Vec<Rc<SimpleType>>>,
+    /// Per-pattern-branch payload-binding SimpleTypes, in pattern-branch
+    /// order, for a structural [`TypedExprNode::Case`] (one with a
+    /// scrutinee).
+    ///
+    /// `emit_case` mints one α per pattern branch to type the per-tag
+    /// narrowed payload, constrained against the scrutinee's variant tags;
+    /// the coalesce pass reads these out to fill in each
+    /// `Pattern::binding.ty` (a `TypedBinding` field not reached by the
+    /// side-table walk, which keys on `Expr` pointers). Same pattern as
+    /// `loop_param_tys`.
+    ///
+    /// **Short-term workaround.** Removed alongside [`Self::side`] by
+    /// the `SimpleType`/`ccl::Type` unification — the binding types
+    /// will then be written in place during emission.
+    case_pattern_tys: HashMap<NodeId, Vec<Rc<SimpleType>>>,
     /// Operator/projection scheme registry.
     schemes: OperatorSchemes,
-    /// Current polymorphism level. Stage 1 holds it at 0 (no `let` bumps);
-    /// the field is threaded through so Stage 2's let-poly extension drops
+    /// Current polymorphism level. Currently held at 0 (no `let` bumps);
+    /// the field is threaded through so a future let-poly extension drops
     /// in without restructuring.
     level: Level,
 }
@@ -283,6 +311,7 @@ impl SimpleSubContext {
             cache: ConstrainCache::new(),
             side: HashMap::new(),
             loop_param_tys: HashMap::new(),
+            case_pattern_tys: HashMap::new(),
             schemes: OperatorSchemes::new(),
             level: 0,
         }
@@ -291,8 +320,8 @@ impl SimpleSubContext {
     /// Convert a public `ccl::Type` into a `SimpleType` for use as a
     /// constraint-graph type. Holes and Infer slots become fresh Vars
     /// at the current level (no shared identity across calls — good
-    /// enough for Stage 1 since Builtin Infer-IDs are never depended on
-    /// across nodes inside the simple-sub path).
+    /// enough while everything is monomorphic, since Builtin Infer-IDs
+    /// are never depended on across nodes inside the simple-sub path).
     fn type_to_simple(&self, ty: &Type) -> Rc<SimpleType> {
         match ty {
             Type::Base(b) => prim(b.clone()),
@@ -337,13 +366,18 @@ impl SimpleSubContext {
                 // refinement context.
                 self.type_to_simple(inner)
             }
-            Type::Union(_) => {
-                // Stage 1 rejects unions when emitted; an annotated
-                // union still becomes a fresh var here so the constraint
-                // emitter can continue past it (the unsupported error is
-                // surfaced at coalesce time if the variable doesn't get
-                // pinned to a single concrete type).
-                fresh_var(self.level)
+            Type::Variant(tags) => {
+                // Tagged sum: lift directly into the lattice — the
+                // structural rule (`SimpleType::Variant`'s constrain_subtype
+                // arm) handles polarity-correct flow at both positive and
+                // negative positions. This subsumes the old untagged
+                // `Type::Union`: a positional sum is just a `Variant` whose
+                // tags are all `FieldKey::Index`.
+                let mut m = BTreeMap::new();
+                for (k, t) in tags {
+                    m.insert(k.clone(), self.type_to_simple(t));
+                }
+                Rc::new(SimpleType::Variant(m))
             }
             Type::Hole | Type::Infer(_) => fresh_var(self.level),
         }
@@ -417,6 +451,11 @@ fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferError {
             type_a: simple_to_type(&in_type),
             type_b: Type::Hole,
         },
+        ConstrainError::ExtraTag { tag, in_type } => InferError::TypeMismatch {
+            ctx: format!("{ctx_label} (variant tag .{tag} not accepted)"),
+            type_a: simple_to_type(&in_type),
+            type_b: Type::Hole,
+        },
     }
 }
 
@@ -439,7 +478,7 @@ fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferError {
             at: ctx_label.to_string(),
         },
         CoalesceError::RecursiveType { details } => InferError::Unsupported(format!(
-            "recursive type at {}: {} (Stage 1 forbids residual μ-types)",
+            "recursive type at {}: {} (residual μ-types are forbidden)",
             ctx_label, details
         )),
     }
@@ -565,7 +604,12 @@ fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<Rc<SimpleTyp
 
         TypedExprNode::List(elts) => emit_list(elts, ctx)?,
 
-        TypedExprNode::Case { branches } => emit_case(branches, &label, ctx)?,
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => emit_case(id, scrutinee.as_deref_mut(), branches, &label, ctx)?,
+
+        TypedExprNode::VariantCtor { tag, payload } => emit_variant_ctor(tag, payload, ctx)?,
 
         TypedExprNode::Source(name) => match ctx.sources.get(name) {
             Some(t) => Rc::clone(t),
@@ -663,10 +707,10 @@ fn emit_lambda(
     //
     // TODO (SOUNDNESS): two-way equality is unsound for annotations
     // containing union types (positive) or intersection types (negative) —
-    // those should use one-way subtype constrain_subtype only. Stage 1 avoids this
-    // because type_to_simple converts Union → fresh_var, so union
+    // those should use one-way subtype constrain_subtype only. We avoid this
+    // today because type_to_simple converts Union → fresh_var, so union
     // annotations are unconstrained and equality degrades to trivially
-    // satisfiable subtyping. Replace in Stage 2.
+    // satisfiable subtyping. Replace once let-polymorphism lands.
     if let Some(ann) = param.user_annotation.clone() {
         let ann_simple = ctx.type_to_simple(&ann);
         let inferred_ty = simple_to_type(&param_simple);
@@ -718,13 +762,13 @@ fn emit_apply(
     // projection's domain with the argument's Infer var.
     //
     // TODO (SOUNDNESS): monomorphizing hack. Collapses polymorphism at
-    // apply sites the same way HM does. Stage 2 prep replaces this with
-    // `Type::ForAll` + a monomorphization pass between `infer` and
-    // `inline` (see
-    // `docs/brainstorm/2026-05-06_simple_sub_prototype_status.md` §3.1
-    // "Deferred to Stage 2 prep"). Remove this line and the polarity
-    // fallback in `simple_sub.rs::compact_go` together once the
-    // monomorphization pass lands.
+    // apply sites the same way HM does. The let-polymorphism work replaces
+    // this with `Type::ForAll` + a monomorphization pass between `infer`
+    // and `inline` (see
+    // `docs/brainstorm/2026-05-06_simple_sub_prototype_status.md` §3.1).
+    // Remove this line and the polarity fallback in
+    // `simple_sub.rs::compact_go` together once the monomorphization pass
+    // lands.
     constrain_subtype(&fn_ty, &expected, &mut ctx.cache)
         .map_err(|e| map_constrain_err(e, "Apply"))?;
     constrain_subtype(&expected, &fn_ty, &mut ctx.cache)
@@ -752,31 +796,48 @@ fn emit_collection_union(
     exprs: &mut [Expr],
     ctx: &mut SimpleSubContext,
 ) -> Result<Rc<SimpleType>, InferError> {
-    // CollectionUnion: structural, can't be a scheme. Compute domain
-    // union and dedup-union of codomains directly. For Stage 1 we
-    // approximate with fresh vars; full expressivity returns once
-    // Stage 2's variants land.
-
-    // Result domain: a fresh var that's a supertype of both — can't
-    // express union directly (Stage 2 work), so we leave it open.
-    let result_dom = fresh_var(ctx.level);
-
-    // Result codomain: similarly open. Today's dedup logic doesn't
-    // map cleanly without unions; leave it for Stage 2.
-    let result_cod = fresh_var(ctx.level);
-
-    for e in exprs.iter_mut() {
+    // CollectionUnion: the result is a collection (a function from index
+    // to element) whose *domain* is tagged and whose *codomain* is the
+    // join of branch codomains.
+    //
+    // The domain is a `Variant({_0: …, _1: …, …})` because the union
+    // genuinely discriminates at runtime — `UnionOperator`
+    // (`src/interpreter/operator_conversion.rs`) must know which operand
+    // to dispatch to. Surface `a ++ b ++ c` flattens to a single N-ary
+    // node at construction (see `TypedExpr::collection_union`), so we
+    // emit one flat N-tag variant rather than the nested binary variants
+    // of the pre-flattening design.
+    //
+    // The codomain is a single fresh var with every branch codomain as a
+    // lower bound (a join), not a Variant. Once the union has dispatched
+    // on the input tag, the runtime presents one combined output stream
+    // regardless of which branch produced an element, so the codomain
+    // carries no useful tag information. Encoding it as a join lets
+    // `coalesce_compact` dedupe matching atoms (homogeneous unions like
+    // `[1] ++ [2]` collapse to the common element type — consumers like
+    // `Sum` then constrain the join `<: Int` directly) and surface
+    // `IncompatibleBounds` on genuinely heterogeneous branches (the right
+    // answer until traits / proper union elimination land).
+    //
+    // The domain tags are anonymous `FieldKey::Index` positions (the
+    // dual of a tuple): operand `i` contributes tag `Index(i)`. These are
+    // distinct from source-level `FieldKey::Name` tags, so a user variant
+    // can never collide with a collection-union tag, and `Type::Display`
+    // flattens all-`Index` variants back to a bare `A | B | C`.
+    let cod_var = fresh_var(ctx.level);
+    let mut tags = BTreeMap::new();
+    for (i, e) in exprs.iter_mut().enumerate() {
         let ty = emit_node(e, ctx)?;
         let dom = fresh_var(ctx.level);
         let cod = fresh_var(ctx.level);
         constrain_subtype(&ty, &fun(Rc::clone(&dom), Rc::clone(&cod)), &mut ctx.cache)
             .map_err(|e| map_constrain_err(e, "CollectionUnion element"))?;
-        constrain_subtype(&dom, &result_dom, &mut ctx.cache)
-            .map_err(|e| map_constrain_err(e, "CollectionUnion domain"))?;
-        constrain_subtype(&cod, &result_cod, &mut ctx.cache)
+        constrain_subtype(&cod, &cod_var, &mut ctx.cache)
             .map_err(|e| map_constrain_err(e, "CollectionUnion codomain"))?;
+        tags.insert(FieldKey::Index(i), dom);
     }
-    Ok(fun(result_dom, result_cod))
+    let dom_variant = Rc::new(SimpleType::Variant(tags));
+    Ok(fun(dom_variant, cod_var))
 }
 
 fn emit_aggregate(
@@ -817,8 +878,8 @@ fn emit_let(
             }
         })?;
     }
-    // Stage 1 monomorphic let: bind name to bound_ty as-is. Stage 2
-    // will instead generalize bound_ty into a PolyScheme here.
+    // Monomorphic let: bind name to bound_ty as-is. A future let-poly
+    // extension will instead generalize bound_ty into a PolyScheme here.
     ctx.scopes.push_scope();
     ctx.scopes.bind(&binding.name, Rc::clone(&bound_ty));
     let body_ty = emit_node(body, ctx);
@@ -867,7 +928,19 @@ fn emit_list(elts: &mut [Expr], ctx: &mut SimpleSubContext) -> Result<Rc<SimpleT
     Ok(fun(Rc::new(SimpleType::UIntRange(n)), first_ty))
 }
 
+/// Emit constraints for a [`TypedExprNode::Case`] — the unified
+/// logical/structural dispatch node.
+///
+/// When `scrutinee` is present, the branch patterns' tags form the expected
+/// scrutinee `Variant({tag: αᵢ})`; width-subtyping enforces "scrutinee's
+/// tags ⊆ branch tags", and each αᵢ (the per-tag narrowed payload) is bound
+/// for its branch and stashed in `case_pattern_tys` so coalesce can fill the
+/// pattern binding's `.ty`. Every branch's guard is constrained to `Bool`
+/// (a pattern-only branch carries the literal-`true` guard), and all branch
+/// bodies are mutually constrained to a single result type.
 fn emit_case(
+    id: NodeId,
+    scrutinee: Option<&mut Expr>,
     branches: &mut [Branch],
     label: &str,
     ctx: &mut SimpleSubContext,
@@ -877,26 +950,78 @@ fn emit_case(
             at: label.to_string(),
         });
     }
+
+    // Structural dispatch: constrain the scrutinee to the Variant of the
+    // branch pattern tags, minting one payload var αᵢ per pattern branch.
+    let mut payload_vars: Vec<Rc<SimpleType>> = Vec::new();
+    if let Some(scrut) = scrutinee {
+        let scrut_ty = emit_node(scrut, ctx)?;
+        let mut expected_tags: BTreeMap<FieldKey, Rc<SimpleType>> = BTreeMap::new();
+        for b in branches.iter() {
+            if let Some(p) = &b.pattern {
+                let alpha = fresh_var(ctx.level);
+                payload_vars.push(Rc::clone(&alpha));
+                expected_tags.insert(FieldKey::Name(SmolStr::from(p.tag.as_str())), alpha);
+            }
+        }
+        let expected = Rc::new(SimpleType::Variant(expected_tags));
+        constrain_subtype(&scrut_ty, &expected, &mut ctx.cache)
+            .map_err(|e| map_constrain_err(e, "Case scrutinee"))?;
+        // Stash payload vars (in pattern-branch order) so the coalesce pass
+        // can fill in each `Pattern::binding.ty` — the bindings live on
+        // `Branch`, not on an `Expr`, so the side-table walk never reaches
+        // them. Same pattern as `loop_param_tys`.
+        ctx.case_pattern_tys.insert(id, payload_vars.clone());
+    }
+
     let mut result_ty: Option<Rc<SimpleType>> = None;
-    for Branch { guard, body } in branches.iter_mut() {
-        let guard_ty = emit_node(guard, ctx)?;
-        let bool_ty = prim(BaseType::Bool);
-        constrain_subtype(&guard_ty, &bool_ty, &mut ctx.cache)
-            .map_err(|e| map_constrain_err(e, "Case guard"))?;
-        constrain_subtype(&bool_ty, &guard_ty, &mut ctx.cache)
-            .map_err(|e| map_constrain_err(e, "Case guard"))?;
-        let arm_ty = emit_node(body, ctx)?;
+    let mut pattern_idx = 0;
+    for b in branches.iter_mut() {
+        // A pattern binds its payload over the branch's guard and body.
+        let pushed = b.pattern.is_some();
+        if let Some(p) = &b.pattern {
+            ctx.scopes.push_scope();
+            ctx.scopes
+                .bind(&p.binding.name, Rc::clone(&payload_vars[pattern_idx]));
+            pattern_idx += 1;
+        }
+        // Capture the body-emission result so we always pop the scope on
+        // both the happy and error paths. Early-`?` would leak the scope.
+        let branch_result: Result<Rc<SimpleType>, InferError> = (|| {
+            let guard_ty = emit_node(&mut b.guard, ctx)?;
+            let bool_ty = prim(BaseType::Bool);
+            constrain_subtype(&guard_ty, &bool_ty, &mut ctx.cache)
+                .map_err(|e| map_constrain_err(e, "Case guard"))?;
+            constrain_subtype(&bool_ty, &guard_ty, &mut ctx.cache)
+                .map_err(|e| map_constrain_err(e, "Case guard"))?;
+            emit_node(&mut b.body, ctx)
+        })();
+        if pushed {
+            ctx.scopes.pop_scope();
+        }
+        let body_ty = branch_result?;
         match &result_ty {
-            None => result_ty = Some(arm_ty),
+            None => result_ty = Some(body_ty),
             Some(prev) => {
-                constrain_subtype(&arm_ty, prev, &mut ctx.cache)
+                constrain_subtype(&body_ty, prev, &mut ctx.cache)
                     .map_err(|e| map_constrain_err(e, "Case arm"))?;
-                constrain_subtype(prev, &arm_ty, &mut ctx.cache)
+                constrain_subtype(prev, &body_ty, &mut ctx.cache)
                     .map_err(|e| map_constrain_err(e, "Case arm"))?;
             }
         }
     }
     Ok(result_ty.expect("non-empty branches"))
+}
+
+fn emit_variant_ctor(
+    tag: &str,
+    payload: &mut Expr,
+    ctx: &mut SimpleSubContext,
+) -> Result<Rc<SimpleType>, InferError> {
+    let payload_ty = emit_node(payload, ctx)?;
+    let mut tags = BTreeMap::new();
+    tags.insert(FieldKey::Name(SmolStr::from(tag)), payload_ty);
+    Ok(Rc::new(SimpleType::Variant(tags)))
 }
 
 fn emit_compose(
@@ -1163,11 +1288,40 @@ fn coalesce_node(expr: &mut Expr, ctx: &SimpleSubContext, errors: &mut Vec<Infer
                 coalesce_node(e, ctx, errors);
             }
         }
-        TypedExprNode::Case { branches } => {
-            for Branch { guard, body } in branches.iter_mut() {
-                coalesce_node(guard, ctx, errors);
-                coalesce_node(body, ctx, errors);
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            if let Some(s) = scrutinee {
+                coalesce_node(s, ctx, errors);
             }
+            for b in branches.iter_mut() {
+                coalesce_node(&mut b.guard, ctx, errors);
+                coalesce_node(&mut b.body, ctx, errors);
+            }
+            // Materialize per-pattern-branch payload-binding types.
+            // `emit_case` stored one α per pattern branch (in order) in
+            // `case_pattern_tys`; coalesce each through the same pipeline
+            // used for `expr.ty` slots so `Pattern::binding.ty` is concrete
+            // (mirrors the Loop arm below). `type_saturate` then has a real
+            // type to bind when it pushes the branch scope.
+            if let Some(alphas) = ctx.case_pattern_tys.get(&id).cloned() {
+                let mut alphas = alphas.into_iter();
+                for b in branches.iter_mut() {
+                    let Some(p) = &mut b.pattern else { continue };
+                    let Some(alpha) = alphas.next() else { break };
+                    match coalesce_compact(&simplify_type(compact_type(&alpha))) {
+                        Ok(ty) => p.binding.ty = ty,
+                        Err(err) => {
+                            let label = format!("Case pattern `.{}` payload", p.tag);
+                            push_coalesce_err(errors, map_coalesce_err(err, &label), label);
+                        }
+                    }
+                }
+            }
+        }
+        TypedExprNode::VariantCtor { payload, .. } => {
+            coalesce_node(payload, ctx, errors);
         }
         TypedExprNode::ExprStmt { expr: e, body } => {
             coalesce_node(e, ctx, errors);
@@ -1241,7 +1395,7 @@ fn coalesce_node(expr: &mut Expr, ctx: &SimpleSubContext, errors: &mut Vec<Infer
         }
     } else {
         // Not recorded in side table — usually means we never visited
-        // this node (e.g. inside a Join/Jump body that Stage 1 doesn't
+        // this node (e.g. inside a Join/Jump body that the solver doesn't
         // structurally walk). Leave expr.ty alone.
     }
 }

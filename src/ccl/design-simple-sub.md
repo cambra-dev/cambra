@@ -62,7 +62,7 @@ Throughout this doc, **larger level numbers correspond to more deeply nested sco
 * **Schemes (`PolyScheme`):** A `PolyScheme` records a **cutoff level** equal to the depth of the scope that defined the binding. Variables whose level is numerically *greater* than the cutoff — i.e. minted inside the let body, deeper than the defining scope — are the quantified ones; they get freshened at each use site.[^2] For example, inferring `def id(x): return x` yields a body `α → α` with `α` at level 1; instantiating at level 0 mints a fresh `β`, yielding `β → β`.
 * **Extrude:** A **level mismatch** occurs during `constrain(Var v, rhs)` (or the mirror case) when the other side contains a type variable whose level is numerically higher than `v`'s. The fast path that simply appends to `v`'s bounds is gated on `other.level ≤ v.level`, because recording an inner-scope (higher-level) variable directly as a bound of an outer-scope (lower-level) variable would let the inner variable escape its scope — unsound under let-polymorphism. **Extrude** is the recovery path: it walks the offending type and replaces each too-high variable with a fresh proxy at `v`'s level, linked back to the original through the polarity-appropriate bound so subtyping information still flows. The result is a level-clean copy safe to record as a bound of `v`.
 
-In Stage 1 every variable is minted at level 0, so no level mismatch ever arises and extrude is a no-op (see §3.1).
+In the current prototype every variable is minted at level 0, so no level mismatch ever arises and extrude is a no-op (see §3.1).
 
 ### Coalescing: From Bounds to Types
 
@@ -92,7 +92,7 @@ def get_status(is_ready):
 * **Coalesce:** `α` occupies the return slot — a *positive* position — so its lower bounds materialize as a union.
 * **Logical result type:** `Bool → (Int | String)`.
 
-*Stage-1 status:* Cambra's current prototype raises an `IncompatibleBounds` error here rather than emitting the union (see [§4](#4-information-flow-and-type-mapping) and question Q3 in the review). Beyond not being implemented, a positive-position union is also not yet *consumable* under Stage 1's feature set: with no tagged variants there is no syntactic discriminator to case-split on, and with no let-polymorphism there is no way to thread the value through a polymorphic function to delay resolution. The principal type is real but has no productive consumer until Stage 2 (tagged variants) or polymorphism lands — so rejecting it is a coherent choice, not merely a missing feature.
+*Current status:* Cambra's prototype raises an `IncompatibleBounds` error here rather than emitting the union (see [§4](#4-information-flow-and-type-mapping) and question Q3 in the review). A positive-position *untagged* union is also not productively *consumable*: an untagged sum has no syntactic discriminator to case-split on (a *tagged* `Variant` does — see §4), and without let-polymorphism there is no way to thread the value through a polymorphic function to delay resolution. The principal type is real but has no productive consumer for an untagged primitive collision — so rejecting it is a coherent choice, not merely a missing feature.
 
 **2. Upper bounds become intersections (inputs / negative polarity)**
 
@@ -118,17 +118,21 @@ def identity(x):
 * **Inference:** The parameter `x` is a fresh variable `α`; since the body just returns `x`, the type is `α → α`.
 * **Bounds:** `x` is never passed to another function (no upper bounds) and never assigned a concrete value (no lower bounds): `α.lower = []`, `α.upper = []`.
 * **Coalesce:** `α` has no concrete atoms. In pure simple-sub this is fine — it is the principal, universally quantified type `∀α. α → α`.
-* **The Cambra gap:** Cambra's public `ccl::Type` AST currently lacks a `Type::ForAll`. If `identity` is never applied to a concrete value, `α` coalesces to a bare `Type::Infer` slot. To work around this at call sites in Stage 1, Cambra uses a "bidirectional apply" hack that forces the function's domain to equal the caller's argument, monomorphizing the type (see §2, Pass 1).
+* **The Cambra gap:** Cambra's public `ccl::Type` AST currently lacks a `Type::ForAll`. If `identity` is never applied to a concrete value, `α` coalesces to a bare `Type::Infer` slot. To work around this at call sites, the current prototype uses a "bidirectional apply" hack that forces the function's domain to equal the caller's argument, monomorphizing the type (see §2, Pass 1).
 
 ### Roadmap and Current Prototype Status
 
-The implementation is planned across several distinct stages:
+**Implemented today:**
 
-* **Stage 1: Parity (current prototype).** Feature parity with the legacy HM solver, keeping `let` bindings strictly monomorphic (every variable is at level 0, making extrude a no-op).
-* **Stage 2: Tagged Variants.** Introduces tagged variants—the dual of records—to natively support sum types and pattern-match exhaustiveness inside the structural solver. This stage also introduces a `Type::ForAll` and a monomorphization pass.
-* **Stage 3: SMT-Backed Refinements.** Augments our sidecar refinements with logical payloads (e.g. `v > 0`) verified by an external SMT solver such as Z3.
+* **Parity with the legacy HM solver.** `let` bindings are kept strictly monomorphic — every variable is at level 0, making extrude a no-op.
+* **Tagged variants.** The dual of records, natively supporting sum types and pattern-match exhaustiveness inside the structural solver (see §4). Both named (`.Tag(...)`) and positional (`++`-style) sums are handled.
 
-*(There are parallel workstreams planned, such as a separate nominal-type/trait-resolution pass, but the core lattice capabilities revolve around these three stages.)*
+**Not yet implemented:**
+
+* **Let-polymorphism.** Introducing a `Type::ForAll` and a monomorphization pass, which together retire the bidirectional-apply hack and the opposite-polarity fallback described below.
+* **SMT-backed refinements.** Augmenting the sidecar refinements with logical payloads (e.g. `v > 0`) verified by an external SMT solver such as Z3.
+
+*(There are parallel workstreams planned, such as a separate nominal-type/trait-resolution pass, but the core lattice capabilities revolve around these features.)*
 
 ---
 
@@ -180,7 +184,7 @@ constrain(lhs, rhs):
         # (level-mismatch arms extrude the offending side and retry; see §1)
 ```
 
-**The bidirectional-apply hack.** The `Apply` rule above shows only the textbook constraint, `constrain(fn_ty, Fun(arg_ty, result))`. The Stage-1 implementation additionally emits the *reverse* constraint, `constrain(Fun(arg_ty, result), fn_ty)`. This is a temporary monomorphizing workaround for the missing `Type::ForAll` (§1, example 3): constraining both directions forces the function's domain and the argument to share strict equality, collapsing polymorphism at apply sites the way standard HM does. It is not part of the core algorithm and will be removed once Stage 2 introduces a real monomorphization pass.
+**The bidirectional-apply hack.** The `Apply` rule above shows only the textbook constraint, `constrain(fn_ty, Fun(arg_ty, result))`. The current implementation additionally emits the *reverse* constraint, `constrain(Fun(arg_ty, result), fn_ty)`. This is a temporary monomorphizing workaround for the missing `Type::ForAll` (§1, example 3): constraining both directions forces the function's domain and the argument to share strict equality, collapsing polymorphism at apply sites the way standard HM does. It is not part of the core algorithm and will be removed once a real monomorphization pass lands alongside let-polymorphism.
 
 ### Pass 2: Coalesce and Write-back
 
@@ -189,26 +193,26 @@ The algorithm walks the AST a second time. For each node it looks up the inferre
 The three steps take a `SimpleType` (a graph whose variables carry mutable lower/upper bound lists) and turn it into a flat, per-polarity-position representation that a single concrete type can be read off of:
 
 1. **`compact_type`:** Walks the `SimpleType`, transitively following each variable's bounds at the polarity of its occurrence, and collects everything reachable at a given polarity-position into one flat `CompactType` (the bundle is a `CompactGraph`: the top-level `CompactType` plus a side-table of any recursive-variable definitions). "Compacting" means gathering the scattered bounds that reach a position into a single bag of contributions (variables, atoms, a record shape, a function shape). When two record shapes meet at a position, they merge by polarity: at a **positive** position their fields are *intersected* (a value that is reliably both `{a, b}` and `{a, c}` is only reliably `{a}`); at a **negative** position their fields are *unioned*.
-   * *Implementation hack — opposite-polarity fallback:* if walking a variable's polarity-correct bounds yields no concrete structure, the algorithm falls back to the opposite polarity's bounds. This works around the missing `Type::ForAll`: it is sound in Stage 1 (everything is monomorphic, so a variable's type is the same at both ends) but breaks let-polymorphism, and will be removed in Stage 2 alongside the monomorphization pass.
+   * *Implementation hack — opposite-polarity fallback:* if walking a variable's polarity-correct bounds yields no concrete structure, the algorithm falls back to the opposite polarity's bounds. This works around the missing `Type::ForAll`: it is sound while everything is monomorphic (a variable's type is the same at both ends) but breaks let-polymorphism, and will be removed alongside a future monomorphization pass.
 2. **`simplify_type`:** Runs polar co-occurrence analysis to keep types from growing exponentially. "Dropping" a variable here means removing it from the contribution bags at its occurrences; the position keeps whatever concrete structure remains, and a position left with no contributions coalesces to `Type::Infer`. Three rules:
    * *Polar-only elimination:* a variable whose every occurrence is at a single polarity carries no information (nothing constrains it from the other side), so it is dropped. A purely-negative variable means the function accepts anything there; a purely-positive one means the caller imposes nothing on it.
    * *Co-occurrence merging:* if variable `v` and variable `w` always occur together at a given polarity (and symmetrically), they carry identical information, so `w` is merged into `v`.
    * *Atomic absorption:* if a concrete atom `A` co-occurs with variable `v` at *both* polarities, `v` is sandwiched between two identical `A` constraints and is redundant, so it is dropped.
-   * The pass is cosmetic in Stage 1 (everything is monomorphic) and becomes load-bearing in Stage 2, where let-polymorphism introduces genuine polar asymmetry.
+   * The pass is currently cosmetic (everything is monomorphic) and becomes load-bearing once let-polymorphism introduces genuine polar asymmetry.
 3. **`coalesce_compact`:** Materializes the simplified `CompactGraph` into the final `ccl::Type` by counting the concrete structural contributions (e.g. `Int`, a record, a variant) remaining at each position. Variable contributions never appear in the output — their bounds have already been expanded into the structural bags by `compact_type`.
    * *Zero shapes:* emit a fresh `Type::Infer` placeholder.
    * *Exactly one shape:* emit it as the `ccl::Type`. Records with dense indices become `Type::Tuple`; sparse indices become `Type::PartialTuple`; variant maps preserve their tags and become `Type::Variant`.
-   * *Multiple shapes:* if several distinct types survive (e.g. `Int` and `String`), throw an `IncompatibleBounds` error, because Stage 1 intentionally declines to resolve them into a `Type::Union`.
+   * *Multiple shapes:* if several distinct concrete types survive (e.g. `Int` and `String`) with no tag to discriminate them, throw an `IncompatibleBounds` error — the solver won't invent an anonymous sum from a primitive collision. (A genuinely *tagged* `Variant` is one shape, not a collision.)
 
 ### Pass 3: The Saturate Pass (Departure from Upstream)
 
 Simple-sub requires the lattice to be "blind" to types that do not behave purely structurally. To handle Cambra's needs we add a third pass (`type_saturate.rs`).
 
-**Why it's needed.** A later stage will propagate refinements through the lattice in a semi-opaque manner. Until then, putting `Refinement` or `Type::Union` types directly into the `SimpleType` lattice would make the simplifier incorrect: two structurally identical variables carrying different logical refinements (e.g. `x > 0` vs `x < 10`) would be wrongly merged by co-occurrence analysis.
+**Why it's needed.** A later stage will propagate refinements through the lattice in a semi-opaque manner. Until then, putting `Refinement` types directly into the `SimpleType` lattice would make the simplifier incorrect: two structurally identical variables carrying different logical refinements (e.g. `x > 0` vs `x < 10`) would be wrongly merged by co-occurrence analysis. (Tagged variants, by contrast, *are* structural and live in the lattice directly — see §4.)
 
 **How it works.** The `saturate` pass walks the fully coalesced AST with a lexical scope environment, patching up the blind spots the solver left:
 
-* **Lexical Scoping:** `Var` nodes overwrite their generic inferred types with the types attached to their environment bindings after saturation. The scope is populated by enclosing `Lambda`, `Let`, and `MatchArm` binders; for `MatchArm` the per-arm payload type comes from `binding.ty`, which Pass 2 already materialized.
+* **Lexical Scoping:** `Var` nodes overwrite their generic inferred types with the types attached to their environment bindings after saturation. The scope is populated by enclosing `Lambda`, `Let`, and `Case` pattern binders; for a `Case` pattern the per-branch payload type comes from `Pattern::binding.ty`, which Pass 2 already materialized.
 * **Refinement Stitching:** collects how a lambda parameter is used in the body, extracts any predicate refinements from those usages, and wraps them around the lambda's finalized domain type.
 * **Let Binding Resolution:** splices the bound expression's resolved type into both the binding slot and the `Let`'s own `expr.ty`.
 
@@ -224,19 +228,36 @@ Because simple-sub drops HM's union-find equality engine, it behaves in ways tha
 
 Vanilla simple-sub makes a `let`-bound function polymorphic by **freshening**: every time a generalized binding is used, the solver copies its type graph, minting fresh variables for that use site. This is ordinary let-generalization/instantiation — the same idea as HM's `∀`-quantification — applied to the bound graph rather than to a syntactic type scheme.
 
-**How Cambra forces monomorphization in Stage 1.** The Stage-1 prototype does not yet support let-polymorphism. To keep `let` strictly monomorphic it bypasses freshening entirely: every variable is minted at `level = 0` and the level is never incremented. Because all variables share level 0, they are linked by reference into one global constraint graph, so every use site shares a single set of bounds.
+**How Cambra forces monomorphization.** The current prototype does not yet support let-polymorphism. To keep `let` strictly monomorphic it bypasses freshening entirely: every variable is minted at `level = 0` and the level is never incremented. Because all variables share level 0, they are linked by reference into one global constraint graph, so every use site shares a single set of bounds.
 
 ---
 
 ## 4. Information Flow and Type Mapping
 
-Cambra needs features that algebraic subtyping intentionally drops (explicit refinements, flow-typed untagged unions), so information must be carefully mapped in and out of the solver during the passes above.
+Cambra needs features that algebraic subtyping intentionally drops (explicit refinements), so information must be carefully mapped in and out of the solver during the passes above.
 
-Three similar-sounding terms are kept distinct throughout:
+#### The unified tagged sum
 
-* ***union of lower bounds*** — the lattice operation performed at coalesce time (§1, §2). This is an internal solver operation, not an AST node.
-* **`Type::Union`** — the user-facing AST variant. It is type-checkable as an annotation target but is **not produced by Stage 1 inference**; it appears only when a user writes one.
-* **`Type::Variant`** — Stage 2 tagged sums (the dual of records). These are never called "unions."
+Cambra has **one** sum representation, the **tagged variant**, used at both layers:
+
+* **`SimpleType::Variant(BTreeMap<FieldKey, _>)`** in the solver, and
+* **`Type::Variant(Vec<(FieldKey, Type)>)`** in the public AST.
+
+Tags are [`FieldKey`]s — the same key type as records/tuples — so a sum can be **named** (`FieldKey::Name`, a source-level `.Tag(...)`) or **anonymous/positional** (`FieldKey::Index`, the dual of a tuple). The formerly-separate untagged `Type::Union` is gone: a positional union `A | B` is simply `Variant([(Index 0, A), (Index 1, B)])`, and the surface `++`/CollectionUnion produces exactly that (see §2's `emit_collection_union`). One constructor, one coalesce path, one width-subtyping rule (the dual of records: a subtype has *fewer* tags).
+
+Two senses of "union" remain distinct:
+
+* ***union of lower bounds*** — the lattice operation at coalesce time (§1, §2); an internal solver operation, not an AST node.
+* a **positional `Variant`** — the all-`Index` tagged sum that materializes a `++` collection-union or a user `A | B` annotation.
+
+Inference does not *infer* a multi-atom sum from a primitive collision (it raises `IncompatibleBounds`); positional variants enter only via `++` or a user annotation.
+
+#### Tagged-variant expressions
+
+* **`VariantCtor { tag, payload }`** constructs a singleton `Variant({tag: payload})`; width-subtyping flows it into any consumer expecting a superset of tags.
+* **`Case`** is the single dispatch node for both logical (`if`/guard) and structural (variant-tag) matching — see §2's `emit_case`. A structural `Case` carries a scrutinee and branches with `Pattern`s; width-subtyping enforces tag coverage and binds each payload at its per-tag narrowed type.
+
+(`VariantCtor`/structural `Case` have no surface syntax yet, so lowering never emits them; they are exercised by direct AST construction in the variant tests.)
 
 ### Flowing In: `ccl::Type` → `SimpleType`
 
@@ -246,17 +267,16 @@ During Pass 1, `type_to_simple` lowers public types into the lattice:
 * **Tuples and Records:** both map to a uniform `SimpleType::Record` keyed by `FieldKey` (`Index(usize)` for tuples, `Name(SmolStr)` for records). Width-subtyping applies uniformly.
 * **Partial/Open Records:** enter as ordinary `Record`s containing only the known keys.
 * **Refinements:** are **stripped entirely** from the `SimpleType` and preserved on the AST node as a sidecar, so they don't interfere with the solver's co-occurrence simplification.
-* **Untagged `Type::Union`:** converted into fresh variables, deferring resolution to coalesce. Not produced by Stage 1 inference; only appears if user-annotated.
-* **`Type::Variant`:** lifted directly into the lattice as `SimpleType::Variant`. Variants are admissible at both polarities (the dual of `Record`), so unlike untagged unions they don't need the fresh-var indirection. (Stage 2.)
+* **`Type::Variant`:** lifted directly into the lattice as `SimpleType::Variant`, tags preserved. Variants are admissible at both polarities (the dual of `Record`), so they need no fresh-var indirection — this holds for both named and positional (`++`-style) sums.
 
 ### Flowing Out: `SimpleType` → `ccl::Type`
 
 Once constraints are resolved (Pass 2), `coalesce_compact` rebuilds the public types:
 
 * **Records:** dense `Index` keys become `Type::Tuple`; sparse `Index` keys become `Type::PartialTuple`; `Name` keys become `Type::Record` or `Type::PartialRecord`.
-* **Variants:** materialize into `Type::Variant(Vec<(Tag, Type)>)` with tags in `BTreeMap` order. A variant payload sits at a record-field-like position, so it inherits that position's polarity and coalesces by the same rule as a record field value. (Stage 2.)
-* **Incompatible bounds:** if a variable accumulates multiple distinct concrete primitives (e.g. `Int` and `String`), Stage 1 emits an `IncompatibleBounds` error rather than a `Type::Union`. Tagged variants are unaffected — `[Int | String]` is a single `Variant` value, not a primitive collision.
-* **Recursive types:** simple-sub has no occurs check, so a self-application like `λx. x x` types successfully as an infinite recursive type. Because that is almost always a mistake in Cambra, residual cyclic types are explicitly rejected at coalesce time with a `RecursiveType` error in Stage 1.
+* **Variants:** materialize into `Type::Variant(Vec<(FieldKey, Type)>)` with tags in `BTreeMap` order. A variant payload sits at a record-field-like position, so it inherits that position's polarity and coalesces by the same rule as a record field value. An all-`Index` variant pretty-prints as a bare `A | B | C`.
+* **Incompatible bounds:** if a variable accumulates multiple distinct concrete primitives (e.g. `Int` and `String`) with no tag to discriminate them, the solver emits an `IncompatibleBounds` error. A *tagged* sum is unaffected — `[.0: Int | .1: String]` is a single `Variant`, not a primitive collision.
+* **Recursive types:** simple-sub has no occurs check, so a self-application like `λx. x x` types successfully as an infinite recursive type. Because that is almost always a mistake in Cambra, residual cyclic types are explicitly rejected at coalesce time with a `RecursiveType` error.
 
 ---
 
@@ -278,7 +298,9 @@ Consult these definitions as needed; each term is introduced in context in §1�
 | **CompactType** | Simple-Sub | A flat, per-position bag of contributions (variables, atoms, an optional record shape, an optional function shape) produced for simplification and co-occurrence analysis. |
 | **`CompactGraph`** | Simple-Sub | A top-level `CompactType` plus a side-table of recursive-variable definitions; the intermediate produced by `compact_type` and consumed by `simplify_type` / `coalesce_compact`. |
 | **Coalesce** | Simple-Sub | Materializing a `CompactGraph` back into an immutable `ccl::Type`: positive occurrences become a union of lower bounds, negative occurrences an intersection of upper bounds. |
-| **`ccl::Type`** | Cambra-Specific | The public, immutable, user-facing AST type. Contains variants absent from the solver, such as `Refinement`, `Union`, `PartialTuple`, and `Hole`. |
+| **`FieldKey`** | Simple-Sub | The shared key for record/tuple fields *and* variant tags: `Index(usize)` for positional (anonymous) keys, `Name(SmolStr)` for named ones. |
+| **`Variant` (tagged sum)** | Both | The single sum representation: `SimpleType::Variant` / `Type::Variant`, keyed by [`FieldKey`]. Named tags are source-level `.Tag(...)`; positional (`Index`) tags are anonymous sums (what `++` produces). Width-subtyping is the dual of records (a subtype has *fewer* tags). Subsumes the old untagged `Type::Union`. |
+| **`ccl::Type`** | Cambra-Specific | The public, immutable, user-facing AST type. Contains variants absent from the solver, such as `Refinement`, `PartialTuple`, and `Hole`. |
 | **Saturate** | Cambra-Specific | A Cambra-specific, post-coalesce AST pass that fixes up node types the `SimpleType` lattice is structurally blind to (refinements, lexical-scope identity for binders). A *saturated type* is one that has been through this pass. |
 | **Refinement Propagation** | Cambra-Specific | Inspecting a lambda's body to see how the parameter is used, extracting predicate refinements from those usages, and wrapping them around the lambda's inferred domain type. (Also called Refinement Stitching; see Pass 3 and review Q4.) |
 | **Let Binding Resolution** | Cambra-Specific | Ensuring a `Let` binding's fully resolved type overwrites the type of any `Var` references to it within the let body. |

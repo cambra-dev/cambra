@@ -57,10 +57,10 @@ pub struct SimpleVarUid(pub u32);
 
 /// Polymorphism scope level. Higher levels are nested deeper.
 ///
-/// In Stage 1 we keep `let` monomorphic, so every variable shares the same
+/// We currently keep `let` monomorphic, so every variable shares the same
 /// level (0). Levels are nevertheless threaded through the data structures
-/// because Stage 2's variants and a future let-poly extension will need
-/// them; introducing the field now avoids a breaking refactor later.
+/// because a future let-polymorphism extension will need them; introducing
+/// the field now avoids a breaking refactor later.
 pub type Level = u32;
 
 /// Mutable state of an inference variable.
@@ -125,6 +125,18 @@ pub enum FieldKey {
     Name(SmolStr),
 }
 
+impl std::fmt::Display for FieldKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Positional keys render as a bare index, matching tuple/record
+            // projection (`.0`, `.1`); the dot prefix in tag/field contexts
+            // is supplied by the caller, so a positional sum reads `.0`, `.1`.
+            FieldKey::Index(n) => write!(f, "{n}"),
+            FieldKey::Name(s) => write!(f, "{s}"),
+        }
+    }
+}
+
 /// Inference-time type representation. Internal to the simple-sub solver.
 ///
 /// Variants intentionally exclude:
@@ -134,8 +146,6 @@ pub enum FieldKey {
 ///   by [`SimpleType::Var`].
 /// - `Refinement` — refinements are not part of the lattice; see the
 ///   module docs.
-/// - `Union` — Stage 1 rejects untagged unions. Stage 2 introduces a
-///   `Variant` constructor (separate from `Type::Union`).
 /// - `PartialTuple` / `PartialRecord` — open-width records are
 ///   represented by ordinary `Record` constraints; openness lives in
 ///   the variable's bounds, not in a distinct variant.
@@ -157,6 +167,24 @@ pub enum SimpleType {
     /// closed-vs-open and tuple-vs-record distinctions only emerge at
     /// coalesce time; inside the solver, the structural rule is uniform.
     Record(BTreeMap<FieldKey, Rc<SimpleType>>),
+    /// Tagged sum (variant). Width-subtyping is the **dual** of `Record`:
+    /// `[A] <: [A, B]` — a subtype has *fewer* tags than its supertype.
+    ///
+    /// `constrain_subtype(lhs, rhs)` iterates `lhs`'s tags and requires each to
+    /// appear in `rhs` (mirror of Record's rule, which iterates `rhs`).
+    /// Payload depth is covariant: `[A(t0)] <: [A(t1)]` iff `t0 <: t1`.
+    ///
+    /// Admissible at both polarities — the polarity-trap closer that
+    /// tagged variants were introduced to provide.
+    ///
+    /// Tags are [`FieldKey`]s, the same key type as `Record`: `Name` for
+    /// source-level `.Tag(...)` variants, `Index` for the anonymous
+    /// positional tags that a collection-union (`++`) and other
+    /// structurally-tagged sums produce. This is the single tagged-sum
+    /// representation Cambra uses — `ccl::Type::Variant` materializes from
+    /// it directly, and the old untagged `Type::Union` is just the
+    /// all-`Index` case.
+    Variant(BTreeMap<FieldKey, Rc<SimpleType>>),
     /// An inference variable.
     ///
     /// The variable's bounds live behind the `RefCell` so that
@@ -175,6 +203,7 @@ impl SimpleType {
             SimpleType::Prim(_) | SimpleType::UIntRange(_) | SimpleType::Source(_) => 0,
             SimpleType::Fun(d, c) => d.level().max(c.level()),
             SimpleType::Record(fields) => fields.values().map(|t| t.level()).max().unwrap_or(0),
+            SimpleType::Variant(tags) => tags.values().map(|t| t.level()).max().unwrap_or(0),
             SimpleType::Var(v) => v.borrow().level,
         }
     }
@@ -207,14 +236,14 @@ pub fn fun(d: Rc<SimpleType>, c: Rc<SimpleType>) -> Rc<SimpleType> {
 /// replaced with fresh variables via [`PolyScheme::instantiate`]. Vars
 /// whose level is ≤ `level` leaked in from an outer scope and stay fixed.
 ///
-/// # Stage 1 usage
+/// # Current usage
 ///
-/// Stage 1 keeps `let` monomorphic, so we never *generalize* a binding
+/// We currently keep `let` monomorphic, so we never *generalize* a binding
 /// into a `PolyScheme`. The struct exists to encode operator and
 /// projection signatures (`Compare : ∀α. α → α → Bool`,
 /// `Proj(Index n) : ∀α. {n: α, …} → α`, etc.) which are inherently
-/// polymorphic — and to support Stage 2's let-poly extension without a
-/// breaking refactor. See `design-simple-sub.md` for the rationale.
+/// polymorphic — and to support a future let-polymorphism extension without
+/// a breaking refactor. See `design-simple-sub.md` for the rationale.
 #[derive(Debug, Clone)]
 pub struct PolyScheme {
     /// Quantification cutoff: vars in `body` at level > `self.level`
@@ -282,6 +311,13 @@ pub fn freshen_above(
             }
             Rc::new(SimpleType::Record(new_fields))
         }
+        SimpleType::Variant(tags) => {
+            let mut new_tags = BTreeMap::new();
+            for (k, t) in tags {
+                new_tags.insert(k.clone(), freshen_above(lim, t, current_level, cache));
+            }
+            Rc::new(SimpleType::Variant(new_tags))
+        }
         SimpleType::Var(tv) => {
             let uid = tv.borrow().uid;
             if let Some(existing) = cache.get(&uid) {
@@ -342,6 +378,17 @@ pub enum ConstrainError {
         /// The missing key.
         key: FieldKey,
         /// The lhs record that should have contained the key.
+        in_type: Rc<SimpleType>,
+    },
+    /// A variant-on-variant constraint had a tag in lhs that rhs did
+    /// not accept. The dual of [`Self::MissingField`]: variant width-
+    /// subtyping inverts records, so rhs's tag set must be a *super*set
+    /// of lhs's, and the violation is an *extra* tag on lhs rather than a
+    /// missing field.
+    ExtraTag {
+        /// The tag present in lhs but not accepted by rhs.
+        tag: FieldKey,
+        /// The rhs variant that should have accepted the tag.
         in_type: Rc<SimpleType>,
     },
 }
@@ -416,6 +463,25 @@ pub fn constrain_subtype(
             Ok(())
         }
 
+        // Variant: width-subtyping is the dual. lhs's tags must all
+        // appear in rhs (with a payload subtype check). Payload depth
+        // is covariant — same polarity as the outer constraint, NOT
+        // flipped like Fun's domain.
+        (SimpleType::Variant(vs0), SimpleType::Variant(vs1)) => {
+            for (k, t0) in vs0 {
+                match vs1.get(k) {
+                    Some(t1) => constrain_subtype(t0, t1, cache)?,
+                    None => {
+                        return Err(ConstrainError::ExtraTag {
+                            tag: k.clone(),
+                            in_type: Rc::clone(rhs),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
+
         // Variable on lhs, rhs has compatible level: append rhs to upper
         // bounds, propagate to all known lower bounds.
         (SimpleType::Var(lv), _) if rhs.level() <= lv.borrow().level => {
@@ -473,9 +539,9 @@ pub fn constrain_subtype(
 /// preserve: positive (`true`) keeps the lower bound, negative (`false`)
 /// keeps the upper bound.
 ///
-/// Stage 1 keeps `let` monomorphic, so all variables share level 0 and
+/// We currently keep `let` monomorphic, so all variables share level 0 and
 /// extrude is effectively a no-op. The implementation is included here so
-/// Stage 2's let-polymorphism extension (and the constrain_subtype solver's
+/// a future let-polymorphism extension (and the constrain_subtype solver's
 /// level-mismatch branches) compile against a working reference.
 pub fn extrude(
     ty: &Rc<SimpleType>,
@@ -498,6 +564,15 @@ pub fn extrude(
                 new_fields.insert(k.clone(), extrude(t, pol, target_level, cache));
             }
             Rc::new(SimpleType::Record(new_fields))
+        }
+        SimpleType::Variant(tags) => {
+            let mut new_tags = BTreeMap::new();
+            for (k, t) in tags {
+                // Variant payloads are covariant — same polarity as the
+                // outer extrusion, no flip.
+                new_tags.insert(k.clone(), extrude(t, pol, target_level, cache));
+            }
+            Rc::new(SimpleType::Variant(new_tags))
         }
         SimpleType::Var(tv) => {
             let uid = tv.borrow().uid;
@@ -556,8 +631,9 @@ pub enum CoalesceError {
     /// A variable's bounds at a positive position (or the upper bounds at
     /// a negative position) included multiple incompatible structural
     /// types — e.g. `Int` and `String` both flowing into the same value.
-    /// Stage 1 rejects this rather than emitting a `Type::Union`; see the
-    /// "Decisions" section of the plan.
+    /// The solver rejects this rather than inventing an anonymous (untagged)
+    /// sum from the collision — a genuinely tagged `Variant` is a single
+    /// shape and never triggers this.
     IncompatibleBounds {
         /// `true` = positive polarity (lower bounds forming a union);
         /// `false` = negative polarity (upper bounds forming an intersection).
@@ -578,7 +654,7 @@ pub enum CoalesceError {
         /// Pretty representation of the partial fields.
         details: String,
     },
-    /// A recursive (cyclic) type was inferred. Stage 1 deliberately
+    /// A recursive (cyclic) type was inferred. The solver deliberately
     /// rejects these per the plan's R2 review note; they would otherwise
     /// silently arise from programs like `λx. x x`.
     RecursiveType {
@@ -607,10 +683,10 @@ pub enum PartialKind {
 // fields, functions by polar recursion).
 //
 // `simplify_type` — the polar co-occurrence analyzer that merges
-// redundant variables — is not implemented yet. For Stage 1's
-// monomorphic programs the constraint graph is already tight enough
-// that `coalesce_compact` below produces clean types. The pass is
-// needed before let-polymorphism lands.
+// redundant variables — is implemented and wired between `compact_type`
+// and `coalesce_compact`. The one stubbed path is recursive-variable
+// merging (guarded by `rec_vars.contains_key`), which only fires when
+// recursive types are present; it is deferred until those are supported.
 
 /// "Atomic" leaf-shaped types other than functions and records.
 ///
@@ -665,7 +741,29 @@ pub struct CompactType {
     /// Record fields, if any. At positive polarity these are
     /// intersected (kept only when both sides have the field); at
     /// negative, unioned (kept when either side has the field).
+    ///
+    /// `None` and `Some(empty)` are **distinct** and both load-bearing in
+    /// [`merge`](Self::merge): `None` means "no record component here" and
+    /// acts as the merge *identity* (the other side passes through
+    /// untouched — it imposes nothing, i.e. ⊤). `Some(map)` means a record
+    /// shape is present; `Some(empty)` specifically arises from
+    /// *intersecting* two disjoint field sets at positive polarity and is
+    /// the *absorbing* element, not the identity. Collapsing to a bare
+    /// `BTreeMap` would conflate the two, and the intersect identity (⊤)
+    /// has no finite-map representation anyway.
     pub rec: Option<BTreeMap<FieldKey, CompactType>>,
+    /// Variant tags, if any. The polarities are the **dual** of `rec`:
+    /// at positive polarity tags are *unioned* (a producer of `[A]` or
+    /// `[B]` could emit `[A, B]`); at negative polarity tags are
+    /// *intersected* (a consumer accepting `[A, B]` AND `[B, C]` only
+    /// reliably handles `[B]`). Payload merge for matching tags uses
+    /// the same polarity as the outer merge (covariant depth).
+    ///
+    /// `None` vs `Some(empty)` carry the same distinct meanings as for
+    /// [`rec`](Self::rec) — `None` is the merge identity, `Some(empty)`
+    /// the absorbing element (here from intersecting disjoint tag sets at
+    /// negative polarity).
+    pub var: Option<BTreeMap<FieldKey, CompactType>>,
     /// Function shape, if any. Recursively merged with polarity flip
     /// on the domain.
     pub fun: Option<(Box<CompactType>, Box<CompactType>)>,
@@ -690,8 +788,15 @@ impl CompactType {
         let mut atoms = lhs.atoms;
         atoms.extend(rhs.atoms);
         let rec = match (lhs.rec, rhs.rec) {
+            // `None` is the identity: a position with no record component
+            // imposes nothing, so the other side passes through. A present
+            // `Some(empty)` is *not* identity — see the `rec` field docs.
             (None, r) | (r, None) => r,
             (Some(a), Some(b)) => Some(Self::merge_records(pol, a, b)),
+        };
+        let var = match (lhs.var, rhs.var) {
+            (None, v) | (v, None) => v,
+            (Some(a), Some(b)) => Some(Self::merge_variants(pol, a, b)),
         };
         let fun = match (lhs.fun, rhs.fun) {
             (None, f) | (f, None) => f,
@@ -704,33 +809,81 @@ impl CompactType {
             vars,
             atoms,
             rec,
+            var,
             fun,
         }
     }
 
+    /// Merge two variant-tag maps. Variant width-sub is the **dual** of
+    /// records: at positive polarity tags are *unioned* (a producer of
+    /// `[A]` OR `[B]` could emit either), at negative polarity they are
+    /// *intersected* (a consumer accepting `[A,B]` AND `[B,C]` only
+    /// reliably handles `[B]`). Payload depth at matching tags is
+    /// covariant — payloads recurse at the outer polarity `pol`, not
+    /// flipped.
+    fn merge_variants(
+        pol: bool,
+        lhs: BTreeMap<FieldKey, CompactType>,
+        rhs: BTreeMap<FieldKey, CompactType>,
+    ) -> BTreeMap<FieldKey, CompactType> {
+        // Variants invert the set-op vs records (so `!pol` selects
+        // intersect-vs-union) but keep payload polarity at the outer
+        // `pol` (covariant depth, same as records).
+        Self::merge_keyed(!pol, pol, lhs, rhs)
+    }
+
+    /// Merge two record-field maps. At positive polarity fields are
+    /// *intersected* (the union of two record values has at least the
+    /// fields common to both), at negative polarity they are *unioned*
+    /// (a function accepting both `{a,b}` and `{a,c}` accepts `{a,b,c}`).
+    /// Payload depth at matching fields is covariant — payloads recurse
+    /// at the outer polarity `pol`.
     fn merge_records(
         pol: bool,
         lhs: BTreeMap<FieldKey, CompactType>,
         rhs: BTreeMap<FieldKey, CompactType>,
     ) -> BTreeMap<FieldKey, CompactType> {
+        // For records the set-op aligns with polarity (pos = intersect)
+        // and payload polarity also tracks `pol` (covariant depth).
+        Self::merge_keyed(pol, pol, lhs, rhs)
+    }
+
+    /// Shared keyed-merge skeleton used by both records and variants.
+    ///
+    /// The two flags are independent because the relationship between
+    /// the outer polarity and the *set operation on keys* differs
+    /// between records (pos = intersect) and variants (pos = union),
+    /// while the relationship between the outer polarity and *payload
+    /// recursion* is the same in both (covariant depth, recurse at
+    /// outer polarity).
+    ///
+    /// - `intersect_keys = true`: keep only keys present on both sides.
+    /// - `intersect_keys = false`: keep keys present on either side.
+    /// - `payload_pol`: polarity passed to the recursive
+    ///   [`CompactType::merge`] for matching payloads.
+    ///
+    /// See [`Self::merge_records`] and [`Self::merge_variants`] for how
+    /// outer polarity maps onto these two flags at each call site.
+    fn merge_keyed<K: Ord + Clone>(
+        intersect_keys: bool,
+        payload_pol: bool,
+        lhs: BTreeMap<K, CompactType>,
+        rhs: BTreeMap<K, CompactType>,
+    ) -> BTreeMap<K, CompactType> {
         let mut out = BTreeMap::new();
-        if pol {
-            // Positive: keep only fields present in BOTH sides. At
-            // positive position the structural rule for record union is
-            // "the union of two record values has at least the
-            // intersection of fields" — a value that's `{a, b}` OR
-            // `{a, c}` is only known to have `a`.
+        if intersect_keys {
             for (k, v_lhs) in &lhs {
                 if let Some(v_rhs) = rhs.get(k) {
-                    out.insert(k.clone(), Self::merge(pol, v_lhs.clone(), v_rhs.clone()));
+                    out.insert(
+                        k.clone(),
+                        Self::merge(payload_pol, v_lhs.clone(), v_rhs.clone()),
+                    );
                 }
             }
         } else {
-            // Negative: union of fields. A function that accepts both
-            // `{a, b}` and `{a, c}` shapes accepts `{a, b, c}`.
             for (k, v_lhs) in lhs {
                 let merged = match rhs.get(&k) {
-                    Some(v_rhs) => Self::merge(pol, v_lhs, v_rhs.clone()),
+                    Some(v_rhs) => Self::merge(payload_pol, v_lhs, v_rhs.clone()),
                     None => v_lhs,
                 };
                 out.insert(k, merged);
@@ -765,7 +918,7 @@ impl CompactType {
 ///
 /// `rec_vars[uid]` holds the bound for a recursive variable; its
 /// occurrences in `term` and elsewhere are represented by
-/// `CompactType { vars: {uid}, .. }`. Stage 1 rejects residual
+/// `CompactType { vars: {uid}, .. }`. The solver rejects residual
 /// recursive types at coalesce time (per plan R2), so non-empty
 /// `rec_vars` is itself an error condition unless we're handling a
 /// user-annotated recursive type — which we don't yet.
@@ -833,6 +986,23 @@ fn compact_go(
                 ..Default::default()
             }
         }
+        SimpleType::Variant(tags) => {
+            // Variant payloads are covariant — recurse at the same
+            // polarity (no flip, unlike Fun's domain). The merge rule
+            // for variants flips records' polarity behaviour, but
+            // payload depth is unaffected.
+            let mut compacted = BTreeMap::new();
+            for (k, v) in tags {
+                compacted.insert(
+                    k.clone(),
+                    compact_go(v, pol, &BTreeSet::new(), in_process, recursive, rec_vars),
+                );
+            }
+            CompactType {
+                var: Some(compacted),
+                ..Default::default()
+            }
+        }
         SimpleType::Var(state) => {
             let uid = state.borrow().uid;
             let key = (uid, pol);
@@ -853,25 +1023,21 @@ fn compact_go(
             }
             in_process.insert(key);
             // TODO (SOUNDNESS): drop this opposite-polarity fallback when
-            // simplify_type lands. Currently sound for monomorphic Stage 1
-            // only; Stage 2 polymorphism will silently produce wrong types.
+            // `Type::ForAll` + the monomorphization pass land (the
+            // let-polymorphism work).
+            // `simplify_type` has already landed and is wired in, but it does
+            // not fix this — the root issue is that `ccl::Type` has no
+            // representation for polymorphic types.
             //
-            // Without `simplify_type`, a parameter variable whose only
-            // concrete information flows via lowers (e.g. `x` in
-            // `λ x. x > 1` — Int gets recorded as a lower of the
-            // Compare-instantiated `α'`, propagated to `x`'s upper
-            // bound list as a Var, but never as a direct atom) loses
-            // that information at negative polarity. The old HM path
-            // saw it because `constrain_equal` propagates both ways;
-            // simple-sub sees it correctly only after polar
-            // co-occurrence analysis (the unimplemented `simplify_type`
-            // pass) merges +α' and −α' as the same TypeVariable.
-            //
-            // Until that's ported, fall back to the opposite-polarity
-            // bounds when the polarity-correct ones are empty. Sound
-            // for monomorphic Stage 1 (a variable's type is the same
-            // at both ends); breaks Stage 2 polymorphism and must come
-            // out before then.
+            // A parameter variable like `x` in `λ x. x > 1` has principal
+            // type `∀α ⊇ Int. α → Bool`. Without ForAll, we can't express
+            // that: `ccl::Type` is monomorphic, so the variable must be
+            // collapsed to a concrete type. The fallback achieves this by
+            // treating the opposite-polarity bounds as if they were the
+            // polarity-correct ones, recovering `Int` from x's upper bounds.
+            // Sound while monomorphic (a variable's type is the same
+            // at both polar ends); breaks let-polymorphism and must
+            // come out before that lands.
             let s = state.borrow();
             let primary = if pol { &s.lower } else { &s.upper };
             // When the polarity-correct list is empty we fall back to
@@ -887,13 +1053,12 @@ fn compact_go(
             // (both fields) when the Var is coalesced at positive
             // polarity, not the positive-polarity intersection (empty).
             //
-            // Stage 2 prep: this whole fallback + the bidirectional
-            // Apply hack in `infer_simple_sub.rs::emit_apply` are the
-            // two monomorphizing collapses that work because `ccl::Type`
-            // has no `Type::ForAll`. Replace both at once when the
-            // monomorphization pass lands — see
-            // `docs/brainstorm/2026-05-06_simple_sub_prototype_status.md`
-            // §3.1 "Deferred to Stage 2 prep".
+            // This whole fallback + the bidirectional Apply hack in
+            // `infer_simple_sub.rs::emit_apply` are the two monomorphizing
+            // collapses that work because `ccl::Type` has no `Type::ForAll`.
+            // Replace both at once when the monomorphization pass lands
+            // alongside let-polymorphism — see
+            // `docs/brainstorm/2026-05-06_simple_sub_prototype_status.md` §3.1.
             let primary_bounds = primary.clone();
             let opposite_bounds = if pol {
                 s.upper.clone()
@@ -918,9 +1083,9 @@ fn compact_go(
             // `Type::Infer(?N)` instead of its real type — most commonly
             // a fresh lambda param whose Apply-site bound flows in at the
             // opposite polarity from where the lambda is coalesced. Sound
-            // for monomorphic Stage 1 (a variable's type is the same at
-            // both polar ends); must come out before Stage 2's
-            // let-polymorphism. See big TODO above for the full reasoning.
+            // while monomorphic (a variable's type is the same at
+            // both polar ends); must come out before let-polymorphism
+            // lands. See big TODO above for the full reasoning.
             if bound.atoms.is_empty() && bound.rec.is_none() && bound.fun.is_none() {
                 for b in &opposite_bounds {
                     let bc = compact_go(b, !pol, &new_parents, in_process, recursive, rec_vars);
@@ -971,14 +1136,14 @@ enum CoOccItem {
 ///    polarities, `v` is "sandwiched" between two structural `A` constraints
 ///    and is redundant; it is dropped.
 ///
-/// The operation is cosmetic at Stage 1 (all types are monomorphic) but
-/// becomes load-bearing at Stage 2 where let-polymorphism introduces genuine
-/// polar asymmetry. It is placed between [`compact_type`] and
+/// The operation is currently cosmetic (all types are monomorphic) but
+/// becomes load-bearing once let-polymorphism introduces genuine polar
+/// asymmetry. It is placed between [`compact_type`] and
 /// [`coalesce_compact`] in the pipeline.
 ///
-/// Recursive variables: Stage 1 never produces non-empty `rec_vars`, so the
-/// recursive-variable merge path is guarded but remains unexercised until
-/// Stage 2.
+/// Recursive variables: the solver never produces non-empty `rec_vars`
+/// today, so the recursive-variable merge path is guarded but remains
+/// unexercised until recursive types are supported.
 pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
     // All variable UIDs encountered during the walk.
     let mut all_vars: BTreeSet<SimpleVarUid> = cty.rec_vars.keys().cloned().collect();
@@ -1042,8 +1207,8 @@ pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
                         if v_in_w {
                             var_subst.insert(w, Some(v));
                             if cty.rec_vars.contains_key(&w) {
-                                // Both recursive: rec-bound merging deferred to Stage 2.
-                                // (Stage 1 never reaches this branch — rec_vars is always empty.)
+                                // Both recursive: rec-bound merging deferred until recursive types land.
+                                // (Never reached today — rec_vars is always empty.)
                             } else {
                                 // Non-recursive: intersect v's !pol co-occs with w's !pol co-occs.
                                 let w_neg: HashSet<CoOccItem> =
@@ -1146,6 +1311,20 @@ fn simplify_analyze(
             );
         }
     }
+    // Variant payloads recurse at the same polarity (covariant depth),
+    // matching how records' payloads behave.
+    if let Some(tags) = &ct.var {
+        for v in tags.values() {
+            simplify_analyze(
+                v,
+                pol,
+                input_rec_vars,
+                all_vars,
+                rec_processed,
+                co_occurrences,
+            );
+        }
+    }
     if let Some((dom, cod)) = &ct.fun {
         simplify_analyze(
             dom,
@@ -1188,6 +1367,12 @@ fn simplify_reconstruct(
             .collect()
     });
 
+    let new_var = ct.var.map(|tags| {
+        tags.into_iter()
+            .map(|(k, v)| (k, simplify_reconstruct(v, var_subst)))
+            .collect()
+    });
+
     let new_fun = ct.fun.map(|(dom, cod)| {
         (
             Box::new(simplify_reconstruct(*dom, var_subst)),
@@ -1199,6 +1384,7 @@ fn simplify_reconstruct(
         vars: new_vars,
         atoms: ct.atoms,
         rec: new_rec,
+        var: new_var,
         fun: new_fun,
     }
 }
@@ -1210,7 +1396,8 @@ fn simplify_reconstruct(
 /// Materialize a CompactType into `ccl::Type`.
 ///
 /// Multiple atom contributions at the same position is an error
-/// (`IncompatibleBounds`) — Stage 1 doesn't emit `Type::Union`. A
+/// (`IncompatibleBounds`) — the solver won't invent an anonymous sum from a
+/// primitive collision. A
 /// CompactType with no concrete contributions coalesces to a fresh
 /// `Type::Infer` (caller's `check_fully_typed` reports it).
 ///
@@ -1230,13 +1417,16 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
 
 fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, CoalesceError> {
     // Count concrete (non-variable) contributions to pick the output
-    // type. With multiple distinct contributions, Stage 1 would need
+    // type. With multiple distinct contributions, we would need
     // a Union/Intersection — we error instead.
     let mut atoms: Vec<Type> = ct.atoms.iter().map(|a| a.to_type()).collect();
     let mut shapes: Vec<Type> = Vec::new();
 
     if let Some(rec) = &ct.rec {
         shapes.push(materialize_record(rec, polarity)?);
+    }
+    if let Some(var) = &ct.var {
+        shapes.push(materialize_variant(var, polarity)?);
     }
     if let Some((dom, cod)) = &ct.fun {
         let d = coalesce_compact_go(dom, !polarity)?;
@@ -1271,6 +1461,20 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
             })
         }
     }
+}
+
+/// Materialize a variant-tag map into [`Type::Variant`], preserving tag
+/// order by name (BTreeMap iterates in key order, so output is stable).
+/// Payloads coalesce at the same polarity as the outer (covariant depth).
+fn materialize_variant(
+    tags: &BTreeMap<FieldKey, CompactType>,
+    polarity: bool,
+) -> Result<Type, CoalesceError> {
+    let mut out = Vec::with_capacity(tags.len());
+    for (k, v) in tags {
+        out.push((k.clone(), coalesce_compact_go(v, polarity)?));
+    }
+    Ok(Type::Variant(out))
 }
 
 fn materialize_record(
@@ -1325,7 +1529,7 @@ fn materialize_record(
         }
         // We don't have a way to distinguish open vs closed name-keyed
         // records at this layer (no field-count invariant analogous
-        // to dense indices). For Stage 1, emit Record always — the
+        // to dense indices). For now, emit Record always — the
         // existing path's Record/PartialRecord distinction is driven
         // by lowering, which already differentiates field-set-known
         // sites from projection sites.
@@ -1605,7 +1809,7 @@ mod tests {
 
     #[test]
     fn coalesce_var_with_incompatible_lowers_fails() {
-        // α : lower=[Int, String]. Stage 1 rejects unions — both
+        // α : lower=[Int, String]. The solver rejects unions — both
         // primitives flow into the atom set, and coalesce_compact
         // emits IncompatibleBounds when more than one concrete
         // contribution survives.
@@ -1794,5 +1998,219 @@ mod tests {
         let (dom_s, cod_s) = simplified.term.fun.unwrap();
         assert!(dom_s.vars.contains(&uid_a), "a preserved in dom");
         assert!(cod_s.vars.contains(&uid_a), "a preserved in cod");
+    }
+
+    // -----------------------------------------------------------------------
+    // Variant — constrain_subtype, compact merging, coalesce
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a `Variant({tag: payload, ...})` SimpleType with
+    /// named (`FieldKey::Name`) tags.
+    fn variant<const N: usize>(tags: [(&str, Rc<SimpleType>); N]) -> Rc<SimpleType> {
+        let mut m = BTreeMap::new();
+        for (k, v) in tags {
+            m.insert(FieldKey::Name(SmolStr::from(k)), v);
+        }
+        Rc::new(SimpleType::Variant(m))
+    }
+
+    /// `[A] <: [A, B]` — subtype's tag set is a subset of supertype's. Accept.
+    #[test]
+    fn variant_width_sub_accept() {
+        let lhs = variant([("A", prim(BaseType::Int))]);
+        let rhs = variant([("A", prim(BaseType::Int)), ("B", prim(BaseType::String))]);
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&lhs, &rhs, &mut cache).expect("[A] <: [A, B] should hold");
+    }
+
+    /// `[A, B] <: [A]` — supertype is missing a tag that lhs has. Reject.
+    #[test]
+    fn variant_width_sub_reject_missing_tag() {
+        let lhs = variant([("A", prim(BaseType::Int)), ("B", prim(BaseType::String))]);
+        let rhs = variant([("A", prim(BaseType::Int))]);
+        let mut cache = ConstrainCache::new();
+        let err = constrain_subtype(&lhs, &rhs, &mut cache)
+            .expect_err("[A, B] <: [A] should be rejected: B not in rhs");
+        match err {
+            ConstrainError::ExtraTag { tag, .. } => {
+                assert_eq!(tag, FieldKey::Name(SmolStr::from("B")))
+            }
+            other => panic!("expected ExtraTag, got {other:?}"),
+        }
+    }
+
+    /// Payload depth is covariant: `[A(Int)] <: [A(Int)]` passes,
+    /// `[A(Int)] <: [A(Str)]` fails on payload mismatch.
+    #[test]
+    fn variant_payload_covariance() {
+        let lhs = variant([("A", prim(BaseType::Int))]);
+        let rhs_ok = variant([("A", prim(BaseType::Int))]);
+        let rhs_bad = variant([("A", prim(BaseType::String))]);
+
+        let mut c = ConstrainCache::new();
+        constrain_subtype(&lhs, &rhs_ok, &mut c).expect("equal payloads accept");
+
+        let mut c = ConstrainCache::new();
+        constrain_subtype(&lhs, &rhs_bad, &mut c)
+            .expect_err("Int payload should not flow into String payload");
+    }
+
+    /// Variable on lhs flowed against a variant: rhs becomes upper bound;
+    /// subsequent lower-bound additions on lhs propagate against rhs.
+    #[test]
+    fn variant_var_lhs_propagation() {
+        let v = fresh_var(0);
+        let upper = variant([("A", prim(BaseType::Int))]);
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&v, &upper, &mut cache).unwrap();
+        // The propagation rule recorded `upper` on v's upper bounds. A
+        // subsequent `concrete <: v` adds concrete to lower and propagates
+        // it against upper — concrete must satisfy `concrete <: upper`.
+        let concrete_ok = variant([("A", prim(BaseType::Int))]);
+        constrain_subtype(&concrete_ok, &v, &mut cache).expect("[A(Int)] <: v <: [A(Int)] ok");
+
+        let v2 = fresh_var(0);
+        let upper2 = variant([("A", prim(BaseType::Int))]);
+        let mut cache2 = ConstrainCache::new();
+        constrain_subtype(&v2, &upper2, &mut cache2).unwrap();
+        let concrete_bad = variant([("A", prim(BaseType::Int)), ("B", prim(BaseType::String))]);
+        constrain_subtype(&concrete_bad, &v2, &mut cache2)
+            .expect_err("[A, B] must not flow into v whose upper is [A]");
+    }
+
+    /// Compact merge at positive polarity unions tags.
+    #[test]
+    fn compact_merge_variants_positive_unions() {
+        let int_a = CompactType {
+            var: Some(
+                [(FieldKey::Name(SmolStr::from("A")), CompactType::default())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let int_b = CompactType {
+            var: Some(
+                [(FieldKey::Name(SmolStr::from("B")), CompactType::default())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let merged = CompactType::merge(true, int_a, int_b);
+        let var = merged.var.expect("variant present");
+        assert!(var.contains_key(&FieldKey::Name(SmolStr::from("A"))));
+        assert!(var.contains_key(&FieldKey::Name(SmolStr::from("B"))));
+    }
+
+    /// Compact merge at negative polarity intersects tags.
+    #[test]
+    fn compact_merge_variants_negative_intersects() {
+        let int_ab = CompactType {
+            var: Some(
+                [
+                    (FieldKey::Name(SmolStr::from("A")), CompactType::default()),
+                    (FieldKey::Name(SmolStr::from("B")), CompactType::default()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        };
+        let int_bc = CompactType {
+            var: Some(
+                [
+                    (FieldKey::Name(SmolStr::from("B")), CompactType::default()),
+                    (FieldKey::Name(SmolStr::from("C")), CompactType::default()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        };
+        let merged = CompactType::merge(false, int_ab, int_bc);
+        let var = merged.var.expect("variant present");
+        assert!(!var.contains_key(&FieldKey::Name(SmolStr::from("A"))));
+        assert!(var.contains_key(&FieldKey::Name(SmolStr::from("B"))));
+        assert!(!var.contains_key(&FieldKey::Name(SmolStr::from("C"))));
+    }
+
+    /// Payload-depth polarity for variant merge: payloads at matching
+    /// tags must recurse at the *outer* variant polarity (covariant
+    /// depth), NOT the flipped polarity used to pick "union vs
+    /// intersect tags". The two are independent and the helper has to
+    /// thread them separately.
+    ///
+    /// To make the difference visible we use records as payloads —
+    /// record-field merging is itself polarity-sensitive (pos =
+    /// intersect, neg = union). At positive variant polarity the
+    /// payload should merge at pos → record fields intersect.
+    #[test]
+    fn compact_merge_variants_propagates_outer_polarity_to_payloads() {
+        // Both sides have tag "A". Payload on lhs: CompactType { rec:
+        // {a: ?} }, payload on rhs: CompactType { rec: {b: ?} }.
+        let payload_a = CompactType {
+            rec: Some(
+                [(FieldKey::Name(SmolStr::from("a")), CompactType::default())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let payload_b = CompactType {
+            rec: Some(
+                [(FieldKey::Name(SmolStr::from("b")), CompactType::default())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let lhs = CompactType {
+            var: Some(
+                [(FieldKey::Name(SmolStr::from("A")), payload_a)]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let rhs = CompactType {
+            var: Some(
+                [(FieldKey::Name(SmolStr::from("A")), payload_b)]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        // Outer positive variant merge: tags union (one tag A here).
+        // Payload depth covariant → payload merges at pos → record
+        // fields intersect → empty rec map (no field in both).
+        let merged = CompactType::merge(true, lhs, rhs);
+        let var = merged.var.expect("variant present");
+        let payload = var.get(&FieldKey::Name(SmolStr::from("A"))).expect("tag A");
+        let rec = payload.rec.as_ref().expect("payload rec present");
+        assert!(
+            rec.is_empty(),
+            "positive payload merge intersects fields; got {rec:?}"
+        );
+    }
+
+    /// Coalesce a variant SimpleType into `Type::Variant` with preserved tags.
+    #[test]
+    fn coalesce_variant_roundtrips_to_type_variant() {
+        let v = variant([
+            ("Some", prim(BaseType::Int)),
+            ("None", prim(BaseType::Unit)),
+        ]);
+        let scheme = simplify_type(compact_type(&v));
+        let ty = coalesce_compact(&scheme).expect("coalesce ok");
+        match ty {
+            Type::Variant(tags) => {
+                let names: Vec<String> = tags.iter().map(|(n, _)| n.to_string()).collect();
+                // BTreeMap iteration order is by FieldKey key — Name tags
+                // sort lexicographically.
+                assert_eq!(names, vec!["None", "Some"]);
+            }
+            other => panic!("expected Variant, got {other}"),
+        }
     }
 }

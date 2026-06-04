@@ -320,8 +320,16 @@ impl OpConversionContext {
                 domain: Box::new(self.extent_of(a)?),
                 codomain: Box::new(self.extent_of(b)?),
             }),
-            Type::Union(ts) => {
-                let extents: Result<Vec<_>, _> = ts.iter().map(|t| self.extent_of(t)).collect();
+            // Tagged sum — at runtime `UnionOperator` already
+            // discriminates by tag position, so the tags carry no
+            // additional dispatch information here; payloads lower to an
+            // `Extent::Union`. This covers both the anonymous positional
+            // sums that `++`/CollectionUnion produces (all `Index` tags)
+            // and named source-level variants; the tags are stripped at
+            // this boundary.
+            Type::Variant(tags) => {
+                let extents: Result<Vec<_>, _> =
+                    tags.iter().map(|(_, t)| self.extent_of(t)).collect();
                 Ok(Extent::Union(extents?))
             }
             // Leaf types — no refinements possible, handle inline.

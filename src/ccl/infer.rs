@@ -187,7 +187,7 @@ pub enum InferError {
         at: String,
     },
     /// An incompatible-bounds conflict from simple-sub coalescing.
-    /// Stage 1 rejects unions/intersections of distinct concrete types.
+    /// The solver rejects unions/intersections of distinct concrete types.
     IncompatibleBounds {
         /// `true` = positive polarity (lower-bound union); `false` = negative (upper-bound intersection).
         polarity: bool,
@@ -255,7 +255,7 @@ impl std::fmt::Debug for InferError {
                 let var_ids: Vec<_> = vars.iter().map(|v| v.0).collect();
                 write!(
                     f,
-                    "Type Inference Error: Incompatible {bound_kind} bounds\nRejected by: Stage 1 (rejects Type::Union)\nConflicting Types: {conflicting}\nVariables: {var_ids:?}\n\nError originated at:\n  {aligned_origin}"
+                    "Type Inference Error: Incompatible {bound_kind} bounds\nRejected by: structural inference (won't infer an untagged sum from a collision)\nConflicting Types: {conflicting}\nVariables: {var_ids:?}\n\nError originated at:\n  {aligned_origin}"
                 )?;
                 if !context.is_empty() {
                     write!(f, "\n\nIn context of:")?;
@@ -331,6 +331,26 @@ fn collect_expr_errors(
             collect_type_errors(&binding.ty, &binding.name, errors, seen_refinements);
             expr.walk_children(|e| collect_expr_errors(e, errors, seen_refinements));
         }
+        TypedExprNode::VariantCtor { payload, .. } => {
+            collect_expr_errors(payload, errors, seen_refinements);
+        }
+        // `Case` carries per-branch pattern bindings on `TypedBinding`
+        // (not reached by `walk_children`), so check their types here.
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            if let Some(s) = scrutinee {
+                collect_expr_errors(s, errors, seen_refinements);
+            }
+            for b in branches {
+                if let Some(p) = &b.pattern {
+                    collect_type_errors(&p.binding.ty, &p.binding.name, errors, seen_refinements);
+                }
+                collect_expr_errors(&b.guard, errors, seen_refinements);
+                collect_expr_errors(&b.body, errors, seen_refinements);
+            }
+        }
         TypedExprNode::Loop { params, .. } => {
             for p in params {
                 collect_type_errors(&p.ty, &p.name, errors, seen_refinements);
@@ -377,9 +397,9 @@ fn collect_type_errors(
                 collect_type_errors(ty, context_sym, errors, seen_refinements);
             }
         }
-        Type::Union(variants) => {
-            for variant in variants {
-                collect_type_errors(variant, context_sym, errors, seen_refinements);
+        Type::Variant(tags) => {
+            for (_, payload) in tags {
+                collect_type_errors(payload, context_sym, errors, seen_refinements);
             }
         }
         Type::Refinement(inner, refinement) => {
@@ -472,7 +492,7 @@ pub fn dbg_typecheck_mv(expr: Expr) -> Expr {
 /// TODO: each literal yields only its base type (`Int`, `String`, …); a
 /// literal could instead carry a refinement pinning it to its exact value
 /// (e.g. `{Int | _ == 3}` for `Lit::Int(3)`). Decide whether to refine to
-/// the singleton value once Stage 3 SMT refinements land.
+/// the singleton value once SMT-backed refinements land.
 fn lit_type(lit: &Lit) -> Type {
     match lit {
         Lit::Int(_) => Type::Base(BaseType::Int),
@@ -493,9 +513,16 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
     // Case interleaves per-branch recursion with per-branch type checks, so it
     // doesn't fit the "recurse all children, then check this node" template
     // used by every other variant — handle it inline.
-    if let TypedExprNode::Case { branches } = &expr.node {
+    if let TypedExprNode::Case {
+        scrutinee,
+        branches,
+    } = &expr.node
+    {
         let bool_ty = Type::Base(BaseType::Bool);
-        for Branch { guard, body } in branches {
+        if let Some(s) = scrutinee {
+            collect_typecheck_errors(s, errors);
+        }
+        for Branch { guard, body, .. } in branches {
             collect_typecheck_errors(guard, errors);
             collect_typecheck_errors(body, errors);
             if !typecheck_equal(&guard.ty, &bool_ty) {
@@ -666,6 +693,13 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
         TypedExprNode::Case { .. } => unreachable!("Case handled by early-return above"),
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
+        // Variant constructor: payload's type becomes the tag's payload in
+        // `expr.ty`. Recurse so payload errors surface, but no further
+        // structural typecheck is needed (the constraint emitter already
+        // enforced `expr.ty = Variant({tag: payload.ty})`).
+        TypedExprNode::VariantCtor { payload, .. } => {
+            collect_typecheck_errors(payload, errors);
+        }
     }
 }
 
@@ -772,29 +806,16 @@ fn typecheck_equal(a: &Type, b: &Type) -> bool {
         | (Type::PartialTuple(partial), Type::Tuple(full)) => partial
             .iter()
             .all(|(i, t)| full.get(*i).is_some_and(|f_t| typecheck_equal(t, f_t))),
-        // Nested unions are semantically flat: Union(Union(A,B),C) ≡ Union(A,B,C).
-        // Flatten both sides before comparing to handle rewriting passes that
-        // normalise the nesting level (e.g. collection-union flattening in simplify).
-        (Type::Union(a_variants), Type::Union(b_variants)) => {
-            fn flat_union(variants: &[Type]) -> Vec<&Type> {
-                variants
+        // Tagged variants (incl. the all-`Index` anonymous sums that `++`
+        // produces) compare structurally: same tags in order, payloads
+        // pairwise equal. `++` flattens at construction, so there is no
+        // nested-union normalization mismatch to special-case here.
+        (Type::Variant(a_tags), Type::Variant(b_tags)) => {
+            a_tags.len() == b_tags.len()
+                && a_tags
                     .iter()
-                    .flat_map(|v| {
-                        if let Type::Union(sub) = v {
-                            flat_union(sub)
-                        } else {
-                            std::slice::from_ref(v).iter().collect()
-                        }
-                    })
-                    .collect()
-            }
-            let a_flat = flat_union(a_variants);
-            let b_flat = flat_union(b_variants);
-            a_flat.len() == b_flat.len()
-                && a_flat
-                    .iter()
-                    .zip(b_flat.iter())
-                    .all(|(a, b)| typecheck_equal(a, b))
+                    .zip(b_tags.iter())
+                    .all(|((ak, at), (bk, bt))| ak == bk && typecheck_equal(at, bt))
         }
         _ => a == b,
     }
@@ -2095,7 +2116,9 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         // { true → let x = 42 in x + 1 }
         let mut expr = Expr::new(TypedExprNode::Case {
+            scrutinee: None,
             branches: vec![Branch {
+                pattern: None,
                 guard: Expr::lit(Lit::Bool(true)),
                 body: Expr::let_bind(
                     "x",
@@ -2119,12 +2142,15 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         // { true → 1; true → 2 }
         let mut expr = Expr::new(TypedExprNode::Case {
+            scrutinee: None,
             branches: vec![
                 Branch {
+                    pattern: None,
                     guard: Expr::lit(Lit::Bool(true)),
                     body: Expr::lit(Lit::Int(1)),
                 },
                 Branch {
+                    pattern: None,
                     guard: Expr::lit(Lit::Bool(true)),
                     body: Expr::lit(Lit::Int(2)),
                 },
@@ -2138,7 +2164,10 @@ mod tests {
     #[test]
     fn test_infer_case_no_branches() {
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::new(TypedExprNode::Case { branches: vec![] });
+        let mut expr = Expr::new(TypedExprNode::Case {
+            scrutinee: None,
+            branches: vec![],
+        });
         assert!(matches!(
             infer(&mut expr, &mut ctx),
             Err(ref errs) if errs.iter().any(|e| matches!(e, InferError::EmptyCase { .. }))

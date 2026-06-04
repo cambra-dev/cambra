@@ -1,19 +1,20 @@
 //! Post-coalesce saturation pass for simple-sub inference.
 //!
 //! **This pass is a temporary architectural workaround**, not a desired
-//! long-term state. The goal is to eliminate it once the type system handles
-//! refinements and unions directly (Stage 2 variants + Stage 3 SMT
-//! refinements). Until then it consolidates all `SimpleType`-blindspot fixes
-//! in one place so they are easy to find and remove together.
+//! long-term state. Tagged variants are now handled structurally inside the
+//! lattice; the remaining goal is to eliminate this pass once the type system
+//! also handles refinements directly (a future SMT-backed refinement pass).
+//! Until then it consolidates all `SimpleType`-blindspot fixes in one place
+//! so they are easy to find and remove together.
 //!
 //! Simple-sub's [`SimpleType`](crate::ccl::simple_sub::SimpleType) lattice is
-//! intentionally **refinement-blind** and **Union-blind** (plan R1, R5): the
-//! solver's lattice tracks structural shapes only, so refinements and
-//! tagged unions cannot ride along inside it. Most CCL programs do not need
-//! either feature inside the lattice — but a handful of typing rules
-//! (Refinement Propagation, Let Binding Resolution,
-//! `BinOp::CollectionUnion`'s structural Union result) require those shapes
-//! to appear on `expr.ty` slots after
+//! intentionally **refinement-blind** (plan R1): the solver tracks structural
+//! shapes only, so refinement predicates cannot ride along inside it.
+//! (Tagged sums *are* structural and live in the lattice as
+//! `SimpleType::Variant`, so — unlike in earlier stages — collection-union
+//! results no longer need fixing up here.) A couple of typing rules
+//! (Refinement Propagation, Let Binding Resolution) still require
+//! refinement/lexical-scope information to appear on `expr.ty` slots after
 //! coalescing. Rather than smuggle them through `SimpleType`, we run a
 //! separate top-down pass that walks the already-coalesced tree with a
 //! lexical scope environment and rewrites each affected node's `expr.ty`
@@ -31,7 +32,7 @@
 //! than consulting any sidecar. Sidecar reads stay local to
 //! `infer_simple_sub.rs`.
 
-use crate::ccl::{Branch, Expr, Refinement, Type, TypedExprNode};
+use crate::ccl::{Expr, Refinement, Type, TypedExprNode};
 use crate::util::ScopeStack;
 
 /// Walk `expr` top-down, rewriting each node's `expr.ty` to agree with its
@@ -154,38 +155,6 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
             expr.ty = body.ty.clone();
         }
 
-        // `++` (CollectionUnion): rebuild the result as
-        // `Fun(Union(dom_0, …, dom_n), dedup_union(cod_0, …, cod_n))` from
-        // the operands' already-resolved Fun types. Simple-sub's coalesce
-        // path can only see structural shapes and emits a `Fun(?dom, ?cod)`
-        // from fresh vars (see `emit_collection_union`); this rule
-        // materialises the proper Union shape after the fact. Stage 2's
-        // `Variant` rule subsumes it once tagged variants land.
-        TypedExprNode::CollectionUnion(operands) => {
-            for op in operands.iter_mut() {
-                saturate_node(op, scope);
-            }
-            // Only materialise when every operand coalesced to a Fun; if any
-            // didn't, leave the generic coalesce result alone and let
-            // downstream surface a diagnostic.
-            if operands.iter().all(|op| matches!(op.ty, Type::Fun(_, _))) {
-                let mut domains = Vec::with_capacity(operands.len());
-                let mut codomain: Option<Type> = None;
-                for op in operands.iter() {
-                    let Type::Fun(dom, cod) = &op.ty else {
-                        unreachable!("all-Fun checked above");
-                    };
-                    domains.push((**dom).clone());
-                    codomain = Some(match codomain {
-                        Some(acc) => dedup_union(acc, (**cod).clone()),
-                        None => (**cod).clone(),
-                    });
-                }
-                let codomain = codomain.expect("CollectionUnion has >= 2 operands");
-                expr.ty = Type::Fun(Box::new(Type::Union(domains)), Box::new(codomain));
-            }
-        }
-
         // Generic recursion for everything else. `expr.ty` was set by
         // coalesce and we don't touch it.
         TypedExprNode::Lit(_)
@@ -202,7 +171,13 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
         }
         TypedExprNode::UnaryOp(_, inner) => saturate_node(inner, scope),
         TypedExprNode::Aggregate { input, .. } => saturate_node(input, scope),
-        TypedExprNode::List(elts) | TypedExprNode::Tuple(elts) => {
+        // CollectionUnion no longer needs a type-reconstruction arm:
+        // `emit_collection_union` now emits a proper `Fun(Variant, _)`
+        // shape directly, so coalesce already produces the correct
+        // `expr.ty`. We only recurse to saturate the operands.
+        TypedExprNode::List(elts)
+        | TypedExprNode::Tuple(elts)
+        | TypedExprNode::CollectionUnion(elts) => {
             for e in elts.iter_mut() {
                 saturate_node(e, scope);
             }
@@ -249,12 +224,25 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
                 saturate_node(e, scope);
             }
         }
-        TypedExprNode::Case { branches } => {
-            for Branch { guard, body } in branches.iter_mut() {
-                saturate_node(guard, scope);
-                saturate_node(body, scope);
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            if let Some(s) = scrutinee {
+                saturate_node(s, scope);
+            }
+            for b in branches.iter_mut() {
+                // A structural pattern binds its payload over the branch's
+                // guard and body; guard-only branches add nothing to scope.
+                let mut arm_scope = scope.enter_scope();
+                if let Some(p) = &b.pattern {
+                    arm_scope.bind(&p.binding.name, p.binding.ty.clone());
+                }
+                saturate_node(&mut b.guard, &mut arm_scope);
+                saturate_node(&mut b.body, &mut arm_scope);
             }
         }
+        TypedExprNode::VariantCtor { payload, .. } => saturate_node(payload, scope),
         TypedExprNode::ExprStmt { expr: e, body } => {
             saturate_node(e, scope);
             saturate_node(body, scope);
@@ -334,11 +322,28 @@ fn collect_param_refinements(body: &Expr, param_name: &str, out: &mut Vec<Refine
                 collect_param_refinements(e, param_name, out);
             }
         }
-        TypedExprNode::Case { branches } => {
-            for Branch { guard, body } in branches {
-                collect_param_refinements(guard, param_name, out);
-                collect_param_refinements(body, param_name, out);
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            if let Some(s) = scrutinee {
+                collect_param_refinements(s, param_name, out);
             }
+            for b in branches {
+                // A pattern that binds `param_name` shadows it inside the
+                // branch, so don't collect refinements from there.
+                if b.pattern
+                    .as_ref()
+                    .is_some_and(|p| p.binding.name == param_name)
+                {
+                    continue;
+                }
+                collect_param_refinements(&b.guard, param_name, out);
+                collect_param_refinements(&b.body, param_name, out);
+            }
+        }
+        TypedExprNode::VariantCtor { payload, .. } => {
+            collect_param_refinements(payload, param_name, out);
         }
         TypedExprNode::ExprStmt { expr, body } => {
             collect_param_refinements(expr, param_name, out);
@@ -363,45 +368,10 @@ fn collect_param_refinements(body: &Expr, param_name: &str, out: &mut Vec<Refine
     }
 }
 
-/// Flatten and deduplicate two types into a single [`Type::Union`].
-///
-/// Collapses adjacent `Type::Union` variants and removes structural
-/// duplicates so `Int @ Int @ Int`'s codomain stays a single `Int`
-/// rather than nesting `Union(Union(Int, Int), Int)`. Returns the lone
-/// variant directly when only one survives.
-fn dedup_union(a: Type, b: Type) -> Type {
-    fn flatten(ty: Type, out: &mut Vec<Type>) {
-        match ty {
-            Type::Union(ts) => {
-                for t in ts {
-                    flatten(t, out);
-                }
-            }
-            other => out.push(other),
-        }
-    }
-    let mut variants = Vec::new();
-    flatten(a, &mut variants);
-    flatten(b, &mut variants);
-    let mut seen: Vec<Type> = Vec::new();
-    variants.retain(|v| {
-        if seen.contains(v) {
-            false
-        } else {
-            seen.push(v.clone());
-            true
-        }
-    });
-    if variants.len() == 1 {
-        variants.remove(0)
-    } else {
-        Type::Union(variants)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::simple_sub::FieldKey;
     use crate::ccl::{BaseType, Lit, RefinementKind, TypedBinding, TypedExpr, next_refinement_id};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -418,46 +388,45 @@ mod tests {
         }
     }
 
-    /// Verify rule (b): `Let` with a `CollectionUnion`-built `Fun(Union, …)`
-    /// bound to a name, `Var` of that name in the body picks up the union.
+    /// Verify rule (b): `Let` with a complex-typed bound expression
+    /// propagates that type to `Var(x)` references in the body and to
+    /// the Let's own `ty`. Pre-set the bound expression's type
+    /// directly — saturate's job is to splice it through, not to
+    /// (re)construct it. (Previously the bound expression was a
+    /// `BinOp(CollectionUnion)` and saturate had a dedicated arm to
+    /// build the Union shape; that arm is gone now since inference
+    /// produces the right shape directly.)
     #[test]
-    fn let_propagates_collection_union_type_to_var() {
-        // post-coalesce shape:
-        //   Let { x = (left @ right : Fun(?d, ?c))
-        //         body = x : Fun(?d, ?c) }
-        // expected: Var x.ty = Fun(Union(Int, Int), Int); Let.ty = same.
+    fn let_propagates_bound_type_to_var() {
         let int_ty = Type::Base(BaseType::Int);
-        let coll_l = TypedExpr::new(TypedExprNode::Lit(Lit::Unit))
-            .with_ty(Type::fun(int_ty.clone(), int_ty.clone()));
-        let coll_r = TypedExpr::new(TypedExprNode::Lit(Lit::Unit))
-            .with_ty(Type::fun(int_ty.clone(), int_ty.clone()));
-        let union = TypedExpr::new(TypedExprNode::CollectionUnion(vec![coll_l, coll_r]));
-        let var_x = TypedExpr::new(TypedExprNode::Var("x".into()))
-            .with_ty(Type::fun(int_ty.clone(), int_ty.clone()));
+        let union_fun = Type::fun(
+            Type::Variant(vec![
+                (FieldKey::Index(0), int_ty.clone()),
+                (FieldKey::Index(1), int_ty.clone()),
+            ]),
+            int_ty.clone(),
+        );
+        let bound = TypedExpr::new(TypedExprNode::Lit(Lit::Unit)).with_ty(union_fun.clone());
+        let var_x = TypedExpr::new(TypedExprNode::Var("x".into())).with_ty(Type::Hole);
         let mut expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
             },
-            bound_expr: Box::new(union),
+            bound_expr: Box::new(bound),
             body: Box::new(var_x),
         });
 
         saturate(&mut expr);
 
-        let expected_union_fun = Type::fun(
-            Type::Union(vec![int_ty.clone(), int_ty.clone()]),
-            int_ty.clone(),
-        );
-        // Let's body Var(x) picks up the resolved union shape.
         if let TypedExprNode::Let { body, binding, .. } = &expr.node {
-            assert_eq!(binding.ty, expected_union_fun);
-            assert_eq!(body.ty, expected_union_fun);
+            assert_eq!(binding.ty, union_fun);
+            assert_eq!(body.ty, union_fun);
         } else {
             panic!("expected Let");
         }
-        assert_eq!(expr.ty, expected_union_fun);
+        assert_eq!(expr.ty, union_fun);
     }
 
     /// Verify rule (a): a lambda whose body applies a refined callee to its
@@ -509,7 +478,10 @@ mod tests {
     fn shadowing_inner_lambda_stops_var_propagation() {
         let int_ty = Type::Base(BaseType::Int);
         let union_fun_ty = Type::fun(
-            Type::Union(vec![int_ty.clone(), int_ty.clone()]),
+            Type::Variant(vec![
+                (FieldKey::Index(0), int_ty.clone()),
+                (FieldKey::Index(1), int_ty.clone()),
+            ]),
             int_ty.clone(),
         );
         // Build a Let whose bound_expr resolves to `union_fun_ty` and whose
@@ -526,20 +498,17 @@ mod tests {
             refinement: None,
         })
         .with_ty(Type::fun(int_ty.clone(), int_ty.clone()));
-        // Mock a CollectionUnion-built bound expression so the outer
-        // let-binding ends up with the union type after saturation.
-        let coll_l = TypedExpr::new(TypedExprNode::Lit(Lit::Unit))
-            .with_ty(Type::fun(int_ty.clone(), int_ty.clone()));
-        let coll_r = TypedExpr::new(TypedExprNode::Lit(Lit::Unit))
-            .with_ty(Type::fun(int_ty.clone(), int_ty.clone()));
-        let union = TypedExpr::new(TypedExprNode::CollectionUnion(vec![coll_l, coll_r]));
+        // Pre-set the bound expression's type to the union shape
+        // directly; saturate propagates it to the let binding without
+        // needing the (removed) `BinOp(CollectionUnion)` reconstruct arm.
+        let bound = TypedExpr::new(TypedExprNode::Lit(Lit::Unit)).with_ty(union_fun_ty.clone());
         let mut expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
             },
-            bound_expr: Box::new(union),
+            bound_expr: Box::new(bound),
             body: Box::new(inner_lambda),
         });
 

@@ -29,6 +29,8 @@ use std::{
 
 use smol_str::SmolStr;
 
+use crate::ccl::simple_sub::FieldKey;
+
 /// Global counter for assigning unique IDs to [`Refinement`] instances.
 static REFINEMENT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -693,23 +695,49 @@ pub enum TypedExprNode {
     /// function-encoding of lists used at the operator-graph level.
     List(Vec<TypedExpr>),
 
-    /// Multi-way conditional branching.
+    /// Multi-way conditional branching on boolean guards.
     ///
-    /// Evaluates each [`Branch`] in order; the first branch whose guard evaluates
-    /// to `true` wins. Guards must have type [`Type::Base`]`(`[`BaseType::Bool`]`)`.
+    /// Multi-way dispatch — the single construct for both **logical**
+    /// (guard-based) and **structural** (variant-tag) branching, and for
+    /// combinations of the two.
     ///
-    /// `if`/`elif`/`else` chains are flattened into a single `Case` with one
-    /// [`Branch`] per condition. Ternary `if` expressions produce a 2-branch
-    /// `Case`. Python `match` statement lowering (planned) will desugar patterns
-    /// into guards and [`TypedExprNode::Let`] bindings before producing `Case`.
+    /// Each [`Branch`] carries an optional structural [`Pattern`] (match a
+    /// variant tag of `scrutinee`, binding its payload) and an optional
+    /// boolean `guard`. Branches are evaluated top-to-bottom; the first
+    /// whose pattern matches *and* whose guard is `true` wins. A branch may
+    /// have both a pattern and a guard — that is "match on structure and
+    /// logic at the same time".
     ///
-    /// NOTE: All arms must currently infer the **same** type. Mismatched arm types
-    /// are a hard [`crate::ccl::infer::InferError::TypeMismatch`] rather than
-    /// producing a [`Type::Union`].
+    /// - **Pure `if`/`elif`/`else`:** `scrutinee` is `None` and every branch
+    ///   is guard-only (`pattern: None`). Guards are constrained to
+    ///   [`Type::Base`]`(`[`BaseType::Bool`]`)`.
+    /// - **Pattern match:** `scrutinee` is `Some(_)`; each pattern branch
+    ///   constrains the scrutinee to a [`Type::Variant`] whose tags are the
+    ///   branch tags, binding each payload at the per-tag narrowed type.
+    ///
+    /// NOTE: All branch bodies must currently infer the **same** type.
+    /// Mismatched body types are a hard
+    /// [`crate::ccl::infer::InferError::TypeMismatch`] rather than producing
+    /// a sum type ([`Type::Variant`]).
     Case {
-        /// Ordered list of branches. Evaluated top-to-bottom; the first branch
-        /// whose guard is `true` wins.
+        /// Optional scrutinee whose variant tag the structural branches
+        /// match. `None` for pure guard-based dispatch (the classic
+        /// `if`/`elif` chain).
+        scrutinee: Option<Box<TypedExpr>>,
+        /// Ordered list of branches.
         branches: Vec<Branch>,
+    },
+
+    /// Tagged variant constructor: `.Tag(payload)`.
+    ///
+    /// Produces a [`Type::Variant`] containing a single tag whose payload type
+    /// is inferred from `payload`. Width-subtyping then lets the resulting
+    /// singleton variant flow into any consumer expecting a superset of tags.
+    VariantCtor {
+        /// Tag name; arbitrary identifier.
+        tag: String,
+        /// Payload expression.
+        payload: Box<TypedExpr>,
     },
 
     /// A bounded iteration loop with explicit loop-carried accumulators.
@@ -1269,6 +1297,26 @@ impl TypedExpr {
         .with_ty(result_ty)
     }
 
+    /// Construct a [`TypedExprNode::VariantCtor`] node.
+    ///
+    /// Produces a singleton variant value at the inference layer. Width-
+    /// subtyping flows it into any consumer expecting a superset of tags.
+    pub fn variant_ctor(tag: impl Into<String>, payload: TypedExpr) -> Self {
+        Self::new(TypedExprNode::VariantCtor {
+            tag: tag.into(),
+            payload: Box::new(payload),
+        })
+    }
+
+    /// Construct a pattern-matching [`TypedExprNode::Case`] node — a `Case`
+    /// with a scrutinee whose branches carry structural [`Pattern`]s.
+    pub fn match_expr(scrutinee: TypedExpr, branches: Vec<Branch>) -> Self {
+        Self::new(TypedExprNode::Case {
+            scrutinee: Some(Box::new(scrutinee)),
+            branches,
+        })
+    }
+
     /// Build a [`TypedExprNode::Lambda`] with a predicate [`Refinement`].
     pub fn lambda_with_refinement(
         param: &str,
@@ -1347,12 +1395,19 @@ impl TypedExpr {
                     f(e);
                 }
             }
-            TypedExprNode::Case { branches } => {
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+            } => {
+                if let Some(s) = scrutinee {
+                    f(s);
+                }
                 for b in branches {
                     f(&b.guard);
                     f(&b.body);
                 }
             }
+            TypedExprNode::VariantCtor { payload, .. } => f(payload),
             TypedExprNode::Record(fields) => {
                 for (_, e) in fields {
                     f(e);
@@ -1478,12 +1533,19 @@ impl TypedExpr {
                     f(e);
                 }
             }
-            TypedExprNode::Case { branches } => {
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+            } => {
+                if let Some(s) = scrutinee {
+                    f(s);
+                }
                 for b in branches {
                     f(&mut b.guard);
                     f(&mut b.body);
                 }
             }
+            TypedExprNode::VariantCtor { payload, .. } => f(payload),
             TypedExprNode::Record(fields) => {
                 for (_, e) in fields {
                     f(e);
@@ -1683,17 +1745,45 @@ pub struct MutationLoopShapeMut<'a> {
     pub loop_body: &'a mut Expr,
 }
 
-/// A single conditional branch in a [`TypedExprNode::Case`] expression.
+/// A single branch in a [`TypedExprNode::Case`] expression.
 ///
-/// Holds a `guard` (a boolean expression) and a `body` (the value produced
-/// when the guard is `true`). [`TypedExprNode::Case`] evaluates branches in
-/// order and returns the first body whose guard is satisfied.
+/// A branch carries an optional structural [`Pattern`] (match a variant tag
+/// of the enclosing `Case`'s scrutinee, binding its payload) and an optional
+/// boolean `guard`. The branch wins when its pattern matches *and* its guard
+/// is `true`; `body` is then evaluated in scope of any pattern binding.
+///
+/// Branch kinds:
+/// - guard only (`pattern: None`) — a classic `if`/`elif` condition;
+/// - pattern only — a bare `case .Tag(x):` arm; its `guard` is the literal
+///   `true` (the structural match alone decides the branch);
+/// - both — `case .Tag(x) if x > 0:`, matching structure and logic at once.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Branch {
-    /// Boolean guard; constrained to [`Type::Base`]`(`[`BaseType::Bool`]`)` during inference.
+    /// Optional structural pattern. Requires the enclosing `Case` to have a
+    /// scrutinee; `None` for a purely logical branch.
+    pub pattern: Option<Pattern>,
+    /// Boolean guard; constrained to
+    /// [`Type::Base`]`(`[`BaseType::Bool`]`)` during inference. A pattern
+    /// branch with no secondary filter carries a literal `true` guard, so
+    /// the "first branch whose guard holds" rule is uniform.
     pub guard: TypedExpr,
-    /// Value expression; evaluated when `guard` is `true`.
+    /// Value expression; evaluated when the branch wins.
     pub body: TypedExpr,
+}
+
+/// The structural part of a [`Branch`]: a variant tag plus the binding that
+/// receives its payload.
+///
+/// Matches one tag of the enclosing [`TypedExprNode::Case`]'s scrutinee and
+/// binds the payload to `binding.name`; `binding.ty` is filled in by
+/// inference to the per-tag narrowed payload type.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pattern {
+    /// Tag this branch matches; must agree with one of the scrutinee
+    /// variant's keys.
+    pub tag: String,
+    /// Payload binding, in scope for the branch's `guard` and `body`.
+    pub binding: TypedBinding,
 }
 
 /// A CCL type annotation.
@@ -1736,11 +1826,17 @@ pub enum Type {
     /// Unifies with [`Type::Record`] by constraining matching fields, and with
     /// another `PartialRecord` by constraining overlapping fields.
     PartialRecord(Vec<(String, Type)>),
-    /// A sum type.
+    /// A tagged sum type — each tag has its own payload type.
     ///
-    /// Representable in the type system but not yet produced by inference.
-    /// TODO: Generating and compiling `Union` types.
-    Union(Vec<Type>),
+    /// Tags are [`FieldKey`]s, the dual of `Record`/`Tuple` keys: `Name`
+    /// for source-level `.Tag(...)` variants, `Index` for anonymous
+    /// positional sums. This is the single sum representation — the
+    /// formerly-separate untagged `Union` is just the all-`Index` case
+    /// (`a ++ b` is `Variant([(Index(0), A), (Index(1), B)])`), so
+    /// positional and named sums share one constructor, one coalesce
+    /// path, and one width-subtyping rule. `Vec` order is preserved for
+    /// display.
+    Variant(Vec<(FieldKey, Type)>),
     /// A refinement of another type
     Refinement(Box<Type>, Refinement),
     /// Pre-inference placeholder stamped by lowering on every new node.
@@ -1778,6 +1874,34 @@ pub enum Type {
     // Refinement { base: Box<Type>, predicate: Box<Expr> }
 }
 
+/// If every tag in `tags` is an anonymous positional [`FieldKey::Index`]
+/// tag (as produced by `++`/CollectionUnion and other unnamed sums),
+/// return the payloads in order — recursively flattening nested
+/// all-positional variants so chained `a ++ b ++ c` renders flat as
+/// `A | B | C` rather than as nested `[._0: … | ._1: …]`. Returns `None`
+/// for any variant containing a `Name` tag (a source-level `.Tag(...)`),
+/// which is rendered with its tags shown.
+///
+/// Because positional (`Index`) and named (`Name`) tags are distinct
+/// `FieldKey` cases, there is no ambiguity here: a user-written named tag
+/// can never be mistaken for a synthetic positional one.
+fn synthetic_payloads(tags: &[(FieldKey, Type)]) -> Option<Vec<Type>> {
+    if tags.iter().any(|(k, _)| !matches!(k, FieldKey::Index(_))) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(tags.len());
+    for (_, t) in tags {
+        match t {
+            Type::Variant(inner) => match synthetic_payloads(inner) {
+                Some(mut flat) => out.append(&mut flat),
+                None => out.push(t.clone()),
+            },
+            _ => out.push(t.clone()),
+        }
+    }
+    Some(out)
+}
+
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1813,9 +1937,30 @@ impl fmt::Display for Type {
                 let parts: Vec<_> = entries.iter().map(|(n, t)| format!("{n}: {t}")).collect();
                 write!(f, "{{{}..}}", parts.join(", "))
             }
-            Type::Union(ts) => {
-                let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
-                write!(f, "{}", parts.join(" | "))
+            Type::Variant(tags) => {
+                // Anonymous positional variants (all tags are
+                // `FieldKey::Index`, as `++`/CollectionUnion produces) are
+                // rendered as a flat `A | B` join — the positional tags
+                // carry no user-meaningful information. Nested
+                // all-positional variants flatten recursively so
+                // `a ++ b ++ c` prints as `A | B | C` rather than
+                // `[._0: [._0: A | ._1: B] | ._1: C]`.
+                if let Some(payloads) = synthetic_payloads(tags) {
+                    let parts: Vec<_> = payloads.iter().map(|t| t.to_string()).collect();
+                    write!(f, "{}", parts.join(" | "))
+                } else {
+                    let parts: Vec<_> = tags
+                        .iter()
+                        .map(|(n, t)| {
+                            if matches!(t, Type::Base(BaseType::Unit)) {
+                                format!(".{n}")
+                            } else {
+                                format!(".{n}({t})")
+                            }
+                        })
+                        .collect();
+                    write!(f, "[{}]", parts.join(" | "))
+                }
             }
             Type::Refinement(t, r) => write!(
                 f,
@@ -1890,7 +2035,7 @@ impl Type {
                 f(domain);
                 f(codomain);
             }
-            Type::Tuple(ts) | Type::Union(ts) => {
+            Type::Tuple(ts) => {
                 for t in ts {
                     f(t);
                 }
@@ -1911,6 +2056,11 @@ impl Type {
                 }
             }
             Type::Refinement(base, _) => f(base),
+            Type::Variant(tags) => {
+                for (_, t) in tags {
+                    f(t);
+                }
+            }
         }
     }
 
@@ -1928,7 +2078,7 @@ impl Type {
                 f(domain);
                 f(codomain);
             }
-            Type::Tuple(ts) | Type::Union(ts) => {
+            Type::Tuple(ts) => {
                 for t in ts {
                     f(t);
                 }
@@ -1949,6 +2099,11 @@ impl Type {
                 }
             }
             Type::Refinement(base, _) => f(base),
+            Type::Variant(tags) => {
+                for (_, t) in tags {
+                    f(t);
+                }
+            }
         }
     }
 

@@ -83,8 +83,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, Branch, Expr, Lit, Refinement, RefinementKind, Type, TypedExpr, TypedExprNode,
-    ccl_utils::count_free, next_refinement_id, walk_loop_children,
+    BaseType, Branch, Expr, Lit, Pattern, Refinement, RefinementKind, Type, TypedExpr,
+    TypedExprNode, ccl_utils::count_free, next_refinement_id, walk_loop_children,
 };
 
 /// Errors that can arise while desugaring `Defer`/`Feed`/`Define` nodes.
@@ -154,7 +154,11 @@ impl fmt::Display for DeferError {
 /// based fan-out.
 fn try_extract_filter_feed(body: &Expr, defer_name: &str) -> Option<(Expr, Expr)> {
     let branches = match &body.node {
-        TypedExprNode::Case { branches } => branches,
+        // The filter-feed shape is a guard-only `if` (no scrutinee).
+        TypedExprNode::Case {
+            scrutinee: None,
+            branches,
+        } => branches,
         _ => return None,
     };
     if branches.len() != 2 {
@@ -374,7 +378,7 @@ fn classify_lambda(lambda: &Expr) -> LambdaClass {
 /// Returns `None` if `lambda` doesn't match the simple float-able
 /// shape — e.g. the `Defer` is nested inside a non-trivial outer
 /// expression rather than appearing as the immediate `let`-binding.
-/// Stage 2 will widen the shape match as we encounter more patterns
+/// We will widen the shape match as we encounter more patterns
 /// in test cases; for now we handle the canonical lowering shape:
 ///
 /// ```text
@@ -849,13 +853,24 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
                 .map(|(n, e)| (n, rewrite_chains_in_scope(e, ctx)))
                 .collect(),
         ),
-        TypedExprNode::Case { branches } => TypedExprNode::Case {
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => TypedExprNode::Case {
+            scrutinee: scrutinee.map(|s| Box::new(rewrite_chains_in_scope(*s, ctx))),
             branches: branches
                 .into_iter()
-                .map(|Branch { guard, body }| Branch {
-                    guard: rewrite_chains_in_scope(guard, ctx),
-                    body: rewrite_chains_in_scope(body, ctx),
-                })
+                .map(
+                    |Branch {
+                         pattern,
+                         guard,
+                         body,
+                     }| Branch {
+                        pattern,
+                        guard: rewrite_chains_in_scope(guard, ctx),
+                        body: rewrite_chains_in_scope(body, ctx),
+                    },
+                )
                 .collect(),
         },
         TypedExprNode::Loop {
@@ -885,6 +900,12 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
         | TypedExprNode::Source(_)
         | TypedExprNode::Defer) => leaf,
         TypedExprNode::Error => crate::unexpected_error_node!(),
+        // Variant constructors / Match are not yet emitted by lowering
+        // (§3.2 surface-syntax workstream lands separately); desugar_defers
+        // runs on the lowered AST so it cannot see them today.
+        TypedExprNode::VariantCtor { .. } => {
+            unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
+        }
     };
     TypedExpr {
         node: new_node,
@@ -913,6 +934,9 @@ fn rebinds(expr: &Expr, name: &str) -> bool {
         TypedExprNode::Let { binding, .. } => binding.name == name,
         TypedExprNode::Lambda { param, .. } => param.name == name,
         TypedExprNode::Loop { params, .. } => params.iter().any(|p| p.name == name),
+        TypedExprNode::Case { branches, .. } => branches
+            .iter()
+            .any(|b| b.pattern.as_ref().is_some_and(|p| p.binding.name == name)),
         _ => false,
     };
     here || expr.any_child(|c| rebinds(c, name))
@@ -1065,13 +1089,24 @@ fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
                 .map(|(n, e)| (n, pre_infer_substitute(e, name, replacement)))
                 .collect(),
         ),
-        TypedExprNode::Case { branches } => TypedExprNode::Case {
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => TypedExprNode::Case {
+            scrutinee: scrutinee.map(|s| Box::new(pre_infer_substitute(*s, name, replacement))),
             branches: branches
                 .into_iter()
-                .map(|Branch { guard, body }| Branch {
-                    guard: pre_infer_substitute(guard, name, replacement),
-                    body: pre_infer_substitute(body, name, replacement),
-                })
+                .map(
+                    |Branch {
+                         pattern,
+                         guard,
+                         body,
+                     }| Branch {
+                        pattern,
+                        guard: pre_infer_substitute(guard, name, replacement),
+                        body: pre_infer_substitute(body, name, replacement),
+                    },
+                )
                 .collect(),
         },
         TypedExprNode::Loop {
@@ -1111,6 +1146,9 @@ fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             value: Box::new(pre_infer_substitute(*value, name, replacement)),
         },
         TypedExprNode::Error => crate::unexpected_error_node!(),
+        TypedExprNode::VariantCtor { .. } => {
+            unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
+        }
     };
     TypedExpr {
         node: new_node,
@@ -1326,10 +1364,15 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
                 .map(|(n, e)| (n, drop_expr_stmts(e)))
                 .collect(),
         ),
-        TypedExprNode::Case { branches } => TypedExprNode::Case {
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => TypedExprNode::Case {
+            scrutinee: scrutinee.map(|s| Box::new(drop_expr_stmts(*s))),
             branches: branches
                 .into_iter()
                 .map(|b| Branch {
+                    pattern: b.pattern,
                     guard: drop_expr_stmts(b.guard),
                     body: drop_expr_stmts(b.body),
                 })
@@ -1356,6 +1399,9 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)) => node,
         TypedExprNode::Error => crate::unexpected_error_node!(),
+        TypedExprNode::VariantCtor { .. } => {
+            unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
+        }
     };
     TypedExpr {
         node: new_node,
@@ -1396,10 +1442,18 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
         TypedExprNode::Record(fields) => fields
             .iter()
             .try_for_each(|(_, e)| assert_no_defer_residue(e)),
-        TypedExprNode::Case { branches } => branches.iter().try_for_each(|b| {
-            assert_no_defer_residue(&b.guard)?;
-            assert_no_defer_residue(&b.body)
-        }),
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            if let Some(s) = scrutinee {
+                assert_no_defer_residue(s)?;
+            }
+            branches.iter().try_for_each(|b| {
+                assert_no_defer_residue(&b.guard)?;
+                assert_no_defer_residue(&b.body)
+            })
+        }
         TypedExprNode::Loop {
             init_args,
             source,
@@ -1420,6 +1474,9 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_) => Ok(()),
         TypedExprNode::Error => crate::unexpected_error_node!(),
+        TypedExprNode::VariantCtor { .. } => {
+            unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
+        }
     }
 }
 
@@ -2116,10 +2173,27 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<String> {
                     rec(e, bound, out);
                 }
             }
-            TypedExprNode::Case { branches } => {
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+            } => {
+                if let Some(s) = scrutinee {
+                    rec(s, bound, out);
+                }
                 for b in branches {
+                    // A structural pattern binds its payload name over the
+                    // branch's guard and body.
+                    let pushed = if let Some(p) = &b.pattern {
+                        bound.push(p.binding.name.clone());
+                        true
+                    } else {
+                        false
+                    };
                     rec(&b.guard, bound, out);
                     rec(&b.body, bound, out);
+                    if pushed {
+                        bound.pop();
+                    }
                 }
             }
             TypedExprNode::Loop {
@@ -2152,6 +2226,9 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<String> {
             | TypedExprNode::Source(_)
             | TypedExprNode::Defer => {}
             TypedExprNode::Error => crate::unexpected_error_node!(),
+            TypedExprNode::VariantCtor { .. } => {
+                unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
+            }
         }
     }
     let mut targets: HashSet<String> = HashSet::new();
@@ -3182,7 +3259,10 @@ fn extract_for_defer(
                 refinement,
             }
         }
-        TypedExprNode::Case { branches } => {
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
             // Case branches: each branch is an inner scope.  When *some*
             // arm contains a feed for `defer_name`, we wrap each arm's
             // terminal in `Record({result, to_<d>})` with an Empty channel
@@ -3195,9 +3275,15 @@ fn extract_for_defer(
             // For arms with feeds where the feed value references arm-local
             // bindings, the Record wrap inside the arm keeps those bindings
             // in scope at the publication site.
-            let mut per_branch: Vec<(Expr, Vec<Expr>, Expr)> = Vec::with_capacity(branches.len());
+            let mut per_branch: Vec<(Option<Pattern>, Expr, Vec<Expr>, Expr)> =
+                Vec::with_capacity(branches.len());
             let mut any_feed = false;
-            for Branch { guard, body } in branches {
+            for Branch {
+                pattern,
+                guard,
+                body,
+            } in branches
+            {
                 let mut branch_feeds = Vec::new();
                 let mut branch_define = None;
                 let body = extract_for_defer(
@@ -3214,12 +3300,12 @@ fn extract_for_defer(
                 if !branch_feeds.is_empty() {
                     any_feed = true;
                 }
-                per_branch.push((guard, branch_feeds, body));
+                per_branch.push((pattern, guard, branch_feeds, body));
             }
             if any_feed {
                 let new_branches: Vec<Branch> = per_branch
                     .into_iter()
-                    .map(|(guard, branch_feeds, body)| {
+                    .map(|(pattern, guard, branch_feeds, body)| {
                         let channel = if branch_feeds.is_empty() {
                             empty_channel()
                         } else {
@@ -3228,6 +3314,7 @@ fn extract_for_defer(
                         // Build the arm's per-branch Record at its terminal.
                         let wrapped = augment_terminal_with_channel(body, defer_name, channel);
                         Branch {
+                            pattern,
                             guard,
                             body: wrapped,
                         }
@@ -3235,6 +3322,7 @@ fn extract_for_defer(
                     .collect();
                 let case_expr = TypedExpr {
                     node: TypedExprNode::Case {
+                        scrutinee: scrutinee.clone(),
                         branches: new_branches,
                     },
                     ty: ty.clone(),
@@ -3247,9 +3335,14 @@ fn extract_for_defer(
                 return Ok(Expr::apply(case_expr, Expr::proj_field("result")));
             }
             TypedExprNode::Case {
+                scrutinee,
                 branches: per_branch
                     .into_iter()
-                    .map(|(guard, _, body)| Branch { guard, body })
+                    .map(|(pattern, guard, _, body)| Branch {
+                        pattern,
+                        guard,
+                        body,
+                    })
                     .collect(),
             }
         }
@@ -3275,6 +3368,9 @@ fn extract_for_defer(
         | TypedExprNode::Source(_)
         | TypedExprNode::Defer) => node,
         TypedExprNode::Error => crate::unexpected_error_node!(),
+        TypedExprNode::VariantCtor { .. } => {
+            unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
+        }
     };
     Ok(TypedExpr {
         node,
@@ -3650,7 +3746,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Stage 1: lambda classification + defer-float helpers
+    // lambda classification + defer-float helpers
     // -----------------------------------------------------------------
 
     /// `λx → x` — pure identity is [`LambdaClass::VarBody`].
@@ -4182,18 +4278,22 @@ mod tests {
             right: Box::new(lit(0)),
         });
         let feeding_arm = Branch {
+            pattern: None,
             guard,
             body: Expr::feed("d".into(), var("x")),
         };
         let unrelated_arm = Branch {
+            pattern: None,
             guard: Expr::lit(Lit::Bool(false)),
             body: Expr::lit(Lit::Unit),
         };
         let true_arm = Branch {
+            pattern: None,
             guard: Expr::lit(Lit::Bool(true)),
             body: Expr::lit(Lit::Unit),
         };
         let case_expr = Expr::new(TypedExprNode::Case {
+            scrutinee: None,
             branches: vec![feeding_arm, unrelated_arm, true_arm],
         });
         let body_lambda = Expr::lambda("x", Type::Hole, case_expr);

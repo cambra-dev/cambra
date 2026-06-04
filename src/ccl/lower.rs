@@ -414,12 +414,15 @@ pub fn lower_expr(
             let true_arm = lower_expr(then_expr, ctx)?;
             let false_arm = lower_expr(else_expr, ctx)?;
             Ok(Expr::new(TypedExprNode::Case {
+                scrutinee: None,
                 branches: vec![
                     Branch {
+                        pattern: None,
                         guard,
                         body: true_arm,
                     },
                     Branch {
+                        pattern: None,
                         guard: Expr::lit(Lit::Bool(true)),
                         body: false_arm,
                     },
@@ -961,14 +964,20 @@ fn lower_if(
     for branch in branches {
         let guard = lower_expr(&branch.cond, ctx)?;
         let body = lower_stmts_inner(&branch.body, outer_bindings, ctx, false)?;
-        out_branches.push(Branch { guard, body });
+        out_branches.push(Branch {
+            pattern: None,
+            guard,
+            body,
+        });
     }
     let else_expr = lower_stmts_inner(else_body, outer_bindings, ctx, false)?;
     out_branches.push(Branch {
+        pattern: None,
         guard: Expr::lit(Lit::Bool(true)),
         body: else_expr,
     });
     Ok(Expr::new(TypedExprNode::Case {
+        scrutinee: None,
         branches: out_branches,
     }))
 }
@@ -1823,12 +1832,15 @@ fn lower_for_body_terminal(
                 ctx,
             )?;
             Ok(Expr::new(TypedExprNode::Case {
+                scrutinee: None,
                 branches: vec![
                     Branch {
+                        pattern: None,
                         guard: cond,
                         body: true_arm,
                     },
                     Branch {
+                        pattern: None,
                         guard: Expr::lit(Lit::Bool(true)),
                         body: Expr::lit(Lit::Unit),
                     },

@@ -161,8 +161,26 @@ fn is_let_bound(name: &str, expr: &Expr) -> bool {
         // A Lambda param shadows `name` inside the body — treat it as a binding
         // site so we don't substitute through it.
         TypedExprNode::Lambda { param, .. } if param.name == name => true,
+        // A Loop with any param matching `name` is a definitive bind site.
         TypedExprNode::Loop { params, .. } if params.iter().any(|p| p.name == name) => true,
         TypedExprNode::Error => crate::unexpected_error_node!(),
+        // A `Case` branch's structural pattern binds its payload name,
+        // shadowing `name` inside that branch's guard/body; `any_child`
+        // can't see binding names, so check explicitly. (Guard-only
+        // branches have `pattern: None` and never shadow.)
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            scrutinee.as_ref().is_some_and(|s| is_let_bound(name, s))
+                || branches.iter().any(|b| {
+                    if b.pattern.as_ref().is_some_and(|p| p.binding.name == name) {
+                        false
+                    } else {
+                        is_let_bound(name, &b.guard) || is_let_bound(name, &b.body)
+                    }
+                })
+        }
         _ => expr.any_child(|e| is_let_bound(name, e)),
     }
 }

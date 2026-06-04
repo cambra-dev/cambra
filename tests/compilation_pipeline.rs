@@ -246,8 +246,9 @@ fn test_bool_ops(#[case] code: &str, #[case] expected: Value) {
         deleted: BitSet::new(),
     })]
 #[case("sum([1] ++ [2])", Tile::Scalar(ColumnValue::Ints(vec![3])))]
-#[ignore = "Fixed with SimpleType variants in upstack PR"]
 #[case("sum([1 for y in [1] ++ [2]])", Tile::Scalar(ColumnValue::Ints(vec![2])))]
+#[case("sum([1 for y in [1] ++ [2] ++ [3]])", Tile::Scalar(ColumnValue::Ints(vec![3])))]
+#[case("sum([1] ++ [2] ++ [3])", Tile::Scalar(ColumnValue::Ints(vec![6])))]
 fn test_unions(#[case] code: &str, #[case] expected: Tile) {
     let result = run_pipeline(code);
     assert_eq!(result, expected);
@@ -1089,7 +1090,7 @@ fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
 // An identity `def` called at two distinct argument types in the same program.
 // Both call sites must type-check (exercising let-generalised polymorphism for
 // user-defined functions); the program's value is the final expression.
-#[ignore = "needs Stage 2 of simple-sub plan: polymorphism and monomorphization"]
+#[ignore = "needs let-polymorphism and monomorphization (not yet implemented)"]
 #[rstest]
 #[timeout(Duration::from_secs(1))]
 fn test_function_def_polymorphic_identity() {
@@ -1562,7 +1563,10 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
         deleted: BitSet::new(),
     }
 )]
-#[ignore = "Fixed with SimpleType variants in upstack PR"]
+#[ignore = "simple-sub monomorphization gap: the filtered inner comprehension's \
+            refined __iter_record argument coalesces to an unresolved Infer var \
+            (not fixed by the tagged-variant work; needs the \
+            monomorphization pass)"]
 #[case(
     "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], lambda x: x // 2)]",
     Tile::SealedFunction {

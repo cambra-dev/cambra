@@ -149,9 +149,36 @@ fn count_free_with_visited(name: &str, expr: &Expr, visited: &mut HashSet<Refine
             value,
         } => (handle == name) as usize + count_free_with_visited(name, value, visited),
 
-        // All remaining variants: just sum counts across the direct
-        // children.  Atoms (Lit/Proj/Builtin/Source/Defer) have no
-        // children, so the fold returns 0.
+        // A `Case` branch's structural pattern binds its payload name,
+        // shadowing `name` inside that branch's guard and body.
+        // `walk_children` only visits child Exprs and can't see that
+        // `pattern.binding.name` shadows `name`, so it would over-count
+        // free occurrences in shadowing branches. Handle `Case` explicitly.
+        // (Guard-only branches have `pattern: None` and never shadow.)
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            let scrut = scrutinee
+                .as_ref()
+                .map_or(0, |s| count_free_with_visited(name, s, visited));
+            scrut
+                + branches
+                    .iter()
+                    .map(|b| {
+                        if b.pattern.as_ref().is_some_and(|p| p.binding.name == name) {
+                            0
+                        } else {
+                            count_free_with_visited(name, &b.guard, visited)
+                                + count_free_with_visited(name, &b.body, visited)
+                        }
+                    })
+                    .sum::<usize>()
+        }
+
+        // VariantCtor payload and all other variants: just sum counts
+        // across the direct children.  Atoms (Lit/Proj/Builtin/Source/
+        // Defer) have no children, so the fold returns 0.
         _ => {
             let mut sum = 0;
             expr.walk_children(|e| sum += count_free_with_visited(name, e, visited));

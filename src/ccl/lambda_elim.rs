@@ -469,8 +469,13 @@ pub(crate) fn zip_pair_ty(f: &Expr, g: &Expr) -> Type {
 /// loop compiles via the general path (correct but no `Restrict` operator).
 /// A follow-up could peel leading `Let` nodes before the pattern check.
 fn is_filter_case_body(body: &Expr) -> bool {
-    if let TypedExprNode::Case { branches } = &body.node {
+    if let TypedExprNode::Case {
+        scrutinee: None,
+        branches,
+    } = &body.node
+    {
         branches.len() == 2
+            && branches.iter().all(|b| b.pattern.is_none())
             && matches!(&branches[1].guard.node, TypedExprNode::Lit(Lit::Bool(true)))
             && matches!(&branches[1].body.node, TypedExprNode::Lit(Lit::Unit))
     } else {
@@ -482,7 +487,7 @@ fn is_filter_case_body(body: &Expr) -> bool {
 ///
 /// Panics if `body` is not a filter-pattern Case; call [`is_filter_case_body`] first.
 fn extract_filter_case(body: Expr) -> (Expr, Expr) {
-    if let TypedExprNode::Case { mut branches } = body.node {
+    if let TypedExprNode::Case { mut branches, .. } = body.node {
         let first = branches.remove(0);
         (first.guard, first.body)
     } else {
