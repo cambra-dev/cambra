@@ -283,18 +283,20 @@ impl SimpleSubContext {
 
     /// Normalize a user annotation / source type into a solver-ready
     /// `Type`: every `Hole` becomes a fresh inference variable at the
-    /// current level, and `Refinement` wrappers are stripped (refinements
-    /// are lattice-blind and stay sidecared on the AST node). Everything
-    /// else — including existing `Infer` vars and the structural variants
-    /// the solver operates on — is kept as-is.
+    /// current level. Everything else — including existing `Infer` vars,
+    /// the structural variants the solver operates on, and `Refinement`
+    /// wrappers (refinements now ride the lattice as restriction tags) — is
+    /// kept, recursing to normalize nested holes.
     fn normalize_annotation(&self, ty: &Type) -> Type {
         match ty {
             // A `Hole` annotation means "infer this" → fresh variable.
             Type::Hole => fresh_var(self.level),
-            // Refinements are lattice-blind: strip the wrapper (the
-            // predicate stays sidecared on the AST node and `type_saturate`
-            // re-attaches it on output).
-            Type::Refinement(inner, _) => self.normalize_annotation(inner),
+            // Refinements ride the lattice: keep the wrapper, normalize the
+            // inner (so a `Refinement(Hole, r)` source annotation becomes
+            // `Refinement(?fresh, r)` rather than losing the tag).
+            Type::Refinement(inner, r) => {
+                Type::Refinement(Box::new(self.normalize_annotation(inner)), r.clone())
+            }
             // Structural types are already solver-ready; recurse to
             // normalize any nested holes/refinements.
             Type::Fun(d, c) => fun(self.normalize_annotation(d), self.normalize_annotation(c)),
@@ -313,6 +315,50 @@ impl SimpleSubContext {
             ),
             // Leaves and existing inference vars pass through unchanged.
             Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Infer(_) => ty.clone(),
+        }
+    }
+}
+
+/// Emit constraints for every refinement predicate embedded in an
+/// annotation `Type`, so their expression sub-trees get inferred types.
+/// Refinement predicates are `Expr`s that mention free variables of the
+/// enclosing scope; this must run while those bindings are live (i.e.
+/// during `emit_node` of the annotated node). `try_borrow_mut` skips a
+/// predicate already being walked (the same `Rc` can recur through its own
+/// type slot).
+fn emit_annotation_predicates(ty: &Type, ctx: &mut SimpleSubContext) -> Result<(), InferError> {
+    match ty {
+        Type::Refinement(inner, r) => {
+            let RefinementKind::Predicate(def) = &r.kind;
+            if let Ok(mut pred) = def.try_borrow_mut() {
+                emit_node(&mut pred, ctx)?;
+            }
+            emit_annotation_predicates(inner, ctx)
+        }
+        Type::Fun(d, c) => {
+            emit_annotation_predicates(d, ctx)?;
+            emit_annotation_predicates(c, ctx)
+        }
+        Type::Tuple(ts) => {
+            for t in ts {
+                emit_annotation_predicates(t, ctx)?;
+            }
+            Ok(())
+        }
+        Type::Record(fs) => {
+            for (_, t) in fs {
+                emit_annotation_predicates(t, ctx)?;
+            }
+            Ok(())
+        }
+        Type::Variant(tags) => {
+            for (_, t) in tags {
+                emit_annotation_predicates(t, ctx)?;
+            }
+            Ok(())
+        }
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {
+            Ok(())
         }
     }
 }
@@ -577,6 +623,14 @@ fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<Type, InferE
     // annotation. Annotation wins on success; on conflict we surface
     // AnnotationMismatch.
     if let Some(annotation) = expr.user_annotation.clone() {
+        // The annotation may carry refinement predicates (e.g. a
+        // filter-feed source annotation `Fun(Refinement(Hole, r), Hole)`
+        // from `desugar_defers`). Now that refinements ride the lattice,
+        // those predicates surface on the node's coalesced type and reach
+        // the post-inference checks, so their expression trees must be
+        // inferred in the current scope. (Lambda-node refinements are
+        // handled in `emit_lambda`; this covers annotation-only ones.)
+        emit_annotation_predicates(&annotation, ctx)?;
         let ann_simple = ctx.normalize_annotation(&annotation);
         // Snapshot the inferred type before the annotation bounds are added
         // so the error message shows what was actually inferred, not the
@@ -623,8 +677,13 @@ fn emit_lambda(
 ) -> Result<Type, InferError> {
     // Param type: convert any explicit annotation/Hole/Infer into a
     // the solver. A Hole turns into a fresh Var that will accumulate
-    // bounds from body usage and call sites.
+    // bounds from body usage and call sites. Link `param.ty` to that
+    // (shared) var so `coalesce_node` can resolve the binding slot in
+    // place — the slot ends up carrying the body-usage restriction tags
+    // but *not* the lambda's own refinement (that decorates only the
+    // function-boundary domain in `expr.ty`).
     let param_simple = ctx.normalize_annotation(&param.ty);
+    param.ty = param_simple.clone();
     let body_ty = {
         ctx.scopes.push_scope();
         ctx.scopes.bind(&param.name, param_simple.clone());
@@ -661,19 +720,26 @@ fn emit_lambda(
         })?;
     }
 
-    // Refinement: not lifted into the structural lattice and not into the inferred
-    // function type. The refinement metadata lives on the AST node;
-    // `type_saturate` and `lambda_elim` read it from there. We still
-    // need to walk the refinement's predicate so its inner expressions
-    // get inferred types (otherwise downstream consumers see `Hole`s
-    // inside the predicate body).
-    if let Some(r) = refinement {
-        let RefinementKind::Predicate(def) = &r.kind;
-        // The predicate is compiled lazily inside an `Rc<RefCell<Expr>>`.
-        emit_node(&mut def.borrow_mut(), ctx)?;
-    }
+    // Refinement: lift the lambda's *own* refinement into the inferred
+    // domain so it rides the lattice as a restriction tag (replacing the
+    // old `type_saturate` re-stitch). The AST node keeps its `refinement`
+    // field — `lambda_elim` reads it from there, not from the type, so
+    // there's no double-wrapping. We still walk the predicate so its inner
+    // expressions get inferred types (otherwise downstream consumers see
+    // `Hole`s inside the predicate body). The param is bound in scope under
+    // the *unrefined* `param_simple`, so `Var(param)` body references stay
+    // bare; restriction tags decorate only the function boundary.
+    let domain_ty = match refinement {
+        Some(r) => {
+            let RefinementKind::Predicate(def) = &r.kind;
+            // The predicate is compiled lazily inside an `Rc<RefCell<Expr>>`.
+            emit_node(&mut def.borrow_mut(), ctx)?;
+            Type::Refinement(Box::new(param_simple), r.clone())
+        }
+        None => param_simple,
+    };
 
-    Ok(fun(param_simple, body_ty))
+    Ok(fun(domain_ty, body_ty))
 }
 
 fn emit_apply(
@@ -1192,6 +1258,11 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
                     coalesce_node(&mut pred, errors);
                 }
             }
+            // `param.ty` is resolved from the lambda's coalesced domain in
+            // the end-of-function block (it can't be coalesced standalone:
+            // body-usage restriction tags are negative-polarity upper-bound
+            // facts that only materialize in the contravariant domain
+            // position of `expr.ty`).
         }
         TypedExprNode::Aggregate { input, .. } => coalesce_node(input, errors),
         TypedExprNode::Let {
@@ -1291,19 +1362,88 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
     // compact → simplify → coalesce pipeline to materialize a concrete
     // `Type`.
     //
-    // Refinements are AST-node metadata (on `Expr::Lambda`) and are *not*
-    // lifted into the inferred function type — `type_saturate` reads the
-    // refinement off the AST node and `lambda_elim` wraps
-    // `Type::Refinement` around the domain when it desugars a refined
-    // lambda. Round-tripping the refinement through the inferred type also
-    // created a false divergence between `lambda_elim`'s `original_ty` and
-    // `result.ty` for synthetic refined lambdas (groupby, multi-gen
-    // comprehensions).
+    // Refinements now ride the lattice as restriction tags, so a refined
+    // domain coalesces straight onto `expr.ty` here (no `type_saturate`
+    // re-stitch). `lambda_elim` still reads the lambda's own refinement
+    // off the AST node — it is duplicated there deliberately, and the
+    // tag's id-equality dedups any structural overlap downstream.
     let label = symbolic(expr);
     match resolve_var_type(&expr.ty) {
         Ok(ty) => expr.ty = ty,
         Err(err) => push_coalesce_err(errors, map_coalesce_err(err, &label), label),
     }
+
+    // A lambda's param binding slot mirrors its coalesced domain, minus the
+    // lambda's *own* refinement layer (that decorates only the function
+    // boundary; `lambda_elim` re-wraps it from the AST node). Deriving it
+    // from the resolved domain — rather than coalescing the slot var
+    // standalone — is what preserves body-usage restriction tags, which are
+    // negative-polarity facts visible only in the contravariant domain.
+    if let TypedExprNode::Lambda {
+        param, refinement, ..
+    } = &mut expr.node
+        && let Type::Fun(dom, _) = &expr.ty
+    {
+        let mut d = (**dom).clone();
+        if let Some(r) = refinement {
+            d = strip_refinement_id(d, r.id);
+        }
+        param.ty = d;
+    }
+
+    // Resolve any refinement predicates that ride on this node's type but
+    // aren't reached through the main expression tree — e.g. a filter-feed
+    // source annotation `Fun(Refinement(_, r), _)`. Their expression trees
+    // were emitted (in `emit_annotation_predicates`); resolve their var
+    // slots so the post-inference checks see concrete types. `try_borrow_mut`
+    // breaks the cycle when a predicate's own type slot carries the same
+    // refinement.
+    coalesce_type_predicates(&expr.ty, errors);
+}
+
+/// Coalesce refinement predicates embedded anywhere in `ty` (see the call
+/// site in `coalesce_node`). Idempotent for predicates already resolved by
+/// the `Lambda` arm.
+fn coalesce_type_predicates(ty: &Type, errors: &mut Vec<InferError>) {
+    match ty {
+        Type::Refinement(inner, r) => {
+            let RefinementKind::Predicate(def) = &r.kind;
+            if let Ok(mut pred) = def.try_borrow_mut() {
+                coalesce_node(&mut pred, errors);
+            }
+            coalesce_type_predicates(inner, errors);
+        }
+        Type::Fun(d, c) => {
+            coalesce_type_predicates(d, errors);
+            coalesce_type_predicates(c, errors);
+        }
+        Type::Tuple(ts) => ts.iter().for_each(|t| coalesce_type_predicates(t, errors)),
+        Type::Record(fs) => fs
+            .iter()
+            .for_each(|(_, t)| coalesce_type_predicates(t, errors)),
+        Type::Variant(tags) => tags
+            .iter()
+            .for_each(|(_, t)| coalesce_type_predicates(t, errors)),
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+    }
+}
+
+/// Remove the single [`Type::Refinement`] layer whose tag id matches `id`
+/// (if present), preserving the relative order of the other layers. Tags
+/// may coalesce in any order, so we can't assume a fixed position.
+fn strip_refinement_id(ty: Type, id: crate::ccl::RefinementId) -> Type {
+    let mut layers = Vec::new();
+    let mut cur = ty;
+    while let Type::Refinement(inner, r) = cur {
+        if r.id != id {
+            layers.push(r);
+        }
+        cur = *inner;
+    }
+    layers
+        .into_iter()
+        .rev()
+        .fold(cur, |acc, r| Type::Refinement(Box::new(acc), r))
 }
 
 // ---------------------------------------------------------------------------

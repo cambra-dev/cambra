@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::BaseType;
+use crate::ccl::simple_sub::{ConstrainCache, constrain_subtype};
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
 use crate::ccl::{
     BinOpKind, Branch, Expr, InferVarId, Lit, RefinementKind, Type, TypedExprNode, UnaryOpKind,
@@ -509,14 +510,14 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
         for Branch { guard, body, .. } in branches {
             collect_typecheck_errors(guard, errors);
             collect_typecheck_errors(body, errors);
-            if !typecheck_equal(&guard.ty, &bool_ty) {
+            if !typecheck_subtype(&guard.ty, &bool_ty) {
                 errors.push(InferError::TypeMismatch {
                     ctx: symbolic(expr),
                     type_a: bool_ty.clone(),
                     type_b: guard.ty.clone(),
                 });
             }
-            if !typecheck_equal(&body.ty, &expr.ty) {
+            if !typecheck_subtype(&body.ty, &expr.ty) {
                 errors.push(InferError::TypeMismatch {
                     ctx: symbolic(expr),
                     type_a: expr.ty.clone(),
@@ -554,14 +555,14 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
 
         TypedExprNode::Apply { function, argument } => match &function.ty {
             Type::Fun(domain, codomain) => {
-                if !typecheck_equal(&argument.ty, domain) {
+                if !typecheck_subtype(&argument.ty, domain) {
                     errors.push(InferError::TypeMismatch {
                         ctx: format!("domain of {}", symbolic(expr)),
                         type_a: (**domain).clone(),
                         type_b: argument.ty.clone(),
                     });
                 }
-                if !typecheck_equal(&expr.ty, codomain) {
+                if !typecheck_subtype(codomain, &expr.ty) {
                     errors.push(InferError::TypeMismatch {
                         ctx: format!("codomain of {}", symbolic(expr)),
                         type_a: (**codomain).clone(),
@@ -580,7 +581,7 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
         // recheck that here; the inference pass already validates it.
         TypedExprNode::Lambda { body, .. } => match &expr.ty {
             Type::Fun(_, codomain) => {
-                if !typecheck_equal(codomain, &body.ty) {
+                if !typecheck_subtype(&body.ty, codomain) {
                     errors.push(InferError::TypeMismatch {
                         ctx: symbolic(body),
                         type_a: body.ty.clone(),
@@ -599,14 +600,14 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
             bound_expr,
             body,
         } => {
-            if !typecheck_equal(&binding.ty, &bound_expr.ty) {
+            if !typecheck_subtype(&bound_expr.ty, &binding.ty) {
                 errors.push(InferError::TypeMismatch {
                     ctx: symbolic(bound_expr),
                     type_a: binding.ty.clone(),
                     type_b: bound_expr.ty.clone(),
                 });
             }
-            if !typecheck_equal(&expr.ty, &body.ty) {
+            if !typecheck_subtype(&body.ty, &expr.ty) {
                 errors.push(InferError::TypeMismatch {
                     ctx: symbolic(body),
                     type_a: body.ty.clone(),
@@ -620,7 +621,7 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
         TypedExprNode::Tuple(elts) => {
             let elem_tys: Vec<Type> = elts.iter().map(|e| e.ty.clone()).collect();
             let expected = Type::Tuple(elem_tys);
-            if !typecheck_equal(&expr.ty, &expected) {
+            if !typecheck_subtype(&expected, &expr.ty) {
                 errors.push(InferError::TypeMismatch {
                     ctx: symbolic(expr),
                     type_a: expected,
@@ -635,7 +636,7 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
                 .map(|(n, e)| (n.clone(), e.ty.clone()))
                 .collect();
             let expected = Type::Record(field_tys);
-            if !typecheck_equal(&expr.ty, &expected) {
+            if !typecheck_subtype(&expected, &expr.ty) {
                 errors.push(InferError::TypeMismatch {
                     ctx: symbolic(expr),
                     type_a: expected,
@@ -687,105 +688,81 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
     }
 }
 
-/// One-way subtype check: `a <: b` for structural types.
+/// Deep-strip every [`Type::Refinement`] layer, at any nesting depth,
+/// returning the bare structural type.
 ///
-/// Implements width subtyping on records (extra fields allowed) and
-/// tuples (extra trailing elements allowed). Functions compose
-/// contravariantly on domain, covariantly on codomain. All other shapes
-/// fall back to [`typecheck_equal`].
+/// The post-inference typecheck is **refinement-placement-insensitive**:
+/// refinement *correctness* is enforced by the strict solver
+/// ([`constrain_subtype`]) during inference proper, where `unrefined ⊀ refined`
+/// holds. This redundant structural sanity pass (slated for removal — see the
+/// `collect_typecheck_errors` TODO) must not re-police refinements, because a
+/// restriction tag rides whichever position the solver coalesced it onto —
+/// a collection's *domain* (a `Restrict` the iteration applies; see
+/// [`crate::interpreter::operator_conversion`]'s `iterate_type`), a join's
+/// *codomain*, or a whole function — and there is no single subtype direction
+/// that holds for a node vs. its structural reconstruction across those
+/// placements. So the structural checks compare refinement-stripped types.
 ///
-/// Currently used only by the Compose chain checker; the goal is to
-/// replace [`typecheck_equal`] with this throughout `collect_type_errors`
-/// once we verify no existing checks relied on strictness.
-///
-/// TODO: handle refinements correctly here rather than stripping them —
-/// `Refinement(T, p) <: T` is valid but `T <: Refinement(T, p)` is not.
-///
-/// TODO: this hand-rolled structural subtype check duplicates the subtyping
-/// logic in [`crate::ccl::simple_sub::constrain_subtype`]; now that the solver
-/// operates over `ccl::Type` directly, reuse it here once the post-inference
-/// checks can be expressed as constraints rather than a boolean predicate.
-fn typecheck_subtype(a: &Type, b: &Type) -> bool {
-    match (a, b) {
-        // Width subtyping on closed records: a must have all of b's
-        // named fields with compatible types; extras in a are allowed.
-        (Type::Record(a_fields), Type::Record(b_fields)) => {
-            let a_map: HashMap<&str, &Type> =
-                a_fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
-            b_fields.iter().all(|(n, t)| {
-                a_map
-                    .get(n.as_str())
-                    .is_some_and(|p| typecheck_subtype(p, t))
-            })
+/// TODO: drop this strip (and enforce refinements strictly in the post-inference
+/// checks) once the explicit cast operator from
+/// https://github.com/cambra-dev/Cambra/pull/218 lands. The cast makes
+/// "acquiring a restriction" an explicit node that produces a `{T | r}` value,
+/// so refinements ride canonical, value-producing positions and a directional
+/// `constrain_subtype` (strict: `unrefined ⊀ refined`) holds end-to-end —
+/// node vs. reconstruction included — with no need to strip.
+fn strip_refinements_deep(ty: &Type) -> Type {
+    match ty {
+        Type::Refinement(inner, _) => strip_refinements_deep(inner),
+        Type::Fun(d, c) => Type::Fun(
+            Box::new(strip_refinements_deep(d)),
+            Box::new(strip_refinements_deep(c)),
+        ),
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(strip_refinements_deep).collect()),
+        Type::Record(fs) => Type::Record(
+            fs.iter()
+                .map(|(n, t)| (n.clone(), strip_refinements_deep(t)))
+                .collect(),
+        ),
+        Type::Variant(tags) => Type::Variant(
+            tags.iter()
+                .map(|(k, t)| (k.clone(), strip_refinements_deep(t)))
+                .collect(),
+        ),
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {
+            ty.clone()
         }
-        // Width subtyping on closed tuples: a must be at least as long
-        // as b, with matching element types at the indices b uses.
-        (Type::Tuple(a_elems), Type::Tuple(b_elems)) => {
-            a_elems.len() >= b_elems.len()
-                && a_elems
-                    .iter()
-                    .zip(b_elems.iter())
-                    .all(|(p, n)| typecheck_subtype(p, n))
-        }
-        // Functions: contravariant domain, covariant codomain.
-        (Type::Fun(a_dom, a_cod), Type::Fun(b_dom, b_cod)) => {
-            typecheck_subtype(b_dom, a_dom) && typecheck_subtype(a_cod, b_cod)
-        }
-        // TODO: handle refinement subtyping correctly.
-        // Refinement(T, p) <: T is valid; T <: Refinement(T, p) is not.
-        // For now, strip refinements on both sides (over-permissive).
-        (Type::Refinement(a, _), b) => typecheck_subtype(a, b),
-        (a, Type::Refinement(b, _)) => typecheck_subtype(a, b),
-        // Anything else: defer to strict equality.
-        _ => typecheck_equal(a, b),
     }
 }
 
-/// Checks if two types should be considered equal for the purposes of typechecking.
-/// Currently treats refinements as transparent
-fn typecheck_equal(a: &Type, b: &Type) -> bool {
-    match (a, b) {
-        (Type::Refinement(a, _), b) => typecheck_equal(a, b),
-        (a, Type::Refinement(b, _)) => typecheck_equal(a, b),
-        (Type::Fun(a_domain, a_codomain), Type::Fun(b_domain, b_codomain)) => {
-            typecheck_equal(a_domain, b_domain) && typecheck_equal(a_codomain, b_codomain)
-        }
-        (Type::Tuple(a_elems), Type::Tuple(b_elems)) => {
-            if a_elems.len() != b_elems.len() {
-                return false;
-            }
-            a_elems
-                .iter()
-                .zip(b_elems.iter())
-                .all(|(a, b)| typecheck_equal(a, b))
-        }
-        (Type::Record(a_fields), Type::Record(b_fields)) => {
-            if a_fields.len() != b_fields.len() {
-                return false;
-            }
-            // Compare by field name, not position — record field order is an artifact of
-            // how inference accumulates constraints and should not affect type equality.
-            let a_map: HashMap<&str, &Type> =
-                a_fields.iter().map(|(n, t)| (n.as_str(), t)).collect();
-            b_fields.iter().all(|(n, t)| {
-                a_map
-                    .get(n.as_str())
-                    .is_some_and(|a_t| typecheck_equal(a_t, t))
-            })
-        }
-        // Tagged variants (incl. the all-`Index` anonymous sums that `++`
-        // produces) compare structurally: same tags in order, payloads
-        // pairwise equal. `++` flattens at construction, so there is no
-        // nested-union normalization mismatch to special-case here.
-        (Type::Variant(a_tags), Type::Variant(b_tags)) => {
-            a_tags.len() == b_tags.len()
-                && a_tags
-                    .iter()
-                    .zip(b_tags.iter())
-                    .all(|((ak, at), (bk, bt))| ak == bk && typecheck_equal(at, bt))
-        }
-        _ => a == b,
-    }
+/// One-way structural subtype check: whether `a` is a subtype of `b`, ignoring
+/// refinements.
+///
+/// Delegates to the solver's own [`constrain_subtype`] (the single source of
+/// truth for width on records/tuples, the dual on variants, and
+/// contra/covariance on functions) after deep-stripping refinements from both
+/// sides — see [`strip_refinements_deep`] for why this pass is refinement-blind.
+/// By the time the post-inference typecheck runs, [`check_fully_typed`] has
+/// removed every `Type::Infer`, so `constrain_subtype` performs a pure
+/// structural check and mutates no bounds; a constraint failure means `a` is
+/// not a structural subtype of `b`.
+fn typecheck_subtype(a: &Type, b: &Type) -> bool {
+    constrain_subtype(
+        &strip_refinements_deep(a),
+        &strip_refinements_deep(b),
+        &mut ConstrainCache::new(),
+    )
+    .is_ok()
+}
+
+/// Whether `a` and `b` are structurally compatible in *either* direction
+/// (`a <: b` or `b <: a`), ignoring refinements.
+///
+/// Used for symmetric agreement checks — binary-op operands, list-element
+/// homogeneity — where neither side flows into the other, so a one-directional
+/// width-subtype check would spuriously reject e.g. `{a, b} == {a}` (the wider
+/// record is a subtype of the narrower, but not vice versa).
+fn typecheck_compatible(a: &Type, b: &Type) -> bool {
+    typecheck_subtype(a, b) || typecheck_subtype(b, a)
 }
 
 /// Check [`BinOpKind`] type rules for a single binary-op node and push any
@@ -804,7 +781,7 @@ fn check_binop_types(
     match op {
         BinOpKind::Arithmetic(_) => {
             // Operands must agree with each other.
-            if !typecheck_equal(&left.ty, &right.ty) {
+            if !typecheck_compatible(&left.ty, &right.ty) {
                 errors.push(InferError::TypeMismatch {
                     ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
                     type_a: left.ty.clone(),
@@ -812,7 +789,7 @@ fn check_binop_types(
                 });
             }
             // Node type must match the operand type.
-            if !typecheck_equal(node_ty, &left.ty) {
+            if !typecheck_subtype(&left.ty, node_ty) {
                 errors.push(InferError::TypeMismatch {
                     ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
                     type_a: left.ty.clone(),
@@ -823,7 +800,7 @@ fn check_binop_types(
         BinOpKind::Concat => {
             let string_ty = Type::Base(BaseType::String);
             for ty in [&left.ty, &right.ty, node_ty] {
-                if !typecheck_equal(ty, &string_ty) {
+                if !typecheck_subtype(ty, &string_ty) {
                     errors.push(InferError::TypeMismatch {
                         ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
                         type_a: string_ty.clone(),
@@ -834,7 +811,7 @@ fn check_binop_types(
         }
         BinOpKind::Compare(_) => {
             // Operands must agree; result must be Bool.
-            if !typecheck_equal(&left.ty, &right.ty) {
+            if !typecheck_compatible(&left.ty, &right.ty) {
                 errors.push(InferError::TypeMismatch {
                     ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
                     type_a: left.ty.clone(),
@@ -842,7 +819,7 @@ fn check_binop_types(
                 });
             }
             let bool_ty = Type::Base(BaseType::Bool);
-            if !typecheck_equal(node_ty, &bool_ty) {
+            if !typecheck_subtype(&bool_ty, node_ty) {
                 errors.push(InferError::TypeMismatch {
                     ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
                     type_a: bool_ty,
@@ -854,7 +831,7 @@ fn check_binop_types(
             // All three (left operand, right operand, result) must be Bool.
             let bool_ty = Type::Base(BaseType::Bool);
             for ty in [&left.ty, &right.ty, node_ty] {
-                if !typecheck_equal(ty, &bool_ty) {
+                if !typecheck_subtype(ty, &bool_ty) {
                     errors.push(InferError::TypeMismatch {
                         ctx: format!("{} {} {}", symbolic(left), op.sym(), symbolic(right)),
                         type_a: bool_ty.clone(),
@@ -904,14 +881,14 @@ fn check_unaryop_types(
         UnaryOpKind::Neg => Type::Base(BaseType::Int),
         UnaryOpKind::Not => Type::Base(BaseType::Bool),
     };
-    if !typecheck_equal(&inner.ty, &expected) {
+    if !typecheck_subtype(&inner.ty, &expected) {
         errors.push(InferError::TypeMismatch {
             ctx: format!("{:?} {}", op, symbolic(inner)),
             type_a: expected.clone(),
             type_b: inner.ty.clone(),
         });
     }
-    if !typecheck_equal(node_ty, &expected) {
+    if !typecheck_subtype(&expected, node_ty) {
         errors.push(InferError::TypeMismatch {
             ctx: format!("{:?} {}", op, symbolic(inner)),
             type_a: expected,
@@ -932,7 +909,7 @@ fn check_list_types(node_ty: &Type, elts: &[Expr], errors: &mut Vec<InferError>)
     let elem_ty = &first.ty;
     // All elements must share the type of the first element.
     for elt in elts.iter().skip(1) {
-        if !typecheck_equal(&elt.ty, elem_ty) {
+        if !typecheck_compatible(&elt.ty, elem_ty) {
             errors.push(InferError::TypeMismatch {
                 ctx: symbolic(elt),
                 type_a: elem_ty.clone(),
@@ -945,7 +922,7 @@ fn check_list_types(node_ty: &Type, elts: &[Expr], errors: &mut Vec<InferError>)
         Box::new(Type::UIntRange(elts.len())),
         Box::new(elem_ty.clone()),
     );
-    if !typecheck_equal(node_ty, &expected) {
+    if !typecheck_subtype(&expected, node_ty) {
         errors.push(InferError::TypeMismatch {
             ctx: "list".to_string(),
             type_a: expected,
@@ -995,12 +972,18 @@ fn check_compose_types(node_ty: &Type, morphisms: &[Expr], errors: &mut Vec<Infe
             });
         }
     }
-    // Overall node type must be Fun(first_domain, last_codomain).
+    // Overall node type must be Fun(first_domain, last_codomain). Checked up to
+    // refinements — `typecheck_subtype` is refinement-blind, so a restriction
+    // tag the solver coalesced onto `node_ty` (a groupby key on the whole
+    // function, a filter on the domain) doesn't spuriously diverge from the
+    // bare reconstruction. The residual relation is genuine width subtyping.
+    // TODO: tighten to an equality check once we have the cast operator in
+    //  https://github.com/cambra-dev/Cambra/pull/218
     if let (Some(first), Some(last)) = (fun_tys.first(), fun_tys.last())
         && let (Some((first_dom, _)), Some((_, last_cod))) = (first, last)
     {
         let expected = Type::Fun(Box::new(first_dom.clone()), Box::new(last_cod.clone()));
-        if !typecheck_equal(node_ty, &expected) {
+        if !typecheck_subtype(&expected, node_ty) {
             errors.push(InferError::TypeMismatch {
                 ctx: "compose".to_string(),
                 type_a: expected,

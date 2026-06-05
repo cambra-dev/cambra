@@ -617,9 +617,13 @@ merges the `PartialTuple` entries, so the final `probe()` returns the complete t
 
 N-ary `Compose([f₀, f₁, …, fₙ₋₁])` is inferred by chaining: each morphism's codomain is constrained as a **subtype** of the next morphism's domain (`constrain_subtype(prev_codomain, d_i)`). This allows a refined codomain (e.g. `Refinement(T, pred)`) to feed into a base-typed domain (`T`) without a type error. The overall type is `Fun(domain(f₀), codomain(fₙ₋₁))`. This case arises when `infer` is run over output from `simplify`, which can produce `Compose` nodes.
 
-### `Type::Union` semantic equality
+### Variant (sum) semantic equality
 
-`typecheck_equal` treats nested union types as structurally flat: `Union(Union(A,B),C)` is equal to `Union(A,B,C)`. This handles the let-bound-union case — a `Var(y)` whose type is itself a `Type::Union` appearing as one variant of an outer `CollectionUnion` produces a nested domain that may need to compare equal to a flattened equivalent stamped elsewhere by inference.
+The post-inference structural checks decide type equality via the solver's
+`constrain_subtype` (bidirectionally, in `typecheck_compatible`), which compares
+`Type::Variant` tag sets structurally. Nested sums never reach this comparison:
+`TypedExpr::collection_union` flattens at construction (next section), so a
+`Var(y)` referencing a let-bound sum still contributes a single flat variant.
 
 ### Union flattening (construction-time)
 

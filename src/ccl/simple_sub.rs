@@ -10,11 +10,24 @@
 //!
 //! # Refinements
 //!
-//! Refinements are lattice-blind: `constrain_subtype` strips the
-//! `Type::Refinement` wrapper. Refinement metadata lives on the AST node
-//! (`Expr::Lambda::refinement`); `type_saturate` and `lambda_elim` read it
-//! from there. Baking refinements into the lattice would break simple-sub's
-//! co-occurrence simplification — see the plan's "R1" review note.
+//! Refinements ride the lattice natively as **restriction-tag sets**. A
+//! refined type `{T | S}` carries a set `S` of [`crate::ccl::RefinementId`]
+//! tags (compared by id only — no predicate implication). Subtyping is
+//! superset-on-tags, structurally identical to record width-subtyping
+//! (`{T | p, q} <: {T | p}`, and `{T | p} <: T`); a tag set therefore
+//! merges with the same polarity rule as `rec` (positive ⇒ intersect,
+//! negative ⇒ union) and is preserved verbatim through simplification
+//! (tags are positional, never folded into a variable's identity, so
+//! co-occurrence merging cannot move or drop them). A refinement is a
+//! *required* restriction, so `constrain_subtype` is strict in the other
+//! direction: an unrefined value does **not** flow into a refined position
+//! (`T ⊀ {T | p}`). Acquiring a restriction is an explicit operation — the
+//! interpreter compiles a refinement on a *collection domain* to a runtime
+//! `Restrict`/`Filter` at the iteration boundary
+//! ([`crate::interpreter::operator_conversion`]'s `iterate_type`); it is not
+//! modelled as subsumption here. The predicate `Expr` of each tag lives in
+//! [`crate::ccl::Refinement`] and is inferred/coalesced like any other
+//! sub-tree.
 //!
 //! # Reference
 //!
@@ -33,7 +46,9 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use crate::ccl::{BaseType, InferVar, InferVarId, Level, Type, fresh_infer_var_id};
+use crate::ccl::{
+    BaseType, InferVar, InferVarId, Level, Refinement, RefinementId, Type, fresh_infer_var_id,
+};
 
 /// Identifies a field inside a structural record/tuple, or a variant tag.
 ///
@@ -305,11 +320,6 @@ pub fn constrain_subtype(
     }
 
     match (lhs, rhs) {
-        // Refinements are lattice-blind: strip the wrapper and constrain the
-        // underlying type. The predicate stays sidecared on the AST node.
-        (Type::Refinement(t, _), _) => constrain_subtype(t, rhs, cache),
-        (_, Type::Refinement(t, _)) => constrain_subtype(lhs, t, cache),
-
         // Leaf types match by structural equality.
         (Type::Base(a), Type::Base(b)) if a == b => Ok(()),
         (Type::UIntRange(a), Type::UIntRange(b)) if a == b => Ok(()),
@@ -410,11 +420,57 @@ pub fn constrain_subtype(
             constrain_subtype(&new_lhs, rhs, cache)
         }
 
+        // Refinement subtyping between concrete (non-variable) types:
+        //   {b₁ | S₁} <: {b₂ | S₂}  iff  b₁ <: b₂  and  S₂ ⊆ S₁
+        // (more restrictions ⇒ subtype; tags compare by id only). Cases
+        // where one side is a *top-level* variable were already handled above —
+        // the var arms record the whole refined other side as a bound, so its
+        // restriction tags propagate. Here both peeled bases are concrete, so a
+        // restriction the rhs *requires* but the lhs lacks is a genuine
+        // mismatch.
+        //
+        // The cases this covers (one side refined, neither a top-level var):
+        //   - {b₁|S₁} <: b₂ (rhs unrefined): S₂ = ∅ ⊆ S₁, recurse — dropping
+        //     a restriction is widening.
+        //   - b₁ <: {b₂|S₂} (lhs *unrefined*, S₂ ≠ ∅): mismatch. A refinement
+        //     is a *required* restriction, not one the consumer silently
+        //     applies; an unrestricted value cannot stand in where a restricted
+        //     one is demanded. (Acquiring a restriction is an explicit
+        //     `Restrict`, modelled at the collection-iteration boundary by the
+        //     interpreter — not by subsumption here.)
+        //   - {b₁|S₁} <: {b₂|S₂} (lhs *refined*): require S₂ ⊆ S₁ — a value
+        //     restricted by S₁ cannot carry a *different* restriction it lacks
+        //     (predicates compare by id only); this is what makes `{T|q} ⊀ {T|p}`
+        //     and, with S₁ = ∅, `T ⊀ {T|p}`.
+        (Type::Refinement(..), _) | (_, Type::Refinement(..)) => {
+            let (lbase, lset) = peel_refinements(lhs);
+            let (rbase, rset) = peel_refinements(rhs);
+            if !rset.is_subset(&lset) {
+                return Err(ConstrainError::Mismatch {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                });
+            }
+            constrain_subtype(lbase, rbase, cache)
+        }
+
         _ => Err(ConstrainError::Mismatch {
             lhs: lhs.clone(),
             rhs: rhs.clone(),
         }),
     }
+}
+
+/// Peel all outer [`Type::Refinement`] layers, returning the bare base type
+/// and the set of restriction-tag ids carried by the peeled layers.
+fn peel_refinements(ty: &Type) -> (&Type, BTreeSet<RefinementId>) {
+    let mut set = BTreeSet::new();
+    let mut cur = ty;
+    while let Type::Refinement(inner, r) = cur {
+        set.insert(r.id);
+        cur = inner;
+    }
+    (cur, set)
 }
 
 /// Lift `ty` so that all its variables live at level ≤ `target_level`.
@@ -657,6 +713,14 @@ pub struct CompactType {
     /// Function shape, if any. Recursively merged with polarity flip
     /// on the domain.
     pub fun: Option<(Box<CompactType>, Box<CompactType>)>,
+    /// Refinement (restriction-tag) contributions at this position,
+    /// keyed by [`RefinementId`]. A refinement-set is width-subtyped
+    /// exactly like `rec`: more restrictions ⇒ subtype
+    /// (`{T | p, q} <: {T | p}`), so at positive polarity the sets are
+    /// *intersected* and at negative *unioned* (see
+    /// [`CompactType::merge`]). Tags compare by id only; the stored
+    /// [`Refinement`] is the payload carried to coalesce.
+    pub refinements: BTreeMap<RefinementId, Refinement>,
 }
 
 impl CompactType {
@@ -695,12 +759,41 @@ impl CompactType {
                 Box::new(Self::merge(pol, *ra, *rb)),
             )),
         };
+        let refinements = Self::merge_refinements(pol, lhs.refinements, rhs.refinements);
         CompactType {
             vars,
             atoms,
             rec,
             var,
             fun,
+            refinements,
+        }
+    }
+
+    /// Merge two refinement (restriction-tag) sets. The set-op tracks
+    /// polarity the same way `rec` does — positive ⇒ *intersect*,
+    /// negative ⇒ *union* — because refinement-sets width-subtype like
+    /// record fields (more restrictions ⇒ subtype). At a positive
+    /// position the value is reliably restricted only by tags *both*
+    /// sides guarantee; at a negative position a consumer that may
+    /// impose either set imposes their union.
+    fn merge_refinements(
+        pol: bool,
+        lhs: BTreeMap<RefinementId, Refinement>,
+        rhs: BTreeMap<RefinementId, Refinement>,
+    ) -> BTreeMap<RefinementId, Refinement> {
+        if pol {
+            // The types are being unioned, so the restriction tags should be intersected.
+            lhs.into_iter()
+                .filter(|(id, _)| rhs.contains_key(id))
+                .collect()
+        } else {
+            // The types are being intersected, so the restriction tags should be unioned.
+            let mut out = lhs;
+            for (id, r) in rhs {
+                out.entry(id).or_insert(r);
+            }
+            out
         }
     }
 
@@ -851,9 +944,14 @@ fn compact_go(
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {
             CompactType::from_atom(AtomKey::from_type(ty).unwrap())
         }
-        // Refinements are lattice-blind: compact the underlying type.
-        Type::Refinement(inner, _) => {
-            compact_go(inner, pol, parents, in_process, recursive, rec_vars)
+        // Refinements ride the lattice as a restriction-tag set: compact
+        // the underlying type, then attach this layer's tag. Walking a
+        // variable's bound that is `Refinement(D, r)` therefore unions `r`
+        // into that variable's compacted position — the propagation path.
+        Type::Refinement(inner, r) => {
+            let mut ct = compact_go(inner, pol, parents, in_process, recursive, rec_vars);
+            ct.refinements.insert(r.id, r.clone());
+            ct
         }
         // A bare `Hole` shouldn't reach the solver (emission turns it into a
         // fresh var), but treat it as no contribution for exhaustiveness.
@@ -978,15 +1076,26 @@ fn compact_go(
                 s.lower.clone()
             };
             drop(s);
-            // Walk bounds, transitively expanding. Each bound's
-            // contribution is merged into a base of `{this var}` so
-            // the variable itself shows up in the CompactType.
+            // Walk bounds, transitively expanding. We fold the bounds'
+            // contributions *without* seeding from the variable's own identity
+            // (`CompactType::from_var(uid)`) and inject the var id only at the
+            // end. Seeding with `from_var` would mix the variable's *empty*
+            // refinement set into the merge, and at positive polarity `merge`
+            // *intersects* refinement sets (`merge_refinements`) — so the empty
+            // seed would intersect away every bound's tags (∅ is absorbing under
+            // intersection). The variable identity must be refinement-*neutral*;
+            // `rec`/`var`/`fun` get this for free from their `None` merge
+            // identity, but refinement sets have no such sentinel, so we keep
+            // the var out of the structural fold.
             let mut new_parents = parents.clone();
             new_parents.insert(uid);
-            let mut bound = CompactType::from_var(uid);
+            let mut bound: Option<CompactType> = None;
             for b in &primary_bounds {
                 let bc = compact_go(b, pol, &new_parents, in_process, recursive, rec_vars);
-                bound = CompactType::merge(pol, bound, bc);
+                bound = Some(match bound {
+                    None => bc,
+                    Some(acc) => CompactType::merge(pol, acc, bc),
+                });
             }
             // Opposite-polarity fallback: walk the other side too if the
             // primary walk did not produce any concrete (atom / shape)
@@ -998,12 +1107,23 @@ fn compact_go(
             // while monomorphic (a variable's type is the same at
             // both polar ends); must come out before let-polymorphism
             // lands. See big TODO above for the full reasoning.
-            if bound.atoms.is_empty() && bound.rec.is_none() && bound.fun.is_none() {
+            let no_concrete = bound
+                .as_ref()
+                .is_none_or(|b| b.atoms.is_empty() && b.rec.is_none() && b.fun.is_none());
+            if no_concrete {
                 for b in &opposite_bounds {
                     let bc = compact_go(b, !pol, &new_parents, in_process, recursive, rec_vars);
-                    bound = CompactType::merge(!pol, bound, bc);
+                    bound = Some(match bound {
+                        None => bc,
+                        Some(acc) => CompactType::merge(!pol, acc, bc),
+                    });
                 }
             }
+            // Inject the variable's own identity (refinement-neutral) so it
+            // shows up in the CompactType — equivalent to the old `from_var`
+            // seed for `vars`, but without polluting the refinement merge.
+            let mut bound = bound.unwrap_or_else(CompactType::empty);
+            bound.vars.insert(uid);
             in_process.remove(&key);
             // Recursive types: store the bound under the placeholder
             // variable and emit a reference.
@@ -1052,6 +1172,16 @@ enum CoOccItem {
 /// becomes load-bearing once let-polymorphism introduces genuine polar
 /// asymmetry. It is placed between [`compact_type`] and
 /// [`coalesce_compact`] in the pipeline.
+///
+/// **Refinements need no special handling here.** Restriction tags live on
+/// each [`CompactType`] *position* (`ct.refinements`), not on variable
+/// identity, and [`simplify_reconstruct`] copies them through unchanged while
+/// `var_subst` only ever rewrites or drops variable uids. Co-occurring
+/// variables (the merge candidates) sit in the same position and therefore
+/// carry the same tags, so merging or eliminating a variable can never move
+/// or lose a refinement. (The classic "merge x>0 with x<10" hazard applies
+/// only to representations that fold the predicate into the variable's
+/// identity; ours keeps them positional.)
 ///
 /// Recursive variables: the solver never produces non-empty `rec_vars`
 /// today, so the recursive-variable merge path is guarded but remains
@@ -1298,6 +1428,7 @@ fn simplify_reconstruct(
         rec: new_rec,
         var: new_var,
         fun: new_fun,
+        refinements: ct.refinements,
     }
 }
 
@@ -1350,14 +1481,14 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
     all.append(&mut atoms);
     all.append(&mut shapes);
 
-    match all.len() {
+    let inner = match all.len() {
         0 => {
             // No concrete contribution; emit a fresh Infer slot.
             // check_fully_typed reports it as UnresolvedInfer if it
             // survives.
-            Ok(Type::Infer(InferVar::fresh(0)))
+            Type::Infer(InferVar::fresh(0))
         }
-        1 => Ok(all.remove(0)),
+        1 => all.remove(0),
         _ => {
             // Multiple incompatible contributions. Reject.
             let pretty = all
@@ -1366,13 +1497,23 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                 .collect::<Vec<_>>()
                 .join(" | ");
             let vars: Vec<InferVarId> = ct.vars.iter().copied().collect();
-            Err(CoalesceError::IncompatibleBounds {
+            return Err(CoalesceError::IncompatibleBounds {
                 polarity,
                 vars,
                 details: pretty,
-            })
+            });
         }
-    }
+    };
+
+    // Re-wrap the restriction tags carried at this position. `extent_of`
+    // and `iterate_type` both strip refinements at every depth and compose
+    // the resulting `Restrict`s, so the wrap order is semantically
+    // irrelevant; `BTreeMap` iteration by `RefinementId` makes it stable.
+    let out = ct
+        .refinements
+        .values()
+        .fold(inner, |acc, r| Type::Refinement(Box::new(acc), r.clone()));
+    Ok(out)
 }
 
 /// Materialize a variant-tag map into [`Type::Variant`], preserving tag
@@ -1506,6 +1647,138 @@ mod tests {
         } else {
             Type::Tuple(fields.iter().map(|(_, t)| t.clone()).collect())
         }
+    }
+
+    /// Build `{base | id}` — a `Type::Refinement` whose tag has the given
+    /// id. The predicate body is a dummy literal (refinements compare by id
+    /// only, so the body is irrelevant to the lattice).
+    fn refined(base: Type, id: RefinementId) -> Type {
+        use crate::ccl::{Lit, RefinementKind, TypedExpr};
+        use std::cell::RefCell;
+        let r = Refinement {
+            id,
+            description: format!("r{id}"),
+            kind: RefinementKind::Predicate(Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))))),
+        };
+        Type::Refinement(Box::new(base), r)
+    }
+
+    #[test]
+    fn refined_superset_is_subtype() {
+        // {Int | p, q} <: {Int | p}  — more restrictions ⇒ subtype.
+        let p = crate::ccl::next_refinement_id();
+        let q = crate::ccl::next_refinement_id();
+        let lhs = refined(refined(prim(BaseType::Int), p), q);
+        let rhs = refined(prim(BaseType::Int), p);
+        let mut cache = ConstrainCache::new();
+        assert!(constrain_subtype(&lhs, &rhs, &mut cache).is_ok());
+    }
+
+    #[test]
+    fn refined_missing_tag_is_not_subtype() {
+        // {Int | q} </: {Int | p}  — a q-restricted value cannot stand in
+        // for a p-restricted one (predicates compare by id only).
+        let p = crate::ccl::next_refinement_id();
+        let q = crate::ccl::next_refinement_id();
+        let lhs = refined(prim(BaseType::Int), q);
+        let rhs = refined(prim(BaseType::Int), p);
+        let mut cache = ConstrainCache::new();
+        assert!(matches!(
+            constrain_subtype(&lhs, &rhs, &mut cache),
+            Err(ConstrainError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn refined_drops_to_base() {
+        // {Int | p} <: Int  — dropping a restriction is widening.
+        let p = crate::ccl::next_refinement_id();
+        let lhs = refined(prim(BaseType::Int), p);
+        let rhs = prim(BaseType::Int);
+        let mut cache = ConstrainCache::new();
+        assert!(constrain_subtype(&lhs, &rhs, &mut cache).is_ok());
+    }
+
+    #[test]
+    fn unrefined_does_not_flow_into_refined() {
+        // Int </: {Int | p}  — a refinement is a *required* restriction, not
+        // one the consumer silently applies. An unrestricted value cannot
+        // stand in where a restricted one is demanded; acquiring the
+        // restriction is an explicit `Restrict`, not subsumption.
+        let p = crate::ccl::next_refinement_id();
+        let lhs = prim(BaseType::Int);
+        let rhs = refined(prim(BaseType::Int), p);
+        let mut cache = ConstrainCache::new();
+        assert!(matches!(
+            constrain_subtype(&lhs, &rhs, &mut cache),
+            Err(ConstrainError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn distinct_refinements_survive_simplification() {
+        // A record carrying two *different* restriction tags at two field
+        // positions must round-trip through compact → simplify → coalesce
+        // with both tags intact (they are positional, not folded into a
+        // variable identity, so co-occurrence analysis cannot merge them).
+        let p = crate::ccl::next_refinement_id();
+        let q = crate::ccl::next_refinement_id();
+        let ty = Type::Record(vec![
+            ("a".to_string(), refined(prim(BaseType::Int), p)),
+            ("b".to_string(), refined(prim(BaseType::Int), q)),
+        ]);
+        let out = coalesce_compact(&simplify_type(compact_type(&ty))).unwrap();
+        assert_eq!(out, ty);
+    }
+
+    #[test]
+    fn var_constrained_to_refined_coalesces_refined() {
+        // A fresh var equated to a refined type (both bounds — exactly what
+        // `emit_apply`'s two-way `constrain_argument` records when an index var
+        // flows into a refined-domain collection) must coalesce *carrying* the
+        // refinement, not drop it to the bare base.
+        let p = crate::ccl::next_refinement_id();
+        let v = fresh_var(0);
+        let refined_int = refined(prim(BaseType::Int), p);
+        let mut cache = ConstrainCache::new();
+        // v ⟺ {Int | p}
+        constrain_subtype(&v, &refined_int, &mut cache).unwrap();
+        constrain_subtype(&refined_int, &v, &mut cache).unwrap();
+        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
+        assert_eq!(out, refined_int, "var equated to {{Int|p}} lost its tag");
+    }
+
+    #[test]
+    fn apply_index_var_coalesces_refined() {
+        // Mirror `emit_apply` exactly: an index var `v` applied to a function
+        // whose domain is `{d | p}` (d ⟺ Int). `as_function_eq` introduces a
+        // domain var `dom` (fn ⟺ dom ⇒ cod), then `constrain_argument` equates
+        // v and dom two-way. v's coalesced type should be `{Int | p}`.
+        let p = crate::ccl::next_refinement_id();
+        let d = fresh_var(0);
+        let cod = fresh_var(0);
+        let dom = fresh_var(0);
+        let cap = fresh_var(0);
+        let v = fresh_var(0);
+        let mut cache = ConstrainCache::new();
+        // d ⟺ Int
+        constrain_subtype(&d, &prim(BaseType::Int), &mut cache).unwrap();
+        constrain_subtype(&prim(BaseType::Int), &d, &mut cache).unwrap();
+        // fn = {d|p} ⇒ cod
+        let fn_ty = fun(refined(d.clone(), p), cod.clone());
+        // as_function_eq: fn ⟺ dom ⇒ cap
+        let shape = fun(dom.clone(), cap.clone());
+        constrain_subtype(&fn_ty, &shape, &mut cache).unwrap();
+        constrain_subtype(&shape, &fn_ty, &mut cache).unwrap();
+        // constrain_argument(v, dom): two-way
+        constrain_subtype(&v, &dom, &mut cache).unwrap();
+        constrain_subtype(&dom, &v, &mut cache).unwrap();
+        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
+        assert_eq!(
+            out,
+            refined(prim(BaseType::Int), p),
+            "Apply index var lost its tag"
+        );
     }
 
     #[test]

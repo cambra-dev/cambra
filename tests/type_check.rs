@@ -549,11 +549,11 @@ fn test_unconstrained_identity_applied_resolves() {
 }
 
 /// A refined comprehension carries its filter predicate as a refinement on
-/// the inferred function's domain (the predicate is `__iter_record_restr`-
-/// bound). This pins down the post-§1.3 shape: the refinement is sourced
-/// from the AST node and reapplied by `type_saturate`, so the inferred type
-/// still surfaces it — what changed is the *source of truth*, not the type
-/// shape.
+/// the inferred function's domain. The refinement now rides the constraint
+/// lattice natively — `emit_lambda` lifts it onto the domain and
+/// `constrain_subtype`/`coalesce` propagate it — rather than being
+/// re-stitched by a post-pass. This pins that the inferred domain still
+/// surfaces the refinement end-to-end through inference.
 #[test]
 fn test_filtered_comprehension_has_refinement_on_domain() {
     let ty = infer_program("[x for x in [1, 2, 3] if x > 1]");

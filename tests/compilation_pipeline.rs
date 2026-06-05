@@ -1121,16 +1121,18 @@ fn test_function_def_polymorphic_identity() {
 )]
 // Filter via if-guard.
 //
-// **Currently ignored** — Short version: in the return-value
-// desugar design, the function body's filter-feed pattern attaches a
-// `Refinement` to the source's `user_annotation`; after inference the
-// refinement lands on the cluster binding's *type*, but the
-// value-expression at the binding (a `Record` projection) doesn't
-// carry the refinement on its own `expr.ty`.
-// `operator_conversion`'s `iterate_type` only inspects the
-// value-expression's type, so the `Restrict` operator never gets
-// emitted and the filter is dropped — the program currently produces
-// `[-1, 2, -3, 4]` instead of the expected `[2, 4]`.
+// **Still ignored** — narrowed by the native-refinement work but not fully
+// fixed. The return-value desugar attaches a `Refinement` to the source's
+// `user_annotation`; that tag now rides the lattice and lands on the
+// binding/domain type, and its predicate is inferred. But a domain
+// refinement is a *negative-polarity* (upper-bound) fact, so it surfaces in
+// the contravariant domain position — not on the *positive-position*
+// value-expression that `operator_conversion::iterate_type` inspects to emit
+// the `Restrict`. So the filter is still dropped here and the program
+// produces `[-1, 2, -3, 4]` instead of `[2, 4]`. Fixing this is a
+// refinement-*placement* issue in the desugar / operator-conversion path,
+// not in the solver. Same root cause as `generator_pipeline` and
+// `filter_and_aggregate_currently_buggy`.
 #[ignore]
 #[case(
     r#"
@@ -2525,7 +2527,7 @@ fn test_no_fan_outs(#[case] code: &str) {
 )]
 #[case(
     "[x + y for x in [2] for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]",
-    "([2] ≫ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add) ▷ converse) ▷ uncurry ▷ map_domain ≫ (.0 ≫ [2], .1 ≫ (.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add) ▷ zip ≫ add:(([0, 0], ([0, 1], [0, 2])) ⇒ Int)",
+    "([2] ≫ (([1, 2] ≫ [1, 2, 3] ▷ converse) ▷ uncurry ▷ map_domain ≫ (.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add) ▷ converse) ▷ uncurry ▷ map_domain ≫ (.0 ≫ [2], .1 ≫ (.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add) ▷ zip ≫ add:(([0, 0], ([0, 1], [0, 2])) ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),

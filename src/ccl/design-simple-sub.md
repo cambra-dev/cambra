@@ -126,11 +126,12 @@ def identity(x):
 
 * **Parity with the legacy HM solver.** `let` bindings are kept strictly monomorphic — every variable is at level 0, making extrude a no-op.
 * **Tagged variants.** The dual of records, natively supporting sum types and pattern-match exhaustiveness inside the structural solver (see §4). Both named (`.Tag(...)`) and positional (`++`-style) sums are handled.
+* **Lattice-carried refinements.** Restriction tags ride the lattice natively (compared by id) rather than being stitched on by a post-pass; see §4 and [`crate::ccl::simple_sub`]'s `# Refinements`.
 
 **Not yet implemented:**
 
 * **Let-polymorphism.** Introducing a `Type::ForAll` and a monomorphization pass, which together retire the bidirectional-apply hack and the opposite-polarity fallback described below.
-* **SMT-backed refinements.** Augmenting the sidecar refinements with logical payloads (e.g. `v > 0`) verified by an external SMT solver such as Z3.
+* **SMT-backed refinements.** Augmenting the lattice-carried restriction tags (today compared by id only) with logical payloads (e.g. `v > 0`) reasoned about — implication, not just equality — by an external SMT solver such as Z3.
 
 *(There are parallel workstreams planned, such as a separate nominal-type/trait-resolution pass, but the core lattice capabilities revolve around these features.)*
 
@@ -142,7 +143,7 @@ The inference engine drives the AST through three passes, defined in `infer_simp
 
 ### Pass 1: Constraint Emission
 
-The algorithm walks the AST top-down. It normalizes each node's expected type into a solver-ready `ccl::Type` (via `normalize_annotation`: `Hole` → fresh `Type::Infer`, `Refinement` stripped to the sidecar), generates constraints, and writes each node's resulting `Type` directly onto `expr.ty`.
+The algorithm walks the AST top-down. It normalizes each node's expected type into a solver-ready `ccl::Type` (via `normalize_annotation`: `Hole` → fresh `Type::Infer`; `Refinement` wrappers are *kept* — they ride the lattice as restriction tags, see §4), generates constraints, and writes each node's resulting `Type` directly onto `expr.ty`.
 
 Because inference variables are shared `Rc<InferVar>`s, constraints emitted *after* a node's type is stored continue to accumulate bounds that remain visible through the stored `Type` — so there is no separate side table; the AST node *is* the record of the node's inferred type.
 
@@ -206,17 +207,17 @@ The three steps take a `Type` whose `Type::Infer` variables carry mutable lower/
 
 ### Pass 3: The Saturate Pass (Departure from Upstream)
 
-Simple-sub requires the lattice to be "blind" to types that do not behave purely structurally. To handle Cambra's needs we add a third pass (`type_saturate.rs`).
+Simple-sub's single-sided `Var <: Var` constrain rule leaves a couple of *structural* blind spots that a post-coalesce pass (`type_saturate.rs`) patches up. **Refinements are no longer one of them** — they ride the lattice natively (see §4) and coalesce straight onto each node, including the predicate's own sub-expression types.
 
-**Why it's needed.** A later stage will propagate refinements through the lattice in a semi-opaque manner. Until then, letting `Refinement` types participate in the structural lattice would make the simplifier incorrect: two structurally identical variables carrying different logical refinements (e.g. `x > 0` vs `x < 10`) would be wrongly merged by co-occurrence analysis. This is why `normalize_annotation` strips refinements to a sidecar before constraint solving even though they remain `ccl::Type` values. (Tagged variants, by contrast, *are* structural and live in the lattice directly — see §4.)
+**Why it's needed.** The solver's `Var <: Var` rule records only one bound side (mirroring upstream `Typer.scala`), so a variable that only ever appears at a negative position — e.g. each `Proj` morphism's domain in a `Compose` chain — coalesces to an under-determined `Type::Infer` rather than the concrete record/tuple flowing in. The same single-sidedness means a `Var` reference and a `Let` binding slot are not automatically reconciled to the binder's resolved type.
 
-**How it works.** The `saturate` pass walks the fully coalesced AST with a lexical scope environment, patching up the blind spots the solver left:
+**How it works.** The `saturate` pass walks the fully coalesced AST with a lexical scope environment:
 
-* **Lexical Scoping:** `Var` nodes overwrite their generic inferred types with the types attached to their environment bindings after saturation. The scope is populated by enclosing `Lambda`, `Let`, and `Case` pattern binders; for a `Case` pattern the per-branch payload type comes from `Pattern::binding.ty`, which Pass 2 already materialized.
-* **Refinement Stitching:** collects how a lambda parameter is used in the body, extracts any predicate refinements from those usages, and wraps them around the lambda's finalized domain type.
+* **Lexical Scoping:** `Var` nodes adopt their environment binding's resolved type; the scope is populated by enclosing `Lambda`, `Let`, and `Case` pattern binders (a `Case` pattern's payload type comes from `Pattern::binding.ty`, materialized in Pass 2).
 * **Let Binding Resolution:** splices the bound expression's resolved type into both the binding slot and the `Let`'s own `expr.ty`.
+* **Compose/Proj domain reconstruction:** replaces each `Proj` morphism's under-determined domain with the preceding morphism's codomain (the actual record/tuple flowing in), and rebuilds the `Compose`'s own `Fun(first.domain, last.codomain)` type.
 
-This pass is an architectural workaround intended to shrink over time. The precise mechanism by which each of its three jobs is retired — and in particular whether Refinement Stitching is sound as written or is a placeholder for the planned lattice-carried refinement mechanism — is an open question tracked in the review (Q4, Q5). What is *not* yet settled should not be read into the wording here: Lexical Scoping and Let Binding Resolution may well persist, and the path that retires Refinement Stitching is the refinements-through-the-lattice follow-up rather than tagged variants per se.
+This pass is an architectural workaround intended to shrink over time; folding the Compose/Proj reconstruction into the solver (e.g. a two-sided `Var <: Var` rule) is the path that retires it.
 
 ---
 
@@ -234,7 +235,7 @@ Vanilla simple-sub makes a `let`-bound function polymorphic by **freshening**: e
 
 ## 4. Information Flow and Type Mapping
 
-Cambra needs features that algebraic subtyping intentionally drops (explicit refinements), so information must be carefully mapped in and out of the solver during the passes above.
+Cambra carries features beyond plain algebraic subtyping (explicit refinements, tagged sums); this section describes how each is represented in the solver and materialized back out.
 
 #### The unified tagged sum
 
@@ -256,12 +257,18 @@ Inference does not *infer* a multi-atom sum from a primitive collision (it raise
 
 (`VariantCtor`/structural `Case` have no surface syntax yet, so lowering never emits them; they are exercised by direct AST construction in the variant tests.)
 
+#### Refinements as restriction-tag sets
+
+A refinement `{T | p}` carries a **set** of restriction tags (each a `RefinementId`). It is a fourth structural dimension on `CompactType`, width-subtyped exactly like records: **`{T | S₁} <: {T | S₂}` iff `S₂ ⊆ S₁`** — more restrictions ⇒ subtype. So `{T | p, q} <: {T | p}` and `{T | p} <: T`, but `{T | q} ⊀ {T | p}` (tags compare by `id` only — no predicate implication). The tag set merges with the *same polarity rule as `rec`* (positive ⇒ intersect, negative ⇒ union) and is carried verbatim through simplification (tags are positional, never folded into a variable's identity, so co-occurrence merging can't move or drop them).
+
+A refinement is a **required restriction**, so `constrain_subtype` is strict: an unrefined value does **not** flow into a refined position (`T ⊀ {T | p}`). Only widening is admissible — dropping a restriction (`{T | p} <: T`) or keeping a superset of the demanded tags. Acquiring a restriction is an *explicit* operation, not subsumption: the interpreter compiles a refinement on a **collection domain** to a runtime `Restrict`/`Filter` at the iteration boundary (`operator_conversion::iterate_type`). The post-inference structural `typecheck` is therefore (for now) deliberately **refinement-blind** (it strips refinements before its width-subtyping checks), because the strict solver already enforces refinement correctness during constraint solving, and a coalesced tag can ride any of several non-canonical positions (a collection's domain, a join's codomain, a whole function) for which no single subtype direction holds. The explicit cast operator from [PR #218](https://github.com/cambra-dev/Cambra/pull/218) makes restriction-acquisition an explicit value-producing node, canonicalizing placement so the post-inference checks can enforce refinements strictly and drop the strip (tracked as a TODO on `strip_refinements_deep`). The predicate `Expr` of each tag is inferred/coalesced like any other sub-tree (annotation-borne predicates via `emit_annotation_predicates` / `coalesce_type_predicates`).
+
 ### Flowing In: normalizing annotations
 
 There is no conversion *into* a solver type — the solver consumes `ccl::Type` as-is. The only adjustment Pass 1 makes is `normalize_annotation`, which readies a user annotation / expected type for constraint solving:
 
 * **Holes (`Type::Hole`):** become fresh `Type::Infer` variables at the current level.
-* **Refinements:** are **stripped entirely** from the type fed to the solver and preserved on the AST node as a sidecar, so they don't interfere with the solver's co-occurrence simplification.
+* **Refinements:** are **kept** (recursing to normalize the inner) — they ride the lattice as restriction tags (above). A `Refinement(Hole, r)` source annotation thus becomes `Refinement(?fresh, r)`.
 * **Everything else** — including existing `Type::Infer` vars, `Tuple`/`Record` products, and `Type::Variant` sums — is kept verbatim and handled by the solver's structural constraint rules. Tuples and records are width-subtyped positionally/by name; variants are admissible at both polarities (the dual of records), so they need no fresh-var indirection.
 
 ### Flowing Out: coalescing
@@ -270,6 +277,7 @@ Once constraints are resolved (Pass 2), `coalesce_compact` resolves each node's 
 
 * **Products:** dense `Index` keys become `Type::Tuple`; `Name` keys become `Type::Record`; a sparse `Index` product (an open/under-determined position) coalesces to a fresh `Type::Infer` rather than a concrete product.
 * **Variants:** materialize into `Type::Variant(Vec<(FieldKey, Type)>)` with tags in `BTreeMap` order. A variant payload sits at a record-field-like position, so it inherits that position's polarity and coalesces by the same rule as a record field value. An all-`Index` variant pretty-prints as a bare `A | B | C`.
+* **Refinements:** the restriction-tag set carried at a position is re-wrapped as nested `Type::Refinement` layers around the materialized inner type (in `RefinementId` order — deterministic and, since consumers strip at all depths, order-independent).
 * **Incompatible bounds:** if a variable accumulates multiple distinct concrete primitives (e.g. `Int` and `String`) with no tag to discriminate them, the solver emits an `IncompatibleBounds` error. A *tagged* sum is unaffected — `[.0: Int | .1: String]` is a single `Variant`, not a primitive collision.
 * **Recursive types:** simple-sub has no occurs check, so a self-application like `λx. x x` types successfully as an infinite recursive type. Because that is almost always a mistake in Cambra, residual cyclic types are explicitly rejected at coalesce time with a `RecursiveType` error.
 
@@ -290,14 +298,14 @@ Consult these definitions as needed; each term is introduced in context in §1�
 | **Level mismatch** | Simple-Sub | During `constrain` involving a variable `v`, the condition that the other side contains a variable whose level is numerically higher than `v`'s. Triggers extrude. |
 | **Extrude** | Simple-Sub | On a level mismatch, the process of copying a type down to a target level by replacing each too-high variable with a fresh proxy at that level (linked back via the polarity-appropriate bound), so the constraint can be recorded without leaking inner-scope variables. |
 | **Scheme (PolyScheme)** | Simple-Sub | A generalized type with a cutoff level. Variables whose level is numerically greater than the cutoff are quantified; using the scheme *instantiates* (freshens) them at the current level. |
-| **CompactType** | Simple-Sub | A flat, per-position bag of contributions (variables, atoms, an optional record shape, an optional function shape) produced for simplification and co-occurrence analysis. |
+| **CompactType** | Simple-Sub | A flat, per-position bag of contributions (variables, atoms, an optional record shape, an optional function shape, and a restriction-tag set) produced for simplification and co-occurrence analysis. |
 | **`CompactGraph`** | Simple-Sub | A top-level `CompactType` plus a side-table of recursive-variable definitions; the intermediate produced by `compact_type` and consumed by `simplify_type` / `coalesce_compact`. |
 | **Coalesce** | Simple-Sub | Materializing a `CompactGraph` back into an immutable `ccl::Type`: positive occurrences become a union of lower bounds, negative occurrences an intersection of upper bounds. |
 | **`FieldKey`** | Simple-Sub | The shared key for record/tuple fields *and* variant tags: `Index(usize)` for positional (anonymous) keys, `Name(SmolStr)` for named ones. |
 | **`Variant` (tagged sum)** | Both | The single sum representation: `Type::Variant`, keyed by [`FieldKey`]. Named tags are source-level `.Tag(...)`; positional (`Index`) tags are anonymous sums (what `++` produces). Width-subtyping is the dual of records (a subtype has *fewer* tags). Subsumes the old untagged `Type::Union`. |
-| **`ccl::Type`** | Both | The public, immutable, user-facing AST type — and, since the unification, also the solver's working representation. Inference unknowns are `Type::Infer`; `Refinement` and `Hole` are normalized away (sidecar / fresh var) before constraint solving. |
-| **Saturate** | Cambra-Specific | A Cambra-specific, post-coalesce AST pass that fixes up node types the structural lattice is blind to (refinements, lexical-scope identity for binders). A *saturated type* is one that has been through this pass. |
-| **Refinement Propagation** | Cambra-Specific | Inspecting a lambda's body to see how the parameter is used, extracting predicate refinements from those usages, and wrapping them around the lambda's inferred domain type. (Also called Refinement Stitching; see Pass 3 and review Q4.) |
+| **`ccl::Type`** | Both | The public, immutable, user-facing AST type — and, since the unification, also the solver's working representation. Inference unknowns are `Type::Infer`; `Hole` is normalized to a fresh var, while `Refinement` is kept and rides the lattice as a restriction tag. |
+| **Refinement (restriction tag)** | Both | A `Type::Refinement(T, r)` carries a restriction tag `r` (a `RefinementId` + predicate `Expr`). A type holds a *set* of tags, width-subtyped like records (more restrictions ⇒ subtype; `{T\|p,q} <: {T\|p}`). Tags compare by id only. A refinement is a *required* restriction — `constrain_subtype` is strict (`T ⊀ {T\|p}`); acquiring one is an explicit runtime `Restrict` at the collection-iteration boundary, not subsumption. |
+| **Saturate** | Cambra-Specific | A Cambra-specific, post-coalesce AST pass that fixes up *structural* blind spots from the single-sided `Var <: Var` rule (lexical Var/Let propagation, Compose/Proj domain reconstruction). It no longer touches refinements — those ride the lattice. A *saturated type* is one that has been through this pass. |
 | **Let Binding Resolution** | Cambra-Specific | Ensuring a `Let` binding's fully resolved type overwrites the type of any `Var` references to it within the let body. |
 
 ---
