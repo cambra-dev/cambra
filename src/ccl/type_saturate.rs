@@ -195,9 +195,11 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
                 saturate_node(e, scope);
             }
             // simple-sub coalesces each `Proj` morphism independently, so its
-            // domain captures only the field it touches — i.e. a `PartialTuple`
-            // or a `Record` containing a `PartialTuple`/`PartialRecord` value.
-            // Downstream passes (operator conversion) demand a concrete domain;
+            // domain captures only the field it touches — an open record-var
+            // that never closed to a concrete shape (it coalesces to an
+            // under-determined `Type::Infer`, or a record whose other fields
+            // are `Infer`). Downstream passes (operator conversion) demand a
+            // concrete domain;
             // replace each `Proj`'s domain with the preceding morphism's
             // codomain, which is the actual record/tuple flowing in.
             // The Proj's codomain still describes the field it extracts.

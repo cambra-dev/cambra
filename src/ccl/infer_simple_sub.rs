@@ -342,23 +342,6 @@ impl SimpleSubContext {
                 }
                 Rc::new(SimpleType::Record(m))
             }
-            Type::PartialTuple(es) => {
-                // Partial tuples enter the solver as records with only
-                // the listed Index keys. Width-subtyping then admits
-                // any closed tuple with at least these positions.
-                let mut m = BTreeMap::new();
-                for (i, t) in es {
-                    m.insert(FieldKey::Index(*i), self.type_to_simple(t));
-                }
-                Rc::new(SimpleType::Record(m))
-            }
-            Type::PartialRecord(es) => {
-                let mut m = BTreeMap::new();
-                for (n, t) in es {
-                    m.insert(FieldKey::Name(SmolStr::from(n)), self.type_to_simple(t));
-                }
-                Rc::new(SimpleType::Record(m))
-            }
             Type::Refinement(inner, _) => {
                 // Refinements are sidecared, not lifted into SimpleType.
                 // The wrapper is stripped here; coalesce wraps it back
@@ -757,8 +740,8 @@ fn emit_apply(
     // apply sites. Without this, a fresh Var on the function side (e.g.
     // a `Proj`'s synthesized `record_var`) only sees one polarity's
     // bounds and coalesces to a too-narrow type — closed `Tuple([α])`
-    // instead of `PartialTuple([(0, α)])` — even when the argument is
-    // a richer record. This mirrors what HM achieves by unifying the
+    // instead of staying an open record `{0: α}` — even when the argument
+    // is a richer record. This mirrors what HM achieves by unifying the
     // projection's domain with the argument's Infer var.
     //
     // TODO (SOUNDNESS): monomorphizing hack. Collapses polymorphism at

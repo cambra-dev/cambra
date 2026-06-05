@@ -1812,20 +1812,6 @@ pub enum Type {
     Tuple(Vec<Type>),
     /// A named product type (record).
     Record(Vec<(String, Type)>),
-    /// A partially-known tuple: only the listed index positions are constrained.
-    ///
-    /// Used as the domain type of index-projection morphisms during inference.
-    /// `Proj(Index(n))` gets type `PartialTuple([(n, ?a)]) ⇒ ?a`.
-    /// Unifies with [`Type::Tuple`] by constraining each indexed element, and
-    /// with another `PartialTuple` by constraining overlapping indices.
-    PartialTuple(Vec<(usize, Type)>),
-    /// A partially-known record: only the listed named fields are constrained.
-    ///
-    /// Used as the domain type of field-projection morphisms during inference.
-    /// `Proj(Field("x"))` gets type `PartialRecord([("x", ?a)]) ⇒ ?a`.
-    /// Unifies with [`Type::Record`] by constraining matching fields, and with
-    /// another `PartialRecord` by constraining overlapping fields.
-    PartialRecord(Vec<(String, Type)>),
     /// A tagged sum type — each tag has its own payload type.
     ///
     /// Tags are [`FieldKey`]s, the dual of `Record`/`Tuple` keys: `Name`
@@ -1929,14 +1915,6 @@ impl fmt::Display for Type {
                 let parts: Vec<_> = fields.iter().map(|(n, t)| format!("{n}: {t}")).collect();
                 write!(f, "{{{}}}", parts.join(", "))
             }
-            Type::PartialTuple(entries) => {
-                let parts: Vec<_> = entries.iter().map(|(i, t)| format!(".{i}: {t}")).collect();
-                write!(f, "{{{}..}}", parts.join(", "))
-            }
-            Type::PartialRecord(entries) => {
-                let parts: Vec<_> = entries.iter().map(|(n, t)| format!("{n}: {t}")).collect();
-                write!(f, "{{{}..}}", parts.join(", "))
-            }
             Type::Variant(tags) => {
                 // Anonymous positional variants (all tags are
                 // `FieldKey::Index`, as `++`/CollectionUnion produces) are
@@ -2017,8 +1995,8 @@ impl Type {
     ///
     /// "Direct child" means a `Type` reachable through this type's value
     /// fields — the domain and codomain of a `Fun`, the elements of a
-    /// `Tuple` / `Record` / `PartialTuple` / `PartialRecord`, the arms of
-    /// a `Union`, and the base of a `Refinement`.
+    /// `Tuple` / `Record`, the payloads of a `Variant`, and the base of a
+    /// `Refinement`.
     ///
     /// Does **not** descend into the refinement *predicate* (which is a
     /// [`TypedExpr`], not a `Type`).  Callers that need to walk a
@@ -2042,16 +2020,6 @@ impl Type {
             }
             Type::Record(fields) => {
                 for (_, t) in fields {
-                    f(t);
-                }
-            }
-            Type::PartialTuple(entries) => {
-                for (_, t) in entries {
-                    f(t);
-                }
-            }
-            Type::PartialRecord(entries) => {
-                for (_, t) in entries {
                     f(t);
                 }
             }
@@ -2085,16 +2053,6 @@ impl Type {
             }
             Type::Record(fields) => {
                 for (_, t) in fields {
-                    f(t);
-                }
-            }
-            Type::PartialTuple(entries) => {
-                for (_, t) in entries {
-                    f(t);
-                }
-            }
-            Type::PartialRecord(entries) => {
-                for (_, t) in entries {
                     f(t);
                 }
             }

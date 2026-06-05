@@ -146,9 +146,10 @@ impl std::fmt::Display for FieldKey {
 ///   by [`SimpleType::Var`].
 /// - `Refinement` — refinements are not part of the lattice; see the
 ///   module docs.
-/// - `PartialTuple` / `PartialRecord` — open-width records are
-///   represented by ordinary `Record` constraints; openness lives in
-///   the variable's bounds, not in a distinct variant.
+/// - open / partial records — there is no distinct "partial" variant;
+///   open-width records are ordinary `Record` constraints and openness
+///   lives in the variable's bounds. (`ccl::Type` has no partial variant
+///   either — an open record-var that never closes coalesces to `Infer`.)
 /// - `Top` / `Bottom` — openness is implicit (empty bounds list),
 ///   matching the reference implementation.
 #[derive(Debug, Clone)]
@@ -1048,7 +1049,7 @@ fn compact_go(
             // wrong polarity collapses disjoint-field records to the
             // empty record at coalesce time. Fix for the multi-gen
             // iter-record case: lambda param `__iter_record` accumulates
-            // upper bounds `PartialRecord({.0})` and `PartialRecord({.1})`
+            // upper bounds (open records `{.0}` and `{.1}`)
             // from projections; we want their negative-polarity union
             // (both fields) when the Var is coalesced at positive
             // polarity, not the positive-polarity intersection (empty).
@@ -1508,15 +1509,19 @@ fn materialize_record(
             }
             Ok(Type::Tuple(out))
         } else {
-            // Sparse indices — emit PartialTuple. Per plan R5: a
-            // record variable that didn't get pinned to a closed
-            // tuple shape during inference is genuinely open at this
-            // position.
-            let mut entries = Vec::with_capacity(indexed.len());
-            for (idx, v) in indexed {
-                entries.push((idx, coalesce_compact_go(v, polarity)?));
+            // Sparse indices — an open record-var (e.g. an isolated
+            // index-projection domain) that never got pinned to a closed
+            // tuple shape during inference. It is genuinely
+            // under-determined and unconstructable by the runtime, so it
+            // coalesces to a fresh `Type::Infer` (an ambiguous-type
+            // condition, reported by `check_fully_typed` if it survives to
+            // the program's output). Note: still recurse the payloads so
+            // any nested var bounds are visited even though we discard the
+            // shape.
+            for (_, v) in indexed {
+                coalesce_compact_go(v, polarity)?;
             }
-            Ok(Type::PartialTuple(entries))
+            Ok(Type::Infer(fresh_infer_var_id()))
         }
     } else if all_name {
         let mut out = Vec::with_capacity(rec.len());
@@ -1758,16 +1763,17 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_sparse_index_emits_partial_tuple() {
-        // Per plan R5: coalesce emits PartialTuple for sparse Index
-        // records (e.g. a bare Proj morphism's domain). Today's path
-        // relies on this for `Proj(Index(n))` types.
+    fn coalesce_sparse_index_emits_infer() {
+        // A sparse Index record (e.g. an isolated index-projection
+        // domain that never closed to a dense tuple) is under-determined
+        // and unconstructable, so coalesce emits a fresh `Type::Infer`
+        // (an ambiguous-type condition) rather than a closed shape.
         let r = record(&[
             (FieldKey::Index(0), prim(BaseType::Int)),
             (FieldKey::Index(2), prim(BaseType::String)),
         ]);
         let t = coalesce_compact(&compact_type(&r)).unwrap();
-        assert!(matches!(t, Type::PartialTuple(_)));
+        assert!(matches!(t, Type::Infer(_)), "expected Infer, got {t:?}");
     }
 
     #[test]

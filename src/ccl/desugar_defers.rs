@@ -2037,8 +2037,7 @@ fn collect_free_vars(expr: &Expr, out: &mut HashSet<String>) {
 /// Walk `ty` for any [`RefinementKind::Predicate`] expressions and
 /// collect their free variables into `out`.  Structural recursion via
 /// [`Type::walk_children`] so every compound type variant (`Fun`,
-/// `Tuple`, `Union`, `Record`, `PartialTuple`, `PartialRecord`) is
-/// covered uniformly.
+/// `Tuple`, `Record`, `Variant`) is covered uniformly.
 ///
 /// `try_borrow().ok()` silently treats an actively-mutated predicate
 /// as "no references"; callers run between passes when no predicate

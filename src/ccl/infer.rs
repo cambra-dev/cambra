@@ -424,21 +424,6 @@ fn collect_type_errors(
             }
             collect_type_errors(inner, context_sym, errors, seen_refinements);
         }
-        // Partial tuples/records are a legitimate simple-sub output shape
-        // for projection morphisms (per plan R5: a record variable that
-        // didn't get pinned to a closed tuple shape during inference is
-        // genuinely open at this position).  Walk their entries for
-        // unresolved children; do not flag the partial type itself.
-        Type::PartialTuple(entries) => {
-            for (_, ty) in entries {
-                collect_type_errors(ty, context_sym, errors, seen_refinements);
-            }
-        }
-        Type::PartialRecord(entries) => {
-            for (_, ty) in entries {
-                collect_type_errors(ty, context_sym, errors, seen_refinements);
-            }
-        }
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {}
     }
 }
@@ -789,23 +774,6 @@ fn typecheck_equal(a: &Type, b: &Type) -> bool {
                     .is_some_and(|a_t| typecheck_equal(a_t, t))
             })
         }
-        // A full Record satisfies a PartialRecord constraint if all named fields match.
-        (Type::Record(full), Type::PartialRecord(partial))
-        | (Type::PartialRecord(partial), Type::Record(full)) => {
-            let full_map: HashMap<&str, &Type> =
-                full.iter().map(|(n, t)| (n.as_str(), t)).collect();
-            partial.iter().all(|(n, t)| {
-                full_map
-                    .get(n.as_str())
-                    .is_some_and(|f_t| typecheck_equal(t, f_t))
-            })
-        }
-        // A full Tuple satisfies a PartialTuple constraint if every named
-        // index is in range and the element types match.
-        (Type::Tuple(full), Type::PartialTuple(partial))
-        | (Type::PartialTuple(partial), Type::Tuple(full)) => partial
-            .iter()
-            .all(|(i, t)| full.get(*i).is_some_and(|f_t| typecheck_equal(t, f_t))),
         // Tagged variants (incl. the all-`Index` anonymous sums that `++`
         // produces) compare structurally: same tags in order, payloads
         // pairwise equal. `++` flattens at construction, so there is no
@@ -1788,16 +1756,16 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PartialTuple inference via body-inference unification
+    // Open-record (projection) inference via body usage
     // -----------------------------------------------------------------------
 
     /// `λ p → f(p._0) + g(p._2)` where f : Int → Int and g : Bool → Bool.
     ///
-    /// Inference resolves `p` to `PartialTuple([(0, Int), (2, Bool)])` from
-    /// the two projection sites. The body then fails with a type error from
-    /// the `BoolLogic(And)` operator (Int vs Bool result).
+    /// Body usage constrains `p` to an open record with `Int` at index 0 and
+    /// `Bool` at index 2 (via the two projection sites). The body then fails
+    /// with a type error from the `BoolLogic(And)` operator (Int vs Bool).
     #[test]
-    fn test_tuple_field_gap_now_infers_partial_tuple() {
+    fn test_tuple_field_gap_infers_from_projections() {
         let f = Expr::lambda("a", Type::Base(BaseType::Int), Expr::var("a"));
         let g = Expr::lambda("b", Type::Base(BaseType::Bool), Expr::var("b"));
         let mut expr = Expr::lambda(
@@ -2320,12 +2288,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Proj / PartialTuple / PartialRecord inference tests
+    // Proj inference tests
     // -----------------------------------------------------------------------
 
     /// `Proj(Index(2))` applied to a 3-tuple infers the third element type.
     ///
-    /// This was the broken case before PartialTuple: the old fallback produced
+    /// This was the broken case under the old HM fallback, which produced
     /// `Fun(?a, ?b)` for any index ≥ 2, losing all structural information.
     #[test]
     fn test_infer_proj_index_2_on_3_tuple() {
