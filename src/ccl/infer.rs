@@ -26,7 +26,6 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::BaseType;
-use crate::ccl::simple_sub::SimpleVarUid;
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
 use crate::ccl::{
     BinOpKind, Branch, Expr, InferVarId, Lit, RefinementKind, Type, TypedExprNode, UnaryOpKind,
@@ -194,7 +193,7 @@ pub enum InferError {
         /// Display string of the conflicting types, e.g. `"handle(0) | handle(1)"`.
         conflicting: String,
         /// UIDs of the simple-sub variables whose bounds conflicted.
-        vars: Vec<SimpleVarUid>,
+        vars: Vec<InferVarId>,
         /// The innermost expression label where the conflict was first detected.
         origin: String,
         /// Enclosing expression labels, innermost-first.
@@ -379,8 +378,8 @@ fn collect_type_errors(
         Type::Hole => errors.push(InferError::UnresolvedHole {
             at: context_sym.to_string(),
         }),
-        Type::Infer(id) => errors.push(InferError::UnresolvedInfer {
-            id: *id,
+        Type::Infer(var) => errors.push(InferError::UnresolvedInfer {
+            id: var.uid,
             at: context_sym.to_string(),
         }),
         Type::Fun(domain, codomain) => {
@@ -703,9 +702,9 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
 /// `Refinement(T, p) <: T` is valid but `T <: Refinement(T, p)` is not.
 ///
 /// TODO: this hand-rolled structural subtype check duplicates the subtyping
-/// logic in [`crate::ccl::simple_sub::constrain_subtype`]; reuse it here
-/// once the post-inference checks can run against the solver's `SimpleType`
-/// representation instead of re-implementing it over `ccl::Type`.
+/// logic in [`crate::ccl::simple_sub::constrain_subtype`]; now that the solver
+/// operates over `ccl::Type` directly, reuse it here once the post-inference
+/// checks can be expressed as constraints rather than a boolean predicate.
 fn typecheck_subtype(a: &Type, b: &Type) -> bool {
     match (a, b) {
         // Width subtyping on closed records: a must have all of b's
@@ -2063,7 +2062,7 @@ mod tests {
     }
 
     /// An empty record: simple-sub cannot distinguish an empty `Record` from an empty
-    /// `Tuple` at coalesce time (both become `SimpleType::Record(BTreeMap::new())`)
+    /// `Tuple` at coalesce time (both compact to a `CompactType` with an empty field map)
     /// and produces `Tuple([])`.
     #[test]
     fn test_infer_record_empty() {
@@ -2234,8 +2233,9 @@ mod tests {
     /// (`"1"`), and the var ID matches the one used to build the type.
     #[test]
     fn test_check_fully_typed_infer_on_root() {
-        let id = crate::ccl::fresh_infer_var_id();
-        let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Infer(id));
+        let var = crate::ccl::InferVar::fresh(0);
+        let id = var.uid;
+        let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Infer(var));
         assert_eq!(
             check_fully_typed(&expr),
             Err(vec![InferError::UnresolvedInfer { id, at: "1".into() }])
@@ -2248,13 +2248,14 @@ mod tests {
     /// because `check_fully_typed` passes `|| param.name.clone()` for param checks.
     #[test]
     fn test_check_fully_typed_infer_in_lambda_param() {
-        let id = crate::ccl::fresh_infer_var_id();
+        let var = crate::ccl::InferVar::fresh(0);
+        let id = var.uid;
         // The lambda's own type is concrete, but the param still holds an Infer var.
         // After removing CannotInferParam, collect_type_errors reports UnresolvedInfer.
         let expr = Expr::new(TypedExprNode::Lambda {
             param: TypedBinding {
                 name: "x".into(),
-                ty: Type::Infer(id), // unsolved
+                ty: Type::Infer(var), // unsolved
                 user_annotation: None,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),

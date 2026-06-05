@@ -1,117 +1,41 @@
-//! Simple-sub algorithm core: type representation and constraint solver.
+//! Simple-sub algorithm core: the constraint solver.
 //!
-//! This module is the constraint-graph representation that lives only inside
-//! the type inference pass. It is *not* the same as [`crate::ccl::Type`]; the
-//! coalesce step at the end of inference materializes a `SimpleType` graph
-//! into the public `ccl::Type` shape that downstream passes consume.
+//! The solver operates **directly on [`crate::ccl::Type`]** — there is no
+//! separate internal type representation. An inference variable is a
+//! [`Type::Infer`] carrying a mutable [`crate::ccl::InferVar`] (lower/upper
+//! bound lists); `constrain_subtype` mutates those bounds in place, and the
+//! `compact`/`simplify`/`coalesce` pipeline resolves a bound graph back into
+//! a concrete `Type`. The only intermediate is the internal `CompactType`
+//! used by simplification.
 //!
 //! # Refinements
 //!
-//! Refinements are deliberately absent from `SimpleType`. Refinement metadata
-//! lives on the AST node (`Expr::Lambda::refinement`); `type_saturate` and
-//! `lambda_elim` read it from there. Baking refinements into the lattice
-//! would break simple-sub's co-occurrence simplification — see the plan's
-//! "R1" review note.
+//! Refinements are lattice-blind: `constrain_subtype` strips the
+//! `Type::Refinement` wrapper. Refinement metadata lives on the AST node
+//! (`Expr::Lambda::refinement`); `type_saturate` and `lambda_elim` read it
+//! from there. Baking refinements into the lattice would break simple-sub's
+//! co-occurrence simplification — see the plan's "R1" review note.
 //!
 //! # Reference
 //!
 //! Implements the algorithm from Parreaux, "The Simple Essence of Algebraic
 //! Subtyping" (ICFP 2020).
 
-use std::cell::RefCell;
+// The `constrain` cycle cache keys on `(Type, Type)`. `Type` has interior
+// mutability (an `Infer` var's `RefCell` bounds), but its `Hash`/`Eq` are
+// identity-by-`uid` and never inspect the bounds — so mutating a variable's
+// bounds during solving cannot change a key's hash. The lint's hazard
+// therefore doesn't apply here.
+#![allow(clippy::mutable_key_type)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use smol_str::SmolStr;
 
-use crate::ccl::{BaseType, Type, fresh_infer_var_id};
+use crate::ccl::{BaseType, InferVar, InferVarId, Level, Type, fresh_infer_var_id};
 
-/// Global counter for assigning unique IDs to inference variables.
-///
-/// Distinct from [`crate::ccl::InferVarId`]; this counter is internal to the
-/// simple-sub solver. Coalescing maps these to fresh `InferVarId`s only when
-/// a variable survives simplification (i.e. the inferred type is not fully
-/// closed).
-static SIMPLE_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-/// Allocate a fresh, globally-unique `SimpleVarUid`.
-fn next_simple_var_uid() -> SimpleVarUid {
-    SimpleVarUid(SIMPLE_VAR_COUNTER.fetch_add(1, Ordering::Relaxed))
-}
-
-/// Reset the simple-sub variable counter to zero.
-///
-/// Test-only. Not safe to call concurrently.
-#[cfg(test)]
-pub fn reset_simple_var_counter() {
-    SIMPLE_VAR_COUNTER.store(0, Ordering::Relaxed);
-}
-
-/// Unique ID for a [`VarState`].
-///
-/// Stable for the lifetime of the variable; used as a hash key in cycle
-/// caches inside the `constrain_subtype` and `extrude` passes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SimpleVarUid(pub u32);
-
-/// Polymorphism scope level. Higher levels are nested deeper.
-///
-/// We currently keep `let` monomorphic, so every variable shares the same
-/// level (0). Levels are nevertheless threaded through the data structures
-/// because a future let-polymorphism extension will need them; introducing
-/// the field now avoids a breaking refactor later.
-pub type Level = u32;
-
-/// Mutable state of an inference variable.
-///
-/// Each variable accumulates lower bounds (positive flow — types that flow
-/// into the variable) and upper bounds (negative flow — types that flow out
-/// of it). The constrain_subtype solver enforces the invariant that every type in
-/// `lower` is a subtype of every type in `upper`, and that no bound exceeds
-/// the variable's own `level`.
-#[derive(Debug)]
-pub struct VarState {
-    /// Globally-unique identifier; stable for the variable's lifetime.
-    pub uid: SimpleVarUid,
-    /// Polymorphism scope level. Bounds may not refer to types whose level
-    /// exceeds this value; `extrude` lifts them when they would.
-    pub level: Level,
-    /// Lower bounds — types that flow into this variable.
-    ///
-    /// Conceptually a join (⊔). At positive (output) positions, the
-    /// variable behaves like the union of its lower bounds. These bounds
-    /// represnet the **covariant** flow of data (what values this variable
-    /// actually holds or produces)
-    ///
-    /// Lower bounds are transitive from LHS to RHS of a
-    /// `constrain_subtype(LHS, RHS) => LHS <: RHS` relation.
-    pub lower: Vec<Rc<SimpleType>>,
-    /// Upper bounds — types this variable must flow into.
-    ///
-    /// Conceptually a meet (⊓). At negative (input) positions, the
-    /// variable behaves like the intersection of its upper bounds. These bounds
-    /// represent the **contravariant** flow of constraints (how this variable is
-    /// being used, or the requirements imposed upon it by consumers).
-    ///
-    /// Upper bounds are transitive from RHS to LHS of a
-    /// `constrain_subtype(LHS, RHS) => LHS <: RHS` relation.
-    pub upper: Vec<Rc<SimpleType>>,
-}
-
-impl VarState {
-    /// Create a fresh variable with no bounds at the given level.
-    pub fn fresh(level: Level) -> Rc<RefCell<Self>> {
-        Rc::new(RefCell::new(Self {
-            uid: next_simple_var_uid(),
-            level,
-            lower: Vec::new(),
-            upper: Vec::new(),
-        }))
-    }
-}
-
-/// Identifies a field inside a structural [`SimpleType::Record`].
+/// Identifies a field inside a structural record/tuple, or a variant tag.
 ///
 /// `Index` is used for tuple-shaped records (positional projection);
 /// `Name` for named-field records. The constrain_subtype solver treats them
@@ -137,93 +61,36 @@ impl std::fmt::Display for FieldKey {
     }
 }
 
-/// Inference-time type representation. Internal to the simple-sub solver.
-///
-/// Variants intentionally exclude:
-///
-/// - `Hole` / `Infer` — those are pre- and post-inference markers in
-///   [`crate::ccl::Type`]; inside the solver, an unknown is represented
-///   by [`SimpleType::Var`].
-/// - `Refinement` — refinements are not part of the lattice; see the
-///   module docs.
-/// - open / partial records — there is no distinct "partial" variant;
-///   open-width records are ordinary `Record` constraints and openness
-///   lives in the variable's bounds. (`ccl::Type` has no partial variant
-///   either — an open record-var that never closes coalesces to `Infer`.)
-/// - `Top` / `Bottom` — openness is implicit (empty bounds list),
-///   matching the reference implementation.
-#[derive(Debug, Clone)]
-pub enum SimpleType {
-    /// A primitive type (Int, UInt, String, Bool, Unit).
-    Prim(BaseType),
-    /// A finite index range `[0, n)`. Mirrors [`crate::ccl::Type::UIntRange`].
-    UIntRange(usize),
-    /// The opaque domain type of an externally-registered data source.
-    Source(SmolStr),
-    /// Function type. Domain is contravariant; codomain is covariant.
-    Fun(Rc<SimpleType>, Rc<SimpleType>),
-    /// Structural record. Width-subtyping: `{a, b, c} <: {a, b}`.
-    ///
-    /// Tuples are represented as records with dense `Index` keys. The
-    /// closed-vs-open and tuple-vs-record distinctions only emerge at
-    /// coalesce time; inside the solver, the structural rule is uniform.
-    Record(BTreeMap<FieldKey, Rc<SimpleType>>),
-    /// Tagged sum (variant). Width-subtyping is the **dual** of `Record`:
-    /// `[A] <: [A, B]` — a subtype has *fewer* tags than its supertype.
-    ///
-    /// `constrain_subtype(lhs, rhs)` iterates `lhs`'s tags and requires each to
-    /// appear in `rhs` (mirror of Record's rule, which iterates `rhs`).
-    /// Payload depth is covariant: `[A(t0)] <: [A(t1)]` iff `t0 <: t1`.
-    ///
-    /// Admissible at both polarities — the polarity-trap closer that
-    /// tagged variants were introduced to provide.
-    ///
-    /// Tags are [`FieldKey`]s, the same key type as `Record`: `Name` for
-    /// source-level `.Tag(...)` variants, `Index` for the anonymous
-    /// positional tags that a collection-union (`++`) and other
-    /// structurally-tagged sums produce. This is the single tagged-sum
-    /// representation Cambra uses — `ccl::Type::Variant` materializes from
-    /// it directly, and the old untagged `Type::Union` is just the
-    /// all-`Index` case.
-    Variant(BTreeMap<FieldKey, Rc<SimpleType>>),
-    /// An inference variable.
-    ///
-    /// The variable's bounds live behind the `RefCell` so that
-    /// `constrain_subtype` can append to them without re-rooting the graph.
-    Var(Rc<RefCell<VarState>>),
-}
-
-impl SimpleType {
-    /// The level of this type — the maximum level of any variable
-    /// occurring inside it.
-    ///
-    /// Used by `extrude` and (in a future let-poly extension) by
-    /// generalization to decide which variables are quantifiable.
-    pub fn level(&self) -> Level {
-        match self {
-            SimpleType::Prim(_) | SimpleType::UIntRange(_) | SimpleType::Source(_) => 0,
-            SimpleType::Fun(d, c) => d.level().max(c.level()),
-            SimpleType::Record(fields) => fields.values().map(|t| t.level()).max().unwrap_or(0),
-            SimpleType::Variant(tags) => tags.values().map(|t| t.level()).max().unwrap_or(0),
-            SimpleType::Var(v) => v.borrow().level,
-        }
+/// The level of `ty` — the maximum scope level of any inference variable
+/// occurring inside it. Leaves and `Hole` are level 0; `Refinement` defers
+/// to its inner type (refinements are lattice-blind). Used by `extrude` and
+/// (in a future let-poly extension) by generalization.
+pub fn type_level(ty: &Type) -> Level {
+    match ty {
+        Type::Infer(v) => v.level,
+        Type::Fun(d, c) => type_level(d).max(type_level(c)),
+        Type::Tuple(ts) => ts.iter().map(type_level).max().unwrap_or(0),
+        Type::Record(fs) => fs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
+        Type::Variant(tags) => tags.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
+        Type::Refinement(inner, _) => type_level(inner),
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => 0,
     }
 }
 
-/// Construct a fresh inference variable at the given level, wrapped as a
-/// [`SimpleType`] for direct use in constraint emission.
-pub fn fresh_var(level: Level) -> Rc<SimpleType> {
-    Rc::new(SimpleType::Var(VarState::fresh(level)))
+/// Construct a fresh inference variable at the given level, as a [`Type`]
+/// for direct use in constraint emission.
+pub fn fresh_var(level: Level) -> Type {
+    Type::Infer(InferVar::fresh(level))
 }
 
-/// Wrap a [`BaseType`] as a primitive [`SimpleType`].
-pub fn prim(b: BaseType) -> Rc<SimpleType> {
-    Rc::new(SimpleType::Prim(b))
+/// Wrap a [`BaseType`] as a primitive [`Type`].
+pub fn prim(b: BaseType) -> Type {
+    Type::Base(b)
 }
 
-/// Build a function [`SimpleType`] from domain and codomain.
-pub fn fun(d: Rc<SimpleType>, c: Rc<SimpleType>) -> Rc<SimpleType> {
-    Rc::new(SimpleType::Fun(d, c))
+/// Build a function [`Type`] from domain and codomain.
+pub fn fun(d: Type, c: Type) -> Type {
+    Type::Fun(Box::new(d), Box::new(c))
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +99,7 @@ pub fn fun(d: Rc<SimpleType>, c: Rc<SimpleType>) -> Rc<SimpleType> {
 
 /// A polymorphic type scheme.
 ///
-/// `body` may contain [`SimpleType::Var`]s whose `level` exceeds `level`.
+/// `body` may contain [`Type::Infer`] vars whose `level` exceeds `level`.
 /// Those are the *quantified* variables — at each use site they are
 /// replaced with fresh variables via [`PolyScheme::instantiate`]. Vars
 /// whose level is ≤ `level` leaked in from an outer scope and stay fixed.
@@ -252,18 +119,18 @@ pub struct PolyScheme {
     pub level: Level,
     /// Scheme body. May contain quantified vars (level > self.level)
     /// and free vars (level ≤ self.level).
-    pub body: Rc<SimpleType>,
+    pub body: Type,
 }
 
 impl PolyScheme {
     /// A monotype scheme: no quantified variables. Convenience for
     /// scalar operator types like `Bool → Bool`.
-    pub fn mono(body: Rc<SimpleType>) -> Self {
+    pub fn mono(body: Type) -> Self {
         Self { level: 0, body }
     }
 
     /// Construct a polytype with the given quantification cutoff.
-    pub fn poly(level: Level, body: Rc<SimpleType>) -> Self {
+    pub fn poly(level: Level, body: Type) -> Self {
         Self { level, body }
     }
 
@@ -273,7 +140,7 @@ impl PolyScheme {
     /// Called at every use site of the scheme to ensure each occurrence
     /// gets independent constraints (e.g. two uses of `Compare` can
     /// compare `Int`s and `String`s respectively without conflict).
-    pub fn instantiate(&self, current_level: Level) -> Rc<SimpleType> {
+    pub fn instantiate(&self, current_level: Level) -> Type {
         freshen_above(self.level, &self.body, current_level, &mut HashMap::new())
     }
 }
@@ -281,7 +148,7 @@ impl PolyScheme {
 /// Cache for [`freshen_above`], mapping each original quantified
 /// variable to its single fresh replacement so multiple occurrences
 /// share the same fresh var.
-pub type FreshenCache = HashMap<SimpleVarUid, Rc<RefCell<VarState>>>;
+pub type FreshenCache = HashMap<InferVarId, Rc<InferVar>>;
 
 /// Walk `ty` and replace every variable at level > `lim` with a fresh
 /// variable at `current_level`. Variables at level ≤ `lim` are kept
@@ -292,47 +159,50 @@ pub type FreshenCache = HashMap<SimpleVarUid, Rc<RefCell<VarState>>>;
 /// original.
 pub fn freshen_above(
     lim: Level,
-    ty: &Rc<SimpleType>,
+    ty: &Type,
     current_level: Level,
     cache: &mut FreshenCache,
-) -> Rc<SimpleType> {
-    if ty.level() <= lim {
-        return Rc::clone(ty);
+) -> Type {
+    if type_level(ty) <= lim {
+        return ty.clone();
     }
-    match ty.as_ref() {
-        SimpleType::Prim(_) | SimpleType::UIntRange(_) | SimpleType::Source(_) => Rc::clone(ty),
-        SimpleType::Fun(d, c) => Rc::new(SimpleType::Fun(
-            freshen_above(lim, d, current_level, cache),
-            freshen_above(lim, c, current_level, cache),
-        )),
-        SimpleType::Record(fields) => {
-            let mut new_fields = BTreeMap::new();
-            for (k, t) in fields {
-                new_fields.insert(k.clone(), freshen_above(lim, t, current_level, cache));
-            }
-            Rc::new(SimpleType::Record(new_fields))
-        }
-        SimpleType::Variant(tags) => {
-            let mut new_tags = BTreeMap::new();
-            for (k, t) in tags {
-                new_tags.insert(k.clone(), freshen_above(lim, t, current_level, cache));
-            }
-            Rc::new(SimpleType::Variant(new_tags))
-        }
-        SimpleType::Var(tv) => {
-            let uid = tv.borrow().uid;
-            if let Some(existing) = cache.get(&uid) {
-                return Rc::new(SimpleType::Var(Rc::clone(existing)));
+    match ty {
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => ty.clone(),
+        Type::Fun(d, c) => Type::Fun(
+            Box::new(freshen_above(lim, d, current_level, cache)),
+            Box::new(freshen_above(lim, c, current_level, cache)),
+        ),
+        Type::Tuple(ts) => Type::Tuple(
+            ts.iter()
+                .map(|t| freshen_above(lim, t, current_level, cache))
+                .collect(),
+        ),
+        Type::Record(fs) => Type::Record(
+            fs.iter()
+                .map(|(n, t)| (n.clone(), freshen_above(lim, t, current_level, cache)))
+                .collect(),
+        ),
+        Type::Variant(tags) => Type::Variant(
+            tags.iter()
+                .map(|(k, t)| (k.clone(), freshen_above(lim, t, current_level, cache)))
+                .collect(),
+        ),
+        Type::Refinement(inner, r) => Type::Refinement(
+            Box::new(freshen_above(lim, inner, current_level, cache)),
+            r.clone(),
+        ),
+        Type::Infer(tv) => {
+            if let Some(existing) = cache.get(&tv.uid) {
+                return Type::Infer(Rc::clone(existing));
             }
             // Mint fresh variable at the use site's level.
-            let v = VarState::fresh(current_level);
-            cache.insert(uid, Rc::clone(&v));
+            let v = InferVar::fresh(current_level);
+            cache.insert(tv.uid, Rc::clone(&v));
 
-            // Snapshot bounds before recursing — the recursion may
-            // touch other variables but must not see partially-mutated
-            // state on the original.
+            // Snapshot bounds before recursing — the recursion may touch
+            // other variables but must not see partially-mutated state.
             let (lows, ups) = {
-                let s = tv.borrow();
+                let s = tv.bounds.borrow();
                 (s.lower.clone(), s.upper.clone())
             };
             let new_lows: Vec<_> = lows
@@ -344,11 +214,11 @@ pub fn freshen_above(
                 .map(|t| freshen_above(lim, t, current_level, cache))
                 .collect();
             {
-                let mut s = v.borrow_mut();
+                let mut s = v.bounds.borrow_mut();
                 s.lower = new_lows;
                 s.upper = new_ups;
             }
-            Rc::new(SimpleType::Var(v))
+            Type::Infer(v)
         }
     }
 }
@@ -364,22 +234,22 @@ pub fn freshen_above(
 #[derive(Debug, Clone)]
 pub enum ConstrainError {
     /// `lhs` and `rhs` cannot be related by the subtyping rules of
-    /// [`SimpleType`] — e.g. two distinct primitives, a function compared
+    /// [`Type`] — e.g. two distinct primitives, a function compared
     /// to a record, etc.
     Mismatch {
         /// The offending lhs type.
-        lhs: Rc<SimpleType>,
+        lhs: Type,
         /// The offending rhs type.
-        rhs: Rc<SimpleType>,
+        rhs: Type,
     },
-    /// A record-on-record constraint required a field that lhs did not
-    /// have. Width-subtyping says rhs's keys must be a subset of lhs's;
-    /// this is the violation.
+    /// A record/tuple-on-record/tuple constraint required a field/position
+    /// that lhs did not have. Width-subtyping says rhs's keys must be a
+    /// subset of lhs's; this is the violation.
     MissingField {
         /// The missing key.
         key: FieldKey,
-        /// The lhs record that should have contained the key.
-        in_type: Rc<SimpleType>,
+        /// The lhs record/tuple that should have contained the key.
+        in_type: Type,
     },
     /// A variant-on-variant constraint had a tag in lhs that rhs did
     /// not accept. The dual of [`Self::MissingField`]: variant width-
@@ -390,25 +260,26 @@ pub enum ConstrainError {
         /// The tag present in lhs but not accepted by rhs.
         tag: FieldKey,
         /// The rhs variant that should have accepted the tag.
-        in_type: Rc<SimpleType>,
+        in_type: Type,
     },
 }
 
 /// Cache of in-progress subtyping checks. Breaks cycles introduced through
 /// variable bounds.
 ///
-/// Keyed by raw [`Rc`] pointer pairs — pointer identity is sufficient
-/// because the constrain_subtype solver never duplicates Rcs to the same logical
-/// type at distinct addresses (variables are shared, structural types are
-/// freshly allocated per emission and don't cycle on themselves).
-pub type ConstrainCache = HashSet<(*const SimpleType, *const SimpleType)>;
+/// Keyed by the `(lhs, rhs)` pair *by value*. Identity at [`Type::Infer`] is
+/// by `uid` (see [`InferVar`]), so this is cycle-safe (a recursive type's
+/// graph re-enters through a shared `Infer`, whose hash/eq stop at the uid)
+/// and de-dups structurally-equal constraints. Only var-involving pairs are
+/// inserted; purely-structural constraints are finite trees that bottom out.
+pub type ConstrainCache = HashSet<(Type, Type)>;
 
-/// Cache for [`extrude`], keyed by the polar pair (variable, polarity).
+/// Cache for [`extrude`], keyed by the polar pair (variable uid, polarity).
 ///
 /// Each polarity gets its own extruded copy so positive and negative
 /// occurrences of the same variable can be approximated independently
 /// (see Parreaux 2020 §3.4).
-pub type ExtrudeCache = HashMap<(SimpleVarUid, bool), Rc<RefCell<VarState>>>;
+pub type ExtrudeCache = HashMap<(InferVarId, bool), Rc<InferVar>>;
 
 /// Constrain `lhs <: rhs`, mutating variable bounds in place.
 ///
@@ -416,47 +287,50 @@ pub type ExtrudeCache = HashMap<(SimpleVarUid, bool), Rc<RefCell<VarState>>>;
 /// the top of each constraint emission and reuse it for the recursive
 /// subtyping the rule fires.
 pub fn constrain_subtype(
-    lhs: &Rc<SimpleType>,
-    rhs: &Rc<SimpleType>,
+    lhs: &Type,
+    rhs: &Type,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    if Rc::ptr_eq(lhs, rhs) {
+    if lhs == rhs {
         return Ok(());
     }
 
     // Cycle-break: only constraints involving variables can recur.
     // Non-variable structural types are regular trees; their constraints
-    // bottom out without revisiting themselves.
-    let either_var =
-        matches!(lhs.as_ref(), SimpleType::Var(_)) || matches!(rhs.as_ref(), SimpleType::Var(_));
-    if either_var {
-        let key = (Rc::as_ptr(lhs), Rc::as_ptr(rhs));
-        if !cache.insert(key) {
-            return Ok(());
-        }
+    // bottom out without revisiting themselves. Key by value — identity at
+    // `Infer` is by `uid`, so this is cycle-safe.
+    let either_var = matches!(lhs, Type::Infer(_)) || matches!(rhs, Type::Infer(_));
+    if either_var && !cache.insert((lhs.clone(), rhs.clone())) {
+        return Ok(());
     }
 
-    match (lhs.as_ref(), rhs.as_ref()) {
-        // Primitives and other "leaf" types match by structural equality.
-        (SimpleType::Prim(a), SimpleType::Prim(b)) if a == b => Ok(()),
-        (SimpleType::UIntRange(a), SimpleType::UIntRange(b)) if a == b => Ok(()),
-        (SimpleType::Source(a), SimpleType::Source(b)) if a == b => Ok(()),
+    match (lhs, rhs) {
+        // Refinements are lattice-blind: strip the wrapper and constrain the
+        // underlying type. The predicate stays sidecared on the AST node.
+        (Type::Refinement(t, _), _) => constrain_subtype(t, rhs, cache),
+        (_, Type::Refinement(t, _)) => constrain_subtype(lhs, t, cache),
+
+        // Leaf types match by structural equality.
+        (Type::Base(a), Type::Base(b)) if a == b => Ok(()),
+        (Type::UIntRange(a), Type::UIntRange(b)) if a == b => Ok(()),
+        (Type::DataSource(a), Type::DataSource(b)) if a == b => Ok(()),
 
         // Function: contravariant on domain, covariant on codomain.
-        (SimpleType::Fun(d0, c0), SimpleType::Fun(d1, c1)) => {
+        (Type::Fun(d0, c0), Type::Fun(d1, c1)) => {
             constrain_subtype(d1, d0, cache)?;
             constrain_subtype(c0, c1, cache)
         }
 
-        // Record: width-subtyping. rhs's fields must all appear in lhs.
-        (SimpleType::Record(fs0), SimpleType::Record(fs1)) => {
-            for (k, t1) in fs1 {
-                match fs0.get(k) {
+        // Tuple: positional width-subtyping. A longer/equal tuple is a
+        // subtype, so every position rhs requires must exist in lhs.
+        (Type::Tuple(a), Type::Tuple(b)) => {
+            for (i, t1) in b.iter().enumerate() {
+                match a.get(i) {
                     Some(t0) => constrain_subtype(t0, t1, cache)?,
                     None => {
                         return Err(ConstrainError::MissingField {
-                            key: k.clone(),
-                            in_type: Rc::clone(lhs),
+                            key: FieldKey::Index(i),
+                            in_type: lhs.clone(),
                         });
                     }
                 }
@@ -464,18 +338,32 @@ pub fn constrain_subtype(
             Ok(())
         }
 
-        // Variant: width-subtyping is the dual. lhs's tags must all
-        // appear in rhs (with a payload subtype check). Payload depth
-        // is covariant — same polarity as the outer constraint, NOT
-        // flipped like Fun's domain.
-        (SimpleType::Variant(vs0), SimpleType::Variant(vs1)) => {
-            for (k, t0) in vs0 {
-                match vs1.get(k) {
-                    Some(t1) => constrain_subtype(t0, t1, cache)?,
+        // Record: named width-subtyping. rhs's fields must all appear in lhs.
+        (Type::Record(a), Type::Record(b)) => {
+            for (name, t1) in b {
+                match a.iter().find(|(n, _)| n == name) {
+                    Some((_, t0)) => constrain_subtype(t0, t1, cache)?,
+                    None => {
+                        return Err(ConstrainError::MissingField {
+                            key: FieldKey::Name(SmolStr::from(name.as_str())),
+                            in_type: lhs.clone(),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        // Variant: width-subtyping is the dual. lhs's tags must all appear
+        // in rhs (with a payload subtype check). Payload depth is covariant.
+        (Type::Variant(a), Type::Variant(b)) => {
+            for (k, t0) in a {
+                match b.iter().find(|(bk, _)| bk == k) {
+                    Some((_, t1)) => constrain_subtype(t0, t1, cache)?,
                     None => {
                         return Err(ConstrainError::ExtraTag {
                             tag: k.clone(),
-                            in_type: Rc::clone(rhs),
+                            in_type: rhs.clone(),
                         });
                     }
                 }
@@ -485,10 +373,10 @@ pub fn constrain_subtype(
 
         // Variable on lhs, rhs has compatible level: append rhs to upper
         // bounds, propagate to all known lower bounds.
-        (SimpleType::Var(lv), _) if rhs.level() <= lv.borrow().level => {
+        (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
-                let mut s = lv.borrow_mut();
-                s.upper.push(Rc::clone(rhs));
+                let mut s = lv.bounds.borrow_mut();
+                s.upper.push(rhs.clone());
                 s.lower.clone()
             };
             for low in lows {
@@ -499,10 +387,10 @@ pub fn constrain_subtype(
 
         // Variable on rhs, lhs has compatible level: append lhs to lower
         // bounds, propagate to all known upper bounds.
-        (_, SimpleType::Var(rv)) if lhs.level() <= rv.borrow().level => {
+        (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
-                let mut s = rv.borrow_mut();
-                s.lower.push(Rc::clone(lhs));
+                let mut s = rv.bounds.borrow_mut();
+                s.lower.push(lhs.clone());
                 s.upper.clone()
             };
             for up in ups {
@@ -513,20 +401,18 @@ pub fn constrain_subtype(
 
         // Level mismatch: variable's level is below the other side's.
         // Lift the other side down via extrude and retry.
-        (SimpleType::Var(lv), _) => {
-            let level = lv.borrow().level;
-            let new_rhs = extrude(rhs, false, level, &mut ExtrudeCache::new());
+        (Type::Infer(lv), _) => {
+            let new_rhs = extrude(rhs, false, lv.level, &mut ExtrudeCache::new());
             constrain_subtype(lhs, &new_rhs, cache)
         }
-        (_, SimpleType::Var(rv)) => {
-            let level = rv.borrow().level;
-            let new_lhs = extrude(lhs, true, level, &mut ExtrudeCache::new());
+        (_, Type::Infer(rv)) => {
+            let new_lhs = extrude(lhs, true, rv.level, &mut ExtrudeCache::new());
             constrain_subtype(&new_lhs, rhs, cache)
         }
 
         _ => Err(ConstrainError::Mismatch {
-            lhs: Rc::clone(lhs),
-            rhs: Rc::clone(rhs),
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
         }),
     }
 }
@@ -544,52 +430,49 @@ pub fn constrain_subtype(
 /// extrude is effectively a no-op. The implementation is included here so
 /// a future let-polymorphism extension (and the constrain_subtype solver's
 /// level-mismatch branches) compile against a working reference.
-pub fn extrude(
-    ty: &Rc<SimpleType>,
-    pol: bool,
-    target_level: Level,
-    cache: &mut ExtrudeCache,
-) -> Rc<SimpleType> {
-    if ty.level() <= target_level {
-        return Rc::clone(ty);
+pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCache) -> Type {
+    if type_level(ty) <= target_level {
+        return ty.clone();
     }
-    match ty.as_ref() {
-        SimpleType::Prim(_) | SimpleType::UIntRange(_) | SimpleType::Source(_) => Rc::clone(ty),
-        SimpleType::Fun(d, c) => Rc::new(SimpleType::Fun(
-            extrude(d, !pol, target_level, cache),
-            extrude(c, pol, target_level, cache),
-        )),
-        SimpleType::Record(fields) => {
-            let mut new_fields = BTreeMap::new();
-            for (k, t) in fields {
-                new_fields.insert(k.clone(), extrude(t, pol, target_level, cache));
-            }
-            Rc::new(SimpleType::Record(new_fields))
-        }
-        SimpleType::Variant(tags) => {
-            let mut new_tags = BTreeMap::new();
-            for (k, t) in tags {
-                // Variant payloads are covariant — same polarity as the
-                // outer extrusion, no flip.
-                new_tags.insert(k.clone(), extrude(t, pol, target_level, cache));
-            }
-            Rc::new(SimpleType::Variant(new_tags))
-        }
-        SimpleType::Var(tv) => {
-            let uid = tv.borrow().uid;
-            if let Some(existing) = cache.get(&(uid, pol)) {
-                return Rc::new(SimpleType::Var(Rc::clone(existing)));
+    match ty {
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => ty.clone(),
+        Type::Fun(d, c) => Type::Fun(
+            Box::new(extrude(d, !pol, target_level, cache)),
+            Box::new(extrude(c, pol, target_level, cache)),
+        ),
+        Type::Tuple(ts) => Type::Tuple(
+            ts.iter()
+                .map(|t| extrude(t, pol, target_level, cache))
+                .collect(),
+        ),
+        Type::Record(fs) => Type::Record(
+            fs.iter()
+                .map(|(n, t)| (n.clone(), extrude(t, pol, target_level, cache)))
+                .collect(),
+        ),
+        Type::Variant(tags) => Type::Variant(
+            tags.iter()
+                // Variant payloads are covariant — same polarity, no flip.
+                .map(|(k, t)| (k.clone(), extrude(t, pol, target_level, cache)))
+                .collect(),
+        ),
+        Type::Refinement(inner, r) => Type::Refinement(
+            Box::new(extrude(inner, pol, target_level, cache)),
+            r.clone(),
+        ),
+        Type::Infer(tv) => {
+            if let Some(existing) = cache.get(&(tv.uid, pol)) {
+                return Type::Infer(Rc::clone(existing));
             }
             // Conservative approximation: a fresh variable at the target
             // level, linked to the original by the appropriate bound.
-            let nvs = VarState::fresh(target_level);
-            cache.insert((uid, pol), Rc::clone(&nvs));
-            let nvs_st = Rc::new(SimpleType::Var(Rc::clone(&nvs)));
+            let nvs = InferVar::fresh(target_level);
+            cache.insert((tv.uid, pol), Rc::clone(&nvs));
 
             // Snapshot the bounds we'll need to extrude before we mutate
             // the original; otherwise we'd race the borrow checker.
             let (lows, ups) = {
-                let s = tv.borrow();
+                let s = tv.bounds.borrow();
                 (s.lower.clone(), s.upper.clone())
             };
 
@@ -597,30 +480,36 @@ pub fn extrude(
                 // Positive: original flows into new var. Original gains
                 // `nvs` as an upper bound; new var inherits original's
                 // lower bounds (extruded at the same polarity).
-                tv.borrow_mut().upper.push(Rc::clone(&nvs_st));
+                tv.bounds
+                    .borrow_mut()
+                    .upper
+                    .push(Type::Infer(Rc::clone(&nvs)));
                 let new_lows: Vec<_> = lows
                     .iter()
                     .map(|t| extrude(t, pol, target_level, cache))
                     .collect();
-                nvs.borrow_mut().lower = new_lows;
+                nvs.bounds.borrow_mut().lower = new_lows;
             } else {
                 // Negative: new var flows into original. Original gains
                 // `nvs` as a lower bound; new var inherits original's
                 // upper bounds.
-                tv.borrow_mut().lower.push(Rc::clone(&nvs_st));
+                tv.bounds
+                    .borrow_mut()
+                    .lower
+                    .push(Type::Infer(Rc::clone(&nvs)));
                 let new_ups: Vec<_> = ups
                     .iter()
                     .map(|t| extrude(t, pol, target_level, cache))
                     .collect();
-                nvs.borrow_mut().upper = new_ups;
+                nvs.bounds.borrow_mut().upper = new_ups;
             }
-            nvs_st
+            Type::Infer(nvs)
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Coalesce: SimpleType -> ccl::Type
+// Coalesce: CompactGraph -> ccl::Type
 // ---------------------------------------------------------------------------
 
 /// Errors raised by [`coalesce_compact`].
@@ -640,7 +529,7 @@ pub enum CoalesceError {
         /// `false` = negative polarity (upper bounds forming an intersection).
         polarity: bool,
         /// UIDs of the simple-sub variables that contributed these bounds.
-        vars: Vec<SimpleVarUid>,
+        vars: Vec<InferVarId>,
         /// Pretty representation of the conflicting bounds.
         details: String,
     },
@@ -678,7 +567,7 @@ pub enum PartialKind {
 // CompactType + compact_type: bound-graph flattening
 // ---------------------------------------------------------------------------
 //
-// `compact_type` walks a SimpleType and produces a `CompactType` per
+// `compact_type` walks a `Type` and produces a `CompactType` per
 // position, transitively expanding variable bounds at the appropriate
 // polarity and merging structurally (records by union/intersection of
 // fields, functions by polar recursion).
@@ -706,11 +595,11 @@ pub enum AtomKey {
 }
 
 impl AtomKey {
-    fn from_simple(ty: &SimpleType) -> Option<AtomKey> {
+    fn from_type(ty: &Type) -> Option<AtomKey> {
         match ty {
-            SimpleType::Prim(b) => Some(AtomKey::Prim(b.clone())),
-            SimpleType::UIntRange(n) => Some(AtomKey::UIntRange(*n)),
-            SimpleType::Source(n) => Some(AtomKey::Source(n.clone())),
+            Type::Base(b) => Some(AtomKey::Prim(b.clone())),
+            Type::UIntRange(n) => Some(AtomKey::UIntRange(*n)),
+            Type::DataSource(n) => Some(AtomKey::Source(SmolStr::from(n.as_str()))),
             _ => None,
         }
     }
@@ -736,7 +625,7 @@ pub struct CompactType {
     /// Variable contributions from this position. Multiple variables
     /// can co-occur (e.g. when two projection morphisms both flow into
     /// the same parameter, both record-vars accumulate here).
-    pub vars: BTreeSet<SimpleVarUid>,
+    pub vars: BTreeSet<InferVarId>,
     /// Atomic-type contributions.
     pub atoms: BTreeSet<AtomKey>,
     /// Record fields, if any. At positive polarity these are
@@ -905,7 +794,7 @@ impl CompactType {
         }
     }
 
-    fn from_var(uid: SimpleVarUid) -> Self {
+    fn from_var(uid: InferVarId) -> Self {
         let mut vars = BTreeSet::new();
         vars.insert(uid);
         Self {
@@ -926,18 +815,18 @@ impl CompactType {
 #[derive(Debug, Clone)]
 pub struct CompactGraph {
     pub term: CompactType,
-    pub rec_vars: BTreeMap<SimpleVarUid, CompactType>,
+    pub rec_vars: BTreeMap<InferVarId, CompactType>,
 }
 
-/// Walk a SimpleType, transitively expanding variable bounds at the
+/// Walk a `Type`, transitively expanding variable bounds at the
 /// appropriate polarity, and produce a CompactType.
 ///
 /// The `parents` set tracks variables whose bounds we are currently
 /// walking, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
-pub fn compact_type(ty: &Rc<SimpleType>) -> CompactGraph {
-    let mut recursive: HashMap<(SimpleVarUid, bool), SimpleVarUid> = HashMap::new();
-    let mut rec_vars: BTreeMap<SimpleVarUid, CompactType> = BTreeMap::new();
+pub fn compact_type(ty: &Type) -> CompactGraph {
+    let mut recursive: HashMap<(InferVarId, bool), InferVarId> = HashMap::new();
+    let mut rec_vars: BTreeMap<InferVarId, CompactType> = BTreeMap::new();
     let term = compact_go(
         ty,
         true,
@@ -950,19 +839,26 @@ pub fn compact_type(ty: &Rc<SimpleType>) -> CompactGraph {
 }
 
 fn compact_go(
-    ty: &Rc<SimpleType>,
+    ty: &Type,
     pol: bool,
-    parents: &BTreeSet<SimpleVarUid>,
-    in_process: &mut HashSet<(SimpleVarUid, bool)>,
-    recursive: &mut HashMap<(SimpleVarUid, bool), SimpleVarUid>,
-    rec_vars: &mut BTreeMap<SimpleVarUid, CompactType>,
+    parents: &BTreeSet<InferVarId>,
+    in_process: &mut HashSet<(InferVarId, bool)>,
+    recursive: &mut HashMap<(InferVarId, bool), InferVarId>,
+    rec_vars: &mut BTreeMap<InferVarId, CompactType>,
 ) -> CompactType {
-    match ty.as_ref() {
+    match ty {
         // Atomic types contribute a single atom.
-        SimpleType::Prim(_) | SimpleType::UIntRange(_) | SimpleType::Source(_) => {
-            CompactType::from_atom(AtomKey::from_simple(ty).unwrap())
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {
+            CompactType::from_atom(AtomKey::from_type(ty).unwrap())
         }
-        SimpleType::Fun(d, c) => {
+        // Refinements are lattice-blind: compact the underlying type.
+        Type::Refinement(inner, _) => {
+            compact_go(inner, pol, parents, in_process, recursive, rec_vars)
+        }
+        // A bare `Hole` shouldn't reach the solver (emission turns it into a
+        // fresh var), but treat it as no contribution for exhaustiveness.
+        Type::Hole => CompactType::empty(),
+        Type::Fun(d, c) => {
             // Function: domain is contravariant. A fresh `parents` set
             // per child mirrors Scala's `Set.empty` argument — cycles
             // span only one variable's bound chain, not across
@@ -974,11 +870,13 @@ fn compact_go(
                 ..Default::default()
             }
         }
-        SimpleType::Record(fs) => {
+        // Tuples and records share the structural `rec` representation,
+        // keyed by `Index` and `Name` respectively.
+        Type::Tuple(ts) => {
             let mut compacted = BTreeMap::new();
-            for (k, v) in fs {
+            for (i, v) in ts.iter().enumerate() {
                 compacted.insert(
-                    k.clone(),
+                    FieldKey::Index(i),
                     compact_go(v, pol, &BTreeSet::new(), in_process, recursive, rec_vars),
                 );
             }
@@ -987,7 +885,20 @@ fn compact_go(
                 ..Default::default()
             }
         }
-        SimpleType::Variant(tags) => {
+        Type::Record(fs) => {
+            let mut compacted = BTreeMap::new();
+            for (n, v) in fs {
+                compacted.insert(
+                    FieldKey::Name(SmolStr::from(n.as_str())),
+                    compact_go(v, pol, &BTreeSet::new(), in_process, recursive, rec_vars),
+                );
+            }
+            CompactType {
+                rec: Some(compacted),
+                ..Default::default()
+            }
+        }
+        Type::Variant(tags) => {
             // Variant payloads are covariant — recurse at the same
             // polarity (no flip, unlike Fun's domain). The merge rule
             // for variants flips records' polarity behaviour, but
@@ -1004,8 +915,8 @@ fn compact_go(
                 ..Default::default()
             }
         }
-        SimpleType::Var(state) => {
-            let uid = state.borrow().uid;
+        Type::Infer(state) => {
+            let uid = state.uid;
             let key = (uid, pol);
             if in_process.contains(&key) {
                 if parents.contains(&uid) {
@@ -1017,9 +928,9 @@ fn compact_go(
                 // We need only the identifier here — the cycle is surfaced
                 // by `coalesce_compact` as a `RecursiveType` error before
                 // any level-sensitive code observes it — so we don't
-                // allocate a full `VarState` (no bounds, no level value
+                // allocate a full `InferVar` (no bounds, no level value
                 // to defend).
-                let placeholder = *recursive.entry(key).or_insert_with(next_simple_var_uid);
+                let placeholder = *recursive.entry(key).or_insert_with(fresh_infer_var_id);
                 return CompactType::from_var(placeholder);
             }
             in_process.insert(key);
@@ -1039,7 +950,7 @@ fn compact_go(
             // Sound while monomorphic (a variable's type is the same
             // at both polar ends); breaks let-polymorphism and must
             // come out before that lands.
-            let s = state.borrow();
+            let s = state.bounds.borrow();
             let primary = if pol { &s.lower } else { &s.upper };
             // When the polarity-correct list is empty we fall back to
             // the opposite-polarity bounds (see big TODO above). Track
@@ -1113,7 +1024,7 @@ fn compact_go(
 /// An item that can appear in a co-occurrence set during [`simplify_type`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CoOccItem {
-    Var(SimpleVarUid),
+    Var(InferVarId),
     Atom(AtomKey),
 }
 
@@ -1147,11 +1058,11 @@ enum CoOccItem {
 /// unexercised until recursive types are supported.
 pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
     // All variable UIDs encountered during the walk.
-    let mut all_vars: BTreeSet<SimpleVarUid> = cty.rec_vars.keys().cloned().collect();
+    let mut all_vars: BTreeSet<InferVarId> = cty.rec_vars.keys().cloned().collect();
     // Guards against re-entering a rec-var bound during analysis.
-    let mut rec_processed: BTreeSet<SimpleVarUid> = BTreeSet::new();
+    let mut rec_processed: BTreeSet<InferVarId> = BTreeSet::new();
     // co_occurrences[(pol, uid)] = set of items that ALWAYS co-occur with uid at polarity pol.
-    let mut co_occurrences: HashMap<(bool, SimpleVarUid), HashSet<CoOccItem>> = HashMap::new();
+    let mut co_occurrences: HashMap<(bool, InferVarId), HashSet<CoOccItem>> = HashMap::new();
 
     // Phase 1: analysis — walk the term, collecting co-occurrence sets.
     simplify_analyze(
@@ -1164,7 +1075,7 @@ pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
     );
 
     // Phase 2: decision — determine substitutions.
-    let mut var_subst: HashMap<SimpleVarUid, Option<SimpleVarUid>> = HashMap::new();
+    let mut var_subst: HashMap<InferVarId, Option<InferVarId>> = HashMap::new();
 
     // Eliminate polar-only non-recursive variables.
     for &v in &all_vars {
@@ -1178,7 +1089,7 @@ pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
     }
 
     // Unify co-occurring variables; absorb atom-sandwiched variables.
-    let all_vars_vec: Vec<SimpleVarUid> = all_vars.iter().cloned().collect();
+    let all_vars_vec: Vec<InferVarId> = all_vars.iter().cloned().collect();
     for &v in &all_vars_vec {
         if var_subst.contains_key(&v) {
             continue;
@@ -1237,7 +1148,7 @@ pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
     }
 
     // Phase 3: reconstruction — apply var_subst to the term and rec_var bounds.
-    let new_rec_vars: BTreeMap<SimpleVarUid, CompactType> = cty
+    let new_rec_vars: BTreeMap<InferVarId, CompactType> = cty
         .rec_vars
         .iter()
         .filter(|&(&uid, _)| !var_subst.contains_key(&uid))
@@ -1260,10 +1171,10 @@ pub fn simplify_type(cty: CompactGraph) -> CompactGraph {
 fn simplify_analyze(
     ct: &CompactType,
     pol: bool,
-    input_rec_vars: &BTreeMap<SimpleVarUid, CompactType>,
-    all_vars: &mut BTreeSet<SimpleVarUid>,
-    rec_processed: &mut BTreeSet<SimpleVarUid>,
-    co_occurrences: &mut HashMap<(bool, SimpleVarUid), HashSet<CoOccItem>>,
+    input_rec_vars: &BTreeMap<InferVarId, CompactType>,
+    all_vars: &mut BTreeSet<InferVarId>,
+    rec_processed: &mut BTreeSet<InferVarId>,
+    co_occurrences: &mut HashMap<(bool, InferVarId), HashSet<CoOccItem>>,
 ) {
     // Items present at this position (vars + atoms).
     let here: HashSet<CoOccItem> = ct
@@ -1349,9 +1260,9 @@ fn simplify_analyze(
 /// Apply `var_subst` to a [`CompactType`], producing the simplified version.
 fn simplify_reconstruct(
     ct: CompactType,
-    var_subst: &HashMap<SimpleVarUid, Option<SimpleVarUid>>,
+    var_subst: &HashMap<InferVarId, Option<InferVarId>>,
 ) -> CompactType {
-    let new_vars: BTreeSet<SimpleVarUid> = ct
+    let new_vars: BTreeSet<InferVarId> = ct
         .vars
         .iter()
         .flat_map(|&tv| match var_subst.get(&tv) {
@@ -1444,7 +1355,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
             // No concrete contribution; emit a fresh Infer slot.
             // check_fully_typed reports it as UnresolvedInfer if it
             // survives.
-            Ok(Type::Infer(fresh_infer_var_id()))
+            Ok(Type::Infer(InferVar::fresh(0)))
         }
         1 => Ok(all.remove(0)),
         _ => {
@@ -1454,7 +1365,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                 .map(|t| format!("{t}"))
                 .collect::<Vec<_>>()
                 .join(" | ");
-            let vars: Vec<SimpleVarUid> = ct.vars.iter().copied().collect();
+            let vars: Vec<InferVarId> = ct.vars.iter().copied().collect();
             Err(CoalesceError::IncompatibleBounds {
                 polarity,
                 vars,
@@ -1521,7 +1432,7 @@ fn materialize_record(
             for (_, v) in indexed {
                 coalesce_compact_go(v, polarity)?;
             }
-            Ok(Type::Infer(fresh_infer_var_id()))
+            Ok(Type::Infer(InferVar::fresh(0)))
         }
     } else if all_name {
         let mut out = Vec::with_capacity(rec.len());
@@ -1556,33 +1467,45 @@ mod tests {
 
     #[test]
     fn fresh_var_has_no_bounds() {
-        let v = VarState::fresh(0);
-        let s = v.borrow();
+        let v = InferVar::fresh(0);
+        let s = v.bounds.borrow();
         assert!(s.lower.is_empty());
         assert!(s.upper.is_empty());
-        assert_eq!(s.level, 0);
+        assert_eq!(v.level, 0);
     }
 
     #[test]
     fn level_of_compound_is_max_of_components() {
         let v0 = fresh_var(0);
         let v1 = fresh_var(1);
-        let f = SimpleType::Fun(v0, v1);
-        assert_eq!(f.level(), 1);
+        let f = fun(v0, v1);
+        assert_eq!(type_level(&f), 1);
     }
 
     #[test]
     fn primitives_have_level_zero() {
-        let p = SimpleType::Prim(BaseType::Int);
-        assert_eq!(p.level(), 0);
+        let p = prim(BaseType::Int);
+        assert_eq!(type_level(&p), 0);
     }
 
-    fn record(fields: &[(FieldKey, Rc<SimpleType>)]) -> Rc<SimpleType> {
-        let mut m = BTreeMap::new();
-        for (k, t) in fields {
-            m.insert(k.clone(), Rc::clone(t));
+    /// Build a `Type` from `FieldKey`-keyed fields: all-`Name` → `Record`,
+    /// otherwise a dense `Tuple` (the only product shapes `ccl::Type` has).
+    /// Sparse-`Index` inputs have no `Type` form — tests that need them
+    /// build the `CompactType` directly.
+    fn record(fields: &[(FieldKey, Type)]) -> Type {
+        if fields.iter().all(|(k, _)| matches!(k, FieldKey::Name(_))) {
+            Type::Record(
+                fields
+                    .iter()
+                    .map(|(k, t)| match k {
+                        FieldKey::Name(n) => (n.to_string(), t.clone()),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+            )
+        } else {
+            Type::Tuple(fields.iter().map(|(_, t)| t.clone()).collect())
         }
-        Rc::new(SimpleType::Record(m))
     }
 
     #[test]
@@ -1656,8 +1579,8 @@ mod tests {
         let p = prim(BaseType::Int);
         let mut cache = ConstrainCache::new();
         constrain_subtype(&v, &p, &mut cache).unwrap();
-        if let SimpleType::Var(state) = v.as_ref() {
-            let s = state.borrow();
+        if let Type::Infer(state) = &v {
+            let s = state.bounds.borrow();
             assert_eq!(s.upper.len(), 1);
             assert!(s.lower.is_empty());
         } else {
@@ -1672,8 +1595,8 @@ mod tests {
         let p = prim(BaseType::Int);
         let mut cache = ConstrainCache::new();
         constrain_subtype(&p, &v, &mut cache).unwrap();
-        if let SimpleType::Var(state) = v.as_ref() {
-            let s = state.borrow();
+        if let Type::Infer(state) = &v {
+            let s = state.bounds.borrow();
             assert!(s.upper.is_empty());
             assert_eq!(s.lower.len(), 1);
         } else {
@@ -1698,11 +1621,11 @@ mod tests {
         constrain_subtype(&alpha, &int_ty, &mut cache).unwrap();
         constrain_subtype(&beta, &alpha, &mut cache).unwrap();
 
-        if let SimpleType::Var(state) = beta.as_ref() {
-            let s = state.borrow();
+        if let Type::Infer(state) = &beta {
+            let s = state.bounds.borrow();
             assert_eq!(s.upper.len(), 1);
             // The recorded upper bound is α itself, not Int.
-            assert!(matches!(s.upper[0].as_ref(), SimpleType::Var(_)));
+            assert!(matches!(&s.upper[0], Type::Infer(_)));
         } else {
             unreachable!()
         }
@@ -1764,15 +1687,29 @@ mod tests {
 
     #[test]
     fn coalesce_sparse_index_emits_infer() {
-        // A sparse Index record (e.g. an isolated index-projection
-        // domain that never closed to a dense tuple) is under-determined
-        // and unconstructable, so coalesce emits a fresh `Type::Infer`
-        // (an ambiguous-type condition) rather than a closed shape.
-        let r = record(&[
-            (FieldKey::Index(0), prim(BaseType::Int)),
-            (FieldKey::Index(2), prim(BaseType::String)),
-        ]);
-        let t = coalesce_compact(&compact_type(&r)).unwrap();
+        // A sparse Index record (e.g. an isolated index-projection domain
+        // that never closed to a dense tuple) is under-determined and
+        // unconstructable, so coalesce emits a fresh `Type::Infer`. There
+        // is no `ccl::Type` for a sparse-index product, so build the
+        // `CompactType` directly (the input the solver would produce
+        // internally).
+        let mut rec = BTreeMap::new();
+        rec.insert(
+            FieldKey::Index(0),
+            CompactType::from_atom(AtomKey::Prim(BaseType::Int)),
+        );
+        rec.insert(
+            FieldKey::Index(2),
+            CompactType::from_atom(AtomKey::Prim(BaseType::String)),
+        );
+        let graph = CompactGraph {
+            term: CompactType {
+                rec: Some(rec),
+                ..Default::default()
+            },
+            rec_vars: BTreeMap::new(),
+        };
+        let t = coalesce_compact(&graph).unwrap();
         assert!(matches!(t, Type::Infer(_)), "expected Infer, got {t:?}");
     }
 
@@ -1844,8 +1781,8 @@ mod tests {
         // body triggers the placeholder/RecursiveType path. That case
         // is exercised by the differential test sweep, not here.
         let v = fresh_var(0);
-        if let SimpleType::Var(state) = v.as_ref() {
-            state.borrow_mut().lower.push(Rc::clone(&v));
+        if let Type::Infer(state) = &v {
+            state.bounds.borrow_mut().lower.push(v.clone());
         }
         match coalesce_compact(&compact_type(&v)).unwrap() {
             Type::Infer(_) => {}
@@ -1870,7 +1807,7 @@ mod tests {
     fn constrain_function_via_var_succeeds() {
         // λx. x typed as α -> α; constrain_subtype α -> α <: Int -> Int succeeds.
         let v = fresh_var(0);
-        let identity = fun(Rc::clone(&v), Rc::clone(&v));
+        let identity = fun(v.clone(), v.clone());
         let int_to_int = fun(prim(BaseType::Int), prim(BaseType::Int));
         let mut cache = ConstrainCache::new();
         assert!(constrain_subtype(&identity, &int_to_int, &mut cache).is_ok());
@@ -1878,9 +1815,9 @@ mod tests {
 
     // ------- simplify_type unit tests ----------------------------------------
 
-    /// Build a fresh [`SimpleVarUid`] for use in hand-constructed CompactTypes.
-    fn fresh_uid() -> SimpleVarUid {
-        VarState::fresh(0).borrow().uid
+    /// Build a fresh [`InferVarId`] for use in hand-constructed CompactTypes.
+    fn fresh_uid() -> InferVarId {
+        InferVar::fresh(0).uid
     }
 
     #[test]
@@ -1921,7 +1858,7 @@ mod tests {
         let uid_a = fresh_uid();
         let int_key = AtomKey::Prim(BaseType::Int);
 
-        let make_side = |vars: BTreeSet<SimpleVarUid>| CompactType {
+        let make_side = |vars: BTreeSet<InferVarId>| CompactType {
             vars,
             atoms: [int_key.clone()].into_iter().collect(),
             ..Default::default()
@@ -1951,7 +1888,7 @@ mod tests {
         // a and b always appear together at both polarities → one merged into the other.
         let uid_a = fresh_uid();
         let uid_b = fresh_uid();
-        let both: BTreeSet<SimpleVarUid> = [uid_a, uid_b].into_iter().collect();
+        let both: BTreeSet<InferVarId> = [uid_a, uid_b].into_iter().collect();
 
         let graph = CompactGraph {
             term: CompactType {
@@ -2010,14 +1947,14 @@ mod tests {
     // Variant — constrain_subtype, compact merging, coalesce
     // -----------------------------------------------------------------------
 
-    /// Helper: build a `Variant({tag: payload, ...})` SimpleType with
-    /// named (`FieldKey::Name`) tags.
-    fn variant<const N: usize>(tags: [(&str, Rc<SimpleType>); N]) -> Rc<SimpleType> {
-        let mut m = BTreeMap::new();
-        for (k, v) in tags {
-            m.insert(FieldKey::Name(SmolStr::from(k)), v);
-        }
-        Rc::new(SimpleType::Variant(m))
+    /// Helper: build a `Type::Variant({tag: payload, ...})` with named
+    /// (`FieldKey::Name`) tags.
+    fn variant<const N: usize>(tags: [(&str, Type); N]) -> Type {
+        Type::Variant(
+            tags.into_iter()
+                .map(|(k, v)| (FieldKey::Name(SmolStr::from(k)), v))
+                .collect(),
+        )
     }
 
     /// `[A] <: [A, B]` — subtype's tag set is a subset of supertype's. Accept.
@@ -2200,7 +2137,7 @@ mod tests {
         );
     }
 
-    /// Coalesce a variant SimpleType into `Type::Variant` with preserved tags.
+    /// Coalesce a variant `Type` into `Type::Variant` with preserved tags.
     #[test]
     fn coalesce_variant_roundtrips_to_type_variant() {
         let v = variant([

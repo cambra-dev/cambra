@@ -65,7 +65,7 @@ pub fn reset_all_id_counters() {
 ///
 /// The inner `u32` is `pub(crate)` to prevent external code from constructing
 /// arbitrary `InferVarId` values. Use [`fresh_infer_var_id`] instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InferVarId(pub(crate) u32);
 
 impl fmt::Display for InferVarId {
@@ -94,6 +94,74 @@ pub(crate) fn fresh_infer_var_id() -> InferVarId {
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn reset_infer_var_counter() {
     INFER_VAR_COUNTER.store(0, Ordering::Relaxed);
+}
+
+/// Polymorphism scope level. Larger = more deeply nested. We currently keep
+/// every variable at level 0 (monomorphic `let`); the field is threaded
+/// through for a future let-poly extension.
+pub type Level = u32;
+
+/// The mutable bound lists of an [`InferVar`].
+///
+/// `lower` are types that flow *into* the variable (`L <: α`); `upper` are
+/// types it must flow into (`α <: U`). The simple-sub solver appends to
+/// these in place via the variable's [`RefCell`]; coalescing reads them to
+/// materialize a concrete [`Type`].
+#[derive(Debug, Clone, Default)]
+pub struct InferBounds {
+    /// Lower bounds — `L <: α`. Unioned at positive (output) positions.
+    pub lower: Vec<Type>,
+    /// Upper bounds — `α <: U`. Intersected at negative (input) positions.
+    pub upper: Vec<Type>,
+}
+
+/// A type inference variable: an unknown type the solver pins down by
+/// accumulating subtyping bounds.
+///
+/// Carried by [`Type::Infer`]. The `uid` and `level` are immutable and live
+/// *outside* the `RefCell`, so identity (equality, hashing, display) is
+/// borrow-free and never inspects the bound graph — which is what lets
+/// [`Type`] keep deriving `PartialEq`/`Eq`/`Hash`/`Debug` even while a
+/// variable's bounds are cyclic (a recursive type, pre-rejection) or
+/// mutably borrowed mid-constraint. Only [`InferVar::bounds`] is mutable.
+pub struct InferVar {
+    /// Stable, globally-unique identity.
+    pub uid: InferVarId,
+    /// Scope level at which the variable was minted.
+    pub level: Level,
+    /// Mutable lower/upper bound lists.
+    pub bounds: RefCell<InferBounds>,
+}
+
+impl InferVar {
+    /// Mint a fresh, unconstrained inference variable at `level`.
+    pub fn fresh(level: Level) -> Rc<InferVar> {
+        Rc::new(InferVar {
+            uid: fresh_infer_var_id(),
+            level,
+            bounds: RefCell::new(InferBounds::default()),
+        })
+    }
+}
+
+// Identity-based: two inference variables are equal iff they share a `uid`.
+// Borrow-free and cycle-free (never touches `bounds`), so it's safe to call
+// on a variable whose bound graph is cyclic or currently borrowed.
+impl PartialEq for InferVar {
+    fn eq(&self, other: &Self) -> bool {
+        self.uid == other.uid
+    }
+}
+impl Eq for InferVar {}
+impl std::hash::Hash for InferVar {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.uid.hash(state);
+    }
+}
+impl fmt::Debug for InferVar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "?{}", self.uid)
+    }
 }
 
 use crate::interpreter::{ColumnValue, Extent};
@@ -1847,7 +1915,13 @@ pub enum Type {
     /// as `UnresolvedInfer`. `Infer` survivals are permitted only inside
     /// sub-expressions whose output type is not exercised (e.g. a top-level
     /// `f = lambda x: x` that is never applied).
-    Infer(InferVarId),
+    ///
+    /// Carries the mutable [`InferVar`] (id + level + bounds) that the
+    /// simple-sub solver constrains in place. A *coalesced* `Infer` (one
+    /// surviving inference) has empty bounds and matters only for its
+    /// `uid`; the solver guarantees no still-mutating variable escapes
+    /// into a downstream pass.
+    Infer(Rc<InferVar>),
     /// The opaque domain type of an externally-registered data source.
     ///
     /// Used as the domain in `Fun(DataSource(name), output_type)` types emitted
@@ -1950,7 +2024,7 @@ impl fmt::Display for Type {
                 }
             ),
             Type::Hole => write!(f, "_"),
-            Type::Infer(id) => write!(f, "?{}", id.0),
+            Type::Infer(var) => write!(f, "?{}", var.uid),
             Type::DataSource(name) => write!(f, "source({name})"),
         }
     }
@@ -1988,7 +2062,7 @@ impl Type {
     /// will fill in.
     #[cfg(test)]
     pub fn infer() -> Self {
-        Type::Infer(fresh_infer_var_id())
+        Type::Infer(InferVar::fresh(0))
     }
 
     /// Invoke `f` on each direct child [`Type`] of this type.

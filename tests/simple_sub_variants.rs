@@ -2,7 +2,7 @@
 //!
 //! Builds [`TypedExpr`] trees directly (mirroring `tests/simple_sub_differential.rs`)
 //! and runs them through the public `cambra::ccl::infer::infer` entry point.
-//! These tests exercise the variant lattice (`SimpleType::Variant`), the new
+//! These tests exercise the variant lattice (`Type::Variant`), the new
 //! AST nodes (`VariantCtor`, `Match`), and their constraint/coalesce
 //! integration — without depending on CHL surface syntax for variants
 //! (which is a separate workstream).

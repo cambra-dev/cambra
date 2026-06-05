@@ -10,11 +10,11 @@ A [glossary](#5-glossary) at the end defines every term of art used below. The c
 
 The type inference engine is based on Lionel Parreaux's *Simple Essence of Algebraic Subtyping* (ICFP 2020). It replaces standard Hindley-Milner (HM) biunification with a constraint-graph solver that natively supports subtyping, Principal Types (the most general type for each term)[^1], and structural records.
 
-Instead of generating equality constraints and resolving them via unification, the simple-sub algorithm generates directional subtyping constraints written `constrain(lhs, rhs)`, read as "`lhs` must be a subtype of `rhs`" (`lhs <: rhs`). The CCL AST is traversed; each node emits a `SimpleType` and constrains the resulting types against their expected positions.
+Instead of generating equality constraints and resolving them via unification, the simple-sub algorithm generates directional subtyping constraints written `constrain(lhs, rhs)`, read as "`lhs` must be a subtype of `rhs`" (`lhs <: rhs`). The CCL AST is traversed; each node emits a `ccl::Type` and constrains the resulting types against their expected positions. The solver operates **directly on `ccl::Type`** — there is no separate internal type representation; an inference unknown is a `Type::Infer` carrying mutable bounds (see below).
 
 ### The Core Mechanism: Bounds and Recursive Constraints
 
-The entire algorithm revolves around managing **bounds** on type variables. "Variable" here always means a *type variable* — an inference unknown the solver is trying to pin down — not a program/term variable. Every unknown type is represented as a mutable `VarState` tracking a list of **lower bounds** and **upper bounds**.
+The entire algorithm revolves around managing **bounds** on type variables. "Variable" here always means a *type variable* — an inference unknown the solver is trying to pin down — not a program/term variable. Every unknown type is a `Type::Infer(Rc<InferVar>)`, where the shared `InferVar` carries a `level`, a stable identity (`uid`), and a `RefCell` of **lower bounds** and **upper bounds**. Because the `InferVar` is shared by `Rc`, recording a bound at one occurrence is immediately visible at every other occurrence of the same variable.
 
 The bound lists are populated by the `constrain` rule, which is where the informal phrase "a type flows into a variable" gets its precise meaning. When a term `x` is used in a position whose expected type is `T`, the solver emits `constrain(type(x), T)`:
 
@@ -142,9 +142,9 @@ The inference engine drives the AST through three passes, defined in `infer_simp
 
 ### Pass 1: Constraint Emission
 
-The algorithm walks the AST top-down. It translates expected types into `SimpleType`s, generates constraints, and saves each node's resulting `SimpleType` into a **side table** (`ctx.side`) keyed by the node's pointer ID (`NodeId`).
+The algorithm walks the AST top-down. It normalizes each node's expected type into a solver-ready `ccl::Type` (via `normalize_annotation`: `Hole` → fresh `Type::Infer`, `Refinement` stripped to the sidecar), generates constraints, and writes each node's resulting `Type` directly onto `expr.ty`.
 
-*(The side table is a short-term architectural workaround. After unifying `SimpleType` and `ccl::Type`, inference will write types directly into `expr.ty` during emission and the table will be removed.)*
+Because inference variables are shared `Rc<InferVar>`s, constraints emitted *after* a node's type is stored continue to accumulate bounds that remain visible through the stored `Type` — so there is no separate side table; the AST node *is* the record of the node's inferred type.
 
 The constraint rules for the fundamental forms, in language-neutral pseudocode:
 
@@ -188,11 +188,11 @@ constrain(lhs, rhs):
 
 ### Pass 2: Coalesce and Write-back
 
-The algorithm walks the AST a second time. For each node it looks up the inferred `SimpleType` in the side table and runs it through a three-step pipeline before writing the materialized `ccl::Type` into `expr.ty`.
+The algorithm walks the AST a second time. For each node it takes the `Type` already stored on `expr.ty` (whose `Infer` variables now carry their fully accumulated bounds) and runs it through a three-step pipeline, writing the resolved, variable-free `ccl::Type` back into `expr.ty` in place.
 
-The three steps take a `SimpleType` (a graph whose variables carry mutable lower/upper bound lists) and turn it into a flat, per-polarity-position representation that a single concrete type can be read off of:
+The three steps take a `Type` whose `Type::Infer` variables carry mutable lower/upper bound lists and turn it into a flat, per-polarity-position representation that a single concrete type can be read off of:
 
-1. **`compact_type`:** Walks the `SimpleType`, transitively following each variable's bounds at the polarity of its occurrence, and collects everything reachable at a given polarity-position into one flat `CompactType` (the bundle is a `CompactGraph`: the top-level `CompactType` plus a side-table of any recursive-variable definitions). "Compacting" means gathering the scattered bounds that reach a position into a single bag of contributions (variables, atoms, a record shape, a function shape). When two record shapes meet at a position, they merge by polarity: at a **positive** position their fields are *intersected* (a value that is reliably both `{a, b}` and `{a, c}` is only reliably `{a}`); at a **negative** position their fields are *unioned*.
+1. **`compact_type`:** Walks the `Type`, transitively following each variable's bounds at the polarity of its occurrence, and collects everything reachable at a given polarity-position into one flat `CompactType` (the bundle is a `CompactGraph`: the top-level `CompactType` plus a side-table of any recursive-variable definitions). "Compacting" means gathering the scattered bounds that reach a position into a single bag of contributions (variables, atoms, a record shape, a function shape). When two record shapes meet at a position, they merge by polarity: at a **positive** position their fields are *intersected* (a value that is reliably both `{a, b}` and `{a, c}` is only reliably `{a}`); at a **negative** position their fields are *unioned*.
    * *Implementation hack — opposite-polarity fallback:* if walking a variable's polarity-correct bounds yields no concrete structure, the algorithm falls back to the opposite polarity's bounds. This works around the missing `Type::ForAll`: it is sound while everything is monomorphic (a variable's type is the same at both ends) but breaks let-polymorphism, and will be removed alongside a future monomorphization pass.
 2. **`simplify_type`:** Runs polar co-occurrence analysis to keep types from growing exponentially. "Dropping" a variable here means removing it from the contribution bags at its occurrences; the position keeps whatever concrete structure remains, and a position left with no contributions coalesces to `Type::Infer`. Three rules:
    * *Polar-only elimination:* a variable whose every occurrence is at a single polarity carries no information (nothing constrains it from the other side), so it is dropped. A purely-negative variable means the function accepts anything there; a purely-positive one means the caller imposes nothing on it.
@@ -201,14 +201,14 @@ The three steps take a `SimpleType` (a graph whose variables carry mutable lower
    * The pass is currently cosmetic (everything is monomorphic) and becomes load-bearing once let-polymorphism introduces genuine polar asymmetry.
 3. **`coalesce_compact`:** Materializes the simplified `CompactGraph` into the final `ccl::Type` by counting the concrete structural contributions (e.g. `Int`, a record, a variant) remaining at each position. Variable contributions never appear in the output — their bounds have already been expanded into the structural bags by `compact_type`.
    * *Zero shapes:* emit a fresh `Type::Infer` placeholder.
-   * *Exactly one shape:* emit it as the `ccl::Type`. Records with dense indices become `Type::Tuple`; sparse indices become `Type::PartialTuple`; variant maps preserve their tags and become `Type::Variant`.
+   * *Exactly one shape:* emit it as the `ccl::Type`. Records with dense `Index` keys (0..n) become `Type::Tuple`; `Name` keys become `Type::Record`; a *sparse* index product (a gap in the indices, which only an open/under-determined position can produce) coalesces to a fresh `Type::Infer` rather than a concrete product; variant maps preserve their tags and become `Type::Variant`.
    * *Multiple shapes:* if several distinct concrete types survive (e.g. `Int` and `String`) with no tag to discriminate them, throw an `IncompatibleBounds` error — the solver won't invent an anonymous sum from a primitive collision. (A genuinely *tagged* `Variant` is one shape, not a collision.)
 
 ### Pass 3: The Saturate Pass (Departure from Upstream)
 
 Simple-sub requires the lattice to be "blind" to types that do not behave purely structurally. To handle Cambra's needs we add a third pass (`type_saturate.rs`).
 
-**Why it's needed.** A later stage will propagate refinements through the lattice in a semi-opaque manner. Until then, putting `Refinement` types directly into the `SimpleType` lattice would make the simplifier incorrect: two structurally identical variables carrying different logical refinements (e.g. `x > 0` vs `x < 10`) would be wrongly merged by co-occurrence analysis. (Tagged variants, by contrast, *are* structural and live in the lattice directly — see §4.)
+**Why it's needed.** A later stage will propagate refinements through the lattice in a semi-opaque manner. Until then, letting `Refinement` types participate in the structural lattice would make the simplifier incorrect: two structurally identical variables carrying different logical refinements (e.g. `x > 0` vs `x < 10`) would be wrongly merged by co-occurrence analysis. This is why `normalize_annotation` strips refinements to a sidecar before constraint solving even though they remain `ccl::Type` values. (Tagged variants, by contrast, *are* structural and live in the lattice directly — see §4.)
 
 **How it works.** The `saturate` pass walks the fully coalesced AST with a lexical scope environment, patching up the blind spots the solver left:
 
@@ -238,10 +238,7 @@ Cambra needs features that algebraic subtyping intentionally drops (explicit ref
 
 #### The unified tagged sum
 
-Cambra has **one** sum representation, the **tagged variant**, used at both layers:
-
-* **`SimpleType::Variant(BTreeMap<FieldKey, _>)`** in the solver, and
-* **`Type::Variant(Vec<(FieldKey, Type)>)`** in the public AST.
+Cambra has **one** sum representation, the **tagged variant** — `Type::Variant(Vec<(FieldKey, Type)>)`. Since the solver works on `ccl::Type` directly, there is no second variant form to convert to: inference, coalescing, and the public AST all use this one type. (Internally, `compact_type` keys its transient `CompactType` bag by `FieldKey`, but that is an implementation detail of compaction, not a separate type.)
 
 Tags are [`FieldKey`]s — the same key type as records/tuples — so a sum can be **named** (`FieldKey::Name`, a source-level `.Tag(...)`) or **anonymous/positional** (`FieldKey::Index`, the dual of a tuple). The formerly-separate untagged `Type::Union` is gone: a positional union `A | B` is simply `Variant([(Index 0, A), (Index 1, B)])`, and the surface `++`/CollectionUnion produces exactly that (see §2's `emit_collection_union`). One constructor, one coalesce path, one width-subtyping rule (the dual of records: a subtype has *fewer* tags).
 
@@ -259,21 +256,19 @@ Inference does not *infer* a multi-atom sum from a primitive collision (it raise
 
 (`VariantCtor`/structural `Case` have no surface syntax yet, so lowering never emits them; they are exercised by direct AST construction in the variant tests.)
 
-### Flowing In: `ccl::Type` → `SimpleType`
+### Flowing In: normalizing annotations
 
-During Pass 1, `type_to_simple` lowers public types into the lattice:
+There is no conversion *into* a solver type — the solver consumes `ccl::Type` as-is. The only adjustment Pass 1 makes is `normalize_annotation`, which readies a user annotation / expected type for constraint solving:
 
-* **Holes and Infers:** become fresh `Var`s at the current level.
-* **Tuples and Records:** both map to a uniform `SimpleType::Record` keyed by `FieldKey` (`Index(usize)` for tuples, `Name(SmolStr)` for records). Width-subtyping applies uniformly.
-* **Partial/Open Records:** enter as ordinary `Record`s containing only the known keys.
-* **Refinements:** are **stripped entirely** from the `SimpleType` and preserved on the AST node as a sidecar, so they don't interfere with the solver's co-occurrence simplification.
-* **`Type::Variant`:** lifted directly into the lattice as `SimpleType::Variant`, tags preserved. Variants are admissible at both polarities (the dual of `Record`), so they need no fresh-var indirection — this holds for both named and positional (`++`-style) sums.
+* **Holes (`Type::Hole`):** become fresh `Type::Infer` variables at the current level.
+* **Refinements:** are **stripped entirely** from the type fed to the solver and preserved on the AST node as a sidecar, so they don't interfere with the solver's co-occurrence simplification.
+* **Everything else** — including existing `Type::Infer` vars, `Tuple`/`Record` products, and `Type::Variant` sums — is kept verbatim and handled by the solver's structural constraint rules. Tuples and records are width-subtyped positionally/by name; variants are admissible at both polarities (the dual of records), so they need no fresh-var indirection.
 
-### Flowing Out: `SimpleType` → `ccl::Type`
+### Flowing Out: coalescing
 
-Once constraints are resolved (Pass 2), `coalesce_compact` rebuilds the public types:
+Once constraints are resolved (Pass 2), `coalesce_compact` resolves each node's `Type::Infer` variables in place:
 
-* **Records:** dense `Index` keys become `Type::Tuple`; sparse `Index` keys become `Type::PartialTuple`; `Name` keys become `Type::Record` or `Type::PartialRecord`.
+* **Products:** dense `Index` keys become `Type::Tuple`; `Name` keys become `Type::Record`; a sparse `Index` product (an open/under-determined position) coalesces to a fresh `Type::Infer` rather than a concrete product.
 * **Variants:** materialize into `Type::Variant(Vec<(FieldKey, Type)>)` with tags in `BTreeMap` order. A variant payload sits at a record-field-like position, so it inherits that position's polarity and coalesces by the same rule as a record field value. An all-`Index` variant pretty-prints as a bare `A | B | C`.
 * **Incompatible bounds:** if a variable accumulates multiple distinct concrete primitives (e.g. `Int` and `String`) with no tag to discriminate them, the solver emits an `IncompatibleBounds` error. A *tagged* sum is unaffected — `[.0: Int | .1: String]` is a single `Variant`, not a primitive collision.
 * **Recursive types:** simple-sub has no occurs check, so a self-application like `λx. x x` types successfully as an infinite recursive type. Because that is almost always a mistake in Cambra, residual cyclic types are explicitly rejected at coalesce time with a `RecursiveType` error.
@@ -286,7 +281,7 @@ Consult these definitions as needed; each term is introduced in context in §1�
 
 | Term | Origin | Definition |
 | :--- | :--- | :--- |
-| **SimpleType** | Simple-Sub | The internal, mutable constraint-graph representation used only inside the solver (`Prim`, `Fun`, `Record`, `Variant`, `Var`). |
+| **`Type::Infer` / `InferVar`** | Simple-Sub | An inference unknown. `Type::Infer(Rc<InferVar>)`; the shared `InferVar` carries a stable `uid`, a `level`, and a `RefCell` of lower/upper bounds. The solver works directly on `ccl::Type`, so this *is* the constraint-graph node — there is no separate "SimpleType". |
 | **Position** | Simple-Sub | A location within a type expression where another type sits (a function domain/codomain, a record field value). Each position has a polarity determined by its path from the outermost type. |
 | **Polarity** | Simple-Sub | Positive or negative. The outermost type is positive; codomains and field values preserve polarity, domains flip it. Variables at positive positions materialize as a union of lower bounds; at negative positions, as an intersection of upper bounds. |
 | **Lower Bound** | Simple-Sub | A type `L` recorded on variable `α` such that `L <: α` must hold (a type that "flows into" `α`). At a positive occurrence of `α`, the lower bounds are unioned to form the type at that position. |
@@ -299,9 +294,9 @@ Consult these definitions as needed; each term is introduced in context in §1�
 | **`CompactGraph`** | Simple-Sub | A top-level `CompactType` plus a side-table of recursive-variable definitions; the intermediate produced by `compact_type` and consumed by `simplify_type` / `coalesce_compact`. |
 | **Coalesce** | Simple-Sub | Materializing a `CompactGraph` back into an immutable `ccl::Type`: positive occurrences become a union of lower bounds, negative occurrences an intersection of upper bounds. |
 | **`FieldKey`** | Simple-Sub | The shared key for record/tuple fields *and* variant tags: `Index(usize)` for positional (anonymous) keys, `Name(SmolStr)` for named ones. |
-| **`Variant` (tagged sum)** | Both | The single sum representation: `SimpleType::Variant` / `Type::Variant`, keyed by [`FieldKey`]. Named tags are source-level `.Tag(...)`; positional (`Index`) tags are anonymous sums (what `++` produces). Width-subtyping is the dual of records (a subtype has *fewer* tags). Subsumes the old untagged `Type::Union`. |
-| **`ccl::Type`** | Cambra-Specific | The public, immutable, user-facing AST type. Contains variants absent from the solver, such as `Refinement`, `PartialTuple`, and `Hole`. |
-| **Saturate** | Cambra-Specific | A Cambra-specific, post-coalesce AST pass that fixes up node types the `SimpleType` lattice is structurally blind to (refinements, lexical-scope identity for binders). A *saturated type* is one that has been through this pass. |
+| **`Variant` (tagged sum)** | Both | The single sum representation: `Type::Variant`, keyed by [`FieldKey`]. Named tags are source-level `.Tag(...)`; positional (`Index`) tags are anonymous sums (what `++` produces). Width-subtyping is the dual of records (a subtype has *fewer* tags). Subsumes the old untagged `Type::Union`. |
+| **`ccl::Type`** | Both | The public, immutable, user-facing AST type — and, since the unification, also the solver's working representation. Inference unknowns are `Type::Infer`; `Refinement` and `Hole` are normalized away (sidecar / fresh var) before constraint solving. |
+| **Saturate** | Cambra-Specific | A Cambra-specific, post-coalesce AST pass that fixes up node types the structural lattice is blind to (refinements, lexical-scope identity for binders). A *saturated type* is one that has been through this pass. |
 | **Refinement Propagation** | Cambra-Specific | Inspecting a lambda's body to see how the parameter is used, extracting predicate refinements from those usages, and wrapping them around the lambda's inferred domain type. (Also called Refinement Stitching; see Pass 3 and review Q4.) |
 | **Let Binding Resolution** | Cambra-Specific | Ensuring a `Let` binding's fully resolved type overwrites the type of any `Var` references to it within the let body. |
 

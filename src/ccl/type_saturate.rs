@@ -4,25 +4,25 @@
 //! long-term state. Tagged variants are now handled structurally inside the
 //! lattice; the remaining goal is to eliminate this pass once the type system
 //! also handles refinements directly (a future SMT-backed refinement pass).
-//! Until then it consolidates all `SimpleType`-blindspot fixes in one place
+//! Until then it consolidates all lattice-blindspot fixes in one place
 //! so they are easy to find and remove together.
 //!
-//! Simple-sub's [`SimpleType`](crate::ccl::simple_sub::SimpleType) lattice is
+//! Simple-sub's structural lattice is
 //! intentionally **refinement-blind** (plan R1): the solver tracks structural
 //! shapes only, so refinement predicates cannot ride along inside it.
 //! (Tagged sums *are* structural and live in the lattice as
-//! `SimpleType::Variant`, so — unlike in earlier stages — collection-union
+//! `Type::Variant`, so — unlike in earlier stages — collection-union
 //! results no longer need fixing up here.) A couple of typing rules
 //! (Refinement Propagation, Let Binding Resolution) still require
 //! refinement/lexical-scope information to appear on `expr.ty` slots after
-//! coalescing. Rather than smuggle them through `SimpleType`, we run a
+//! coalescing. Rather than smuggle them through the structural lattice, we run a
 //! separate top-down pass that walks the already-coalesced tree with a
 //! lexical scope environment and rewrites each affected node's `expr.ty`
 //! based on its children's resolved types and the surrounding bindings.
 //!
 //! Contract: given an [`Expr`] tree whose every node carries a coalesced
 //! [`Type`] (some correctly-typed, some carrying placeholders from
-//! SimpleType-blind paths), [`saturate`] rewrites types in place so that
+//! lattice-blind paths), [`saturate`] rewrites types in place so that
 //! every node agrees with its already-resolved children and bindings.
 //!
 //! The pass has **no dependency** on [`SimpleSubContext`](crate::ccl::infer_simple_sub):
@@ -65,7 +65,7 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
         // The domain currently carries (after coalesce + sidecar wrap):
         //   - optional outer `Refinement(_, own_ref)` from the lambda's own
         //     sidecar refinement (sidecar wrap happened in coalesce_node);
-        //   - inner: the SimpleType-coalesced parameter shape.
+        //   - inner: the solver-coalesced parameter shape.
         // We collect refinements coming from how the body USES `param`
         // (i.e. `Apply { function: f, argument: Var(param) }` where `f.ty`
         // is `Fun(Refinement(_, r), _)`) and wrap them inside the own_ref
@@ -109,7 +109,7 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
 
             // Bind `param` in scope using the *innermost* shape (no
             // refinement layers). Var(param) inside the body is the
-            // SimpleType-coalesced reference; matching `inner_dom` keeps
+            // solver-coalesced reference; matching `inner_dom` keeps
             // us consistent with what coalesce would already have written
             // there. The lambda's outer refinement decoration applies at
             // the function boundary, not at every reference.
@@ -271,7 +271,7 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
 /// `param_name`).
 ///
 /// Mirrors the previous in-tree walker in `infer_simple_sub.rs`. The
-/// SimpleType graph carries structural shapes only, so refinements that
+/// the solver's lattice carries structural shapes only, so refinements that
 /// flow through `param` via callee domains cannot be observed without an
 /// AST-level walk like this one.
 fn collect_param_refinements(body: &Expr, param_name: &str, out: &mut Vec<Refinement>) {
