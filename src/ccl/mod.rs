@@ -12,9 +12,9 @@ pub mod desugar_defers;
 pub mod infer;
 pub mod infer_simple_sub;
 pub mod inline;
-pub mod join_plan;
 pub mod lambda_elim;
 pub mod lower;
+pub mod planning;
 pub mod simple_sub;
 pub mod simplify;
 pub mod symbolic;
@@ -341,11 +341,11 @@ pub enum UnaryOpKind {
 /// These are the named combinators that earlier passes used to refer to via
 /// [`TypedExprNode::Var`] with hard-coded magic strings.  Representing them as
 /// a dedicated enum makes it cheap and type-safe for downstream passes
-/// (simplify, join_plan, operator_conversion, …) to recognise primitives
+/// (simplify, planning, operator_conversion, …) to recognise primitives
 /// without string matching.
 ///
 /// Built-in nodes are produced by [`crate::ccl::lambda_elim`] and
-/// [`crate::ccl::join_plan`]; they never appear in source-lowered CCL prior
+/// [`crate::ccl::planning`]; they never appear in source-lowered CCL prior
 /// to lambda elimination, so type inference does not need to reason about
 /// them — types are stamped onto the surrounding [`TypedExpr`] at the point
 /// each built-in is emitted.
@@ -372,8 +372,46 @@ pub enum Builtin {
     Converse,
     /// `uncurry : (A → (B → C)) → ((A, B) → C)`.
     Uncurry,
-    /// `restrict` — filter the domain of a function by a predicate.
+    /// `restrict : (D ⇒ Bool) ⇒ (D ⇒ T) ⇒ ({d: D | p(d)} ⇒ T)` —
+    /// mid-chain filter step.
+    ///
+    /// `restrict` is a *codomain-parametric function transformer*: it
+    /// narrows the domain of an upstream value-producer `D ⇒ T` to the
+    /// subset satisfying `p`, passing the values `T` through unchanged.
+    /// So the refinement lands on the **domain** and `T` is preserved on
+    /// the codomain — not the unsound `D ⇒ {d: D | p(d)}` (which would
+    /// claim every `d : D` satisfies `p`).  The transformer
+    /// `Apply(p, Restrict)` is therefore **applied to** its upstream
+    /// (`Apply(upstream, Apply(p, Restrict))`), not composed with it —
+    /// its domain is a function type, so it cannot be a morphism in a CCC
+    /// `Compose` chain.
+    ///
+    /// Op-conversion compiles the application via the generic
+    /// applied-combinator arm: `upstream` is converted with `input=None`,
+    /// then this `Restrict` arm consumes it as `input=Some(_)`, compiles
+    /// the predicate against it, and wraps it in a `Restrict` tile.
+    /// Emitted by [`crate::ccl::planning`] for every downstream filter —
+    /// the outer layers of a nested-refinement iteration site, the
+    /// residual predicate of `JoinPlan::Loop`, and the residual predicate
+    /// of `JoinPlan::Hash`.  Chain-head iteration is the separate
+    /// `Iterate` variant.  See [`crate::ccl::ccl_utils::make_restrict`].
     Restrict,
+    /// `iterate : (D ⇒ Bool) ⇒ ({d: D | p(d)} ⇒ {d: D | p(d)})` —
+    /// chain-head iteration source.
+    ///
+    /// `Apply(p, Iterate)` requires `input=None`; op-conversion compiles
+    /// it to an `IterateExtent` over `D` (plus a `Restrict` filter when
+    /// `p` is non-trivial).  Emitted by [`crate::ccl::planning`] at the
+    /// head of every iteration site: aggregate arguments, top-level
+    /// program results, sink-bound fields, mutation-loop sources, and
+    /// `JoinPlan::Loop` / `JoinPlan::Hash` arm leaves.  Mid-chain
+    /// filtering is the separate `Restrict` variant.
+    ///
+    /// Planning is the sole emitter; lambda elimination never produces
+    /// `Iterate`.  The trivially-true predicate `Apply(Lit::Bool(true), Const)`
+    /// marks unrefined sites — op-conversion recognises it and emits
+    /// just `IterateExtent` (no filter).
+    Iterate,
     /// `permute_domain` — reorder positions in a tuple-typed domain.
     PermuteDomain,
     /// `flatten_domain` — flatten selected nested-tuple positions in a domain.
@@ -447,6 +485,7 @@ impl Builtin {
             Self::Converse => "converse",
             Self::Uncurry => "uncurry",
             Self::Restrict => "restrict",
+            Self::Iterate => "iterate",
             Self::PermuteDomain => "permute_domain",
             Self::FlattenDomain => "flatten_domain",
             Self::BinOp(op) => op.fn_name(),
@@ -473,6 +512,52 @@ impl Builtin {
             AggregateKind::Sum => Self::Sum,
             AggregateKind::Max => Self::Max,
         }
+    }
+
+    /// Op-conversion's `Apply { argument, function: Builtin(self) }` arm
+    /// compiles `argument` (or, for tuple-shaped arguments, its
+    /// iteration-source sub-parts) with `input=None`, treating it as a
+    /// function-typed iteration source.  This is op-conversion's
+    /// "input-internalising" group.
+    ///
+    /// Consulted by two helpers in [`crate::ccl::planning`]:
+    ///
+    /// - `is_internalising_builtin_function` — at `Apply { function }`
+    ///   positions during the iteration-site walk, decides which
+    ///   builtins' arguments to wrap with `iterate(_)`.  `CollectionUnion`
+    ///   and `LastOrDefault` are in this list because they self-iterate
+    ///   from sub-parts of their tuple argument, but the walk's
+    ///   per-shape match arms handle them before the catch-all that
+    ///   consults this method — so the per-element wrapping fires first
+    ///   and the catch-all is never reached for them.
+    /// - `is_iteration_bearing` — at chain heads, decides which builtins
+    ///   already provide their own iteration (and so should not be
+    ///   wrapped with another `iterate(_)`).  Scalar-result builtins
+    ///   (`Sum`, `Max`, `LastOrDefault`) are in the list too; the
+    ///   caller's `expr.ty.domain()` check filters them out at chain
+    ///   heads independently.
+    ///
+    /// `Iterate` is NOT in this list — it is an iteration source, but
+    /// it does not iterate *from* its argument (the argument is the
+    /// predicate, threaded with `input=Some`).  `is_iteration_bearing`
+    /// handles `Iterate` separately.  `Restrict` is also excluded: it
+    /// threads its input through to the predicate (`input=Some`),
+    /// neither iterating from arg nor providing its own iteration.
+    ///
+    /// Keep in sync with the corresponding arms in operator_conversion.rs.
+    pub fn iterates_arg(self) -> bool {
+        matches!(
+            self,
+            Self::Sum
+                | Self::Max
+                | Self::Converse
+                | Self::MapDomain
+                | Self::Uncurry
+                | Self::PermuteDomain
+                | Self::FlattenDomain
+                | Self::CollectionUnion
+                | Self::LastOrDefault
+        )
     }
 }
 
@@ -668,7 +753,7 @@ pub enum TypedExprNode {
 
     /// A reference to a built-in primitive function.
     ///
-    /// Introduced by [`crate::ccl::lambda_elim`] (and [`crate::ccl::join_plan`])
+    /// Introduced by [`crate::ccl::lambda_elim`] (and [`crate::ccl::planning`])
     /// to refer to combinators such as `id`, `zip`, `curry`, `apply`, the
     /// arithmetic / comparison / logic operators, the unary operators, and the
     /// aggregations.  Replaces the earlier convention of using

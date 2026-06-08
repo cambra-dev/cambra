@@ -11,8 +11,8 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, ProjKey, Refinement, RefinementKind,
-    Type, TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, ProjKey, Refinement,
+    RefinementKind, Type, TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -154,6 +154,17 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             // Apply is left-associative: `x ▷ f ▷ g` means `(x ▷ f) ▷ g`.
             // Render arg at Apply so a nested Apply is not parenthesised
             // (left-assoc), but Lambda / BinOp / etc. are.
+            // Iterate at an unrefined site is rendered as the bare `iterate`
+            // atom (without the boilerplate trivially-true predicate) — the
+            // predicate is implicit at unrefined sites, and showing
+            // `true ▷ const ▷ iterate` at every program root drowns the
+            // useful structure in marker noise.  The full `pred ▷ iterate`
+            // form still renders normally when the predicate is non-trivial.
+            if matches!(function.node, TypedExprNode::Builtin(Builtin::Iterate))
+                && is_trivially_true_arg(argument)
+            {
+                return (Precedence::Atom, "iterate".to_string());
+            }
             let is_proj = matches!(function.node, TypedExprNode::Proj(..));
             let rendered_arg = fmt(argument, Precedence::Apply, opts);
             let rendered_func = fmt_apply_func(function, opts);
@@ -435,6 +446,18 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
 /// as outer `▷`), which would otherwise silently re-associate.
 fn fmt_apply_func(func: &Expr, opts: &SymbolicOpts) -> String {
     fmt(func, Precedence::Apply.next_highest(), opts)
+}
+
+/// Returns `true` if `arg` is the trivially-true predicate `Apply(Lit(true), Const)`
+/// — the canonical predicate planning emits at unrefined iteration sites.  Detection
+/// here lets [`fmt_inner`] render `Apply(true_pred, Iterate)` as a bare `iterate`
+/// atom rather than the verbose `true ▷ const ▷ iterate` form.
+fn is_trivially_true_arg(arg: &Expr) -> bool {
+    let TypedExprNode::Apply { argument, function } = &arg.node else {
+        return false;
+    };
+    matches!(&function.node, TypedExprNode::Builtin(Builtin::Const))
+        && matches!(&argument.node, TypedExprNode::Lit(Lit::Bool(true)))
 }
 
 /// Render a [`Lit`] as its CCL symbolic form.

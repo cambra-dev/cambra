@@ -1,8 +1,14 @@
 //! Miscellaneous utilities for working with CCL.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 
-use crate::ccl::{Builtin, Expr, RefinementId, RefinementKind, Type, TypedExprNode};
+use crate::ccl::infer::typecheck_subtype;
+use crate::ccl::{
+    BaseType, Builtin, Expr, Lit, Refinement, RefinementId, RefinementKind, Type, TypedExprNode,
+    next_refinement_id,
+};
 
 /// Builds an application of a primitive combinator, setting the types based on
 /// the input expression's type and the provided output type.
@@ -28,6 +34,137 @@ pub fn typed_compose(elts: Vec<Expr>) -> Expr {
     let d_ty = elts[0].ty.domain().unwrap().clone();
     let c_ty = elts[elts.len() - 1].ty.codomain().unwrap().clone();
     Expr::compose(elts).with_ty(Type::fun(d_ty, c_ty))
+}
+
+/// Construct the trivially-true predicate `λ _ → true` over the given domain,
+/// represented in point-free form as `true ▷ const`.
+///
+/// Returned expression has type `domain ⇒ Bool`.  Used by [`crate::ccl::planning`]
+/// when emitting `iterate(pred)` at an unrefined iteration site, and matched by
+/// op-conversion via [`is_trivially_true_predicate`] to skip the predicate's filter.
+pub fn trivially_true_predicate(domain: Type) -> Expr {
+    let bool_ty = Type::Base(BaseType::Bool);
+    let true_lit = Expr::lit(Lit::Bool(true)).with_ty(bool_ty.clone());
+    apply_primitive(true_lit, Builtin::Const, Type::fun(domain, bool_ty))
+}
+
+/// Returns `true` if `expr` is the trivially-true predicate `true ▷ const`
+/// (the canonical predicate emitted at unrefined iteration sites by
+/// [`crate::ccl::planning`]).
+pub fn is_trivially_true_predicate(expr: &Expr) -> bool {
+    let TypedExprNode::Apply { argument, function } = &expr.node else {
+        return false;
+    };
+    matches!(&function.node, TypedExprNode::Builtin(Builtin::Const))
+        && matches!(&argument.node, TypedExprNode::Lit(Lit::Bool(true)))
+}
+
+/// Construct `Apply(predicate, Iterate)`, the chain-head iteration-source
+/// marker emitted by [`crate::ccl::planning`] at every iteration site.
+/// `predicate` must have type `D ⇒ Bool` (a point-free combinator chain
+/// after lambda elimination).
+///
+/// The result has type `{D | p} ⇒ {D | p}` — `iterate(p)` is the identity
+/// on the predicate's refined domain.  As a special case, when `predicate`
+/// is the trivially-true predicate (recognised by
+/// [`is_trivially_true_predicate`]), the output type degenerates to
+/// `D ⇒ D` with no refinement wrapper: the refinement would carry no
+/// information, and skipping it keeps program dumps and golden tests
+/// free of `{D | true ▷ const}` noise.  The refinement is fresh —
+/// refinement IDs are used only for cycle detection in walkers and
+/// extent caching, so a fresh ID per marker is safe.
+///
+/// Op-conversion compiles `Apply(p, Iterate)` to an `IterateExtent` tile
+/// (plus a `Restrict` filter when the predicate is non-trivial).  The
+/// Iterate arm requires `input=None` — mid-chain filtering is handled by
+/// the separate [`make_restrict`] form.  Refinements are transparent
+/// under [`crate::ccl::infer::typecheck`], so the symmetric
+/// `{D | p} ⇒ {D | p}` shape composes cleanly against either a refined
+/// or unrefined adjacent edge.
+pub fn make_iterate(predicate: Expr) -> Expr {
+    let domain = predicate
+        .ty
+        .domain()
+        .expect("iterate predicate must have a function type")
+        .clone();
+    let refined = refine_with(domain, &predicate);
+    apply_primitive(
+        predicate,
+        Builtin::Iterate,
+        Type::fun(refined.clone(), refined),
+    )
+}
+
+/// Construct the mid-chain filter `restrict(p)` **applied to its
+/// `upstream` value-producer** — the term `Apply(upstream, Apply(p,
+/// Restrict))`.
+///
+/// `restrict` is a *codomain-parametric function transformer*: given a
+/// predicate `p : D ⇒ Bool` it narrows the domain of an upstream
+/// `D ⇒ T`, passing the values `T` through unchanged.  So the transformer
+/// `Apply(p, Restrict)` has type `(D ⇒ T) ⇒ ({d : D | p(d)} ⇒ T)`, and
+/// applying it to `upstream : D ⇒ T` yields `{d : D | p(d)} ⇒ T` — the
+/// refinement on the **domain**, the value `T` preserved on the codomain.
+///
+/// This is application, not composition: `restrict`'s domain is a
+/// *function* type, so it cannot sit as a morphism in a CCC `Compose`
+/// chain (its honest type makes that ill-typed, and [`typecheck`] now
+/// rejects it).  Modelling it as an applied higher-order function is what
+/// keeps the emitted term well-typed — see [`crate::ccl::planning`].
+///
+/// `predicate` must have type `D ⇒ Bool` and `upstream` type `D ⇒ T`
+/// (matching domains).  Emitted by [`crate::ccl::planning`] for every
+/// filter step downstream of an iteration source — `JoinPlan::Loop` /
+/// `JoinPlan::Hash` residual predicates and the outer layers of
+/// nested-refinement iteration sites.  Op-conversion compiles it via the
+/// generic applied-combinator arm: `upstream` is converted with
+/// `input=None`, then the `Restrict` arm consumes it as `input=Some(_)`,
+/// compiles the predicate against it, and wraps it in a `Restrict` tile.
+/// Chain-head iteration is the separate [`make_iterate`] form.
+///
+/// [`typecheck`]: crate::ccl::infer::typecheck
+pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
+    let domain = predicate
+        .ty
+        .domain()
+        .expect("restrict predicate must have a function type")
+        .clone();
+    let upstream_ty = upstream.ty.clone();
+    let value_ty = upstream_ty
+        .codomain()
+        .expect("restrict upstream must have a function type D ⇒ T")
+        .clone();
+    debug_assert!(
+        typecheck_subtype(&upstream_ty.domain().unwrap(), &domain),
+        "restrict upstream domain {} must match predicate domain {}",
+        upstream_ty.domain().unwrap(),
+        domain,
+    );
+    // `{d : D | p(d)} ⇒ T` — refinement on the domain, value preserved.
+    let refined_stream = Type::fun(refine_with(domain, &predicate), value_ty);
+    // The transformer node `restrict(p) : (D ⇒ T) ⇒ ({d : D | p(d)} ⇒ T)`.
+    let restrict = apply_primitive(
+        predicate,
+        Builtin::Restrict,
+        Type::fun(upstream_ty, refined_stream.clone()),
+    );
+    apply_function(upstream, restrict, refined_stream)
+}
+
+/// Wrap `base` in a fresh `Type::Refinement` carrying `predicate`,
+/// unless the predicate is trivially true (then return `base` unchanged).
+fn refine_with(base: Type, predicate: &Expr) -> Type {
+    if is_trivially_true_predicate(predicate) {
+        return base;
+    }
+    Type::Refinement(
+        Box::new(base),
+        Refinement {
+            id: next_refinement_id(),
+            description: String::new(),
+            kind: RefinementKind::Predicate(Rc::new(RefCell::new(predicate.clone()))),
+        },
+    )
 }
 
 /// Count free occurrences of `name` in `expr`, including occurrences in

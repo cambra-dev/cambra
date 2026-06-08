@@ -181,6 +181,142 @@ TODOs for implementing hash joins:
 
 - Add support for MapApply to take a `CurriedFunction(A → UInt → B)` as the function argument, which will then convert `SealedFunction(C → A)` to `CurriedFunction(C → UInt → B)`
 
+---
+
+## Operator Conversion (`interpreter/operator_conversion.rs`)
+
+Op-conversion is the final stage of the front-end: it takes a fully simplified,
+join-planned, iterate-marked CCL AST and emits a static `TileOperator` graph.  Each
+AST node maps to one or more tile operators; the resulting graph is then driven by
+the consumer attached at `compile_program`.
+
+The pass is structured as a single recursive walk (`convert_impl`) that threads two
+things through the recursion: a **scope** of let-bindings (each carrying a
+[`FanOut`] handle plus a [`BindingKind`] tag), and an **input** — the upstream
+[`TileOperator`] whose output the current sub-expression should consume.  Every
+arm decides how to pass `input` (or `None`) down to its children, and that
+dispatch is the heart of the pass.
+
+### Input-policy dispatch
+
+Op-conversion's arms split into two groups by how they handle their parent's
+`input`:
+
+- **Input-threading arms** accept `input=Some(upstream)` and either pass it
+  unchanged into their argument (`Map`, `Restrict`) or fan it out to multiple
+  children via [`FanOut`] (`Zip`, `Let`).  Their argument is *not* an iteration
+  site; it inherits the surrounding iteration.
+
+- **Input-internalising arms** assert `input.is_none()` and compile their
+  argument with `input=None`.  The argument is an iteration source compiled in
+  isolation, with its own iteration extent at the bottom of its chain.  Examples:
+  `Iterate` (the canonical chain-head extent producer), `MapDomain`, `Uncurry`,
+  `FlattenDomain`, `PermuteDomain`, `CollectionUnion`, `Sum` / `Max`,
+  `LastOrDefault`, and the catch-all `Apply` arm (where the function position
+  is a `Proj` / `Var` / curried `Apply`).
+
+`Converse` straddles the split: it accepts either `input=None` (produce an
+iteration source itself by compiling its argument with `input=None`) or
+`input=Some` (wrap the standalone converse in a `MapResult` over the upstream).
+
+This dispatch is mirrored exactly by the iteration-marking pass in
+[`crate::ccl::planning::insert_iterate_markers`] — its
+`is_internalising_builtin_function` and `is_iteration_bearing` helpers both
+consult [`Builtin::iterates_arg`], the single per-builtin policy method that
+enumerates the input-internalising group.  The pass walks the AST inserting
+`Apply(true ▷ const, Iterate)` as the source at every iteration site and
+*applying* zero or more `restrict(p)` filter steps to it (one per refinement
+layer) — `iterate ▷ (p ▷ restrict) ▷ …`, application rather than composition.
+Op-conversion never has to invent an iteration source on its own.
+
+### Iteration sources
+
+After planning, the only ways op-conversion learns about an iteration are via
+`Apply(_, Iterate)` (chain head) and `Apply(_, Restrict)` (mid-chain filter):
+
+- **`Apply(predicate, Iterate)`** — requires `input=None`; the chain-head
+  iteration source.  Construct `IterateExtent::new(extent_of(predicate.domain))`;
+  when `predicate` is the trivially-true `Apply(Lit::Bool(true), Const)`
+  (recognised via `is_trivially_true_predicate`), return that iteration source
+  directly.  Otherwise compile `predicate` with the iteration as its input and
+  wrap in `Restrict`, yielding an identity over the filtered domain.
+
+- **`Apply(predicate, Restrict)`** — requires `input=Some(upstream)`; mid-chain
+  filter.  Compile `predicate` with `upstream` as its input and wrap in a
+  `Restrict` tile.  Planning emits this for every downstream filter step — the
+  outer layers of a nested-refinement iteration site, and the residual
+  predicates of `JoinPlan::Loop` and `JoinPlan::Hash`.
+
+The invariant is: **every other op-conversion arm rejects `input=None` for
+function-typed expressions** (the arms that compile arguments with `input=None`
+do so only after planning has placed an `Iterate` at the chain head).  Any
+non-`Iterate` arm reaching op-conversion with `input=None` fails an assertion —
+a planner bug, not a user error.  Similarly, `Restrict` reaching op-conversion
+with `input=None` is a planner bug.
+
+### Let-bindings and `BindingKind`
+
+`Let { binding, bound_expr, body }` fans the parent's input out to both children
+(or passes `None` to both if there is no upstream input), then compiles
+`bound_expr` and `body` independently against their respective fan-out branches.
+The bound operator is wrapped in `Memo::new(...)` and pushed into the scope
+under `binding.name` along with a [`BindingKind`]:
+
+- **`BindingKind::Aligned`** — the bound expression was compiled with
+  `Some(input)`, so its tile-domain matches the surrounding iteration.  At a
+  `Var` reference inside that iteration, op-conversion returns the `FanOut`
+  branch directly: the value already varies in lockstep.
+
+- **`BindingKind::Free`** — the bound expression was compiled with `None`, so it
+  is a stand-alone function value.  A reference under an iteration wraps it in
+  `MapResult(input, bound_op)` to look up the function per iteration position.
+
+This bit determines whether a `Var` use is a passthrough or a per-position
+lookup.  It is recorded once at the let-bind site rather than re-derived at each
+use, because the tile-level information needed to disambiguate is already gone
+by Var-lookup time.
+
+(There is a known limitation with multi-depth iterations — see the
+TODO(nested-mutation) comment on `BindingKind` for the planned generalisation.)
+
+### Fan-out and sharing
+
+Three arms share an input across multiple downstream consumers:
+
+- **`Apply(_, Zip)` with `Tuple` / `Record` arguments** fans the input out to
+  each tuple / record element; the elements get `Some(fan_out_branch)` and
+  combine via [`fan_in`] (function-tiled arms) or [`ScalarFanIn`] (scalar arms).
+  The 2-arm Zip-with-const fast path skips the fan-out and emits a single
+  `MapResultToConst` instead.
+
+- **`Let { bound_expr, body }`** fans the parent input into both the bound
+  expression and the body (described above).
+
+- **`Loop` bodies** fan-out the cyclic prev-accumulator stream and the body
+  output (via `FanOut::new_cyclic`); see the `Recurse` description above for
+  the full structure.
+
+### Aggregates, sinks, and the program root
+
+The pipeline always bottoms out at one of three consumer shapes:
+
+1. A scalar produced by `Apply(<chain>, Sum)` / `Max` (compiles to
+   `Aggregate` + `ExtractAggregate`) or `Apply(Tuple([stream, default]), LastOrDefault)`
+   (compiles to `ExtractLast`).
+2. A function-typed program result — `convert_to_operators` is the entry
+   point, the resulting tile is subscribed by the user-supplied `main_consumer`
+   at `compile_program`.
+3. A trailing `Record` of sink-bound names — `convert_record_fields_to_operators`
+   compiles one operator per field, sharing the scope (and therefore the
+   `FanOut` / `Memo` of let-bound upstream) across every field.  Each field
+   is subscribed by its corresponding `SinkConsumer`.
+
+In all three cases planning has ensured every iteration site has an explicit
+`iterate(p)` marker, so op-conversion is a context-free walk: each arm decides
+what to emit based only on its own AST shape and the input flowing in.
+
+---
+
 ## Open Challenges
 
 ### Streaming Joins

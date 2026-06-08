@@ -11,12 +11,15 @@ use super::common::expect_scalar;
 // that refinement lives on the cluster binding's *type*, but the
 // value-expression at the binding (a `Record` projection) doesn't
 // carry the refinement on its own `expr.ty`.
-// `operator_conversion::iterate_type` only inspects the value
-// expression's type, so the `Restrict` operator never gets emitted.
+// `planning::insert_iterate_markers` reads the refinement from the
+// value-expression's type when deciding what predicate to feed into
+// `Apply(p, Iterate)`, so the filter never makes it into an iterate
+// marker.
 //
-// A coworker is fixing `operator_conversion` to honour refinements on
-// let-binding types.  Once that lands, drop the `#[ignore]` here —
-// no changes are expected in desugar itself.  Same root cause as
+// Fixing this means extending the iteration-marker pass to honour
+// refinements attached to let-binding types.  Once that lands, drop
+// the `#[ignore]` here — no changes are expected in desugar itself.
+// Same root cause as
 // `tests/compilation_pipeline.rs::test_generator_function::positives`;
 // see `src/ccl/design-desugar-defers.md` "Known gaps & future work"
 // for the longer write-up.

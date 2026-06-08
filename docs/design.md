@@ -32,7 +32,7 @@ CHL source
   → infer            (ccl/infer.rs: type inference via simple-sub; delegates to ccl/infer_simple_sub.rs)
   → inline           (ccl/inline.rs: inline UDF Let bindings with non-iterable domains; beta-reduce at call sites)
   → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators)
-  → join_plan        (ccl/join_plan.rs: hash-join and keyed aggregate optimization)
+  → planning        (ccl/planning.rs: hash-join and keyed aggregate optimization)
   → simplify         (ccl/simplify.rs: CCC algebraic rewrites to fixed point)
   → operator_conversion  (interpreter/operator_conversion.rs: λ-free CCL → tile operators)
   → subscribe()

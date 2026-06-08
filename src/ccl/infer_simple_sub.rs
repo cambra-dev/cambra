@@ -29,7 +29,7 @@
 //! is `instantiate`d at every use site, minting fresh vars per use.
 //!
 //! Most `Builtin` nodes are introduced post-inference by
-//! `lambda_elim`/`join_plan` with their type pre-stamped on the node, and
+//! `lambda_elim`/`planning` with their type pre-stamped on the node, and
 //! inference just rubber-stamps them. The exceptions are polymorphic
 //! builtins introduced pre-inference (e.g. `LastOrDefault` from
 //! `lower_mutation_loop`); those have entries in [`OperatorSchemes`] and

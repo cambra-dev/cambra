@@ -13,8 +13,9 @@ use crate::{
     ccl::{
         Expr, Type, desugar_defers,
         infer::{InferError, TypeInferenceContext, check_fully_typed, infer, typecheck},
-        inline, join_plan, lambda_elim,
+        inline, lambda_elim,
         lower::{LoweringContext, LoweringError, lower_stmts},
+        planning,
         symbolic::{symbolic, symbolic_typed},
     },
     interpreter::{
@@ -518,13 +519,22 @@ pub fn compile_program(
     check_fully_typed(&lambda_elim).expect("missing types");
     typecheck(&lambda_elim).expect("type error after lambda elimination");
 
-    let join_planned = join_plan::run(lambda_elim);
+    let join_planned = planning::run(lambda_elim);
     debug!(
         "Join-planned CCL:\n{} : {}",
         symbolic(&join_planned),
         join_planned.ty
     );
     debug!("Join-planned CCL:\n{}", symbolic_typed(&join_planned));
+
+    // Planning is the only pass that *introduces* `iterate` / `restrict` /
+    // `Compose` staging nodes, and op-conversion consumes its output
+    // directly.  Re-run the structural checker so that mistake in the
+    // emitted shapes (e.g. a `restrict` transformer landing in a
+    // morphism-`Compose`, or an adjacency that doesn't chain) is caught
+    // here rather than surfacing as a confusing op-conversion failure or,
+    // worse, a silently wrong tile graph.
+    typecheck(&join_planned).expect("type error after join planning");
 
     // Compile to one operator per field of the trailing record.  Pure
     // programs (no sinks) end up at this point with a bare expression at the

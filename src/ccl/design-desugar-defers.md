@@ -303,8 +303,10 @@ channel = refined_source ≫ (λp → V)
 ```
 
 The original Lambda's body collapses to `Unit`.  Inference treats
-the refinement-typed source as a filtered iteration; operator
-conversion emits a `Restrict` operator for the guard.
+the refinement-typed source as a filtered iteration; `planning`'s
+`insert_iterate_markers` pass reifies the refinement into an explicit
+`Apply(guard, Iterate)` at the iteration site, which op-conversion
+compiles to an `IterateExtent` + `Restrict` filter pair.
 
 #### Case-arm fan-out (multi-arm Case with feeds)
 
@@ -454,15 +456,20 @@ cluster-binding's type — but the value expression at the binding
 site is now `Apply(call_expr, Proj("to_<target>"))`, which doesn't
 expose the refinement on its own `expr.ty`.
 
-[`crate::interpreter::operator_conversion::iterate_type`] inspects
-the value-expression's type when deciding whether to emit a
-`Restrict` operator.  Today it only looks at the source's type,
-not at any refinement attached to the let-binding the source is
-bound to, so the filter is silently dropped.  End-to-end: the
-`test_generator_function::positives` case currently produces the
-unfiltered list.
+`planning`'s `insert_iterate_markers` pass walks each function-typed
+expression and reifies its domain refinement into a chain-head
+`Apply(true ▷ const, Iterate)` source with one `restrict(p)` *applied*
+per refinement layer (`iterate ▷ (p ▷ restrict) ▷ …`), which
+op-conversion compiles to an `IterateExtent` plus one `Restrict` tile
+per layer.  Today the pass reads the
+refinement from the value-expression's type (the wrapped function
+value); it does not look at any refinement attached to the surrounding
+let-binding's type, so a refinement that only surfaces on the binding
+(the cluster binding's type after inference) is silently dropped — and
+end-to-end, the `test_generator_function::positives` case currently
+produces the unfiltered list.
 
-A known TODO is extending `operator_conversion` to honour refinements
+A known TODO is extending the planning walk to honour refinements
 attached to let-binding types (the cluster binding's type carries
 the refinement after inference; that's the right place to read it
 from).  Once that lands:

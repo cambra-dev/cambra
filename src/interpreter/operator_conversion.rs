@@ -1,9 +1,9 @@
-use log::{debug, trace};
+use log::trace;
 
 use crate::{
     ccl::{
-        AggregateKind, Builtin, Expr, Lit, ProjKey, RefinementKind, Type, TypedExprNode,
-        symbolic::{symbolic, symbolic_typed},
+        AggregateKind, Builtin, Expr, Lit, ProjKey, Type, TypedExprNode,
+        ccl_utils::is_trivially_true_predicate, symbolic::symbolic,
     },
     interpreter::{
         ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
@@ -46,8 +46,14 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 /// of Constant, MapResult, and ScalarFanIn operators.  Functions can only be combined via composition
 /// and zip, and every function is lifted over a domain with a Map-style operator (MapResult,
 /// MapResultToConst, or MapResultWithSource). The input to each lifted function is carried through
-/// conversion as the `input` argument, and when `input` is None for a function structure, an
-/// IterateExtent over the function's domain is automatically inserted.
+/// conversion as the `input` argument.  Iteration is never inserted implicitly here — every
+/// iteration site is explicitly marked by a chain-head `Apply(predicate, Builtin::Iterate)`
+/// emitted by [`crate::ccl::planning`]'s `insert_iterate_markers` pass (plus zero or more
+/// `Apply(p, Builtin::Restrict)` mid-chain filters per refinement layer).  This module compiles
+/// `Iterate` to an `IterateExtent` tile (plus a `Restrict` filter when the predicate is
+/// non-trivial) and `Restrict` to a `Restrict` tile over the upstream input.  Arms that
+/// previously fell back to an implicit iteration when `input=None` now error out — a planner bug,
+/// not a user error.
 /// Let-bindings are compiled by converting the bound expression to an operator, memoising it, and
 /// pushing a FanOut into the scope to share it between uses.
 ///
@@ -57,7 +63,7 @@ pub fn convert_to_operators(
     expr: &Expr,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    convert_impl(expr, None, None, ctx)
+    convert_impl(expr, None, ctx)
 }
 
 /// One compiled operator per field of a trailing record.
@@ -84,7 +90,7 @@ pub fn convert_record_fields_to_operators(
             bound_expr,
             body,
         } => {
-            let bound_op = convert_impl(bound_expr, None, None, ctx)?;
+            let bound_op = convert_impl(bound_expr, None, ctx)?;
             let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
             let mut scope = ctx.enter_scope();
             // No surrounding iteration here (this entry point compiles a
@@ -94,7 +100,7 @@ pub fn convert_record_fields_to_operators(
         }
         TypedExprNode::Record(fields) => fields
             .iter()
-            .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, None, ctx)?)))
+            .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, ctx)?)))
             .collect(),
         other => Err(ConversionError::Unsupported(format!(
             "convert_record_fields_to_operators: expected Let* Record, got {other:?}"
@@ -355,12 +361,6 @@ impl OpConversionContext {
 fn convert_impl(
     expr: &Expr,
     input: Option<Box<dyn TileOperator>>,
-    // TODO remove this once refinements are propagated correctly
-    // Currently, it forces iteration to be of the specified type if Some, overriding
-    // the type on the current expression.
-    // We only need this because Compose sometimes has a refined type that is not present
-    // on its first child.
-    input_ty: Option<Type>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     trace!("Converting {}", symbolic(expr));
@@ -368,14 +368,8 @@ fn convert_impl(
         // f ≫ g: left-to-right composition.  Apply left first, then right.
         TypedExprNode::Compose(elems) => {
             let mut result = input;
-            let mut input_ty = if result.is_none() {
-                Some(expr.ty.clone())
-            } else {
-                None
-            };
             for elem in elems.iter() {
-                result = Some(convert_impl(elem, result, input_ty, ctx)?);
-                input_ty = None
+                result = Some(convert_impl(elem, result, ctx)?);
             }
             Ok(result.unwrap())
         }
@@ -421,20 +415,27 @@ fn convert_impl(
             } else {
                 BindingKind::Free
             };
-            let bound_op = convert_impl(bound_expr, bound_input, input_ty.clone(), ctx)?;
+            // `bound_expr` is compiled unconditionally — whether or not
+            // `body` references the binding.  This is why `planning` must
+            // make every function-typed bound expr iteration-bearing: an
+            // unused, non-iteration-bearing function-typed binding would
+            // otherwise reach an `input=None` arm here and error.  It also
+            // means a dead iterable binding is materialised rather than
+            // dropped; #232 tracks making iteration use-driven (lazy `Let`
+            // compilation / DCE) so this eager compile is no longer forced.
+            let bound_op = convert_impl(bound_expr, bound_input, ctx)?;
             let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
             let mut scope = ctx.enter_scope();
             scope.bind(&binding.name, fan_out, kind);
-            convert_impl(body, body_input, input_ty, &mut scope)
+            convert_impl(body, body_input, &mut scope)
         }
 
         // const(c): maps every domain element to the constant value c.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Const) =>
         {
-            let input =
-                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
-            let const_op = convert_impl(argument, None, None, ctx)?;
+            let input = expect_input(input, "const")?;
+            let const_op = convert_impl(argument, None, ctx)?;
             Ok(Box::new(MapResultToConst::new(
                 input,
                 const_op,
@@ -446,8 +447,7 @@ fn convert_impl(
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Zip) =>
         {
-            let input =
-                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
+            let input = expect_input(input, "zip")?;
             match &argument.node {
                 TypedExprNode::Tuple(elts) => {
                     let consts: Vec<_> = elts.iter().map(is_const).collect();
@@ -456,14 +456,13 @@ fn convert_impl(
                     if elts.len() == 2
                         && let Some(const_idx) = consts.iter().position(|c| c.is_some())
                     {
-                        let const_arm = convert_impl(consts[const_idx].unwrap(), None, None, ctx)?;
+                        let const_arm = convert_impl(consts[const_idx].unwrap(), None, ctx)?;
                         let mode = if const_idx == 0 {
                             MapResultToConstMode::FanInLeft
                         } else {
                             MapResultToConstMode::FanInRight
                         };
-                        let non_const_arm =
-                            convert_impl(&elts[1 - const_idx], Some(input), None, ctx)?;
+                        let non_const_arm = convert_impl(&elts[1 - const_idx], Some(input), ctx)?;
                         return Ok(Box::new(MapResultToConst::new(
                             non_const_arm,
                             const_arm,
@@ -478,7 +477,7 @@ fn convert_impl(
                     let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
                     let mut ops = Vec::new();
                     for elt in elts {
-                        ops.push(convert_impl(elt, Some(fan_out.branch()), None, ctx)?);
+                        ops.push(convert_impl(elt, Some(fan_out.branch()), ctx)?);
                     }
                     Ok(fan_in(ops))
                 }
@@ -491,7 +490,7 @@ fn convert_impl(
                         .map(|(name, elt)| {
                             Ok((
                                 name.clone(),
-                                convert_impl(elt, Some(fan_out.branch()), None, ctx)?,
+                                convert_impl(elt, Some(fan_out.branch()), ctx)?,
                             ))
                         })
                         .collect();
@@ -509,17 +508,14 @@ fn convert_impl(
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Map) =>
         {
-            if input.is_none() {
-                return Err(ConversionError::Unsupported("map requires an input".into()));
-            }
-            convert_impl(argument, input, None, ctx)
+            convert_impl(argument, Some(expect_input(input, "map")?), ctx)
         }
 
         // converse translates 1:1 to the Converse operator
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Converse) =>
         {
-            let converse = Box::new(Converse::new(convert_impl(argument, None, None, ctx)?));
+            let converse = Box::new(Converse::new(convert_impl(argument, None, ctx)?));
             if let Some(input) = input {
                 Ok(Box::new(MapResult::new(input, converse)))
             } else {
@@ -532,11 +528,7 @@ fn convert_impl(
         // Compiles directly to a `UnionOperator` over the N operand
         // collections.
         TypedExprNode::CollectionUnion(operands) => {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    "collection_union requires no input".into(),
-                ));
-            }
+            expect_no_input(input, "collection_union")?;
             if operands.len() < 2 {
                 return Err(ConversionError::Unsupported(format!(
                     "collection_union expects at least 2 inputs, got {}",
@@ -545,7 +537,7 @@ fn convert_impl(
             }
             let ops = operands
                 .iter()
-                .map(|e| convert_impl(e, None, None, ctx))
+                .map(|e| convert_impl(e, None, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Box::new(UnionOperator::new(ops)))
         }
@@ -558,11 +550,7 @@ fn convert_impl(
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::CollectionUnion) =>
         {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    "collection_union requires no input".into(),
-                ));
-            }
+            expect_no_input(input, "collection_union")?;
             let TypedExprNode::Tuple(elts) = &argument.node else {
                 return Err(ConversionError::Unsupported(format!(
                     "collection_union expects a Tuple argument, got {:?}",
@@ -577,7 +565,7 @@ fn convert_impl(
             }
             let ops = elts
                 .iter()
-                .map(|e| convert_impl(e, None, None, ctx))
+                .map(|e| convert_impl(e, None, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Box::new(UnionOperator::new(ops)))
         }
@@ -586,53 +574,77 @@ fn convert_impl(
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::MapDomain) =>
         {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    "map_domain requires no input".into(),
-                ));
-            }
-            Ok(Box::new(MapDomain::new(convert_impl(
-                argument, None, None, ctx,
-            )?)))
+            expect_no_input(input, "map_domain")?;
+            Ok(Box::new(MapDomain::new(convert_impl(argument, None, ctx)?)))
         }
 
         // uncurry flattens a curried function into a sealed function with a pair domain.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Uncurry) =>
         {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    "uncurry requires no input".into(),
-                ));
-            }
-            Ok(Box::new(Uncurry::new(convert_impl(
-                argument, None, None, ctx,
-            )?)))
+            expect_no_input(input, "uncurry")?;
+            Ok(Box::new(Uncurry::new(convert_impl(argument, None, ctx)?)))
         }
 
+        // iterate(p): the chain-head iteration-source marker emitted by
+        // planning at every iteration site.
+        //
+        // `argument` is the predicate `D ⇒ Bool` (a closed combinator chain
+        // after lambda elimination), and `function` is `Builtin::Iterate`.
+        // The result of `Apply(p, Iterate)` represents the refined-domain
+        // iteration source `{D | p} ⇒ {D | p}`.
+        //
+        // Iterate is strictly chain-head: it asserts `input.is_none()`.
+        // Mid-chain filters use the separate `Builtin::Restrict` arm
+        // below, which takes the upstream as `input=Some(_)`.
+        //
+        // The iteration is started by building
+        // `IterateExtent::new(extent_of(D))` and either:
+        // - returning it directly when the predicate is trivially
+        //   `λ _ → true` (recognised by [`is_trivially_true_predicate`])
+        //   — no filter tile needed, or
+        // - compiling the predicate against that iteration as its input
+        //   stream and wrapping in a `Restrict` tile that derives the
+        //   surviving-domain identity from the predicate's boolean
+        //   codomain.
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::Iterate) =>
+        {
+            expect_no_input(input, "iterate")?;
+            let predicate = argument.as_ref();
+            let domain_ty = predicate.ty.domain().ok_or_else(|| {
+                ConversionError::TypeError(format!(
+                    "iterate predicate must be a function type, got {}",
+                    predicate.ty
+                ))
+            })?;
+            let extent = ctx.extent_of(&domain_ty)?;
+            let pred_input: Box<dyn TileOperator> = Box::new(IterateExtent::new(extent));
+            if is_trivially_true_predicate(predicate) {
+                return Ok(pred_input);
+            }
+            let pred_op = convert_impl(predicate, Some(pred_input), ctx)?;
+            Ok(Box::new(Restrict::new(pred_op)))
+        }
+
+        // restrict(p): mid-chain filter form.  Requires `input=Some(_)`;
+        // compiles the predicate against the upstream input and wraps in
+        // a `Restrict` tile.  Chain-head iteration is the separate
+        // `Builtin::Iterate` arm above.
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::Restrict) =>
         {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    "restrict requires no input".into(),
-                ));
-            }
-            Ok(Box::new(Restrict::new(convert_impl(
-                argument, None, None, ctx,
-            )?)))
+            let upstream = expect_input(input, "restrict")?;
+            let pred_op = convert_impl(argument, Some(upstream), ctx)?;
+            Ok(Box::new(Restrict::new(pred_op)))
         }
 
         // If we are applying an aggregate, then it is a global aggregate that should use the Aggregate operator.
         TypedExprNode::Apply { argument, function }
             if let Some(kind) = as_builtin(function).and_then(builtin_to_aggregate) =>
         {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    "scalar aggregates expect no input".into(),
-                ));
-            }
-            let input = convert_impl(argument, None, None, ctx)?;
+            expect_no_input(input, "scalar aggregate")?;
+            let input = convert_impl(argument, None, ctx)?;
             apply_aggregate(input, kind)
         }
 
@@ -644,11 +656,7 @@ fn convert_impl(
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::LastOrDefault) =>
         {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    "LastOrDefault expects no input (it composes a function-typed argument)".into(),
-                ));
-            }
+            expect_no_input(input, "last_or_default")?;
             let TypedExprNode::Tuple(elts) = &argument.node else {
                 return Err(ConversionError::Unsupported(format!(
                     "LastOrDefault expects a 2-element Tuple argument, got {:?}",
@@ -661,26 +669,18 @@ fn convert_impl(
                     elts.len()
                 )));
             }
-            let stream_op = convert_impl(&elts[0], None, None, ctx)?;
-            let default_op = convert_impl(&elts[1], None, None, ctx)?;
+            let stream_op = convert_impl(&elts[0], None, ctx)?;
+            let default_op = convert_impl(&elts[1], None, ctx)?;
             Ok(Box::new(ExtractLast::new(stream_op, default_op)))
         }
 
         TypedExprNode::Apply { function, argument } if is_applied_flatten_domain(function) => {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    "flatten_domain expects no input".into(),
-                ));
-            }
+            expect_no_input(input, "flatten_domain")?;
             convert_flatten_domain(function, argument, ctx)
         }
 
         TypedExprNode::Apply { function, argument } if is_applied_permute_domain(function) => {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    "permute_domain expects no input".into(),
-                ));
-            }
+            expect_no_input(input, "permute_domain")?;
             convert_permute_domain(function, argument, ctx)
         }
 
@@ -691,21 +691,17 @@ fn convert_impl(
                     symbolic(function)
                 )));
             }
-            let arg = convert_impl(argument, None, None, ctx)?;
-            convert_impl(function, Some(arg), None, ctx)
+            let arg = convert_impl(argument, None, ctx)?;
+            convert_impl(function, Some(arg), ctx)
         }
 
         // Standalone projection morphism: project field _n from codomain of input.
         TypedExprNode::Proj(ProjKey::Index(n)) => {
-            let input =
-                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
-            proj_field(input, *n)
+            proj_field(expect_input(input, &format!("Proj({n})"))?, *n)
         }
 
         TypedExprNode::Proj(ProjKey::Field(name)) => {
-            let input =
-                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
-            proj_named_field(input, name)
+            proj_named_field(expect_input(input, &format!("Proj({name})"))?, name)
         }
 
         TypedExprNode::Var(name) => {
@@ -730,17 +726,15 @@ fn convert_impl(
         // Standalone reference to a built-in primitive — composed with an
         // input rather than applied directly.
         TypedExprNode::Builtin(b) => {
-            let mut get = |input: Option<Box<dyn TileOperator>>| {
-                Ok(input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?))
-            };
+            let input = expect_input(input, &format!("Builtin({})", b.name()))?;
             match b {
-                Builtin::Id => get(input),
-                Builtin::MapDomain => Ok(Box::new(MapDomain::new(get(input)?))),
-                b if let Some(op) = builtin_to_binop(*b) => apply_binop(get(input)?, op),
-                b if let Some(op) = builtin_to_unaryop(*b) => apply_unaryop(get(input)?, op),
+                Builtin::Id => Ok(input),
+                Builtin::MapDomain => Ok(Box::new(MapDomain::new(input))),
+                b if let Some(op) = builtin_to_binop(*b) => apply_binop(input, op),
+                b if let Some(op) = builtin_to_unaryop(*b) => apply_unaryop(input, op),
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
                 b if let Some(kind) = builtin_to_aggregate(*b) => Ok(Box::new(
-                    MapExtractAggregate::new(Box::new(MapAggregate::new(get(input)?, kind)), kind),
+                    MapExtractAggregate::new(Box::new(MapAggregate::new(input, kind)), kind),
                 )),
                 _ => Err(ConversionError::Unsupported(format!(
                     "unsupported Builtin({}) in λ-free CCL",
@@ -752,9 +746,13 @@ fn convert_impl(
         // List literal: materialise as SealedFunction(UIntRange(n), T).
         TypedExprNode::List(elts) => {
             let fn_const = compile_list_fn(elts)?;
-            // Use the provided input as the index stream, or create one from UIntRange(n).
-            let index_stream =
-                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
+            let index_stream = input.ok_or_else(|| {
+                ConversionError::Unsupported(
+                    "list literal reached op-conversion without an input — planning \
+                     should have inserted iterate(_) before any standalone List"
+                        .into(),
+                )
+            })?;
             Ok(Box::new(MapResult::new(index_stream, fn_const)))
         }
 
@@ -768,45 +766,32 @@ fn convert_impl(
         // mutation-loop projections like `Var(acc)`); `fan_in` dispatches
         // between `ScalarFanIn` and `FanIn` accordingly.
         TypedExprNode::Tuple(elts) => {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    "tuples expect no input".into(),
-                ));
-            }
-
+            expect_no_input(input, "tuple literal")?;
             let ops: Result<Vec<_>, _> = elts
                 .iter()
-                .map(|elt| convert_impl(elt, None, None, ctx))
+                .map(|elt| convert_impl(elt, None, ctx))
                 .collect();
             Ok(fan_in(ops?))
         }
 
         TypedExprNode::Record(fields) => {
-            if input.is_some() {
-                return Err(ConversionError::Unsupported(
-                    "record literals expect no input".into(),
-                ));
-            }
+            expect_no_input(input, "record literal")?;
             let ops: Result<Vec<_>, _> = fields
                 .iter()
-                .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, None, ctx)?)))
+                .map(|(name, elt)| Ok((name.clone(), convert_impl(elt, None, ctx)?)))
                 .collect();
             Ok(fan_in_named(ops?))
         }
 
         // Literal constant: produce a scalar.
         TypedExprNode::Lit(lit) => {
-            assert!(
-                input.is_none(),
-                "unexpected input operator for literal expression"
-            );
+            expect_no_input(input, "literal")?;
             compile_lit(lit)
         }
 
         // Data source: produces MapResultWithSource(IterateExtent(domain), source).
         TypedExprNode::Source(name) => {
-            let input =
-                input.unwrap_or(iterate_domain(input_ty.as_ref().unwrap_or(&expr.ty), ctx)?);
+            let input = expect_input(input, &format!("Source({name})"))?;
             let source = ctx.get_source(name)?;
             Ok(Box::new(MapResultWithSource::new(source, input)))
         }
@@ -852,12 +837,12 @@ fn convert_impl(
             // into a single Record (`_0`, `_1`, …) so that `Recurse`'s
             // codomain is one packed tile rather than N parallel cycles.
             let init_op: Box<dyn TileOperator> = if n_accs == 1 {
-                convert_impl(&shape.init_args[0], None, None, ctx)?
+                convert_impl(&shape.init_args[0], None, ctx)?
             } else {
                 let arms: Vec<Box<dyn TileOperator>> = shape
                     .init_args
                     .iter()
-                    .map(|init| convert_impl(init, None, None, ctx))
+                    .map(|init| convert_impl(init, None, ctx))
                     .collect::<Result<_, _>>()?;
                 fan_in(arms)
             };
@@ -866,7 +851,7 @@ fn convert_impl(
             let recurse = Recurse::new(init_op, domain_op);
             let set_recursive_input = recurse.recursive_input_setter();
             let prev_acc_fan = Rc::new(FanOut::new_cyclic(Box::new(recurse)));
-            let source_op = convert_impl(shape.source, None, None, ctx)?;
+            let source_op = convert_impl(shape.source, None, ctx)?;
             // Wire the body's input.  For a single accumulator the input
             // is `fan_in(prev_acc, source)` — a 2-arm record `(_0, _1)`
             // matching the body's `let acc = p.0 in let item = p.1`
@@ -884,7 +869,7 @@ fn convert_impl(
                 arms.push(source_op);
                 fan_in(arms)
             };
-            let body_op = convert_impl(shape.loop_body, Some(body_input), None, ctx)?;
+            let body_op = convert_impl(shape.loop_body, Some(body_input), ctx)?;
             let body_fan = Rc::new(FanOut::new_cyclic(Box::new(Memo::new(body_op))));
             // Always cycle on `.step`; the external output is the
             // running body Record stream.  Surrounding lowering
@@ -911,43 +896,31 @@ fn convert_impl(
     result
 }
 
-/// Build an [`IterateExtent`] for the given CCL type, threading predicate
-/// refinements into immediate [`Filter`] nodes.
+/// Unwrap an upstream input or report a planner bug.
 ///
-/// For a plain `Fun(D, _)` type this returns `IterateExtent(extent_of(D))`.
-/// For a `Fun(Refinement(D, Predicate(pred)), _)` type it returns
-/// `Filter(IterateExtent(extent_of(D)), compiled_pred)`, ensuring the domain
-/// stream is already narrowed before any downstream operator sees it.
-fn iterate_domain(
-    ty: &Type,
-    ctx: &mut OpConversionContext,
+/// Called by op-conversion arms (`Const`, `Zip`) that need an input stream
+/// but do not internalise iteration themselves.  After
+/// [`crate::ccl::planning`]'s `insert_iterate_markers` pass, every
+/// iteration site is preceded by an explicit `Apply(_, Iterate)` term —
+/// so reaching one of these arms without an input is a planner bug, not
+/// a user error.
+fn expect_input(
+    input: Option<Box<dyn TileOperator>>,
+    name: &str,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    trace!("Iterating {ty}");
-    if let Type::Fun(domain, _) = ty {
-        iterate_type(domain, ctx)
-    } else {
-        Err(ConversionError::TypeError(format!(
-            "Cannot iterate non-function type {ty}"
-        )))
-    }
+    input.ok_or_else(|| ConversionError::Unsupported(format!("{name} requires an input operator")))
 }
 
-fn iterate_type(
-    ty: &Type,
-    ctx: &mut OpConversionContext,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
-    if let Type::Refinement(base, refinement) = ty {
-        let RefinementKind::Predicate(pred) = &refinement.kind;
-        debug!("Converting predicate: {}", symbolic(&pred.borrow()));
-        debug!("Converting predicate: {}", symbolic_typed(&pred.borrow()));
-        Ok(Box::new(Restrict::new(convert_impl(
-            &pred.borrow(),
-            Some(iterate_type(base, ctx)?),
-            None,
-            ctx,
-        )?)))
+fn expect_no_input(
+    input: Option<Box<dyn TileOperator>>,
+    name: &str,
+) -> Result<(), ConversionError> {
+    if input.is_some() {
+        Err(ConversionError::Unsupported(format!(
+            "{name} requires empty input"
+        )))
     } else {
-        Ok(Box::new(IterateExtent::new(ctx.extent_of(ty)?)))
+        Ok(())
     }
 }
 
@@ -1286,7 +1259,7 @@ fn convert_permute_domain(
     let permutation = extract_usize_list(inner_arg)?;
 
     Ok(Box::new(PermuteRecordDomain::new(
-        convert_impl(argument, None, None, ctx)?,
+        convert_impl(argument, None, ctx)?,
         permutation,
     )))
 }
@@ -1316,7 +1289,7 @@ fn convert_flatten_domain(
     let flatten_indices = extract_usize_list(inner_arg)?;
 
     Ok(Box::new(FlattenTupleDomain::new(
-        convert_impl(argument, None, None, ctx)?,
+        convert_impl(argument, None, ctx)?,
         flatten_indices,
     )))
 }

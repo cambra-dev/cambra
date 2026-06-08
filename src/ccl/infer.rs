@@ -745,7 +745,7 @@ fn strip_refinements_deep(ty: &Type) -> Type {
 /// removed every `Type::Infer`, so `constrain_subtype` performs a pure
 /// structural check and mutates no bounds; a constraint failure means `a` is
 /// not a structural subtype of `b`.
-fn typecheck_subtype(a: &Type, b: &Type) -> bool {
+pub(crate) fn typecheck_subtype(a: &Type, b: &Type) -> bool {
     constrain_subtype(
         &strip_refinements_deep(a),
         &strip_refinements_deep(b),

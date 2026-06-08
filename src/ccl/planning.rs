@@ -4,7 +4,9 @@ use std::mem::take;
 
 use log::trace;
 
-use crate::ccl::ccl_utils::{apply_function, typed_compose};
+use crate::ccl::ccl_utils::{
+    apply_function, make_iterate, make_restrict, trivially_true_predicate, typed_compose,
+};
 use crate::ccl::{
     BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, ProjKey, Refinement,
     RefinementKind, Type, TypedExprNode,
@@ -20,12 +22,438 @@ fn is_builtin(expr: &Expr, b: Builtin) -> bool {
     matches!(&expr.node, TypedExprNode::Builtin(x) if *x == b)
 }
 
-/// Looks for patterns in an expression that can be run more efficiently than the loop joins
-/// that come out of lambda elimination.
+/// Materialize every iteration site in the post-lambda-elim CCL, choosing
+/// an efficient implementation strategy at each one.
+///
+/// At each iteration site (aggregate arguments, mutation-loop sources,
+/// `LastOrDefault` streams, value-position `Record` fields, `CollectionUnion`
+/// operands, the program's top-level function-valued result, top-level
+/// let-bound function values, and a few other shapes enumerated by
+/// [`insert_iterate_recurse`]), [`insert_iterate_markers`] dispatches via
+/// [`wrap_with_iterate`] to:
+///
+/// 1. **Hash-join rewrite** ([`try_hash_join_rewrite`]) when the site's
+///    domain is a refined tuple whose predicate decomposes into equality
+///    join conditions.  Emitted as a `JoinPlan::Hash` / `JoinPlan::Loop`
+///    tree compiled to a CCL chain whose leaves are iteration-bearing.
+/// 2. **Iterate-then-restricts chain** otherwise — build the source by
+///    *applying* one `restrict(p)` filter per refinement layer (innermost
+///    first) to a chain-head `Apply(true ▷ const, Iterate)`, then compose
+///    the value-producing body onto it: `(iterate ▷ (p_inner ▷ restrict)
+///    ▷ … ▷ (p_outer ▷ restrict)) ≫ body`.  Each `restrict` *applies* to
+///    its upstream — it is a function transformer, not a morphism composed
+///    with the source (its honest type makes the composed form ill-typed;
+///    see [`make_restrict`]).  Unrefined sites get just the chain-head
+///    iterate.
+///
+/// Hash join is the specialised strategy; the iterate-then-restricts
+/// chain is the default.  Both branches are materialising the same
+/// iteration site — folding them into a single walk lets hash-join
+/// planning fire at every site (not just the program root, as an earlier
+/// pass did).
+///
+/// Also: the curried-correlated-refinement rewrite for keyed aggregates
+/// ([`replace_curried_correlated_refinements`] /
+/// [`convert_groupby`]) runs before the materialisation walk.
 pub fn run(mut expr: Expr) -> Expr {
-    create_hash_joins(&mut expr);
     replace_curried_correlated_refinements(&mut expr);
+    let mut expr = simplify(expr);
+    insert_iterate_markers(&mut expr);
+    // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
+    // boilerplate that [`try_hash_join_rewrite`] emits via
+    // [`replace_tuple_project_with_id`].  `simplify` is marker-aware: its
+    // structural-discard rules self-guard against dropping or relocating
+    // the `Apply(_, Iterate)` / `Apply(_, Restrict)` markers just inserted,
+    // so the only rules that fire here are the always-safe cleanups (plus
+    // any reduction of a fully marker-free sub-tree, which is sound).
     simplify(expr)
+}
+
+/// Walks `expr` and materializes every iteration site, choosing the best
+/// available implementation strategy at each one.
+///
+/// "Iteration site" means any position where op-conversion would otherwise
+/// compile with `input=None` and the expression is function-typed —
+/// aggregate arguments, the stream side of `LastOrDefault`, mutation-loop
+/// sources, value-position `Record` fields, `CollectionUnion` operands,
+/// the program's top-level function-valued result, top-level let-bound
+/// function values, and a few other shapes enumerated by
+/// [`insert_iterate_recurse`].  At each site the pass dispatches via
+/// [`wrap_with_iterate`]:
+///
+/// 1. **Hash-join rewrite** ([`try_hash_join_rewrite`]) when the site's
+///    domain is a refined tuple whose predicate decomposes into equality
+///    join conditions.  The emitted chain is itself iteration-bearing
+///    (its `JoinPlan::Loop` leaves emit `Apply(true ▷ const, Iterate)`),
+///    so no extra marker is added.
+/// 2. **Iterate-then-restricts chain** (the [`wrap_with_iterate`]
+///    fallback) — build the source by *applying* one `restrict(p)`
+///    filter per refinement layer (innermost first) to a chain-head
+///    `Apply(true ▷ const, Iterate)`, then compose the body onto it:
+///    `(iterate ▷ (p_inner ▷ restrict) ▷ … ▷ (p_outer ▷ restrict)) ≫
+///    body`.  Each `restrict` *applies* to its upstream (it is a
+///    function transformer, not a composed morphism — see
+///    [`make_restrict`]).  Unrefined sites get just the chain-head
+///    iterate.
+///
+/// Hash join is the specialised strategy; the iterate-then-restricts
+/// chain is the default.  Folding hash-join dispatch into the
+/// iteration-site walk (rather than running it as a separate
+/// top-level-only pass) automatically extends hash-join coverage to
+/// every iteration site — see [`try_hash_join_rewrite`] for the full
+/// list.
+///
+/// The pass is idempotent on already-iteration-bearing chains via
+/// [`is_iteration_bearing`], which treats `Apply(_, Iterate)` at a head
+/// — and, on a refined site, the outer `restrict` filter
+/// `Apply(_, Apply(_, Restrict))` — plus the other iteration-
+/// internalising builtins (`MapDomain`, `Uncurry`, `CollectionUnion`,
+/// `Converse`, the nested `PermuteDomain` / `FlattenDomain` shapes) as
+/// already providing iteration — avoiding the double-wrap that would
+/// otherwise feed those `input=None` arms an unwanted upstream stream
+/// (or, for a refined site, stack a second iteration source onto a
+/// still-refined domain).
+///
+/// Op-conversion relies on this pass: the only term that creates
+/// iteration without an upstream input is [`Builtin::Iterate`].  Any
+/// other input-less term reaching op-conversion (after this pass) is a
+/// planner bug.
+fn insert_iterate_markers(expr: &mut Expr) {
+    insert_iterate_recurse(expr);
+    // In addition to any deeper iteration sites materialised by the
+    // recursion, the program root itself may also be an iteration site.
+    wrap_with_iterate(expr);
+}
+
+/// Recursively walks `expr` and materializes every iteration site that
+/// op-conversion's `input=None` arms expose.
+///
+/// Op-conversion's combinator arms split into two groups:
+///
+/// - **Input-internalising** (`Sum`/`Max`/`LastOrDefault`, `Converse`,
+///   `MapDomain`, `Uncurry`, `FlattenDomain`, `PermuteDomain`,
+///   `CollectionUnion`, plus `Iterate` itself): these arms require
+///   `input=None` and compile their argument (or each operand, in
+///   `CollectionUnion`'s case) with `input=None`.  The argument is a
+///   function-typed sub-expression that is iterated by the surrounding
+///   tile operator, so it is an iteration site — its chain head must
+///   be iteration-bearing (`Apply(_, Iterate)` in the default case; a
+///   hash-join chain when the site's domain matches a join pattern).
+/// - **Input-threading** (`Const`, `Zip`, `Map`, `Restrict`): these
+///   accept an upstream `input` and thread it (or fan it out, in
+///   `Zip`'s case) into their argument's compilation, so their
+///   argument is not an iteration site.
+///
+/// This pass walks the AST and calls [`wrap_with_iterate`] on each
+/// argument of an input-internalising arm.  `wrap_with_iterate` then
+/// picks the materialisation strategy (hash join when applicable, else
+/// the uniform `iterate(true) ▷ (p₁ ▷ restrict) ▷ … ▷ (pₙ ▷ restrict)`
+/// source — each `restrict` applied to its upstream, not composed —
+/// with the body composed onto it).  Structural recursion covers the
+/// rest of the tree — every iteration site reachable from the program
+/// root is reached.
+fn insert_iterate_recurse(expr: &mut Expr) {
+    // Special-case `Apply(Tuple|Record, Zip)`: op-conversion's `Zip` arm
+    // fans the outer input out to each tuple/record field, so each field
+    // is compiled with `input=Some(fan_out_branch)`.  Field wrapping
+    // would still be semantically safe (the wrapped `iterate`'s
+    // trivially-true predicate just passes the input through), but it
+    // produces redundant operators and churns golden tests.  Recurse into
+    // each field without firing the value-position `Tuple`/`Record` case
+    // below.
+    if let TypedExprNode::Apply { argument, function } = &mut expr.node
+        && matches!(&function.node, TypedExprNode::Builtin(Builtin::Zip))
+    {
+        match &mut argument.node {
+            TypedExprNode::Tuple(elts) => {
+                for elt in elts.iter_mut() {
+                    insert_iterate_recurse(elt);
+                }
+            }
+            TypedExprNode::Record(fields) => {
+                for (_, field) in fields.iter_mut() {
+                    insert_iterate_recurse(field);
+                }
+            }
+            _ => insert_iterate_recurse(argument),
+        }
+        insert_iterate_recurse(function);
+        return;
+    }
+
+    expr.walk_children_mut(insert_iterate_recurse);
+    match &mut expr.node {
+        // `LastOrDefault` takes `Tuple([stream, default])` — only `stream`
+        // is iterated; the `default` is a scalar consumed when the stream
+        // is empty.
+        TypedExprNode::Apply { argument, function }
+            if matches!(
+                &function.node,
+                TypedExprNode::Builtin(Builtin::LastOrDefault)
+            ) =>
+        {
+            if let TypedExprNode::Tuple(elts) = &mut argument.node
+                && let Some(stream) = elts.first_mut()
+            {
+                wrap_with_iterate(stream);
+            }
+        }
+        // `CollectionUnion`'s function form: argument is `Tuple(ops...)`
+        // and op-conversion compiles each operand with `input=None` — wrap
+        // each.
+        TypedExprNode::Apply { argument, function }
+            if matches!(
+                &function.node,
+                TypedExprNode::Builtin(Builtin::CollectionUnion)
+            ) =>
+        {
+            if let TypedExprNode::Tuple(elts) = &mut argument.node {
+                for elt in elts.iter_mut() {
+                    wrap_with_iterate(elt);
+                }
+            }
+        }
+        // `CollectionUnion`'s value form: each operand is compiled with
+        // `input=None`.
+        TypedExprNode::CollectionUnion(operands) => {
+            for operand in operands.iter_mut() {
+                wrap_with_iterate(operand);
+            }
+        }
+        // The remaining input-internalising builtins all compile their
+        // (single) argument with `input=None` — wrap it uniformly.
+        TypedExprNode::Apply { argument, function }
+            if is_internalising_builtin_function(function) =>
+        {
+            wrap_with_iterate(argument);
+        }
+        // Mutation-loop sources are iterated internally by [`Recurse`];
+        // op-conversion's `Loop` arm compiles `source` with `input=None`.
+        TypedExprNode::Loop { source, .. } => {
+            wrap_with_iterate(source);
+        }
+        // Value-position `Record` literals (not the special-cased
+        // `Apply(Record, Zip)` form, which `Zip`'s arm handles via fan-out):
+        // op-conversion's `Record` arm compiles each field with
+        // `input=None`, so every function-typed field is an iteration site.
+        // The fan-out form is unaffected because `walk_children_mut`
+        // visits the `Record` inside `Apply(_, Zip)` but the outer `Apply`
+        // does its own input-threading there.
+        TypedExprNode::Record(fields) => {
+            for (_, field) in fields.iter_mut() {
+                if matches!(&field.ty, Type::Fun(..)) {
+                    wrap_with_iterate(field);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Returns `true` if `func` is a function position that op-conversion
+/// compiles by treating its argument as an `input=None` iteration site.
+///
+/// Used by [`insert_iterate_recurse`] to enumerate the input-internalising
+/// arms.  The actual policy lives on [`Builtin::iterates_arg`]; this
+/// helper just handles the structural cases (direct builtin vs the
+/// nested `PermuteDomain` / `FlattenDomain` shape).
+fn is_internalising_builtin_function(func: &Expr) -> bool {
+    builtin_at_function_position(func).is_some_and(Builtin::iterates_arg)
+}
+
+/// Extract the [`Builtin`] in `func`'s function position, handling both
+/// the direct `Builtin(_)` form and the nested
+/// `Apply { function: Builtin(_), .. }` form used by `PermuteDomain` and
+/// `FlattenDomain`.
+fn builtin_at_function_position(func: &Expr) -> Option<Builtin> {
+    match &func.node {
+        TypedExprNode::Builtin(b) => Some(*b),
+        TypedExprNode::Apply {
+            function: inner, ..
+        } => match &inner.node {
+            TypedExprNode::Builtin(b) => Some(*b),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Materialize the iteration site at `expr`, picking the best available
+/// implementation strategy.
+///
+/// Dispatch order:
+///
+/// 1. `Let` is structural — recurse into the bound expression and body
+///    (op-conversion's `Let` arm threads its `input=None` to both).
+/// 2. If the chain at `expr` already provides iteration ([`is_iteration_bearing`]),
+///    return — wrapping would either be redundant or break op-conversion.
+/// 3. Try the hash-join rewrite ([`try_hash_join_rewrite`]) when `expr`'s
+///    domain is a refined tuple whose predicate decomposes into equality
+///    join conditions.  On success the rewrite replaces `expr` with the
+///    hash-join chain (whose leaves are themselves iteration-bearing) and
+///    returns.
+/// 4. Otherwise fall through to the default strategy: walk every nested
+///    `Type::Refinement` layer of the domain, lift each predicate, and
+///    build the iteration source by *applying* one `restrict(p)` filter
+///    per layer (innermost first) to a single chain-head `Apply(true ▷
+///    const, Iterate)` over the unrefined base, then compose the body
+///    onto it — `(iterate ▷ (p_inner ▷ restrict) ▷ … ▷ (p_outer ▷
+///    restrict)) ≫ body`.  There is exactly one `iterate` (the base
+///    source); the per-layer filters are `restrict`s *applied* to it, not
+///    additional iterates and not morphisms composed with it (its honest
+///    type makes the composed form ill-typed — see [`make_restrict`]).
+///    Unrefined sites get just the chain-head iterate with a single
+///    trivially-true predicate (`true ▷ const`) so op-conversion still
+///    sees an explicit iteration marker; the trivially-true form is
+///    recognised by op-conversion and compiles to a bare `IterateExtent`
+///    with no filter tile.
+///
+/// The hash-join branch and the default branch are *both* materialising
+/// the same iteration site — hash join is just the specialised strategy
+/// when the type structure permits.  In both cases the result is a chain
+/// whose head provides iteration, so the surrounding op-conversion arm
+/// can compile its argument with `input=None` without erroring.
+fn wrap_with_iterate(expr: &mut Expr) {
+    // `Let` nodes pass input through to both children — op-conversion's
+    // `Let` arm threads its `input` into bound_expr and body.  At a
+    // top-level Let (the only context that calls into this function with
+    // a Let), both children are at `input=None` positions, so recurse
+    // into them rather than prepending iterate to the Let itself.  This
+    // arm runs before [`is_iteration_bearing`]'s early-return below
+    // because Let isn't recognised as iteration-bearing on its own.
+    //
+    // No matching `Record` arm here: [`insert_iterate_recurse`]'s value-
+    // position `Record` case already wraps function-typed fields wherever
+    // a Record appears in the AST (top-level, Let-bound, Apply-arg-of-
+    // catch-all), so a redundant descent here would just re-visit
+    // already-iterate-led fields.
+    if let TypedExprNode::Let {
+        bound_expr, body, ..
+    } = &mut expr.node
+    {
+        // Every function-typed bound expr is made iteration-bearing,
+        // whether or not `body` uses it: op-conversion's `Let` arm
+        // compiles `bound_expr` unconditionally, so an unused,
+        // non-iteration-bearing function-typed binding would otherwise
+        // hit an `input=None` arm and error.  This wrap is the workaround
+        // for that eager compilation — #232 tracks making iteration
+        // use-driven so a dead binding is dropped rather than wrapped.
+        if matches!(&bound_expr.ty, Type::Fun(..)) {
+            wrap_with_iterate(bound_expr);
+        }
+        wrap_with_iterate(body);
+        return;
+    }
+    if is_iteration_bearing(expr) {
+        return;
+    }
+    let Some(domain_ty) = expr.ty.domain() else {
+        // Non-function expressions can't be iterated; leave them alone.
+        return;
+    };
+    // Specialised iteration strategies come first: try the hash-join
+    // rewrite when the domain is a refined tuple that decomposes into
+    // equality join conditions.  Both this and the default
+    // `iterate(predicate)` fall-through are choosing how to materialise
+    // the same iteration site — hash join is just a more efficient
+    // strategy when the type structure permits.
+    if try_hash_join_rewrite(expr, &domain_ty) {
+        return;
+    }
+    // Walk every nested `Type::Refinement` layer (innermost ⊇ outermost,
+    // each layer's predicate must hold), collecting the predicates
+    // outer-to-inner; reverse to inner-to-outer.  Then emit a uniform
+    // chain: one chain-head `iterate(true)` over the unrefined base
+    // (op-conversion's `IterateExtent`), followed by one
+    // `restrict(p_inner)`, `restrict(p_next)`, … per refinement layer,
+    // narrowing the domain layer by layer.  Unrefined sites get just
+    // the iterate.
+    let mut preds: Vec<Expr> = Vec::new();
+    let mut current = &domain_ty;
+    while let Type::Refinement(base, refinement) = current {
+        let RefinementKind::Predicate(pred) = &refinement.kind;
+        preds.push(pred.borrow().clone());
+        current = base.as_ref();
+    }
+    preds.reverse();
+    let body = take(expr);
+    // Build the iteration source by applying one `restrict(p)` per
+    // refinement layer (innermost first) to a chain-head `iterate(true)`
+    // over the unrefined base.  Each `restrict` is a function transformer
+    // *applied* to its upstream (not composed): `make_restrict` narrows
+    // the domain layer by layer while preserving the codomain, so `source`
+    // ends with type `{{…{D | p_inner} …} | p_outer} ⇒ D` — the full
+    // refinement on the domain.  The value-producing `body` is then
+    // composed onto that source as a genuine CCC morphism.
+    let site_ty = body.ty.clone();
+    let source = preds.into_iter().fold(
+        make_iterate(trivially_true_predicate(current.clone())),
+        |upstream, pred| make_restrict(pred, upstream),
+    );
+    let mut elts: Vec<Expr> = vec![source];
+    match body.node {
+        TypedExprNode::Compose(existing) => {
+            elts.extend(existing);
+        }
+        _ => elts.push(body),
+    }
+    // The override is now redundant — `source`'s domain already carries
+    // the full refinement structure, so `typed_compose` derives the
+    // correct `{…} ⇒ T`.  Keep it to pin the original site's refinement
+    // identities (`make_restrict` mints fresh refinement ids per layer).
+    *expr = typed_compose(elts).with_ty(site_ty);
+}
+
+/// Returns `true` if `expr` (or the first element of `expr` if it's a
+/// `Compose`) already provides iteration — i.e. wrapping it with
+/// `iterate` would either be redundant or break op-conversion.
+///
+/// The check covers three groups:
+///
+/// 1. Already iterate-led: `Apply(_, Iterate)` at head — or
+///    `restrict`-led, `Apply(_, Apply(_, Restrict))` at head.  A
+///    `restrict` application always sits on an iteration source by
+///    construction ([`make_restrict`] only ever wraps an
+///    iteration-bearing upstream), so a refined site whose head is the
+///    outermost `restrict` filter is iteration-bearing just as its
+///    unrefined `iterate`-led counterpart is.
+/// 2. Self-iterating builtins ([`Builtin::iterates_arg`]): the
+///    iteration-internalising group — `MapDomain`, `Uncurry`,
+///    `Converse`, `CollectionUnion`, plus the nested `PermuteDomain` /
+///    `FlattenDomain` shapes.  (Sum / Max / LastOrDefault are also in
+///    `iterates_arg`, but they produce scalars; [`wrap_with_iterate`]'s
+///    `expr.ty.domain()` check filters them out independently.)  Plus
+///    the catch-all `Apply` with a non-builtin function (`Proj`, `Var`,
+///    curried `Apply`, …) — op-conversion's catch-all arm rejects
+///    `input=Some`.  Plus value-position `Tuple` / `Record` literals
+///    (also reject `input=Some`).
+/// 3. Function-typed `Var` references — op-conversion's `Var` arm
+///    returns its bound op directly under `input=None`, and that bound
+///    op was itself iterate-wrapped at its let-bind site.
+fn is_iteration_bearing(expr: &Expr) -> bool {
+    let head = match &expr.node {
+        TypedExprNode::Compose(elts) if !elts.is_empty() => &elts[0],
+        _ => expr,
+    };
+    match &head.node {
+        TypedExprNode::CollectionUnion(_) | TypedExprNode::Tuple(_) | TypedExprNode::Record(_) => {
+            true
+        }
+        TypedExprNode::Var(_) if matches!(&head.ty, Type::Fun(..)) => true,
+        TypedExprNode::Apply { function, .. } => match builtin_at_function_position(function) {
+            // `Iterate` is the canonical head marker; `Restrict` heads a
+            // refined site whose upstream is itself iteration-bearing
+            // (`make_restrict` only wraps an iteration source), so a
+            // restrict-led chain must be recognised too — otherwise
+            // re-running the marker pass would double-wrap refined sites.
+            Some(b) => matches!(b, Builtin::Iterate | Builtin::Restrict) || b.iterates_arg(),
+            // Non-builtin function position (`Proj`, `Var`, curried
+            // `Apply`, …): op-conversion's catch-all `Apply` arm
+            // rejects `input=Some`, so wrapping would break compilation.
+            None => true,
+        },
+        _ => false,
+    }
 }
 
 /// Identifies constructs corresponding to partitioning by key and swaps from the key
@@ -1022,6 +1450,14 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
     match plan {
         // For loop joins (including the trivial one-branch sort), iterate a tuple
         // type consisting of the types of just the arms in this join.
+        //
+        // The leaf emission is always `iterate(pred)` — the iteration-site
+        // marker that op-conversion compiles to an `IterateExtent` (plus a
+        // `Restrict` filter when `pred` is non-trivial).  When the loop has
+        // its own residual predicate, it is composed with the base
+        // identity and passed as `iterate`'s predicate; when there is no
+        // predicate, the trivially-true predicate `true ▷ const` is used
+        // and op-conversion recognises it as a filter-free iteration.
         JoinPlan::Loop { arms, predicate } => {
             let base_iteration = (|| {
                 if arms.len() == 1 {
@@ -1038,20 +1474,22 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
                             return transformed;
                         }
                     }
-                    Expr::builtin(Builtin::Id)
-                        .with_ty(Type::fun(types[arms[0]].clone(), types[arms[0]].clone()))
+                    make_iterate(trivially_true_predicate(types[arms[0]].clone()))
                 } else {
                     let ty = Type::Tuple(arms.iter().map(|&i| types[i].clone()).collect());
-                    Expr::builtin(Builtin::Id).with_ty(Type::fun(ty.clone(), ty))
+                    make_iterate(trivially_true_predicate(ty))
                 }
             })();
             if let Some(predicate) = predicate {
-                let result_ty = base_iteration.ty.clone();
-                apply_primitive(
-                    typed_compose(vec![base_iteration, predicate.clone()]),
-                    Builtin::Restrict,
-                    result_ty,
-                )
+                // Apply `restrict(predicate)` to the base iteration source as
+                // a downstream filter step.  `restrict(p)` is the transformer
+                // `(D ⇒ T) ⇒ ({d : D | p(d)} ⇒ T)`; applying it to
+                // `base_iteration` narrows the domain and yields
+                // `{D | predicate} ⇒ T`.  Op-conversion compiles this via the
+                // generic applied-combinator arm: `base_iteration` is the
+                // upstream (`input=None`), then the Restrict arm consumes it
+                // (`input=Some(_)`) and emits a `Restrict` tile.
+                make_restrict(predicate.clone(), base_iteration)
             } else {
                 base_iteration
             }
@@ -1216,12 +1654,13 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
             );
 
             let result = if let Some(predicate) = predicate {
-                let result_ty = map_domain.ty.clone();
-                apply_primitive(
-                    typed_compose(vec![map_domain, predicate.clone()]),
-                    Builtin::Restrict,
-                    result_ty,
-                )
+                // Apply `restrict(predicate)` to `map_domain` (the iteration
+                // source over the joined flat-tuple domain) as a downstream
+                // filter step.  `map_domain` is the upstream value-producer
+                // that `restrict` consumes — op-conversion converts it with
+                // `input=None` (preserving the invariant `MapDomain`
+                // requires), then the Restrict arm filters the joined output.
+                make_restrict(predicate.clone(), map_domain)
             } else {
                 map_domain
             };
@@ -1301,72 +1740,63 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
     Some(result)
 }
 
-/// Finds loop joins that can be converted into hash joins.
+/// Try the hash-join rewrite at an iteration site whose domain is `domain_ty`.
 ///
-/// Loop joins can occur either at the top-level of an expression, or inside a global aggregate.
-/// This function looks for cases where the type at those points is a refined 2-tuple where the
-/// refinement is of the form `(x, y) ▷ zip ≫ eq` where:
-/// - x only depends on one of the elements of the tuple
-/// - y only depends on the other element of the tuple
+/// Called from [`wrap_with_iterate`] before its iterate-then-restricts
+/// fallback: hash join is the specialised iteration strategy when the site's
+/// domain is a refined tuple whose predicate decomposes into equality join
+/// conditions (the recogniser is implemented by [`plan_loop_join`] /
+/// [`convert_loop_join`]).  Returns `true` and rewrites `expr` to
+/// `Compose([transformed, original])` on success, leaving `expr` untouched
+/// and returning `false` otherwise.  `transformed` is itself iteration-bearing
+/// at its leaves (`JoinPlan::Loop` emits `Apply(true ▷ const, Iterate)`),
+/// so the resulting chain already has explicit iterate markers — no
+/// further wrap is needed.
 ///
-/// Then, we transform this from iterating both elements as a cross product to iterating one, computing
-/// the keys, and conversing, then iterating the other, computing the keys on that side, then looking up
-/// the elements from the other side.
+/// Loop joins can occur anywhere an iteration site appears: at the program
+/// root, at sink-bound `Record` fields, at aggregate arguments, at
+/// `LastOrDefault` streams, at `Loop` sources, at `CollectionUnion`
+/// operands, or as a let-bound function value.
 ///
-/// Supports n-way joins (n ≥ 2) when all arms are connected via equality conditions that
-/// form a spanning tree.  Build/probe assignment follows the BFS order of that spanning tree.
-/// For now, predicates must be expressed as conjunctions of single-arm equality conditions.
-fn create_hash_joins(expr: &mut Expr) {
+/// Supports n-way joins (n ≥ 2) when all arms are connected via equality
+/// conditions that form a spanning tree.  Build/probe assignment follows
+/// the BFS order of that spanning tree.  For now, predicates must be
+/// expressed as conjunctions of single-arm equality conditions.
+fn try_hash_join_rewrite(expr: &mut Expr, domain_ty: &Type) -> bool {
+    let Type::Refinement(base, refinement) = domain_ty else {
+        return false;
+    };
+    let RefinementKind::Predicate(pred_rc) = &refinement.kind;
+    let pred = pred_rc.borrow().clone();
     trace!(
-        "replace_loop_joins called on: {} with type {}",
+        "Attempting hash-join rewrite at iteration site: {}",
         symbolic(expr),
-        expr.ty
     );
-
-    // We need to convert the innermost body of nested Lets, not the outer expr.
-    // This is because we need the let-bound variables to be defined for the execution
-    // of the hash joins.
-    if let TypedExprNode::Let { body, .. } = &mut expr.node {
-        return create_hash_joins(body);
-    }
-
-    if let Type::Fun(domain, codomain) = expr.ty.clone()
-        && let Type::Refinement(base, refinement) = (*domain).clone()
-    {
-        let RefinementKind::Predicate(pred_rc) = &refinement.kind;
-        let pred = pred_rc.borrow().clone();
-        trace!("Attempting loop join conversion for: {}", symbolic(expr));
-        if let Some(transformed) = convert_loop_join(&base, &pred) {
-            trace!(
-                "Successfully transformed to: {} : {}",
-                symbolic(&transformed),
-                transformed.ty
-            );
-            let result_ty = Type::fun(transformed.ty.domain().expect("non-function"), *codomain);
-            *expr = compose(transformed, take(expr)).with_ty(result_ty);
-        } else {
-            trace!("Loop join pattern did not match");
-        }
-    }
-
-    create_hash_joins_recurse(expr);
-}
-
-/// Helper to explore the expression tree for convertible loop joins.
-fn create_hash_joins_recurse(expr: &mut Expr) {
-    // An `Aggregate` is a boundary where a hash-join conversion may be
-    // available — dispatch to the entry-point checker and stop, since
-    // `create_hash_joins` itself recurses into the aggregate's input.
-    if matches!(&expr.node, TypedExprNode::Aggregate { .. }) {
-        create_hash_joins(expr);
-        return;
-    }
-    expr.walk_children_mut(create_hash_joins_recurse);
+    let Some(transformed) = convert_loop_join(base, &pred) else {
+        trace!("Hash-join pattern did not match");
+        return false;
+    };
+    trace!(
+        "Hash-join rewrite succeeded: {} : {}",
+        symbolic(&transformed),
+        transformed.ty,
+    );
+    let codomain = expr.ty.codomain().expect("function-typed iteration site");
+    let result_ty = Type::fun(
+        transformed
+            .ty
+            .domain()
+            .expect("convert_loop_join output must be function-typed"),
+        codomain,
+    );
+    *expr = compose(transformed, take(expr)).with_ty(result_ty);
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::simple_sub::FieldKey;
     use crate::ccl::{BaseType, Expr};
 
     fn var(name: &str) -> Expr {
@@ -1922,7 +2352,7 @@ mod tests {
 
         assert_eq!(
             symbolic(&result.unwrap()),
-            "(id ≫ id ≫ (id ≫ id) ▷ converse) ▷ uncurry ▷ map_domain"
+            "(iterate ≫ id ≫ (iterate ≫ id) ▷ converse) ▷ uncurry ▷ map_domain"
         );
     }
 
@@ -2557,11 +2987,13 @@ mod tests {
             "convert_loop_join should succeed when eq conditions + extra filter are present"
         );
 
-        // The output should contain "restrict" since the filter predicate is attached.
+        // The output should contain "iterate" with the pushed-down filter attached
+        // (filter predicates ride into the iteration via iterate(p) rather than the
+        // legacy `restrict` builtin).
         let sym = symbolic(&result.unwrap());
         assert!(
-            sym.contains("restrict"),
-            "expected 'restrict' in output for pushed-down filter, got: {sym}"
+            sym.contains("iterate"),
+            "expected 'iterate' in output for pushed-down filter, got: {sym}"
         );
     }
 
@@ -2583,5 +3015,781 @@ mod tests {
             None,
             "should return None when no equality conditions are present"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Helpers for the iteration-insertion test group.
+    // -----------------------------------------------------------------
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::ccl::ccl_utils::is_trivially_true_predicate;
+    use crate::ccl::symbolic::symbolic;
+    use crate::ccl::{Refinement, RefinementKind, next_refinement_id};
+
+    fn bool_ty() -> Type {
+        Type::Base(BaseType::Bool)
+    }
+
+    /// Build a [`Type::Refinement`] wrapping `base` with `predicate` as its
+    /// predicate.  The predicate must have type `base ⇒ Bool` so the
+    /// refinement is well-formed.
+    fn refined_ty(base: Type, predicate: Expr) -> Type {
+        Type::Refinement(
+            Box::new(base),
+            Refinement {
+                id: next_refinement_id(),
+                description: String::new(),
+                kind: RefinementKind::Predicate(Rc::new(RefCell::new(predicate))),
+            },
+        )
+    }
+
+    /// Build an `Apply { argument, function: <builtin> }` whose function
+    /// position carries the supplied `function_ty`.  Used to construct
+    /// arms-internalising shapes (`Sum`, `Converse`, `MapDomain`, …)
+    /// without going through the full lambda-elim pipeline.
+    fn apply_builtin(argument: Expr, builtin: Builtin, function_ty: Type, result_ty: Type) -> Expr {
+        Expr::apply(argument, Expr::builtin(builtin).with_ty(function_ty)).with_ty(result_ty)
+    }
+
+    /// Build a finite list literal `[1, 2, 3]` typed `[0, 2] ⇒ Int`.
+    fn list_123() -> Expr {
+        let int = int_ty();
+        Expr::list(vec![
+            Expr::lit(Lit::Int(1)).with_ty(int.clone()),
+            Expr::lit(Lit::Int(2)).with_ty(int.clone()),
+            Expr::lit(Lit::Int(3)).with_ty(int.clone()),
+        ])
+        .with_ty(fun_ty(Type::UIntRange(3), int))
+    }
+
+    /// Returns `true` if `expr` is `Apply { function: Builtin::Iterate, .. }`
+    /// at the top level — used by the assertions below to check that a
+    /// wrap actually fired.
+    fn is_iterate_apply(expr: &Expr) -> bool {
+        let TypedExprNode::Apply { function, .. } = &expr.node else {
+            return false;
+        };
+        matches!(&function.node, TypedExprNode::Builtin(Builtin::Iterate))
+    }
+
+    /// Returns the upstream value-producer if `expr` is `restrict(p)`
+    /// *applied* to it — the term `Apply { argument: upstream, function:
+    /// Apply(p, Restrict) }`.  `restrict` is a function transformer applied
+    /// to its upstream (not composed), so the marker lives in the `function`
+    /// position one level down.  Used to assert mid-chain filter emission
+    /// and to walk down a stack of applied restricts.
+    fn restrict_application_upstream(expr: &Expr) -> Option<&Expr> {
+        let TypedExprNode::Apply { argument, function } = &expr.node else {
+            return None;
+        };
+        let TypedExprNode::Apply {
+            function: inner, ..
+        } = &function.node
+        else {
+            return None;
+        };
+        matches!(&inner.node, TypedExprNode::Builtin(Builtin::Restrict)).then_some(argument)
+    }
+
+    /// Returns the leftmost element of `expr` if it is a [`Compose`], or
+    /// `expr` itself otherwise.  Used to read the chain head out of a
+    /// (possibly-wrapped) compose.
+    fn chain_head(expr: &Expr) -> &Expr {
+        match &expr.node {
+            TypedExprNode::Compose(elts) => elts.first().unwrap_or(expr),
+            _ => expr,
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // is_iteration_bearing
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_is_iteration_bearing_iterate_apply() {
+        // `Apply(true_pred, Iterate)` is the canonical marker — wrapping
+        // would be redundant.
+        let pred = trivially_true_predicate(int_ty());
+        let iter_expr = make_iterate(pred);
+        assert!(is_iteration_bearing(&iter_expr));
+    }
+
+    #[test]
+    fn test_is_iteration_bearing_restrict_apply() {
+        // A refined site's head is the outermost `restrict` filter
+        // *applied* to an iterate source — `Apply(iterate, Apply(p,
+        // Restrict))`.  It is iteration-bearing because its upstream is
+        // (`make_restrict` only ever wraps an iteration source); without
+        // this, a second marker pass would re-enter `wrap_with_iterate`
+        // and double-iterate the refined collection.
+        let iter_expr = make_iterate(trivially_true_predicate(int_ty()));
+        // A non-trivial predicate (`false ▷ const`, structurally distinct
+        // from the trivially-true one) so `make_restrict` actually wraps
+        // the domain in a `Type::Refinement` — the refined-site shape.
+        let pred = apply_primitive(
+            Expr::lit(Lit::Bool(false)).with_ty(bool_ty()),
+            Builtin::Const,
+            fun_ty(int_ty(), bool_ty()),
+        );
+        let restricted = make_restrict(pred, iter_expr);
+        // Sanity: the head really is a restrict applied to its upstream.
+        assert!(restrict_application_upstream(&restricted).is_some());
+        assert!(is_iteration_bearing(&restricted));
+    }
+
+    #[test]
+    fn test_is_iteration_bearing_map_domain_apply() {
+        // `Apply(_, MapDomain)` internalises iteration in op-conversion
+        // (its arm asserts `input.is_none()`), so wrapping would break it.
+        let int = int_ty();
+        let inner = list_123();
+        let expr = apply_builtin(
+            inner,
+            Builtin::MapDomain,
+            fun_ty(
+                fun_ty(Type::UIntRange(3), int.clone()),
+                fun_ty(Type::UIntRange(3), int.clone()),
+            ),
+            fun_ty(Type::UIntRange(3), int),
+        );
+        assert!(is_iteration_bearing(&expr));
+    }
+
+    #[test]
+    fn test_is_iteration_bearing_converse_apply() {
+        // `Apply(_, Converse)` accepts `input=None` (it is itself an
+        // iteration source) — recognising it prevents prepending an
+        // outer iterate that would force an infinite extent over the
+        // converse's input domain.
+        let int = int_ty();
+        let inner = list_123();
+        let expr = apply_builtin(
+            inner,
+            Builtin::Converse,
+            fun_ty(
+                fun_ty(Type::UIntRange(3), int.clone()),
+                fun_ty(int.clone(), fun_ty(Type::UIntRange(3), Type::UIntRange(3))),
+            ),
+            fun_ty(int, fun_ty(Type::UIntRange(3), Type::UIntRange(3))),
+        );
+        assert!(is_iteration_bearing(&expr));
+    }
+
+    #[test]
+    fn test_is_iteration_bearing_const_apply_not_iteration_bearing() {
+        // `Apply(_, Const)` is input-threading — wrapping it adds a real
+        // iteration source.
+        let int = int_ty();
+        let const_apply = apply_builtin(
+            Expr::lit(Lit::Int(5)).with_ty(int.clone()),
+            Builtin::Const,
+            fun_ty(int.clone(), fun_ty(int.clone(), int.clone())),
+            fun_ty(int.clone(), int),
+        );
+        assert!(!is_iteration_bearing(&const_apply));
+    }
+
+    #[test]
+    fn test_is_iteration_bearing_list_literal_not_iteration_bearing() {
+        // List literals are iteration leaves; op-conversion's arm
+        // requires an input stream, so planning must prepend iterate.
+        assert!(!is_iteration_bearing(&list_123()));
+    }
+
+    #[test]
+    fn test_is_iteration_bearing_var_function_typed() {
+        // A function-typed `Var` references a let-bound iteration source
+        // that was already iterate-wrapped at its bind site, so the
+        // dereference itself doesn't need another wrap.
+        let var_expr = var("xs").with_ty(fun_ty(Type::UIntRange(3), int_ty()));
+        assert!(is_iteration_bearing(&var_expr));
+    }
+
+    #[test]
+    fn test_is_iteration_bearing_var_scalar_not_iteration_bearing() {
+        // A scalar `Var` isn't an iteration site at all — it shouldn't
+        // be flagged as already-iterating either; `wrap_with_iterate`'s
+        // domain-check then no-ops on it.
+        let var_expr = var("x").with_ty(int_ty());
+        assert!(!is_iteration_bearing(&var_expr));
+    }
+
+    #[test]
+    fn test_is_iteration_bearing_record_at_head() {
+        // Value-position `Record` is compiled by op-conversion's
+        // `Record` arm under `input=None`; wrapping the chain would
+        // feed an unwanted upstream stream in.
+        let int = int_ty();
+        let record = Expr::new(TypedExprNode::Record(vec![("f".to_string(), list_123())])).with_ty(
+            Type::Record(vec![("f".to_string(), fun_ty(Type::UIntRange(3), int))]),
+        );
+        assert!(is_iteration_bearing(&record));
+    }
+
+    #[test]
+    fn test_is_iteration_bearing_proj_apply() {
+        // `Apply(record, Proj)` falls through to op-conversion's catch-all
+        // `Apply` arm, which asserts `input.is_none()`.  Recognising
+        // non-builtin function position as iteration-bearing avoids the
+        // wrap-then-fail trap.
+        let int = int_ty();
+        let record_ty = Type::Record(vec![(
+            "f".to_string(),
+            fun_ty(Type::UIntRange(3), int.clone()),
+        )]);
+        let record = Expr::new(TypedExprNode::Record(vec![("f".to_string(), list_123())]))
+            .with_ty(record_ty.clone());
+        let proj = Expr::proj_field("f")
+            .with_ty(fun_ty(record_ty, fun_ty(Type::UIntRange(3), int.clone())));
+        let apply = Expr::apply(record, proj).with_ty(fun_ty(Type::UIntRange(3), int));
+        assert!(is_iteration_bearing(&apply));
+    }
+
+    #[test]
+    fn test_is_iteration_bearing_compose_inspects_head() {
+        // `is_iteration_bearing` peeks at the first compose element —
+        // a compose led by a non-iteration-bearing leaf is itself
+        // wrap-eligible.
+        let int = int_ty();
+        let chain = compose(vec![
+            list_123(),
+            apply_builtin(
+                Expr::tuple(vec![
+                    Expr::builtin(Builtin::Id).with_ty(fun_ty(int.clone(), int.clone())),
+                    apply_builtin(
+                        Expr::lit(Lit::Int(10)).with_ty(int.clone()),
+                        Builtin::Const,
+                        fun_ty(int.clone(), fun_ty(int.clone(), int.clone())),
+                        fun_ty(int.clone(), int.clone()),
+                    ),
+                ])
+                .with_ty(Type::Tuple(vec![
+                    fun_ty(int.clone(), int.clone()),
+                    fun_ty(int.clone(), int.clone()),
+                ])),
+                Builtin::Zip,
+                fun_ty(
+                    Type::Tuple(vec![
+                        fun_ty(int.clone(), int.clone()),
+                        fun_ty(int.clone(), int.clone()),
+                    ]),
+                    fun_ty(int.clone(), Type::Tuple(vec![int.clone(), int.clone()])),
+                ),
+                fun_ty(int.clone(), Type::Tuple(vec![int.clone(), int.clone()])),
+            ),
+        ])
+        .with_ty(fun_ty(
+            Type::UIntRange(3),
+            Type::Tuple(vec![int.clone(), int]),
+        ));
+        assert!(!is_iteration_bearing(&chain));
+    }
+
+    // -----------------------------------------------------------------
+    // wrap_with_iterate
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_wrap_with_iterate_unrefined_list_prepends_trivial_iterate() {
+        let mut expr = list_123();
+        wrap_with_iterate(&mut expr);
+        let head = chain_head(&expr);
+        assert!(
+            is_iterate_apply(head),
+            "expected iterate at chain head, got: {}",
+            symbolic(&expr)
+        );
+        // Trivial predicate => the symbolic shortcut shows just `iterate`.
+        assert!(
+            symbolic(&expr).starts_with("iterate ≫"),
+            "expected trivial-iterate prefix, got: {}",
+            symbolic(&expr)
+        );
+    }
+
+    #[test]
+    fn test_wrap_with_iterate_refined_emits_iterate_then_restrict() {
+        // Build a refined-domain list: `[1,2,3] : {[0,2] | some_pred} ⇒ Int`.
+        // After wrapping, the iteration source is `restrict(some_pred)`
+        // *applied* to a chain-head trivially-true `iterate`, with the
+        // value-producer `[1, 2, 3]` composed onto it:
+        //   (iterate(true) ▷ some_pred ▷ restrict) ≫ [1, 2, 3].
+        let int = int_ty();
+        let pred = var("some_pred").with_ty(fun_ty(Type::UIntRange(3), bool_ty()));
+        let refined_domain = refined_ty(Type::UIntRange(3), pred.clone());
+
+        let mut expr = list_123().with_ty(fun_ty(refined_domain, int));
+        wrap_with_iterate(&mut expr);
+
+        let TypedExprNode::Compose(elts) = &expr.node else {
+            panic!("expected Compose, got: {}", symbolic(&expr));
+        };
+        assert_eq!(
+            elts.len(),
+            2,
+            "expected [source, body], got {}: {}",
+            elts.len(),
+            symbolic(&expr)
+        );
+        // Chain head is the iteration source: `restrict(some_pred)` applied
+        // to the trivially-true `iterate`.
+        let upstream = restrict_application_upstream(&elts[0]).unwrap_or_else(|| {
+            panic!(
+                "expected restrict application at head, got: {}",
+                symbolic(&elts[0])
+            )
+        });
+        let TypedExprNode::Apply { argument, function } = &upstream.node else {
+            panic!(
+                "expected iterate Apply as upstream, got: {}",
+                symbolic(upstream)
+            );
+        };
+        assert!(matches!(
+            &function.node,
+            TypedExprNode::Builtin(Builtin::Iterate)
+        ));
+        assert!(
+            is_trivially_true_predicate(argument),
+            "head iterate's predicate should be trivially true, got: {}",
+            symbolic(argument)
+        );
+    }
+
+    #[test]
+    fn test_wrap_with_iterate_nested_refinements_emits_chain() {
+        // `{{D | p_inner} | p_outer} ⇒ Int` builds the iteration source by
+        // *applying* one restrict per refinement layer (inner first) to a
+        // chain-head trivially-true iterate, then composes `body` onto it:
+        //   restrict(p_outer)(restrict(p_inner)(iterate(true))) ≫ body.
+        // So the outermost application narrows by `p_outer`, its upstream
+        // narrows by `p_inner`, and the innermost upstream is the iterate.
+        let int = int_ty();
+        let inner_pred = var("p_inner").with_ty(fun_ty(Type::UIntRange(3), bool_ty()));
+        let outer_pred = var("p_outer").with_ty(fun_ty(Type::UIntRange(3), bool_ty()));
+        let inner_refined = refined_ty(Type::UIntRange(3), inner_pred);
+        let outer_refined = refined_ty(inner_refined, outer_pred);
+
+        let mut expr = list_123().with_ty(fun_ty(outer_refined, int));
+        wrap_with_iterate(&mut expr);
+
+        let TypedExprNode::Compose(elts) = &expr.node else {
+            panic!("expected Compose, got: {}", symbolic(&expr));
+        };
+        // [source, body]: the source is the stack of applied restricts.
+        assert_eq!(
+            elts.len(),
+            2,
+            "expected [source, body], got {}: {}",
+            elts.len(),
+            symbolic(&expr)
+        );
+        // Outermost filter restrict(p_outer); upstream restrict(p_inner);
+        // innermost upstream the trivially-true iterate.
+        let outer_upstream = restrict_application_upstream(&elts[0])
+            .unwrap_or_else(|| panic!("expected outer restrict, got: {}", symbolic(&elts[0])));
+        let inner_upstream = restrict_application_upstream(outer_upstream).unwrap_or_else(|| {
+            panic!("expected inner restrict, got: {}", symbolic(outer_upstream))
+        });
+        assert!(
+            is_iterate_apply(inner_upstream),
+            "innermost upstream should be the trivially-true iterate, got: {}",
+            symbolic(inner_upstream)
+        );
+    }
+
+    #[test]
+    fn test_wrap_with_iterate_already_iteration_bearing_is_noop() {
+        // Wrapping an `iterate(...)`-led chain leaves it untouched —
+        // double-wrap would mean a redundant `IterateExtent` at runtime.
+        let pred = trivially_true_predicate(int_ty());
+        let mut expr = make_iterate(pred);
+        let before = symbolic(&expr);
+        wrap_with_iterate(&mut expr);
+        assert_eq!(
+            symbolic(&expr),
+            before,
+            "wrapping an already-iterate expression should be a no-op"
+        );
+    }
+
+    #[test]
+    fn test_wrap_with_iterate_recurses_into_let() {
+        // For a `Let { bound_expr: list, body: var }`, the helper should
+        // descend: wrap the bound list (function-typed) and walk into the
+        // body (the function-typed Var is already iteration-bearing, so
+        // no wrap there).  Critically, the Let itself is *not* prefixed
+        // with iterate — that would force op-conversion's Let arm to
+        // feed an unwanted input through to its bound expression.
+        let int = int_ty();
+        let list_ty = fun_ty(Type::UIntRange(3), int);
+        let mut expr = Expr::let_bind(
+            "xs".to_string(),
+            list_123(),
+            var("xs").with_ty(list_ty.clone()),
+        )
+        .with_ty(list_ty);
+
+        wrap_with_iterate(&mut expr);
+
+        // Outer Let stays as a Let — no wrap inserted at the program root.
+        let TypedExprNode::Let {
+            bound_expr, body, ..
+        } = &expr.node
+        else {
+            panic!("expected Let to remain at root, got: {}", symbolic(&expr));
+        };
+        // Bound expression is now iterate-led.
+        assert!(
+            is_iterate_apply(chain_head(bound_expr)),
+            "bound list should be iterate-led, got: {}",
+            symbolic(bound_expr)
+        );
+        // Body is a function-typed Var (iteration-bearing) ⇒ unchanged.
+        assert!(matches!(body.node, TypedExprNode::Var(_)));
+    }
+
+    #[test]
+    fn test_wrap_with_iterate_record_is_noop() {
+        // [`wrap_with_iterate`] no-ops on a Record: [`is_iteration_bearing`]
+        // returns `true` for Records (they reject `input=Some` and so
+        // can't be wrapped without breaking op-conversion), and field
+        // wrapping is the responsibility of [`insert_iterate_recurse`]'s
+        // value-position `Record` case — that pass walks the AST and
+        // wraps function-typed fields wherever a Record appears.
+        let int = int_ty();
+        let field_ty = fun_ty(Type::UIntRange(3), int.clone());
+        let mut expr = Expr::new(TypedExprNode::Record(vec![
+            ("xs".to_string(), list_123()),
+            (
+                "constant".to_string(),
+                Expr::lit(Lit::Int(42)).with_ty(int.clone()),
+            ),
+        ]))
+        .with_ty(Type::Record(vec![
+            ("xs".to_string(), field_ty),
+            ("constant".to_string(), int),
+        ]));
+
+        let before = symbolic(&expr);
+        wrap_with_iterate(&mut expr);
+        assert_eq!(
+            symbolic(&expr),
+            before,
+            "wrap_with_iterate on a Record should be a no-op; insert_iterate_recurse \
+             handles field wrapping at the walk site",
+        );
+    }
+
+    #[test]
+    fn test_wrap_with_iterate_scalar_is_noop() {
+        // Top-level scalars (e.g. an aggregate result) have no domain
+        // to iterate; the helper bails without modifying anything.
+        let mut expr = Expr::lit(Lit::Int(5)).with_ty(int_ty());
+        let before = symbolic(&expr);
+        wrap_with_iterate(&mut expr);
+        assert_eq!(symbolic(&expr), before);
+    }
+
+    // -----------------------------------------------------------------
+    // insert_iterate_recurse
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_insert_iterate_recurse_aggregate_wraps_argument() {
+        // `Apply(list, Sum)` — Sum's arm needs an iteration source
+        // before the scalar fold, so the argument gets iterate-wrapped.
+        let int = int_ty();
+        let mut expr = apply_builtin(
+            list_123(),
+            Builtin::Sum,
+            fun_ty(fun_ty(Type::UIntRange(3), int.clone()), int.clone()),
+            int,
+        );
+        insert_iterate_recurse(&mut expr);
+        let TypedExprNode::Apply { argument, .. } = &expr.node else {
+            panic!("expected Apply, got: {}", symbolic(&expr));
+        };
+        assert!(
+            is_iterate_apply(chain_head(argument)),
+            "Sum's argument should be iterate-led, got: {}",
+            symbolic(argument)
+        );
+    }
+
+    #[test]
+    fn test_insert_iterate_recurse_converse_wraps_argument() {
+        // `Apply(list, Converse)` — Converse compiles its argument
+        // under `input=None`, so the argument is an iteration site.
+        let int = int_ty();
+        let mut expr = apply_builtin(
+            list_123(),
+            Builtin::Converse,
+            fun_ty(
+                fun_ty(Type::UIntRange(3), int.clone()),
+                fun_ty(int.clone(), fun_ty(Type::UIntRange(3), Type::UIntRange(3))),
+            ),
+            fun_ty(int, fun_ty(Type::UIntRange(3), Type::UIntRange(3))),
+        );
+        insert_iterate_recurse(&mut expr);
+        let TypedExprNode::Apply { argument, .. } = &expr.node else {
+            panic!("expected Apply, got: {}", symbolic(&expr));
+        };
+        assert!(
+            is_iterate_apply(chain_head(argument)),
+            "Converse's argument should be iterate-led, got: {}",
+            symbolic(argument)
+        );
+    }
+
+    #[test]
+    fn test_insert_iterate_recurse_zip_arg_tuple_left_alone() {
+        // `Apply(Tuple(fields), Zip)` — Zip's arm runs the tuple under
+        // `input=Some(fan_out_branch)`, so each field receives the
+        // surrounding iteration via fan-out and must *not* be wrapped.
+        // The catch-all `Apply` walk would otherwise wrap the inner
+        // Record/Tuple fields and introduce redundant operators.
+        let int = int_ty();
+        let proj0 = Expr::proj_index(0).with_ty(fun_ty(
+            Type::Tuple(vec![int.clone(), int.clone()]),
+            int.clone(),
+        ));
+        let tuple_arg = Expr::tuple(vec![proj0.clone(), proj0.clone()]).with_ty(Type::Tuple(vec![
+            fun_ty(Type::Tuple(vec![int.clone(), int.clone()]), int.clone()),
+            fun_ty(Type::Tuple(vec![int.clone(), int.clone()]), int.clone()),
+        ]));
+        let mut expr = apply_builtin(
+            tuple_arg,
+            Builtin::Zip,
+            fun_ty(
+                Type::Tuple(vec![
+                    fun_ty(Type::Tuple(vec![int.clone(), int.clone()]), int.clone()),
+                    fun_ty(Type::Tuple(vec![int.clone(), int.clone()]), int.clone()),
+                ]),
+                fun_ty(
+                    Type::Tuple(vec![int.clone(), int.clone()]),
+                    Type::Tuple(vec![int.clone(), int.clone()]),
+                ),
+            ),
+            fun_ty(
+                Type::Tuple(vec![int.clone(), int.clone()]),
+                Type::Tuple(vec![int.clone(), int]),
+            ),
+        );
+        let before = symbolic(&expr);
+        insert_iterate_recurse(&mut expr);
+        assert_eq!(
+            symbolic(&expr),
+            before,
+            "Zip's tuple-argument fields should not get iterate prepended"
+        );
+    }
+
+    #[test]
+    fn test_insert_iterate_recurse_collection_union_wraps_operands() {
+        // The value-form `CollectionUnion(operands)` — op-conversion
+        // compiles each operand with `input=None`, so each is an
+        // iteration site.
+        let int = int_ty();
+        let mut expr = Expr::new(TypedExprNode::CollectionUnion(vec![list_123(), list_123()]))
+            .with_ty(fun_ty(
+                Type::Variant(vec![
+                    (FieldKey::Index(0), Type::UIntRange(3)),
+                    (FieldKey::Index(1), Type::UIntRange(3)),
+                ]),
+                int,
+            ));
+        insert_iterate_recurse(&mut expr);
+        let TypedExprNode::CollectionUnion(operands) = &expr.node else {
+            panic!("expected CollectionUnion, got: {}", symbolic(&expr));
+        };
+        for (i, operand) in operands.iter().enumerate() {
+            assert!(
+                is_iterate_apply(chain_head(operand)),
+                "operand {i} should be iterate-led, got: {}",
+                symbolic(operand)
+            );
+        }
+    }
+
+    #[test]
+    fn test_insert_iterate_recurse_loop_wraps_source() {
+        // `Loop`'s `source` is iterated by `Recurse` at runtime, and
+        // op-conversion compiles it with `input=None` — wrap it here.
+        let int = int_ty();
+        let list_ty = fun_ty(Type::UIntRange(3), int.clone());
+        // Build a minimal Loop with one accumulator and a body that just
+        // re-emits the previous accumulator value.  The exact body shape
+        // doesn't matter for this test — we're only checking the
+        // `source` field gets iterate-wrapped.
+        let body = Expr::new(TypedExprNode::Record(vec![(
+            "step".to_string(),
+            Expr::proj_index(0).with_ty(fun_ty(
+                Type::Tuple(vec![int.clone(), int.clone()]),
+                int.clone(),
+            )),
+        )]))
+        .with_ty(Type::Record(vec![(
+            "step".to_string(),
+            fun_ty(Type::Tuple(vec![int.clone(), int.clone()]), int.clone()),
+        )]));
+
+        let mut expr = Expr::loop_node(
+            vec!["acc".to_string()],
+            vec![Expr::lit(Lit::Int(0)).with_ty(int.clone())],
+            list_123().with_ty(list_ty.clone()),
+            body,
+        )
+        .with_ty(list_ty);
+
+        insert_iterate_recurse(&mut expr);
+
+        let TypedExprNode::Loop { source, .. } = &expr.node else {
+            panic!("expected Loop, got: {}", symbolic(&expr));
+        };
+        assert!(
+            is_iterate_apply(chain_head(source)),
+            "Loop's source should be iterate-led, got: {}",
+            symbolic(source)
+        );
+    }
+
+    #[test]
+    fn test_insert_iterate_recurse_record_wraps_function_fields() {
+        // Value-position `Record` literal — each function-typed field is
+        // an iteration site (op-conversion's `Record` arm compiles each
+        // field with `input=None`).
+        let int = int_ty();
+        let mut expr = Expr::new(TypedExprNode::Record(vec![
+            ("xs".to_string(), list_123()),
+            ("n".to_string(), Expr::lit(Lit::Int(0)).with_ty(int.clone())),
+        ]))
+        .with_ty(Type::Record(vec![
+            ("xs".to_string(), fun_ty(Type::UIntRange(3), int.clone())),
+            ("n".to_string(), int),
+        ]));
+        insert_iterate_recurse(&mut expr);
+        let TypedExprNode::Record(fields) = &expr.node else {
+            panic!("expected Record, got: {}", symbolic(&expr));
+        };
+        let xs = &fields.iter().find(|(n, _)| n == "xs").unwrap().1;
+        assert!(
+            is_iterate_apply(chain_head(xs)),
+            "function-typed field `xs` should be iterate-led, got: {}",
+            symbolic(xs)
+        );
+        let n = &fields.iter().find(|(n, _)| n == "n").unwrap().1;
+        assert!(
+            matches!(n.node, TypedExprNode::Lit(_)),
+            "scalar field `n` should be untouched"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // End-to-end: insert_iterate_markers
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_insert_iterate_markers_top_level_let_descends_into_bound_and_body() {
+        // Full driver pass: a `let xs = [1,2,3] in xs ≫ id` program.  The
+        // top-level wrap should reach the bound list (compiled with
+        // `input=None` by op-conversion's `Let` arm) and the body's
+        // compose head (also `input=None` from the same arm).  The
+        // function-typed Var inside the body is already iteration-
+        // bearing, so it doesn't get a second wrap.
+        let int = int_ty();
+        let list_ty = fun_ty(Type::UIntRange(3), int.clone());
+        let body_chain = compose(vec![
+            var("xs").with_ty(list_ty.clone()),
+            Expr::builtin(Builtin::Id).with_ty(fun_ty(int.clone(), int)),
+        ])
+        .with_ty(list_ty.clone());
+
+        let mut expr = Expr::let_bind("xs".to_string(), list_123(), body_chain).with_ty(list_ty);
+
+        insert_iterate_markers(&mut expr);
+
+        let TypedExprNode::Let {
+            bound_expr, body, ..
+        } = &expr.node
+        else {
+            panic!("expected Let, got: {}", symbolic(&expr));
+        };
+        assert!(
+            is_iterate_apply(chain_head(bound_expr)),
+            "bound list should be iterate-led, got: {}",
+            symbolic(bound_expr)
+        );
+        // Body's compose head is `Var(xs)` (iteration-bearing) — the
+        // pass should leave the compose alone.
+        let head = chain_head(body);
+        assert!(
+            matches!(head.node, TypedExprNode::Var(_)),
+            "body's chain head should remain `Var(xs)`, got: {}",
+            symbolic(head)
+        );
+    }
+
+    #[test]
+    fn test_insert_iterate_markers_scalar_top_level_only_wraps_aggregate_arg() {
+        // `sum([1,2,3])` — the program root is scalar (Int), so no
+        // top-level wrap.  The aggregate's argument, however, *is* an
+        // iteration site and must be wrapped by the recursive pass.
+        let int = int_ty();
+        let mut expr = apply_builtin(
+            list_123(),
+            Builtin::Sum,
+            fun_ty(fun_ty(Type::UIntRange(3), int.clone()), int.clone()),
+            int,
+        );
+        insert_iterate_markers(&mut expr);
+        let TypedExprNode::Apply { argument, function } = &expr.node else {
+            panic!("expected Apply, got: {}", symbolic(&expr));
+        };
+        // Function position untouched (Sum is still Sum).
+        assert!(matches!(
+            &function.node,
+            TypedExprNode::Builtin(Builtin::Sum)
+        ));
+        // Argument is iterate-led.
+        assert!(
+            is_iterate_apply(chain_head(argument)),
+            "Sum's argument should be iterate-led, got: {}",
+            symbolic(argument)
+        );
+    }
+
+    #[test]
+    fn test_insert_iterate_markers_record_root_wraps_each_function_field() {
+        // Programs that end in a sink-bound `Record` — each
+        // function-typed field is an iteration site (`compile_program`
+        // dispatches to `convert_record_fields_to_operators`, which
+        // compiles each field with `input=None`).
+        let int = int_ty();
+        let field_ty = fun_ty(Type::UIntRange(3), int.clone());
+        let mut expr = Expr::new(TypedExprNode::Record(vec![
+            ("out_a".to_string(), list_123()),
+            ("out_b".to_string(), list_123()),
+        ]))
+        .with_ty(Type::Record(vec![
+            ("out_a".to_string(), field_ty.clone()),
+            ("out_b".to_string(), field_ty),
+        ]));
+
+        insert_iterate_markers(&mut expr);
+
+        let TypedExprNode::Record(fields) = &expr.node else {
+            panic!("expected Record, got: {}", symbolic(&expr));
+        };
+        for (name, value) in fields {
+            assert!(
+                is_iterate_apply(chain_head(value)),
+                "sink field `{name}` should be iterate-led, got: {}",
+                symbolic(value)
+            );
+        }
     }
 }

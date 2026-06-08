@@ -6,7 +6,14 @@
 //!
 //! # Entry point
 //!
-//! [`simplify`] runs all rules to a fixed point.
+//! [`simplify`] runs the rule set to a fixed point and is safe at any point
+//! in the pipeline.  There is no mode: the structural-discard rules
+//! self-guard on [`contains_load_bearing_marker`], so they fire on pure CCC
+//! morphisms but never drop or relocate an `Apply(_, Iterate)` /
+//! `Apply(_, Restrict)` marker.  Before
+//! `crate::ccl::planning::insert_iterate_markers` no markers exist (every
+//! rule fires); afterwards the always-safe rules still absorb the `id` /
+//! nested-`Compose` leftovers from the hash-join rewrite.
 //!
 //! # Rule summary
 //!
@@ -14,20 +21,31 @@
 //! consecutive `(elts[i], elts[i+1])` pair inside an n-ary
 //! [`TypedExprNode::Compose`] and fire on the first matching pair.
 //!
-//! | Rule | Pattern | Reduction |
-//! |------|---------|-----------|
-//! | Compose identity | `… ≫ id ≫ …` / `… ≫ id ≫ …` | remove `id` |
-//! | Const reduce | `f ≫ g ▷ const` | `g ▷ const` |
-//! | Product beta (fst) | `⟨f, g⟩ ≫ .0` | `f` |
-//! | Product beta (snd) | `⟨f, g⟩ ≫ .1` | `g` |
-//! | Literal tuple projection | `(e₀, …, eₙ).i` | `eᵢ` |
-//! | CCC universal | `⟨.1, .0 ≫ curry(f)⟩ ≫ apply` | `f` |
-//! | Exponential beta | `⟨g, curry(h)⟩ ≫ apply` | `⟨id, g⟩ ≫ h` |
-//! | Exponential eta | `curry(⟨.1, .0 ≫ f⟩ ≫ apply)` | `f` |
-//! | Const-apply | `⟨f, const(g)⟩ ≫ apply` | `f ≫ g` |
-//! | Product eta | `⟨f ≫ .0, f ≫ .1⟩` | `f` |
-//! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` |
-//! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` |
+//! The **Marker-guarded?** column flags whether a rule is gated on
+//! [`contains_load_bearing_marker`].  A rule is *unguarded* (✓ — always
+//! safe) iff it preserves every sub-expression of the input (and therefore
+//! every iterate/restrict marker inside any of them).  A *guarded* rule (✗)
+//! is one that drops or relocates a sub-expression whose purity it cannot
+//! verify; it must not fire on a sub-tree containing a marker, because an
+//! `Apply(_, Iterate)` at a chain head *is* the iteration source for
+//! everything downstream, and an `Apply(_, Restrict)` carries a load-bearing
+//! filter whose removal silently widens the result set.
+//!
+//! | Rule | Pattern | Reduction | Marker-guarded? |
+//! |------|---------|-----------|-----------------|
+//! | Compose identity | `… ≫ id ≫ …` / `… ≫ id ≫ …` | remove `id` | ✓ |
+//! | Const reduce | `f ≫ g ▷ const` | `g ▷ const` | ✗ (drops `f`) |
+//! | Product beta (fst) | `⟨f, g⟩ ≫ .0` | `f` | ✗ (drops `g`) |
+//! | Product beta (snd) | `⟨f, g⟩ ≫ .1` | `g` | ✗ (drops `f`) |
+//! | Literal tuple projection | `(e₀, …, eₙ).i` | `eᵢ` | ✗ (drops siblings) |
+//! | CCC universal | `⟨.1, .0 ≫ curry(f)⟩ ≫ apply` | `f` | ✗ (drops structure) |
+//! | Exponential beta | `⟨g, curry(h)⟩ ≫ apply` | `⟨id, g⟩ ≫ h` | ✗ (restructures) |
+//! | Exponential eta | `curry(⟨.1, .0 ≫ f⟩ ≫ apply)` | `f` | ✗ (drops structure) |
+//! | Const-apply | `⟨f, const(g)⟩ ≫ apply` | `f ≫ g` | ✗ (drops `const` wrap) |
+//! | Product eta | `⟨f ≫ .0, f ≫ .1⟩` | `f` | ✗ (collapses) |
+//! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` | ✓ |
+//! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
+//! | String add-to-concat | `Arithmetic(Add) : (String,String)→String` | `Concat` | ✓ |
 
 use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
@@ -45,16 +63,69 @@ fn is_builtin(expr: &Expr, b: Builtin) -> bool {
 // Simplification pass
 // ---------------------------------------------------------------------------
 
-/// Apply the CCC simplification rules to `expr` until no further changes occur.
+/// Returns `true` if `expr` is *itself* a load-bearing iteration marker —
+/// an `Apply(_, Iterate)` chain-head source or an `Apply(_, Restrict)`
+/// filter transformer.  This is the per-node test only; the subtree-wide
+/// "contains a marker" property is accumulated bottom-up in
+/// [`simplify_once`] (OR-ing this node's result with its children's) and
+/// threaded to the discard-rule guard in [`apply_simplification_rules`],
+/// so the subtree is never re-scanned at every node.
 ///
-/// Runs [`simplify_once`] bottom-up passes until no rule fires.
+/// Note the restrict transformer appears nested inside its application,
+/// `Apply(upstream, Apply(p, Restrict))`: the inner `Apply(p, Restrict)`
+/// node — which sits in the outer Apply's `function` position — is the one
+/// this predicate flags, and `walk_children_mut` visits it so the flag
+/// propagates up to the application.
+///
+/// These markers, emitted by `crate::ccl::planning::insert_iterate_markers`,
+/// are *not* pure CCC morphisms: an iterate is the iteration source for
+/// everything downstream (dropping it strands the chain — op-conversion
+/// errors), and a restrict is a filter whose removal silently widens the
+/// result set.  The structural-discard / restructure rewrite rules are
+/// equationally valid only on pure morphisms, so they consult the
+/// accumulated guard and refuse to fire on any sub-tree that contains a
+/// marker.  That makes the rule set correct at any point in the pipeline —
+/// before *or* after marker insertion — which is why [`simplify`] needs no
+/// mode parameter.
+fn is_load_bearing_marker(expr: &Expr) -> bool {
+    matches!(
+        &expr.node,
+        TypedExprNode::Apply { function, .. }
+            if matches!(
+                &function.node,
+                TypedExprNode::Builtin(Builtin::Iterate | Builtin::Restrict)
+            )
+    )
+}
+
+/// Apply the CCC simplification rule set to `expr` until no further changes
+/// occur (bottom-up fixed-point iteration).
+///
+/// Safe to run at any point in the pipeline.  The structural-discard rules
+/// self-guard on [`contains_load_bearing_marker`], so they fire on pure
+/// CCC morphisms — pre-iterate-insertion CCL, or marker-free sub-trees of
+/// post-insertion CCL — but never drop or relocate an iterate/restrict
+/// marker.  (Before `crate::ccl::planning::insert_iterate_markers` no
+/// markers exist, so every rule fires; afterwards the always-safe rules
+/// still absorb the `id` / nested-`Compose` leftovers from the hash-join
+/// rewrite's `replace_tuple_project_with_id`.)
 pub fn simplify(mut expr: Expr) -> Expr {
-    while simplify_once(&mut expr) {}
+    while simplify_once(&mut expr).0 {}
     expr
 }
 
-/// One bottom-up simplification pass. Returns `true` if any rule fired.
-fn simplify_once(expr: &mut Expr) -> bool {
+/// One bottom-up simplification pass over the subtree at `expr`.
+///
+/// Returns `(changed, contains_marker)`:
+/// - `changed` — whether any rule fired anywhere in the subtree.
+/// - `contains_marker` — whether the subtree contains a load-bearing
+///   iterate/restrict marker ([`is_load_bearing_marker`]).  Computed
+///   bottom-up: OR the children's results (from [`recurse_simplify`]) with
+///   whether this node is itself a marker.  Passing it to
+///   [`apply_simplification_rules`] lets the discard-rule guard read it in
+///   O(1) instead of re-scanning the whole subtree at every node — the
+///   re-scan was O(n²) over the long compose chains planning emits.
+fn simplify_once(expr: &mut Expr) -> (bool, bool) {
     let mut changed = false;
     if let Type::Fun(domain, _) = &mut expr.ty
         && let Type::Refinement(_, refinment) = &mut **domain
@@ -82,19 +153,31 @@ fn simplify_once(expr: &mut Expr) -> bool {
         // domain refinement on `Fun(...)` (Lambda's refinement slot
         // shape) rather than every refinement reachable from the type.
         if let Ok(mut p) = pred.try_borrow_mut() {
-            changed = simplify_once(&mut p);
+            // A refinement predicate's own marker-containment is irrelevant
+            // to the term-tree guard: markers are inserted into the term
+            // tree, never inside predicates.  Discard the marker bit here —
+            // matching the original recursive scan, which never descended
+            // into `expr.ty`.
+            changed = simplify_once(&mut p).0;
         }
     }
-    changed |= recurse_simplify(expr);
-    changed |= apply_simplification_rules(expr);
-    changed
+    let (children_changed, children_have_marker) = recurse_simplify(expr);
+    changed |= children_changed;
+    let contains_marker = children_have_marker || is_load_bearing_marker(expr);
+    changed |= apply_simplification_rules(expr, contains_marker);
+    (changed, contains_marker)
 }
 
 /// Recursively apply [`simplify_once`] to all child expressions (bottom-up).
 ///
-/// Returns `true` if any child was modified.
-fn recurse_simplify(expr: &mut Expr) -> bool {
-    let mut changed = expr.fold_children_mut(false, |c, e| c | simplify_once(e));
+/// Returns `(changed, contains_marker)`: whether any child was modified,
+/// and whether any child's subtree contains a load-bearing marker (OR-ed
+/// up so the parent need not re-scan its descendants).
+fn recurse_simplify(expr: &mut Expr) -> (bool, bool) {
+    let (mut changed, has_marker) = expr.fold_children_mut((false, false), |(c, m), e| {
+        let (child_changed, child_has_marker) = simplify_once(e);
+        (c | child_changed, m | child_has_marker)
+    });
     // After simplifying children, propagate the Let body's type up to the Let
     // itself. Simplification can change the body's type (e.g., union flattening
     // rewrites Fun(Union(Union(A,B),C), D) → Fun(Union(A,B,C), D)); the Let
@@ -106,7 +189,7 @@ fn recurse_simplify(expr: &mut Expr) -> bool {
             changed = true;
         }
     }
-    changed
+    (changed, has_marker)
 }
 
 /// Temporarily take ownership of `expr`, leaving a cheap placeholder.
@@ -167,21 +250,37 @@ fn try_string_add_to_concat(expr: &mut Expr) -> bool {
 /// `curry(h)` right-arm of a zip in multi-generator comprehension contexts.
 ///
 /// Returns `true` if any rule fired.
-fn apply_simplification_rules(expr: &mut Expr) -> bool {
+fn apply_simplification_rules(expr: &mut Expr, contains_marker: bool) -> bool {
     let mut changed = false;
+    // Always-safe rules — neither discard sub-expressions nor relocate
+    // iteration sources, so they fire regardless of any markers present.
+    // (They also preserve the subtree's marker set, so `contains_marker` —
+    // computed before they run — is still accurate at the guard below.)
     changed |= check(try_compose_identity(expr), expr);
-    changed |= check(try_const_reduce(expr), expr);
-    changed |= check(try_product_beta_fst(expr), expr);
-    changed |= check(try_product_beta_snd(expr), expr);
-    changed |= check(try_literal_tuple_projection(expr), expr);
-    changed |= check(try_ccc_universal(expr), expr);
-    changed |= check(try_exponential_beta(expr), expr);
-    changed |= check(try_exponential_eta(expr), expr);
-    changed |= check(try_const_apply(expr), expr);
-    changed |= check(try_product_eta(expr), expr);
     changed |= check(try_flatten_compose(expr), expr);
-    changed |= check(try_zip_distribute_compose(expr), expr);
     changed |= check(try_string_add_to_concat(expr), expr);
+
+    // Rules that may discard or restructure sub-expressions.  Equationally
+    // valid only on pure CCC morphisms, so they must not touch a sub-tree
+    // carrying a load-bearing iterate/restrict marker (dropping or
+    // relocating one is a correctness bug — see [`is_load_bearing_marker`]).
+    // `contains_marker` is accumulated bottom-up by [`simplify_once`], so
+    // this guard is O(1) here rather than a fresh subtree scan.  Guarding
+    // on marker-freeness is what lets the rule set run correctly at any
+    // point in the pipeline — the invariant is a property of the *nodes*,
+    // not of pass timing.
+    if !contains_marker {
+        changed |= check(try_const_reduce(expr), expr);
+        changed |= check(try_product_beta_fst(expr), expr);
+        changed |= check(try_product_beta_snd(expr), expr);
+        changed |= check(try_literal_tuple_projection(expr), expr);
+        changed |= check(try_ccc_universal(expr), expr);
+        changed |= check(try_exponential_beta(expr), expr);
+        changed |= check(try_exponential_eta(expr), expr);
+        changed |= check(try_const_apply(expr), expr);
+        changed |= check(try_product_eta(expr), expr);
+        changed |= check(try_zip_distribute_compose(expr), expr);
+    }
 
     changed
 }
@@ -851,6 +950,9 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::ccl_utils::{
+        apply_primitive, make_iterate, make_restrict, trivially_true_predicate,
+    };
     use crate::ccl::lambda_elim::{curry, zip_pair};
     use crate::ccl::{BaseType, Expr};
 
@@ -1230,6 +1332,67 @@ mod tests {
         let expected = typed_compose(vec![aa, f, g, bb]);
 
         assert_eq!(simplify(expr), expected);
+    }
+
+    // -----------------------------------------------------------------
+    // Load-bearing-marker guard
+    //
+    // The discard rules are equationally valid only on pure morphisms;
+    // they must never drop or relocate an iterate/restrict marker.  These
+    // tests pin that guard: a discard-rule-shaped term *containing* a
+    // marker must be left intact, even though the identical marker-free
+    // shape reduces.
+    // -----------------------------------------------------------------
+
+    /// `iterate ≫ (k ▷ const)` is a textbook `try_const_reduce` candidate
+    /// (`f ≫ g ▷ const ⟹ g ▷ const`, which would drop `f` = the iterate
+    /// source).  The marker guard must skip the rule so the iterate
+    /// survives.
+    #[test]
+    fn simplify_preserves_iterate_marker_under_const_reduce() {
+        let const_k = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
+
+        // Sanity: with a plain morphism in the lead, the same shape *does*
+        // reduce — so the rule genuinely fires here and the guard below is
+        // load-bearing, not vacuous.
+        let unguarded = typed_compose2(
+            var("f").with_ty(fun_ty(int_ty(), int_ty())),
+            const_k.clone(),
+        );
+        assert!(
+            !matches!(simplify(unguarded).node, TypedExprNode::Compose(_)),
+            "const-reduce should have collapsed the marker-free compose"
+        );
+
+        // With a load-bearing iterate at the head, the compose is intact.
+        let guarded = typed_compose2(make_iterate(trivially_true_predicate(int_ty())), const_k);
+        assert_eq!(
+            simplify(guarded.clone()),
+            guarded,
+            "const-reduce must not drop the iterate marker"
+        );
+    }
+
+    /// The guard also recognises the nested restrict marker
+    /// `Apply(upstream, Apply(p, Restrict))`: a `restrict`-led filter
+    /// sitting in a const-reduce position must likewise survive.
+    #[test]
+    fn simplify_preserves_restrict_marker_under_const_reduce() {
+        // `restrict(p)` applied to an iterate source: `{Int | p} ⇒ Int`.
+        let pred = apply_primitive(
+            Expr::lit(Lit::Bool(false)).with_ty(Type::Base(BaseType::Bool)),
+            Builtin::Const,
+            fun_ty(int_ty(), Type::Base(BaseType::Bool)),
+        );
+        let restricted = make_restrict(pred, make_iterate(trivially_true_predicate(int_ty())));
+        let const_k = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
+
+        let guarded = typed_compose2(restricted, const_k);
+        assert_eq!(
+            simplify(guarded.clone()),
+            guarded,
+            "const-reduce must not drop the restrict marker"
+        );
     }
 
     /// Exponential eta: curry(⟨.1, .0 ≫ f⟩ ≫ apply)  ⟹  f

@@ -586,7 +586,7 @@ are most legible against the structural expression form
 folding inside predicates, etc.), and runs alongside the existing
 point-free pass — neither replaces the other.
 
-### Planning (`src/ccl/join_plan.rs`)
+### Planning (`src/ccl/planning.rs`)
 
 CCL-to-CCL pass between simplify and operator conversion. Walks the
 AST, identifies every iteration site, and resolves each one to a
@@ -689,7 +689,7 @@ order.
 planning recognizes a group-by:
 pre-bucketize the inner source by `key_fn` once and let the outer
 iteration over `𝑘` look up its bucket per iteration step. This is
-`convert_groupby` in the existing code (`join_plan.rs`),
+`convert_groupby` in the existing code (`planning.rs`),
 rewritten to operate on the new pointful refinement form. Planning
 emits the bucketize-and-lookup CCL chain — `iterate` over the
 distinct-keys side, partition-fetch over the buckets, and the
@@ -918,7 +918,7 @@ use the disambiguated name from the start.
    the dependency information that the special case used to extract
    from the AST structure.
 
-5. **Planning rewrite**: rework `join_plan` to be the single
+5. **Planning rewrite**: rework `planning` to be the single
    planning pass — CCL-to-CCL, walks the AST, identifies iteration
    sites, recognizes specialized patterns (group-by, hash join,
    semi-join, anti-join, ...) and emits their CCL chains, falls
