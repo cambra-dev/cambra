@@ -639,6 +639,16 @@ fn convert_impl(
             Ok(Box::new(Restrict::new(pred_op)))
         }
 
+        // cast(value): pure type-level assertion — re-views `value` under
+        // the (refined) `target` type (set at lowering time by
+        // [`crate::ccl::ccl_utils::make_cast`]).  Runtime semantics is
+        // identity: compile the value and discard the wrapper.  The
+        // refinement encoded in the type has already been consumed by
+        // planning to produce any necessary `iterate(predicate)` or
+        // specialized join chain — by op-conversion time the cast is
+        // value-level inert.
+        TypedExprNode::Cast { value, .. } => convert_impl(value, input, ctx),
+
         // If we are applying an aggregate, then it is a global aggregate that should use the Aggregate operator.
         TypedExprNode::Apply { argument, function }
             if let Some(kind) = as_builtin(function).and_then(builtin_to_aggregate) =>

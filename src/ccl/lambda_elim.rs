@@ -44,7 +44,9 @@ use std::cell::RefCell;
 use std::mem::replace;
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::{is_free, typed_compose, walk_refined_predicates_mut};
+use crate::ccl::ccl_utils::{
+    cast_target_refinement, is_free, typed_compose, walk_refined_predicates_mut,
+};
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
 use crate::ccl::{
@@ -633,6 +635,57 @@ fn elim_lambda_impl(
             } else {
                 Ok(dbg_typecheck_mv(curry(inner_elim)))
             }
+        }
+
+        // TEMPORARY: we should be handling Pi types more generally and once
+        // we do we can delete this and the special-case logic for nested lambdas
+        // with correlated refinements.
+        //
+        // Cast-wrapped lambda: λ x → cast(λ y → body, {𝐷 | 𝑝} ⇒ 𝑉)
+        //   ⟹  rewrite to the legacy refined-lambda shape and recurse so
+        //       the nested-Lambda arm above handles the (possibly
+        //       correlated) refinement uniformly.
+        //
+        // The cast's `target` carries the refined type `Fun(Refinement(_, R), _)`;
+        // we extract `R` and reattach it to the inner lambda's binder as
+        // `Lambda { refinement: Some(R) }`.  Sema: same as
+        // `λ x → λ y [refinement = R] → body` — the inner function's domain
+        // is refined by `R`, and `R`'s predicate may reference `x`
+        // (correlated, see the groupby pattern) or only local binders
+        // (uncorrelated, see the for-filter pattern).  The existing
+        // nested-Lambda + correlated-refinement code path handles both.  This
+        // arm exists because lowering emits the cast shape for these
+        // constructs (see [`crate::ccl::ccl_utils::make_cast`]);
+        // `Expr::lambda_with_refinement` is used only for the internal
+        // reconstruction this arm performs.
+        TypedExprNode::Cast { value, target }
+            if matches!(value.node, TypedExprNode::Lambda { .. }) =>
+        {
+            let refinement = cast_target_refinement(&target)
+                .expect("Cast.target must be Fun(Refinement(_, _), _) (the make_cast invariant)");
+            let TypedExprNode::Lambda {
+                param: y_binding,
+                body: y_body,
+                ..
+            } = value.node
+            else {
+                unreachable!("guard matched Lambda above");
+            };
+            // The legacy lambda's `.ty` must be the refined function type
+            // — the cast's resolved type (`body_ty`) — *not* the inner
+            // lambda's unrefined inferred type.  Without this, the post-elim
+            // chain would advertise an unrefined codomain and
+            // `debug_typecheck` would catch the mismatch.
+            let legacy_lambda = TypedExpr {
+                ty: body_ty.clone(),
+                user_annotation: None,
+                node: TypedExprNode::Lambda {
+                    param: y_binding,
+                    body: y_body,
+                    refinement: Some(refinement),
+                },
+            };
+            return elim_lambda(ctx, param, param_ty, legacy_lambda);
         }
 
         // Application: λ x → e ▷ f  ⟹  ⟨λx→e, λx→f⟩ ≫ apply

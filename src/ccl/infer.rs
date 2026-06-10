@@ -576,6 +576,13 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
             }),
         },
 
+        // Cast: no per-node structural check. `value` is recursed into by
+        // `walk_children` above; the refinement `expr.ty` acquires over
+        // `value.ty` is validated by the strict solver during inference, and
+        // this pass is deliberately refinement-blind (see `strip_refinements_deep`),
+        // so it has nothing to assert about the acquisition here.
+        TypedExprNode::Cast { .. } => {}
+
         // Node type must be Fun; its codomain must match the body type. The
         // domain may be a Refinement-wrapped version of param.ty — we do not
         // recheck that here; the inference pass already validates it.
@@ -696,8 +703,9 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
 /// ([`constrain_subtype`]) during inference proper, where `unrefined ⊀ refined`
 /// holds. This redundant structural sanity pass (slated for removal — see the
 /// `collect_typecheck_errors` TODO) must not re-police refinements, because a
-/// restriction tag rides whichever position the solver coalesced it onto —
-/// a collection's *domain* (a `Restrict` the iteration applies; see
+/// refinement tag rides whichever position the solver coalesced it onto —
+/// a collection's *domain* (where it compiles to a `Restrict` the iteration
+/// applies; see
 /// [`crate::interpreter::operator_conversion`]'s `iterate_type`), a join's
 /// *codomain*, or a whole function — and there is no single subtype direction
 /// that holds for a node vs. its structural reconstruction across those
@@ -706,7 +714,7 @@ fn collect_typecheck_errors(expr: &Expr, errors: &mut Vec<InferError>) {
 /// TODO: drop this strip (and enforce refinements strictly in the post-inference
 /// checks) once the explicit cast operator from
 /// https://github.com/cambra-dev/Cambra/pull/218 lands. The cast makes
-/// "acquiring a restriction" an explicit node that produces a `{T | r}` value,
+/// "acquiring a refinement" an explicit node that produces a `{T | r}` value,
 /// so refinements ride canonical, value-producing positions and a directional
 /// `constrain_subtype` (strict: `unrefined ⊀ refined`) holds end-to-end —
 /// node vs. reconstruction included — with no need to strip.
@@ -973,7 +981,7 @@ fn check_compose_types(node_ty: &Type, morphisms: &[Expr], errors: &mut Vec<Infe
         }
     }
     // Overall node type must be Fun(first_domain, last_codomain). Checked up to
-    // refinements — `typecheck_subtype` is refinement-blind, so a restriction
+    // refinements — `typecheck_subtype` is refinement-blind, so a refinement
     // tag the solver coalesced onto `node_ty` (a groupby key on the whole
     // function, a filter on the domain) doesn't spuriously diverge from the
     // bare reconstruction. The residual relation is genuine width subtyping.

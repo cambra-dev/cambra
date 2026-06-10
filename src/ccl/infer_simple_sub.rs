@@ -285,7 +285,7 @@ impl SimpleSubContext {
     /// `Type`: every `Hole` becomes a fresh inference variable at the
     /// current level. Everything else — including existing `Infer` vars,
     /// the structural variants the solver operates on, and `Refinement`
-    /// wrappers (refinements now ride the lattice as restriction tags) — is
+    /// wrappers (refinements ride the lattice as refinement tags) — is
     /// kept, recursing to normalize nested holes.
     fn normalize_annotation(&self, ty: &Type) -> Type {
         match ty {
@@ -331,7 +331,8 @@ fn emit_annotation_predicates(ty: &Type, ctx: &mut SimpleSubContext) -> Result<(
         Type::Refinement(inner, r) => {
             let RefinementKind::Predicate(def) = &r.kind;
             if let Ok(mut pred) = def.try_borrow_mut() {
-                emit_node(&mut pred, ctx)?;
+                let pred_ty = emit_node(&mut pred, ctx)?;
+                constrain_predicate_bool(&pred_ty, ctx)?;
             }
             emit_annotation_predicates(inner, ctx)
         }
@@ -361,6 +362,20 @@ fn emit_annotation_predicates(ty: &Type, ctx: &mut SimpleSubContext) -> Result<(
             Ok(())
         }
     }
+}
+
+/// Constrain a refinement predicate's inferred type to the closed-function
+/// shape `D ⇒ Bool`. A predicate's body is the membership decision, so its
+/// codomain must be a `Bool` (the current representation — see
+/// `docs/refinement-types-design.md`). `if` filters in list comprehensions and
+/// for-loops lower to such predicates, so this is where a non-Bool guard (e.g.
+/// `[x for x in xs if x]`) is rejected. The domain is left as a fresh variable;
+/// only the codomain is pinned.
+fn constrain_predicate_bool(pred_ty: &Type, ctx: &mut SimpleSubContext) -> Result<(), InferError> {
+    let pred_domain = fresh_var(ctx.level);
+    let expected = fun(pred_domain, prim(BaseType::Bool));
+    constrain_subtype(pred_ty, &expected, &mut ctx.cache)
+        .map_err(|e| map_constrain_err(e, "refinement predicate"))
 }
 
 /// Apply a binary scheme: instantiate, build the expected call shape,
@@ -534,6 +549,35 @@ fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<Type, InferE
             refinement,
         } => emit_lambda(param, body, refinement, ctx)?,
 
+        // Cast: `cast(value, target)` is an upcast — it re-views `value` at
+        // the supertype `target`. Its whole typing rule is the single
+        // subtype obligation `value_ty <: target`.
+        //
+        // For the domain refinement lowering emits, this holds by
+        // contravariance: `D ⇒ V <: {D | p} ⇒ V` because `{D | p} <: D`. The
+        // refinement-aware solver (see `simple_sub::constrain_subtype`'s
+        // refinement arm) flows the tag onto the *fresh* target-domain var,
+        // stacking it onto any tags `value` already carries — so nested casts
+        // (`{D|p} ⇒ V <: {?a|q} ⇒ V`) compose. The result is `target`;
+        // coalesce pins its fresh vars from `value` (the domain var, in
+        // negative position, takes `value`'s domain as an upper bound; the
+        // codomain var takes `value`'s codomain as a lower bound).
+        //
+        // `emit_annotation_predicates` types `target`'s predicate(s) and
+        // enforces the `D ⇒ Bool` shape; `coalesce_type_predicates(&expr.ty)`
+        // resolves them later (the result shares `target`'s tags). A covariant
+        // refinement (`Int <: {Int | p}`) correctly *fails* this subtype check
+        // — acquiring a value-level refinement is a runtime/SMT-checked
+        // narrowing, not an upcast.
+        TypedExprNode::Cast { value, target } => {
+            let value_ty = emit_node(value, ctx)?;
+            emit_annotation_predicates(target, ctx)?;
+            let target_ty = ctx.normalize_annotation(target);
+            constrain_subtype(&value_ty, &target_ty, &mut ctx.cache)
+                .map_err(|e| map_constrain_err(e, "cast"))?;
+            target_ty
+        }
+
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
         TypedExprNode::BinOp { left, op, right } => emit_binop(left, *op, right, ctx)?,
@@ -679,7 +723,7 @@ fn emit_lambda(
     // the solver. A Hole turns into a fresh Var that will accumulate
     // bounds from body usage and call sites. Link `param.ty` to that
     // (shared) var so `coalesce_node` can resolve the binding slot in
-    // place — the slot ends up carrying the body-usage restriction tags
+    // place — the slot ends up carrying the body-usage refinement tags
     // but *not* the lambda's own refinement (that decorates only the
     // function-boundary domain in `expr.ty`).
     let param_simple = ctx.normalize_annotation(&param.ty);
@@ -721,19 +765,20 @@ fn emit_lambda(
     }
 
     // Refinement: lift the lambda's *own* refinement into the inferred
-    // domain so it rides the lattice as a restriction tag (replacing the
-    // old `type_saturate` re-stitch). The AST node keeps its `refinement`
-    // field — `lambda_elim` reads it from there, not from the type, so
-    // there's no double-wrapping. We still walk the predicate so its inner
-    // expressions get inferred types (otherwise downstream consumers see
-    // `Hole`s inside the predicate body). The param is bound in scope under
-    // the *unrefined* `param_simple`, so `Var(param)` body references stay
-    // bare; restriction tags decorate only the function boundary.
+    // domain so it rides the lattice as a refinement tag. The AST node keeps
+    // its `refinement` field — `lambda_elim` reads it from there, not from
+    // the type, so there's no double-wrapping. We still walk the predicate
+    // so its inner expressions get inferred types (otherwise downstream
+    // consumers see `Hole`s inside the predicate body). The param is bound
+    // in scope under the *unrefined* `param_simple`, so `Var(param)` body
+    // references stay bare; refinement tags decorate only the function
+    // boundary.
     let domain_ty = match refinement {
         Some(r) => {
             let RefinementKind::Predicate(def) = &r.kind;
             // The predicate is compiled lazily inside an `Rc<RefCell<Expr>>`.
-            emit_node(&mut def.borrow_mut(), ctx)?;
+            let pred_ty = emit_node(&mut def.borrow_mut(), ctx)?;
+            constrain_predicate_bool(&pred_ty, ctx)?;
             Type::Refinement(Box::new(param_simple), r.clone())
         }
         None => param_simple,
@@ -1236,6 +1281,11 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
             coalesce_node(function, errors);
             coalesce_node(argument, errors);
         }
+        // `target`'s refinement predicate is *not* coalesced here — it rides
+        // `expr.ty` (the constructed `Fun({d | r}, v)` reuses `target`'s tag),
+        // so the `coalesce_type_predicates(&expr.ty)` call at the end of this
+        // function resolves it through the shared `Rc`.
+        TypedExprNode::Cast { value, .. } => coalesce_node(value, errors),
         TypedExprNode::BinOp { left, right, .. } => {
             coalesce_node(left, errors);
             coalesce_node(right, errors);
@@ -1260,7 +1310,7 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
             }
             // `param.ty` is resolved from the lambda's coalesced domain in
             // the end-of-function block (it can't be coalesced standalone:
-            // body-usage restriction tags are negative-polarity upper-bound
+            // body-usage refinement tags are negative-polarity upper-bound
             // facts that only materialize in the contravariant domain
             // position of `expr.ty`).
         }
@@ -1362,11 +1412,11 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
     // compact → simplify → coalesce pipeline to materialize a concrete
     // `Type`.
     //
-    // Refinements now ride the lattice as restriction tags, so a refined
-    // domain coalesces straight onto `expr.ty` here (no `type_saturate`
-    // re-stitch). `lambda_elim` still reads the lambda's own refinement
-    // off the AST node — it is duplicated there deliberately, and the
-    // tag's id-equality dedups any structural overlap downstream.
+    // Refinements ride the lattice as refinement tags, so a refined domain
+    // coalesces straight onto `expr.ty` here. `lambda_elim` reads the
+    // lambda's own refinement off the AST node — it is duplicated there
+    // deliberately, and the tag's id-equality dedups any structural overlap
+    // downstream.
     let label = symbolic(expr);
     match resolve_var_type(&expr.ty) {
         Ok(ty) => expr.ty = ty,
@@ -1377,7 +1427,7 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
     // lambda's *own* refinement layer (that decorates only the function
     // boundary; `lambda_elim` re-wraps it from the AST node). Deriving it
     // from the resolved domain — rather than coalescing the slot var
-    // standalone — is what preserves body-usage restriction tags, which are
+    // standalone — is what preserves body-usage refinement tags, which are
     // negative-polarity facts visible only in the contravariant domain.
     if let TypedExprNode::Lambda {
         param, refinement, ..

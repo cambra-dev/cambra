@@ -65,6 +65,7 @@ use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, Branch, Builtin, CompareKind, Expr,
         Lit, LogicKind, RefinementKind, Type, TypedExprNode, UnaryOpKind,
+        ccl_utils::{make_cast, refined_fn_type},
     },
     chl_parser::ast::{
         AssignTarget, AugOp, BinOp as ChlBinOp, BoolOp, CmpOp, CompClause, Comprehension,
@@ -1021,7 +1022,13 @@ fn lower_call(
 
     match name {
         // groupby(c: I -> A, key_fn: A -> K) lowers to
-        // λ k → λ i :(I | key_fn(c(i)) == k) → c(i)
+        //   λ k → cast({I | λ r → key_fn(c(r)) == k} ⇒ A, λ i → c(i))
+        //
+        // The cast wraps the (unrefined) inner λ i → c(i) under a function
+        // type whose domain carries the partition predicate.  The
+        // predicate captures `k` from the outer lambda's scope —
+        // surfacing this as the canonical "dependent refinement" site
+        // without a dedicated AST shape.
         "groupby" => {
             if args.len() != 2 {
                 return Err(LoweringError::unsupported(
@@ -1032,24 +1039,22 @@ fn lower_call(
             let collection = lower_expr(&args[0], ctx)?;
             let key_fn = lower_expr(&args[1], ctx)?;
 
+            let pred_lambda = Expr::lambda(
+                "__gb_r",
+                Type::Hole,
+                Expr::binop(
+                    Expr::apply(Expr::apply(Expr::var("__gb_r"), collection.clone()), key_fn),
+                    BinOpKind::Compare(CompareKind::Equals),
+                    Expr::var("__gb_k"),
+                ),
+            );
+            let inner_body = Expr::apply(Expr::var("__gb_i"), collection);
+            let unrefined_inner = Expr::lambda("__gb_i", Type::Hole, inner_body);
+            let target_ty = refined_fn_type(Type::Hole, pred_lambda, Type::Hole, "groupby");
             Ok(Expr::lambda(
                 "__gb_k",
                 Type::Hole,
-                Expr::lambda_with_refinement(
-                    "__gb_i",
-                    Type::Hole,
-                    Expr::apply(Expr::var("__gb_i"), collection.clone()),
-                    Expr::lambda(
-                        "__gb_r",
-                        Type::Hole,
-                        Expr::binop(
-                            Expr::apply(Expr::apply(Expr::var("__gb_r"), collection), key_fn),
-                            BinOpKind::Compare(CompareKind::Equals),
-                            Expr::var("__gb_k"),
-                        ),
-                    ),
-                    "groupby",
-                ),
+                make_cast(unrefined_inner, target_ty),
             ))
         }
         "sum" | "max" => {
@@ -2476,13 +2481,16 @@ fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Ex
                 Expr::lambda(iter_var, Type::Hole, pred_expr),
             );
         }
-        Ok(Expr::lambda_with_refinement(
-            outer_var,
-            Type::Hole,
-            body_expr,
-            Expr::lambda(restr_outer_var, Type::Hole, pred_expr),
-            &pred_desc,
-        ))
+        // Lowering emits a `cast(refined_fn_type, λ outer_var → body_expr)`
+        // here — a pure type-level assertion of the predicate-refined
+        // domain.  The refinement is carried by the cast's target type; the
+        // Cast Apply arm in `infer_simple_sub` constructs the refined result
+        // from it, and the generic annotation handler infers the predicate's
+        // sub-expressions.
+        let pred_lambda = Expr::lambda(restr_outer_var, Type::Hole, pred_expr);
+        let unrefined_lambda = Expr::lambda(outer_var, Type::Hole, body_expr);
+        let target_ty = refined_fn_type(Type::Hole, pred_lambda, Type::Hole, &pred_desc);
+        Ok(make_cast(unrefined_lambda, target_ty))
     } else {
         Ok(Expr::lambda(outer_var, Type::Hole, body_expr))
     }
@@ -3470,22 +3478,22 @@ f";
     // Variable collection and inline key lambda
     #[case(
         "groupby(xs, lambda x: x)",
-        "λ __gb_k → λ __gb_i : {??? | (λ __gb_r → __gb_r ▷ xs ▷ (λ x → x) == __gb_k)} → __gb_i ▷ xs"
+        "λ __gb_k → cast(({_ | λ __gb_r → __gb_r ▷ xs ▷ (λ x → x) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], lambda x: x // 2)",
-        "λ __gb_k → λ __gb_i : {??? | (λ __gb_r → __gb_r ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k)} → __gb_i ▷ [1, 2, 3]"
+        "λ __gb_k → cast(({_ | λ __gb_r → __gb_r ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
     )]
     // Key is a variable reference (pre-defined function)
     #[case(
         "groupby(xs, key_fn)",
-        "λ __gb_k → λ __gb_i : {??? | (λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k)} → __gb_i ▷ xs"
+        "λ __gb_k → cast(({_ | λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "λ __iter_record → __iter_record ▷ (λ __gb_k → λ __gb_i : {??? | (λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k)} → __gb_i ▷ xs) ▷ (λ x → Sum(x))"
+        "λ __iter_record → __iter_record ▷ (λ __gb_k → cast(({_ | λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

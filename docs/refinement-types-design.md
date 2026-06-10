@@ -892,9 +892,11 @@ use the disambiguated name from the start.
 
 1. **Type system additions**: change `Type::Fun` to its struct-form
    with `name: Option<String>`. Update the `Refinement` struct
-   shape. Add `Builtin::Cast` and `Builtin::Iterate` to the
-   `Builtin` enum, along with their type signatures in the
-   builtin-stamping logic. Stub out exhaustive-match arms with
+   shape. Add a `TypedExprNode::Cast { value, target }` node and
+   `Builtin::Iterate` to the `Builtin` enum (cast is a node, not a
+   builtin — it carries its own typing rule and structural shape),
+   along with their type signatures in the builtin-stamping logic.
+   Stub out exhaustive-match arms with
    `unimplemented!` everywhere they're needed. The compile-error
    count provides a touch-point inventory.
 
@@ -961,7 +963,7 @@ use the disambiguated name from the start.
 9. **Remove `Builtin::Restrict`**: once steps 1–8 have landed and
    the migration is complete, delete the `Builtin::Restrict` variant
    and its supporting code. Its responsibilities are now split
-   between `Builtin::Cast` (lowering) and `Builtin::Iterate`
+   between the `Cast` node (lowering) and `Builtin::Iterate`
    (planning).
 
 ## Appendix: worked example for `groupby`

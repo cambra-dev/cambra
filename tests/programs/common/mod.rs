@@ -39,10 +39,11 @@
 //! use super::common::expect_scalar_currently_buggy;
 //!
 //! #[test]
-//! fn filter_and_aggregate_currently_buggy() {
-//!     // Should be 253; currently 345 because the if-clause is dropped
-//!     // when the comprehension source is a let-bound list.
-//!     expect_scalar_currently_buggy(include_str!("program.cambra"), "345");
+//! fn some_known_bug() {
+//!     // State the *correct* output in the comment; pin the current wrong
+//!     // output as the argument so the test goes red the moment the bug is
+//!     // fixed (fully or partially) and prompts an update.
+//!     expect_scalar_currently_buggy(include_str!("program.cambra"), "<current wrong output>");
 //! }
 //! ```
 //!
@@ -146,6 +147,7 @@ pub fn expect_compile_error(source: &str, needle: &str) {
 /// and prompts an update.  The doc comment on the test function should say
 /// what the *correct* output would be so the eventual fixer knows the
 /// target.
+#[allow(dead_code)] // Reserved for future "pin current buggy output" tests.
 pub fn expect_scalar_currently_buggy(source: &str, current_buggy_output: &str) {
     let tile = run_to_tile(source);
     let actual = tile_to_canonical(tile);

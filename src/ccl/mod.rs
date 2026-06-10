@@ -528,8 +528,8 @@ impl Builtin {
     ///   and `LastOrDefault` are in this list because they self-iterate
     ///   from sub-parts of their tuple argument, but the walk's
     ///   per-shape match arms handle them before the catch-all that
-    ///   consults this method — so the per-element wrapping fires first
-    ///   and the catch-all is never reached for them.
+    ///   consults this metho — so the per-element wrapping fires first
+    ///   and the catch-all isd never reached for them.
     /// - `is_iteration_bearing` — at chain heads, decides which builtins
     ///   already provide their own iteration (and so should not be
     ///   wrapped with another `iterate(_)`).  Scalar-result builtins
@@ -776,6 +776,54 @@ pub enum TypedExprNode {
         argument: Box<TypedExpr>,
     },
 
+    /// Pure type-level assertion that re-views `value` under `target`.
+    ///
+    /// `cast(value, target)` does not change `value`'s runtime data — it
+    /// asserts that `value` may be viewed at `target`.  Today the only
+    /// `target` shape lowering emits is `Fun(Refinement(_, _), _)`: a
+    /// function type whose domain carries a refinement predicate, so the
+    /// cast attaches a refinement to a function's domain.  Lowering emits
+    /// it for list-comprehension filters, for-loop `if`-guards, and
+    /// `groupby` (see [`crate::ccl::ccl_utils::make_cast`]).
+    ///
+    /// `Cast` is an **upcast**: its whole typing rule is the single subtype
+    /// obligation `value_ty <: target`.  For the domain refinement lowering
+    /// emits, that holds by contravariance — `(𝐷 ⇒ 𝑉) <: ({𝐷 | 𝑝} ⇒ 𝑉)`
+    /// because `{𝐷 | 𝑝} <: 𝐷` — so viewing an unrefined-domain collection
+    /// function at a refined-domain type is sound.  The
+    /// refinement-aware solver ([`crate::ccl::simple_sub::constrain_subtype`])
+    /// flows the tag onto the fresh target-domain variable, *stacking* it
+    /// onto any tags the value already carries, so nested casts compose
+    /// (nested list comprehensions).  `target`'s predicate is inferred by the
+    /// same `emit_annotation_predicates` / `coalesce_type_predicates` path as
+    /// any refinement-bearing type.  A *covariant* refinement (e.g. casting
+    /// `Int` to `{Int | p}`) correctly fails the subtype check — acquiring a
+    /// value-level refinement is a runtime/SMT-checked narrowing, not an
+    /// upcast.
+    ///
+    /// `target` is the lowering-time *specification* (its domain/codomain
+    /// are typically `Type::Hole`, carrying only the refinement); the
+    /// resolved cast type lands on [`TypedExpr::ty`] after inference — the
+    /// same split as [`TypedExpr::user_annotation`] vs `ty` elsewhere.
+    ///
+    /// `Cast` denotes a pure value (it re-views another value), so it
+    /// satisfies the CCL purity invariant.  At runtime it is a no-op:
+    /// op-conversion compiles `value` and discards the wrapper, because the
+    /// refinement on the type has already been consumed by planning.
+    ///
+    /// TODO: the name `Cast` is more general than the current
+    /// implementation, which only honours `Fun(Refinement(_, _), _)`
+    /// targets.  Either generalize to the full `𝑈 ⇒ 𝑇` semantics or
+    /// rename narrower (`Refine`, `AssertDomain`).  See
+    /// `docs/refinement-types-design.md` for the migration plan.
+    Cast {
+        /// The value being re-viewed under `target`.
+        value: Box<TypedExpr>,
+        /// The target type to view `value` at — a `Fun(Refinement(_, _), _)`
+        /// carrying the domain refinement to acquire.
+        target: Type,
+    },
+
     /// A binary operation.
     BinOp {
         /// The left-hand operand.
@@ -803,11 +851,19 @@ pub enum TypedExprNode {
         param: TypedBinding,
         /// The lambda body.
         body: Box<TypedExpr>,
-        /// Refinement on the param type computed by this lambda.
+        /// **Transitional.** Refinement on the param type computed by
+        /// this lambda — kept only as an internal scratch shape used by
+        /// [`crate::ccl::lambda_elim`] to dispatch the cast-wrapped-lambda
+        /// pattern through the existing correlated-refinement code path.
         ///
-        /// This is a separate field from `param.ty` because it can be set
-        /// before the type is known, and its presence indicates that the
-        /// refinement should be interpreted in the scope of this lambda.
+        /// Lowering does not populate this field: it emits a
+        /// [`TypedExprNode::Cast`] node ([`crate::ccl::ccl_utils::make_cast`])
+        /// instead, and [`crate::ccl::lambda_elim`] reconstructs this field
+        /// from that node for `groupby`.  The field will be removed once
+        /// `convert_groupby` / `replace_curried_correlated_refinements` in
+        /// [`crate::ccl::planning`] recognise the `Cast` node directly
+        /// (planning rewrite step).  See the migration plan in
+        /// `docs/refinement-types-design.md`.
         refinement: Option<Refinement>,
     },
 
@@ -1430,6 +1486,17 @@ impl TypedExpr {
         })
     }
 
+    /// Construct a [`TypedExprNode::Cast`] re-viewing `value` under `target`.
+    ///
+    /// Prefer [`crate::ccl::ccl_utils::make_cast`], which enforces the
+    /// `target` shape contract; this is the bare constructor it builds on.
+    pub fn cast(value: TypedExpr, target: Type) -> Self {
+        Self::new(TypedExprNode::Cast {
+            value: Box::new(value),
+            target,
+        })
+    }
+
     /// Build an unannotated or pre-annotated [`TypedExprNode::Lambda`].
     ///
     /// Pass [`Type::Hole`] for `param_ty` when the parameter type is not yet
@@ -1527,6 +1594,9 @@ impl TypedExpr {
                 f(function);
                 f(argument);
             }
+            // Only `value` is an expression child; `target` is a type (its
+            // refinement predicate is reached via type walks, not here).
+            TypedExprNode::Cast { value, .. } => f(value),
             TypedExprNode::BinOp { left, right, .. } => {
                 f(left);
                 f(right);
@@ -1665,6 +1735,9 @@ impl TypedExpr {
                 f(function);
                 f(argument);
             }
+            // Only `value` is an expression child; `target` is a type (its
+            // refinement predicate is reached via type walks, not here).
+            TypedExprNode::Cast { value, .. } => f(value),
             TypedExprNode::BinOp { left, right, .. } => {
                 f(left);
                 f(right);

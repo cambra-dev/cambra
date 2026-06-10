@@ -806,6 +806,11 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
                 argument: Box::new(argument),
             }
         }
+        // `cast` wraps a pure value; recurse into it and keep `target`.
+        TypedExprNode::Cast { value, target } => TypedExprNode::Cast {
+            value: Box::new(rewrite_chains_in_scope(*value, ctx)),
+            target,
+        },
         TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
             left: Box::new(rewrite_chains_in_scope(*left, ctx)),
             op,
@@ -1015,6 +1020,13 @@ fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
         TypedExprNode::Apply { function, argument } => TypedExprNode::Apply {
             function: Box::new(pre_infer_substitute(*function, name, replacement)),
             argument: Box::new(pre_infer_substitute(*argument, name, replacement)),
+        },
+        // Recurse into the wrapped value; `target` (a type) is left as-is,
+        // mirroring how the prior `Apply(_, Cast)` form left its
+        // `user_annotation`-borne target untouched.
+        TypedExprNode::Cast { value, target } => TypedExprNode::Cast {
+            value: Box::new(pre_infer_substitute(*value, name, replacement)),
+            target,
         },
         TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
             left: Box::new(pre_infer_substitute(*left, name, replacement)),
@@ -1325,6 +1337,10 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
             function: Box::new(drop_expr_stmts(*function)),
             argument: Box::new(drop_expr_stmts(*argument)),
         },
+        TypedExprNode::Cast { value, target } => TypedExprNode::Cast {
+            value: Box::new(drop_expr_stmts(*value)),
+            target,
+        },
         TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
             left: Box::new(drop_expr_stmts(*left)),
             op,
@@ -1427,6 +1443,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
             assert_no_defer_residue(function)?;
             assert_no_defer_residue(argument)
         }
+        TypedExprNode::Cast { value, .. } => assert_no_defer_residue(value),
         TypedExprNode::BinOp { left, right, .. } => {
             assert_no_defer_residue(left)?;
             assert_no_defer_residue(right)
@@ -2152,6 +2169,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<String> {
                 rec(function, bound, out);
                 rec(argument, bound, out);
             }
+            TypedExprNode::Cast { value, .. } => rec(value, bound, out),
             TypedExprNode::BinOp { left, right, .. } => {
                 rec(left, bound, out);
                 rec(right, bound, out);
@@ -3008,6 +3026,21 @@ fn extract_for_defer(
                 }
             }
         }
+        // `cast` wraps a pure value; recurse into it and keep `target`. (The
+        // prior `Apply(_, Cast)` form fell through to the Apply else-branch,
+        // which likewise recursed only into the value — the smart-walk
+        // patterns never fire on a `Cast` function position.)
+        TypedExprNode::Cast { value, target } => TypedExprNode::Cast {
+            value: Box::new(extract_for_defer(
+                *value,
+                defer_name,
+                feeds,
+                define,
+                in_inner_scope,
+                ctx,
+            )?),
+            target,
+        },
         TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
             left: Box::new(extract_for_defer(
                 *left,

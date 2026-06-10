@@ -232,6 +232,20 @@ fn test_list_comp_with_filter() {
     );
 }
 
+#[test]
+fn test_list_comp_non_bool_filter_rejected() {
+    // [x for x in [1, 2, 3] if x] — the filter `x` is an Int, not a Bool.
+    // The `if` guard lowers to a refinement predicate (a closed function
+    // `D ⇒ Bool`); inference must reject the non-Bool predicate body rather
+    // than silently accepting it.
+    let errs = infer_program_err("[x for x in [1, 2, 3] if x]");
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, InferError::TypeMismatch { .. })),
+        "expected a TypeMismatch from the non-Bool filter, got {errs:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Aggregate tests
 // ---------------------------------------------------------------------------

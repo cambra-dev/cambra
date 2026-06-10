@@ -177,6 +177,23 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Apply, rendered_ap)
         }
 
+        // Cast renders as `cast(value)` post-inference, or
+        // `cast(target, value)` pre-inference.  After inference the refined
+        // target type lives on `expr.ty` and is surfaced separately by callers
+        // (`symbolic_typed` and the test harness append a `:type` suffix to
+        // the outer expression), so inlining `target` here just duplicates
+        // information and bloats nested-cast dumps quadratically.  Before
+        // inference, `expr.ty` is still a `Hole`/`Infer` placeholder and
+        // `target` is the only place the type is visible, so render it inline.
+        TypedExprNode::Cast { value, target } => {
+            let rendered_arg = fmt(value, Precedence::Lowest, opts);
+            let text = match &expr.ty {
+                Type::Hole | Type::Infer(_) => format!("cast({target}, {rendered_arg})"),
+                _ => format!("cast({rendered_arg})"),
+            };
+            (Precedence::Atom, text)
+        }
+
         TypedExprNode::Lambda {
             param,
             body,

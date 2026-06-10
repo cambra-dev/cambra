@@ -219,6 +219,18 @@ Generator expressions `(expr for x in xs)` are lowered via `lower_list_comp` to 
 
 The result type is `Fun(K, Fun(UInt, V))` where `K` is the key type and `V` is the element type. The outer function maps a key to a group; the inner function maps an unsigned index to an element within that group — the same encoding used for lists (`Fun(UIntRange(n), V)`), but with an unbounded `UInt` domain since group sizes are not known statically.
 
+### `Cast` — explicit refinement acquisition
+
+`Cast { value, target }` is a pure type-level assertion that re-views `value` under `target`. It is a node (not a `Builtin`) because it has its own typing rule and its own structural shape — modelling it as `Apply(value, Cast)` with the target hidden on `user_annotation` forced every traversal to special-case the `Apply`-with-Cast-head pattern and read the target out of a side field. The node makes both the value child and the target type first-class.
+
+Lowering ([`ccl_utils::make_cast`]) emits it for list-comprehension filters, for-loop `if`-guards, and `groupby`. The only `target` shape lowering produces today is `Fun(Refinement(_, 𝑝), _)`: a function type whose domain carries the predicate `𝑝`, so the cast attaches a refinement to a collection function's domain. `target` is the lowering-time *specification* (its domain/codomain are typically `Type::Hole`, carrying only the refinement); the resolved cast type lands on `expr.ty` after inference — the same `user_annotation`-vs-`ty` split used elsewhere.
+
+`Cast` is an **upcast**: its whole typing rule is the single subtype obligation `value_ty <: target`. For the domain refinement lowering emits, that holds by contravariance — `(𝐷 ⇒ 𝑉) <: ({𝐷 | 𝑝} ⇒ 𝑉)` because `{𝐷 | 𝑝} <: 𝐷` — so viewing an unrefined-domain collection function at a refined-domain type is sound. The refinement-aware solver (`simple_sub::constrain_subtype`'s refinement arm) flows the demanded tag onto the *fresh* target-domain variable, *stacking* it onto any tags the value already carries, so chained casts (nested list comprehensions: `{𝐷|𝑝} ⇒ 𝑉 <: {?a|𝑞} ⇒ 𝑉`) compose. The result is `target`; coalesce pins its fresh vars from `value` (the domain var, in negative position, takes `value`'s domain as an upper bound; the codomain var takes `value`'s codomain as a lower bound). `target`'s predicate is inferred and coalesced by the same `emit_annotation_predicates` / `coalesce_type_predicates` path as any refinement-bearing type. A *covariant* refinement (casting `Int` to `{Int | 𝑝}`) correctly *fails* the subtype check — acquiring a value-level refinement is a runtime/SMT-checked narrowing, not an upcast.
+
+This relies on the solver flowing a demanded refinement tag onto a *variable base* under a refinement layer (`{?a | 𝑞} <: {𝐷 | 𝑝}` records `?a <: {𝐷 | 𝑝}` rather than rejecting on `{𝑝} ⊄ {𝑞}`). An earlier implementation worked around the solver lacking this by *constructing* the refined result type from the value plus `target`'s tag; once the refinement arm learned to flow the deficit onto a variable base (the refinement analog of how the record/function arms thread structure through variables), the cast collapsed to the plain upcast above.
+
+`lambda_elim` has a transitional arm that recognises `Cast { value: Lambda, .. }` as the body of an outer lambda and reconstructs the legacy `Lambda { refinement: Some(R) }` shape (reading `R` from `target`) so `convert_groupby` keeps working. Casts that are not a lambda body — top-level filter / for-loop guards wrapping point-free code — survive `lambda_elim` (the standard structural recursion descends into `value` and keeps the wrapper) and propagate through to op-conversion, which compiles them as a pure pass-through: the refinement lives on `expr.ty` and is consumed by planning (`operator_conversion::iterate_type` turns a domain refinement into a `Restrict`) before reaching the tile graph. The migration plan toward a general `𝑈 ⇒ 𝑇` cast — and removal of the `Lambda::refinement` scratch field — is in `docs/refinement-types-design.md`.
+
 ### `Case` only — no `IfThenElse`
 
 CHL `if/else`, `elif` chains, and ternary `if` expressions are all lowered to `Case` during CHL → CCL lowering. There is no `IfThenElse` node in the CCL AST. `Case` subsumes all multi-way branching.
@@ -356,6 +368,10 @@ enum TypedExprNode {
       function: Box<TypedExpr>,
       argument: Box<TypedExpr>
     },         // unary application: f(x) == x ▷ f
+    Cast {
+        value: Box<TypedExpr>,   // the value being re-viewed
+        target: Type,            // Fun(Refinement(_, _), _): the type to view it at
+    },         // pure type-level assertion; see "Cast — explicit refinement acquisition" below
     BinOp{
       left: Box<TypedExpr>,
       op: BinOpKind,
@@ -747,7 +763,7 @@ simplify(expr)
 `simplify` brackets the marker pass on both sides — the same marker-aware pass, not two modes:
 
 - The **pre-marker `simplify`** runs on an iterate-free AST.  Hash-join pattern detection needs canonical refinement predicates (`(x, y) ▷ zip ≫ eq` rather than partially-simplified variants); with no markers present, every rule fires.
-- The **post-marker `simplify`** absorbs the `id` leaves and nested `Compose` boilerplate that `replace_tuple_project_with_id` produces while planning a hash join.  Safety here is a property of the *nodes*, not of pass timing: `simplify`'s structural-discard rules (`try_const_reduce`, `try_product_beta_fst`/`_snd`, `try_literal_tuple_projection`, `try_ccc_universal`, `try_exponential_eta`, …) self-guard on a marker-freeness check — `simplify_once` accumulates "this sub-tree contains a load-bearing marker" bottom-up (OR-ing `is_load_bearing_marker` over the node and its children) and the discard rules refuse to fire whenever it holds, because an `Apply(_, Iterate)` at a chain head *is* the iteration source for everything downstream and an `Apply(_, Restrict)` is a load-bearing filter whose removal silently widens the result set.  Reductions of fully marker-free sub-trees remain sound (they are pure CCC morphisms), so no separate iterate-safe mode is needed.
+- The **post-marker `simplify`** absorbs the `id` leaves and nested `Compose` boilerplate that `replace_tuple_project_with_id` produces while planning a hash join.  Safety here is a property of the *nodes*, not of pass timing: `simplify`'s structural-discard rules (`try_const_reduce`, `try_product_beta_fst`/`_snd`, `try_literal_tuple_projection`, `try_ccc_universal`, `try_exponential_eta`, …) self-guard on an iteration-freeness check — `simplify_once` accumulates "this sub-tree contains an `iterate` source" bottom-up (OR-ing `is_iteration` over the node and its children) and the discard rules refuse to fire whenever it holds, because an `Apply(_, Iterate)` at a chain head *is* the iteration source for everything downstream, so dropping it strands the chain.  Only `iterate` needs guarding: a `restrict` filter is always applied to an iterate-bearing upstream, so it is never separable from its source and the same guard protects it transitively.  Reductions of fully iteration-free sub-trees remain sound (they are pure CCC morphisms), so no separate iterate-safe mode is needed.
 
 ### Hash Joins
 

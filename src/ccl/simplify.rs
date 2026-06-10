@@ -8,10 +8,9 @@
 //!
 //! [`simplify`] runs the rule set to a fixed point and is safe at any point
 //! in the pipeline.  There is no mode: the structural-discard rules
-//! self-guard on [`contains_load_bearing_marker`], so they fire on pure CCC
-//! morphisms but never drop or relocate an `Apply(_, Iterate)` /
-//! `Apply(_, Restrict)` marker.  Before
-//! `crate::ccl::planning::insert_iterate_markers` no markers exist (every
+//! self-guard on [`is_iteration`], so they fire on pure CCC morphisms but
+//! never drop an `Apply(_, Iterate)` iteration source.  Before
+//! `crate::ccl::planning::insert_iterate_markers` no `iterate` exists (every
 //! rule fires); afterwards the always-safe rules still absorb the `id` /
 //! nested-`Compose` leftovers from the hash-join rewrite.
 //!
@@ -21,17 +20,18 @@
 //! consecutive `(elts[i], elts[i+1])` pair inside an n-ary
 //! [`TypedExprNode::Compose`] and fire on the first matching pair.
 //!
-//! The **Marker-guarded?** column flags whether a rule is gated on
-//! [`contains_load_bearing_marker`].  A rule is *unguarded* (✓ — always
-//! safe) iff it preserves every sub-expression of the input (and therefore
-//! every iterate/restrict marker inside any of them).  A *guarded* rule (✗)
-//! is one that drops or relocates a sub-expression whose purity it cannot
-//! verify; it must not fire on a sub-tree containing a marker, because an
-//! `Apply(_, Iterate)` at a chain head *is* the iteration source for
-//! everything downstream, and an `Apply(_, Restrict)` carries a load-bearing
-//! filter whose removal silently widens the result set.
+//! The **Iteration-guarded?** column flags whether a rule is gated on
+//! [`is_iteration`].  A rule is *unguarded* (✓ — always safe) iff it
+//! preserves every sub-expression of the input (and therefore every
+//! `iterate` inside any of them).  A *guarded* rule (✗) drops or relocates a
+//! sub-expression whose purity it cannot verify; it must not fire on a
+//! sub-tree containing an `iterate`, because an `Apply(_, Iterate)` at a
+//! chain head *is* the iteration source for everything downstream — dropping
+//! it strands the chain (op-conversion then errors).  A `restrict` filter is
+//! always applied to an iterate-bearing upstream, so this single guard
+//! protects it transitively; it needs no check of its own.
 //!
-//! | Rule | Pattern | Reduction | Marker-guarded? |
+//! | Rule | Pattern | Reduction | Iteration-guarded? |
 //! |------|---------|-----------|-----------------|
 //! | Compose identity | `… ≫ id ≫ …` / `… ≫ id ≫ …` | remove `id` | ✓ |
 //! | Const reduce | `f ≫ g ▷ const` | `g ▷ const` | ✗ (drops `f`) |
@@ -63,38 +63,53 @@ fn is_builtin(expr: &Expr, b: Builtin) -> bool {
 // Simplification pass
 // ---------------------------------------------------------------------------
 
-/// Returns `true` if `expr` is *itself* a load-bearing iteration marker —
-/// an `Apply(_, Iterate)` chain-head source or an `Apply(_, Restrict)`
-/// filter transformer.  This is the per-node test only; the subtree-wide
-/// "contains a marker" property is accumulated bottom-up in
+/// Returns `true` if `expr` is *itself* an iteration source — an
+/// `Apply(_, Iterate)` chain head.  This is the per-node test only; the
+/// subtree-wide "contains an iteration" property is accumulated bottom-up in
 /// [`simplify_once`] (OR-ing this node's result with its children's) and
-/// threaded to the discard-rule guard in [`apply_simplification_rules`],
-/// so the subtree is never re-scanned at every node.
+/// threaded to the discard-rule guard in [`apply_simplification_rules`], so
+/// the subtree is never re-scanned at every node.
 ///
-/// Note the restrict transformer appears nested inside its application,
-/// `Apply(upstream, Apply(p, Restrict))`: the inner `Apply(p, Restrict)`
-/// node — which sits in the outer Apply's `function` position — is the one
-/// this predicate flags, and `walk_children_mut` visits it so the flag
-/// propagates up to the application.
+/// `iterate`, emitted by `crate::ccl::planning::insert_iterate_markers`, is
+/// *not* a pure CCC morphism: it is the iteration source for everything
+/// downstream, so dropping it strands the chain (op-conversion errors).  The
+/// structural-discard / restructure rewrite rules are equationally valid only
+/// on pure morphisms, so they consult the accumulated guard and refuse to fire
+/// on any sub-tree that contains an `iterate`.  That makes the rule set correct
+/// at any point in the pipeline — before *or* after iterate insertion — which
+/// is why [`simplify`] needs no mode parameter.
 ///
-/// These markers, emitted by `crate::ccl::planning::insert_iterate_markers`,
-/// are *not* pure CCC morphisms: an iterate is the iteration source for
-/// everything downstream (dropping it strands the chain — op-conversion
-/// errors), and a restrict is a filter whose removal silently widens the
-/// result set.  The structural-discard / restructure rewrite rules are
-/// equationally valid only on pure morphisms, so they consult the
-/// accumulated guard and refuse to fire on any sub-tree that contains a
-/// marker.  That makes the rule set correct at any point in the pipeline —
-/// before *or* after marker insertion — which is why [`simplify`] needs no
-/// mode parameter.
-fn is_load_bearing_marker(expr: &Expr) -> bool {
+/// **Only `iterate` needs guarding.**  A `restrict` filter
+/// (`Apply(upstream, Apply(p, Restrict))`) is always emitted *applied to* an
+/// iterate-bearing upstream (see `crate::ccl::planning`), so it is never
+/// separable from its iteration source: any discard rule that would drop a
+/// `restrict` also drops the `iterate` in its upstream, which this guard
+/// already catches.  Guarding `iterate` therefore protects `restrict`
+/// transitively — there is no need to flag `restrict` (or any other filter)
+/// directly.
+///
+/// **Why `cast` is deliberately *not* guarded here.** A
+/// [`TypedExprNode::Cast`] carries a domain refinement (a filter) on its type,
+/// so it is tempting to protect it the same way — dropping a cast looks like a
+/// "filter silently dropped" hazard.  It is not, and adding the guard
+/// regresses real reductions (witness: `test_new_compile::case_27` in
+/// `tests/compilation_pipeline.rs`).  No rule matches a `Cast` node (the
+/// simplify rules operate on `Apply`/`Compose`), so none collapses `cast(v)`
+/// to `v` directly; a rule only *drops a sub-tree containing a cast* when that
+/// sub-tree is extensionally dead — a tuple arm a later `Proj` discards
+/// (`⟨a, b ▷ cast⟩ ≫ .0 ⟹ a`), or the input of a `const` that ignores it.  A
+/// dead cast carries a dead filter, so pruning it is sound; a cast feeding a
+/// *consumed* collection (the `filter_and_aggregate` case) sits in a live
+/// position no discard rule touches, and casts are freely duplicated, so a
+/// live occurrence survives even when a dead duplicate is pruned.  The one
+/// drop rule that keeps a refinement-bearing position alive,
+/// `try_const_reduce`, re-stamps the dropped operand's *domain* — refinement
+/// included — onto the rewritten `const`, so planning still sees the filter.
+fn is_iteration(expr: &Expr) -> bool {
     matches!(
         &expr.node,
         TypedExprNode::Apply { function, .. }
-            if matches!(
-                &function.node,
-                TypedExprNode::Builtin(Builtin::Iterate | Builtin::Restrict)
-            )
+            if matches!(&function.node, TypedExprNode::Builtin(Builtin::Iterate))
     )
 }
 
@@ -102,13 +117,13 @@ fn is_load_bearing_marker(expr: &Expr) -> bool {
 /// occur (bottom-up fixed-point iteration).
 ///
 /// Safe to run at any point in the pipeline.  The structural-discard rules
-/// self-guard on [`contains_load_bearing_marker`], so they fire on pure
-/// CCC morphisms — pre-iterate-insertion CCL, or marker-free sub-trees of
-/// post-insertion CCL — but never drop or relocate an iterate/restrict
-/// marker.  (Before `crate::ccl::planning::insert_iterate_markers` no
-/// markers exist, so every rule fires; afterwards the always-safe rules
-/// still absorb the `id` / nested-`Compose` leftovers from the hash-join
-/// rewrite's `replace_tuple_project_with_id`.)
+/// self-guard on [`is_iteration`], so they fire on pure CCC morphisms —
+/// pre-iterate-insertion CCL, or iteration-free sub-trees of post-insertion
+/// CCL — but never drop an `iterate` source.  (Before
+/// `crate::ccl::planning::insert_iterate_markers` no `iterate` exists, so
+/// every rule fires; afterwards the always-safe rules still absorb the `id` /
+/// nested-`Compose` leftovers from the hash-join rewrite's
+/// `replace_tuple_project_with_id`.)
 pub fn simplify(mut expr: Expr) -> Expr {
     while simplify_once(&mut expr).0 {}
     expr
@@ -116,15 +131,14 @@ pub fn simplify(mut expr: Expr) -> Expr {
 
 /// One bottom-up simplification pass over the subtree at `expr`.
 ///
-/// Returns `(changed, contains_marker)`:
+/// Returns `(changed, contains_iteration)`:
 /// - `changed` — whether any rule fired anywhere in the subtree.
-/// - `contains_marker` — whether the subtree contains a load-bearing
-///   iterate/restrict marker ([`is_load_bearing_marker`]).  Computed
-///   bottom-up: OR the children's results (from [`recurse_simplify`]) with
-///   whether this node is itself a marker.  Passing it to
-///   [`apply_simplification_rules`] lets the discard-rule guard read it in
-///   O(1) instead of re-scanning the whole subtree at every node — the
-///   re-scan was O(n²) over the long compose chains planning emits.
+/// - `contains_iteration` — whether the subtree contains an `iterate` source
+///   ([`is_iteration`]).  Computed bottom-up: OR the children's results (from
+///   [`recurse_simplify`]) with whether this node is itself an `iterate`.
+///   Passing it to [`apply_simplification_rules`] lets the discard-rule guard
+///   read it in O(1) instead of re-scanning the whole subtree at every node —
+///   the re-scan was O(n²) over the long compose chains planning emits.
 fn simplify_once(expr: &mut Expr) -> (bool, bool) {
     let mut changed = false;
     if let Type::Fun(domain, _) = &mut expr.ty
@@ -153,30 +167,30 @@ fn simplify_once(expr: &mut Expr) -> (bool, bool) {
         // domain refinement on `Fun(...)` (Lambda's refinement slot
         // shape) rather than every refinement reachable from the type.
         if let Ok(mut p) = pred.try_borrow_mut() {
-            // A refinement predicate's own marker-containment is irrelevant
-            // to the term-tree guard: markers are inserted into the term
-            // tree, never inside predicates.  Discard the marker bit here —
-            // matching the original recursive scan, which never descended
-            // into `expr.ty`.
+            // A refinement predicate's own iteration-containment is irrelevant
+            // to the term-tree guard: `iterate` sources are inserted into the
+            // term tree, never inside predicates.  Discard the iteration bit
+            // here — matching the original recursive scan, which never
+            // descended into `expr.ty`.
             changed = simplify_once(&mut p).0;
         }
     }
-    let (children_changed, children_have_marker) = recurse_simplify(expr);
+    let (children_changed, children_have_iteration) = recurse_simplify(expr);
     changed |= children_changed;
-    let contains_marker = children_have_marker || is_load_bearing_marker(expr);
-    changed |= apply_simplification_rules(expr, contains_marker);
-    (changed, contains_marker)
+    let contains_iteration = children_have_iteration || is_iteration(expr);
+    changed |= apply_simplification_rules(expr, contains_iteration);
+    (changed, contains_iteration)
 }
 
 /// Recursively apply [`simplify_once`] to all child expressions (bottom-up).
 ///
-/// Returns `(changed, contains_marker)`: whether any child was modified,
-/// and whether any child's subtree contains a load-bearing marker (OR-ed
-/// up so the parent need not re-scan its descendants).
+/// Returns `(changed, contains_iteration)`: whether any child was modified,
+/// and whether any child's subtree contains an `iterate` source (OR-ed up so
+/// the parent need not re-scan its descendants).
 fn recurse_simplify(expr: &mut Expr) -> (bool, bool) {
-    let (mut changed, has_marker) = expr.fold_children_mut((false, false), |(c, m), e| {
-        let (child_changed, child_has_marker) = simplify_once(e);
-        (c | child_changed, m | child_has_marker)
+    let (mut changed, has_iteration) = expr.fold_children_mut((false, false), |(c, it), e| {
+        let (child_changed, child_has_iteration) = simplify_once(e);
+        (c | child_changed, it | child_has_iteration)
     });
     // After simplifying children, propagate the Let body's type up to the Let
     // itself. Simplification can change the body's type (e.g., union flattening
@@ -189,7 +203,7 @@ fn recurse_simplify(expr: &mut Expr) -> (bool, bool) {
             changed = true;
         }
     }
-    (changed, has_marker)
+    (changed, has_iteration)
 }
 
 /// Temporarily take ownership of `expr`, leaving a cheap placeholder.
@@ -250,26 +264,25 @@ fn try_string_add_to_concat(expr: &mut Expr) -> bool {
 /// `curry(h)` right-arm of a zip in multi-generator comprehension contexts.
 ///
 /// Returns `true` if any rule fired.
-fn apply_simplification_rules(expr: &mut Expr, contains_marker: bool) -> bool {
+fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool {
     let mut changed = false;
     // Always-safe rules — neither discard sub-expressions nor relocate
-    // iteration sources, so they fire regardless of any markers present.
-    // (They also preserve the subtree's marker set, so `contains_marker` —
-    // computed before they run — is still accurate at the guard below.)
+    // iteration sources, so they fire regardless of any `iterate` present.
+    // (They also preserve the subtree's iteration set, so `contains_iteration`
+    // — computed before they run — is still accurate at the guard below.)
     changed |= check(try_compose_identity(expr), expr);
     changed |= check(try_flatten_compose(expr), expr);
     changed |= check(try_string_add_to_concat(expr), expr);
 
     // Rules that may discard or restructure sub-expressions.  Equationally
     // valid only on pure CCC morphisms, so they must not touch a sub-tree
-    // carrying a load-bearing iterate/restrict marker (dropping or
-    // relocating one is a correctness bug — see [`is_load_bearing_marker`]).
-    // `contains_marker` is accumulated bottom-up by [`simplify_once`], so
-    // this guard is O(1) here rather than a fresh subtree scan.  Guarding
-    // on marker-freeness is what lets the rule set run correctly at any
-    // point in the pipeline — the invariant is a property of the *nodes*,
-    // not of pass timing.
-    if !contains_marker {
+    // containing an `iterate` source (dropping it strands the iteration — a
+    // correctness bug; see [`is_iteration`]).  `contains_iteration` is
+    // accumulated bottom-up by [`simplify_once`], so this guard is O(1) here
+    // rather than a fresh subtree scan.  Guarding on iteration-freeness is
+    // what lets the rule set run correctly at any point in the pipeline — the
+    // invariant is a property of the *nodes*, not of pass timing.
+    if !contains_iteration {
         changed |= check(try_const_reduce(expr), expr);
         changed |= check(try_product_beta_fst(expr), expr);
         changed |= check(try_product_beta_snd(expr), expr);
@@ -1335,49 +1348,50 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Load-bearing-marker guard
+    // Iteration guard
     //
     // The discard rules are equationally valid only on pure morphisms;
-    // they must never drop or relocate an iterate/restrict marker.  These
-    // tests pin that guard: a discard-rule-shaped term *containing* a
-    // marker must be left intact, even though the identical marker-free
-    // shape reduces.
+    // they must never drop an `iterate` source.  These tests pin that
+    // guard: a discard-rule-shaped term *containing* an `iterate` must be
+    // left intact, even though the identical iteration-free shape reduces.
     // -----------------------------------------------------------------
 
     /// `iterate ≫ (k ▷ const)` is a textbook `try_const_reduce` candidate
     /// (`f ≫ g ▷ const ⟹ g ▷ const`, which would drop `f` = the iterate
-    /// source).  The marker guard must skip the rule so the iterate
+    /// source).  The iteration guard must skip the rule so the iterate
     /// survives.
     #[test]
-    fn simplify_preserves_iterate_marker_under_const_reduce() {
+    fn simplify_preserves_iteration_under_const_reduce() {
         let const_k = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
 
         // Sanity: with a plain morphism in the lead, the same shape *does*
         // reduce — so the rule genuinely fires here and the guard below is
-        // load-bearing, not vacuous.
+        // meaningful, not vacuous.
         let unguarded = typed_compose2(
             var("f").with_ty(fun_ty(int_ty(), int_ty())),
             const_k.clone(),
         );
         assert!(
             !matches!(simplify(unguarded).node, TypedExprNode::Compose(_)),
-            "const-reduce should have collapsed the marker-free compose"
+            "const-reduce should have collapsed the iteration-free compose"
         );
 
-        // With a load-bearing iterate at the head, the compose is intact.
+        // With an `iterate` at the head, the compose is intact.
         let guarded = typed_compose2(make_iterate(trivially_true_predicate(int_ty())), const_k);
         assert_eq!(
             simplify(guarded.clone()),
             guarded,
-            "const-reduce must not drop the iterate marker"
+            "const-reduce must not drop the iterate source"
         );
     }
 
-    /// The guard also recognises the nested restrict marker
-    /// `Apply(upstream, Apply(p, Restrict))`: a `restrict`-led filter
-    /// sitting in a const-reduce position must likewise survive.
+    /// A `restrict` filter is protected *transitively*: it is always applied
+    /// to an iterate-bearing upstream (`Apply(upstream, Apply(p, Restrict))`),
+    /// so the subtree contains an `iterate` and the iteration guard skips the
+    /// discard rule — a `restrict`-led filter in a const-reduce position
+    /// survives without `is_iteration` flagging `restrict` itself.
     #[test]
-    fn simplify_preserves_restrict_marker_under_const_reduce() {
+    fn simplify_preserves_restrict_over_iteration_under_const_reduce() {
         // `restrict(p)` applied to an iterate source: `{Int | p} ⇒ Int`.
         let pred = apply_primitive(
             Expr::lit(Lit::Bool(false)).with_ty(Type::Base(BaseType::Bool)),
@@ -1391,7 +1405,7 @@ mod tests {
         assert_eq!(
             simplify(guarded.clone()),
             guarded,
-            "const-reduce must not drop the restrict marker"
+            "const-reduce must not drop the restrict (its upstream iterate guards it)"
         );
     }
 

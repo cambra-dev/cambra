@@ -151,6 +151,81 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
     apply_function(upstream, restrict, refined_stream)
 }
 
+/// Construct a [`TypedExprNode::Cast`], a pure type-level assertion that
+/// re-views `value` under `target_ty`.
+///
+/// `cast` is an upcast: [`crate::ccl::infer_simple_sub`]'s `Cast` arm types it
+/// by the single obligation `value_ty <: target_ty`.
+///
+/// Op-conversion treats `cast` as a no-op — see [`TypedExprNode::Cast`] — so
+/// this is purely a type-level coercion with no runtime cost.
+///
+/// **Temporary shape contract:** `target_ty` must be
+/// `Fun(Refinement(_, _), _)` — a refinement on a function domain.  Inference
+/// no longer *requires* this (any `target` with `value_ty <: target` is a
+/// well-typed upcast), but it is the only shape lowering produces today and
+/// the one [`crate::ccl::lambda_elim`]'s groupby reconstruction reads a tag
+/// off of, so this asserts the lowering contract: a non-conforming target is
+/// a construction-time bug, not a user error, so it panics rather than
+/// emitting a cast `lambda_elim` would mishandle.  See [`TypedExprNode::Cast`]
+/// for the migration plan toward a general `𝑈 ⇒ 𝑇` cast.
+/// TODO remove this constraint once we get rid of the special-casing correlated
+/// refinement code in lambda_elim.
+pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
+    assert!(
+        matches!(&target_ty, Type::Fun(d, _) if matches!(d.as_ref(), Type::Refinement(..))),
+        "make_cast target_ty must be Fun(Refinement(_, _), _), got {target_ty}"
+    );
+    Expr::cast(value, target_ty)
+}
+
+/// Read the domain refinement off a cast target type — the refinement tag a
+/// [`make_cast`] target carries on its `Fun(Refinement(_, r), _)` shape.
+///
+/// [`crate::ccl::lambda_elim`]'s cast-wrapped-lambda arm calls this on a
+/// [`TypedExprNode::Cast`]'s `target` to reattach the refinement to the
+/// reconstructed `groupby` lambda.  (Inference does not need it: it types the
+/// cast as the upcast `value_ty <: target` and lets the solver carry the tag.)
+/// The returned `Refinement` shares the predicate's `Rc<RefCell<Expr>>` with
+/// `target`.
+pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
+    let Type::Fun(domain, _) = target else {
+        return None;
+    };
+    let Type::Refinement(_, refinement) = domain.as_ref() else {
+        return None;
+    };
+    Some(refinement.clone())
+}
+
+/// Build a function type whose domain is `base_domain` wrapped in a fresh
+/// `Type::Refinement` carrying `predicate`, and whose codomain is `codomain`.
+///
+/// Used by lowering to build the target type for a [`make_cast`] that
+/// imposes a refinement on a function's domain (the canonical shape produced
+/// by list-comp filters, for-loop `if`-guards, and `groupby`).
+///
+/// `base_domain` and `codomain` are typically `Type::Hole` at lowering time;
+/// inference fills them in by unifying against the value being cast.
+pub fn refined_fn_type(
+    base_domain: Type,
+    predicate: Expr,
+    codomain: Type,
+    description: &str,
+) -> Type {
+    Type::fun(
+        Type::Refinement(
+            Box::new(base_domain),
+            Refinement {
+                id: next_refinement_id(),
+                description: description.to_string(),
+                kind: RefinementKind::Predicate(Rc::new(RefCell::new(predicate))),
+            },
+        ),
+        codomain,
+    )
+}
+
 /// Wrap `base` in a fresh `Type::Refinement` carrying `predicate`,
 /// unless the predicate is trivially true (then return `base` unchanged).
 fn refine_with(base: Type, predicate: &Expr) -> Type {

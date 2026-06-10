@@ -50,10 +50,10 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
             }
         }
 
-        // Lambda: refinements now ride the inferred type natively (see
+        // Lambda: refinements ride the inferred type natively (see
         // `infer_simple_sub::emit_lambda` + `constrain_subtype`), so the
-        // domain/`param.ty` already carry their restriction tags out of
-        // coalesce. Saturate no longer rewrites them. It still recurses —
+        // domain/`param.ty` already carry their refinement tags out of
+        // coalesce; saturate leaves them untouched. It still recurses —
         // to run the Var/Let lexical-propagation rules inside the body and
         // to saturate the predicate — binding `param` under the bare
         // (refinement-stripped) domain so `Var(param)` body references see
@@ -77,7 +77,7 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
 
             let inner_dom: Type = match &expr.ty {
                 // Bind the param under the *refined* domain so `Var(param)` body
-                // references see the restriction the lambda's domain carries —
+                // references see the refinement the lambda's domain carries —
                 // a body use that flows the param into a refined-domain consumer
                 // (e.g. indexing a filtered collection) must itself be refined,
                 // or the post-inference check rejects `unrefined ⊀ refined`.
@@ -119,6 +119,10 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
             saturate_node(function, scope);
             saturate_node(argument, scope);
         }
+        // `value` is the only expression child; `target`'s refinement rides
+        // `expr.ty` and is left untouched (matching the pre-node
+        // `Apply(_, Cast)` behaviour, which saturated only the wrapped value).
+        TypedExprNode::Cast { value, .. } => saturate_node(value, scope),
         TypedExprNode::BinOp { left, right, .. } => {
             saturate_node(left, scope);
             saturate_node(right, scope);
