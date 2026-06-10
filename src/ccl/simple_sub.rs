@@ -1686,6 +1686,51 @@ mod tests {
         assert_eq!(v.level, 0);
     }
 
+    /// Regression: mutually-constrained inference variables form an `Rc`
+    /// cycle through their bounds (`?a <: ?b` stores `?b` in `?a`'s upper
+    /// bounds and vice versa). Reference counting alone never reclaims it;
+    /// the owning [`InferArena`](crate::ccl::infer::InferArena)'s `Drop` is
+    /// what clears the bounds and breaks the cycle.
+    /// If this fails, the cycle is leaking again.
+    #[test]
+    fn mutually_constrained_vars_leak_via_rc_cycle() {
+        use crate::ccl::infer::InferArena;
+        use std::rc::Weak;
+
+        // Activate an arena so the two `fresh_var` mints below are owned by
+        // it; its `Drop` is what clears the bounds and breaks the cycle.
+        let arena = InferArena::new();
+
+        let a = fresh_var(0);
+        let b = fresh_var(0);
+        let mut cache = ConstrainCache::new();
+        // ?a <: ?b and ?b <: ?a — the ordinary "spurious cycle" the solver
+        // tolerates; nothing recursive or exotic is required.
+        constrain_subtype(&a, &b, &mut cache).unwrap();
+        constrain_subtype(&b, &a, &mut cache).unwrap();
+
+        let (wa, wb): (Weak<InferVar>, Weak<InferVar>) = match (&a, &b) {
+            (Type::Infer(va), Type::Infer(vb)) => (Rc::downgrade(va), Rc::downgrade(vb)),
+            _ => unreachable!("fresh_var yields Type::Infer"),
+        };
+
+        // Drop every external strong handle. The cache also holds `Type`
+        // clones (its keys are `(Type, Type)`), so it must go too — it is
+        // dropped at the end of a real constraint-emission pass anyway.
+        drop(cache);
+        drop(a);
+        drop(b);
+
+        // Tearing down the arena clears both cells' bounds, severing the
+        // mutual `Rc` edges. Only after this can the refcounts reach zero.
+        drop(arena);
+
+        assert!(
+            wa.upgrade().is_none() && wb.upgrade().is_none(),
+            "expected the Rc cycle to be reclaimed; both inference vars leaked"
+        );
+    }
+
     #[test]
     fn level_of_compound_is_max_of_components() {
         let v0 = fresh_var(0);

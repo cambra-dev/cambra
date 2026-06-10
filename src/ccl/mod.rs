@@ -133,14 +133,66 @@ pub struct InferVar {
     pub bounds: RefCell<InferBounds>,
 }
 
+thread_local! {
+    /// Storage for every inference variable minted during the active inference
+    /// run on this thread — owned directly by this slot, not shared. Installed
+    /// (as an empty `Vec`) by [`arena_enter`] on scope entry and removed by
+    /// [`arena_exit`] at teardown, which hands the variables back so their
+    /// bounds can be cleared. Inference runs one-at-a-time per thread: this is
+    /// a single slot, not a stack, because nesting an inference run inside
+    /// another on the same thread is a bug (caught by the `debug_assert!` in
+    /// [`arena_enter`]), not a supported mode. `None` outside any inference
+    /// run, in which case [`InferVar::fresh`] records nowhere (a harmless
+    /// no-op — used by unit tests that mint vars directly).
+    static ACTIVE_ARENA: RefCell<Option<Vec<Rc<InferVar>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Begin capturing every [`InferVar::fresh`] minted on this thread.
+///
+/// Inference is non-reentrant: at most one arena may be active per thread at a
+/// time. The `debug_assert!` enforces the slot is free before installing a
+/// fresh capture buffer, so an accidental nested inference run trips loudly in
+/// debug builds.
+pub(crate) fn arena_enter() {
+    ACTIVE_ARENA.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        debug_assert!(
+            slot.is_none(),
+            "inference is non-reentrant: an InferArena is already active on this thread",
+        );
+        *slot = Some(Vec::new());
+    });
+}
+
+/// Stop capturing and return every variable minted since [`arena_enter`], so
+/// the caller can clear their bounds. Yields an empty `Vec` if no run was
+/// active (which the [`InferArena`](crate::ccl::infer::InferArena) RAII guard
+/// makes unreachable in practice).
+pub(crate) fn arena_exit() -> Vec<Rc<InferVar>> {
+    ACTIVE_ARENA.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+}
+
 impl InferVar {
     /// Mint a fresh, unconstrained inference variable at `level`.
+    ///
+    /// If an inference arena is active on this thread (see [`arena_enter`]),
+    /// the new variable is registered with it so the arena owns a strong
+    /// handle and can clear its bounds at teardown, breaking the `Rc` cycles
+    /// that mutual subtyping constraints create. With no active arena (e.g.
+    /// direct use in unit tests) registration is a no-op.
     pub fn fresh(level: Level) -> Rc<InferVar> {
-        Rc::new(InferVar {
+        let var = Rc::new(InferVar {
             uid: fresh_infer_var_id(),
             level,
             bounds: RefCell::new(InferBounds::default()),
-        })
+        });
+        ACTIVE_ARENA.with(|slot| {
+            if let Some(vars) = slot.borrow_mut().as_mut() {
+                vars.push(Rc::clone(&var));
+            }
+        });
+        var
     }
 }
 

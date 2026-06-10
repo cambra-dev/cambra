@@ -30,6 +30,98 @@ use crate::ccl::{Expr, InferVarId, RefinementKind, Type, TypedExprNode};
 use crate::util::ScopeStack;
 
 // ---------------------------------------------------------------------------
+// InferArena
+// ---------------------------------------------------------------------------
+
+/// Owns every inference variable minted during one inference run and breaks
+/// the `Rc` cycles their bounds form.
+///
+/// # Why this exists
+///
+/// The simple-sub solver records `α <: β` by pushing `Type::Infer(β)` into
+/// `α`'s bounds and `Type::Infer(α)` into `β`'s bounds. Mutual constraints
+/// (and self-recursive ones) therefore make each [`crate::ccl::InferVar`]
+/// hold a strong `Rc` to the others through its `RefCell<InferBounds>`. Once
+/// Pass 2 (coalesce) overwrites every `expr.ty` with a concrete,
+/// variable-free type, those cells become unreachable from the final AST but
+/// keep each other alive — reference counting alone never reclaims the
+/// cycle, so the whole variable graph leaks after each `infer()` run.
+///
+/// The arena is a zero-field RAII guard over a thread-local capture buffer
+/// (see [`crate::ccl::arena_enter`]). While it is alive, every
+/// [`crate::ccl::InferVar::fresh`] registers its variable in that buffer, so
+/// the buffer holds one strong handle to *every* variable minted during the
+/// run. On drop the arena takes the buffer back and clears each variable's
+/// lower and upper bound lists, severing all bound edges so every refcount
+/// can reach zero. A single flat `Vec` suffices: variables are never looked
+/// up by id (the `Type` carries the `Rc` directly); the arena only needs to
+/// enumerate them once at teardown. Clearing bounds before the `Vec` drops
+/// handles self-cycles and N-way cycles uniformly.
+///
+/// # Why clearing is always safe
+///
+/// Coalesce never reuses a bound-carrying solver variable in its output: it
+/// builds a fresh `Type` and, for a position with no concrete contribution,
+/// mints a brand-new *unconstrained* `Type::Infer`. So every variable the
+/// arena clears is either orphaned from the result tree or has empty bounds
+/// already — clearing can never corrupt a type that survives into the AST.
+///
+/// # Drop-time borrow rule
+///
+/// `Drop` calls `borrow_mut()` on each cell's bounds, so nothing may hold a
+/// live `borrow_mut()` on any owned variable across the arena drop. This is
+/// safe in practice: the solver's bound borrows are all transient
+/// (taken and released within a single `constrain`/`coalesce` step), and the
+/// arena drops only after inference has fully exited.
+///
+/// # Rejected alternative: `Weak` back-edges
+///
+/// We could instead make one direction of each bound edge a
+/// `Weak<InferVar>`, so the cycle is never strong. Rejected: simple-sub
+/// constraints are *symmetric* mutual references with no natural "back
+/// edge" to demote, so we'd be upgrading `Weak`s and handling the `None`
+/// case throughout the constraint/coalesce hot path. The arena instead pays
+/// a single linear teardown and keeps every bound a plain, always-valid
+/// strong `Type`.
+pub struct InferArena {
+    /// Zero-sized: the captured variables live in the thread-local buffer
+    /// installed by [`crate::ccl::arena_enter`], not in the guard itself.
+    /// `!Send`/`!Sync` and unconstructible outside this module's `new`.
+    _private: (),
+}
+
+impl InferArena {
+    /// Create an arena and begin capturing minted variables on this thread.
+    /// Every [`crate::ccl::InferVar::fresh`] called before this arena is
+    /// dropped registers its variable. Inference is non-reentrant: at most
+    /// one arena is active per thread at a time, and constructing a second one
+    /// while another is live trips a `debug_assert!` (see
+    /// [`crate::ccl::arena_enter`]).
+    pub fn new() -> Self {
+        crate::ccl::arena_enter();
+        InferArena { _private: () }
+    }
+}
+
+impl Default for InferArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for InferArena {
+    fn drop(&mut self) {
+        // Take back every variable minted during the run and sever its bound
+        // edges, so the (otherwise cyclic) refcounts can all reach zero.
+        for var in crate::ccl::arena_exit() {
+            let mut bounds = var.bounds.borrow_mut();
+            bounds.lower.clear();
+            bounds.upper.clear();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TypeInferenceContext
 // ---------------------------------------------------------------------------
 
@@ -281,6 +373,13 @@ impl std::fmt::Debug for InferError {
 /// tree is fully annotated and contains no `Type::Hole` or `Type::Infer`
 /// placeholders.
 pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Vec<InferError>> {
+    // The arena owns every inference variable minted by the passes below
+    // (captured through the thread-local mint sink). Its lifetime spans both
+    // Pass 1 (constraint emission) and Pass 2 (coalesce); when it drops here
+    // — on the `Ok` and the `?`/error paths alike — its `Drop` clears every
+    // variable's bounds, breaking the `Rc` cycles that would otherwise leak
+    // the whole variable graph. See [`InferArena`].
+    let _arena = InferArena::new();
     crate::ccl::infer_simple_sub::infer(expr, &ctx.source_types)
 }
 
