@@ -3,7 +3,7 @@
 //! The canonical type inference implementation, invoked via
 //! [`crate::ccl::infer::infer`].
 //!
-//! # Design (monomorphic let)
+//! # Design
 //!
 //! Two passes over the expression tree:
 //!
@@ -18,13 +18,42 @@
 //!    from the AST directly.
 //! 2. **Coalesce + write-back**: walk the tree again and, for each node,
 //!    run [`coalesce_compact`](crate::ccl::simple_sub::coalesce_compact) to
-//!    resolve the inference variables in its `expr.ty` in place.
+//!    resolve the inference variables in its `expr.ty` in place. A generalized
+//!    `let`'s definition subtree is *skipped* here (its quantified variables
+//!    have no use-site bounds, so it would coalesce under-determined) and
+//!    resolved by Pass 3 instead.
+//! 3. **Monomorphize** ([`monomorphize`]): for each generalized `let`, group
+//!    its uses by resolved type and emit one specialized definition per
+//!    distinct type, shared across the uses that demand it.
 //!
-//! # Polymorphism
+//! # Let-polymorphism
 //!
-//! No let-generalization (`let` is monomorphic). The
-//! [`OperatorSchemes`] registry contains [`PolyScheme`]s only for the
-//! handful of operator/projection cases that are inherently polymorphic
+//! A `let` whose RHS is a *function definition* is **generalized**: its RHS is
+//! emitted one level deeper (`in_let_rhs`), then generalized into a
+//! [`PolyScheme`] at the binding site (`scoped_let`), so each use instantiates
+//! fresh quantified variables and is constrained independently. This is what
+//! lets `let id = λx.x in (id 1, id "a")` type-check
+//! where a monomorphic `let` would collide.
+//!
+//! Because `ccl::Type` has no `ForAll` and the downstream passes are
+//! monomorphic, generalization is paired with **monomorphization**: the
+//! post-coalesce [`monomorphize`] pass collects the distinct resolved types a
+//! generalized `let` is used at, emits one specialized clone of the definition
+//! per distinct type (`freshen_expr_types` + a per-type constrain/coalesce),
+//! and rewrites each use to reference its specialization. So inference both
+//! type-checks the polymorphism and lowers it to concrete per-type code before
+//! lambda-elimination. Sharing one specialization across same-typed uses is
+//! what lets a collection/generator UDF used at several element types compile
+//! to one *cached* binding per element type rather than a copy per call.
+//!
+//! Generalization itself is narrow ([`should_generalize`]): only *function*
+//! definitions with a quantifiable variable. Value bindings stay monomorphic
+//! and shared (the pre-let-poly behavior), since specializing a value would
+//! duplicate it, which the feed/define and join-planning machinery is sensitive
+//! to.
+//!
+//! The [`OperatorSchemes`] registry additionally contains [`PolyScheme`]s for
+//! the handful of operator/projection cases that are inherently polymorphic
 //! (`Compare : ∀α. α → α → Bool`, `Max : ∀α γ. (α → γ) → γ`, etc.). Each scheme
 //! is `instantiate`d at every use site, minting fresh vars per use.
 //!
@@ -35,15 +64,18 @@
 //! `lower_mutation_loop`); those have entries in [`OperatorSchemes`] and
 //! are freshened at each use site like any other scheme.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 use smol_str::SmolStr;
 
 use crate::ccl::ccl_utils::cast_target_refinement;
 use crate::ccl::infer::InferError;
 use crate::ccl::simple_sub::{
-    CoalesceError, ConstrainCache, ConstrainError, FieldKey, PolyScheme, coalesce_compact,
-    compact_type, constrain_subtype, fresh_var, fun, prim, simplify_type,
+    CoalesceError, ConstrainCache, ConstrainError, FieldKey, FreshenCache, FreshenLevel,
+    PolyScheme, coalesce_compact, compact_type, constrain_subtype, fresh_var, freshen_above, fun,
+    prim, simplify_type, type_level,
 };
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
@@ -248,16 +280,116 @@ impl Default for OperatorSchemes {
 // SimpleSubContext (Step 7c)
 // ---------------------------------------------------------------------------
 
-/// Inference state for the simple-sub path.
+/// A lexical-scope entry: the binder's polymorphic scheme.
 ///
-/// The solver works directly on [`Type`]: each node's inferred type (and
-/// each binder's `.ty`) is written into the AST during emission and
+/// The solver works directly on [`Type`]: each node's inferred type (and each
+/// binder's `.ty`) is written into the AST during emission and resolved in
+/// place during coalesce.
+struct Binding {
+    /// The binder's scheme. Monomorphic binders quantify nothing (cutoff at
+    /// their introduction level); a generalized `let` quantifies its RHS-local
+    /// variables, so each `Var` use [`PolyScheme::instantiate`]s a fresh copy.
+    /// Use-site *monomorphization* (turning each instantiation into concrete
+    /// code) is deferred to the post-coalesce [`monomorphize`] pass.
+    scheme: PolyScheme,
+}
+
+/// Whether a `let` bound to `def` at `level` should be **generalized** —
+/// typed polymorphically, with each use [`PolyScheme::instantiate`]ing a fresh
+/// copy and the post-coalesce [`monomorphize`] pass specializing per distinct
+/// use type. Requires both of:
+///
+/// - **A function definition** (`def` is a `Lambda`). Let-polymorphism
+///   generalizes function definitions; value bindings stay monomorphic and
+///   *shared* — specializing a value would duplicate it, which breaks
+///   structures that rely on sharing (e.g. a deferred-feed value used in
+///   `y ++ y`).
+/// - **A genuinely polymorphic type** — some variable deeper than `level` to
+///   quantify. A function with no quantifiable variable is already monomorphic,
+///   so generalizing it would be a no-op.
+///
+/// This is the single predicate both emission ([`emit_let`]) and the
+/// post-coalesce [`monomorphize`] pass consult, so they agree on which `let`s
+/// are polymorphic. It deliberately makes *no* use-count or generator
+/// distinction: a single-use function generalizes to one specialization
+/// (later inlined like any monomorphic def), and a generator/collection-
+/// producing UDF generalizes to one specialization *per distinct element type*,
+/// which `inline` then leaves shared (cached) rather than duplicated.
+fn should_generalize(def: &Expr, level: Level) -> bool {
+    matches!(def.node, TypedExprNode::Lambda { .. }) && type_level(&def.ty) > level
+}
+
+/// Freshen every type slot in a cloned definition subtree through one shared
+/// [`FreshenCache`], producing an independent copy to specialize. This both
+/// *renames* each quantified variable (level > `cutoff`) to a fresh one (level
+/// per `target`) and *copies its bounds*, so the clone can be constrained to a
+/// resolved use type and coalesced without disturbing the original definition
+/// or any other clone. The shared cache keeps the renaming consistent across
+/// slots (a variable in one node and in another's bounds maps to the same fresh
+/// var). See [`monomorphize`], which freshens one clone per distinct use type
+/// with [`FreshenLevel::Preserve`] (so nested generalized `let`s keep their
+/// deeper levels and stay recognizable as polymorphic).
+///
+/// Crucially this freshens *every* type in the AST — `expr.ty`, binder slots
+/// (lambda param, `let` binding, `Case` payload, `Loop` params), and
+/// refinement predicates — not just those reachable from the definition's root
+/// type. A definition's interior carries variables (e.g. `Proj` seeds) that
+/// never appear in its root type; missing them would leave the clone with a
+/// mix of fresh and original variables and coalesce to an unresolved type.
+fn freshen_expr_types(
+    expr: &mut Expr,
+    cutoff: Level,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) {
+    expr.ty = freshen_above(cutoff, &expr.ty, target, cache);
+    match &mut expr.node {
+        TypedExprNode::Lambda {
+            param, refinement, ..
+        } => {
+            param.ty = freshen_above(cutoff, &param.ty, target, cache);
+            if let Some(r) = refinement {
+                // `Predicate` is an `Rc<RefCell<_>>` and `Expr::clone` only
+                // bumps the refcount, so every clone — and the original — share
+                // *one* predicate cell. Freshening in place would corrupt the
+                // original and entangle the specializations (one would
+                // re-freshen another's variables). De-alias: freshen an owned
+                // copy and install it under a fresh cell so this clone's
+                // predicate is freshened independently of all others.
+                let RefinementKind::Predicate(def) = &r.kind;
+                let mut pred = def.borrow().clone();
+                freshen_expr_types(&mut pred, cutoff, target, cache);
+                r.kind = RefinementKind::Predicate(Rc::new(RefCell::new(pred)));
+            }
+        }
+        TypedExprNode::Let { binding, .. } => {
+            binding.ty = freshen_above(cutoff, &binding.ty, target, cache);
+        }
+        TypedExprNode::Case { branches, .. } => {
+            for b in branches.iter_mut() {
+                if let Some(p) = &mut b.pattern {
+                    p.binding.ty = freshen_above(cutoff, &p.binding.ty, target, cache);
+                }
+            }
+        }
+        TypedExprNode::Loop { params, .. } => {
+            for p in params.iter_mut() {
+                p.ty = freshen_above(cutoff, &p.ty, target, cache);
+            }
+        }
+        _ => {}
+    }
+    expr.walk_children_mut(|c| freshen_expr_types(c, cutoff, target, cache));
+}
+
 /// resolved in place during coalesce — there is no side table.
 struct SimpleSubContext {
-    /// Lexical scope: name → `Type` for in-scope variables and let-bound
-    /// names. We currently store monotypes; a future let-poly extension
-    /// will widen this to `PolyScheme` schemes.
-    scopes: ScopeStack<Type>,
+    /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
+    /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
+    /// polymorphic `let` additionally stashes its typed definition subtree so
+    /// each use site can splice a freshened, use-specialized copy (see
+    /// `scoped_let` and the `Var` arm of `emit_node`).
+    scopes: ScopeStack<Binding>,
     /// Externally-registered data sources (set by
     /// `TypeInferenceContext::register_source_type`).
     sources: HashMap<String, Type>,
@@ -265,9 +397,9 @@ struct SimpleSubContext {
     cache: ConstrainCache,
     /// Operator/projection scheme registry.
     schemes: OperatorSchemes,
-    /// Current polymorphism level. Currently held at 0 (no `let` bumps);
-    /// the field is threaded through so a future let-poly extension drops
-    /// in without restructuring.
+    /// Current polymorphism level. Bumped while emitting a `let` RHS (see
+    /// `in_let_rhs`) so RHS-local variables are minted deeper than the
+    /// defining scope and become generalizable at the binding site.
     level: Level,
 }
 
@@ -372,9 +504,38 @@ trait Typing {
         self.require_sub(b, a, at)
     }
 
-    /// Run `f` with `name: ty` bound in the lexical scope, restoring the
-    /// scope afterward on both the success and error paths.
+    /// Run `f` with `name: ty` bound *monomorphically* in the lexical scope
+    /// (lambda params, pattern/loop binders), restoring the scope afterward on
+    /// both the success and error paths.
     fn scoped<R>(&mut self, name: &str, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized;
+
+    /// Emit/check a `let` RHS. Emit bumps the polymorphism level so RHS-local
+    /// variables become generalizable at the binding site; Check (which trusts
+    /// recorded types) runs `f` unchanged.
+    fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized;
+
+    /// Whether generalizing a `let` bound to `def` would quantify anything —
+    /// i.e. the binding is genuinely polymorphic (see [`should_generalize`]).
+    /// Emit answers from the definition and level; Check always returns `false`
+    /// (it never generalizes).
+    fn is_generalizable(&self, def: &Expr) -> bool;
+
+    /// Run `f` with a `let` name bound over the body. When `generalize` is set,
+    /// Emit generalizes `bound_ty` at the current level into a polymorphic
+    /// scheme (so each use site instantiates fresh quantified variables);
+    /// otherwise it binds monomorphically (shared). Check ignores `generalize`
+    /// and simply runs `f`.
+    fn scoped_let<R>(
+        &mut self,
+        name: &str,
+        bound_ty: &Type,
+        generalize: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R
     where
         Self: Sized;
 
@@ -410,9 +571,9 @@ trait Typing {
 
     /// Like [`Typing::as_function`] but records equality (`t ⟺ domain ⇒
     /// codomain`). Used at `Apply`, where the argument and the function's
-    /// domain are unified (the Stage-1 monomorphizing hack). In Check both
-    /// directions hold once `t` is destructured, so it behaves identically to
-    /// [`Typing::as_function`].
+    /// domain are unified (see `constrain_argument` and `emit_apply`). In Check
+    /// both directions hold once `t` is destructured, so it behaves identically
+    /// to [`Typing::as_function`].
     fn as_function_eq(
         &mut self,
         t: &Type,
@@ -421,16 +582,25 @@ trait Typing {
 
     /// Relate an applied argument to the function's parameter domain.
     ///
-    /// The sound rule is `arg <: domain` (the argument must fit the parameter,
-    /// so a *refined* argument may flow into an unrefined parameter — dropping
-    /// a restriction is admissible). Check records exactly that. Emit
-    /// *additionally* records the reverse, unifying the two — the Stage-1
-    /// monomorphizing hack (see `emit_apply`) that lets a function-side var
-    /// (e.g. a `Proj`'s `record_var`) see both polarities and coalesce
-    /// correctly. The reverse is unsound in general and only safe because Emit
-    /// constrains a fresh var; in Check, where the argument may legitimately
-    /// carry a restriction the parameter lacks, the one-way rule is the correct
-    /// one.
+    /// One-way in both Emit and Check: the sound subtyping rule `arg <: domain`
+    /// (the argument must fit the parameter, so a *refined* argument may flow
+    /// into an unrefined parameter — dropping a restriction is admissible). A
+    /// function domain is contravariant, so this alone leaves a *projection*'s
+    /// domain var under-determined (a `Proj` only ever constrains the one field
+    /// it touches, so it compacts to a field-narrow / `Infer`-laden shape). That
+    /// shape — the record/tuple actually flowing in — is recovered *structurally*
+    /// in `type_saturate` by monomorphizing the projection to its input (see
+    /// [`specialize_projection_domain`]), the closed-form case of the same
+    /// use-site specialization `monomorphize` performs for generalized `let`s.
+    ///
+    /// This retired an earlier emit-time reverse `domain <: arg`, which
+    /// pre-deposited that shape on the domain var's upper edge *and* eagerly
+    /// propagated it across the connected component. The propagation was
+    /// load-bearing but over-reaching — it could not be replaced by a general
+    /// two-sided `Var <: Var` rule (that corrupts mutually-bounded-but-distinct
+    /// join vars), only by the local projection recovery, which suffices because
+    /// projections are the only morphisms whose domain coalesces
+    /// under-determined.
     fn constrain_argument(
         &mut self,
         arg: &Type,
@@ -478,7 +648,66 @@ impl Typing for SimpleSubContext {
 
     fn scoped<R>(&mut self, name: &str, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
         self.scopes.push_scope();
-        self.scopes.bind(name, ty.clone());
+        // Monomorphic binder: lambda params and pattern/loop binders are not
+        // generalized. The scheme's cutoff is the *current* level, not 0:
+        // these binders' variables are minted at `self.level` (a `let` RHS may
+        // have bumped it), and a cutoff below that would wrongly quantify them,
+        // freshening the binder on every use and severing it from its body
+        // constraints. `poly(self.level, ty)` quantifies nothing at this level,
+        // so `instantiate` returns the binder's variables verbatim.
+        self.scopes.bind(
+            name,
+            Binding {
+                scheme: PolyScheme::poly(self.level, ty.clone()),
+            },
+        );
+        let r = f(self);
+        self.scopes.pop_scope();
+        r
+    }
+
+    fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        // Mint RHS-local variables one level deeper than the defining scope,
+        // so generalization at the binding site (the outer level) quantifies
+        // exactly those variables. Restore the level on the way out.
+        self.level += 1;
+        let r = f(self);
+        self.level -= 1;
+        r
+    }
+
+    fn is_generalizable(&self, def: &Expr) -> bool {
+        should_generalize(def, self.level)
+    }
+
+    fn scoped_let<R>(
+        &mut self,
+        name: &str,
+        bound_ty: &Type,
+        generalize: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        // Generalize at the current (outer) level: any variable in `bound_ty`
+        // whose level exceeds `self.level` was minted inside the RHS and is
+        // universally quantified; `instantiate` freshens it per use site.
+        // Variables that escaped to an outer scope were already lowered to
+        // `self.level` (or below) by `extrude` during constraint solving, so
+        // they stay fixed. (Sound to generalize unconditionally because CCL is
+        // a pure value language — no value-restriction hazard.)
+        let scheme = if generalize {
+            // Polymorphic: generalize at the outer level. Each `Var` use
+            // instantiates a fresh copy; the post-coalesce `monomorphize` pass
+            // then specializes the definition per distinct resolved use type.
+            PolyScheme::poly(self.level, bound_ty.clone())
+        } else {
+            // Monomorphic: bind verbatim with a cutoff above the RHS level so
+            // `instantiate` freshens nothing — uses stay as `Var` references and
+            // share the binding's variables (the pre-let-poly behavior). Handled
+            // structurally / by the `inline` pass downstream.
+            PolyScheme::poly(self.level + 1, bound_ty.clone())
+        };
+        self.scopes.push_scope();
+        self.scopes.bind(name, Binding { scheme });
         let r = f(self);
         self.scopes.pop_scope();
         r
@@ -541,8 +770,8 @@ impl Typing for SimpleSubContext {
         let d = self.fresh();
         let c = self.fresh();
         let f = fun(d.clone(), c.clone());
-        // Two-way == equality, matching the Apply monomorphizing hack: see
-        // `emit_apply`.
+        // Two-way == equality, matching the Apply domain unification: see
+        // `constrain_argument` and `emit_apply`.
         self.require_sub(t, &f, at)?;
         self.require_sub(&f, t, at)?;
         Ok((d, c))
@@ -554,9 +783,14 @@ impl Typing for SimpleSubContext {
         domain: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), InferError> {
-        // Two-way (the monomorphizing hack): unify the argument and domain.
-        self.require_sub(arg, domain, at)?;
-        self.require_sub(domain, arg, at)
+        // One-way: the sound subtyping rule `arg <: domain` (the argument must fit
+        // the parameter). The contravariant domain var's shape — the record/tuple
+        // actually flowing in — is recovered structurally in `type_saturate` (its
+        // `Apply` arm rebuilds a projection's domain from the resolved argument,
+        // just as the `Compose` arm rebuilds a non-leading projection's domain from
+        // the preceding morphism's codomain), rather than pre-deposited here by a
+        // reverse `domain <: arg`. See the trait-method docs.
+        self.require_sub(arg, domain, at)
     }
 }
 
@@ -745,13 +979,21 @@ pub fn infer(expr: &mut Expr, sources: &HashMap<String, Type>) -> Result<Type, V
     // Pass 1: emit constraints.
     emit_node(expr, &mut sub_ctx).map_err(|e| vec![e])?;
 
-    // Pass 2: resolve each node's inference variables in place into expr.ty.
+    // Pass 2: resolve each node's inference variables in place into expr.ty
+    // (skipping generalized-`let` definitions, left for Pass 3).
     let errors = coalesce_pass(expr);
     if !errors.is_empty() {
         return Err(errors);
     }
-    // Pass 3: saturate refinement/lexical-scope shapes the structural lattice cannot
-    // carry, fixing up the four kinds of nodes affected (Refinement
+    // Pass 3: monomorphize each generalized `let` into one specialized
+    // definition per distinct resolved use type, shared across same-typed uses.
+    let mut mono_errors = Vec::new();
+    monomorphize(expr, &mut mono_errors);
+    if !mono_errors.is_empty() {
+        return Err(mono_errors);
+    }
+    // Pass 4: saturate refinement/lexical-scope shapes the structural lattice
+    // cannot carry, fixing up the kinds of nodes affected (Refinement
     // Propagation, Let Binding Resolution, CollectionUnion direct-build).
     // See `type_saturate` for the rule set.
     crate::ccl::type_saturate::saturate(expr);
@@ -771,9 +1013,16 @@ fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<Type, InferE
     let ty = match &mut expr.node {
         TypedExprNode::Lit(lit) => lit_base(lit),
 
+        // Resolve a variable through its bound scheme. A monomorphic binder
+        // freshens nothing and returns its type verbatim. A *polymorphic* `let`
+        // instantiates fresh quantified variables, so this use accumulates its
+        // own constraints and coalesces to this call site's concrete type
+        // independently of every other use. The `Var` node stays in place; the
+        // post-coalesce `monomorphize` pass reads the resolved use type back off
+        // it and splices in a per-type-specialized definition.
         TypedExprNode::Var(name) => match ctx.scopes.lookup(name) {
-            Some(t) => t.clone(),
             None => return Err(InferError::UnboundVariable(name.clone())),
+            Some(binding) => binding.scheme.instantiate(ctx.level),
         },
 
         // Builtins with a polymorphic signature (shared type variables
@@ -916,6 +1165,7 @@ fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<Type, InferE
     // accumulate into the same variables and are visible here at coalesce
     // time — no side table needed.
     expr.ty = ty.clone();
+
     Ok(ty)
 }
 
@@ -1029,20 +1279,14 @@ fn emit_apply<C: Typing>(
     // `fn_ty ⟺ domain ⇒ codomain` in Emit; in Check it destructures the
     // resolved function type directly.
     let (domain, codomain) = ctx.as_function_eq(&fn_ty, &|| "Apply".to_string())?;
-    // The argument flows into the parameter domain. Emit unifies them (the
-    // bidirectional monomorphizing hack — matching HM's `constrain_equal` at
-    // apply sites — so a fresh Var on the function side, e.g. a `Proj`'s
-    // `record_var`, sees both polarities and doesn't coalesce too narrow);
-    // Check uses the sound one-way `arg <: domain`, so a refined argument (a
-    // filtered collection `{D | p}`) may flow into an unrefined parameter. See
-    // `Typing::constrain_argument`.
-    //
-    // TODO (SOUNDNESS): the Emit-side equality is a monomorphizing hack. Stage
-    // 2 prep replaces it with `Type::ForAll` + a monomorphization pass between
-    // `infer` and `inline` (see
-    // `docs/brainstorm/2026-05-06_simple_sub_prototype_status.md` §3.1). Make
-    // `constrain_argument` one-way in Emit too, and drop the polarity fallback
-    // in `simple_sub.rs::compact_go`, once that pass lands.
+    // The argument flows into the parameter domain via the sound one-way rule
+    // `arg <: domain` (see `Typing::constrain_argument`). A function domain is
+    // contravariant, so this alone leaves a *projection*'s domain var
+    // under-determined (a `Proj` only constrains the one field it touches);
+    // `type_saturate`'s projection-domain specialization recovers it from the
+    // record/tuple actually flowing in. That replaced an earlier emit-time
+    // reverse `domain <: arg` whose global propagation was load-bearing but
+    // over-reaching; see `specialize_projection_domain`.
     ctx.constrain_argument(&arg_ty, &domain, &|| "Apply".to_string())?;
     Ok(codomain)
 }
@@ -1152,20 +1396,31 @@ fn emit_aggregate<C: Typing>(
     apply_unary_scheme(ctx, scheme, &input_ty, &|| "Aggregate".to_string())
 }
 
+/// Emit/check a `let`, returning the body type.
+///
+/// A genuinely-polymorphic function definition ([`Typing::is_generalizable`])
+/// is generalized so each `Var` use instantiates a fresh copy; the
+/// post-coalesce [`monomorphize`] pass later specializes the definition per
+/// distinct resolved use type. Everything else is bound monomorphically and
+/// shared (the pre-let-poly behavior). Generalization carries no use-count or
+/// generator condition — see [`should_generalize`].
 fn emit_let<C: Typing>(
     binding: &mut TypedBinding,
     bound_expr: &mut Expr,
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, InferError> {
-    let bound_ty = ctx.subexpr(bound_expr)?;
+    // Emit the RHS at a deeper level so its locally-minted variables can be
+    // generalized at the binding site (`scoped_let`).
+    let bound_ty = ctx.in_let_rhs(|ctx| ctx.subexpr(bound_expr))?;
     // User annotation on binding site (e.g. `x: Int = expr`):
     if let Some(ann) = &binding.user_annotation {
         ctx.bind_annotation(&bound_ty, ann)?;
     }
-    // Monomorphic let: bind name to bound_ty as-is. Later we
-    // will instead generalize bound_ty into a PolyScheme here.
-    ctx.scoped(&binding.name, &bound_ty, |ctx| ctx.subexpr(body))
+    let generalize = ctx.is_generalizable(bound_expr);
+    ctx.scoped_let(&binding.name, &bound_ty, generalize, |ctx| {
+        ctx.subexpr(body)
+    })
 }
 
 /// Build the open-product shape a projection of `key` requires its input to
@@ -1522,6 +1777,29 @@ impl Typing for CheckCtx {
         f(self)
     }
 
+    fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        // No generalization in Check (recorded types are trusted), so no level
+        // bump is needed.
+        f(self)
+    }
+
+    fn is_generalizable(&self, _def: &Expr) -> bool {
+        // Check never generalizes — by the time it runs, polymorphic `let`s
+        // have been monomorphized into concrete per-type specializations.
+        false
+    }
+
+    fn scoped_let<R>(
+        &mut self,
+        _name: &str,
+        _bound_ty: &Type,
+        _generalize: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        // See `scoped`: Check maintains no scope and does not generalize.
+        f(self)
+    }
+
     fn bind_annotation(&mut self, _inferred: &Type, _ann: &Type) -> Result<(), InferError> {
         // The annotation was already folded into the binder's type during
         // inference; nothing to re-check here.
@@ -1571,8 +1849,9 @@ impl Typing for CheckCtx {
         at: &dyn Fn() -> String,
     ) -> Result<(), InferError> {
         // Sound one-way only: a refined argument may flow into an unrefined
-        // parameter (dropping a restriction is admissible). The Emit-side
-        // monomorphizing hack's reverse direction does not apply here.
+        // parameter (dropping a restriction is admissible). Emit's reverse
+        // direction (domain coalescing) is not the sound subtyping rule and so
+        // does not apply to the post-inference check.
         self.require_sub(arg, domain, at)
     }
 }
@@ -1616,6 +1895,8 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
             emit_aggregate(input, &scheme, ctx)?
         }
 
+        // Check never generalizes (`is_generalizable` is `false`), so every
+        // `let` it sees is treated monomorphically.
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -1757,7 +2038,7 @@ fn push_coalesce_err(errors: &mut Vec<InferError>, new_err: InferError, label: S
 
 fn coalesce_pass(expr: &mut Expr) -> Vec<InferError> {
     let mut errors = Vec::new();
-    coalesce_node(expr, &mut errors);
+    coalesce_node(expr, 0, &mut errors);
     errors
 }
 
@@ -1767,9 +2048,17 @@ fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
     coalesce_compact(&simplify_type(compact_type(ty)))
 }
 
-fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
+fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
     // Recurse into sub-expressions first so child types are settled
     // before we coalesce this node's (which may reference them).
+    //
+    // `level` mirrors emission's polymorphism level: only a `let` RHS bumps it
+    // (see `in_let_rhs`); every other binder leaves it unchanged. It is used
+    // solely to recognize a *generalized* `let` (`should_generalize`) so its
+    // definition subtree can be skipped — that subtree's quantified variables
+    // carry no use-site bounds, so coalescing it would (a) produce an
+    // under-determined type and (b) overwrite the bound-bearing `InferVar`s the
+    // `monomorphize` pass needs to specialize from.
     match &mut expr.node {
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
@@ -1777,25 +2066,25 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
         | TypedExprNode::Source(_)
         | TypedExprNode::Proj(_) => {}
         TypedExprNode::Apply { function, argument } => {
-            coalesce_node(function, errors);
-            coalesce_node(argument, errors);
+            coalesce_node(function, level, errors);
+            coalesce_node(argument, level, errors);
         }
         // `target`'s refinement predicate is *not* coalesced here — it rides
         // `expr.ty` (the constructed `Fun({d | r}, v)` reuses `target`'s tag),
         // so the `coalesce_type_predicates(&expr.ty)` call at the end of this
         // function resolves it through the shared `Rc`.
-        TypedExprNode::Cast { value, .. } => coalesce_node(value, errors),
+        TypedExprNode::Cast { value, .. } => coalesce_node(value, level, errors),
         TypedExprNode::BinOp { left, right, .. } => {
-            coalesce_node(left, errors);
-            coalesce_node(right, errors);
+            coalesce_node(left, level, errors);
+            coalesce_node(right, level, errors);
         }
-        TypedExprNode::UnaryOp(_, inner) => coalesce_node(inner, errors),
+        TypedExprNode::UnaryOp(_, inner) => coalesce_node(inner, level, errors),
         TypedExprNode::Lambda {
             param: _,
             body,
             refinement,
         } => {
-            coalesce_node(body, errors);
+            coalesce_node(body, level, errors);
             // Refinement predicate is itself an Expr that was inferred
             // by emit_lambda. Walk into it so its sub-trees get their
             // expr.ty slots filled — otherwise downstream code (and
@@ -1804,7 +2093,7 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
             if let Some(r) = refinement {
                 let RefinementKind::Predicate(def) = &r.kind;
                 if let Ok(mut pred) = def.try_borrow_mut() {
-                    coalesce_node(&mut pred, errors);
+                    coalesce_node(&mut pred, level, errors);
                 }
             }
             // `param.ty` is resolved from the lambda's coalesced domain in
@@ -1813,26 +2102,31 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
             // facts that only materialize in the contravariant domain
             // position of `expr.ty`).
         }
-        TypedExprNode::Aggregate { input, .. } => coalesce_node(input, errors),
+        TypedExprNode::Aggregate { input, .. } => coalesce_node(input, level, errors),
         TypedExprNode::Let {
             binding: _,
             bound_expr,
             body,
         } => {
-            coalesce_node(bound_expr, errors);
-            coalesce_node(body, errors);
+            // A generalized `let`'s definition is left uncoalesced for
+            // `monomorphize` to specialize; a monomorphic one is coalesced
+            // here. Either way the RHS lives one level deeper.
+            if !should_generalize(bound_expr, level) {
+                coalesce_node(bound_expr, level + 1, errors);
+            }
+            coalesce_node(body, level, errors);
         }
         TypedExprNode::List(elts)
         | TypedExprNode::Tuple(elts)
         | TypedExprNode::Compose(elts)
         | TypedExprNode::CollectionUnion(elts) => {
             for e in elts.iter_mut() {
-                coalesce_node(e, errors);
+                coalesce_node(e, level, errors);
             }
         }
         TypedExprNode::Record(fs) => {
             for (_, e) in fs.iter_mut() {
-                coalesce_node(e, errors);
+                coalesce_node(e, level, errors);
             }
         }
         TypedExprNode::Case {
@@ -1840,11 +2134,11 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
             branches,
         } => {
             if let Some(s) = scrutinee {
-                coalesce_node(s, errors);
+                coalesce_node(s, level, errors);
             }
             for b in branches.iter_mut() {
-                coalesce_node(&mut b.guard, errors);
-                coalesce_node(&mut b.body, errors);
+                coalesce_node(&mut b.guard, level, errors);
+                coalesce_node(&mut b.body, level, errors);
             }
             // Resolve each pattern's payload-binding type in place.
             // `emit_case` wrote the per-tag narrowed var into
@@ -1863,11 +2157,11 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
             }
         }
         TypedExprNode::VariantCtor { payload, .. } => {
-            coalesce_node(payload, errors);
+            coalesce_node(payload, level, errors);
         }
         TypedExprNode::ExprStmt { expr: e, body } => {
-            coalesce_node(e, errors);
-            coalesce_node(body, errors);
+            coalesce_node(e, level, errors);
+            coalesce_node(body, level, errors);
         }
         // Defer/Feed/Define are eliminated by `desugar_defers` before
         // inference runs, so coalesce never sees them.
@@ -1884,11 +2178,11 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
             loop_body,
             ..
         } => {
-            coalesce_node(source, errors);
+            coalesce_node(source, level, errors);
             for a in init_args.iter_mut() {
-                coalesce_node(a, errors);
+                coalesce_node(a, level, errors);
             }
-            coalesce_node(loop_body, errors);
+            coalesce_node(loop_body, level, errors);
             // Resolve each accumulator-slot type in place. `emit_loop`
             // wrote the slot var into `params[i].ty`; run it through the
             // same pipeline used for `expr.ty` so it ends up concrete.
@@ -1947,33 +2241,290 @@ fn coalesce_node(expr: &mut Expr, errors: &mut Vec<InferError>) {
     // slots so the post-inference checks see concrete types. `try_borrow_mut`
     // breaks the cycle when a predicate's own type slot carries the same
     // refinement.
-    coalesce_type_predicates(&expr.ty, errors);
+    coalesce_type_predicates(&expr.ty, level, errors);
 }
 
 /// Coalesce refinement predicates embedded anywhere in `ty` (see the call
 /// site in `coalesce_node`). Idempotent for predicates already resolved by
-/// the `Lambda` arm.
-fn coalesce_type_predicates(ty: &Type, errors: &mut Vec<InferError>) {
+/// the `Lambda` arm. `level` is forwarded to the predicate's own
+/// [`coalesce_node`] (a predicate is emitted in the enclosing scope).
+fn coalesce_type_predicates(ty: &Type, level: Level, errors: &mut Vec<InferError>) {
     match ty {
         Type::Refinement(inner, r) => {
             let RefinementKind::Predicate(def) = &r.kind;
             if let Ok(mut pred) = def.try_borrow_mut() {
-                coalesce_node(&mut pred, errors);
+                coalesce_node(&mut pred, level, errors);
             }
-            coalesce_type_predicates(inner, errors);
+            coalesce_type_predicates(inner, level, errors);
         }
         Type::Fun(d, c) => {
-            coalesce_type_predicates(d, errors);
-            coalesce_type_predicates(c, errors);
+            coalesce_type_predicates(d, level, errors);
+            coalesce_type_predicates(c, level, errors);
         }
-        Type::Tuple(ts) => ts.iter().for_each(|t| coalesce_type_predicates(t, errors)),
+        Type::Tuple(ts) => ts
+            .iter()
+            .for_each(|t| coalesce_type_predicates(t, level, errors)),
         Type::Record(fs) => fs
             .iter()
-            .for_each(|(_, t)| coalesce_type_predicates(t, errors)),
+            .for_each(|(_, t)| coalesce_type_predicates(t, level, errors)),
         Type::Variant(tags) => tags
             .iter()
-            .for_each(|(_, t)| coalesce_type_predicates(t, errors)),
+            .for_each(|(_, t)| coalesce_type_predicates(t, level, errors)),
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass 3: Monomorphization
+// ---------------------------------------------------------------------------
+
+/// Lower each generalized `let` to concrete, per-type code.
+///
+/// After coalesce, every *use* of a generalized binding carries its resolved
+/// instantiation type on its `Var` node, while the binding's definition was
+/// left uncoalesced (`coalesce_node` skips it, preserving its bound-bearing
+/// inference variables). This pass groups the uses by distinct resolved type,
+/// emits **one** specialized clone of the definition per distinct type — shared
+/// across the uses that demand it — and rewrites each use to reference its
+/// specialization. A binding used at K distinct types becomes K nested `let`s;
+/// same-typed uses share one definition, so a collection/generator UDF used at
+/// several element types compiles to one *cached* binding per element type
+/// rather than a copy per call site (cf. [`crate::ccl::inline`]).
+///
+/// This is classic monomorphization, deferred until *after* types are known so
+/// it can key specialization on the resolved type — which is what lets one
+/// definition be shared across same-typed uses. It supersedes the earlier
+/// emit-time splice, which duplicated per use site (before types were known)
+/// and so could neither share nor reach collection-shaped definitions.
+fn monomorphize(expr: &mut Expr, errors: &mut Vec<InferError>) {
+    let mut next_id: u32 = 0;
+    monomorphize_go(expr, 0, &mut next_id, errors);
+}
+
+/// Specialize a projection morphism to the value flowing into it — the
+/// **closed-form** case of use-site specialization, the sibling of
+/// [`specialize_def`].
+///
+/// A projection `.i` is a *polymorphic* morphism: its principal type is
+/// `∀ρ. ρ ⇒ ρ.i` for any record/tuple `ρ` carrying field `i`. simple-sub never
+/// generalizes it (it is a builtin, not a `let`) and its single-sided
+/// `Var <: Var` rule feeds the domain var only the one field the projection
+/// touches, so the domain coalesces under-determined. Recovering it from the
+/// concrete `input` flowing in at the use site **monomorphizes** the projection
+/// to that use — exactly what [`specialize_def`] does for a generalized `let`
+/// (and what `compact_go`'s opposite-polarity fallback does for a bare
+/// contravariant domain var). The realizations differ only because the
+/// relationship differs: a `let`'s use type relates to its definition by
+/// arbitrary subtyping (so it needs freshen + pin + re-coalesce), whereas a
+/// projection's domain *equals* its input (`domain = ρ`), so the specialization
+/// collapses to a single overwrite — no clone, constraint, or re-coalesce. The
+/// codomain (the field extracted) is preserved.
+///
+/// `input` is supplied by the use site: the argument at an `Apply`, or the
+/// preceding morphism's codomain inside a `Compose`. No-op unless `morphism` is
+/// a `Proj` whose coalesced type is a function.
+///
+/// Invoked from [`crate::ccl::type_saturate`] (Pass 4), *not* `monomorphize`
+/// (Pass 3): the `input` (e.g. a join-pair binder) only acquires its resolved
+/// type from saturate's lexical Var/Let propagation, which must run after
+/// monomorphize (monomorphize mints the per-type specialization names that
+/// propagation fills in). So this closed-form specialization lives with its
+/// general sibling but fires where the use-site type is actually available.
+pub(crate) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
+    if matches!(morphism.node, TypedExprNode::Proj(_))
+        && let Type::Fun(_, cod) = &morphism.ty
+    {
+        let cod = (**cod).clone();
+        morphism.ty = Type::Fun(Box::new(input.clone()), Box::new(cod));
+    }
+}
+
+fn monomorphize_go(expr: &mut Expr, level: Level, next_id: &mut u32, errors: &mut Vec<InferError>) {
+    // `level` mirrors emission/coalesce: only a `let` RHS bumps it. A `let` is
+    // generalized iff `should_generalize` holds at its defining level — the same
+    // predicate emission and coalesce consulted, so all three agree on which
+    // `let`s are polymorphic.
+    let is_poly = matches!(
+        &expr.node,
+        TypedExprNode::Let { bound_expr, .. } if should_generalize(bound_expr, level)
+    );
+    if !is_poly {
+        match &mut expr.node {
+            TypedExprNode::Let {
+                bound_expr, body, ..
+            } => {
+                monomorphize_go(bound_expr, level + 1, next_id, errors);
+                monomorphize_go(body, level, next_id, errors);
+            }
+            _ => expr.walk_children_mut(|c| monomorphize_go(c, level, &mut *next_id, &mut *errors)),
+        }
+        return;
+    }
+
+    // Take ownership of the generalized `let`'s parts; we rebuild it as a stack
+    // of specialized monomorphic `let`s.
+    let saved_annotation = expr.user_annotation.take();
+    let node = std::mem::replace(&mut expr.node, TypedExprNode::Error);
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = node
+    else {
+        unreachable!("is_poly implies Let")
+    };
+    let cutoff = level;
+    let def = *bound_expr;
+    let mut body = *body;
+
+    // Assign one fresh specialization name per distinct resolved use type, and
+    // rewrite each use in place to its name. `for_each_free_use` respects
+    // shadowing, so an inner binder of the same name is left untouched. The
+    // generated names are globally unique (via `next_id`), so they cannot
+    // capture or be captured by anything in `body`.
+    let mut groups: Vec<(Type, String)> = Vec::new();
+    for_each_free_use(&mut body, &binding.name, &mut |u| {
+        let name = match groups.iter().find(|(t, _)| *t == u.ty) {
+            Some((_, n)) => n.clone(),
+            None => {
+                let n = format!("{}__mono{}", binding.name, *next_id);
+                *next_id += 1;
+                groups.push((u.ty.clone(), n.clone()));
+                n
+            }
+        };
+        if let TypedExprNode::Var(v) = &mut u.node {
+            *v = name;
+        }
+    });
+
+    // Recurse into the (rewritten) body for any further generalized `let`s.
+    monomorphize_go(&mut body, level, next_id, errors);
+
+    // Wrap the body in one specialized `let` per distinct type. Built in reverse
+    // so first-seen types end up outermost; ordering is immaterial since the
+    // specializations never reference one another. An unused binding (no groups)
+    // is dropped entirely — its definition is dead code.
+    let mut result = body;
+    for (ty_i, name_i) in groups.into_iter().rev() {
+        let mut def_i = specialize_def(&def, cutoff, &ty_i, errors);
+        // The specialization may itself contain generalized `let`s.
+        monomorphize_go(&mut def_i, cutoff + 1, next_id, errors);
+        let body_ty = result.ty.clone();
+        result = Expr::new(TypedExprNode::Let {
+            binding: TypedBinding {
+                name: name_i,
+                ty: def_i.ty.clone(),
+                user_annotation: None,
+            },
+            bound_expr: Box::new(def_i),
+            body: Box::new(result),
+        })
+        .with_ty(body_ty);
+    }
+    *expr = result;
+    expr.user_annotation = saved_annotation;
+}
+
+/// Specialize a generalized definition to one resolved use type.
+///
+/// Freshens an independent copy of `def` (so neither the original nor any other
+/// specialization is disturbed), pins its type to `target` (the resolved use
+/// type), and coalesces the copy in place — yielding a definition whose every
+/// node carries concrete, `target`-specialized types. `target` is already
+/// concrete, so the two-way pin merely drives it into the freshened quantified
+/// variables; it should never fail (the type came from this definition's own
+/// instantiation), but any error is surfaced rather than silently dropped.
+// `ConstrainCache` keys on `Type`, whose `Refinement` predicates carry interior
+// mutability; the solver relies on identity-by-`uid`, not the mutable payload
+// (matching `simple_sub`'s module-level allow).
+#[allow(clippy::mutable_key_type)]
+fn specialize_def(def: &Expr, cutoff: Level, target: &Type, errors: &mut Vec<InferError>) -> Expr {
+    let mut clone = def.clone();
+    let mut fresh = FreshenCache::new();
+    // Preserve levels: the definition may contain nested generalized `let`s
+    // whose RHS variables live deeper than `cutoff + 1`. Collapsing them to a
+    // single level would make `monomorphize_go`'s recursive descent (and the
+    // coalesce skip below) stop recognizing the inner generalization.
+    freshen_expr_types(&mut clone, cutoff, FreshenLevel::Preserve, &mut fresh);
+
+    let mut cache = ConstrainCache::new();
+    let pinned = constrain_subtype(&clone.ty, target, &mut cache)
+        .and_then(|()| constrain_subtype(target, &clone.ty, &mut cache));
+    if let Err(e) = pinned {
+        errors.push(map_constrain_err(e, "monomorphization specialization"));
+    }
+
+    coalesce_node(&mut clone, cutoff + 1, errors);
+    clone
+}
+
+/// Invoke `f` on every *free* `Var(name)` use within `expr`, skipping subtrees
+/// where an inner binder shadows `name` (a lambda param, a nested `let`, a
+/// `Case` pattern payload, or a `Loop` accumulator). The closure may both read
+/// the use's resolved type (`u.ty`) and rewrite its node.
+fn for_each_free_use(expr: &mut Expr, name: &str, f: &mut impl FnMut(&mut Expr)) {
+    // The `Var` case needs the whole `&mut expr`, so check it without holding a
+    // borrow of `expr.node`.
+    if let TypedExprNode::Var(v) = &expr.node {
+        if v == name {
+            f(expr);
+        }
+        return;
+    }
+    match &mut expr.node {
+        TypedExprNode::Lambda { param, body, .. } => {
+            // A refinement predicate ranges over the param, not an outer
+            // binding, so it cannot free-reference `name`.
+            if param.name != name {
+                for_each_free_use(body, name, f);
+            }
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            // CCL `let` is non-recursive: `bound_expr` sees the *outer* `name`.
+            for_each_free_use(bound_expr, name, f);
+            if binding.name != name {
+                for_each_free_use(body, name, f);
+            }
+        }
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            if let Some(s) = scrutinee {
+                for_each_free_use(s, name, f);
+            }
+            for b in branches {
+                // A pattern payload binding shadows `name` in guard + body.
+                if b.pattern.as_ref().is_some_and(|p| p.binding.name == name) {
+                    continue;
+                }
+                for_each_free_use(&mut b.guard, name, f);
+                for_each_free_use(&mut b.body, name, f);
+            }
+        }
+        TypedExprNode::Loop {
+            params,
+            init_args,
+            source,
+            loop_body,
+        } => {
+            // `params` are bound only inside `loop_body`; `init_args` and
+            // `source` are evaluated in the enclosing scope.
+            for a in init_args {
+                for_each_free_use(a, name, f);
+            }
+            for_each_free_use(source, name, f);
+            if !params.iter().any(|p| p.name == name) {
+                for_each_free_use(loop_body, name, f);
+            }
+        }
+        // No binder for `name`: recurse into all children uniformly.
+        _ => expr.walk_children_mut(|c| for_each_free_use(c, name, &mut *f)),
     }
 }
 
@@ -2082,6 +2633,236 @@ mod tests {
         });
         let ty = run_simple_sub(&mut e).expect("inference succeeds");
         assert_eq!(ty, Type::Base(BaseType::Int));
+    }
+
+    #[test]
+    fn let_poly_identity_used_at_two_types() {
+        // let id = λx. x in (id(1), id("a"))  →  (Int, String).
+        //
+        // The two use sites would collide under monomorphic `let` (both flow
+        // into one shared param var → `IncompatibleBounds`). Let-generalization
+        // instantiates `id` independently per use, and the post-coalesce
+        // `monomorphize` pass emits one specialized definition per distinct use
+        // type.
+        let id = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
+        let use_int = TypedExpr::apply(lit_int(1), TypedExpr::var("id"));
+        let use_str = TypedExpr::apply(lit_string("a"), TypedExpr::var("id"));
+        let body = TypedExpr::new(TypedExprNode::Tuple(vec![use_int, use_str]));
+        let mut e = TypedExpr::let_bind("id", id, body);
+        let ty = run_simple_sub(&mut e).expect("polymorphic identity type-checks");
+        assert_eq!(
+            ty,
+            Type::Tuple(vec![
+                Type::Base(BaseType::Int),
+                Type::Base(BaseType::String)
+            ])
+        );
+    }
+
+    /// Walk `expr`, counting `Let` bindings minted by [`monomorphize`] (their
+    /// names carry the `__mono` marker) and the distinct specialization names
+    /// that `Var` nodes reference.
+    fn specialization_stats(expr: &Expr) -> (usize, std::collections::BTreeSet<String>) {
+        fn go(e: &Expr, lets: &mut usize, used: &mut std::collections::BTreeSet<String>) {
+            match &e.node {
+                TypedExprNode::Let { binding, .. } if binding.name.contains("__mono") => *lets += 1,
+                TypedExprNode::Var(v) if v.contains("__mono") => {
+                    used.insert(v.clone());
+                }
+                _ => {}
+            }
+            e.walk_children(|c| go(c, lets, used));
+        }
+        let mut lets = 0;
+        let mut used = std::collections::BTreeSet::new();
+        go(expr, &mut lets, &mut used);
+        (lets, used)
+    }
+
+    #[test]
+    fn monomorphize_shares_one_specialization_per_type() {
+        // let f = λx. x in (f 1, f 2, f "a")
+        //
+        // Three uses at two *distinct* types (Int twice, String once). The lead
+        // F1 concern: specialization is keyed on the resolved type, not the use
+        // site, so the two `Int` uses share *one* definition — exactly two
+        // specializations, not three.
+        let f = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
+        let body = TypedExpr::new(TypedExprNode::Tuple(vec![
+            TypedExpr::apply(lit_int(1), TypedExpr::var("f")),
+            TypedExpr::apply(lit_int(2), TypedExpr::var("f")),
+            TypedExpr::apply(lit_string("a"), TypedExpr::var("f")),
+        ]));
+        let mut e = TypedExpr::let_bind("f", f, body);
+        let ty = run_simple_sub(&mut e).expect("type-checks");
+        assert_eq!(
+            ty,
+            Type::Tuple(vec![
+                Type::Base(BaseType::Int),
+                Type::Base(BaseType::Int),
+                Type::Base(BaseType::String),
+            ])
+        );
+        let (specializations, used_names) = specialization_stats(&e);
+        assert_eq!(specializations, 2, "one specialization per distinct type");
+        assert_eq!(
+            used_names.len(),
+            2,
+            "the three uses collapse onto two specializations"
+        );
+    }
+
+    #[test]
+    fn captured_var_exercises_extrude() {
+        // (λouter. let g = λy. outer(y) in g(1)) (λz. z)  →  Int.
+        //
+        // `extrude`'s level-mismatch recovery, now that generalized `let` RHSs
+        // mint variables one level deeper. `g`'s RHS (level 1) applies the
+        // *captured* outer variable `outer` (level 0) to its local `y` (level
+        // 1): `constrain(outer@0, ?y@1 ⇒ ?r@1)` is a level mismatch on `outer`,
+        // routing through `extrude` (negative polarity — `outer` acquires a
+        // function *upper* bound). The `Int` flowing in via `g(1)` must survive
+        // extrusion to a level-0 proxy, or the result would coalesce to `Infer`.
+        let g_def = TypedExpr::lambda(
+            "y",
+            Type::Hole,
+            TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("outer")),
+        );
+        let outer_body = TypedExpr::let_bind(
+            "g",
+            g_def,
+            TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
+        );
+        let outer = TypedExpr::lambda("outer", Type::Hole, outer_body);
+        let id = TypedExpr::lambda("z", Type::Hole, TypedExpr::var("z"));
+        let mut e = TypedExpr::apply(id, outer);
+        let ty = run_simple_sub(&mut e).expect("captured-var application type-checks");
+        assert_eq!(ty, Type::Base(BaseType::Int));
+    }
+
+    #[test]
+    fn nested_generalized_let_exercises_extrude_two_levels() {
+        // let mk = λp. (let g = λy. p(y) in g) in (mk(λz. z))(5)  →  Int.
+        //
+        // Two levels of generalization deep: `mk` is generalized (level-0 let),
+        // and *its* RHS contains a second generalized let `g` whose RHS lives at
+        // level 2. Applying the captured `p` (level 1) to `y` (level 2) drives a
+        // level-2→1 `extrude` — deeper than `captured_var_exercises_extrude`.
+        // It also exercises `monomorphize` recursing into a specialized
+        // definition that itself contains a generalized `let`.
+        let g_def = TypedExpr::lambda(
+            "y",
+            Type::Hole,
+            TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("p")),
+        );
+        let mk_body = TypedExpr::let_bind("g", g_def, TypedExpr::var("g"));
+        let mk = TypedExpr::lambda("p", Type::Hole, mk_body);
+        let id = TypedExpr::lambda("z", Type::Hole, TypedExpr::var("z"));
+        let applied = TypedExpr::apply(lit_int(5), TypedExpr::apply(id, TypedExpr::var("mk")));
+        let mut e = TypedExpr::let_bind("mk", mk, applied);
+        let ty = run_simple_sub(&mut e).expect("two-level nested generalization type-checks");
+        assert_eq!(ty, Type::Base(BaseType::Int));
+    }
+
+    #[test]
+    fn nested_generalized_let_polymorphic_within_one_specialization() {
+        // let outer = λw. (let inner = λy. y in (inner(w), inner(1)))
+        // in outer("a")                                 →  (String, Int).
+        //
+        // `inner` is a *generalized* `let` nested inside `outer`'s definition,
+        // and within the single `outer("a")` specialization it is used at two
+        // distinct types — `inner(w)` at `w`'s type (`String`) and `inner(1)`
+        // at `Int`. The monomorphization pass must recurse into the `outer`
+        // specialization and specialize `inner` per type *there*. This works
+        // only because specialization freshens with `FreshenLevel::Preserve`:
+        // collapsing `inner`'s deeper level makes it look monomorphic, so the
+        // pass would not recurse and `inner` would stay a single bare-`Infer`
+        // definition shared by both uses (under-determined, F1's concern).
+        let inner = TypedExpr::lambda("y", Type::Hole, TypedExpr::var("y"));
+        let inner_uses = TypedExpr::new(TypedExprNode::Tuple(vec![
+            TypedExpr::apply(TypedExpr::var("w"), TypedExpr::var("inner")),
+            TypedExpr::apply(lit_int(1), TypedExpr::var("inner")),
+        ]));
+        let outer = TypedExpr::lambda(
+            "w",
+            Type::Hole,
+            TypedExpr::let_bind("inner", inner, inner_uses),
+        );
+        let mut e = TypedExpr::let_bind(
+            "outer",
+            outer,
+            TypedExpr::apply(lit_string("a"), TypedExpr::var("outer")),
+        );
+        let ty = run_simple_sub(&mut e).expect("nested generalization type-checks");
+        assert_eq!(
+            ty,
+            Type::Tuple(vec![
+                Type::Base(BaseType::String),
+                Type::Base(BaseType::Int),
+            ])
+        );
+        // The discriminating check: three specializations — one for `outer`,
+        // and *two* nested ones for `inner` (at `String` and `Int`). Without
+        // level-preserving freshening the pass would not recurse into `inner`,
+        // leaving a single `outer` specialization.
+        let (specializations, _) = specialization_stats(&e);
+        assert_eq!(
+            specializations, 3,
+            "outer + two per-type inner specializations"
+        );
+        // And the two inner specializations carry concrete, distinct param
+        // types — never the under-determined shared definition.
+        let inner_param_tys = collect_inner_param_types(&e);
+        assert!(
+            inner_param_tys.contains(&Type::Base(BaseType::String))
+                && inner_param_tys.contains(&Type::Base(BaseType::Int)),
+            "inner specialized at String and Int, got {inner_param_tys:?}"
+        );
+    }
+
+    /// Collect the lambda param types of every `__mono` specialization of the
+    /// `inner` binding (used by the nested-polymorphism test).
+    fn collect_inner_param_types(expr: &Expr) -> Vec<Type> {
+        fn go(e: &Expr, out: &mut Vec<Type>) {
+            if let TypedExprNode::Let {
+                binding,
+                bound_expr,
+                ..
+            } = &e.node
+                && binding.name.starts_with("inner__mono")
+                && let TypedExprNode::Lambda { param, .. } = &bound_expr.node
+            {
+                out.push(param.ty.clone());
+            }
+            e.walk_children(|c| go(c, out));
+        }
+        let mut out = Vec::new();
+        go(expr, &mut out);
+        out
+    }
+
+    #[test]
+    fn self_application_rejected_without_panic() {
+        // let g = λy. y(y) in g(1)
+        //
+        // Self-application types as an infinite recursive type; Cambra rejects
+        // residual cycles at coalesce (`RecursiveType`). The point here is the
+        // recursion handling — `extrude`'s `(uid, pol)` cache and coalesce's
+        // cycle break — must surface a clean error, never panic or loop.
+        let g_def = TypedExpr::lambda(
+            "y",
+            Type::Hole,
+            TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("y")),
+        );
+        let mut e = TypedExpr::let_bind(
+            "g",
+            g_def,
+            TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
+        );
+        assert!(
+            run_simple_sub(&mut e).is_err(),
+            "self-application must be rejected, not accepted or panic"
+        );
     }
 
     /// TRIPWIRE — documents a known soundness gap, NOT desired behavior.

@@ -505,8 +505,8 @@ same source.
 `ccl::infer` runs simple-sub algebraic subtyping (Parreaux 2020, ICFP). The
 full algorithm description — motivation, data structures, constraint rules,
 polarity, let-polymorphism, the coalesce pipeline — lives in
-`docs/brainstorm/2026-05-06_simple_sub_prototype_status.md`. This section
-covers only the CCL-specific wiring.
+[`design-simple-sub.md`](./design-simple-sub.md). This section covers only the
+CCL-specific wiring.
 
 ### Pass structure
 

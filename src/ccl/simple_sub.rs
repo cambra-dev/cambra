@@ -79,8 +79,9 @@ impl std::fmt::Display for FieldKey {
 
 /// The level of `ty` — the maximum scope level of any inference variable
 /// occurring inside it. Leaves and `Hole` are level 0; `Refinement` defers
-/// to its inner type (refinements are lattice-blind). Used by `extrude` and
-/// (in a future let-poly extension) by generalization.
+/// to its inner type (refinements are lattice-blind). Used by `extrude` and by
+/// let-generalization (`infer_simple_sub::should_generalize`, which generalizes
+/// a binding when its type's level exceeds the binding level).
 pub fn type_level(ty: &Type) -> Level {
     match ty {
         Type::Infer(v) => v.level,
@@ -120,14 +121,15 @@ pub fn fun(d: Type, c: Type) -> Type {
 /// replaced with fresh variables via [`PolyScheme::instantiate`]. Vars
 /// whose level is ≤ `level` leaked in from an outer scope and stay fixed.
 ///
-/// # Current usage
+/// # Usage
 ///
-/// We currently keep `let` monomorphic, so we never *generalize* a binding
-/// into a `PolyScheme`. The struct exists to encode operator and
-/// projection signatures (`Compare : ∀α. α → α → Bool`,
-/// `Proj(Index n) : ∀α. {n: α, …} → α`, etc.) which are inherently
-/// polymorphic — and to support a future let-polymorphism extension without
-/// a breaking refactor. See `design-simple-sub.md` for the rationale.
+/// Two sources of schemes: (1) operator/projection signatures that are
+/// inherently polymorphic (`Compare : ∀α. α → α → Bool`,
+/// `Proj(Index n) : ∀α. {n: α, …} → α`, etc.), built once in
+/// `OperatorSchemes`; and (2) let-generalization — a multi-use function
+/// binding is generalized into a `PolyScheme` at its binding level
+/// (`infer_simple_sub::scoped_let`) and `instantiate`d per use. See
+/// `design-simple-sub.md` for the rationale.
 #[derive(Debug, Clone)]
 pub struct PolyScheme {
     /// Quantification cutoff: vars in `body` at level > `self.level`
@@ -157,7 +159,12 @@ impl PolyScheme {
     /// gets independent constraints (e.g. two uses of `Compare` can
     /// compare `Int`s and `String`s respectively without conflict).
     pub fn instantiate(&self, current_level: Level) -> Type {
-        freshen_above(self.level, &self.body, current_level, &mut HashMap::new())
+        freshen_above(
+            self.level,
+            &self.body,
+            FreshenLevel::At(current_level),
+            &mut HashMap::new(),
+        )
     }
 }
 
@@ -166,8 +173,23 @@ impl PolyScheme {
 /// share the same fresh var.
 pub type FreshenCache = HashMap<InferVarId, Rc<InferVar>>;
 
+/// The level [`freshen_above`] assigns to each fresh variable it mints.
+#[derive(Clone, Copy)]
+pub enum FreshenLevel {
+    /// Mint every fresh variable at this one level. Use-site instantiation
+    /// wants the copy to live at the *use's* level so it integrates with that
+    /// site's constraints.
+    At(Level),
+    /// Mint each fresh variable at its *original* variable's level, preserving
+    /// the relative level structure. Per-type specialization (the
+    /// `infer_simple_sub::monomorphize` pass) wants this: a definition may
+    /// contain nested generalized `let`s whose deeper levels must survive, or
+    /// the inner generalization stops being recognized.
+    Preserve,
+}
+
 /// Walk `ty` and replace every variable at level > `lim` with a fresh
-/// variable at `current_level`. Variables at level ≤ `lim` are kept
+/// variable (level chosen by `target`). Variables at level ≤ `lim` are kept
 /// as-is — they're free in the surrounding scope, not quantified.
 ///
 /// The bounds of each quantified variable are themselves freshened
@@ -176,7 +198,7 @@ pub type FreshenCache = HashMap<InferVarId, Rc<InferVar>>;
 pub fn freshen_above(
     lim: Level,
     ty: &Type,
-    current_level: Level,
+    target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Type {
     if type_level(ty) <= lim {
@@ -185,34 +207,39 @@ pub fn freshen_above(
     match ty {
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => ty.clone(),
         Type::Fun(d, c) => Type::Fun(
-            Box::new(freshen_above(lim, d, current_level, cache)),
-            Box::new(freshen_above(lim, c, current_level, cache)),
+            Box::new(freshen_above(lim, d, target, cache)),
+            Box::new(freshen_above(lim, c, target, cache)),
         ),
         Type::Tuple(ts) => Type::Tuple(
             ts.iter()
-                .map(|t| freshen_above(lim, t, current_level, cache))
+                .map(|t| freshen_above(lim, t, target, cache))
                 .collect(),
         ),
         Type::Record(fs) => Type::Record(
             fs.iter()
-                .map(|(n, t)| (n.clone(), freshen_above(lim, t, current_level, cache)))
+                .map(|(n, t)| (n.clone(), freshen_above(lim, t, target, cache)))
                 .collect(),
         ),
         Type::Variant(tags) => Type::Variant(
             tags.iter()
-                .map(|(k, t)| (k.clone(), freshen_above(lim, t, current_level, cache)))
+                .map(|(k, t)| (k.clone(), freshen_above(lim, t, target, cache)))
                 .collect(),
         ),
         Type::Refinement(inner, r) => Type::Refinement(
-            Box::new(freshen_above(lim, inner, current_level, cache)),
+            Box::new(freshen_above(lim, inner, target, cache)),
             r.clone(),
         ),
         Type::Infer(tv) => {
             if let Some(existing) = cache.get(&tv.uid) {
                 return Type::Infer(Rc::clone(existing));
             }
-            // Mint fresh variable at the use site's level.
-            let v = InferVar::fresh(current_level);
+            // Mint the fresh variable at the level `target` dictates: the use
+            // site's level (`At`) or the original's own level (`Preserve`).
+            let new_level = match target {
+                FreshenLevel::At(level) => level,
+                FreshenLevel::Preserve => tv.level,
+            };
+            let v = InferVar::fresh(new_level);
             cache.insert(tv.uid, Rc::clone(&v));
 
             // Snapshot bounds before recursing — the recursion may touch
@@ -223,11 +250,11 @@ pub fn freshen_above(
             };
             let new_lows: Vec<_> = lows
                 .iter()
-                .map(|t| freshen_above(lim, t, current_level, cache))
+                .map(|t| freshen_above(lim, t, target, cache))
                 .collect();
             let new_ups: Vec<_> = ups
                 .iter()
-                .map(|t| freshen_above(lim, t, current_level, cache))
+                .map(|t| freshen_above(lim, t, target, cache))
                 .collect();
             {
                 let mut s = v.bounds.borrow_mut();
@@ -514,10 +541,10 @@ fn wrap_refinements(base: &Type, refs: &[&Refinement]) -> Type {
 /// preserve: positive (`true`) keeps the lower bound, negative (`false`)
 /// keeps the upper bound.
 ///
-/// We currently keep `let` monomorphic, so all variables share level 0 and
-/// extrude is effectively a no-op. The implementation is included here so
-/// a future let-polymorphism extension (and the constrain_subtype solver's
-/// level-mismatch branches) compile against a working reference.
+/// Outside generalized `let`s every variable shares level 0, so extrude is a
+/// no-op there; it fires for real once let-generalization (`scoped_let`) mints
+/// RHS variables at a deeper level and a cross-level constraint arises (the
+/// constrain_subtype solver's level-mismatch branches).
 pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCache) -> Type {
     if type_level(ty) <= target_level {
         return ty.clone();
@@ -1066,43 +1093,53 @@ fn compact_go(
                 return CompactType::from_var(placeholder);
             }
             in_process.insert(key);
-            // TODO (SOUNDNESS): drop this opposite-polarity fallback when
-            // `Type::ForAll` + the monomorphization pass land (the
-            // let-polymorphism work).
-            // `simplify_type` has already landed and is wired in, but it does
-            // not fix this — the root issue is that `ccl::Type` has no
-            // representation for polymorphic types.
+            // The opposite-polarity fallback below is monomorphization's
+            // coalesce-time *read* for a contravariant position. A function
+            // domain is negative, so an argument flowing in (`arg <: domain`) is
+            // recorded as a *lower* bound of the domain var — but negative
+            // coalesce reads *upper* bounds. The fallback recovers the concrete
+            // type from the lower side. Choosing a concrete type for a
+            // negative-position var that only ever receives `arg` *is*
+            // monomorphizing it; the answer is the concrete `arg`.
             //
-            // A parameter variable like `x` in `λ x. x > 1` has principal
-            // type `∀α ⊇ Int. α → Bool`. Without ForAll, we can't express
-            // that: `ccl::Type` is monomorphic, so the variable must be
-            // collapsed to a concrete type. The fallback achieves this by
-            // treating the opposite-polarity bounds as if they were the
-            // polarity-correct ones, recovering `Int` from x's upper bounds.
-            // Sound while monomorphic (a variable's type is the same
-            // at both polar ends); breaks let-polymorphism and must
-            // come out before that lands.
+            // Algebraic subtyping's "principal" answer for such a var is
+            // `∀α ⊇ arg. …`, which would need a `Type::ForAll`. Cambra uses
+            // implicit, level-based polymorphism and lowers it to concrete code,
+            // so the desired output here is the concrete `arg`, not a quantifier
+            // — this is a pragmatic fit, not a ban on ever representing `∀`.
+            //
+            // The read is sound because every variable reaching coalesce is
+            // *monomorphically determined* — pinned to one type by its uses, or
+            // its bounds collide into `IncompatibleBounds` (never a silent
+            // mis-type). This invariant is the structural-collision check; it
+            // predates let-polymorphism. A generalized binding's definition is
+            // never coalesced (`infer_simple_sub` skips it); only its per-use
+            // instantiations reach here, each fixed by one use site, then
+            // specialized by the post-coalesce `monomorphize` pass.
             let s = state.bounds.borrow();
             let primary = if pol { &s.lower } else { &s.upper };
-            // When the polarity-correct list is empty we fall back to
-            // the opposite-polarity bounds (see big TODO above). Track
-            // which polarity the bounds came from so we walk + merge
-            // them at THAT polarity — record merge is asymmetric (union
-            // at negative, intersection at positive), and using the
-            // wrong polarity collapses disjoint-field records to the
-            // empty record at coalesce time. Fix for the multi-gen
-            // iter-record case: lambda param `__iter_record` accumulates
-            // upper bounds (open records `{.0}` and `{.1}`)
-            // from projections; we want their negative-polarity union
-            // (both fields) when the Var is coalesced at positive
-            // polarity, not the positive-polarity intersection (empty).
+            // When the polarity-correct list is empty we fall back to the
+            // opposite-polarity bounds (see the rationale above). Track which
+            // polarity the bounds came from so we walk + merge them at THAT
+            // polarity — record merge is asymmetric (union at negative,
+            // intersection at positive), and using the wrong polarity collapses
+            // disjoint-field records to the empty record at coalesce time. Fix
+            // for the multi-gen iter-record case: lambda param `__iter_record`
+            // accumulates upper bounds (open records `{.0}` and `{.1}`) from
+            // projections; we want their negative-polarity union (both fields)
+            // when the Var is coalesced at positive polarity, not the
+            // positive-polarity intersection (empty).
             //
-            // This whole fallback + the bidirectional Apply hack in
-            // `infer_simple_sub.rs::emit_apply` are the two monomorphizing
-            // collapses that work because `ccl::Type` has no `Type::ForAll`.
-            // Replace both at once when the monomorphization pass lands
-            // alongside let-polymorphism — see
-            // `docs/brainstorm/2026-05-06_simple_sub_prototype_status.md` §3.1.
+            // This fallback is the *fundamental* half of the contravariant
+            // domain read: it materializes the type locally at coalesce. The
+            // two-way `constrain_argument` in `infer_simple_sub::emit_apply`
+            // pre-deposits the same fact at emit time AND propagates it across
+            // the connected component — that propagation (not the read) is what
+            // the local fallback cannot replicate, so the eager constraint is
+            // currently load-bearing for multi-hop monomorphic record/join code.
+            // It is removable only once a general coalesce-time propagation
+            // (a two-sided `Var <: Var` rule) does the spreading; see
+            // `design-simple-sub.md` §2 (F6).
             let primary_bounds = primary.clone();
             let opposite_bounds = if pol {
                 s.upper.clone()
@@ -1137,10 +1174,10 @@ fn compact_go(
             // information lives on the opposite polarity coalesces to
             // `Type::Infer(?N)` instead of its real type — most commonly
             // a fresh lambda param whose Apply-site bound flows in at the
-            // opposite polarity from where the lambda is coalesced. Sound
-            // while monomorphic (a variable's type is the same at
-            // both polar ends); must come out before let-polymorphism
-            // lands. See big TODO above for the full reasoning.
+            // opposite polarity from where the lambda is coalesced. This is the
+            // coalesce-time read of monomorphization; it is sound because every
+            // var reaching coalesce is monomorphically determined (one type or
+            // an `IncompatibleBounds` error). See the rationale above.
             let no_concrete = bound
                 .as_ref()
                 .is_none_or(|b| b.atoms.is_empty() && b.rec.is_none() && b.fun.is_none());

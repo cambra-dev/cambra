@@ -9,11 +9,14 @@
 //! * **Lexical Var/Let propagation** — a `Var` node adopts its binding's
 //!   resolved type from scope, and a `Let` splices its bound expression's
 //!   type into the binding slot and the `Let`'s own `expr.ty`.
-//! * **Compose/Proj domain reconstruction** — simple-sub coalesces each
-//!   `Proj` morphism's domain independently (the `Var <: Var` constrain rule
-//!   is single-sided), so a `Compose` chain's domains come out
-//!   under-determined; this pass rebuilds them from the preceding morphism's
-//!   codomain.
+//! * **Projection-domain specialization** (`Compose`/`Apply`) — a `Proj`'s
+//!   domain coalesces under-determined (single-sided `Var <: Var`), so it is
+//!   monomorphized to the value flowing in: the preceding morphism's codomain in
+//!   a `Compose`, the argument at an `Apply`. This is the **closed-form** case of
+//!   the same use-site specialization `monomorphize` performs for generalized
+//!   `let`s (see [`crate::ccl::infer_simple_sub::specialize_projection_domain`]);
+//!   it runs *here*, in Pass 4, because the input's type is only resolved by the
+//!   lexical propagation above — which must follow monomorphize (Pass 3).
 //!
 //! Contract: given an [`Expr`] tree whose every node carries a coalesced
 //! [`Type`] (some correctly-typed, some carrying placeholders from the
@@ -24,7 +27,9 @@
 //! [`SimpleSubContext`](crate::ccl::infer_simple_sub): it inspects already-
 //! coalesced types directly.
 
-use crate::ccl::{Expr, Type, TypedExprNode};
+use crate::ccl::ccl_utils::cast_target_refinement;
+use crate::ccl::infer_simple_sub::specialize_projection_domain;
+use crate::ccl::{Expr, RefinementKind, Type, TypedExprNode};
 use crate::util::ScopeStack;
 
 /// Walk `expr` top-down, rewriting each node's `expr.ty` to agree with its
@@ -67,7 +72,7 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
             // emission; saturate it in a fresh isolated scope (its free
             // variables are not the surrounding lexical scope).
             if let Some(r) = refinement {
-                let crate::ccl::RefinementKind::Predicate(def) = &r.kind;
+                let RefinementKind::Predicate(def) = &r.kind;
                 if let Ok(mut pred) = def.try_borrow_mut() {
                     let mut pred_scope: ScopeStack<Type> = ScopeStack::new();
                     let mut pred_guard = pred_scope.enter_scope();
@@ -118,11 +123,30 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
         TypedExprNode::Apply { function, argument } => {
             saturate_node(function, scope);
             saturate_node(argument, scope);
+            // A projection applied to a (now lexically-resolved) argument:
+            // monomorphize its domain to the argument flowing in — the closed-form
+            // use-site specialization, the structural replacement for the
+            // emit-time reverse `domain <: arg` that `constrain_argument` dropped.
+            specialize_projection_domain(function, &argument.ty);
         }
-        // `value` is the only expression child; `target`'s refinement rides
-        // `expr.ty` and is left untouched (matching the pre-node
-        // `Apply(_, Cast)` behaviour, which saturated only the wrapped value).
-        TypedExprNode::Cast { value, .. } => saturate_node(value, scope),
+        // `value` is the saturated expression child. The cast `target`'s
+        // refinement predicate (a `λ restr → ...` filter — e.g. a join
+        // condition) is its own expression tree, not reached by the main walk,
+        // so its projections' domains stay under-determined. Saturate it in an
+        // isolated scope (its free variable is the predicate binder, not the
+        // surrounding lexical scope) so its `Proj` recoveries fire, exactly as
+        // for a `Lambda`'s own refinement above.
+        TypedExprNode::Cast { value, target } => {
+            saturate_node(value, scope);
+            if let Some(r) = cast_target_refinement(target) {
+                let RefinementKind::Predicate(def) = &r.kind;
+                if let Ok(mut pred) = def.try_borrow_mut() {
+                    let mut pred_scope: ScopeStack<Type> = ScopeStack::new();
+                    let mut pred_guard = pred_scope.enter_scope();
+                    saturate_node(&mut pred, &mut pred_guard);
+                }
+            }
+        }
         TypedExprNode::BinOp { left, right, .. } => {
             saturate_node(left, scope);
             saturate_node(right, scope);
@@ -140,38 +164,24 @@ fn saturate_node(expr: &mut Expr, scope: &mut ScopeStack<Type>) {
                 saturate_node(e, scope);
             }
         }
-        // Compose: rebuild `expr.ty` as `Fun(first.domain, last.codomain)`
-        // from the saturated children. simple-sub's coalesce can emit
-        // `Fun(?, ?)` here because `constrain_subtype`'s Var <: Var rule is
-        // single-sided (see `simple_sub.rs` Var arms, mirroring
-        // upstream `Typer.scala`): a fresh negative-position var only
-        // receives one bound side and compacts to `Type::Infer`. The
-        // post-coalesce typecheck (`check_compose_types`) reconstructs
-        // the same shape we materialise here.
+        // Compose: recurse for lexical (Var/Let) propagation, then monomorphize
+        // each non-leading `Proj`'s domain to the preceding morphism's codomain
+        // (the record/tuple flowing in) and rebuild the chain's own
+        // `Fun(first.domain, last.codomain)` type. simple-sub's single-sided
+        // `Var <: Var` rule leaves both under-determined; downstream operator
+        // conversion demands a concrete domain. The per-`Proj` recovery is the
+        // closed-form use-site specialization shared with the `Apply` arm — and
+        // the closed-form sibling of `monomorphize`'s `specialize_def`.
         TypedExprNode::Compose(elts) => {
             for e in elts.iter_mut() {
                 saturate_node(e, scope);
             }
-            // simple-sub coalesces each `Proj` morphism independently, so its
-            // domain captures only the field it touches — an open record-var
-            // that never closed to a concrete shape (it coalesces to an
-            // under-determined `Type::Infer`, or a record whose other fields
-            // are `Infer`). Downstream passes (operator conversion) demand a
-            // concrete domain;
-            // replace each `Proj`'s domain with the preceding morphism's
-            // codomain, which is the actual record/tuple flowing in.
-            // The Proj's codomain still describes the field it extracts.
             for i in 1..elts.len() {
                 let prev_cod = match &elts[i - 1].ty {
                     Type::Fun(_, cod) => (**cod).clone(),
                     _ => continue,
                 };
-                if matches!(&elts[i].node, TypedExprNode::Proj(_))
-                    && let Type::Fun(_, cod) = &elts[i].ty
-                {
-                    let cod = (**cod).clone();
-                    elts[i].ty = Type::Fun(Box::new(prev_cod), Box::new(cod));
-                }
+                specialize_projection_domain(&mut elts[i], &prev_cod);
             }
             if let (Some(first), Some(last)) = (elts.first(), elts.last())
                 && let (Type::Fun(first_dom, _), Type::Fun(_, last_cod)) = (&first.ty, &last.ty)

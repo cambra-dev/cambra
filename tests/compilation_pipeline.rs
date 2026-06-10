@@ -1087,15 +1087,19 @@ fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
-// An identity `def` called at two distinct argument types in the same program.
-// Both call sites must type-check (exercising let-generalised polymorphism for
-// user-defined functions); the program's value is the final expression.
-#[ignore = "needs let-polymorphism and monomorphization (not yet implemented)"]
+// A polymorphic UDF applied at two *distinct* argument types in the same
+// program, end-to-end. `x == x` is `∀α. α → Bool`, so the two calls have
+// incompatible domains (Int vs String) — under a monomorphic `let` they would
+// collide (`IncompatibleBounds`). Let-generalization + use-site monomorphization
+// must specialize each call independently. `x == x` is deliberately *not* the
+// identity (which lowering β-reduces away before inference), so a real `let f`
+// survives to the solver and exercises the splice path. Both results are `Bool`,
+// so they combine to a checkable scalar.
 #[rstest]
 #[timeout(Duration::from_secs(1))]
-fn test_function_def_polymorphic_identity() {
-    let code = "def f(x):\n    x\nf(1)\nf(\"foo\")";
-    check_scalar(code, Value::String("foo".into()));
+fn test_function_def_polymorphic_used_at_two_types() {
+    let code = "f = lambda x: x == x\nf(1) and f(\"foo\")";
+    check_scalar(code, Value::Bool(true));
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,6 +1186,22 @@ fn test_generator_with_loop_carried_mutation(#[case] code: &str, #[case] expecte
 )]
 fn test_generator_function_with_aggregate(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
+}
+
+// F2 (PR #227) — a generator UDF that is *polymorphic over its element type*
+// (`yield 1` ignores the element, so `ones : ∀α. [α] ⇒ [Int]`), applied at two
+// *distinct* element types in one program. The old generator carve-out kept
+// such UDFs monomorphic and shared, so the `Int`-list and `String`-list calls
+// collided into one parameter (`IncompatibleBounds`) and the program failed to
+// compile. Per-type monomorphization specializes the generator once per element
+// type — and because its domain is iterable, `inline` leaves each specialization
+// *cached* rather than duplicating it — so both calls compile and run. Summing
+// the two `[Int]` results (3 ones + 2 ones) gives a single checkable scalar.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_generator_polymorphic_over_element_type() {
+    let code = "def ones(xs):\n    for x in xs:\n        yield 1\nsum(ones([1, 2, 3])) + sum(ones([\"a\", \"b\"]))";
+    check_scalar(code, Value::Int(5));
 }
 
 // Nested generator calls: one generator feeds into another.

@@ -895,22 +895,23 @@ mod tests {
     #[test]
     fn test_collect_multi_conflict() {
         // λ x → Apply(λ a:Int → a, Var(x)) + Apply(λ b:String → b, Var(x))
-        // Constraints are [Int, String] → TypeMismatch.
+        // `x` is the argument to both an Int-domain and a String-domain function.
+        // The sound one-way `arg <: domain` rule records `x <: Int` and
+        // `x <: String` — two upper bounds, with no eager cross-constraint — so
+        // the conflict surfaces structurally at coalesce when the bounds collide
+        // (`IncompatibleBounds`, an untagged-sum rejection) rather than as an
+        // eager `TypeMismatch` from the (retired) reverse `domain <: arg`. Both
+        // correctly reject the program.
         let mut expr = double_apply_lambda(Type::Base(BaseType::Int), Type::Base(BaseType::String));
         let mut ctx = TypeInferenceContext::new();
-        // simple-sub catches the conflict at the Apply site.
-        let errs = infer(&mut expr, &mut ctx)
-            .expect_err("expected TypeMismatch Int/String under simple-sub");
+        let errs = infer(&mut expr, &mut ctx).expect_err("expected an Int/String conflict");
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                InferError::TypeMismatch {
-                    type_a: Type::Base(BaseType::Int),
-                    type_b: Type::Base(BaseType::String),
-                    ..
-                }
+                InferError::IncompatibleBounds { conflicting, .. }
+                    if conflicting.contains("Int") && conflicting.contains("String")
             )),
-            "expected TypeMismatch Int/String, got {errs:?}"
+            "expected IncompatibleBounds Int/String, got {errs:?}"
         );
     }
 
