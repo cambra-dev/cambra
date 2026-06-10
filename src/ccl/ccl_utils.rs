@@ -4,7 +4,6 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use crate::ccl::infer::typecheck_subtype;
 use crate::ccl::{
     BaseType, Builtin, Expr, Lit, Refinement, RefinementId, RefinementKind, Type, TypedExprNode,
     next_refinement_id,
@@ -134,11 +133,12 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
         .codomain()
         .expect("restrict upstream must have a function type D ⇒ T")
         .clone();
+    let upstream_dom = upstream_ty
+        .domain()
+        .expect("restrict upstream must have a function type D ⇒ T");
     debug_assert!(
-        typecheck_subtype(&upstream_ty.domain().unwrap(), &domain),
-        "restrict upstream domain {} must match predicate domain {}",
-        upstream_ty.domain().unwrap(),
-        domain,
+        strip_refinements(&upstream_dom) == strip_refinements(&domain),
+        "restrict upstream domain {upstream_dom} must match predicate domain {domain}",
     );
     // `{d : D | p(d)} ⇒ T` — refinement on the domain, value preserved.
     let refined_stream = Type::fun(refine_with(domain, &predicate), value_ty);
@@ -149,6 +149,84 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
         Type::fun(upstream_ty, refined_stream.clone()),
     );
     apply_function(upstream, restrict, refined_stream)
+}
+
+/// Wrap a join morphism `D ⇒ C`'s **codomain** in a refinement carrying
+/// `predicate`, yielding `D ⇒ {C | predicate}` (the morphism unchanged when
+/// `predicate` is trivially true).
+///
+/// A hash join consumes its equi-join conditions structurally — into the
+/// key-lookup shape, with no residual `Restrict` — so the extent it produces
+/// reaches downstream consumers *bare* even though every element it yields
+/// satisfies the join condition. A `cast({C | predicate} ⇒ …)` that consumes
+/// the extent then sees `C ⊀ {C | predicate}` at the adjacency. Re-stamping
+/// the produced codomain with the join condition keeps both sides aligned —
+/// this is what a [`make_restrict`] residual does for the loop-join arm, made
+/// explicit for the equi-join case that has no residual to carry it.
+///
+/// A thin wrapper over [`set_codomain`] that refines the existing codomain in
+/// place rather than replacing it; see there for how the rewrite is threaded
+/// down the combinator's function spine so the post-planning `typecheck`
+/// reconstructs it. No runtime node is added (the combinators are type-level).
+pub fn refine_codomain(morphism: Expr, predicate: &Expr) -> Expr {
+    if is_trivially_true_predicate(predicate) {
+        return morphism;
+    }
+    let codomain = morphism
+        .ty
+        .codomain()
+        .expect("join morphism must be a function type")
+        .clone();
+    set_codomain(morphism, refine_with(codomain, predicate))
+}
+
+/// Re-stamp a morphism `D ⇒ _`'s codomain to `new_codomain`, yielding
+/// `D ⇒ new_codomain`. Used by join planning to surface the refined extent a
+/// producer yields (see [`refine_codomain`], and `wrap_with_iterate`'s
+/// iteration source, whose codomain is its own refined domain).
+///
+/// The morphism's result type is the trailing codomain of *every* node on its
+/// function spine — `apply_function` records `fun(arg.ty, result)` on the
+/// combinator node, and a combinator built by application (`make_restrict` →
+/// `Apply(pred, Restrict)`) nests that one level deeper. The Check pass
+/// rebuilds an `Apply`'s result from the leaf combinator's recorded type, so
+/// the new result must be threaded all the way down the spine, not just onto
+/// the outermost node — otherwise the post-planning `typecheck` sees an
+/// internally-inconsistent node it cannot reconstruct.
+pub fn set_codomain(mut morphism: Expr, new_codomain: Type) -> Expr {
+    let domain = morphism
+        .ty
+        .domain()
+        .expect("morphism must be a function type")
+        .clone();
+    let new_ty = Type::fun(domain, new_codomain);
+    if let TypedExprNode::Apply { function, .. } = &mut morphism.node {
+        restamp_spine_result(function, new_ty.clone());
+    } else {
+        debug_assert!(
+            false,
+            "set_codomain: morphism must be an applied combinator"
+        );
+    }
+    morphism.ty = new_ty;
+    morphism
+}
+
+/// Re-stamp a combinator-node's recorded type so its codomain becomes
+/// `new_result` (the rewritten morphism type), recursing down the function
+/// spine of an applied combinator so the leaf builtin — which the Check pass
+/// rebuilds from — agrees. See [`set_codomain`].
+fn restamp_spine_result(node: &mut Expr, new_result: Type) {
+    let domain = node
+        .ty
+        .domain()
+        .expect("combinator node must be a function type")
+        .clone();
+    let new_ty = Type::fun(domain, new_result);
+    if let TypedExprNode::Apply { function, .. } = &mut node.node {
+        restamp_spine_result(function, new_ty.clone());
+    }
+    node.ty = new_ty;
 }
 
 /// Construct a [`TypedExprNode::Cast`], a pure type-level assertion that
@@ -224,6 +302,17 @@ pub fn refined_fn_type(
         ),
         codomain,
     )
+}
+
+/// Peel every top-level [`Type::Refinement`] layer off `ty`, returning the
+/// bare base type.  Used to compare domains up to refinements (which are
+/// transparent to structural shape).
+fn strip_refinements(ty: &Type) -> &Type {
+    let mut t = ty;
+    while let Type::Refinement(base, _) = t {
+        t = base;
+    }
+    t
 }
 
 /// Wrap `base` in a fresh `Type::Refinement` carrying `predicate`,

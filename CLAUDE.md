@@ -11,7 +11,7 @@ cargo fmt        # Run formatter
 cargo build      # Build the project
 cargo clippy --all-targets -- -D warnings # Run linter (part of the ci script)
 ci.sh --fix      # Runs complete CI suite, auto-formatting first
-cargo test       # Run all tests
+cargo test -q --no-fail-fast      # Run all tests
 cargo test <name>  # Run a specific test by name
 ```
 

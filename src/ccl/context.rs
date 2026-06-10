@@ -527,13 +527,14 @@ pub fn compile_program(
     );
     debug!("Join-planned CCL:\n{}", symbolic_typed(&join_planned));
 
-    // Planning is the only pass that *introduces* `iterate` / `restrict` /
-    // `Compose` staging nodes, and op-conversion consumes its output
-    // directly.  Re-run the structural checker so that mistake in the
-    // emitted shapes (e.g. a `restrict` transformer landing in a
-    // morphism-`Compose`, or an adjacency that doesn't chain) is caught
-    // here rather than surfacing as a confusing op-conversion failure or,
-    // worse, a silently wrong tile graph.
+    // Planning is the one pass that introduces `iterate` / `restrict` /
+    // `Compose` staging, so re-checking its output catches a malformed tile
+    // graph an adjacency that doesn't chain would otherwise hide. Planning
+    // surfaces each iterated / join-satisfying extent on its producer's
+    // codomain (`refine_codomain` / `set_codomain`) and the strict checker
+    // matches the fresh refinement ids it mints by structural predicate
+    // equality, so the staging shapes now validate without re-blinding the
+    // check or peeling cast refinements.
     typecheck(&join_planned).expect("type error after join planning");
 
     // Compile to one operator per field of the trailing record.  Pure

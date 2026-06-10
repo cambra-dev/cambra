@@ -299,7 +299,15 @@ fn apply_simplification_rules(expr: &mut Expr, contains_iteration: bool) -> bool
 }
 
 fn check(changed: bool, expr: &Expr) -> bool {
-    debug_typecheck(expr);
+    // Only re-typecheck when a rewrite actually fired: the assertion validates
+    // that a *transformation* preserved typing, so an untouched expression
+    // (already valid on the way in) needs no re-check. Skipping the no-op case
+    // avoids re-typechecking every subexpression after every rewrite *attempt*
+    // (10 per node per fixpoint pass), which otherwise dominates simplify in
+    // debug builds.
+    if changed {
+        debug_typecheck(expr);
+    }
     changed
 }
 
@@ -1091,22 +1099,17 @@ mod tests {
         assert_eq!(simplify(expr), lit2);
     }
 
-    /// Out-of-range index is left alone — let a later pass surface the real error.
-    #[test]
-    fn simplify_literal_tuple_projection_out_of_range_is_noop() {
-        let lit1 = Expr::lit(Lit::Int(1)).with_ty(int_ty());
-        let tup_ty = Type::Tuple(vec![int_ty()]);
-        let tuple = Expr::tuple(vec![lit1]).with_ty(tup_ty.clone());
-        let proj = proj_idx(5).with_ty(fun_ty(tup_ty, int_ty()));
-        let expr = Expr::apply(tuple, proj).with_ty(int_ty());
-        assert_eq!(simplify(expr.clone()), expr);
-    }
-
-    /// Non-tuple argument: `Apply(Var("xs"), Proj(.0))` is *not* a literal-tuple
+    /// Non-literal argument: `Apply(Var("xs"), Proj(.0))` is *not* a literal-tuple
     /// projection — the rule must leave it alone.
+    ///
+    /// (Out-of-range and non-product projections can't reach `simplify`:
+    /// inference rejects them, and the unified `typecheck` — run by
+    /// `debug_typecheck` inside `simplify` — now enforces the `Proj` input shape.
+    /// So the scaffolding here is kept well-typed; the only thing under test is
+    /// that a non-literal argument leaves the rewrite untriggered.)
     #[test]
-    fn simplify_literal_tuple_projection_non_tuple_argument_is_noop() {
-        let xs_ty = fun_ty(Type::UIntRange(3), int_ty());
+    fn simplify_literal_tuple_projection_non_literal_argument_is_noop() {
+        let xs_ty = Type::Tuple(vec![int_ty()]);
         let xs = var("xs").with_ty(xs_ty.clone());
         let proj = proj_idx(0).with_ty(fun_ty(xs_ty, int_ty()));
         let expr = Expr::apply(xs, proj).with_ty(int_ty());

@@ -2327,17 +2327,77 @@ pub struct Refinement {
 }
 
 impl PartialEq for Refinement {
+    /// Two refinements match if they share an `id` **or** carry structurally
+    /// equal predicates. The structural fallback makes refinement-bearing
+    /// `Type`/`Expr` equality agnostic to the fresh ids join planning mints at
+    /// every marker (`make_iterate` / `make_restrict` / `refine_with`), so a
+    /// re-minted `{D | p}` compares equal to its structural twin — which is
+    /// what lets the post-planning `typecheck` chain the re-minted tags. `id`
+    /// stays the fast path: a refinement that merely flows around keeps its id
+    /// within an inference run. This is *equality*, not implication — `{T | p}`
+    /// and `{T | q}` with structurally-distinct predicates remain unequal. The
+    /// recursion (a predicate's `Expr` carries `Type`s that may themselves be
+    /// refined) terminates because coalesced types are acyclic.
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        if self.id == other.id {
+            return true;
+        }
+        let (RefinementKind::Predicate(a), RefinementKind::Predicate(b)) =
+            (&self.kind, &other.kind);
+        *a.borrow() == *b.borrow()
     }
 }
 
 impl Eq for Refinement {}
 
 impl std::hash::Hash for Refinement {
+    /// Hashes the predicate's *structure*, never its `id` — structurally-equal
+    /// refinements may carry distinct ids yet must hash equal to stay
+    /// consistent with this type's [`PartialEq`](Refinement::eq) (refined
+    /// `Type`s are hashed as `ConstrainCache` keys). [`hash_refinement_predicate`]
+    /// hashes the predicate's node shape and scalar leaves but skips embedded
+    /// `Type`s, so it ignores nested refinement ids exactly as `==` does.
+    ///
+    /// `try_borrow` (symmetric with `PartialEq`): a cell transiently held
+    /// `borrow_mut` by a rewrite pass hashes as the empty predicate rather than
+    /// panicking. Safe because refined `Type`s are hashed only inside
+    /// `constrain_subtype`, where predicate cells are not being mutated, so the
+    /// borrow always succeeds there and the hash is stable.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+        let RefinementKind::Predicate(p) = &self.kind;
+        if let Ok(p) = p.try_borrow() {
+            hash_refinement_predicate(&p, state);
+        }
     }
+}
+
+/// Structural hash of a refinement predicate, consistent with the structural
+/// equality in [`Refinement`]'s `PartialEq`: it hashes the predicate's node
+/// discriminant and scalar leaves (operators, builtins, literals, names) and
+/// recurses into child `Expr`s, but never hashes the embedded `Type`s. Skipping
+/// types is what makes it ignore refinement ids — two predicates `==` treats as
+/// equal (e.g. differing only in ids planning re-minted) hash identically — and
+/// keeps it non-recursive through refinements (so it always terminates and adds
+/// no extra borrows).
+fn hash_refinement_predicate<H: std::hash::Hasher>(e: &TypedExpr, state: &mut H) {
+    use std::hash::Hash;
+    std::mem::discriminant(&e.node).hash(state);
+    match &e.node {
+        TypedExprNode::Lit(Lit::Int(n)) => n.hash(state),
+        TypedExprNode::Lit(Lit::String(s)) => s.hash(state),
+        TypedExprNode::Lit(Lit::Bool(b)) => b.hash(state),
+        TypedExprNode::Lit(Lit::Unit) => {}
+        TypedExprNode::Var(name) => name.hash(state),
+        TypedExprNode::Builtin(b) => b.hash(state),
+        TypedExprNode::BinOp { op, .. } => op.hash(state),
+        TypedExprNode::UnaryOp(kind, _) => kind.hash(state),
+        TypedExprNode::Aggregate { kind, .. } => kind.hash(state),
+        TypedExprNode::VariantCtor { tag, .. } => tag.hash(state),
+        TypedExprNode::Proj(ProjKey::Index(i)) => i.hash(state),
+        TypedExprNode::Proj(ProjKey::Field(f)) => f.hash(state),
+        _ => {}
+    }
+    e.walk_children(|child| hash_refinement_predicate(child, state));
 }
 
 /// Carries the predicate of a refinement.

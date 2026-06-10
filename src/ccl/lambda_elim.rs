@@ -618,15 +618,31 @@ fn elim_lambda_impl(
                 // make elim_lambdas idempotent or find a way to call it on the new refinement exactly once.
                 let fully_elim_ref_body = elim_lambdas(ctx, lambda_elim_ref_body)?;
 
-                let inner_ty = inner_elim.ty.clone();
-                inner_elim = inner_elim.with_ty(Type::Refinement(
-                    Box::new(inner_ty),
+                // `fully_elim_ref_body` is a predicate over the *pair domain*
+                // (built over `pair_ty` above), so the correlated refinement
+                // belongs on the uncurried function's **domain** —
+                // `{(param, y) | r} ⇒ cod` — not wrapped around the whole
+                // function. Domain placement is both semantically right (the
+                // predicate constrains the argument pair) and keeps the tree
+                // reconstructable: the point-free body rebuilds the bare
+                // `(param, y) ⇒ cod`, which is a subtype of the domain-refined
+                // type by contravariance (a bare-domain function is more
+                // general), so the post-inference check passes strictly.
+                let Type::Fun(inner_dom, inner_cod) = inner_elim.ty.clone() else {
+                    unreachable!(
+                        "uncurried lambda body must have a function type, got {}",
+                        inner_elim.ty
+                    );
+                };
+                let refined_dom = Type::Refinement(
+                    inner_dom,
                     Refinement {
                         id: next_refinement_id(),
                         description: "uncurried".into(),
                         kind: RefinementKind::Predicate(Rc::new(RefCell::new(fully_elim_ref_body))),
                     },
-                ));
+                );
+                inner_elim = inner_elim.with_ty(Type::fun(refined_dom, *inner_cod));
 
                 let curry_var = Expr::builtin(Builtin::Curry)
                     .with_ty(Type::fun(inner_elim.ty.clone(), result_ty.clone()));
@@ -1120,7 +1136,9 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, Expr, Lit, Type, symbolic::symbolic};
+    use crate::ccl::{
+        ArithmeticKind, BaseType, BinOpKind, CompareKind, Expr, Lit, Type, symbolic::symbolic,
+    };
     use test_log::test;
 
     // -----------------------------------------------------------------------
@@ -1148,6 +1166,11 @@ mod tests {
     /// Build a `Fun(a, b)` type.
     fn fun_ty(a: Type, b: Type) -> Type {
         Type::Fun(Box::new(a), Box::new(b))
+    }
+
+    /// `Bool` base type, for predicate bodies and other boolean-typed nodes.
+    fn bool_ty() -> Type {
+        Type::Base(BaseType::Bool)
     }
 
     /// Compare two expressions structurally, ignoring type annotations.
@@ -1309,18 +1332,50 @@ mod tests {
 
     #[test]
     fn substitute_in_refinement() {
-        // Create a refinement predicate that references a free variable "y"
-        let refinement_pred = Expr::var("y").with_ty(int_ty());
+        // A refinement predicate is a closed function `D ⇒ Bool` (see
+        // `docs/refinement-types-design.md`), so build one whose body uses the
+        // free variable `y` in a Bool position: `λ _p : Int → y > 0`. A bare
+        // `y` predicate would be ill-typed — the post-substitution
+        // `debug_typecheck` requires the predicate to be a Bool-returning
+        // function — so `y` is wrapped in a comparison. We substitute `y` and
+        // confirm the replacement reached into the predicate body.
+        let pred_of = |y_expr: Expr| {
+            Expr::lambda(
+                "_p",
+                int_ty(),
+                Expr::binop(
+                    y_expr,
+                    BinOpKind::Compare(CompareKind::Greater),
+                    lit(0).with_ty(int_ty()),
+                )
+                .with_ty(bool_ty()),
+            )
+            .with_ty(fun_ty(int_ty(), bool_ty()))
+        };
+        let refinement_pred = pred_of(var("y").with_ty(int_ty()));
 
-        // Create a lambda with a refinement containing the predicate
-        let expr = Expr::lambda_with_refinement(
+        // Create a lambda with a refinement containing the predicate. The
+        // param is refined, so the lambda's own type must carry the *same*
+        // refinement on its domain (`{Int | y > 0} ⇒ Int`) — otherwise the
+        // refinement-aware check rejects the node as `{Int|…} ⇒ Int ⊀ Int ⇒ Int`
+        // (a bare-domain annotation can't subsume a refined param). Read the
+        // refinement back off the constructed lambda so the ids match.
+        let lambda = Expr::lambda_with_refinement(
             "x",
             int_ty(),
             Expr::var("x").with_ty(int_ty()),
             refinement_pred,
-            "y",
-        )
-        .with_ty(fun_ty(int_ty(), int_ty()));
+            "y > 0",
+        );
+        let TypedExprNode::Lambda {
+            refinement: Some(r),
+            ..
+        } = &lambda.node
+        else {
+            unreachable!("just built a lambda with a refinement");
+        };
+        let refined_param = Type::Refinement(Box::new(int_ty()), r.clone());
+        let expr = lambda.clone().with_ty(fun_ty(refined_param, int_ty()));
 
         // Substitute "y" with a literal value in the expression
         let replacement = Expr::lit(Lit::Int(42)).with_ty(int_ty());
@@ -1338,8 +1393,8 @@ mod tests {
             panic!("Expected lambda with refinement");
         };
 
-        // The predicate should now be `42` instead of `y`
-        assert_expr_eq(pred_after_subst, replacement);
+        // The predicate's `y` should now be `42`: `λ _p : Int → 42 > 0`.
+        assert_expr_eq(pred_after_subst, pred_of(replacement.clone()));
     }
 
     // -----------------------------------------------------------------------

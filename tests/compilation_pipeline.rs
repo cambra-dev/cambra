@@ -2526,7 +2526,7 @@ fn test_no_fan_outs(#[case] code: &str) {
 )]
 #[case(
     "[x + y for x in [2] for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]",
-    "(iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ add):(([0, 0], ([0, 1], [0, 2])) ⇒ Int)",
+    "(iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ add):(([0, 0], {([0, 1], [0, 2]) | (.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq}) ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),

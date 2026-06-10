@@ -524,9 +524,10 @@ Lowering → TypedExpr (all nodes carry Type::Hole)
           TypedExpr (nodes carry concrete Type, some Type::Infer residuals)
                 │
           saturate (src/ccl/type_saturate.rs)
-                │  fixes up SimpleType-blind slots: Var scoping, refinements,
-                │  Let splicing, CollectionUnion. Temporary pass — see that
-                │  module's doc for removal conditions.
+                │  fixes up SimpleType-blind slots: Var scoping, Let
+                │  splicing, Compose/Proj domains, CollectionUnion (refinements
+                │  ride the lattice — see design-simple-sub.md §4). Temporary
+                │  pass — see that module's doc for removal conditions.
                 ▼
           TypedExpr (fully typed; Type::Hole eliminated)
 ```
@@ -836,7 +837,9 @@ Keyed aggregates are patterns like `sum(x) for x in groupby(xs, key_fn)` where:
 
 ### The Optimization
 
-The pass identifies constructs where a `curry` operator is applied to a type with a predicate refinement.
+The pass identifies constructs where a `curry` operator is applied to a function whose **domain**
+carries a predicate refinement (`{(key, value) | …} ⇒ A` — the placement `lambda_elim` uses for the
+correlated partition predicate; see `design-simple-sub.md` §4).
 The refinement expresses equality with a key: elements are partitioned when the key function applied
 to them equals a particular value. This pattern is rewritten to:
 

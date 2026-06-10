@@ -5,7 +5,8 @@ use std::mem::take;
 use log::trace;
 
 use crate::ccl::ccl_utils::{
-    apply_function, make_iterate, make_restrict, trivially_true_predicate, typed_compose,
+    apply_function, make_iterate, make_restrict, refine_codomain, set_codomain,
+    trivially_true_predicate, typed_compose,
 };
 use crate::ccl::{
     BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, ProjKey, Refinement,
@@ -390,6 +391,23 @@ fn wrap_with_iterate(expr: &mut Expr) {
         make_iterate(trivially_true_predicate(current.clone())),
         |upstream, pred| make_restrict(pred, upstream),
     );
+    // An iteration source produces the refined extent it iterates, so its
+    // codomain is the *site's* refined domain `{D | p}`, mirroring
+    // `make_iterate`'s `{D | p} ⇒ {D | p}` symmetry. Surfacing the refinement
+    // on the codomain lets the value-producing `body` — which `cast`s each
+    // element to the refined element type — compose against a producer that
+    // *already* carries `{D | p}`, rather than acquiring it from a bare
+    // codomain (`make_restrict` refines only the domain). We use `domain_ty`
+    // rather than the built source's domain because `make_restrict` drops a
+    // *trivially-true* layer (`if True`): the source then iterates a bare base,
+    // but the body's cast still demands the site's `{D | true}`, so the
+    // codomain must reflect the site domain to match it. Unrefined sites keep a
+    // bare `D ⇒ D`.
+    let source = if matches!(domain_ty, Type::Refinement(..)) {
+        set_codomain(source, domain_ty.clone())
+    } else {
+        source
+    };
     let mut elts: Vec<Expr> = vec![source];
     match body.node {
         TypedExprNode::Compose(existing) => {
@@ -472,19 +490,25 @@ fn replace_curried_correlated_refinements(expr: &mut Expr) {
     // `expr.node` end before we attempt to overwrite `*expr`.
     let groupby = if let TypedExprNode::Apply { argument, function } = &expr.node
         && is_builtin(function, Builtin::Curry)
-        && matches!(&argument.ty, Type::Refinement(..))
+        && let Type::Fun(arg_domain, _) = &argument.ty
+        && matches!(arg_domain.as_ref(), Type::Refinement(..))
     {
+        // The correlated groupby predicate refines the uncurried function's
+        // *domain* — `{(key, value) | k == key_fn(value)} ⇒ A` — as placed by
+        // `lambda_elim`'s correlated-refinement arm. Read the predicate off the
+        // domain refinement; `convert_groupby` takes the function type itself
+        // (it only needs the codomain) and the predicate.
         let Type::Refinement(
-            inner_ty,
+            _,
             Refinement {
                 kind: RefinementKind::Predicate(p),
                 ..
             },
-        ) = &argument.ty
+        ) = arg_domain.as_ref()
         else {
             unreachable!();
         };
-        Some(convert_groupby(argument, inner_ty, &p.borrow()))
+        Some(convert_groupby(argument, &argument.ty, &p.borrow()))
     } else {
         None
     };
@@ -1692,11 +1716,19 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
     trace!("convert_loop_join: planning succeeded. Plan:\n{plan:#?}");
     let expr = join_plan_to_expr(&plan, arm_types);
 
+    // The morphism produces the join-satisfying extent; surface that on its
+    // codomain so downstream consumers (e.g. a `cast({base | r} ⇒ …)` reading
+    // the produced tuples) see the refinement they expect. A hash join folds
+    // its equi-conditions into the key structure with no residual `Restrict`,
+    // so the codomain would otherwise be bare — see [`refine_codomain`]. Apply
+    // it to whichever morphism is returned (the refinement is the extent's,
+    // independent of the BFS arm permutation, which only reorders the domain).
+
     // If BFS produced arms out of canonical order, undo the permutation so that the
     // output domain matches the original tuple type expected by the caller.
     let canonical: Vec<usize> = (0..arm_types.len()).collect();
     if arm_order == canonical {
-        return Some(expr);
+        return Some(refine_codomain(expr, refinement));
     }
 
     // perm[j] = position of canonical arm j in arm_order (i.e. where to find it in actual).
@@ -1718,11 +1750,21 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
         Type::Base(BaseType::Int),
     ));
 
+    // permute_domain is polymorphic in the morphism it rearranges: it takes
+    // `expr` (the join morphism, whose domain may carry the join-condition
+    // refinement) and produces a canonical-ordered morphism. Declare its input
+    // as `expr`'s *actual* type, not a bare `actual_ty ⇒ actual_ty`. Otherwise
+    // `apply_function` re-stamps `permute_func`'s recorded type to
+    // `fun(expr.ty, …)` (carrying expr's refinement) while its inner
+    // `PermuteDomain` builtin keeps the bare declaration — an internally
+    // inconsistent node the post-inference reconstruction can't rebuild
+    // (the refinement rides the morphism's invariant domain⇒codomain position).
+    let morphism_ty = expr.ty.clone();
     let permute_func = apply_primitive(
         perm_arg,
         Builtin::PermuteDomain,
         Type::fun(
-            Type::fun(actual_ty.clone(), actual_ty.clone()),
+            morphism_ty,
             Type::fun(canonical_ty.clone(), actual_ty.clone()),
         ),
     );
@@ -1736,6 +1778,7 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
         Builtin::MapDomain,
         Type::fun(canonical_ty.clone(), canonical_ty.clone()),
     );
+    let result = refine_codomain(result, refinement);
     typecheck(&result).expect("Bad permute_domain expr");
     Some(result)
 }
