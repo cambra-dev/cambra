@@ -83,8 +83,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, Branch, Expr, Lit, Pattern, Refinement, RefinementKind, Type, TypedExpr,
-    TypedExprNode, ccl_utils::count_free, next_refinement_id, walk_loop_children,
+    BaseType, Branch, Expr, Lit, Pattern, Refinement, Type, TypedExpr, TypedExprNode,
+    ccl_utils::count_free, next_refinement_id, walk_loop_children,
 };
 
 /// Errors that can arise while desugaring `Defer`/`Feed`/`Define` nodes.
@@ -2016,7 +2016,7 @@ fn collect_free_vars(expr: &Expr, out: &mut HashSet<String>) {
                     // The Lambda's own refinement lives in the *outer*
                     // scope (before the param is bound), so visit it
                     // before pushing `param.name`.
-                    let RefinementKind::Predicate(pred_rc) = &r.kind;
+                    let pred_rc = &r.predicate;
                     if let Ok(pred) = pred_rc.try_borrow() {
                         rec(&pred, bound, out);
                     }
@@ -2051,7 +2051,7 @@ fn collect_free_vars(expr: &Expr, out: &mut HashSet<String>) {
     rec(expr, &mut bound, out);
 }
 
-/// Walk `ty` for any [`RefinementKind::Predicate`] expressions and
+/// Walk `ty` for any [`Refinement`](crate::ccl::Refinement) predicate expressions and
 /// collect their free variables into `out`.  Structural recursion via
 /// [`Type::walk_children`] so every compound type variant (`Fun`,
 /// `Tuple`, `Record`, `Variant`) is covered uniformly.
@@ -2061,7 +2061,7 @@ fn collect_free_vars(expr: &Expr, out: &mut HashSet<String>) {
 /// is being walked elsewhere, so the under-count is safe in practice.
 fn collect_free_vars_in_type(ty: &Type, out: &mut HashSet<String>) {
     if let Type::Refinement(_, refinement) = ty {
-        let RefinementKind::Predicate(pred_rc) = &refinement.kind;
+        let pred_rc = &refinement.predicate;
         if let Ok(pred) = pred_rc.try_borrow() {
             // Refinement predicates are themselves CCL expressions;
             // recurse into them through `collect_free_vars` so their
@@ -2923,7 +2923,7 @@ fn extract_for_defer(
                     let refinement_struct = Refinement {
                         id: next_refinement_id(),
                         description: "filter-feed".to_string(),
-                        kind: RefinementKind::Predicate(Rc::new(RefCell::new(pred_on_source))),
+                        predicate: Rc::new(RefCell::new(pred_on_source)),
                     };
                     let mut refined_argument = new_argument.clone();
                     refined_argument.user_annotation = Some(Type::fun(
@@ -3143,9 +3143,7 @@ fn extract_for_defer(
                             let refinement_struct = Refinement {
                                 id: next_refinement_id(),
                                 description: "filter-feed".to_string(),
-                                kind: RefinementKind::Predicate(Rc::new(RefCell::new(
-                                    pred_on_source,
-                                ))),
+                                predicate: Rc::new(RefCell::new(pred_on_source)),
                             };
                             let mut refined_prefix = source_prefix.clone();
                             refined_prefix.user_annotation = Some(Type::fun(
@@ -4358,7 +4356,7 @@ mod tests {
         let refinement = Refinement {
             id: next_refinement_id(),
             description: "test".to_string(),
-            kind: RefinementKind::Predicate(Rc::new(RefCell::new(pred))),
+            predicate: Rc::new(RefCell::new(pred)),
         };
         let annotated = TypedExpr {
             node: TypedExprNode::Var("__chan".to_string()),
@@ -4390,7 +4388,7 @@ mod tests {
         let refinement = Refinement {
             id: next_refinement_id(),
             description: "test".to_string(),
-            kind: RefinementKind::Predicate(Rc::new(RefCell::new(pred))),
+            predicate: Rc::new(RefCell::new(pred)),
         };
         let typed = TypedExpr {
             node: TypedExprNode::Lit(Lit::Unit),
@@ -4422,7 +4420,7 @@ mod tests {
         let refinement = Refinement {
             id: next_refinement_id(),
             description: "test".to_string(),
-            kind: RefinementKind::Predicate(Rc::new(RefCell::new(pred))),
+            predicate: Rc::new(RefCell::new(pred)),
         };
         let lambda = TypedExpr {
             node: TypedExprNode::Lambda {

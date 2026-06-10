@@ -468,25 +468,20 @@ enum Type {
     Hole,                                // lowering placeholder; converted to Infer at inference entry
     Infer(InferVarId),                   // residual type variable after simple-sub coalesce
     Error,                               // inference already failed here; suppresses cascades
-    Refinement(Box<Type>, Refinement),   // refined base type; `Refinement.kind` carries join strategy
+    Refinement(Box<Type>, Refinement),   // refined base type; `Refinement.predicate` is the restriction
     DataSource(String),                  // opaque domain type of a source
     // Future:
     // Pi { param, param_ty, body_ty }  — dependent function type
 }
 
-/// Carries the join strategy for a restricted Lambda (i.e. a filtered/joined comprehension).
+/// Carries the restriction predicate for a refined Lambda domain (i.e. a filtered/joined comprehension).
 struct Refinement {
     /// Unique ID for this refinement
     id: RefinementId, 
     /// Human-readable description shown by the symbolic printer (e.g. `"x < 10"`, `"x == y"`).
     description: String,
-    /// Always an arbitrary predicate.  TODO flatten this away
-    kind: RefinementKind,
-}
-
-enum RefinementKind {
     /// Arbitrary boolean predicate expressed as CCL.
-    Predicate(Rc<RefCell<TypedExpr>>),
+    predicate: Rc<RefCell<TypedExpr>>,
 }
 ```
 
@@ -519,15 +514,13 @@ Lowering → TypedExpr (all nodes carry Type::Hole)
           SimpleType constraint graph (VarState.lower/upper bound lists)
                 │
           coalesce_pass   (compact_type → coalesce_compact per node)
-                │  turns constraint graph back into ccl::Type values
-                ▼
-          TypedExpr (nodes carry concrete Type, some Type::Infer residuals)
-                │
-          saturate (src/ccl/type_saturate.rs)
-                │  fixes up SimpleType-blind slots: Var scoping, Let
-                │  splicing, Compose/Proj domains, CollectionUnion (refinements
-                │  ride the lattice — see design-simple-sub.md §4). Temporary
-                │  pass — see that module's doc for removal conditions.
+                │  turns the constraint graph back into ccl::Type values, and
+                │  in the same walk fills the binder slots that aren't any
+                │  node's expr.ty (Lambda param, Let binding, Case/Loop slots).
+                │  Var uses need no scope — they share the binder's var.
+                │  Compose/Proj domains are reconstructed earlier, in the solver
+                │  (emit_compose's reverse adjacency). Refinements ride the
+                │  lattice — see design-simple-sub.md §4.
                 ▼
           TypedExpr (fully typed; Type::Hole eliminated)
 ```

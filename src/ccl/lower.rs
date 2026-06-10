@@ -17,8 +17,8 @@
 //! | Boolean operators (`and`, `or`) | left-folded [`TypedExprNode::BinOp`] chain |
 //! | List literals `[e0, e1, ...]` | [`TypedExprNode::List`] |
 //! | Single-generator list comprehensions (no `if`) | `Lambda`/`Apply` encoding |
-//! | 2-gen equality-join comprehensions (`if x.k == y.k`) | hash-join [`crate::ccl::RefinementKind::Predicate`] |
-//! | Multi-gen filtered comprehensions (non-equality or 3+ generators) | loop-join [`crate::ccl::RefinementKind::Predicate`] |
+//! | 2-gen equality-join comprehensions (`if x.k == y.k`) | hash-join [`crate::ccl::Refinement`] predicate |
+//! | Multi-gen filtered comprehensions (non-equality or 3+ generators) | loop-join [`crate::ccl::Refinement`] predicate |
 //! | Assignment + expression blocks | nested [`TypedExprNode::Let`] |
 //! | Augmented assignment `x op= e` | desugared to [`TypedExprNode::Let`] via [`TypedExprNode::BinOp`] |
 //! | `sum(expr)` / `max(expr)` calls | [`TypedExprNode::Aggregate`] |
@@ -64,7 +64,7 @@ use std::{
 use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, Branch, Builtin, CompareKind, Expr,
-        Lit, LogicKind, RefinementKind, Type, TypedExprNode, UnaryOpKind,
+        Lit, LogicKind, Type, TypedExprNode, UnaryOpKind,
         ccl_utils::{make_cast, refined_fn_type},
     },
     chl_parser::ast::{
@@ -1446,7 +1446,7 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
             // `Rc<RefCell<>>` is freshly allocated during lowering and not
             // yet shared, so mutating in place is safe.
             if let Some(r) = &refinement {
-                let RefinementKind::Predicate(pred) = &r.kind;
+                let pred = &r.predicate;
                 let inner = pred.borrow().clone();
                 *pred.borrow_mut() = substitute_param_in_body(inner, name, replacement);
             }
@@ -2336,8 +2336,8 @@ fn lower_function_body(
 /// ```
 ///
 /// **Multiple generators / non-equality predicates** — loop-join encoding.
-/// The outer lambda carries a [`RefinementKind::Predicate`] with the combined
-/// guard expression; the runtime filters via a correlation vector:
+/// The outer lambda carries a [`Refinement`](crate::ccl::Refinement) predicate
+/// with the combined guard expression; the runtime filters via a correlation vector:
 /// ```text
 /// λ __iter_record : {T | pred} →
 ///   __iter_record[0] ▷ lower(source0) ▷ (λ var0 →
@@ -2346,8 +2346,10 @@ fn lower_function_body(
 ///
 /// **Two generators, single equality predicate** — hash-join encoding.
 /// Detected by [`try_extract_ccl_equality_join`] on the lowered predicate.
-/// The outer lambda carries a [`RefinementKind::HashJoin`]; `compile_ccl`
-/// translates it to an O(N+M) hash-join-based restriction:
+/// The outer lambda carries the same [`Refinement`](crate::ccl::Refinement)
+/// predicate (an equality `build_var == probe_var`); join planning
+/// (`crate::ccl::join_plan`) recognises the equality shape and translates it to
+/// an O(N+M) hash-join-based restriction:
 /// ```text
 /// λ __iter_record : {T | build_var == probe_var} →
 ///   __iter_record[0] ▷ lower(source0) ▷ (λ var0 →

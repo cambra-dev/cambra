@@ -49,9 +49,7 @@ use crate::ccl::ccl_utils::{
 };
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
-use crate::ccl::{
-    BaseType, Expr, RefinementKind, Type, TypedExpr, TypedExprNode, symbolic::symbolic,
-};
+use crate::ccl::{BaseType, Expr, Type, TypedExpr, TypedExprNode, symbolic::symbolic};
 use crate::ccl::{Builtin, Lit, Refinement, next_refinement_id};
 
 // ---------------------------------------------------------------------------
@@ -284,8 +282,7 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             mut refinement,
         } => {
             if let Some(Refinement {
-                kind: RefinementKind::Predicate(pred_rc),
-                ..
+                predicate: pred_rc, ..
             }) = &mut refinement
             {
                 let t = Expr::lit(Lit::Unit);
@@ -404,8 +401,7 @@ fn substitute_in_type(ty: &mut Type, name: &str, replacement: &Expr) {
     // the predicate explicitly, then recurse into structural type children.
     if let Type::Refinement(_, refinement) = ty {
         let Refinement {
-            kind: RefinementKind::Predicate(pred_rc),
-            ..
+            predicate: pred_rc, ..
         } = &mut *refinement;
         let t = Expr::lit(Lit::Unit);
         // Substitute within the refinement, unless we are already inside that same refinement
@@ -565,20 +561,17 @@ fn elim_lambda_impl(
             let mut y_ty = y_binding.ty.clone();
             let mut correlated_refinement = None;
             if let Some(ref r) = refinement {
-                match &r.kind {
-                    RefinementKind::Predicate(p) => {
-                        // Handle refinements on the lambda.  There are two options:
-                        // If the refinement is correlated with `param`, then we need to lift it to be
-                        // over the tuple we are going to create, so remove it from y.
-                        // If it is uncorrelated, attach it to y's type.
-                        let param_ty = y_ty.clone();
-                        if is_free(param, &p.borrow()) {
-                            correlated_refinement = Some(p.borrow().clone());
-                        } else {
-                            y_ty = Type::Refinement(Box::new(param_ty), r.clone());
-                        };
-                    }
-                }
+                let p = &r.predicate;
+                // Handle refinements on the lambda.  There are two options:
+                // If the refinement is correlated with `param`, then we need to lift it to be
+                // over the tuple we are going to create, so remove it from y.
+                // If it is uncorrelated, attach it to y's type.
+                let param_ty = y_ty.clone();
+                if is_free(param, &p.borrow()) {
+                    correlated_refinement = Some(p.borrow().clone());
+                } else {
+                    y_ty = Type::Refinement(Box::new(param_ty), r.clone());
+                };
             };
 
             // Merge λ x → λ y into λ __pair where x = pair[0], y = pair[1].
@@ -639,7 +632,7 @@ fn elim_lambda_impl(
                     Refinement {
                         id: next_refinement_id(),
                         description: "uncurried".into(),
-                        kind: RefinementKind::Predicate(Rc::new(RefCell::new(fully_elim_ref_body))),
+                        predicate: Rc::new(RefCell::new(fully_elim_ref_body)),
                     },
                 );
                 inner_elim = inner_elim.with_ty(Type::fun(refined_dom, *inner_cod));
@@ -956,10 +949,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             ref param,
             body: inner_body,
             refinement: Some(ref r),
-        } if matches!(r.kind, RefinementKind::Predicate(_)) => {
-            let mut pred = match &r.kind {
-                RefinementKind::Predicate(pred_rc) => pred_rc.borrow_mut(),
-            };
+        } => {
+            let mut pred = r.predicate.borrow_mut();
             *pred = elim_lambdas(ctx, pred.clone())?;
             // Desugar, preserving the lambda's type on the resulting Compose.
             let param_name = param.name.clone();
@@ -1038,7 +1029,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let refinement = Refinement {
                 id: next_refinement_id(),
                 description: "for-filter".into(),
-                kind: RefinementKind::Predicate(Rc::new(RefCell::new(pred_on_source))),
+                predicate: Rc::new(RefCell::new(pred_on_source)),
             };
             let refined_domain = Type::Refinement(Box::new(source_domain), refinement);
             let refined_source = target_elim.with_ty(Type::fun(refined_domain, source_codomain));
@@ -1387,7 +1378,7 @@ mod tests {
             ..
         } = &result.node
         {
-            let RefinementKind::Predicate(pred_rc) = &r.kind;
+            let pred_rc = &r.predicate;
             pred_rc.borrow().clone()
         } else {
             panic!("Expected lambda with refinement");
@@ -1605,7 +1596,7 @@ mod tests {
     /// `substitute` to silently skip the substitution.
     #[test]
     fn is_free_detects_var_in_partial_tuple_refinement() {
-        use crate::ccl::{Refinement, RefinementKind, next_refinement_id};
+        use crate::ccl::{Refinement, next_refinement_id};
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -1614,7 +1605,7 @@ mod tests {
         let refinement = Refinement {
             id: next_refinement_id(),
             description: "test".to_string(),
-            kind: RefinementKind::Predicate(pred),
+            predicate: pred,
         };
 
         // Tuple([Int, Refinement(Int, pred_x)]): x only appears in the second component.

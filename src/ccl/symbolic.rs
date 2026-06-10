@@ -11,8 +11,8 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, ProjKey, Refinement,
-    RefinementKind, Type, TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, ProjKey, Refinement, Type,
+    TypedExprNode, UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -488,14 +488,11 @@ fn fmt_lit(lit: &Lit) -> String {
 }
 
 fn fmt_refinement(r: &Refinement, opts: &SymbolicOpts) -> String {
-    match &r.kind {
-        RefinementKind::Predicate(p) => {
-            if let Ok(pred) = &p.try_borrow() {
-                fmt(pred, Precedence::Atom, opts)
-            } else {
-                r.description.clone()
-            }
-        }
+    let p = &r.predicate;
+    if let Ok(pred) = &p.try_borrow() {
+        fmt(pred, Precedence::Atom, opts)
+    } else {
+        r.description.clone()
     }
 }
 

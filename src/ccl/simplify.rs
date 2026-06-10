@@ -50,8 +50,8 @@
 use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, Builtin, Expr, Lit, ProjKey, RefinementKind, Type,
-    TypedExpr, TypedExprNode,
+    ArithmeticKind, BaseType, BinOpKind, Builtin, Expr, Lit, ProjKey, Type, TypedExpr,
+    TypedExprNode,
 };
 
 /// Returns `true` if `expr` directly references the given built-in primitive.
@@ -144,7 +144,7 @@ fn simplify_once(expr: &mut Expr) -> (bool, bool) {
     if let Type::Fun(domain, _) = &mut expr.ty
         && let Type::Refinement(_, refinment) = &mut **domain
     {
-        let RefinementKind::Predicate(pred) = &refinment.kind;
+        let pred = &refinment.predicate;
         // A refinement's predicate is itself an `Expr` whose own
         // subexpressions may carry the same refinement on their `ty`
         // (inference shares the `Rc<RefCell<Expr>>` across all places
@@ -156,9 +156,8 @@ fn simplify_once(expr: &mut Expr) -> (bool, bool) {
         // could fire will fire on a later pass.
         //
         // This try_borrow_mut fallback is the same cycle-handling
-        // mechanism used by [`crate::ccl::infer_simple_sub::coalesce_node`]
-        // and [`crate::ccl::type_saturate::saturate_node`].  A
-        // related visited-set variant lives in
+        // mechanism used by [`crate::ccl::infer_simple_sub::coalesce_node`].
+        // A related visited-set variant lives in
         // [`crate::ccl::ccl_utils::walk_refined_predicates`] and is
         // used by [`crate::ccl::ccl_utils::count_free`],
         // [`crate::ccl::infer::check_fully_typed`], and

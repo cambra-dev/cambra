@@ -1772,14 +1772,12 @@ mod tests {
     /// [`Refinement`]'s `PartialEq`), so a shared dummy body would spuriously
     /// make every tag match every other.
     fn refined(base: Type, id: RefinementId) -> Type {
-        use crate::ccl::{Lit, RefinementKind, TypedExpr};
+        use crate::ccl::{Lit, TypedExpr};
         use std::cell::RefCell;
         let r = Refinement {
             id,
             description: format!("r{id}"),
-            kind: RefinementKind::Predicate(Rc::new(RefCell::new(TypedExpr::lit(Lit::Int(
-                id as i64,
-            ))))),
+            predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Int(id as i64)))),
         };
         Type::Refinement(Box::new(base), r)
     }
@@ -1817,7 +1815,7 @@ mod tests {
         // predicates under distinct ids — exactly what join planning produces
         // by re-minting a refinement id at each marker. Equality of the
         // predicate `Expr`, not the id, decides the match (`Refinement: PartialEq`).
-        use crate::ccl::{Lit, RefinementKind, TypedExpr};
+        use crate::ccl::{Lit, TypedExpr};
         use std::cell::RefCell;
         let mk = |id| {
             Type::Refinement(
@@ -1825,9 +1823,7 @@ mod tests {
                 Refinement {
                     id,
                     description: String::new(),
-                    kind: RefinementKind::Predicate(Rc::new(RefCell::new(TypedExpr::lit(
-                        Lit::Bool(true),
-                    )))),
+                    predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true)))),
                 },
             )
         };
@@ -1843,7 +1839,7 @@ mod tests {
         // distinct ids are `==`, so they must also hash equal — otherwise the
         // `ConstrainCache` (`HashSet<(Type, Type)>`) cycle-break could miss a
         // match. Pins consistency between `Refinement`'s `PartialEq` and `Hash`.
-        use crate::ccl::{Lit, RefinementKind, TypedExpr};
+        use crate::ccl::{Lit, TypedExpr};
         use std::cell::RefCell;
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -1853,9 +1849,7 @@ mod tests {
                 Refinement {
                     id,
                     description: String::new(),
-                    kind: RefinementKind::Predicate(Rc::new(RefCell::new(TypedExpr::lit(
-                        Lit::Bool(true),
-                    )))),
+                    predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true)))),
                 },
             )
         };
@@ -1881,9 +1875,7 @@ mod tests {
             Refinement {
                 id: crate::ccl::next_refinement_id(),
                 description: String::new(),
-                kind: RefinementKind::Predicate(Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(
-                    false,
-                ))))),
+                predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(false)))),
             },
         );
         assert_ne!(a, c, "distinct predicates must stay distinct");

@@ -9,8 +9,8 @@ use crate::ccl::ccl_utils::{
     trivially_true_predicate, typed_compose,
 };
 use crate::ccl::{
-    BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, ProjKey, Refinement,
-    RefinementKind, Type, TypedExprNode,
+    BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, ProjKey, Refinement, Type,
+    TypedExprNode,
     ccl_utils::apply_primitive,
     infer::typecheck,
     lambda_elim::{compose, id},
@@ -372,7 +372,7 @@ fn wrap_with_iterate(expr: &mut Expr) {
     let mut preds: Vec<Expr> = Vec::new();
     let mut current = &domain_ty;
     while let Type::Refinement(base, refinement) = current {
-        let RefinementKind::Predicate(pred) = &refinement.kind;
+        let pred = &refinement.predicate;
         preds.push(pred.borrow().clone());
         current = base.as_ref();
     }
@@ -498,14 +498,7 @@ fn replace_curried_correlated_refinements(expr: &mut Expr) {
         // `lambda_elim`'s correlated-refinement arm. Read the predicate off the
         // domain refinement; `convert_groupby` takes the function type itself
         // (it only needs the codomain) and the predicate.
-        let Type::Refinement(
-            _,
-            Refinement {
-                kind: RefinementKind::Predicate(p),
-                ..
-            },
-        ) = arg_domain.as_ref()
-        else {
+        let Type::Refinement(_, Refinement { predicate: p, .. }) = arg_domain.as_ref() else {
             unreachable!();
         };
         Some(convert_groupby(argument, &argument.ty, &p.borrow()))
@@ -527,7 +520,7 @@ fn replace_curried_correlated_refinements(expr: &mut Expr) {
         ..
     } = &mut expr.node
     {
-        let RefinementKind::Predicate(p) = &refinement.kind;
+        let p = &refinement.predicate;
         replace_curried_correlated_refinements(&mut p.borrow_mut());
     }
     expr.walk_children_mut(replace_curried_correlated_refinements);
@@ -1486,7 +1479,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
             let base_iteration = (|| {
                 if arms.len() == 1 {
                     if let Type::Refinement(base_ty, refinement) = &types[arms[0]] {
-                        let RefinementKind::Predicate(pred_rc) = &refinement.kind;
+                        let pred_rc = &refinement.predicate;
                         let pred = pred_rc.borrow().clone();
                         trace!("Attempting loop join conversion inside iteration");
                         if let Some(transformed) = convert_loop_join(base_ty, &pred) {
@@ -1809,7 +1802,7 @@ fn try_hash_join_rewrite(expr: &mut Expr, domain_ty: &Type) -> bool {
     let Type::Refinement(base, refinement) = domain_ty else {
         return false;
     };
-    let RefinementKind::Predicate(pred_rc) = &refinement.kind;
+    let pred_rc = &refinement.predicate;
     let pred = pred_rc.borrow().clone();
     trace!(
         "Attempting hash-join rewrite at iteration site: {}",
@@ -3069,7 +3062,7 @@ mod tests {
 
     use crate::ccl::ccl_utils::is_trivially_true_predicate;
     use crate::ccl::symbolic::symbolic;
-    use crate::ccl::{Refinement, RefinementKind, next_refinement_id};
+    use crate::ccl::{Refinement, next_refinement_id};
 
     fn bool_ty() -> Type {
         Type::Base(BaseType::Bool)
@@ -3084,7 +3077,7 @@ mod tests {
             Refinement {
                 id: next_refinement_id(),
                 description: String::new(),
-                kind: RefinementKind::Predicate(Rc::new(RefCell::new(predicate))),
+                predicate: Rc::new(RefCell::new(predicate)),
             },
         )
     }

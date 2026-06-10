@@ -5,8 +5,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, Builtin, Expr, Lit, Refinement, RefinementId, RefinementKind, Type, TypedExprNode,
-    next_refinement_id,
+    BaseType, Builtin, Expr, Lit, Refinement, RefinementId, Type, TypedExprNode, next_refinement_id,
 };
 
 /// Builds an application of a primitive combinator, setting the types based on
@@ -297,7 +296,7 @@ pub fn refined_fn_type(
             Refinement {
                 id: next_refinement_id(),
                 description: description.to_string(),
-                kind: RefinementKind::Predicate(Rc::new(RefCell::new(predicate))),
+                predicate: Rc::new(RefCell::new(predicate)),
             },
         ),
         codomain,
@@ -326,7 +325,7 @@ fn refine_with(base: Type, predicate: &Expr) -> Type {
         Refinement {
             id: next_refinement_id(),
             description: String::new(),
-            kind: RefinementKind::Predicate(Rc::new(RefCell::new(predicate.clone()))),
+            predicate: Rc::new(RefCell::new(predicate.clone())),
         },
     )
 }
@@ -381,7 +380,7 @@ fn count_free_with_visited(name: &str, expr: &Expr, visited: &mut HashSet<Refine
                     if !visited.insert(r.id) {
                         return Some(0);
                     }
-                    let RefinementKind::Predicate(pred_rc) = &r.kind;
+                    let pred_rc = &r.predicate;
                     pred_rc
                         .try_borrow()
                         .ok()
@@ -558,7 +557,7 @@ where
     if let Type::Refinement(_, refinement) = ty
         && visited.insert(refinement.id)
     {
-        let RefinementKind::Predicate(pred_rc) = &refinement.kind;
+        let pred_rc = &refinement.predicate;
         if let Ok(p) = pred_rc.try_borrow() {
             f(&p, visited);
         }
@@ -577,7 +576,7 @@ where
     if let Type::Refinement(_, refinement) = ty
         && visited.insert(refinement.id)
     {
-        let RefinementKind::Predicate(pred_rc) = &refinement.kind;
+        let pred_rc = &refinement.predicate;
         if let Ok(mut p) = pred_rc.try_borrow_mut() {
             f(&mut p, visited);
         }

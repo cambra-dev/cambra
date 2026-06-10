@@ -14,8 +14,7 @@
 //!    accumulate into bounds that are already visible through the stored
 //!    `Type` — no side table is needed. Refinements stay on the AST node
 //!    (`Expr::Lambda::refinement`) and are *not* part of the structural
-//!    lattice (see plan R1); `type_saturate` and `lambda_elim` read them
-//!    from the AST directly.
+//!    lattice (see plan R1); `lambda_elim` reads them from the AST directly.
 //! 2. **Coalesce + write-back**: walk the tree again and, for each node,
 //!    run [`coalesce_compact`](crate::ccl::simple_sub::coalesce_compact) to
 //!    resolve the inference variables in its `expr.ty` in place. A generalized
@@ -80,7 +79,7 @@ use crate::ccl::simple_sub::{
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     AggregateKind, BaseType, BinOpKind, Branch, Builtin, Expr, Level, Lit, ProjKey, Refinement,
-    RefinementKind, Type, TypedBinding, TypedExprNode, UnaryOpKind,
+    Type, TypedBinding, TypedExprNode, UnaryOpKind,
 };
 use crate::util::ScopeStack;
 
@@ -356,10 +355,10 @@ fn freshen_expr_types(
                 // re-freshen another's variables). De-alias: freshen an owned
                 // copy and install it under a fresh cell so this clone's
                 // predicate is freshened independently of all others.
-                let RefinementKind::Predicate(def) = &r.kind;
+                let def = &r.predicate;
                 let mut pred = def.borrow().clone();
                 freshen_expr_types(&mut pred, cutoff, target, cache);
-                r.kind = RefinementKind::Predicate(Rc::new(RefCell::new(pred)));
+                r.predicate = Rc::new(RefCell::new(pred));
             }
         }
         TypedExprNode::Let { binding, .. } => {
@@ -589,9 +588,10 @@ trait Typing {
     /// domain var under-determined (a `Proj` only ever constrains the one field
     /// it touches, so it compacts to a field-narrow / `Infer`-laden shape). That
     /// shape — the record/tuple actually flowing in — is recovered *structurally*
-    /// in `type_saturate` by monomorphizing the projection to its input (see
-    /// [`specialize_projection_domain`]), the closed-form case of the same
-    /// use-site specialization `monomorphize` performs for generalized `let`s.
+    /// in `coalesce_node` (its `Apply`/`Compose` arms) by monomorphizing the
+    /// projection to its input (see [`specialize_projection_domain`]), the
+    /// closed-form case of the same use-site specialization `monomorphize`
+    /// performs for generalized `let`s.
     ///
     /// This retired an earlier emit-time reverse `domain <: arg`, which
     /// pre-deposited that shape on the domain var's upper edge *and* eagerly
@@ -719,12 +719,30 @@ impl Typing for SimpleSubContext {
         // U ≠ T → propagation fails immediately → AnnotationMismatch).
         // One-way-only would defer the conflict to coalesce.
         //
-        // TODO (SOUNDNESS): two-way equality is unsound for annotations
-        // containing union types (positive) or intersection types (negative);
-        // those should use one-way subtype only. Stage 1 avoids this because
-        // `normalize_annotation` converts Union → fresh_var, so union
-        // annotations degrade to trivially satisfiable subtyping. Replace in
-        // Stage 2.
+        // KNOWN OVER-RESTRICTION: an ascription `x: T = e` only *needs*
+        // `inferred <: T` (the value is usable where T is expected). The
+        // reverse direction (`T <: inferred`) additionally rejects a value
+        // whose inferred type is a *strict subtype* of the annotation — e.g.
+        // a variant inferred as `{A}` annotated at the wider `{A | B}`, which
+        // is a sound widening. So the right rule for any annotation with a
+        // non-trivial subtyping lattice (variants, `UIntRange`) is one-way
+        // `inferred <: ann` in positive position.
+        //
+        // This is currently unreachable, but NOT for the reason the old
+        // comment here claimed (it referenced the long-removed `Type::Union`
+        // and a `normalize_annotation` Union→fresh_var step that no longer
+        // exists — `normalize_annotation` now recurses structurally through
+        // `Type::Variant`). The actual reason: `lower_type_annotation`
+        // (`lower.rs`) only lowers `int`/`str`/`bool`/`None` annotations from
+        // source, all of which are `Type::Base` leaves where two-way ≡ one-way
+        // (distinct bases are incomparable; equal bases compare reflexively).
+        //
+        // Switching to one-way is a soundness-and-completeness change to the
+        // inference core, untestable from source today, and entangled with the
+        // sibling bidirectional-equality constraint in `emit_apply`/`as_function_eq`
+        // (which blocks the `#[ignore]`d `variant_param_accepts_subtype` in
+        // `tests/simple_sub_variants.rs`). Make both one-way together, with
+        // AST-level tests, when variant/range annotations become source-reachable.
         let ann_simple = self.normalize_annotation(ann);
         // Snapshot the inferred type before the annotation bounds are added so
         // the error shows what was actually inferred, not the partially
@@ -785,7 +803,7 @@ impl Typing for SimpleSubContext {
     ) -> Result<(), InferError> {
         // One-way: the sound subtyping rule `arg <: domain` (the argument must fit
         // the parameter). The contravariant domain var's shape — the record/tuple
-        // actually flowing in — is recovered structurally in `type_saturate` (its
+        // actually flowing in — is recovered structurally in `coalesce_node` (its
         // `Apply` arm rebuilds a projection's domain from the resolved argument,
         // just as the `Compose` arm rebuilds a non-leading projection's domain from
         // the preceding morphism's codomain), rather than pre-deposited here by a
@@ -804,7 +822,7 @@ impl Typing for SimpleSubContext {
 fn emit_annotation_predicates(ty: &Type, ctx: &mut SimpleSubContext) -> Result<(), InferError> {
     match ty {
         Type::Refinement(inner, r) => {
-            let RefinementKind::Predicate(def) = &r.kind;
+            let def = &r.predicate;
             if let Ok(mut pred) = def.try_borrow_mut() {
                 let pred_ty = emit_node(&mut pred, ctx)?;
                 constrain_predicate_bool(&pred_ty, ctx)?;
@@ -980,7 +998,9 @@ pub fn infer(expr: &mut Expr, sources: &HashMap<String, Type>) -> Result<Type, V
     emit_node(expr, &mut sub_ctx).map_err(|e| vec![e])?;
 
     // Pass 2: resolve each node's inference variables in place into expr.ty
-    // (skipping generalized-`let` definitions, left for Pass 3).
+    // (skipping generalized-`let` definitions, left for Pass 3), and fill the
+    // binder slots that aren't any node's expr.ty (the `Let` binding slot in
+    // particular). This subsumed the former `saturate` pass.
     let errors = coalesce_pass(expr);
     if !errors.is_empty() {
         return Err(errors);
@@ -992,11 +1012,6 @@ pub fn infer(expr: &mut Expr, sources: &HashMap<String, Type>) -> Result<Type, V
     if !mono_errors.is_empty() {
         return Err(mono_errors);
     }
-    // Pass 4: saturate refinement/lexical-scope shapes the structural lattice
-    // cannot carry, fixing up the kinds of nodes affected (Refinement
-    // Propagation, Let Binding Resolution, CollectionUnion direct-build).
-    // See `type_saturate` for the rule set.
-    crate::ccl::type_saturate::saturate(expr);
     Ok(expr.ty.clone())
 }
 
@@ -1205,15 +1220,15 @@ fn emit_lambda<C: Typing>(
     }
 
     // Refinement: lift the lambda's *own* refinement into the inferred
-    // domain so it rides the lattice as a refinement tag (replacing the
-    // old `type_saturate` re-stitch). The AST node keeps its `refinement`
+    // domain so it rides the lattice as a refinement tag (rather than being
+    // re-stitched in a later pass). The AST node keeps its `refinement`
     // field — `lambda_elim` reads it from there, not from the type, so
     // there's no double-wrapping. We still walk the predicate so its inner
     // expressions get inferred types (otherwise downstream consumers see
     // `Hole`s inside the predicate body).
     let domain_ty = match refinement {
         Some(r) => {
-            let RefinementKind::Predicate(def) = &r.kind;
+            let def = &r.predicate;
             // The predicate is compiled lazily inside an `Rc<RefCell<Expr>>`.
             let pred_ty = ctx.subexpr(&mut def.borrow_mut())?;
             constrain_predicate_bool(&pred_ty, ctx)?;
@@ -1255,7 +1270,7 @@ fn emit_cast<C: Typing>(value: &mut Expr, target: &Type, ctx: &mut C) -> Result<
     // Type the domain-refinement predicate and enforce `D ⇒ Bool`, mirroring
     // `emit_lambda`'s refinement arm.
     if let Some(r) = &refinement {
-        let RefinementKind::Predicate(def) = &r.kind;
+        let def = &r.predicate;
         let pred_ty = ctx.subexpr(&mut def.borrow_mut())?;
         constrain_predicate_bool(&pred_ty, ctx)?;
     }
@@ -1283,7 +1298,7 @@ fn emit_apply<C: Typing>(
     // `arg <: domain` (see `Typing::constrain_argument`). A function domain is
     // contravariant, so this alone leaves a *projection*'s domain var
     // under-determined (a `Proj` only constrains the one field it touches);
-    // `type_saturate`'s projection-domain specialization recovers it from the
+    // `coalesce_node`'s projection-domain specialization recovers it from the
     // record/tuple actually flowing in. That replaced an earlier emit-time
     // reverse `domain <: arg` whose global propagation was load-bearing but
     // over-reaching; see `specialize_projection_domain`.
@@ -1563,6 +1578,12 @@ fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Type, Infer
     // Decompose each morphism into (domain, codomain); adjacent pairs must
     // compose (`prev_cod <: next_dom`). `as_function` destructures the resolved
     // function in Check and introduces-and-constrains in Emit.
+    //
+    // The single-sided `Var <: Var` rule leaves a `Proj` morphism's domain
+    // under-determined here (it only ever gets the lower bound from this
+    // forward edge); the concrete domain is rebuilt post-coalesce in
+    // `coalesce_node`'s `Compose` arm from the preceding morphism's codomain,
+    // so there is no reverse-adjacency constraint at emit time.
     let (first_dom, mut prev_cod) = ctx.as_function(&tys[0], &|| "Compose[0]".to_string())?;
     for (i, t) in tys.iter().enumerate().skip(1) {
         let (d_i, c_i) = ctx.as_function(t, &|| "Compose[i]".to_string())?;
@@ -1979,10 +2000,11 @@ pub fn check(expr: &Expr) -> Result<(), Vec<InferError>> {
 // Coalesce pass (Step 7e)
 // ---------------------------------------------------------------------------
 //
-// lattice-blind stitching that used to live here (Refinement Propagation,
-// Let Binding Resolution, the `dedup_union` helper, `propagate_var_ty`, and
-// the CollectionUnion direct build) now lives in [`crate::ccl::type_saturate`],
-// invoked by [`infer`] after `coalesce_pass`.
+// This pass resolves every node's inference variables into a concrete `Type`
+// and, in the same walk, fills the binder slots that aren't any node's
+// `expr.ty` (notably the `Let` binding slot) and rebuilds under-determined
+// `Compose`/`Proj` morphism domains — see `coalesce_node`. This subsumed the
+// former post-coalesce `saturate` pass.
 
 /// Returns `true` for expression labels that are structurally significant
 /// (let bindings, lambdas, comprehensions) and worth showing as error context.
@@ -2048,6 +2070,29 @@ fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
     coalesce_compact(&simplify_type(compact_type(ty)))
 }
 
+/// Coalesce every node's `expr.ty` in place, resolving its inference variables
+/// into a concrete `Type`.
+///
+/// `Var` references need no lexical-scope lookup. A *monomorphic* binder's uses
+/// share its inference variable (it binds verbatim), so they coalesce to the
+/// same type. A *generalized* `let`'s uses instantiate fresh variables and
+/// coalesce to their own per-use types; its definition subtree is **skipped**
+/// here (its quantified variables carry no use-site bounds, so coalescing would
+/// produce an under-determined type and overwrite the bound-bearing `InferVar`s
+/// the post-coalesce `monomorphize` pass specializes from). `level` mirrors
+/// emission's polymorphism depth — only a `let` RHS bumps it (see `in_let_rhs`)
+/// — so `should_generalize` can recognize the generalized `let`.
+///
+/// The only slots the bottom-up `expr.ty` resolution doesn't reach are the
+/// **binder slots** — they carry a type but are not a node's `expr.ty` — so each
+/// is resolved explicitly here, mirroring its definition: a `Lambda`'s
+/// `param.ty` from the coalesced domain, a `Let`'s `binding.ty` from the bound
+/// expression, `Case`/`Loop` slots via `resolve_var_type`. (This is what the
+/// former post-coalesce `saturate` pass did for `Let`; it is a local
+/// binder-slot fact, not lexical scoping.)
+///
+/// Refinement predicates ride the lattice and coalesce straight onto each node
+/// (including predicate sub-trees).
 fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
     // Recurse into sub-expressions first so child types are settled
     // before we coalesce this node's (which may reference them).
@@ -2068,6 +2113,14 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
         TypedExprNode::Apply { function, argument } => {
             coalesce_node(function, level, errors);
             coalesce_node(argument, level, errors);
+            // A projection applied to a resolved argument: monomorphize its
+            // domain to the argument flowing in — the closed-form use-site
+            // specialization (see `specialize_projection_domain`), the structural
+            // replacement for the retired emit-time reverse `domain <: arg`. The
+            // cast-target / join-filter predicate case is reached the same way:
+            // `coalesce_type_predicates` (end of this fn) runs `coalesce_node` on
+            // each refinement predicate, so its projections recover here too.
+            specialize_projection_domain(function, &argument.ty);
         }
         // `target`'s refinement predicate is *not* coalesced here — it rides
         // `expr.ty` (the constructed `Fun({d | r}, v)` reuses `target`'s tag),
@@ -2084,18 +2137,18 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
             body,
             refinement,
         } => {
-            coalesce_node(body, level, errors);
             // Refinement predicate is itself an Expr that was inferred
             // by emit_lambda. Walk into it so its sub-trees get their
             // expr.ty slots filled — otherwise downstream code (and
             // structural equality for tests) sees a tree of Holes
             // inside the refinement's RefCell<Expr>.
             if let Some(r) = refinement {
-                let RefinementKind::Predicate(def) = &r.kind;
+                let def = &r.predicate;
                 if let Ok(mut pred) = def.try_borrow_mut() {
                     coalesce_node(&mut pred, level, errors);
                 }
             }
+            coalesce_node(body, level, errors);
             // `param.ty` is resolved from the lambda's coalesced domain in
             // the end-of-function block (it can't be coalesced standalone:
             // body-usage refinement tags are negative-polarity upper-bound
@@ -2104,24 +2157,64 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
         }
         TypedExprNode::Aggregate { input, .. } => coalesce_node(input, level, errors),
         TypedExprNode::Let {
-            binding: _,
+            binding,
             bound_expr,
             body,
         } => {
             // A generalized `let`'s definition is left uncoalesced for
             // `monomorphize` to specialize; a monomorphic one is coalesced
-            // here. Either way the RHS lives one level deeper.
+            // here (its RHS lives one level deeper) and its binder slot filled.
             if !should_generalize(bound_expr, level) {
                 coalesce_node(bound_expr, level + 1, errors);
+                // Binder slot: a monomorphic `let`'s binding type *is* its
+                // (now-coalesced) bound expression's type. The bottom-up
+                // `expr.ty` resolution doesn't reach this slot, so fill it
+                // explicitly — exactly as the `Lambda` / `Case` / `Loop`
+                // binder slots are filled. (For a generalized `let` the slot is
+                // moot: `monomorphize` replaces the binding with per-type ones.)
+                binding.ty = bound_expr.ty.clone();
             }
             coalesce_node(body, level, errors);
         }
         TypedExprNode::List(elts)
         | TypedExprNode::Tuple(elts)
-        | TypedExprNode::Compose(elts)
         | TypedExprNode::CollectionUnion(elts) => {
             for e in elts.iter_mut() {
                 coalesce_node(e, level, errors);
+            }
+        }
+        TypedExprNode::Compose(elts) => {
+            for e in elts.iter_mut() {
+                coalesce_node(e, level, errors);
+            }
+            // Compose/Proj domain reconstruction. simple-sub coalesces each
+            // `Proj` morphism's domain independently — the `Var <: Var`
+            // constrain rule is single-sided, so a fresh negative-position
+            // domain var only ever receives the field the `Proj` itself
+            // touches and compacts to an under-determined, field-narrow shape
+            // (e.g. the `.0` of a multi-accumulator loop's `step` tuple
+            // coalesces to a 1-tuple `(T)` instead of the full `(T, U)`).
+            // Rebuild each `Proj`'s domain from the preceding morphism's
+            // coalesced codomain — the actual record/tuple flowing in — and the
+            // chain's own type from its end morphisms. Children are already
+            // resolved (bottom-up), so reading their codomains is sound.
+            //
+            // This folds in the former post-coalesce `saturate` pass.
+            // Reconstructing structurally here — after the shapes are
+            // resolved — rather than via an emit-time reverse-adjacency bound
+            // is what keeps it robust under let-polymorphism's monomorphization
+            // (which re-mints var identities a recorded bound would not follow).
+            for i in 1..elts.len() {
+                let Type::Fun(_, prev_cod) = &elts[i - 1].ty else {
+                    continue;
+                };
+                let prev_cod = (**prev_cod).clone();
+                specialize_projection_domain(&mut elts[i], &prev_cod);
+            }
+            if let (Some(first), Some(last)) = (elts.first(), elts.last())
+                && let (Type::Fun(first_dom, _), Type::Fun(_, last_cod)) = (&first.ty, &last.ty)
+            {
+                expr.ty = Type::fun((**first_dom).clone(), (**last_cod).clone());
             }
         }
         TypedExprNode::Record(fs) => {
@@ -2139,19 +2232,17 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
             for b in branches.iter_mut() {
                 coalesce_node(&mut b.guard, level, errors);
                 coalesce_node(&mut b.body, level, errors);
-            }
-            // Resolve each pattern's payload-binding type in place.
-            // `emit_case` wrote the per-tag narrowed var into
-            // `Pattern::binding.ty`; run it through the same pipeline used
-            // for `expr.ty` so it ends up concrete. `type_saturate` then has
-            // a real type to bind when it pushes the branch scope.
-            for b in branches.iter_mut() {
-                let Some(p) = &mut b.pattern else { continue };
-                match resolve_var_type(&p.binding.ty) {
-                    Ok(ty) => p.binding.ty = ty,
-                    Err(err) => {
-                        let label = format!("Case pattern `.{}` payload", p.tag);
-                        push_coalesce_err(errors, map_coalesce_err(err, &label), label);
+                // Binder slot: resolve the pattern's payload-binding type.
+                // `emit_case` wrote the per-tag narrowed var into
+                // `Pattern::binding.ty`; run it through the same pipeline used
+                // for `expr.ty` so it ends up concrete.
+                if let Some(p) = &mut b.pattern {
+                    match resolve_var_type(&p.binding.ty) {
+                        Ok(ty) => p.binding.ty = ty,
+                        Err(err) => {
+                            let label = format!("Case pattern `.{}` payload", p.tag);
+                            push_coalesce_err(errors, map_coalesce_err(err, &label), label);
+                        }
                     }
                 }
             }
@@ -2205,11 +2296,11 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
     // compact → simplify → coalesce pipeline to materialize a concrete
     // `Type`.
     //
-    // Refinements ride the lattice as refinement tags, so a refined domain
-    // coalesces straight onto `expr.ty` here. `lambda_elim` reads the
-    // lambda's own refinement off the AST node — it is duplicated there
-    // deliberately, and the tag's id-equality dedups any structural overlap
-    // downstream.
+    // Refinements now ride the lattice as refinement tags, so a refined
+    // domain coalesces straight onto `expr.ty` here (no separate
+    // re-stitch). `lambda_elim` still reads the lambda's own refinement
+    // off the AST node — it is duplicated there deliberately, and the
+    // tag's id-equality dedups any structural overlap downstream.
     let label = symbolic(expr);
     match resolve_var_type(&expr.ty) {
         Ok(ty) => expr.ty = ty,
@@ -2251,7 +2342,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
 fn coalesce_type_predicates(ty: &Type, level: Level, errors: &mut Vec<InferError>) {
     match ty {
         Type::Refinement(inner, r) => {
-            let RefinementKind::Predicate(def) = &r.kind;
+            let def = &r.predicate;
             if let Ok(mut pred) = def.try_borrow_mut() {
                 coalesce_node(&mut pred, level, errors);
             }
@@ -2324,13 +2415,12 @@ fn monomorphize(expr: &mut Expr, errors: &mut Vec<InferError>) {
 /// preceding morphism's codomain inside a `Compose`. No-op unless `morphism` is
 /// a `Proj` whose coalesced type is a function.
 ///
-/// Invoked from [`crate::ccl::type_saturate`] (Pass 4), *not* `monomorphize`
-/// (Pass 3): the `input` (e.g. a join-pair binder) only acquires its resolved
-/// type from saturate's lexical Var/Let propagation, which must run after
-/// monomorphize (monomorphize mints the per-type specialization names that
-/// propagation fills in). So this closed-form specialization lives with its
-/// general sibling but fires where the use-site type is actually available.
-pub(crate) fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
+/// Invoked from `coalesce_node`'s `Apply`/`Compose` arms, which run bottom-up so
+/// the `input` (argument / preceding codomain) is already resolved. The
+/// cast-target / join-filter predicate case is reached the same way:
+/// `coalesce_type_predicates` runs `coalesce_node` over each refinement
+/// predicate, so its projections recover through the `Apply` arm too.
+fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
     if matches!(morphism.node, TypedExprNode::Proj(_))
         && let Type::Fun(_, cod) = &morphism.ty
     {

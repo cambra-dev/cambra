@@ -554,14 +554,14 @@ mod tests {
 
     #[test]
     fn non_iterable_domain_refinement_wraps_non_iterable() {
-        use crate::ccl::{Refinement, RefinementKind, next_refinement_id};
+        use crate::ccl::{Refinement, next_refinement_id};
         use std::cell::RefCell;
         use std::rc::Rc;
         let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));
         let refinement = Refinement {
             id: next_refinement_id(),
             description: "test".to_string(),
-            kind: RefinementKind::Predicate(pred),
+            predicate: pred,
         };
         let ty = Type::Refinement(Box::new(Type::Base(BaseType::Int)), refinement);
         assert!(!is_iterable_domain(&ty));
@@ -569,14 +569,14 @@ mod tests {
 
     #[test]
     fn iterable_domain_refinement_wraps_iterable() {
-        use crate::ccl::{Refinement, RefinementKind, next_refinement_id};
+        use crate::ccl::{Refinement, next_refinement_id};
         use std::cell::RefCell;
         use std::rc::Rc;
         let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));
         let refinement = Refinement {
             id: next_refinement_id(),
             description: "test".to_string(),
-            kind: RefinementKind::Predicate(pred),
+            predicate: pred,
         };
         let ty = Type::Refinement(Box::new(Type::UIntRange(3)), refinement);
         assert!(is_iterable_domain(&ty));
@@ -625,14 +625,14 @@ mod tests {
     fn should_inline_refined_fun_codomain() {
         // Int → Refinement(Int → Int, pred): domain is non-iterable (Int),
         // so the function is inlined regardless of the refined codomain.
-        use crate::ccl::{Refinement, RefinementKind, next_refinement_id};
+        use crate::ccl::{Refinement, next_refinement_id};
         use std::cell::RefCell;
         use std::rc::Rc;
         let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));
         let refinement = Refinement {
             id: next_refinement_id(),
             description: "test".to_string(),
-            kind: RefinementKind::Predicate(pred),
+            predicate: pred,
         };
         let inner_fun = Type::Fun(
             Box::new(Type::Base(BaseType::Int)),

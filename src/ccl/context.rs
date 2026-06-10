@@ -12,7 +12,7 @@ use log::debug;
 use crate::{
     ccl::{
         Expr, Type, desugar_defers,
-        infer::{InferError, TypeInferenceContext, check_fully_typed, infer, typecheck},
+        infer::{InferError, TypeInferenceContext, infer, typecheck},
         inline, lambda_elim,
         lower::{LoweringContext, LoweringError, lower_stmts},
         planning,
@@ -516,7 +516,8 @@ pub fn compile_program(
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
     debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
 
-    check_fully_typed(&lambda_elim).expect("missing types");
+    // `typecheck` now enforces hole-freeness as its first phase, so a separate
+    // `check_fully_typed` call is no longer needed here.
     typecheck(&lambda_elim).expect("type error after lambda elimination");
 
     let join_planned = planning::run(lambda_elim);

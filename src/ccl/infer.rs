@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
-use crate::ccl::{Expr, InferVarId, RefinementKind, Type, TypedExprNode};
+use crate::ccl::{Expr, InferVarId, Type, TypedExprNode};
 use crate::util::ScopeStack;
 
 // ---------------------------------------------------------------------------
@@ -390,7 +390,8 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Ve
 /// Returns `Ok(())` if the tree is fully annotated, or all holes and unresolved
 /// inference variables found in a depth-first walk.
 ///
-/// TODO fold this into [`typecheck`]
+/// Runs as the first phase of [`typecheck`]; callers that want the combined
+/// hole-freeness + semantic check should call [`typecheck`] directly.
 pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
     let mut errors = Vec::new();
     let mut seen: HashSet<crate::ccl::RefinementId> = HashSet::new();
@@ -507,14 +508,13 @@ fn collect_type_errors(
             // [`crate::ccl::lambda_elim::elim_lambdas_in_type`] (both
             // via [`crate::ccl::ccl_utils::walk_refined_predicates`]),
             // and a try_borrow_mut fallback variant in
-            // [`crate::ccl::infer_simple_sub::coalesce_node`],
-            // [`crate::ccl::type_saturate::saturate_node`], and
+            // [`crate::ccl::infer_simple_sub::coalesce_node`] and
             // [`crate::ccl::simplify::simplify_once`].  This site
             // doesn't share the helper because it mixes per-node
             // error checks with the refinement walk; if drift makes
             // the cycle logic important here, sync with those sites.
             if seen_refinements.insert(refinement.id) {
-                let RefinementKind::Predicate(def) = &refinement.kind;
+                let def = &refinement.predicate;
                 collect_expr_errors(&def.borrow(), errors, seen_refinements);
             }
             collect_type_errors(inner, context_sym, errors, seen_refinements);
@@ -538,10 +538,14 @@ fn collect_type_errors(
 /// is consistent with its sub-expression types and with the type rules of
 /// the expression.
 ///
-/// Assumes [`check_fully_typed`] has already passed (no [`Type::Hole`] or
-/// [`Type::Infer`] placeholders remain). Returns `Ok(())` if no errors are
-/// found, or all discovered errors as `Err(errs)`.
+/// First enforces full annotation via [`check_fully_typed`] (no [`Type::Hole`]
+/// or [`Type::Infer`] placeholders remain anywhere), then runs the semantic
+/// rules — the latter assume hole-freeness, so checking it here makes that
+/// precondition self-enforcing rather than an implicit caller obligation.
+/// Returns `Ok(())` if no errors are found, or all discovered errors as
+/// `Err(errs)`.
 pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
+    check_fully_typed(expr)?;
     crate::ccl::infer_simple_sub::check(expr)
 }
 

@@ -18,7 +18,6 @@ pub mod planning;
 pub mod simple_sub;
 pub mod simplify;
 pub mod symbolic;
-pub mod type_saturate;
 
 use std::{
     cell::RefCell,
@@ -1607,7 +1606,7 @@ impl TypedExpr {
             refinement: Some(Refinement {
                 id: next_refinement_id(),
                 description: refinement_desc.to_string(),
-                kind: RefinementKind::Predicate(Rc::new(RefCell::new(refinement))),
+                predicate: Rc::new(RefCell::new(refinement)),
             }),
         })
     }
@@ -2227,11 +2226,9 @@ impl fmt::Display for Type {
             Type::Refinement(t, r) => write!(
                 f,
                 "{{{t} | {}}}",
-                match &r.kind {
-                    RefinementKind::Predicate(p) => p
-                        .try_borrow()
-                        .map_or(r.description.clone(), |e| symbolic::symbolic(&e)),
-                }
+                r.predicate
+                    .try_borrow()
+                    .map_or(r.description.clone(), |e| symbolic::symbolic(&e)),
             ),
             Type::Hole => write!(f, "_"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
@@ -2374,8 +2371,8 @@ pub struct Refinement {
     pub id: RefinementId,
     /// Human-readable description of the predicate or join condition.
     pub description: String,
-    /// Whether this refinement is a loop-join predicate or a hash join.
-    pub kind: RefinementKind,
+    /// Arbitrary boolean predicate; compiled as an element-wise loop join.
+    pub predicate: Rc<RefCell<TypedExpr>>,
 }
 
 impl PartialEq for Refinement {
@@ -2394,34 +2391,12 @@ impl PartialEq for Refinement {
         if self.id == other.id {
             return true;
         }
-        let (RefinementKind::Predicate(a), RefinementKind::Predicate(b)) =
-            (&self.kind, &other.kind);
-        *a.borrow() == *b.borrow()
+
+        *self.predicate.borrow() == *other.predicate.borrow()
     }
 }
 
 impl Eq for Refinement {}
-
-impl std::hash::Hash for Refinement {
-    /// Hashes the predicate's *structure*, never its `id` — structurally-equal
-    /// refinements may carry distinct ids yet must hash equal to stay
-    /// consistent with this type's [`PartialEq`](Refinement::eq) (refined
-    /// `Type`s are hashed as `ConstrainCache` keys). [`hash_refinement_predicate`]
-    /// hashes the predicate's node shape and scalar leaves but skips embedded
-    /// `Type`s, so it ignores nested refinement ids exactly as `==` does.
-    ///
-    /// `try_borrow` (symmetric with `PartialEq`): a cell transiently held
-    /// `borrow_mut` by a rewrite pass hashes as the empty predicate rather than
-    /// panicking. Safe because refined `Type`s are hashed only inside
-    /// `constrain_subtype`, where predicate cells are not being mutated, so the
-    /// borrow always succeeds there and the hash is stable.
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let RefinementKind::Predicate(p) = &self.kind;
-        if let Ok(p) = p.try_borrow() {
-            hash_refinement_predicate(&p, state);
-        }
-    }
-}
 
 /// Structural hash of a refinement predicate, consistent with the structural
 /// equality in [`Refinement`]'s `PartialEq`: it hashes the predicate's node
@@ -2452,12 +2427,24 @@ fn hash_refinement_predicate<H: std::hash::Hasher>(e: &TypedExpr, state: &mut H)
     e.walk_children(|child| hash_refinement_predicate(child, state));
 }
 
-/// Carries the predicate of a refinement.
-/// TODO decide whether we need other types of predicates, or inline this away.
-#[derive(Debug, Clone, PartialEq)]
-pub enum RefinementKind {
-    /// Arbitrary boolean predicate; compiled as an element-wise loop join.
-    Predicate(Rc<RefCell<TypedExpr>>),
+impl std::hash::Hash for Refinement {
+    /// Hashes the predicate's *structure*, never its `id` — structurally-equal
+    /// refinements may carry distinct ids yet must hash equal to stay
+    /// consistent with this type's [`PartialEq`](Refinement::eq) (refined
+    /// `Type`s are hashed as `ConstrainCache` keys). [`hash_refinement_predicate`]
+    /// hashes the predicate's node shape and scalar leaves but skips embedded
+    /// `Type`s, so it ignores nested refinement ids exactly as `==` does.
+    ///
+    /// `try_borrow` (symmetric with `PartialEq`): a cell transiently held
+    /// `borrow_mut` by a rewrite pass hashes as the empty predicate rather than
+    /// panicking. Safe because refined `Type`s are hashed only inside
+    /// `constrain_subtype`, where predicate cells are not being mutated, so the
+    /// borrow always succeeds there and the hash is stable.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        if let Ok(p) = self.predicate.try_borrow() {
+            hash_refinement_predicate(&p, state);
+        }
+    }
 }
 
 /// Convenience for the [`TypedExprNode::Error`] match arm in passes that run
