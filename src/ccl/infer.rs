@@ -279,6 +279,20 @@ pub enum InferError {
         /// Symbolic label of the expression whose type is partial.
         at: String,
     },
+    /// A node's coalesced type references a term binder that is not in scope
+    /// at that node — a violation of the scope-validity invariant (design
+    /// §6.2). Like [`InferError::UnresolvedHole`], treat as a compiler bug
+    /// (a substitution that failed to discharge a binder), not a user-facing
+    /// error: user scoping mistakes are rejected earlier with source context.
+    ScopeViolation {
+        /// Symbolic label of the expression whose type is ill-scoped.
+        at: String,
+        /// The ill-scoped type.
+        ty: Type,
+        /// The out-of-scope binder names free in the type's refinement
+        /// predicates.
+        unbound: Vec<String>,
+    },
     /// An incompatible-bounds conflict from simple-sub coalescing.
     /// The solver rejects unions/intersections of distinct concrete types.
     IncompatibleBounds {
@@ -335,6 +349,13 @@ impl std::fmt::Debug for InferError {
             }
             InferError::UnresolvedPartial { kind, at } => {
                 write!(f, "Unresolved partial {kind} in expression: {at}")
+            }
+            InferError::ScopeViolation { at, ty, unbound } => {
+                write!(
+                    f,
+                    "Scope violation (compiler bug, design §6.2): type {ty} at {at} \
+                     references out-of-scope binder(s) {unbound:?}"
+                )
             }
             InferError::IncompatibleBounds {
                 polarity,
@@ -485,7 +506,9 @@ fn collect_type_errors(
             id: var.uid,
             at: context_sym.to_string(),
         }),
-        Type::Fun(domain, codomain) => {
+        Type::Fun {
+            domain, codomain, ..
+        } => {
             collect_type_errors(domain, context_sym, errors, seen_refinements);
             collect_type_errors(codomain, context_sym, errors, seen_refinements);
         }
@@ -519,9 +542,17 @@ fn collect_type_errors(
             // doesn't share the helper because it mixes per-node
             // error checks with the refinement walk; if drift makes
             // the cycle logic important here, sync with those sites.
-            if seen_refinements.insert(refinement.cell_id()) {
-                let def = &refinement.predicate;
-                collect_expr_errors(&def.borrow(), errors, seen_refinements);
+            if seen_refinements.insert(refinement.cell_id())
+                && let Ok(def) = refinement.predicate.try_borrow()
+            {
+                // `try_borrow` (not `borrow`): this check can run *while* a
+                // predicate is mid-substitution (e.g. `lambda_elim::substitute`
+                // holds a predicate's `borrow_mut` and calls `debug_typecheck`,
+                // which lands here). A predicate's own type slots may reference
+                // this same refinement, so a panicking `borrow` would re-borrow
+                // the held cell; skipping the in-flight predicate is correct —
+                // the substitution that holds it checks it on its own.
+                collect_expr_errors(&def, errors, seen_refinements);
             }
             collect_type_errors(inner, context_sym, errors, seen_refinements);
         }
@@ -618,10 +649,11 @@ mod tests {
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
             ty,
-            Type::Fun(
-                Box::new(Type::Base(BaseType::Int)),
-                Box::new(Type::Base(BaseType::Int))
-            )
+            Type::Fun {
+                name: None,
+                domain: Box::new(Type::Base(BaseType::Int)),
+                codomain: Box::new(Type::Base(BaseType::Int))
+            }
         );
     }
 
@@ -653,10 +685,11 @@ mod tests {
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
             ty,
-            Type::Fun(
-                Box::new(Type::UIntRange(2)),
-                Box::new(Type::Base(BaseType::Int))
-            )
+            Type::Fun {
+                name: None,
+                domain: Box::new(Type::UIntRange(2)),
+                codomain: Box::new(Type::Base(BaseType::Int))
+            }
         );
     }
 
@@ -686,7 +719,14 @@ mod tests {
         let mut expr = Expr::lambda("x", Type::infer(), Expr::var("x"));
         let ty = infer(&mut expr, &mut ctx).expect("simple-sub allows unconstrained λ x → x");
         assert!(
-            matches!(ty, Type::Fun(_, _)),
+            matches!(
+                ty,
+                Type::Fun {
+                    domain: _,
+                    codomain: _,
+                    ..
+                }
+            ),
             "expected Fun type, got {ty:?}"
         );
     }
@@ -717,7 +757,14 @@ mod tests {
         let ty =
             infer(&mut expr, &mut ctx).expect("simple-sub allows partially-constrained params");
         assert!(
-            matches!(ty, Type::Fun(_, _)),
+            matches!(
+                ty,
+                Type::Fun {
+                    domain: _,
+                    codomain: _,
+                    ..
+                }
+            ),
             "expected Fun type, got {ty:?}"
         );
     }
@@ -847,10 +894,11 @@ mod tests {
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
             ty,
-            Type::Fun(
-                Box::new(Type::Base(BaseType::Int)),
-                Box::new(Type::Base(BaseType::Int))
-            )
+            Type::Fun {
+                name: None,
+                domain: Box::new(Type::Base(BaseType::Int)),
+                codomain: Box::new(Type::Base(BaseType::Int))
+            }
         );
         // The param.ty was filled in as Int.
         if let TypedExprNode::Lambda { param, .. } = &expr.node {
@@ -1121,21 +1169,18 @@ mod tests {
 
     #[test]
     fn test_infer_lambda_with_predicate_refinement() {
-        // λ x : Int {λ _ : Int → True} → x
-        // The predicate is a standalone annotated lambda; no outer vars needed.
-        // Return type must be Fun(Refinement(Int, r), Int).
+        // λ x : Int {True} → x
+        // The predicate is a bare Bool over the implicit refinement binder; no
+        // outer vars needed. Return type must be Fun(Refinement(Int, r), Int).
         let mut ctx = TypeInferenceContext::new();
-        let predicate = Expr::lambda("_", Type::Base(BaseType::Int), Expr::lit(Lit::Bool(true)));
-        let mut expr = Expr::lambda_with_refinement(
-            "x",
-            Type::Base(BaseType::Int),
-            Expr::var("x"),
-            predicate,
-            "test predicate",
-        );
+        let predicate = Expr::lit(Lit::Bool(true));
+        let mut expr =
+            Expr::lambda_with_refinement("x", Type::Base(BaseType::Int), Expr::var("x"), predicate);
         let ty = infer(&mut expr, &mut ctx).unwrap();
         match ty {
-            Type::Fun(domain, codomain) => {
+            Type::Fun {
+                domain, codomain, ..
+            } => {
                 assert_eq!(*codomain, Type::Base(BaseType::Int));
                 match *domain {
                     Type::Refinement(inner, _) => {
@@ -1157,13 +1202,8 @@ mod tests {
         // by accidentally seeing the body's scope.
         let mut ctx = TypeInferenceContext::new();
         let predicate = Expr::var("x");
-        let mut expr = Expr::lambda_with_refinement(
-            "x",
-            Type::Base(BaseType::Int),
-            Expr::var("x"),
-            predicate,
-            "outer scope test",
-        );
+        let mut expr =
+            Expr::lambda_with_refinement("x", Type::Base(BaseType::Int), Expr::var("x"), predicate);
         let result = infer(&mut expr, &mut ctx);
         assert_eq!(result, Err(vec![InferError::UnboundVariable("x".into())]));
     }
@@ -1500,10 +1540,11 @@ mod tests {
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
             ty,
-            Type::Fun(
-                Box::new(Type::Base(BaseType::Int)),
-                Box::new(Type::Base(BaseType::Unit))
-            )
+            Type::Fun {
+                name: None,
+                domain: Box::new(Type::Base(BaseType::Int)),
+                codomain: Box::new(Type::Base(BaseType::Unit))
+            }
         );
         if let TypedExprNode::Lambda { param, .. } = &expr.node {
             assert_eq!(param.ty, Type::Base(BaseType::Int));
@@ -1518,10 +1559,11 @@ mod tests {
     #[test]
     fn test_infer_source_returns_registered_type() {
         let mut ctx = TypeInferenceContext::new();
-        let source_ty = Type::Fun(
-            Box::new(Type::DataSource("mystream".into())),
-            Box::new(Type::Base(BaseType::String)),
-        );
+        let source_ty = Type::Fun {
+            name: None,
+            domain: Box::new(Type::DataSource("mystream".into())),
+            codomain: Box::new(Type::Base(BaseType::String)),
+        };
         ctx.register_source_type("mystream", source_ty.clone());
         let mut expr = Expr::new(TypedExprNode::Source("mystream".into()));
         assert_eq!(infer(&mut expr, &mut ctx), Ok(source_ty));
@@ -1543,14 +1585,16 @@ mod tests {
     #[test]
     fn test_infer_multiple_sources_resolve_independently() {
         let mut ctx = TypeInferenceContext::new();
-        let int_ty = Type::Fun(
-            Box::new(Type::DataSource("ints".into())),
-            Box::new(Type::Base(BaseType::Int)),
-        );
-        let str_ty = Type::Fun(
-            Box::new(Type::DataSource("strs".into())),
-            Box::new(Type::Base(BaseType::String)),
-        );
+        let int_ty = Type::Fun {
+            name: None,
+            domain: Box::new(Type::DataSource("ints".into())),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        };
+        let str_ty = Type::Fun {
+            name: None,
+            domain: Box::new(Type::DataSource("strs".into())),
+            codomain: Box::new(Type::Base(BaseType::String)),
+        };
         ctx.register_source_type("ints", int_ty.clone());
         ctx.register_source_type("strs", str_ty.clone());
 
@@ -1729,10 +1773,11 @@ mod tests {
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
             refinement: None,
         })
-        .with_ty(Type::Fun(
-            Box::new(Type::Base(BaseType::Int)),
-            Box::new(Type::Base(BaseType::Int)),
-        ));
+        .with_ty(Type::Fun {
+            name: None,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        });
         let expr = Expr::new(TypedExprNode::Apply {
             function: Box::new(lambda),
             argument: Box::new(Expr::lit(Lit::Int(42)).with_ty(Type::Base(BaseType::Int))),
@@ -1771,10 +1816,11 @@ mod tests {
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
             refinement: None,
         })
-        .with_ty(Type::Fun(
-            Box::new(Type::Base(BaseType::Int)),
-            Box::new(Type::Base(BaseType::Int)),
-        ));
+        .with_ty(Type::Fun {
+            name: None,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        });
         let expr = Expr::new(TypedExprNode::Apply {
             function: Box::new(func),
             argument: Box::new(arg),
@@ -1823,10 +1869,11 @@ mod tests {
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
             refinement: None,
         })
-        .with_ty(Type::Fun(
-            Box::new(Type::Base(BaseType::Int)),
-            Box::new(Type::Base(BaseType::Int)),
-        ));
+        .with_ty(Type::Fun {
+            name: None,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        });
         assert_eq!(
             check_fully_typed(&expr),
             Err(vec![InferError::UnresolvedInfer { id, at: "x".into() }])
@@ -1840,10 +1887,11 @@ mod tests {
     #[test]
     fn test_check_fully_typed_hole_inside_fun_type() {
         // The node type is Fun(Hole, Int) — the Hole is inside the compound type.
-        let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Fun(
-            Box::new(Type::Hole),
-            Box::new(Type::Base(BaseType::Int)),
-        ));
+        let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Fun {
+            name: None,
+            domain: Box::new(Type::Hole),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        });
         assert_eq!(
             check_fully_typed(&expr),
             Err(vec![InferError::UnresolvedHole { at: "1".into() }])
@@ -2055,10 +2103,11 @@ mod tests {
         // constructing the node directly with pre-typed children.
         let int_elem = Expr::lit(Lit::Int(1)).with_ty(Type::Base(BaseType::Int));
         let str_elem = Expr::lit(Lit::String("hello".into())).with_ty(Type::Base(BaseType::String));
-        let list_ty = Type::Fun(
-            Box::new(Type::UIntRange(2)),
-            Box::new(Type::Base(BaseType::Int)),
-        );
+        let list_ty = Type::Fun {
+            name: None,
+            domain: Box::new(Type::UIntRange(2)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        };
         let expr = Expr::new(TypedExprNode::List(vec![int_elem, str_elem])).with_ty(list_ty);
         let result = typecheck(&expr);
         assert!(
@@ -2088,10 +2137,11 @@ mod tests {
             body: Box::new(Expr::var("x").with_ty(Type::Base(BaseType::String))),
             refinement: None,
         })
-        .with_ty(Type::Fun(
-            Box::new(Type::Base(BaseType::String)),
-            Box::new(Type::Base(BaseType::String)),
-        ));
+        .with_ty(Type::Fun {
+            name: None,
+            domain: Box::new(Type::Base(BaseType::String)),
+            codomain: Box::new(Type::Base(BaseType::String)),
+        });
         let expr = Expr::new(TypedExprNode::Apply {
             function: Box::new(lambda),
             argument: Box::new(Expr::lit(Lit::Int(42)).with_ty(Type::Base(BaseType::Int))),
@@ -2142,7 +2192,12 @@ mod tests {
         ]));
         let mut expr = Expr::lambda("p", Type::infer(), body);
         let ty = infer(&mut expr, &mut ctx).unwrap();
-        if let Type::Fun(domain, _) = ty {
+        if let Type::Fun {
+            domain,
+            codomain: _,
+            ..
+        } = ty
+        {
             match *domain {
                 Type::Tuple(ref elts) if elts.len() == 2 => {
                     assert_eq!(

@@ -47,7 +47,10 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use crate::ccl::{BaseType, InferVar, InferVarId, Level, Refinement, Type, fresh_infer_var_id};
+use crate::ccl::subst::Subst;
+use crate::ccl::{
+    BaseType, Bound, InferVar, InferVarId, Level, Refinement, Type, fresh_infer_var_id,
+};
 
 /// Identifies a field inside a structural record/tuple, or a variant tag.
 ///
@@ -83,7 +86,11 @@ impl std::fmt::Display for FieldKey {
 pub fn type_level(ty: &Type) -> Level {
     match ty {
         Type::Infer(v) => v.level,
-        Type::Fun(d, c) => type_level(d).max(type_level(c)),
+        Type::Fun {
+            domain: d,
+            codomain: c,
+            ..
+        } => type_level(d).max(type_level(c)),
         Type::Tuple(ts) => ts.iter().map(type_level).max().unwrap_or(0),
         Type::Record(fs) => fs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Variant(tags) => tags.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
@@ -105,7 +112,11 @@ pub fn prim(b: BaseType) -> Type {
 
 /// Build a function [`Type`] from domain and codomain.
 pub fn fun(d: Type, c: Type) -> Type {
-    Type::Fun(Box::new(d), Box::new(c))
+    Type::Fun {
+        name: None,
+        domain: Box::new(d),
+        codomain: Box::new(c),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -204,10 +215,15 @@ pub fn freshen_above(
     }
     match ty {
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => ty.clone(),
-        Type::Fun(d, c) => Type::Fun(
-            Box::new(freshen_above(lim, d, target, cache)),
-            Box::new(freshen_above(lim, c, target, cache)),
-        ),
+        Type::Fun {
+            name,
+            domain: d,
+            codomain: c,
+        } => Type::Fun {
+            name: name.clone(),
+            domain: Box::new(freshen_above(lim, d, target, cache)),
+            codomain: Box::new(freshen_above(lim, c, target, cache)),
+        },
         Type::Tuple(ts) => Type::Tuple(
             ts.iter()
                 .map(|t| freshen_above(lim, t, target, cache))
@@ -225,6 +241,17 @@ pub fn freshen_above(
         ),
         Type::Refinement(inner, r) => Type::Refinement(
             Box::new(freshen_above(lim, inner, target, cache)),
+            // O2 (deferred): the predicate is shared by `Rc` across instantiations
+            // rather than copied with its type slots freshened through this same
+            // `cache`. That is only load-bearing for a *polymorphic* (let-
+            // generalized) refined value used at several types — the prototype's
+            // scenario M. Our dependent refinements are introduced monomorphically
+            // (group-by, comprehension filters), so freshening never crosses a
+            // refined value today; the design (O2/O3) flags faithful copy-and-
+            // freshen of predicate type slots as the separable polymorphic-case
+            // requirement. Doing it safely needs a refinement-cycle guard (a
+            // predicate's slot may reference its own refined type), so it is left
+            // for the polymorphic-dependent-function work rather than rushed here.
             r.clone(),
         ),
         Type::Infer(tv) => {
@@ -246,13 +273,22 @@ pub fn freshen_above(
                 let s = tv.bounds.borrow();
                 (s.lower.clone(), s.upper.clone())
             };
+            // Freshen the bound's type; the edge substitution rides along
+            // unchanged here (its own type slots are freshened in the
+            // predicate-freshening stage).
             let new_lows: Vec<_> = lows
                 .iter()
-                .map(|t| freshen_above(lim, t, target, cache))
+                .map(|b| Bound {
+                    ty: freshen_above(lim, &b.ty, target, cache),
+                    subst: b.subst.clone(),
+                })
                 .collect();
             let new_ups: Vec<_> = ups
                 .iter()
-                .map(|t| freshen_above(lim, t, target, cache))
+                .map(|b| Bound {
+                    ty: freshen_above(lim, &b.ty, target, cache),
+                    subst: b.subst.clone(),
+                })
                 .collect();
             {
                 let mut s = v.bounds.borrow_mut();
@@ -332,14 +368,44 @@ pub fn constrain_subtype(
     rhs: &Type,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    if lhs == rhs {
+    constrain_go(lhs, rhs, &Subst::id(), cache)
+}
+
+/// Constrain `lhs <: rhs` under a correspondence `sigma : ctx(lhs) → ctx(rhs)`
+/// that aligns the two sides' Pi binders.
+///
+/// `sigma` is `Subst::id()` for ordinary monomorphic constraints — in which
+/// case every arm below reduces exactly to the substitution-free solver. A
+/// non-identity `sigma` is *derived* when constraining two function types
+/// whose codomains mention their binders (the Pi-vs-Pi arm mints the binder
+/// correspondence) and is recorded on the constraint edges so the coalesce
+/// walk can compose it (design §3.6).
+///
+/// Edge-storage convention: a `Bound { ty, subst }` recorded on variable `V`
+/// reads, in `V`'s context, as `subst.apply(ty)` — i.e. `subst : ctx(ty) →
+/// ctx(V)`. Lower edges therefore carry `sigma` (source `lhs` → holder `V`);
+/// upper edges carry `sigma⁻¹` (the holder is the source, so the morphism to
+/// the bound is inverted). Only renames are inverted, which is why a
+/// correspondence is always a rename.
+fn constrain_go(
+    lhs: &Type,
+    rhs: &Type,
+    sigma: &Subst,
+    cache: &mut ConstrainCache,
+) -> Result<(), ConstrainError> {
+    // The trivial-equality short-circuit is only sound when the edge carries
+    // no transformation — under a non-identity correspondence `lhs` and `rhs`
+    // live in different contexts even when structurally equal.
+    if sigma.is_id() && lhs == rhs {
         return Ok(());
     }
 
     // Cycle-break: only constraints involving variables can recur.
     // Non-variable structural types are regular trees; their constraints
     // bottom out without revisiting themselves. Key by value — identity at
-    // `Infer` is by `uid`, so this is cycle-safe.
+    // `Infer` is by `uid`, so this is cycle-safe. The correspondence is not
+    // part of the key: like the prototype's var-pair cache, deduping on the
+    // `(lhs, rhs)` pair alone is what guarantees termination on cyclic edges.
     let either_var = matches!(lhs, Type::Infer(_)) || matches!(rhs, Type::Infer(_));
     if either_var && !cache.insert((lhs.clone(), rhs.clone())) {
         return Ok(());
@@ -351,10 +417,40 @@ pub fn constrain_subtype(
         (Type::UIntRange(a), Type::UIntRange(b)) if a == b => Ok(()),
         (Type::DataSource(a), Type::DataSource(b)) if a == b => Ok(()),
 
-        // Function: contravariant on domain, covariant on codomain.
-        (Type::Fun(d0, c0), Type::Fun(d1, c1)) => {
-            constrain_subtype(d1, d0, cache)?;
-            constrain_subtype(c0, c1, cache)
+        // Function: contravariant on domain, covariant on codomain. The
+        // codomain edge *derives* the binder correspondence — aligning the two
+        // Pi binders `k ↦ x` — and carries it onward (design §3.6); the domain
+        // edge flips the correspondence with the polarity. When neither side is
+        // a Pi (both names `None`) the correspondence is unchanged, so this is
+        // exactly the ordinary contravariant/covariant rule.
+        (
+            Type::Fun {
+                name: n0,
+                domain: d0,
+                codomain: c0,
+            },
+            Type::Fun {
+                name: n1,
+                domain: d1,
+                codomain: c1,
+            },
+        ) => {
+            // The domain edge flips sides, so the correspondence must run
+            // rhs → lhs. A rename inverts exactly. A σ carrying a discharge
+            // does not invert — and unlike the var arms' reverse-edge bounds
+            // (which live in the post-discharge context, making the id
+            // fallback exact there), the lhs domain here is a *pre*-discharge
+            // type that may still mention the discharged binder. Transport it
+            // forward into rhs context instead and compare under the identity.
+            match sigma.invert() {
+                Some(inv) => constrain_go(d1, d0, &inv, cache)?,
+                None => constrain_go(d1, &sigma.apply_type(d0), &Subst::id(), cache)?,
+            }
+            let cod_sigma = match (n0, n1) {
+                (Some(k), Some(x)) => sigma.extended_rename(k, x),
+                _ => sigma.clone(),
+            };
+            constrain_go(c0, c1, &cod_sigma, cache)
         }
 
         // Tuple: positional width-subtyping. A longer/equal tuple is a
@@ -362,7 +458,7 @@ pub fn constrain_subtype(
         (Type::Tuple(a), Type::Tuple(b)) => {
             for (i, t1) in b.iter().enumerate() {
                 match a.get(i) {
-                    Some(t0) => constrain_subtype(t0, t1, cache)?,
+                    Some(t0) => constrain_go(t0, t1, sigma, cache)?,
                     None => {
                         return Err(ConstrainError::MissingField {
                             key: FieldKey::Index(i),
@@ -378,7 +474,7 @@ pub fn constrain_subtype(
         (Type::Record(a), Type::Record(b)) => {
             for (name, t1) in b {
                 match a.iter().find(|(n, _)| n == name) {
-                    Some((_, t0)) => constrain_subtype(t0, t1, cache)?,
+                    Some((_, t0)) => constrain_go(t0, t1, sigma, cache)?,
                     None => {
                         return Err(ConstrainError::MissingField {
                             key: FieldKey::Name(SmolStr::from(name.as_str())),
@@ -395,7 +491,7 @@ pub fn constrain_subtype(
         (Type::Variant(a), Type::Variant(b)) => {
             for (k, t0) in a {
                 match b.iter().find(|(bk, _)| bk == k) {
-                    Some((_, t1)) => constrain_subtype(t0, t1, cache)?,
+                    Some((_, t1)) => constrain_go(t0, t1, sigma, cache)?,
                     None => {
                         return Err(ConstrainError::ExtraTag {
                             tag: k.clone(),
@@ -408,29 +504,37 @@ pub fn constrain_subtype(
         }
 
         // Variable on lhs, rhs has compatible level: append rhs to upper
-        // bounds, propagate to all known lower bounds.
+        // bounds (stored in `lv`'s context, so under `sigma⁻¹`), propagate to
+        // all known lower bounds (composing each lower edge with `sigma`).
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
                 let mut s = lv.bounds.borrow_mut();
-                s.upper.push(rhs.clone());
+                s.upper
+                    .push(Bound::with_subst(rhs.clone(), sigma.invert_or_id()));
                 s.lower.clone()
             };
             for low in lows {
-                constrain_subtype(&low, rhs, cache)?;
+                constrain_go(&low.ty, rhs, &Subst::then(&low.subst, sigma), cache)?;
             }
             Ok(())
         }
 
         // Variable on rhs, lhs has compatible level: append lhs to lower
-        // bounds, propagate to all known upper bounds.
+        // bounds (stored in `rv`'s context, so under `sigma`), propagate to
+        // all known upper bounds (composing each upper edge's inverse).
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
                 let mut s = rv.bounds.borrow_mut();
-                s.lower.push(lhs.clone());
+                s.lower.push(Bound::with_subst(lhs.clone(), sigma.clone()));
                 s.upper.clone()
             };
             for up in ups {
-                constrain_subtype(lhs, &up, cache)?;
+                constrain_go(
+                    lhs,
+                    &up.ty,
+                    &Subst::then(sigma, &up.subst.invert_or_id()),
+                    cache,
+                )?;
             }
             Ok(())
         }
@@ -439,20 +543,27 @@ pub fn constrain_subtype(
         // Lift the other side down via extrude and retry.
         (Type::Infer(lv), _) => {
             let new_rhs = extrude(rhs, false, lv.level, &mut ExtrudeCache::new());
-            constrain_subtype(lhs, &new_rhs, cache)
+            constrain_go(lhs, &new_rhs, sigma, cache)
         }
         (_, Type::Infer(rv)) => {
             let new_lhs = extrude(lhs, true, rv.level, &mut ExtrudeCache::new());
-            constrain_subtype(&new_lhs, rhs, cache)
+            constrain_go(&new_lhs, rhs, sigma, cache)
         }
 
         // Refinement subtyping:
-        //   {b₁ | S₁} <: {b₂ | S₂}  iff  b₁ <: b₂  and  S₂ ⊆ S₁ ∪ tags(b₁)
+        //   {b₁ | S₁} <: {b₂ | S₂}  iff  b₁ <: b₂  and  σ(S₂) ⊆ σ(S₁) ∪ tags(b₁)
         // (more refinements ⇒ subtype). Refinements match by [`Refinement`]'s
         // `PartialEq` — structural predicate equality — so a tag join planning
         // re-minted in a fresh cell still matches; never by predicate
-        // implication. The lhs carries every refinement rhs requires when its
-        // explicit layers `S₁` plus whatever its *base* `b₁` carries cover `S₂`.
+        // implication. The two sides live in different binder contexts, so an
+        // lhs tag is transported through the correspondence (`σ(S₁)`, via
+        // [`Subst::force_refinement`]) before comparing: a predicate mentioning
+        // a Pi binder matches its renamed — or, when a discharge edge composed
+        // into σ on the way through a variable, *discharged* — copy on the
+        // rhs. Under the identity this is plain structural equality. The lhs
+        // carries every
+        // refinement rhs requires when its explicit layers `S₁` plus whatever
+        // its *base* `b₁` carries cover `S₂`.
         //
         // `peel_refinements` strips the explicit layers down to the bases, so a
         // top-level refinement whose base is a variable reaches here rather than
@@ -475,22 +586,24 @@ pub fn constrain_subtype(
         (Type::Refinement(..), _) | (_, Type::Refinement(..)) => {
             let (lbase, lrefs) = peel_refinements(lhs);
             let (rbase, rrefs) = peel_refinements(rhs);
-            // The refinements rhs requires that no lhs layer matches (by
-            // `Refinement`'s structural `PartialEq`).
+            // The refinements rhs requires that no σ-transported lhs layer
+            // matches (by `Refinement`'s structural `PartialEq`).
+            let lrefs_in_rhs_ctx: Vec<Refinement> =
+                lrefs.iter().map(|l| sigma.force_refinement(l)).collect();
             let deficit: Vec<&Refinement> = rrefs
                 .iter()
                 .copied()
-                .filter(|r| !lrefs.contains(r))
+                .filter(|r| !lrefs_in_rhs_ctx.contains(r))
                 .collect();
             if deficit.is_empty() {
                 // lhs's explicit layers already supply every refinement rhs requires.
-                constrain_subtype(lbase, rbase, cache)
+                constrain_go(lbase, rbase, sigma, cache)
             } else if matches!(lbase, Type::Infer(_)) {
                 // Variable base: flow the deficit onto it (`b₁ <: {b₂ | deficit}`)
                 // rather than rejecting; it fails later iff the variable
                 // resolves to a concrete base lacking those tags.
                 let demanded = wrap_refinements(rbase, &deficit);
-                constrain_subtype(lbase, &demanded, cache)
+                constrain_go(lbase, &demanded, sigma, cache)
             } else {
                 Err(ConstrainError::Mismatch {
                     lhs: lhs.clone(),
@@ -549,10 +662,15 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
     }
     match ty {
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => ty.clone(),
-        Type::Fun(d, c) => Type::Fun(
-            Box::new(extrude(d, !pol, target_level, cache)),
-            Box::new(extrude(c, pol, target_level, cache)),
-        ),
+        Type::Fun {
+            name,
+            domain: d,
+            codomain: c,
+        } => Type::Fun {
+            name: name.clone(),
+            domain: Box::new(extrude(d, !pol, target_level, cache)),
+            codomain: Box::new(extrude(c, pol, target_level, cache)),
+        },
         Type::Tuple(ts) => Type::Tuple(
             ts.iter()
                 .map(|t| extrude(t, pol, target_level, cache))
@@ -596,10 +714,13 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 tv.bounds
                     .borrow_mut()
                     .upper
-                    .push(Type::Infer(Rc::clone(&nvs)));
+                    .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_lows: Vec<_> = lows
                     .iter()
-                    .map(|t| extrude(t, pol, target_level, cache))
+                    .map(|b| Bound {
+                        ty: extrude(&b.ty, pol, target_level, cache),
+                        subst: b.subst.clone(),
+                    })
                     .collect();
                 nvs.bounds.borrow_mut().lower = new_lows;
             } else {
@@ -609,10 +730,13 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 tv.bounds
                     .borrow_mut()
                     .lower
-                    .push(Type::Infer(Rc::clone(&nvs)));
+                    .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
                 let new_ups: Vec<_> = ups
                     .iter()
-                    .map(|t| extrude(t, pol, target_level, cache))
+                    .map(|b| Bound {
+                        ty: extrude(&b.ty, pol, target_level, cache),
+                        subst: b.subst.clone(),
+                    })
                     .collect();
                 nvs.bounds.borrow_mut().upper = new_ups;
             }
@@ -767,9 +891,13 @@ pub struct CompactType {
     /// the absorbing element (here from intersecting disjoint tag sets at
     /// negative polarity).
     pub var: Option<BTreeMap<FieldKey, CompactType>>,
-    /// Function shape, if any. Recursively merged with polarity flip
-    /// on the domain.
-    pub fun: Option<(Box<CompactType>, Box<CompactType>)>,
+    /// Function shape, if any: an optional Pi binder name plus the domain
+    /// and codomain. Recursively merged with polarity flip on the domain.
+    /// The name is preserved so a dependent codomain's refinement predicate
+    /// keeps its binder bound through coalesce; it is stripped at
+    /// materialization when the codomain does not actually reference it
+    /// (keeping ordinary functions `name: None`).
+    pub fun: Option<(Option<String>, Box<CompactType>, Box<CompactType>)>,
     /// Refinement-tag contributions at this position. A set with `==`
     /// membership (deduplicated by [`Refinement`]'s structural `PartialEq`),
     /// stored as a `Vec` in first-insertion order. A refinement-set is
@@ -812,7 +940,12 @@ impl CompactType {
         };
         let fun = match (lhs.fun, rhs.fun) {
             (None, f) | (f, None) => f,
-            (Some((la, ra)), Some((lb, rb))) => Some((
+            (Some((na, la, ra)), Some((nb, lb, rb))) => Some((
+                // Prefer a present binder name; two distinct names at one
+                // position only arise for unrelated functions merging, where
+                // either is as good (the name is stripped at coalesce unless
+                // the codomain references it).
+                na.or(nb),
                 Box::new(Self::merge(!pol, *la, *lb)),
                 Box::new(Self::merge(pol, *ra, *rb)),
             )),
@@ -977,6 +1110,7 @@ pub fn compact_type(ty: &Type) -> CompactGraph {
     let term = compact_go(
         ty,
         true,
+        &Subst::id(),
         &BTreeSet::new(),
         &mut HashSet::new(),
         &mut recursive,
@@ -985,16 +1119,27 @@ pub fn compact_type(ty: &Type) -> CompactGraph {
     CompactGraph { term, rec_vars }
 }
 
+/// Compact `ty` at polarity `pol`, composing `subst_acc` — the substitution
+/// accumulated from the edges walked so far — into every refinement predicate
+/// materialized along the way. `subst_acc` is `Subst::id()` for ordinary
+/// (non-dependent) types, in which case it is a perfect no-op and this behaves
+/// exactly as the substitution-free solver. A non-identity accumulator arises
+/// from Pi-binder correspondences and dependent-application discharges: each
+/// bound edge composes its own `subst` in (`then(edge_subst, subst_acc)`), and
+/// the composite is applied where a refinement predicate is reached — the
+/// coalesce-time forcing of suspended substitutions (design §3.6).
 fn compact_go(
     ty: &Type,
     pol: bool,
+    subst_acc: &Subst,
     parents: &BTreeSet<InferVarId>,
     in_process: &mut HashSet<(InferVarId, bool)>,
     recursive: &mut HashMap<(InferVarId, bool), InferVarId>,
     rec_vars: &mut BTreeMap<InferVarId, CompactType>,
 ) -> CompactType {
     match ty {
-        // Atomic types contribute a single atom.
+        // Atomic types contribute a single atom. A term substitution never
+        // touches an atom, so `subst_acc` is irrelevant here.
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {
             CompactType::from_atom(AtomKey::from_type(ty).unwrap())
         }
@@ -1002,25 +1147,57 @@ fn compact_go(
         // the underlying type, then attach this layer's tag. Walking a
         // variable's bound that is `Refinement(D, r)` therefore unions `r`
         // into that variable's compacted position — the propagation path.
+        // The accumulated substitution is *forced* here: it rewrites the
+        // predicate's free binders (e.g. discharging a dependent application's
+        // argument) before the tag lands in the position.
         Type::Refinement(inner, r) => {
-            let mut ct = compact_go(inner, pol, parents, in_process, recursive, rec_vars);
-            if !ct.refinements.contains(r) {
-                ct.refinements.push(r.clone());
+            let mut ct = compact_go(
+                inner, pol, subst_acc, parents, in_process, recursive, rec_vars,
+            );
+            let r = subst_acc.force_refinement(r);
+            if !ct.refinements.contains(&r) {
+                ct.refinements.push(r);
             }
             ct
         }
         // A bare `Hole` shouldn't reach the solver (emission turns it into a
         // fresh var), but treat it as no contribution for exhaustiveness.
         Type::Hole => CompactType::empty(),
-        Type::Fun(d, c) => {
+        Type::Fun {
+            name,
+            domain: d,
+            codomain: c,
+        } => {
             // Function: domain is contravariant. A fresh `parents` set
             // per child mirrors Scala's `Set.empty` argument — cycles
             // span only one variable's bound chain, not across
             // function boundaries.
-            let dom = compact_go(d, !pol, &BTreeSet::new(), in_process, recursive, rec_vars);
-            let cod = compact_go(c, pol, &BTreeSet::new(), in_process, recursive, rec_vars);
+            let dom = compact_go(
+                d,
+                !pol,
+                subst_acc,
+                &BTreeSet::new(),
+                in_process,
+                recursive,
+                rec_vars,
+            );
+            // A Pi binder shadows the accumulated substitution inside the
+            // codomain (it binds the name locally), so restrict it there.
+            let cod_acc = match name {
+                Some(b) => subst_acc.shadow(b),
+                None => subst_acc.clone(),
+            };
+            let cod = compact_go(
+                c,
+                pol,
+                &cod_acc,
+                &BTreeSet::new(),
+                in_process,
+                recursive,
+                rec_vars,
+            );
             CompactType {
-                fun: Some((Box::new(dom), Box::new(cod))),
+                fun: Some((name.clone(), Box::new(dom), Box::new(cod))),
                 ..Default::default()
             }
         }
@@ -1031,7 +1208,15 @@ fn compact_go(
             for (i, v) in ts.iter().enumerate() {
                 compacted.insert(
                     FieldKey::Index(i),
-                    compact_go(v, pol, &BTreeSet::new(), in_process, recursive, rec_vars),
+                    compact_go(
+                        v,
+                        pol,
+                        subst_acc,
+                        &BTreeSet::new(),
+                        in_process,
+                        recursive,
+                        rec_vars,
+                    ),
                 );
             }
             CompactType {
@@ -1044,7 +1229,15 @@ fn compact_go(
             for (n, v) in fs {
                 compacted.insert(
                     FieldKey::Name(SmolStr::from(n.as_str())),
-                    compact_go(v, pol, &BTreeSet::new(), in_process, recursive, rec_vars),
+                    compact_go(
+                        v,
+                        pol,
+                        subst_acc,
+                        &BTreeSet::new(),
+                        in_process,
+                        recursive,
+                        rec_vars,
+                    ),
                 );
             }
             CompactType {
@@ -1061,7 +1254,15 @@ fn compact_go(
             for (k, v) in tags {
                 compacted.insert(
                     k.clone(),
-                    compact_go(v, pol, &BTreeSet::new(), in_process, recursive, rec_vars),
+                    compact_go(
+                        v,
+                        pol,
+                        subst_acc,
+                        &BTreeSet::new(),
+                        in_process,
+                        recursive,
+                        rec_vars,
+                    ),
                 );
             }
             CompactType {
@@ -1157,7 +1358,20 @@ fn compact_go(
             new_parents.insert(uid);
             let mut bound: Option<CompactType> = None;
             for b in &primary_bounds {
-                let bc = compact_go(b, pol, &new_parents, in_process, recursive, rec_vars);
+                // Compose this edge's substitution onto the accumulator before
+                // descending: a bound reached transitively through `v → w → …`
+                // arrives with every edge's morphism composed (design §3.6).
+                // Identity edges leave `subst_acc` unchanged (the common case).
+                let inner_acc = Subst::then(&b.subst, subst_acc);
+                let bc = compact_go(
+                    &b.ty,
+                    pol,
+                    &inner_acc,
+                    &new_parents,
+                    in_process,
+                    recursive,
+                    rec_vars,
+                );
                 bound = Some(match bound {
                     None => bc,
                     Some(acc) => CompactType::merge(pol, acc, bc),
@@ -1178,7 +1392,16 @@ fn compact_go(
                 .is_none_or(|b| b.atoms.is_empty() && b.rec.is_none() && b.fun.is_none());
             if no_concrete {
                 for b in &opposite_bounds {
-                    let bc = compact_go(b, !pol, &new_parents, in_process, recursive, rec_vars);
+                    let inner_acc = Subst::then(&b.subst, subst_acc);
+                    let bc = compact_go(
+                        &b.ty,
+                        !pol,
+                        &inner_acc,
+                        &new_parents,
+                        in_process,
+                        recursive,
+                        rec_vars,
+                    );
                     bound = Some(match bound {
                         None => bc,
                         Some(acc) => CompactType::merge(!pol, acc, bc),
@@ -1433,7 +1656,7 @@ fn simplify_analyze(
             );
         }
     }
-    if let Some((dom, cod)) = &ct.fun {
+    if let Some((_, dom, cod)) = &ct.fun {
         simplify_analyze(
             dom,
             !pol,
@@ -1481,8 +1704,9 @@ fn simplify_reconstruct(
             .collect()
     });
 
-    let new_fun = ct.fun.map(|(dom, cod)| {
+    let new_fun = ct.fun.map(|(name, dom, cod)| {
         (
+            name,
             Box::new(simplify_reconstruct(*dom, var_subst)),
             Box::new(simplify_reconstruct(*cod, var_subst)),
         )
@@ -1537,10 +1761,21 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
     if let Some(var) = &ct.var {
         shapes.push(materialize_variant(var, polarity)?);
     }
-    if let Some((dom, cod)) = &ct.fun {
+    if let Some((name, dom, cod)) = &ct.fun {
         let d = coalesce_compact_go(dom, !polarity)?;
         let c = coalesce_compact_go(cod, polarity)?;
-        shapes.push(Type::Fun(Box::new(d), Box::new(c)));
+        // Strip the Pi binder unless the codomain's refinement predicates
+        // actually reference it (design §3.2 / O10): keeps ordinary functions
+        // `name: None` while a genuinely dependent codomain keeps its binder
+        // bound.
+        let kept_name = name
+            .clone()
+            .filter(|b| crate::ccl::subst::type_free_vars(&c).contains(b));
+        shapes.push(Type::Fun {
+            name: kept_name,
+            domain: Box::new(d),
+            codomain: Box::new(c),
+        });
     }
 
     let mut all = Vec::new();
@@ -1768,7 +2003,6 @@ mod tests {
         use crate::ccl::{Lit, TypedExpr};
         use std::cell::RefCell;
         let r = Refinement {
-            description: format!("r{marker}"),
             predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Int(marker)))),
         };
         Type::Refinement(Box::new(base), r)
@@ -1812,7 +2046,6 @@ mod tests {
             Type::Refinement(
                 Box::new(prim(BaseType::Int)),
                 Refinement {
-                    description: String::new(),
                     predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true)))),
                 },
             )
@@ -1837,7 +2070,6 @@ mod tests {
             Type::Refinement(
                 Box::new(prim(BaseType::Int)),
                 Refinement {
-                    description: String::new(),
                     predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true)))),
                 },
             )
@@ -1862,7 +2094,6 @@ mod tests {
         let c = Type::Refinement(
             Box::new(prim(BaseType::Int)),
             Refinement {
-                description: String::new(),
                 predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(false)))),
             },
         );
@@ -1898,7 +2129,7 @@ mod tests {
         let Type::Infer(v) = &a else { unreachable!() };
         let expected = refined(prim(BaseType::Int), p);
         assert!(
-            v.bounds.borrow().upper.contains(&expected),
+            v.bounds.borrow().upper.iter().any(|u| u.ty == expected),
             "?a should carry {{Int | p}} as an upper bound, got {:?}",
             v.bounds.borrow().upper
         );
@@ -2119,7 +2350,7 @@ mod tests {
             let s = state.bounds.borrow();
             assert_eq!(s.upper.len(), 1);
             // The recorded upper bound is α itself, not Int.
-            assert!(matches!(&s.upper[0], Type::Infer(_)));
+            assert!(matches!(&s.upper[0].ty, Type::Infer(_)));
         } else {
             unreachable!()
         }
@@ -2140,10 +2371,11 @@ mod tests {
         let t = coalesce_compact(&compact_type(&s)).unwrap();
         assert_eq!(
             t,
-            Type::Fun(
-                Box::new(Type::Base(BaseType::Int)),
-                Box::new(Type::Base(BaseType::Bool))
-            )
+            Type::Fun {
+                name: None,
+                domain: Box::new(Type::Base(BaseType::Int)),
+                codomain: Box::new(Type::Base(BaseType::Bool))
+            }
         );
     }
 
@@ -2278,7 +2510,7 @@ mod tests {
         // the path is defensive.
         let v = fresh_var(0);
         if let Type::Infer(state) = &v {
-            state.bounds.borrow_mut().lower.push(v.clone());
+            state.bounds.borrow_mut().lower.push(Bound::conc(v.clone()));
         }
         match coalesce_compact(&compact_type(&v)).unwrap() {
             Type::Infer(_) => {}
@@ -2334,14 +2566,14 @@ mod tests {
         };
         let graph = CompactGraph {
             term: CompactType {
-                fun: Some((Box::new(dom), Box::new(cod))),
+                fun: Some((None, Box::new(dom), Box::new(cod))),
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
         };
 
         let simplified = simplify_type(graph);
-        let (dom_s, cod_s) = simplified.term.fun.unwrap();
+        let (_, dom_s, cod_s) = simplified.term.fun.unwrap();
         assert!(dom_s.vars.contains(&uid_a), "a kept in dom");
         assert!(cod_s.vars.contains(&uid_a), "a kept in cod");
         assert!(!cod_s.vars.contains(&uid_b), "b eliminated from cod");
@@ -2362,6 +2594,7 @@ mod tests {
         let graph = CompactGraph {
             term: CompactType {
                 fun: Some((
+                    None,
                     Box::new(make_side([uid_a].into_iter().collect())),
                     Box::new(make_side([uid_a].into_iter().collect())),
                 )),
@@ -2371,7 +2604,7 @@ mod tests {
         };
 
         let simplified = simplify_type(graph);
-        let (dom_s, cod_s) = simplified.term.fun.unwrap();
+        let (_, dom_s, cod_s) = simplified.term.fun.unwrap();
         assert!(dom_s.vars.is_empty(), "a absorbed in dom");
         assert!(cod_s.vars.is_empty(), "a absorbed in cod");
         assert!(dom_s.atoms.contains(&int_key), "Int remains in dom");
@@ -2389,6 +2622,7 @@ mod tests {
         let graph = CompactGraph {
             term: CompactType {
                 fun: Some((
+                    None,
                     Box::new(CompactType {
                         vars: both.clone(),
                         ..Default::default()
@@ -2404,7 +2638,7 @@ mod tests {
         };
 
         let simplified = simplify_type(graph);
-        let (dom_s, cod_s) = simplified.term.fun.unwrap();
+        let (_, dom_s, cod_s) = simplified.term.fun.unwrap();
         assert_eq!(dom_s.vars.len(), 1, "one var after merge in dom");
         assert_eq!(cod_s.vars.len(), 1, "one var after merge in cod");
         assert_eq!(dom_s.vars, cod_s.vars, "same representative in dom and cod");
@@ -2419,6 +2653,7 @@ mod tests {
         let graph = CompactGraph {
             term: CompactType {
                 fun: Some((
+                    None,
                     Box::new(CompactType {
                         vars: [uid_a].into_iter().collect(),
                         ..Default::default()
@@ -2434,7 +2669,7 @@ mod tests {
         };
 
         let simplified = simplify_type(graph);
-        let (dom_s, cod_s) = simplified.term.fun.unwrap();
+        let (_, dom_s, cod_s) = simplified.term.fun.unwrap();
         assert!(dom_s.vars.contains(&uid_a), "a preserved in dom");
         assert!(cod_s.vars.contains(&uid_a), "a preserved in cod");
     }
@@ -2651,5 +2886,123 @@ mod tests {
             }
             other => panic!("expected Variant, got {other}"),
         }
+    }
+
+    // ---- Dependent refinements: correspondence derivation + coalesce-time
+    // forcing of suspended substitutions (prototype scenarios K/L). These
+    // exercise the non-identity substitution paths the monomorphic suite never
+    // reaches.
+
+    use crate::ccl::subst::Subst;
+    use crate::ccl::{BinOpKind, CompareKind, Lit, TypedExpr};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Build a refinement whose predicate is the **bare** `__elem > <rhs>` —
+    /// the element is the implicit `REFINEMENT_BINDER`, free in the predicate,
+    /// exactly as real refinements are shaped (no element-binding lambda).
+    fn gt_refinement(rhs: TypedExpr) -> Refinement {
+        let pred = TypedExpr::binop(
+            TypedExpr::var(crate::ccl::REFINEMENT_BINDER),
+            BinOpKind::Compare(CompareKind::Greater),
+            rhs,
+        );
+        Refinement {
+            predicate: Rc::new(RefCell::new(pred)),
+        }
+    }
+
+    fn coalesce(ty: &Type) -> Type {
+        coalesce_compact(&compact_type(ty)).expect("coalesce")
+    }
+
+    /// The refinement predicate of a `Fun(Refinement(_, r), _)`, rendered.
+    fn domain_predicate(ty: &Type) -> String {
+        let Type::Fun { domain, .. } = ty else {
+            panic!("expected fun, got {ty}");
+        };
+        let Type::Refinement(_, r) = domain.as_ref() else {
+            panic!("expected refined domain, got {domain}");
+        };
+        crate::ccl::symbolic::symbolic(&r.predicate.borrow())
+    }
+
+    // L — a Pi-vs-Pi constraint DERIVES the binder correspondence `[k ↦ x]`,
+    // renaming the codomain refinement's reference to the bound key.
+    #[test]
+    fn pi_correspondence_renames_codomain_refinement() {
+        let arena = crate::ccl::infer::InferArena::new();
+        let result = fresh_var(0);
+        let Type::Infer(result_var) = &result else {
+            unreachable!()
+        };
+
+        // g : (k: Int) ⇒ ({i | i > k} ⇒ Int)
+        let g_ty = Type::pi(
+            "k",
+            prim(BaseType::Int),
+            Type::fun(
+                Type::Refinement(
+                    Box::new(prim(BaseType::Int)),
+                    gt_refinement(TypedExpr::var("k")),
+                ),
+                prim(BaseType::Int),
+            ),
+        );
+        // expected : (x: Int) ⇒ result
+        let expected = Type::pi("x", prim(BaseType::Int), result.clone());
+
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&g_ty, &expected, &mut cache).expect("constrain");
+
+        // result coalesces to `{i | i > x} ⇒ Int` — k renamed to the expected
+        // binder x by the derived correspondence.
+        let res = coalesce(&Type::Infer(Rc::clone(result_var)));
+        assert_eq!(domain_predicate(&res), "__elem > x");
+        drop(arena);
+    }
+
+    // K — a discharge `[x ↦ 0]` on a var edge composes with the correspondence
+    // at coalesce, yielding the fully-substituted predicate `i > 0`: the
+    // dependent application `g(0)`.
+    #[test]
+    fn dependent_application_discharges_through_coalesce() {
+        let arena = crate::ccl::infer::InferArena::new();
+        let result = fresh_var(0);
+        let Type::Infer(result_var) = &result else {
+            unreachable!()
+        };
+
+        let g_ty = Type::pi(
+            "k",
+            prim(BaseType::Int),
+            Type::fun(
+                Type::Refinement(
+                    Box::new(prim(BaseType::Int)),
+                    gt_refinement(TypedExpr::var("k")),
+                ),
+                prim(BaseType::Int),
+            ),
+        );
+        let expected = Type::pi("x", prim(BaseType::Int), result.clone());
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&g_ty, &expected, &mut cache).expect("constrain");
+
+        // The application term γ: its type is `result` under the discharge
+        // [x ↦ 0] (what emit_apply mints).
+        let gamma = fresh_var(0);
+        let Type::Infer(gamma_var) = &gamma else {
+            unreachable!()
+        };
+        gamma_var.bounds.borrow_mut().lower.push(Bound::with_subst(
+            Type::Infer(Rc::clone(result_var)),
+            Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
+        ));
+
+        let app_ty = coalesce(&Type::Infer(Rc::clone(gamma_var)));
+        // g(0) : {i | i > 0} ⇒ Int — both the correspondence rename and the
+        // discharge fired, composed along the coalesce walk.
+        assert_eq!(domain_predicate(&app_ty), "__elem > 0");
+        drop(arena);
     }
 }

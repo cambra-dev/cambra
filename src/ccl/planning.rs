@@ -1,19 +1,21 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::mem::take;
+use std::rc::Rc;
 
 use log::trace;
 
 use crate::ccl::ccl_utils::{
-    apply_function, make_iterate, make_restrict, refine_codomain, set_codomain,
+    self, apply_function, make_iterate, make_restrict, refine_codomain, set_codomain,
     trivially_true_predicate, typed_compose,
 };
 use crate::ccl::{
-    BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, ProjKey, Refinement, Type,
-    TypedExprNode,
+    BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, ProjKey, REFINEMENT_BINDER,
+    Type, TypedExprNode,
     ccl_utils::apply_primitive,
     infer::typecheck,
-    lambda_elim::{compose, id},
+    lambda_elim::{self, compose, id},
     simplify::simplify,
     symbolic::{symbolic, symbolic_typed},
 };
@@ -21,6 +23,58 @@ use crate::ccl::{
 /// Returns `true` if `expr` directly references the given built-in primitive.
 fn is_builtin(expr: &Expr, b: Builtin) -> bool {
     matches!(&expr.node, TypedExprNode::Builtin(x) if *x == b)
+}
+
+/// Identity key for a refinement predicate — the `Rc<RefCell<Expr>>` address.
+/// Keyed on object identity, not [`crate::ccl::RefinementId`]: a
+/// substituted/discharged refinement keeps its id but holds an independently
+/// cloned predicate that must be compiled on its own (keying by id would skip
+/// the clone and leave it in lambda form).
+type PredPtr = *const RefCell<Expr>;
+
+/// Compile every refinement predicate reachable from `expr` by running the
+/// lambda-elim → simplify sub-pipeline on it (design §6.3/§6.5).
+///
+/// Refinement predicates ride the pipeline as bare expressions over the implicit
+/// `REFINEMENT_BINDER`; this normalizes each to `__elem ▷ p` with a point-free
+/// `p`, the form the recognizers and op-conversion's `Restrict` consume (it
+/// recovers `p` via `fn_of_bare_predicate` and re-wraps). Each distinct predicate
+/// `Rc` is compiled once.
+fn compile_refinement_predicates(expr: &mut Expr, seen: &mut HashSet<PredPtr>) {
+    compile_predicates_in_type(&mut expr.ty, seen);
+    expr.walk_children_mut(|child| compile_refinement_predicates(child, seen));
+}
+
+/// The point-free predicate function `p : base ⇒ Bool` underlying a refinement's
+/// bare predicate `__elem ▷ p` (the inverse of [`ccl_utils::bare_predicate_of_fn`]).
+/// Fast-pathed when the bare predicate is already that single application;
+/// otherwise η-expands to `λ __elem → bare` and lambda-eliminates to point-free.
+fn fn_of_bare_predicate(base: &Type, bare: &Expr) -> Expr {
+    if let TypedExprNode::Apply { argument, function } = &bare.node
+        && matches!(&argument.node, TypedExprNode::Var(n) if n == REFINEMENT_BINDER)
+    {
+        return (**function).clone();
+    }
+    lambda_elim::run(Expr::lambda(REFINEMENT_BINDER, base.clone(), bare.clone()))
+        .expect("lambda-elim of refinement predicate")
+}
+
+fn compile_predicates_in_type(ty: &mut Type, seen: &mut HashSet<PredPtr>) {
+    if let Type::Refinement(base, refinement) = ty
+        && seen.insert(Rc::as_ptr(&refinement.predicate))
+        && let Ok(mut pred) = refinement.predicate.try_borrow_mut()
+    {
+        // Normalize the bare predicate to `__elem ▷ p` with `p` point-free:
+        // recover the predicate function and re-wrap it. This keeps the stored
+        // predicate in the single bare form while pinning a point-free core, so
+        // the iterate/restrict producers (built from the same `p`) carry a
+        // structurally-identical refinement to the cast demand they satisfy.
+        let p = fn_of_bare_predicate(base, &pred);
+        *pred = ccl_utils::bare_predicate_of_fn(base, p);
+    }
+    // Recurse into structural type children (refinement base, function
+    // domain/codomain, tuple/record/variant elements).
+    ty.walk_children_mut(|child| compile_predicates_in_type(child, seen));
 }
 
 /// Materialize every iteration site in the post-lambda-elim CCL, choosing
@@ -53,11 +107,17 @@ fn is_builtin(expr: &Expr, b: Builtin) -> bool {
 /// planning fire at every site (not just the program root, as an earlier
 /// pass did).
 ///
-/// Also: the curried-correlated-refinement rewrite for keyed aggregates
-/// ([`replace_curried_correlated_refinements`] /
-/// [`convert_groupby`]) runs before the materialisation walk.
+/// Also: the pointful group-by rewrite for keyed aggregates
+/// ([`recognize_groupby_sites`] / [`convert_groupby_pointful`]) runs before the
+/// materialisation walk.
 pub fn run(mut expr: Expr) -> Expr {
-    replace_curried_correlated_refinements(&mut expr);
+    // Refinement predicates travel through inference and lambda-elim as bare
+    // expressions over the implicit `REFINEMENT_BINDER` (design §6.3) and are
+    // compiled to point-free form only when a refined type is iterated (§6.5).
+    // The group-by recognizer runs first and matches the bare predicate
+    // directly; the generic filter / hash-join paths compile the predicate
+    // lazily at each iteration site (see `wrap_with_iterate`).
+    recognize_groupby_sites(&mut expr);
     let mut expr = simplify(expr);
     insert_iterate_markers(&mut expr);
     // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
@@ -242,7 +302,7 @@ fn insert_iterate_recurse(expr: &mut Expr) {
         // does its own input-threading there.
         TypedExprNode::Record(fields) => {
             for (_, field) in fields.iter_mut() {
-                if matches!(&field.ty, Type::Fun(..)) {
+                if matches!(&field.ty, Type::Fun { .. }) {
                     wrap_with_iterate(field);
                 }
             }
@@ -339,7 +399,7 @@ fn wrap_with_iterate(expr: &mut Expr) {
         // hit an `input=None` arm and error.  This wrap is the workaround
         // for that eager compilation — #232 tracks making iteration
         // use-driven so a dead binding is dropped rather than wrapped.
-        if matches!(&bound_expr.ty, Type::Fun(..)) {
+        if matches!(&bound_expr.ty, Type::Fun { .. }) {
             wrap_with_iterate(bound_expr);
         }
         wrap_with_iterate(body);
@@ -352,15 +412,42 @@ fn wrap_with_iterate(expr: &mut Expr) {
         // Non-function expressions can't be iterated; leave them alone.
         return;
     };
-    // Specialised iteration strategies come first: try the hash-join
-    // rewrite when the domain is a refined tuple that decomposes into
-    // equality join conditions.  Both this and the default
-    // `iterate(predicate)` fall-through are choosing how to materialise
-    // the same iteration site — hash join is just a more efficient
-    // strategy when the type structure permits.
+    // Specialised iteration strategies come first: try the hash/loop-join
+    // rewrite when the domain is a refined tuple whose **pointful** predicate
+    // decomposes into equality join conditions (design §6.5 — the recognizer
+    // matches the lambda form directly). Both this and the default
+    // `iterate(predicate)` fall-through are choosing how to materialise the same
+    // iteration site — hash join is just a more efficient strategy when the type
+    // structure permits.
     if try_hash_join_rewrite(expr, &domain_ty) {
         return;
     }
+    // Generic fallback. Now compile the site's refinement predicates (design
+    // §6.5: "run the lambda-elim → simplify sub-pipeline on the lifted predicate
+    // when a refined type is iterated") so the iterate/restrict lowering below
+    // consumes point-free predicates. (Group-by and join sites matched the
+    // pointful form and were already rewritten.)
+    //
+    // NOT YET HANDLED here: §6.5's binder-*lifting* for the loop-join fallback —
+    // hoisting an enclosing `Fun`-binder that is *not* in scope at the iteration
+    // site into the predicate's parameter list (matrix case F: a returned filter
+    // capting an outer binder, iterated outside that binder's scope). The
+    // recognized shapes (group-by, hash/loop join, in-scope filters: matrix
+    // cases A–E, G, H) are covered and tested; case F has no lowering that
+    // reaches it today and is deferred with the opaque/polymorphic
+    // dependent-function work (proposal O3). A predicate that *did* reach here
+    // with a free outer binder would surface as a surviving free var, not a
+    // silent miscompile.
+    //
+    // The `seen` set dedups predicates *within* this site's subtree (a predicate
+    // `Rc` shared across positions is compiled once). It is fresh per site, so a
+    // predicate reachable from two sibling sites may be visited again; that is
+    // safe because `lambda_elim::run` is idempotent on an already-point-free
+    // predicate (re-running finds no lambdas to eliminate).
+    compile_refinement_predicates(expr, &mut HashSet::new());
+    let Some(domain_ty) = expr.ty.domain() else {
+        return;
+    };
     // Walk every nested `Type::Refinement` layer (innermost ⊇ outermost,
     // each layer's predicate must hold), collecting the predicates
     // outer-to-inner; reverse to inner-to-outer.  Then emit a uniform
@@ -369,11 +456,14 @@ fn wrap_with_iterate(expr: &mut Expr) {
     // `restrict(p_inner)`, `restrict(p_next)`, … per refinement layer,
     // narrowing the domain layer by layer.  Unrefined sites get just
     // the iterate.
+    // Recover each layer's point-free predicate function from its bare
+    // `__elem ▷ p` form — that is what `make_restrict` filters with (the
+    // refinement type it then re-stamps stays bare).
     let mut preds: Vec<Expr> = Vec::new();
     let mut current = &domain_ty;
     while let Type::Refinement(base, refinement) = current {
-        let pred = &refinement.predicate;
-        preds.push(pred.borrow().clone());
+        let bare = refinement.predicate.borrow();
+        preds.push(fn_of_bare_predicate(base.as_ref(), &bare));
         current = base.as_ref();
     }
     preds.reverse();
@@ -459,7 +549,7 @@ fn is_iteration_bearing(expr: &Expr) -> bool {
         TypedExprNode::CollectionUnion(_) | TypedExprNode::Tuple(_) | TypedExprNode::Record(_) => {
             true
         }
-        TypedExprNode::Var(_) if matches!(&head.ty, Type::Fun(..)) => true,
+        TypedExprNode::Var(_) if matches!(&head.ty, Type::Fun { .. }) => true,
         TypedExprNode::Apply { function, .. } => match builtin_at_function_position(function) {
             // `Iterate` is the canonical head marker; `Restrict` heads a
             // refined site whose upstream is itself iteration-bearing
@@ -476,179 +566,179 @@ fn is_iteration_bearing(expr: &Expr) -> bool {
     }
 }
 
-/// Identifies constructs corresponding to partitioning by key and swaps from the key
-/// being the outer variable to the collection being the outer variable.
-fn replace_curried_correlated_refinements(expr: &mut Expr) {
-    // Special case: detected groupby pattern at this node.  Either rewrite
-    // and stop, or — if conversion fails — also stop, since the pattern's
-    // internals have already been inspected by `convert_groupby` and
-    // descending into them won't reveal anything new.
-    //
-    // The `Option<Option<Expr>>` layering distinguishes "pattern didn't
-    // match" (outer `None`, fall through to structural recursion) from
-    // "pattern matched but conversion failed" (outer `Some(None)`, stop
-    // here without rewriting).  Computing the result inside the `if-let`
-    // and then matching on it outside lets the immutable borrow of
-    // `expr.node` end before we attempt to overwrite `*expr`.
-    let groupby = if let TypedExprNode::Apply { argument, function } = &expr.node
-        && is_builtin(function, Builtin::Curry)
-        && let Type::Fun(arg_domain, _) = &argument.ty
-        && matches!(arg_domain.as_ref(), Type::Refinement(..))
-    {
-        // The correlated groupby predicate refines the uncurried function's
-        // *domain* — `{(key, value) | k == key_fn(value)} ⇒ A` — as placed by
-        // `lambda_elim`'s correlated-refinement arm. Read the predicate off the
-        // domain refinement; `convert_groupby` takes the function type itself
-        // (it only needs the codomain) and the predicate.
-        let Type::Refinement(_, Refinement { predicate: p, .. }) = arg_domain.as_ref() else {
-            unreachable!();
-        };
-        Some(convert_groupby(argument, &argument.ty, &p.borrow()))
-    } else {
-        None
-    };
-    if let Some(maybe_new) = groupby {
-        if let Some(new) = maybe_new {
-            *expr = new;
-        }
+/// Recognize group-by sites and rewrite them to the bucketize chain.
+///
+/// Group-by lowers to the dependent-refinement source `const(cast(c)) :
+/// (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒ V)`; [`convert_groupby_pointful`] matches
+/// that **pointful** form (design §6.5) and rewrites it to
+/// `converse(c ≫ key) ≫ map(c)`. Walks the tree, rewriting every such site
+/// (a rewritten site's tail may contain further sites).
+fn recognize_groupby_sites(expr: &mut Expr) {
+    if let Some(rewritten) = convert_groupby_pointful(expr) {
+        *expr = rewritten;
+        expr.walk_children_mut(recognize_groupby_sites);
         return;
     }
-    // Lambdas also carry a refinement *predicate* that `walk_children_mut`
-    // doesn't visit (it's not a structural child of the lambda node).
-    // Walk into it explicitly before falling through to the generic
-    // structural recursion.
-    if let TypedExprNode::Lambda {
-        refinement: Some(refinement),
-        ..
-    } = &mut expr.node
-    {
-        let p = &refinement.predicate;
-        replace_curried_correlated_refinements(&mut p.borrow_mut());
-    }
-    expr.walk_children_mut(replace_curried_correlated_refinements);
+    expr.walk_children_mut(recognize_groupby_sites);
 }
 
-/// Look for an expression that corresponds to a group-by and rewrite it to use Converse
-/// instead of iterating over both the collection and key.
-/// The expression must be the argument of curry, and the type must be a 2-tuple with a refinement
-/// of the form `(x, y) ▷ zip ≫ eq` where:
-/// - The input type is a 2-tuple
-/// - x only depends on one of the elements of the tuple
-/// - y only depends on the other element of the tuple
-///
-/// This allows us to rewrite into an expression that iterates over just one side, compute the value
-/// of the other side, then use Converse to do the grouping.
-///
-/// Note: this is technically not handling empty groups properly.  The incoming CCL says we should
-/// output a group for _every_ k, but here we only output non-empty groups
-/// TODO pay attention to whether the key has a refinements that specifies empty group handling.
-fn convert_groupby(body: &Expr, body_ty: &Type, refinement: &Expr) -> Option<Expr> {
-    // First, check all the prereqs
-    let TypedExprNode::Compose(elts) = &refinement.node else {
-        return None;
-    };
-    if elts.len() != 2 {
-        return None;
-    }
-    if !is_builtin(
-        &elts[1],
-        Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)),
-    ) {
-        return None;
-    }
-    let TypedExprNode::Apply {
-        function: zip,
-        argument: args,
-    } = &elts[0].node
-    else {
-        return None;
-    };
-    if !is_builtin(zip, Builtin::Zip) {
-        return None;
-    }
-    let TypedExprNode::Tuple(args) = &args.node else {
-        return None;
-    };
-    if args.len() != 2 {
-        return None;
-    }
-    let arg0_tuple_idx = is_function_of_single_tuple_arm(&args[0])?;
-    let arg1_tuple_idx = is_function_of_single_tuple_arm(&args[1])?;
-    let value_tuple_idx = is_function_of_single_tuple_arm(body)?;
-    if arg0_tuple_idx == arg1_tuple_idx {
-        return None;
-    }
-    let key_tuple_idx = 1 - value_tuple_idx;
-    let Some(Type::Tuple(arm_types)) = refinement.ty.domain().clone() else {
-        return None;
-    };
-    if arm_types.len() != 2 {
-        return None;
-    }
-
-    // Everything has matched, so build the output structure
-    let value_idx_ty = arm_types[value_tuple_idx].clone();
-    let key_ty = arm_types[key_tuple_idx].clone();
-
-    let value_ty = body_ty
-        .codomain()
-        .unwrap_or_else(|| panic!("Expected function, got {}", body.ty));
-    let mut values = body.clone();
-    // Clear the refinement first before doing projection substitution.
-    values = values.with_ty(Type::fun(
-        Type::Tuple(vec![key_ty.clone(), value_idx_ty.clone()]),
-        value_ty.clone(),
-    ));
-    replace_tuple_project_with_id(&mut values, &value_idx_ty);
-    let key_extract_idx = if arg0_tuple_idx == value_tuple_idx {
-        0
-    } else {
-        1
-    };
-    let mut keys = args[key_extract_idx].clone();
-
-    // Sanity check that the term on the other side of the key extraction doesn't do
-    // any transformation
-    if !matches!(
-        args[1 - key_extract_idx].node,
-        TypedExprNode::Proj(ProjKey::Index(_))
-    ) {
-        return None;
-    }
-
-    replace_tuple_project_with_id(&mut keys, &value_idx_ty);
+/// Build the bucketize-and-aggregate chain `converse(keys) ≫ map(values)`
+/// : `K ⇒ (I ⇒ V)` from a key-extraction morphism `keys : I ⇒ K` and a value
+/// morphism `values : I ⇒ V` over the shared element-index domain `I`. Shared
+/// by the pointful recognizer ([`convert_groupby_pointful`]); the surrounding aggregate is
+/// composed on by the caller and `wrap_with_iterate` prepends the `iterate`.
+fn emit_groupby(
+    keys: Expr,
+    values: Expr,
+    value_idx_ty: Type,
+    key_ty: Type,
+    value_ty: Type,
+) -> Expr {
     let converse_ty = Type::fun(
         key_ty.clone(),
         Type::fun(value_idx_ty.clone(), value_idx_ty.clone()),
     );
-    let grouped = apply_primitive(keys.clone(), Builtin::Converse, converse_ty);
+    let grouped = apply_primitive(keys, Builtin::Converse, converse_ty);
     typecheck(&grouped).expect("Bad group expr");
-
-    trace!("Grouped: {} : {}", symbolic(&grouped), grouped.ty);
-
     let values_fn = apply_primitive(
-        values.clone(),
+        values,
         Builtin::Map,
         Type::fun(
             Type::fun(value_idx_ty.clone(), value_idx_ty.clone()),
             Type::fun(value_idx_ty.clone(), value_ty.clone()),
         ),
     );
-
-    let grouped_values_ty = Type::fun(
-        key_ty.clone(),
-        Type::fun(value_idx_ty.clone(), value_ty.clone()),
-    );
+    let grouped_values_ty = Type::fun(key_ty, Type::fun(value_idx_ty, value_ty));
     typecheck(&values_fn).expect("Bad values_fn expr");
     let grouped_values = compose(grouped, values_fn).with_ty(grouped_values_ty);
-    trace!(
-        "Grouped values {} : {}",
-        symbolic_typed(&grouped_values),
-        grouped_values.ty
-    );
     typecheck(&grouped_values).expect("Bad grouped_values expr");
+    grouped_values
+}
 
-    Some(grouped_values)
+/// Pointful group-by recognizer (design §6.5). Match the source
+/// `const(cast(c)) : (k) ⇒ ({i: I | i ▷ c ▷ key == k} ⇒ V)` — the form
+/// lambda-elim now produces for `groupby(c, key)` — and rewrite it to the same
+/// bucketize chain `emit_groupby` builds. The group-by **key binder** is
+/// identified structurally as the free variable on one side of the predicate's
+/// equality (not by a Pi-name match, which the comprehension's discharge may
+/// have stripped). `expr` is a `Compose` whose head is the source; the head is
+/// replaced and the tail (the per-group aggregate) kept. Returns `None` if the
+/// shape doesn't match.
+fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
+    let TypedExprNode::Compose(elts) = &expr.node else {
+        return None;
+    };
+    let head = elts.first()?;
+    let TypedExprNode::Apply {
+        argument: cast_expr,
+        function: const_fn,
+    } = &head.node
+    else {
+        return None;
+    };
+    if !is_builtin(const_fn, Builtin::Const) {
+        return None;
+    }
+    let TypedExprNode::Cast { value: c, .. } = &cast_expr.node else {
+        return None;
+    };
+    // head.ty = (k: K) ⇒ ({I | pred} ⇒ V) — read the types (name-agnostic).
+    let Type::Fun {
+        domain: key_ty,
+        codomain: inner,
+        ..
+    } = &head.ty
+    else {
+        return None;
+    };
+    let Type::Fun {
+        domain: refined_dom,
+        codomain: value_ty,
+        ..
+    } = inner.as_ref()
+    else {
+        return None;
+    };
+    let Type::Refinement(idx_ty, refinement) = refined_dom.as_ref() else {
+        return None;
+    };
+    // The bare predicate binds the implicit REFINEMENT_BINDER as the element:
+    //   pred = (__elem ▷ c ▷ key) == <key binder>
+    let pred = refinement.predicate.borrow();
+    let r_name = REFINEMENT_BINDER;
+    let TypedExprNode::BinOp {
+        left,
+        op: BinOpKind::Compare(CompareKind::Equals),
+        right,
+    } = &pred.node
+    else {
+        return None;
+    };
+    // Identify which side is the element-extraction `__elem ▷ c ▷ key` and which
+    // is the free key binder (a `Var` not bound by the element).
+    let extract = if side_extracts_element(left, r_name) && is_free_var(right, r_name) {
+        left
+    } else if side_extracts_element(right, r_name) && is_free_var(left, r_name) {
+        right
+    } else {
+        return None;
+    };
+    // extract = r ▷ c ▷ key = Apply { argument: Apply { argument: Var(r), .. }, function: key }
+    let TypedExprNode::Apply {
+        function: key_expr,
+        argument: extract_arg,
+    } = &extract.node
+    else {
+        return None;
+    };
+    // The group-by lowering only ever emits a *single-stage* key extraction
+    // `r ▷ c ▷ key`, so `extract_arg` (what `key` is applied to) must be exactly
+    // `r ▷ c` — its own argument the bare element binder. A multi-stage
+    // extraction (`r ▷ c ▷ key1 ▷ key2`) would peel only the outermost `key`
+    // and silently drop the inner stage(s) below, miscompiling the grouping;
+    // like every other shape mismatch in this recognizer, fall back to the
+    // generic iterate/restrict lowering instead. (`keys` below is built from
+    // the head's `c`, trusting it matches the `c` inside this extraction —
+    // also a lowering invariant.)
+    if !matches!(&extract_arg.node, TypedExprNode::Apply { argument: a, .. } if matches!(&a.node, TypedExprNode::Var(n) if n.as_str() == r_name))
+    {
+        return None;
+    }
+
+    // Compile the pointful key function to a point-free morphism V ⇒ K, then
+    // build `keys = c ≫ key : I ⇒ K` and `values = c : I ⇒ V`.
+    let key_pf = lambda_elim::run((**key_expr).clone()).ok()?;
+    let value_idx_ty = (**idx_ty).clone();
+    let keys =
+        compose((**c).clone(), key_pf).with_ty(Type::fun(value_idx_ty.clone(), (**key_ty).clone()));
+    let grouped_values = emit_groupby(
+        keys,
+        (**c).clone(),
+        value_idx_ty,
+        (**key_ty).clone(),
+        (**value_ty).clone(),
+    );
+
+    let mut new_elts = vec![grouped_values];
+    new_elts.extend(elts.iter().skip(1).cloned());
+    Some(typed_compose(new_elts).with_ty(expr.ty.clone()))
+}
+
+/// Is `e` the element-extraction `r ▷ c ▷ key` — an application whose innermost
+/// argument is `Var(r)` (the refinement's element binder)?
+fn side_extracts_element(e: &Expr, r: &str) -> bool {
+    match &e.node {
+        TypedExprNode::Apply { argument, .. } => {
+            matches!(&argument.node, TypedExprNode::Var(n) if n == r)
+                || side_extracts_element(argument, r)
+        }
+        _ => false,
+    }
+}
+
+/// Is `e` a bare `Var` other than the element binder `r` (the free key binder)?
+fn is_free_var(e: &Expr, r: &str) -> bool {
+    matches!(&e.node, TypedExprNode::Var(n) if n != r)
 }
 
 // Returns whether the given expression is a constant, or a function of a constant.
@@ -717,7 +807,11 @@ fn is_function_of_single_tuple_arm(expr: &Expr) -> Option<usize> {
 
 fn set_domain_ty(fun_ty: &mut Type, ty: &Type) {
     match fun_ty {
-        Type::Fun(domain, _) => {
+        Type::Fun {
+            domain,
+            codomain: _,
+            ..
+        } => {
             **domain = ty.clone();
         }
         _ => panic!("Not function type: {}", fun_ty),
@@ -755,7 +849,11 @@ fn replace_tuple_project_with_id(expr: &mut Expr, ty: &Type) {
         TypedExprNode::Tuple(_) => {
             if let Type::Tuple(elts) = &mut expr.ty {
                 elts.iter_mut().for_each(|elt| match elt {
-                    Type::Fun(domain, _) => {
+                    Type::Fun {
+                        domain,
+                        codomain: _,
+                        ..
+                    } => {
                         **domain = ty.clone();
                     }
                     _ => panic!(),
@@ -775,96 +873,96 @@ fn replace_tuple_project_with_id(expr: &mut Expr, ty: &Type) {
     };
 }
 
-/// Extracts `(key_a, key_b)` from a single equality condition `(key_a, key_b) ▷ zip ≫ eq`.
-fn extract_single_eq_condition(cond: &Expr) -> Option<(&Expr, &Expr)> {
-    let TypedExprNode::Compose(elts) = &cond.node else {
-        return None;
-    };
-    if elts.len() != 2 {
-        return None;
-    }
-    if !is_builtin(
-        &elts[1],
-        Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)),
-    ) {
-        return None;
-    }
-    let TypedExprNode::Apply {
-        function: zip_fn,
-        argument: args,
-    } = &elts[0].node
-    else {
-        return None;
-    };
-    if !is_builtin(zip_fn, Builtin::Zip) {
-        return None;
-    }
-    let TypedExprNode::Tuple(zip_args) = &args.node else {
-        return None;
-    };
-    if zip_args.len() != 2 {
-        return None;
-    }
-    Some((&zip_args[0], &zip_args[1]))
-}
-
-/// Splits a conjunction predicate into equality join conditions and other predicates.
+/// Splits a (pointful) join predicate into equality join conditions and
+/// residual predicates, each compiled to a point-free morphism over the tuple
+/// domain (design §6.5).
 ///
-/// Equality conditions take the form `(key_a, key_b) ▷ zip ≫ eq` where each key depends on
-/// exactly one arm.  AND chains `(cond_1, …, cond_N) ▷ zip ≫ and` are recursively split.
-/// Anything that does not match these patterns is collected as an "other" predicate to be
-/// pushed down to the lowest join node where all its required arms are available.
-fn split_join_conditions(refinement: &Expr) -> (Vec<(Expr, Expr)>, Vec<Expr>) {
+/// The predicate is **bare** — the refinement binds the implicit
+/// REFINEMENT_BINDER as the record `rec`, of type `rec_ty` — and has the shape
+/// `rec.0 ▷ l0 ▷ (λ v0 → … rec.k ▷ lk ▷ (λ vk → <bool over v0…vk>))`:
+/// each `rec.i ▷ li` binds the element `vi` of arm `i`, and the innermost
+/// boolean is a conjunction of `==` conditions and residual predicates over
+/// those element binders. We build the `vi ↦ rec.i ▷ li` environment,
+/// decompose the boolean (`and` / `==` / other), and for each side substitute
+/// the environment and lambda-eliminate `λ rec → side` to recover the
+/// combinator morphism over `rec` that [`plan_loop_join`] consumes.
+fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>, Vec<Expr>) {
     let mut eq_conds = Vec::new();
     let mut other_preds = Vec::new();
-    collect_conditions(refinement, &mut eq_conds, &mut other_preds);
+    // A bare predicate is `Bool`-typed; a function-typed expression here is not a
+    // decomposable join predicate, so treat the whole thing as one residual (no
+    // join forms — plan_loop_join then bails on the empty equality set).
+    if refinement.ty.domain().is_some() {
+        other_preds.push(refinement.clone());
+        return (eq_conds, other_preds);
+    }
+    // env: element binder name → its extraction morphism `rec.i ▷ li` (over rec).
+    let mut env: Vec<(String, Expr)> = Vec::new();
+    let mut cur = refinement;
+    while let TypedExprNode::Apply { argument, function } = &cur.node
+        && let TypedExprNode::Lambda {
+            param, body: inner, ..
+        } = &function.node
+    {
+        env.push((param.name.clone(), (**argument).clone()));
+        cur = inner.as_ref();
+    }
+    decompose_join_bool(
+        cur,
+        &env,
+        REFINEMENT_BINDER,
+        rec_ty,
+        &mut eq_conds,
+        &mut other_preds,
+    );
     (eq_conds, other_preds)
 }
 
-/// Recursive helper for [`split_join_conditions`].
-fn collect_conditions(
-    refinement: &Expr,
+/// Decompose the innermost boolean of a join predicate into equality conditions
+/// (`==`, recorded as a pair of compiled sides) and residual predicates,
+/// splitting top-level conjunctions.
+fn decompose_join_bool(
+    e: &Expr,
+    env: &[(String, Expr)],
+    rec_name: &str,
+    rec_ty: &Type,
     eq_conds: &mut Vec<(Expr, Expr)>,
     other_preds: &mut Vec<Expr>,
 ) {
-    // Single equality condition.
-    if let Some((ka, kb)) = extract_single_eq_condition(refinement) {
-        eq_conds.push((ka.clone(), kb.clone()));
-        return;
+    match &e.node {
+        TypedExprNode::BinOp {
+            left,
+            op: BinOpKind::BoolLogic(LogicKind::And),
+            right,
+        } => {
+            decompose_join_bool(left, env, rec_name, rec_ty, eq_conds, other_preds);
+            decompose_join_bool(right, env, rec_name, rec_ty, eq_conds, other_preds);
+        }
+        TypedExprNode::BinOp {
+            left,
+            op: BinOpKind::Compare(CompareKind::Equals),
+            right,
+        } => {
+            let ka = compile_join_side(left, env, rec_name, rec_ty);
+            let kb = compile_join_side(right, env, rec_name, rec_ty);
+            eq_conds.push((ka, kb));
+        }
+        _ => other_preds.push(compile_join_side(e, env, rec_name, rec_ty)),
     }
-    // AND of conditions: `(cond_1, …, cond_N) ▷ zip ≫ and`.
-    let TypedExprNode::Compose(elts) = &refinement.node else {
-        other_preds.push(refinement.clone());
-        return;
-    };
-    if elts.len() != 2
-        || !is_builtin(
-            &elts[1],
-            Builtin::BinOp(BinOpKind::BoolLogic(LogicKind::And)),
-        )
-    {
-        other_preds.push(refinement.clone());
-        return;
+}
+
+/// Substitute the element-binder environment into `side` (an expression over
+/// the element binders) and lambda-eliminate `λ rec → side` to the point-free
+/// morphism over the tuple domain.
+fn compile_join_side(side: &Expr, env: &[(String, Expr)], rec_name: &str, rec_ty: &Type) -> Expr {
+    let mut body = side.clone();
+    for (var, morph) in env {
+        body = lambda_elim::substitute(body, var, morph);
     }
-    let TypedExprNode::Apply {
-        function: zip_fn,
-        argument: args,
-    } = &elts[0].node
-    else {
-        other_preds.push(refinement.clone());
-        return;
-    };
-    if !is_builtin(zip_fn, Builtin::Zip) {
-        other_preds.push(refinement.clone());
-        return;
-    }
-    let TypedExprNode::Tuple(conds) = &args.node else {
-        other_preds.push(refinement.clone());
-        return;
-    };
-    for c in conds {
-        collect_conditions(c, eq_conds, other_preds);
-    }
+    let side_ty = body.ty.clone();
+    let lam =
+        Expr::lambda(rec_name, rec_ty.clone(), body).with_ty(Type::fun(rec_ty.clone(), side_ty));
+    lambda_elim::run(lam).expect("lambda-elim of join-condition side")
 }
 
 /// Collects the original arm indices accessed by `expr` at domain-accessing positions.
@@ -945,7 +1043,7 @@ fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]
         TypedExprNode::Tuple(_) => {
             if let Type::Tuple(tys) = &mut expr.ty {
                 for ty in tys.iter_mut() {
-                    if matches!(ty, Type::Fun(..)) {
+                    if matches!(ty, Type::Fun { .. }) {
                         set_domain_ty(ty, new_domain_ty);
                     }
                 }
@@ -961,7 +1059,7 @@ fn reindex_for_domain(expr: &mut Expr, new_domain_ty: &Type, arm_order: &[usize]
             }
         }
         _ => {
-            if matches!(expr.ty, Type::Fun(..)) {
+            if matches!(expr.ty, Type::Fun { .. }) {
                 set_domain_ty(&mut expr.ty, new_domain_ty);
             }
         }
@@ -1381,7 +1479,8 @@ fn plan_loop_join(arm_types: &[Type], refinement: &Expr) -> Option<(JoinPlan, Ve
         return None;
     }
 
-    let (eq_conditions_raw, other_preds_raw) = split_join_conditions(refinement);
+    let (eq_conditions_raw, other_preds_raw) =
+        split_join_conditions(refinement, &Type::Tuple(arm_types.to_vec()));
 
     if eq_conditions_raw.is_empty() {
         trace!("plan_loop_join: no equality conditions, cannot build hash join");
@@ -1850,7 +1949,11 @@ mod tests {
     }
 
     fn fun_ty(domain: Type, codomain: Type) -> Type {
-        Type::Fun(Box::new(domain), Box::new(codomain))
+        Type::Fun {
+            name: None,
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
     }
 
     fn tuple_ty(tys: Vec<Type>) -> Type {
@@ -1942,209 +2045,11 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_curried_correlated_refinements_on_var() {
+    fn test_recognize_groupby_sites_on_var() {
         let mut expr = var("x");
-        replace_curried_correlated_refinements(&mut expr);
+        recognize_groupby_sites(&mut expr);
         // Should remain unchanged
         assert!(matches!(expr.node, TypedExprNode::Var(ref v) if v == "x"));
-    }
-
-    #[test]
-    fn test_convert_groupby_basic() {
-        let int_ty_val = int_ty();
-        let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
-        let value_ty = int_ty_val.clone();
-
-        // body: projects element 0 from a tuple
-        // type: (int, int) -> int
-        let body_ty = fun_ty(tuple_ty_val.clone(), value_ty.clone());
-        let body = proj_idx(0).with_ty(body_ty.clone());
-
-        // refinement: zip(proj_idx(0), proj_idx(1)) ≫ eq
-        let zip_arg_ty = fun_ty(
-            tuple_ty_val.clone(),
-            tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-        );
-        let eq_arg_ty = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
-        let eq_ty = fun_ty(eq_arg_ty.clone(), int_ty_val.clone());
-
-        let args_tuple = Expr::tuple(vec![
-            proj_idx(0).with_ty(zip_arg_ty.clone()),
-            proj_idx(1).with_ty(zip_arg_ty.clone()),
-        ]);
-
-        let zip_applied = Expr::apply(
-            args_tuple,
-            Expr::builtin(Builtin::Zip).with_ty(fun_ty(
-                tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-                tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-            )),
-        )
-        .with_ty(fun_ty(
-            tuple_ty_val.clone(),
-            tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-        ));
-
-        let refinement = compose(vec![
-            zip_applied,
-            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals))).with_ty(eq_ty),
-        ])
-        .with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone()));
-
-        // Should successfully convert
-        let result = convert_groupby(&body, &body_ty, &refinement);
-        assert!(
-            result.is_some(),
-            "convert_groupby should succeed for valid input"
-        );
-
-        let grouped_values = result.unwrap();
-
-        // Verify the result type: key_ty -> (input_idx_ty -> value_ty)
-        assert_eq!(
-            grouped_values.ty,
-            fun_ty(
-                int_ty_val.clone(),
-                fun_ty(int_ty_val.clone(), value_ty.clone())
-            )
-        );
-
-        // Verify the result is a composition of two elements
-        let TypedExprNode::Compose(elts) = &grouped_values.node else {
-            panic!("Expected Compose node, got {:?}", grouped_values.node);
-        };
-        assert_eq!(elts.len(), 2, "Expected 2 elements in composition");
-
-        // First element should be: keys ≫ converse
-        // (an Apply with converse as the function)
-        let TypedExprNode::Apply {
-            function: grouped_fn,
-            argument: grouped_arg,
-        } = &elts[0].node
-        else {
-            panic!(
-                "Expected Apply node for first element, got {:?}",
-                elts[0].node
-            );
-        };
-
-        assert!(
-            matches!(&grouped_fn.node, TypedExprNode::Builtin(Builtin::Converse)),
-            "Expected first Apply to use 'converse' primitive"
-        );
-
-        // Verify grouped argument is the keys expression with id replacing the projection
-        // Since the original expression is just a projection, it becomes just id
-        assert!(
-            matches!(&grouped_arg.node, TypedExprNode::Builtin(Builtin::Id)),
-            "Expected keys to be 'id' (replaced projection), got {:?}",
-            grouped_arg.node
-        );
-
-        // Second element should be: values ≫ map
-        // (an Apply with map as the function)
-        let TypedExprNode::Apply {
-            function: values_fn,
-            argument: values_arg,
-        } = &elts[1].node
-        else {
-            panic!(
-                "Expected Apply node for second element, got {:?}",
-                elts[1].node
-            );
-        };
-
-        assert!(
-            matches!(&values_fn.node, TypedExprNode::Builtin(Builtin::Map)),
-            "Expected second Apply to use 'map' primitive"
-        );
-
-        // Verify values argument is the body expression with id replacing the projection
-        // Since the original expression is just a projection, it becomes just id
-        assert!(
-            matches!(&values_arg.node, TypedExprNode::Builtin(Builtin::Id)),
-            "Expected values to be 'id' (replaced projection), got {:?}",
-            values_arg.node
-        );
-    }
-
-    #[test]
-    fn test_convert_groupby_rejects_non_compose_refinement() {
-        let int_ty_val = int_ty();
-        let body = var("x").with_ty(int_ty_val.clone());
-        let body_ty = int_ty_val.clone();
-        let refinement = var("ref").with_ty(int_ty_val.clone());
-
-        // Should return None because refinement is not a compose
-        let result = convert_groupby(&body, &body_ty, &refinement);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_convert_groupby_rejects_wrong_refinement_length() {
-        let int_ty_val = int_ty();
-        let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
-        let body = proj_idx(0).with_ty(fun_ty(tuple_ty_val.clone(), int_ty()));
-        let body_ty = int_ty_val.clone();
-
-        // Create a compose with three elements (not two)
-        let f_ty = fun_ty(tuple_ty_val.clone(), int_ty());
-        let refinement = compose(vec![
-            var("f").with_ty(f_ty.clone()),
-            var("g").with_ty(f_ty.clone()),
-            var("h").with_ty(f_ty),
-        ])
-        .with_ty(fun_ty(tuple_ty_val, int_ty()));
-
-        // Should return None because refinement doesn't have exactly 2 elements
-        let result = convert_groupby(&body, &body_ty, &refinement);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_convert_groupby_rejects_non_eq_second_element() {
-        let int_ty_val = int_ty();
-        let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
-        let body = proj_idx(0).with_ty(fun_ty(tuple_ty_val.clone(), int_ty()));
-        let body_ty = int_ty_val.clone();
-
-        // Create a compose where the second element is not "eq"
-        let ref_ty = fun_ty(tuple_ty_val.clone(), int_ty());
-        let f_ty = fun_ty(tuple_ty_val.clone(), tuple_ty(vec![int_ty(), int_ty()]));
-        let refinement = compose(vec![
-            var("f").with_ty(f_ty),
-            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::NotEquals)))
-                .with_ty(fun_ty(tuple_ty(vec![int_ty(), int_ty()]), int_ty())),
-        ])
-        .with_ty(ref_ty);
-
-        // Should return None because second element is not "eq"
-        let result = convert_groupby(&body, &body_ty, &refinement);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_convert_groupby_rejects_missing_zip() {
-        let int_ty_val = int_ty();
-        let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
-        let body = proj_idx(0).with_ty(fun_ty(tuple_ty_val.clone(), int_ty()));
-        let body_ty = int_ty_val.clone();
-
-        // Create a compose where the first element is not a zip application
-        let ref_ty = fun_ty(tuple_ty_val.clone(), int_ty());
-        let refinement = compose(vec![
-            var("not_zip").with_ty(fun_ty(
-                tuple_ty_val.clone(),
-                tuple_ty(vec![int_ty(), int_ty()]),
-            )),
-            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)))
-                .with_ty(fun_ty(tuple_ty(vec![int_ty(), int_ty()]), int_ty())),
-        ])
-        .with_ty(ref_ty);
-
-        // Should return None because there's no zip
-        let result = convert_groupby(&body, &body_ty, &refinement);
-        assert_eq!(result, None);
     }
 
     // Tests for convert_loop_join function
@@ -2351,35 +2256,42 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    /// Build a **bare** 2-arm join predicate `__elem.0 ▷ (λ x → __elem.1 ▷
+    /// (λ y → <mk_bool(x, y)>))` over `(scalar, scalar)` — the implicit
+    /// REFINEMENT_BINDER form `split_join_conditions` decomposes (the element
+    /// binder is the refinement's own, no enclosing `λ rec`).
+    fn pointful_2arm_pred(scalar: &Type, mk_bool: impl FnOnce(Expr, Expr) -> Expr) -> Expr {
+        let b = Type::Base(BaseType::Bool);
+        let rec_ty = tuple_ty(vec![scalar.clone(), scalar.clone()]);
+        let rec_arm = |i: usize| {
+            Expr::apply(
+                var(REFINEMENT_BINDER).with_ty(rec_ty.clone()),
+                proj_idx(i).with_ty(fun_ty(rec_ty.clone(), scalar.clone())),
+            )
+            .with_ty(scalar.clone())
+        };
+        let body = mk_bool(
+            var("x").with_ty(scalar.clone()),
+            var("y").with_ty(scalar.clone()),
+        );
+        let inner =
+            Expr::lambda("y", scalar.clone(), body).with_ty(fun_ty(scalar.clone(), b.clone()));
+        let mid = Expr::apply(rec_arm(1), inner).with_ty(b.clone());
+        let outer =
+            Expr::lambda("x", scalar.clone(), mid).with_ty(fun_ty(scalar.clone(), b.clone()));
+        Expr::apply(rec_arm(0), outer).with_ty(b)
+    }
+
     #[test]
     fn test_convert_loop_join_succeeds_with_valid_input() {
         let int_ty_val = int_ty();
         let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
 
-        // Create refinement: compose(zip(proj(0), proj(1)), eq)
-        let ref_args_tuple = Expr::tuple(vec![
-            proj_idx(0).with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
-            proj_idx(1).with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
-        ]);
-        let ref_zip_apply = Expr::apply(
-            ref_args_tuple,
-            Expr::builtin(Builtin::Zip).with_ty(fun_ty(
-                tuple_ty_val.clone(),
-                tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-            )),
-        )
-        .with_ty(fun_ty(
-            tuple_ty_val.clone(),
-            tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]),
-        ));
-
-        let ref_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
-        let refinement = compose(vec![
-            ref_zip_apply,
-            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals)))
-                .with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
-        ])
-        .with_ty(ref_ty);
+        // Pointful predicate: λ rec → rec.0 ▷ (λ x → rec.1 ▷ (λ y → x == y)).
+        let refinement = pointful_2arm_pred(&int_ty_val, |x, y| {
+            Expr::binop(x, BinOpKind::Compare(CompareKind::Equals), y)
+                .with_ty(Type::Base(BaseType::Bool))
+        });
 
         // Should successfully convert
         let result = convert_loop_join(&tuple_ty_val, &refinement);
@@ -2591,7 +2503,11 @@ mod tests {
         if let Type::Tuple(ref elts) = expr.ty {
             for elt in elts {
                 match elt {
-                    Type::Fun(domain, _) => {
+                    Type::Fun {
+                        domain,
+                        codomain: _,
+                        ..
+                    } => {
                         assert_eq!(**domain, int_ty_val);
                     }
                     _ => panic!("Expected function type in tuple"),
@@ -2644,7 +2560,12 @@ mod tests {
         replace_constant_domain_type(&mut expr, &int_ty_val);
 
         // After replacement, domain should be updated
-        if let Type::Fun(domain, _) = &expr.ty {
+        if let Type::Fun {
+            domain,
+            codomain: _,
+            ..
+        } = &expr.ty
+        {
             assert_eq!(**domain, int_ty_val);
         } else {
             panic!("Expected function type");
@@ -2670,7 +2591,12 @@ mod tests {
         replace_constant_domain_type(&mut expr, &int_ty_val);
 
         // After replacement, domain should be updated
-        if let Type::Fun(domain, _) = &expr.ty {
+        if let Type::Fun {
+            domain,
+            codomain: _,
+            ..
+        } = &expr.ty
+        {
             assert_eq!(**domain, int_ty_val);
         } else {
             panic!("Expected function type");
@@ -2875,53 +2801,12 @@ mod tests {
         .with_ty(fun_ty(tup.clone(), scalar.clone()))
     }
 
-    #[test]
-    fn test_split_join_conditions_pure_eq() {
-        let i = int_ty();
-        let t = tuple_ty(vec![i.clone(), i.clone()]);
-        let refinement = make_eq_cond(&t, &i);
-        let (eq, other) = split_join_conditions(&refinement);
-        assert_eq!(eq.len(), 1);
-        assert!(other.is_empty());
-    }
-
-    #[test]
-    fn test_split_join_conditions_pure_non_eq() {
-        let i = int_ty();
-        let t = tuple_ty(vec![i.clone(), i.clone()]);
-        let refinement = make_filter_pred(&t, &i, 0);
-        let (eq, other) = split_join_conditions(&refinement);
-        assert!(eq.is_empty());
-        assert_eq!(other.len(), 1);
-    }
-
-    #[test]
-    fn test_split_join_conditions_mixed_and() {
-        let i = int_ty();
-        let t = tuple_ty(vec![i.clone(), i.clone()]);
-        let eq_cond = make_eq_cond(&t, &i);
-        let filter = make_filter_pred(&t, &i, 0);
-        // AND of eq + filter
-        let bool_ty_val = int_ty(); // using int as a stand-in
-        let and_args = Expr::tuple(vec![eq_cond, filter]).with_ty(tuple_ty(vec![
-            fun_ty(t.clone(), bool_ty_val.clone()),
-            fun_ty(t.clone(), bool_ty_val.clone()),
-        ]));
-        let and_zipped = Expr::apply(
-            and_args,
-            Expr::builtin(Builtin::Zip).with_ty(fun_ty(t.clone(), t.clone())),
-        )
-        .with_ty(fun_ty(t.clone(), t.clone()));
-        let refinement = compose(vec![
-            and_zipped,
-            Expr::builtin(Builtin::BinOp(BinOpKind::BoolLogic(LogicKind::And)))
-                .with_ty(fun_ty(t.clone(), bool_ty_val.clone())),
-        ])
-        .with_ty(fun_ty(t.clone(), bool_ty_val));
-        let (eq, other) = split_join_conditions(&refinement);
-        assert_eq!(eq.len(), 1, "expected 1 equality condition");
-        assert_eq!(other.len(), 1, "expected 1 other predicate");
-    }
+    // `split_join_conditions` now decomposes the *pointful* predicate form
+    // (`λ rec → rec.i ▷ li ▷ (λ vi → <bool>)`); it is exercised end-to-end by
+    // the join goldens (`test_joins` — including the unsound-zip-substitution
+    // probe — and the multi-arm AND/residual/permute cases in
+    // `test_new_compile`), which run it on real inferred predicates rather than
+    // hand-built combinator ASTs.
 
     // --- collect_arms_used ---
 
@@ -2962,61 +2847,17 @@ mod tests {
     fn test_convert_loop_join_succeeds_with_eq_plus_filter_predicate() {
         let i = int_ty();
         let t = tuple_ty(vec![i.clone(), i.clone()]);
-        let bool_ty_val = Type::Base(BaseType::Bool);
+        let b = Type::Base(BaseType::Bool);
 
-        // Build the eq join condition: zip(proj(0), proj(1)) ≫ eq
-        let eq_args = Expr::tuple(vec![
-            proj_idx(0).with_ty(fun_ty(t.clone(), i.clone())),
-            proj_idx(1).with_ty(fun_ty(t.clone(), i.clone())),
-        ]);
-        let eq_zipped = Expr::apply(
-            eq_args,
-            Expr::builtin(Builtin::Zip).with_ty(fun_ty(
-                tuple_ty(vec![i.clone(), i.clone()]),
-                tuple_ty(vec![i.clone(), i.clone()]),
-            )),
-        )
-        .with_ty(fun_ty(t.clone(), tuple_ty(vec![i.clone(), i.clone()])));
-        let eq_cond = compose(vec![
-            eq_zipped,
-            Expr::builtin(Builtin::BinOp(BinOpKind::Compare(CompareKind::Equals))).with_ty(fun_ty(
-                tuple_ty(vec![i.clone(), i.clone()]),
-                bool_ty_val.clone(),
-            )),
-        ])
-        .with_ty(fun_ty(t.clone(), bool_ty_val.clone()));
-
-        // Build a filter predicate on arm 0: proj(0) ≫ some_filter
-        let filter = compose(vec![
-            proj_idx(0).with_ty(fun_ty(t.clone(), i.clone())),
-            var("some_filter").with_ty(fun_ty(i.clone(), bool_ty_val.clone())),
-        ])
-        .with_ty(fun_ty(t.clone(), bool_ty_val.clone()));
-
-        // AND: (eq_cond, filter) ▷ zip ≫ and
-        let and_args = Expr::tuple(vec![eq_cond, filter]).with_ty(tuple_ty(vec![
-            fun_ty(t.clone(), bool_ty_val.clone()),
-            fun_ty(t.clone(), bool_ty_val.clone()),
-        ]));
-        let and_zipped = Expr::apply(
-            and_args,
-            Expr::builtin(Builtin::Zip).with_ty(fun_ty(
-                tuple_ty(vec![bool_ty_val.clone(), bool_ty_val.clone()]),
-                tuple_ty(vec![bool_ty_val.clone(), bool_ty_val.clone()]),
-            )),
-        )
-        .with_ty(fun_ty(
-            t.clone(),
-            tuple_ty(vec![bool_ty_val.clone(), bool_ty_val.clone()]),
-        ));
-        let refinement = compose(vec![
-            and_zipped,
-            Expr::builtin(Builtin::BinOp(BinOpKind::BoolLogic(LogicKind::And))).with_ty(fun_ty(
-                tuple_ty(vec![bool_ty_val.clone(), bool_ty_val.clone()]),
-                bool_ty_val.clone(),
-            )),
-        ])
-        .with_ty(fun_ty(t.clone(), bool_ty_val));
+        // Pointful: λ rec → rec.0 ▷ (λ x → rec.1 ▷ (λ y → x == y and x ▷ some_filter)).
+        // The equality drives the join; `x ▷ some_filter` is a residual on arm 0.
+        let refinement = pointful_2arm_pred(&i, |x, y| {
+            let eq = Expr::binop(x.clone(), BinOpKind::Compare(CompareKind::Equals), y)
+                .with_ty(b.clone());
+            let filt = Expr::apply(x, var("some_filter").with_ty(fun_ty(i.clone(), b.clone())))
+                .with_ty(b.clone());
+            Expr::binop(eq, BinOpKind::BoolLogic(LogicKind::And), filt).with_ty(b.clone())
+        });
 
         // Should succeed: eq condition drives the hash join, filter becomes a predicate.
         let result = convert_loop_join(&t, &refinement);
@@ -3077,7 +2918,6 @@ mod tests {
         Type::Refinement(
             Box::new(base),
             Refinement {
-                description: String::new(),
                 predicate: Rc::new(RefCell::new(predicate)),
             },
         )

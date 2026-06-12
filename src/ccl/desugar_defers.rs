@@ -2921,7 +2921,6 @@ fn extract_for_defer(
                     let pred_lambda = Expr::lambda(&param.name, param.ty.clone(), guard);
                     let pred_on_source = Expr::apply(new_argument.clone(), pred_lambda);
                     let refinement_struct = Refinement {
-                        description: "filter-feed".to_string(),
                         predicate: Rc::new(RefCell::new(pred_on_source)),
                     };
                     let mut refined_argument = new_argument.clone();
@@ -3140,7 +3139,6 @@ fn extract_for_defer(
                             let pred_on_source =
                                 Expr::compose(vec![source_prefix.clone(), pred_lambda]);
                             let refinement_struct = Refinement {
-                                description: "filter-feed".to_string(),
                                 predicate: Rc::new(RefCell::new(pred_on_source)),
                             };
                             let mut refined_prefix = source_prefix.clone();
@@ -4352,7 +4350,6 @@ mod tests {
         //   `Var("__chan")` with user_annotation = Fun(Refinement(Hole, pred(outer_n)), Hole)
         let pred = var("outer_n");
         let refinement = Refinement {
-            description: "test".to_string(),
             predicate: Rc::new(RefCell::new(pred)),
         };
         let annotated = TypedExpr {
@@ -4383,15 +4380,15 @@ mod tests {
     fn collect_free_vars_descends_into_ty_refinement_predicates() {
         let pred = var("inner_k");
         let refinement = Refinement {
-            description: "test".to_string(),
             predicate: Rc::new(RefCell::new(pred)),
         };
         let typed = TypedExpr {
             node: TypedExprNode::Lit(Lit::Unit),
-            ty: Type::Fun(
-                Box::new(Type::Refinement(Box::new(Type::Hole), refinement)),
-                Box::new(Type::Hole),
-            ),
+            ty: Type::Fun {
+                name: None,
+                domain: Box::new(Type::Refinement(Box::new(Type::Hole), refinement)),
+                codomain: Box::new(Type::Hole),
+            },
             user_annotation: None,
         };
         let mut free: HashSet<String> = HashSet::new();
@@ -4414,7 +4411,6 @@ mod tests {
         // bound by the lambda).
         let pred = var("outer_k");
         let refinement = Refinement {
-            description: "test".to_string(),
             predicate: Rc::new(RefCell::new(pred)),
         };
         let lambda = TypedExpr {

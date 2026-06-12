@@ -486,10 +486,11 @@ pub fn compile_program(
         let output_type = source.borrow().output_type();
         ctx.inference_ctx().register_source_type(
             &name,
-            Type::Fun(
-                Box::new(Type::DataSource(name.clone())),
-                Box::new(output_type),
-            ),
+            Type::Fun {
+                name: None,
+                domain: Box::new(Type::DataSource(name.clone())),
+                codomain: Box::new(output_type),
+            },
         );
         ctx.conversion_ctx().register_source(name, source);
     }

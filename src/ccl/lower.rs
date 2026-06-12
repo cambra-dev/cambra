@@ -64,7 +64,7 @@ use std::{
 use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, Branch, Builtin, CompareKind, Expr,
-        Lit, LogicKind, Type, TypedExprNode, UnaryOpKind,
+        Lit, LogicKind, REFINEMENT_BINDER, Type, TypedExprNode, UnaryOpKind,
         ccl_utils::{make_cast, refined_fn_type},
     },
     chl_parser::ast::{
@@ -1022,12 +1022,13 @@ fn lower_call(
 
     match name {
         // groupby(c: I -> A, key_fn: A -> K) lowers to
-        //   λ k → cast({I | λ r → key_fn(c(r)) == k} ⇒ A, λ i → c(i))
+        //   λ k → cast({I | key_fn(c(__elem)) == k} ⇒ A, λ i → c(i))
         //
         // The cast wraps the (unrefined) inner λ i → c(i) under a function
-        // type whose domain carries the partition predicate.  The
-        // predicate captures `k` from the outer lambda's scope —
-        // surfacing this as the canonical "dependent refinement" site
+        // type whose domain carries the partition predicate.  The predicate
+        // is a bare boolean expression whose element is the implicit
+        // REFINEMENT_BINDER and which captures `k` from the outer lambda's
+        // scope — surfacing this as the canonical "dependent refinement" site
         // without a dedicated AST shape.
         "groupby" => {
             if args.len() != 2 {
@@ -1039,18 +1040,17 @@ fn lower_call(
             let collection = lower_expr(&args[0], ctx)?;
             let key_fn = lower_expr(&args[1], ctx)?;
 
-            let pred_lambda = Expr::lambda(
-                "__gb_r",
-                Type::Hole,
-                Expr::binop(
-                    Expr::apply(Expr::apply(Expr::var("__gb_r"), collection.clone()), key_fn),
-                    BinOpKind::Compare(CompareKind::Equals),
-                    Expr::var("__gb_k"),
+            let bare_pred = Expr::binop(
+                Expr::apply(
+                    Expr::apply(Expr::var(REFINEMENT_BINDER), collection.clone()),
+                    key_fn,
                 ),
+                BinOpKind::Compare(CompareKind::Equals),
+                Expr::var("__gb_k"),
             );
             let inner_body = Expr::apply(Expr::var("__gb_i"), collection);
             let unrefined_inner = Expr::lambda("__gb_i", Type::Hole, inner_body);
-            let target_ty = refined_fn_type(Type::Hole, pred_lambda, Type::Hole, "groupby");
+            let target_ty = refined_fn_type(Type::Hole, bare_pred, Type::Hole);
             Ok(Expr::lambda(
                 "__gb_k",
                 Type::Hole,
@@ -2401,21 +2401,11 @@ fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Ex
 
     // Combine all `if` guards into a single loop-join predicate (used when hash
     // join is not applicable — non-equality, 3+ generators, or multiple predicates).
-    // Description strings come from `chl_expr_to_string`; the format is a
-    // pretty-printed-ish rendering used downstream for refinement labels.
     let mut pred_op: Option<Expr> = None;
-    let mut pred_desc = String::new();
-    for (chl_pred, lowered) in chl_preds.iter().zip(lowered_preds) {
-        let pred_str = chl_expr_to_string(&chl_pred.node);
+    for (_chl_pred, lowered) in chl_preds.iter().zip(lowered_preds) {
         pred_op = Some(match pred_op {
-            Some(lhs) => {
-                pred_desc.push_str(&format!(" and {pred_str}"));
-                Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), lowered)
-            }
-            None => {
-                pred_desc = pred_str;
-                lowered
-            }
+            Some(lhs) => Expr::binop(lhs, BinOpKind::BoolLogic(LogicKind::And), lowered),
+            None => lowered,
         });
     }
 
@@ -2467,10 +2457,10 @@ fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Ex
 
     // ---- Phase 6: Attach restriction ----------
     if let Some(pred_op) = pred_op {
-        // Non-equality or multi-predicate: loop-join restriction lambda.
-        // Uses an independent "__iter_record_restr" variable so it does not
-        // recursively depend on a correlation vector.
-        let restr_outer_var = "__iter_record_restr";
+        // Non-equality or multi-predicate: loop-join restriction predicate.
+        // The refinement's element is the implicit REFINEMENT_BINDER (the
+        // record over which the correlation vector ranges); the predicate is a
+        // bare boolean expression, not a lambda.
         let mut pred_expr: Expr = pred_op;
         for (i, (iter_var, pred_source)) in gen_iter_vars
             .iter()
@@ -2479,7 +2469,7 @@ fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Ex
             .rev()
         {
             pred_expr = Expr::apply(
-                Expr::apply(make_idx_arg(restr_outer_var, i), pred_source),
+                Expr::apply(make_idx_arg(REFINEMENT_BINDER, i), pred_source),
                 Expr::lambda(iter_var, Type::Hole, pred_expr),
             );
         }
@@ -2489,9 +2479,8 @@ fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Ex
         // Cast Apply arm in `infer_simple_sub` constructs the refined result
         // from it, and the generic annotation handler infers the predicate's
         // sub-expressions.
-        let pred_lambda = Expr::lambda(restr_outer_var, Type::Hole, pred_expr);
         let unrefined_lambda = Expr::lambda(outer_var, Type::Hole, body_expr);
-        let target_ty = refined_fn_type(Type::Hole, pred_lambda, Type::Hole, &pred_desc);
+        let target_ty = refined_fn_type(Type::Hole, pred_expr, Type::Hole);
         Ok(make_cast(unrefined_lambda, target_ty))
     } else {
         Ok(Expr::lambda(outer_var, Type::Hole, body_expr))
@@ -2542,99 +2531,6 @@ fn group_comp_clauses(clauses: &[CompClause]) -> Result<Vec<CompGenerator<'_>>, 
         "group_comp_clauses: empty clause list (parser invariant violated)"
     );
     Ok(out)
-}
-
-/// Render a CHL expression to roughly source-like text.
-///
-/// Downstream lowering uses this string only as a label embedded in
-/// refinement descriptions; precise formatting does not affect correctness,
-/// just readability of generated names. Only the operator and literal forms
-/// that actually appear inside comprehension guards are handled in detail;
-/// anything else falls through to a `{:?}` debug dump.
-fn chl_expr_to_string(expr: &ChlExpr) -> String {
-    match expr {
-        ChlExpr::Lit(ChlLit::Int(n)) => n.to_string(),
-        ChlExpr::Lit(ChlLit::String(s)) => format!("{s:?}"),
-        ChlExpr::Lit(ChlLit::Bool(true)) => "True".into(),
-        ChlExpr::Lit(ChlLit::Bool(false)) => "False".into(),
-        ChlExpr::Lit(ChlLit::None) => "None".into(),
-        ChlExpr::Name(id) => id.as_str().to_string(),
-        ChlExpr::Attribute { target, attr, .. } => {
-            format!("{}.{}", chl_expr_to_string(&target.node), attr)
-        }
-        ChlExpr::Compare {
-            left,
-            ops,
-            comparators,
-        } => {
-            let mut s = chl_expr_to_string(&left.node);
-            for (op, comp) in ops.iter().zip(comparators.iter()) {
-                let op_str = match op {
-                    CmpOp::Eq => "==",
-                    CmpOp::NotEq => "!=",
-                    CmpOp::Lt => "<",
-                    CmpOp::LtE => "<=",
-                    CmpOp::Gt => ">",
-                    CmpOp::GtE => ">=",
-                };
-                s.push(' ');
-                s.push_str(op_str);
-                s.push(' ');
-                s.push_str(&chl_expr_to_string(&comp.node));
-            }
-            s
-        }
-        ChlExpr::BinOp { left, op, right } => {
-            let op_str = match op {
-                ChlBinOp::Add => "+",
-                ChlBinOp::Sub => "-",
-                ChlBinOp::Mul => "*",
-                ChlBinOp::FloorDiv => "//",
-                ChlBinOp::LogicalAnd => "&",
-                ChlBinOp::LogicalOr => "|",
-                ChlBinOp::LogicalXor => "^",
-                ChlBinOp::CollectionUnion => "++",
-            };
-            format!(
-                "{} {} {}",
-                chl_expr_to_string(&left.node),
-                op_str,
-                chl_expr_to_string(&right.node)
-            )
-        }
-        ChlExpr::BoolOp { op, operands } => {
-            let sep = match op {
-                BoolOp::And => " and ",
-                BoolOp::Or => " or ",
-            };
-            operands
-                .iter()
-                .map(|e| chl_expr_to_string(&e.node))
-                .collect::<Vec<_>>()
-                .join(sep)
-        }
-        ChlExpr::UnaryOp { op, operand } => {
-            let op_str = match op {
-                UnaryOp::Neg => "-",
-                UnaryOp::Not => "not ",
-            };
-            format!("{}{}", op_str, chl_expr_to_string(&operand.node))
-        }
-        ChlExpr::Call { func, args } => {
-            let args_str = args
-                .iter()
-                .map(|a| chl_expr_to_string(&a.node))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{}({})", chl_expr_to_string(&func.node), args_str)
-        }
-        ChlExpr::Subscript { target, index } => format!(
-            "{}[{}]",
-            chl_expr_to_string(&target.node),
-            chl_expr_to_string(&index.node)
-        ),
-        other => format!("{other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3480,22 +3376,22 @@ f";
     // Variable collection and inline key lambda
     #[case(
         "groupby(xs, lambda x: x)",
-        "λ __gb_k → cast(({_ | λ __gb_r → __gb_r ▷ xs ▷ (λ x → x) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)"
+        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], lambda x: x // 2)",
-        "λ __gb_k → cast(({_ | λ __gb_r → __gb_r ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
+        "λ __gb_k → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
     )]
     // Key is a variable reference (pre-defined function)
     #[case(
         "groupby(xs, key_fn)",
-        "λ __gb_k → cast(({_ | λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)"
+        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "λ __iter_record → __iter_record ▷ (λ __gb_k → cast(({_ | λ __gb_r → __gb_r ▷ xs ▷ key_fn == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
+        "λ __iter_record → __iter_record ▷ (λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

@@ -115,7 +115,11 @@ fn is_iterable_domain(ty: &Type) -> bool {
         Type::UIntRange(_) | Type::DataSource(_) => true,
         // There are infinitely many possible functions for any given function
         // type, so function-typed domains cannot be enumerated.
-        Type::Fun(_, _) => false,
+        Type::Fun {
+            domain: _,
+            codomain: _,
+            ..
+        } => false,
         _ => true,
     }
 }
@@ -138,7 +142,11 @@ fn is_iterable_domain(ty: &Type) -> bool {
 /// from sharing, so they are left intact.
 fn should_inline(bound_ty: &Type) -> bool {
     match bound_ty {
-        Type::Fun(domain, _) => !is_iterable_domain(domain),
+        Type::Fun {
+            domain,
+            codomain: _,
+            ..
+        } => !is_iterable_domain(domain),
         _ => false,
     }
 }
@@ -596,10 +604,7 @@ mod tests {
         use std::cell::RefCell;
         use std::rc::Rc;
         let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));
-        let refinement = Refinement {
-            description: "test".to_string(),
-            predicate: pred,
-        };
+        let refinement = Refinement { predicate: pred };
         let ty = Type::Refinement(Box::new(Type::Base(BaseType::Int)), refinement);
         assert!(!is_iterable_domain(&ty));
     }
@@ -610,10 +615,7 @@ mod tests {
         use std::cell::RefCell;
         use std::rc::Rc;
         let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));
-        let refinement = Refinement {
-            description: "test".to_string(),
-            predicate: pred,
-        };
+        let refinement = Refinement { predicate: pred };
         let ty = Type::Refinement(Box::new(Type::UIntRange(3)), refinement);
         assert!(is_iterable_domain(&ty));
     }
@@ -622,10 +624,11 @@ mod tests {
     fn non_iterable_domain_fun() {
         // There are infinitely many possible Int → Int functions, so Fun-as-domain
         // has no finite, enumerable extent.
-        let ty = Type::Fun(
-            Box::new(Type::Base(BaseType::Int)),
-            Box::new(Type::Base(BaseType::Int)),
-        );
+        let ty = Type::Fun {
+            name: None,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        };
         assert!(!is_iterable_domain(&ty));
     }
 
@@ -635,10 +638,11 @@ mod tests {
 
     #[test]
     fn should_inline_scalar_to_scalar() {
-        let ty = Type::Fun(
-            Box::new(Type::Base(BaseType::Int)),
-            Box::new(Type::Base(BaseType::Int)),
-        );
+        let ty = Type::Fun {
+            name: None,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        };
         assert!(should_inline(&ty));
     }
 
@@ -647,13 +651,15 @@ mod tests {
         // Int → (Int → Int): domain is non-iterable (Int), so the curried
         // function is now inlined. Beta-reduction at concrete call sites
         // eliminates the nested lambda before any `curry` combinator is produced.
-        let ty = Type::Fun(
-            Box::new(Type::Base(BaseType::Int)),
-            Box::new(Type::Fun(
-                Box::new(Type::Base(BaseType::Int)),
-                Box::new(Type::Base(BaseType::Int)),
-            )),
-        );
+        let ty = Type::Fun {
+            name: None,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Fun {
+                name: None,
+                domain: Box::new(Type::Base(BaseType::Int)),
+                codomain: Box::new(Type::Base(BaseType::Int)),
+            }),
+        };
         assert!(should_inline(&ty));
     }
 
@@ -665,41 +671,42 @@ mod tests {
         use std::cell::RefCell;
         use std::rc::Rc;
         let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));
-        let refinement = Refinement {
-            description: "test".to_string(),
-            predicate: pred,
+        let refinement = Refinement { predicate: pred };
+        let inner_fun = Type::Fun {
+            name: None,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
         };
-        let inner_fun = Type::Fun(
-            Box::new(Type::Base(BaseType::Int)),
-            Box::new(Type::Base(BaseType::Int)),
-        );
-        let ty = Type::Fun(
-            Box::new(Type::Base(BaseType::Int)),
-            Box::new(Type::Refinement(Box::new(inner_fun), refinement)),
-        );
+        let ty = Type::Fun {
+            name: None,
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(Type::Refinement(Box::new(inner_fun), refinement)),
+        };
         assert!(should_inline(&ty));
     }
 
     #[test]
     fn should_not_inline_iterable_domain() {
         // UIntRange(3) → Int: iterable domain, don't inline.
-        let ty = Type::Fun(
-            Box::new(Type::UIntRange(3)),
-            Box::new(Type::Base(BaseType::Int)),
-        );
+        let ty = Type::Fun {
+            name: None,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        };
         assert!(!should_inline(&ty));
     }
 
     #[test]
     fn should_inline_all_non_iterable_tuple_domain() {
         // (Int, Int) → Int: both components non-iterable, should inline.
-        let ty = Type::Fun(
-            Box::new(Type::Tuple(vec![
+        let ty = Type::Fun {
+            name: None,
+            domain: Box::new(Type::Tuple(vec![
                 Type::Base(BaseType::Int),
                 Type::Base(BaseType::Int),
             ])),
-            Box::new(Type::Base(BaseType::Int)),
-        );
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        };
         assert!(should_inline(&ty));
     }
 
@@ -707,13 +714,14 @@ mod tests {
     fn should_inline_mixed_tuple_domain() {
         // (UIntRange(3), Int) → Int: any non-iterable component makes the tuple
         // non-iterable, so this is inlined.
-        let ty = Type::Fun(
-            Box::new(Type::Tuple(vec![
+        let ty = Type::Fun {
+            name: None,
+            domain: Box::new(Type::Tuple(vec![
                 Type::UIntRange(3),
                 Type::Base(BaseType::Int),
             ])),
-            Box::new(Type::Base(BaseType::Int)),
-        );
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        };
         assert!(should_inline(&ty));
     }
 
@@ -930,7 +938,11 @@ mod tests {
 
     /// `Fun(domain, codomain)` shorthand for the tests below.
     fn fn_ty(domain: Type, codomain: Type) -> Type {
-        Type::Fun(Box::new(domain), Box::new(codomain))
+        Type::Fun {
+            name: None,
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
     }
 
     // is_name_in_function_position — call-site detector

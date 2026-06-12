@@ -512,9 +512,14 @@ against the in-scope binders at the destination position and panics
 on mismatch with a message identifying which pass and which binder
 caused the violation.
 
-In release builds the check is typically compiled out (gated on
-`cfg(debug_assertions)`); in dev/test it runs at every propagation
-site. The intent is to catch compiler bugs — incorrect α-renaming,
+Enforcement is two-tier. The per-propagation-site checks are
+`debug_assert!`s — fast-path regression guards, compiled out in
+release builds. The end-of-inference boundary check
+(`check_scope_valid` in `infer_simple_sub.rs`) runs unconditionally,
+in release builds too, reporting any ill-scoped node as an internal
+`InferError::ScopeViolation` — the violations it guards are compiler
+bugs that would otherwise flow into planning as silent miscompiles.
+The intent is to catch compiler bugs — incorrect α-renaming,
 missed descent into predicates during substitution, an inliner
 that fails to handle some binding form, a unification rule that
 resolves `?α` to a type whose free vars aren't in scope at every
@@ -1256,22 +1261,22 @@ matrix should cover that rejection path.
 
 ### Assertion unit tests
 
-The scope-validity assertion is a small, isolated piece of code
-that takes a refinement (or any type containing one) and a scope
-description, and panics if the refinement's predicate has free
-variables that aren't in the scope. The tests below exercise the
-assertion's implementation directly — they construct in-memory
-types and scopes via the type-system API, call the assertion,
-and verify it fires (or doesn't) as expected. They are unit
-tests against the assertion function, not integration tests over
-Cambra source programs.
+The scope-validity check (`check_scope_valid`) is a small, isolated
+piece of code that takes an expression (whose type may contain
+refinements) and a scope description, and reports a `ScopeViolation`
+error if a refinement's predicate has free variables that aren't in
+the scope. The tests below exercise the check's implementation
+directly — they construct in-memory types and scopes via the
+type-system API, call the check, and verify it fires (or doesn't) as
+expected. They are unit tests against the check function, not
+integration tests over Cambra source programs.
 
 #### J. Assertion fires on a free variable not in scope
 
 Construct a `Refinement { name: "v", base: Int, predicate:
 <expression mentioning 𝑥> }` and a scope that does *not* contain
-`𝑥`. Call the assertion against this refinement at the empty
-position. The assertion should panic with a message naming `𝑥`
+`𝑥`. Call the check against this refinement at the empty
+position. The check should report a `ScopeViolation` naming `𝑥`
 as the unresolved free variable.
 
 #### K. Assertion succeeds on a refinement whose only free vars are in scope
@@ -1279,7 +1284,7 @@ as the unresolved free variable.
 Construct the same refinement (predicate mentions `𝑥`) but with a
 scope that *does* contain `𝑥` — say, an enclosing
 `Fun { name: Some("x"), .. }` binder on the path. Call the
-assertion; it should return cleanly without panicking.
+check; it should report no errors.
 
 #### L. Assertion succeeds on a refinement whose only free var is its own binder
 
@@ -1287,7 +1292,7 @@ Construct `Refinement { name: "v", base: Int, predicate:
 <expression mentioning 𝑣 only> }` with an empty surrounding
 scope. The predicate's only free variable is the refinement's
 own binder, which is always in scope inside its own predicate.
-Assertion returns cleanly.
+The check reports no errors.
 
 #### M. Assertion fires after a buggy substitution
 

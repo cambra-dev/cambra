@@ -229,7 +229,7 @@ Lowering ([`ccl_utils::make_cast`]) emits it for list-comprehension filters, for
 
 This relies on the solver flowing a demanded refinement tag onto a *variable base* under a refinement layer (`{?a | 𝑞} <: {𝐷 | 𝑝}` records `?a <: {𝐷 | 𝑝}` rather than rejecting on `{𝑝} ⊄ {𝑞}`). An earlier implementation worked around the solver lacking this by *constructing* the refined result type from the value plus `target`'s tag; once the refinement arm learned to flow the deficit onto a variable base (the refinement analog of how the record/function arms thread structure through variables), the cast collapsed to the plain upcast above.
 
-`lambda_elim` has a transitional arm that recognises `Cast { value: Lambda, .. }` as the body of an outer lambda and reconstructs the legacy `Lambda { refinement: Some(R) }` shape (reading `R` from `target`) so `convert_groupby` keeps working. Casts that are not a lambda body — top-level filter / for-loop guards wrapping point-free code — survive `lambda_elim` (the standard structural recursion descends into `value` and keeps the wrapper) and propagate through to op-conversion, which compiles them as a pure pass-through: the refinement lives on `expr.ty` and is consumed by planning (`operator_conversion::iterate_type` turns a domain refinement into a `Restrict`) before reaching the tile graph. The migration plan toward a general `𝑈 ⇒ 𝑇` cast — and removal of the `Lambda::refinement` scratch field — is in `docs/refinement-types-design.md`.
+`lambda_elim` recognises `Cast { value: Lambda, .. }` as the body of an outer lambda whose binder is free only in the cast's *refinement* (the group-by shape) and emits the **Pi-const** form `const(cast(<point-free inner>))` typed as a Pi `(param) ⇒ ({D | p} ⇒ V)`: the binder-dependence rides the refinement and is materialized as a `Restrict` at iteration (the dependent-application model), and planning's pointful group-by recognizer (`convert_groupby_pointful`) reads the binder off the predicate. (This replaced the former correlated-refinement uncurrying that reconstructed a `Lambda { refinement }`.) Casts that are not a lambda body — top-level filter / for-loop guards wrapping point-free code — survive `lambda_elim` (the standard structural recursion descends into `value` and keeps the wrapper) and propagate through to op-conversion, which compiles them as a pure pass-through: the refinement lives on `expr.ty` and is consumed by planning (`operator_conversion::iterate_type` turns a domain refinement into a `Restrict`) before reaching the tile graph. The migration plan toward a general `𝑈 ⇒ 𝑇` cast is in `docs/refinement-types-design.md`.
 
 ### `Case` only — no `IfThenElse`
 
@@ -459,7 +459,7 @@ enum TypedExprNode {
 enum Type {
     Base(BaseType),
     UIntRange(usize),                    // finite index range [0, n); domain of list types
-    Fun(Box<Type>, Box<Type>),           // T ⇒ U
+    Fun { name: Option<String>, domain, codomain }, // T ⇒ U, or Pi (x: T) ⇒ U when named
     Tuple(Vec<Type>),
     Record(Vec<(String, Type)>),
     PartialTuple(Vec<(usize, Type)>),    // partial tuple: only listed indices constrained; domain of Proj(Index(n))
@@ -470,18 +470,26 @@ enum Type {
     Error,                               // inference already failed here; suppresses cascades
     Refinement(Box<Type>, Refinement),   // refined base type; `Refinement.predicate` is the restriction
     DataSource(String),                  // opaque domain type of a source
-    // Future:
-    // Pi { param, param_ty, body_ty }  — dependent function type
 }
 
-/// Carries the restriction predicate for a refined Lambda domain (i.e. a filtered/joined comprehension).
+// `Fun.name` is the **Pi binder**: when `Some(x)`, `x` is bound in `codomain`
+// and may be referenced by refinement predicates nested within it — the
+// dependent-function type `(x: domain) ⇒ codomain`. Inference (`emit_lambda`)
+// always names the binder from the lambda parameter; coalesce keeps the name
+// only when the codomain's predicates reference it and strips it otherwise, so
+// an ordinary arrow stays `name: None`. See the dependent-refinements section
+// of `design-simple-sub.md`.
+
+/// Carries the restriction predicate for a refined domain (i.e. a filtered/joined comprehension).
 /// Equality is type-blind structural equality of the predicate term (pointer-equal
 /// cells short-circuit); traversals needing occurrence identity key on the
 /// predicate cell's address (`PredicateCellId`).
 struct Refinement {
-    /// Human-readable description shown by the symbolic printer (e.g. `"x < 10"`, `"x == y"`).
-    description: String,
-    /// Arbitrary boolean predicate expressed as CCL.
+    /// A **bare** boolean predicate (not a lambda) in which the single reserved
+    /// implicit binder `REFINEMENT_BINDER` ("__elem") is free — the element the
+    /// refinement ranges over. Every refinement shares that one binder; nested
+    /// refinements shadow it. (A predicate *function* `D ⇒ Bool` is stored bare
+    /// as `__elem ▷ p`.)
     predicate: Rc<RefCell<TypedExpr>>,
 }
 ```
@@ -739,7 +747,7 @@ goal — see `Type::PartialRecord` in the type table above.
 
 `planning::run` runs after `lambda_elim` and produces the CCL that operator conversion will see.  The pass does general iteration-site planning — hash-join planning is just one *specialised* strategy folded in at a site, not the whole job (hence `planning`, not `join_plan`).  It performs two CCL-to-CCL rewrites and a final cleanup:
 
-1. **Keyed-aggregate rewrite** (`replace_curried_correlated_refinements` / `convert_groupby`) — recognises the `λ k → ...` form that lambda elimination emits for `[sum(g) for g in groupby(xs, key_fn)]` and folds the partition dispatch through `converse`.
+1. **Keyed-aggregate rewrite** (`recognize_groupby_sites` / `convert_groupby_pointful`) — recognises the **pointful** dependent-refinement source `const(cast(c)) : (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒ V)` that lambda elimination emits for `[sum(g) for g in groupby(xs, key_fn)]` and folds the partition dispatch through `converse`.  (This replaced the former combinator recogniser that matched lambda-elim's correlated-refinement uncurrying.)
 2. **Iteration-site materialization** (`insert_iterate_markers`) — a single walk that visits every position where op-conversion would compile with `input=None`.  At each site the pass picks the best implementation strategy:
    - **Hash join** (`try_hash_join_rewrite` → `convert_loop_join` → `plan_loop_join` → `join_plan_to_expr`) when the site's domain is a refined tuple whose predicate decomposes into equality join conditions.  The emitted chain is itself iteration-bearing at its leaves (each `JoinPlan::Loop` emits `Apply(true ▷ const, Iterate)`), so no further marker is added.
    - **Iterate-then-restricts chain** (`wrap_with_iterate`'s fallback) — build the iteration source by *applying* one `restrict(p)` per refinement layer (innermost first) to a chain-head `Apply(true ▷ const, Iterate)`, then compose the value-producing body onto it, when the hash-join recogniser doesn't match.  `restrict` is a function transformer `(𝐷 ⇒ 𝑇) ⇒ ({𝑑: 𝐷 \| 𝑝(𝑑)} ⇒ 𝑇)` — applied, not composed — so each layer narrows the domain while preserving the value `𝑇`, and the chain stays well-typed (its honest second-order type would make a morphism-`Compose` ill-typed; `typecheck` now rejects that).
@@ -749,7 +757,7 @@ Hash-join planning is the *specialised* strategy at an iteration site; the unifo
 The full pipeline inside `run`:
 
 ```
-replace_curried_correlated_refinements(&mut expr);
+recognize_groupby_sites(&mut expr);
 let expr = simplify(expr);
 insert_iterate_markers(&mut expr);
 simplify(expr)
@@ -757,7 +765,7 @@ simplify(expr)
 
 `simplify` brackets the marker pass on both sides — the same marker-aware pass, not two modes:
 
-- The **pre-marker `simplify`** runs on an iterate-free AST.  Hash-join pattern detection needs canonical refinement predicates (`(x, y) ▷ zip ≫ eq` rather than partially-simplified variants); with no markers present, every rule fires.
+- The **pre-marker `simplify`** runs on an iterate-free AST, canonicalising the value-level combinators before marker insertion; with no markers present, every rule fires.  (The join/group-by recognizers match the *pointful* predicate carried in the type, which `simplify` does not touch — see §6.5.)
 - The **post-marker `simplify`** absorbs the `id` leaves and nested `Compose` boilerplate that `replace_tuple_project_with_id` produces while planning a hash join.  Safety here is a property of the *nodes*, not of pass timing: `simplify`'s structural-discard rules (`try_const_reduce`, `try_product_beta_fst`/`_snd`, `try_literal_tuple_projection`, `try_ccc_universal`, `try_exponential_eta`, …) self-guard on an iteration-freeness check — `simplify_once` accumulates "this sub-tree contains an `iterate` source" bottom-up (OR-ing `is_iteration` over the node and its children) and the discard rules refuse to fire whenever it holds, because an `Apply(_, Iterate)` at a chain head *is* the iteration source for everything downstream, so dropping it strands the chain.  Only `iterate` needs guarding: a `restrict` filter is always applied to an iterate-bearing upstream, so it is never separable from its source and the same guard protects it transitively.  Reductions of fully iteration-free sub-trees remain sound (they are pure CCC morphisms), so no separate iterate-safe mode is needed.
 
 ### Hash Joins
@@ -766,11 +774,11 @@ Loop join patterns — where a predicate filters a cartesian product of two or m
 
 #### Recognised pattern
 
-A refinement predicate is eligible when it is one of:
-- A single equality: `(key_a, key_b) ▷ zip ≫ eq`
-- An AND of equalities: `(cond_1, …, cond_N) ▷ zip ≫ and` where each `cond_i` has the single form
+The recognizer matches the **pointful** predicate form (design §6.5) — the lambda the refinement carries, not a compiled combinator chain. The predicate has the shape `λ rec → rec.0 ▷ l0 ▷ (λ v0 → … rec.k ▷ lk ▷ (λ vk → <bool>))`, where each `rec.i ▷ li` binds the element `vi` of arm `i` and the innermost boolean is a conjunction of:
+- equalities `vi == vj` (the join conditions), and
+- residual predicates over the element binders.
 
-Each side of the equality conditions must depend on a *single* arm of the input tuple, identified by `is_function_of_single_tuple_arm`.
+`split_join_conditions` builds the `vi ↦ rec.i ▷ li` environment, decomposes the boolean (`and` / `==` / residual), and for each side substitutes the environment and runs lambda-elim to recover the combinator morphism over `rec`. Each equality side must then depend on a *single* arm, identified by `is_function_of_single_tuple_arm`.
 
 #### 2-way join
 
@@ -783,7 +791,7 @@ For two arms the transformation is straightforward:
 
 For `n ≥ 3` arms `plan_loop_join` constructs a left-deep binary hash-join tree using a five-step algorithm:
 
-1. **Split conditions** (`split_join_conditions`): partition the conjunction predicate into equality join conditions of the form `(key_a, key_b) ▷ zip ≫ eq` — where each key depends on exactly one arm — and *other predicates* that don't match this form.  For each equality condition, `replace_tuple_project_with_id` strips the tuple projection, leaving a function of just the arm's own type.  Each non-equality predicate is paired with the set of arm indices it references (`collect_arms_used`), so it can be pushed to the right level later.
+1. **Split conditions** (`split_join_conditions`): decompose the pointful predicate (above) into equality join conditions — each side compiled to a combinator morphism over the tuple domain, where each key depends on exactly one arm — and *other predicates* that aren't equalities.  For each equality condition, `replace_tuple_project_with_id` strips the tuple projection, leaving a function of just the arm's own type.  Each non-equality predicate is paired with the set of arm indices it references (`collect_arms_used`), so it can be pushed to the right level later.
 
 2. **Build spanning tree** (`spanning_tree_children`): treat each equality condition as an undirected edge `(arm_a, arm_b)` and run BFS from arm 0 over this graph.  Returns `children: Vec<Vec<usize>>` — the BFS spanning tree as an adjacency list — or `None` if the graph is disconnected (some arm has no join path to arm 0).
 

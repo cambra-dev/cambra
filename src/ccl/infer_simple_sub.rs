@@ -79,7 +79,7 @@ use crate::ccl::simple_sub::{
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     AggregateKind, BaseType, BinOpKind, Branch, Builtin, Expr, Level, Lit, PredicateCellId,
-    ProjKey, Refinement, Type, TypedBinding, TypedExprNode, UnaryOpKind,
+    ProjKey, REFINEMENT_BINDER, Refinement, Type, TypedBinding, TypedExprNode, UnaryOpKind,
 };
 use crate::util::ScopeStack;
 
@@ -724,7 +724,15 @@ impl SimpleSubContext {
             }
             // Structural types are already solver-ready; recurse to
             // normalize any nested holes/refinements.
-            Type::Fun(d, c) => fun(self.normalize_annotation(d), self.normalize_annotation(c)),
+            Type::Fun {
+                name,
+                domain: d,
+                codomain: c,
+            } => Type::Fun {
+                name: name.clone(),
+                domain: Box::new(self.normalize_annotation(d)),
+                codomain: Box::new(self.normalize_annotation(c)),
+            },
             Type::Tuple(ts) => {
                 Type::Tuple(ts.iter().map(|t| self.normalize_annotation(t)).collect())
             }
@@ -831,6 +839,20 @@ trait Typing {
     where
         Self: Sized;
 
+    /// Close a `let` body's type over its binder when lifting it to the `let`
+    /// node: discharge `[name ↦ bound_expr]` into refinement predicates
+    /// (design §6.2 move-site rule), so the lifted type stays well-formed
+    /// outside the binder's scope.
+    ///
+    /// Emit returns `body_ty` unchanged: the body type is an unresolved var
+    /// there, and the closing runs on the *resolved* type in `coalesce_node`'s
+    /// Let arm — discharging here would clone refinement cells out of any
+    /// already-concrete body type (e.g. a lambda's `Fun`), and the clones
+    /// would escape coalesce unresolved. Check re-runs the discharge so its
+    /// reconstruction matches the recorded (closed) node type under structural
+    /// predicate equality.
+    fn close_let_type(&self, name: &str, bound_expr: &Expr, body_ty: Type) -> Type;
+
     /// Reconcile a binder's inferred type with its user annotation. In Emit
     /// mode this two-way-constrains the two (eagerly surfacing
     /// [`InferError::AnnotationMismatch`]); the annotation is the canonical
@@ -910,6 +932,27 @@ trait Typing {
         domain: &Type,
         at: &dyn Fn() -> String,
     ) -> Result<(), InferError>;
+
+    /// Type an application `function(argument)`.
+    ///
+    /// The result is the function's codomain with its Pi binder *discharged* to
+    /// the argument — `codomain[binder ↦ argument]` — so a dependent refinement
+    /// in the codomain reflects the actual argument (design §5). For an ordinary
+    /// (non-dependent) function the discharge is vacuous and this is the plain
+    /// codomain.
+    ///
+    /// Emit constrains `fn_ty <: (x: arg) ⇒ result` against a *named* expected
+    /// Pi (whose codomain edge derives the binder correspondence) and returns
+    /// `result` under a suspended discharge that fires at coalesce. Check
+    /// destructures the already-resolved function and re-runs the discharge on
+    /// its concrete codomain, so its reconstruction matches the recorded type.
+    fn apply(
+        &mut self,
+        fn_ty: &Type,
+        arg_ty: &Type,
+        argument: &Expr,
+        at: &dyn Fn() -> String,
+    ) -> Result<Type, InferError>;
 }
 
 /// Peel every outer [`Type::Refinement`] layer off `t`, returning the bare
@@ -1014,6 +1057,12 @@ impl Typing for SimpleSubContext {
         let r = f(self);
         self.scopes.pop_scope();
         r
+    }
+
+    fn close_let_type(&self, _name: &str, _bound_expr: &Expr, body_ty: Type) -> Type {
+        // No-op: the closing discharge runs on the resolved type in
+        // `coalesce_node`'s Let arm (see the trait doc).
+        body_ty
     }
 
     fn bind_annotation(&mut self, inferred: &Type, ann: &Type) -> Result<(), InferError> {
@@ -1123,6 +1172,68 @@ impl Typing for SimpleSubContext {
         // reverse `domain <: arg`. See the trait-method docs.
         self.require_sub(arg, domain, at)
     }
+
+    fn apply(
+        &mut self,
+        fn_ty: &Type,
+        arg_ty: &Type,
+        argument: &Expr,
+        at: &dyn Fn() -> String,
+    ) -> Result<Type, InferError> {
+        // Expect a *named* Pi `(x: d) ⇒ result`, so the codomain edge derives the
+        // binder correspondence when `fn_ty`'s real Pi flows in (constrain's
+        // Fun/Fun arm). The shape edge is one-way (`fn_ty <: (x: d) ⇒ result`),
+        // matching `constrain_argument`'s one-way rule — the contravariant
+        // domain a morphism loses under one-way edges is recovered structurally
+        // at coalesce (see `Typing::constrain_argument`); only the expected
+        // shape gained a binder.
+        //
+        // When `fn_ty` is *already* a concrete Pi (the directly-applied case —
+        // a `λ k → …`, or a let-bound dependent function whose type has resolved),
+        // reuse its binder `k` as the expected binder rather than minting a fresh
+        // one. The derived correspondence is then the **identity** `[k ↦ k]`, so a
+        // discharge `[k ↦ arg]` keyed on the real binder substitutes the
+        // predicate's `k` directly at *every* polarity. Minting a distinct `x`
+        // makes the correspondence a rename `[k ↦ x]` whose **inverse** `[x ↦ k]`
+        // rides the contravariant (upper) edge — and a one-way discharge composed
+        // onto an inverse rename is a no-op on the predicate, leaving the binder
+        // undischarged at every contravariant use, e.g. the parameter domain a
+        // `map`/aggregate feeds a dependent application (design O8). The identity
+        // correspondence sidesteps that. (Reusing the binder only reintroduces the
+        // capture risk the global-freshness discipline guards when two *distinct*
+        // dependent functions sharing a binder name meet at one coalescing
+        // position — the extent-join case, tracked as O1/O4; the
+        // monomorphic-direct shapes that arise today never do.)
+        let x = match peel_refinements_outer(fn_ty) {
+            Type::Fun { name: Some(k), .. } => k.clone(),
+            _ => crate::ccl::subst::fresh_binder("__arg"),
+        };
+        let d = self.fresh();
+        let result = self.fresh();
+        let expected = Type::pi(&x, d.clone(), result.clone());
+        self.require_sub(fn_ty, &expected, at)?;
+        self.constrain_argument(arg_ty, &d, at)?;
+        // The application's type is `result` with the binder discharged to the
+        // argument. The discharge rides a fresh var's lower edge and fires at
+        // coalesce, composing with the correspondence rename `[k ↦ x]` to the
+        // effective `[k ↦ argument]` (design §5.2). For a non-dependent codomain
+        // `result` does not mention `x`, so the discharge is vacuous.
+        let applied = self.fresh();
+        // `fresh()` always yields an `Infer` var; the discharge *must* be
+        // recorded on its edge or the dependent application silently loses its
+        // substitution, so state the invariant rather than guarding it away.
+        let Type::Infer(v) = &applied else {
+            unreachable!("fresh() yields a Type::Infer var");
+        };
+        v.bounds
+            .borrow_mut()
+            .lower
+            .push(crate::ccl::Bound::with_subst(
+                result,
+                crate::ccl::subst::Subst::discharge(&x, argument.clone()),
+            ));
+        Ok(applied)
+    }
 }
 
 /// Emit constraints for every refinement predicate embedded in an
@@ -1135,14 +1246,17 @@ impl Typing for SimpleSubContext {
 fn emit_annotation_predicates(ty: &Type, ctx: &mut SimpleSubContext) -> Result<(), InferError> {
     match ty {
         Type::Refinement(inner, r) => {
-            let def = &r.predicate;
-            if let Ok(mut pred) = def.try_borrow_mut() {
-                let pred_ty = emit_node(&mut pred, ctx)?;
-                constrain_predicate_bool(&pred_ty, ctx)?;
-            }
+            // The annotation's refinement is bare over REFINEMENT_BINDER, just
+            // like a cast target's — bind the element over the refined base and
+            // check `Bool`.
+            emit_bare_predicate(r, inner, ctx)?;
             emit_annotation_predicates(inner, ctx)
         }
-        Type::Fun(d, c) => {
+        Type::Fun {
+            domain: d,
+            codomain: c,
+            ..
+        } => {
             emit_annotation_predicates(d, ctx)?;
             emit_annotation_predicates(c, ctx)
         }
@@ -1170,22 +1284,28 @@ fn emit_annotation_predicates(ty: &Type, ctx: &mut SimpleSubContext) -> Result<(
     }
 }
 
-/// Constrain a refinement predicate's inferred type to the closed-function
-/// shape `D ⇒ Bool`. A predicate's body is the membership decision, so its
-/// codomain must be a `Bool` (the current representation — see
-/// `docs/refinement-types-design.md`). `if` filters in list comprehensions and
-/// for-loops lower to such predicates, so this is where a non-Bool guard (e.g.
-/// `[x for x in xs if x]`) is rejected. The domain is left as a fresh variable;
-/// only the codomain is pinned.
-fn constrain_predicate_bool<C: Typing>(pred_ty: &Type, ctx: &mut C) -> Result<(), InferError> {
-    // One-way `pred_ty <: (_ ⇒ Bool)`: the covariant codomain forces the
-    // predicate body to be a `Bool` directly (a non-Bool guard like `Int`
-    // fails as a base-type `TypeMismatch`), while the contravariant domain is
-    // left unconstrained as a fresh variable.
-    let pred_domain = ctx.fresh();
-    ctx.require_sub(pred_ty, &fun(pred_domain, prim(BaseType::Bool)), &|| {
-        "refinement predicate".to_string()
-    })
+/// Type a refinement's **bare** predicate (design §6.2). The refinement is a
+/// binding form: its element is the implicit [`REFINEMENT_BINDER`], bound to
+/// the refined base type `domain` while the predicate is inferred, and the
+/// predicate itself must be `Bool` — exactly as `infer_lambda` binds a
+/// parameter for its body, but with the refinement doing the binding.
+///
+/// `try_borrow_mut` is the re-entrancy guard shared with `emit_lambda` /
+/// `coalesce_type_predicates`: a predicate cell can recur through its own type
+/// slot, in which case it is already being walked (and bool-checked) by the
+/// enclosing borrow, so skipping here loses nothing.
+fn emit_bare_predicate<C: Typing>(
+    r: &Refinement,
+    domain: &Type,
+    ctx: &mut C,
+) -> Result<(), InferError> {
+    if let Ok(mut pred) = r.predicate.try_borrow_mut() {
+        let pred_ty = ctx.scoped(REFINEMENT_BINDER, domain, |ctx| ctx.subexpr(&mut pred))?;
+        ctx.require_sub(&pred_ty, &prim(BaseType::Bool), &|| {
+            "refinement predicate".to_string()
+        })?;
+    }
+    Ok(())
 }
 
 /// Apply a binary scheme: instantiate, build the expected call shape,
@@ -1236,7 +1356,7 @@ fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferError {
             // `constrain_subtype(lhs, rhs)` means `lhs <: rhs`. If rhs is a function
             // and lhs is not, the caller passed a non-function where a function
             // was expected (e.g. applying a non-function at an Apply site).
-            if matches!(rhs, Type::Fun(..)) && !matches!(lhs, Type::Fun(..)) {
+            if matches!(rhs, Type::Fun { .. }) && !matches!(lhs, Type::Fun { .. }) {
                 InferError::ExpectedFunction {
                     found: lhs_ty,
                     at: ctx_label.to_string(),
@@ -1329,6 +1449,26 @@ pub fn infer(expr: &mut Expr, sources: &HashMap<String, Type>) -> Result<Type, V
     monomorphize(expr, &mut remap, &mut mono_errors);
     if !mono_errors.is_empty() {
         return Err(mono_errors);
+    }
+    // Stamp the resolved binder types onto free `Var` references a discharge
+    // substituted into refinement predicates (see `retype_predicate_slots`).
+    retype_predicate_slots(expr, &HashMap::new());
+    // Scope-validity check (design §6.2): every coalesced node's type is
+    // well-formed in the lexical scope at that node — every free term-variable
+    // of its refinement predicates is bound by an enclosing Pi binder
+    // (subtracted by `type_free_vars`) or an enclosing AST binder. This holds at
+    // *every* node now that dependent application discharges its binder to the
+    // argument at both polarities and `let`-closing discharges bound names as
+    // the type leaves their scope. The program's sources are in scope at the root.
+    // Unconditional: value-only substitution deliberately leaves type-slot
+    // occurrences of a discharged binder unrewritten, so a descent bug leaves a
+    // dangling predicate binder — this boundary must reject it as an error
+    // rather than let it flow into planning as a silent miscompile.
+    let root_scope: std::collections::BTreeSet<String> = sources.keys().cloned().collect();
+    let mut scope_errors = Vec::new();
+    check_scope_valid(expr, &root_scope, &mut scope_errors);
+    if !scope_errors.is_empty() {
+        return Err(scope_errors);
     }
     Ok(expr.ty.clone())
 }
@@ -1528,23 +1668,21 @@ fn emit_lambda<C: Typing>(
     // `Hole`s inside the predicate body).
     let domain_ty = match refinement {
         Some(r) => {
-            let def = &r.predicate;
-            // The predicate is compiled lazily inside an `Rc<RefCell<Expr>>`.
-            // `try_borrow_mut` (the discipline shared with
-            // `emit_annotation_predicates` / `coalesce_type_predicates`): the
-            // same `Rc` can recur through its own type slot, in which case
-            // the cell is already being walked — and bool-checked — by the
-            // enclosing borrow, so skipping here loses nothing.
-            if let Ok(mut pred) = def.try_borrow_mut() {
-                let pred_ty = ctx.subexpr(&mut pred)?;
-                constrain_predicate_bool(&pred_ty, ctx)?;
-            }
+            // The lambda's own refinement decorates the (unrefined) domain; its
+            // bare predicate binds the implicit element over `param_simple`.
+            emit_bare_predicate(r, &param_simple, ctx)?;
             Type::Refinement(Box::new(param_simple), r.clone())
         }
         None => param_simple,
     };
 
-    Ok(fun(domain_ty, body_ty))
+    // Emit a *named* Pi: the parameter binds in the codomain, so a refinement
+    // predicate nested in `body_ty` that closes over the parameter (the
+    // dependent-refinement case) stays bound. The binder is cosmetic for
+    // ordinary functions — coalesce strips it when the codomain does not
+    // reference it (see `coalesce_compact_go`) — so monomorphic output is
+    // unchanged.
+    Ok(Type::pi(&param.name, domain_ty, body_ty))
 }
 
 /// Type a [`TypedExprNode::Cast`]: `cast(value, target)` re-views `value` at
@@ -1568,33 +1706,35 @@ fn emit_lambda<C: Typing>(
 /// `value_ty`'s already-resolved `D`/`V`. `target`'s own holes are *not* used
 /// for the result — Check's `normalize` is the identity, so they would survive
 /// as unsolved vars; reconstructing from `value` keeps both modes honest. The
-/// domain-refinement predicate is typed via `ctx.subexpr` and constrained to
-/// the `D ⇒ Bool` shape exactly as [`emit_lambda`] handles a lambda's own
-/// refinement; `coalesce_type_predicates(&expr.ty)` resolves it later (the
-/// result shares `target`'s tag `r`).
+/// domain-refinement's bare predicate is typed by `emit_bare_predicate` (the
+/// element bound to `D`, the predicate checked `Bool`) exactly as [`emit_lambda`]
+/// handles a lambda's own refinement; `coalesce_type_predicates(&expr.ty)`
+/// resolves it later (the result shares `target`'s tag `r`).
 ///
 /// Shared by [`emit_node`] (Emit) and [`check_node`] (Check) via [`Typing`].
 fn emit_cast<C: Typing>(value: &mut Expr, target: &Type, ctx: &mut C) -> Result<Type, InferError> {
     let value_ty = ctx.subexpr(value)?;
     let refinement = cast_target_refinement(target);
-    // Type the domain-refinement predicate and enforce `D ⇒ Bool`, mirroring
-    // `emit_lambda`'s refinement arm (including its `try_borrow_mut`
-    // re-entrancy guard — a cell already held is being walked, and
-    // bool-checked, by the enclosing borrow).
-    if let Some(r) = &refinement {
-        let def = &r.predicate;
-        if let Ok(mut pred) = def.try_borrow_mut() {
-            let pred_ty = ctx.subexpr(&mut pred)?;
-            constrain_predicate_bool(&pred_ty, ctx)?;
-        }
-    }
     // Re-view `value : D ⇒ V` as `{D | r} ⇒ V` (the refinement on the domain).
     let (d, v) = ctx.as_function(&value_ty, &|| "cast value".to_string())?;
+    // Type the domain-refinement's bare predicate with the implicit binder
+    // bound to the (unrefined) domain `d`, enforcing `Bool` (§6.2).
+    if let Some(r) = &refinement {
+        emit_bare_predicate(r, &d, ctx)?;
+    }
     let domain = match refinement {
         Some(r) => Type::Refinement(Box::new(d), r),
         None => d,
     };
-    Ok(fun(domain, v))
+    // Preserve the value's Pi binder so the cast result stays a *named* function.
+    // A dependent application of the cast then reconciles binders by the identity
+    // correspondence (reusing the binder rather than minting a fresh `__arg`),
+    // which is what keeps the O8 contravariant-domain discharge from leaving an
+    // undischarged binder in the domain's refinement predicate (design §5.2, O8).
+    match peel_refinements_outer(&value_ty) {
+        Type::Fun { name: Some(k), .. } => Ok(Type::pi(k.clone(), domain, v)),
+        _ => Ok(fun(domain, v)),
+    }
 }
 
 fn emit_apply<C: Typing>(
@@ -1604,20 +1744,15 @@ fn emit_apply<C: Typing>(
 ) -> Result<Type, InferError> {
     let arg_ty = ctx.subexpr(argument)?;
     let fn_ty = ctx.subexpr(function)?;
-    // Both Apply edges are one-way (see `Typing::constrain_argument` for the
-    // full story). Shape edge: `fn_ty <: domain ⇒ codomain` decomposes the
-    // function (`as_function`; Check destructures the resolved type directly) —
-    // there is no reverse `domain ⇒ codomain <: fn_ty`, so a lambda's domain
-    // coalesces to only what its body demands; `coalesce_node` recovers the
-    // full width structurally (see `specialize_lambda_domain`).
-    let (domain, codomain) = ctx.as_function(&fn_ty, &|| "Apply".to_string())?;
-    // Argument edge: the sound one-way `arg <: domain`. A function domain is
-    // contravariant, so this alone leaves a *projection*'s domain var
-    // under-determined (a `Proj` only constrains the one field it touches);
-    // `coalesce_node`'s projection-domain specialization recovers it from the
-    // record/tuple actually flowing in (see `specialize_projection_domain`).
-    ctx.constrain_argument(&arg_ty, &domain, &|| "Apply".to_string())?;
-    Ok(codomain)
+    // The application's type is the function's codomain with its Pi binder
+    // discharged to the argument (dependent application, design §5). `apply`
+    // also pins the function/argument shapes with the one-way Apply edges
+    // (see `Typing::constrain_argument` for the full story): the shape edge
+    // `fn_ty <: (x: domain) ⇒ codomain` and the argument edge `arg <: domain`.
+    // A morphism's contravariant domain, left under-determined by the one-way
+    // edges, is recovered structurally at coalesce
+    // (`specialize_projection_domain` / `specialize_lambda_domain`).
+    ctx.apply(&fn_ty, &arg_ty, argument, &|| "Apply".to_string())
 }
 
 fn emit_binop<C: Typing>(
@@ -1747,9 +1882,13 @@ fn emit_let<C: Typing>(
         ctx.bind_annotation(&bound_ty, ann)?;
     }
     let generalize = ctx.is_generalizable(bound_expr);
-    ctx.scoped_let(&binding.name, &bound_ty, generalize, |ctx| {
+    let body_ty = ctx.scoped_let(&binding.name, &bound_ty, generalize, |ctx| {
         ctx.subexpr(body)
-    })
+    })?;
+    // Lifting the body type out of the binder's scope must close it over the
+    // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
+    // story.
+    Ok(ctx.close_let_type(&binding.name, bound_expr, body_ty))
 }
 
 /// Build the open-product shape a projection of `key` requires its input to
@@ -1912,7 +2051,25 @@ fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Type, Infer
         ctx.require_sub(&prev_cod, &d_i, &|| format!("Compose[{i}]"))?;
         prev_cod = c_i;
     }
-    Ok(fun(first_dom, prev_cod))
+    // Keep a dependent *final* morphism's Pi binder on the chain type: the
+    // chain's codomain is the final codomain, which may reference that binder
+    // (`id ≫ cast(…) ▷ const : (__gb_k: Int) ⇒ {… == __gb_k} ⇒ …` is the
+    // groupby shape); dropping the name would leave the reference dangling.
+    // The recorded type carries the eliminated lambda's own binder instead,
+    // and the Pi-vs-Pi constraint arm α-aligns the two. (Closed-form only for
+    // value-preserving prefixes — the same direct-vs-opaque boundary as the
+    // dependent-apply discharge; nothing else reaches a dependent final
+    // morphism today.) In Emit the morphism types are bare inference vars, so
+    // this peels to `None` and the chain type is the plain arrow.
+    let last_name = match peel_refinements_outer(tys.last().expect("len >= 2")) {
+        Type::Fun { name, .. } => name.clone(),
+        _ => None,
+    };
+    Ok(Type::Fun {
+        name: last_name,
+        domain: Box::new(first_dom),
+        codomain: Box::new(prev_cod),
+    })
 }
 
 /// Emit Simple-sub constraints for a `Loop` node and return its outer type
@@ -2135,6 +2292,14 @@ impl Typing for CheckCtx {
         f(self)
     }
 
+    fn close_let_type(&self, name: &str, bound_expr: &Expr, body_ty: Type) -> Type {
+        // Mirror the let-closing in `coalesce_node`'s Let arm (design §6.2):
+        // the recorded node type has the binding discharged, so the
+        // reconstruction must re-run the same substitution to reconcile under
+        // structural predicate equality.
+        crate::ccl::subst::Subst::discharge(name, bound_expr.clone()).apply_type(&body_ty)
+    }
+
     fn bind_annotation(&mut self, _inferred: &Type, _ann: &Type) -> Result<(), InferError> {
         // The annotation was already folded into the binder's type during
         // inference; nothing to re-check here.
@@ -2154,7 +2319,11 @@ impl Typing for CheckCtx {
         // Destructure the resolved type directly (no inference vars). Peel any
         // outer refinement tags the function picked up during solving.
         match peel_refinements_outer(t) {
-            Type::Fun(d, c) => Ok(((**d).clone(), (**c).clone())),
+            Type::Fun {
+                domain: d,
+                codomain: c,
+                ..
+            } => Ok(((**d).clone(), (**c).clone())),
             _ => {
                 self.errors.push(InferError::ExpectedFunction {
                     found: t.clone(),
@@ -2188,6 +2357,27 @@ impl Typing for CheckCtx {
         // direction (domain coalescing) is not the sound subtyping rule and so
         // does not apply to the post-inference check.
         self.require_sub(arg, domain, at)
+    }
+
+    fn apply(
+        &mut self,
+        fn_ty: &Type,
+        arg_ty: &Type,
+        argument: &Expr,
+        at: &dyn Fn() -> String,
+    ) -> Result<Type, InferError> {
+        let (domain, codomain) = self.as_function(fn_ty, at)?;
+        self.constrain_argument(arg_ty, &domain, at)?;
+        // Re-run the discharge on the resolved codomain so the reconstructed
+        // type matches the recorded (discharged) one. A named Pi discharges its
+        // binder to the argument; an ordinary function's codomain is unchanged.
+        let result = match peel_refinements_outer(fn_ty) {
+            Type::Fun { name: Some(b), .. } => {
+                crate::ccl::subst::Subst::discharge(b, argument.clone()).apply_type(&codomain)
+            }
+            _ => codomain,
+        };
+        Ok(result)
     }
 }
 
@@ -2383,6 +2573,85 @@ fn coalesce_pass(expr: &mut Expr) -> Vec<InferError> {
     errors
 }
 
+/// The design's scope-validity check (§6.2): a coalesced node's type must be
+/// **well-formed in the lexical scope at that node** — every free term-variable
+/// of its refinement predicates is bound by an enclosing Pi binder (subtracted
+/// by [`crate::ccl::subst::type_free_vars`]) or an enclosing AST binder
+/// (lambda / `let` / loop / case), or is a program source (seeded into the root
+/// `scope`).
+///
+/// A violation means a refinement reached a position where its predicate's free
+/// variables are out of scope — e.g. a dependent-application discharge that
+/// failed to reach a contravariant use, a `let`-closing that didn't fire, or a
+/// substitution that forgot to descend into predicates (the regression case M of
+/// the proposal's matrix). On a correct implementation over a well-typed program
+/// it never fires; user-facing scoping errors are caught earlier with source
+/// context (§3.4). Because the violations it guards are compiler bugs that
+/// would otherwise miscompile silently, it runs in release builds too,
+/// reporting each ill-scoped node as an [`InferError::ScopeViolation`].
+fn check_scope_valid(
+    expr: &Expr,
+    scope: &std::collections::BTreeSet<String>,
+    errors: &mut Vec<InferError>,
+) {
+    let free = crate::ccl::subst::type_free_vars(&expr.ty);
+    if !free.is_subset(scope) {
+        errors.push(InferError::ScopeViolation {
+            at: symbolic(expr),
+            ty: expr.ty.clone(),
+            unbound: free.difference(scope).cloned().collect(),
+        });
+    }
+    match &expr.node {
+        TypedExprNode::Lambda { param, body, .. } => {
+            let mut s = scope.clone();
+            s.insert(param.name.clone());
+            check_scope_valid(body, &s, errors);
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            check_scope_valid(bound_expr, scope, errors);
+            let mut s = scope.clone();
+            s.insert(binding.name.clone());
+            check_scope_valid(body, &s, errors);
+        }
+        TypedExprNode::Loop {
+            params,
+            init_args,
+            source,
+            loop_body,
+        } => {
+            init_args
+                .iter()
+                .for_each(|a| check_scope_valid(a, scope, errors));
+            check_scope_valid(source, scope, errors);
+            let mut s = scope.clone();
+            s.extend(params.iter().map(|p| p.name.clone()));
+            check_scope_valid(loop_body, &s, errors);
+        }
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            if let Some(sc) = scrutinee {
+                check_scope_valid(sc, scope, errors);
+            }
+            for b in branches {
+                let mut s = scope.clone();
+                if let Some(p) = &b.pattern {
+                    s.insert(p.binding.name.clone());
+                }
+                check_scope_valid(&b.guard, &s, errors);
+                check_scope_valid(&b.body, &s, errors);
+            }
+        }
+        _ => expr.walk_children(|c| check_scope_valid(c, scope, errors)),
+    }
+}
+
 /// Resolve a type that may contain inference variables into a concrete
 /// `Type`, via the compact → simplify → coalesce pipeline.
 fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
@@ -2447,8 +2716,11 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
             // and comprehension lowering). The function's resolved type is
             // `Fun(Fun(expected_dom, _), _)`; that inner domain is the value
             // the lambda will be fed, so specialize the lambda to it.
-            if let Type::Fun(param, _) = peel_refinements_outer(&function.ty)
-                && let Type::Fun(expected_dom, _) = peel_refinements_outer(param)
+            if let Type::Fun { domain: param, .. } = peel_refinements_outer(&function.ty)
+                && let Type::Fun {
+                    domain: expected_dom,
+                    ..
+                } = peel_refinements_outer(param)
             {
                 let expected_dom = (**expected_dom).clone();
                 specialize_lambda_domain(argument, &expected_dom);
@@ -2553,10 +2825,13 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
             // morphism is still the bare codomain, so peel before
             // destructuring rather than silently skipping the wrapped case.
             for i in 1..elts.len() {
-                let Type::Fun(_, prev_cod) = peel_refinements_outer(&elts[i - 1].ty) else {
+                let Type::Fun {
+                    codomain: prev_cod, ..
+                } = peel_refinements_outer(&elts[i - 1].ty)
+                else {
                     continue;
                 };
-                let prev_cod = (**prev_cod).clone();
+                let prev_cod = prev_cod.as_ref().clone();
                 specialize_projection_domain(&mut elts[i], &prev_cod);
                 // Lambda morphisms (for-loop bodies lower to
                 // `Compose([source, Lambda])`) have the same under-determined
@@ -2564,12 +2839,31 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
                 specialize_lambda_domain(&mut elts[i], &prev_cod);
             }
             if let (Some(first), Some(last)) = (elts.first(), elts.last())
-                && let (Type::Fun(first_dom, _), Type::Fun(_, last_cod)) = (
+                && let (
+                    Type::Fun {
+                        domain: first_dom, ..
+                    },
+                    Type::Fun {
+                        name: last_name,
+                        codomain: last_cod,
+                        ..
+                    },
+                ) = (
                     peel_refinements_outer(&first.ty),
                     peel_refinements_outer(&last.ty),
                 )
             {
-                expr.ty = Type::fun((**first_dom).clone(), (**last_cod).clone());
+                // Keep a dependent *final* morphism's Pi binder on the rebuilt
+                // chain type, mirroring `emit_compose`: the chain's codomain is
+                // the final codomain, which may reference that binder, and the
+                // Apply re-derivation dispatches on the name — rebuilding with
+                // a bare arrow here would make it clobber the discharged
+                // codomain with the undischarged one.
+                expr.ty = Type::Fun {
+                    name: last_name.clone(),
+                    domain: Box::new((**first_dom).clone()),
+                    codomain: Box::new((**last_cod).clone()),
+                };
             }
         }
         TypedExprNode::Record(fs) => {
@@ -2655,17 +2949,81 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
     // domain coalesces straight onto `expr.ty` here (no separate
     // re-stitch). `lambda_elim` still reads the lambda's own refinement
     // off the AST node — it is duplicated there deliberately, and the
-    // tag's id-equality dedups any structural overlap downstream.
+    // tags' structural predicate equality dedups any overlap downstream.
     let label = symbolic(expr);
     match resolve_var_type(&expr.ty) {
         Ok(ty) => expr.ty = ty,
         Err(err) => push_coalesce_err(errors, map_coalesce_err(err, &label), label),
     }
 
+    // Application reconstruction (mirrors the `Compose` arm's post-coalesce
+    // structural reconstruction). Once the function child has resolved to a
+    // concrete `Fun`, the application's type is its codomain — discharged to
+    // the argument when the function is a dependent Pi `(k: d′) ⇒ result′`,
+    // giving `result′[k ↦ argument]`. Reading the result off the **resolved**
+    // function — rather than the `applied` var the emit-time discharge edge
+    // feeds — is what makes a higher-order / opaque dependent application
+    // discharge correctly (design O3): when the function was an inference
+    // variable at emit time, `apply` minted a fresh `__arg` binder that never
+    // matched the function's real binder, so the discharge edge no-ops and the
+    // codomain's refinement predicate is left referencing the undischarged
+    // binder. That stale predicate rides the var graph into every *parent*
+    // application too, so the leaf-only emit-time edge cannot be salvaged in
+    // place — each apply node must instead re-derive its type from its
+    // already-resolved function child (children coalesce first, bottom-up).
+    // Discharging here, keyed on the real `k`, substitutes at every polarity
+    // and reproduces the directly-applied case's type exactly (idempotent), so
+    // the post-inference `check`'s reconstruction — which re-runs the same
+    // discharge — still reconciles under structural predicate equality.
+    if let TypedExprNode::Apply { function, argument } = &expr.node
+        && let Type::Fun { name, codomain, .. } = peel_refinements_outer(&function.ty)
+    {
+        let reconstructed = match name {
+            Some(k) => {
+                crate::ccl::subst::Subst::discharge(k, (**argument).clone()).apply_type(codomain)
+            }
+            None => (**codomain).clone(),
+        };
+        expr.ty = reconstructed;
+    }
+
     // A lambda's param binding slot mirrors its coalesced domain (see
     // `refresh_lambda_param_slot`). It must be re-derived again whenever a
     // parent arm later rewrites the domain (`specialize_lambda_domain`).
     refresh_lambda_param_slot(expr);
+
+    // Codomain extraction (design §6.2 move site): a `let x = v in body` node's
+    // type is the body's type, whose refinement predicates may close over `x`.
+    // As the type is lifted out of the let's scope, discharge `[x ↦ v]` into it
+    // so the lifted type is well-formed (closed over `x`) — the same
+    // term-substitution dependent application uses (§5). It is derived from the
+    // *body's* already-coalesced type rather than re-resolved from the let's own
+    // var, so chained `let`s compose to fixpoint: an inner let has already
+    // discharged its binding into `body.ty`, and this layer discharges `x` on
+    // top. The post-inference `check` reconciles because it re-runs the same
+    // discharge, producing structurally equal predicates (see
+    // `Subst::force_refinement`).
+    //
+    // A *generalized* `let` is skipped: its definition is still uncoalesced
+    // here (quantified vars awaiting `monomorphize`), so splicing it into a
+    // predicate would deposit a clone full of irresolvable inference variables
+    // — and the clone's fresh cell is type-borne, which `monomorphize`'s
+    // use-renaming deliberately never walks. `monomorphize_go` performs the
+    // closing instead, when it wraps the body in specialized (concrete) lets.
+    let let_closed = match &expr.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } if !should_generalize(bound_expr, level) => {
+            let sigma = crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone());
+            Some(sigma.apply_type(&body.ty))
+        }
+        _ => None,
+    };
+    if let Some(closed) = let_closed {
+        expr.ty = closed;
+    }
 
     // Resolve any refinement predicates that ride on this node's type but
     // aren't reached through the main expression tree — e.g. a filter-feed
@@ -2690,7 +3048,11 @@ fn coalesce_type_predicates(ty: &Type, level: Level, errors: &mut Vec<InferError
             }
             coalesce_type_predicates(inner, level, errors);
         }
-        Type::Fun(d, c) => {
+        Type::Fun {
+            domain: d,
+            codomain: c,
+            ..
+        } => {
             coalesce_type_predicates(d, level, errors);
             coalesce_type_predicates(c, level, errors);
         }
@@ -2773,10 +3135,10 @@ fn monomorphize(expr: &mut Expr, remap: &mut CellRemap, errors: &mut Vec<InferEr
 /// predicate, so its projections recover through the `Apply` arm too.
 fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
     if matches!(morphism.node, TypedExprNode::Proj(_))
-        && let Type::Fun(_, cod) = &morphism.ty
+        && let Some(cod) = morphism.ty.codomain()
     {
-        let cod = (**cod).clone();
-        morphism.ty = Type::Fun(Box::new(input.clone()), Box::new(cod));
+        // A projection is non-dependent, so the rebuilt arrow keeps `name: None`.
+        morphism.ty = Type::fun(input.clone(), cod);
     }
 }
 
@@ -2822,7 +3184,12 @@ fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
         fn_layers.push(r);
         cur = *inner;
     }
-    let Type::Fun(dom, cod) = cur else {
+    let Type::Fun {
+        name,
+        domain: dom,
+        codomain: cod,
+    } = cur
+    else {
         return;
     };
     // Peel the domain's refinement layers down to the base `input` replaces.
@@ -2845,12 +3212,16 @@ fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
         .rev()
         .filter(|r| !input_tags.contains(&r))
         .fold(input.clone(), |acc, r| Type::Refinement(Box::new(acc), r));
-    lambda.ty = fn_layers
-        .into_iter()
-        .rev()
-        .fold(Type::Fun(Box::new(new_dom), cod), |acc, r| {
-            Type::Refinement(Box::new(acc), r)
-        });
+    lambda.ty = fn_layers.into_iter().rev().fold(
+        // Preserve the Pi binder: specialization rewrites only the domain
+        // *shape*; a dependent codomain still refers to the same binder.
+        Type::Fun {
+            name,
+            domain: Box::new(new_dom),
+            codomain: cod,
+        },
+        |acc, r| Type::Refinement(Box::new(acc), r),
+    );
     // The param slot was derived from the pre-specialization domain during the
     // lambda's own `coalesce_node`; re-derive it from the rewritten one.
     refresh_lambda_param_slot(lambda);
@@ -2867,7 +3238,7 @@ fn refresh_lambda_param_slot(expr: &mut Expr) {
     if let TypedExprNode::Lambda {
         param, refinement, ..
     } = &mut expr.node
-        && let Type::Fun(dom, _) = &expr.ty
+        && let Type::Fun { domain: dom, .. } = &expr.ty
     {
         let mut d = (**dom).clone();
         if let Some(r) = refinement {
@@ -2956,7 +3327,25 @@ fn monomorphize_go(
         let mut def_i = specialize_def(&def, cutoff, &ty_i, remap, errors);
         // The specialization may itself contain generalized `let`s.
         monomorphize_go(&mut def_i, cutoff + 1, next_id, remap, errors);
-        let body_ty = result.ty.clone();
+        // Stamp the *specialization's* resolved type onto each use, then
+        // re-derive the dependent node types that were computed from the
+        // use's instantiation type at main coalesce. The instantiation type
+        // is structurally identical to `def_i.ty` (the pin is two-way) but
+        // its refinement-predicate *internals* still carry the definition's
+        // quantified inference vars — a parent `Apply`'s discharge cloned
+        // that stale content into its own type, where neither realiasing nor
+        // the spec's coalesce can reach it. Re-running the reconstruction
+        // over the now-concrete child types replaces those clones.
+        for_each_free_use(&mut result, &name_i, &mut |u| u.ty = def_i.ty.clone());
+        rederive_dependent_types(&mut result);
+        // Close the lifted body type over the new binding (§6.2 move site):
+        // a body refinement predicate may call `name_i` (predicate uses were
+        // renamed along with the rest of the body above). `coalesce_node`'s
+        // Let arm skipped the generalized original because its definition was
+        // uncoalesced then; `def_i` is specialized and concrete now, so the
+        // discharge splices resolved types.
+        let body_ty =
+            crate::ccl::subst::Subst::discharge(&name_i, def_i.clone()).apply_type(&result.ty);
         result = Expr::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: name_i,
@@ -2970,6 +3359,38 @@ fn monomorphize_go(
     }
     *expr = result;
     expr.user_annotation = saved_annotation;
+}
+
+/// Re-derive the node types that the main coalesce computed from a
+/// generalized use's *instantiation* type, after `monomorphize_go` stamped the
+/// resolved specialization type onto the use. Bottom-up re-run of the same
+/// reconstruction rules `coalesce_node` applies — the `Apply` codomain
+/// discharge (design O3) and the `let` codomain extraction (§6.2) — so the
+/// replaced types match the post-inference `check`'s reconstruction by
+/// construction. Idempotent: a type that was already derived from concrete
+/// children re-derives to a structurally equal one.
+fn rederive_dependent_types(expr: &mut Expr) {
+    expr.walk_children_mut(rederive_dependent_types);
+    match &expr.node {
+        TypedExprNode::Apply { function, argument } => {
+            if let Type::Fun { name, codomain, .. } = peel_refinements_outer(&function.ty) {
+                expr.ty = match name {
+                    Some(k) => crate::ccl::subst::Subst::discharge(k, (**argument).clone())
+                        .apply_type(codomain),
+                    None => (**codomain).clone(),
+                };
+            }
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            expr.ty = crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone())
+                .apply_type(&body.ty);
+        }
+        _ => {}
+    }
 }
 
 /// Specialize a generalized definition to one resolved use type.
@@ -3148,6 +3569,131 @@ fn for_each_free_use_in_type(ty: &Type, name: &str, f: &mut impl FnMut(&mut Expr
     ty.walk_children(|child| for_each_free_use_in_type(child, name, &mut *f));
 }
 
+/// Stamp the resolved type of each binder onto the **free term-variable
+/// references inside refinement predicates** (`scope` maps a binder name to its
+/// coalesced type).
+///
+/// A dependent-application discharge substitutes the *argument expression* into a
+/// predicate (§5). That argument copy is captured at emit time — when its type
+/// slots are still inference variables — and is independent of the main AST, so
+/// the per-node coalesce that resolved the original argument never reaches the
+/// copy; re-coalescing it standalone yields a fresh placeholder var, leaving an
+/// unresolved `Type::Infer` in the predicate (which a downstream type-check would
+/// reject). But the substituted argument is just a reference to a binder that
+/// *is* in lexical scope — a `λ`/`let` whose type coalesce already resolved — so
+/// its correct type is exactly that binder's resolved type. Look it up by name
+/// and stamp it. (O2/O7 for the monomorphic-direct case: the binders predicates
+/// close over are ordinary in-scope binders, each with a single solution.)
+fn retype_predicate_slots(expr: &mut Expr, scope: &HashMap<String, Type>) {
+    retype_in_type(&mut expr.ty, scope);
+    match &mut expr.node {
+        TypedExprNode::Lambda { param, body, .. } => {
+            let mut s = scope.clone();
+            s.insert(param.name.clone(), param.ty.clone());
+            retype_predicate_slots(body, &s);
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            retype_predicate_slots(bound_expr, scope);
+            let mut s = scope.clone();
+            s.insert(binding.name.clone(), binding.ty.clone());
+            retype_predicate_slots(body, &s);
+        }
+        TypedExprNode::Loop {
+            params,
+            init_args,
+            source,
+            loop_body,
+        } => {
+            init_args
+                .iter_mut()
+                .for_each(|a| retype_predicate_slots(a, scope));
+            retype_predicate_slots(source, scope);
+            let mut s = scope.clone();
+            for p in params.iter() {
+                s.insert(p.name.clone(), p.ty.clone());
+            }
+            retype_predicate_slots(loop_body, &s);
+        }
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            if let Some(sc) = scrutinee {
+                retype_predicate_slots(sc, scope);
+            }
+            for b in branches.iter_mut() {
+                let mut s = scope.clone();
+                if let Some(p) = &b.pattern {
+                    s.insert(p.binding.name.clone(), p.binding.ty.clone());
+                }
+                retype_predicate_slots(&mut b.guard, &s);
+                retype_predicate_slots(&mut b.body, &s);
+            }
+        }
+        _ => expr.walk_children_mut(|c| retype_predicate_slots(c, scope)),
+    }
+}
+
+/// Recurse into `ty`'s refinement predicates, stamping each free `Var`'s
+/// resolved type from `scope`.
+fn retype_in_type(ty: &mut Type, scope: &HashMap<String, Type>) {
+    match ty {
+        Type::Fun {
+            domain, codomain, ..
+        } => {
+            retype_in_type(domain, scope);
+            retype_in_type(codomain, scope);
+        }
+        Type::Tuple(ts) => ts.iter_mut().for_each(|t| retype_in_type(t, scope)),
+        Type::Record(fs) => fs.iter_mut().for_each(|(_, t)| retype_in_type(t, scope)),
+        Type::Variant(tags) => tags.iter_mut().for_each(|(_, t)| retype_in_type(t, scope)),
+        Type::Refinement(base, r) => {
+            retype_in_type(base, scope);
+            if let Ok(mut pred) = r.predicate.try_borrow_mut() {
+                retype_pred_expr(&mut pred, scope);
+            }
+        }
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+    }
+}
+
+/// Stamp free `Var` types inside a predicate expression from `scope`, tracking
+/// the predicate's own binders (so they shadow outer names rather than being
+/// rewritten). Only an unresolved (`Infer`/`Hole`) slot is overwritten — a slot
+/// coalesce already resolved is left intact.
+fn retype_pred_expr(e: &mut Expr, scope: &HashMap<String, Type>) {
+    retype_in_type(&mut e.ty, scope);
+    match &mut e.node {
+        TypedExprNode::Var(n) => {
+            if matches!(e.ty, Type::Infer(_) | Type::Hole)
+                && let Some(t) = scope.get(n)
+            {
+                e.ty = t.clone();
+            }
+        }
+        TypedExprNode::Lambda { param, body, .. } => {
+            let mut s = scope.clone();
+            s.insert(param.name.clone(), param.ty.clone());
+            retype_pred_expr(body, &s);
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            retype_pred_expr(bound_expr, scope);
+            let mut s = scope.clone();
+            s.insert(binding.name.clone(), binding.ty.clone());
+            retype_pred_expr(body, &s);
+        }
+        _ => e.walk_children_mut(|c| retype_pred_expr(c, scope)),
+    }
+}
+
 /// Remove the [`Type::Refinement`] layers whose tag aliases the predicate
 /// `cell` (if present), preserving the relative order of the other layers.
 /// Tags may coalesce in any order, so we can't assume a fixed position.
@@ -3190,6 +3736,69 @@ mod tests {
     fn run_simple_sub(expr: &mut Expr) -> Result<Type, Vec<InferError>> {
         let mut ctx = TypeInferenceContext::new();
         crate::ccl::infer::infer(expr, &mut ctx)
+    }
+
+    /// `{Int | __elem > rhs}` — a refinement whose bare predicate compares
+    /// the implicit element binder ([`REFINEMENT_BINDER`]) against `rhs`.
+    fn refined_int(rhs: TypedExpr) -> Type {
+        use crate::ccl::CompareKind;
+        let pred = TypedExpr::binop(
+            TypedExpr::var(REFINEMENT_BINDER),
+            BinOpKind::Compare(CompareKind::Greater),
+            rhs,
+        );
+        Type::Refinement(
+            Box::new(Type::Base(BaseType::Int)),
+            Refinement {
+                predicate: Rc::new(RefCell::new(pred)),
+            },
+        )
+    }
+
+    // Scope-validity check (design §6.2), appendix case J: a refinement whose
+    // predicate references a binder not in scope is reported as a
+    // `ScopeViolation` naming that binder.
+    #[test]
+    fn scope_check_reports_out_of_scope_binder() {
+        let mut e = lit_int(1);
+        e.ty = refined_int(TypedExpr::var("x"));
+        let mut errors = Vec::new();
+        check_scope_valid(&e, &std::collections::BTreeSet::new(), &mut errors);
+        let [InferError::ScopeViolation { unbound, .. }] = errors.as_slice() else {
+            panic!("expected a single ScopeViolation, got {errors:?}");
+        };
+        assert_eq!(unbound, &["x".to_string()]);
+    }
+
+    // Appendix case K: the same refinement is accepted when the referenced
+    // binder is bound on the path — by the enclosing lambda for the body
+    // node, and by the Pi binder name for the lambda's own dependent type
+    // (`(x: Int) ⇒ {Int | v > x}`).
+    #[test]
+    fn scope_check_accepts_enclosing_binder() {
+        let mut body = lit_int(1);
+        body.ty = refined_int(TypedExpr::var("x"));
+        let mut lam = TypedExpr::lambda("x", Type::Base(BaseType::Int), body);
+        lam.ty = Type::Fun {
+            name: Some("x".to_string()),
+            domain: Box::new(Type::Base(BaseType::Int)),
+            codomain: Box::new(refined_int(TypedExpr::var("x"))),
+        };
+        let mut errors = Vec::new();
+        check_scope_valid(&lam, &std::collections::BTreeSet::new(), &mut errors);
+        assert_eq!(errors, vec![]);
+    }
+
+    // Appendix case L: a predicate whose only free variable is the
+    // refinement's own implicit element binder is well-scoped in an empty
+    // scope.
+    #[test]
+    fn scope_check_accepts_own_element_binder() {
+        let mut e = lit_int(1);
+        e.ty = refined_int(lit_int(0));
+        let mut errors = Vec::new();
+        check_scope_valid(&e, &std::collections::BTreeSet::new(), &mut errors);
+        assert_eq!(errors, vec![]);
     }
 
     #[test]

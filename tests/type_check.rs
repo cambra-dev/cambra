@@ -52,10 +52,11 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
         // Sources are registered with type Fun(DataSource(name), elem_ty).
         ictx.register_source_type(
             name,
-            Type::Fun(
-                Box::new(Type::DataSource(name.to_string())),
-                Box::new(elem_ty.clone()),
-            ),
+            Type::Fun {
+                name: None,
+                domain: Box::new(Type::DataSource(name.to_string())),
+                codomain: Box::new(elem_ty.clone()),
+            },
         );
     }
     let stmts = parse_module(code);
@@ -93,10 +94,11 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
         lctx.register_source(*name, stub);
         ictx.register_source_type(
             name,
-            Type::Fun(
-                Box::new(Type::DataSource(name.to_string())),
-                Box::new(elem_ty.clone()),
-            ),
+            Type::Fun {
+                name: None,
+                domain: Box::new(Type::DataSource(name.to_string())),
+                codomain: Box::new(elem_ty.clone()),
+            },
         );
     }
     let stmts = parse_module(code);
@@ -185,7 +187,11 @@ fn test_unary_op(#[case] code: &str, #[case] expected: BaseType) {
 fn test_list_literal() {
     assert_eq!(
         infer_program("[1, 2, 3]"),
-        Type::Fun(Box::new(Type::UIntRange(3)), Box::new(int()))
+        Type::Fun {
+            name: None,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(int())
+        }
     );
 }
 
@@ -194,7 +200,11 @@ fn test_list_comp_identity() {
     // [x for x in [1, 2]] — element type inferred from inner list
     assert_eq!(
         infer_program("[x for x in [1, 2]]"),
-        Type::Fun(Box::new(Type::UIntRange(2)), Box::new(int()))
+        Type::Fun {
+            name: None,
+            domain: Box::new(Type::UIntRange(2)),
+            codomain: Box::new(int())
+        }
     );
 }
 
@@ -203,7 +213,11 @@ fn test_list_comp_arithmetic_body() {
     // [x + 1 for x in [1, 2]]
     assert_eq!(
         infer_program("[x + 1 for x in [1, 2]]"),
-        Type::Fun(Box::new(Type::UIntRange(2)), Box::new(int()))
+        Type::Fun {
+            name: None,
+            domain: Box::new(Type::UIntRange(2)),
+            codomain: Box::new(int())
+        }
     );
 }
 
@@ -213,10 +227,11 @@ fn test_list_comp_two_gens() {
     let ty = infer_program("[x + y for x in [1, 2] for y in [10, 20]]");
     assert_eq!(
         ty,
-        Type::Fun(
-            Box::new(Type::Tuple(vec![Type::UIntRange(2), Type::UIntRange(2)])),
-            Box::new(int())
-        ),
+        Type::Fun {
+            name: None,
+            domain: Box::new(Type::Tuple(vec![Type::UIntRange(2), Type::UIntRange(2)])),
+            codomain: Box::new(int())
+        },
         "got {ty}"
     );
 }
@@ -350,7 +365,12 @@ fn test_collection_union_produces_variant_typed_domain() {
             ("src2", Type::Base(BaseType::Int)),
         ],
     );
-    let Type::Fun(dom, cod) = &ty else {
+    let Type::Fun {
+        domain: dom,
+        codomain: cod,
+        ..
+    } = &ty
+    else {
         panic!("expected Fun, got {ty}");
     };
     // Domain is a Variant with two anonymous positional (Index) tags.
@@ -412,6 +432,82 @@ sum(g)
         .trim(),
     );
     assert_eq!(ty, int(), "expected Int, got {ty}");
+}
+
+/// Dependent application: looking up one partition of a group-by applies the
+/// key function `(k) ⇒ {i | key(i) == k} ⇒ V` at a concrete key, and the
+/// surviving partition predicate must reflect that key — the binder is
+/// *discharged* to the argument (design §5 / Appendix A). This is the headline
+/// case the Pi-type + substitution machinery unlocks: before it, the predicate
+/// kept the unbound group-by key.
+#[test]
+fn test_groupby_dependent_application_discharges_key() {
+    // groups : (k) ⇒ ({i | i ▷ xs ▷ key_fn == k} ⇒ Int); groups(0) discharges
+    // k ↦ 0, so the partition predicate must mention the literal 0 and no
+    // longer reference the group-by key binder `__gb_k`.
+    let ty = infer_program(
+        r#"
+groups = groupby([1, 2, 3], lambda x: x)
+groups(0)
+"#
+        .trim(),
+    );
+    let Type::Fun { domain: dom, .. } = &ty else {
+        panic!("expected a partition function type, got {ty}");
+    };
+    let Type::Refinement(_, r) = &**dom else {
+        panic!("expected a refined partition domain, got {ty}");
+    };
+    let pred = cambra::ccl::symbolic::symbolic(&r.predicate.borrow());
+    assert!(
+        !pred.contains("__gb_k"),
+        "group-by key binder should be discharged, but predicate still has it: {pred}"
+    );
+    assert!(
+        pred.contains('0'),
+        "discharged predicate should mention the argument 0: {pred}"
+    );
+}
+
+// O3 (higher-order dependent application): apply a dependent function through a
+// function-typed *parameter* whose type is still an inference variable at emit
+// time. `apply0`'s parameter `g` is a var when `g(0)` is emitted, so `apply`
+// cannot peek its Pi binder to build the identity correspondence — the discharge
+// `[k ↦ 0]` must instead be resolved at coalesce, once `g` resolves to the
+// group-by partition function. The result of `apply0(groups)` must be the same
+// `{i | key(i) == 0} ⇒ Int` partition the *direct* `groups(0)` yields: predicate
+// mentions `0`, not the group-by key binder `__gb_k`.
+//
+// Was blocked on O3 until the apply discharge moved to coalesce: `coalesce_node`
+// re-derives each application's type from its already-resolved function child,
+// discharging on the function's *real* binder rather than the fresh `__arg`
+// binder `emit_apply` peeks when the function is still an inference variable
+// (see `brainstorm/2026-06-10-apply-contravariant-recovery-at-coalesce.md`).
+#[test]
+fn test_higher_order_dependent_application_discharges_key() {
+    let ty = infer_program(
+        r#"
+groups = groupby([1, 2, 3], lambda x: x)
+apply0 = lambda g: g(0)
+apply0(groups)
+"#
+        .trim(),
+    );
+    let Type::Fun { domain: dom, .. } = &ty else {
+        panic!("expected a partition function type, got {ty}");
+    };
+    let Type::Refinement(_, r) = &**dom else {
+        panic!("expected a refined partition domain, got {ty}");
+    };
+    let pred = cambra::ccl::symbolic::symbolic(&r.predicate.borrow());
+    assert!(
+        !pred.contains("__gb_k"),
+        "group-by key binder should be discharged through the higher-order apply, but: {pred}"
+    );
+    assert!(
+        pred.contains('0'),
+        "discharged predicate should mention the argument 0: {pred}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -502,7 +598,7 @@ fn test_self_application_types() {
     // `self_application_rejected_without_panic` in `infer_simple_sub.rs`.
     let ty = infer_program("lambda x: x(x)");
     assert!(
-        matches!(&ty, Type::Fun(d, _) if matches!(&**d, Type::Fun(..))),
+        matches!(&ty, Type::Fun { domain: d, .. } if matches!(&**d, Type::Fun { .. })),
         "expected a function-domained function type, got {ty:?}"
     );
 }
@@ -513,14 +609,14 @@ fn test_self_application_types() {
 f = lambda x: x > 1
 f
 ",
-    Type::Fun(Box::new(int()), Box::new(bool_ty()))
+    Type::Fun { name: None, domain: Box::new(int()), codomain: Box::new(bool_ty()) }
 )]
 #[case::arithmetic(
     r"
 f = lambda x: x + 1
 f
 ",
-    Type::Fun(Box::new(int()), Box::new(int()))
+    Type::Fun { name: None, domain: Box::new(int()), codomain: Box::new(int()) }
 )]
 fn test_lambda_unapplied(#[case] code: &str, #[case] expected: Type) {
     assert_eq!(infer_program(code), expected);
@@ -531,7 +627,12 @@ fn test_generic_identity() {
     // f = lambda x: x; f -> Fun(?a, ?b)
     // simple-sub allows unconstrained parameters to remain unresolved.
     let ty = infer_program("f = lambda x: x\nf");
-    if let Type::Fun(dom, cod) = ty {
+    if let Type::Fun {
+        domain: dom,
+        codomain: cod,
+        ..
+    } = ty
+    {
         assert!(matches!(*dom, Type::Infer(_)));
         assert!(matches!(*cod, Type::Infer(_)));
     } else {
@@ -570,7 +671,12 @@ fn test_unconstrained_identity_applied_resolves() {
 #[test]
 fn test_filtered_comprehension_has_refinement_on_domain() {
     let ty = infer_program("[x for x in [1, 2, 3] if x > 1]");
-    if let Type::Fun(dom, cod) = &ty {
+    if let Type::Fun {
+        domain: dom,
+        codomain: cod,
+        ..
+    } = &ty
+    {
         assert!(
             matches!(&**dom, Type::Refinement(_, _)),
             "expected Refinement-wrapped domain, got {ty}"

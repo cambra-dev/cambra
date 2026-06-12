@@ -17,6 +17,7 @@ pub mod lower;
 pub mod planning;
 pub mod simple_sub;
 pub mod simplify;
+pub mod subst;
 pub mod symbolic;
 
 use std::{
@@ -83,18 +84,60 @@ pub fn reset_infer_var_counter() {
 /// through for a future let-poly extension.
 pub type Level = u32;
 
+/// A single subtyping bound on an [`InferVar`], paired with the substitution
+/// that rides its constraint edge.
+///
+/// `ty` is the bounding type (a concrete type, or a `Type::Infer` for a
+/// variable-to-variable edge). `subst` is the context morphism carried on the
+/// edge (design §3.5): identity for an ordinary monomorphic bound, a *rename*
+/// for a Pi-binder correspondence, or a *discharge* for a dependent
+/// application. To read the bound *in the holder's context*, apply `subst` to
+/// `ty` via [`Bound::materialize`]; the coalesce walk composes these
+/// substitutions along transitive edges.
+#[derive(Debug, Clone)]
+pub struct Bound {
+    /// The bounding type, expressed in the *source* context of the edge.
+    pub ty: Type,
+    /// The edge's context morphism (`Subst::id()` for ordinary bounds).
+    pub subst: subst::Subst,
+}
+
+impl Bound {
+    /// A concrete bound carrying the identity substitution — the ordinary,
+    /// non-dependent case. Behaviourally a bare `Type` until a non-identity
+    /// substitution rides the edge.
+    pub fn conc(ty: Type) -> Self {
+        Bound {
+            ty,
+            subst: subst::Subst::id(),
+        }
+    }
+
+    /// A bound carrying an explicit edge substitution.
+    pub fn with_subst(ty: Type, subst: subst::Subst) -> Self {
+        Bound { ty, subst }
+    }
+
+    /// The bound type expressed in the holder's context — `subst` applied to
+    /// `ty`. A no-op when `subst` is the identity.
+    pub fn materialize(&self) -> Type {
+        self.subst.apply_type(&self.ty)
+    }
+}
+
 /// The mutable bound lists of an [`InferVar`].
 ///
 /// `lower` are types that flow *into* the variable (`L <: α`); `upper` are
 /// types it must flow into (`α <: U`). The simple-sub solver appends to
 /// these in place via the variable's [`RefCell`]; coalescing reads them to
-/// materialize a concrete [`Type`].
+/// materialize a concrete [`Type`]. Each entry is a [`Bound`] carrying the
+/// substitution on its constraint edge.
 #[derive(Debug, Clone, Default)]
 pub struct InferBounds {
     /// Lower bounds — `L <: α`. Unioned at positive (output) positions.
-    pub lower: Vec<Type>,
+    pub lower: Vec<Bound>,
     /// Upper bounds — `α <: U`. Intersected at negative (input) positions.
-    pub upper: Vec<Type>,
+    pub upper: Vec<Bound>,
 }
 
 /// A type inference variable: an unknown type the solver pins down by
@@ -1572,12 +1615,13 @@ impl TypedExpr {
     }
 
     /// Build a [`TypedExprNode::Lambda`] with a predicate [`Refinement`].
+    /// The `refinement` predicate is a bare boolean expression in which
+    /// [`REFINEMENT_BINDER`] is free (distinct from the lambda's `param`).
     pub fn lambda_with_refinement(
         param: &str,
         param_ty: Type,
         body: TypedExpr,
         refinement: TypedExpr,
-        refinement_desc: &str,
     ) -> Self {
         Self::new(TypedExprNode::Lambda {
             param: TypedBinding {
@@ -1587,7 +1631,6 @@ impl TypedExpr {
             },
             body: Box::new(body),
             refinement: Some(Refinement {
-                description: refinement_desc.to_string(),
                 predicate: Rc::new(RefCell::new(refinement)),
             }),
         })
@@ -2065,8 +2108,29 @@ pub enum Type {
     /// with the exact length of the source list. `compile_ccl::extent_of` maps
     /// it directly to `Extent::UIntRange { start: 0, end: n }`.
     UIntRange(usize),
-    /// A non-dependent function type: `T ⇒ U`.
-    Fun(Box<Type>, Box<Type>),
+    /// A function type. When `name` is `None` it is the ordinary
+    /// non-dependent arrow `domain ⇒ codomain`. When `name` is `Some(x)` it
+    /// is a **Pi type** `(x: domain) ⇒ codomain`: the binder `x` is in scope
+    /// in `codomain` and may be referenced by refinement predicates nested
+    /// anywhere within it.
+    ///
+    /// Inference always populates `name` when it introduces a function type
+    /// from a lambda's parameter (see `emit_lambda`); whether the codomain
+    /// actually references the binder is a *property* of the resulting type,
+    /// not a structural decision made up front. A `Some`-named function whose
+    /// codomain does not mention the binder is observationally identical to
+    /// the same function with `name: None` — the binder is only load-bearing
+    /// once a nested refinement closes over it (dependent application).
+    Fun {
+        /// The Pi binder, if this function type is dependent. Bound in
+        /// `codomain`; not part of structural equality up to α-renaming once
+        /// dependent refinements consume it (see the substitution machinery).
+        name: Option<String>,
+        /// The parameter (argument) type. Contravariant position.
+        domain: Box<Type>,
+        /// The result type. Covariant position; may reference `name`.
+        codomain: Box<Type>,
+    },
     /// An ordered product type with unnamed fields (tuple).
     Tuple(Vec<Type>),
     /// A named product type (record).
@@ -2171,7 +2235,16 @@ impl fmt::Display for Type {
             // it as `∅` instead of computing `n - 1` and underflowing.
             Type::UIntRange(0) => write!(f, "∅"),
             Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
-            Type::Fun(a, b) => write!(f, "({a} ⇒ {b})"),
+            Type::Fun {
+                name: Some(x),
+                domain,
+                codomain,
+            } => write!(f, "(({x}: {domain}) ⇒ {codomain})"),
+            Type::Fun {
+                name: None,
+                domain,
+                codomain,
+            } => write!(f, "({domain} ⇒ {codomain})"),
             Type::Tuple(ts) => {
                 let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
                 write!(f, "({})", parts.join(", "))
@@ -2210,7 +2283,7 @@ impl fmt::Display for Type {
                 "{{{t} | {}}}",
                 r.predicate
                     .try_borrow()
-                    .map_or(r.description.clone(), |e| symbolic::symbolic(&e)),
+                    .map_or_else(|_| "…".to_string(), |e| symbolic::symbolic(&e)),
             ),
             Type::Hole => write!(f, "_"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
@@ -2220,14 +2293,27 @@ impl fmt::Display for Type {
 }
 
 impl Type {
-    /// Helper for creating function types
+    /// Helper for creating a non-dependent function type (`name: None`).
     pub fn fun(domain: Self, codomain: Self) -> Self {
-        Type::Fun(Box::new(domain), Box::new(codomain))
+        Type::Fun {
+            name: None,
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
+    }
+
+    /// Helper for creating a dependent (Pi) function type `(name: domain) ⇒ codomain`.
+    pub fn pi(name: impl Into<String>, domain: Self, codomain: Self) -> Self {
+        Type::Fun {
+            name: Some(name.into()),
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
     }
 
     /// If this is a function type, return the domain type, otherwise None.
     pub fn domain(&self) -> Option<Type> {
-        if let Type::Fun(domain, _) = &self {
+        if let Type::Fun { domain, .. } = &self {
             Some(domain.as_ref().clone())
         } else {
             None
@@ -2236,10 +2322,48 @@ impl Type {
 
     /// If this is a function type, return the codomain type, otherwise None.
     pub fn codomain(&self) -> Option<Type> {
-        if let Type::Fun(_, codomain) = &self {
+        if let Type::Fun { codomain, .. } = &self {
             Some(codomain.as_ref().clone())
         } else {
             None
+        }
+    }
+
+    /// A structural copy with every Pi binder name erased (`Fun.name → None`).
+    ///
+    /// The binder is load-bearing only inside the type solver (it carries
+    /// dependent-refinement correspondences); downstream passes treat function
+    /// types structurally and a `Some`/`None` binder is the same arrow to them.
+    /// Use this when comparing types for structural equality across a pass that
+    /// does not preserve the cosmetic binder.
+    pub fn without_pi_names(&self) -> Type {
+        match self {
+            Type::Fun {
+                domain, codomain, ..
+            } => Type::Fun {
+                name: None,
+                domain: Box::new(domain.without_pi_names()),
+                codomain: Box::new(codomain.without_pi_names()),
+            },
+            Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| t.without_pi_names()).collect()),
+            Type::Record(fs) => Type::Record(
+                fs.iter()
+                    .map(|(n, t)| (n.clone(), t.without_pi_names()))
+                    .collect(),
+            ),
+            Type::Variant(tags) => Type::Variant(
+                tags.iter()
+                    .map(|(k, t)| (k.clone(), t.without_pi_names()))
+                    .collect(),
+            ),
+            Type::Refinement(base, r) => {
+                Type::Refinement(Box::new(base.without_pi_names()), r.clone())
+            }
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::Hole
+            | Type::Infer(_)
+            | Type::DataSource(_) => self.clone(),
         }
     }
 
@@ -2272,7 +2396,9 @@ impl Type {
             | Type::Hole
             | Type::Infer(_)
             | Type::DataSource(_) => {}
-            Type::Fun(domain, codomain) => {
+            Type::Fun {
+                domain, codomain, ..
+            } => {
                 f(domain);
                 f(codomain);
             }
@@ -2305,7 +2431,9 @@ impl Type {
             | Type::Hole
             | Type::Infer(_)
             | Type::DataSource(_) => {}
-            Type::Fun(domain, codomain) => {
+            Type::Fun {
+                domain, codomain, ..
+            } => {
                 f(domain);
                 f(codomain);
             }
@@ -2342,12 +2470,24 @@ impl Type {
     }
 }
 
-/// Represents a type refinement carried by a [`TypedExprNode::Lambda`] parameter.
+/// Represents a type refinement: a base type narrowed by a boolean predicate.
+///
+/// The refinement *is a binding form*. Rather than carry a per-refinement
+/// binder name, every refinement implicitly binds the single reserved
+/// [`REFINEMENT_BINDER`], which ranges over the refined base type and is free
+/// in [`predicate`]. A predicate references its own element through that one
+/// name; nested refinements simply shadow it, which is the correct lexical
+/// scoping (a predicate never refers to an *outer* refinement's element, only
+/// to its own plus enclosing `Fun`-binders, which have their own distinct
+/// names). A fixed binder means refinement equality is plain structural
+/// equality of the bare predicate — no α-renaming needed.
+///
+/// [`predicate`]: Refinement::predicate
 #[derive(Debug, Clone)]
 pub struct Refinement {
-    /// Human-readable description of the predicate or join condition.
-    pub description: String,
-    /// Arbitrary boolean predicate; compiled as an element-wise loop join.
+    /// A **bare** boolean expression (not a lambda) in which
+    /// [`REFINEMENT_BINDER`] is free. Compiled as an element-wise loop join
+    /// when its type is iterated.
     pub predicate: Rc<RefCell<TypedExpr>>,
 }
 
@@ -2361,6 +2501,12 @@ pub struct Refinement {
 /// traversal over a tree that owns the `Rc`s (a freed cell's address can be
 /// reused).
 pub type PredicateCellId = *const RefCell<TypedExpr>;
+
+/// The single reserved binder every [`Refinement`] implicitly introduces. It
+/// is free in a refinement's predicate and ranges over the refined base type.
+/// Disjoint from user identifiers by construction (lowering never produces
+/// it); nested refinements share it and shadow positionally.
+pub const REFINEMENT_BINDER: &str = "__elem";
 
 impl Refinement {
     /// The [`PredicateCellId`] of this refinement's predicate cell.
@@ -2385,8 +2531,12 @@ impl PartialEq for Refinement {
     /// one predicate made along a specialization descent line — privatized,
     /// freshened, pinned at different use types — denote the same refinement
     /// while their type slots differ. Comparing the term and skipping the
-    /// types keeps those copies equal, exactly as [`Hash`](Refinement::hash)
-    /// keeps them hash-equal.
+    /// types keeps those copies equal, exactly as the [`Hash`](std::hash::Hash)
+    /// impl keeps them hash-equal.
+    ///
+    /// Every refinement binds the same reserved [`REFINEMENT_BINDER`], so
+    /// equality is plain structural equality of the bare predicate — the
+    /// binder appears identically on both sides, with no α-renaming to do.
     ///
     /// Pointer-equal cells short-circuit: a refinement that merely flows
     /// around shares its predicate `Rc`, so the common case never compares
@@ -2826,11 +2976,10 @@ mod tests {
         let cast_pred = |op: CompareKind| {
             TypedExpr::cast(
                 TypedExpr::var("xs"),
-                ccl_utils::refined_fn_type(Type::Hole, filter(op), Type::Hole, "filter"),
+                ccl_utils::refined_fn_type(Type::Hole, filter(op), Type::Hole),
             )
         };
         let refinement = |pred: TypedExpr| Refinement {
-            description: String::new(),
             predicate: Rc::new(RefCell::new(pred)),
         };
 

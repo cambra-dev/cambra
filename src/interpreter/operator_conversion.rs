@@ -322,7 +322,11 @@ impl OpConversionContext {
                     .collect();
                 Ok(Extent::record(fields?))
             }
-            Type::Fun(a, b) => Ok(Extent::Function {
+            Type::Fun {
+                domain: a,
+                codomain: b,
+                ..
+            } => Ok(Extent::Function {
                 domain: Box::new(self.extent_of(a)?),
                 codomain: Box::new(self.extent_of(b)?),
             }),
@@ -1218,7 +1222,7 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
 fn is_const(expr: &Expr) -> Option<&Expr> {
     if let TypedExprNode::Apply { function, argument } = &expr.node
         && as_builtin(function) == Some(Builtin::Const)
-        && !matches!(argument.ty, Type::Fun(..))
+        && !matches!(argument.ty, Type::Fun { .. })
     {
         return Some(argument.as_ref());
     }

@@ -4,7 +4,10 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use crate::ccl::{BaseType, Builtin, Expr, Lit, PredicateCellId, Refinement, Type, TypedExprNode};
+use crate::ccl::{
+    BaseType, Builtin, Expr, Lit, PredicateCellId, REFINEMENT_BINDER, Refinement, Type,
+    TypedExprNode,
+};
 
 /// Builds an application of a primitive combinator, setting the types based on
 /// the input expression's type and the provided output type.
@@ -165,16 +168,24 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
 /// place rather than replacing it; see there for how the rewrite is threaded
 /// down the combinator's function spine so the post-planning `typecheck`
 /// reconstructs it. No runtime node is added (the combinators are type-level).
-pub fn refine_codomain(morphism: Expr, predicate: &Expr) -> Expr {
-    if is_trivially_true_predicate(predicate) {
-        return morphism;
-    }
+pub fn refine_codomain(morphism: Expr, bare_predicate: &Expr) -> Expr {
     let codomain = morphism
         .ty
         .codomain()
         .expect("join morphism must be a function type")
         .clone();
-    set_codomain(morphism, refine_with(codomain, predicate))
+    // `bare_predicate` is already the bare `Bool`-over-`__elem` form (the extent's
+    // membership condition, the same predicate the body's `cast` demands), so it
+    // is stored directly — *not* via `refine_with`, which wraps a predicate
+    // *function*. Storing the identical bare term keeps the producer codomain
+    // structurally equal to the cast demand.
+    let refined = Type::Refinement(
+        Box::new(codomain),
+        Refinement {
+            predicate: Rc::new(RefCell::new(bare_predicate.clone())),
+        },
+    );
+    set_codomain(morphism, refined)
 }
 
 /// Re-stamp a morphism `D ⇒ _`'s codomain to `new_codomain`, yielding
@@ -248,7 +259,7 @@ fn restamp_spine_result(node: &mut Expr, new_result: Type) {
 /// refinement code in lambda_elim.
 pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
     assert!(
-        matches!(&target_ty, Type::Fun(d, _) if matches!(d.as_ref(), Type::Refinement(..))),
+        matches!(&target_ty, Type::Fun { domain: d, codomain: _, .. } if matches!(d.as_ref(), Type::Refinement(..))),
         "make_cast target_ty must be Fun(Refinement(_, _), _), got {target_ty}"
     );
     Expr::cast(value, target_ty)
@@ -264,7 +275,7 @@ pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
 /// The returned `Refinement` shares the predicate's `Rc<RefCell<Expr>>` with
 /// `target`.
 pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
-    let Type::Fun(domain, _) = target else {
+    let Type::Fun { domain, .. } = target else {
         return None;
     };
     let Type::Refinement(_, refinement) = domain.as_ref() else {
@@ -278,21 +289,17 @@ pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
 ///
 /// Used by lowering to build the target type for a [`make_cast`] that
 /// imposes a refinement on a function's domain (the canonical shape produced
-/// by list-comp filters, for-loop `if`-guards, and `groupby`).
+/// by list-comp filters, for-loop `if`-guards, and `groupby`). `predicate` is
+/// a **bare** boolean expression in which [`REFINEMENT_BINDER`] is free (the
+/// element being filtered) — not a lambda.
 ///
 /// `base_domain` and `codomain` are typically `Type::Hole` at lowering time;
 /// inference fills them in by unifying against the value being cast.
-pub fn refined_fn_type(
-    base_domain: Type,
-    predicate: Expr,
-    codomain: Type,
-    description: &str,
-) -> Type {
+pub fn refined_fn_type(base_domain: Type, predicate: Expr, codomain: Type) -> Type {
     Type::fun(
         Type::Refinement(
             Box::new(base_domain),
             Refinement {
-                description: description.to_string(),
                 predicate: Rc::new(RefCell::new(predicate)),
             },
         ),
@@ -300,28 +307,65 @@ pub fn refined_fn_type(
     )
 }
 
-/// Peel every top-level [`Type::Refinement`] layer off `ty`, returning the
-/// bare base type.  Used to compare domains up to refinements (which are
-/// transparent to structural shape).
-fn strip_refinements(ty: &Type) -> &Type {
-    let mut t = ty;
-    while let Type::Refinement(base, _) = t {
-        t = base;
+/// A structural copy of `ty` with every [`Type::Refinement`] layer removed,
+/// at any depth (inside tuples / records / function types).  Used to compare
+/// domains up to refinements (which are transparent to structural shape) —
+/// the two sides may carry the same predicate at different compilation stages
+/// (bare `__elem ▷ p` before vs after planning normalizes `p` to point-free),
+/// so refinements must not participate in the comparison at any depth.
+fn strip_refinements(ty: &Type) -> Type {
+    match ty {
+        Type::Refinement(base, _) => strip_refinements(base),
+        Type::Fun {
+            name,
+            domain,
+            codomain,
+        } => Type::Fun {
+            name: name.clone(),
+            domain: Box::new(strip_refinements(domain)),
+            codomain: Box::new(strip_refinements(codomain)),
+        },
+        Type::Tuple(ts) => Type::Tuple(ts.iter().map(strip_refinements).collect()),
+        Type::Record(fs) => Type::Record(
+            fs.iter()
+                .map(|(n, t)| (n.clone(), strip_refinements(t)))
+                .collect(),
+        ),
+        Type::Variant(tags) => Type::Variant(
+            tags.iter()
+                .map(|(k, t)| (k.clone(), strip_refinements(t)))
+                .collect(),
+        ),
+        Type::Base(_) | Type::UIntRange(_) | Type::Hole | Type::Infer(_) | Type::DataSource(_) => {
+            ty.clone()
+        }
     }
-    t
 }
 
-/// Wrap `base` in a fresh `Type::Refinement` carrying `predicate`,
-/// unless the predicate is trivially true (then return `base` unchanged).
+/// The **bare** boolean form of a point-free predicate function `p : D ⇒ Bool`:
+/// the application `__elem ▷ p` (`= p(__elem)`), in which the implicit
+/// [`REFINEMENT_BINDER`] (typed at the element type `base`) stands for the
+/// element. This is the one shape a [`Refinement`] ever stores — a function `p`
+/// lives only in a *term* (an `Apply(p, Iterate/Restrict)` argument), never in a
+/// refinement type. `planning::fn_of_bare_predicate` is the inverse.
+pub fn bare_predicate_of_fn(base: &Type, predicate: Expr) -> Expr {
+    let elem = Expr::var(REFINEMENT_BINDER).with_ty(base.clone());
+    Expr::apply(elem, predicate).with_ty(Type::Base(BaseType::Bool))
+}
+
+/// Wrap `base` in a fresh `Type::Refinement` whose bare predicate filters the
+/// element by the point-free function `predicate : base ⇒ Bool` (stored as
+/// `__elem ▷ predicate`, see [`bare_predicate_of_fn`]). Returns `base` unchanged
+/// when the predicate is trivially true.
 fn refine_with(base: Type, predicate: &Expr) -> Type {
     if is_trivially_true_predicate(predicate) {
         return base;
     }
+    let bare = bare_predicate_of_fn(&base, predicate.clone());
     Type::Refinement(
         Box::new(base),
         Refinement {
-            description: String::new(),
-            predicate: Rc::new(RefCell::new(predicate.clone())),
+            predicate: Rc::new(RefCell::new(bare)),
         },
     )
 }
@@ -495,6 +539,95 @@ fn count_free_with_visited(
 /// shadowing rules.
 pub fn is_free(name: &str, expr: &Expr) -> bool {
     count_free(name, expr) > 0
+}
+
+/// Like [`is_free`] but considers only the **value** (the node tree), ignoring
+/// type slots — whether `name` occurs free in `expr`'s term structure, *not* in
+/// any refinement predicate riding its types.
+///
+/// Lambda elimination uses this to distinguish a binder used in the value (which
+/// needs real point-free elimination) from one free only in a refinement on the
+/// body's type. The latter is the **Pi-const** case: the value is a `const` and
+/// the binder rides the type as a Pi binder (a dependent refinement), e.g. after
+/// pairing rewrites a partition predicate onto a pair domain.
+pub fn is_free_in_value(name: &str, expr: &Expr) -> bool {
+    count_free_in_value(name, expr) > 0
+}
+
+/// Value-only worker for [`is_free_in_value`]: mirrors [`count_free`]'s
+/// shadowing rules over the node tree but never descends into type slots (and so
+/// a refinement on a `Lambda` param — which lives in the type — is ignored).
+fn count_free_in_value(name: &str, expr: &Expr) -> usize {
+    match &expr.node {
+        TypedExprNode::Var(n) => (n == name) as usize,
+        TypedExprNode::Lambda { param, body, .. } => {
+            if param.name == name {
+                0
+            } else {
+                count_free_in_value(name, body)
+            }
+        }
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            count_free_in_value(name, bound_expr)
+                + if binding.name == name {
+                    0
+                } else {
+                    count_free_in_value(name, body)
+                }
+        }
+        TypedExprNode::Loop {
+            params,
+            init_args,
+            source,
+            loop_body,
+        } => {
+            let shadowed = params.iter().any(|p| p.name == name);
+            (if shadowed {
+                0
+            } else {
+                count_free_in_value(name, loop_body)
+            }) + count_free_in_value(name, source)
+                + init_args
+                    .iter()
+                    .map(|a| count_free_in_value(name, a))
+                    .sum::<usize>()
+        }
+        TypedExprNode::Feed {
+            name: handle,
+            value,
+        }
+        | TypedExprNode::Define {
+            name: handle,
+            value,
+        } => (handle == name) as usize + count_free_in_value(name, value),
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            scrutinee
+                .as_ref()
+                .map_or(0, |s| count_free_in_value(name, s))
+                + branches
+                    .iter()
+                    .map(|b| {
+                        if b.pattern.as_ref().is_some_and(|p| p.binding.name == name) {
+                            0
+                        } else {
+                            count_free_in_value(name, &b.guard) + count_free_in_value(name, &b.body)
+                        }
+                    })
+                    .sum::<usize>()
+        }
+        _ => {
+            let mut sum = 0;
+            expr.walk_children(|e| sum += count_free_in_value(name, e));
+            sum
+        }
+    }
 }
 
 /// Recursive worker for the type-walking side of [`count_free`].  Same

@@ -141,7 +141,11 @@ pub fn simplify(mut expr: Expr) -> Expr {
 ///   the re-scan was O(n²) over the long compose chains planning emits.
 fn simplify_once(expr: &mut Expr) -> (bool, bool) {
     let mut changed = false;
-    if let Type::Fun(domain, _) = &mut expr.ty
+    if let Type::Fun {
+        domain,
+        codomain: _,
+        ..
+    } = &mut expr.ty
         && let Type::Refinement(_, refinment) = &mut **domain
     {
         let pred = &refinment.predicate;
@@ -195,8 +199,18 @@ fn recurse_simplify(expr: &mut Expr) -> (bool, bool) {
     // itself. Simplification can change the body's type (e.g., union flattening
     // rewrites Fun(Union(Union(A,B),C), D) → Fun(Union(A,B,C), D)); the Let
     // must stay in sync so downstream passes see a consistent representation.
-    if let TypedExprNode::Let { body, .. } = &expr.node {
-        let body_ty = body.ty.clone();
+    // Lifting the body's type out of the binder's scope must discharge
+    // `[v ↦ bound]` into its refinement predicates (design §6.2 move-site
+    // rule), matching inference's let-closing so the recorded type stays
+    // well-formed (closed over `v`) and the post-pass check reconciles.
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &expr.node
+    {
+        let body_ty = crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone())
+            .apply_type(&body.ty);
         if expr.ty != body_ty {
             expr.ty = body_ty;
             changed = true;
@@ -238,7 +252,11 @@ fn try_string_add_to_concat(expr: &mut Expr) -> bool {
         TypedExprNode::Builtin(Builtin::BinOp(op))
             if *op == BinOpKind::Arithmetic(ArithmeticKind::Add) =>
         {
-            if let Type::Fun(arg_ty, _) = &expr.ty
+            if let Type::Fun {
+                domain: arg_ty,
+                codomain: _,
+                ..
+            } = &expr.ty
                 && let Type::Tuple(elts) = arg_ty.as_ref()
                 && elts.first() == Some(&Type::Base(BaseType::String))
             {
@@ -849,15 +867,33 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
 
             // Compute types for the composed expressions
             let g_ty = match (&left.ty, &g.ty) {
-                (Type::Fun(dom, _), Type::Fun(_, cod)) => {
-                    Type::fun(dom.as_ref().clone(), cod.as_ref().clone())
-                }
+                (
+                    Type::Fun {
+                        domain: dom,
+                        codomain: _,
+                        ..
+                    },
+                    Type::Fun {
+                        domain: _,
+                        codomain: cod,
+                        ..
+                    },
+                ) => Type::fun(dom.as_ref().clone(), cod.as_ref().clone()),
                 _ => Type::Hole,
             };
             let h_ty = match (&left.ty, &h.ty) {
-                (Type::Fun(dom, _), Type::Fun(_, cod)) => {
-                    Type::fun(dom.as_ref().clone(), cod.as_ref().clone())
-                }
+                (
+                    Type::Fun {
+                        domain: dom,
+                        codomain: _,
+                        ..
+                    },
+                    Type::Fun {
+                        domain: _,
+                        codomain: cod,
+                        ..
+                    },
+                ) => Type::fun(dom.as_ref().clone(), cod.as_ref().clone()),
                 _ => Type::Hole,
             };
 
@@ -999,22 +1035,32 @@ mod tests {
     }
 
     fn fun_ty(a: Type, b: Type) -> Type {
-        Type::Fun(Box::new(a), Box::new(b))
+        Type::Fun {
+            name: None,
+            domain: Box::new(a),
+            codomain: Box::new(b),
+        }
     }
 
     fn typed_compose(elts: Vec<Expr>) -> Expr {
         let mut fun_tys = Vec::new();
         for e in &elts {
-            if let Type::Fun(d, c) = &e.ty {
+            if let Type::Fun {
+                domain: d,
+                codomain: c,
+                ..
+            } = &e.ty
+            {
                 fun_tys.push(((*d).clone(), (*c).clone()));
             } else {
                 panic!("compose element not a function: {e:?}");
             }
         }
-        let ty = Type::Fun(
-            fun_tys.first().unwrap().0.clone(),
-            fun_tys.last().unwrap().1.clone(),
-        );
+        let ty = Type::Fun {
+            name: None,
+            domain: fun_tys.first().unwrap().0.clone(),
+            codomain: fun_tys.last().unwrap().1.clone(),
+        };
         Expr::compose(elts).with_ty(ty)
     }
 

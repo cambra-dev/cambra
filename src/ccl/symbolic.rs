@@ -492,7 +492,8 @@ fn fmt_refinement(r: &Refinement, opts: &SymbolicOpts) -> String {
     if let Ok(pred) = &p.try_borrow() {
         fmt(pred, Precedence::Atom, opts)
     } else {
-        r.description.clone()
+        // The cell is transiently held by a rewrite pass; show a placeholder.
+        "…".to_string()
     }
 }
 
@@ -700,10 +701,7 @@ mod tests {
     #[case(
         Expr::lambda(
             "x",
-            Type::Fun(
-                Box::new(Type::Base(BaseType::Int)),
-                Box::new(Type::Base(BaseType::Bool)),
-            ),
+            Type::Fun { name: None, domain: Box::new(Type::Base(BaseType::Int)), codomain: Box::new(Type::Base(BaseType::Bool)) },
             Expr::var("x"),
         ),
         "λ x : (Int ⇒ Bool) → x"
@@ -767,7 +765,6 @@ in x"
             Type::infer(),
             Expr::var("x"),
             Expr::lit(Lit::Bool(true)),
-            "x > 0",
         ),
         "λ x : {??? | true} → x"
     )]
@@ -778,7 +775,6 @@ in x"
             Type::Base(BaseType::Int),
             Expr::var("x"),
             Expr::lit(Lit::Bool(true)),
-            "x > 0",
         ),
         "λ x : {Int | true} → x"
     )]

@@ -1622,10 +1622,6 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
         deleted: BitSet::new(),
     }
 )]
-#[ignore = "simple-sub monomorphization gap: the filtered inner comprehension's \
-            refined __iter_record argument coalesces to an unresolved Infer var \
-            (not fixed by the tagged-variant work; needs the \
-            monomorphization pass)"]
 #[case(
     "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], lambda x: x // 2)]",
     Tile::SealedFunction {
@@ -2351,7 +2347,7 @@ fn test_no_fan_outs(#[case] code: &str) {
 )]
 #[case(
     "[x for x in [False,True] if x]",
-    "iterate ▷ ([false, true] ▷ restrict) ≫ cast([false, true]):({[0, 1] | [false, true]} ⇒ Bool)",
+    "iterate ▷ ([false, true] ▷ restrict) ≫ cast([false, true]):({[0, 1] | __elem ▷ [false, true]} ⇒ Bool)",
     Tile::SealedFunction {
         domain: ColumnValue::UInts(vec![1]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Bools(BitVec::from_elem(1, true)))),
@@ -2361,7 +2357,7 @@ fn test_no_fan_outs(#[case] code: &str) {
 )]
 #[case(
     "[x + 10 for x in [1,2,3] if x == 2]",
-    "iterate ▷ (([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq) ▷ restrict) ≫ cast([1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add):({[0, 2] | [1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq} ⇒ Int)",
+    "iterate ▷ (([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq) ▷ restrict) ≫ cast([1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add):({[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq)} ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::UInts(vec![1]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![12]))),
@@ -2422,7 +2418,7 @@ fn test_no_fan_outs(#[case] code: &str) {
 )]
 #[case(
     "[x + y for x in [1,2,3] if x == 2 for y in [10,20] if y == 10]",
-    "iterate ▷ ((((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add):({([0, 2], [0, 1]) | ((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and} ⇒ Int)",
+    "iterate ▷ ((((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add):({([0, 2], [0, 1]) | __elem ▷ (((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and)} ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![1])),
@@ -2443,7 +2439,7 @@ fn test_no_fan_outs(#[case] code: &str) {
 )]
 #[case(
     "[x for x in [y for y in [1,2,3] if y < 3] if x < 2]",
-    "iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(cast([1, 2, 3])):({{[0, 2] | [1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt} | cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt} ⇒ Int)",
+    "iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(cast([1, 2, 3])):({{[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} | __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⇒ Int)",
     make_int_list(&[1])
 )]
 #[case(
@@ -2483,7 +2479,7 @@ fn test_no_fan_outs(#[case] code: &str) {
 )]
 #[case(
     "[x + 10 for x in testsource1() if x < 15]",
-    "iterate ▷ ((source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add):({source(testsource1) | source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt} ⇒ Int)",
+    "iterate ▷ ((source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add):({source(testsource1) | __elem ▷ (source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt)} ⇒ Int)",
     make_int_list(&[10, 20])
 )]
 #[case("sum([1,2,3])", "(iterate ≫ [1, 2, 3]) ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]
@@ -2584,7 +2580,7 @@ fn test_no_fan_outs(#[case] code: &str) {
 )]
 #[case(
     "[x + y for x in [2] for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]",
-    "(iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ add):(([0, 0], {([0, 1], [0, 2]) | (.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq}) ⇒ Int)",
+    "(iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ add):(([0, 0], {([0, 1], [0, 2]) | __elem.0 ▷ [1, 2] ▷ (λ a : Int → __elem.1 ▷ [1, 2, 3] ▷ (λ b : Int → a == b))}) ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
@@ -2639,7 +2635,7 @@ fn test_no_fan_outs(#[case] code: &str) {
 )]
 #[case(
     "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and x + y == z + 1]",
-    "iterate ▷ (((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | (((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and} ⇒ Int)",
+    "iterate ▷ (((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ ((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and)} ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),
@@ -2783,5 +2779,21 @@ fn test_collection_let_unaffected(#[case] code: &str, #[case] expected: Tile) {
 #[case("add3 = lambda x, y, z: x + y + z\nadd3(1, 2, 3)", Value::Int(6))]
 #[case("mix = lambda x, y, z: x * y - z\nmix(4, 5, 2)", Value::Int(18))]
 fn test_multi_arg_udf(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// Dependent application end-to-end: a single-key group-by lookup `g(k)` is
+// typed as a partition function whose refinement predicate has the key
+// discharged (the Pi-type machinery), and the existing cast→Restrict
+// consumption filters the collection by that predicate at the iteration
+// boundary. These exercise the dependent type *through to runtime values*.
+#[rstest]
+#[case("g = groupby([1,1,2,2,3], lambda x: x)\nsum(g(1))", Value::Int(2))] // {1,1}
+#[case("g = groupby([1,1,2,2,3], lambda x: x)\nsum(g(2))", Value::Int(4))] // {2,2}
+#[case("g = groupby([1,1,2,2,3], lambda x: x)\nsum(g(3))", Value::Int(3))] // {3}
+#[case("g = groupby([1,2,3,4,5], lambda x: x // 2)\nsum(g(0))", Value::Int(1))] // {1}
+#[case("g = groupby([1,2,3,4,5], lambda x: x // 2)\nsum(g(1))", Value::Int(5))] // {2,3}
+#[case("g = groupby([1,2,3,4,5], lambda x: x // 2)\nsum(g(2))", Value::Int(9))] // {4,5}
+fn test_dependent_groupby_lookup(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
