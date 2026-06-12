@@ -50,7 +50,7 @@ use crate::ccl::ccl_utils::{
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
 use crate::ccl::{BaseType, Expr, Type, TypedExpr, TypedExprNode, symbolic::symbolic};
-use crate::ccl::{Builtin, Lit, Refinement, next_refinement_id};
+use crate::ccl::{Builtin, Lit, Refinement};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -90,7 +90,7 @@ pub fn run(expr: Expr) -> Result<Expr, LambdaElimError> {
     // by [`crate::ccl::desugar_defers`]) and eliminate lambdas inside
     // them too — the main walk only visits expressions, so predicates
     // sitting in type positions wouldn't otherwise be touched.
-    let mut seen_refinements: std::collections::HashSet<crate::ccl::RefinementId> =
+    let mut seen_refinements: std::collections::HashSet<crate::ccl::PredicateCellId> =
         std::collections::HashSet::new();
     elim_lambdas_in_type_refinements(&mut point_free, &mut ctx, &mut seen_refinements)?;
     let simplified = simplify(point_free);
@@ -99,13 +99,13 @@ pub fn run(expr: Expr) -> Result<Expr, LambdaElimError> {
 
 /// Walk `expr` and every nested `Type::Refinement` predicate, running
 /// [`elim_lambdas`] on the predicate so it becomes point-free.  Tracks
-/// already-visited [`Refinement::id`]s in `seen` so shared refinement
+/// already-visited predicate cells in `seen` so shared refinement
 /// instances (e.g. duplicated by [`substitute`] cloning a type with
 /// `Rc`-shared predicates) are processed only once.
 fn elim_lambdas_in_type_refinements(
     expr: &mut Expr,
     ctx: &mut ElimContext,
-    seen: &mut std::collections::HashSet<crate::ccl::RefinementId>,
+    seen: &mut std::collections::HashSet<crate::ccl::PredicateCellId>,
 ) -> Result<(), LambdaElimError> {
     elim_lambdas_in_type(&mut expr.ty, ctx, seen)?;
     // `Defer`/`Feed`/`Define`/`ExprStmt` are eliminated by
@@ -122,11 +122,11 @@ fn elim_lambdas_in_type_refinements(
 }
 
 /// Walk `ty` and run [`elim_lambdas`] on every `Refinement` predicate
-/// nested inside.  Skips refinements whose ID is already in `seen`.
+/// nested inside.  Skips predicate cells already in `seen`.
 fn elim_lambdas_in_type(
     ty: &mut Type,
     ctx: &mut ElimContext,
-    seen: &mut std::collections::HashSet<crate::ccl::RefinementId>,
+    seen: &mut std::collections::HashSet<crate::ccl::PredicateCellId>,
 ) -> Result<(), LambdaElimError> {
     let mut err = Ok(());
     walk_refined_predicates_mut(ty, seen, &mut |pred, _vis| {
@@ -630,7 +630,6 @@ fn elim_lambda_impl(
                 let refined_dom = Type::Refinement(
                     inner_dom,
                     Refinement {
-                        id: next_refinement_id(),
                         description: "uncurried".into(),
                         predicate: Rc::new(RefCell::new(fully_elim_ref_body)),
                     },
@@ -1027,7 +1026,6 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let source_domain = target_elim.ty.domain().unwrap();
             let source_codomain = target_elim.ty.codomain().unwrap();
             let refinement = Refinement {
-                id: next_refinement_id(),
                 description: "for-filter".into(),
                 predicate: Rc::new(RefCell::new(pred_on_source)),
             };
@@ -1596,14 +1594,13 @@ mod tests {
     /// `substitute` to silently skip the substitution.
     #[test]
     fn is_free_detects_var_in_partial_tuple_refinement() {
-        use crate::ccl::{Refinement, next_refinement_id};
+        use crate::ccl::Refinement;
         use std::cell::RefCell;
         use std::rc::Rc;
 
         // pred = Var("x") — the refinement predicate references x.
         let pred = Rc::new(RefCell::new(Expr::var("x")));
         let refinement = Refinement {
-            id: next_refinement_id(),
             description: "test".to_string(),
             predicate: pred,
         };

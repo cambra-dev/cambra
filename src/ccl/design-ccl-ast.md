@@ -475,9 +475,10 @@ enum Type {
 }
 
 /// Carries the restriction predicate for a refined Lambda domain (i.e. a filtered/joined comprehension).
+/// Equality is type-blind structural equality of the predicate term (pointer-equal
+/// cells short-circuit); traversals needing occurrence identity key on the
+/// predicate cell's address (`PredicateCellId`).
 struct Refinement {
-    /// Unique ID for this refinement
-    id: RefinementId, 
     /// Human-readable description shown by the symbolic printer (e.g. `"x < 10"`, `"x == y"`).
     description: String,
     /// Arbitrary boolean predicate expressed as CCL.

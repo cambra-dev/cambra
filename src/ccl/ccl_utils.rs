@@ -4,9 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use crate::ccl::{
-    BaseType, Builtin, Expr, Lit, Refinement, RefinementId, Type, TypedExprNode, next_refinement_id,
-};
+use crate::ccl::{BaseType, Builtin, Expr, Lit, PredicateCellId, Refinement, Type, TypedExprNode};
 
 /// Builds an application of a primitive combinator, setting the types based on
 /// the input expression's type and the provided output type.
@@ -68,9 +66,9 @@ pub fn is_trivially_true_predicate(expr: &Expr) -> bool {
 /// [`is_trivially_true_predicate`]), the output type degenerates to
 /// `D ⇒ D` with no refinement wrapper: the refinement would carry no
 /// information, and skipping it keeps program dumps and golden tests
-/// free of `{D | true ▷ const}` noise.  The refinement is fresh —
-/// refinement IDs are used only for cycle detection in walkers and
-/// extent caching, so a fresh ID per marker is safe.
+/// free of `{D | true ▷ const}` noise.  The refinement's predicate lives
+/// in a fresh cell — safe because tags match by structural predicate
+/// equality, while walkers key cycle detection on the cell address.
 ///
 /// Op-conversion compiles `Apply(p, Iterate)` to an `IterateExtent` tile
 /// (plus a `Restrict` filter when the predicate is non-trivial).  The
@@ -199,14 +197,14 @@ pub fn set_codomain(mut morphism: Expr, new_codomain: Type) -> Expr {
         .expect("morphism must be a function type")
         .clone();
     let new_ty = Type::fun(domain, new_codomain);
-    if let TypedExprNode::Apply { function, .. } = &mut morphism.node {
-        restamp_spine_result(function, new_ty.clone());
-    } else {
-        debug_assert!(
-            false,
-            "set_codomain: morphism must be an applied combinator"
-        );
-    }
+    // Construction-time contract, not a user error: a non-`Apply` morphism
+    // has no spine to restamp, and silently restamping only the outer type
+    // would hand the post-planning typecheck an internally-inconsistent node
+    // (see the doc comment). Panic in all builds, matching `make_cast`.
+    let TypedExprNode::Apply { function, .. } = &mut morphism.node else {
+        unreachable!("set_codomain: morphism must be an applied combinator");
+    };
+    restamp_spine_result(function, new_ty.clone());
     morphism.ty = new_ty;
     morphism
 }
@@ -294,7 +292,6 @@ pub fn refined_fn_type(
         Type::Refinement(
             Box::new(base_domain),
             Refinement {
-                id: next_refinement_id(),
                 description: description.to_string(),
                 predicate: Rc::new(RefCell::new(predicate)),
             },
@@ -323,7 +320,6 @@ fn refine_with(base: Type, predicate: &Expr) -> Type {
     Type::Refinement(
         Box::new(base),
         Refinement {
-            id: next_refinement_id(),
             description: String::new(),
             predicate: Rc::new(RefCell::new(predicate.clone())),
         },
@@ -354,13 +350,17 @@ pub fn count_free(name: &str, expr: &Expr) -> usize {
 }
 
 /// Recursive worker for [`count_free`].  Threads a `visited` set of
-/// already-walked [`crate::ccl::RefinementId`]s so that self-referential
-/// refinements (a Lambda param `xs` whose type contains a refinement
-/// whose predicate references `xs`) terminate cleanly.  Each refinement
-/// is walked at most once per top-level [`count_free`] call — its
-/// predicate's free-var count is collected on first encounter and
-/// short-circuited on subsequent encounters.
-fn count_free_with_visited(name: &str, expr: &Expr, visited: &mut HashSet<RefinementId>) -> usize {
+/// already-walked predicate cells ([`PredicateCellId`]) so that
+/// self-referential refinements (a Lambda param `xs` whose type contains a
+/// refinement whose predicate references `xs`) terminate cleanly.  Each
+/// predicate cell is walked at most once per top-level [`count_free`] call —
+/// its free-var count is collected on first encounter and short-circuited on
+/// subsequent encounters.
+fn count_free_with_visited(
+    name: &str,
+    expr: &Expr,
+    visited: &mut HashSet<PredicateCellId>,
+) -> usize {
     let in_type = count_free_in_type_with_visited(name, &expr.ty, visited);
     let in_node = match &expr.node {
         TypedExprNode::Var(n) => (n == name) as usize,
@@ -377,7 +377,7 @@ fn count_free_with_visited(name: &str, expr: &Expr, visited: &mut HashSet<Refine
             let in_refinement = refinement
                 .as_ref()
                 .and_then(|r| {
-                    if !visited.insert(r.id) {
+                    if !visited.insert(r.cell_id()) {
                         return Some(0);
                     }
                     let pred_rc = &r.predicate;
@@ -515,7 +515,7 @@ pub fn is_free(name: &str, expr: &Expr) -> bool {
 fn count_free_in_type_with_visited(
     name: &str,
     ty: &Type,
-    visited: &mut HashSet<RefinementId>,
+    visited: &mut HashSet<PredicateCellId>,
 ) -> usize {
     let mut count = 0;
     walk_refined_predicates(ty, visited, &mut |pred, vis| {
@@ -525,9 +525,9 @@ fn count_free_in_type_with_visited(
 }
 
 /// Walk every [`Type::Refinement`] reachable from `ty` and invoke `f`
-/// on its predicate expression by *shared* reference.  Each refinement
-/// is visited at most once per call (keyed by [`RefinementId`] in
-/// `visited`) — this breaks cycles that arise when a refinement's
+/// on its predicate expression by *shared* reference.  Each predicate
+/// cell is visited at most once per call (keyed by [`PredicateCellId`]
+/// in `visited`) — this breaks cycles that arise when a refinement's
 /// predicate has type slots referencing the same refinement
 /// (e.g. inference sharing the `Rc<RefCell<Expr>>` across all places
 /// the refined value surfaces).
@@ -550,12 +550,12 @@ fn count_free_in_type_with_visited(
 /// A related dual-mechanism (try_borrow_mut fallback without an
 /// explicit visited set) lives in [`crate::ccl::simplify::simplify`]
 /// — see the note there for why that site can't use this helper today.
-pub fn walk_refined_predicates<F>(ty: &Type, visited: &mut HashSet<RefinementId>, f: &mut F)
+pub fn walk_refined_predicates<F>(ty: &Type, visited: &mut HashSet<PredicateCellId>, f: &mut F)
 where
-    F: FnMut(&Expr, &mut HashSet<RefinementId>),
+    F: FnMut(&Expr, &mut HashSet<PredicateCellId>),
 {
     if let Type::Refinement(_, refinement) = ty
-        && visited.insert(refinement.id)
+        && visited.insert(refinement.cell_id())
     {
         let pred_rc = &refinement.predicate;
         if let Ok(p) = pred_rc.try_borrow() {
@@ -569,12 +569,15 @@ where
 /// `try_borrow_mut`; silently skips refinements whose predicate is
 /// already mutably borrowed elsewhere in the call stack (the outer
 /// pass is processing the same predicate).
-pub fn walk_refined_predicates_mut<F>(ty: &mut Type, visited: &mut HashSet<RefinementId>, f: &mut F)
-where
-    F: FnMut(&mut Expr, &mut HashSet<RefinementId>),
+pub fn walk_refined_predicates_mut<F>(
+    ty: &mut Type,
+    visited: &mut HashSet<PredicateCellId>,
+    f: &mut F,
+) where
+    F: FnMut(&mut Expr, &mut HashSet<PredicateCellId>),
 {
     if let Type::Refinement(_, refinement) = ty
-        && visited.insert(refinement.id)
+        && visited.insert(refinement.cell_id())
     {
         let pred_rc = &refinement.predicate;
         if let Ok(mut p) = pred_rc.try_borrow_mut() {

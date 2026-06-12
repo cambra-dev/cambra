@@ -417,8 +417,10 @@ fn wrap_with_iterate(expr: &mut Expr) {
     }
     // The override is now redundant — `source`'s domain already carries
     // the full refinement structure, so `typed_compose` derives the
-    // correct `{…} ⇒ T`.  Keep it to pin the original site's refinement
-    // identities (`make_restrict` mints fresh refinement ids per layer).
+    // correct `{…} ⇒ T`.  Keep it to pin the original site's predicate
+    // cells (`make_restrict` re-mints each layer's predicate in a fresh
+    // cell; the re-mints compare equal structurally, but the override
+    // keeps downstream tags aliasing the site's own cells).
     *expr = typed_compose(elts).with_ty(site_ty);
 }
 
@@ -3060,9 +3062,9 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use crate::ccl::Refinement;
     use crate::ccl::ccl_utils::is_trivially_true_predicate;
     use crate::ccl::symbolic::symbolic;
-    use crate::ccl::{Refinement, next_refinement_id};
 
     fn bool_ty() -> Type {
         Type::Base(BaseType::Bool)
@@ -3075,7 +3077,6 @@ mod tests {
         Type::Refinement(
             Box::new(base),
             Refinement {
-                id: next_refinement_id(),
                 description: String::new(),
                 predicate: Rc::new(RefCell::new(predicate)),
             },

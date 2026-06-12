@@ -183,7 +183,6 @@ canonicalization; it doesn't affect correctness.
 
 ```rust
 struct Refinement {
-    id: RefinementId,
     description: String,
     /// The binder name introduced by this refinement, visible in
     /// `predicate`.  Cambra-source-derived refinements use
@@ -271,11 +270,10 @@ The unification rules for `Fun` types:
   codomain — the existing `Fun` unification.
 
 For refinements: two refinements with the same predicate up to
-α-renaming of their own `name` unify. Different refinements
-(different `id`) on the same base type may unify or fail
-depending on predicate equivalence — SMT-hard in general;
-structural equality (with Rc-sharing as acceleration) suffices for
-the common case.
+α-renaming of their own `name` unify. Refinements with distinct
+predicates on the same base type may unify or fail depending on
+predicate equivalence — SMT-hard in general; structural equality
+(with Rc-sharing as acceleration) suffices for the common case.
 
 **Binder-name reuse.** Always generating a fresh name on each
 unification damages debugging: error messages and IDE hover-info

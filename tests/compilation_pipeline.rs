@@ -679,6 +679,44 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
+// A *let-bound* (and therefore generalized) UDF referenced from inside a
+// filter predicate. The predicate's `f(x)` use lives inside the cast-target
+// refinement, not the main expression tree — exercising monomorphize's
+// rewrite of uses reachable only through refinement predicates.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_udf_used_inside_filter_predicate() {
+    let code = "f = lambda x: x > 1\n[x for x in [1, 2, 3] if f(x)]";
+    check_tile(
+        code,
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+// The dual of the test above: the generalized definition itself *contains*
+// the filter, so `specialize_def`'s clone carries a cast-target refinement.
+// Exercises `freshen_expr_types`' predicate-cell de-aliasing for anchored
+// (cast-target) predicates.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_udf_containing_filter() {
+    let code = "f = lambda xs: [x for x in xs if x > 1]\nf([1, 2, 3])";
+    check_tile(
+        code,
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
 #[rstest]
 #[timeout(Duration::from_secs(1))]
 #[case::simple_feed("x = defer(); x <<= 1; x", Tile::Scalar(ColumnValue::Ints(vec![1])))]

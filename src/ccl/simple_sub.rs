@@ -11,9 +11,9 @@
 //! # Refinements
 //!
 //! Refinements ride the lattice natively as **refinement-tag sets**. A
-//! refined type `{T | S}` carries a set `S` of [`crate::ccl::RefinementId`]
-//! tags (matched by id or structural predicate equality — see
-//! [`Refinement`]'s `PartialEq` — but never by predicate implication). Subtyping is
+//! refined type `{T | S}` carries a set `S` of [`Refinement`] tags
+//! (matched by structural predicate equality — see [`Refinement`]'s
+//! `PartialEq` — but never by predicate implication). Subtyping is
 //! superset-on-tags, structurally identical to record width-subtyping
 //! (`{T | p, q} <: {T | p}`, and `{T | p} <: T`); a tag set therefore
 //! merges with the same polarity rule as `rec` (positive ⇒ intersect,
@@ -47,9 +47,7 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
-use crate::ccl::{
-    BaseType, InferVar, InferVarId, Level, Refinement, RefinementId, Type, fresh_infer_var_id,
-};
+use crate::ccl::{BaseType, InferVar, InferVarId, Level, Refinement, Type, fresh_infer_var_id};
 
 /// Identifies a field inside a structural record/tuple, or a variant tag.
 ///
@@ -451,8 +449,8 @@ pub fn constrain_subtype(
         // Refinement subtyping:
         //   {b₁ | S₁} <: {b₂ | S₂}  iff  b₁ <: b₂  and  S₂ ⊆ S₁ ∪ tags(b₁)
         // (more refinements ⇒ subtype). Refinements match by [`Refinement`]'s
-        // `PartialEq` — id, then structural predicate equality — so a tag join
-        // planning re-minted under a fresh id still matches; never by predicate
+        // `PartialEq` — structural predicate equality — so a tag join planning
+        // re-minted in a fresh cell still matches; never by predicate
         // implication. The lhs carries every refinement rhs requires when its
         // explicit layers `S₁` plus whatever its *base* `b₁` carries cover `S₂`.
         //
@@ -478,7 +476,7 @@ pub fn constrain_subtype(
             let (lbase, lrefs) = peel_refinements(lhs);
             let (rbase, rrefs) = peel_refinements(rhs);
             // The refinements rhs requires that no lhs layer matches (by
-            // `Refinement`'s id-or-structural `PartialEq`).
+            // `Refinement`'s structural `PartialEq`).
             let deficit: Vec<&Refinement> = rrefs
                 .iter()
                 .copied()
@@ -772,16 +770,15 @@ pub struct CompactType {
     /// Function shape, if any. Recursively merged with polarity flip
     /// on the domain.
     pub fun: Option<(Box<CompactType>, Box<CompactType>)>,
-    /// Refinement-tag contributions at this position,
-    /// keyed by [`RefinementId`]. A refinement-set is width-subtyped
-    /// exactly like `rec`: more refinements ⇒ subtype
+    /// Refinement-tag contributions at this position. A set with `==`
+    /// membership (deduplicated by [`Refinement`]'s structural `PartialEq`),
+    /// stored as a `Vec` in first-insertion order. A refinement-set is
+    /// width-subtyped exactly like `rec`: more refinements ⇒ subtype
     /// (`{T | p, q} <: {T | p}`), so at positive polarity the sets are
     /// *intersected* and at negative *unioned* (see
-    /// [`CompactType::merge`]). The compaction merge keys purely by id — ids
-    /// are stable within an inference run, so the structural matching in
-    /// [`Refinement`]'s `PartialEq` is needed only in the subtype *equality*
-    /// test, not here. The stored [`Refinement`] is the payload carried to coalesce.
-    pub refinements: BTreeMap<RefinementId, Refinement>,
+    /// [`CompactType::merge`]). The stored [`Refinement`] is the payload
+    /// carried to coalesce.
+    pub refinements: Vec<Refinement>,
 }
 
 impl CompactType {
@@ -838,21 +835,17 @@ impl CompactType {
     /// position the value reliably carries only the tags *both*
     /// sides guarantee; at a negative position a consumer that may
     /// impose either set imposes their union.
-    fn merge_refinements(
-        pol: bool,
-        lhs: BTreeMap<RefinementId, Refinement>,
-        rhs: BTreeMap<RefinementId, Refinement>,
-    ) -> BTreeMap<RefinementId, Refinement> {
+    fn merge_refinements(pol: bool, lhs: Vec<Refinement>, rhs: Vec<Refinement>) -> Vec<Refinement> {
         if pol {
             // The types are being unioned, so the refinement tags should be intersected.
-            lhs.into_iter()
-                .filter(|(id, _)| rhs.contains_key(id))
-                .collect()
+            lhs.into_iter().filter(|r| rhs.contains(r)).collect()
         } else {
             // The types are being intersected, so the refinement tags should be unioned.
             let mut out = lhs;
-            for (id, r) in rhs {
-                out.entry(id).or_insert(r);
+            for r in rhs {
+                if !out.contains(&r) {
+                    out.push(r);
+                }
             }
             out
         }
@@ -1011,7 +1004,9 @@ fn compact_go(
         // into that variable's compacted position — the propagation path.
         Type::Refinement(inner, r) => {
             let mut ct = compact_go(inner, pol, parents, in_process, recursive, rec_vars);
-            ct.refinements.insert(r.id, r.clone());
+            if !ct.refinements.contains(r) {
+                ct.refinements.push(r.clone());
+            }
             ct
         }
         // A bare `Hole` shouldn't reach the solver (emission turns it into a
@@ -1130,16 +1125,16 @@ fn compact_go(
             // when the Var is coalesced at positive polarity, not the
             // positive-polarity intersection (empty).
             //
-            // This fallback is the *fundamental* half of the contravariant
-            // domain read: it materializes the type locally at coalesce. The
-            // two-way `constrain_argument` in `infer_simple_sub::emit_apply`
-            // pre-deposits the same fact at emit time AND propagates it across
-            // the connected component — that propagation (not the read) is what
-            // the local fallback cannot replicate, so the eager constraint is
-            // currently load-bearing for multi-hop monomorphic record/join code.
-            // It is removable only once a general coalesce-time propagation
-            // (a two-sided `Var <: Var` rule) does the spreading; see
-            // `design-simple-sub.md` §2 (F6).
+            // This fallback handles a *bare* under-determined domain var: it
+            // materializes the type locally at coalesce from the lower-bound
+            // side. The other half of the contravariant-domain story — a
+            // *structured* domain (a tuple/record with `Infer`s inside, which
+            // this per-var read cannot reassemble) — is recovered separately
+            // by `coalesce_node`'s `specialize_projection_domain` /
+            // `specialize_lambda_domain`. Both Apply edges are one-way (no
+            // emit-time reverse whose eager cross-component propagation would
+            // cover these halves); see `design-simple-sub.md` ("Apply is
+            // one-way" and "Closing the single-sided blind spots").
             let primary_bounds = primary.clone();
             let opposite_bounds = if pol {
                 s.upper.clone()
@@ -1579,10 +1574,10 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
     // Re-wrap the refinement tags carried at this position. `extent_of`
     // and `iterate_type` both strip refinements at every depth and compose
     // the resulting `Restrict`s, so the wrap order is semantically
-    // irrelevant; `BTreeMap` iteration by `RefinementId` makes it stable.
+    // irrelevant; first-insertion order in the `Vec` makes it stable.
     let out = ct
         .refinements
-        .values()
+        .iter()
         .fold(inner, |acc, r| Type::Refinement(Box::new(acc), r.clone()));
     Ok(out)
 }
@@ -1765,19 +1760,16 @@ mod tests {
         }
     }
 
-    /// Build `{base | id}` — a `Type::Refinement` whose tag has the given
-    /// id. The predicate body encodes the id (an `Int(id)` literal) so that
-    /// distinct-id tags also carry structurally-distinct predicates:
-    /// refinements now compare by id *or* structural predicate equality (see
-    /// [`Refinement`]'s `PartialEq`), so a shared dummy body would spuriously
-    /// make every tag match every other.
-    fn refined(base: Type, id: RefinementId) -> Type {
+    /// Build `{base | marker}` — a `Type::Refinement` whose tag's predicate
+    /// encodes `marker` (an `Int(marker)` literal). Refinements compare by
+    /// structural predicate equality (see [`Refinement`]'s `PartialEq`), so
+    /// equal markers match and distinct markers stay distinct.
+    fn refined(base: Type, marker: i64) -> Type {
         use crate::ccl::{Lit, TypedExpr};
         use std::cell::RefCell;
         let r = Refinement {
-            id,
-            description: format!("r{id}"),
-            predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Int(id as i64)))),
+            description: format!("r{marker}"),
+            predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Int(marker)))),
         };
         Type::Refinement(Box::new(base), r)
     }
@@ -1785,8 +1777,7 @@ mod tests {
     #[test]
     fn refined_superset_is_subtype() {
         // {Int | p, q} <: {Int | p}  — more refinements ⇒ subtype.
-        let p = crate::ccl::next_refinement_id();
-        let q = crate::ccl::next_refinement_id();
+        let (p, q) = (1, 2);
         let lhs = refined(refined(prim(BaseType::Int), p), q);
         let rhs = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
@@ -1797,9 +1788,8 @@ mod tests {
     fn refined_missing_tag_is_not_subtype() {
         // {Int | q} </: {Int | p}  — a q-refined value cannot stand in for a
         // p-refined one. `refined` gives p and q structurally-distinct
-        // predicates, so neither the id nor the structural fallback matches.
-        let p = crate::ccl::next_refinement_id();
-        let q = crate::ccl::next_refinement_id();
+        // predicates, so the tags don't match.
+        let (p, q) = (1, 2);
         let lhs = refined(prim(BaseType::Int), q);
         let rhs = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
@@ -1810,51 +1800,50 @@ mod tests {
     }
 
     #[test]
-    fn structurally_equal_predicate_matches_across_ids() {
+    fn structurally_equal_predicate_matches_across_cells() {
         // {Int | p} <: {Int | q} when p and q carry *structurally identical*
-        // predicates under distinct ids — exactly what join planning produces
-        // by re-minting a refinement id at each marker. Equality of the
-        // predicate `Expr`, not the id, decides the match (`Refinement: PartialEq`).
+        // predicates in distinct cells — exactly what join planning produces
+        // by re-minting a refinement at each marker. Equality of the
+        // predicate `Expr`, not cell identity, decides the match
+        // (`Refinement: PartialEq`).
         use crate::ccl::{Lit, TypedExpr};
         use std::cell::RefCell;
-        let mk = |id| {
+        let mk = || {
             Type::Refinement(
                 Box::new(prim(BaseType::Int)),
                 Refinement {
-                    id,
                     description: String::new(),
                     predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true)))),
                 },
             )
         };
-        let lhs = mk(crate::ccl::next_refinement_id());
-        let rhs = mk(crate::ccl::next_refinement_id());
+        let lhs = mk();
+        let rhs = mk();
         let mut cache = ConstrainCache::new();
         assert!(constrain_subtype(&lhs, &rhs, &mut cache).is_ok());
     }
 
     #[test]
     fn structurally_equal_refinements_hash_equal() {
-        // The `Hash`/`Eq` contract: structurally-equal refinements with
-        // distinct ids are `==`, so they must also hash equal — otherwise the
+        // The `Hash`/`Eq` contract: structurally-equal refinements in
+        // distinct cells are `==`, so they must also hash equal — otherwise the
         // `ConstrainCache` (`HashSet<(Type, Type)>`) cycle-break could miss a
         // match. Pins consistency between `Refinement`'s `PartialEq` and `Hash`.
         use crate::ccl::{Lit, TypedExpr};
         use std::cell::RefCell;
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        let mk = |id| {
+        let mk = || {
             Type::Refinement(
                 Box::new(prim(BaseType::Int)),
                 Refinement {
-                    id,
                     description: String::new(),
                     predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true)))),
                 },
             )
         };
-        let a = mk(crate::ccl::next_refinement_id());
-        let b = mk(crate::ccl::next_refinement_id());
+        let a = mk();
+        let b = mk();
         let hash = |t: &Type| {
             let mut h = DefaultHasher::new();
             t.hash(&mut h);
@@ -1873,7 +1862,6 @@ mod tests {
         let c = Type::Refinement(
             Box::new(prim(BaseType::Int)),
             Refinement {
-                id: crate::ccl::next_refinement_id(),
                 description: String::new(),
                 predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(false)))),
             },
@@ -1884,7 +1872,7 @@ mod tests {
     #[test]
     fn refined_drops_to_base() {
         // {Int | p} <: Int  — dropping a refinement is widening.
-        let p = crate::ccl::next_refinement_id();
+        let p = 1;
         let lhs = refined(prim(BaseType::Int), p);
         let rhs = prim(BaseType::Int);
         let mut cache = ConstrainCache::new();
@@ -1899,8 +1887,7 @@ mod tests {
         // that is *already* refined be cast to add a further tag (nested
         // list-comprehension filters: `{D|p} ⇒ V <: {?a|q} ⇒ V`); a ground
         // `{p} ⊆ {q}` check would reject it.
-        let p = crate::ccl::next_refinement_id();
-        let q = crate::ccl::next_refinement_id();
+        let (p, q) = (1, 2);
         let a = fresh_var(0);
         let lhs = refined(a.clone(), q);
         let rhs = refined(prim(BaseType::Int), p);
@@ -1909,11 +1896,9 @@ mod tests {
         // The deficit must have been recorded on ?a as the upper bound
         // `{Int | p}`, so coalescing ?a yields a base carrying p.
         let Type::Infer(v) = &a else { unreachable!() };
+        let expected = refined(prim(BaseType::Int), p);
         assert!(
-            v.bounds.borrow().upper.iter().any(|u| matches!(
-                u, Type::Refinement(inner, r)
-                    if r.id == p && matches!(inner.as_ref(), Type::Base(BaseType::Int))
-            )),
+            v.bounds.borrow().upper.contains(&expected),
             "?a should carry {{Int | p}} as an upper bound, got {:?}",
             v.bounds.borrow().upper
         );
@@ -1924,8 +1909,7 @@ mod tests {
         // {Int | q} </: {Int | p}: with a *concrete* base there is nothing to
         // absorb the deficit, so the strict rejection (`{T|q} ⊀ {T|p}`) is
         // preserved — only a variable base can acquire missing tags.
-        let p = crate::ccl::next_refinement_id();
-        let q = crate::ccl::next_refinement_id();
+        let (p, q) = (1, 2);
         let lhs = refined(prim(BaseType::Int), q);
         let rhs = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
@@ -1941,7 +1925,7 @@ mod tests {
         // consumer silently applies. An unrefined value cannot stand in
         // where a refined one is demanded; acquiring the refinement is an
         // explicit `Restrict`, not subsumption.
-        let p = crate::ccl::next_refinement_id();
+        let p = 1;
         let lhs = prim(BaseType::Int);
         let rhs = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
@@ -1957,8 +1941,7 @@ mod tests {
         // positions must round-trip through compact → simplify → coalesce
         // with both tags intact (they are positional, not folded into a
         // variable identity, so co-occurrence analysis cannot merge them).
-        let p = crate::ccl::next_refinement_id();
-        let q = crate::ccl::next_refinement_id();
+        let (p, q) = (1, 2);
         let ty = Type::Record(vec![
             ("a".to_string(), refined(prim(BaseType::Int), p)),
             ("b".to_string(), refined(prim(BaseType::Int), q)),
@@ -1969,11 +1952,11 @@ mod tests {
 
     #[test]
     fn var_constrained_to_refined_coalesces_refined() {
-        // A fresh var equated to a refined type (both bounds — exactly what
-        // `emit_apply`'s two-way `constrain_argument` records when an index var
-        // flows into a refined-domain collection) must coalesce *carrying* the
-        // refinement, not drop it to the bare base.
-        let p = crate::ccl::next_refinement_id();
+        // A fresh var equated to a refined type (both bounds) must coalesce
+        // *carrying* the refinement, not drop it to the bare base. Solver-level
+        // property: equality bounds may still arise (e.g. `bind_annotation`,
+        // `require_eq` on list elements), so tags must survive them.
+        let p = 1;
         let v = fresh_var(0);
         let refined_int = refined(prim(BaseType::Int), p);
         let mut cache = ConstrainCache::new();
@@ -1986,11 +1969,13 @@ mod tests {
 
     #[test]
     fn apply_index_var_coalesces_refined() {
-        // Mirror `emit_apply` exactly: an index var `v` applied to a function
-        // whose domain is `{d | p}` (d ⟺ Int). `as_function_eq` introduces a
-        // domain var `dom` (fn ⟺ dom ⇒ cod), then `constrain_argument` equates
-        // v and dom two-way. v's coalesced type should be `{Int | p}`.
-        let p = crate::ccl::next_refinement_id();
+        // Solver-level tag-propagation property: an index var `v` equated
+        // (both bounds) with the domain `dom` of a function shape that is
+        // itself equated with `{d | p} ⇒ cod` (d ⟺ Int). The tag `p` must
+        // propagate through the var⇄var equality chain onto `v`'s coalesced
+        // type, `{Int | p}` — refinements ride the lattice; they must not be
+        // dropped at var merges.
+        let p = 1;
         let d = fresh_var(0);
         let cod = fresh_var(0);
         let dom = fresh_var(0);
@@ -2283,12 +2268,14 @@ mod tests {
         // returns a CompactType containing just the variable. With no
         // concrete contributions, coalesce_compact emits Type::Infer.
         //
-        // Real recursive types (e.g. `λx. x x` which produces
-        // `α <: Fun(α, _)`) flow through compact_type's structural
-        // recursion — a `Function` boundary resets `parents` to empty,
-        // so re-encountering α at the same polarity inside the Fun
-        // body triggers the placeholder/RecursiveType path. That case
-        // is exercised by the differential test sweep, not here.
+        // Real recursive bounds (α reachable from itself through a
+        // structural intermediary, e.g. `α <: Fun(α, _)`) flow through
+        // compact_type's structural recursion — a `Function` boundary
+        // resets `parents` to empty, so re-encountering α at the same
+        // polarity inside the Fun body triggers the
+        // placeholder/RecursiveType path. One-way constraint emission
+        // produces no such cycles today (even `λx. x x` types cleanly);
+        // the path is defensive.
         let v = fresh_var(0);
         if let Type::Infer(state) = &v {
             state.bounds.borrow_mut().lower.push(v.clone());

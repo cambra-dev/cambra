@@ -86,8 +86,11 @@ use crate::util::ScopeStack;
 pub struct InferArena {
     /// Zero-sized: the captured variables live in the thread-local buffer
     /// installed by [`crate::ccl::arena_enter`], not in the guard itself.
-    /// `!Send`/`!Sync` and unconstructible outside this module's `new`.
-    _private: (),
+    /// The raw-pointer `PhantomData` suppresses the `Send`/`Sync` auto
+    /// traits — the guard must drop on the thread whose buffer it opened
+    /// (dropping elsewhere would tear down the wrong thread's slot). Also
+    /// unconstructible outside this module's `new`.
+    _not_send_sync: std::marker::PhantomData<*const ()>,
 }
 
 impl InferArena {
@@ -99,7 +102,9 @@ impl InferArena {
     /// [`crate::ccl::arena_enter`]).
     pub fn new() -> Self {
         crate::ccl::arena_enter();
-        InferArena { _private: () }
+        InferArena {
+            _not_send_sync: std::marker::PhantomData,
+        }
     }
 }
 
@@ -394,7 +399,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Ve
 /// hole-freeness + semantic check should call [`typecheck`] directly.
 pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
     let mut errors = Vec::new();
-    let mut seen: HashSet<crate::ccl::RefinementId> = HashSet::new();
+    let mut seen: HashSet<crate::ccl::PredicateCellId> = HashSet::new();
     collect_expr_errors(expr, &mut errors, &mut seen);
     if errors.is_empty() {
         Ok(())
@@ -405,15 +410,16 @@ pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
 
 /// Recursively collect all type errors from `expr` into `errors`.
 ///
-/// `seen_refinements` tracks already-visited `RefinementId`s to break
-/// cycles when a refinement's predicate expression has a type slot
-/// containing the same refinement (post-inference, this happens when
-/// a Lambda param's refinement embeds a predicate that mentions the
-/// param — e.g. filter-feed inside a defer-mediating UDF body).
+/// `seen_refinements` tracks already-visited predicate cells
+/// ([`crate::ccl::PredicateCellId`]) to break cycles when a refinement's
+/// predicate expression has a type slot containing the same refinement
+/// (post-inference, this happens when a Lambda param's refinement embeds
+/// a predicate that mentions the param — e.g. filter-feed inside a
+/// defer-mediating UDF body).
 fn collect_expr_errors(
     expr: &Expr,
     errors: &mut Vec<InferError>,
-    seen_refinements: &mut HashSet<crate::ccl::RefinementId>,
+    seen_refinements: &mut HashSet<crate::ccl::PredicateCellId>,
 ) {
     collect_type_errors(&expr.ty, &symbolic(expr), errors, seen_refinements);
     // Binder-bearing variants emit per-binding type errors before descending
@@ -469,7 +475,7 @@ fn collect_type_errors(
     ty: &Type,
     context_sym: &str,
     errors: &mut Vec<InferError>,
-    seen_refinements: &mut HashSet<crate::ccl::RefinementId>,
+    seen_refinements: &mut HashSet<crate::ccl::PredicateCellId>,
 ) {
     match ty {
         Type::Hole => errors.push(InferError::UnresolvedHole {
@@ -499,9 +505,9 @@ fn collect_type_errors(
             }
         }
         Type::Refinement(inner, refinement) => {
-            // Walk the predicate only once per RefinementId to break
-            // cycles that arise post-inference when the predicate's
-            // expressions have type slots containing the same refinement.
+            // Walk each predicate cell only once to break cycles that
+            // arise post-inference when the predicate's expressions
+            // have type slots containing the same refinement.
             //
             // The same visited-set cycle-handling pattern lives in
             // [`crate::ccl::ccl_utils::count_free_in_type_with_visited`],
@@ -513,7 +519,7 @@ fn collect_type_errors(
             // doesn't share the helper because it mixes per-node
             // error checks with the refinement walk; if drift makes
             // the cycle logic important here, sync with those sites.
-            if seen_refinements.insert(refinement.id) {
+            if seen_refinements.insert(refinement.cell_id()) {
                 let def = &refinement.predicate;
                 collect_expr_errors(&def.borrow(), errors, seen_refinements);
             }

@@ -53,6 +53,8 @@ Specific decision points where this matters:
 ### Code Comments
 Comment when the *why* is non-obvious — a hidden constraint, a load-bearing invariant, an unusual choice, behavior that would surprise a reader. Skip comments when a good name and a clear signature already convey the intent. Follow rustdoc best practices for public items; don't manufacture docstrings to hit a coverage target.
 
+Avoid comments that describe the history of the codebase.  Comments should explain how and why the code works.  If there is an alternative approach that seems reasonable but doesn't work, it's ok to describe that, but the comments should always fully make sense just by looking at the current version of the code.
+
 ### Rendering CCL ASTs in conversation
 When showing a CCL AST in chat or when writing code comments — walking through an example, illustrating what a pass sees, comparing before/after a rewrite — **render it in symbolic form** (the output shape of `ccl::symbolic::symbolic` / `symbolic_typed`). The whole reasoning surface here is the algebra; symbolic notation makes that legible at a glance.
 

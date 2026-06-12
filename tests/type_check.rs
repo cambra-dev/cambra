@@ -489,22 +489,21 @@ else:
 }
 
 // ---------------------------------------------------------------------------
-// Edge cases: Recursive types, unapplied lambdas, etc.
+// Edge cases: Self-application, unapplied lambdas, etc.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_recursive_type_rejection() {
-    // lambda x: x(x) -> Recursive type error
-    let err = infer_program_err("lambda x: x(x)");
+fn test_self_application_types() {
+    // `lambda x: x(x)` is the MLsub poster child `(α ∧ (α ⇒ β)) ⇒ β`. With
+    // both Apply edges one-way there is no var⇄var cycle, so it types
+    // cleanly: the unconstrained `α` leg drops and the lambda infers as
+    // `(?a ⇒ ?b) ⇒ ?c`, carrying unresolved `Infer` vars like any other
+    // unapplied lambda. *Misusing* a self-applicator still errors — see
+    // `self_application_rejected_without_panic` in `infer_simple_sub.rs`.
+    let ty = infer_program("lambda x: x(x)");
     assert!(
-        err.iter().any(|e| {
-            if let InferError::Unsupported(msg) = e {
-                msg.contains("recursive type")
-            } else {
-                false
-            }
-        }),
-        "expected Unsupported recursive type error, got {err:?}"
+        matches!(&ty, Type::Fun(d, _) if matches!(&**d, Type::Fun(..))),
+        "expected a function-domained function type, got {ty:?}"
     );
 }
 

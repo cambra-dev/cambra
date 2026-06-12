@@ -118,14 +118,14 @@ fn variant_ctor_nested_payload() {
 /// a call argument of `.Some(5)` (singleton variant `[Some(Int)]`). The
 /// width-sub rule `[Some] <: [Some, None]` is the polarity-trap closer.
 ///
-/// **Ignored**: hits today's bidirectional `Apply` constraint (the "TODO:
-/// SOUNDNESS" hack in `infer_simple_sub.rs::emit_apply`), which forces
-/// argument type to equal parameter type and so disallows width-sub at
-/// apply sites. Will pass once the let-polymorphism work replaces the
-/// bidirectional Apply + opposite-polarity fallback with `Type::ForAll` +
-/// monomorphization (see brainstorm doc §3.1).
+/// **Ignored**: the widening itself now infers correctly (the one-way Apply
+/// edges admit `[Some] <: [Some, None]` at the call site), but the coalesced
+/// variant comes back with canonicalized tag order (`[None, Some]`) rather
+/// than the annotation's declaration order, so the structural equality
+/// fails. Un-ignore once variant tag order is preserved (or the comparison
+/// is made order-insensitive).
 #[test]
-#[ignore = "blocked by bidirectional Apply equality-collapse; needs let-polymorphism"]
+#[ignore = "coalesce canonicalizes variant tag order, losing declaration order"]
 fn variant_param_accepts_subtype() {
     let param_ty = variant(&[("Some", int()), ("None", unit_ty())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {

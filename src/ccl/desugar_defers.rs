@@ -84,7 +84,7 @@ use std::rc::Rc;
 
 use crate::ccl::{
     BaseType, Branch, Expr, Lit, Pattern, Refinement, Type, TypedExpr, TypedExprNode,
-    ccl_utils::count_free, next_refinement_id, walk_loop_children,
+    ccl_utils::count_free, walk_loop_children,
 };
 
 /// Errors that can arise while desugaring `Defer`/`Feed`/`Define` nodes.
@@ -2921,7 +2921,6 @@ fn extract_for_defer(
                     let pred_lambda = Expr::lambda(&param.name, param.ty.clone(), guard);
                     let pred_on_source = Expr::apply(new_argument.clone(), pred_lambda);
                     let refinement_struct = Refinement {
-                        id: next_refinement_id(),
                         description: "filter-feed".to_string(),
                         predicate: Rc::new(RefCell::new(pred_on_source)),
                     };
@@ -3141,7 +3140,6 @@ fn extract_for_defer(
                             let pred_on_source =
                                 Expr::compose(vec![source_prefix.clone(), pred_lambda]);
                             let refinement_struct = Refinement {
-                                id: next_refinement_id(),
                                 description: "filter-feed".to_string(),
                                 predicate: Rc::new(RefCell::new(pred_on_source)),
                             };
@@ -4354,7 +4352,6 @@ mod tests {
         //   `Var("__chan")` with user_annotation = Fun(Refinement(Hole, pred(outer_n)), Hole)
         let pred = var("outer_n");
         let refinement = Refinement {
-            id: next_refinement_id(),
             description: "test".to_string(),
             predicate: Rc::new(RefCell::new(pred)),
         };
@@ -4386,7 +4383,6 @@ mod tests {
     fn collect_free_vars_descends_into_ty_refinement_predicates() {
         let pred = var("inner_k");
         let refinement = Refinement {
-            id: next_refinement_id(),
             description: "test".to_string(),
             predicate: Rc::new(RefCell::new(pred)),
         };
@@ -4418,7 +4414,6 @@ mod tests {
         // bound by the lambda).
         let pred = var("outer_k");
         let refinement = Refinement {
-            id: next_refinement_id(),
             description: "test".to_string(),
             predicate: Rc::new(RefCell::new(pred)),
         };
