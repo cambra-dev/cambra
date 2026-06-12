@@ -65,7 +65,8 @@ use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, Branch, Builtin, CompareKind, Expr,
         Lit, LogicKind, REFINEMENT_BINDER, Type, TypedExprNode, UnaryOpKind,
-        ccl_utils::{make_cast, refined_fn_type},
+        ccl_utils::{is_free_in_type, make_cast, refined_fn_type},
+        symbolic::symbolic,
     },
     chl_parser::ast::{
         AssignTarget, AugOp, BinOp as ChlBinOp, BoolOp, CmpOp, CompClause, Comprehension,
@@ -1403,6 +1404,38 @@ fn lower_lambda(
 /// fresh unique id via [`LoweringContext::fresh_tuple_arg`], so no two
 /// nested multi-arg lambdas can share a tuple-parameter name.
 fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr {
+    // Refinements ride the type lattice (introduced by `cast`), and this
+    // substitution rewrites only the term spine — it threads `ty`/
+    // `user_annotation`/`Cast::target` through unchanged. So a refinement
+    // whose predicate closes over `name` (a dependent refinement at lowering
+    // time) would be left un-substituted, silently dropping the dependence.
+    // The shape is user-reachable: a comprehension filter that references an
+    // enclosing multi-arg lambda's parameter — e.g.
+    // `lambda lo, hi: sum([x for x in data if x >= lo])` — lowers the filter
+    // into the comprehension's `Cast::target` predicate with `lo` free in it.
+    // Substituting through type-carried predicates is not yet implemented, so
+    // fail loudly: proceeding would leave the predicate referencing the
+    // uncurried name — an unbound-variable error at best, and silently wrong
+    // results if an outer binding happens to share the name.
+    let cast_target_mentions = match &expr.node {
+        TypedExprNode::Cast { target, .. } => is_free_in_type(name, target),
+        _ => false,
+    };
+    if is_free_in_type(name, &expr.ty)
+        || cast_target_mentions
+        || expr
+            .user_annotation
+            .as_ref()
+            .is_some_and(|ann| is_free_in_type(name, ann))
+    {
+        todo!(
+            "substitute_param_in_body: `{name}` occurs free in a type-position \
+             refinement predicate of {}; substituting through type-carried \
+             (cast-introduced) refinements is not yet implemented",
+            symbolic(&expr),
+        );
+    }
+
     // Fast path: substitute Var hits, return atoms unchanged without traversal.
     match &expr.node {
         TypedExprNode::Var(n) if n == name => return replacement.clone(),
@@ -1422,40 +1455,14 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
     } = expr;
 
     let new_node = match node {
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } if param.name == name => {
-            // `name` is shadowed by this lambda's param; leave body and
-            // refinement alone (the refinement is in this lambda's scope too).
-            TypedExprNode::Lambda {
-                param,
-                body,
-                refinement,
-            }
+        TypedExprNode::Lambda { param, body } if param.name == name => {
+            // `name` is shadowed by this lambda's param; leave the body alone.
+            TypedExprNode::Lambda { param, body }
         }
-        TypedExprNode::Lambda {
+        TypedExprNode::Lambda { param, body } => TypedExprNode::Lambda {
             param,
-            body,
-            refinement,
-        } => {
-            // Refinements may reference outer-scope names (e.g. list-comp
-            // guards that close over an enclosing function parameter), so
-            // substitute through the predicate expression as well. The
-            // `Rc<RefCell<>>` is freshly allocated during lowering and not
-            // yet shared, so mutating in place is safe.
-            if let Some(r) = &refinement {
-                let pred = &r.predicate;
-                let inner = pred.borrow().clone();
-                *pred.borrow_mut() = substitute_param_in_body(inner, name, replacement);
-            }
-            TypedExprNode::Lambda {
-                param,
-                body: Box::new(substitute_param_in_body(*body, name, replacement)),
-                refinement,
-            }
-        }
+            body: Box::new(substitute_param_in_body(*body, name, replacement)),
+        },
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -2473,8 +2480,8 @@ fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Ex
                 Expr::lambda(iter_var, Type::Hole, pred_expr),
             );
         }
-        // Lowering emits a `cast(refined_fn_type, λ outer_var → body_expr)`
-        // here — a pure type-level assertion of the predicate-refined
+        // A refined parameter lowers to a `cast(refined_fn_type, λ outer_var →
+        // body_expr)` — a pure type-level assertion of the predicate-refined
         // domain.  The refinement is carried by the cast's target type; the
         // Cast Apply arm in `infer_simple_sub` constructs the refined result
         // from it, and the generic annotation handler infers the predicate's

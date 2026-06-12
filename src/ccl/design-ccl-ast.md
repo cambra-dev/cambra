@@ -381,9 +381,9 @@ enum TypedExprNode {
     Lambda {
         param: TypedBinding,    // name + ty (Unknown until inferred) + user_annotation
         body: Box<TypedExpr>,
-        /// Optional restriction on the outer iteration variable.
-        /// `None` for unrestricted lambdas; `Some(r)` for filtered or joined comprehensions.
-        refinement: Option<Refinement>,
+        // A refined parameter (filtered / joined comprehension, groupby) carries
+        // its predicate on `param.ty` as a `Type::Refinement`, introduced by
+        // `cast` (`ccl_utils::make_cast`) — not on a dedicated AST field.
     },
     Let {
         binding: TypedBinding,  // name + ty mirrors bound_expr.ty after inference

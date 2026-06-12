@@ -12,9 +12,9 @@
 //!    bounds), writing each node's emitted `Type` straight onto `expr.ty`.
 //!    Because the vars are shared `Rc<InferVar>`s, later constraints
 //!    accumulate into bounds that are already visible through the stored
-//!    `Type` — no side table is needed. Refinements stay on the AST node
-//!    (`Expr::Lambda::refinement`) and are *not* part of the structural
-//!    lattice (see plan R1); `lambda_elim` reads them from the AST directly.
+//!    `Type` — no side table is needed. Domain refinements ride the type
+//!    lattice as restriction tags on [`Type::Refinement`] (introduced by the
+//!    `cast` Apply arm), so they flow through the solver structurally.
 //! 2. **Coalesce + write-back**: walk the tree again and, for each node,
 //!    run [`coalesce_compact`](crate::ccl::simple_sub::coalesce_compact) to
 //!    resolve the inference variables in its `expr.ty` in place. A generalized
@@ -331,10 +331,11 @@ fn should_generalize(def: &Expr, level: Level) -> bool {
 ///
 /// Crucially this freshens *every* type in the AST — `expr.ty`, binder slots
 /// (lambda param, `let` binding, `Case` payload, `Loop` params), and
-/// refinement predicates — not just those reachable from the definition's root
-/// type. A definition's interior carries variables (e.g. `Proj` seeds) that
-/// never appear in its root type; missing them would leave the clone with a
-/// mix of fresh and original variables and coalesce to an unresolved type.
+/// refinement predicates carried on those types — not just those reachable
+/// from the definition's root type. A definition's interior carries variables
+/// (e.g. `Proj` seeds) that never appear in its root type; missing them would
+/// leave the clone with a mix of fresh and original variables and coalesce to
+/// an unresolved type.
 fn freshen_expr_types(
     expr: &mut Expr,
     cutoff: Level,
@@ -347,13 +348,8 @@ fn freshen_expr_types(
         dealias_anchored_predicates(annotation, cutoff, target, cache, remap);
     }
     match &mut expr.node {
-        TypedExprNode::Lambda {
-            param, refinement, ..
-        } => {
+        TypedExprNode::Lambda { param, .. } => {
             param.ty = freshen_above(cutoff, &param.ty, target, cache);
-            if let Some(r) = refinement {
-                dealias_refinement_predicate(r, cutoff, target, cache, remap);
-            }
         }
         TypedExprNode::Cast {
             target: cast_target,
@@ -528,13 +524,8 @@ fn realias_refinement_tags(
         realias_tags_in_type(annotation, remap, seen);
     }
     match &mut expr.node {
-        TypedExprNode::Lambda {
-            param, refinement, ..
-        } => {
+        TypedExprNode::Lambda { param, .. } => {
             realias_tags_in_type(&mut param.ty, remap, seen);
-            if let Some(r) = refinement {
-                realias_tag(r, remap, seen);
-            }
         }
         TypedExprNode::Cast { target, .. } => realias_tags_in_type(target, remap, seen),
         TypedExprNode::Let { binding, .. } => realias_tags_in_type(&mut binding.ty, remap, seen),
@@ -590,13 +581,8 @@ fn collect_anchor_cells(expr: &Expr, cells: &mut AnchorCells) {
     if let Some(annotation) = &expr.user_annotation {
         collect_anchor_cells_in_type(annotation, cells);
     }
-    match &expr.node {
-        TypedExprNode::Lambda {
-            refinement: Some(r),
-            ..
-        } => register_anchor_cell(r, cells),
-        TypedExprNode::Cast { target, .. } => collect_anchor_cells_in_type(target, cells),
-        _ => {}
+    if let TypedExprNode::Cast { target, .. } = &expr.node {
+        collect_anchor_cells_in_type(target, cells);
     }
     expr.walk_children(|c| collect_anchor_cells(c, cells));
 }
@@ -1512,11 +1498,7 @@ fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<Type, InferE
             }
         }
 
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => emit_lambda(param, body, refinement, ctx)?,
+        TypedExprNode::Lambda { param, body } => emit_lambda(param, body, ctx)?,
 
         // Cast: an upcast re-viewing `value` at the supertype `target`. See
         // [`emit_cast`] (shared with `check_node`).
@@ -1636,16 +1618,14 @@ fn lit_base(lit: &Lit) -> Type {
 fn emit_lambda<C: Typing>(
     param: &mut TypedBinding,
     body: &mut Expr,
-    refinement: &mut Option<Refinement>,
     ctx: &mut C,
 ) -> Result<Type, InferError> {
     // Param type: convert any explicit annotation/Hole/Infer into a
     // the solver. A Hole turns into a fresh Var that will accumulate
     // bounds from body usage and call sites. Link `param.ty` to that
     // (shared) var so `coalesce_node` can resolve the binding slot in
-    // place — the slot ends up carrying the body-usage refinement tags
-    // but *not* the lambda's own refinement (that decorates only the
-    // function-boundary domain in `expr.ty`).
+    // place. Domain refinements ride the type lattice (introduced by `cast`),
+    // not the lambda node, so the param binds under its bare type here.
     let param_simple = ctx.normalize(&param.ty);
     param.ty = param_simple.clone();
     // The param is bound in scope under the *unrefined* `param_simple`, so
@@ -1659,30 +1639,13 @@ fn emit_lambda<C: Typing>(
         ctx.bind_annotation(&param_simple, &ann)?;
     }
 
-    // Refinement: lift the lambda's *own* refinement into the inferred
-    // domain so it rides the lattice as a refinement tag (rather than being
-    // re-stitched in a later pass). The AST node keeps its `refinement`
-    // field — `lambda_elim` reads it from there, not from the type, so
-    // there's no double-wrapping. We still walk the predicate so its inner
-    // expressions get inferred types (otherwise downstream consumers see
-    // `Hole`s inside the predicate body).
-    let domain_ty = match refinement {
-        Some(r) => {
-            // The lambda's own refinement decorates the (unrefined) domain; its
-            // bare predicate binds the implicit element over `param_simple`.
-            emit_bare_predicate(r, &param_simple, ctx)?;
-            Type::Refinement(Box::new(param_simple), r.clone())
-        }
-        None => param_simple,
-    };
-
     // Emit a *named* Pi: the parameter binds in the codomain, so a refinement
     // predicate nested in `body_ty` that closes over the parameter (the
     // dependent-refinement case) stays bound. The binder is cosmetic for
     // ordinary functions — coalesce strips it when the codomain does not
     // reference it (see `coalesce_compact_go`) — so monomorphic output is
     // unchanged.
-    Ok(Type::pi(&param.name, domain_ty, body_ty))
+    Ok(Type::pi(&param.name, param_simple, body_ty))
 }
 
 /// Type a [`TypedExprNode::Cast`]: `cast(value, target)` re-views `value` at
@@ -2395,11 +2358,7 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
             expr.ty.clone()
         }
 
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => emit_lambda(param, body, refinement, ctx)?,
+        TypedExprNode::Lambda { param, body } => emit_lambda(param, body, ctx)?,
 
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
 
@@ -2743,28 +2702,14 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
             coalesce_node(right, level, errors);
         }
         TypedExprNode::UnaryOp(_, inner) => coalesce_node(inner, level, errors),
-        TypedExprNode::Lambda {
-            param: _,
-            body,
-            refinement,
-        } => {
-            // Refinement predicate is itself an Expr that was inferred
-            // by emit_lambda. Walk into it so its sub-trees get their
-            // expr.ty slots filled — otherwise downstream code (and
-            // structural equality for tests) sees a tree of Holes
-            // inside the refinement's RefCell<Expr>.
-            if let Some(r) = refinement {
-                let def = &r.predicate;
-                if let Ok(mut pred) = def.try_borrow_mut() {
-                    coalesce_node(&mut pred, level, errors);
-                }
-            }
+        TypedExprNode::Lambda { param: _, body } => {
             coalesce_node(body, level, errors);
             // `param.ty` is resolved from the lambda's coalesced domain in
             // the end-of-function block (it can't be coalesced standalone:
             // body-usage refinement tags are negative-polarity upper-bound
             // facts that only materialize in the contravariant domain
-            // position of `expr.ty`).
+            // position of `expr.ty`). Domain-refinement predicates ride
+            // `expr.ty` and are coalesced with it.
         }
         TypedExprNode::Aggregate { input, .. } => coalesce_node(input, level, errors),
         TypedExprNode::Let {
@@ -2945,11 +2890,9 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
     // compact → simplify → coalesce pipeline to materialize a concrete
     // `Type`.
     //
-    // Refinements now ride the lattice as refinement tags, so a refined
-    // domain coalesces straight onto `expr.ty` here (no separate
-    // re-stitch). `lambda_elim` still reads the lambda's own refinement
-    // off the AST node — it is duplicated there deliberately, and the
-    // tags' structural predicate equality dedups any overlap downstream.
+    // Refinements ride the lattice as refinement tags, so a refined
+    // domain coalesces straight onto `expr.ty` here — downstream passes
+    // (`lambda_elim` included) read it from the type.
     let label = symbolic(expr);
     match resolve_var_type(&expr.ty) {
         Ok(ty) => expr.ty = ty,
@@ -3227,24 +3170,16 @@ fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
     refresh_lambda_param_slot(lambda);
 }
 
-/// Fill a lambda's `param.ty` binder slot from its coalesced function type:
-/// the domain, minus the lambda's *own* refinement layer (that decorates only
-/// the function boundary; `lambda_elim` re-wraps it from the AST node).
-/// Deriving the slot from the resolved domain — rather than coalescing the
-/// slot var standalone — is what preserves body-usage refinement tags, which
-/// are negative-polarity facts visible only in the contravariant domain.
-/// No-op for non-lambdas and unresolved function types.
+/// Fill a lambda's `param.ty` binder slot from its coalesced function type's
+/// domain. Deriving the slot from the resolved domain — rather than
+/// coalescing the slot var standalone — is what preserves body-usage
+/// refinement tags, which are negative-polarity facts visible only in the
+/// contravariant domain. No-op for non-lambdas and unresolved function types.
 fn refresh_lambda_param_slot(expr: &mut Expr) {
-    if let TypedExprNode::Lambda {
-        param, refinement, ..
-    } = &mut expr.node
+    if let TypedExprNode::Lambda { param, .. } = &mut expr.node
         && let Type::Fun { domain: dom, .. } = &expr.ty
     {
-        let mut d = (**dom).clone();
-        if let Some(r) = refinement {
-            d = strip_refinement_cell(d, r.cell_id());
-        }
-        param.ty = d;
+        param.ty = (**dom).clone();
     }
 }
 
@@ -3463,7 +3398,7 @@ fn specialize_def(
 /// so a `Var(name)` inside one is a real free use — e.g. a list-comprehension
 /// filter calling a let-bound UDF lives only in the cast-target refinement.
 /// Predicates are visited at their *syntactic anchors* (`user_annotation`, a
-/// `Cast` target, a lambda's refinement slot) so the binder-shadowing rules
+/// `Cast` target) so the binder-shadowing rules
 /// above apply to them positionally. Refinement tags riding inferred types
 /// (`expr.ty`) are deliberately *not* walked: they alias anchor cells, and an
 /// outward-propagated tag may close over a binder that shadows `name` — its
@@ -3485,21 +3420,10 @@ fn for_each_free_use(expr: &mut Expr, name: &str, f: &mut impl FnMut(&mut Expr))
         for_each_free_use_in_type(annotation, name, f);
     }
     match &mut expr.node {
-        TypedExprNode::Lambda {
-            param,
-            refinement,
-            body,
-            ..
-        } => {
-            // The param scopes the body *and* the refinement predicate (the
-            // predicate ranges over the param), so both are skipped when the
-            // param shadows `name`.
+        TypedExprNode::Lambda { param, body } => {
+            // The param scopes the body, so it is skipped when the param
+            // shadows `name`.
             if param.name != name {
-                if let Some(r) = refinement
-                    && let Ok(mut pred) = r.predicate.try_borrow_mut()
-                {
-                    for_each_free_use(&mut pred, name, f);
-                }
                 for_each_free_use(body, name, f);
             }
         }
@@ -3694,27 +3618,6 @@ fn retype_pred_expr(e: &mut Expr, scope: &HashMap<String, Type>) {
     }
 }
 
-/// Remove the [`Type::Refinement`] layers whose tag aliases the predicate
-/// `cell` (if present), preserving the relative order of the other layers.
-/// Tags may coalesce in any order, so we can't assume a fixed position.
-/// Cell identity, not structural equality, is the right match here: the
-/// caller is removing one specific anchor's decoration, and the anchor's
-/// tags share its cell.
-fn strip_refinement_cell(ty: Type, cell: PredicateCellId) -> Type {
-    let mut layers = Vec::new();
-    let mut cur = ty;
-    while let Type::Refinement(inner, r) = cur {
-        if r.cell_id() != cell {
-            layers.push(r);
-        }
-        cur = *inner;
-    }
-    layers
-        .into_iter()
-        .rev()
-        .fold(cur, |acc, r| Type::Refinement(Box::new(acc), r))
-}
-
 // ---------------------------------------------------------------------------
 // Smoke tests
 // ---------------------------------------------------------------------------
@@ -3811,7 +3714,6 @@ mod tests {
                 user_annotation: None,
             },
             body: Box::new(TypedExpr::new(TypedExprNode::Var("x".to_string()))),
-            refinement: None,
         });
         let app = TypedExpr::new(TypedExprNode::Apply {
             function: Box::new(lam),
@@ -4130,7 +4032,6 @@ mod tests {
                 lit_int(1),
                 lit_int(2),
             ]))),
-            refinement: None,
         });
         let mut e = TypedExpr::aggregate(lam, AggregateKind::Max);
         let ty = run_simple_sub(&mut e).expect("inference succeeds (the bug under test)");

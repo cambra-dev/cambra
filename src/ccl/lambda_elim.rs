@@ -229,35 +229,14 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
     substitute_in_type(&mut ty, name, replacement);
 
     let new_node = match node {
-        TypedExprNode::Lambda {
-            param,
-            body,
-            mut refinement,
-        } => {
-            // The refinement binds REFINEMENT_BINDER; a substitution of that
-            // very name is shadowed inside the predicate (see `substitute_in_type`).
-            if name != REFINEMENT_BINDER
-                && let Some(Refinement {
-                    predicate: pred_rc, ..
-                }) = &mut refinement
-            {
-                let t = Expr::lit(Lit::Unit);
-                let old_pred = replace(&mut *pred_rc.borrow_mut(), t);
-                let new_pred = substitute(old_pred, name, replacement);
-                *pred_rc.borrow_mut() = new_pred;
-            }
+        TypedExprNode::Lambda { param, body } => {
             if param.name == name {
                 // name is shadowed; do not substitute inside
-                TypedExprNode::Lambda {
-                    param,
-                    body,
-                    refinement,
-                }
+                TypedExprNode::Lambda { param, body }
             } else {
                 TypedExprNode::Lambda {
                     param,
                     body: Box::new(substitute(*body, name, replacement)),
-                    refinement,
                 }
             }
         }
@@ -568,19 +547,9 @@ fn elim_lambda_impl(
         TypedExprNode::Lambda {
             param: y_binding,
             body: inner_body,
-            refinement,
         } => {
             let y = y_binding.name;
-            let mut y_ty = y_binding.ty.clone();
-            if let Some(ref r) = refinement {
-                // A refinement on a nested lambda is *uncorrelated* with the
-                // outer binder `param` — it constrains only `y`, so attach it to
-                // `y`'s domain type. (A refinement correlated with `param` — the
-                // group-by shape — never reaches here: it is handled by the
-                // Pi-const path in the cast-wrapped-lambda arm below.)
-                let base = y_ty.clone();
-                y_ty = Type::Refinement(Box::new(base), r.clone());
-            };
+            let y_ty = y_binding.ty.clone();
 
             // Merge λ x → λ y into λ __pair where x = pair[0], y = pair[1].
             // The pair variable has type (param_ty, y_ty).
@@ -608,27 +577,12 @@ fn elim_lambda_impl(
             Ok(dbg_typecheck_mv(curry(inner_elim)))
         }
 
-        // TEMPORARY: we should be handling Pi types more generally and once
-        // we do we can delete this and the special-case logic for nested lambdas
-        // with correlated refinements.
-        //
-        // Cast-wrapped lambda: λ x → cast(λ y → body, {𝐷 | 𝑝} ⇒ 𝑉)
-        //   ⟹  rewrite to the legacy refined-lambda shape and recurse so
-        //       the nested-Lambda arm above handles the (possibly
-        //       correlated) refinement uniformly.
-        //
-        // The cast's `target` carries the refined type `Fun(Refinement(_, R), _)`;
-        // we extract `R` and reattach it to the inner lambda's binder as
-        // `Lambda { refinement: Some(R) }`.  Sema: same as
-        // `λ x → λ y [refinement = R] → body` — the inner function's domain
-        // is refined by `R`, and `R`'s predicate may reference `x`
-        // (correlated, see the groupby pattern) or only local binders
-        // (uncorrelated, see the for-filter pattern).  The existing
-        // nested-Lambda + correlated-refinement code path handles both.  This
-        // arm exists because lowering emits the cast shape for these
-        // constructs (see [`crate::ccl::ccl_utils::make_cast`]);
-        // `Expr::lambda_with_refinement` is used only for the internal
-        // reconstruction this arm performs.
+        // Cast-wrapped lambda: `λ param → cast(λ y → body, {𝐷 | 𝑝} ⇒ 𝑉)` — the
+        // group-by / for-filter shape lowering emits (see
+        // [`crate::ccl::ccl_utils::make_cast`]), where the cast's refinement `𝑝`
+        // may reference the outer binder `param` (correlated, the groupby
+        // shape) or only local binders (uncorrelated, the for-filter shape).
+        // Handled by the Pi-const path below.
         TypedExprNode::Cast { value, target }
             if matches!(value.node, TypedExprNode::Lambda { .. }) =>
         {
@@ -943,34 +897,10 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
     } = expr;
     let original_ty = ty.clone();
     let result = match node {
-        // Lambda with predicate refinement: desugar to composition with restrict.
-        // λ x | pred → body  ⟹  (λx→pred) ▷ restrict ≫ (λx→body)
-        TypedExprNode::Lambda {
-            ref param,
-            body: inner_body,
-            refinement: Some(ref r),
-        } => {
-            let mut pred = r.predicate.borrow_mut();
-            *pred = elim_lambdas(ctx, pred.clone())?;
-            // Desugar, preserving the lambda's type on the resulting Compose.
-            let param_name = param.name.clone();
-            let param_ty = param.ty.clone();
-            let desugared = Expr::lambda(
-                &param_name,
-                Type::Refinement(Box::new(param_ty), r.clone()),
-                *inner_body,
-            )
-            .with_ty(ty);
-            debug_typecheck(&desugared);
-            elim_lambdas(ctx, desugared)
-        }
-
-        // Plain lambda (no refinement): eliminate then continue.
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement: _,
-        } => {
+        // Lambda: eliminate then continue. (Domain refinements ride the type
+        // lattice via `cast`; the cast-wrapped-lambda arm below handles the
+        // dependent case.)
+        TypedExprNode::Lambda { param, body } => {
             let original = symbolic(&Expr::lambda(&param.name, param.ty.clone(), *body.clone()));
             let result = elim_lambda(ctx, &param.name, &param.ty, *body)?;
             // Compare modulo Pi binder names: the point-free construction
@@ -1003,11 +933,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                 && matches!(
                     terms.last(),
                     Some(Expr {
-                        node: TypedExprNode::Lambda {
-                            body,
-                            refinement: None,
-                            ..
-                        },
+                        node: TypedExprNode::Lambda { body, .. },
                         ..
                     }) if is_filter_case_body(body)
                 ) =>
@@ -1347,42 +1273,29 @@ mod tests {
         };
         let refinement_pred = pred_of(var("y").with_ty(int_ty()));
 
-        // Create a lambda with a refinement containing the predicate. The
-        // param is refined, so the lambda's own type must carry the *same*
-        // refinement on its domain (`{Int | y > 0} ⇒ Int`) — otherwise the
-        // refinement-aware check rejects the node as `{Int|…} ⇒ Int ⊀ Int ⇒ Int`
-        // (a bare-domain annotation can't subsume a refined param). Read the
-        // refinement back off the constructed lambda so the ids match.
-        let lambda = Expr::lambda_with_refinement(
-            "x",
-            int_ty(),
-            Expr::var("x").with_ty(int_ty()),
-            refinement_pred,
-        );
-        let TypedExprNode::Lambda {
-            refinement: Some(r),
-            ..
-        } = &lambda.node
-        else {
-            unreachable!("just built a lambda with a refinement");
+        // Refinements ride the type lattice (introduced by `cast`), so the
+        // predicate lives in the lambda's *domain type* `{Int | y > 0}`, not on
+        // a dedicated AST field. `substitute` must descend through the type
+        // (via `substitute_in_type`) into the predicate body.
+        let refinement = Refinement {
+            predicate: Rc::new(RefCell::new(refinement_pred)),
         };
-        let refined_param = Type::Refinement(Box::new(int_ty()), r.clone());
-        let expr = lambda.clone().with_ty(fun_ty(refined_param, int_ty()));
+        let refined_param = Type::Refinement(Box::new(int_ty()), refinement);
+        let expr = Expr::lambda("x", int_ty(), Expr::var("x").with_ty(int_ty()))
+            .with_ty(fun_ty(refined_param, int_ty()));
 
         // Substitute "y" with a literal value in the expression
         let replacement = Expr::lit(Lit::Int(42)).with_ty(int_ty());
         let result = substitute(expr, "y", &replacement);
 
-        // Extract the refinement predicate from the result to verify substitution occurred
-        let pred_after_subst = if let TypedExprNode::Lambda {
-            refinement: Some(r),
-            ..
-        } = &result.node
-        {
-            let pred_rc = &r.predicate;
-            pred_rc.borrow().clone()
-        } else {
-            panic!("Expected lambda with refinement");
+        // Extract the refinement predicate from the result's domain type to
+        // verify substitution descended into it.
+        let pred_after_subst = match &result.ty {
+            Type::Fun { domain, .. } => match domain.as_ref() {
+                Type::Refinement(_, r) => r.predicate.borrow().clone(),
+                other => panic!("expected refined domain, got {other}"),
+            },
+            other => panic!("expected function type, got {other}"),
         };
 
         // The predicate's `y` should now be `42`: `λ _p : Int → 42 > 0`.
@@ -1488,94 +1401,35 @@ mod tests {
         assert_expr_eq(result, expected);
     }
 
-    /// Test of refinement substitution in nested lambda elimination
+    /// Test direct elimination of a lambda whose parameter has a refined type
     ///
-    /// Tests the refinement rewriting logic in the nested-lambda rule.
-    /// When the inner lambda has a refinement, it needs to be substituted along with
-    /// the body during the pair uncurrying process.
-    ///
-    /// This test verifies that:
-    /// 1. Refinements are correctly detected on inner lambdas
-    /// 2. Correlated refinements (mentioning outer param) are lifted out
-    /// 3. Uncorrelated refinements remain attached to the param
-    /// 4. The elimination completes without type errors
-    #[test]
-    fn nested_lambda_with_refinement_substitution() {
-        // Test case: λ x → λ y → y {ref} where ref is a refinement predicate
-        // This tests the core refinement substitution logic
-        let _x_ty = int_ty();
-        let y_ty = int_ty();
-        let bool_ty = Type::Base(BaseType::Bool);
-
-        // Create a simple refinement predicate that returns Bool
-        // Using a constant Bool value (which is already point-free)
-        let refinement_pred =
-            Expr::lit(Lit::Bool(true)).with_ty(fun_ty(y_ty.clone(), bool_ty.clone()));
-
-        // Inner lambda body: identity on y
-        let inner_body = var("y").with_ty(y_ty.clone());
-
-        // Inner lambda with refinement: λ y → y {bool_true}
-        let inner_lambda =
-            Expr::lambda_with_refinement("y", y_ty.clone(), inner_body, refinement_pred)
-                .with_ty(fun_ty(y_ty.clone(), y_ty.clone()));
-
-        // Test that the nested lambda can be successfully constructed and processed
-        // The inner lambda should be a valid nested lambda for elim_lambda to handle
-        assert_eq!(
-            inner_lambda.ty,
-            fun_ty(y_ty.clone(), y_ty.clone()),
-            "Inner lambda should have correct type"
-        );
-
-        // Verify the refinement is present
-        match &inner_lambda.node {
-            TypedExprNode::Lambda { refinement, .. } => {
-                assert!(refinement.is_some(), "Lambda should have a refinement");
-            }
-            _ => {
-                panic!("Expected a lambda expression");
-            }
-        }
-    }
-
-    /// Test direct elimination of a lambda with refined parameter type
-    ///
-    /// This tests a simpler case where we eliminate a lambda whose parameter
-    /// has a refined type, exercising the code paths that handle refinements
-    /// in the nested-lambda rule.
+    /// Refinements ride the type lattice (introduced by `cast`), so a refined
+    /// parameter shows up as a `Type::Refinement` domain. Eliminating `λ y → y`
+    /// over such a domain should yield `id` with the refinement preserved.
     #[test]
     fn lambda_with_refined_param_type() {
-        // Create a lambda: λ y → y where y has a refined type
-        let y_ty = int_ty();
         let bool_ty = Type::Base(BaseType::Bool);
 
-        // Body: var "y" (we'll create it twice since body is moved)
-        let body1 = var("y").with_ty(y_ty.clone());
-        let body2 = var("y").with_ty(y_ty.clone());
+        // Uncorrelated refinement (a Bool constant predicate) on the param.
+        let refinement = Refinement {
+            predicate: Rc::new(RefCell::new(Expr::lit(Lit::Bool(true)).with_ty(bool_ty))),
+        };
+        let refined_y_ty = Type::Refinement(Box::new(int_ty()), refinement);
+        let body = var("y").with_ty(int_ty());
 
-        // Simple uncorrelated refinement: just a Bool constant
-        // This doesn't mention the parameter, so it remains attached to the type
-        let refinement_pred = Expr::lit(Lit::Bool(true)).with_ty(bool_ty.clone());
-
-        // Create lambda with refinement (uses body1)
-        let _lambda = Expr::lambda_with_refinement("y", y_ty.clone(), body1, refinement_pred)
-            .with_ty(fun_ty(y_ty.clone(), y_ty.clone()));
-
-        // Eliminate the lambda using body2
+        // Eliminate λ y → y over the refined domain.
         let mut ctx = ElimContext::new();
-        let result = elim_lambda(&mut ctx, "y", &y_ty, body2);
+        let result = elim_lambda(&mut ctx, "y", &refined_y_ty, body);
 
-        // The elimination should succeed
         assert!(result.is_ok(), "Lambda elimination should succeed");
-
         let eliminated = result.unwrap();
 
-        // Eliminating λ y → y should give us the identity function
+        // Eliminating λ y → y is `id`; the refined domain is preserved and the
+        // codomain is the body's type (`Int`, the type recorded on `Var(y)`).
         assert_eq!(
             eliminated.ty,
-            fun_ty(y_ty.clone(), y_ty.clone()),
-            "Result of eliminating λ y → y should be id: Int → Int"
+            fun_ty(refined_y_ty, int_ty()),
+            "Result of eliminating λ y → y should be id with the refined domain"
         );
     }
 

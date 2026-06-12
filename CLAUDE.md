@@ -63,7 +63,7 @@ Vocabulary, matching `src/ccl/symbolic.rs`:
 - **Apply**: `arg ▷ func` (left-assoc; `a ▷ f ▷ g` means `(a ▷ f) ▷ g`).
 - **Apply with `Proj` as function**: postfix dot-access. `t ▷ .0` → `t.0`, `rec ▷ .name` → `rec.name`.
 - **Compose**: `f ≫ g ≫ h`.
-- **Lambda**: `λ x → body`. With annotated param: `λ x : T → body`. With refinement: `λ x : {T | predicate} → body` (or `{??? | predicate}` when the param type is `Hole`/`Infer`). After our cleanup of the `Refined(...)` wrapper, the predicate appears bare inside the braces — do not write `{T | Refined(p)}`.
+- **Lambda**: `λ x → body`. With annotated param: `λ x : T → body`. With refinement: `λ x : {T | predicate} → body` (an unresolved refined base renders by its own type form: `{_ | predicate}` for a `Hole`, `{?N | predicate}` for an `Infer`). The refinement rides the param *type* — there is no separate lambda refinement slot — and the predicate appears bare inside the braces; do not write `{T | Refined(p)}`.
 - **Let**: `let x = e in body`.
 - **Aggregate**: `Sum(input)`, `Max(input)`, etc. — the kind name then parens.
 - **Loop**: `loop i = 0 over xs do body` (single accumulator), `loop (x = 0, y = 1) over xs do (x, y)` (multi).

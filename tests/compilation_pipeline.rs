@@ -2782,6 +2782,22 @@ fn test_multi_arg_udf(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
+// A comprehension filter that references an enclosing multi-arg lambda's
+// parameter lowers the filter into the comprehension's `Cast::target`
+// predicate with that parameter free in it. Uncurrying cannot substitute
+// through type-carried predicates yet, so lowering must fail loudly
+// (`substitute_param_in_body`'s guard) — proceeding would leave the predicate
+// referencing the uncurried name: an unbound-variable error at best, and
+// silently wrong results if an outer binding happens to share the name.
+#[test]
+#[should_panic(expected = "substituting through type-carried")]
+fn test_multi_arg_param_in_filter_predicate_fails_loudly() {
+    let code = "data = [1, 2, 30]\n\
+                pick = lambda lo, hi: sum([x for x in data if x >= lo])\n\
+                pick(8, 0)";
+    check_scalar(code, Value::Int(30));
+}
+
 // Dependent application end-to-end: a single-key group-by lookup `g(k)` is
 // typed as a partition function whose refinement predicate has the key
 // discharged (the Pi-type machinery), and the existing cast→Restrict

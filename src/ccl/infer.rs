@@ -752,7 +752,6 @@ mod tests {
                 user_annotation: None,
             },
             body: Box::new(body),
-            refinement: None,
         });
         let ty =
             infer(&mut expr, &mut ctx).expect("simple-sub allows partially-constrained params");
@@ -1168,14 +1167,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_infer_lambda_with_predicate_refinement() {
-        // λ x : Int {True} → x
-        // The predicate is a bare Bool over the implicit refinement binder; no
-        // outer vars needed. Return type must be Fun(Refinement(Int, r), Int).
+    fn test_infer_cast_yields_refined_domain() {
+        // Refinements ride the type lattice, introduced by `cast`:
+        //   cast(λ x : Int → x, target = {Int | True} ⇒ Int)
+        // The cast Apply arm must *construct* the refined result, so inference
+        // yields `Fun(Refinement(Int, _), Int)`. The target's predicate is a
+        // bare Bool over the implicit refinement binder.
         let mut ctx = TypeInferenceContext::new();
+        let int = || Type::Base(BaseType::Int);
+        let value = Expr::lambda("x", int(), Expr::var("x").with_ty(int()))
+            .with_ty(Type::fun(int(), int()));
         let predicate = Expr::lit(Lit::Bool(true));
-        let mut expr =
-            Expr::lambda_with_refinement("x", Type::Base(BaseType::Int), Expr::var("x"), predicate);
+        let target = crate::ccl::ccl_utils::refined_fn_type(int(), predicate, int());
+        let mut expr = crate::ccl::ccl_utils::make_cast(value, target);
         let ty = infer(&mut expr, &mut ctx).unwrap();
         match ty {
             Type::Fun {
@@ -1191,21 +1195,6 @@ mod tests {
             }
             other => panic!("expected Fun, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_infer_predicate_uses_outer_not_body_scope() {
-        // λ x : Int {Var("x")} → x
-        // The predicate references `x`. Since the predicate is inferred in the
-        // outer scope (after the body's with_scope closes), `x` is NOT bound
-        // there, so inference fails with UnboundVariable rather than succeeding
-        // by accidentally seeing the body's scope.
-        let mut ctx = TypeInferenceContext::new();
-        let predicate = Expr::var("x");
-        let mut expr =
-            Expr::lambda_with_refinement("x", Type::Base(BaseType::Int), Expr::var("x"), predicate);
-        let result = infer(&mut expr, &mut ctx);
-        assert_eq!(result, Err(vec![InferError::UnboundVariable("x".into())]));
     }
 
     // -----------------------------------------------------------------------
@@ -1473,7 +1462,6 @@ mod tests {
                 user_annotation: Some(Type::Base(BaseType::Int)),
             },
             body: Box::new(Expr::apply(Expr::var("x"), inner)),
-            refinement: None,
         });
         assert_eq!(
             infer(&mut expr, &mut ctx),
@@ -1504,7 +1492,6 @@ mod tests {
                     user_annotation: Some(Type::Base(BaseType::String)),
                 },
                 body: Box::new(Expr::var("x")),
-                refinement: None,
             })),
             argument: Box::new(Expr::lit(Lit::Int(42))),
         });
@@ -1535,7 +1522,6 @@ mod tests {
                 user_annotation: Some(Type::Base(BaseType::Int)),
             },
             body: Box::new(Expr::lit(Lit::Unit)),
-            refinement: None,
         });
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
@@ -1771,7 +1757,6 @@ mod tests {
                 user_annotation: None,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
-            refinement: None,
         })
         .with_ty(Type::Fun {
             name: None,
@@ -1814,7 +1799,6 @@ mod tests {
                 user_annotation: None,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
-            refinement: None,
         })
         .with_ty(Type::Fun {
             name: None,
@@ -1867,7 +1851,6 @@ mod tests {
                 user_annotation: None,
             },
             body: Box::new(Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int))),
-            refinement: None,
         })
         .with_ty(Type::Fun {
             name: None,
@@ -2135,7 +2118,6 @@ mod tests {
                 user_annotation: None,
             },
             body: Box::new(Expr::var("x").with_ty(Type::Base(BaseType::String))),
-            refinement: None,
         })
         .with_ty(Type::Fun {
             name: None,

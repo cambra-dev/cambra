@@ -928,20 +928,6 @@ pub enum TypedExprNode {
         param: TypedBinding,
         /// The lambda body.
         body: Box<TypedExpr>,
-        /// **Transitional.** Refinement on the param type computed by
-        /// this lambda — kept only as an internal scratch shape used by
-        /// [`crate::ccl::lambda_elim`] to dispatch the cast-wrapped-lambda
-        /// pattern through the existing correlated-refinement code path.
-        ///
-        /// Lowering does not populate this field: it emits a
-        /// [`TypedExprNode::Cast`] node ([`crate::ccl::ccl_utils::make_cast`])
-        /// instead, and [`crate::ccl::lambda_elim`] reconstructs this field
-        /// from that node for `groupby`.  The field will be removed once
-        /// `convert_groupby` / `replace_curried_correlated_refinements` in
-        /// [`crate::ccl::planning`] recognise the `Cast` node directly
-        /// (planning rewrite step).  See the migration plan in
-        /// `docs/refinement-types-design.md`.
-        refinement: Option<Refinement>,
     },
 
     /// An aggregation over a function (including, and usually being, a collection)
@@ -1589,7 +1575,6 @@ impl TypedExpr {
                 user_annotation: None,
             },
             body: Box::new(body),
-            refinement: None,
         })
         .with_ty(result_ty)
     }
@@ -1611,28 +1596,6 @@ impl TypedExpr {
         Self::new(TypedExprNode::Case {
             scrutinee: Some(Box::new(scrutinee)),
             branches,
-        })
-    }
-
-    /// Build a [`TypedExprNode::Lambda`] with a predicate [`Refinement`].
-    /// The `refinement` predicate is a bare boolean expression in which
-    /// [`REFINEMENT_BINDER`] is free (distinct from the lambda's `param`).
-    pub fn lambda_with_refinement(
-        param: &str,
-        param_ty: Type,
-        body: TypedExpr,
-        refinement: TypedExpr,
-    ) -> Self {
-        Self::new(TypedExprNode::Lambda {
-            param: TypedBinding {
-                name: param.to_string(),
-                ty: param_ty,
-                user_annotation: None,
-            },
-            body: Box::new(body),
-            refinement: Some(Refinement {
-                predicate: Rc::new(RefCell::new(refinement)),
-            }),
         })
     }
 }
@@ -1958,6 +1921,10 @@ impl Default for TypedExpr {
 /// This helper is the single source of truth for the Loop walk rule —
 /// the substitute / inline / lambda-elim passes all delegate here so a
 /// shadow-check fix lands in one place.
+// Params mirror the `Loop` node's boxed fields so callers pass them verbatim
+// (and `loop_body` is returned boxed in the shadow case); unboxing only `source`
+// would be an inconsistent API for no real gain.
+#[allow(clippy::boxed_local)]
 pub fn walk_loop_children<F>(
     params: Vec<TypedBinding>,
     init_args: Vec<TypedExpr>,
@@ -1987,6 +1954,7 @@ where
 
 /// Fallible variant of [`walk_loop_children`] for passes whose recursion
 /// function returns a `Result`.
+#[allow(clippy::boxed_local)]
 pub fn try_walk_loop_children<F, E>(
     params: Vec<TypedBinding>,
     init_args: Vec<TypedExpr>,
@@ -2556,9 +2524,7 @@ impl Eq for Refinement {}
 /// counterpart of [`hash_refinement_predicate`]: compares node shape, scalar
 /// leaves (operators, builtins, literals, names, tags), binder names, and
 /// child `Expr`s pairwise, but never the embedded `Type`s (`ty` slots,
-/// annotations, binding types, or the transitional
-/// [`TypedExprNode::Lambda`] `refinement` decoration — all inference
-/// metadata).
+/// annotations, binding types — all inference metadata).
 ///
 /// One type-anchored slot **is** compared: a [`TypedExprNode::Cast`]'s
 /// `target` carries the cast's domain-refinement *predicate term*

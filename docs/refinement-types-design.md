@@ -391,10 +391,10 @@ inference resolution, or accept the conservative interpretation.
 
 ### Lowering (`src/ccl/lower.rs`)
 
-In the redesigned world, the `refinement` field on
-`TypedExprNode::Lambda` is removed and the `Expr::lambda_with_refinement`
-helper goes with it. Refinement-introducing forms lower to
-applications of `cast`, the type-change operator:
+The `refinement` field on `TypedExprNode::Lambda` and the
+`Expr::lambda_with_refinement` helper have been removed.
+Refinement-introducing forms lower to applications of `cast`, the
+type-change operator:
 
   `cast : (𝑇: Type) ⇒ {𝑈: Type | 𝑈 <: 𝑇} ⇒ 𝑇`
 
@@ -910,18 +910,21 @@ use the disambiguated name from the start.
    for cast-to-refined-domain. The scope-validity invariant comes
    for free with capture-avoiding substitution.
 
-3. **Lowering updates**: remove the `refinement` field on
+3. **Lowering updates** — *done*: removed the `refinement` field on
    `TypedExprNode::Lambda` and the `Expr::lambda_with_refinement`
-   helper. Rewrite the lowering of `groupby` at `lower.rs:805` to
-   emit `λ __gb_k → cast({𝐷 | key_fn(𝑐(__gb_i)) == __gb_k} ⇒ 𝑉, 𝑐)`
-   instead of a nested lambda with a refinement attached. Rewrite
-   list-comp filter lowering and for-loop if-guard lowering to emit
-   `cast` applications around the iterated source.
+   helper. The lowering of `groupby`, list-comp filters, and
+   for-loop if-guards now emits `cast` applications around the
+   iterated source (e.g. `groupby` emits
+   `λ __gb_k → cast({𝐷 | key_fn(𝑐(__gb_i)) == __gb_k} ⇒ 𝑉, 𝑐)`)
+   instead of a nested lambda with a refinement attached.
 
-4. **Lambda elim cleanup**: remove the correlated-refinement special
-   case from the nested-Lambda rule. The named-binder Fun handles
-   the dependency information that the special case used to extract
-   from the AST structure.
+4. **Lambda elim cleanup** — *partially done*: the
+   correlated-refinement special case has been removed from the
+   nested-Lambda rule. The dependency information it used to extract
+   from the AST structure now rides the type lattice as a domain
+   refinement introduced by `cast` (the cast-wrapped-lambda arm
+   handles it). Reworking this onto the named-binder Fun, once that
+   lands in steps 1–2, remains.
 
 5. **Planning rewrite**: rework `planning` to be the single
    planning pass — CCL-to-CCL, walks the AST, identifies iteration

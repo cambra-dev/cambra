@@ -397,12 +397,7 @@ fn float_defer_in_lambda(lambda: Expr) -> Option<Expr> {
         ty,
         user_annotation,
     } = lambda;
-    let TypedExprNode::Lambda {
-        param,
-        body,
-        refinement,
-    } = node
-    else {
+    let TypedExprNode::Lambda { param, body } = node else {
         return None;
     };
     let (modified_body, floated_name) = extract_defer_binding(*body)?;
@@ -411,7 +406,6 @@ fn float_defer_in_lambda(lambda: Expr) -> Option<Expr> {
         node: TypedExprNode::Lambda {
             param,
             body: Box::new(inner_lambda),
-            refinement,
         },
         ty,
         user_annotation,
@@ -823,14 +817,9 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
             input: Box::new(rewrite_chains_in_scope(*input, ctx)),
             kind,
         },
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => TypedExprNode::Lambda {
+        TypedExprNode::Lambda { param, body } => TypedExprNode::Lambda {
             param,
             body: Box::new(rewrite_chains_in_scope(*body, ctx)),
-            refinement,
         },
         TypedExprNode::Tuple(elts) => TypedExprNode::Tuple(
             elts.into_iter()
@@ -1041,11 +1030,7 @@ fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             input: Box::new(pre_infer_substitute(*input, name, replacement)),
             kind,
         },
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => {
+        TypedExprNode::Lambda { param, body } => {
             // Param shadows `name` inside the body.
             let body = if param.name == name {
                 *body
@@ -1055,7 +1040,6 @@ fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             TypedExprNode::Lambda {
                 param,
                 body: Box::new(body),
-                refinement,
             }
         }
         TypedExprNode::Let {
@@ -1349,14 +1333,9 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         TypedExprNode::UnaryOp(op, inner) => {
             TypedExprNode::UnaryOp(op, Box::new(drop_expr_stmts(*inner)))
         }
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => TypedExprNode::Lambda {
+        TypedExprNode::Lambda { param, body } => TypedExprNode::Lambda {
             param,
             body: Box::new(drop_expr_stmts(*body)),
-            refinement,
         },
         TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
             input: Box::new(drop_expr_stmts(*input)),
@@ -1961,10 +1940,9 @@ fn emit_cluster_then(inner: Expr, order: &[String], mut channels: HashMap<String
 /// shadowing by enclosing `Let`/`Lambda` bindings on the term spine.
 ///
 /// Also walks references hidden in **type positions**:
-/// - `expr.ty` refinement predicates
+/// - `expr.ty` refinement predicates (including a lambda's refined domain)
 /// - `expr.user_annotation` refinement predicates (set by
 ///   [`extract_for_defer`]'s filter-feed rewrite)
-/// - `Lambda::refinement` predicates
 ///
 /// Without these, a channel that references an outer let-binding only
 /// through a refinement predicate would be missed by
@@ -2007,20 +1985,10 @@ fn collect_free_vars(expr: &Expr, out: &mut HashSet<String>) {
                 rec(body, bound, out);
                 bound.pop();
             }
-            TypedExprNode::Lambda {
-                param,
-                body,
-                refinement,
-            } => {
-                if let Some(r) = refinement {
-                    // The Lambda's own refinement lives in the *outer*
-                    // scope (before the param is bound), so visit it
-                    // before pushing `param.name`.
-                    let pred_rc = &r.predicate;
-                    if let Ok(pred) = pred_rc.try_borrow() {
-                        rec(&pred, bound, out);
-                    }
-                }
+            TypedExprNode::Lambda { param, body } => {
+                // Domain refinements ride the param's *type*, visited
+                // unconditionally by the `collect_free_vars_in_type(&expr.ty)`
+                // call at the top of `rec` (they belong to the outer scope).
                 bound.push(param.name.clone());
                 rec(body, bound, out);
                 bound.pop();
@@ -2302,14 +2270,7 @@ fn rewrite_lambda_to_return_contributions(
         user_annotation,
     } = lambda;
     match (class, node) {
-        (
-            LambdaClass::ParamAsTarget,
-            TypedExprNode::Lambda {
-                param,
-                body,
-                refinement,
-            },
-        ) => {
+        (LambdaClass::ParamAsTarget, TypedExprNode::Lambda { param, body }) => {
             let primary_target = param.name.clone();
             let cr = build_contributions_record(*body, &primary_target, ctx)?;
             Ok(RewrittenFunction {
@@ -2317,7 +2278,6 @@ fn rewrite_lambda_to_return_contributions(
                     node: TypedExprNode::Lambda {
                         param,
                         body: Box::new(cr.body),
-                        refinement,
                     },
                     ty,
                     user_annotation,
@@ -2331,7 +2291,6 @@ fn rewrite_lambda_to_return_contributions(
             TypedExprNode::Lambda {
                 param: outer_param,
                 body: outer_body,
-                refinement: outer_refinement,
             },
         ) => {
             let TypedExpr {
@@ -2342,7 +2301,6 @@ fn rewrite_lambda_to_return_contributions(
             let TypedExprNode::Lambda {
                 param: inner_param,
                 body: inner_body,
-                refinement: inner_refinement,
             } = outer_body_node
             else {
                 unreachable!("DI post-float guarantees outer body is a Lambda");
@@ -2353,7 +2311,6 @@ fn rewrite_lambda_to_return_contributions(
                 node: TypedExprNode::Lambda {
                     param: inner_param,
                     body: Box::new(cr.body),
-                    refinement: inner_refinement,
                 },
                 ty: outer_body_ty,
                 user_annotation: outer_body_ann,
@@ -2363,7 +2320,6 @@ fn rewrite_lambda_to_return_contributions(
                     node: TypedExprNode::Lambda {
                         param: outer_param,
                         body: Box::new(new_inner),
-                        refinement: outer_refinement,
                     },
                     ty,
                     user_annotation,
@@ -2891,16 +2847,16 @@ fn extract_for_defer(
             if let TypedExprNode::Lambda {
                 param,
                 body: lambda_body,
-                refinement,
             } = function.node.clone()
                 && param.name != defer_name
             {
                 // Filter-feed pattern: `λ p → Case({g → Feed(d, V); true →
-                // Unit})`.  Recognized so we can emit the channel as a
-                // *refined* Lambda — `Lambda(p, V, refinement: g)` — and
-                // collapse the original Lambda's body to Unit.  Without
-                // this, the generic Case handler wraps both arms in
-                // mismatched Records (`to_d: V` vs `to_d: unit`) which
+                // Unit})`.  Recognized so we can emit the channel as a source
+                // whose *domain type* carries the guard refinement (via the
+                // `user_annotation` below) and collapse the original Lambda's
+                // body to Unit.  Without this, the generic Case handler wraps
+                // both arms in mismatched Records (`to_d: V` vs `to_d: unit`)
+                // which
                 // fails inference.
                 if let Some((guard, feed_value)) = try_extract_filter_feed(&lambda_body, defer_name)
                 {
@@ -2973,7 +2929,6 @@ fn extract_for_defer(
                     node: TypedExprNode::Lambda {
                         param,
                         body: Box::new(new_lambda_body),
-                        refinement,
                     },
                     ty: function.ty.clone(),
                     user_annotation: function.user_annotation.clone(),
@@ -3110,11 +3065,7 @@ fn extract_for_defer(
                 let elt_ty = elt.ty.clone();
                 let elt_user_ann = elt.user_annotation.clone();
                 match elt.node {
-                    TypedExprNode::Lambda {
-                        param,
-                        body,
-                        refinement,
-                    } if param.name != defer_name => {
+                    TypedExprNode::Lambda { param, body } if param.name != defer_name => {
                         // Filter-feed: `λ p → Case({g → Feed(d, V); true →
                         // Unit})` becomes a refined-Lambda channel
                         // (`λ p with {g} → V`) plus a Lambda whose body
@@ -3159,7 +3110,6 @@ fn extract_for_defer(
                                 node: TypedExprNode::Lambda {
                                     param,
                                     body: Box::new(Expr::lit(Lit::Unit)),
-                                    refinement,
                                 },
                                 ty: elt_ty,
                                 user_annotation: elt_user_ann,
@@ -3202,7 +3152,6 @@ fn extract_for_defer(
                             node: TypedExprNode::Lambda {
                                 param,
                                 body: Box::new(new_body),
-                                refinement,
                             },
                             ty: elt_ty,
                             user_annotation: elt_user_ann,
@@ -3242,11 +3191,7 @@ fn extract_for_defer(
             }
             TypedExprNode::Record(new_fields)
         }
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => {
+        TypedExprNode::Lambda { param, body } => {
             // Lambda body is an inner scope.  Feeds extracted from inside
             // may reference the param, so each channel contribution must
             // be re-wrapped with the same Lambda before bubbling up to
@@ -3282,7 +3227,6 @@ fn extract_for_defer(
             TypedExprNode::Lambda {
                 param,
                 body: Box::new(body),
-                refinement,
             }
         }
         TypedExprNode::Case {
@@ -3532,11 +3476,7 @@ fn process_loop_for_defer(
         user_annotation: loop_body_ann,
     } = *loop_body;
     let (new_loop_body, body_feeds) = match loop_body_node {
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => {
+        TypedExprNode::Lambda { param, body } => {
             let mut body_feeds: Vec<Expr> = Vec::new();
             let mut body_define: Option<Expr> = None;
             let new_inner = extract_for_defer(
@@ -3554,7 +3494,6 @@ fn process_loop_for_defer(
                 node: TypedExprNode::Lambda {
                     param,
                     body: Box::new(new_inner),
-                    refinement,
                 },
                 ty: loop_body_ty,
                 user_annotation: loop_body_ann,
@@ -3678,14 +3617,9 @@ fn augment_loop_body_record_named(
             expr: e,
             body: Box::new(augment_loop_body_record_named(*body, field_name, value)?),
         },
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => TypedExprNode::Lambda {
+        TypedExprNode::Lambda { param, body } => TypedExprNode::Lambda {
             param,
             body: Box::new(augment_loop_body_record_named(*body, field_name, value)?),
-            refinement,
         },
         TypedExprNode::Record(mut fields) => {
             fields.push((field_name.to_string(), value));
@@ -4396,45 +4330,6 @@ mod tests {
         assert!(
             free.contains("inner_k"),
             "expr.ty predicate reference should be collected: got {free:?}"
-        );
-    }
-
-    /// `collect_free_vars` must descend into a Lambda's
-    /// [`TypedExprNode::Lambda::refinement`] (the dedicated refinement
-    /// slot, not via type).  References inside the refinement live in
-    /// the *outer* scope (the lambda hasn't bound its param yet), so
-    /// they must be visited before the param-shadow is pushed.
-    #[test]
-    fn collect_free_vars_descends_into_lambda_refinement() {
-        // Build `λ x with {refinement: outer_k} → x`, then check that
-        // `collect_free_vars` sees both `outer_k` and *not* `x` (x is
-        // bound by the lambda).
-        let pred = var("outer_k");
-        let refinement = Refinement {
-            predicate: Rc::new(RefCell::new(pred)),
-        };
-        let lambda = TypedExpr {
-            node: TypedExprNode::Lambda {
-                param: crate::ccl::TypedBinding {
-                    name: "x".to_string(),
-                    ty: Type::Hole,
-                    user_annotation: None,
-                },
-                body: Box::new(var("x")),
-                refinement: Some(refinement),
-            },
-            ty: Type::Hole,
-            user_annotation: None,
-        };
-        let mut free: HashSet<String> = HashSet::new();
-        collect_free_vars(&lambda, &mut free);
-        assert!(
-            free.contains("outer_k"),
-            "Lambda::refinement reference should be collected: got {free:?}"
-        );
-        assert!(
-            !free.contains("x"),
-            "param `x` should be shadowed inside its lambda body: got {free:?}"
         );
     }
 }

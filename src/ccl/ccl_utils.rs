@@ -371,8 +371,7 @@ fn refine_with(base: Type, predicate: &Expr) -> Type {
 }
 
 /// Count free occurrences of `name` in `expr`, including occurrences in
-/// any refinement predicates carried by the expression's type or by any
-/// nested [`TypedExprNode::Lambda`]'s [`crate::ccl::Refinement`].
+/// any refinement predicates carried by the expression's type.
 ///
 /// A variable is *free* at a use site when no enclosing
 /// [`TypedExprNode::Lambda`] or [`TypedExprNode::Let`] inside `expr`
@@ -409,37 +408,17 @@ fn count_free_with_visited(
     let in_node = match &expr.node {
         TypedExprNode::Var(n) => (n == name) as usize,
 
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => {
-            // `try_borrow().ok()` silently under-counts when a
-            // refinement predicate is currently mutably borrowed.  See
-            // the matching note on [`count_free_in_type_with_visited`]
-            // for why this is OK with today's callers.
-            let in_refinement = refinement
-                .as_ref()
-                .and_then(|r| {
-                    if !visited.insert(r.cell_id()) {
-                        return Some(0);
-                    }
-                    let pred_rc = &r.predicate;
-                    pred_rc
-                        .try_borrow()
-                        .ok()
-                        .map(|p| count_free_with_visited(name, &p, visited))
-                })
-                .unwrap_or(0);
-            // `param.name` shadows `name` inside the lambda body, but
-            // any free occurrences in the refinement live in the
-            // *outer* scope and so are not shadowed.
-            let in_body = if param.name == name {
+        TypedExprNode::Lambda { param, body } => {
+            // Domain refinements ride the type lattice, so any free
+            // occurrences in a refinement predicate are counted by
+            // `count_free_in_type_with_visited` on `expr.ty` above (and live
+            // in the *outer* scope, unshadowed). Here `param.name` shadows
+            // `name` inside the lambda body.
+            if param.name == name {
                 0
             } else {
                 count_free_with_visited(name, body, visited)
-            };
-            in_body + in_refinement
+            }
         }
 
         TypedExprNode::Let {
@@ -628,6 +607,19 @@ fn count_free_in_value(name: &str, expr: &Expr) -> usize {
             sum
         }
     }
+}
+
+/// Returns `true` if `name` appears free inside a refinement predicate
+/// reachable from `ty` (walking every [`Type::Refinement`] layer, including
+/// nested ones in `Fun`/`Tuple`/`Record`/`Variant` positions).
+///
+/// This is the *type-position* counterpart to [`is_free`]: it ignores the
+/// term spine entirely and only inspects predicates carried by the type. Use
+/// it to detect when a term substitution would need to reach into a
+/// type-carried predicate (e.g. a `cast`-introduced domain refinement that
+/// closes over the substituted variable).
+pub fn is_free_in_type(name: &str, ty: &Type) -> bool {
+    count_free_in_type_with_visited(name, ty, &mut HashSet::new()) > 0
 }
 
 /// Recursive worker for the type-walking side of [`count_free`].  Same

@@ -347,26 +347,26 @@ fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
         let argument = inline_and_beta_reduce(*argument, name, lambda);
         let function = inline_and_beta_reduce(*function, name, lambda);
         match function.node {
-            TypedExprNode::Lambda {
-                param,
-                body,
-                refinement,
-            } => {
-                // A refinement on the outer user-parameter lambda would
-                // encode a precondition `P(arg)` that must hold for the
-                // beta-reduced form to be equivalent. Current lowering of
-                // generator/list-returning `def`s produces no refinement on
-                // the outer parameter — the only refinement-bearing lambda
-                // in that shape is the inner `__iter_record` lambda (if-guard
-                // predicate), which we never beta-reduce here. If a future
-                // lowering pass attaches a refinement to the outer param,
-                // this branch needs a principled lift (e.g. emit a
+            TypedExprNode::Lambda { param, body } => {
+                // A domain refinement on this outer lambda would encode a
+                // precondition `P(arg)` that beta reduction must preserve.
+                // Such refinements ride the param's *type* (a
+                // `Type::Refinement` introduced by `cast`, and copied into
+                // `param.ty` by coalesce's `refresh_lambda_param_slot`);
+                // current lowering of generator/list-returning `def`s puts no
+                // refinement on the outer parameter (only the inner
+                // `__iter_record` if-guard lambda is refined, and that is
+                // never beta-reduced here). If a future lowering refines the
+                // outer param, this branch needs a principled lift (e.g. a
                 // `restrict(pred)` guard around the substituted body) before
-                // proceeding.
+                // proceeding. A hard assert, not debug_assert: the condition
+                // reads a live post-inference data path, and a release build
+                // proceeding past it would silently drop the precondition —
+                // a wrong-results miscompile, not a recoverable state.
                 assert!(
-                    refinement.is_none(),
+                    !matches!(param.ty, Type::Refinement(..)),
                     "inline_and_beta_reduce: outer lambda for `{name}` has a \
-                         refinement; beta reduction would silently drop its \
+                         refined parameter type; beta reduction would silently drop its \
                          precondition. Extend this branch if list-UDF lowering \
                          starts producing refined outer params."
                 );
@@ -398,23 +398,14 @@ fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
         user_annotation,
     } = expr;
     let new_node = match node {
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => {
+        TypedExprNode::Lambda { param, body } => {
             if param.name == name {
                 // shadowed — stop substituting inside
-                TypedExprNode::Lambda {
-                    param,
-                    body,
-                    refinement,
-                }
+                TypedExprNode::Lambda { param, body }
             } else {
                 TypedExprNode::Lambda {
                     param,
                     body: Box::new(inline_and_beta_reduce(*body, name, lambda)),
-                    refinement,
                 }
             }
         }

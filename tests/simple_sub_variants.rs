@@ -135,7 +135,6 @@ fn variant_param_accepts_subtype() {
             user_annotation: Some(param_ty.clone()),
         },
         body: Box::new(var("v")),
-        refinement: None,
     });
     let arg = TypedExpr::variant_ctor("Some", lit_int(5));
     let app = TypedExpr::apply(arg, lambda);
@@ -155,7 +154,6 @@ fn variant_extra_tag_rejected() {
             user_annotation: Some(param_ty),
         },
         body: Box::new(var("v")),
-        refinement: None,
     });
     let arg = TypedExpr::variant_ctor("Other", lit_int(5));
     let app = TypedExpr::apply(arg, lambda);
@@ -341,7 +339,6 @@ fn lambda_returns_variant() {
             user_annotation: Some(int()),
         },
         body: Box::new(TypedExpr::variant_ctor("Some", var("x"))),
-        refinement: None,
     });
     let app = TypedExpr::apply(lit_int(5), lambda);
     let ty = run(app).expect("inference ok");
@@ -404,7 +401,6 @@ fn payload_covariance_accept() {
             user_annotation: Some(param_ty.clone()),
         },
         body: Box::new(var("v")),
-        refinement: None,
     });
     let arg = TypedExpr::variant_ctor("A", lit_int(5));
     let ty = run(TypedExpr::apply(arg, lambda)).expect("payload variance ok");
@@ -422,7 +418,6 @@ fn payload_mismatch_reject() {
             user_annotation: Some(param_ty),
         },
         body: Box::new(var("v")),
-        refinement: None,
     });
     let arg = TypedExpr::variant_ctor("A", lit_int(5));
     assert!(

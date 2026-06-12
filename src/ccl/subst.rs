@@ -206,23 +206,15 @@ impl Subst {
                 None => Var(n.clone()),
             },
 
-            Lambda {
-                param,
-                body,
-                refinement,
-            } => {
-                // A refinement on the param lives in the *outer* scope — the
-                // param does not shadow it (mirrors `count_free`).
-                let refinement = refinement.clone();
+            Lambda { param, body } => {
+                // Domain refinements ride the param's *type* (a
+                // `Type::Refinement`); those predicates are substituted by
+                // `apply_type`, not here.
                 let (param_name, inner) = self.under_binder(&param.name, body);
                 let body = Box::new(inner.apply_expr(body));
                 let mut param = param.clone();
                 param.name = param_name;
-                Lambda {
-                    param,
-                    body,
-                    refinement,
-                }
+                Lambda { param, body }
             }
 
             Let {
@@ -596,22 +588,7 @@ fn collect_expr_fv(
                 out.insert(n.clone());
             }
         }
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => {
-            // A refinement on the param lives in the *outer* scope — the param
-            // does not shadow it (mirrors `count_free`) — but the refinement's
-            // own implicit REFINEMENT_BINDER is bound inside its predicate.
-            if let Some(r) = refinement
-                && visited.insert(r.cell_id())
-                && let Ok(pred) = r.predicate.try_borrow()
-            {
-                with_binders(bound, [REFINEMENT_BINDER.to_string()], |bnd| {
-                    collect_expr_fv(&pred, bnd, visited, out)
-                });
-            }
+        TypedExprNode::Lambda { param, body } => {
             with_binders(bound, [param.name.clone()], |bnd| {
                 collect_expr_fv(body, bnd, visited, out)
             });

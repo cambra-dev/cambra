@@ -11,8 +11,8 @@
 //! The public entry point is [`symbolic`].
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, ProjKey, Refinement, Type,
-    TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, ProjKey, Type, TypedExprNode,
+    UnaryOpKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -194,20 +194,12 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Atom, text)
         }
 
-        TypedExprNode::Lambda {
-            param,
-            body,
-            refinement,
-        } => {
-            let header = match (&param.ty, refinement) {
-                (Type::Hole | Type::Infer(_), None) => format!("λ {}", param.name),
-                (ty, None) => format!("λ {} : {ty}", param.name),
-                (Type::Hole | Type::Infer(_), Some(r)) => {
-                    format!("λ {} : {{??? | {}}}", param.name, fmt_refinement(r, opts))
-                }
-                (ty, Some(r)) => {
-                    format!("λ {} : {{{ty} | {}}}", param.name, fmt_refinement(r, opts))
-                }
+        TypedExprNode::Lambda { param, body } => {
+            // Domain refinements ride the type lattice, so they render as part
+            // of `param.ty` (a `Type::Refinement`) via `Display for Type`.
+            let header = match &param.ty {
+                Type::Hole | Type::Infer(_) => format!("λ {}", param.name),
+                ty => format!("λ {} : {ty}", param.name),
             };
             let body_str = fmt(body, Precedence::Lowest, opts);
             (Precedence::Lowest, format!("{header} → {body_str}"))
@@ -487,16 +479,6 @@ fn fmt_lit(lit: &Lit) -> String {
     }
 }
 
-fn fmt_refinement(r: &Refinement, opts: &SymbolicOpts) -> String {
-    let p = &r.predicate;
-    if let Ok(pred) = &p.try_borrow() {
-        fmt(pred, Precedence::Atom, opts)
-    } else {
-        // The cell is transiently held by a rewrite pass; show a placeholder.
-        "…".to_string()
-    }
-}
-
 /// Return the precedence level for a binary operator.
 fn binop_prec(op: &BinOpKind) -> Precedence {
     match op {
@@ -521,10 +503,12 @@ mod tests {
     use super::symbolic;
     use crate::ccl::BaseType;
     use crate::ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, Type, TypedBinding,
-        TypedExpr, TypedExprNode, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, Refinement, Type,
+        TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
     };
     use rstest::rstest;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     // -----------------------------------------------------------------------
     // Per-variant direct-construction tests
@@ -758,23 +742,18 @@ in x"
         }),
         "{ x → 1; true → 0 }"
     )]
-    // Lambda with predicate refinement, no type annotation
+    // Lambda whose parameter carries a domain refinement (refinements ride the
+    // type lattice; the header renders the refined type via `Display for Type`).
     #[case(
-        Expr::lambda_with_refinement(
+        Expr::lambda(
             "x",
-            Type::infer(),
+            Type::Refinement(
+                Box::new(Type::Base(BaseType::Int)),
+                Refinement {
+                    predicate: Rc::new(RefCell::new(Expr::lit(Lit::Bool(true)))),
+                },
+            ),
             Expr::var("x"),
-            Expr::lit(Lit::Bool(true)),
-        ),
-        "λ x : {??? | true} → x"
-    )]
-    // Lambda with predicate refinement and type annotation
-    #[case(
-        Expr::lambda_with_refinement(
-            "x",
-            Type::Base(BaseType::Int),
-            Expr::var("x"),
-            Expr::lit(Lit::Bool(true)),
         ),
         "λ x : {Int | true} → x"
     )]
