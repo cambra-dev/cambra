@@ -279,15 +279,17 @@ pub fn freshen_above(
             let new_lows: Vec<_> = lows
                 .iter()
                 .map(|b| Bound {
+                    self_subst: b.self_subst.clone(),
                     ty: freshen_above(lim, &b.ty, target, cache),
-                    subst: b.subst.clone(),
+                    ty_subst: b.ty_subst.clone(),
                 })
                 .collect();
             let new_ups: Vec<_> = ups
                 .iter()
                 .map(|b| Bound {
+                    self_subst: b.self_subst.clone(),
                     ty: freshen_above(lim, &b.ty, target, cache),
-                    subst: b.subst.clone(),
+                    ty_subst: b.ty_subst.clone(),
                 })
                 .collect();
             {
@@ -349,7 +351,16 @@ pub enum ConstrainError {
 /// graph re-enters through a shared `Infer`, whose hash/eq stop at the uid)
 /// and de-dups structurally-equal constraints. Only var-involving pairs are
 /// inserted; purely-structural constraints are finite trees that bottom out.
-pub type ConstrainCache = HashSet<(Type, Type)>;
+/// σ-aware: each visited `(lhs, rhs)` pair keeps the list of side-morphism
+/// pairs it has been constrained under. The same pair under a *different*
+/// morphism is a genuinely different constraint (e.g. two discharges of one
+/// dependent codomain, `[k ↦ 0]` vs `[k ↦ 1]`) and must not be conflated;
+/// the same pair under the *same* morphisms is the recursive/cyclic revisit
+/// the cache exists to terminate. Termination: morphisms arising on cyclic
+/// (var⇄var) edges are renames over the episode's finite binder set, whose
+/// composites saturate; discharges ride acyclic content edges only (their
+/// composites grow along lexical nesting depth, not around cycles).
+pub type ConstrainCache = HashMap<(Type, Type), Vec<(Subst, Subst)>>;
 
 /// Cache for [`extrude`], keyed by the polar pair (variable uid, polarity).
 ///
@@ -368,47 +379,156 @@ pub fn constrain_subtype(
     rhs: &Type,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    constrain_go(lhs, rhs, &Subst::id(), cache)
+    constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache)
 }
 
-/// Constrain `lhs <: rhs` under a correspondence `sigma : ctx(lhs) → ctx(rhs)`
-/// that aligns the two sides' Pi binders.
+/// Bridge the holder gap when chaining two edges through one variable.
 ///
-/// `sigma` is `Subst::id()` for ordinary monomorphic constraints — in which
-/// case every arm below reduces exactly to the substitution-free solver. A
-/// non-identity `sigma` is *derived* when constraining two function types
+/// A lower entry `L‹σ_L› <: V‹lo›` and an upper entry `V‹hi› <: U‹σ_U›`
+/// relate *different views* of `V` unless `lo == hi`. Transitivity needs the
+/// two views reconciled; the returned bridge `(τ_L, τ_U)` is composed onto the
+/// lower and upper **content** sides respectively, yielding the closure edge
+/// `L‹τ_L∘σ_L› <: U‹τ_U∘σ_U›`.
+///
+/// The bridge moves whichever side is movable — substitution application is
+/// monotone w.r.t. subtyping, so applying one morphism to *both* sides of an
+/// edge preserves it:
+/// - equal morphisms need no bridge (covers two entries that arrived under
+///   the *same* discharge);
+/// - an invertible `lo` (identity or rename) moves the lower into the upper's
+///   frame: `τ_L = hi ∘ lo⁻¹` — the common case;
+/// - otherwise an invertible `hi` moves the upper into the lower's frame:
+///   `τ_U = lo ∘ hi⁻¹` (e.g. a discharge-bearing lower meeting an ordinary
+///   upper — a discharge lands on a holder side at every contravariant edge
+///   swap — where `V <: U` and `L <: V‹[x↦0]›` derive `L <: U‹[x↦0]›`);
+/// - two *distinct non-invertible* morphisms meeting at one variable is the
+///   unhandled extent-join corner (O1/O4) — `invert_rename` is its loud
+///   tripwire.
+fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
+    if lo == hi {
+        return (Subst::id(), Subst::id());
+    }
+    // Reconcile on the LICENSED CORRESPONDENCE VIEWS: Var-target discharges
+    // read as correspondences into the outer scope, under the monomorphic
+    // license documented at `Subst::licensed_correspondence_view` (the only
+    // species override anywhere). Species elsewhere stay caller-declared, so
+    // when the license expires with polymorphic fibers, deleting the view
+    // re-arms the tripwire below for exactly the sites that depended on it.
+    let lo = &lo.licensed_correspondence_view();
+    let hi = &hi.licensed_correspondence_view();
+    if let Some(lo_inv) = lo.invert() {
+        return (Subst::then(&lo_inv, hi), Subst::id());
+    }
+    if let Some(hi_inv) = hi.invert() {
+        return (Subst::id(), Subst::then(&hi_inv, lo));
+    }
+    // Both composites are non-invertible. Factor each into its rename part
+    // and its term (discharge) part: when the term parts agree — the common
+    // shape, two views of ONE instantiation reached through different routes —
+    // the gap is purely a rename gap, bridged on whichever side inverts. The
+    // routes arise without any dependent types in play: every application
+    // mints its discharge edge unconditionally (vacuous when the codomain is
+    // non-dependent), composition faithfully records its action on
+    // intermediate binders (§3.6), and extrude's level-crossing proxies and
+    // monomorphize's specializations copy bound lists — so one variable
+    // receives the same content under composites that differ only in which
+    // fresh expected binders and correspondences each route threaded. Such
+    // entries are inert on all content (nothing references the minted
+    // binders); reconciling them is bookkeeping, not semantics. The extra
+    // composite entries the bridge result carries are likewise inert on
+    // content that doesn't mention the intermediate binders free (the §3.6
+    // freshness discipline).
+    let (lo_ren, lo_term) = lo.split_renames();
+    let (hi_ren, hi_term) = hi.split_renames();
+    // Term parts compare modulo type slots: a discharge captures its argument
+    // at emit time with freshly-minted inference-var slots, so two captures of
+    // the SAME argument can differ in slots while denoting the same term
+    // (`Subst::eq_modulo_ty_slots`). Strict `==` here would shunt a sound
+    // same-fiber meeting into the tripwire below.
+    if lo_term.eq_modulo_ty_slots(&hi_term) {
+        if let Some(lo_ren_inv) = lo_ren.invert() {
+            return (Subst::then(&lo_ren_inv, &hi_ren), Subst::id());
+        }
+        if let Some(hi_ren_inv) = hi_ren.invert() {
+            return (Subst::id(), Subst::then(&hi_ren_inv, &lo_ren));
+        }
+    }
+    // Last resort before declaring the morphisms genuinely different: equal
+    // up to type slots as WHOLES (two captures of one fiber whose rename
+    // parts also coincide) bridges as the same view.
+    if lo.eq_modulo_ty_slots(hi) {
+        return (Subst::id(), Subst::id());
+    }
+    // Two *distinct* non-invertible morphisms meeting at one variable: bounds
+    // constraining different fibers (of one family — g(0) vs g(1) — or of two
+    // unrelated families), between which no sound transport exists. This is
+    // the extent-join corner (O1/O4); the eventual resolution is the
+    // lossless-Σ extent regime (vault: type-checker-data-vs-compute-functions),
+    // under which both fibers become components of the one Σ-type and the
+    // question dissolves. Until then: no reachable program produces this
+    // shape, so reaching it means a solver bug — refuse loudly rather than
+    // corrupt the edge.
+    panic!(
+        "closure bridge: two distinct non-invertible morphisms met at one \
+         variable (extent-join corner, O1/O4): lo={lo:?}, hi={hi:?}"
+    );
+}
+
+/// Constrain `lhs‹sl› <: rhs‹sr›` — each side under its own context morphism,
+/// both mapping into the constraint's shared ambient frame.
+///
+/// Both are `Subst::id()` for ordinary monomorphic constraints — in which
+/// case every arm below reduces exactly to the substitution-free solver.
+/// Non-identity morphisms are *derived* when constraining two function types
 /// whose codomains mention their binders (the Pi-vs-Pi arm mints the binder
-/// correspondence) and is recorded on the constraint edges so the coalesce
-/// walk can compose it (design §3.6).
+/// correspondence, recorded on the lhs side) or introduced by a dependent
+/// application's discharge riding a closure step.
 ///
-/// Edge-storage convention: a `Bound { ty, subst }` recorded on variable `V`
-/// reads, in `V`'s context, as `subst.apply(ty)` — i.e. `subst : ctx(ty) →
-/// ctx(V)`. Lower edges therefore carry `sigma` (source `lhs` → holder `V`);
-/// upper edges carry `sigma⁻¹` (the holder is the source, so the morphism to
-/// the bound is inverted). Only renames are inverted, which is why a
-/// correspondence is always a rename.
+/// Edge-storage convention: bounds are recorded in their **native two-sided
+/// form** (see [`Bound`]) — an upper entry on `V` is `V‹self_subst› <:
+/// ty‹ty_subst›`, a lower entry `ty‹ty_subst› <: V‹self_subst›` — with *no
+/// inversion at record time*. The transitive closure recovers a previously
+/// recorded edge's forward morphism by reading it directly, reconciling the
+/// two entries' holder views via `bridge_holder_gap` and composing forward;
+/// the only inversions anywhere are of renames (lossless).
+/// This is what lets a non-invertible discharge survive crossing a consumer
+/// edge that was recorded before the producer's content arrived.
 fn constrain_go(
     lhs: &Type,
     rhs: &Type,
-    sigma: &Subst,
+    sl: &Subst,
+    sr: &Subst,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
     // The trivial-equality short-circuit is only sound when the edge carries
-    // no transformation — under a non-identity correspondence `lhs` and `rhs`
-    // live in different contexts even when structurally equal.
-    if sigma.is_id() && lhs == rhs {
+    // no transformation — under non-identity morphisms `lhs` and `rhs` live
+    // in different contexts even when structurally equal.
+    if sl.is_id() && sr.is_id() && lhs == rhs {
         return Ok(());
     }
 
     // Cycle-break: only constraints involving variables can recur.
     // Non-variable structural types are regular trees; their constraints
     // bottom out without revisiting themselves. Key by value — identity at
-    // `Infer` is by `uid`, so this is cycle-safe. The correspondence is not
-    // part of the key: like the prototype's var-pair cache, deduping on the
-    // `(lhs, rhs)` pair alone is what guarantees termination on cyclic edges.
+    // `Infer` is by `uid`, so this is cycle-safe. The side morphisms ARE part
+    // of the visited state: the same pair under different morphisms is a
+    // different constraint (see `ConstrainCache`).
     let either_var = matches!(lhs, Type::Infer(_)) || matches!(rhs, Type::Infer(_));
-    if either_var && !cache.insert((lhs.clone(), rhs.clone())) {
-        return Ok(());
+    if either_var {
+        let seen = cache.entry((lhs.clone(), rhs.clone())).or_default();
+        // Morphisms compare modulo emit-time type slots — the SAME notion of
+        // constraint identity the closure bridge uses (`eq_modulo_ty_slots`).
+        // Strict `==` here would admit a near-duplicate edge (two captures of
+        // one fiber differing only in minted slots) that the bridge would then
+        // immediately reconcile as same-fiber: wasted edges and traversal, and
+        // two components disagreeing about what "the same constraint" means.
+        if seen
+            .iter()
+            .any(|(a, b)| a.eq_modulo_ty_slots(sl) && b.eq_modulo_ty_slots(sr))
+        {
+            return Ok(());
+        }
+        seen.push((sl.clone(), sr.clone()));
     }
 
     match (lhs, rhs) {
@@ -420,9 +540,11 @@ fn constrain_go(
         // Function: contravariant on domain, covariant on codomain. The
         // codomain edge *derives* the binder correspondence — aligning the two
         // Pi binders `k ↦ x` — and carries it onward (design §3.6); the domain
-        // edge flips the correspondence with the polarity. When neither side is
-        // a Pi (both names `None`) the correspondence is unchanged, so this is
-        // exactly the ordinary contravariant/covariant rule.
+        // edge flips with the polarity by **swapping the two sides'
+        // morphisms** — no inversion, so a discharge crosses a domain edge
+        // intact. When neither side is a Pi (both names `None`) the
+        // correspondence is unchanged, so this is exactly the ordinary
+        // contravariant/covariant rule.
         (
             Type::Fun {
                 name: n0,
@@ -435,22 +557,12 @@ fn constrain_go(
                 codomain: c1,
             },
         ) => {
-            // The domain edge flips sides, so the correspondence must run
-            // rhs → lhs. A rename inverts exactly. A σ carrying a discharge
-            // does not invert — and unlike the var arms' reverse-edge bounds
-            // (which live in the post-discharge context, making the id
-            // fallback exact there), the lhs domain here is a *pre*-discharge
-            // type that may still mention the discharged binder. Transport it
-            // forward into rhs context instead and compare under the identity.
-            match sigma.invert() {
-                Some(inv) => constrain_go(d1, d0, &inv, cache)?,
-                None => constrain_go(d1, &sigma.apply_type(d0), &Subst::id(), cache)?,
-            }
-            let cod_sigma = match (n0, n1) {
-                (Some(k), Some(x)) => sigma.extended_rename(k, x),
-                _ => sigma.clone(),
+            constrain_go(d1, d0, sr, sl, cache)?;
+            let cod_sl = match (n0, n1) {
+                (Some(k), Some(x)) => sl.extended_rename(k, x),
+                _ => sl.clone(),
             };
-            constrain_go(c0, c1, &cod_sigma, cache)
+            constrain_go(c0, c1, &cod_sl, sr, cache)
         }
 
         // Tuple: positional width-subtyping. A longer/equal tuple is a
@@ -458,7 +570,7 @@ fn constrain_go(
         (Type::Tuple(a), Type::Tuple(b)) => {
             for (i, t1) in b.iter().enumerate() {
                 match a.get(i) {
-                    Some(t0) => constrain_go(t0, t1, sigma, cache)?,
+                    Some(t0) => constrain_go(t0, t1, sl, sr, cache)?,
                     None => {
                         return Err(ConstrainError::MissingField {
                             key: FieldKey::Index(i),
@@ -474,7 +586,7 @@ fn constrain_go(
         (Type::Record(a), Type::Record(b)) => {
             for (name, t1) in b {
                 match a.iter().find(|(n, _)| n == name) {
-                    Some((_, t0)) => constrain_go(t0, t1, sigma, cache)?,
+                    Some((_, t0)) => constrain_go(t0, t1, sl, sr, cache)?,
                     None => {
                         return Err(ConstrainError::MissingField {
                             key: FieldKey::Name(SmolStr::from(name.as_str())),
@@ -491,7 +603,7 @@ fn constrain_go(
         (Type::Variant(a), Type::Variant(b)) => {
             for (k, t0) in a {
                 match b.iter().find(|(bk, _)| bk == k) {
-                    Some((_, t1)) => constrain_go(t0, t1, sigma, cache)?,
+                    Some((_, t1)) => constrain_go(t0, t1, sl, sr, cache)?,
                     None => {
                         return Err(ConstrainError::ExtraTag {
                             tag: k.clone(),
@@ -503,36 +615,53 @@ fn constrain_go(
             Ok(())
         }
 
-        // Variable on lhs, rhs has compatible level: append rhs to upper
-        // bounds (stored in `lv`'s context, so under `sigma⁻¹`), propagate to
-        // all known lower bounds (composing each lower edge with `sigma`).
+        // Variable on lhs, rhs has compatible level: record the upper edge in
+        // native form (`V‹sl› <: rhs‹sr›`, no inversion), then close each
+        // existing lower (`low.ty‹low.ty_subst› <: V‹low.self_subst›`) against
+        // the new upper by bridging the holder gap and composing **forward**
+        // onto the two content sides.
         (Type::Infer(lv), _) if type_level(rhs) <= lv.level => {
             let lows = {
                 let mut s = lv.bounds.borrow_mut();
                 s.upper
-                    .push(Bound::with_subst(rhs.clone(), sigma.invert_or_id()));
+                    .push(Bound::edge(sl.clone(), rhs.clone(), sr.clone()));
                 s.lower.clone()
             };
             for low in lows {
-                constrain_go(&low.ty, rhs, &Subst::then(&low.subst, sigma), cache)?;
+                let (tau_l, tau_u) = bridge_holder_gap(&low.self_subst, sl);
+                constrain_go(
+                    &low.ty,
+                    rhs,
+                    &Subst::then(&low.ty_subst, &tau_l),
+                    &Subst::then(sr, &tau_u),
+                    cache,
+                )?;
             }
             Ok(())
         }
 
-        // Variable on rhs, lhs has compatible level: append lhs to lower
-        // bounds (stored in `rv`'s context, so under `sigma`), propagate to
-        // all known upper bounds (composing each upper edge's inverse).
+        // Variable on rhs, lhs has compatible level: record the lower edge in
+        // native form (`lhs‹sl› <: V‹sr›`), then close the new lower against
+        // each existing upper (`V‹up.self_subst› <: up.ty‹up.ty_subst›`) the
+        // same way — forward composition only. This closure step is where the
+        // inverted-storage convention lost dependent discharges: the upper
+        // edge's forward morphism was reconstructed by inverting its stored
+        // inverse, and a non-invertible discharge degraded to `id` twice over.
+        // Here the forward morphism is read directly off the edge.
         (_, Type::Infer(rv)) if type_level(lhs) <= rv.level => {
             let ups = {
                 let mut s = rv.bounds.borrow_mut();
-                s.lower.push(Bound::with_subst(lhs.clone(), sigma.clone()));
+                s.lower
+                    .push(Bound::edge(sr.clone(), lhs.clone(), sl.clone()));
                 s.upper.clone()
             };
             for up in ups {
+                let (tau_l, tau_u) = bridge_holder_gap(sr, &up.self_subst);
                 constrain_go(
                     lhs,
                     &up.ty,
-                    &Subst::then(sigma, &up.subst.invert_or_id()),
+                    &Subst::then(sl, &tau_l),
+                    &Subst::then(&up.ty_subst, &tau_u),
                     cache,
                 )?;
             }
@@ -543,11 +672,11 @@ fn constrain_go(
         // Lift the other side down via extrude and retry.
         (Type::Infer(lv), _) => {
             let new_rhs = extrude(rhs, false, lv.level, &mut ExtrudeCache::new());
-            constrain_go(lhs, &new_rhs, sigma, cache)
+            constrain_go(lhs, &new_rhs, sl, sr, cache)
         }
         (_, Type::Infer(rv)) => {
             let new_lhs = extrude(lhs, true, rv.level, &mut ExtrudeCache::new());
-            constrain_go(&new_lhs, rhs, sigma, cache)
+            constrain_go(&new_lhs, rhs, sl, sr, cache)
         }
 
         // Refinement subtyping:
@@ -586,24 +715,28 @@ fn constrain_go(
         (Type::Refinement(..), _) | (_, Type::Refinement(..)) => {
             let (lbase, lrefs) = peel_refinements(lhs);
             let (rbase, rrefs) = peel_refinements(rhs);
-            // The refinements rhs requires that no σ-transported lhs layer
-            // matches (by `Refinement`'s structural `PartialEq`).
-            let lrefs_in_rhs_ctx: Vec<Refinement> =
-                lrefs.iter().map(|l| sigma.force_refinement(l)).collect();
+            // The refinements rhs requires that no transported lhs layer
+            // matches (by `Refinement`'s structural `PartialEq`). Each side's
+            // tags are forced through its own morphism into the ambient frame
+            // before comparing (`sl(S₁)` vs `sr(S₂)`); the deficit keeps the
+            // *untransported* rhs tags, since the recursive constraint below
+            // carries `sr` for them.
+            let lrefs_in_ambient: Vec<Refinement> =
+                lrefs.iter().map(|l| sl.force_refinement(l)).collect();
             let deficit: Vec<&Refinement> = rrefs
                 .iter()
                 .copied()
-                .filter(|r| !lrefs_in_rhs_ctx.contains(r))
+                .filter(|r| !lrefs_in_ambient.contains(&sr.force_refinement(r)))
                 .collect();
             if deficit.is_empty() {
                 // lhs's explicit layers already supply every refinement rhs requires.
-                constrain_go(lbase, rbase, sigma, cache)
+                constrain_go(lbase, rbase, sl, sr, cache)
             } else if matches!(lbase, Type::Infer(_)) {
                 // Variable base: flow the deficit onto it (`b₁ <: {b₂ | deficit}`)
                 // rather than rejecting; it fails later iff the variable
                 // resolves to a concrete base lacking those tags.
                 let demanded = wrap_refinements(rbase, &deficit);
-                constrain_go(lbase, &demanded, sigma, cache)
+                constrain_go(lbase, &demanded, sl, sr, cache)
             } else {
                 Err(ConstrainError::Mismatch {
                     lhs: lhs.clone(),
@@ -718,8 +851,9 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 let new_lows: Vec<_> = lows
                     .iter()
                     .map(|b| Bound {
+                        self_subst: b.self_subst.clone(),
                         ty: extrude(&b.ty, pol, target_level, cache),
-                        subst: b.subst.clone(),
+                        ty_subst: b.ty_subst.clone(),
                     })
                     .collect();
                 nvs.bounds.borrow_mut().lower = new_lows;
@@ -734,8 +868,9 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 let new_ups: Vec<_> = ups
                     .iter()
                     .map(|b| Bound {
+                        self_subst: b.self_subst.clone(),
                         ty: extrude(&b.ty, pol, target_level, cache),
-                        subst: b.subst.clone(),
+                        ty_subst: b.ty_subst.clone(),
                     })
                     .collect();
                 nvs.bounds.borrow_mut().upper = new_ups;
@@ -1358,11 +1493,11 @@ fn compact_go(
             new_parents.insert(uid);
             let mut bound: Option<CompactType> = None;
             for b in &primary_bounds {
-                // Compose this edge's substitution onto the accumulator before
+                // Compose this edge's morphisms onto the accumulator before
                 // descending: a bound reached transitively through `v → w → …`
                 // arrives with every edge's morphism composed (design §3.6).
                 // Identity edges leave `subst_acc` unchanged (the common case).
-                let inner_acc = Subst::then(&b.subst, subst_acc);
+                let inner_acc = Subst::then(&b.render_subst(), subst_acc);
                 let bc = compact_go(
                     &b.ty,
                     pol,
@@ -1392,7 +1527,7 @@ fn compact_go(
                 .is_none_or(|b| b.atoms.is_empty() && b.rec.is_none() && b.fun.is_none());
             if no_concrete {
                 for b in &opposite_bounds {
-                    let inner_acc = Subst::then(&b.subst, subst_acc);
+                    let inner_acc = Subst::then(&b.render_subst(), subst_acc);
                     let bc = compact_go(
                         &b.ty,
                         !pol,
@@ -2084,11 +2219,20 @@ mod tests {
         assert_eq!(a, b, "structurally-equal refinements must be ==");
         assert_eq!(hash(&a), hash(&b), "== refinements must hash equal");
 
-        // The cache scenario: the second structurally-equal pair is recognised
-        // as already present.
+        // The cache scenario: a structurally-equal pair finds the same entry
+        // (same key), so a revisit under the same side-morphisms is recognised.
         let mut cache = ConstrainCache::new();
-        assert!(cache.insert((a.clone(), prim(BaseType::Int))));
-        assert!(!cache.insert((b, prim(BaseType::Int))));
+        let sid = (Subst::id(), Subst::id());
+        cache
+            .entry((a.clone(), prim(BaseType::Int)))
+            .or_default()
+            .push(sid.clone());
+        assert!(
+            cache
+                .get(&(b, prim(BaseType::Int)))
+                .is_some_and(|seen| seen.contains(&sid)),
+            "structurally-equal refined key must hit the same cache entry"
+        );
 
         // A structurally *different* predicate must not collapse into it.
         let c = Type::Refinement(
@@ -3003,6 +3147,189 @@ mod tests {
         // g(0) : {i | i > 0} ⇒ Int — both the correspondence rename and the
         // discharge fired, composed along the coalesce walk.
         assert_eq!(domain_predicate(&app_ty), "__elem > 0");
+        drop(arena);
+    }
+
+    /// `g : (k: Int) ⇒ ({i | i > k} ⇒ Int)`, shared by the dependent-edge
+    /// order tests below.
+    fn dependent_g_ty() -> Type {
+        Type::pi(
+            "k",
+            prim(BaseType::Int),
+            Type::fun(
+                Type::Refinement(
+                    Box::new(prim(BaseType::Int)),
+                    gt_refinement(TypedExpr::var("k")),
+                ),
+                prim(BaseType::Int),
+            ),
+        )
+    }
+
+    // M — the discharge must survive the *opaque* constraint order: the
+    // application result flows into a consumer (a contravariant argument
+    // slot) BEFORE the function's concrete codomain arrives (the function
+    // was a parameter; its value reaches the apply site last). The consumer
+    // edge is recorded across `result` while the discharge `[x ↦ 0]` is the
+    // only morphism in hand; when `Cod` arrives later it must cross that
+    // edge still wearing the discharge. The regression this guards:
+    // holder-context-normalized storage (invert at record, re-invert at
+    // closure) destroys the non-invertible discharge in the round trip,
+    // leaving the consumer's copy with a free binder — `i > x` instead of
+    // `i > 0`.
+    #[test]
+    fn dependent_discharge_survives_opaque_constraint_order() {
+        let arena = crate::ccl::infer::InferArena::new();
+        let result = fresh_var(0);
+        let Type::Infer(result_var) = &result else {
+            unreachable!()
+        };
+        let expected = Type::pi("x", prim(BaseType::Int), result.clone());
+        let mut cache = ConstrainCache::new();
+
+        // g(0): the application's type is `result` under [x ↦ 0].
+        let gamma = fresh_var(0);
+        let Type::Infer(gamma_var) = &gamma else {
+            unreachable!()
+        };
+        gamma_var.bounds.borrow_mut().lower.push(Bound::with_subst(
+            Type::Infer(Rc::clone(result_var)),
+            Subst::discharge("x", TypedExpr::lit(Lit::Int(0))),
+        ));
+
+        // The consumer edge first: g(0) flows into an argument slot.
+        let consumer = fresh_var(0);
+        let Type::Infer(consumer_var) = &consumer else {
+            unreachable!()
+        };
+        constrain_subtype(&gamma, &consumer, &mut cache).expect("g(0) <: consumer");
+
+        // The function's concrete type arrives last (opaque order).
+        constrain_subtype(&dependent_g_ty(), &expected, &mut cache).expect("g <: expected");
+
+        // Both materializations must show the discharged predicate.
+        let app_ty = coalesce(&Type::Infer(Rc::clone(gamma_var)));
+        assert_eq!(domain_predicate(&app_ty), "__elem > 0", "result node");
+        let consumer_ty = coalesce(&Type::Infer(Rc::clone(consumer_var)));
+        assert_eq!(
+            domain_predicate(&consumer_ty),
+            "__elem > 0",
+            "consumer copy (crossed the upper edge)"
+        );
+        drop(arena);
+    }
+
+    // N — two applications of one dependent function at different keys,
+    // both flowing into one position: the constraint `Cod <: V` arrives
+    // twice with *different* morphisms (`[k ↦ 0]`, `[k ↦ 1]`). A cache
+    // keyed on the `(lhs, rhs)` pair alone conflates them and silently
+    // swallows the second edge; V must receive both discharged copies.
+    #[test]
+    fn distinct_discharges_of_one_codomain_both_recorded() {
+        let arena = crate::ccl::infer::InferArena::new();
+        let g_ty = dependent_g_ty();
+        let mut cache = ConstrainCache::new();
+        let v = fresh_var(0);
+        let Type::Infer(vv) = &v else { unreachable!() };
+
+        for lit in [0i64, 1] {
+            let r = fresh_var(0);
+            let expected = Type::pi("k", prim(BaseType::Int), r.clone());
+            constrain_subtype(&g_ty, &expected, &mut cache).expect("g <: expected");
+            let app = fresh_var(0);
+            let Type::Infer(av) = &app else {
+                unreachable!()
+            };
+            av.bounds.borrow_mut().lower.push(Bound::with_subst(
+                r.clone(),
+                Subst::discharge("k", TypedExpr::lit(Lit::Int(lit))),
+            ));
+            constrain_subtype(&app, &v, &mut cache).expect("app <: V");
+        }
+
+        let lows = vv.bounds.borrow().lower.clone();
+        let rendered: Vec<String> = lows
+            .iter()
+            .map(|b| format!("{}", b.materialize()))
+            .collect();
+        assert_eq!(
+            lows.len(),
+            2,
+            "V must receive BOTH discharged copies, got: {rendered:?}"
+        );
+        drop(arena);
+    }
+
+    // O — two captures of the SAME discharge argument, differing only in
+    // their emit-time inference-var type slots, must bridge as one fiber
+    // rather than hitting the distinct-discharge tripwire. A discharge
+    // captures its argument expression at emit time; two syntactic
+    // occurrences of the same argument (or one type reaching a variable
+    // along two propagation paths) mint distinct `Infer` slots, so strict
+    // structural `Subst` equality misses and only `eq_modulo_ty_slots`
+    // recognizes the captures as the same written term.
+    #[test]
+    fn bridge_unifies_same_fiber_captures_with_distinct_ty_slots() {
+        let arena = crate::ccl::infer::InferArena::new();
+        // Non-var capture (`y + 1`) so neither side is rename-shaped; fresh
+        // slot per capture, as emission would mint.
+        let capture = || {
+            let mut y = TypedExpr::var("y");
+            y.ty = fresh_var(0);
+            TypedExpr::binop(
+                y,
+                BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
+                TypedExpr::lit(Lit::Int(1)),
+            )
+        };
+        let lo = Subst::discharge("k", capture());
+        let hi = Subst::discharge("k", capture());
+        assert_ne!(lo, hi, "premise: strict equality misses (distinct slots)");
+
+        let (tau_l, tau_u) = bridge_holder_gap(&lo, &hi);
+        assert!(
+            tau_l.is_id() && tau_u.is_id(),
+            "same-written captures must bridge as the same fiber"
+        );
+        drop(arena);
+    }
+
+    // `Subst::eq_modulo_ty_slots` (backed by the codebase's type-blind
+    // `eq_refinement_predicate`) — the comparison the bridge relies on:
+    // insensitive to inferred slots (positive), but a genuine structural or
+    // name difference must still distinguish (negatives — what keeps the
+    // bridge from conflating genuinely different fibers).
+    #[test]
+    fn eq_modulo_ty_slots_ignores_slots_but_not_structure() {
+        let arena = crate::ccl::infer::InferArena::new();
+        let capture = |name: &str, lit: i64| {
+            let mut v = TypedExpr::var(name);
+            v.ty = fresh_var(0);
+            Subst::discharge(
+                "k",
+                TypedExpr::binop(
+                    v,
+                    BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
+                    TypedExpr::lit(Lit::Int(lit)),
+                ),
+            )
+        };
+        // Same written term, distinct slots: equal.
+        assert!(capture("y", 1).eq_modulo_ty_slots(&capture("y", 1)));
+        // Different literal: unequal.
+        assert!(!capture("y", 1).eq_modulo_ty_slots(&capture("y", 2)));
+        // Different variable name: unequal.
+        assert!(!capture("y", 1).eq_modulo_ty_slots(&capture("z", 1)));
+        // Binder slots are blind too: identical lambda captures whose param
+        // slots differ compare equal.
+        let lam = || {
+            let mut l = TypedExpr::lambda("w", Type::Hole, TypedExpr::var("w"));
+            if let crate::ccl::TypedExprNode::Lambda { param, .. } = &mut l.node {
+                param.ty = fresh_var(0);
+            }
+            Subst::discharge("k", l)
+        };
+        assert!(lam().eq_modulo_ty_slots(&lam()));
         drop(arena);
     }
 }

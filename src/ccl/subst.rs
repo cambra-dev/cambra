@@ -33,10 +33,38 @@ use crate::ccl::{Branch, PredicateCellId, REFINEMENT_BINDER, Type, TypedExpr, Ty
 /// A term binder name.
 pub type Binder = String;
 
-/// A simultaneous substitution `{binder ↦ term, …}`. An absent binder maps to
-/// itself (the identity). The empty map is [`Subst::id`].
+/// A single mapping target: a **rename** to another binder (invertible) or a
+/// **discharge** to a term (one-way).
+///
+/// The variant is the morphism's *species*, assigned at construction —
+/// provenance, not target shape reconstructed by inspecting terms. This is
+/// what lets [`Subst::invert`] and [`Subst::split_renames`] be exact by
+/// construction: inversion legality is type-enforced, and "the rename part"
+/// means precisely the entries constructed as correspondences.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Mapping {
+    /// `binder ↦ other binder` — a correspondence between frames. Invertible.
+    Rename(Binder),
+    /// `binder ↦ term` — plug a term in for the binder. No inverse.
+    /// (Boxed: a term is much larger than a binder name.)
+    Discharge(Box<TypedExpr>),
+}
+
+impl Mapping {
+    /// The mapping's replacement as a term (a `Rename` materializes as a bare
+    /// variable reference).
+    fn as_expr(&self) -> TypedExpr {
+        match self {
+            Mapping::Rename(to) => TypedExpr::var(to.clone()),
+            Mapping::Discharge(t) => (**t).clone(),
+        }
+    }
+}
+
+/// A simultaneous substitution `{binder ↦ mapping, …}`. An absent binder maps
+/// to itself (the identity). The empty map is [`Subst::id`].
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct Subst(BTreeMap<Binder, TypedExpr>);
+pub struct Subst(BTreeMap<Binder, Mapping>);
 
 /// Monotonic source of fresh binder suffixes for capture-avoiding α-renaming.
 /// Renaming is rare (only when a substitution's range mentions a binder it is
@@ -66,14 +94,24 @@ impl Subst {
     /// A rename `[from ↦ to]` — a bijection on binders, hence invertible.
     pub fn rename(from: &str, to: &str) -> Self {
         let mut m = BTreeMap::new();
-        m.insert(from.to_string(), TypedExpr::var(to));
+        m.insert(from.to_string(), Mapping::Rename(to.to_string()));
         Subst(m)
     }
 
-    /// A discharge `[binder ↦ term]` — plug `term` in for `binder`. One-way.
+    /// A discharge `[binder ↦ term]` — plug `term` in for `binder`. One-way,
+    /// **unconditionally**: the species is the caller's declared intent, even
+    /// when `term` happens to be a bare variable reference. `[x ↦ k0]` from a
+    /// dependent application `g(k0)` is fiber *selection* — inverting it
+    /// would be fiber→family generalization, an overclaim in general. The one
+    /// consumer permitted to read a Var-target discharge as a correspondence
+    /// is the closure bridge, through the explicitly licensed
+    /// [`Subst::licensed_correspondence_view`]; everywhere else the species
+    /// is honest, and a caller that *means* a frame correspondence
+    /// (relabeling, inversion-safe with no license) must say so with
+    /// [`Subst::rename`].
     pub fn discharge(binder: &str, term: TypedExpr) -> Self {
         let mut m = BTreeMap::new();
-        m.insert(binder.to_string(), term);
+        m.insert(binder.to_string(), Mapping::Discharge(Box::new(term)));
         Subst(m)
     }
 
@@ -82,10 +120,65 @@ impl Subst {
         self.0.keys()
     }
 
+    /// Split into the rename entries and the discharge entries — a variant
+    /// partition, exact by construction (see [`Mapping`]). The two act on
+    /// disjoint binders, so the original is their parallel union; this is the
+    /// factoring [`crate::ccl::simple_sub`]'s closure bridge uses to
+    /// reconcile two composite holder-side morphisms that share their
+    /// discharge part but differ in correspondence renames.
+    pub fn split_renames(&self) -> (Subst, Subst) {
+        let (ren, term): (BTreeMap<_, _>, BTreeMap<_, _>) = self
+            .0
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .partition(|(_, v)| matches!(v, Mapping::Rename(_)));
+        (Subst(ren), Subst(term))
+    }
+
+    /// Equality up to the terms' *type slots* — same binders, and each pair
+    /// of replacement terms equal by the codebase's type-blind structural
+    /// comparison (`eq_refinement_predicate`, the equality that backs
+    /// [`crate::ccl::Refinement`]'s `PartialEq`).
+    ///
+    /// Why this exists: a discharge captures its argument expression **at emit
+    /// time**, with whatever inference-variable slots emission minted — so two
+    /// captures of the *same* argument (two syntactic occurrences, or one type
+    /// reaching a variable along two propagation paths) carry distinct
+    /// `Infer` uids and compare unequal under derived `==` even though they
+    /// denote the same term. The closure bridge uses this as its last check
+    /// before declaring two morphisms genuinely different: conflating two
+    /// same-written, differently-slotted captures is sound wherever the
+    /// alternative was refusing to bridge at all. (Caveat, accepted: two
+    /// same-named binders from *different* scopes meeting at one variable
+    /// would also compare equal here; predicates resolve names lexically at
+    /// their introduction site, so this requires two distinct dependent
+    /// functions with colliding argument spellings meeting at one position —
+    /// the extent-join territory that O1/O4 owns anyway.)
+    pub fn eq_modulo_ty_slots(&self, other: &Subst) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(other.0.iter())
+                .all(|((ka, va), (kb, vb))| {
+                    ka == kb
+                        && match (va, vb) {
+                            (Mapping::Rename(a), Mapping::Rename(b)) => a == b,
+                            (Mapping::Discharge(a), Mapping::Discharge(b)) => {
+                                crate::ccl::eq_refinement_predicate(a, b)
+                            }
+                            _ => false,
+                        }
+                })
+    }
+
     /// True if any binder of `self`'s *range* (the replacement terms) contains a
     /// free `name` — i.e. substituting under a binder `name` would capture.
     fn range_mentions(&self, name: &str) -> bool {
-        self.0.values().any(|t| is_free(name, t))
+        self.0.values().any(|m| match m {
+            Mapping::Rename(to) => to == name,
+            Mapping::Discharge(t) => is_free(name, t),
+        })
     }
 
     /// Compose two morphisms: `then(a, b)` is "apply `a`, then `b`" — the
@@ -103,39 +196,34 @@ impl Subst {
         keys.extend(b.0.keys().cloned());
         let mut m = BTreeMap::new();
         for k in keys {
-            let from_a =
-                a.0.get(&k)
-                    .cloned()
-                    .unwrap_or_else(|| TypedExpr::var(k.clone()));
-            let composed = b.apply_expr(&from_a);
-            // Drop entries that resolve back to the identity on `k`.
-            if !is_var_named(&composed, &k) {
+            // Species composes from the INPUT species, never from the shape
+            // of the composed term — one-way-ness is contagious. Rename∘Rename
+            // is a rename; a discharge anywhere in the chain (including a
+            // rename whose target `b` discharges) makes the composite a
+            // discharge, even if the composed term happens to be a bare
+            // variable.
+            let composed = match a.0.get(&k) {
+                Some(Mapping::Rename(to)) => match b.0.get(to) {
+                    Some(mb) => mb.clone(),
+                    None => Mapping::Rename(to.clone()),
+                },
+                Some(Mapping::Discharge(t)) => Mapping::Discharge(Box::new(b.apply_expr(t))),
+                None => match b.0.get(&k) {
+                    Some(mb) => mb.clone(),
+                    None => continue,
+                },
+            };
+            // Drop entries that resolve back to the identity on `k` — for
+            // either species: `[x ↦ x]` substitutes a variable for itself.
+            let is_identity = match &composed {
+                Mapping::Rename(to) => *to == k,
+                Mapping::Discharge(t) => is_var_named(t, &k),
+            };
+            if !is_identity {
                 m.insert(k, composed);
             }
         }
         Subst(m)
-    }
-
-    /// Invert, requiring this be a rename (identity inverts to identity). Used
-    /// on the contravariant domain edge and when recording an upper bound,
-    /// where the discipline guarantees only renames ride the edge — a discharge
-    /// here is a solver bug, so this panics loudly rather than silently
-    /// corrupting the edge.
-    pub fn invert_rename(&self) -> Subst {
-        self.invert()
-            .expect("correspondence / upper edge must be a rename (invertible)")
-    }
-
-    /// Invert if possible, otherwise the identity. Used when recording the
-    /// *reverse* of a constraint edge whose forward morphism may be a discharge
-    /// (a non-invertible projection). A discharge `[x ↦ arg]` only rewrites
-    /// predicate binders, which `constrain` treats opaquely, and the bound
-    /// being recorded on the reverse edge lives in the *post*-discharge context
-    /// — it never mentions the discharged binder — so the discharge's action on
-    /// it is the identity. Falling back to `id` is therefore exact for that
-    /// bound (it is *not* a general inverse of the discharge).
-    pub fn invert_or_id(&self) -> Subst {
-        self.invert().unwrap_or_else(Subst::id)
     }
 
     /// Extend this substitution with a fresh binder correspondence `k ↦ x`
@@ -143,22 +231,80 @@ impl Subst {
     /// newly-scoped binder, so this is an insert, not a composition.
     pub fn extended_rename(&self, k: &str, x: &str) -> Subst {
         let mut m = self.0.clone();
-        m.insert(k.to_string(), TypedExpr::var(x));
+        m.insert(k.to_string(), Mapping::Rename(x.to_string()));
         Subst(m)
     }
 
-    /// Invert a **rename** (every range term is a distinct bare variable).
-    /// Returns `None` if any frame is a discharge or the map is not injective —
-    /// the discipline that keeps only renames on bidirectional edges (§3.6).
+    /// The **licensed correspondence view** of this substitution: every
+    /// `Rename` entry kept, and every discharge whose argument is a bare
+    /// variable reference (`[x ↦ k0]`, the dependent application at a
+    /// variable) *read as if* it were a correspondence into the outer scope.
+    /// Non-variable discharges are unchanged.
+    ///
+    /// This view is the **only** place a discharge's species is overridden,
+    /// and it exists for exactly one consumer: the closure bridge, when
+    /// reconciling two holder views of one variable. The reading is a license
+    /// with two terms, both currently held by **monomorphic determinism**
+    /// (every inference variable inhabits one fiber) and both expiring at the
+    /// polymorphism boundary (O1/O4/O2):
+    /// 1. Inverting `[x ↦ k0]` is fiber→family *generalization* — re-stating
+    ///    a fact about the fiber at `k0` over the open binder `x`. Sound only
+    ///    while the family is inhabited at exactly one index.
+    /// 2. `k0` is a program variable, not a globally fresh correspondence
+    ///    binder, so the inverse rewrites *incidental* free occurrences of
+    ///    `k0` along with fiber-index ones; the two roles coincide under the
+    ///    same monomorphic license.
+    ///
+    /// When polymorphic fibers land, delete this view: the bridge then sees
+    /// the honest `Discharge` species and its tripwire reports exactly the
+    /// sites that demanded the no-longer-licensed transport. The retirement
+    /// plan — observability probes first, then γ[σ] suspensions-on-uses for
+    /// first-class dependent functions — is tracked in the vault issue
+    /// `type-checker-first-class-dependent-functions`.
+    pub fn licensed_correspondence_view(&self) -> Subst {
+        let m = self
+            .0
+            .iter()
+            .map(|(k, v)| {
+                let v = match v {
+                    Mapping::Discharge(t) => match &t.node {
+                        TypedExprNode::Var(n) => Mapping::Rename(n.clone()),
+                        _ => v.clone(),
+                    },
+                    Mapping::Rename(_) => v.clone(),
+                };
+                (k.clone(), v)
+            })
+            .collect();
+        Subst(m)
+    }
+
+    /// Invert a **rename** (every entry a [`Mapping::Rename`], distinct
+    /// targets). Returns `None` if any entry is a discharge or the map is not
+    /// injective — the discipline that keeps only renames on bidirectional
+    /// edges (§3.6). Exact by construction: the variant carries the species,
+    /// so no target-shape inspection is involved.
+    ///
+    /// There is deliberately no invert-or-fall-back-to-identity convenience:
+    /// the identity fallback is exact when *rendering* a bound's content in
+    /// the holder's frame (post-discharge content cannot mention the
+    /// discharged binder), but silently destroys the discharge when
+    /// *transporting* bounds across an edge — and one lenient helper serving
+    /// both roles cannot tell them apart. Rendering applies the fallback
+    /// explicitly at its call sites ([`crate::ccl::Bound::render_subst`]);
+    /// transport never inverts a discharge — the closure bridge panics on the
+    /// unbridgeable corner instead.
     pub fn invert(&self) -> Option<Subst> {
         let mut m = BTreeMap::new();
         let mut seen = BTreeSet::new();
         for (k, v) in &self.0 {
-            let to = as_var_name(v)?;
-            if !seen.insert(to.to_string()) {
+            let Mapping::Rename(to) = v else {
+                return None; // a discharge has no inverse
+            };
+            if !seen.insert(to.clone()) {
                 return None; // not injective
             }
-            m.insert(to.to_string(), TypedExpr::var(k.clone()));
+            m.insert(to.clone(), Mapping::Rename(k.clone()));
         }
         Some(Subst(m))
     }
@@ -202,7 +348,7 @@ impl Subst {
             Var(n) => match self.0.get(n) {
                 // The replacement carries its own type/annotation, so return it
                 // wholesale rather than rebuilding `e`.
-                Some(repl) => return repl.clone(),
+                Some(repl) => return repl.as_expr(),
                 None => Var(n.clone()),
             },
 
@@ -357,19 +503,18 @@ impl Subst {
         // Scope-validity (design §6.2): a discharged binder must not survive in
         // the rewritten predicate's value — once `[x ↦ arg]` fires, no free `x`
         // may remain, or a downstream pass would observe a dangling reference.
-        // (A rename `[k ↦ x]` maps its binder to a bare variable; only
-        // non-variable range terms — discharges — are checked, since a rename
-        // legitimately *introduces* its target. Value-only, agreeing with what
-        // `apply_expr` rewrites: a binder buried in a sub-expression's
-        // type-slot predicate is out of the substitution contract and would
-        // fire this spuriously on a correct program.) In a correct
-        // implementation this never fires; it is the debug-build fast-path
-        // regression guard for substitution-descent bugs — the release-build
-        // guard is the unconditional end-of-inference scope-validity check
+        // (Only `Discharge` entries are checked: a rename legitimately
+        // *introduces* its target. Value-only, agreeing with what `apply_expr`
+        // rewrites: a binder buried in a sub-expression's type-slot predicate
+        // is out of the substitution contract and would fire this spuriously
+        // on a correct program.) In a correct implementation this never fires;
+        // it is the debug-build fast-path regression guard for
+        // substitution-descent bugs — the release-build guard is the
+        // unconditional end-of-inference scope-validity check
         // (`check_scope_valid`).
         #[cfg(debug_assertions)]
-        for (b, t) in &self.0 {
-            if !matches!(t.node, TypedExprNode::Var(_)) {
+        for (b, m) in &self.0 {
+            if matches!(m, Mapping::Discharge(_)) {
                 debug_assert!(
                     !is_free_in_value(b, &new_pred),
                     "discharged binder `{b}` still free after substitution into predicate",
@@ -475,14 +620,6 @@ impl Subst {
 /// Is `e` exactly the variable `name` (a bare `Var(name)`)?
 fn is_var_named(e: &TypedExpr, name: &str) -> bool {
     matches!(&e.node, TypedExprNode::Var(n) if n == name)
-}
-
-/// If `e` is a bare variable reference, its name.
-fn as_var_name(e: &TypedExpr) -> Option<&str> {
-    match &e.node {
-        TypedExprNode::Var(n) => Some(n.as_str()),
-        _ => None,
-    }
 }
 
 // ---- contexts: the *checking* device (free vars ⊆ context) ----

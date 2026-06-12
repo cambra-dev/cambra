@@ -1172,28 +1172,16 @@ impl Typing for SimpleSubContext {
         // matching `constrain_argument`'s one-way rule — the contravariant
         // domain a morphism loses under one-way edges is recovered structurally
         // at coalesce (see `Typing::constrain_argument`); only the expected
-        // shape gained a binder.
-        //
-        // When `fn_ty` is *already* a concrete Pi (the directly-applied case —
-        // a `λ k → …`, or a let-bound dependent function whose type has resolved),
-        // reuse its binder `k` as the expected binder rather than minting a fresh
-        // one. The derived correspondence is then the **identity** `[k ↦ k]`, so a
-        // discharge `[k ↦ arg]` keyed on the real binder substitutes the
-        // predicate's `k` directly at *every* polarity. Minting a distinct `x`
-        // makes the correspondence a rename `[k ↦ x]` whose **inverse** `[x ↦ k]`
-        // rides the contravariant (upper) edge — and a one-way discharge composed
-        // onto an inverse rename is a no-op on the predicate, leaving the binder
-        // undischarged at every contravariant use, e.g. the parameter domain a
-        // `map`/aggregate feeds a dependent application (design O8). The identity
-        // correspondence sidesteps that. (Reusing the binder only reintroduces the
-        // capture risk the global-freshness discipline guards when two *distinct*
-        // dependent functions sharing a binder name meet at one coalescing
-        // position — the extent-join case, tracked as O1/O4; the
-        // monomorphic-direct shapes that arise today never do.)
-        let x = match peel_refinements_outer(fn_ty) {
-            Type::Fun { name: Some(k), .. } => k.clone(),
-            _ => crate::ccl::subst::fresh_binder("__arg"),
-        };
+        // shape gained a binder.        //
+        // No binder reuse: bounds are stored in their native two-sided form
+        // (see `Bound`), so the discharge `[x ↦ arg]` composes through the
+        // correspondence and reaches the predicate at *every* polarity and in
+        // *every* constraint order — including the opaque/higher-order case
+        // where `fn_ty` is still a variable here and its concrete Pi arrives
+        // only later (design O3). The fresh binder also keeps the §3.6
+        // global-freshness discipline (reusing a function's own binder as the
+        // expected binder would violate it).
+        let x = crate::ccl::subst::fresh_binder("__arg");
         let d = self.fresh();
         let result = self.fresh();
         let expected = Type::pi(&x, d.clone(), result.clone());
@@ -2800,10 +2788,11 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
             {
                 // Keep a dependent *final* morphism's Pi binder on the rebuilt
                 // chain type, mirroring `emit_compose`: the chain's codomain is
-                // the final codomain, which may reference that binder, and the
-                // Apply re-derivation dispatches on the name — rebuilding with
-                // a bare arrow here would make it clobber the discharged
-                // codomain with the undischarged one.
+                // the final codomain, which may reference that binder, and
+                // `rederive_dependent_types`' Apply arm (the monomorphize
+                // splice path's re-derivation) dispatches on the name —
+                // rebuilding with a bare arrow here would make it clobber the
+                // discharged codomain with the undischarged one.
                 expr.ty = Type::Fun {
                     name: last_name.clone(),
                     domain: Box::new((**first_dom).clone()),
@@ -2897,37 +2886,6 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
     match resolve_var_type(&expr.ty) {
         Ok(ty) => expr.ty = ty,
         Err(err) => push_coalesce_err(errors, map_coalesce_err(err, &label), label),
-    }
-
-    // Application reconstruction (mirrors the `Compose` arm's post-coalesce
-    // structural reconstruction). Once the function child has resolved to a
-    // concrete `Fun`, the application's type is its codomain — discharged to
-    // the argument when the function is a dependent Pi `(k: d′) ⇒ result′`,
-    // giving `result′[k ↦ argument]`. Reading the result off the **resolved**
-    // function — rather than the `applied` var the emit-time discharge edge
-    // feeds — is what makes a higher-order / opaque dependent application
-    // discharge correctly (design O3): when the function was an inference
-    // variable at emit time, `apply` minted a fresh `__arg` binder that never
-    // matched the function's real binder, so the discharge edge no-ops and the
-    // codomain's refinement predicate is left referencing the undischarged
-    // binder. That stale predicate rides the var graph into every *parent*
-    // application too, so the leaf-only emit-time edge cannot be salvaged in
-    // place — each apply node must instead re-derive its type from its
-    // already-resolved function child (children coalesce first, bottom-up).
-    // Discharging here, keyed on the real `k`, substitutes at every polarity
-    // and reproduces the directly-applied case's type exactly (idempotent), so
-    // the post-inference `check`'s reconstruction — which re-runs the same
-    // discharge — still reconciles under structural predicate equality.
-    if let TypedExprNode::Apply { function, argument } = &expr.node
-        && let Type::Fun { name, codomain, .. } = peel_refinements_outer(&function.ty)
-    {
-        let reconstructed = match name {
-            Some(k) => {
-                crate::ccl::subst::Subst::discharge(k, (**argument).clone()).apply_type(codomain)
-            }
-            None => (**codomain).clone(),
-        };
-        expr.ty = reconstructed;
     }
 
     // A lambda's param binding slot mirrors its coalesced domain (see
@@ -3298,12 +3256,32 @@ fn monomorphize_go(
 
 /// Re-derive the node types that the main coalesce computed from a
 /// generalized use's *instantiation* type, after `monomorphize_go` stamped the
-/// resolved specialization type onto the use. Bottom-up re-run of the same
-/// reconstruction rules `coalesce_node` applies — the `Apply` codomain
-/// discharge (design O3) and the `let` codomain extraction (§6.2) — so the
-/// replaced types match the post-inference `check`'s reconstruction by
-/// construction. Idempotent: a type that was already derived from concrete
-/// children re-derives to a structurally equal one.
+/// resolved specialization type onto the use.
+///
+/// This is the **remaining re-derivation site** — the one copy of the Apply
+/// codomain discharge and `let` codomain extraction that the graph-level
+/// dependent-discharge machinery (two-sided `Bound` edges) cannot subsume.
+/// The reason is structural: the splice operates *after* coalesce, stamping
+/// resolved specialization types onto use sites with no live constraint
+/// graph to propagate the change. Every parent's recorded type was derived
+/// from the instantiation-time view of the use — whose embedded predicate
+/// copies carry unresolved inference slots ("Unresolved inference variable in
+/// expression …" is the failure shape if this walk is removed; see
+/// `test_udf_containing_filter`). With no edges to compose through, the fix
+/// is bottom-up structural recomputation: re-fire `[k ↦ argument]` on each
+/// apply's resolved function child, and `[x ↦ v]` for each `let` — plain
+/// type surgery on dead stamped types, safe here because every metavariable
+/// the substitution touches is already solved.
+///
+/// TODO(vault: type-checker-coalesce-integrated-monomorphization): delete
+/// this function by moving specialization *into* the coalesce walk — the
+/// graph is complete by coalesce time, so specializing a generalized use at
+/// first visit (memoized per resolved type) lets every parent derive from
+/// correct children on the first pass, and the discharge logic lives in
+/// exactly one substrate.
+///
+/// Idempotent: a type that was already derived from concrete children
+/// re-derives to a structurally equal one.
 fn rederive_dependent_types(expr: &mut Expr) {
     expr.walk_children_mut(rederive_dependent_types);
     match &expr.node {

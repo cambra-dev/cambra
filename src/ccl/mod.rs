@@ -84,44 +84,128 @@ pub fn reset_infer_var_counter() {
 /// through for a future let-poly extension.
 pub type Level = u32;
 
-/// A single subtyping bound on an [`InferVar`], paired with the substitution
-/// that rides its constraint edge.
+/// A single subtyping bound on an [`InferVar`], stored as the constraint's
+/// **native two-sided form** — each side keeps its own context morphism, and
+/// neither is inverted at record time.
 ///
-/// `ty` is the bounding type (a concrete type, or a `Type::Infer` for a
-/// variable-to-variable edge). `subst` is the context morphism carried on the
-/// edge (design §3.5): identity for an ordinary monomorphic bound, a *rename*
-/// for a Pi-binder correspondence, or a *discharge* for a dependent
-/// application. To read the bound *in the holder's context*, apply `subst` to
-/// `ty` via [`Bound::materialize`]; the coalesce walk composes these
-/// substitutions along transitive edges.
+/// An entry in a variable `V`'s *upper* list reads `V‹self_subst› <:
+/// ty‹ty_subst›`; in its *lower* list, `ty‹ty_subst› <: V‹self_subst›`. Both
+/// substitutions are `Subst::id()` for ordinary monomorphic bounds; a *rename*
+/// arises from a Pi-binder correspondence and a *discharge* from a dependent
+/// application (design §3.5).
+///
+/// Why two-sided: the tempting alternative — normalize every entry into the
+/// holder's context — requires inverting the edge morphism when recording an
+/// upper bound. That is exact for renames, but a **discharge has no
+/// inverse**: it degrades to the identity at record time, and any later
+/// attempt to recover the forward morphism by inverting again yields `id`,
+/// silently dropping the discharge whenever a consumer edge is recorded
+/// before the producer's content arrives (the opaque/higher-order
+/// application order). Storing the native direction keeps the closure a pure
+/// forward composition; the only inversions anywhere are of renames, which
+/// round-trip losslessly.
 #[derive(Debug, Clone)]
 pub struct Bound {
-    /// The bounding type, expressed in the *source* context of the edge.
+    /// Morphism on the **holder's** side of the edge (`Subst::id()` unless
+    /// the constraint reached the holder under a suspended morphism — e.g. a
+    /// dependent application's discharge riding a transitive closure step).
+    pub self_subst: subst::Subst,
+    /// The bounding type (a concrete type, or a `Type::Infer` for a
+    /// variable-to-variable edge), expressed in its own source context.
     pub ty: Type,
-    /// The edge's context morphism (`Subst::id()` for ordinary bounds).
-    pub subst: subst::Subst,
+    /// Morphism on the bound type's side of the edge.
+    pub ty_subst: subst::Subst,
 }
 
 impl Bound {
-    /// A concrete bound carrying the identity substitution — the ordinary,
+    /// A concrete bound with identity morphisms on both sides — the ordinary,
     /// non-dependent case. Behaviourally a bare `Type` until a non-identity
     /// substitution rides the edge.
     pub fn conc(ty: Type) -> Self {
         Bound {
+            self_subst: subst::Subst::id(),
             ty,
-            subst: subst::Subst::id(),
+            ty_subst: subst::Subst::id(),
         }
     }
 
-    /// A bound carrying an explicit edge substitution.
-    pub fn with_subst(ty: Type, subst: subst::Subst) -> Self {
-        Bound { ty, subst }
+    /// A bound whose *content* side carries an explicit morphism (holder side
+    /// identity) — e.g. the dependent application's `result‹[x ↦ arg]›` lower
+    /// edge.
+    pub fn with_subst(ty: Type, ty_subst: subst::Subst) -> Self {
+        Bound {
+            self_subst: subst::Subst::id(),
+            ty,
+            ty_subst,
+        }
     }
 
-    /// The bound type expressed in the holder's context — `subst` applied to
-    /// `ty`. A no-op when `subst` is the identity.
+    /// A fully general two-sided edge.
+    pub fn edge(self_subst: subst::Subst, ty: Type, ty_subst: subst::Subst) -> Self {
+        Bound {
+            self_subst,
+            ty,
+            ty_subst,
+        }
+    }
+
+    /// The morphism that renders this entry's content in its holder's
+    /// context — what the coalesce walk composes onto its accumulator, and
+    /// what [`materialize`](Self::materialize) applies for a direct read.
+    ///
+    /// `ty_subst` applies to the content directly. The holder-side
+    /// `self_subst` is transported by inversion where it is invertible; a
+    /// non-invertible holder side is **factored** (`Subst::split_renames`):
+    /// its rename part is inverted (lossless), and its term (discharge) part
+    /// acts as the identity — exact because the content lives in the
+    /// *post*-discharge context and cannot mention the discharged binders
+    /// (debug-asserted). Falling to the identity *wholesale* would silently
+    /// drop the rename part of a mixed composite, mis-naming binders in the
+    /// rendered content.
+    pub fn render_subst(&self) -> subst::Subst {
+        if self.self_subst.is_id() {
+            return self.ty_subst.clone();
+        }
+        let inv = match self.self_subst.invert() {
+            Some(inv) => inv,
+            None => {
+                let (ren, _term) = self.self_subst.split_renames();
+                // A non-injective rename part also lands here and falls to the
+                // identity — the very "silently drop the rename part" the doc
+                // above warns about. That branch is assert-guarded, not
+                // impossible: the debug check below demands the content not
+                // mention any untransported binder, which covers it.
+                let inv = ren.invert().unwrap_or_else(subst::Subst::id);
+                #[cfg(debug_assertions)]
+                {
+                    // Binders the inversion does NOT transport (the term part,
+                    // plus a non-injective rename remainder) must be absent
+                    // from the content (post-discharge context).
+                    let transported: std::collections::BTreeSet<_> = if inv.is_id() {
+                        Default::default()
+                    } else {
+                        ren.binders().collect()
+                    };
+                    let fv = subst::type_free_vars(&self.ty);
+                    debug_assert!(
+                        self.self_subst
+                            .binders()
+                            .filter(|b| !transported.contains(b))
+                            .all(|b| !fv.contains(b)),
+                        "non-invertible holder side: bound content must not mention \
+                         the untransported binders (post-discharge context)",
+                    );
+                }
+                inv
+            }
+        };
+        subst::Subst::then(&self.ty_subst, &inv)
+    }
+
+    /// The bound type expressed in the holder's context — see
+    /// [`render_subst`](Self::render_subst).
     pub fn materialize(&self) -> Type {
-        self.subst.apply_type(&self.ty)
+        self.render_subst().apply_type(&self.ty)
     }
 }
 
