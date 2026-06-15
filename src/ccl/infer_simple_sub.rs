@@ -15,15 +15,14 @@
 //!    `Type` — no side table is needed. Domain refinements ride the type
 //!    lattice as restriction tags on [`Type::Refinement`] (introduced by the
 //!    `cast` Apply arm), so they flow through the solver structurally.
-//! 2. **Coalesce + write-back**: walk the tree again and, for each node,
-//!    run [`coalesce_compact`](crate::ccl::simple_sub::coalesce_compact) to
-//!    resolve the inference variables in its `expr.ty` in place. A generalized
-//!    `let`'s definition subtree is *skipped* here (its quantified variables
-//!    have no use-site bounds, so it would coalesce under-determined) and
-//!    resolved by Pass 3 instead.
-//! 3. **Monomorphize** ([`monomorphize`]): for each generalized `let`, group
-//!    its uses by resolved type and emit one specialized definition per
-//!    distinct type, shared across the uses that demand it.
+//! 2. **Coalesce + write-back + monomorphize**: walk the tree again and, for
+//!    each node, run
+//!    [`coalesce_compact`](crate::ccl::simple_sub::coalesce_compact) to
+//!    resolve the inference variables in its `expr.ty` in place. The same
+//!    walk lowers let-polymorphism: a use of a generalized `let` is
+//!    specialized at first visit, memoized per distinct resolved type
+//!    ([`specialize_use`]), and the `let` rebuilds itself as the chain of
+//!    demanded specializations ([`coalesce_generalized_let`]).
 //!
 //! # Let-polymorphism
 //!
@@ -35,15 +34,21 @@
 //! where a monomorphic `let` would collide.
 //!
 //! Because `ccl::Type` has no `ForAll` and the downstream passes are
-//! monomorphic, generalization is paired with **monomorphization**: the
-//! post-coalesce [`monomorphize`] pass collects the distinct resolved types a
-//! generalized `let` is used at, emits one specialized clone of the definition
-//! per distinct type (`freshen_expr_types` + a per-type constrain/coalesce),
-//! and rewrites each use to reference its specialization. So inference both
-//! type-checks the polymorphism and lowers it to concrete per-type code before
-//! lambda-elimination. Sharing one specialization across same-typed uses is
-//! what lets a collection/generator UDF used at several element types compile
-//! to one *cached* binding per element type rather than a copy per call.
+//! monomorphic, generalization is paired with **monomorphization**,
+//! integrated into the coalesce walk: at a generalized use, the walk resolves
+//! the instantiation type off the live constraint graph (complete by then),
+//! emits one specialized clone of the definition per distinct resolved type
+//! (`freshen_expr_types` + a constrain-against-the-live-use-type pin + a
+//! re-entrant coalesce), and rewrites the use to reference its
+//! specialization. So inference both type-checks the polymorphism and lowers
+//! it to concrete per-type code before lambda-elimination. Sharing one
+//! specialization across same-typed uses is what lets a collection/generator
+//! UDF used at several element types compile to one *cached* binding per
+//! element type rather than a copy per call. Specializing *inside* the walk —
+//! rather than splicing after it — is what keeps every parent type derived
+//! from concrete children (no post-hoc re-derivation of dependent types), and
+//! handles chained polymorphism (a generalized UDF used only inside another
+//! generalized definition) by plain recursion.
 //!
 //! Generalization itself is narrow ([`should_generalize`]): only *function*
 //! definitions with a quantifiable variable. Value bindings stay monomorphic
@@ -72,14 +77,14 @@ use smol_str::SmolStr;
 use crate::ccl::ccl_utils::cast_target_refinement;
 use crate::ccl::infer::InferError;
 use crate::ccl::simple_sub::{
-    CoalesceError, ConstrainCache, ConstrainError, FieldKey, FreshenCache, FreshenLevel,
+    CellRemap, CoalesceError, ConstrainCache, ConstrainError, FieldKey, FreshenCache, FreshenLevel,
     PolyScheme, coalesce_compact, compact_type, constrain_subtype, fresh_var, freshen_above, fun,
     prim, simplify_type, type_level,
 };
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    AggregateKind, BaseType, BinOpKind, Branch, Builtin, Expr, Level, Lit, Name, PredicateCellId,
-    ProjKey, Refinement, Type, TypedBinding, TypedExprNode, UnaryOpKind,
+    AggregateKind, BaseType, BinOpKind, Branch, Builtin, Expr, InferVar, InferVarId, Level, Lit,
+    Name, PredicateCellId, ProjKey, Refinement, Type, TypedBinding, TypedExprNode, UnaryOpKind,
 };
 use crate::util::ScopeStack;
 
@@ -289,14 +294,14 @@ struct Binding {
     /// their introduction level); a generalized `let` quantifies its RHS-local
     /// variables, so each `Var` use [`PolyScheme::instantiate`]s a fresh copy.
     /// Use-site *monomorphization* (turning each instantiation into concrete
-    /// code) is deferred to the post-coalesce [`monomorphize`] pass.
+    /// code) happens during the coalesce walk ([`specialize_use`]).
     scheme: PolyScheme,
 }
 
 /// Whether a `let` bound to `def` at `level` should be **generalized** —
 /// typed polymorphically, with each use [`PolyScheme::instantiate`]ing a fresh
-/// copy and the post-coalesce [`monomorphize`] pass specializing per distinct
-/// use type. Requires both of:
+/// copy and the coalesce walk specializing per distinct resolved use type
+/// ([`specialize_use`]). Requires both of:
 ///
 /// - **A function definition** (`def` is a `Lambda`). Let-polymorphism
 ///   generalizes function definitions; value bindings stay monomorphic and
@@ -307,9 +312,9 @@ struct Binding {
 ///   quantify. A function with no quantifiable variable is already monomorphic,
 ///   so generalizing it would be a no-op.
 ///
-/// This is the single predicate both emission ([`emit_let`]) and the
-/// post-coalesce [`monomorphize`] pass consult, so they agree on which `let`s
-/// are polymorphic. It deliberately makes *no* use-count or generator
+/// This is the single predicate emission ([`emit_let`]), privatization, and
+/// the coalesce walk all consult, so they agree on which `let`s are
+/// polymorphic. It deliberately makes *no* use-count or generator
 /// distinction: a single-use function generalizes to one specialization
 /// (later inlined like any monomorphic def), and a generator/collection-
 /// producing UDF generalizes to one specialization *per distinct element type*,
@@ -325,9 +330,9 @@ fn should_generalize(def: &Expr, level: Level) -> bool {
 /// resolved use type and coalesced without disturbing the original definition
 /// or any other clone. The shared cache keeps the renaming consistent across
 /// slots (a variable in one node and in another's bounds maps to the same fresh
-/// var). See [`monomorphize`], which freshens one clone per distinct use type
-/// with [`FreshenLevel::Preserve`] (so nested generalized `let`s keep their
-/// deeper levels and stay recognizable as polymorphic).
+/// var). See [`specialize_use`], which freshens one clone per distinct use
+/// type with [`FreshenLevel::Preserve`] (so nested generalized `let`s keep
+/// their deeper levels and stay recognizable as polymorphic).
 ///
 /// Crucially this freshens *every* type in the AST — `expr.ty`, binder slots
 /// (lambda param, `let` binding, `Case` payload, `Loop` params), and
@@ -335,7 +340,9 @@ fn should_generalize(def: &Expr, level: Level) -> bool {
 /// from the definition's root type. A definition's interior carries variables
 /// (e.g. `Proj` seeds) that never appear in its root type; missing them would
 /// leave the clone with a mix of fresh and original variables and coalesce to
-/// an unresolved type.
+/// an unresolved type. The one slot family this walk cannot reach — the terms
+/// captured inside the copied bounds' *edge substitutions* — is handled by
+/// the follow-up [`freshen_bound_substs`] sweep over the cache.
 fn freshen_expr_types(
     expr: &mut Expr,
     cutoff: Level,
@@ -375,6 +382,64 @@ fn freshen_expr_types(
         _ => {}
     }
     expr.walk_children_mut(|c| freshen_expr_types(c, cutoff, target, cache, remap));
+}
+
+/// Freshen the suspended-substitution payloads riding the freshened clone's
+/// copied bound edges — the slots [`freshen_expr_types`] cannot reach.
+///
+/// [`freshen_above`] copies each bound's *type* through the cache but carries
+/// its edge substitutions over verbatim, so a discharge's captured argument
+/// term still holds the *definition's* inference variables in its type slots.
+/// Those variables are never pinned (only the clone's freshened copies are),
+/// so when coalesce later forces the discharge, the spliced term's slots
+/// would resolve under-determined — the chained poly-calls-poly failure
+/// (`g = λys → f(ys)`: the `[xs ↦ ys]` discharge inside a `g` clone must
+/// reference the clone's `ys`, not the original definition's). Sweep every
+/// variable the freshen minted and rename each bound's discharge terms
+/// through the same cache. A worklist, run to fixpoint: freshening a captured
+/// term can itself mint cache entries whose copied bounds carry further
+/// substitutions.
+///
+/// TODO(vault: type-checker-immutable-predicate-terms): this sweep exists only
+/// because freshening is split — `freshen_above` walks *types* but a bound's
+/// suspended-discharge payload is a *term* riding the edge, so its slots are a
+/// blind spot patched here. The migration's "one uniform capture-avoiding
+/// substitution over terms and types" closes that split: freshening a bound
+/// would rename its payload's slots in the same traversal, and this separate
+/// pass goes away.
+fn freshen_bound_substs(
+    cutoff: Level,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+    remap: &mut CellRemap,
+) {
+    let mut seen: HashSet<InferVarId> = HashSet::new();
+    loop {
+        let pending: Vec<Rc<InferVar>> = cache
+            .values()
+            .filter(|v| !seen.contains(&v.uid))
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        for var in pending {
+            seen.insert(var.uid);
+            // Holding this var's bounds mutably is safe across the recursive
+            // freshen: a captured term's slots hold *original* (or already-
+            // freshened, cache-hit) variables, never this freshly minted one,
+            // so the recursion borrows other vars only.
+            let mut bounds = var.bounds.borrow_mut();
+            let bounds = &mut *bounds;
+            for b in bounds.lower.iter_mut().chain(bounds.upper.iter_mut()) {
+                for subst in [&mut b.self_subst, &mut b.ty_subst] {
+                    subst.for_each_discharge_term_mut(&mut |t| {
+                        freshen_expr_types(t, cutoff, target, cache, remap)
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// De-alias and freshen one refinement's predicate cell, for
@@ -432,85 +497,26 @@ fn dealias_anchored_predicates(
     ty.walk_children_mut(|child| dealias_anchored_predicates(child, cutoff, target, cache, remap));
 }
 
-/// Tracks retired refinement-predicate cells and their replacements, keyed
-/// by the retired cell's address ([`PredicateCellId`]).
-///
-/// Refinement identity *is* the predicate cell: tags aliasing one cell are
-/// one refinement. When a pass replaces a cell — privatizing a generalized
-/// definition's anchors ([`privatize_refinement_cells`]) or de-aliasing a
-/// specialized clone's ([`dealias_refinement_predicate`]) — tags elsewhere
-/// still alias the retired cell; the remap is how
-/// [`realias_refinement_tags`] re-points them at the replacement. Each entry
-/// keeps the retired `Rc` alive so its address cannot be reused by a newly
-/// minted cell while the remap is live (a raw-pointer key is only meaningful
-/// while its cell is).
-///
-/// A replacement may itself be retired later (a privatized anchor cell is
-/// re-celled again per specialization), so [`CellRemap::resolve`] follows
-/// the chain to the final live cell. A cell retired more than once (one
-/// privatized definition specialized at several types) keeps its *first*
-/// recording: orphaned tags resolve to the first specialization's cell.
-#[derive(Default)]
-struct CellRemap {
-    map: HashMap<PredicateCellId, CellRetirement>,
-}
-
-/// One [`CellRemap`] entry: the retired cell (kept alive so its address —
-/// the map key — stays unique) and its replacement.
-struct CellRetirement {
-    retired: Rc<RefCell<Expr>>,
-    replacement: Rc<RefCell<Expr>>,
-}
-
-impl CellRemap {
-    /// Record `retired → replacement`. First recording for a cell wins.
-    fn record(&mut self, retired: Rc<RefCell<Expr>>, replacement: Rc<RefCell<Expr>>) {
-        self.map
-            .entry(Rc::as_ptr(&retired))
-            .or_insert(CellRetirement {
-                retired,
-                replacement,
-            });
-    }
-
-    /// A cell's direct replacement, if it was retired.
-    fn replacement(&self, cell: &Rc<RefCell<Expr>>) -> Option<&Rc<RefCell<Expr>>> {
-        self.map.get(&Rc::as_ptr(cell)).map(|e| &e.replacement)
-    }
-
-    /// Resolve a cell through retirement chains to its final replacement;
-    /// `None` if it was never retired. Terminates: a replacement is freshly
-    /// allocated while every key's cell is still alive (the entries keep
-    /// them so), so no replacement can alias an earlier key — chains move
-    /// strictly forward in recording order.
-    fn resolve(&self, cell: &Rc<RefCell<Expr>>) -> Option<Rc<RefCell<Expr>>> {
-        let mut cur = self.replacement(cell)?;
-        while let Some(next) = self.replacement(cur) {
-            cur = next;
-        }
-        Some(cur.clone())
-    }
-
-    /// Fold a clone-local remap into this pass-global one (first-wins).
-    fn absorb(&mut self, other: CellRemap) {
-        for e in other.map.into_values() {
-            self.record(e.retired, e.replacement);
-        }
-    }
-}
+// `CellRemap` — the retired-predicate-cell remap shared with the solver —
+// lives in `simple_sub`, where `compact_type` canonicalizes every refinement
+// tag it collects through it. This pass *fills* it (privatization and
+// per-specialization de-aliasing record retirements) and runs the final
+// whole-tree re-alias over it.
 
 /// Re-point every refinement tag whose predicate cell was retired in `remap`
 /// at its (transitive) replacement cell.
 ///
-/// Two callers: [`specialize_def`] restores intra-clone sharing after
+/// Two callers: [`specialize_use`] restores intra-clone sharing after
 /// [`freshen_expr_types`] (de-aliasing gave each *anchor* a private,
 /// freshened cell, but tags riding inferred types — `expr.ty`, binder slots
 /// — were cloned by [`freshen_above`] cell-intact and still alias the
 /// original definition's cells, whose contents carry the original quantified
-/// variables and are never coalesced); and [`monomorphize`]'s final pass
-/// re-points use-site tags orphaned by privatization + specialization. Left
-/// stale, retired cells surface unresolved-variable errors when
-/// post-inference validation walks the tags.
+/// variables and are never coalesced); and [`infer`]'s post-coalesce sweep
+/// re-points tags stamped before the relevant specialization existed (a type
+/// the walk read *during* coalesce materialized its tags canonically through
+/// `compact_type`, but one read before the binding's first use still aliases
+/// a retired cell). Left stale, retired cells surface unresolved-variable
+/// errors when post-inference validation walks the tags.
 ///
 /// Tags whose cell was never retired are left untouched — their cells are
 /// live anchors coalesced by the main pass.
@@ -604,7 +610,7 @@ fn collect_anchor_cells_in_type(ty: &Type, cells: &mut AnchorCells) {
 }
 
 /// Give a generalized definition private copies of its refinement predicate
-/// cells, before coalesce *skips* the definition.
+/// cells, before the coalesce walk runs over its `let` body.
 ///
 /// The cells are shared with refinement tags on *use-site* types: each use
 /// instantiated the definition's scheme via [`freshen_above`], which clones
@@ -612,12 +618,14 @@ fn collect_anchor_cells_in_type(ty: &Type, cells: &mut AnchorCells) {
 /// `coalesce_type_predicates` walks those tags and coalesces the shared
 /// cell's expression types **under-determined** (a predicate's variables are
 /// the definition's quantified variables, which carry no use-site bounds) —
-/// severing the bound-bearing `InferVar` links [`specialize_def`] later
+/// severing the bound-bearing `InferVar` links [`specialize_use`] later
 /// freshens and pins. Re-celling the definition's anchors (and its internal
 /// same-cell tags) keeps a pristine copy on the definition; the old cells
 /// stay on the use-site tags, and the retirements recorded in `remap` let
-/// [`monomorphize`]'s final re-alias pass resolve those tags through the
-/// chain (original → privatized → specialized) onto the surviving anchors.
+/// every later read resolve those tags through the chain (original →
+/// privatized → specialized) onto the surviving anchors — `compact_type`
+/// canonicalizes tags it materializes during the walk, and [`infer`]'s final
+/// re-alias sweep re-points the rest.
 fn privatize_refinement_cells(def: &mut Expr, remap: &mut CellRemap) {
     let mut cells = AnchorCells::new();
     collect_anchor_cells(def, &mut cells);
@@ -633,17 +641,17 @@ fn privatize_refinement_cells(def: &mut Expr, remap: &mut CellRemap) {
 
 /// Pre-coalesce pass: privatize the predicate cells of every generalized
 /// definition (see [`privatize_refinement_cells`]), recording the
-/// retirements in `remap` for [`monomorphize`]'s final re-alias pass.
+/// retirements in the pass remap.
 ///
 /// Runs before any use-site coalescing can corrupt the shared cells (a
 /// definition's uses live in its `let` body, so privatizing the whole tree
 /// up front is equivalent to privatizing each definition just before its
-/// body coalesces). `level` mirrors the coalesce/monomorphize discipline —
-/// only a `let` RHS bumps it — so `should_generalize` agrees with those
-/// passes on which `let`s are polymorphic. A generalized definition is
-/// privatized as a whole and not descended into, mirroring coalesce's skip;
-/// nested generalized `let`s inside it are handled per specialized clone by
-/// [`specialize_def`].
+/// body coalesces). `level` mirrors the coalesce discipline — only a `let`
+/// RHS bumps it — so `should_generalize` agrees with the walk on which
+/// `let`s are polymorphic. A generalized definition is privatized as a whole
+/// and not descended into (the walk never coalesces it in place); nested
+/// generalized `let`s inside it are handled per specialized clone by
+/// [`specialize_use`].
 fn privatize_generalized_defs(expr: &mut Expr, level: Level, remap: &mut CellRemap) {
     if let TypedExprNode::Let {
         bound_expr, body, ..
@@ -910,8 +918,9 @@ trait Typing {
     /// the value actually flowing in — is recovered *structurally* in
     /// `coalesce_node` (its `Apply`/`Compose` arms) by monomorphizing the
     /// morphism to its input ([`specialize_projection_domain`] /
-    /// [`specialize_lambda_domain`]), the closed-form case of the same use-site
-    /// specialization `monomorphize` performs for generalized `let`s.
+    /// [`specialize_lambda_domain`]), the closed-form case of the same
+    /// use-site specialization [`specialize_use`] performs for generalized
+    /// `let`s.
     fn constrain_argument(
         &mut self,
         arg: &Type,
@@ -1028,8 +1037,9 @@ impl Typing for SimpleSubContext {
         // a pure value language — no value-restriction hazard.)
         let scheme = if generalize {
             // Polymorphic: generalize at the outer level. Each `Var` use
-            // instantiates a fresh copy; the post-coalesce `monomorphize` pass
-            // then specializes the definition per distinct resolved use type.
+            // instantiates a fresh copy; the coalesce walk then specializes
+            // the definition per distinct resolved use type
+            // (`specialize_use`).
             PolyScheme::poly(self.level, bound_ty.clone())
         } else {
             // Monomorphic: bind verbatim with a cutoff above the RHS level so
@@ -1317,8 +1327,10 @@ fn apply_unary_scheme<C: Typing>(
 /// Resolve a (possibly variable-laden) [`Type`] to a concrete type for use
 /// in error messages. Falls back to [`Type::Hole`] if coalesce fails (which
 /// can happen for types with incompatible bounds that triggered the error).
+/// Tags are rendered against an empty cell remap: error paths run during
+/// emission, before any cell is retired.
 fn coalesce_for_error(ty: &Type) -> Type {
-    resolve_var_type(ty).unwrap_or(Type::Hole)
+    resolve_var_type(ty, &CellRemap::default()).unwrap_or(Type::Hole)
 }
 
 /// Map a [`ConstrainError`] onto the public [`InferError`] enum.
@@ -1404,26 +1416,29 @@ pub fn infer(expr: &mut Expr, sources: &HashMap<String, Type>) -> Result<Type, V
     // Pass 1: emit constraints.
     emit_node(expr, &mut sub_ctx).map_err(|e| vec![e])?;
 
-    // Pass 2: resolve each node's inference variables in place into expr.ty
-    // (skipping generalized-`let` definitions, left for Pass 3), and fill the
-    // binder slots that aren't any node's expr.ty (the `Let` binding slot in
-    // particular). This subsumed the former `saturate` pass. Generalized
-    // definitions first get private predicate cells; the retirements
-    // accumulate in `remap` so Pass 3's final re-alias can re-point use-site
-    // tags at the specialized anchors.
+    // Pass 2: resolve each node's inference variables in place into expr.ty,
+    // fill the binder slots that aren't any node's expr.ty (the `Let` binding
+    // slot in particular — this subsumed the former `saturate` pass), and
+    // monomorphize generalized `let`s in the same walk: a use specializes at
+    // first visit, the `let` rebuilds as its per-type specializations (see
+    // `coalesce_node`). Generalized definitions first get private predicate
+    // cells; those retirements — and the per-specialization de-aliasings made
+    // during the walk — accumulate in the remap that canonicalizes every
+    // refinement tag the walk materializes.
     let mut remap = CellRemap::default();
     privatize_generalized_defs(expr, 0, &mut remap);
-    let errors = coalesce_pass(expr);
+    let (errors, remap) = coalesce_pass(expr, remap);
     if !errors.is_empty() {
         return Err(errors);
     }
-    // Pass 3: monomorphize each generalized `let` into one specialized
-    // definition per distinct resolved use type, shared across same-typed uses.
-    let mut mono_errors = Vec::new();
-    monomorphize(expr, &mut remap, &mut mono_errors);
-    if !mono_errors.is_empty() {
-        return Err(mono_errors);
-    }
+    // A type stamped *before* the relevant specialization existed can still
+    // carry a tag aliasing a retired cell (e.g. a sibling read earlier in the
+    // walk than the binding's first use): resolve each such tag through the
+    // retirement chains onto the surviving (coalesced) anchor cells. This
+    // also consolidates aliases, so passes that rewrite a predicate cell in
+    // place (planning's point-free compilation) reach every tag of one
+    // refinement through one cell.
+    realias_refinement_tags(expr, &remap, &mut HashSet::new());
     // Stamp the resolved binder types onto free `Var` references a discharge
     // substituted into refinement predicates (see `retype_predicate_slots`).
     retype_predicate_slots(expr, &HashMap::new());
@@ -1465,8 +1480,9 @@ fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<Type, InferE
         // instantiates fresh quantified variables, so this use accumulates its
         // own constraints and coalesces to this call site's concrete type
         // independently of every other use. The `Var` node stays in place; the
-        // post-coalesce `monomorphize` pass reads the resolved use type back off
-        // it and splices in a per-type-specialized definition.
+        // coalesce walk reads the resolved use type back off the live graph
+        // and rewrites the use to a per-type specialization
+        // (`specialize_use`).
         TypedExprNode::Var(name) => match ctx.scopes.lookup(name) {
             None => return Err(InferError::UnboundVariable(name.to_string())),
             Some(binding) => binding.scheme.instantiate(ctx.level),
@@ -1814,9 +1830,9 @@ fn emit_aggregate<C: Typing>(
 /// Emit/check a `let`, returning the body type.
 ///
 /// A genuinely-polymorphic function definition ([`Typing::is_generalizable`])
-/// is generalized so each `Var` use instantiates a fresh copy; the
-/// post-coalesce [`monomorphize`] pass later specializes the definition per
-/// distinct resolved use type. Everything else is bound monomorphically and
+/// is generalized so each `Var` use instantiates a fresh copy; the coalesce
+/// walk later specializes the definition per distinct resolved use type
+/// ([`specialize_use`]). Everything else is bound monomorphically and
 /// shared (the pre-let-poly behavior). Generalization carries no use-count or
 /// generator condition — see [`should_generalize`].
 fn emit_let<C: Typing>(
@@ -2514,10 +2530,263 @@ fn push_coalesce_err(errors: &mut Vec<InferError>, new_err: InferError, label: S
     }
 }
 
-fn coalesce_pass(expr: &mut Expr) -> Vec<InferError> {
-    let mut errors = Vec::new();
-    coalesce_node(expr, 0, &mut errors);
-    errors
+/// State threaded through the coalesce walk.
+///
+/// Beyond resolving types, the walk performs **integrated monomorphization**:
+/// a use of a generalized `let` is specialized at first visit (memoized per
+/// distinct resolved type), so every parent's type is derived from concrete
+/// children on the first pass — there is no post-coalesce splice and no
+/// re-derivation of dependent types. The constraint graph is *complete* by
+/// coalesce time (emission saw the whole program), so a use's instantiation
+/// is fully determined when the walk reaches it; "specialize when
+/// dependencies are satisfied" reduces to the bottom-up visit order.
+struct CoalesceCtx {
+    /// The walk's lexical scope: one [`ScopeEntry::Generalized`] frame per
+    /// in-scope generalized `let`, plus a [`ScopeEntry::Shadow`] marker per
+    /// other binder so an inner binder hides an outer generalized binding of
+    /// the same name (the same shadowing discipline emission's `ScopeStack`
+    /// applies).
+    scope: Vec<ScopeEntry>,
+    /// Pass-wide retired-cell remap. Filled by `privatize_generalized_defs`
+    /// (before the walk) and by per-specialization de-aliasing (during it);
+    /// consulted by every `resolve_var_type` so materialized refinement tags
+    /// are born canonical, and by the final `realias_refinement_tags` sweep.
+    remap: CellRemap,
+    errors: Vec<InferError>,
+    /// Every read the walk performed, for the end-of-pass ordering-invariant
+    /// check ([`assert_reads_stable`]). Debug builds only.
+    #[cfg(debug_assertions)]
+    reads: Vec<ReadRecord>,
+}
+
+impl CoalesceCtx {
+    /// Log one read for [`assert_reads_stable`] (debug builds; free in
+    /// release). `unresolved` must be the var-laden type *as resolved* —
+    /// its shared `Rc<InferVar>`s are what let the end-of-pass check
+    /// re-resolve it against the final graph.
+    fn record_read(&mut self, unresolved: &Type, resolved: &Type, label: impl Fn() -> String) {
+        #[cfg(debug_assertions)]
+        self.reads.push(ReadRecord {
+            unresolved: unresolved.clone(),
+            resolved: resolved.clone(),
+            label: label(),
+        });
+        #[cfg(not(debug_assertions))]
+        {
+            let _ = (unresolved, resolved, label);
+        }
+    }
+}
+
+/// One type the walk read (debug builds): the var-laden type exactly as it
+/// was resolved, and what it resolved to. The snapshot shares the live
+/// `Rc<InferVar>`s with the graph, so re-resolving it later observes every
+/// bound added since — which is what [`assert_reads_stable`] exploits.
+#[cfg(debug_assertions)]
+struct ReadRecord {
+    unresolved: Type,
+    resolved: Type,
+    label: String,
+}
+
+/// End-of-pass check of the integrated-monomorphization ordering invariant —
+/// **specialization may only add bounds to variables the walk has not yet
+/// read** — via its observable consequence: every type the walk read must
+/// still resolve, against the final graph, to what was stamped. A violation
+/// means some specialization's pin semantically changed a variable an
+/// earlier read had already consumed — a stamped type was derived from state
+/// that later turned out to be stale, exactly the disease the integrated
+/// design exists to rule out.
+#[cfg(debug_assertions)]
+fn assert_reads_stable(reads: &[ReadRecord], remap: &CellRemap) {
+    for r in reads {
+        let now = resolve_var_type(&r.unresolved, remap);
+        debug_assert!(
+            matches!(&now, Ok(t) if types_agree_modulo_unread(&r.resolved, t)),
+            "ordering invariant (specialization may only add bounds to \
+             variables the walk has not yet read) violated: `{}` was read as \
+             {} during the walk, but the final graph resolves it to {:?}",
+            r.label,
+            r.resolved,
+            now,
+        );
+    }
+}
+
+/// Skeletal agreement between a type read during the walk and its
+/// re-resolution against the final graph. The ordering invariant is about
+/// **bounds on inference variables**, so this checks the *structural
+/// skeleton* a bound determines — bases, ranges, sources, Pi binder names,
+/// function/product/variant shape, and the *number* of refinement layers at
+/// each position — and deliberately does **not** compare predicate interiors.
+/// Two drifts are legitimate and out of scope:
+///
+/// - **Under-determined positions are wildcards.** A position with no
+///   concrete content resolves to a fresh `Infer` placeholder each time, so
+///   placeholder identity can never match — and nothing was stamped there,
+///   so nothing can have been invalidated. (`Hole` likewise, for error-path
+///   resolutions.)
+/// - **Refinement-predicate content is not compared.** A non-vacuous
+///   discharge mints a fresh cell each time it is forced, and a later
+///   specialization rewrites a predicate's interior uses (`p` → `p__mono1`)
+///   — both lowering by the very machinery this guards, neither a stale
+///   bound. The predicate *terms* are checked elsewhere (`check_scope_valid`
+///   and the post-inference `check` reconcile); here only the refinement
+///   *layer count* per position participates, so a whole layer appearing or
+///   vanishing across a pin is still caught.
+#[cfg(debug_assertions)]
+fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
+    // Peel refinement layers, counting them. The *base* under the tags is
+    // what recurses structurally; predicate content is out of scope (above).
+    fn peel<'t>(mut t: &'t Type, layers: &mut usize) -> &'t Type {
+        while let Type::Refinement(inner, _) = t {
+            *layers += 1;
+            t = inner;
+        }
+        t
+    }
+    let (mut read_layers, mut now_layers) = (0, 0);
+    let read = peel(read, &mut read_layers);
+    let now = peel(now, &mut now_layers);
+    if read_layers != now_layers {
+        return false;
+    }
+    match (read, now) {
+        (Type::Infer(_) | Type::Hole, _) | (_, Type::Infer(_) | Type::Hole) => true,
+        (Type::Base(a), Type::Base(b)) => a == b,
+        (Type::UIntRange(a), Type::UIntRange(b)) => a == b,
+        (Type::DataSource(a), Type::DataSource(b)) => a == b,
+        (
+            Type::Fun {
+                name: n1,
+                domain: d1,
+                codomain: c1,
+            },
+            Type::Fun {
+                name: n2,
+                domain: d2,
+                codomain: c2,
+            },
+        ) => n1 == n2 && types_agree_modulo_unread(d1, d2) && types_agree_modulo_unread(c1, c2),
+        (Type::Tuple(xs), Type::Tuple(ys)) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys)
+                    .all(|(x, y)| types_agree_modulo_unread(x, y))
+        }
+        (Type::Record(xs), Type::Record(ys)) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys)
+                    .all(|((nx, x), (ny, y))| nx == ny && types_agree_modulo_unread(x, y))
+        }
+        (Type::Variant(xs), Type::Variant(ys)) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys)
+                    .all(|((kx, x), (ky, y))| kx == ky && types_agree_modulo_unread(x, y))
+        }
+        _ => false,
+    }
+}
+
+/// One entry of the coalesce walk's lexical scope.
+enum ScopeEntry {
+    /// An in-scope generalized `let`, awaiting per-use specialization.
+    /// (Boxed: a frame carries a whole definition subtree, dwarfing the
+    /// shadow variant.)
+    Generalized(Box<SpecializeFrame>),
+    /// Any other binder (lambda param, monomorphic `let`, `Case` pattern,
+    /// `Loop` accumulator). Recorded purely so name lookup stops here: a use
+    /// under this binder refers to it, not to an outer generalized binding.
+    Shadow(Name),
+}
+
+/// Specialization state for one generalized `let`, live while its body is
+/// being coalesced.
+struct SpecializeFrame {
+    name: Name,
+    /// The uncoalesced definition (anchor predicate cells already privatized
+    /// by `privatize_generalized_defs`), cloned once per distinct use type.
+    def: Expr,
+    /// The binding's polymorphism level — the freshen cutoff: variables
+    /// deeper than this are the quantified ones.
+    cutoff: Level,
+    /// Specializations minted so far. Scanned linearly: keyed on the use's
+    /// resolved type, whose `PartialEq` is structural (refinement tags
+    /// compare by type-blind predicate equality), so same-typed uses share
+    /// one specialization.
+    specs: Vec<Specialization>,
+}
+
+/// One memoized specialization of a generalized definition.
+struct Specialization {
+    /// The resolved use type this specialization serves (the memo key).
+    use_ty: Type,
+    /// Its binding name — a [`Name::mono`] carrying the source binding's name
+    /// as provenance and a globally-fresh uid for identity (so it can neither
+    /// capture nor be captured).
+    name: Name,
+    /// The specialized, fully-coalesced definition. Spliced as a `let`
+    /// binding around the generalized `let`'s body once that body's walk
+    /// completes.
+    def: Expr,
+}
+
+/// Find the scope entry a free use of `name` refers to: scanning innermost-
+/// out, the nearest matching entry decides — a generalized frame means
+/// "specialize here" (returning its index), a shadow marker means the use is
+/// an ordinary monomorphic reference.
+fn lookup_generalized(scope: &[ScopeEntry], name: &Name) -> Option<usize> {
+    for (i, entry) in scope.iter().enumerate().rev() {
+        match entry {
+            ScopeEntry::Generalized(f) if f.name == *name => return Some(i),
+            ScopeEntry::Shadow(n) if n == name => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Run `f` with `names` pushed as shadow markers, restoring the scope on the
+/// way out. Mirrors emission's monomorphic `scoped` binding.
+fn with_shadows<R>(
+    ctx: &mut CoalesceCtx,
+    names: impl IntoIterator<Item = Name>,
+    f: impl FnOnce(&mut CoalesceCtx) -> R,
+) -> R {
+    let depth = ctx.scope.len();
+    ctx.scope.extend(names.into_iter().map(ScopeEntry::Shadow));
+    let r = f(ctx);
+    ctx.scope.truncate(depth);
+    r
+}
+
+fn coalesce_pass(expr: &mut Expr, remap: CellRemap) -> (Vec<InferError>, CellRemap) {
+    let mut ctx = CoalesceCtx {
+        scope: Vec::new(),
+        remap,
+        errors: Vec::new(),
+        #[cfg(debug_assertions)]
+        reads: Vec::new(),
+    };
+    coalesce_node(expr, 0, &mut ctx);
+    debug_assert!(
+        ctx.scope.is_empty(),
+        "coalesce scope must be balanced: every frame/shadow pushed during the \
+         walk is popped when its binder's subtree completes"
+    );
+    // With the whole graph in its final state, re-check every read the walk
+    // performed (skipped on the error path — a failed program's reads are
+    // not expected to be stable).
+    #[cfg(debug_assertions)]
+    if ctx.errors.is_empty() {
+        assert_reads_stable(&ctx.reads, &ctx.remap);
+    }
+    (ctx.errors, ctx.remap)
 }
 
 /// The design's scope-validity check (§6.2): a coalesced node's type must be
@@ -2600,23 +2869,32 @@ fn check_scope_valid(
 }
 
 /// Resolve a type that may contain inference variables into a concrete
-/// `Type`, via the compact → simplify → coalesce pipeline.
-fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
-    coalesce_compact(&simplify_type(compact_type(ty)))
+/// `Type`, via the compact → simplify → coalesce pipeline. `cells`
+/// canonicalizes refinement tags whose predicate cell was retired (see
+/// [`CellRemap`]), so the materialized type points at live, specialized
+/// cells.
+fn resolve_var_type(ty: &Type, cells: &CellRemap) -> Result<Type, CoalesceError> {
+    coalesce_compact(&simplify_type(compact_type(ty, cells)))
 }
 
 /// Coalesce every node's `expr.ty` in place, resolving its inference variables
-/// into a concrete `Type`.
+/// into a concrete `Type` — and, in the same walk, **monomorphize**: a use of
+/// a generalized `let` is specialized at first visit ([`specialize_use`]) and
+/// the binding's `let` node is rebuilt as the chain of its per-type
+/// specializations ([`coalesce_generalized_let`]).
 ///
-/// `Var` references need no lexical-scope lookup. A *monomorphic* binder's uses
-/// share its inference variable (it binds verbatim), so they coalesce to the
-/// same type. A *generalized* `let`'s uses instantiate fresh variables and
-/// coalesce to their own per-use types; its definition subtree is **skipped**
-/// here (its quantified variables carry no use-site bounds, so coalescing would
-/// produce an under-determined type and overwrite the bound-bearing `InferVar`s
-/// the post-coalesce `monomorphize` pass specializes from). `level` mirrors
-/// emission's polymorphism depth — only a `let` RHS bumps it (see `in_let_rhs`)
-/// — so `should_generalize` can recognize the generalized `let`.
+/// A *monomorphic* binder's uses share its inference variable (it binds
+/// verbatim), so they coalesce to the same type with no scope lookup. A
+/// *generalized* `let`'s uses instantiate fresh variables; each use's
+/// instantiation is fully determined by the time the walk reaches it (the
+/// constraint graph is complete after emission), so the `Var` arm resolves it,
+/// specializes the definition to it, and stamps the result — every parent then
+/// derives its own type from concrete children. The definition subtree itself
+/// is never coalesced in place (its quantified variables carry no use-site
+/// bounds and must stay bound-bearing for the per-use clones); it rides in a
+/// [`SpecializeFrame`] until the body walk completes. `level` mirrors
+/// emission's polymorphism depth — only a `let` RHS bumps it (see
+/// `in_let_rhs`) — so `should_generalize` recognizes the generalized `let`.
 ///
 /// The only slots the bottom-up `expr.ty` resolution doesn't reach are the
 /// **binder slots** — they carry a type but are not a node's `expr.ty` — so each
@@ -2627,18 +2905,40 @@ fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
 /// binder-slot fact, not lexical scoping.)
 ///
 /// Refinement predicates ride the lattice and coalesce straight onto each node
-/// (including predicate sub-trees).
-fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
+/// (including predicate sub-trees). A free use of a generalized binding living
+/// *inside* a predicate specializes through the same `Var` arm when the
+/// predicate's expression is coalesced (`coalesce_type_predicates` runs this
+/// walk over it).
+fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
+    // Use of a generalized binding (innermost-out lookup; shadow markers keep
+    // inner same-name binders opaque): resolve the use's instantiation off
+    // the live graph, specialize the definition to it (memoized per distinct
+    // resolved type), rename the use to the specialization, and stamp its
+    // resolved type. The stamped type is final — fully resolved during the
+    // specialization's own coalesce — so the generic tail below is skipped.
+    if let TypedExprNode::Var(name) = &expr.node
+        && let Some(frame_idx) = lookup_generalized(&ctx.scope, name)
+    {
+        specialize_use(expr, frame_idx, ctx);
+        return;
+    }
+    // A generalized `let` rebuilds itself around its body's demanded
+    // specializations; its node type and binder slots are set there, so the
+    // generic tail is skipped likewise.
+    if let TypedExprNode::Let { bound_expr, .. } = &expr.node
+        && should_generalize(bound_expr, level)
+    {
+        coalesce_generalized_let(expr, level, ctx);
+        return;
+    }
+
     // Recurse into sub-expressions first so child types are settled
     // before we coalesce this node's (which may reference them).
     //
     // `level` mirrors emission's polymorphism level: only a `let` RHS bumps it
     // (see `in_let_rhs`); every other binder leaves it unchanged. It is used
-    // solely to recognize a *generalized* `let` (`should_generalize`) so its
-    // definition subtree can be skipped — that subtree's quantified variables
-    // carry no use-site bounds, so coalescing it would (a) produce an
-    // under-determined type and (b) overwrite the bound-bearing `InferVar`s the
-    // `monomorphize` pass needs to specialize from.
+    // solely to recognize a *generalized* `let` (`should_generalize`), handled
+    // above.
     match &mut expr.node {
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
@@ -2646,8 +2946,18 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
         | TypedExprNode::Source(_)
         | TypedExprNode::Proj(_) => {}
         TypedExprNode::Apply { function, argument } => {
-            coalesce_node(function, level, errors);
-            coalesce_node(argument, level, errors);
+            // Function before argument — deliberately, not just source order.
+            // Specializing a generalized use inside `function` pins its clone
+            // into the live graph, which (via the emit-time `arg <: domain`
+            // edge) deposits the clone's body demands onto the argument's
+            // variables; the argument must not have been read yet when those
+            // bounds land. (They are α-copies of demands the instantiation
+            // already deposited at emit, so a reversed order would still
+            // resolve the same types — but the invariant "specialization only
+            // adds bounds to variables the walk has not yet read" is what we
+            // rely on, so the order states it.)
+            coalesce_node(function, level, ctx);
+            coalesce_node(argument, level, ctx);
             // A projection or lambda applied to a resolved argument:
             // monomorphize its domain to the argument flowing in — the
             // closed-form use-site specialization (see
@@ -2677,21 +2987,21 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
         // here explicitly rather than relying on the
         // `coalesce_type_predicates(&expr.ty)` call at the end of this
         // function: `resolve_var_type` rebuilds `expr.ty` from variable
-        // bounds, and in a `specialize_def` clone the rebuilt tags alias the
-        // *definition's* cell, not the clone's freshened anchor cell — only
-        // this arm reliably resolves the anchor, which is the cell
-        // `monomorphize`'s final re-alias pass points every orphaned tag at.
+        // bounds, and in a specialized clone the rebuilt tags canonicalize to
+        // the *first* specialization's cell — only this arm reliably resolves
+        // this clone's own anchor cell.
         TypedExprNode::Cast { value, target } => {
-            coalesce_node(value, level, errors);
-            coalesce_type_predicates(target, level, errors);
+            coalesce_node(value, level, ctx);
+            coalesce_type_predicates(target, level, ctx);
         }
         TypedExprNode::BinOp { left, right, .. } => {
-            coalesce_node(left, level, errors);
-            coalesce_node(right, level, errors);
+            coalesce_node(left, level, ctx);
+            coalesce_node(right, level, ctx);
         }
-        TypedExprNode::UnaryOp(_, inner) => coalesce_node(inner, level, errors),
-        TypedExprNode::Lambda { param: _, body } => {
-            coalesce_node(body, level, errors);
+        TypedExprNode::UnaryOp(_, inner) => coalesce_node(inner, level, ctx),
+        TypedExprNode::Lambda { param, body } => {
+            let param_name = param.name.clone();
+            with_shadows(ctx, [param_name], |ctx| coalesce_node(body, level, ctx));
             // `param.ty` is resolved from the lambda's coalesced domain in
             // the end-of-function block (it can't be coalesced standalone:
             // body-usage refinement tags are negative-polarity upper-bound
@@ -2699,40 +3009,36 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
             // position of `expr.ty`). Domain-refinement predicates ride
             // `expr.ty` and are coalesced with it.
         }
-        TypedExprNode::Aggregate { input, .. } => coalesce_node(input, level, errors),
+        TypedExprNode::Aggregate { input, .. } => coalesce_node(input, level, ctx),
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
         } => {
-            // A generalized `let`'s definition is left uncoalesced for
-            // `monomorphize` to specialize (its predicate cells were
-            // privatized by `privatize_generalized_defs` beforehand, so the
-            // body's use-site tag coalescing below cannot corrupt them); a
-            // monomorphic one is coalesced here (its RHS lives one level
-            // deeper) and its binder slot filled.
-            if !should_generalize(bound_expr, level) {
-                coalesce_node(bound_expr, level + 1, errors);
-                // Binder slot: a monomorphic `let`'s binding type *is* its
-                // (now-coalesced) bound expression's type. The bottom-up
-                // `expr.ty` resolution doesn't reach this slot, so fill it
-                // explicitly — exactly as the `Lambda` / `Case` / `Loop`
-                // binder slots are filled. (For a generalized `let` the slot is
-                // moot: `monomorphize` replaces the binding with per-type ones.)
-                binding.ty = bound_expr.ty.clone();
-            }
-            coalesce_node(body, level, errors);
+            // Monomorphic `let` (the generalized case rebuilt itself above):
+            // the RHS lives one level deeper, and the binder slot is filled
+            // from it. CCL `let` is non-recursive, so the RHS coalesces
+            // outside the binding's shadow.
+            coalesce_node(bound_expr, level + 1, ctx);
+            // Binder slot: a monomorphic `let`'s binding type *is* its
+            // (now-coalesced) bound expression's type. The bottom-up
+            // `expr.ty` resolution doesn't reach this slot, so fill it
+            // explicitly — exactly as the `Lambda` / `Case` / `Loop`
+            // binder slots are filled.
+            binding.ty = bound_expr.ty.clone();
+            let binding_name = binding.name.clone();
+            with_shadows(ctx, [binding_name], |ctx| coalesce_node(body, level, ctx));
         }
         TypedExprNode::List(elts)
         | TypedExprNode::Tuple(elts)
         | TypedExprNode::CollectionUnion(elts) => {
             for e in elts.iter_mut() {
-                coalesce_node(e, level, errors);
+                coalesce_node(e, level, ctx);
             }
         }
         TypedExprNode::Compose(elts) => {
             for e in elts.iter_mut() {
-                coalesce_node(e, level, errors);
+                coalesce_node(e, level, ctx);
             }
             // Compose morphism-domain reconstruction. simple-sub coalesces
             // each morphism's domain independently — the `Var <: Var`
@@ -2788,11 +3094,10 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
             {
                 // Keep a dependent *final* morphism's Pi binder on the rebuilt
                 // chain type, mirroring `emit_compose`: the chain's codomain is
-                // the final codomain, which may reference that binder, and
-                // `rederive_dependent_types`' Apply arm (the monomorphize
-                // splice path's re-derivation) dispatches on the name —
-                // rebuilding with a bare arrow here would make it clobber the
-                // discharged codomain with the undischarged one.
+                // the final codomain, which may reference that binder, and the
+                // dependent-application discharge dispatches on the name —
+                // rebuilding with a bare arrow would silently drop the
+                // dependence.
                 expr.ty = Type::Fun {
                     name: last_name.clone(),
                     domain: Box::new((**first_dom).clone()),
@@ -2802,7 +3107,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
         }
         TypedExprNode::Record(fs) => {
             for (_, e) in fs.iter_mut() {
-                coalesce_node(e, level, errors);
+                coalesce_node(e, level, ctx);
             }
         }
         TypedExprNode::Case {
@@ -2810,32 +3115,41 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
             branches,
         } => {
             if let Some(s) = scrutinee {
-                coalesce_node(s, level, errors);
+                coalesce_node(s, level, ctx);
             }
             for b in branches.iter_mut() {
-                coalesce_node(&mut b.guard, level, errors);
-                coalesce_node(&mut b.body, level, errors);
+                // A pattern's payload binding scopes the branch's guard and
+                // body, shadowing an outer generalized binding of its name.
+                let pattern_name = b.pattern.as_ref().map(|p| p.binding.name.clone());
+                with_shadows(ctx, pattern_name, |ctx| {
+                    coalesce_node(&mut b.guard, level, ctx);
+                    coalesce_node(&mut b.body, level, ctx);
+                });
                 // Binder slot: resolve the pattern's payload-binding type.
                 // `emit_case` wrote the per-tag narrowed var into
                 // `Pattern::binding.ty`; run it through the same pipeline used
                 // for `expr.ty` so it ends up concrete.
                 if let Some(p) = &mut b.pattern {
-                    match resolve_var_type(&p.binding.ty) {
+                    match resolve_var_type(&p.binding.ty, &ctx.remap) {
                         Ok(ty) => p.binding.ty = ty,
                         Err(err) => {
                             let label = format!("Case pattern `.{}` payload", p.tag);
-                            push_coalesce_err(errors, map_coalesce_err(err, &label), label);
+                            push_coalesce_err(
+                                &mut ctx.errors,
+                                map_coalesce_err(err, &label),
+                                label,
+                            );
                         }
                     }
                 }
             }
         }
         TypedExprNode::VariantCtor { payload, .. } => {
-            coalesce_node(payload, level, errors);
+            coalesce_node(payload, level, ctx);
         }
         TypedExprNode::ExprStmt { expr: e, body } => {
-            coalesce_node(e, level, errors);
-            coalesce_node(body, level, errors);
+            coalesce_node(e, level, ctx);
+            coalesce_node(body, level, ctx);
         }
         // Defer/Feed/Define are eliminated by `desugar_defers` before
         // inference runs, so coalesce never sees them.
@@ -2852,20 +3166,22 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
             loop_body,
             ..
         } => {
-            coalesce_node(source, level, errors);
+            coalesce_node(source, level, ctx);
             for a in init_args.iter_mut() {
-                coalesce_node(a, level, errors);
+                coalesce_node(a, level, ctx);
             }
-            coalesce_node(loop_body, level, errors);
+            // Accumulator params are bound only inside the loop body.
+            let param_names: Vec<Name> = params.iter().map(|p| p.name.clone()).collect();
+            with_shadows(ctx, param_names, |ctx| coalesce_node(loop_body, level, ctx));
             // Resolve each accumulator-slot type in place. `emit_loop`
             // wrote the slot var into `params[i].ty`; run it through the
             // same pipeline used for `expr.ty` so it ends up concrete.
             for binding in params.iter_mut() {
-                match resolve_var_type(&binding.ty) {
+                match resolve_var_type(&binding.ty, &ctx.remap) {
                     Ok(ty) => binding.ty = ty,
                     Err(err) => {
                         let label = "Loop param".to_string();
-                        push_coalesce_err(errors, map_coalesce_err(err, &label), label);
+                        push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
                     }
                 }
             }
@@ -2883,9 +3199,19 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
     // domain coalesces straight onto `expr.ty` here — downstream passes
     // (`lambda_elim` included) read it from the type.
     let label = symbolic(expr);
-    match resolve_var_type(&expr.ty) {
-        Ok(ty) => expr.ty = ty,
-        Err(err) => push_coalesce_err(errors, map_coalesce_err(err, &label), label),
+    match resolve_var_type(&expr.ty, &ctx.remap) {
+        Ok(ty) => {
+            // Log the graph read for the ordering-invariant check. The
+            // var-laden `expr.ty` shares the live `InferVar`s, so the
+            // end-of-pass re-resolution sees every bound a later
+            // specialization added — and must still yield `ty`. (Parent arms
+            // may overwrite `expr.ty` afterwards via *structural* recovery
+            // — `specialize_lambda_domain`, let-closing — which is not a
+            // graph read and so is not what this guards.)
+            ctx.record_read(&expr.ty, &ty, || label.clone());
+            expr.ty = ty;
+        }
+        Err(err) => push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label),
     }
 
     // A lambda's param binding slot mirrors its coalesced domain (see
@@ -2903,20 +3229,15 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
     // discharged its binding into `body.ty`, and this layer discharges `x` on
     // top. The post-inference `check` reconciles because it re-runs the same
     // discharge, producing structurally equal predicates (see
-    // `Subst::force_refinement`).
-    //
-    // A *generalized* `let` is skipped: its definition is still uncoalesced
-    // here (quantified vars awaiting `monomorphize`), so splicing it into a
-    // predicate would deposit a clone full of irresolvable inference variables
-    // — and the clone's fresh cell is type-borne, which `monomorphize`'s
-    // use-renaming deliberately never walks. `monomorphize_go` performs the
-    // closing instead, when it wraps the body in specialized (concrete) lets.
+    // `Subst::force_refinement`). Only monomorphic `let`s reach here; a
+    // generalized one rebuilt itself in `coalesce_generalized_let`, which runs
+    // the same closing per spliced specialization.
     let let_closed = match &expr.node {
         TypedExprNode::Let {
             binding,
             bound_expr,
             body,
-        } if !should_generalize(bound_expr, level) => {
+        } => {
             let sigma = crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone());
             Some(sigma.apply_type(&body.ty))
         }
@@ -2933,81 +3254,288 @@ fn coalesce_node(expr: &mut Expr, level: Level, errors: &mut Vec<InferError>) {
     // slots so the post-inference checks see concrete types. `try_borrow_mut`
     // breaks the cycle when a predicate's own type slot carries the same
     // refinement.
-    coalesce_type_predicates(&expr.ty, level, errors);
+    coalesce_type_predicates(&expr.ty, level, ctx);
 }
 
 /// Coalesce refinement predicates embedded anywhere in `ty` (see the call
 /// site in `coalesce_node`). Idempotent for predicates already resolved by
 /// the `Lambda` arm. `level` is forwarded to the predicate's own
-/// [`coalesce_node`] (a predicate is emitted in the enclosing scope).
-fn coalesce_type_predicates(ty: &Type, level: Level, errors: &mut Vec<InferError>) {
+/// [`coalesce_node`] (a predicate is emitted in the enclosing scope), and the
+/// walk's scope travels with `ctx`, so a generalized-binding use living only
+/// inside a predicate specializes here.
+fn coalesce_type_predicates(ty: &Type, level: Level, ctx: &mut CoalesceCtx) {
     match ty {
         Type::Refinement(inner, r) => {
             let def = &r.predicate;
             if let Ok(mut pred) = def.try_borrow_mut() {
-                coalesce_node(&mut pred, level, errors);
+                coalesce_node(&mut pred, level, ctx);
             }
-            coalesce_type_predicates(inner, level, errors);
+            coalesce_type_predicates(inner, level, ctx);
         }
         Type::Fun {
             domain: d,
             codomain: c,
             ..
         } => {
-            coalesce_type_predicates(d, level, errors);
-            coalesce_type_predicates(c, level, errors);
+            coalesce_type_predicates(d, level, ctx);
+            coalesce_type_predicates(c, level, ctx);
         }
         Type::Tuple(ts) => ts
             .iter()
-            .for_each(|t| coalesce_type_predicates(t, level, errors)),
+            .for_each(|t| coalesce_type_predicates(t, level, ctx)),
         Type::Record(fs) => fs
             .iter()
-            .for_each(|(_, t)| coalesce_type_predicates(t, level, errors)),
+            .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
         Type::Variant(tags) => tags
             .iter()
-            .for_each(|(_, t)| coalesce_type_predicates(t, level, errors)),
+            .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
     }
 }
 
 // ---------------------------------------------------------------------------
-// Pass 3: Monomorphization
+// Integrated monomorphization (the coalesce walk's specialization arms)
 // ---------------------------------------------------------------------------
+//
+// Let-generalization is lowered to concrete, per-type code *inside* the
+// coalesce walk. A use of a generalized binding specializes at first visit
+// (`specialize_use`, from `coalesce_node`'s `Var` hook), memoized per distinct
+// resolved type so same-typed uses share one definition — a
+// collection/generator UDF used at several element types compiles to one
+// *cached* binding per element type rather than a copy per call site (cf.
+// [`crate::ccl::inline`]). The binding's `let` node then rebuilds itself as
+// the chain of demanded specializations (`coalesce_generalized_let`). A
+// binding used at K distinct types becomes K nested `let`s; one never used at
+// all is dropped as dead code.
+//
+// Specializing *during* the walk (rather than in a post-coalesce pass) is
+// what lets every parent derive its type from concrete children on the first
+// pass: by coalesce time the constraint graph is complete, so a use's
+// instantiation is fully determined when the bottom-up walk reaches it, and a
+// parent `Apply`'s dependent-codomain discharge forces against the
+// specialization's resolved predicate cells instead of the definition's
+// quantified ones. The retired post-coalesce splice had to re-derive every
+// dependent parent type by hand — a second, graph-unreachable copy of the
+// discharge logic.
+//
+// The load-bearing ordering invariant: **specialization may only add bounds
+// to variables the walk has not yet read.** A use's pin touches its own
+// instantiation variables (read right after, at the use's own stamp), the
+// clone's fresh variables (read only inside the clone's re-entrant walk), and
+// — through emit-time edges — variables of nodes above or beside the use,
+// where any deposit is an α-copy of demands the instantiation already made at
+// emit. The `Apply` arm's function-before-argument order keeps even those
+// copies behind the read front.
+//
+// The invariant is checked **explicitly** rather than argued: `CoalesceCtx`
+// logs every graph read (`record_read`) as a `(var-laden type, resolution)`
+// pair — the snapshot shares the live `InferVar`s — and `assert_reads_stable`
+// re-resolves each against the *final* graph at end of pass, requiring the
+// skeleton to be unchanged (`types_agree_modulo_unread`). A pin that
+// retroactively changed an already-read variable's resolution trips it by
+// name. Debug builds only; free in release.
 
-/// Lower each generalized `let` to concrete, per-type code.
+/// Specialize a use of a generalized binding (frame at `frame_idx` in the
+/// walk's scope) to its resolved instantiation type, then rewrite the use to
+/// reference the specialization and stamp the specialization's resolved type
+/// on it.
 ///
-/// After coalesce, every *use* of a generalized binding carries its resolved
-/// instantiation type on its `Var` node, while the binding's definition was
-/// left uncoalesced (`coalesce_node` skips it, preserving its bound-bearing
-/// inference variables). This pass groups the uses by distinct resolved type,
-/// emits **one** specialized clone of the definition per distinct type — shared
-/// across the uses that demand it — and rewrites each use to reference its
-/// specialization. A binding used at K distinct types becomes K nested `let`s;
-/// same-typed uses share one definition, so a collection/generator UDF used at
-/// several element types compiles to one *cached* binding per element type
-/// rather than a copy per call site (cf. [`crate::ccl::inline`]).
+/// On a memo miss this clones the frame's definition, freshens it
+/// independently ([`freshen_expr_types`] — quantified-variable renaming plus
+/// predicate-cell de-aliasing, recorded in the pass remap), **pins it
+/// two-way to the use's live instantiation type** (the use type is itself
+/// var-laden for a use inside another clone — the chained poly-calls-poly
+/// case — and the live pin is what lets such interior uses resolve concrete),
+/// and coalesces the clone re-entrantly. The re-entrant walk runs in the
+/// *definition site's* scope — entries above the frame are suspended — so a
+/// name the definition references resolves to what was in scope where it was
+/// written, not to a same-named binder introduced between definition and use.
+// `ConstrainCache` keys on `Type`, whose `Refinement` predicates carry interior
+// mutability; the solver relies on identity-by-`uid`, not the mutable payload
+// (matching `simple_sub`'s module-level allow).
+#[allow(clippy::mutable_key_type)]
+fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) {
+    // The use's instantiation type, resolved off the live graph. The graph is
+    // complete (emission saw the whole program), so everything this use
+    // depends on has already been constrained — including, for a use inside
+    // another specialization's clone, that outer clone's pin.
+    let resolved = match resolve_var_type(&use_expr.ty, &ctx.remap) {
+        Ok(t) => t,
+        Err(err) => {
+            let label = symbolic(use_expr);
+            push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
+            return;
+        }
+    };
+    // Log the use's instantiation read for the ordering-invariant check. The
+    // snapshot keeps the live instantiation vars; the pin below (and any
+    // later specialization) may only *add* bounds to them, so re-resolving at
+    // end-of-pass must still agree (the use node itself is overwritten with
+    // the specialization name, but the read is what the walk consumed here).
+    ctx.record_read(&use_expr.ty, &resolved, || symbolic(use_expr));
+    // A use type can resolve with residual `Infer` placeholders only when
+    // nothing concrete ever reached its instantiation (a generic definition
+    // the program never exercises at a concrete type). Inference deliberately
+    // tolerates the residue (`Type::Infer`'s invariant); the strict
+    // post-inference typecheck is the layer that rejects it. Placeholder
+    // identities are fresh per resolution, so such uses never share a memo
+    // entry — each gets its own (under-determined) specialization.
+    let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
+        unreachable!("lookup_generalized returns indices of Generalized entries only");
+    };
+    if let Some(spec) = frame.specs.iter().find(|s| s.use_ty == resolved) {
+        let (name, ty) = (spec.name.clone(), spec.def.ty.clone());
+        use_expr.node = TypedExprNode::Var(name);
+        use_expr.ty = ty;
+        return;
+    }
+    let base_name = frame.name.clone();
+    let cutoff = frame.cutoff;
+    let mut clone = frame.def.clone();
+    // A monomorphization name carrying the source binding as provenance and a
+    // globally-fresh uid for identity — so it can neither capture nor be
+    // captured (the uid is what the old `__mono{N}` counter hand-rolled).
+    let spec_name = Name::mono(base_name.clone());
+
+    // Freshen an independent copy: every quantified variable (level > cutoff)
+    // is renamed with its bounds copied, levels preserved so nested
+    // generalized `let`s stay recognizable; anchor predicate cells are
+    // de-aliased into clone-private ones. The clone-local remap keeps this
+    // freshen from reusing an earlier specialization's retirements; it is
+    // absorbed into the pass remap afterwards (first-wins, so orphaned tags
+    // elsewhere resolve to the first specialization's anchors).
+    let mut fresh = FreshenCache::new();
+    let mut local = CellRemap::default();
+    freshen_expr_types(
+        &mut clone,
+        cutoff,
+        FreshenLevel::Preserve,
+        &mut fresh,
+        &mut local,
+    );
+    // The copied bound edges still carry emit-time substitution payloads
+    // referencing the definition's variables; rename them through the same
+    // cache so the clone shares no live inference state with the definition.
+    freshen_bound_substs(cutoff, FreshenLevel::Preserve, &mut fresh, &mut local);
+    // Freshening de-aliased the clone's *anchor* predicate cells but left
+    // type-borne tags aliasing the definition's cells; re-point them at the
+    // clone's anchors so coalescing below resolves them.
+    realias_refinement_tags(&mut clone, &local, &mut HashSet::new());
+    ctx.remap.absorb(local);
+
+    // Pin the clone to the use's live instantiation type, two-way. Inward,
+    // this drives the use site's accumulated bounds into the clone's
+    // freshened variables (what makes the clone *this* use's specialization);
+    // outward, it connects the clone into the use's component of the live
+    // graph, so a parent reading through emit-time edges reaches the clone's
+    // content. The pin gets a fresh constraint cache: the emit-pass σ-aware
+    // cache is long gone, and sharing one cache across pins could only
+    // conflate edges between independent specializations.
+    let mut cache = ConstrainCache::new();
+    let pinned = constrain_subtype(&clone.ty, &use_expr.ty, &mut cache)
+        .and_then(|()| constrain_subtype(&use_expr.ty, &clone.ty, &mut cache));
+    if let Err(e) = pinned {
+        ctx.errors
+            .push(map_constrain_err(e, "monomorphization specialization"));
+    }
+
+    // The clone's interior may contain nested generalized `let`s; privatize
+    // their anchor cells before coalescing, exactly as
+    // `privatize_generalized_defs` did for the original tree.
+    privatize_generalized_defs(&mut clone, cutoff + 1, &mut ctx.remap);
+
+    // Coalesce the clone re-entrantly, in the definition site's scope: every
+    // entry above the frame (including the frame itself — CCL `let` is
+    // non-recursive, so the definition cannot reference its own name and a
+    // same-named *outer* binding below the frame must stay visible) was
+    // introduced between the definition and this use and is suspended for the
+    // duration. Nested generalized `let`s inside the clone push their own
+    // frames on the truncated stack and specialize recursively.
+    let suspended = ctx.scope.split_off(frame_idx);
+    coalesce_node(&mut clone, cutoff + 1, ctx);
+    ctx.scope.extend(suspended);
+    // (The pin's effect on this use's own resolution — and on every other
+    // read the walk made — is checked in bulk at end-of-pass by
+    // `assert_reads_stable`, which is where the ordering invariant lives.)
+
+    use_expr.node = TypedExprNode::Var(spec_name.clone());
+    use_expr.ty = clone.ty.clone();
+    let ScopeEntry::Generalized(frame) = &mut ctx.scope[frame_idx] else {
+        unreachable!("suspended entries were restored above the frame");
+    };
+    // The memo key is the *specialization's* resolved type, not this use's
+    // pre-pin resolution: the two differ exactly by the canonical-chain
+    // extension above, and every later same-typed use resolves its tags
+    // through the now-extended chains — i.e. to the cells `clone.ty` carries.
+    frame.specs.push(Specialization {
+        use_ty: clone.ty.clone(),
+        name: spec_name,
+        def: clone,
+    });
+}
+
+/// Coalesce a generalized `let`: walk the body under a specialization frame
+/// for the binding, then rebuild the node as the chain of per-type
+/// specializations the body demanded.
 ///
-/// This is classic monomorphization, deferred until *after* types are known so
-/// it can key specialization on the resolved type — which is what lets one
-/// definition be shared across same-typed uses. It supersedes the earlier
-/// emit-time splice, which duplicated per use site (before types were known)
-/// and so could neither share nor reach collection-shaped definitions.
-fn monomorphize(expr: &mut Expr, remap: &mut CellRemap, errors: &mut Vec<InferError>) {
-    monomorphize_go(expr, 0, remap, errors);
-    // Use sites of a monomorphized definition still carry refinement tags
-    // aliasing *retired* predicate cells — instantiation ([`freshen_above`])
-    // cloned tags cell-intact before privatization re-celled the
-    // definition's anchors and specialization re-celled them again, and the
-    // retired contents are never coalesced (their quantified variables have
-    // no resolution). With every definition now specialized, resolve each
-    // tag through `remap`'s retirement chains onto the surviving (coalesced)
-    // anchor cells.
-    realias_refinement_tags(expr, remap, &mut HashSet::new());
+/// Every use of the binding was renamed to its specialization's name and
+/// stamped with its resolved type during the body walk ([`specialize_use`]),
+/// so the spliced `let`s are ordinary monomorphic bindings — concrete
+/// definition, concrete binder slot. Each layer closes the lifted body type
+/// over its binding (`[name_i ↦ def_i]`, the §6.2 move site), exactly as
+/// `coalesce_node`'s tail does for a monomorphic `let` — the specializations
+/// are concrete here, so the discharge splices resolved types. A binding the
+/// body never demanded (no uses at any type) is dropped entirely — its
+/// definition is dead code.
+fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
+    let saved_annotation = expr.user_annotation.take();
+    let node = std::mem::replace(&mut expr.node, TypedExprNode::Error);
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = node
+    else {
+        unreachable!("coalesce_generalized_let is only called on a generalized Let");
+    };
+    let mut body = *body;
+    ctx.scope
+        .push(ScopeEntry::Generalized(Box::new(SpecializeFrame {
+            name: binding.name,
+            def: *bound_expr,
+            cutoff: level,
+            specs: Vec::new(),
+        })));
+    coalesce_node(&mut body, level, ctx);
+    let Some(ScopeEntry::Generalized(frame)) = ctx.scope.pop() else {
+        unreachable!("the binding's frame still tops the scope after a balanced body walk");
+    };
+
+    // Wrap the body in one specialized `let` per distinct type. Built in
+    // reverse so first-demanded types end up outermost; ordering is
+    // immaterial since the specializations never reference one another.
+    let mut result = body;
+    for spec in frame.specs.into_iter().rev() {
+        let body_ty = crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone())
+            .apply_type(&result.ty);
+        result = Expr::new(TypedExprNode::Let {
+            binding: TypedBinding {
+                name: spec.name,
+                ty: spec.def.ty.clone(),
+                user_annotation: None,
+            },
+            bound_expr: Box::new(spec.def),
+            body: Box::new(result),
+        })
+        .with_ty(body_ty);
+    }
+    *expr = result;
+    expr.user_annotation = saved_annotation;
 }
 
 /// Specialize a projection morphism to the value flowing into it — the
 /// **closed-form** case of use-site specialization, the sibling of
-/// [`specialize_def`].
+/// [`specialize_use`].
 ///
 /// A projection `.i` is a *polymorphic* morphism: its principal type is
 /// `∀ρ. ρ ⇒ ρ.i` for any record/tuple `ρ` carrying field `i`. simple-sub never
@@ -3015,7 +3543,7 @@ fn monomorphize(expr: &mut Expr, remap: &mut CellRemap, errors: &mut Vec<InferEr
 /// `Var <: Var` rule feeds the domain var only the one field the projection
 /// touches, so the domain coalesces under-determined. Recovering it from the
 /// concrete `input` flowing in at the use site **monomorphizes** the projection
-/// to that use — exactly what [`specialize_def`] does for a generalized `let`
+/// to that use — exactly what [`specialize_use`] does for a generalized `let`
 /// (and what `compact_go`'s opposite-polarity fallback does for a bare
 /// contravariant domain var). The realizations differ only because the
 /// relationship differs: a `let`'s use type relates to its definition by
@@ -3138,332 +3666,6 @@ fn refresh_lambda_param_slot(expr: &mut Expr) {
     {
         param.ty = (**dom).clone();
     }
-}
-
-fn monomorphize_go(
-    expr: &mut Expr,
-    level: Level,
-    remap: &mut CellRemap,
-    errors: &mut Vec<InferError>,
-) {
-    // `level` mirrors emission/coalesce: only a `let` RHS bumps it. A `let` is
-    // generalized iff `should_generalize` holds at its defining level — the same
-    // predicate emission and coalesce consulted, so all three agree on which
-    // `let`s are polymorphic.
-    let is_poly = matches!(
-        &expr.node,
-        TypedExprNode::Let { bound_expr, .. } if should_generalize(bound_expr, level)
-    );
-    if !is_poly {
-        match &mut expr.node {
-            TypedExprNode::Let {
-                bound_expr, body, ..
-            } => {
-                monomorphize_go(bound_expr, level + 1, remap, errors);
-                monomorphize_go(body, level, remap, errors);
-            }
-            _ => expr.walk_children_mut(|c| monomorphize_go(c, level, &mut *remap, &mut *errors)),
-        }
-        return;
-    }
-
-    // Take ownership of the generalized `let`'s parts; we rebuild it as a stack
-    // of specialized monomorphic `let`s.
-    let saved_annotation = expr.user_annotation.take();
-    let node = std::mem::replace(&mut expr.node, TypedExprNode::Error);
-    let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        body,
-    } = node
-    else {
-        unreachable!("is_poly implies Let")
-    };
-    let cutoff = level;
-    let def = *bound_expr;
-    let mut body = *body;
-
-    // Assign one fresh specialization name per distinct resolved use type, and
-    // rewrite each use in place to its name. `for_each_free_use` respects
-    // shadowing, so an inner binder of the same name is left untouched. Each
-    // `Name::mono` mint carries a globally-fresh uid, so the specialization
-    // names cannot capture or be captured by anything in `body`.
-    let mut groups: Vec<(Type, Name)> = Vec::new();
-    for_each_free_use(&mut body, &binding.name, &mut |u| {
-        let name = match groups.iter().find(|(t, _)| *t == u.ty) {
-            Some((_, n)) => n.clone(),
-            None => {
-                let n = Name::mono();
-                groups.push((u.ty.clone(), n.clone()));
-                n
-            }
-        };
-        if let TypedExprNode::Var(v) = &mut u.node {
-            *v = name;
-        }
-    });
-
-    // Recurse into the (rewritten) body for any further generalized `let`s.
-    monomorphize_go(&mut body, level, remap, errors);
-
-    // Wrap the body in one specialized `let` per distinct type. Built in reverse
-    // so first-seen types end up outermost; ordering is immaterial since the
-    // specializations never reference one another. An unused binding (no groups)
-    // is dropped entirely — its definition is dead code.
-    let mut result = body;
-    for (ty_i, name_i) in groups.into_iter().rev() {
-        let mut def_i = specialize_def(&def, cutoff, &ty_i, remap, errors);
-        // The specialization may itself contain generalized `let`s.
-        monomorphize_go(&mut def_i, cutoff + 1, remap, errors);
-        // Stamp the *specialization's* resolved type onto each use, then
-        // re-derive the dependent node types that were computed from the
-        // use's instantiation type at main coalesce. The instantiation type
-        // is structurally identical to `def_i.ty` (the pin is two-way) but
-        // its refinement-predicate *internals* still carry the definition's
-        // quantified inference vars — a parent `Apply`'s discharge cloned
-        // that stale content into its own type, where neither realiasing nor
-        // the spec's coalesce can reach it. Re-running the reconstruction
-        // over the now-concrete child types replaces those clones.
-        for_each_free_use(&mut result, &name_i, &mut |u| u.ty = def_i.ty.clone());
-        rederive_dependent_types(&mut result);
-        // Close the lifted body type over the new binding (§6.2 move site):
-        // a body refinement predicate may call `name_i` (predicate uses were
-        // renamed along with the rest of the body above). `coalesce_node`'s
-        // Let arm skipped the generalized original because its definition was
-        // uncoalesced then; `def_i` is specialized and concrete now, so the
-        // discharge splices resolved types.
-        let body_ty =
-            crate::ccl::subst::Subst::discharge(&name_i, def_i.clone()).apply_type(&result.ty);
-        result = Expr::new(TypedExprNode::Let {
-            binding: TypedBinding {
-                name: name_i,
-                ty: def_i.ty.clone(),
-                user_annotation: None,
-            },
-            bound_expr: Box::new(def_i),
-            body: Box::new(result),
-        })
-        .with_ty(body_ty);
-    }
-    *expr = result;
-    expr.user_annotation = saved_annotation;
-}
-
-/// Re-derive the node types that the main coalesce computed from a
-/// generalized use's *instantiation* type, after `monomorphize_go` stamped the
-/// resolved specialization type onto the use.
-///
-/// This is the **remaining re-derivation site** — the one copy of the Apply
-/// codomain discharge and `let` codomain extraction that the graph-level
-/// dependent-discharge machinery (two-sided `Bound` edges) cannot subsume.
-/// The reason is structural: the splice operates *after* coalesce, stamping
-/// resolved specialization types onto use sites with no live constraint
-/// graph to propagate the change. Every parent's recorded type was derived
-/// from the instantiation-time view of the use — whose embedded predicate
-/// copies carry unresolved inference slots ("Unresolved inference variable in
-/// expression …" is the failure shape if this walk is removed; see
-/// `test_udf_containing_filter`). With no edges to compose through, the fix
-/// is bottom-up structural recomputation: re-fire `[k ↦ argument]` on each
-/// apply's resolved function child, and `[x ↦ v]` for each `let` — plain
-/// type surgery on dead stamped types, safe here because every metavariable
-/// the substitution touches is already solved.
-///
-/// TODO(vault: type-checker-coalesce-integrated-monomorphization): delete
-/// this function by moving specialization *into* the coalesce walk — the
-/// graph is complete by coalesce time, so specializing a generalized use at
-/// first visit (memoized per resolved type) lets every parent derive from
-/// correct children on the first pass, and the discharge logic lives in
-/// exactly one substrate.
-///
-/// Idempotent: a type that was already derived from concrete children
-/// re-derives to a structurally equal one.
-fn rederive_dependent_types(expr: &mut Expr) {
-    expr.walk_children_mut(rederive_dependent_types);
-    match &expr.node {
-        TypedExprNode::Apply { function, argument } => {
-            if let Type::Fun { name, codomain, .. } = peel_refinements_outer(&function.ty) {
-                expr.ty = match name {
-                    Some(k) => crate::ccl::subst::Subst::discharge(k, (**argument).clone())
-                        .apply_type(codomain),
-                    None => (**codomain).clone(),
-                };
-            }
-        }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            expr.ty = crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone())
-                .apply_type(&body.ty);
-        }
-        _ => {}
-    }
-}
-
-/// Specialize a generalized definition to one resolved use type.
-///
-/// Freshens an independent copy of `def` (so neither the original nor any other
-/// specialization is disturbed), pins its type to `target` (the resolved use
-/// type), and coalesces the copy in place — yielding a definition whose every
-/// node carries concrete, `target`-specialized types. `target` is already
-/// concrete, so the two-way pin merely drives it into the freshened quantified
-/// variables; it should never fail (the type came from this definition's own
-/// instantiation), but any error is surfaced rather than silently dropped.
-// `ConstrainCache` keys on `Type`, whose `Refinement` predicates carry interior
-// mutability; the solver relies on identity-by-`uid`, not the mutable payload
-// (matching `simple_sub`'s module-level allow).
-#[allow(clippy::mutable_key_type)]
-fn specialize_def(
-    def: &Expr,
-    cutoff: Level,
-    target: &Type,
-    remap: &mut CellRemap,
-    errors: &mut Vec<InferError>,
-) -> Expr {
-    let mut clone = def.clone();
-    let mut fresh = FreshenCache::new();
-    // Clone-local remap: every specialization de-aliases the definition's
-    // predicate cells into its own fresh ones, so the freshen must not see
-    // (and reuse) an earlier specialization's retirements from the pass
-    // remap. Absorbed into the pass remap afterwards — first-wins, so
-    // orphaned use-site tags resolve to the first specialization's anchors.
-    let mut local = CellRemap::default();
-    // Preserve levels: the definition may contain nested generalized `let`s
-    // whose RHS variables live deeper than `cutoff + 1`. Collapsing them to a
-    // single level would make `monomorphize_go`'s recursive descent (and the
-    // coalesce skip below) stop recognizing the inner generalization.
-    freshen_expr_types(
-        &mut clone,
-        cutoff,
-        FreshenLevel::Preserve,
-        &mut fresh,
-        &mut local,
-    );
-    // Freshening de-aliased the clone's *anchor* predicate cells but left
-    // type-borne tags aliasing the original's cells; re-point them at the
-    // clone's anchors so coalescing below resolves them.
-    realias_refinement_tags(&mut clone, &local, &mut HashSet::new());
-    remap.absorb(local);
-
-    let mut cache = ConstrainCache::new();
-    let pinned = constrain_subtype(&clone.ty, target, &mut cache)
-        .and_then(|()| constrain_subtype(target, &clone.ty, &mut cache));
-    if let Err(e) = pinned {
-        errors.push(map_constrain_err(e, "monomorphization specialization"));
-    }
-
-    // The clone's interior may contain nested generalized `let`s; privatize
-    // them before coalescing, exactly as `privatize_generalized_defs` did
-    // for the original tree.
-    privatize_generalized_defs(&mut clone, cutoff + 1, remap);
-    coalesce_node(&mut clone, cutoff + 1, errors);
-    clone
-}
-
-/// Invoke `f` on every *free* `Var(name)` use within `expr`, skipping subtrees
-/// where an inner binder shadows `name` (a lambda param, a nested `let`, a
-/// `Case` pattern payload, or a `Loop` accumulator). The closure may both read
-/// the use's resolved type (`u.ty`) and rewrite its node.
-///
-/// "Within `expr`" includes refinement *predicates*: a predicate is an
-/// expression scoped to the enclosing expression (plus the refined binder),
-/// so a `Var(name)` inside one is a real free use — e.g. a list-comprehension
-/// filter calling a let-bound UDF lives only in the cast-target refinement.
-/// Predicates are visited at their *syntactic anchors* (`user_annotation`, a
-/// `Cast` target) so the binder-shadowing rules
-/// above apply to them positionally. Refinement tags riding inferred types
-/// (`expr.ty`) are deliberately *not* walked: they alias anchor cells, and an
-/// outward-propagated tag may close over a binder that shadows `name` — its
-/// anchor sits under that binder, where the walk correctly prunes.
-/// `try_borrow_mut` skips a cell already being walked higher up the stack
-/// (the outer borrow is processing it); a cell shared by several anchors is
-/// visited more than once, which is harmless because a rewritten use no
-/// longer matches `name`.
-fn for_each_free_use(expr: &mut Expr, name: &Name, f: &mut impl FnMut(&mut Expr)) {
-    // The `Var` case needs the whole `&mut expr`, so check it without holding a
-    // borrow of `expr.node`.
-    if let TypedExprNode::Var(v) = &expr.node {
-        if v == name {
-            f(expr);
-        }
-        return;
-    }
-    if let Some(annotation) = &expr.user_annotation {
-        for_each_free_use_in_type(annotation, name, f);
-    }
-    match &mut expr.node {
-        TypedExprNode::Lambda { param, body } => {
-            // The param scopes the body, so it is skipped when the param
-            // shadows `name`.
-            if &param.name != name {
-                for_each_free_use(body, name, f);
-            }
-        }
-        TypedExprNode::Cast { value, target } => {
-            for_each_free_use_in_type(target, name, f);
-            for_each_free_use(value, name, f);
-        }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            // CCL `let` is non-recursive: `bound_expr` sees the *outer* `name`.
-            for_each_free_use(bound_expr, name, f);
-            if &binding.name != name {
-                for_each_free_use(body, name, f);
-            }
-        }
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => {
-            if let Some(s) = scrutinee {
-                for_each_free_use(s, name, f);
-            }
-            for b in branches {
-                // A pattern payload binding shadows `name` in guard + body.
-                if b.pattern.as_ref().is_some_and(|p| &p.binding.name == name) {
-                    continue;
-                }
-                for_each_free_use(&mut b.guard, name, f);
-                for_each_free_use(&mut b.body, name, f);
-            }
-        }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            // `params` are bound only inside `loop_body`; `init_args` and
-            // `source` are evaluated in the enclosing scope.
-            for a in init_args {
-                for_each_free_use(a, name, f);
-            }
-            for_each_free_use(source, name, f);
-            if !params.iter().any(|p| &p.name == name) {
-                for_each_free_use(loop_body, name, f);
-            }
-        }
-        // No binder for `name`: recurse into all children uniformly.
-        _ => expr.walk_children_mut(|c| for_each_free_use(c, name, &mut *f)),
-    }
-}
-
-/// Type-side companion of [`for_each_free_use`]: invoke `f` on every free
-/// `Var(name)` use inside the refinement predicates embedded in `ty` (a
-/// syntactic anchor — a `Cast` target or user annotation). Mutation goes
-/// through the predicate cells' interior mutability; the type structure
-/// itself is untouched.
-fn for_each_free_use_in_type(ty: &Type, name: &Name, f: &mut impl FnMut(&mut Expr)) {
-    if let Type::Refinement(_, r) = ty
-        && let Ok(mut pred) = r.predicate.try_borrow_mut()
-    {
-        for_each_free_use(&mut pred, name, f);
-    }
-    ty.walk_children(|child| for_each_free_use_in_type(child, name, &mut *f));
 }
 
 /// Stamp the resolved type of each binder onto the **free term-variable
@@ -3748,9 +3950,8 @@ mod tests {
         //
         // The two use sites would collide under monomorphic `let` (both flow
         // into one shared param var → `IncompatibleBounds`). Let-generalization
-        // instantiates `id` independently per use, and the post-coalesce
-        // `monomorphize` pass emits one specialized definition per distinct use
-        // type.
+        // instantiates `id` independently per use, and the coalesce walk emits
+        // one specialized definition per distinct resolved use type.
         let id = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
         let use_int = TypedExpr::apply(lit_int(1), TypedExpr::var("id"));
         let use_str = TypedExpr::apply(lit_string("a"), TypedExpr::var("id"));
@@ -3766,7 +3967,7 @@ mod tests {
         );
     }
 
-    /// Walk `expr`, counting `Let` bindings minted by [`monomorphize`] (their
+    /// Walk `expr`, counting `Let` bindings minted by specialization (their
     /// names carry the `__mono` marker) and the distinct specialization names
     /// that `Var` nodes reference.
     fn specialization_stats(expr: &Expr) -> (usize, std::collections::BTreeSet<Name>) {
@@ -3775,7 +3976,7 @@ mod tests {
             matches!(
                 n,
                 Name::Synthetic {
-                    kind: SyntheticKind::Mono,
+                    kind: SyntheticKind::Mono(_),
                     ..
                 }
             )
@@ -3830,6 +4031,242 @@ mod tests {
     }
 
     #[test]
+    fn chained_poly_calls_poly_specializes_per_use_type() {
+        // let f = λx. (x, x) in let g = λy. f(y) in (g(1), g("a"))
+        //
+        // `f`'s only use sits inside *another* generalized definition (`g`),
+        // so it is reached only while a `g` clone's re-entrant walk runs —
+        // after that clone's pin has driven the use's instantiation concrete.
+        // Each `g` specialization demands its own `f` specialization, with
+        // `f`'s frame still in scope below `g`'s. The body is structural
+        // (`(x, x)`), so no pre-inference beta-reduction rescues the chain.
+        let f = TypedExpr::lambda(
+            "x",
+            Type::Hole,
+            TypedExpr::new(TypedExprNode::Tuple(vec![
+                TypedExpr::var("x"),
+                TypedExpr::var("x"),
+            ])),
+        );
+        let g = TypedExpr::lambda(
+            "y",
+            Type::Hole,
+            TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("f")),
+        );
+        let uses = TypedExpr::new(TypedExprNode::Tuple(vec![
+            TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
+            TypedExpr::apply(lit_string("a"), TypedExpr::var("g")),
+        ]));
+        let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
+        let ty = run_simple_sub(&mut e).expect("chained poly-calls-poly type-checks");
+        let pair = |b: BaseType| Type::Tuple(vec![Type::Base(b.clone()), Type::Base(b)]);
+        assert_eq!(
+            ty,
+            Type::Tuple(vec![pair(BaseType::Int), pair(BaseType::String)])
+        );
+        // Two `g` specializations, each demanding its own `f` specialization
+        // — and every minted specialization is referenced.
+        let (specializations, used_names) = specialization_stats(&e);
+        assert_eq!(specializations, 4, "two g + two f specializations");
+        assert_eq!(used_names.len(), 4, "all four specializations are used");
+    }
+
+    #[test]
+    fn chained_poly_shares_inner_specialization_across_same_typed_clones() {
+        // let f = λx. (x, x) in let g = λy. f(y) in (g(1), g(2), g("a"))
+        //
+        // Three `g` uses at two distinct types. The same-typed `g` uses share
+        // one `g` clone (and so one interior `f` use), so `f` specializes
+        // once per distinct type — sharing is per resolved type even when the
+        // demanding uses live inside freshly minted clones.
+        let f = TypedExpr::lambda(
+            "x",
+            Type::Hole,
+            TypedExpr::new(TypedExprNode::Tuple(vec![
+                TypedExpr::var("x"),
+                TypedExpr::var("x"),
+            ])),
+        );
+        let g = TypedExpr::lambda(
+            "y",
+            Type::Hole,
+            TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("f")),
+        );
+        let uses = TypedExpr::new(TypedExprNode::Tuple(vec![
+            TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
+            TypedExpr::apply(lit_int(2), TypedExpr::var("g")),
+            TypedExpr::apply(lit_string("a"), TypedExpr::var("g")),
+        ]));
+        let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
+        run_simple_sub(&mut e).expect("chained poly with shared uses type-checks");
+        let (specializations, used_names) = specialization_stats(&e);
+        assert_eq!(
+            specializations, 4,
+            "two g specializations (Int shared) + two f specializations"
+        );
+        assert_eq!(used_names.len(), 4);
+    }
+
+    #[test]
+    fn triple_chained_poly_specializes_through_every_layer() {
+        // let f = λx. (x, x) in let g = λy. f(y) in let h = λz. g(z)
+        // in (h(1), h("a"))
+        //
+        // Poly → poly → poly with concrete leaf uses. Each layer's uses
+        // become concrete only inside the next-outer layer's clones, so the
+        // re-entrant specialization must compound through every layer.
+        let f = TypedExpr::lambda(
+            "x",
+            Type::Hole,
+            TypedExpr::new(TypedExprNode::Tuple(vec![
+                TypedExpr::var("x"),
+                TypedExpr::var("x"),
+            ])),
+        );
+        let g = TypedExpr::lambda(
+            "y",
+            Type::Hole,
+            TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("f")),
+        );
+        let h = TypedExpr::lambda(
+            "z",
+            Type::Hole,
+            TypedExpr::apply(TypedExpr::var("z"), TypedExpr::var("g")),
+        );
+        let uses = TypedExpr::new(TypedExprNode::Tuple(vec![
+            TypedExpr::apply(lit_int(1), TypedExpr::var("h")),
+            TypedExpr::apply(lit_string("a"), TypedExpr::var("h")),
+        ]));
+        let mut e = TypedExpr::let_bind(
+            "f",
+            f,
+            TypedExpr::let_bind("g", g, TypedExpr::let_bind("h", h, uses)),
+        );
+        let ty = run_simple_sub(&mut e).expect("triple poly chain type-checks");
+        let pair = |b: BaseType| Type::Tuple(vec![Type::Base(b.clone()), Type::Base(b)]);
+        assert_eq!(
+            ty,
+            Type::Tuple(vec![pair(BaseType::Int), pair(BaseType::String)])
+        );
+        let (specializations, used_names) = specialization_stats(&e);
+        assert_eq!(specializations, 6, "two specializations per chain layer");
+        assert_eq!(used_names.len(), 6);
+    }
+
+    #[test]
+    fn poly_used_directly_and_through_wrapper_shares_specializations() {
+        // let f = λx. (x, x) in let g = λy. f(y) in (f(1), g(1), g("a"))
+        //
+        // `f` is used both directly and through a generalized wrapper. The
+        // direct Int use and the chained Int use (inside `g`'s Int clone)
+        // resolve to the same type, so they must group onto ONE `f`
+        // specialization — the memo is per frame, not per demanding region.
+        let f = TypedExpr::lambda(
+            "x",
+            Type::Hole,
+            TypedExpr::new(TypedExprNode::Tuple(vec![
+                TypedExpr::var("x"),
+                TypedExpr::var("x"),
+            ])),
+        );
+        let g = TypedExpr::lambda(
+            "y",
+            Type::Hole,
+            TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("f")),
+        );
+        let uses = TypedExpr::new(TypedExprNode::Tuple(vec![
+            TypedExpr::apply(lit_int(1), TypedExpr::var("f")),
+            TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
+            TypedExpr::apply(lit_string("a"), TypedExpr::var("g")),
+        ]));
+        let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
+        run_simple_sub(&mut e).expect("mixed direct + chained uses type-check");
+        let (specializations, used_names) = specialization_stats(&e);
+        assert_eq!(
+            specializations, 4,
+            "two g specializations + two f specializations (direct Int use \
+             shares the chained Int clone's specialization)"
+        );
+        assert_eq!(used_names.len(), 4);
+    }
+
+    #[test]
+    fn unexercised_chained_use_tolerated_as_residual_infer() {
+        // let f = λx. (x, x) in let g = λy. f in g(1)
+        //
+        // `g(1)` pins `g`'s param, but `f` is merely *referenced* (never
+        // applied) inside `g`, so its instantiation has nothing concrete to
+        // resolve to. Inference tolerates the residue (`Type::Infer`'s
+        // invariant — the strict post-inference typecheck owns rejection);
+        // the pinned behavior here is "no panic, no error from infer".
+        let f = TypedExpr::lambda(
+            "x",
+            Type::Hole,
+            TypedExpr::new(TypedExprNode::Tuple(vec![
+                TypedExpr::var("x"),
+                TypedExpr::var("x"),
+            ])),
+        );
+        let g = TypedExpr::lambda("y", Type::Hole, TypedExpr::var("f"));
+        let mut e = TypedExpr::let_bind(
+            "f",
+            f,
+            TypedExpr::let_bind("g", g, TypedExpr::apply(lit_int(1), TypedExpr::var("g"))),
+        );
+        let ty = run_simple_sub(&mut e).expect("unexercised generic use is tolerated");
+        // The result is the unapplied `f` specialization: a function type
+        // whose domain/codomain stay unresolved.
+        assert!(
+            matches!(ty, Type::Fun { .. }),
+            "expected residual function type, got {ty}"
+        );
+    }
+
+    #[test]
+    fn shadowed_generalized_binding_specializes_against_its_own_definition() {
+        // let f = λx. (x, x) in let g = λy. f(y) in let f = λx. x
+        // in (g(1), f("a"))
+        //
+        // The inner `f` *shadows* the outer one after `g`'s definition. `g`'s
+        // clone references the OUTER `f` (in scope where `g` was written), so
+        // its re-entrant walk must suspend the inner `f`'s frame — resolving
+        // by use-site scope would specialize the wrong definition. The outer
+        // `f` produces a pair, the inner is the identity; the result types
+        // only come out right if each use hits its own definition.
+        let outer_f = TypedExpr::lambda(
+            "x",
+            Type::Hole,
+            TypedExpr::new(TypedExprNode::Tuple(vec![
+                TypedExpr::var("x"),
+                TypedExpr::var("x"),
+            ])),
+        );
+        let g = TypedExpr::lambda(
+            "y",
+            Type::Hole,
+            TypedExpr::apply(TypedExpr::var("y"), TypedExpr::var("f")),
+        );
+        let inner_f = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
+        let uses = TypedExpr::new(TypedExprNode::Tuple(vec![
+            TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
+            TypedExpr::apply(lit_string("a"), TypedExpr::var("f")),
+        ]));
+        let mut e = TypedExpr::let_bind(
+            "f",
+            outer_f,
+            TypedExpr::let_bind("g", g, TypedExpr::let_bind("f", inner_f, uses)),
+        );
+        let ty = run_simple_sub(&mut e).expect("shadowed generalized bindings type-check");
+        assert_eq!(
+            ty,
+            Type::Tuple(vec![
+                Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)]),
+                Type::Base(BaseType::String),
+            ])
+        );
+    }
+
+    #[test]
     fn captured_var_exercises_extrude() {
         // (λouter. let g = λy. outer(y) in g(1)) (λz. z)  →  Int.
         //
@@ -3865,8 +4302,8 @@ mod tests {
         // and *its* RHS contains a second generalized let `g` whose RHS lives at
         // level 2. Applying the captured `p` (level 1) to `y` (level 2) drives a
         // level-2→1 `extrude` — deeper than `captured_var_exercises_extrude`.
-        // It also exercises `monomorphize` recursing into a specialized
-        // definition that itself contains a generalized `let`.
+        // It also exercises specialization recursing into a clone that
+        // itself contains a generalized `let`.
         let g_def = TypedExpr::lambda(
             "y",
             Type::Hole,
@@ -3954,7 +4391,7 @@ mod tests {
                 && matches!(
                     binding.name,
                     Name::Synthetic {
-                        kind: SyntheticKind::Mono,
+                        kind: SyntheticKind::Mono(_),
                         ..
                     }
                 )

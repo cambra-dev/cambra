@@ -118,6 +118,19 @@ impl Subst {
         self.0.keys()
     }
 
+    /// Visit each discharge mapping's captured term mutably (renames have no
+    /// term). For specialization freshening: a suspended discharge's term was
+    /// captured at emit with the definition's inference variables in its type
+    /// slots, and a freshened clone must rename those alongside every other
+    /// slot it copies — see `infer_simple_sub::freshen_bound_substs`.
+    pub fn for_each_discharge_term_mut(&mut self, f: &mut impl FnMut(&mut TypedExpr)) {
+        for m in self.0.values_mut() {
+            if let Mapping::Discharge(t) = m {
+                f(t);
+            }
+        }
+    }
+
     /// Split into the rename entries and the discharge entries — a variant
     /// partition, exact by construction (see [`Mapping`]). The two act on
     /// disjoint binders, so the original is their parallel union; this is the

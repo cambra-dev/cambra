@@ -83,14 +83,21 @@ impl ReservedName {
 /// *is* the synthetic's only meaning beyond its [`Uid`]: a synthetic carries no
 /// source spelling, so this is how code recognizes its provenance, and
 /// [`SyntheticKind::stem`] is its whole display.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Not [`Copy`]: [`SyntheticKind::Mono`] carries the source binding's [`Name`]
+/// as provenance, so a kind owns heap data. Clone where a copy is needed.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SyntheticKind {
     /// The tupled binder lambda elimination mints merging `λx→λy→body` into
     /// `λ__pair→…`.
     Pair,
     /// A per-resolved-type specialization of a generalized `let`, from
-    /// monomorphization.
-    Mono,
+    /// monomorphization. Carries the **source binding's name** it specializes
+    /// (e.g. `f` for an `f__mono`), so a specialization's provenance is read
+    /// off its `kind` rather than parsed from a mangled spelling. (Boxed: a
+    /// `Name` may itself be a `Synthetic` carrying a `SyntheticKind`, so the
+    /// reference must be indirected to keep the type finite-sized.)
+    Mono(Box<Name>),
     /// A defer handle renamed to dodge a shadow during channelization.
     ShadowRename,
     /// A lambda/binding floated out during defer desugaring.
@@ -104,10 +111,10 @@ impl SyntheticKind {
     /// The display stem for this kind (e.g. `__pair`). A synthetic renders as
     /// just this — like a [`Name::Unique`]'s `base`, it is ambiguous across
     /// instances on purpose (the [`Uid`] disambiguates, surfaced via `Debug`).
-    pub fn stem(self) -> &'static str {
+    pub fn stem(&self) -> &'static str {
         match self {
             SyntheticKind::Pair => "__pair",
-            SyntheticKind::Mono => "__mono",
+            SyntheticKind::Mono(_) => "__mono",
             SyntheticKind::ShadowRename => "__shadowed",
             SyntheticKind::FloatedDefer => "__floated",
             SyntheticKind::SolverArg => "__arg",
@@ -181,9 +188,10 @@ impl Name {
         Self::synthetic(SyntheticKind::Pair)
     }
 
-    /// A monomorphization specialization of a generalized `let`.
-    pub fn mono() -> Self {
-        Self::synthetic(SyntheticKind::Mono)
+    /// A monomorphization specialization of the generalized `let` bound to
+    /// `source` — its name rides on the `kind` as provenance.
+    pub fn mono(source: Name) -> Self {
+        Self::synthetic(SyntheticKind::Mono(Box::new(source)))
     }
 
     /// A defer handle renamed to dodge a shadow (channelization).
@@ -294,7 +302,15 @@ mod tests {
         let p = Name::pair();
         assert_eq!(p, p.clone()); // copies preserve identity
         assert_eq!(Name::pair().base(), "__pair");
-        assert_eq!(Name::mono().base(), "__mono");
+        assert_eq!(Name::mono(Name::raw("f")).base(), "__mono");
+        // The `kind` carries the source binding it specializes (provenance).
+        assert!(matches!(
+            Name::mono(Name::raw("f")),
+            Name::Synthetic {
+                kind: SyntheticKind::Mono(src),
+                ..
+            } if *src == Name::raw("f")
+        ));
         assert_eq!(Name::shadow_rename().base(), "__shadowed");
         assert_eq!(Name::floated().base(), "__floated");
         assert_eq!(Name::solver_arg().base(), "__arg");

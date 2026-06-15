@@ -509,7 +509,22 @@ pub fn compile_program(
     infer(&mut expr, infer_ctx).errs()?;
     debug!("Inferred:\n{}", symbolic(&expr));
     debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
-    typecheck(&expr).expect("Inference created invalid expr");
+    // Typecheck wall between `infer` and the rewriting passes. A failure here
+    // is a compiler bug — with one exception: residual `Type::Infer`
+    // variables, which inference deliberately tolerates for a generalized
+    // definition the program never exercises at a concrete type (see
+    // `Type::Infer`'s invariant). That residue is an *ambiguous program* — a
+    // user error — so it is rendered as a diagnostic; anything else panics.
+    typecheck(&expr).map_err(|errs| {
+        if errs
+            .iter()
+            .all(|e| matches!(e, InferError::UnresolvedInfer { .. }))
+        {
+            errs.into_compile_errors()
+        } else {
+            panic!("Inference created invalid expr: {errs:?}")
+        }
+    })?;
 
     // Inline UDFs: substitute both scalar and list-producing UDF Let bindings
     // and beta-reduce at each call site before lambda elimination.  This

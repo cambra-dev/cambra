@@ -42,6 +42,7 @@
 // therefore doesn't apply here.
 #![allow(clippy::mutable_key_type)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -49,7 +50,8 @@ use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
 use crate::ccl::{
-    BaseType, Bound, InferVar, InferVarId, Level, Name, Refinement, Type, fresh_infer_var_id,
+    BaseType, Bound, InferVar, InferVarId, Level, Name, PredicateCellId, Refinement, Type,
+    TypedExpr, fresh_infer_var_id,
 };
 
 /// Identifies a field inside a structural record/tuple, or a variant tag.
@@ -190,8 +192,8 @@ pub enum FreshenLevel {
     /// site's constraints.
     At(Level),
     /// Mint each fresh variable at its *original* variable's level, preserving
-    /// the relative level structure. Per-type specialization (the
-    /// `infer_simple_sub::monomorphize` pass) wants this: a definition may
+    /// the relative level structure. Per-type specialization
+    /// (`infer_simple_sub::specialize_use`) wants this: a definition may
     /// contain nested generalized `let`s whose deeper levels must survive, or
     /// the inner generalization stops being recognized.
     Preserve,
@@ -274,8 +276,11 @@ pub fn freshen_above(
                 (s.lower.clone(), s.upper.clone())
             };
             // Freshen the bound's type; the edge substitution rides along
-            // unchanged here (its own type slots are freshened in the
-            // predicate-freshening stage).
+            // unchanged here — a discharge payload's type slots still
+            // reference the source graph's variables after this copy. This
+            // per-type walk cannot reach them (payloads live on edges, not in
+            // any type); `infer_simple_sub::freshen_bound_substs` sweeps the
+            // cache afterwards to rename them.
             let new_lows: Vec<_> = lows
                 .iter()
                 .map(|b| Bound {
@@ -430,7 +435,7 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
     // mints its discharge edge unconditionally (vacuous when the codomain is
     // non-dependent), composition faithfully records its action on
     // intermediate binders (§3.6), and extrude's level-crossing proxies and
-    // monomorphize's specializations copy bound lists — so one variable
+    // specialization clones copy bound lists — so one variable
     // receives the same content under composites that differ only in which
     // fresh expected binders and correspondences each route threaded. Such
     // entries are inert on all content (nothing references the minted
@@ -1227,6 +1232,89 @@ impl CompactType {
 /// recursive types at coalesce time (per plan R2), so non-empty
 /// `rec_vars` is itself an error condition unless we're handling a
 /// user-annotated recursive type — which we don't yet.
+/// Tracks retired refinement-predicate cells and their replacements, keyed
+/// by the retired cell's address ([`PredicateCellId`]).
+///
+/// Refinement identity *is* the predicate cell: tags aliasing one cell are
+/// one refinement. When a pass replaces a cell — privatizing a generalized
+/// definition's anchors or de-aliasing a specialized clone's (both in
+/// `infer_simple_sub`) — tags elsewhere still alias the retired cell. The
+/// remap is consulted in two places: [`compact_type`] *canonicalizes* each
+/// tag it collects (so a type materialized from the bound graph carries the
+/// live cell, and a suspended discharge forces from specialized — resolved —
+/// predicate content rather than a retired copy), and
+/// `infer_simple_sub::realias_refinement_tags` re-points tags on already-
+/// stamped types. Each entry keeps the retired `Rc` alive so its address
+/// cannot be reused by a newly minted cell while the remap is live (a
+/// raw-pointer key is only meaningful while its cell is).
+///
+/// A replacement may itself be retired later (a privatized anchor cell is
+/// re-celled again per specialization), so [`CellRemap::resolve`] follows
+/// the chain to the final live cell. A cell retired more than once (one
+/// privatized definition specialized at several types) keeps its *first*
+/// recording: orphaned tags resolve to the first specialization's cell —
+/// sound because tag equality is structural and type-blind, so
+/// specializations of one predicate remain one refinement under `==`.
+#[derive(Default)]
+pub struct CellRemap {
+    map: HashMap<PredicateCellId, CellRetirement>,
+}
+
+/// One [`CellRemap`] entry: the retired cell (kept alive so its address —
+/// the map key — stays unique) and its replacement.
+struct CellRetirement {
+    retired: Rc<RefCell<TypedExpr>>,
+    replacement: Rc<RefCell<TypedExpr>>,
+}
+
+impl CellRemap {
+    /// Record `retired → replacement`. First recording for a cell wins.
+    pub fn record(&mut self, retired: Rc<RefCell<TypedExpr>>, replacement: Rc<RefCell<TypedExpr>>) {
+        self.map
+            .entry(Rc::as_ptr(&retired))
+            .or_insert(CellRetirement {
+                retired,
+                replacement,
+            });
+    }
+
+    /// A cell's direct replacement, if it was retired.
+    pub fn replacement(&self, cell: &Rc<RefCell<TypedExpr>>) -> Option<&Rc<RefCell<TypedExpr>>> {
+        self.map.get(&Rc::as_ptr(cell)).map(|e| &e.replacement)
+    }
+
+    /// Resolve a cell through retirement chains to its final replacement;
+    /// `None` if it was never retired. Terminates: a replacement is freshly
+    /// allocated while every key's cell is still alive (the entries keep
+    /// them so), so no replacement can alias an earlier key — chains move
+    /// strictly forward in recording order.
+    pub fn resolve(&self, cell: &Rc<RefCell<TypedExpr>>) -> Option<Rc<RefCell<TypedExpr>>> {
+        let mut cur = self.replacement(cell)?;
+        while let Some(next) = self.replacement(cur) {
+            cur = next;
+        }
+        Some(cur.clone())
+    }
+
+    /// `r` re-pointed at its live (transitive) replacement cell, or an
+    /// unchanged clone when its cell was never retired. The canonical form
+    /// [`compact_type`] materializes for every tag it collects.
+    pub fn canonical(&self, r: &Refinement) -> Refinement {
+        let mut r = r.clone();
+        if let Some(cell) = self.resolve(&r.predicate) {
+            r.predicate = cell;
+        }
+        r
+    }
+
+    /// Fold a clone-local remap into this pass-global one (first-wins).
+    pub fn absorb(&mut self, other: CellRemap) {
+        for e in other.map.into_values() {
+            self.record(e.retired, e.replacement);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompactGraph {
     pub term: CompactType,
@@ -1239,19 +1327,44 @@ pub struct CompactGraph {
 /// The `parents` set tracks variables whose bounds we are currently
 /// walking, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
-pub fn compact_type(ty: &Type) -> CompactGraph {
-    let mut recursive: HashMap<(InferVarId, bool), InferVarId> = HashMap::new();
-    let mut rec_vars: BTreeMap<InferVarId, CompactType> = BTreeMap::new();
-    let term = compact_go(
-        ty,
-        true,
-        &Subst::id(),
-        &BTreeSet::new(),
-        &mut HashSet::new(),
-        &mut recursive,
-        &mut rec_vars,
-    );
-    CompactGraph { term, rec_vars }
+///
+/// `cells` canonicalizes each refinement tag collected along the way (see
+/// [`CellRemap`]): bound-graph entries keep aliasing whatever cell a tag had
+/// when the bound was recorded, so a tag whose cell was since retired —
+/// privatization or per-specialization de-aliasing of a generalized
+/// definition — must be re-pointed at the live cell *here*, before the
+/// accumulated substitution is forced on it. Forcing first would copy the
+/// retired cell's content, whose type slots are the definition's quantified
+/// (never-resolved) inference variables. Pass an empty remap when no cell
+/// has been retired (tests, error rendering).
+pub fn compact_type(ty: &Type, cells: &CellRemap) -> CompactGraph {
+    let mut st = CompactState {
+        cells,
+        in_process: HashSet::new(),
+        recursive: HashMap::new(),
+        rec_vars: BTreeMap::new(),
+    };
+    let term = compact_go(ty, true, &Subst::id(), &BTreeSet::new(), &mut st);
+    CompactGraph {
+        term,
+        rec_vars: st.rec_vars,
+    }
+}
+
+/// Walk-wide state threaded through [`compact_go`]: the pass's cell remap
+/// plus the cycle-tracking tables. (`parents` stays a per-path argument — it
+/// is scoped to one variable's bound chain and reset across structural
+/// boundaries — and the substitution accumulator composes per edge.)
+struct CompactState<'a> {
+    /// Canonicalizes collected refinement tags; see [`compact_type`].
+    cells: &'a CellRemap,
+    /// Variables whose bounds are currently being walked, per polarity.
+    in_process: HashSet<(InferVarId, bool)>,
+    /// Placeholder ids minted for genuinely recursive revisits.
+    recursive: HashMap<(InferVarId, bool), InferVarId>,
+    /// Bounds of recursive variables (surfaced as `RecursiveType` errors by
+    /// `coalesce_compact`).
+    rec_vars: BTreeMap<InferVarId, CompactType>,
 }
 
 /// Compact `ty` at polarity `pol`, composing `subst_acc` — the substitution
@@ -1268,9 +1381,7 @@ fn compact_go(
     pol: bool,
     subst_acc: &Subst,
     parents: &BTreeSet<InferVarId>,
-    in_process: &mut HashSet<(InferVarId, bool)>,
-    recursive: &mut HashMap<(InferVarId, bool), InferVarId>,
-    rec_vars: &mut BTreeMap<InferVarId, CompactType>,
+    st: &mut CompactState,
 ) -> CompactType {
     match ty {
         // Atomic types contribute a single atom. A term substitution never
@@ -1282,14 +1393,27 @@ fn compact_go(
         // the underlying type, then attach this layer's tag. Walking a
         // variable's bound that is `Refinement(D, r)` therefore unions `r`
         // into that variable's compacted position — the propagation path.
-        // The accumulated substitution is *forced* here: it rewrites the
+        // The tag is *canonicalized* first (a retired cell re-pointed at its
+        // live specialized replacement — see [`compact_type`]) and the
+        // accumulated substitution is then *forced* on it: it rewrites the
         // predicate's free binders (e.g. discharging a dependent application's
-        // argument) before the tag lands in the position.
+        // argument) before the tag lands in the position. Order matters: a
+        // non-vacuous force copies the cell's content, so it must read the
+        // canonical (coalesced) cell, not a retired one.
+        //
+        // TODO(vault: type-checker-immutable-predicate-terms): the
+        // canonicalization step is scaffolding for *mutable shared predicate
+        // cells* — a clone can't own its predicates without re-celling, which
+        // strands tags on retired cells that this `st.cells.canonical` chase
+        // re-points. With immutable predicate terms and one uniform
+        // capture-avoiding substitution, a clone's predicates are produced by
+        // the same substitution that freshens its other slots, so there are no
+        // cells to retire and the `CellRemap` consultation here disappears;
+        // "force reads specialized content" then falls out of the clone being
+        // a proper substitution instance.
         Type::Refinement(inner, r) => {
-            let mut ct = compact_go(
-                inner, pol, subst_acc, parents, in_process, recursive, rec_vars,
-            );
-            let r = subst_acc.force_refinement(r);
+            let mut ct = compact_go(inner, pol, subst_acc, parents, st);
+            let r = subst_acc.force_refinement(&st.cells.canonical(r));
             if !ct.refinements.contains(&r) {
                 ct.refinements.push(r);
             }
@@ -1307,30 +1431,14 @@ fn compact_go(
             // per child mirrors Scala's `Set.empty` argument — cycles
             // span only one variable's bound chain, not across
             // function boundaries.
-            let dom = compact_go(
-                d,
-                !pol,
-                subst_acc,
-                &BTreeSet::new(),
-                in_process,
-                recursive,
-                rec_vars,
-            );
+            let dom = compact_go(d, !pol, subst_acc, &BTreeSet::new(), st);
             // A Pi binder shadows the accumulated substitution inside the
             // codomain (it binds the name locally), so restrict it there.
             let cod_acc = match name {
                 Some(b) => subst_acc.shadow(b),
                 None => subst_acc.clone(),
             };
-            let cod = compact_go(
-                c,
-                pol,
-                &cod_acc,
-                &BTreeSet::new(),
-                in_process,
-                recursive,
-                rec_vars,
-            );
+            let cod = compact_go(c, pol, &cod_acc, &BTreeSet::new(), st);
             CompactType {
                 fun: Some((name.clone(), Box::new(dom), Box::new(cod))),
                 ..Default::default()
@@ -1343,15 +1451,7 @@ fn compact_go(
             for (i, v) in ts.iter().enumerate() {
                 compacted.insert(
                     FieldKey::Index(i),
-                    compact_go(
-                        v,
-                        pol,
-                        subst_acc,
-                        &BTreeSet::new(),
-                        in_process,
-                        recursive,
-                        rec_vars,
-                    ),
+                    compact_go(v, pol, subst_acc, &BTreeSet::new(), st),
                 );
             }
             CompactType {
@@ -1364,15 +1464,7 @@ fn compact_go(
             for (n, v) in fs {
                 compacted.insert(
                     FieldKey::Name(SmolStr::from(n.as_str())),
-                    compact_go(
-                        v,
-                        pol,
-                        subst_acc,
-                        &BTreeSet::new(),
-                        in_process,
-                        recursive,
-                        rec_vars,
-                    ),
+                    compact_go(v, pol, subst_acc, &BTreeSet::new(), st),
                 );
             }
             CompactType {
@@ -1389,15 +1481,7 @@ fn compact_go(
             for (k, v) in tags {
                 compacted.insert(
                     k.clone(),
-                    compact_go(
-                        v,
-                        pol,
-                        subst_acc,
-                        &BTreeSet::new(),
-                        in_process,
-                        recursive,
-                        rec_vars,
-                    ),
+                    compact_go(v, pol, subst_acc, &BTreeSet::new(), st),
                 );
             }
             CompactType {
@@ -1408,7 +1492,7 @@ fn compact_go(
         Type::Infer(state) => {
             let uid = state.uid;
             let key = (uid, pol);
-            if in_process.contains(&key) {
+            if st.in_process.contains(&key) {
                 if parents.contains(&uid) {
                     // Spurious cycle (a <: b and b <: a with no
                     // structural intermediary). Drop the bound.
@@ -1420,10 +1504,10 @@ fn compact_go(
                 // any level-sensitive code observes it — so we don't
                 // allocate a full `InferVar` (no bounds, no level value
                 // to defend).
-                let placeholder = *recursive.entry(key).or_insert_with(fresh_infer_var_id);
+                let placeholder = *st.recursive.entry(key).or_insert_with(fresh_infer_var_id);
                 return CompactType::from_var(placeholder);
             }
-            in_process.insert(key);
+            st.in_process.insert(key);
             // The opposite-polarity fallback below is monomorphization's
             // coalesce-time *read* for a contravariant position. A function
             // domain is negative, so an argument flowing in (`arg <: domain`) is
@@ -1444,9 +1528,10 @@ fn compact_go(
             // its bounds collide into `IncompatibleBounds` (never a silent
             // mis-type). This invariant is the structural-collision check; it
             // predates let-polymorphism. A generalized binding's definition is
-            // never coalesced (`infer_simple_sub` skips it); only its per-use
-            // instantiations reach here, each fixed by one use site, then
-            // specialized by the post-coalesce `monomorphize` pass.
+            // never coalesced in place (`infer_simple_sub` keeps it aside and
+            // coalesces per-use *clones* pinned to one resolved use type);
+            // only those clones and the per-use instantiations reach here,
+            // each fixed by a single use site.
             let s = state.bounds.borrow();
             let primary = if pol { &s.lower } else { &s.upper };
             // When the polarity-correct list is empty we fall back to the
@@ -1498,15 +1583,7 @@ fn compact_go(
                 // arrives with every edge's morphism composed (design §3.6).
                 // Identity edges leave `subst_acc` unchanged (the common case).
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                let bc = compact_go(
-                    &b.ty,
-                    pol,
-                    &inner_acc,
-                    &new_parents,
-                    in_process,
-                    recursive,
-                    rec_vars,
-                );
+                let bc = compact_go(&b.ty, pol, &inner_acc, &new_parents, st);
                 bound = Some(match bound {
                     None => bc,
                     Some(acc) => CompactType::merge(pol, acc, bc),
@@ -1528,15 +1605,7 @@ fn compact_go(
             if no_concrete {
                 for b in &opposite_bounds {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                    let bc = compact_go(
-                        &b.ty,
-                        !pol,
-                        &inner_acc,
-                        &new_parents,
-                        in_process,
-                        recursive,
-                        rec_vars,
-                    );
+                    let bc = compact_go(&b.ty, !pol, &inner_acc, &new_parents, st);
                     bound = Some(match bound {
                         None => bc,
                         Some(acc) => CompactType::merge(!pol, acc, bc),
@@ -1548,12 +1617,12 @@ fn compact_go(
             // seed for `vars`, but without polluting the refinement merge.
             let mut bound = bound.unwrap_or_else(CompactType::empty);
             bound.vars.insert(uid);
-            in_process.remove(&key);
+            st.in_process.remove(&key);
             // Recursive types: store the bound under the placeholder
             // variable and emit a reference.
-            if let Some(rec_uid) = recursive.get(&key) {
+            if let Some(rec_uid) = st.recursive.get(&key) {
                 let rec_uid = *rec_uid;
-                rec_vars.insert(rec_uid, bound);
+                st.rec_vars.insert(rec_uid, bound);
                 return CompactType::from_var(rec_uid);
             }
             bound
@@ -2321,7 +2390,8 @@ mod tests {
             ("a".to_string(), refined(prim(BaseType::Int), p)),
             ("b".to_string(), refined(prim(BaseType::Int), q)),
         ]);
-        let out = coalesce_compact(&simplify_type(compact_type(&ty))).unwrap();
+        let out =
+            coalesce_compact(&simplify_type(compact_type(&ty, &CellRemap::default()))).unwrap();
         assert_eq!(out, ty);
     }
 
@@ -2338,7 +2408,8 @@ mod tests {
         // v ⟺ {Int | p}
         constrain_subtype(&v, &refined_int, &mut cache).unwrap();
         constrain_subtype(&refined_int, &v, &mut cache).unwrap();
-        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
+        let out =
+            coalesce_compact(&simplify_type(compact_type(&v, &CellRemap::default()))).unwrap();
         assert_eq!(out, refined_int, "var equated to {{Int|p}} lost its tag");
     }
 
@@ -2369,7 +2440,8 @@ mod tests {
         // constrain_argument(v, dom): two-way
         constrain_subtype(&v, &dom, &mut cache).unwrap();
         constrain_subtype(&dom, &v, &mut cache).unwrap();
-        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
+        let out =
+            coalesce_compact(&simplify_type(compact_type(&v, &CellRemap::default()))).unwrap();
         assert_eq!(
             out,
             refined(prim(BaseType::Int), p),
@@ -2504,7 +2576,7 @@ mod tests {
     fn coalesce_primitive_round_trips() {
         let s = prim(BaseType::Int);
         assert_eq!(
-            coalesce_compact(&compact_type(&s)).unwrap(),
+            coalesce_compact(&compact_type(&s, &CellRemap::default())).unwrap(),
             Type::Base(BaseType::Int)
         );
     }
@@ -2512,7 +2584,7 @@ mod tests {
     #[test]
     fn coalesce_function_preserves_shape() {
         let s = fun(prim(BaseType::Int), prim(BaseType::Bool));
-        let t = coalesce_compact(&compact_type(&s)).unwrap();
+        let t = coalesce_compact(&compact_type(&s, &CellRemap::default())).unwrap();
         assert_eq!(
             t,
             Type::Fun {
@@ -2529,7 +2601,7 @@ mod tests {
             (FieldKey::Index(0), prim(BaseType::Int)),
             (FieldKey::Index(1), prim(BaseType::String)),
         ]);
-        let t = coalesce_compact(&compact_type(&r)).unwrap();
+        let t = coalesce_compact(&compact_type(&r, &CellRemap::default())).unwrap();
         assert_eq!(
             t,
             Type::Tuple(vec![
@@ -2545,7 +2617,7 @@ mod tests {
             (FieldKey::Name("x".into()), prim(BaseType::Int)),
             (FieldKey::Name("y".into()), prim(BaseType::Bool)),
         ]);
-        let t = coalesce_compact(&compact_type(&r)).unwrap();
+        let t = coalesce_compact(&compact_type(&r, &CellRemap::default())).unwrap();
         assert_eq!(
             t,
             Type::Record(vec![
@@ -2590,7 +2662,7 @@ mod tests {
         let mut cache = ConstrainCache::new();
         constrain_subtype(&prim(BaseType::Int), &v, &mut cache).unwrap();
         assert_eq!(
-            coalesce_compact(&compact_type(&v)).unwrap(),
+            coalesce_compact(&compact_type(&v, &CellRemap::default())).unwrap(),
             Type::Base(BaseType::Int)
         );
     }
@@ -2606,7 +2678,7 @@ mod tests {
         let mut cache = ConstrainCache::new();
         constrain_subtype(&v, &prim(BaseType::Int), &mut cache).unwrap();
         assert_eq!(
-            coalesce_compact(&compact_type(&v)).unwrap(),
+            coalesce_compact(&compact_type(&v, &CellRemap::default())).unwrap(),
             Type::Base(BaseType::Int)
         );
     }
@@ -2614,7 +2686,7 @@ mod tests {
     #[test]
     fn coalesce_var_with_no_bounds_emits_infer() {
         let v = fresh_var(0);
-        match coalesce_compact(&compact_type(&v)).unwrap() {
+        match coalesce_compact(&compact_type(&v, &CellRemap::default())).unwrap() {
             Type::Infer(_) => {}
             other => panic!("expected Type::Infer, got {:?}", other),
         }
@@ -2631,7 +2703,7 @@ mod tests {
         constrain_subtype(&prim(BaseType::Int), &v, &mut cache).unwrap();
         constrain_subtype(&prim(BaseType::String), &v, &mut cache).unwrap();
         assert!(matches!(
-            coalesce_compact(&compact_type(&v)),
+            coalesce_compact(&compact_type(&v, &CellRemap::default())),
             Err(CoalesceError::IncompatibleBounds { .. })
         ));
     }
@@ -2656,7 +2728,7 @@ mod tests {
         if let Type::Infer(state) = &v {
             state.bounds.borrow_mut().lower.push(Bound::conc(v.clone()));
         }
-        match coalesce_compact(&compact_type(&v)).unwrap() {
+        match coalesce_compact(&compact_type(&v, &CellRemap::default())).unwrap() {
             Type::Infer(_) => {}
             other => panic!("expected Type::Infer for spurious self-cycle, got {other:?}"),
         }
@@ -3019,7 +3091,7 @@ mod tests {
             ("Some", prim(BaseType::Int)),
             ("None", prim(BaseType::Unit)),
         ]);
-        let scheme = simplify_type(compact_type(&v));
+        let scheme = simplify_type(compact_type(&v, &CellRemap::default()));
         let ty = coalesce_compact(&scheme).expect("coalesce ok");
         match ty {
             Type::Variant(tags) => {
@@ -3057,7 +3129,7 @@ mod tests {
     }
 
     fn coalesce(ty: &Type) -> Type {
-        coalesce_compact(&compact_type(ty)).expect("coalesce")
+        coalesce_compact(&compact_type(ty, &CellRemap::default())).expect("coalesce")
     }
 
     /// The refinement predicate of a `Fun(Refinement(_, r), _)`, rendered.

@@ -681,8 +681,8 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
 
 // A *let-bound* (and therefore generalized) UDF referenced from inside a
 // filter predicate. The predicate's `f(x)` use lives inside the cast-target
-// refinement, not the main expression tree — exercising monomorphize's
-// rewrite of uses reachable only through refinement predicates.
+// refinement, not the main expression tree — exercising the coalesce walk's
+// specialization of uses reachable only through refinement predicates.
 #[rstest]
 #[timeout(Duration::from_secs(1))]
 fn test_udf_used_inside_filter_predicate() {
@@ -699,7 +699,7 @@ fn test_udf_used_inside_filter_predicate() {
 }
 
 // The dual of the test above: the generalized definition itself *contains*
-// the filter, so `specialize_def`'s clone carries a cast-target refinement.
+// the filter, so the specialization clone carries a cast-target refinement.
 // Exercises `freshen_expr_types`' predicate-cell de-aliasing for anchored
 // (cast-target) predicates.
 #[rstest]
@@ -1240,6 +1240,179 @@ fn test_generator_function_with_aggregate(#[case] code: &str, #[case] expected: 
 fn test_generator_polymorphic_over_element_type() {
     let code = "def ones(xs):\n    for x in xs:\n        yield 1\nsum(ones([1, 2, 3])) + sum(ones([\"a\", \"b\"]))";
     check_scalar(code, Value::Int(5));
+}
+
+// ---------------------------------------------------------------------------
+// Chained monomorphization — a polymorphic UDF used only inside another
+// polymorphic UDF's definition. Such a use becomes concrete only inside the
+// wrapper's per-type clones, so it specializes during each clone's re-entrant
+// coalesce, against the inner binding's still-in-scope frame. The wrapper
+// bodies below are structural (a real call, not a bare variable), so no
+// pre-inference beta-reduction rescues the chain.
+// ---------------------------------------------------------------------------
+
+// Scalar poly-calls-poly at two concrete use types — the chained variant of
+// `test_function_def_polymorphic_used_at_two_types`.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_poly_calls_poly_at_two_types() {
+    let code = "f = lambda x: x == x\ng = lambda y: f(y)\ng(1) and g(\"foo\")";
+    check_scalar(code, Value::Bool(true));
+}
+
+// List-producing body chained through a poly wrapper, single concrete use
+// type. The lone `f` use sits inside `g`'s (generalized) definition, so it is
+// only ever reached through `g`'s clone — one concrete use type suffices to
+// exercise the chain.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_poly_calls_poly_list_body() {
+    let code = "f = lambda x: [x, x]\ng = lambda y: f(y)\nsum(g(5))";
+    check_scalar(code, Value::Int(10));
+}
+
+// Collection (comprehension) UDF chained through a poly wrapper at one
+// element type.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_collection_udf_through_poly_wrapper() {
+    let code = "f = lambda xs: [x for x in xs]\ng = lambda ys: f(ys)\ng([1, 2, 3])";
+    check_tile(code, make_int_list(&[1, 2, 3]));
+}
+
+// Collection UDF chained through a poly wrapper at two element types — the
+// `inline`-keeps-shared path: one cached specialization per element type.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_collection_udf_through_poly_wrapper_two_element_types() {
+    let code = "f = lambda xs: [1 for x in xs]\ng = lambda ys: f(ys)\nsum(g([1, 2, 3])) + sum(g([\"a\", \"b\"]))";
+    check_scalar(code, Value::Int(5));
+}
+
+// Generator `def` chained through a poly wrapper at two element types — the
+// chained variant of `test_generator_polymorphic_over_element_type`.
+//
+// **Currently ignored** — pre-existing `desugar_defers` bug, independent of
+// monomorphization: a yield-based generator `def` *invoked inside a lambda
+// body* desugars to `λ ys → λ __floated___floated_chain_0 → ()` — the
+// generator's body is lost and the wrapper returns unit, so inference rejects
+// `sum(wrap(...))` with "Type mismatch for Aggregate: expected (), found
+// Int". The defer/feed plumbing assumes a generator call's result is
+// consumed at the statement level, not captured under a binder. Tracked in
+// the `defer-generator-call-inside-lambda` vault issue.
+#[ignore = "desugar_defers drops a generator def's body when the call sits inside a lambda"]
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_generator_def_through_poly_wrapper_two_element_types() {
+    let code = "def ones(xs):\n    for x in xs:\n        yield 1\nwrap = lambda ys: ones(ys)\nsum(wrap([1, 2, 3])) + sum(wrap([\"a\", \"b\"]))";
+    check_scalar(code, Value::Int(5));
+}
+
+// Triple chain (poly → poly → poly) with a concrete leaf use.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_triple_poly_chain_collection() {
+    let code = "f = lambda xs: [x for x in xs]\ng = lambda ys: f(ys)\nh = lambda zs: g(zs)\nsum(h([1, 2, 3]))";
+    check_scalar(code, Value::Int(6));
+}
+
+// Triple chain at two concrete leaf types: every layer specializes twice.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_triple_poly_chain_at_two_types() {
+    let code = "f = lambda x: x == x\ng = lambda y: f(y)\nh = lambda z: g(z)\nh(1) and h(\"foo\")";
+    check_scalar(code, Value::Bool(true));
+}
+
+// Diamond: two poly wrappers over one poly base, each used at a different
+// type. The base's specializations are demanded from two *distinct* freshly
+// minted wrapper clones, sharing one memo.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_poly_diamond() {
+    let code = "f = lambda x: x == x\ng = lambda y: f(y)\nh = lambda z: f(z)\ng(1) and h(\"foo\")";
+    check_scalar(code, Value::Bool(true));
+}
+
+// The inner UDF used both directly (concrete in the main walk) and through a
+// poly wrapper (concrete only inside the wrapper's clone).
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_poly_used_directly_and_through_wrapper() {
+    let code = "f = lambda x: x == x\ng = lambda y: f(y)\nf(1) and g(\"foo\")";
+    check_scalar(code, Value::Bool(true));
+}
+
+// N outer × M inner: the wrapper uses the inner UDF twice (param-dependent
+// and concrete), and is itself used at two types. The four interior `f` uses
+// collapse onto two specializations (Int, String).
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_poly_fanout_inside_wrapper() {
+    let code = "f = lambda x: x == x\ng = lambda y: f(y) and f(\"z\")\ng(1) and g(\"foo\")";
+    check_scalar(code, Value::Bool(true));
+}
+
+// Chained variant of `test_udf_containing_filter`: the inner generalized
+// definition anchors a cast-target refinement, so the wrapper-driven
+// specialization exercises predicate-cell de-aliasing through *two* layers of
+// cloning (the `CellRemap` retirement chains).
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_filter_udf_through_poly_wrapper() {
+    let code = "f = lambda xs: [x for x in xs if x > 1]\ng = lambda ys: f(ys)\ng([1, 2, 3])";
+    check_tile(
+        code,
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+// Chained variant of `test_udf_used_inside_filter_predicate`: the generalized
+// predicate UDF's only use lives inside a refinement predicate anchored in
+// *another* generalized definition — the coalesce walk reaches it through the
+// wrapper clone's cast-target predicate.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_predicate_udf_used_inside_poly_wrapper_filter() {
+    let code = "p = lambda x: x > 1\ng = lambda ys: [y for y in ys if p(y)]\ng([1, 2, 3])";
+    check_tile(
+        code,
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+// A multi-arg poly wrapper around a collection UDF (uncurrying composes with
+// chaining).
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_poly_chain_with_extra_param() {
+    let code = "f = lambda xs: [x for x in xs]\ng = lambda ys, n: sum(f(ys)) + n\ng([1, 2], 10)";
+    check_scalar(code, Value::Int(13));
+}
+
+// A generalized definition the program never exercises at a concrete type is
+// an *ambiguous program*: residual inference variables reach the post-infer
+// typecheck wall, which must surface a rendered diagnostic — not panic.
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn test_unexercised_generic_definition_is_an_error_not_a_panic() {
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let result = compile_program(&mut ctx, "f = lambda x: [x, x]\nf", consumer);
+    assert!(
+        result.is_err(),
+        "ambiguous (never-exercised) generic must fail with a diagnostic"
+    );
 }
 
 // Nested generator calls: one generator feeds into another.
