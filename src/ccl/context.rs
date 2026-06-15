@@ -17,6 +17,7 @@ use crate::{
         lower::{LoweringContext, LoweringError, lower_stmts},
         planning,
         symbolic::{symbolic, symbolic_typed},
+        uniquify,
     },
     interpreter::{
         Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
@@ -471,6 +472,13 @@ pub fn compile_program(
     let sink_bindings_registry = ctx.lowering_ctx().take_sink_bindings();
 
     debug!("Lowered (pre-desugar):\n{}", symbolic(&expr));
+
+    // α-uniquify all binders (Barendregt convention): every binding site gets
+    // a globally fresh `Name` uid, so shadowing ceases to exist before any
+    // pass that compares names. Must run before defer desugaring — desugar's
+    // rewrites splice and rename terms under the assumption that distinct
+    // binders are distinct names.
+    expr = uniquify::run(expr);
 
     // Desugar Defer/Feed/Define before inference: every `let d = Defer in body`
     // gets rewritten so the body publishes its contribution to d via a

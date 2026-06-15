@@ -119,14 +119,15 @@ floated handle.
 For the **outermost** DI call in a chain, `<defer_name>` is the
 let-binding's name (the user's `y` in `let y = f(arg) in …`).  For
 **inner** DI calls in composed chains, [`wrap_di_calls_in_chain`]
-mints a fresh `__floated_inner_N` name and returns it for the caller
-to allocate via `let __floated_inner_N = Defer in …`.
+mints a fresh `FloatedDefer` synthetic name (`Name::floated()`, displayed
+`__floated`) and returns it for the caller to allocate via
+`let __floated = Defer in …`.
 
 After wrapping, the let becomes:
 
 ```text
 let <outermost_defer> = Defer in
-let __floated_inner_0 = Defer in
+let __floated = Defer in
 …
 ExprStmt(<wrapped chain>, <body>)
 ```
@@ -140,8 +141,8 @@ The wrapped chain is now in a shape Phase 2 can walk.
 1. **`let y = <chain>`** — if `<chain>` contains a DI call, use `y` as
    the outermost defer name and emit a `let y = Defer in …` prefix.
 2. **`<chain>` at expression position** — not let-bound; allocate a
-   fresh `__floated_chain_N` and emit it as both the outermost defer
-   and the chain's reduction target.
+   fresh `FloatedDefer` synthetic (`Name::floated()`) and emit it as both
+   the outermost defer and the chain's reduction target.
 
 A `let f = lambda in body` where the lambda is defer-mediating
 registers `f` in the function context, recurses into the body
@@ -219,8 +220,8 @@ Two complications along the way:
   free `n` would resolve to the body's binding instead of the outer
   scope's.  [`compute_protected_set`] identifies these names; for
   each shadowing `Let`, the binding is α-renamed to a fresh
-  `__shadowed_<name>_N` and the inner body's references are
-  substituted.
+  `ShadowRename` synthetic (`Name::shadow_rename()`) and the inner
+  body's references are substituted.
 
 - **Cross-cluster references through intervening lets.**  Patterns
   like `let d_1 = Defer in let z = E in let d_2 = Defer in …` where

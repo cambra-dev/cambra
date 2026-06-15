@@ -11,8 +11,8 @@ use crate::ccl::ccl_utils::{
     trivially_true_predicate, typed_compose,
 };
 use crate::ccl::{
-    BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, ProjKey, REFINEMENT_BINDER,
-    Type, TypedExprNode,
+    BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, Name, ProjKey, Type,
+    TypedExprNode,
     ccl_utils::apply_primitive,
     infer::typecheck,
     lambda_elim::{self, compose, id},
@@ -51,11 +51,11 @@ fn compile_refinement_predicates(expr: &mut Expr, seen: &mut HashSet<PredPtr>) {
 /// otherwise η-expands to `λ __elem → bare` and lambda-eliminates to point-free.
 fn fn_of_bare_predicate(base: &Type, bare: &Expr) -> Expr {
     if let TypedExprNode::Apply { argument, function } = &bare.node
-        && matches!(&argument.node, TypedExprNode::Var(n) if n == REFINEMENT_BINDER)
+        && matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
     {
         return (**function).clone();
     }
-    lambda_elim::run(Expr::lambda(REFINEMENT_BINDER, base.clone(), bare.clone()))
+    lambda_elim::run(Expr::lambda(Name::elem(), base.clone(), bare.clone()))
         .expect("lambda-elim of refinement predicate")
 }
 
@@ -665,7 +665,6 @@ fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
     // The bare predicate binds the implicit REFINEMENT_BINDER as the element:
     //   pred = (__elem ▷ c ▷ key) == <key binder>
     let pred = refinement.predicate.borrow();
-    let r_name = REFINEMENT_BINDER;
     let TypedExprNode::BinOp {
         left,
         op: BinOpKind::Compare(CompareKind::Equals),
@@ -676,9 +675,9 @@ fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
     };
     // Identify which side is the element-extraction `__elem ▷ c ▷ key` and which
     // is the free key binder (a `Var` not bound by the element).
-    let extract = if side_extracts_element(left, r_name) && is_free_var(right, r_name) {
+    let extract = if side_extracts_element(left) && is_free_var(right) {
         left
-    } else if side_extracts_element(right, r_name) && is_free_var(left, r_name) {
+    } else if side_extracts_element(right) && is_free_var(left) {
         right
     } else {
         return None;
@@ -700,7 +699,7 @@ fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
     // generic iterate/restrict lowering instead. (`keys` below is built from
     // the head's `c`, trusting it matches the `c` inside this extraction —
     // also a lowering invariant.)
-    if !matches!(&extract_arg.node, TypedExprNode::Apply { argument: a, .. } if matches!(&a.node, TypedExprNode::Var(n) if n.as_str() == r_name))
+    if !matches!(&extract_arg.node, TypedExprNode::Apply { argument: a, .. } if matches!(&a.node, TypedExprNode::Var(n) if n.is_elem()))
     {
         return None;
     }
@@ -724,21 +723,21 @@ fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
     Some(typed_compose(new_elts).with_ty(expr.ty.clone()))
 }
 
-/// Is `e` the element-extraction `r ▷ c ▷ key` — an application whose innermost
-/// argument is `Var(r)` (the refinement's element binder)?
-fn side_extracts_element(e: &Expr, r: &str) -> bool {
+/// Is `e` the element-extraction `__elem ▷ c ▷ key` — an application whose
+/// innermost argument is the refinement element binder?
+fn side_extracts_element(e: &Expr) -> bool {
     match &e.node {
         TypedExprNode::Apply { argument, .. } => {
-            matches!(&argument.node, TypedExprNode::Var(n) if n == r)
-                || side_extracts_element(argument, r)
+            matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
+                || side_extracts_element(argument)
         }
         _ => false,
     }
 }
 
-/// Is `e` a bare `Var` other than the element binder `r` (the free key binder)?
-fn is_free_var(e: &Expr, r: &str) -> bool {
-    matches!(&e.node, TypedExprNode::Var(n) if n != r)
+/// Is `e` a bare `Var` other than the element binder (the free key binder)?
+fn is_free_var(e: &Expr) -> bool {
+    matches!(&e.node, TypedExprNode::Var(n) if !n.is_elem())
 }
 
 // Returns whether the given expression is a constant, or a function of a constant.
@@ -897,7 +896,7 @@ fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>
         return (eq_conds, other_preds);
     }
     // env: element binder name → its extraction morphism `rec.i ▷ li` (over rec).
-    let mut env: Vec<(String, Expr)> = Vec::new();
+    let mut env: Vec<(Name, Expr)> = Vec::new();
     let mut cur = refinement;
     while let TypedExprNode::Apply { argument, function } = &cur.node
         && let TypedExprNode::Lambda {
@@ -910,7 +909,7 @@ fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>
     decompose_join_bool(
         cur,
         &env,
-        REFINEMENT_BINDER,
+        &Name::elem(),
         rec_ty,
         &mut eq_conds,
         &mut other_preds,
@@ -923,8 +922,8 @@ fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>
 /// splitting top-level conjunctions.
 fn decompose_join_bool(
     e: &Expr,
-    env: &[(String, Expr)],
-    rec_name: &str,
+    env: &[(Name, Expr)],
+    rec_name: &Name,
     rec_ty: &Type,
     eq_conds: &mut Vec<(Expr, Expr)>,
     other_preds: &mut Vec<Expr>,
@@ -954,7 +953,7 @@ fn decompose_join_bool(
 /// Substitute the element-binder environment into `side` (an expression over
 /// the element binders) and lambda-eliminate `λ rec → side` to the point-free
 /// morphism over the tuple domain.
-fn compile_join_side(side: &Expr, env: &[(String, Expr)], rec_name: &str, rec_ty: &Type) -> Expr {
+fn compile_join_side(side: &Expr, env: &[(Name, Expr)], rec_name: &Name, rec_ty: &Type) -> Expr {
     let mut body = side.clone();
     for (var, morph) in env {
         body = lambda_elim::substitute(body, var, morph);
@@ -2049,7 +2048,7 @@ mod tests {
         let mut expr = var("x");
         recognize_groupby_sites(&mut expr);
         // Should remain unchanged
-        assert!(matches!(expr.node, TypedExprNode::Var(ref v) if v == "x"));
+        assert!(matches!(expr.node, TypedExprNode::Var(ref v) if v.base() == "x"));
     }
 
     // Tests for convert_loop_join function
@@ -2265,7 +2264,7 @@ mod tests {
         let rec_ty = tuple_ty(vec![scalar.clone(), scalar.clone()]);
         let rec_arm = |i: usize| {
             Expr::apply(
-                var(REFINEMENT_BINDER).with_ty(rec_ty.clone()),
+                Expr::var(Name::elem()).with_ty(rec_ty.clone()),
                 proj_idx(i).with_ty(fun_ty(rec_ty.clone(), scalar.clone())),
             )
             .with_ty(scalar.clone())
@@ -3515,7 +3514,7 @@ mod tests {
         )]));
 
         let mut expr = Expr::loop_node(
-            vec!["acc".to_string()],
+            vec!["acc".into()],
             vec![Expr::lit(Lit::Int(0)).with_ty(int.clone())],
             list_123().with_ty(list_ty.clone()),
             body,

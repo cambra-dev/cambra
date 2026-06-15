@@ -50,9 +50,11 @@
 //! scope before the shadowing takes effect — but the same name may appear at
 //! multiple binding sites in the resulting tree.
 //!
-//! Unlike SSA or ANF form, CCL does not α-rename each assignment to a fresh variable.
-//! This is intentional: the less-normalized representation preserves structure
-//! needed for optimization passes.
+//! Lowering itself does not α-rename — unlike SSA or ANF conversion it keeps
+//! the tree shape un-normalized, preserving structure for optimization passes.
+//! Binder *identity* is handled immediately afterwards by
+//! [`crate::ccl::uniquify`], which mints a fresh [`crate::ccl::Name`] uid per
+//! binding site without touching the tree shape.
 
 use std::{
     cell::RefCell,
@@ -64,9 +66,10 @@ use std::{
 use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, Branch, Builtin, CompareKind, Expr,
-        Lit, LogicKind, REFINEMENT_BINDER, Type, TypedExprNode, UnaryOpKind,
+        Lit, LogicKind, Name, Type, TypedExprNode, UnaryOpKind,
         ccl_utils::{is_free_in_type, make_cast, refined_fn_type},
         symbolic::symbolic,
+        uniquify,
     },
     chl_parser::ast::{
         AssignTarget, AugOp, BinOp as ChlBinOp, BoolOp, CmpOp, CompClause, Comprehension,
@@ -1043,7 +1046,7 @@ fn lower_call(
 
             let bare_pred = Expr::binop(
                 Expr::apply(
-                    Expr::apply(Expr::var(REFINEMENT_BINDER), collection.clone()),
+                    Expr::apply(Expr::var(Name::elem()), collection.clone()),
                     key_fn,
                 ),
                 BinOpKind::Compare(CompareKind::Equals),
@@ -1361,7 +1364,7 @@ fn uncurry_params(params: &[Param], body_expr: Expr, ctx: &mut LoweringContext) 
     let tuple_name = ctx.fresh_tuple_arg();
     let body_with_subs = params.iter().enumerate().fold(body_expr, |acc, (i, arg)| {
         let proj = Expr::apply(Expr::var(&tuple_name), Expr::proj_index(i));
-        substitute_param_in_body(acc, arg.name.as_str(), &proj)
+        substitute_param_in_body(acc, &Name::raw(arg.name.as_str()), &proj)
     });
     Expr::lambda(&tuple_name, Type::Hole, body_with_subs)
 }
@@ -1403,7 +1406,7 @@ fn lower_lambda(
 /// that user code cannot bind, and (2) each multi-arg lambda mints a
 /// fresh unique id via [`LoweringContext::fresh_tuple_arg`], so no two
 /// nested multi-arg lambdas can share a tuple-parameter name.
-fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr {
+fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
     // Refinements ride the type lattice (introduced by `cast`), and this
     // substitution rewrites only the term spine — it threads `ty`/
     // `user_annotation`/`Cast::target` through unchanged. So a refinement
@@ -1455,7 +1458,7 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
     } = expr;
 
     let new_node = match node {
-        TypedExprNode::Lambda { param, body } if param.name == name => {
+        TypedExprNode::Lambda { param, body } if &param.name == name => {
             // `name` is shadowed by this lambda's param; leave the body alone.
             TypedExprNode::Lambda { param, body }
         }
@@ -1470,7 +1473,7 @@ fn substitute_param_in_body(expr: Expr, name: &str, replacement: &Expr) -> Expr 
         } => {
             let new_bound = substitute_param_in_body(*bound_expr, name, replacement);
             // Shadowing: if the Let rebinds `name`, leave its body alone.
-            let new_body = if binding.name == name {
+            let new_body = if &binding.name == name {
                 *body
             } else {
                 substitute_param_in_body(*body, name, replacement)
@@ -2126,7 +2129,12 @@ fn lower_mutation_loop(
     }
 
     let step_lambda = build_body_lambda(inner, ctx);
-    let loop_expr = Expr::loop_node(acc_names.to_vec(), init_args, source, step_lambda);
+    let loop_expr = Expr::loop_node(
+        acc_names.iter().map(Name::from).collect(),
+        init_args,
+        source,
+        step_lambda,
+    );
 
     // Wrap the continuation in:
     //   let acc_stream = Loop {…} in
@@ -2385,7 +2393,13 @@ fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Ex
     let mut gen_iter_vars: Vec<String> = Vec::new();
 
     for (target, iter, _) in generators.iter() {
-        let source = lower_expr(iter, ctx)?;
+        // Mint binder uids inside the source *now*, before Phase 5/6 clone it
+        // into both the body chain and the loop-join predicate: copies of a
+        // minted tree stay structurally equal (uids are preserved by
+        // cloning), which is what lets inference dedup the predicate-side
+        // refinement tags against the body-side ones. See the "mint before
+        // copy" contract in `crate::ccl::uniquify`.
+        let source = uniquify::run(lower_expr(iter, ctx)?);
         let var_name = extract_name_target(target, "comprehension target")?;
         gen_iter_vars.push(var_name);
         gen_sources.push(source);
@@ -2437,8 +2451,8 @@ fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Ex
     // Helper: build the index argument for generator `i`.
     // Single-gen: a bare VarRef to the outer variable.
     // Multi-gen: a RecordField projection of the i-th field from the outer record.
-    let make_idx_arg = |var: &str, i: usize| -> Expr {
-        let vref = Expr::var(var.to_string());
+    let make_idx_arg = |var: Name, i: usize| -> Expr {
+        let vref = Expr::var(var);
         if single_gen {
             vref
         } else {
@@ -2457,7 +2471,7 @@ fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Ex
         .rev()
     {
         body_expr = Expr::apply(
-            Expr::apply(make_idx_arg(outer_var, i), source),
+            Expr::apply(make_idx_arg(Name::raw(outer_var), i), source),
             Expr::lambda(iter_var, Type::Hole, body_expr),
         );
     }
@@ -2476,7 +2490,7 @@ fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Ex
             .rev()
         {
             pred_expr = Expr::apply(
-                Expr::apply(make_idx_arg(REFINEMENT_BINDER, i), pred_source),
+                Expr::apply(make_idx_arg(Name::elem(), i), pred_source),
                 Expr::lambda(iter_var, Type::Hole, pred_expr),
             );
         }

@@ -14,11 +14,13 @@ pub mod infer_simple_sub;
 pub mod inline;
 pub mod lambda_elim;
 pub mod lower;
+pub mod names;
 pub mod planning;
 pub mod simple_sub;
 pub mod simplify;
 pub mod subst;
 pub mod symbolic;
+pub mod uniquify;
 
 use std::{
     cell::RefCell,
@@ -31,6 +33,7 @@ use std::{
 use smol_str::SmolStr;
 
 use crate::ccl::simple_sub::FieldKey;
+pub use names::Name;
 
 /// Reset all IDs allocated by ccl module counters. Test-only convenience for
 /// differential harnesses that re-run lowering + inference and need stable
@@ -842,8 +845,9 @@ fn accumulate_max<T: Ord + Clone>(acc: &mut [T], values: &[T]) {
 /// inferred type is compatible with it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TypedBinding {
-    /// The bound variable name.
-    pub name: String,
+    /// The bound variable name. Carries the binder's identity (`uid`) under
+    /// the Barendregt convention; see [`Name`].
+    pub name: Name,
     /// The variable's type, filled in by type inference.
     ///
     /// Starts as [`Type::Hole`] (lowering placeholder); converted to [`Type::Infer`]
@@ -862,9 +866,9 @@ impl TypedBinding {
     ///
     /// Use this at lowering time when no type is yet known. The inference pass
     /// converts the `Hole` to a registered inference variable before type-checking.
-    pub fn new_unannotated(name: &str) -> Self {
+    pub fn new_unannotated(name: impl Into<Name>) -> Self {
         TypedBinding {
-            name: name.to_string(),
+            name: name.into(),
             ty: Type::Hole,
             user_annotation: None,
         }
@@ -874,7 +878,7 @@ impl TypedBinding {
     ///
     /// Use this at lowering time when the source Python carries an explicit type annotation
     /// (e.g. `x: int = expr`). `ty` is still [`Type::Hole`] — the inference pass fills it in.
-    pub fn new_annotated(name: impl Into<String>, annotation: Type) -> Self {
+    pub fn new_annotated(name: impl Into<Name>, annotation: Type) -> Self {
         TypedBinding {
             name: name.into(),
             ty: Type::Hole,
@@ -910,7 +914,7 @@ pub enum TypedExprNode {
     Lit(Lit),
 
     /// A variable reference by name.
-    Var(String),
+    Var(Name),
 
     /// A reference to a built-in primitive function.
     ///
@@ -1237,13 +1241,13 @@ pub enum TypedExprNode {
     /// Lowers from the `<<` (LShift) binary operator when the LHS names a defer.
     /// Has type `Unit`; the value is collected by [`crate::ccl::desugar_defers`]
     /// and unioned into the source channel that resolves the defer.
-    Feed { name: String, value: Box<Expr> },
+    Feed { name: Name, value: Box<Expr> },
 
     /// Define a deferred output to a specific value: `x <<= value`.
     /// Lowers from the `<<=` (AugAssign LShift) statement when the LHS names a defer.
     /// Has type `Unit`; the value is collected by [`crate::ccl::desugar_defers`]
     /// and replaces the surrounding `Defer` binding.
-    Define { name: String, value: Box<Expr> },
+    Define { name: Name, value: Box<Expr> },
 
     /// Placeholder for an output accumulator introduced by `x = defer()`.
     /// The bound name is resolved by the surrounding `Let` binding.
@@ -1328,7 +1332,7 @@ impl TypedExpr {
     }
 
     /// Construct a variable reference expression.
-    pub fn var(name: impl Into<String>) -> Self {
+    pub fn var(name: impl Into<Name>) -> Self {
         Self::new(TypedExprNode::Var(name.into()))
     }
 
@@ -1364,17 +1368,17 @@ impl TypedExpr {
     }
 
     /// Construct a feed expression.
-    pub fn feed(name: String, value: Self) -> Self {
+    pub fn feed(name: impl Into<Name>, value: Self) -> Self {
         Self::new(TypedExprNode::Feed {
-            name,
+            name: name.into(),
             value: Box::new(value),
         })
     }
 
     /// Construct a define expression.
-    pub fn define(name: String, value: Self) -> Self {
+    pub fn define(name: impl Into<Name>, value: Self) -> Self {
         Self::new(TypedExprNode::Define {
-            name,
+            name: name.into(),
             value: Box::new(value),
         })
     }
@@ -1394,7 +1398,7 @@ impl TypedExpr {
     /// [`crate::ccl::desugar_defers`] for each `<<` feed inside the
     /// loop body (zero if there are no feeds).
     pub fn loop_node(
-        param_names: Vec<String>,
+        param_names: Vec<Name>,
         init_args: Vec<Self>,
         source: Self,
         loop_body: Self,
@@ -1504,8 +1508,8 @@ impl TypedExpr {
     /// This is the canonical CCL representation for iteration: the source
     /// morphism feeds elements to the per-element lambda, which is then
     /// eliminated by lambda elimination into point-free form.
-    pub fn for_loop(iter_var: impl Into<String>, source: Self, body: Self) -> Self {
-        let lambda = Self::lambda(&iter_var.into(), Type::Hole, body);
+    pub fn for_loop(iter_var: impl Into<Name>, source: Self, body: Self) -> Self {
+        let lambda = Self::lambda(iter_var, Type::Hole, body);
         Self::compose(vec![source, lambda])
     }
 
@@ -1517,7 +1521,7 @@ impl TypedExpr {
     /// inference both fields hold the same type; [`crate::ccl::context::compile_program`] reads
     /// `binding.ty` as the authoritative slot. In normal lowering both start as
     /// [`Type::Infer`] and inference fills them together.
-    pub fn let_bind(name: impl Into<String>, bound_expr: Self, body: Self) -> Self {
+    pub fn let_bind(name: impl Into<Name>, bound_expr: Self, body: Self) -> Self {
         let ty = bound_expr.ty.clone();
         Self::new(TypedExprNode::Let {
             binding: TypedBinding {
@@ -1536,7 +1540,7 @@ impl TypedExpr {
     /// Inference validates that the inferred type of `bound_expr` is compatible with
     /// `annotation` and raises [`infer::InferError::AnnotationMismatch`] on conflict.
     pub fn let_bind_annotated(
-        name: impl Into<String>,
+        name: impl Into<Name>,
         bound_expr: Self,
         body: Self,
         annotation: Type,
@@ -1650,11 +1654,11 @@ impl TypedExpr {
     /// known (lowering phase); pass the concrete type when it is already known.
     /// Do not pass `Type::Infer(fresh_infer_var())` from lowering — `Hole` is
     /// the correct lowering placeholder.
-    pub fn lambda(param: &str, param_ty: Type, body: TypedExpr) -> Self {
+    pub fn lambda(param: impl Into<Name>, param_ty: Type, body: TypedExpr) -> Self {
         let result_ty = Type::fun(param_ty.clone(), body.ty.clone());
         Self::new(TypedExprNode::Lambda {
             param: TypedBinding {
-                name: param.to_string(),
+                name: param.into(),
                 ty: param_ty,
                 user_annotation: None,
             },
@@ -2014,13 +2018,13 @@ pub fn walk_loop_children<F>(
     init_args: Vec<TypedExpr>,
     source: Box<TypedExpr>,
     loop_body: Box<TypedExpr>,
-    shadowed_name: Option<&str>,
+    shadowed_name: Option<&Name>,
     mut recurse: F,
 ) -> TypedExprNode
 where
     F: FnMut(TypedExpr) -> TypedExpr,
 {
-    let shadowed = shadowed_name.is_some_and(|n| params.iter().any(|p| p.name == n));
+    let shadowed = shadowed_name.is_some_and(|n| params.iter().any(|p| &p.name == n));
     TypedExprNode::Loop {
         // `source` and `init_args` sit *outside* the loop's parameter
         // scope, so they always get recursed into.  Only `loop_body`
@@ -2044,13 +2048,13 @@ pub fn try_walk_loop_children<F, E>(
     init_args: Vec<TypedExpr>,
     source: Box<TypedExpr>,
     loop_body: Box<TypedExpr>,
-    shadowed_name: Option<&str>,
+    shadowed_name: Option<&Name>,
     mut recurse: F,
 ) -> Result<TypedExprNode, E>
 where
     F: FnMut(TypedExpr) -> Result<TypedExpr, E>,
 {
-    let shadowed = shadowed_name.is_some_and(|n| params.iter().any(|p| p.name == n));
+    let shadowed = shadowed_name.is_some_and(|n| params.iter().any(|p| &p.name == n));
     let new_source = Box::new(recurse(*source)?);
     let new_init_args: Vec<TypedExpr> = init_args
         .into_iter()
@@ -2177,7 +2181,7 @@ pub enum Type {
         /// The Pi binder, if this function type is dependent. Bound in
         /// `codomain`; not part of structural equality up to α-renaming once
         /// dependent refinements consume it (see the substitution machinery).
-        name: Option<String>,
+        name: Option<Name>,
         /// The parameter (argument) type. Contravariant position.
         domain: Box<Type>,
         /// The result type. Covariant position; may reference `name`.
@@ -2355,7 +2359,7 @@ impl Type {
     }
 
     /// Helper for creating a dependent (Pi) function type `(name: domain) ⇒ codomain`.
-    pub fn pi(name: impl Into<String>, domain: Self, codomain: Self) -> Self {
+    pub fn pi(name: impl Into<Name>, domain: Self, codomain: Self) -> Self {
         Type::Fun {
             name: Some(name.into()),
             domain: Box::new(domain),
@@ -2388,6 +2392,15 @@ impl Type {
     /// types structurally and a `Some`/`None` binder is the same arrow to them.
     /// Use this when comparing types for structural equality across a pass that
     /// does not preserve the cosmetic binder.
+    ///
+    /// Under the Barendregt convention the blindness needed at the remaining
+    /// call sites (lambda elimination's type-preservation asserts) is exactly
+    /// `Some` vs `None`: both compared types descend from one derivation, so
+    /// when both carry a binder it is the *same* [`Name`] (uids are preserved
+    /// by every copy along the lineage). What elimination does not preserve is
+    /// the binder's presence — rebuilt combinator arrows (`fun_ty_or_hole`,
+    /// [`Type::fun`]) are constructed with `name: None`. If those sites ever
+    /// preserve binders on rebuilt arrows, this helper can retire.
     pub fn without_pi_names(&self) -> Type {
         match self {
             Type::Fun {
@@ -2967,7 +2980,7 @@ mod tests {
         let names: Vec<&str> = ops
             .iter()
             .map(|e| match &e.node {
-                TypedExprNode::Var(n) => n.as_str(),
+                TypedExprNode::Var(n) => n.base(),
                 _ => panic!("expected Var operand"),
             })
             .collect();
@@ -2986,7 +2999,7 @@ mod tests {
         let names: Vec<&str> = ops
             .iter()
             .map(|e| match &e.node {
-                TypedExprNode::Var(n) => n.as_str(),
+                TypedExprNode::Var(n) => n.base(),
                 _ => panic!("expected Var operand"),
             })
             .collect();

@@ -5,8 +5,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, Builtin, Expr, Lit, PredicateCellId, REFINEMENT_BINDER, Refinement, Type,
-    TypedExprNode,
+    BaseType, Builtin, Expr, Lit, Name, PredicateCellId, Refinement, Type, TypedExprNode,
 };
 
 /// Builds an application of a primitive combinator, setting the types based on
@@ -290,7 +289,7 @@ pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
 /// Used by lowering to build the target type for a [`make_cast`] that
 /// imposes a refinement on a function's domain (the canonical shape produced
 /// by list-comp filters, for-loop `if`-guards, and `groupby`). `predicate` is
-/// a **bare** boolean expression in which [`REFINEMENT_BINDER`] is free (the
+/// a **bare** boolean expression in which [`crate::ccl::REFINEMENT_BINDER`] is free (the
 /// element being filtered) — not a lambda.
 ///
 /// `base_domain` and `codomain` are typically `Type::Hole` at lowering time;
@@ -344,12 +343,12 @@ fn strip_refinements(ty: &Type) -> Type {
 
 /// The **bare** boolean form of a point-free predicate function `p : D ⇒ Bool`:
 /// the application `__elem ▷ p` (`= p(__elem)`), in which the implicit
-/// [`REFINEMENT_BINDER`] (typed at the element type `base`) stands for the
+/// [`crate::ccl::REFINEMENT_BINDER`] (typed at the element type `base`) stands for the
 /// element. This is the one shape a [`Refinement`] ever stores — a function `p`
 /// lives only in a *term* (an `Apply(p, Iterate/Restrict)` argument), never in a
 /// refinement type. `planning::fn_of_bare_predicate` is the inverse.
 pub fn bare_predicate_of_fn(base: &Type, predicate: Expr) -> Expr {
-    let elem = Expr::var(REFINEMENT_BINDER).with_ty(base.clone());
+    let elem = Expr::var(Name::elem()).with_ty(base.clone());
     Expr::apply(elem, predicate).with_ty(Type::Base(BaseType::Bool))
 }
 
@@ -388,7 +387,7 @@ fn refine_with(base: Type, predicate: &Expr) -> Type {
 /// - [`crate::ccl::lambda_elim`] — to decide whether a lambda's body
 ///   captures its parameter (`const`-lift if not) and to test refinement
 ///   predicate occurrences for the let-in-lambda hoisting rules.
-pub fn count_free(name: &str, expr: &Expr) -> usize {
+pub fn count_free(name: &Name, expr: &Expr) -> usize {
     count_free_with_visited(name, expr, &mut HashSet::new())
 }
 
@@ -400,7 +399,7 @@ pub fn count_free(name: &str, expr: &Expr) -> usize {
 /// its free-var count is collected on first encounter and short-circuited on
 /// subsequent encounters.
 fn count_free_with_visited(
-    name: &str,
+    name: &Name,
     expr: &Expr,
     visited: &mut HashSet<PredicateCellId>,
 ) -> usize {
@@ -414,7 +413,7 @@ fn count_free_with_visited(
             // `count_free_in_type_with_visited` on `expr.ty` above (and live
             // in the *outer* scope, unshadowed). Here `param.name` shadows
             // `name` inside the lambda body.
-            if param.name == name {
+            if &param.name == name {
                 0
             } else {
                 count_free_with_visited(name, body, visited)
@@ -428,7 +427,7 @@ fn count_free_with_visited(
         } => {
             // `binding.name` shadows `name` inside `body` only.
             count_free_with_visited(name, bound_expr, visited)
-                + if binding.name == name {
+                + if &binding.name == name {
                     0
                 } else {
                     count_free_with_visited(name, body, visited)
@@ -446,7 +445,7 @@ fn count_free_with_visited(
             // param scope, so they're always counted.  `loop_body` is
             // inside the param scope; if any `params` shadow `name`,
             // its body uses don't count.
-            let shadowed = params.iter().any(|p| p.name == name);
+            let shadowed = params.iter().any(|p| &p.name == name);
             let in_body = if shadowed {
                 0
             } else {
@@ -489,7 +488,7 @@ fn count_free_with_visited(
                 + branches
                     .iter()
                     .map(|b| {
-                        if b.pattern.as_ref().is_some_and(|p| p.binding.name == name) {
+                        if b.pattern.as_ref().is_some_and(|p| &p.binding.name == name) {
                             0
                         } else {
                             count_free_with_visited(name, &b.guard, visited)
@@ -516,7 +515,7 @@ fn count_free_with_visited(
 ///
 /// Thin wrapper around [`count_free`]; see that function for the exact
 /// shadowing rules.
-pub fn is_free(name: &str, expr: &Expr) -> bool {
+pub fn is_free(name: &Name, expr: &Expr) -> bool {
     count_free(name, expr) > 0
 }
 
@@ -529,18 +528,18 @@ pub fn is_free(name: &str, expr: &Expr) -> bool {
 /// body's type. The latter is the **Pi-const** case: the value is a `const` and
 /// the binder rides the type as a Pi binder (a dependent refinement), e.g. after
 /// pairing rewrites a partition predicate onto a pair domain.
-pub fn is_free_in_value(name: &str, expr: &Expr) -> bool {
+pub fn is_free_in_value(name: &Name, expr: &Expr) -> bool {
     count_free_in_value(name, expr) > 0
 }
 
 /// Value-only worker for [`is_free_in_value`]: mirrors [`count_free`]'s
 /// shadowing rules over the node tree but never descends into type slots (and so
 /// a refinement on a `Lambda` param — which lives in the type — is ignored).
-fn count_free_in_value(name: &str, expr: &Expr) -> usize {
+fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
     match &expr.node {
         TypedExprNode::Var(n) => (n == name) as usize,
         TypedExprNode::Lambda { param, body, .. } => {
-            if param.name == name {
+            if &param.name == name {
                 0
             } else {
                 count_free_in_value(name, body)
@@ -552,7 +551,7 @@ fn count_free_in_value(name: &str, expr: &Expr) -> usize {
             body,
         } => {
             count_free_in_value(name, bound_expr)
-                + if binding.name == name {
+                + if &binding.name == name {
                     0
                 } else {
                     count_free_in_value(name, body)
@@ -564,7 +563,7 @@ fn count_free_in_value(name: &str, expr: &Expr) -> usize {
             source,
             loop_body,
         } => {
-            let shadowed = params.iter().any(|p| p.name == name);
+            let shadowed = params.iter().any(|p| &p.name == name);
             (if shadowed {
                 0
             } else {
@@ -593,7 +592,7 @@ fn count_free_in_value(name: &str, expr: &Expr) -> usize {
                 + branches
                     .iter()
                     .map(|b| {
-                        if b.pattern.as_ref().is_some_and(|p| p.binding.name == name) {
+                        if b.pattern.as_ref().is_some_and(|p| &p.binding.name == name) {
                             0
                         } else {
                             count_free_in_value(name, &b.guard) + count_free_in_value(name, &b.body)
@@ -618,7 +617,7 @@ fn count_free_in_value(name: &str, expr: &Expr) -> usize {
 /// it to detect when a term substitution would need to reach into a
 /// type-carried predicate (e.g. a `cast`-introduced domain refinement that
 /// closes over the substituted variable).
-pub fn is_free_in_type(name: &str, ty: &Type) -> bool {
+pub fn is_free_in_type(name: &Name, ty: &Type) -> bool {
     count_free_in_type_with_visited(name, ty, &mut HashSet::new()) > 0
 }
 
@@ -638,7 +637,7 @@ pub fn is_free_in_type(name: &str, ty: &Type) -> bool {
 /// helper to `borrow()` so the mistake panics rather than
 /// miscompiling.
 fn count_free_in_type_with_visited(
-    name: &str,
+    name: &Name,
     ty: &Type,
     visited: &mut HashSet<PredicateCellId>,
 ) -> usize {

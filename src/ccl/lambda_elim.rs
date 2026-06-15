@@ -47,7 +47,7 @@ use std::rc::Rc;
 use crate::ccl::ccl_utils::{cast_target_refinement, is_free, is_free_in_value, typed_compose};
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
-use crate::ccl::{Builtin, Lit, REFINEMENT_BINDER, Refinement};
+use crate::ccl::{Builtin, Lit, Name, Refinement};
 use crate::ccl::{Expr, Type, TypedExpr, TypedExprNode, symbolic::symbolic};
 
 // ---------------------------------------------------------------------------
@@ -99,24 +99,19 @@ pub fn run(expr: Expr) -> Result<Expr, LambdaElimError> {
 
 /// Mutable state threaded through lambda elimination.
 ///
-/// Holds a monotonically increasing counter used to generate fresh variable
-/// names for the nested-lambda rule.
-struct ElimContext {
-    /// Next suffix for `__pair_N` fresh variables.
-    pair_counter: u64,
-}
+/// Currently stateless — the nested-lambda rule mints its `__pair` binder
+/// straight from [`Name::pair`] (uid-identified, no counter to carry) — but
+/// kept as the threaded context the elimination walk already expects.
+struct ElimContext {}
 
 impl ElimContext {
-    /// Create a new context with the counter starting at zero.
     fn new() -> Self {
-        Self { pair_counter: 0 }
+        Self {}
     }
 
-    /// Return a fresh variable name `__pair_N` for use in the nested-lambda rule.
-    fn fresh_pair_name(&mut self) -> String {
-        let n = self.pair_counter;
-        self.pair_counter += 1;
-        format!("__pair_{n}")
+    /// A fresh `__pair` binder for the nested-lambda rule.
+    fn fresh_pair_name(&mut self) -> Name {
+        Name::pair()
     }
 }
 
@@ -207,7 +202,7 @@ pub fn const_(c: Expr) -> Expr {
 /// [`TypedExprNode::Let::binding`].  Does **not** perform capture-avoiding renaming of
 /// other binders; the caller is responsible for ensuring `replacement` does
 /// not contain free variables that would be captured.
-pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
+pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
     debug_typecheck(&expr);
     // Fast path: no allocation needed for atoms.
     match &expr.node {
@@ -230,7 +225,7 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
 
     let new_node = match node {
         TypedExprNode::Lambda { param, body } => {
-            if param.name == name {
+            if &param.name == name {
                 // name is shadowed; do not substitute inside
                 TypedExprNode::Lambda { param, body }
             } else {
@@ -247,7 +242,7 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             body,
         } => {
             let new_bound = substitute(*bound_expr, name, replacement);
-            let new_body = if binding.name == name {
+            let new_body = if &binding.name == name {
                 *body // shadowed; do not substitute
             } else {
                 substitute(*body, name, replacement)
@@ -331,7 +326,7 @@ pub(crate) fn substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
 
 /// Helper for `substitute` that recurses into any refined types where we also need to
 /// substitute the param.
-fn substitute_in_type(ty: &mut Type, name: &str, replacement: &Expr) {
+fn substitute_in_type(ty: &mut Type, name: &Name, replacement: &Expr) {
     // Refinement predicates are sub-expressions, not sub-types — handle
     // the predicate explicitly, then recurse into structural type children.
     if let Type::Refinement(_, refinement) = ty {
@@ -351,7 +346,7 @@ fn substitute_in_type(ty: &mut Type, name: &str, replacement: &Expr) {
         // substitution *of that very name* is shadowed here — descending would
         // capture the refinement's own element binder (the shared name makes
         // this a real hazard for nested refinements).
-        if name != REFINEMENT_BINDER
+        if !name.is_elem()
             && let Ok(mut pred) = pred_rc.try_borrow_mut()
         {
             let old_pred = replace(&mut *pred, t);
@@ -465,7 +460,7 @@ fn extract_filter_case(body: Expr) -> (Expr, Expr) {
 /// i.e. this function is called on the body of a `Lambda { param, body, .. }`.
 fn elim_lambda(
     ctx: &mut ElimContext,
-    param: &str,
+    param: &Name,
     param_ty: &Type,
     body: Expr,
 ) -> Result<Expr, LambdaElimError> {
@@ -476,7 +471,7 @@ fn elim_lambda(
 
 fn elim_lambda_impl(
     ctx: &mut ElimContext,
-    param: &str,
+    param: &Name,
     param_ty: &Type,
     body: Expr,
 ) -> Result<Expr, LambdaElimError> {
@@ -494,7 +489,7 @@ fn elim_lambda_impl(
         Type::Fun {
             domain, codomain, ..
         } if crate::ccl::subst::type_free_vars(&body_ty).contains(param) => Type::Fun {
-            name: Some(param.to_string()),
+            name: Some(param.clone()),
             domain,
             codomain,
         },
@@ -903,9 +898,10 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         TypedExprNode::Lambda { param, body } => {
             let original = symbolic(&Expr::lambda(&param.name, param.ty.clone(), *body.clone()));
             let result = elim_lambda(ctx, &param.name, &param.ty, *body)?;
-            // Compare modulo Pi binder names: the point-free construction
-            // keeps a dependent morphism's own binder but rebuilds combinator
-            // arrows without the solver's `Fun.name`s.
+            // Compare modulo Pi binder *presence*: the point-free
+            // construction keeps a dependent morphism's own binder (same
+            // `Name`, uid-preserved) but rebuilds combinator arrows with
+            // `name: None`; see `Type::without_pi_names`.
             debug_assert!(
                 original_ty.without_pi_names() == result.ty.without_pi_names(),
                 "{}\nto\n{}\nwith {} vs {}",
@@ -1125,7 +1121,7 @@ mod tests {
         let param_ty = int_ty();
         let result = elim_lambda(
             &mut ElimContext::new(),
-            "x",
+            &Name::raw("x"),
             &param_ty,
             var("x").with_ty(int_ty()),
         )
@@ -1154,7 +1150,7 @@ mod tests {
         let param_ty = int_ty();
         let result = elim_lambda(
             &mut ElimContext::new(),
-            "x",
+            &Name::raw("x"),
             &param_ty,
             lit(42).with_ty(int_ty()),
         )
@@ -1168,7 +1164,7 @@ mod tests {
         let param_ty = int_ty();
         let result = elim_lambda(
             &mut ElimContext::new(),
-            "x",
+            &Name::raw("x"),
             &param_ty,
             var("y").with_ty(int_ty()),
         )
@@ -1186,7 +1182,8 @@ mod tests {
             var("f").with_ty(fun_ty(int_ty(), int_ty())),
         )
         .with_ty(int_ty());
-        let result = elim_lambda(&mut ElimContext::new(), "x", &param_ty, body).unwrap();
+        let result =
+            elim_lambda(&mut ElimContext::new(), &Name::raw("x"), &param_ty, body).unwrap();
         let f_ty = fun_ty(int_ty(), int_ty());
         let apply_ty = fun_ty(Type::Tuple(vec![int_ty(), f_ty.clone()]), int_ty());
         // const(f) where f: Int → Int has type Int -> ((Int → Int) -> (Int → Int))
@@ -1211,7 +1208,8 @@ mod tests {
             var("f").with_ty(int_ty()),
         ])
         .with_ty(Type::Tuple(vec![int_ty(), int_ty()]));
-        let result = elim_lambda(&mut ElimContext::new(), "x", &param_ty, body).unwrap();
+        let result =
+            elim_lambda(&mut ElimContext::new(), &Name::raw("x"), &param_ty, body).unwrap();
         // const(f) where f: Int has type Int -> (Int -> Int)
         let const_f_ty = fun_ty(int_ty(), fun_ty(int_ty(), int_ty()));
         let const_var = Expr::builtin(Builtin::Const).with_ty(const_f_ty);
@@ -1286,7 +1284,7 @@ mod tests {
 
         // Substitute "y" with a literal value in the expression
         let replacement = Expr::lit(Lit::Int(42)).with_ty(int_ty());
-        let result = substitute(expr, "y", &replacement);
+        let result = substitute(expr, &Name::raw("y"), &replacement);
 
         // Extract the refinement predicate from the result's domain type to
         // verify substitution descended into it.
@@ -1419,7 +1417,7 @@ mod tests {
 
         // Eliminate λ y → y over the refined domain.
         let mut ctx = ElimContext::new();
-        let result = elim_lambda(&mut ctx, "y", &refined_y_ty, body);
+        let result = elim_lambda(&mut ctx, &Name::raw("y"), &refined_y_ty, body);
 
         assert!(result.is_ok(), "Lambda elimination should succeed");
         let eliminated = result.unwrap();
@@ -1464,7 +1462,7 @@ mod tests {
         let expr = Expr::lit(Lit::Int(42)).with_ty(tuple_ty);
 
         assert!(
-            is_free("x", &expr),
+            is_free(&Name::raw("x"), &expr),
             "x should be free: it appears in the refinement of the second tuple component"
         );
     }

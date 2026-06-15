@@ -78,8 +78,8 @@ use crate::ccl::simple_sub::{
 };
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    AggregateKind, BaseType, BinOpKind, Branch, Builtin, Expr, Level, Lit, PredicateCellId,
-    ProjKey, REFINEMENT_BINDER, Refinement, Type, TypedBinding, TypedExprNode, UnaryOpKind,
+    AggregateKind, BaseType, BinOpKind, Branch, Builtin, Expr, Level, Lit, Name, PredicateCellId,
+    ProjKey, Refinement, Type, TypedBinding, TypedExprNode, UnaryOpKind,
 };
 use crate::util::ScopeStack;
 
@@ -667,7 +667,7 @@ struct SimpleSubContext {
     /// polymorphic `let` additionally stashes its typed definition subtree so
     /// each use site can splice a freshened, use-specialized copy (see
     /// `scoped_let` and the `Var` arm of `emit_node`).
-    scopes: ScopeStack<Binding>,
+    scopes: ScopeStack<Name, Binding>,
     /// Externally-registered data sources (set by
     /// `TypeInferenceContext::register_source_type`).
     sources: HashMap<String, Type>,
@@ -793,7 +793,7 @@ trait Typing {
     /// Run `f` with `name: ty` bound *monomorphically* in the lexical scope
     /// (lambda params, pattern/loop binders), restoring the scope afterward on
     /// both the success and error paths.
-    fn scoped<R>(&mut self, name: &str, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R
+    fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R
     where
         Self: Sized;
 
@@ -817,7 +817,7 @@ trait Typing {
     /// and simply runs `f`.
     fn scoped_let<R>(
         &mut self,
-        name: &str,
+        name: &Name,
         bound_ty: &Type,
         generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
@@ -837,7 +837,7 @@ trait Typing {
     /// would escape coalesce unresolved. Check re-runs the discharge so its
     /// reconstruction matches the recorded (closed) node type under structural
     /// predicate equality.
-    fn close_let_type(&self, name: &str, bound_expr: &Expr, body_ty: Type) -> Type;
+    fn close_let_type(&self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type;
 
     /// Reconcile a binder's inferred type with its user annotation. In Emit
     /// mode this two-way-constrains the two (eagerly surfacing
@@ -978,7 +978,7 @@ impl Typing for SimpleSubContext {
         constrain_subtype(sub, sup, &mut self.cache).map_err(|e| map_constrain_err(e, &at()))
     }
 
-    fn scoped<R>(&mut self, name: &str, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
+    fn scoped<R>(&mut self, name: &Name, ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
         self.scopes.push_scope();
         // Monomorphic binder: lambda params and pattern/loop binders are not
         // generalized. The scheme's cutoff is the *current* level, not 0:
@@ -1014,7 +1014,7 @@ impl Typing for SimpleSubContext {
 
     fn scoped_let<R>(
         &mut self,
-        name: &str,
+        name: &Name,
         bound_ty: &Type,
         generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
@@ -1045,7 +1045,7 @@ impl Typing for SimpleSubContext {
         r
     }
 
-    fn close_let_type(&self, _name: &str, _bound_expr: &Expr, body_ty: Type) -> Type {
+    fn close_let_type(&self, _name: &Name, _bound_expr: &Expr, body_ty: Type) -> Type {
         // No-op: the closing discharge runs on the resolved type in
         // `coalesce_node`'s Let arm (see the trait doc).
         body_ty
@@ -1181,7 +1181,7 @@ impl Typing for SimpleSubContext {
         // only later (design O3). The fresh binder also keeps the §3.6
         // global-freshness discipline (reusing a function's own binder as the
         // expected binder would violate it).
-        let x = crate::ccl::subst::fresh_binder("__arg");
+        let x = Name::solver_arg();
         let d = self.fresh();
         let result = self.fresh();
         let expected = Type::pi(&x, d.clone(), result.clone());
@@ -1259,7 +1259,7 @@ fn emit_annotation_predicates(ty: &Type, ctx: &mut SimpleSubContext) -> Result<(
 }
 
 /// Type a refinement's **bare** predicate (design §6.2). The refinement is a
-/// binding form: its element is the implicit [`REFINEMENT_BINDER`], bound to
+/// binding form: its element is the implicit [`crate::ccl::REFINEMENT_BINDER`], bound to
 /// the refined base type `domain` while the predicate is inferred, and the
 /// predicate itself must be `Bool` — exactly as `infer_lambda` binds a
 /// parameter for its body, but with the refinement doing the binding.
@@ -1274,7 +1274,7 @@ fn emit_bare_predicate<C: Typing>(
     ctx: &mut C,
 ) -> Result<(), InferError> {
     if let Ok(mut pred) = r.predicate.try_borrow_mut() {
-        let pred_ty = ctx.scoped(REFINEMENT_BINDER, domain, |ctx| ctx.subexpr(&mut pred))?;
+        let pred_ty = ctx.scoped(&Name::elem(), domain, |ctx| ctx.subexpr(&mut pred))?;
         ctx.require_sub(&pred_ty, &prim(BaseType::Bool), &|| {
             "refinement predicate".to_string()
         })?;
@@ -1438,7 +1438,7 @@ pub fn infer(expr: &mut Expr, sources: &HashMap<String, Type>) -> Result<Type, V
     // occurrences of a discharged binder unrewritten, so a descent bug leaves a
     // dangling predicate binder — this boundary must reject it as an error
     // rather than let it flow into planning as a silent miscompile.
-    let root_scope: std::collections::BTreeSet<String> = sources.keys().cloned().collect();
+    let root_scope: std::collections::BTreeSet<Name> = sources.keys().map(Name::from).collect();
     let mut scope_errors = Vec::new();
     check_scope_valid(expr, &root_scope, &mut scope_errors);
     if !scope_errors.is_empty() {
@@ -1468,7 +1468,7 @@ fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<Type, InferE
         // post-coalesce `monomorphize` pass reads the resolved use type back off
         // it and splices in a per-type-specialized definition.
         TypedExprNode::Var(name) => match ctx.scopes.lookup(name) {
-            None => return Err(InferError::UnboundVariable(name.clone())),
+            None => return Err(InferError::UnboundVariable(name.to_string())),
             Some(binding) => binding.scheme.instantiate(ctx.level),
         },
 
@@ -1542,7 +1542,7 @@ fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<Type, InferE
 
         TypedExprNode::Source(name) => match ctx.sources.get(name) {
             Some(t) => t.clone(),
-            None => return Err(InferError::UnboundVariable(name.clone())),
+            None => return Err(InferError::UnboundVariable(name.to_string())),
         },
 
         TypedExprNode::Compose(elts) => emit_compose(elts, ctx)?,
@@ -2214,7 +2214,7 @@ impl Typing for CheckCtx {
         Ok(())
     }
 
-    fn scoped<R>(&mut self, _name: &str, _ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
+    fn scoped<R>(&mut self, _name: &Name, _ty: &Type, f: impl FnOnce(&mut Self) -> R) -> R {
         // Check trusts each `Var`/binder node's recorded `Type` rather than
         // resolving names, so there is no scope to maintain.
         f(self)
@@ -2234,7 +2234,7 @@ impl Typing for CheckCtx {
 
     fn scoped_let<R>(
         &mut self,
-        _name: &str,
+        _name: &Name,
         _bound_ty: &Type,
         _generalize: bool,
         f: impl FnOnce(&mut Self) -> R,
@@ -2243,7 +2243,7 @@ impl Typing for CheckCtx {
         f(self)
     }
 
-    fn close_let_type(&self, name: &str, bound_expr: &Expr, body_ty: Type) -> Type {
+    fn close_let_type(&self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type {
         // Mirror the let-closing in `coalesce_node`'s Let arm (design §6.2):
         // the recorded node type has the binding discharged, so the
         // reconstruction must re-run the same substitution to reconcile under
@@ -2538,7 +2538,7 @@ fn coalesce_pass(expr: &mut Expr) -> Vec<InferError> {
 /// reporting each ill-scoped node as an [`InferError::ScopeViolation`].
 fn check_scope_valid(
     expr: &Expr,
-    scope: &std::collections::BTreeSet<String>,
+    scope: &std::collections::BTreeSet<Name>,
     errors: &mut Vec<InferError>,
 ) {
     let free = crate::ccl::subst::type_free_vars(&expr.ty);
@@ -2546,7 +2546,7 @@ fn check_scope_valid(
         errors.push(InferError::ScopeViolation {
             at: symbolic(expr),
             ty: expr.ty.clone(),
-            unbound: free.difference(scope).cloned().collect(),
+            unbound: free.difference(scope).map(|n| n.to_string()).collect(),
         });
     }
     match &expr.node {
@@ -2993,8 +2993,7 @@ fn coalesce_type_predicates(ty: &Type, level: Level, errors: &mut Vec<InferError
 /// emit-time splice, which duplicated per use site (before types were known)
 /// and so could neither share nor reach collection-shaped definitions.
 fn monomorphize(expr: &mut Expr, remap: &mut CellRemap, errors: &mut Vec<InferError>) {
-    let mut next_id: u32 = 0;
-    monomorphize_go(expr, 0, &mut next_id, remap, errors);
+    monomorphize_go(expr, 0, remap, errors);
     // Use sites of a monomorphized definition still carry refinement tags
     // aliasing *retired* predicate cells — instantiation ([`freshen_above`])
     // cloned tags cell-intact before privatization re-celled the
@@ -3144,7 +3143,6 @@ fn refresh_lambda_param_slot(expr: &mut Expr) {
 fn monomorphize_go(
     expr: &mut Expr,
     level: Level,
-    next_id: &mut u32,
     remap: &mut CellRemap,
     errors: &mut Vec<InferError>,
 ) {
@@ -3161,12 +3159,10 @@ fn monomorphize_go(
             TypedExprNode::Let {
                 bound_expr, body, ..
             } => {
-                monomorphize_go(bound_expr, level + 1, next_id, remap, errors);
-                monomorphize_go(body, level, next_id, remap, errors);
+                monomorphize_go(bound_expr, level + 1, remap, errors);
+                monomorphize_go(body, level, remap, errors);
             }
-            _ => expr.walk_children_mut(|c| {
-                monomorphize_go(c, level, &mut *next_id, &mut *remap, &mut *errors)
-            }),
+            _ => expr.walk_children_mut(|c| monomorphize_go(c, level, &mut *remap, &mut *errors)),
         }
         return;
     }
@@ -3189,16 +3185,15 @@ fn monomorphize_go(
 
     // Assign one fresh specialization name per distinct resolved use type, and
     // rewrite each use in place to its name. `for_each_free_use` respects
-    // shadowing, so an inner binder of the same name is left untouched. The
-    // generated names are globally unique (via `next_id`), so they cannot
-    // capture or be captured by anything in `body`.
-    let mut groups: Vec<(Type, String)> = Vec::new();
+    // shadowing, so an inner binder of the same name is left untouched. Each
+    // `Name::mono` mint carries a globally-fresh uid, so the specialization
+    // names cannot capture or be captured by anything in `body`.
+    let mut groups: Vec<(Type, Name)> = Vec::new();
     for_each_free_use(&mut body, &binding.name, &mut |u| {
         let name = match groups.iter().find(|(t, _)| *t == u.ty) {
             Some((_, n)) => n.clone(),
             None => {
-                let n = format!("{}__mono{}", binding.name, *next_id);
-                *next_id += 1;
+                let n = Name::mono();
                 groups.push((u.ty.clone(), n.clone()));
                 n
             }
@@ -3209,7 +3204,7 @@ fn monomorphize_go(
     });
 
     // Recurse into the (rewritten) body for any further generalized `let`s.
-    monomorphize_go(&mut body, level, next_id, remap, errors);
+    monomorphize_go(&mut body, level, remap, errors);
 
     // Wrap the body in one specialized `let` per distinct type. Built in reverse
     // so first-seen types end up outermost; ordering is immaterial since the
@@ -3219,7 +3214,7 @@ fn monomorphize_go(
     for (ty_i, name_i) in groups.into_iter().rev() {
         let mut def_i = specialize_def(&def, cutoff, &ty_i, remap, errors);
         // The specialization may itself contain generalized `let`s.
-        monomorphize_go(&mut def_i, cutoff + 1, next_id, remap, errors);
+        monomorphize_go(&mut def_i, cutoff + 1, remap, errors);
         // Stamp the *specialization's* resolved type onto each use, then
         // re-derive the dependent node types that were computed from the
         // use's instantiation type at main coalesce. The instantiation type
@@ -3385,7 +3380,7 @@ fn specialize_def(
 /// (the outer borrow is processing it); a cell shared by several anchors is
 /// visited more than once, which is harmless because a rewritten use no
 /// longer matches `name`.
-fn for_each_free_use(expr: &mut Expr, name: &str, f: &mut impl FnMut(&mut Expr)) {
+fn for_each_free_use(expr: &mut Expr, name: &Name, f: &mut impl FnMut(&mut Expr)) {
     // The `Var` case needs the whole `&mut expr`, so check it without holding a
     // borrow of `expr.node`.
     if let TypedExprNode::Var(v) = &expr.node {
@@ -3401,7 +3396,7 @@ fn for_each_free_use(expr: &mut Expr, name: &str, f: &mut impl FnMut(&mut Expr))
         TypedExprNode::Lambda { param, body } => {
             // The param scopes the body, so it is skipped when the param
             // shadows `name`.
-            if param.name != name {
+            if &param.name != name {
                 for_each_free_use(body, name, f);
             }
         }
@@ -3416,7 +3411,7 @@ fn for_each_free_use(expr: &mut Expr, name: &str, f: &mut impl FnMut(&mut Expr))
         } => {
             // CCL `let` is non-recursive: `bound_expr` sees the *outer* `name`.
             for_each_free_use(bound_expr, name, f);
-            if binding.name != name {
+            if &binding.name != name {
                 for_each_free_use(body, name, f);
             }
         }
@@ -3429,7 +3424,7 @@ fn for_each_free_use(expr: &mut Expr, name: &str, f: &mut impl FnMut(&mut Expr))
             }
             for b in branches {
                 // A pattern payload binding shadows `name` in guard + body.
-                if b.pattern.as_ref().is_some_and(|p| p.binding.name == name) {
+                if b.pattern.as_ref().is_some_and(|p| &p.binding.name == name) {
                     continue;
                 }
                 for_each_free_use(&mut b.guard, name, f);
@@ -3448,7 +3443,7 @@ fn for_each_free_use(expr: &mut Expr, name: &str, f: &mut impl FnMut(&mut Expr))
                 for_each_free_use(a, name, f);
             }
             for_each_free_use(source, name, f);
-            if !params.iter().any(|p| p.name == name) {
+            if !params.iter().any(|p| &p.name == name) {
                 for_each_free_use(loop_body, name, f);
             }
         }
@@ -3462,7 +3457,7 @@ fn for_each_free_use(expr: &mut Expr, name: &str, f: &mut impl FnMut(&mut Expr))
 /// syntactic anchor — a `Cast` target or user annotation). Mutation goes
 /// through the predicate cells' interior mutability; the type structure
 /// itself is untouched.
-fn for_each_free_use_in_type(ty: &Type, name: &str, f: &mut impl FnMut(&mut Expr)) {
+fn for_each_free_use_in_type(ty: &Type, name: &Name, f: &mut impl FnMut(&mut Expr)) {
     if let Type::Refinement(_, r) = ty
         && let Ok(mut pred) = r.predicate.try_borrow_mut()
     {
@@ -3486,7 +3481,7 @@ fn for_each_free_use_in_type(ty: &Type, name: &str, f: &mut impl FnMut(&mut Expr
 /// its correct type is exactly that binder's resolved type. Look it up by name
 /// and stamp it. (O2/O7 for the monomorphic-direct case: the binders predicates
 /// close over are ordinary in-scope binders, each with a single solution.)
-fn retype_predicate_slots(expr: &mut Expr, scope: &HashMap<String, Type>) {
+fn retype_predicate_slots(expr: &mut Expr, scope: &HashMap<Name, Type>) {
     retype_in_type(&mut expr.ty, scope);
     match &mut expr.node {
         TypedExprNode::Lambda { param, body, .. } => {
@@ -3542,7 +3537,7 @@ fn retype_predicate_slots(expr: &mut Expr, scope: &HashMap<String, Type>) {
 
 /// Recurse into `ty`'s refinement predicates, stamping each free `Var`'s
 /// resolved type from `scope`.
-fn retype_in_type(ty: &mut Type, scope: &HashMap<String, Type>) {
+fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>) {
     match ty {
         Type::Fun {
             domain, codomain, ..
@@ -3567,7 +3562,7 @@ fn retype_in_type(ty: &mut Type, scope: &HashMap<String, Type>) {
 /// the predicate's own binders (so they shadow outer names rather than being
 /// rewritten). Only an unresolved (`Infer`/`Hole`) slot is overwritten — a slot
 /// coalesce already resolved is left intact.
-fn retype_pred_expr(e: &mut Expr, scope: &HashMap<String, Type>) {
+fn retype_pred_expr(e: &mut Expr, scope: &HashMap<Name, Type>) {
     retype_in_type(&mut e.ty, scope);
     match &mut e.node {
         TypedExprNode::Var(n) => {
@@ -3620,11 +3615,11 @@ mod tests {
     }
 
     /// `{Int | __elem > rhs}` — a refinement whose bare predicate compares
-    /// the implicit element binder ([`REFINEMENT_BINDER`]) against `rhs`.
+    /// the implicit element binder ([`crate::ccl::REFINEMENT_BINDER`]) against `rhs`.
     fn refined_int(rhs: TypedExpr) -> Type {
         use crate::ccl::CompareKind;
         let pred = TypedExpr::binop(
-            TypedExpr::var(REFINEMENT_BINDER),
+            TypedExpr::var(Name::elem()),
             BinOpKind::Compare(CompareKind::Greater),
             rhs,
         );
@@ -3661,7 +3656,7 @@ mod tests {
         body.ty = refined_int(TypedExpr::var("x"));
         let mut lam = TypedExpr::lambda("x", Type::Base(BaseType::Int), body);
         lam.ty = Type::Fun {
-            name: Some("x".to_string()),
+            name: Some("x".into()),
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(refined_int(TypedExpr::var("x"))),
         };
@@ -3687,11 +3682,11 @@ mod tests {
         // λx. x applied to 42 → Int
         let lam = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
-                name: "x".to_string(),
+                name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
             },
-            body: Box::new(TypedExpr::new(TypedExprNode::Var("x".to_string()))),
+            body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),
         });
         let app = TypedExpr::new(TypedExprNode::Apply {
             function: Box::new(lam),
@@ -3736,12 +3731,12 @@ mod tests {
         // let x = 42 in x → Int
         let mut e = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
-                name: "x".to_string(),
+                name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
             },
             bound_expr: Box::new(lit_int(42)),
-            body: Box::new(TypedExpr::new(TypedExprNode::Var("x".to_string()))),
+            body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),
         });
         let ty = run_simple_sub(&mut e).expect("inference succeeds");
         assert_eq!(ty, Type::Base(BaseType::Int));
@@ -3774,11 +3769,21 @@ mod tests {
     /// Walk `expr`, counting `Let` bindings minted by [`monomorphize`] (their
     /// names carry the `__mono` marker) and the distinct specialization names
     /// that `Var` nodes reference.
-    fn specialization_stats(expr: &Expr) -> (usize, std::collections::BTreeSet<String>) {
-        fn go(e: &Expr, lets: &mut usize, used: &mut std::collections::BTreeSet<String>) {
+    fn specialization_stats(expr: &Expr) -> (usize, std::collections::BTreeSet<Name>) {
+        use crate::ccl::names::SyntheticKind;
+        fn is_mono(n: &Name) -> bool {
+            matches!(
+                n,
+                Name::Synthetic {
+                    kind: SyntheticKind::Mono,
+                    ..
+                }
+            )
+        }
+        fn go(e: &Expr, lets: &mut usize, used: &mut std::collections::BTreeSet<Name>) {
             match &e.node {
-                TypedExprNode::Let { binding, .. } if binding.name.contains("__mono") => *lets += 1,
-                TypedExprNode::Var(v) if v.contains("__mono") => {
+                TypedExprNode::Let { binding, .. } if is_mono(&binding.name) => *lets += 1,
+                TypedExprNode::Var(v) if is_mono(v) => {
                     used.insert(v.clone());
                 }
                 _ => {}
@@ -3924,24 +3929,35 @@ mod tests {
         );
         // And the two inner specializations carry concrete, distinct param
         // types — never the under-determined shared definition.
-        let inner_param_tys = collect_inner_param_types(&e);
+        let mono_param_tys = collect_mono_param_types(&e);
         assert!(
-            inner_param_tys.contains(&Type::Base(BaseType::String))
-                && inner_param_tys.contains(&Type::Base(BaseType::Int)),
-            "inner specialized at String and Int, got {inner_param_tys:?}"
+            mono_param_tys.contains(&Type::Base(BaseType::String))
+                && mono_param_tys.contains(&Type::Base(BaseType::Int)),
+            "inner specialized at String and Int (Int proves per-type inner), got {mono_param_tys:?}"
         );
     }
 
-    /// Collect the lambda param types of every `__mono` specialization of the
-    /// `inner` binding (used by the nested-polymorphism test).
-    fn collect_inner_param_types(expr: &Expr) -> Vec<Type> {
+    /// Collect the lambda param types of every monomorphization specialization
+    /// (used by the nested-polymorphism test). A `Synthetic` carries no source
+    /// base any more, so this no longer filters to the `inner` binding — but
+    /// the test's discriminator stands: only `inner` specializes at `Int`
+    /// (the `outer` specialization is at `String`), so finding `Int` here
+    /// proves `inner` was specialized per-type.
+    fn collect_mono_param_types(expr: &Expr) -> Vec<Type> {
+        use crate::ccl::names::SyntheticKind;
         fn go(e: &Expr, out: &mut Vec<Type>) {
             if let TypedExprNode::Let {
                 binding,
                 bound_expr,
                 ..
             } = &e.node
-                && binding.name.starts_with("inner__mono")
+                && matches!(
+                    binding.name,
+                    Name::Synthetic {
+                        kind: SyntheticKind::Mono,
+                        ..
+                    }
+                )
                 && let TypedExprNode::Lambda { param, .. } = &bound_expr.node
             {
                 out.push(param.ty.clone());
@@ -4002,7 +4018,7 @@ mod tests {
         // Aggregate { input: λx → (1, 2), kind: Max }
         let lam = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
-                name: "x".to_string(),
+                name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
             },

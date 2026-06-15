@@ -28,6 +28,7 @@ See [docs/operational-semantics/summary.md](operational-semantics/summary.md) fo
 CHL source
   → parse            (chl_parser, see src/chl_parser/design-chl-parser.md)
   → lower            (ccl/lower.rs: CHL AST → CCL Expr)
+  → uniquify         (ccl/uniquify.rs: α-uniquify binders — Barendregt convention, base+uid Names)
   → desugar_defers   (ccl/desugar_defers.rs: Defer/Feed/Define → let-chain + Record channels)
   → infer            (ccl/infer.rs: type inference via simple-sub; delegates to ccl/infer_simple_sub.rs)
   → inline           (ccl/inline.rs: inline UDF Let bindings with non-iterable domains; beta-reduce at call sites)

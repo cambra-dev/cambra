@@ -1,0 +1,499 @@
+//! α-uniquification at lowering: the minting pass of the Barendregt
+//! convention.
+//!
+//! Lowering builds the tree with **raw** names — spellings straight from the
+//! source program, where two distinct binders can share one spelling (Python
+//! reassignment lowers to a shadowing `let`). This pass walks the lowered
+//! tree once, mints a fresh [`Name`] uid at every binding site, and rewrites
+//! each bound variable reference to the name of the binder that lexically
+//! binds it. After it runs, two binders are equal iff they are the *same*
+//! binder — plain structural equality on terms coincides with α-equivalence,
+//! which is what lets every downstream equality-mediated decision (refinement
+//! dedup, demand satisfaction, structural reconciles) compare names without a
+//! scope analysis.
+//!
+//! The convention this establishes (see `src/ccl/names.rs`): **unique binding
+//! sites at lowering; copying preserves uids; no pass mints fresh uids on an
+//! equality-mediated path.** Downstream passes that duplicate terms
+//! (discharges, `let`-closing, monomorphization splices) copy minted names
+//! verbatim, so copies compare equal by construction.
+//!
+//! Scope rules mirror the freeness walkers in [`crate::ccl::ccl_utils`]:
+//! lambda params, `let` bindings (non-recursive: the bound expression sees
+//! the outer scope), loop accumulators, and case-pattern payloads bind;
+//! `Feed`/`Define` target names are *uses* of the defer-handle binder.
+//!
+//! Type-borne refinement predicates are full terms and are walked under the
+//! environment of their syntactic anchor (a `Cast` target or a user
+//! annotation — pre-inference, predicates exist nowhere else): their free
+//! variables resolve against the anchor's lexical scope, and binders *inside*
+//! a predicate mint like any other. The reserved [`crate::ccl::REFINEMENT_BINDER`] is
+//! bound by the refinement itself, never enters the environment, and stays
+//! raw — it is deliberately one shared name (see [`crate::ccl::Refinement`]).
+//! Predicates are rewritten **in place through their cells, once per cell**
+//! (visited-set on [`PredicateCellId`]): lowering's clones share predicate
+//! cells deliberately — downstream passes rewrite predicates through the
+//! shared `Rc` so every alias sees the rewrite — and re-celling here would
+//! split that sharing. (A borrow-through-cell write the immutable-predicates
+//! stage 3 will turn into a rebuild.)
+//!
+//! A variable that resolves to no binder is left raw — it is either a
+//! reference inference will reject as unbound, or a reserved name resolved
+//! by other means.
+//!
+//! **Mint before copy.** Lowering duplicates a few already-lowered subtrees
+//! (a comprehension's generator sources are cloned into its loop-join
+//! predicate; chained comparisons clone the shared middle operand). A copy
+//! made of *raw* trees would mint distinct uids per copy here, making
+//! α-equivalent copies structurally unequal — and the loop-join shape relies
+//! on the copies comparing equal (refinement-tag dedup collapses the
+//! predicate's source against the body's). So lowering runs this pass on a
+//! subtree *before* cloning it (see `lower_list_comp` Phase 1), and the
+//! whole-program run treats minted names as settled: minted binding sites
+//! are not re-minted and push nothing on the environment (their bound
+//! variables are already resolved; their free variables are still raw and
+//! resolve against the environment at the position of each copy). The same
+//! contract makes the pass idempotent. A consequence: after lowering a uid
+//! may legitimately occur at several binding sites — copies preserve uids —
+//! so the checked invariant is "every binding site is minted", not global
+//! binder uniqueness.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::ccl::{Expr, Name, PredicateCellId, Type, TypedBinding, TypedExprNode};
+
+/// α-uniquify every binder in `expr` (see module docs). Runs once per
+/// program, immediately after lowering and before defer desugaring.
+pub fn run(mut expr: Expr) -> Expr {
+    let mut u = Uniquifier {
+        env: HashMap::new(),
+        visited: HashSet::new(),
+    };
+    u.expr(&mut expr);
+    debug_assert!(
+        u.env.values().all(|stack| stack.is_empty()),
+        "uniquify: environment must be fully unwound after the walk"
+    );
+    #[cfg(debug_assertions)]
+    assert_all_binders_minted(&expr);
+    expr
+}
+
+struct Uniquifier {
+    /// Lexical environment: source spelling → stack of minted names, the
+    /// innermost binder last. Raw `Var`s resolve to the top of their
+    /// spelling's stack.
+    env: HashMap<String, Vec<Name>>,
+    /// Predicate cells already rewritten in this run — each shared cell is
+    /// minted once, at the first anchor that reaches it.
+    visited: HashSet<PredicateCellId>,
+}
+
+impl Uniquifier {
+    fn expr(&mut self, e: &mut Expr) {
+        // Anchor-borne types first: `ty` is a lowering `Hole` almost
+        // everywhere, but user annotations (and a few stamped types) can
+        // carry refinement predicates whose free variables live in the
+        // *enclosing* scope — the scope as of this node, before any binder
+        // this node introduces.
+        self.ty(&mut e.ty);
+        if let Some(ann) = &mut e.user_annotation {
+            self.ty(ann);
+        }
+        match &mut e.node {
+            TypedExprNode::Var(n) => {
+                if let Some(m) = self.resolve(n) {
+                    *n = m;
+                }
+            }
+
+            // The target name is a use of the defer-handle binder.
+            TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
+                if let Some(m) = self.resolve(name) {
+                    *name = m;
+                }
+                self.expr(value);
+            }
+
+            TypedExprNode::Lambda { param, body } => {
+                self.binding_tys(param);
+                let base = self.bind(param);
+                self.expr(body);
+                self.unbind(base);
+            }
+
+            // Non-recursive `let`: the bound expression sees the outer scope.
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                self.expr(bound_expr);
+                self.binding_tys(binding);
+                let base = self.bind(binding);
+                self.expr(body);
+                self.unbind(base);
+            }
+
+            TypedExprNode::Loop {
+                params,
+                init_args,
+                source,
+                loop_body,
+            } => {
+                for a in init_args {
+                    self.expr(a);
+                }
+                self.expr(source);
+                let bases: Vec<Option<String>> = params
+                    .iter_mut()
+                    .map(|p| {
+                        self.binding_tys(p);
+                        self.bind(p)
+                    })
+                    .collect();
+                self.expr(loop_body);
+                for base in bases.into_iter().rev() {
+                    self.unbind(base);
+                }
+            }
+
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+            } => {
+                if let Some(s) = scrutinee {
+                    self.expr(s);
+                }
+                for b in branches {
+                    match &mut b.pattern {
+                        Some(p) => {
+                            self.binding_tys(&mut p.binding);
+                            let base = self.bind(&mut p.binding);
+                            self.expr(&mut b.guard);
+                            self.expr(&mut b.body);
+                            self.unbind(base);
+                        }
+                        None => {
+                            self.expr(&mut b.guard);
+                            self.expr(&mut b.body);
+                        }
+                    }
+                }
+            }
+
+            // The cast target is a type slot `walk_children_mut` skips; its
+            // refinement predicate is the main anchor lowering emits.
+            TypedExprNode::Cast { value, target } => {
+                self.ty(target);
+                self.expr(value);
+            }
+
+            // Everything else introduces no binders and no type anchors of
+            // its own: plain structural recursion.
+            _ => e.walk_children_mut(|c| self.expr(c)),
+        }
+    }
+
+    /// Walk a refinement-bearing type, rewriting each predicate in place
+    /// under the current environment — once per shared cell (see module
+    /// docs). `try_borrow_mut` skips a cell already being rewritten higher
+    /// up this same walk (a self-referential predicate type slot).
+    fn ty(&mut self, t: &mut Type) {
+        if let Type::Refinement(_, r) = t
+            && self.visited.insert(r.cell_id())
+            && let Ok(mut pred) = r.predicate.try_borrow_mut()
+        {
+            self.expr(&mut pred);
+        }
+        t.walk_children_mut(|c| self.ty(c));
+    }
+
+    /// Walk the type slots riding a binding site itself. These are in the
+    /// scope *outside* the binder (a binding's annotation cannot reference
+    /// the binding).
+    fn binding_tys(&mut self, b: &mut TypedBinding) {
+        self.ty(&mut b.ty);
+        if let Some(ann) = &mut b.user_annotation {
+            self.ty(ann);
+        }
+    }
+
+    /// Mint a fresh uid for this binding site and push it on its spelling's
+    /// scope stack. Returns the spelling for the matching [`Self::unbind`].
+    /// An already-minted binder (a pre-minted, lowering-copied subtree — see
+    /// module docs) is left as-is and binds nothing: its bound variables were
+    /// resolved when it was minted.
+    fn bind(&mut self, b: &mut TypedBinding) -> Option<String> {
+        if !b.name.is_raw() {
+            return None;
+        }
+        let base = b.name.base().to_string();
+        let fresh = Name::fresh(&base);
+        self.env
+            .entry(base.clone())
+            .or_default()
+            .push(fresh.clone());
+        b.name = fresh;
+        Some(base)
+    }
+
+    fn unbind(&mut self, base: Option<String>) {
+        let Some(base) = base else { return };
+        self.env
+            .get_mut(&base)
+            .expect("uniquify: unbind of never-bound spelling")
+            .pop()
+            .expect("uniquify: scope stack underflow");
+    }
+
+    /// The minted name a raw variable reference resolves to, if any. Minted
+    /// names pass through untouched; unresolved raw names stay raw.
+    fn resolve(&self, n: &Name) -> Option<Name> {
+        if !n.is_raw() {
+            return None;
+        }
+        self.env.get(n.base()).and_then(|s| s.last()).cloned()
+    }
+}
+
+/// The checked Barendregt invariant at the minting boundary: right after
+/// uniquification every binding site is a [`Name::Unique`]. `Synthetic`
+/// binders don't exist yet (later passes mint them) and the element binder is
+/// never a binding site, so `Unique` is exact here — which is the whole point
+/// of keeping the variants distinct. Global binder *uniqueness* is deliberately
+/// not asserted — lowering copies pre-minted subtrees (see module docs), so a
+/// uid may occur at several binding sites; the convention is "distinct
+/// derivations get distinct uids, copies share," which is not a tree-checkable
+/// property.
+#[cfg(debug_assertions)]
+fn assert_all_binders_minted(expr: &Expr) {
+    fn go(e: &Expr) {
+        let check = |b: &TypedBinding| {
+            assert!(
+                matches!(b.name, Name::Unique { .. }),
+                "uniquify must mint every binding site to a Unique name; `{:?}` is not",
+                b.name
+            );
+        };
+        match &e.node {
+            TypedExprNode::Lambda { param, .. } => check(param),
+            TypedExprNode::Let { binding, .. } => check(binding),
+            TypedExprNode::Loop { params, .. } => params.iter().for_each(check),
+            TypedExprNode::Case { branches, .. } => {
+                for b in branches {
+                    if let Some(p) = &b.pattern {
+                        check(&p.binding);
+                    }
+                }
+            }
+            _ => {}
+        }
+        e.walk_children(go);
+    }
+    go(expr);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::lower::{LoweringContext, lower_stmts};
+    use crate::ccl::{Expr, Lit, Refinement};
+
+    /// Parse, lower, and uniquify a CHL program.
+    fn pipeline_front(code: &str) -> Expr {
+        let mut ctx = LoweringContext::default();
+        let stmts = crate::chl_parser::parse_module(code)
+            .into_result()
+            .expect("parse failed")
+            .body;
+        let lowered = lower_stmts(&stmts, &mut ctx);
+        assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
+        run(lowered.value.expect("lowering produced no value"))
+    }
+
+    /// Every refinement reachable from `e`'s types (Cast targets,
+    /// annotations, ty slots), in walk order — including refinements nested
+    /// inside other refinements' predicate expressions.
+    fn collect_refinements(e: &Expr, out: &mut Vec<Refinement>) {
+        fn from_ty(t: &Type, out: &mut Vec<Refinement>) {
+            if let Type::Refinement(_, r) = t {
+                out.push(r.clone());
+                if let Ok(pred) = r.predicate.try_borrow() {
+                    collect_refinements(&pred, out);
+                }
+            }
+            t.walk_children(|c| from_ty(c, out));
+        }
+        from_ty(&e.ty, out);
+        if let Some(ann) = &e.user_annotation {
+            from_ty(ann, out);
+        }
+        if let TypedExprNode::Cast { target, .. } = &e.node {
+            from_ty(target, out);
+        }
+        e.walk_children(|c| collect_refinements(c, out));
+    }
+
+    /// All `Let` binders named (by base) `base`, in walk order.
+    fn let_binders(e: &Expr, base: &str, out: &mut Vec<Name>) {
+        if let TypedExprNode::Let { binding, .. } = &e.node
+            && binding.name.base() == base
+        {
+            out.push(binding.name.clone());
+        }
+        e.walk_children(|c| let_binders(c, base, out));
+    }
+
+    // The scope-blind-equality hazard, closed: the same predicate spelling
+    // under two different `k` bindings (Python reassignment lowers to a
+    // shadowing `let`) yields *distinct* refinements.
+    #[test]
+    fn shadowed_scope_twins_are_distinct_refinements() {
+        let expr = pipeline_front(
+            "k = 1\n\
+             a = [x for x in [1, 2, 3] if x > k]\n\
+             k = 2\n\
+             b = [x for x in [1, 2, 3] if x > k]\n\
+             (a, b)\n",
+        );
+        let mut ks = Vec::new();
+        let_binders(&expr, "k", &mut ks);
+        assert_eq!(ks.len(), 2, "two shadowing k bindings");
+        assert_ne!(ks[0], ks[1], "shadowing binders must mint distinct uids");
+
+        let mut refinements = Vec::new();
+        collect_refinements(&expr, &mut refinements);
+        assert_eq!(refinements.len(), 2, "one refinement per filter");
+        assert_ne!(
+            refinements[0], refinements[1],
+            "`x > k` under different k bindings must be distinct refinements"
+        );
+    }
+
+    // Control for the twins test: *copies of one derivation* still compare
+    // equal. A filtered outer comprehension clones its (filtered) generator
+    // source into the loop-join predicate — mint-before-copy makes the
+    // body-side and predicate-side copies of the inner refinement share
+    // uids, so the tag dedup that collapses them keeps working. (Two
+    // *separately written* identical comprehensions are independent
+    // derivations and deliberately do NOT compare equal under uid naming.)
+    #[test]
+    fn copies_of_one_derivation_compare_equal() {
+        let expr = pipeline_front("[x for x in [y for y in [1, 2, 3] if y < 3] if x < 2]\n");
+        let mut refinements = Vec::new();
+        collect_refinements(&expr, &mut refinements);
+        // The inner `y < 3` refinement appears at several anchors (the inner
+        // comprehension's cast in the body chain and its clone in the
+        // loop-join predicate). Those copies must land in one equality
+        // class — partition the collected refinements by `==` and check a
+        // multi-member class exists.
+        let mut classes: Vec<(Refinement, usize)> = Vec::new();
+        for r in refinements {
+            match classes.iter_mut().find(|(rep, _)| *rep == r) {
+                Some((_, n)) => *n += 1,
+                None => classes.push((r, 1)),
+            }
+        }
+        assert!(
+            classes.iter().any(|(_, n)| *n >= 2),
+            "expected a refinement anchored at multiple copies to compare \
+             equal across them; classes: {:?}",
+            classes.iter().map(|(_, n)| *n).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shadowing_resolves_to_innermost_binder() {
+        let expr = pipeline_front("k = 1\nk = 2\nk\n");
+        let mut ks = Vec::new();
+        let_binders(&expr, "k", &mut ks);
+        assert_eq!(ks.len(), 2);
+        // The terminal `k` reference resolves to the inner (second) binder.
+        fn find_var(e: &Expr, base: &str, out: &mut Vec<Name>) {
+            if let TypedExprNode::Var(n) = &e.node
+                && n.base() == base
+            {
+                out.push(n.clone());
+            }
+            e.walk_children(|c| find_var(c, base, out));
+        }
+        let mut uses = Vec::new();
+        find_var(&expr, "k", &mut uses);
+        assert!(!uses.is_empty());
+        assert!(
+            uses.iter().all(|u| *u == ks[1]),
+            "every free k use sits under the inner binder"
+        );
+    }
+
+    // The refinement's reserved element binder is never minted; the
+    // predicate's free program variables resolve to the enclosing binder.
+    #[test]
+    fn predicate_vars_resolve_at_their_anchor() {
+        let expr = pipeline_front("k = 1\n[x for x in [1, 2, 3] if x > k]\n");
+        let mut ks = Vec::new();
+        let_binders(&expr, "k", &mut ks);
+        assert_eq!(ks.len(), 1);
+        let mut refinements = Vec::new();
+        collect_refinements(&expr, &mut refinements);
+        assert_eq!(refinements.len(), 1);
+        let pred = refinements[0].predicate.borrow();
+        fn vars(e: &Expr, out: &mut Vec<Name>) {
+            if let TypedExprNode::Var(n) = &e.node {
+                out.push(n.clone());
+            }
+            e.walk_children(|c| vars(c, out));
+        }
+        let mut vs = Vec::new();
+        vars(&pred, &mut vs);
+        assert!(
+            vs.iter().any(|v| v.is_elem()),
+            "the element binder stays the raw reserved name"
+        );
+        assert!(
+            vs.iter().any(|v| *v == ks[0]),
+            "the predicate's k resolves to the enclosing binder"
+        );
+    }
+
+    // Feed/Define target names are uses of the defer-handle binder.
+    #[test]
+    fn feed_target_resolves_to_defer_binder() {
+        let inner = Expr::expr_stmt(Expr::feed("d", Expr::lit(Lit::Int(1))), Expr::var("d"));
+        let expr = run(Expr::let_bind("d", Expr::new(TypedExprNode::Defer), inner));
+        let TypedExprNode::Let { binding, body, .. } = &expr.node else {
+            panic!("expected let");
+        };
+        assert!(!binding.name.is_raw());
+        let TypedExprNode::ExprStmt { expr: fed, body } = &body.node else {
+            panic!("expected expr_stmt");
+        };
+        let TypedExprNode::Feed { name, .. } = &fed.node else {
+            panic!("expected feed");
+        };
+        assert_eq!(name, &binding.name, "feed target follows the binder");
+        let TypedExprNode::Var(v) = &body.node else {
+            panic!("expected var");
+        };
+        assert_eq!(v, &binding.name);
+    }
+
+    // Mint-before-copy: a second run leaves a minted tree untouched.
+    #[test]
+    fn idempotent_on_minted_trees() {
+        let expr = pipeline_front("k = 1\n[x for x in [1, 2, 3] if x > k]\n");
+        let again = run(expr.clone());
+        assert_eq!(expr, again, "uniquify must be idempotent");
+    }
+
+    #[test]
+    fn unbound_references_stay_raw() {
+        let expr = run(Expr::var("never_bound"));
+        let TypedExprNode::Var(n) = &expr.node else {
+            panic!("expected var")
+        };
+        assert!(n.is_raw());
+        assert_eq!(n.base(), "never_bound");
+    }
+}

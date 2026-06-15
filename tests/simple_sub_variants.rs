@@ -267,7 +267,7 @@ fn match_fills_arm_binding_and_body_var_types() {
     let TypedExprNode::Var(name) = &left.node else {
         panic!("expected Var(n)");
     };
-    assert_eq!(name, "n");
+    assert_eq!(name.base(), "n");
     assert_eq!(
         left.ty,
         int(),

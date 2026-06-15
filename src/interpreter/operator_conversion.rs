@@ -2,7 +2,7 @@ use log::trace;
 
 use crate::{
     ccl::{
-        AggregateKind, Builtin, Expr, Lit, ProjKey, Type, TypedExprNode,
+        AggregateKind, Builtin, Expr, Lit, Name, ProjKey, Type, TypedExprNode,
         ccl_utils::is_trivially_true_predicate, symbolic::symbolic,
     },
     interpreter::{
@@ -201,7 +201,7 @@ pub struct OpConversionContext {
     /// Variable bindings in scope, innermost scope last.  Each binding
     /// carries a [`BindingKind`] so [`TypedExprNode::Var`] lookups can
     /// dispatch on it without inspecting tile-level types.
-    scopes: ScopeStack<(Rc<FanOut>, BindingKind)>,
+    scopes: ScopeStack<Name, (Rc<FanOut>, BindingKind)>,
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
 }
@@ -279,12 +279,12 @@ impl OpConversionContext {
     /// scope ([`BindingKind::Aligned`]) or outside one ([`BindingKind::Free`]);
     /// [`Self::lookup`] returns this alongside the [`FanOut`] so the
     /// [`TypedExprNode::Var`] arm can dispatch without inspecting tile types.
-    pub(crate) fn bind(&mut self, name: &str, binding: Rc<FanOut>, kind: BindingKind) {
-        self.scopes.bind(name, (binding, kind));
+    pub(crate) fn bind(&mut self, name: &Name, binding: Rc<FanOut>, kind: BindingKind) {
+        self.scopes.bind(name.clone(), (binding, kind));
     }
 
     /// Look up `name` from innermost scope outward.
-    pub(crate) fn lookup(&self, name: &str) -> Option<&(Rc<FanOut>, BindingKind)> {
+    pub(crate) fn lookup(&self, name: &Name) -> Option<&(Rc<FanOut>, BindingKind)> {
         self.scopes.lookup(name)
     }
 

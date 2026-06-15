@@ -58,7 +58,7 @@
 //! [`Feed`]: crate::ccl::TypedExprNode::Feed
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
-use crate::ccl::{Expr, Lit, Type, TypedExprNode, lambda_elim::substitute};
+use crate::ccl::{Expr, Lit, Name, Type, TypedExprNode, lambda_elim::substitute};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -162,15 +162,15 @@ fn should_inline(bound_ty: &Type) -> bool {
 /// `x` via an inner `let x = …` or `λ x → …` would cause the substituted `x`
 /// references to be captured by the shadowing binding, producing incorrect
 /// semantics.
-fn is_let_bound(name: &str, expr: &Expr) -> bool {
+fn is_let_bound(name: &Name, expr: &Expr) -> bool {
     match &expr.node {
         // A Let whose binding matches `name` is a definitive bind site.
-        TypedExprNode::Let { binding, .. } if binding.name == name => true,
+        TypedExprNode::Let { binding, .. } if &binding.name == name => true,
         // A Lambda param shadows `name` inside the body — treat it as a binding
         // site so we don't substitute through it.
-        TypedExprNode::Lambda { param, .. } if param.name == name => true,
+        TypedExprNode::Lambda { param, .. } if &param.name == name => true,
         // A Loop with any param matching `name` is a definitive bind site.
-        TypedExprNode::Loop { params, .. } if params.iter().any(|p| p.name == name) => true,
+        TypedExprNode::Loop { params, .. } if params.iter().any(|p| &p.name == name) => true,
         TypedExprNode::Error => crate::unexpected_error_node!(),
         // A `Case` branch's structural pattern binds its payload name,
         // shadowing `name` inside that branch's guard/body; `any_child`
@@ -182,7 +182,7 @@ fn is_let_bound(name: &str, expr: &Expr) -> bool {
         } => {
             scrutinee.as_ref().is_some_and(|s| is_let_bound(name, s))
                 || branches.iter().any(|b| {
-                    if b.pattern.as_ref().is_some_and(|p| p.binding.name == name) {
+                    if b.pattern.as_ref().is_some_and(|p| &p.binding.name == name) {
                         false
                     } else {
                         is_let_bound(name, &b.guard) || is_let_bound(name, &b.body)
@@ -311,7 +311,7 @@ fn inline_impl(expr: Expr) -> Expr {
 /// perturbs CCC simplify's input shape for list comprehensions, scalar UDFs,
 /// and BinOp paths in ways that need test-suite triage first.  Revisit if a
 /// case surfaces where the surviving anon-lambda blocks downstream work.
-fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
+fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
     // Direct occurrence: replace the variable with the Lambda value.
     if let TypedExprNode::Var(ref n) = expr.node
         && n == name
@@ -399,7 +399,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
     } = expr;
     let new_node = match node {
         TypedExprNode::Lambda { param, body } => {
-            if param.name == name {
+            if &param.name == name {
                 // shadowed — stop substituting inside
                 TypedExprNode::Lambda { param, body }
             } else {
@@ -416,7 +416,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
             body,
         } => {
             let new_bound = inline_and_beta_reduce(*bound_expr, name, lambda);
-            let new_body = if binding.name == name {
+            let new_body = if &binding.name == name {
                 *body
             } else {
                 inline_and_beta_reduce(*body, name, lambda)
@@ -488,7 +488,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &str, lambda: &Expr) -> Expr {
 /// alias of a predicate is the same syntactic predicate, so they all see the
 /// rewrite). `try_borrow_mut` skips a cell already being rewritten higher up
 /// the stack — the outer borrow is processing it.
-fn inline_in_type_predicates(ty: &Type, name: &str, lambda: &Expr) {
+fn inline_in_type_predicates(ty: &Type, name: &Name, lambda: &Expr) {
     if let Type::Refinement(_, r) = ty
         && let Ok(mut pred) = r.predicate.try_borrow_mut()
     {
@@ -502,7 +502,7 @@ fn inline_in_type_predicates(ty: &Type, name: &str, lambda: &Expr) {
 /// Apply chain — i.e. `Var(name)`, or `Apply(_, …Apply(_, Var(name))…)`.
 /// Used by [`inline_and_beta_reduce`] to decide whether an enclosing `Apply`
 /// should beta-reduce after the inner substitution collapses a Lambda.
-fn is_name_in_function_position(expr: &Expr, name: &str) -> bool {
+fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
     match &expr.node {
         TypedExprNode::Var(n) => n == name,
         TypedExprNode::Apply { function, .. } => is_name_in_function_position(function, name),
@@ -942,8 +942,8 @@ mod tests {
     #[test]
     fn name_in_function_position_bare_var() {
         let expr = TypedExpr::var("f");
-        assert!(is_name_in_function_position(&expr, "f"));
-        assert!(!is_name_in_function_position(&expr, "g"));
+        assert!(is_name_in_function_position(&expr, &Name::raw("f")));
+        assert!(!is_name_in_function_position(&expr, &Name::raw("g")));
     }
 
     #[test]
@@ -955,8 +955,8 @@ mod tests {
             TypedExpr::var("f"),
         );
         let outer = TypedExpr::apply(TypedExpr::lit(Lit::Int(2)).with_ty(int), inner);
-        assert!(is_name_in_function_position(&outer, "f"));
-        assert!(!is_name_in_function_position(&outer, "g"));
+        assert!(is_name_in_function_position(&outer, &Name::raw("f")));
+        assert!(!is_name_in_function_position(&outer, &Name::raw("g")));
     }
 
     #[test]
@@ -964,8 +964,8 @@ mod tests {
         // `Apply(Var("f"), Var("g"))` — `f` sits in the *argument* slot, not
         // function. Should not count as `f` in function position.
         let expr = TypedExpr::apply(TypedExpr::var("f"), TypedExpr::var("g"));
-        assert!(is_name_in_function_position(&expr, "g"));
-        assert!(!is_name_in_function_position(&expr, "f"));
+        assert!(is_name_in_function_position(&expr, &Name::raw("g")));
+        assert!(!is_name_in_function_position(&expr, &Name::raw("f")));
     }
 
     #[test]
@@ -973,7 +973,7 @@ mod tests {
         // Lambda/Lit/etc. never put Var(name) in function position by themselves.
         assert!(!is_name_in_function_position(
             &TypedExpr::lit(Lit::Int(1)),
-            "f"
+            &Name::raw("f")
         ));
     }
 
@@ -988,7 +988,7 @@ mod tests {
         let lambda = TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
             .with_ty(fn_ty(int.clone(), int.clone()));
         let body = TypedExpr::var("f").with_ty(fn_ty(int.clone(), int));
-        let result = inline_and_beta_reduce(body, "f", &lambda);
+        let result = inline_and_beta_reduce(body, &Name::raw("f"), &lambda);
         assert_eq!(result, lambda);
     }
 
@@ -1001,7 +1001,7 @@ mod tests {
         let arg = TypedExpr::lit(Lit::Int(3)).with_ty(int.clone());
         let call = TypedExpr::apply(arg.clone(), TypedExpr::var("f").with_ty(lambda.ty.clone()))
             .with_ty(int);
-        let result = inline_and_beta_reduce(call, "f", &lambda);
+        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda);
         assert_eq!(result, arg);
     }
 
@@ -1024,7 +1024,7 @@ mod tests {
             .with_ty(fn_ty(int.clone(), int.clone())),
         )
         .with_ty(int.clone());
-        let result = inline_and_beta_reduce(call, "f", &lambda);
+        let result = inline_and_beta_reduce(call, &Name::raw("f"), &lambda);
         assert_eq!(result, TypedExpr::lit(Lit::Int(1)).with_ty(int));
     }
 
@@ -1044,7 +1044,7 @@ mod tests {
             TypedExpr::lit(Lit::Int(42)).with_ty(int.clone()),
         )
         .with_ty(fn_ty(int.clone(), int));
-        let result = inline_and_beta_reduce(shadowed.clone(), "f", &replacement);
+        let result = inline_and_beta_reduce(shadowed.clone(), &Name::raw("f"), &replacement);
         assert_eq!(result, shadowed);
     }
 

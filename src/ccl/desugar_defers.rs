@@ -83,7 +83,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, Branch, Expr, Lit, Pattern, Refinement, Type, TypedExpr, TypedExprNode,
+    BaseType, Branch, Expr, Lit, Name, Pattern, Refinement, Type, TypedExpr, TypedExprNode,
     ccl_utils::count_free, walk_loop_children,
 };
 
@@ -152,7 +152,7 @@ impl fmt::Display for DeferError {
 /// [`empty_channel`].  See the umbrella entry in `docs/plan.md` ("Tech
 /// Debt — `desugar_defers` prototype") for the planned N-arm refinement-
 /// based fan-out.
-fn try_extract_filter_feed(body: &Expr, defer_name: &str) -> Option<(Expr, Expr)> {
+fn try_extract_filter_feed(body: &Expr, defer_name: &Name) -> Option<(Expr, Expr)> {
     let branches = match &body.node {
         // The filter-feed shape is a guard-only `if` (no scrutinee).
         TypedExprNode::Case {
@@ -188,14 +188,14 @@ fn try_extract_filter_feed(body: &Expr, defer_name: &str) -> Option<(Expr, Expr)
 ///
 /// Rewrites to: `let y = Defer in body_x[x → y] with Var(y) replaced
 /// by body_y`.  The substitution `x → Var(y)` is done via
-/// [`pre_infer_substitute`], which also renames the *target* string of
+/// [`pre_infer_substitute`], which also renames the *target* name of
 /// `Feed`/`Define` nodes when the replacement is a `Var` — so
 /// `Feed("x", …)` becomes `Feed("y", …)` automatically.
 ///
 /// Also handles an optional `ExprStmt` prefix on `bound_expr`: the
 /// heads of any leading ExprStmts become a prefix that's prepended to
 /// the lifted body, with stale Feed/Define target names renamed to `y`.
-fn try_lift_defer(binding_name: &str, bound_expr: &Expr, body: &Expr) -> Option<Expr> {
+fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option<Expr> {
     let mut prefix: Vec<Expr> = Vec::new();
     let mut current = bound_expr.clone();
     while let TypedExprNode::ExprStmt {
@@ -230,7 +230,7 @@ fn try_lift_defer(binding_name: &str, bound_expr: &Expr, body: &Expr) -> Option<
             TypedExprNode::Feed { name: _, value } => TypedExpr {
                 ty: head.ty,
                 node: TypedExprNode::Feed {
-                    name: binding_name.to_string(),
+                    name: binding_name.clone(),
                     value,
                 },
                 user_annotation: None,
@@ -238,7 +238,7 @@ fn try_lift_defer(binding_name: &str, bound_expr: &Expr, body: &Expr) -> Option<
             TypedExprNode::Define { name: _, value } => TypedExpr {
                 ty: head.ty,
                 node: TypedExprNode::Define {
-                    name: binding_name.to_string(),
+                    name: binding_name.clone(),
                     value,
                 },
                 user_annotation: None,
@@ -253,7 +253,7 @@ fn try_lift_defer(binding_name: &str, bound_expr: &Expr, body: &Expr) -> Option<
     let spliced = replace_result_var(inner_subst, new_outer_body);
 
     Some(Expr::let_bind(
-        binding_name.to_string(),
+        binding_name,
         Expr::new(TypedExprNode::Defer),
         spliced,
     ))
@@ -261,12 +261,12 @@ fn try_lift_defer(binding_name: &str, bound_expr: &Expr, body: &Expr) -> Option<
 
 /// Return `true` if `expr` ends in `Var(name)` after walking through
 /// any leading `ExprStmt`/`Let` chains (the body's terminal position).
-fn is_defer_returning(expr: &Expr, name: &str) -> bool {
+fn is_defer_returning(expr: &Expr, name: &Name) -> bool {
     match &expr.node {
         TypedExprNode::Var(n) => n == name,
         TypedExprNode::ExprStmt { body, .. } => is_defer_returning(body, name),
         TypedExprNode::Let { binding, body, .. } => {
-            binding.name != name && is_defer_returning(body, name)
+            &binding.name != name && is_defer_returning(body, name)
         }
         _ => false,
     }
@@ -424,7 +424,7 @@ fn float_defer_in_lambda(lambda: Expr) -> Option<Expr> {
 /// scope shape).  Stopping when we hit other constructs (`Lambda`,
 /// `Apply`, …) keeps the float to the function's *own* defer rather
 /// than nested-closure defers.
-fn extract_defer_binding(body: Expr) -> Option<(Expr, String)> {
+fn extract_defer_binding(body: Expr) -> Option<(Expr, Name)> {
     let TypedExpr {
         node,
         ty,
@@ -439,7 +439,7 @@ fn extract_defer_binding(body: Expr) -> Option<(Expr, String)> {
             if matches!(bound_expr.node, TypedExprNode::Defer) {
                 // Found it.  Rename binding.name → __floated_<name>
                 // throughout the inner body.
-                let floated_name = format!("__floated_{}", binding.name);
+                let floated_name = Name::floated();
                 let renamed =
                     pre_infer_substitute(*inner, &binding.name, &Expr::var(&floated_name));
                 return Some((renamed, floated_name));
@@ -541,16 +541,16 @@ fn chain_has_di(expr: &Expr, ctx: &DesugarCtx) -> bool {
 /// each DI call needs its **own** fresh defer — they're separate
 /// values flowing through the chain.  The *outermost* DI call uses
 /// `outermost_defer` (typically the let-binding's name).  Inner DI
-/// calls get fresh names allocated via [`DesugarCtx::fresh_floated_name`];
-/// those names are returned via `fresh_defers` so the caller can emit
-/// the corresponding `let __fresh = Defer in …` allocations.
+/// calls get fresh names from [`Name::floated`]; those names are returned
+/// via `fresh_defers` so the caller can emit the corresponding
+/// `let __fresh = Defer in …` allocations.
 ///
 /// Walks top-down so the outermost DI is identified first.
 fn wrap_di_calls_in_chain(
     expr: Expr,
-    outermost_defer: &str,
+    outermost_defer: &Name,
     ctx: &mut DesugarCtx,
-) -> (Expr, Vec<String>) {
+) -> (Expr, Vec<Name>) {
     let mut fresh_defers = Vec::new();
     let mut outermost_consumed = false;
     let wrapped = wrap_di_calls_helper(
@@ -565,9 +565,9 @@ fn wrap_di_calls_in_chain(
 
 fn wrap_di_calls_helper(
     expr: Expr,
-    outermost_defer: &str,
+    outermost_defer: &Name,
     outermost_consumed: &mut bool,
-    fresh_defers: &mut Vec<String>,
+    fresh_defers: &mut Vec<Name>,
     ctx: &mut DesugarCtx,
 ) -> Expr {
     let TypedExpr {
@@ -582,18 +582,17 @@ fn wrap_di_calls_helper(
             // first (top-down).
             let is_di = matches!(&function.node, TypedExprNode::Var(fname)
                 if ctx.lookup_function(fname).is_some_and(|f| f.class == LambdaClass::DeferIntroducing));
-            let this_defer = if is_di {
+            // Only a DI call claims a defer; a non-DI Apply has none.
+            let this_defer: Option<Name> = is_di.then(|| {
                 if !*outermost_consumed {
                     *outermost_consumed = true;
-                    outermost_defer.to_string()
+                    outermost_defer.clone()
                 } else {
-                    let fresh = ctx.fresh_floated_name("inner");
+                    let fresh = Name::floated();
                     fresh_defers.push(fresh.clone());
                     fresh
                 }
-            } else {
-                String::new()
-            };
+            });
             let argument = wrap_di_calls_helper(
                 *argument,
                 outermost_defer,
@@ -616,17 +615,16 @@ fn wrap_di_calls_helper(
                 ty: ty.clone(),
                 user_annotation: user_annotation.clone(),
             };
-            if is_di {
-                TypedExpr {
+            match this_defer {
+                Some(defer) => TypedExpr {
                     node: TypedExprNode::Apply {
                         function: Box::new(inner),
-                        argument: Box::new(Expr::var(&this_defer)),
+                        argument: Box::new(Expr::var(&defer)),
                     },
                     ty,
                     user_annotation,
-                }
-            } else {
-                inner
+                },
+                None => inner,
             }
         }
         other => TypedExpr {
@@ -698,7 +696,7 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
                         class,
                         lambda: lambda.clone(),
                         feed_targets: Vec::new(),
-                        primary_target: String::new(),
+                        primary_target: None,
                     };
                     let prev = ctx.register_function(binding.name.clone(), info);
                     let new_body = rewrite_chains_in_scope(*body, ctx);
@@ -756,7 +754,7 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
                 user_annotation: user_annotation.clone(),
             };
             if chain_has_di(&expr_for_check, ctx) {
-                let fresh = ctx.fresh_floated_name("chain");
+                let fresh = Name::floated();
                 let (wrapped, inner_fresh_defers) =
                     wrap_di_calls_in_chain(expr_for_check, &fresh, ctx);
                 // Same nesting order as the Let case: outermost
@@ -918,19 +916,19 @@ fn contains_defer(expr: &Expr) -> bool {
 /// `name` (shadowing it).  Used by the alias-inline check to avoid
 /// substituting an alias name with a source name that would be captured
 /// by a shadowing rebind inside the body.
-fn rebinds(expr: &Expr, name: &str) -> bool {
+fn rebinds(expr: &Expr, name: &Name) -> bool {
     // Recognise binder variants that introduce `name` directly.  Lambda's
     // refinement and Let's bound_expr live in the outer scope (not bound
     // by the param/binding), but if they themselves contain a rebind of
     // `name` further down, `any_child` finds it via structural recursion
     // below — no need to short-circuit on the binder structure here.
     let here = match &expr.node {
-        TypedExprNode::Let { binding, .. } => binding.name == name,
-        TypedExprNode::Lambda { param, .. } => param.name == name,
-        TypedExprNode::Loop { params, .. } => params.iter().any(|p| p.name == name),
+        TypedExprNode::Let { binding, .. } => &binding.name == name,
+        TypedExprNode::Lambda { param, .. } => &param.name == name,
+        TypedExprNode::Loop { params, .. } => params.iter().any(|p| &p.name == name),
         TypedExprNode::Case { branches, .. } => branches
             .iter()
-            .any(|b| b.pattern.as_ref().is_some_and(|p| p.binding.name == name)),
+            .any(|b| b.pattern.as_ref().is_some_and(|p| &p.binding.name == name)),
         _ => false,
     };
     here || expr.any_child(|c| rebinds(c, name))
@@ -939,9 +937,9 @@ fn rebinds(expr: &Expr, name: &str) -> bool {
 /// Return `true` if `expr` contains any `Feed(target, …)` or
 /// `Define(target, …)` node where `target == name`, respecting shadowing
 /// by `Let`/`Lambda` bindings that rebind `name`.
-fn contains_feed_or_define_for(expr: &Expr, name: &str) -> bool {
+fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
     match &expr.node {
-        // Hit: the Feed/Define's target string matches.  Also recurse into
+        // Hit: the Feed/Define's target name matches.  Also recurse into
         // the value (a Feed value could itself contain another
         // Feed/Define of the same name).
         TypedExprNode::Feed { name: t, value } | TypedExprNode::Define { name: t, value } => {
@@ -957,10 +955,10 @@ fn contains_feed_or_define_for(expr: &Expr, name: &str) -> bool {
             body,
         } => {
             contains_feed_or_define_for(bound_expr, name)
-                || (binding.name != name && contains_feed_or_define_for(body, name))
+                || (&binding.name != name && contains_feed_or_define_for(body, name))
         }
         TypedExprNode::Lambda { param, body, .. } => {
-            param.name != name && contains_feed_or_define_for(body, name)
+            &param.name != name && contains_feed_or_define_for(body, name)
         }
         TypedExprNode::Loop {
             params,
@@ -973,7 +971,7 @@ fn contains_feed_or_define_for(expr: &Expr, name: &str) -> bool {
                 .iter()
                 .any(|e| contains_feed_or_define_for(e, name))
                 || contains_feed_or_define_for(source, name)
-                || (!params.iter().any(|p| p.name == name)
+                || (!params.iter().any(|p| &p.name == name)
                     && contains_feed_or_define_for(loop_body, name))
         }
         _ => expr.any_child(|c| contains_feed_or_define_for(c, name)),
@@ -985,11 +983,11 @@ fn contains_feed_or_define_for(expr: &Expr, name: &str) -> bool {
 /// A simpler variant of [`crate::ccl::lambda_elim::substitute`] that does
 /// not require the expression to be type-checked — desugar runs
 /// pre-inference where types are still `Hole`s.  When `replacement` is a
-/// `Var(new_name)`, `Feed`/`Define` nodes whose target string matches
+/// `Var(new_name)`, `Feed`/`Define` nodes whose target name matches
 /// `name` are also renamed to `new_name`; this is the α-renaming that
 /// makes alias-inlining for defer handles correct.
-fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
-    let replacement_name = match &replacement.node {
+fn pre_infer_substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
+    let replacement_name: Option<Name> = match &replacement.node {
         TypedExprNode::Var(n) => Some(n.clone()),
         _ => None,
     };
@@ -999,7 +997,7 @@ fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
         user_annotation,
     } = expr;
     let new_node = match node {
-        TypedExprNode::Var(n) if n == name => return replacement.clone(),
+        TypedExprNode::Var(n) if &n == name => return replacement.clone(),
         TypedExprNode::Var(n) => TypedExprNode::Var(n),
         leaf @ (TypedExprNode::Lit(_)
         | TypedExprNode::Builtin(_)
@@ -1032,7 +1030,7 @@ fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
         },
         TypedExprNode::Lambda { param, body } => {
             // Param shadows `name` inside the body.
-            let body = if param.name == name {
+            let body = if &param.name == name {
                 *body
             } else {
                 pre_infer_substitute(*body, name, replacement)
@@ -1048,7 +1046,7 @@ fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             body,
         } => {
             let bound_expr = pre_infer_substitute(*bound_expr, name, replacement);
-            let body = if binding.name == name {
+            let body = if &binding.name == name {
                 *body
             } else {
                 pre_infer_substitute(*body, name, replacement)
@@ -1117,13 +1115,13 @@ fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             expr: Box::new(pre_infer_substitute(*e, name, replacement)),
             body: Box::new(pre_infer_substitute(*body, name, replacement)),
         },
-        // Feed/Define nodes: rename the target string when the
+        // Feed/Define nodes: rename the target name when the
         // replacement is itself a Var, and substitute inside the value.
         TypedExprNode::Feed {
             name: target,
             value,
         } => TypedExprNode::Feed {
-            name: if target == name {
+            name: if &target == name {
                 replacement_name.clone().unwrap_or(target)
             } else {
                 target
@@ -1134,7 +1132,7 @@ fn pre_infer_substitute(expr: Expr, name: &str, replacement: &Expr) -> Expr {
             name: target,
             value,
         } => TypedExprNode::Define {
-            name: if target == name {
+            name: if &target == name {
                 replacement_name.clone().unwrap_or(target)
             } else {
                 target
@@ -1177,13 +1175,15 @@ struct FunctionInfo {
     /// At call sites, the smart walker uses these names to construct
     /// the per-target `Record` projection that becomes the cluster's
     /// channel contribution.
-    feed_targets: Vec<String>,
+    feed_targets: Vec<Name>,
     /// The primary target — the lambda-param-side defer name (PaT
     /// param, or floated inner param for DI).  At call sites this
     /// maps to the call's first argument; closure-captured targets
     /// in [`Self::feed_targets`] keep their own names across the
-    /// function boundary.  Empty string when registered by Phase 1.
-    primary_target: String,
+    /// function boundary.  `None` when registered by Phase 1 (a
+    /// placeholder before the function is classified) or for a
+    /// [`LambdaClass::VarBody`] function, which has no target.
+    primary_target: Option<Name>,
 }
 
 /// Mutable state threaded through the desugar walk.
@@ -1195,52 +1195,34 @@ struct FunctionInfo {
 /// defer-mediating functions in scope, consulted by the chain
 /// rewriter at call sites.
 struct DesugarCtx {
-    counter: u64,
     /// Defer-mediating functions in lexical scope, keyed by binding
     /// name.  Populated by [`desugar`]'s `Let` arm when classification
     /// flags a lambda as non-`Plain`; the previous binding (if any)
     /// is saved and restored on scope exit so shadowing is handled
     /// correctly.
-    functions: HashMap<String, FunctionInfo>,
+    functions: HashMap<Name, FunctionInfo>,
 }
 
 impl DesugarCtx {
     fn new() -> Self {
         Self {
-            counter: 0,
             functions: HashMap::new(),
         }
-    }
-
-    fn fresh_shadow_rename(&mut self, name: &str) -> String {
-        let n = self.counter;
-        self.counter += 1;
-        format!("__shadowed_{name}_{n}")
-    }
-
-    /// Mint a fresh name for the defer allocated at one direct call
-    /// site of a [`LambdaClass::DeferIntroducing`] function.  The
-    /// `defer_name` part is the original (pre-float) defer's name,
-    /// kept as a breadcrumb so debug output is readable.
-    fn fresh_floated_name(&mut self, defer_name: &str) -> String {
-        let n = self.counter;
-        self.counter += 1;
-        format!("__floated_{defer_name}_{n}")
     }
 
     /// Register a defer-mediating function as in-scope.  Returns the
     /// previous binding under `name` (if any) so the caller can
     /// restore it when the lexical scope ends.
-    fn register_function(&mut self, name: String, info: FunctionInfo) -> Option<FunctionInfo> {
+    fn register_function(&mut self, name: Name, info: FunctionInfo) -> Option<FunctionInfo> {
         self.functions.insert(name, info)
     }
 
     /// Pop a function registration on scope exit.  Restores the saved
     /// previous binding (if any).
-    fn unregister_function(&mut self, name: &str, prev: Option<FunctionInfo>) {
+    fn unregister_function(&mut self, name: &Name, prev: Option<FunctionInfo>) {
         match prev {
             Some(p) => {
-                self.functions.insert(name.to_string(), p);
+                self.functions.insert(name.clone(), p);
             }
             None => {
                 self.functions.remove(name);
@@ -1248,14 +1230,14 @@ impl DesugarCtx {
         }
     }
 
-    fn lookup_function(&self, name: &str) -> Option<&FunctionInfo> {
+    fn lookup_function(&self, name: &Name) -> Option<&FunctionInfo> {
         self.functions.get(name)
     }
 }
 
 /// The field name on the per-scope result Record that carries the channel
 /// contributions for defer `d`.
-fn channel_field_name(defer_name: &str) -> String {
+fn channel_field_name(defer_name: &Name) -> String {
     format!("to_{defer_name}")
 }
 
@@ -1410,7 +1392,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
     match &expr.node {
         TypedExprNode::Defer => Err(DeferError::UnboundDeferHandle("<defer>".into())),
         TypedExprNode::Feed { name, .. } | TypedExprNode::Define { name, .. } => {
-            Err(DeferError::UnboundDeferHandle(name.clone()))
+            Err(DeferError::UnboundDeferHandle(name.base().to_string()))
         }
         TypedExprNode::Let {
             bound_expr, body, ..
@@ -1664,7 +1646,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // `Feed(y, …)` nodes (which really write to the upstream
             // defer `x`) are recognized.
             //
-            // [`pre_infer_substitute`] renames the *target* string of
+            // [`pre_infer_substitute`] renames the *target* name of
             // `Feed`/`Define` nodes when the replacement is a `Var`,
             // so `Feed("y", …)` becomes `Feed("x", …)` automatically.
             //
@@ -1722,13 +1704,13 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
 /// used directly, and top-level scalar feeds are lifted to `Fun(Unit,
 /// T)` via the `λ __unused → V` wrap inside `extract_for_defer`.
 fn channelize_cluster(
-    defer_names: &[String],
+    defer_names: &[Name],
     body: Expr,
     ctx: &mut DesugarCtx,
 ) -> Result<Expr, DeferError> {
     // Extract feeds/defines for each defer.  `rewritten` accumulates the
     // body's Feed/Define replacements as we process each defer in turn.
-    let mut channels: HashMap<String, Expr> = HashMap::new();
+    let mut channels: HashMap<Name, Expr> = HashMap::new();
     let mut rewritten = body;
     for name in defer_names.iter().rev() {
         // Process innermost defer first so its feeds are picked up before
@@ -1740,10 +1722,12 @@ fn channelize_cluster(
         let mut define: Option<Expr> = None;
         rewritten = extract_for_defer(rewritten, name, &mut feeds, &mut define, false, ctx)?;
         let channel = match (feeds.is_empty(), define) {
-            (true, None) => return Err(DeferError::NoFeedOrDefine(name.clone())),
+            (true, None) => return Err(DeferError::NoFeedOrDefine(name.base().to_string())),
             (true, Some(d)) => d,
             (false, None) => combine_feed_values(feeds),
-            (false, Some(_)) => return Err(DeferError::FeedsAndDefinesMixed(name.clone())),
+            (false, Some(_)) => {
+                return Err(DeferError::FeedsAndDefinesMixed(name.base().to_string()));
+            }
         };
         channels.insert(name.clone(), channel);
     }
@@ -1754,9 +1738,9 @@ fn channelize_cluster(
     // first α-renaming any downstream Let-shadows of channel free
     // variables so the channels keep referring to the values they
     // captured at their original feed positions.
-    let protected: HashSet<String> = compute_protected_set(&rewritten, &channels);
+    let protected: HashSet<Name> = compute_protected_set(&rewritten, &channels);
     Ok(rename_shadows_then_bind(
-        rewritten, &order, channels, &protected, ctx,
+        rewritten, &order, channels, &protected,
     ))
 }
 
@@ -1771,12 +1755,12 @@ fn channelize_cluster(
 /// introduced *inside* `body` by `lower_mutation_loop`) are excluded
 /// because the channel's reference correctly resolves to the binding
 /// inside `body`; renaming would break the link.
-fn compute_protected_set(body: &Expr, channels: &HashMap<String, Expr>) -> HashSet<String> {
-    let mut channel_fvs: HashSet<String> = HashSet::new();
+fn compute_protected_set(body: &Expr, channels: &HashMap<Name, Expr>) -> HashSet<Name> {
+    let mut channel_fvs: HashSet<Name> = HashSet::new();
     for c in channels.values() {
         collect_free_vars(c, &mut channel_fvs);
     }
-    let mut body_fvs: HashSet<String> = HashSet::new();
+    let mut body_fvs: HashSet<Name> = HashSet::new();
     collect_free_vars(body, &mut body_fvs);
     channel_fvs.intersection(&body_fvs).cloned().collect()
 }
@@ -1787,10 +1771,9 @@ fn compute_protected_set(body: &Expr, channels: &HashMap<String, Expr>) -> HashS
 /// let-chain in topological order.
 fn rename_shadows_then_bind(
     expr: Expr,
-    order: &[String],
-    channels: HashMap<String, Expr>,
-    protected: &HashSet<String>,
-    ctx: &mut DesugarCtx,
+    order: &[Name],
+    channels: HashMap<Name, Expr>,
+    protected: &HashSet<Name>,
 ) -> Expr {
     let TypedExpr {
         node,
@@ -1808,7 +1791,7 @@ fn rename_shadows_then_bind(
             // left alone — its references to `binding.name` (e.g.
             // `(__acc_stream_1 ≫ .step, x) ▷ last_or_default` where `x`
             // is the outer binding) resolve outward correctly.
-            let fresh = ctx.fresh_shadow_rename(&binding.name);
+            let fresh = Name::shadow_rename();
             let new_body = pre_infer_substitute(*body, &binding.name, &Expr::var(&fresh));
             let new_binding = crate::ccl::TypedBinding {
                 name: fresh,
@@ -1820,7 +1803,7 @@ fn rename_shadows_then_bind(
                     binding: new_binding,
                     bound_expr,
                     body: Box::new(rename_shadows_then_bind(
-                        new_body, order, channels, protected, ctx,
+                        new_body, order, channels, protected,
                     )),
                 },
                 ty,
@@ -1865,9 +1848,7 @@ fn rename_shadows_then_bind(
                 node: TypedExprNode::Let {
                     binding,
                     bound_expr,
-                    body: Box::new(rename_shadows_then_bind(
-                        *body, order, channels, protected, ctx,
-                    )),
+                    body: Box::new(rename_shadows_then_bind(*body, order, channels, protected)),
                 },
                 ty,
                 user_annotation,
@@ -1876,9 +1857,7 @@ fn rename_shadows_then_bind(
         TypedExprNode::ExprStmt { expr: e, body } => TypedExpr {
             node: TypedExprNode::ExprStmt {
                 expr: e,
-                body: Box::new(rename_shadows_then_bind(
-                    *body, order, channels, protected, ctx,
-                )),
+                body: Box::new(rename_shadows_then_bind(*body, order, channels, protected)),
             },
             ty,
             user_annotation,
@@ -1899,7 +1878,7 @@ fn rename_shadows_then_bind(
 /// expression.  Stops at the first non-`Let` node.  Used by the
 /// smart walker to wrap feeds extracted from a substituted body
 /// with the lets they reference.
-fn capture_let_chain_prefix(expr: &Expr) -> Vec<(String, Expr)> {
+fn capture_let_chain_prefix(expr: &Expr) -> Vec<(Name, Expr)> {
     let mut out = Vec::new();
     let mut current = expr;
     while let TypedExprNode::Let {
@@ -1916,7 +1895,7 @@ fn capture_let_chain_prefix(expr: &Expr) -> Vec<(String, Expr)> {
 
 /// Wrap `inner` with a sequence of `let name_i = bound_expr_i in …`
 /// from `prefix` (outermost first), so the let-chain scopes `inner`.
-fn wrap_with_let_prefix(prefix: &[(String, Expr)], inner: Expr) -> Expr {
+fn wrap_with_let_prefix(prefix: &[(Name, Expr)], inner: Expr) -> Expr {
     let mut result = inner;
     for (name, bound) in prefix.iter().rev() {
         result = Expr::let_bind(name.clone(), bound.clone(), result);
@@ -1926,7 +1905,7 @@ fn wrap_with_let_prefix(prefix: &[(String, Expr)], inner: Expr) -> Expr {
 
 /// Wrap `inner` with the cluster's `let n_i = channel_i in …` bindings
 /// in topological order (so dependencies are bound before dependents).
-fn emit_cluster_then(inner: Expr, order: &[String], mut channels: HashMap<String, Expr>) -> Expr {
+fn emit_cluster_then(inner: Expr, order: &[Name], mut channels: HashMap<Name, Expr>) -> Expr {
     let mut result = inner;
     for name in order.iter().rev() {
         if let Some(channel) = channels.remove(name) {
@@ -1955,8 +1934,8 @@ fn emit_cluster_then(inner: Expr, order: &[String], mut channels: HashMap<String
 /// anywhere," not "does the name occur free per lexical-scope
 /// rules."  This matches [`crate::ccl::ccl_utils::count_free`]'s
 /// behaviour on type refinements.
-fn collect_free_vars(expr: &Expr, out: &mut HashSet<String>) {
-    fn rec(expr: &Expr, bound: &mut Vec<String>, out: &mut HashSet<String>) {
+fn collect_free_vars(expr: &Expr, out: &mut HashSet<Name>) {
+    fn rec(expr: &Expr, bound: &mut Vec<Name>, out: &mut HashSet<Name>) {
         // Type-position predicates on this node (`expr.ty` and any
         // user-supplied annotation) are visited unconditionally — they
         // belong to the *outer* scope, and shadowing inside them isn't
@@ -2027,7 +2006,7 @@ fn collect_free_vars(expr: &Expr, out: &mut HashSet<String>) {
 /// `try_borrow().ok()` silently treats an actively-mutated predicate
 /// as "no references"; callers run between passes when no predicate
 /// is being walked elsewhere, so the under-count is safe in practice.
-fn collect_free_vars_in_type(ty: &Type, out: &mut HashSet<String>) {
+fn collect_free_vars_in_type(ty: &Type, out: &mut HashSet<Name>) {
     if let Type::Refinement(_, refinement) = ty {
         let pred_rc = &refinement.predicate;
         if let Ok(pred) = pred_rc.try_borrow() {
@@ -2051,49 +2030,49 @@ fn collect_free_vars_in_type(ty: &Type, out: &mut HashSet<String>) {
 /// the resolution would require letrec semantics that CCL doesn't yet
 /// support.
 fn topo_sort_cluster(
-    defer_names: &[String],
-    channels: &HashMap<String, Expr>,
-) -> Result<Vec<String>, DeferError> {
-    let names: Vec<String> = defer_names.to_vec();
+    defer_names: &[Name],
+    channels: &HashMap<Name, Expr>,
+) -> Result<Vec<Name>, DeferError> {
+    let names: Vec<Name> = defer_names.to_vec();
     // Build dependency edges: d_i depends on d_j if d_i's channel references Var(d_j).
-    let mut deps: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut deps: HashMap<&Name, Vec<&Name>> = HashMap::new();
     for d in &names {
         let mut d_deps = Vec::new();
         if let Some(channel) = channels.get(d) {
             for other in &names {
                 if other != d && count_free(other, channel) > 0 {
-                    d_deps.push(other.as_str());
+                    d_deps.push(other);
                 }
             }
         }
-        deps.insert(d.as_str(), d_deps);
+        deps.insert(d, d_deps);
     }
-    let mut sorted: Vec<String> = Vec::with_capacity(names.len());
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut visiting: HashSet<String> = HashSet::new();
+    let mut sorted: Vec<Name> = Vec::with_capacity(names.len());
+    let mut visited: HashSet<Name> = HashSet::new();
+    let mut visiting: HashSet<Name> = HashSet::new();
     fn visit(
-        name: &str,
-        deps: &HashMap<&str, Vec<&str>>,
-        visited: &mut HashSet<String>,
-        visiting: &mut HashSet<String>,
-        sorted: &mut Vec<String>,
+        name: &Name,
+        deps: &HashMap<&Name, Vec<&Name>>,
+        visited: &mut HashSet<Name>,
+        visiting: &mut HashSet<Name>,
+        sorted: &mut Vec<Name>,
     ) -> Result<(), DeferError> {
         if visited.contains(name) {
             return Ok(());
         }
         if visiting.contains(name) {
             // Cycle — currently unsupported.
-            return Err(DeferError::MutuallyRecursiveCycle(name.to_string()));
+            return Err(DeferError::MutuallyRecursiveCycle(name.base().to_string()));
         }
-        visiting.insert(name.to_string());
+        visiting.insert(name.clone());
         if let Some(dep_list) = deps.get(name) {
             for dep in dep_list {
                 visit(dep, deps, visited, visiting, sorted)?;
             }
         }
         visiting.remove(name);
-        visited.insert(name.to_string());
-        sorted.push(name.to_string());
+        visited.insert(name.clone());
+        sorted.push(name.clone());
         Ok(())
     }
     for d in &names {
@@ -2109,8 +2088,8 @@ fn topo_sort_cluster(
 /// term spine.  Used to identify the full set of defers a function's
 /// body feeds (param + closure-captured) before rewriting the body to
 /// a per-target contributions Record.
-fn collect_feed_target_names(expr: &Expr) -> Vec<String> {
-    fn rec(expr: &Expr, bound: &mut Vec<String>, out: &mut HashSet<String>) {
+fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
+    fn rec(expr: &Expr, bound: &mut Vec<Name>, out: &mut HashSet<Name>) {
         match &expr.node {
             TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
                 if !bound.iter().any(|b| b == name) {
@@ -2216,9 +2195,9 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<String> {
             }
         }
     }
-    let mut targets: HashSet<String> = HashSet::new();
+    let mut targets: HashSet<Name> = HashSet::new();
     rec(expr, &mut Vec::new(), &mut targets);
-    let mut sorted: Vec<String> = targets.into_iter().collect();
+    let mut sorted: Vec<Name> = targets.into_iter().collect();
     // Deterministic order so generated field names compare reliably.
     sorted.sort();
     sorted
@@ -2229,12 +2208,13 @@ struct RewrittenFunction {
     /// The lambda with body replaced by the contributions Record.
     lambda: Expr,
     /// All defer targets the body feeds, primary target first.
-    targets: Vec<String>,
+    targets: Vec<Name>,
     /// Primary target — the lambda-param-side defer name.  For PaT,
     /// this is the lambda's only param; for DI, the floated inner
     /// param.  Other entries in `targets` are closure-captured
     /// defers whose names cross the function boundary unchanged.
-    primary_target: String,
+    /// `None` for a [`LambdaClass::VarBody`] function (no target).
+    primary_target: Option<Name>,
 }
 
 /// Rewrite a defer-mediating lambda's body to return a `Record` whose
@@ -2261,7 +2241,7 @@ fn rewrite_lambda_to_return_contributions(
         return Ok(RewrittenFunction {
             lambda,
             targets: Vec::new(),
-            primary_target: String::new(),
+            primary_target: None,
         });
     }
     let TypedExpr {
@@ -2283,7 +2263,7 @@ fn rewrite_lambda_to_return_contributions(
                     user_annotation,
                 },
                 targets: cr.targets,
-                primary_target,
+                primary_target: Some(primary_target),
             })
         }
         (
@@ -2325,7 +2305,7 @@ fn rewrite_lambda_to_return_contributions(
                     user_annotation,
                 },
                 targets: cr.targets,
-                primary_target,
+                primary_target: Some(primary_target),
             })
         }
         _ => unreachable!(
@@ -2342,7 +2322,7 @@ struct ContributionsRecord {
     /// see and typecheck this expression normally.
     body: Expr,
     /// Targets in deterministic order, primary target first.
-    targets: Vec<String>,
+    targets: Vec<Name>,
 }
 
 /// Walk `body` per target in `collect_feed_target_names(body)`,
@@ -2353,14 +2333,14 @@ struct ContributionsRecord {
 /// the caller can identify it for call-site projection mapping.
 fn build_contributions_record(
     body: Expr,
-    primary_target: &str,
+    primary_target: &Name,
     ctx: &mut DesugarCtx,
 ) -> Result<ContributionsRecord, DeferError> {
     let raw_targets = collect_feed_target_names(&body);
     // Reorder so the primary target is first.
-    let mut targets: Vec<String> = Vec::with_capacity(raw_targets.len().max(1));
+    let mut targets: Vec<Name> = Vec::with_capacity(raw_targets.len().max(1));
     if raw_targets.iter().any(|t| t == primary_target) {
-        targets.push(primary_target.to_string());
+        targets.push(primary_target.clone());
     }
     for t in &raw_targets {
         if t != primary_target {
@@ -2394,7 +2374,9 @@ fn build_contributions_record(
             (true, None) => continue, // target was collected but no feeds for it — skip.
             (true, Some(d)) => d,
             (false, None) => combine_feed_values(feeds),
-            (false, Some(_)) => return Err(DeferError::FeedsAndDefinesMixed(target.clone())),
+            (false, Some(_)) => {
+                return Err(DeferError::FeedsAndDefinesMixed(target.base().to_string()));
+            }
         };
         fields.push((channel_field_name(target), contribution));
     }
@@ -2472,8 +2454,8 @@ fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
 fn smart_walk_synthesize_call_contributions(
     call_expr: &Expr,
     finfo: &FunctionInfo,
-    current_target: &str,
-    defer_name: &str,
+    current_target: &Name,
+    defer_name: &Name,
     feeds: &mut Vec<Expr>,
 ) -> Expr {
     // The call's `ty` / `user_annotation` are the original Apply's
@@ -2482,7 +2464,7 @@ fn smart_walk_synthesize_call_contributions(
     // `Var(defer_name)`, since the cluster's defer-handle binding
     // carries the same type.
     let residue_var = || TypedExpr {
-        node: TypedExprNode::Var(defer_name.to_string()),
+        node: TypedExprNode::Var(defer_name.clone()),
         ty: call_expr.ty.clone(),
         user_annotation: call_expr.user_annotation.clone(),
     };
@@ -2556,7 +2538,7 @@ fn try_smart_walk_pat(
     argument: &Expr,
     outer_ty: &Type,
     outer_ann: &Option<Type>,
-    defer_name: &str,
+    defer_name: &Name,
     feeds: &mut Vec<Expr>,
     ctx: &DesugarCtx,
 ) -> Option<Expr> {
@@ -2585,7 +2567,10 @@ fn try_smart_walk_pat(
     Some(smart_walk_synthesize_call_contributions(
         &call_expr,
         finfo,
-        &finfo.primary_target,
+        finfo
+            .primary_target
+            .as_ref()
+            .expect("DI/PaT call shape implies a classified primary target"),
         defer_name,
         feeds,
     ))
@@ -2616,7 +2601,7 @@ fn try_smart_walk_di(
     argument: &Expr,
     outer_ty: &Type,
     outer_ann: &Option<Type>,
-    defer_name: &str,
+    defer_name: &Name,
     feeds: &mut Vec<Expr>,
     ctx: &DesugarCtx,
 ) -> Option<Expr> {
@@ -2651,7 +2636,10 @@ fn try_smart_walk_di(
     Some(smart_walk_synthesize_call_contributions(
         &call_expr,
         finfo,
-        &finfo.primary_target,
+        finfo
+            .primary_target
+            .as_ref()
+            .expect("DI/PaT call shape implies a classified primary target"),
         defer_name,
         feeds,
     ))
@@ -2675,7 +2663,7 @@ fn try_smart_walk_di(
 /// would need to escape the inner scope.
 fn extract_for_defer(
     expr: Expr,
-    defer_name: &str,
+    defer_name: &Name,
     feeds: &mut Vec<Expr>,
     define: &mut Option<Expr>,
     in_inner_scope: bool,
@@ -2687,7 +2675,7 @@ fn extract_for_defer(
         user_annotation,
     } = expr;
     let node = match node {
-        TypedExprNode::Feed { name, value } if name == defer_name => {
+        TypedExprNode::Feed { name, value } if &name == defer_name => {
             // Top-level (non-iteration) Feeds carry scalar values that need
             // lifting to `Fun(Unit, T)` to match the defer-handle's
             // expected function shape (the consumer compiles to a
@@ -2705,7 +2693,7 @@ fn extract_for_defer(
             feeds.push(lifted);
             TypedExprNode::Lit(Lit::Unit)
         }
-        TypedExprNode::Define { name, value } if name == defer_name => {
+        TypedExprNode::Define { name, value } if &name == defer_name => {
             if in_inner_scope {
                 return Err(DeferError::NestedDefinition);
             }
@@ -2731,7 +2719,8 @@ fn extract_for_defer(
             // this special case the generic Loop arm clones the Loop
             // into the channel projection, duplicating the entire
             // recurrence cycle in the operator graph.
-            if matches!(bound_expr.node, TypedExprNode::Loop { .. }) && binding.name != defer_name {
+            if matches!(bound_expr.node, TypedExprNode::Loop { .. }) && &binding.name != defer_name
+            {
                 let new_bound_expr = process_loop_for_defer(
                     *bound_expr,
                     defer_name,
@@ -2749,7 +2738,7 @@ fn extract_for_defer(
             } else {
                 let bound_expr =
                     extract_for_defer(*bound_expr, defer_name, feeds, define, in_inner_scope, ctx)?;
-                let body = if binding.name == defer_name {
+                let body = if &binding.name == defer_name {
                     // Inner let shadows the defer name; do not descend.
                     *body
                 } else {
@@ -2848,7 +2837,7 @@ fn extract_for_defer(
                 param,
                 body: lambda_body,
             } = function.node.clone()
-                && param.name != defer_name
+                && &param.name != defer_name
             {
                 // Filter-feed pattern: `λ p → Case({g → Feed(d, V); true →
                 // Unit})`.  Recognized so we can emit the channel as a source
@@ -3065,7 +3054,7 @@ fn extract_for_defer(
                 let elt_ty = elt.ty.clone();
                 let elt_user_ann = elt.user_annotation.clone();
                 match elt.node {
-                    TypedExprNode::Lambda { param, body } if param.name != defer_name => {
+                    TypedExprNode::Lambda { param, body } if &param.name != defer_name => {
                         // Filter-feed: `λ p → Case({g → Feed(d, V); true →
                         // Unit})` becomes a refined-Lambda channel
                         // (`λ p with {g} → V`) plus a Lambda whose body
@@ -3206,7 +3195,7 @@ fn extract_for_defer(
             // contains an ExprStmt-wrapped Compose-with-feed.)
             let mut local_feeds: Vec<Expr> = Vec::new();
             let mut local_define: Option<Expr> = None;
-            let body = if param.name == defer_name {
+            let body = if &param.name == defer_name {
                 *body
             } else {
                 extract_for_defer(
@@ -3353,7 +3342,7 @@ fn extract_for_defer(
 /// with `Record({result: <terminal>, to_<defer>: channel})`.
 ///
 /// Used by the Case-branch arm to publish the per-branch channel value.
-fn augment_terminal_with_channel(expr: Expr, defer_name: &str, channel: Expr) -> Expr {
+fn augment_terminal_with_channel(expr: Expr, defer_name: &Name, channel: Expr) -> Expr {
     let TypedExpr {
         node,
         ty,
@@ -3411,8 +3400,8 @@ fn augment_terminal_with_channel(expr: Expr, defer_name: &str, channel: Expr) ->
 /// extracted by recursing through [`extract_for_defer`].
 fn process_loop_for_defer(
     loop_expr: Expr,
-    defer_name: &str,
-    binding_name: Option<&str>,
+    defer_name: &Name,
+    binding_name: Option<&Name>,
     feeds: &mut Vec<Expr>,
     ctx: &DesugarCtx,
 ) -> Result<Expr, DeferError> {
@@ -3450,7 +3439,7 @@ fn process_loop_for_defer(
     if local_define.is_some() {
         return Err(DeferError::NestedDefinition);
     }
-    let body_shadows = params.iter().any(|p| p.name == defer_name);
+    let body_shadows = params.iter().any(|p| &p.name == defer_name);
     if body_shadows {
         return Ok(TypedExpr {
             node: TypedExprNode::Loop {
@@ -3727,7 +3716,7 @@ mod tests {
     /// `λc → feed(c, 100); c` — param-as-target.
     #[test]
     fn classify_param_as_target() {
-        let body = Expr::expr_stmt(Expr::feed("c".into(), lit(100)), var("c"));
+        let body = Expr::expr_stmt(Expr::feed("c", lit(100)), var("c"));
         let lambda = Expr::lambda("c", Type::Hole, body);
         assert_eq!(classify_lambda(&lambda), LambdaClass::ParamAsTarget);
     }
@@ -3748,7 +3737,7 @@ mod tests {
     /// `λp → λ__floated_x → feed(__floated_x, p); __floated_x`.
     #[test]
     fn float_defer_introducing_lambda() {
-        let inner = Expr::expr_stmt(Expr::feed("x".into(), var("p")), var("x"));
+        let inner = Expr::expr_stmt(Expr::feed("x", var("p")), var("x"));
         let body = Expr::let_bind("x", Expr::new(TypedExprNode::Defer), inner);
         let lambda = Expr::lambda("p", Type::Hole, body);
         let floated = float_defer_in_lambda(lambda).expect("should float");
@@ -3763,7 +3752,7 @@ mod tests {
         else {
             panic!("expected outer Lambda after float");
         };
-        assert_eq!(outer_param.name, "p");
+        assert_eq!(outer_param.name, Name::raw("p"));
         let TypedExprNode::Lambda {
             param: inner_param,
             body: inner_body,
@@ -3772,8 +3761,21 @@ mod tests {
         else {
             panic!("expected inner Lambda after float (the floated param)");
         };
-        assert_eq!(inner_param.name, "__floated_x");
-        // The inner body should be `ExprStmt(Feed("__floated_x", p), Var("__floated_x"))`.
+        // The floated binder is a FloatedDefer synthetic (its uid is freshly
+        // minted, so we capture it and check it's used consistently rather
+        // than reconstruct it).
+        let floated = inner_param.name.clone();
+        assert!(
+            matches!(
+                floated,
+                Name::Synthetic {
+                    kind: crate::ccl::names::SyntheticKind::FloatedDefer,
+                    ..
+                }
+            ),
+            "inner param is a floated-defer synthetic, got {floated:?}"
+        );
+        // The inner body should be `ExprStmt(Feed(<floated>, p), Var(<floated>))`.
         let TypedExprNode::ExprStmt {
             expr: feed_node,
             body: ret_node,
@@ -3787,17 +3789,20 @@ mod tests {
         else {
             panic!("expected Feed node");
         };
-        assert_eq!(feed_name, "__floated_x", "feed target renamed to floated");
+        assert_eq!(
+            feed_name, floated,
+            "feed target renamed to the floated binder"
+        );
         let TypedExprNode::Var(ret_name) = ret_node.node else {
             panic!("expected Var as return");
         };
-        assert_eq!(ret_name, "__floated_x", "return renamed to floated");
+        assert_eq!(ret_name, floated, "return renamed to the floated binder");
     }
 
     /// Non-DeferIntroducing lambdas return `None` from `float_defer_in_lambda`.
     #[test]
     fn float_returns_none_for_param_as_target() {
-        let body = Expr::expr_stmt(Expr::feed("c".into(), lit(100)), var("c"));
+        let body = Expr::expr_stmt(Expr::feed("c", lit(100)), var("c"));
         let lambda = Expr::lambda("c", Type::Hole, body);
         assert!(float_defer_in_lambda(lambda).is_none());
     }
@@ -3813,7 +3818,7 @@ mod tests {
     /// descend through the prefix so float still succeeds.
     #[test]
     fn classify_and_float_through_let_prefix() {
-        let inner = Expr::expr_stmt(Expr::feed("x".into(), var("xs")), var("x"));
+        let inner = Expr::expr_stmt(Expr::feed("x", var("xs")), var("x"));
         let defer_let = Expr::let_bind("x", Expr::new(TypedExprNode::Defer), inner);
         let n_let = Expr::let_bind("n", lit(0), defer_let);
         let lambda = Expr::lambda("xs", Type::Hole, n_let);
@@ -3834,11 +3839,18 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(inner_param.name, "__floated_x");
+        let floated = inner_param.name.clone();
+        assert!(matches!(
+            floated,
+            Name::Synthetic {
+                kind: crate::ccl::names::SyntheticKind::FloatedDefer,
+                ..
+            }
+        ));
         let TypedExprNode::Let { binding, body, .. } = inner_body.node else {
             panic!("expected let-prefix preserved under floated lambda")
         };
-        assert_eq!(binding.name, "n");
+        assert_eq!(binding.name, Name::raw("n"));
         // The let-prefix's body should be the renamed inner.
         let TypedExprNode::ExprStmt { expr, .. } = body.node else {
             panic!()
@@ -3846,7 +3858,7 @@ mod tests {
         let TypedExprNode::Feed { name, .. } = expr.node else {
             panic!()
         };
-        assert_eq!(name, "__floated_x");
+        assert_eq!(name, floated);
     }
 
     /// Post-float curried form: `λn → λ__floated_x → __floated_x`
@@ -3863,8 +3875,7 @@ mod tests {
     /// the inner param as a feed target.  Recognised as DI.
     #[test]
     fn classify_post_float_curried_with_param_feed() {
-        let inner_body =
-            Expr::expr_stmt(Expr::feed("__floated".into(), var("n")), var("__floated"));
+        let inner_body = Expr::expr_stmt(Expr::feed("__floated", var("n")), var("__floated"));
         let inner = Expr::lambda("__floated", Type::Hole, inner_body);
         let outer = Expr::lambda("n", Type::Hole, inner);
         assert_eq!(classify_lambda(&outer), LambdaClass::DeferIntroducing);
@@ -3884,7 +3895,7 @@ mod tests {
             class,
             lambda,
             feed_targets: Vec::new(),
-            primary_target: String::new(),
+            primary_target: None,
         }
     }
 
@@ -3904,7 +3915,7 @@ mod tests {
 
     fn ctx_with_pat(name: &str) -> DesugarCtx {
         let mut ctx = DesugarCtx::new();
-        let body = Expr::expr_stmt(Expr::feed("c".into(), lit(100)), var("c"));
+        let body = Expr::expr_stmt(Expr::feed("c", lit(100)), var("c"));
         let lambda = Expr::lambda("c", Type::Hole, body);
         ctx.register_function(
             name.into(),
@@ -3946,7 +3957,7 @@ mod tests {
         let pat_lambda = Expr::lambda(
             "c",
             Type::Hole,
-            Expr::expr_stmt(Expr::feed("c".into(), lit(100)), var("c")),
+            Expr::expr_stmt(Expr::feed("c", lit(100)), var("c")),
         );
         ctx.register_function(
             "g".into(),
@@ -3963,7 +3974,7 @@ mod tests {
     fn wrap_di_calls_single_call() {
         let mut ctx = ctx_with_di("f");
         let expr = Expr::apply(lit(10), var("f"));
-        let (wrapped, fresh) = wrap_di_calls_in_chain(expr, "y", &mut ctx);
+        let (wrapped, fresh) = wrap_di_calls_in_chain(expr, &Name::raw("y"), &mut ctx);
         assert!(fresh.is_empty(), "single DI uses requested name only");
         // Expect Apply { function: Apply { function: Var(f), argument: Lit(10) }, argument: Var(y) }
         let TypedExprNode::Apply {
@@ -3976,7 +3987,7 @@ mod tests {
         let TypedExprNode::Var(arg_name) = outer_arg.node else {
             panic!()
         };
-        assert_eq!(arg_name, "y");
+        assert_eq!(arg_name, Name::raw("y"));
         let TypedExprNode::Apply {
             function: inner_fn, ..
         } = outer_fn.node
@@ -3986,7 +3997,7 @@ mod tests {
         let TypedExprNode::Var(fn_name) = inner_fn.node else {
             panic!()
         };
-        assert_eq!(fn_name, "f");
+        assert_eq!(fn_name, Name::raw("f"));
     }
 
     /// Composed DI-DI `doubles(add_one(xs))` allocates a separate
@@ -4011,11 +4022,17 @@ mod tests {
         // doubles(add_one(xs)) ≡ Apply(Apply(xs, add_one), doubles)
         let inner = Expr::apply(var("xs"), var("add_one"));
         let outer = Expr::apply(inner, var("doubles"));
-        let (_wrapped, fresh) = wrap_di_calls_in_chain(outer, "y", &mut ctx);
+        let (_wrapped, fresh) = wrap_di_calls_in_chain(outer, &Name::raw("y"), &mut ctx);
         // One fresh defer for the inner DI (add_one).  The outer
         // (doubles) uses "y".
         assert_eq!(fresh.len(), 1, "one fresh defer for inner DI");
-        assert!(fresh[0].starts_with("__floated_inner_"));
+        assert!(matches!(
+            fresh[0],
+            Name::Synthetic {
+                kind: crate::ccl::names::SyntheticKind::FloatedDefer,
+                ..
+            }
+        ));
     }
 
     /// `capture_let_chain_prefix` collects `(name, bound_expr)` pairs
@@ -4026,8 +4043,8 @@ mod tests {
         let body = Expr::let_bind("a", lit(1), Expr::let_bind("b", lit(2), var("c")));
         let prefix = capture_let_chain_prefix(&body);
         assert_eq!(prefix.len(), 2);
-        assert_eq!(prefix[0].0, "a");
-        assert_eq!(prefix[1].0, "b");
+        assert_eq!(prefix[0].0, Name::raw("a"));
+        assert_eq!(prefix[1].0, Name::raw("b"));
     }
 
     /// `wrap_with_let_prefix` reconstructs the let-chain around an inner expression.
@@ -4044,7 +4061,7 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(a_b.name, "a");
+        assert_eq!(a_b.name, Name::raw("a"));
         let TypedExprNode::Let {
             binding: b_b,
             body: inner2,
@@ -4053,16 +4070,16 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(b_b.name, "b");
+        assert_eq!(b_b.name, Name::raw("b"));
         let TypedExprNode::Var(c) = inner2.node else {
             panic!()
         };
-        assert_eq!(c, "c");
+        assert_eq!(c, Name::raw("c"));
     }
 
     #[test]
     fn run_single_feed() {
-        let body = Expr::expr_stmt(Expr::feed("d".into(), lit(1)), var("d"));
+        let body = Expr::expr_stmt(Expr::feed("d", lit(1)), var("d"));
         let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
         let result = run(expr).unwrap();
         // After desugar: let __scope_out_d_0 = (Unit; Record({result: d, to_d: 1})) in
@@ -4080,7 +4097,7 @@ mod tests {
     /// `let d = Defer in define(d, 42); d` — Define path: bind d to V directly.
     #[test]
     fn run_define_replaces_directly() {
-        let body = Expr::expr_stmt(Expr::define("d".into(), lit(42)), var("d"));
+        let body = Expr::expr_stmt(Expr::define("d", lit(42)), var("d"));
         let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
         let result = run(expr).unwrap();
         let s = symbolic(&result);
@@ -4105,8 +4122,8 @@ mod tests {
     #[test]
     fn run_multiple_feeds_use_collection_union() {
         let body = Expr::expr_stmt(
-            Expr::feed("d".into(), lit(1)),
-            Expr::expr_stmt(Expr::feed("d".into(), lit(2)), var("d")),
+            Expr::feed("d", lit(1)),
+            Expr::expr_stmt(Expr::feed("d", lit(2)), var("d")),
         );
         let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
         let result = run(expr).unwrap();
@@ -4141,11 +4158,11 @@ mod tests {
         // a
         // ```
         let inner = Expr::expr_stmt(
-            Expr::define("a".into(), var("b")),
+            Expr::define("a", var("b")),
             Expr::expr_stmt(
-                Expr::define("b".into(), var("c")),
+                Expr::define("b", var("c")),
                 Expr::expr_stmt(
-                    Expr::define("c".into(), Expr::list(vec![lit(0), lit(1)])),
+                    Expr::define("c", Expr::list(vec![lit(0), lit(1)])),
                     var("a"),
                 ),
             ),
@@ -4171,8 +4188,8 @@ mod tests {
     #[test]
     fn run_mutual_cycle_is_error() {
         let inner = Expr::expr_stmt(
-            Expr::define("a".into(), var("b")),
-            Expr::expr_stmt(Expr::define("b".into(), var("a")), var("a")),
+            Expr::define("a", var("b")),
+            Expr::expr_stmt(Expr::define("b", var("a")), var("a")),
         );
         let with_b = Expr::let_bind("b", Expr::new(TypedExprNode::Defer), inner);
         let with_a = Expr::let_bind("a", Expr::new(TypedExprNode::Defer), with_b);
@@ -4194,8 +4211,8 @@ mod tests {
         //        Record({step: Var(p)})))
         let inner_record = Expr::new(TypedExprNode::Record(vec![("step".into(), var("p"))]));
         let with_two_feeds = Expr::expr_stmt(
-            Expr::feed("d".into(), lit(1)),
-            Expr::expr_stmt(Expr::feed("d".into(), lit(2)), inner_record),
+            Expr::feed("d", lit(1)),
+            Expr::expr_stmt(Expr::feed("d", lit(2)), inner_record),
         );
         let body_lambda = Expr::lambda("p", Type::Hole, with_two_feeds);
         let loop_expr = Expr::loop_node(
@@ -4240,7 +4257,7 @@ mod tests {
         let feeding_arm = Branch {
             pattern: None,
             guard,
-            body: Expr::feed("d".into(), var("x")),
+            body: Expr::feed("d", var("x")),
         };
         let unrelated_arm = Branch {
             pattern: None,
@@ -4287,7 +4304,7 @@ mod tests {
             predicate: Rc::new(RefCell::new(pred)),
         };
         let annotated = TypedExpr {
-            node: TypedExprNode::Var("__chan".to_string()),
+            node: TypedExprNode::Var(Name::raw("__chan")),
             ty: Type::Hole,
             user_annotation: Some(Type::fun(
                 Type::Refinement(Box::new(Type::Hole), refinement),
@@ -4295,15 +4312,15 @@ mod tests {
             )),
         };
 
-        let mut free: HashSet<String> = HashSet::new();
+        let mut free: HashSet<Name> = HashSet::new();
         collect_free_vars(&annotated, &mut free);
         assert!(
-            free.contains("outer_n"),
+            free.contains(&Name::raw("outer_n")),
             "user_annotation predicate reference should be collected: got {free:?}"
         );
         // The expression node itself names `__chan` — also collected.
         assert!(
-            free.contains("__chan"),
+            free.contains(&Name::raw("__chan")),
             "expr node Var was missed: {free:?}"
         );
     }
@@ -4325,10 +4342,10 @@ mod tests {
             },
             user_annotation: None,
         };
-        let mut free: HashSet<String> = HashSet::new();
+        let mut free: HashSet<Name> = HashSet::new();
         collect_free_vars(&typed, &mut free);
         assert!(
-            free.contains("inner_k"),
+            free.contains(&Name::raw("inner_k")),
             "expr.ty predicate reference should be collected: got {free:?}"
         );
     }

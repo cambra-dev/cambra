@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
-use crate::ccl::{Expr, InferVarId, Type, TypedExprNode};
+use crate::ccl::{Expr, InferVarId, Name, Type, TypedExprNode};
 use crate::util::ScopeStack;
 
 // ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ impl Drop for InferArena {
 #[derive(Default)]
 pub struct TypeInferenceContext {
     /// Lexical scopes mapping variable names to their types.
-    scopes: ScopeStack<Type>,
+    scopes: ScopeStack<Name, Type>,
 
     /// Types of known externally-registered data sources.
     pub(crate) source_types: HashMap<String, Type>,
@@ -205,7 +205,7 @@ impl TypeInferenceContext {
 }
 
 impl Deref for TypeInferenceContext {
-    type Target = ScopeStack<Type>;
+    type Target = ScopeStack<Name, Type>;
     fn deref(&self) -> &Self::Target {
         &self.scopes
     }
@@ -447,11 +447,11 @@ fn collect_expr_errors(
     // into their children; everything else just visits its direct children.
     match &expr.node {
         TypedExprNode::Lambda { param, body, .. } => {
-            collect_type_errors(&param.ty, &param.name, errors, seen_refinements);
+            collect_type_errors(&param.ty, param.name.base(), errors, seen_refinements);
             collect_expr_errors(body, errors, seen_refinements);
         }
         TypedExprNode::Let { binding, .. } => {
-            collect_type_errors(&binding.ty, &binding.name, errors, seen_refinements);
+            collect_type_errors(&binding.ty, binding.name.base(), errors, seen_refinements);
             expr.walk_children(|e| collect_expr_errors(e, errors, seen_refinements));
         }
         TypedExprNode::VariantCtor { payload, .. } => {
@@ -468,7 +468,12 @@ fn collect_expr_errors(
             }
             for b in branches {
                 if let Some(p) = &b.pattern {
-                    collect_type_errors(&p.binding.ty, &p.binding.name, errors, seen_refinements);
+                    collect_type_errors(
+                        &p.binding.ty,
+                        p.binding.name.base(),
+                        errors,
+                        seen_refinements,
+                    );
                 }
                 collect_expr_errors(&b.guard, errors, seen_refinements);
                 collect_expr_errors(&b.body, errors, seen_refinements);
@@ -476,7 +481,7 @@ fn collect_expr_errors(
         }
         TypedExprNode::Loop { params, .. } => {
             for p in params {
-                collect_type_errors(&p.ty, &p.name, errors, seen_refinements);
+                collect_type_errors(&p.ty, p.name.base(), errors, seen_refinements);
             }
             expr.walk_children(|e| collect_expr_errors(e, errors, seen_refinements));
         }
@@ -747,7 +752,7 @@ mod tests {
         let body = Expr::apply(Expr::var("p"), Expr::proj_index(0));
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
-                name: "p".to_string(),
+                name: "p".into(),
                 ty: Type::Tuple(vec![Type::Hole, Type::Hole]),
                 user_annotation: None,
             },
@@ -1005,7 +1010,7 @@ mod tests {
             Err(vec![InferError::UnboundVariable("unbound_var".into())])
         );
         // The scope stack must be empty: "x" should not be visible.
-        assert_eq!(ctx.lookup("x"), None);
+        assert_eq!(ctx.lookup(&Name::raw("x")), None);
     }
 
     #[test]
@@ -1457,7 +1462,7 @@ mod tests {
         let inner = Expr::lambda("s", Type::Base(BaseType::String), Expr::var("s"));
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
-                name: "x".to_string(),
+                name: "x".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::Base(BaseType::Int)),
             },
@@ -1487,7 +1492,7 @@ mod tests {
         let mut expr = TypedExpr::new(TypedExprNode::Apply {
             function: Box::new(TypedExpr::new(TypedExprNode::Lambda {
                 param: TypedBinding {
-                    name: "x".to_string(),
+                    name: "x".into(),
                     ty: Type::infer(),
                     user_annotation: Some(Type::Base(BaseType::String)),
                 },
@@ -1517,7 +1522,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
-                name: "x".to_string(),
+                name: "x".into(),
                 ty: Type::infer(),
                 user_annotation: Some(Type::Base(BaseType::Int)),
             },
@@ -2113,7 +2118,7 @@ mod tests {
         // domain is String — typecheck must detect this.
         let lambda = Expr::new(TypedExprNode::Lambda {
             param: TypedBinding {
-                name: "x".to_string(),
+                name: "x".into(),
                 ty: Type::Base(BaseType::String),
                 user_annotation: None,
             },

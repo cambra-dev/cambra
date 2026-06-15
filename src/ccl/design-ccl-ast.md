@@ -44,19 +44,28 @@ CCL is a λ-calculus IR, not strict A-Normal Form. In ANF every intermediate res
 
 Rationale: strict ANF over-normalizes the tree, destroying structural information needed for optimization passes (reordering, equivalency checks, fusion).
 
-### No α-renaming — name uniqueness not guaranteed
+### Structured names and α-uniquification (Barendregt convention)
 
-CCL does not perform variable renaming (α-renaming) as ANF or SSA IRs do. CHL reassignment of the same variable (`x = 1; x = 2`) produces nested `Let` bindings that shadow each other:
+Binder and variable names are a structured `Name` enum (`ccl/names.rs`), not a bare string. The four ways a name comes to exist are four variants, so the case a site handles is a `match` arm rather than a magic-value check:
+
+- **`Raw(String)`** — what lowering builds; identity is the string (two source binders can share a spelling).
+- **`Unique { base, uid }`** — a uniquified *source* binder; identity is the globally-fresh `uid`, `base` is the source spelling kept as display metadata. Minted at uniquification for every source binding site.
+- **`Synthetic { kind, name }`** — a *compiler-introduced* binder (`kind ∈ {Pair, Mono, ShadowRename, FloatedDefer, SolverArg}`); identity is the mangled `name`. Operationally identical to `Unique` (globally distinct, capture-free) — it differs only in *provenance*: minted by a pass, not written by the user. That keeps `Unique`'s invariant exact ("after uniquification every binder is `Unique`" — a `Synthetic` there is a pass minting too early) and `Unique.base` trustworthy as a real identifier. The solver's dependent-application binder (`__arg`) is a `SolverArg` synthetic, not a `Unique`.
+- **`Reserved(ReservedName)`** — a name with custom semantics; the only one is the refinement element binder `__elem`, the single shared name every refinement binds (which is what makes refinement equality plain structural equality of bare predicates).
+
+Symbolic output prints `Name::base()` for every variant; `Debug` surfaces the `uid` for `Unique`. Identity decisions are `match`es on the variant, never string comparison (e.g. `n.is_elem()`, not `n.base() == "__elem"`).
+
+Lowering itself does not rename: CHL reassignment of the same variable (`x = 1; x = 2`) produces nested `Let` bindings that shadow each other, with both binders spelled `x`. Immediately after lowering, the **uniquify pass** (`ccl/uniquify.rs`) mints a globally fresh uid at every binding site and resolves each bound reference to the binder that lexically binds it:
 
 ```
-let x = 1
-in let x = 2   ← same name, new binding; value evaluated in outer scope
-in x
+let x#1 = 1
+in let x#2 = 2   ← same spelling, its own binder identity
+in x#2
 ```
 
-The semantics are correct for sequential code — each `Let` evaluates its value expression in the enclosing scope before the new binding takes effect — but the same name may appear at multiple binding sites in the tree.
+After uniquification, shadowing ceases to exist for every downstream pass: plain structural equality on terms coincides with α-equivalence, so refinement-predicate comparisons need no scope analysis. The convention is *unique binding sites at lowering; copying preserves uids; no pass mints fresh uids on an equality-mediated path* — passes that duplicate terms (discharges, monomorphization splices, lowering's own clone of comprehension generator sources into the loop-join predicate) copy minted names verbatim, so copies compare equal by construction. Two *independently lowered* α-equivalent terms do **not** compare equal; the one place lowering needed that (the loop-join source clone), it pre-mints the subtree before cloning (see `ccl/uniquify.rs` module docs, "mint before copy").
 
-Rationale: renaming every assignment to a fresh variable would over-normalize the tree for the same reasons strict ANF does, destroying structural information useful for optimization passes.
+Renaming happens at the name level only — the tree shape is untouched, so this does not over-normalize the way strict ANF or SSA conversion would.
 
 ### Application shape
 

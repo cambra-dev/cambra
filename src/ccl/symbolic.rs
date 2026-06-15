@@ -125,7 +125,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
     let res = match &expr.node {
         TypedExprNode::Lit(lit) => (Precedence::Atom, fmt_lit(lit)),
 
-        TypedExprNode::Var(name) => (Precedence::Atom, name.clone()),
+        TypedExprNode::Var(name) => (Precedence::Atom, name.base().to_string()),
 
         TypedExprNode::Builtin(b) => (Precedence::Atom, b.name().to_string()),
 

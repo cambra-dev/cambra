@@ -25,13 +25,12 @@
 //! avoid capture.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ccl::ccl_utils::{is_free, is_free_in_value};
-use crate::ccl::{Branch, PredicateCellId, REFINEMENT_BINDER, Type, TypedExpr, TypedExprNode};
+use crate::ccl::{Branch, Name, PredicateCellId, Type, TypedExpr, TypedExprNode};
 
 /// A term binder name.
-pub type Binder = String;
+pub type Binder = Name;
 
 /// A single mapping target: a **rename** to another binder (invertible) or a
 /// **discharge** to a term (one-way).
@@ -66,15 +65,14 @@ impl Mapping {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Subst(BTreeMap<Binder, Mapping>);
 
-/// Monotonic source of fresh binder suffixes for capture-avoiding α-renaming.
-/// Renaming is rare (only when a substitution's range mentions a binder it is
-/// passing under), so a process-global counter is fine — uniqueness is all that
-/// matters, not determinism across runs.
-static FRESH_BINDER: AtomicU64 = AtomicU64::new(0);
-
+/// Mint a fresh binder for capture-avoiding α-renaming — renaming an existing
+/// binder to a fresh `uid` while preserving its `base`, so it stays the same
+/// (source) binder's lineage as a [`Name::Unique`]. Under the Barendregt
+/// convention this never fires (capture is impossible); stage 2 of the
+/// immutable-predicates plan asserts that and deletes this together with its
+/// only callers.
 pub fn fresh_binder(base: &str) -> Binder {
-    let n = FRESH_BINDER.fetch_add(1, Ordering::Relaxed);
-    format!("{base}#{n}")
+    Name::fresh(base)
 }
 
 impl Subst {
@@ -92,9 +90,9 @@ impl Subst {
     }
 
     /// A rename `[from ↦ to]` — a bijection on binders, hence invertible.
-    pub fn rename(from: &str, to: &str) -> Self {
+    pub fn rename(from: impl Into<Name>, to: impl Into<Name>) -> Self {
         let mut m = BTreeMap::new();
-        m.insert(from.to_string(), Mapping::Rename(to.to_string()));
+        m.insert(from.into(), Mapping::Rename(to.into()));
         Subst(m)
     }
 
@@ -109,9 +107,9 @@ impl Subst {
     /// is honest, and a caller that *means* a frame correspondence
     /// (relabeling, inversion-safe with no license) must say so with
     /// [`Subst::rename`].
-    pub fn discharge(binder: &str, term: TypedExpr) -> Self {
+    pub fn discharge(binder: impl Into<Name>, term: TypedExpr) -> Self {
         let mut m = BTreeMap::new();
-        m.insert(binder.to_string(), Mapping::Discharge(Box::new(term)));
+        m.insert(binder.into(), Mapping::Discharge(Box::new(term)));
         Subst(m)
     }
 
@@ -174,7 +172,7 @@ impl Subst {
 
     /// True if any binder of `self`'s *range* (the replacement terms) contains a
     /// free `name` — i.e. substituting under a binder `name` would capture.
-    fn range_mentions(&self, name: &str) -> bool {
+    fn range_mentions(&self, name: &Name) -> bool {
         self.0.values().any(|m| match m {
             Mapping::Rename(to) => to == name,
             Mapping::Discharge(t) => is_free(name, t),
@@ -229,9 +227,9 @@ impl Subst {
     /// Extend this substitution with a fresh binder correspondence `k ↦ x`
     /// (the Pi-vs-Pi binder alignment derived in the codomain edge). `k` is a
     /// newly-scoped binder, so this is an insert, not a composition.
-    pub fn extended_rename(&self, k: &str, x: &str) -> Subst {
+    pub fn extended_rename(&self, k: impl Into<Name>, x: impl Into<Name>) -> Subst {
         let mut m = self.0.clone();
-        m.insert(k.to_string(), Mapping::Rename(x.to_string()));
+        m.insert(k.into(), Mapping::Rename(x.into()));
         Subst(m)
     }
 
@@ -258,7 +256,7 @@ impl Subst {
     /// When polymorphic fibers land, delete this view: the bridge then sees
     /// the honest `Discharge` species and its tripwire reports exactly the
     /// sites that demanded the no-longer-licensed transport. The retirement
-    /// plan — observability probes first, then γ[σ] suspensions-on-uses for
+    /// plan — observability probes first, then γ\[σ\] suspensions-on-uses for
     /// first-class dependent functions — is tracked in the vault issue
     /// `type-checker-first-class-dependent-functions`.
     pub fn licensed_correspondence_view(&self) -> Subst {
@@ -445,22 +443,22 @@ impl Subst {
     /// `binder` to a fresh name if the (restricted) range would capture it.
     /// Returns the (possibly fresh) binder name to install and the substitution
     /// to use inside its scope.
-    fn under_binder(&self, binder: &str, body: &TypedExpr) -> (Binder, Subst) {
+    fn under_binder(&self, binder: &Name, body: &TypedExpr) -> (Binder, Subst) {
         let restricted = self.shadow(binder);
         // If no substituted binder occurs free in the body, the substitution is
         // inert there — return the identity so the body is left untouched and no
         // spurious capture-avoiding rename is triggered.
         if !restricted.0.keys().any(|k| is_free_in_value(k, body)) {
-            return (binder.to_string(), Subst::id());
+            return (binder.clone(), Subst::id());
         }
         if restricted.range_mentions(binder) {
-            let fresh = fresh_binder(binder);
+            let fresh = fresh_binder(binder.base());
             // Compose the α-rename into the restricted substitution so the body
             // both renames the binder and applies the outer map.
             let renamed = Subst::then(&Subst::rename(binder, &fresh), &restricted);
             (fresh, renamed)
         } else {
-            (binder.to_string(), restricted)
+            (binder.clone(), restricted)
         }
     }
 
@@ -484,7 +482,7 @@ impl Subst {
         // it is never α-renamed — every refinement shares the one global name,
         // and a predicate only ever references its *own* element through it, so
         // there is no capture to avoid.
-        let restricted = self.shadow(REFINEMENT_BINDER);
+        let restricted = self.shadow(&Name::elem());
         let new_pred = {
             let pred = r.predicate.borrow();
             // Vacuous here (no substituted binder occurs free in the
@@ -528,7 +526,7 @@ impl Subst {
 
     /// This substitution with `binder` removed from its source domain (the
     /// binder shadows the outer mapping inside its scope).
-    pub fn shadow(&self, binder: &str) -> Subst {
+    pub fn shadow(&self, binder: &Name) -> Subst {
         if !self.0.contains_key(binder) {
             return self.clone();
         }
@@ -605,20 +603,20 @@ impl Subst {
 
     /// `Fun`-codomain analogue of [`under_binder`](Self::under_binder): shadow
     /// the Pi binder in `codomain`, α-renaming it if the range would capture.
-    fn under_binder_ty(&self, binder: &str, codomain: &Type) -> (Binder, Type) {
+    fn under_binder_ty(&self, binder: &Name, codomain: &Type) -> (Binder, Type) {
         let restricted = self.shadow(binder);
         if restricted.range_mentions(binder) {
-            let fresh = fresh_binder(binder);
+            let fresh = fresh_binder(binder.base());
             let renamed = Subst::rename(binder, &fresh).apply_type(codomain);
             (fresh, restricted.apply_type(&renamed))
         } else {
-            (binder.to_string(), restricted.apply_type(codomain))
+            (binder.clone(), restricted.apply_type(codomain))
         }
     }
 }
 
 /// Is `e` exactly the variable `name` (a bare `Var(name)`)?
-fn is_var_named(e: &TypedExpr, name: &str) -> bool {
+fn is_var_named(e: &TypedExpr, name: &Name) -> bool {
     matches!(&e.node, TypedExprNode::Var(n) if n == name)
 }
 
@@ -689,7 +687,7 @@ fn collect_type_fv(
             if visited.insert(r.cell_id())
                 && let Ok(pred) = r.predicate.try_borrow()
             {
-                with_binders(bound, [REFINEMENT_BINDER.to_string()], |bnd| {
+                with_binders(bound, [Name::elem()], |bnd| {
                     collect_expr_fv(&pred, bnd, visited, out)
                 });
             }
@@ -925,8 +923,8 @@ mod tests {
                 predicate: std::rc::Rc::new(std::cell::RefCell::new(pred)),
             },
         );
-        let only_x: BTreeSet<Binder> = ["x".to_string()].into_iter().collect();
-        let only_k: BTreeSet<Binder> = ["k".to_string()].into_iter().collect();
+        let only_x: BTreeSet<Binder> = [Name::raw("x")].into_iter().collect();
+        let only_k: BTreeSet<Binder> = [Name::raw("k")].into_iter().collect();
         assert!(!well_formed(&bad, &only_x));
         assert!(well_formed(&bad, &only_k));
     }
@@ -941,10 +939,17 @@ mod tests {
         let TypedExprNode::Lambda { param, body, .. } = &out.node else {
             panic!("expected lambda");
         };
-        assert_ne!(param.name, "x", "binder must have been α-renamed");
+        assert_ne!(
+            param.name,
+            Name::raw("x"),
+            "binder must have been α-renamed"
+        );
         // The body's original `x` now refers to the fresh binder, and the
         // substituted `k` became the *outer* `x`.
-        assert!(is_free("x", &out), "outer x is free after substitution");
+        assert!(
+            is_free(&Name::raw("x"), &out),
+            "outer x is free after substitution"
+        );
         // Exactly one free `x` (the substituted k), not the bound occurrence.
         let inner_binder = param.name.clone();
         assert!(is_free(&inner_binder, body));

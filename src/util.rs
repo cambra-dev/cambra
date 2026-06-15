@@ -40,29 +40,29 @@ pub fn fmt_record<V: std::fmt::Display>(
 /// [`bind`](Self::bind) records a name→value mapping in the innermost scope;
 /// [`lookup`](Self::lookup) searches from innermost to outermost, returning the first match.
 ///
-/// This type is generic over the stored value `V`:
+/// This type is generic over the key `K` and the stored value `V`:
 /// ```
 /// use cambra::util::ScopeStack;
 ///
-/// let mut stack: ScopeStack<i32> = ScopeStack::new();
+/// let mut stack: ScopeStack<String, i32> = ScopeStack::new();
 ///
 /// {
 ///     let mut scope = stack.enter_scope();
-///     scope.bind("x", 1);
+///     scope.bind("x".to_string(), 1);
 ///     assert_eq!(scope.lookup("x"), Some(&1));
 ///
 ///     // Inner scope shadows "x".
 ///     let mut inner = scope.enter_scope();
-///     inner.bind("x", 2);
+///     inner.bind("x".to_string(), 2);
 ///     assert_eq!(inner.lookup("x"), Some(&2));
 ///     // `inner` drops here, popping the inner scope.
 /// }
 /// // `scope` drops here, popping the outer scope.
 /// // The stack is now empty; `stack` can be dropped cleanly.
 /// ```
-pub struct ScopeStack<V> {
+pub struct ScopeStack<K, V> {
     /// Scope stack; innermost scope is last.
-    scopes: Vec<HashMap<String, V>>,
+    scopes: Vec<HashMap<K, V>>,
 }
 
 /// An RAII guard that pops a scope from its [`ScopeStack`] when dropped.
@@ -79,24 +79,24 @@ pub struct ScopeStack<V> {
 /// temporary), the scope opens and closes before any bindings are added,
 /// silently falling back to the outer scope.
 #[must_use = "ScopeGuard pops the scope on drop; if unused, the scope closes immediately"]
-pub struct ScopeGuard<'a, V> {
-    stack: &'a mut ScopeStack<V>,
+pub struct ScopeGuard<'a, K: Eq + std::hash::Hash + std::fmt::Debug, V> {
+    stack: &'a mut ScopeStack<K, V>,
 }
 
-impl<'a, V> std::ops::Deref for ScopeGuard<'a, V> {
-    type Target = ScopeStack<V>;
+impl<'a, K: Eq + std::hash::Hash + std::fmt::Debug, V> std::ops::Deref for ScopeGuard<'a, K, V> {
+    type Target = ScopeStack<K, V>;
     fn deref(&self) -> &Self::Target {
         self.stack
     }
 }
 
-impl<'a, V> std::ops::DerefMut for ScopeGuard<'a, V> {
+impl<'a, K: Eq + std::hash::Hash + std::fmt::Debug, V> std::ops::DerefMut for ScopeGuard<'a, K, V> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.stack
     }
 }
 
-impl<'a, V> Drop for ScopeGuard<'a, V> {
+impl<'a, K: Eq + std::hash::Hash + std::fmt::Debug, V> Drop for ScopeGuard<'a, K, V> {
     fn drop(&mut self) {
         // Invariant: `enter_scope` always pushes before handing out this guard,
         // and `scopes` is private, so underflow is impossible in correct code.
@@ -105,7 +105,7 @@ impl<'a, V> Drop for ScopeGuard<'a, V> {
     }
 }
 
-impl<V> ScopeStack<V> {
+impl<K: Eq + std::hash::Hash + std::fmt::Debug, V> ScopeStack<K, V> {
     /// Create a new, empty scope stack.
     pub fn new() -> Self {
         ScopeStack { scopes: Vec::new() }
@@ -116,7 +116,7 @@ impl<V> ScopeStack<V> {
     /// The scope is pushed immediately and popped when the returned [`ScopeGuard`]
     /// goes out of scope. `&mut guard` deref-coerces to `&mut ScopeStack<V>`, so
     /// the guard can be passed directly to functions expecting `&mut ScopeStack<V>`.
-    pub fn enter_scope(&mut self) -> ScopeGuard<'_, V> {
+    pub fn enter_scope(&mut self) -> ScopeGuard<'_, K, V> {
         self.push_scope();
         ScopeGuard { stack: self }
     }
@@ -140,10 +140,7 @@ impl<V> ScopeStack<V> {
                 .scopes
                 .pop()
                 .expect("ScopeStack: scope underflow in pop_scope");
-            trace!(
-                "ScopeStack: pop_scope; popped={:?}",
-                popped.keys().cloned().collect::<Vec<String>>()
-            );
+            trace!("ScopeStack: pop_scope; popped={:?}", popped.keys());
         } else {
             self.scopes.pop();
         }
@@ -155,26 +152,32 @@ impl<V> ScopeStack<V> {
     ///
     /// Panics if called outside of an active scope (no scopes pushed).
     /// In debug builds, also panics if `name` is already bound in the current scope.
-    pub fn bind(&mut self, name: &str, value: V) {
-        debug!("Binding '{name}' in scope");
+    pub fn bind(&mut self, name: impl Into<K>, value: V) {
+        let name = name.into();
+        debug!("Binding '{name:?}' in scope");
         let scope = self
             .scopes
             .last_mut()
             .expect("ScopeStack::bind called with no active scope");
         debug_assert!(
-            !scope.contains_key(name),
-            "ScopeStack::bind: '{name}' already bound in the current scope"
+            !scope.contains_key(&name),
+            "ScopeStack::bind: '{name:?}' already bound in the current scope"
         );
-        scope.insert(name.to_string(), value);
+        scope.insert(name, value);
     }
 
     /// Look up `name` from innermost scope outward, returning the first match.
-    pub fn lookup(&self, name: &str) -> Option<&V> {
+    pub fn lookup<Q>(&self, name: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
         self.scopes.iter().rev().find_map(|s| s.get(name))
     }
 
     pub fn fmt_scopes(&self) -> String
     where
+        K: std::fmt::Display,
         V: std::fmt::Display,
     {
         self.scopes
@@ -192,7 +195,7 @@ impl<V> ScopeStack<V> {
     }
 }
 
-impl<V> Drop for ScopeStack<V> {
+impl<K, V> Drop for ScopeStack<K, V> {
     fn drop(&mut self) {
         // If we are already panicking, don't double-panic (which aborts).
         if !std::thread::panicking() && !self.scopes.is_empty() {
@@ -204,7 +207,7 @@ impl<V> Drop for ScopeStack<V> {
     }
 }
 
-impl<V> Default for ScopeStack<V> {
+impl<K: Eq + std::hash::Hash + std::fmt::Debug, V> Default for ScopeStack<K, V> {
     fn default() -> Self {
         Self::new()
     }

@@ -49,7 +49,7 @@ use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
 use crate::ccl::{
-    BaseType, Bound, InferVar, InferVarId, Level, Refinement, Type, fresh_infer_var_id,
+    BaseType, Bound, InferVar, InferVarId, Level, Name, Refinement, Type, fresh_infer_var_id,
 };
 
 /// Identifies a field inside a structural record/tuple, or a variant tag.
@@ -1032,7 +1032,7 @@ pub struct CompactType {
     /// keeps its binder bound through coalesce; it is stripped at
     /// materialization when the codomain does not actually reference it
     /// (keeping ordinary functions `name: None`).
-    pub fun: Option<(Option<String>, Box<CompactType>, Box<CompactType>)>,
+    pub fun: Option<(Option<Name>, Box<CompactType>, Box<CompactType>)>,
     /// Refinement-tag contributions at this position. A set with `==`
     /// membership (deduplicated by [`Refinement`]'s structural `PartialEq`),
     /// stored as a `Vec` in first-insertion order. A refinement-set is
@@ -3047,7 +3047,7 @@ mod tests {
     /// exactly as real refinements are shaped (no element-binding lambda).
     fn gt_refinement(rhs: TypedExpr) -> Refinement {
         let pred = TypedExpr::binop(
-            TypedExpr::var(crate::ccl::REFINEMENT_BINDER),
+            TypedExpr::var(Name::elem()),
             BinOpKind::Compare(CompareKind::Greater),
             rhs,
         );
