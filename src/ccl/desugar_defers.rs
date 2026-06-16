@@ -980,175 +980,23 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
 
 /// Substitute every free `Var(name)` in `expr` with `replacement`.
 ///
-/// A simpler variant of [`crate::ccl::lambda_elim::substitute`] that does
-/// not require the expression to be type-checked — desugar runs
-/// pre-inference where types are still `Hole`s.  When `replacement` is a
-/// `Var(new_name)`, `Feed`/`Define` nodes whose target name matches
-/// `name` are also renamed to `new_name`; this is the α-renaming that
-/// makes alias-inlining for defer handles correct.
+/// Replace every free occurrence of `Var(name)` with `replacement` in a
+/// pre-inference tree, renaming `Feed`/`Define` targets along the way: when
+/// `replacement` is a `Var(new_name)`, handle uses of `name` become
+/// `new_name` — the α-renaming that makes alias-inlining for defer handles
+/// correct.
+///
+/// A thin wrapper over the uniform engine's in-place mode
+/// ([`crate::ccl::subst::Subst::rewrite_expr`]). Unlike the pre-port
+/// version, the engine also rewrites type-carried refinement predicates
+/// (`Cast` targets, annotations), so a desugar rename now reaches a
+/// predicate that closes over the renamed binder instead of leaving a stale
+/// reference; and a `Case` pattern binding correctly shadows `name` in its
+/// branch.
 fn pre_infer_substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
-    let replacement_name: Option<Name> = match &replacement.node {
-        TypedExprNode::Var(n) => Some(n.clone()),
-        _ => None,
-    };
-    let TypedExpr {
-        node,
-        ty,
-        user_annotation,
-    } = expr;
-    let new_node = match node {
-        TypedExprNode::Var(n) if &n == name => return replacement.clone(),
-        TypedExprNode::Var(n) => TypedExprNode::Var(n),
-        leaf @ (TypedExprNode::Lit(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer) => leaf,
-        TypedExprNode::Apply { function, argument } => TypedExprNode::Apply {
-            function: Box::new(pre_infer_substitute(*function, name, replacement)),
-            argument: Box::new(pre_infer_substitute(*argument, name, replacement)),
-        },
-        // Recurse into the wrapped value; `target` (a type) is left as-is,
-        // mirroring how the prior `Apply(_, Cast)` form left its
-        // `user_annotation`-borne target untouched.
-        TypedExprNode::Cast { value, target } => TypedExprNode::Cast {
-            value: Box::new(pre_infer_substitute(*value, name, replacement)),
-            target,
-        },
-        TypedExprNode::BinOp { left, op, right } => TypedExprNode::BinOp {
-            left: Box::new(pre_infer_substitute(*left, name, replacement)),
-            op,
-            right: Box::new(pre_infer_substitute(*right, name, replacement)),
-        },
-        TypedExprNode::UnaryOp(op, inner) => TypedExprNode::UnaryOp(
-            op,
-            Box::new(pre_infer_substitute(*inner, name, replacement)),
-        ),
-        TypedExprNode::Aggregate { input, kind } => TypedExprNode::Aggregate {
-            input: Box::new(pre_infer_substitute(*input, name, replacement)),
-            kind,
-        },
-        TypedExprNode::Lambda { param, body } => {
-            // Param shadows `name` inside the body.
-            let body = if &param.name == name {
-                *body
-            } else {
-                pre_infer_substitute(*body, name, replacement)
-            };
-            TypedExprNode::Lambda {
-                param,
-                body: Box::new(body),
-            }
-        }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            let bound_expr = pre_infer_substitute(*bound_expr, name, replacement);
-            let body = if &binding.name == name {
-                *body
-            } else {
-                pre_infer_substitute(*body, name, replacement)
-            };
-            TypedExprNode::Let {
-                binding,
-                bound_expr: Box::new(bound_expr),
-                body: Box::new(body),
-            }
-        }
-        TypedExprNode::Tuple(elts) => TypedExprNode::Tuple(
-            elts.into_iter()
-                .map(|e| pre_infer_substitute(e, name, replacement))
-                .collect(),
-        ),
-        TypedExprNode::List(elts) => TypedExprNode::List(
-            elts.into_iter()
-                .map(|e| pre_infer_substitute(e, name, replacement))
-                .collect(),
-        ),
-        TypedExprNode::Compose(elts) => TypedExprNode::Compose(
-            elts.into_iter()
-                .map(|e| pre_infer_substitute(e, name, replacement))
-                .collect(),
-        ),
-        TypedExprNode::CollectionUnion(elts) => TypedExprNode::CollectionUnion(
-            elts.into_iter()
-                .map(|e| pre_infer_substitute(e, name, replacement))
-                .collect(),
-        ),
-        TypedExprNode::Record(fields) => TypedExprNode::Record(
-            fields
-                .into_iter()
-                .map(|(n, e)| (n, pre_infer_substitute(e, name, replacement)))
-                .collect(),
-        ),
-        TypedExprNode::Case {
-            scrutinee,
-            branches,
-        } => TypedExprNode::Case {
-            scrutinee: scrutinee.map(|s| Box::new(pre_infer_substitute(*s, name, replacement))),
-            branches: branches
-                .into_iter()
-                .map(
-                    |Branch {
-                         pattern,
-                         guard,
-                         body,
-                     }| Branch {
-                        pattern,
-                        guard: pre_infer_substitute(guard, name, replacement),
-                        body: pre_infer_substitute(body, name, replacement),
-                    },
-                )
-                .collect(),
-        },
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => walk_loop_children(params, init_args, source, loop_body, Some(name), |e| {
-            pre_infer_substitute(e, name, replacement)
-        }),
-        TypedExprNode::ExprStmt { expr: e, body } => TypedExprNode::ExprStmt {
-            expr: Box::new(pre_infer_substitute(*e, name, replacement)),
-            body: Box::new(pre_infer_substitute(*body, name, replacement)),
-        },
-        // Feed/Define nodes: rename the target name when the
-        // replacement is itself a Var, and substitute inside the value.
-        TypedExprNode::Feed {
-            name: target,
-            value,
-        } => TypedExprNode::Feed {
-            name: if &target == name {
-                replacement_name.clone().unwrap_or(target)
-            } else {
-                target
-            },
-            value: Box::new(pre_infer_substitute(*value, name, replacement)),
-        },
-        TypedExprNode::Define {
-            name: target,
-            value,
-        } => TypedExprNode::Define {
-            name: if &target == name {
-                replacement_name.clone().unwrap_or(target)
-            } else {
-                target
-            },
-            value: Box::new(pre_infer_substitute(*value, name, replacement)),
-        },
-        TypedExprNode::Error => crate::unexpected_error_node!(),
-        TypedExprNode::VariantCtor { .. } => {
-            unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
-        }
-    };
-    TypedExpr {
-        node: new_node,
-        ty,
-        user_annotation,
-    }
+    let mut expr = expr;
+    crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
+    expr
 }
 
 /// Recorded information about a defer-mediating function currently in
@@ -2833,12 +2681,24 @@ fn extract_for_defer(
             // by the generic Lambda arm, which wraps each feed in
             // `Lambda(x, V)` — losing the surrounding `Apply(prefix, …)`
             // context that connects the lambda to its iteration source.
-            if let TypedExprNode::Lambda {
-                param,
-                body: lambda_body,
-            } = function.node.clone()
-                && &param.name != defer_name
-            {
+            if matches!(
+                &function.node,
+                TypedExprNode::Lambda { param, .. } if &param.name != defer_name
+            ) {
+                // Peeked above by reference; take ownership without cloning the
+                // whole function subtree (this runs on every `Apply` walked).
+                let TypedExpr {
+                    node:
+                        TypedExprNode::Lambda {
+                            param,
+                            body: lambda_body,
+                        },
+                    ty: function_ty,
+                    user_annotation: function_user_annotation,
+                } = *function
+                else {
+                    unreachable!("peeked above as a lambda whose param is not the defer binder")
+                };
                 // Filter-feed pattern: `λ p → Case({g → Feed(d, V); true →
                 // Unit})`.  Recognized so we can emit the channel as a source
                 // whose *domain type* carries the guard refinement (via the
@@ -2919,8 +2779,8 @@ fn extract_for_defer(
                         param,
                         body: Box::new(new_lambda_body),
                     },
-                    ty: function.ty.clone(),
-                    user_annotation: function.user_annotation.clone(),
+                    ty: function_ty,
+                    user_annotation: function_user_annotation,
                 };
                 TypedExprNode::Apply {
                     function: Box::new(new_function),

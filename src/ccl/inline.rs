@@ -58,7 +58,10 @@
 //! [`Feed`]: crate::ccl::TypedExprNode::Feed
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
-use crate::ccl::{Expr, Lit, Name, Type, TypedExprNode, lambda_elim::substitute};
+use crate::ccl::{
+    Expr, Lit, Name, Type, TypedExprNode, ccl_utils::walk_refined_predicates_mut,
+    lambda_elim::substitute,
+};
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -323,10 +326,10 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
     // predicate is an expression tree the children-walk below never reaches
     // (e.g. a list-comprehension filter `f(x)` lives only in the cast-target
     // refinement), so a UDF use inside one would survive as a dangling `Var`
-    // once the enclosing `Let` is dropped. Mirrors
-    // `lambda_elim::substitute_in_type`.
-    inline_in_type_predicates(&expr.ty, name, lambda);
-    if let Some(annotation) = &expr.user_annotation {
+    // once the enclosing `Let` is dropped.
+    let mut expr = expr;
+    inline_in_type_predicates(&mut expr.ty, name, lambda);
+    if let Some(annotation) = &mut expr.user_annotation {
         inline_in_type_predicates(annotation, name, lambda);
     }
 
@@ -453,8 +456,8 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
         // predicate — `lambda_elim` and operator conversion read the
         // predicate off the target, not off `ty` — so walk it explicitly
         // rather than relying on `ty` still aliasing the same cell.
-        TypedExprNode::Cast { value, target } => {
-            inline_in_type_predicates(&target, name, lambda);
+        TypedExprNode::Cast { value, mut target } => {
+            inline_in_type_predicates(&mut target, name, lambda);
             TypedExprNode::Cast {
                 value: Box::new(inline_and_beta_reduce(*value, name, lambda)),
                 target,
@@ -486,16 +489,18 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
 /// Run [`inline_and_beta_reduce`] on every refinement predicate embedded in
 /// `ty`, rewriting the shared predicate cells in place (every type-level
 /// alias of a predicate is the same syntactic predicate, so they all see the
-/// rewrite). `try_borrow_mut` skips a cell already being rewritten higher up
-/// the stack — the outer borrow is processing it.
-fn inline_in_type_predicates(ty: &Type, name: &Name, lambda: &Expr) {
-    if let Type::Refinement(_, r) = ty
-        && let Ok(mut pred) = r.predicate.try_borrow_mut()
-    {
-        let old = std::mem::replace(&mut *pred, Expr::lit(Lit::Unit));
+/// rewrite) — each cell once per call, via the canonical
+/// [`walk_refined_predicates_mut`] cycle discipline.
+///
+/// This stays a pass-level walk rather than a `Subst` call because inlining
+/// inside a predicate must also *beta-reduce* the call sites it creates —
+/// substitution proper is the engine's job and runs inside
+/// [`inline_and_beta_reduce`] via `lambda_elim::substitute`.
+fn inline_in_type_predicates(ty: &mut Type, name: &Name, lambda: &Expr) {
+    walk_refined_predicates_mut(ty, &mut std::collections::HashSet::new(), &mut |pred, _| {
+        let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
         *pred = inline_and_beta_reduce(old, name, lambda);
-    }
-    ty.walk_children(|child| inline_in_type_predicates(child, name, lambda));
+    });
 }
 
 /// Returns `true` when `expr` has `Var(name)` in the function position of its

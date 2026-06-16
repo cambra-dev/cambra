@@ -18,15 +18,32 @@
 //!
 //! A [`Subst`] maps *term* binders — `TypedExprNode::Var(name)` references — to
 //! replacement [`TypedExpr`]s. It is deliberately **not** a type-variable
-//! substitution: it never rewrites a [`Type::Infer`] / type slot (those are
-//! relabelled by freshening, a separate mechanism). Applying a substitution
-//! descends into refinement *predicates* (which are terms) and shadows the
-//! binder of any enclosing lambda / `let` / Pi it passes under, α-renaming to
-//! avoid capture.
+//! substitution: it never relabels a [`Type::Infer`] (those belong to
+//! freshening, a separate mechanism). Applying a substitution traverses terms
+//! and types uniformly — refinement *predicates* are terms, and every node's
+//! type slots are reached in the same pass — shadowing the binder of any
+//! enclosing lambda / `let` / Pi it passes under. Under the Barendregt
+//! convention capture cannot occur, and the engine asserts that rather than
+//! α-renaming (see [`Subst::under_binder`]).
+//!
+//! The one engine drives two modes, distinguished by how they treat
+//! refinement predicate **cells**:
+//!
+//! * **Transport** ([`Subst::apply_expr`] / [`Subst::apply_type`]) builds new
+//!   terms/types, used where a substitution rides a constraint edge: the
+//!   source context's original must stay intact, so a changed predicate is
+//!   re-celled ([`Subst::force_refinement`] mints a fresh refinement
+//!   identity) while a vacuous one keeps sharing its cell.
+//! * **In-place rewrite** ([`Subst::rewrite_expr`]) mutates a tree the caller
+//!   owns, used by the pass-level substitutions (lambda elimination,
+//!   inlining, defer desugaring, lowering's uncurrying): predicates are
+//!   rewritten *through* their shared cells, once per cell, so every alias —
+//!   type-borne tags included — observes the rewrite. (Stage 3 of the
+//!   immutable-predicates plan replaces the cell writes with rebuilds.)
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ccl::ccl_utils::{is_free, is_free_in_value};
+use crate::ccl::ccl_utils::is_free;
 use crate::ccl::{Branch, Name, PredicateCellId, Type, TypedExpr, TypedExprNode};
 
 /// A term binder name.
@@ -64,16 +81,6 @@ impl Mapping {
 /// to itself (the identity). The empty map is [`Subst::id`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Subst(BTreeMap<Binder, Mapping>);
-
-/// Mint a fresh binder for capture-avoiding α-renaming — renaming an existing
-/// binder to a fresh `uid` while preserving its `base`, so it stays the same
-/// (source) binder's lineage as a [`Name::Unique`]. Under the Barendregt
-/// convention this never fires (capture is impossible); stage 2 of the
-/// immutable-predicates plan asserts that and deletes this together with its
-/// only callers.
-pub fn fresh_binder(base: &str) -> Binder {
-    Name::fresh(base)
-}
 
 impl Subst {
     /// The identity substitution — a perfect no-op. `apply_*` on it returns the
@@ -321,33 +328,25 @@ impl Subst {
     }
 
     /// Apply this substitution to a **term**. Capture-avoiding: it shadows the
-    /// binder of any lambda / `let` / loop / match-arm it descends under and
-    /// α-renames when its range would otherwise capture. Type slots
-    /// (`expr.ty`) are *not* touched — a term substitution never rewrites a
-    /// type variable, and an occurrence of a substituted binder buried inside
-    /// a type slot's refinement predicate is **out of contract**: it is
-    /// neither rewritten nor counted by the freeness checks below (which use
-    /// the value-only [`is_free_in_value`], agreeing with the rewriter). The
-    /// end-of-inference scope-validity check (`check_scope_valid`, design
-    /// §6.2) is what guards a type-slot occurrence left dangling — it runs
-    /// unconditionally, surfacing the residual as an `InferError` in release
-    /// builds too.
+    /// binder of any lambda / `let` / loop / match-arm it descends under.
+    /// The traversal is **uniform over terms and types**: each node's type
+    /// slots (`expr.ty`, `user_annotation`, a `Cast`'s `target`) are rewritten
+    /// by [`Self::apply_type`] in the same pass, so a substituted binder
+    /// occurring inside a type-borne refinement predicate is discharged right
+    /// here rather than left dangling for the §6.2 scope-validity check to
+    /// catch. (That check accordingly demotes to a debug assert — see
+    /// `check_scope_valid`.)
     pub fn apply_expr(&self, e: &TypedExpr) -> TypedExpr {
         if self.is_id() {
             return e.clone();
         }
-        // No-op short-circuit: if none of the substituted binders occur free in
-        // `e`'s value, the substitution does nothing here. This is not merely
-        // an optimization — without it, descending under a binder whose name
-        // collides with the substitution's *range* (but where the substitution
-        // never actually acts) would trigger a spurious capture-avoiding
-        // α-rename, copying the term with a fresh binder for no reason. The
-        // common case (a vacuous discharge `[x ↦ arg]` from a non-dependent
-        // application, `x` not occurring in `e`) takes this path. Value-only:
-        // a binder free solely in a type-slot predicate would otherwise fail
-        // this check, walk the term, and change nothing — the type slot is
-        // out of contract (see above).
-        if !self.0.keys().any(|k| is_free_in_value(k, e)) {
+        // No-op short-circuit: if none of the substituted binders occur free
+        // in `e` — value or type slots — the substitution does nothing here.
+        // The common case (a vacuous discharge `[x ↦ arg]` from a
+        // non-dependent application, `x` not occurring in `e`) takes this
+        // path, which is what keeps vacuous transport from copying terms or
+        // splitting predicate cells.
+        if !self.0.keys().any(|k| is_free(k, e)) {
             return e.clone();
         }
         self.apply_expr_inner(e)
@@ -362,6 +361,30 @@ impl Subst {
                 Some(repl) => return repl.as_expr(),
                 None => Var(n.clone()),
             },
+
+            // The cast target is a type slot `map_children` cannot reach;
+            // its refinement predicate is a primary anchor.
+            Cast { value, target } => Cast {
+                value: Box::new(self.apply_expr(value)),
+                target: self.apply_type(target),
+            },
+
+            // The target name is a *use* of the defer-handle binder (these
+            // nodes exist only pre-desugar; transport runs during inference,
+            // but the uniform engine handles them for the pre-inference
+            // ports). A var-shaped mapping renames the handle; a discharge
+            // to a non-variable term has no Feed/Define shape to land in, so
+            // the stale handle is kept for desugar's own
+            // `UnboundDeferHandle` boundary to report (feeding a lambda
+            // parameter is user-reachable: `lambda d, v: d << v`).
+            Feed { name, value } => {
+                let (name, value) = self.apply_handle_use(name, value);
+                Feed { name, value }
+            }
+            Define { name, value } => {
+                let (name, value) = self.apply_handle_use(name, value);
+                Define { name, value }
+            }
 
             Lambda { param, body } => {
                 // Domain refinements ride the param's *type* (a
@@ -442,37 +465,279 @@ impl Subst {
             _ => {
                 let mut child = e.clone();
                 child.map_children(|c| self.apply_expr(&c));
+                child.ty = self.apply_type(&e.ty);
+                child.user_annotation = e.user_annotation.as_ref().map(|t| self.apply_type(t));
                 return child;
             }
         };
         TypedExpr {
             node,
-            ty: e.ty.clone(),
-            user_annotation: e.user_annotation.clone(),
+            ty: self.apply_type(&e.ty),
+            user_annotation: e.user_annotation.as_ref().map(|t| self.apply_type(t)),
         }
     }
 
-    /// Restrict this substitution so it does not act on `binder`, and α-rename
-    /// `binder` to a fresh name if the (restricted) range would capture it.
-    /// Returns the (possibly fresh) binder name to install and the substitution
-    /// to use inside its scope.
+    /// Rewrite a `Feed`/`Define` handle use (see the `Feed` arm above for
+    /// the non-variable-discharge rationale).
+    fn apply_handle_use(&self, name: &Name, value: &TypedExpr) -> (Name, Box<TypedExpr>) {
+        (self.handle_target(name), Box::new(self.apply_expr(value)))
+    }
+
+    /// The handle-rename half of [`Self::apply_handle_use`], shared with the
+    /// in-place mode: rename through var-shaped mappings, keep the name on a
+    /// non-variable discharge.
+    fn handle_target(&self, name: &Name) -> Name {
+        match self.0.get(name) {
+            None => name.clone(),
+            Some(Mapping::Rename(to)) => to.clone(),
+            Some(Mapping::Discharge(t)) => match &t.node {
+                TypedExprNode::Var(n) => n.clone(),
+                _ => name.clone(),
+            },
+        }
+    }
+
+    /// Apply this substitution to a term **in place** — the pass-level mode
+    /// (see module docs). Same traversal and shadowing rules as
+    /// [`Self::apply_expr`], but refinement predicates are rewritten through
+    /// their shared cells, **once per cell**, so every alias of a predicate —
+    /// the syntactic anchor and each type-borne tag — observes the rewrite.
+    /// `Compose` node types are recomputed from the rewritten elements
+    /// (substituting a `Var` whose type was an unresolved placeholder can
+    /// concretize the element types; the `Compose.ty == Fun(first_domain,
+    /// last_codomain)` invariant must follow).
+    pub fn rewrite_expr(&self, e: &mut TypedExpr) {
+        if self.is_id() {
+            return;
+        }
+        self.rewrite_expr_go(e, &mut BTreeSet::new());
+    }
+
+    /// Discharge `binder ↦ term` over `e` **in place**, cloning `term` only
+    /// when `binder` actually occurs free in `e`. A vacuous substitution
+    /// costs one [`is_free`] walk and **no clone** — the pass-level callers
+    /// (lambda elimination, defer desugaring, lowering's uncurrying)
+    /// substitute into many subtrees that never mention the binder, so
+    /// cloning `term` for those would be pure waste.
+    pub fn discharge_in_place(e: &mut TypedExpr, binder: &Name, term: &TypedExpr) {
+        if !is_free(binder, e) {
+            return;
+        }
+        Subst::discharge(binder.clone(), term.clone()).rewrite_expr(e);
+    }
+
+    fn rewrite_expr_go(&self, e: &mut TypedExpr, visited: &mut BTreeSet<PredicateCellId>) {
+        // Inert subtree (no substituted binder free in value or type slots):
+        // leave it untouched — predicate cells in particular stay unvisited,
+        // mirroring the transport mode's cell-sharing guarantee.
+        if !self.0.keys().any(|k| is_free(k, e)) {
+            return;
+        }
+        // A mapped `Var` is replaced wholesale (the replacement carries its
+        // own type and annotation), so handle it before rewriting `e`'s own
+        // slots. An *unmapped* `Var` falls through: its type slots may still
+        // carry the substituted binder in a refinement predicate.
+        if let TypedExprNode::Var(n) = &e.node
+            && let Some(repl) = self.0.get(n)
+        {
+            *e = repl.as_expr();
+            return;
+        }
+        self.rewrite_type_go(&mut e.ty, visited);
+        if let Some(ann) = &mut e.user_annotation {
+            self.rewrite_type_go(ann, visited);
+        }
+        match &mut e.node {
+            TypedExprNode::Var(_) => {}
+
+            TypedExprNode::Cast { value, target } => {
+                self.rewrite_type_go(target, visited);
+                self.rewrite_expr_go(value, visited);
+            }
+
+            TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
+                *name = self.handle_target(name);
+                self.rewrite_expr_go(value, visited);
+            }
+
+            TypedExprNode::Lambda { param, body } => {
+                // The param's domain refinement is reached through `e.ty`'s
+                // `Fun` domain (rewritten above, via the shared predicate
+                // cell); only the body is under the binder here.
+                self.under_binder_mut(&param.name, body, visited);
+            }
+
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                self.rewrite_expr_go(bound_expr, visited);
+                self.under_binder_mut(&binding.name, body, visited);
+            }
+
+            TypedExprNode::Loop {
+                params,
+                init_args,
+                source,
+                loop_body,
+            } => {
+                for a in init_args.iter_mut() {
+                    self.rewrite_expr_go(a, visited);
+                }
+                self.rewrite_expr_go(source, visited);
+                let inner = params.iter().fold(self.clone(), |s, p| s.shadow(&p.name));
+                for p in params.iter() {
+                    inner.assert_no_capture(&p.name);
+                }
+                inner.rewrite_expr_go(loop_body, visited);
+            }
+
+            TypedExprNode::Case {
+                scrutinee,
+                branches,
+            } => {
+                if let Some(sc) = scrutinee {
+                    self.rewrite_expr_go(sc, visited);
+                }
+                for b in branches.iter_mut() {
+                    let inner = match &b.pattern {
+                        Some(p) => self.shadow(&p.binding.name),
+                        None => self.clone(),
+                    };
+                    if let Some(p) = &b.pattern {
+                        inner.assert_no_capture(&p.binding.name);
+                    }
+                    inner.rewrite_expr_go(&mut b.guard, visited);
+                    inner.rewrite_expr_go(&mut b.body, visited);
+                }
+            }
+
+            TypedExprNode::Compose(elts) => {
+                for el in elts.iter_mut() {
+                    self.rewrite_expr_go(el, visited);
+                }
+                // Recompute the chain type from the rewritten ends, when both
+                // are concrete enough to read.
+                if let (Some(first), Some(last)) = (elts.first(), elts.last())
+                    && let (Some(d), Some(c)) = (first.ty.domain(), last.ty.codomain())
+                {
+                    e.ty = Type::fun(d, c);
+                }
+            }
+
+            // No binders introduced: recurse structurally into child terms.
+            _ => e.walk_children_mut(|c| self.rewrite_expr_go(c, visited)),
+        }
+    }
+
+    /// In-place analogue of [`Self::under_binder`]: shadow, assert
+    /// no-capture, recurse into the binder's scope.
+    fn under_binder_mut(
+        &self,
+        binder: &Name,
+        body: &mut TypedExpr,
+        visited: &mut BTreeSet<PredicateCellId>,
+    ) {
+        let restricted = self.shadow(binder);
+        if !restricted.0.keys().any(|k| is_free(k, body)) {
+            return;
+        }
+        restricted.assert_no_capture(binder);
+        restricted.rewrite_expr_go(body, visited);
+    }
+
+    /// The Barendregt no-capture invariant at a binder crossing (see
+    /// [`Self::under_binder`] for why capture is impossible by convention).
+    fn assert_no_capture(&self, binder: &Name) {
+        assert!(
+            !self.range_mentions(binder),
+            "Barendregt violation: substitution range mentions binder `{binder:?}` it passes \
+             under — a fresh uid was minted outside lowering, or a copy broke uid preservation"
+        );
+    }
+
+    /// In-place analogue of [`Self::apply_type`]: rewrite the term binders in
+    /// `ty`'s refinement predicates through their shared cells, once per
+    /// cell. `try_borrow_mut` skips a cell already being rewritten higher up
+    /// this same walk (a self-referential predicate type slot).
+    pub fn rewrite_type(&self, ty: &mut Type) {
+        if self.is_id() {
+            return;
+        }
+        self.rewrite_type_go(ty, &mut BTreeSet::new());
+    }
+
+    fn rewrite_type_go(&self, ty: &mut Type, visited: &mut BTreeSet<PredicateCellId>) {
+        match ty {
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::DataSource(_)
+            | Type::Hole
+            | Type::Infer(_) => {}
+
+            Type::Fun {
+                name: None,
+                domain,
+                codomain,
+            } => {
+                self.rewrite_type_go(domain, visited);
+                self.rewrite_type_go(codomain, visited);
+            }
+
+            Type::Fun {
+                name: Some(b),
+                domain,
+                codomain,
+            } => {
+                self.rewrite_type_go(domain, visited);
+                let restricted = self.shadow(b);
+                restricted.assert_no_capture(b);
+                restricted.rewrite_type_go(codomain, visited);
+            }
+
+            Type::Refinement(base, r) => {
+                if visited.insert(r.cell_id())
+                    && let Ok(mut pred) = r.predicate.try_borrow_mut()
+                {
+                    // The refinement implicitly binds REFINEMENT_BINDER in
+                    // its bare predicate.
+                    self.shadow(&Name::elem())
+                        .rewrite_expr_go(&mut pred, visited);
+                }
+                self.rewrite_type_go(base, visited);
+            }
+
+            Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.rewrite_type_go(t, visited)),
+            Type::Record(fs) => fs
+                .iter_mut()
+                .for_each(|(_, t)| self.rewrite_type_go(t, visited)),
+            Type::Variant(tags) => tags
+                .iter_mut()
+                .for_each(|(_, t)| self.rewrite_type_go(t, visited)),
+        }
+    }
+
+    /// Restrict this substitution so it does not act on `binder`. Returns the
+    /// binder name to install and the substitution to use inside its scope.
+    ///
+    /// Capture cannot happen: under the Barendregt convention nothing free in
+    /// a substitution's range can collide with a binder bound inside the
+    /// target term (binder uids are minted once at lowering; copies preserve
+    /// them, so a range name and an inner binder are the same `Name` only if
+    /// they are the same binder — and a binder's scope cannot nest inside
+    /// itself). The α-rename fallback is therefore asserted unreachable,
+    /// which is also what deletes the same-discharge-twice determinism
+    /// hazard: no fresh names are minted on any equality-mediated path.
     fn under_binder(&self, binder: &Name, body: &TypedExpr) -> (Binder, Subst) {
         let restricted = self.shadow(binder);
-        // If no substituted binder occurs free in the body, the substitution is
-        // inert there — return the identity so the body is left untouched and no
-        // spurious capture-avoiding rename is triggered.
-        if !restricted.0.keys().any(|k| is_free_in_value(k, body)) {
+        // If no substituted binder occurs free in the body, the substitution
+        // is inert there — return the identity so the body is left untouched.
+        if !restricted.0.keys().any(|k| is_free(k, body)) {
             return (binder.clone(), Subst::id());
         }
-        if restricted.range_mentions(binder) {
-            let fresh = fresh_binder(binder.base());
-            // Compose the α-rename into the restricted substitution so the body
-            // both renames the binder and applies the outer map.
-            let renamed = Subst::then(&Subst::rename(binder, &fresh), &restricted);
-            (fresh, renamed)
-        } else {
-            (binder.clone(), restricted)
-        }
+        restricted.assert_no_capture(binder);
+        (binder.clone(), restricted)
     }
 
     /// Rewrite a refinement's predicate by this substitution. A no-op clone
@@ -497,37 +762,42 @@ impl Subst {
         // there is no capture to avoid.
         let restricted = self.shadow(&Name::elem());
         let new_pred = {
-            let pred = r.predicate.borrow();
-            // Vacuous here (no substituted binder occurs free in the
-            // predicate's *value* — type-slot occurrences are out of
-            // contract, see `apply_expr`): keep the original refinement,
-            // *sharing its predicate cell*. Downstream passes rewrite
-            // predicates in place through that `Rc` (e.g. planning compiles
-            // the predicate to point-free when its type is iterated);
-            // re-celling on a vacuous substitution would split the copies so
-            // one side misses the rewrite and the structural comparison breaks.
-            if !restricted.0.keys().any(|k| is_free_in_value(k, &pred)) {
+            // The predicate is read through a *shared* borrow held across
+            // `apply_expr` below; a self-referential predicate (its own type
+            // slot carries this refinement) re-enters here under that shared
+            // borrow, which stacks. `try_borrow` rather than `borrow` only
+            // matters if the cell is held *mutably* elsewhere — then return
+            // the original rather than panic. Transport takes only shared
+            // borrows, so today this always succeeds.
+            let Ok(pred) = r.predicate.try_borrow() else {
+                return r.clone();
+            };
+            // Vacuous (no substituted binder occurs free anywhere in the
+            // predicate — value or nested type slots): keep the original
+            // refinement, *sharing its predicate cell*. Downstream passes
+            // rewrite predicates in place through that `Rc` (e.g. planning
+            // compiles the predicate to point-free when its type is
+            // iterated); re-celling on a vacuous substitution would split the
+            // copies so one side misses the rewrite and the structural
+            // comparison breaks.
+            if !restricted.0.keys().any(|k| is_free(k, &pred)) {
                 return r.clone();
             }
             restricted.apply_expr(&pred)
         };
-        // Scope-validity (design §6.2): a discharged binder must not survive in
-        // the rewritten predicate's value — once `[x ↦ arg]` fires, no free `x`
-        // may remain, or a downstream pass would observe a dangling reference.
-        // (Only `Discharge` entries are checked: a rename legitimately
-        // *introduces* its target. Value-only, agreeing with what `apply_expr`
-        // rewrites: a binder buried in a sub-expression's type-slot predicate
-        // is out of the substitution contract and would fire this spuriously
-        // on a correct program.) In a correct implementation this never fires;
-        // it is the debug-build fast-path regression guard for
-        // substitution-descent bugs — the release-build guard is the
-        // unconditional end-of-inference scope-validity check
-        // (`check_scope_valid`).
+        // Scope-validity (design §6.2): a discharged binder must not survive
+        // in the rewritten predicate — once `[x ↦ arg]` fires, no free `x`
+        // may remain, or a downstream pass would observe a dangling
+        // reference. (Only `Discharge` entries are checked: a rename
+        // legitimately *introduces* its target.) In a correct implementation
+        // this never fires; it is the per-rewrite regression guard for
+        // substitution-descent bugs, backing the end-of-inference
+        // `check_scope_valid` debug walk.
         #[cfg(debug_assertions)]
         for (b, m) in &self.0 {
             if matches!(m, Mapping::Discharge(_)) {
                 debug_assert!(
-                    !is_free_in_value(b, &new_pred),
+                    !is_free(b, &new_pred),
                     "discharged binder `{b}` still free after substitution into predicate",
                 );
             }
@@ -550,9 +820,9 @@ impl Subst {
 
     /// Apply this substitution to a **type**, rewriting the term binders that
     /// appear inside refinement predicates. Descends into `Fun` codomains
-    /// (shadowing the Pi binder, α-renaming to avoid capture) and refinement
-    /// predicates. Leaves atoms and type variables untouched — a term
-    /// substitution never rewrites a type slot.
+    /// (shadowing the Pi binder) and refinement predicates. Leaves atoms and
+    /// type *variables* untouched — a term substitution never relabels
+    /// `Infer`/`Hole` slots; those belong to freshening.
     pub fn apply_type(&self, ty: &Type) -> Type {
         if self.is_id() {
             return ty.clone();
@@ -614,17 +884,14 @@ impl Subst {
         }
     }
 
-    /// `Fun`-codomain analogue of [`under_binder`](Self::under_binder): shadow
-    /// the Pi binder in `codomain`, α-renaming it if the range would capture.
+    /// `Fun`-codomain analogue of [`under_binder`](Self::under_binder):
+    /// shadow the Pi binder in `codomain`. Capture is asserted unreachable
+    /// for the same reason (see `under_binder`); this is what retires the
+    /// spurious α-renames PR #233 observed at this site.
     fn under_binder_ty(&self, binder: &Name, codomain: &Type) -> (Binder, Type) {
         let restricted = self.shadow(binder);
-        if restricted.range_mentions(binder) {
-            let fresh = fresh_binder(binder.base());
-            let renamed = Subst::rename(binder, &fresh).apply_type(codomain);
-            (fresh, restricted.apply_type(&renamed))
-        } else {
-            (binder.clone(), restricted.apply_type(codomain))
-        }
+        restricted.assert_no_capture(binder);
+        (binder.clone(), restricted.apply_type(codomain))
     }
 }
 
@@ -869,14 +1136,13 @@ mod tests {
         assert!(Subst::then(&sigma, &dis).invert().is_none());
     }
 
-    // A binder occurring only in a *type slot's* refinement predicate is out
-    // of the substitution contract: the rewriter never touches type slots, so
-    // the freeness checks must not see it either (value-only). The discharge
-    // takes the vacuous fast path — term and predicate cell shared untouched —
-    // instead of walking the term and tripping the dangling-binder guard on a
-    // correct program.
+    // The value-only contract is retired: a binder occurring only in a *type
+    // slot's* refinement predicate is in contract — transport discharges it
+    // and re-cells the changed predicate, leaving no dangling reference for
+    // the §6.2 walk to catch. A genuinely vacuous discharge still shares the
+    // cell.
     #[test]
-    fn type_slot_only_occurrence_is_vacuous() {
+    fn type_slot_occurrence_is_discharged() {
         use std::cell::RefCell;
         use std::rc::Rc;
         // y : {_ | k > 0} — `k` appears only in the type slot's predicate.
@@ -890,21 +1156,36 @@ mod tests {
         let Type::Refinement(_, out_ref) = &out.ty else {
             panic!("type slot preserved");
         };
-        assert!(
-            Rc::ptr_eq(&out_ref.predicate, &slot_ref.predicate),
-            "vacuous apply_expr must share the type slot's predicate cell"
+        assert_eq!(
+            *out_ref.predicate.borrow(),
+            gt(int(5), int(0)),
+            "the type-slot occurrence is discharged"
         );
+        assert!(
+            !Rc::ptr_eq(&out_ref.predicate, &slot_ref.predicate),
+            "a changed predicate is re-celled; the source context's original stays intact"
+        );
+        assert_eq!(*slot_ref.predicate.borrow(), gt(var("k"), int(0)));
 
-        // force_refinement on a predicate whose *sub-expression type* mentions
-        // `k`: vacuous at the value level — cell shared, no dangling-binder
-        // panic.
+        // force_refinement on a predicate whose *sub-expression type*
+        // mentions `k` is no longer vacuous: the nested slot is rewritten.
         let outer = Refinement {
             predicate: Rc::new(RefCell::new(e)),
         };
         let forced = dis.force_refinement(&outer);
+        assert!(!Rc::ptr_eq(&forced.predicate, &outer.predicate));
+        let forced_pred = forced.predicate.borrow();
+        let Type::Refinement(_, nested) = &forced_pred.ty else {
+            panic!("nested refinement preserved");
+        };
+        assert_eq!(*nested.predicate.borrow(), gt(int(5), int(0)));
+
+        // A vacuous discharge still shares the cell.
+        let vac = Subst::discharge("unrelated", int(7));
+        let kept = vac.force_refinement(&outer);
         assert!(
-            Rc::ptr_eq(&forced.predicate, &outer.predicate),
-            "value-vacuous force_refinement must share the predicate cell"
+            Rc::ptr_eq(&kept.predicate, &outer.predicate),
+            "vacuous force_refinement must share the predicate cell"
         );
     }
 
@@ -942,30 +1223,18 @@ mod tests {
         assert!(well_formed(&bad, &only_k));
     }
 
-    // G — capture avoidance: [k↦x] under a binder `x` α-renames the binder.
+    // G — capture is a Barendregt violation, not something to α-rename
+    // around: [k↦x] passing under a binder `x` means a range name collides
+    // with an inner binder, which the convention rules out (binder uids are
+    // minted once at lowering; copies preserve them). The engine asserts
+    // rather than minting a fresh name — minting on this path is the
+    // same-discharge-twice determinism hazard.
     #[test]
-    fn scenario_g_capture_avoidance() {
-        // body: λ x → (x > k); apply [k ↦ x]. The free x in the range must not
-        // be captured by the lambda's own x.
+    #[should_panic(expected = "Barendregt violation")]
+    fn scenario_g_capture_panics() {
+        // body: λ x → (x > k); apply [k ↦ x] — the raw names collide.
         let lam = TypedExpr::lambda("x", Type::Hole, gt(var("x"), var("k")));
-        let out = Subst::rename("k", "x").apply_expr(&lam);
-        let TypedExprNode::Lambda { param, body, .. } = &out.node else {
-            panic!("expected lambda");
-        };
-        assert_ne!(
-            param.name,
-            Name::raw("x"),
-            "binder must have been α-renamed"
-        );
-        // The body's original `x` now refers to the fresh binder, and the
-        // substituted `k` became the *outer* `x`.
-        assert!(
-            is_free(&Name::raw("x"), &out),
-            "outer x is free after substitution"
-        );
-        // Exactly one free `x` (the substituted k), not the bound occurrence.
-        let inner_binder = param.name.clone();
-        assert!(is_free(&inner_binder, body));
+        let _ = Subst::rename("k", "x").apply_expr(&lam);
     }
 
     // apply_type descends into a refinement predicate and discharges a free
@@ -1008,5 +1277,103 @@ mod tests {
             panic!()
         };
         assert_eq!(*r2.predicate.borrow(), gt(var("i"), var("k")));
+    }
+}
+
+#[cfg(test)]
+mod rewrite_tests {
+    use super::*;
+    use crate::ccl::ccl_utils::is_free;
+    use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn var(s: &str) -> TypedExpr {
+        TypedExpr::var(s)
+    }
+    fn int(n: i64) -> TypedExpr {
+        TypedExpr::lit(Lit::Int(n))
+    }
+    fn gt(l: TypedExpr, r: TypedExpr) -> TypedExpr {
+        TypedExpr::binop(l, BinOpKind::Compare(CompareKind::Greater), r)
+    }
+
+    // In-place mode rewrites a predicate *through* its cell, so an alias of
+    // that cell elsewhere observes the rewrite (transport would have
+    // re-celled instead, leaving the alias stale).
+    #[test]
+    fn rewrite_mutates_shared_predicate_cells() {
+        let cell = Rc::new(RefCell::new(gt(var("k"), int(0))));
+        let anchor = Refinement {
+            predicate: Rc::clone(&cell),
+        };
+        let alias = Refinement {
+            predicate: Rc::clone(&cell),
+        };
+        let mut e = var("y").with_ty(Type::Refinement(Box::new(Type::Hole), anchor));
+
+        Subst::discharge("k", int(5)).rewrite_expr(&mut e);
+
+        let Type::Refinement(_, r) = &e.ty else {
+            panic!("refinement preserved");
+        };
+        assert!(
+            Rc::ptr_eq(&r.predicate, &cell),
+            "in-place mode must keep the cell identity"
+        );
+        assert_eq!(
+            *alias.predicate.borrow(),
+            gt(int(5), int(0)),
+            "the alias observes the rewrite through the shared cell"
+        );
+    }
+
+    // The same binder bound again inside the tree (a copy — inlining
+    // duplicates lambdas with their uids) shadows the substitution.
+    #[test]
+    fn rewrite_respects_shadowing_copies() {
+        let a = Name::fresh("a");
+        let inner = TypedExpr::lambda(a.clone(), Type::Hole, gt(var("x"), int(0)));
+        let mut e = TypedExpr::apply(
+            TypedExpr::var(a.clone()),
+            TypedExpr::lambda("w", Type::Hole, inner),
+        );
+        Subst::discharge(a.clone(), int(3)).rewrite_expr(&mut e);
+        let TypedExprNode::Apply { function, argument } = &e.node else {
+            panic!("apply preserved");
+        };
+        assert_eq!(argument.node, TypedExprNode::Lit(Lit::Int(3)));
+        let TypedExprNode::Lambda { body, .. } = &function.node else {
+            panic!("outer lambda preserved");
+        };
+        let TypedExprNode::Lambda { param, .. } = &body.node else {
+            panic!("inner lambda preserved");
+        };
+        assert_eq!(param.name, a, "the copied binding site is untouched");
+        assert!(!is_free(&a, &e), "no free occurrence survives");
+    }
+
+    // Feed/Define handles rename through var-shaped mappings and survive a
+    // non-variable discharge for desugar's own boundary to diagnose.
+    #[test]
+    fn rewrite_renames_feed_handles() {
+        let mut e = TypedExpr::feed("d", var("d"));
+        Subst::rename("d", "q").rewrite_expr(&mut e);
+        let TypedExprNode::Feed { name, value } = &e.node else {
+            panic!("feed preserved");
+        };
+        assert_eq!(name, &Name::raw("q"));
+        assert_eq!(value.node, TypedExprNode::Var(Name::raw("q")));
+
+        let mut stale = TypedExpr::feed("d", int(1));
+        Subst::discharge("d", int(2)).rewrite_expr(&mut stale);
+        let TypedExprNode::Feed { name, .. } = &stale.node else {
+            panic!("feed preserved");
+        };
+        assert_eq!(
+            name,
+            &Name::raw("d"),
+            "a non-variable discharge keeps the handle for UnboundDeferHandle to report"
+        );
     }
 }

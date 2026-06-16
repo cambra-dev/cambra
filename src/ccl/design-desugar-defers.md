@@ -392,9 +392,12 @@ let y = (let x = Defer in body_x) in body_y
   ⟹  let y = Defer in body_x[x → y]    with terminal Var(y) replaced by body_y
 ```
 
-`pre_infer_substitute` renames `Feed("x", …)` and `Define("x",
-…)` target strings to `y` so the outer cluster picks them up.
-Also handles an `ExprStmt` prefix on the outer `bound_expr`.
+`pre_infer_substitute` (a thin wrapper over the uniform engine,
+`ccl::subst::Subst::rewrite_expr`) renames `Feed("x", …)` and
+`Define("x", …)` target names to `y` so the outer cluster picks them
+up — and, through the engine, also rewrites type-carried refinement
+predicates that close over the renamed binder. Also handles an
+`ExprStmt` prefix on the outer `bound_expr`.
 
 There's also a related "let-of-defer-returning-let collapse"
 pattern: `let y = (let z = E in Var(z)) in body_y` becomes
@@ -592,6 +595,6 @@ For navigating the source ([src/ccl/desugar_defers.rs](desugar_defers.rs)):
 | Cluster topo-sort                          | `topo_sort_cluster`                                   |
 | Channel binding emission                   | `channelize_cluster` + `rename_shadows_then_bind`     |
 | Shadow detection                           | `compute_protected_set` + `collect_free_vars`         |
-| Substitution                               | `pre_infer_substitute`                                |
+| Substitution                               | `pre_infer_substitute` (wraps `ccl::subst`)           |
 | Final cleanup                              | `drop_expr_stmts`                                     |
 | Invariant check                            | `assert_no_defer_residue`                             |

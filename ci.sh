@@ -8,6 +8,11 @@ ci_fmt() {
 }
 # --all-targets lints test code too and warms the cache for cargo test
 ci_clippy() { cargo clippy --all-targets -- -D warnings; }
+# Same lint, in release. The debug checks never compile the test target in
+# release, so a `#[cfg(debug_assertions)]`-gated item referenced by ungated code
+# (e.g. a test calling a debug-only fn) only breaks here. `-- -D warnings` is
+# scoped to our crate, not deps.
+ci_clippy_release() { cargo clippy --release --all-targets -- -D warnings; }
 ci_test() { cargo test -q; }
 ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
@@ -26,6 +31,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_clippy || failed=1
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_clippy_release || failed=1
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_doc || failed=1

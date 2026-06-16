@@ -209,8 +209,16 @@ fn recurse_simplify(expr: &mut Expr) -> (bool, bool) {
         body,
     } = &expr.node
     {
-        let body_ty = crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone())
-            .apply_type(&body.ty);
+        // The discharge only changes the type in the dependent case (binder
+        // free in the body type's refinement predicates); skip cloning the
+        // bound expression otherwise. The sync below still runs so a body type
+        // simplify rewrote stays mirrored on the `let`.
+        let body_ty = if crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name) {
+            crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone())
+                .apply_type(&body.ty)
+        } else {
+            body.ty.clone()
+        };
         if expr.ty != body_ty {
             expr.ty = body_ty;
             changed = true;

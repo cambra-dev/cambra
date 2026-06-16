@@ -67,8 +67,7 @@ use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, Branch, Builtin, CompareKind, Expr,
         Lit, LogicKind, Name, Type, TypedExprNode, UnaryOpKind,
-        ccl_utils::{is_free_in_type, make_cast, refined_fn_type},
-        symbolic::symbolic,
+        ccl_utils::{make_cast, refined_fn_type},
         uniquify,
     },
     chl_parser::ast::{
@@ -1394,128 +1393,24 @@ fn lower_lambda(
 /// Replace every free occurrence of `Var(name)` in `expr` with `replacement`,
 /// respecting binder shadowing introduced by inner `Lambda` and `Let` nodes.
 ///
-/// Used during multi-arg lambda lowering to rewrite named CHL parameters
-/// as projections of a synthetic pair variable. This is a pre-inference
-/// substitution, so unlike [`crate::ccl::lambda_elim::substitute`] it does
-/// not invoke `debug_typecheck`; callers can pass `Type::Hole`-typed trees.
+/// Used during multi-arg lambda lowering to rewrite named CHL parameters as
+/// projections of a synthetic tuple variable. A thin wrapper over the uniform
+/// engine's in-place mode ([`crate::ccl::subst::Subst::rewrite_expr`]), which
+/// traverses type slots too: a comprehension filter that references an
+/// enclosing multi-arg lambda's parameter — e.g.
+/// `lambda lo, hi: sum([x for x in data if x >= lo])` — lowers the filter
+/// into the comprehension's `Cast::target` predicate with `lo` free in it,
+/// and the engine rewrites it there along with the term spine.
 ///
-/// Does **not** perform capture-avoiding renaming — the caller must ensure
-/// `replacement` contains no free variables that collide with binders in
-/// `expr`. For the [`lower_lambda`] call site this is guaranteed by two
-/// invariants: (1) the replacement `Var` uses the `__arg_tuple_` prefix
-/// that user code cannot bind, and (2) each multi-arg lambda mints a
-/// fresh unique id via [`LoweringContext::fresh_tuple_arg`], so no two
-/// nested multi-arg lambdas can share a tuple-parameter name.
+/// Capture is structurally impossible at this (pre-uniquify, raw-name) call
+/// site: the replacement's `Var` uses the reserved `__arg_tuple_` prefix
+/// that user code cannot bind, with a fresh unique id per multi-arg lambda
+/// ([`LoweringContext::fresh_tuple_arg`]), so the engine's no-capture assert
+/// cannot fire.
 fn substitute_param_in_body(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
-    // Refinements ride the type lattice (introduced by `cast`), and this
-    // substitution rewrites only the term spine — it threads `ty`/
-    // `user_annotation`/`Cast::target` through unchanged. So a refinement
-    // whose predicate closes over `name` (a dependent refinement at lowering
-    // time) would be left un-substituted, silently dropping the dependence.
-    // The shape is user-reachable: a comprehension filter that references an
-    // enclosing multi-arg lambda's parameter — e.g.
-    // `lambda lo, hi: sum([x for x in data if x >= lo])` — lowers the filter
-    // into the comprehension's `Cast::target` predicate with `lo` free in it.
-    // Substituting through type-carried predicates is not yet implemented, so
-    // fail loudly: proceeding would leave the predicate referencing the
-    // uncurried name — an unbound-variable error at best, and silently wrong
-    // results if an outer binding happens to share the name.
-    let cast_target_mentions = match &expr.node {
-        TypedExprNode::Cast { target, .. } => is_free_in_type(name, target),
-        _ => false,
-    };
-    if is_free_in_type(name, &expr.ty)
-        || cast_target_mentions
-        || expr
-            .user_annotation
-            .as_ref()
-            .is_some_and(|ann| is_free_in_type(name, ann))
-    {
-        todo!(
-            "substitute_param_in_body: `{name}` occurs free in a type-position \
-             refinement predicate of {}; substituting through type-carried \
-             (cast-introduced) refinements is not yet implemented",
-            symbolic(&expr),
-        );
-    }
-
-    // Fast path: substitute Var hits, return atoms unchanged without traversal.
-    match &expr.node {
-        TypedExprNode::Var(n) if n == name => return replacement.clone(),
-        TypedExprNode::Var(_)
-        | TypedExprNode::Lit(_)
-        | TypedExprNode::Builtin(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Source(_)
-        | TypedExprNode::Defer => return expr,
-        _ => {}
-    }
-
-    let Expr {
-        node,
-        ty,
-        user_annotation,
-    } = expr;
-
-    let new_node = match node {
-        TypedExprNode::Lambda { param, body } if &param.name == name => {
-            // `name` is shadowed by this lambda's param; leave the body alone.
-            TypedExprNode::Lambda { param, body }
-        }
-        TypedExprNode::Lambda { param, body } => TypedExprNode::Lambda {
-            param,
-            body: Box::new(substitute_param_in_body(*body, name, replacement)),
-        },
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            let new_bound = substitute_param_in_body(*bound_expr, name, replacement);
-            // Shadowing: if the Let rebinds `name`, leave its body alone.
-            let new_body = if &binding.name == name {
-                *body
-            } else {
-                substitute_param_in_body(*body, name, replacement)
-            };
-            TypedExprNode::Let {
-                binding,
-                bound_expr: Box::new(new_bound),
-                body: Box::new(new_body),
-            }
-        }
-        // Loop params shadow `name` inside `loop_body`, so we can't fall
-        // through to the generic structural recursion below.  Delegate to
-        // the shared shadowing-aware helper.
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            crate::ccl::walk_loop_children(params, init_args, source, loop_body, Some(name), |e| {
-                substitute_param_in_body(e, name, replacement)
-            })
-        }
-
-        // All remaining variants (including the lowering-recovery `Error`
-        // placeholder, which has no children): pure structural recursion.
-        node => {
-            let mut expr = Expr {
-                node,
-                ty,
-                user_annotation,
-            };
-            expr.map_children(|child| substitute_param_in_body(child, name, replacement));
-            return expr;
-        }
-    };
-
-    Expr {
-        node: new_node,
-        ty,
-        user_annotation,
-    }
+    let mut expr = expr;
+    crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
+    expr
 }
 
 // ---------------------------------------------------------------------------

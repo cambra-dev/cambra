@@ -512,13 +512,16 @@ against the in-scope binders at the destination position and panics
 on mismatch with a message identifying which pass and which binder
 caused the violation.
 
-Enforcement is two-tier. The per-propagation-site checks are
-`debug_assert!`s — fast-path regression guards, compiled out in
-release builds. The end-of-inference boundary check
-(`check_scope_valid` in `infer_simple_sub.rs`) runs unconditionally,
-in release builds too, reporting any ill-scoped node as an internal
-`InferError::ScopeViolation` — the violations it guards are compiler
-bugs that would otherwise flow into planning as silent miscompiles.
+Enforcement is two-tier, debug builds only. The per-propagation-site
+checks are `debug_assert!`s — fast-path regression guards. The
+end-of-inference boundary check (`check_scope_valid` in
+`infer_simple_sub.rs`) walks every coalesced node, reporting any
+ill-scoped node as an internal `InferError::ScopeViolation`. It ran
+unconditionally while the substitution was value-only (a type-slot
+occurrence of a discharged binder was out of contract, so only this
+boundary caught the residual); the uniform substitution rewrites type
+slots in the same pass as terms, making that class structurally
+unrepresentable, and the walk demoted to a debug-build net.
 The intent is to catch compiler bugs — incorrect α-renaming,
 missed descent into predicates during substitution, an inliner
 that fails to handle some binding form, a unification rule that

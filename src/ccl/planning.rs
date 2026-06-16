@@ -1580,7 +1580,9 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
                 if arms.len() == 1 {
                     if let Type::Refinement(base_ty, refinement) = &types[arms[0]] {
                         let pred_rc = &refinement.predicate;
-                        let pred = pred_rc.borrow().clone();
+                        // `convert_loop_join` only reads the predicate (it
+                        // builds a new expr), so borrow rather than clone it.
+                        let pred = pred_rc.borrow();
                         trace!("Attempting loop join conversion inside iteration");
                         if let Some(transformed) = convert_loop_join(base_ty, &pred) {
                             trace!(
@@ -1648,7 +1650,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
             let build_output_ty = build_input.ty.codomain().unwrap().clone();
             let build_key = if let Some(build_key_idx) = build_key_idx {
                 typed_compose(vec![
-                    build_input.clone(),
+                    build_input,
                     Expr::proj_index(*build_key_idx).with_ty(Type::fun(
                         build_output_ty.clone(),
                         build_key_expr.ty.domain().unwrap().clone(),
@@ -1656,7 +1658,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
                     build_key_expr.clone(),
                 ])
             } else {
-                typed_compose(vec![build_input.clone(), build_key_expr.clone()])
+                typed_compose(vec![build_input, build_key_expr.clone()])
             };
 
             let converse_ty = Type::fun(
@@ -1678,7 +1680,7 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
             let probe_output_ty = probe_input.ty.codomain().unwrap().clone();
             let probe_key = if let Some(probe_key_idx) = probe_key_idx {
                 typed_compose(vec![
-                    probe_input.clone(),
+                    probe_input,
                     Expr::proj_index(*probe_key_idx).with_ty(Type::fun(
                         probe_output_ty.clone(),
                         probe_key_expr.ty.domain().unwrap().clone(),
@@ -1686,10 +1688,10 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
                     probe_key_expr.clone(),
                 ])
             } else {
-                typed_compose(vec![probe_input.clone(), probe_key_expr.clone()])
+                typed_compose(vec![probe_input, probe_key_expr.clone()])
             };
 
-            let probe_expr = typed_compose(vec![probe_key, build_side.clone()]);
+            let probe_expr = typed_compose(vec![probe_key, build_side]);
             typecheck(&probe_expr).expect("Bad probe expr");
 
             trace!(
@@ -1903,7 +1905,9 @@ fn try_hash_join_rewrite(expr: &mut Expr, domain_ty: &Type) -> bool {
         return false;
     };
     let pred_rc = &refinement.predicate;
-    let pred = pred_rc.borrow().clone();
+    // `convert_loop_join` only reads the predicate (it builds a new expr), so
+    // borrow rather than clone it.
+    let pred = pred_rc.borrow();
     trace!(
         "Attempting hash-join rewrite at iteration site: {}",
         symbolic(expr),

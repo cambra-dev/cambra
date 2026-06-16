@@ -403,7 +403,21 @@ fn count_free_with_visited(
     expr: &Expr,
     visited: &mut HashSet<PredicateCellId>,
 ) -> usize {
-    let in_type = count_free_in_type_with_visited(name, &expr.ty, visited);
+    // Every type slot of the node counts: `ty`, the user annotation, and a
+    // `Cast`'s target (the syntactic anchor of its refinement — pre-inference
+    // no `ty` tag aliases it, so it must be walked explicitly or a
+    // predicate-only occurrence goes unseen).
+    let in_type = count_free_in_type_with_visited(name, &expr.ty, visited)
+        + expr
+            .user_annotation
+            .as_ref()
+            .map_or(0, |t| count_free_in_type_with_visited(name, t, visited))
+        + match &expr.node {
+            TypedExprNode::Cast { target, .. } => {
+                count_free_in_type_with_visited(name, target, visited)
+            }
+            _ => 0,
+        };
     let in_node = match &expr.node {
         TypedExprNode::Var(n) => (n == name) as usize,
 

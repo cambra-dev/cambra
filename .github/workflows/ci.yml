@@ -81,6 +81,14 @@ jobs:
         if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh clippy
 
+      - name: Clippy (release)
+        # Lints all targets — including the test target — in release. The debug
+        # checks never compile tests in release, so debug-only gating that
+        # breaks release builds (a `#[cfg(debug_assertions)]` item referenced by
+        # ungated code) only surfaces here. Runs even if earlier steps failed.
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        run: ./ci.sh clippy_release
+
       - name: Test
         # Run even if earlier steps failed so we see all errors in one run.
         # (Steps default to `if: success()`, which skips on prior failure.)

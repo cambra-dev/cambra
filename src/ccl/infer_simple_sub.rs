@@ -1449,15 +1449,19 @@ pub fn infer(expr: &mut Expr, sources: &HashMap<String, Type>) -> Result<Type, V
     // *every* node now that dependent application discharges its binder to the
     // argument at both polarities and `let`-closing discharges bound names as
     // the type leaves their scope. The program's sources are in scope at the root.
-    // Unconditional: value-only substitution deliberately leaves type-slot
-    // occurrences of a discharged binder unrewritten, so a descent bug leaves a
-    // dangling predicate binder — this boundary must reject it as an error
-    // rather than let it flow into planning as a silent miscompile.
-    let root_scope: std::collections::BTreeSet<Name> = sources.keys().map(Name::from).collect();
-    let mut scope_errors = Vec::new();
-    check_scope_valid(expr, &root_scope, &mut scope_errors);
-    if !scope_errors.is_empty() {
-        return Err(scope_errors);
+    // Debug-only: the uniform substitution traverses type slots in the same
+    // pass as the term (no value-only contract), so a type-borne occurrence of
+    // a discharged binder is rewritten where it sits and the dangling-binder
+    // class this walk guarded is structurally unrepresentable. The walk stays
+    // as the debug-build regression net for substitution-descent bugs.
+    #[cfg(debug_assertions)]
+    {
+        let root_scope: std::collections::BTreeSet<Name> = sources.keys().map(Name::from).collect();
+        let mut scope_errors = Vec::new();
+        check_scope_valid(expr, &root_scope, &mut scope_errors);
+        if !scope_errors.is_empty() {
+            return Err(scope_errors);
+        }
     }
     Ok(expr.ty.clone())
 }
@@ -2264,7 +2268,14 @@ impl Typing for CheckCtx {
         // the recorded node type has the binding discharged, so the
         // reconstruction must re-run the same substitution to reconcile under
         // structural predicate equality.
-        crate::ccl::subst::Subst::discharge(name, bound_expr.clone()).apply_type(&body_ty)
+        // Vacuous unless the binder is free in the body type's refinement
+        // predicates — then return the (owned) body type unchanged rather than
+        // cloning `bound_expr` for a no-op discharge.
+        if crate::ccl::subst::type_free_vars(&body_ty).contains(name) {
+            crate::ccl::subst::Subst::discharge(name, bound_expr.clone()).apply_type(&body_ty)
+        } else {
+            body_ty
+        }
     }
 
     fn bind_annotation(&mut self, _inferred: &Type, _ann: &Type) -> Result<(), InferError> {
@@ -2339,7 +2350,12 @@ impl Typing for CheckCtx {
         // type matches the recorded (discharged) one. A named Pi discharges its
         // binder to the argument; an ordinary function's codomain is unchanged.
         let result = match peel_refinements_outer(fn_ty) {
-            Type::Fun { name: Some(b), .. } => {
+            // Discharge only when the Pi binder is actually free in the
+            // codomain's refinement predicates; otherwise the argument clone
+            // would feed a no-op substitution.
+            Type::Fun { name: Some(b), .. }
+                if crate::ccl::subst::type_free_vars(&codomain).contains(b) =>
+            {
                 crate::ccl::subst::Subst::discharge(b, argument.clone()).apply_type(&codomain)
             }
             _ => codomain,
@@ -2802,9 +2818,11 @@ fn coalesce_pass(expr: &mut Expr, remap: CellRemap) -> (Vec<InferError>, CellRem
 /// substitution that forgot to descend into predicates (the regression case M of
 /// the proposal's matrix). On a correct implementation over a well-typed program
 /// it never fires; user-facing scoping errors are caught earlier with source
-/// context (§3.4). Because the violations it guards are compiler bugs that
-/// would otherwise miscompile silently, it runs in release builds too,
+/// context (§3.4). The uniform substitution rewrites type slots in the same
+/// pass as terms, so the dangling-binder class this walk guards is
+/// structurally unrepresentable; it runs as a debug-build regression net,
 /// reporting each ill-scoped node as an [`InferError::ScopeViolation`].
+#[cfg(debug_assertions)]
 fn check_scope_valid(
     expr: &Expr,
     scope: &std::collections::BTreeSet<Name>,
@@ -3238,8 +3256,16 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             bound_expr,
             body,
         } => {
-            let sigma = crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone());
-            Some(sigma.apply_type(&body.ty))
+            // Only the dependent case (the binder free in the body type's
+            // refinement predicates) does any work; skip cloning the bound
+            // expression when the discharge would be vacuous.
+            if crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name) {
+                let sigma =
+                    crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone());
+                Some(sigma.apply_type(&body.ty))
+            } else {
+                Some(body.ty.clone())
+            }
         }
         _ => None,
     };
@@ -3516,8 +3542,14 @@ fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx
     // immaterial since the specializations never reference one another.
     let mut result = body;
     for spec in frame.specs.into_iter().rev() {
-        let body_ty = crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone())
-            .apply_type(&result.ty);
+        // The discharge only does work when the specialization binder is free
+        // in the body type's refinement predicates; skip cloning `spec.def`
+        // otherwise (it is still moved into the rebuilt `let` below).
+        let body_ty = if crate::ccl::subst::type_free_vars(&result.ty).contains(&spec.name) {
+            crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone()).apply_type(&result.ty)
+        } else {
+            result.ty.clone()
+        };
         result = Expr::new(TypedExprNode::Let {
             binding: TypedBinding {
                 name: spec.name,
@@ -3818,6 +3850,8 @@ mod tests {
 
     /// `{Int | __elem > rhs}` — a refinement whose bare predicate compares
     /// the implicit element binder ([`crate::ccl::REFINEMENT_BINDER`]) against `rhs`.
+    /// Only the debug-only `scope_check_*` tests use it.
+    #[cfg(debug_assertions)]
     fn refined_int(rhs: TypedExpr) -> Type {
         use crate::ccl::CompareKind;
         let pred = TypedExpr::binop(
@@ -3836,6 +3870,9 @@ mod tests {
     // Scope-validity check (design §6.2), appendix case J: a refinement whose
     // predicate references a binder not in scope is reported as a
     // `ScopeViolation` naming that binder.
+    // `check_scope_valid` is a debug-only check (the §6.2 demotion gated it on
+    // `debug_assertions`), so these three tests compile only in debug builds.
+    #[cfg(debug_assertions)]
     #[test]
     fn scope_check_reports_out_of_scope_binder() {
         let mut e = lit_int(1);
@@ -3852,6 +3889,7 @@ mod tests {
     // binder is bound on the path — by the enclosing lambda for the body
     // node, and by the Pi binder name for the lambda's own dependent type
     // (`(x: Int) ⇒ {Int | v > x}`).
+    #[cfg(debug_assertions)]
     #[test]
     fn scope_check_accepts_enclosing_binder() {
         let mut body = lit_int(1);
@@ -3870,6 +3908,7 @@ mod tests {
     // Appendix case L: a predicate whose only free variable is the
     // refinement's own implicit element binder is well-scoped in an empty
     // scope.
+    #[cfg(debug_assertions)]
     #[test]
     fn scope_check_accepts_own_element_binder() {
         let mut e = lit_int(1);

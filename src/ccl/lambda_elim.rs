@@ -41,7 +41,6 @@
 //! | `neg`, `not_fn` | `Builtin(Neg)`, `Builtin(NotFn)` | unary scalar ops |
 
 use std::cell::RefCell;
-use std::mem::replace;
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{cast_target_refinement, is_free, is_free_in_value, typed_compose};
@@ -198,163 +197,20 @@ pub fn const_(c: Expr) -> Expr {
 
 /// Replace every free occurrence of `Var(name)` in `expr` with `replacement`.
 ///
-/// Stops descending when `name` is rebound by [`TypedExprNode::Lambda::param`] or
-/// [`TypedExprNode::Let::binding`].  Does **not** perform capture-avoiding renaming of
-/// other binders; the caller is responsible for ensuring `replacement` does
-/// not contain free variables that would be captured.
+/// A thin wrapper over the uniform engine's in-place mode
+/// ([`crate::ccl::subst::Subst::rewrite_expr`]): one traversal over terms
+/// *and* type slots, predicates rewritten through their shared cells so
+/// every type-borne alias observes the rewrite, `Compose` types recomputed
+/// from the rewritten elements. Shadowing stops the descent exactly as
+/// before (an inlined copy of a lambda can rebind the same `Name`, so the
+/// discipline is still load-bearing); capture is impossible under the
+/// Barendregt convention and the engine asserts it.
 pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
     debug_typecheck(&expr);
-    // Fast path: no allocation needed for atoms.
-    match &expr.node {
-        TypedExprNode::Var(n) if n == name => return replacement.clone(),
-        TypedExprNode::Var(_)
-        | TypedExprNode::Lit(_)
-        | TypedExprNode::Proj(_)
-        | TypedExprNode::Builtin(_) => return expr,
-        _ => {}
-    }
-    if !is_free(name, &expr) {
-        return expr;
-    }
-    let TypedExpr {
-        node,
-        mut ty,
-        user_annotation,
-    } = expr;
-    substitute_in_type(&mut ty, name, replacement);
-
-    let new_node = match node {
-        TypedExprNode::Lambda { param, body } => {
-            if &param.name == name {
-                // name is shadowed; do not substitute inside
-                TypedExprNode::Lambda { param, body }
-            } else {
-                TypedExprNode::Lambda {
-                    param,
-                    body: Box::new(substitute(*body, name, replacement)),
-                }
-            }
-        }
-
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => {
-            let new_bound = substitute(*bound_expr, name, replacement);
-            let new_body = if &binding.name == name {
-                *body // shadowed; do not substitute
-            } else {
-                substitute(*body, name, replacement)
-            };
-            TypedExprNode::Let {
-                binding,
-                bound_expr: Box::new(new_bound),
-                body: Box::new(new_body),
-            }
-        }
-
-        // Loop params shadow `name` inside `loop_body`, so we can't fall
-        // through to the generic structural recursion below — that would
-        // substitute into the body unconditionally.  Delegate to the
-        // shared shadowing-aware helper.
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            crate::ccl::walk_loop_children(params, init_args, source, loop_body, Some(name), |e| {
-                substitute(e, name, replacement)
-            })
-        }
-
-        TypedExprNode::Compose(elts) => {
-            let new_elts: Vec<Expr> = elts
-                .into_iter()
-                .map(|e| substitute(e, name, replacement))
-                .collect();
-            // After substitution element types may change (e.g. a Var
-            // whose type was an unresolved Infer placeholder gets
-            // replaced by a concrete expression with a fully-typed
-            // domain).  Recompute the outer Fun type so the invariant
-            // `Compose.ty == Fun(first_domain, last_codomain)` is
-            // maintained.
-            if let (Some(first), Some(last)) = (new_elts.first(), new_elts.last())
-                && let (Some(new_domain), Some(new_codomain)) =
-                    (first.ty.domain(), last.ty.codomain())
-            {
-                ty = Type::fun(new_domain, new_codomain);
-            }
-            TypedExprNode::Compose(new_elts)
-        }
-
-        // `Defer`, `Feed`, `Define`, and `ExprStmt` are eliminated by
-        // `desugar_defers` before inference; `substitute` only runs on
-        // post-desugar trees.
-        TypedExprNode::Feed { .. }
-        | TypedExprNode::Define { .. }
-        | TypedExprNode::Defer
-        | TypedExprNode::ExprStmt { .. } => {
-            unreachable!("Defer/Feed/Define/ExprStmt eliminated by desugar_defers before inference")
-        }
-
-        TypedExprNode::Error => crate::unexpected_error_node!(),
-
-        // All remaining variants: pure structural recursion, using the
-        // type-substituted `ty`.  Atoms have no children, so this is a
-        // no-op for them.
-        node => {
-            let mut expr = TypedExpr {
-                node,
-                ty,
-                user_annotation,
-            };
-            expr.map_children(|child| substitute(child, name, replacement));
-            debug_typecheck(&expr);
-            return expr;
-        }
-    };
-    let result = TypedExpr {
-        node: new_node,
-        ty,
-        user_annotation,
-    };
-    debug_typecheck(&result);
-    result
-}
-
-/// Helper for `substitute` that recurses into any refined types where we also need to
-/// substitute the param.
-fn substitute_in_type(ty: &mut Type, name: &Name, replacement: &Expr) {
-    // Refinement predicates are sub-expressions, not sub-types — handle
-    // the predicate explicitly, then recurse into structural type children.
-    if let Type::Refinement(_, refinement) = ty {
-        let Refinement {
-            predicate: pred_rc, ..
-        } = &mut *refinement;
-        let t = Expr::lit(Lit::Unit);
-        // Substitute within the refinement, unless we are already inside that same
-        // refinement (a failed `try_borrow_mut` is the cycle guard: a predicate's
-        // own type slots may reference this same refinement). The placeholder `t`
-        // sits in the predicate while `substitute` runs — and `substitute` calls
-        // `debug_typecheck`, which walks refinement predicates, so that walk must
-        // tolerate an already-borrowed predicate (it uses `try_borrow`; see
-        // `infer::collect_type_errors`) rather than re-borrowing and panicking.
-        // TODO: this probably simplifies once we remove the RefCell from the predicate.
-        // The refinement binds REFINEMENT_BINDER inside its predicate, so a
-        // substitution *of that very name* is shadowed here — descending would
-        // capture the refinement's own element binder (the shared name makes
-        // this a real hazard for nested refinements).
-        if !name.is_elem()
-            && let Ok(mut pred) = pred_rc.try_borrow_mut()
-        {
-            let old_pred = replace(&mut *pred, t);
-            let new_pred = substitute(old_pred, name, replacement);
-            *pred = new_pred;
-        }
-    }
-    ty.walk_children_mut(|child| substitute_in_type(child, name, replacement));
+    let mut expr = expr;
+    crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
+    debug_typecheck(&expr);
+    expr
 }
 
 // ---------------------------------------------------------------------------
@@ -890,19 +746,25 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         ty,
         user_annotation,
     } = expr;
+    // Only the debug-build invariant asserts below read `original_ty`.
+    #[cfg(debug_assertions)]
     let original_ty = ty.clone();
     let result = match node {
         // Lambda: eliminate then continue. (Domain refinements ride the type
         // lattice via `cast`; the cast-wrapped-lambda arm below handles the
         // dependent case.)
         TypedExprNode::Lambda { param, body } => {
+            // Render the pre-elimination lambda only in debug builds — the
+            // string (and its `*body` clone) feeds just the assert below.
+            #[cfg(debug_assertions)]
             let original = symbolic(&Expr::lambda(&param.name, param.ty.clone(), *body.clone()));
             let result = elim_lambda(ctx, &param.name, &param.ty, *body)?;
             // Compare modulo Pi binder *presence*: the point-free
             // construction keeps a dependent morphism's own binder (same
             // `Name`, uid-preserved) but rebuilds combinator arrows with
             // `name: None`; see `Type::without_pi_names`.
-            debug_assert!(
+            #[cfg(debug_assertions)]
+            assert!(
                 original_ty.without_pi_names() == result.ty.without_pi_names(),
                 "{}\nto\n{}\nwith {} vs {}",
                 original,
@@ -1038,7 +900,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
     };
     if let Ok(e) = &result {
         debug_typecheck(e);
-        debug_assert!(
+        #[cfg(debug_assertions)]
+        assert!(
             original_ty.without_pi_names() == e.ty.without_pi_names(),
             "{} vs {}",
             original_ty,
