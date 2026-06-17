@@ -507,7 +507,6 @@ mod tests {
         TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
     };
     use rstest::rstest;
-    use std::cell::RefCell;
     use std::rc::Rc;
 
     // -----------------------------------------------------------------------
@@ -750,7 +749,7 @@ in x"
             Type::Refinement(
                 Box::new(Type::Base(BaseType::Int)),
                 Refinement {
-                    predicate: Rc::new(RefCell::new(Expr::lit(Lit::Bool(true)))),
+                    predicate: Rc::new(Expr::lit(Lit::Bool(true))),
                 },
             ),
             Expr::var("x"),

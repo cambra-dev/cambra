@@ -13,7 +13,7 @@
 //!    Because the vars are shared `Rc<InferVar>`s, later constraints
 //!    accumulate into bounds that are already visible through the stored
 //!    `Type` — no side table is needed. Domain refinements ride the type
-//!    lattice as restriction tags on [`Type::Refinement`] (introduced by the
+//!    lattice as restriction witnesses on [`Type::Refinement`] (introduced by the
 //!    `cast` Apply arm), so they flow through the solver structurally.
 //! 2. **Coalesce + write-back + monomorphize**: walk the tree again and, for
 //!    each node, run
@@ -38,7 +38,7 @@
 //! integrated into the coalesce walk: at a generalized use, the walk resolves
 //! the instantiation type off the live constraint graph (complete by then),
 //! emits one specialized clone of the definition per distinct resolved type
-//! (`freshen_expr_types` + a constrain-against-the-live-use-type pin + a
+//! (`freshen_expr_type_slots` + a constrain-against-the-live-use-type pin + a
 //! re-entrant coalesce), and rewrites the use to reference its
 //! specialization. So inference both type-checks the polymorphism and lowers
 //! it to concrete per-type code before lambda-elimination. Sharing one
@@ -68,8 +68,7 @@
 //! `lower_mutation_loop`); those have entries in [`OperatorSchemes`] and
 //! are freshened at each use site like any other scheme.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use smol_str::SmolStr;
@@ -77,14 +76,14 @@ use smol_str::SmolStr;
 use crate::ccl::ccl_utils::cast_target_refinement;
 use crate::ccl::infer::InferError;
 use crate::ccl::simple_sub::{
-    CellRemap, CoalesceError, ConstrainCache, ConstrainError, FieldKey, FreshenCache, FreshenLevel,
-    PolyScheme, coalesce_compact, compact_type, constrain_subtype, fresh_var, freshen_above, fun,
-    prim, simplify_type, type_level,
+    CoalesceError, ConstrainCache, ConstrainError, FieldKey, FreshenCache, FreshenLevel,
+    PolyScheme, coalesce_compact, compact_type, constrain_subtype, fresh_var,
+    freshen_expr_type_slots, fun, prim, simplify_type, type_level,
 };
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    AggregateKind, BaseType, BinOpKind, Branch, Builtin, Expr, InferVar, InferVarId, Level, Lit,
-    Name, PredicateCellId, ProjKey, Refinement, Type, TypedBinding, TypedExprNode, UnaryOpKind,
+    AggregateKind, BaseType, BinOpKind, Branch, Builtin, Expr, Level, Lit, Name, ProjKey,
+    Refinement, Type, TypedBinding, TypedExprNode, UnaryOpKind,
 };
 use crate::util::ScopeStack;
 
@@ -323,351 +322,6 @@ fn should_generalize(def: &Expr, level: Level) -> bool {
     matches!(def.node, TypedExprNode::Lambda { .. }) && type_level(&def.ty) > level
 }
 
-/// Freshen every type slot in a cloned definition subtree through one shared
-/// [`FreshenCache`], producing an independent copy to specialize. This both
-/// *renames* each quantified variable (level > `cutoff`) to a fresh one (level
-/// per `target`) and *copies its bounds*, so the clone can be constrained to a
-/// resolved use type and coalesced without disturbing the original definition
-/// or any other clone. The shared cache keeps the renaming consistent across
-/// slots (a variable in one node and in another's bounds maps to the same fresh
-/// var). See [`specialize_use`], which freshens one clone per distinct use
-/// type with [`FreshenLevel::Preserve`] (so nested generalized `let`s keep
-/// their deeper levels and stay recognizable as polymorphic).
-///
-/// Crucially this freshens *every* type in the AST — `expr.ty`, binder slots
-/// (lambda param, `let` binding, `Case` payload, `Loop` params), and
-/// refinement predicates carried on those types — not just those reachable
-/// from the definition's root type. A definition's interior carries variables
-/// (e.g. `Proj` seeds) that never appear in its root type; missing them would
-/// leave the clone with a mix of fresh and original variables and coalesce to
-/// an unresolved type. The one slot family this walk cannot reach — the terms
-/// captured inside the copied bounds' *edge substitutions* — is handled by
-/// the follow-up [`freshen_bound_substs`] sweep over the cache.
-fn freshen_expr_types(
-    expr: &mut Expr,
-    cutoff: Level,
-    target: FreshenLevel,
-    cache: &mut FreshenCache,
-    remap: &mut CellRemap,
-) {
-    expr.ty = freshen_above(cutoff, &expr.ty, target, cache);
-    if let Some(annotation) = &mut expr.user_annotation {
-        dealias_anchored_predicates(annotation, cutoff, target, cache, remap);
-    }
-    match &mut expr.node {
-        TypedExprNode::Lambda { param, .. } => {
-            param.ty = freshen_above(cutoff, &param.ty, target, cache);
-        }
-        TypedExprNode::Cast {
-            target: cast_target,
-            ..
-        } => {
-            dealias_anchored_predicates(cast_target, cutoff, target, cache, remap);
-        }
-        TypedExprNode::Let { binding, .. } => {
-            binding.ty = freshen_above(cutoff, &binding.ty, target, cache);
-        }
-        TypedExprNode::Case { branches, .. } => {
-            for b in branches.iter_mut() {
-                if let Some(p) = &mut b.pattern {
-                    p.binding.ty = freshen_above(cutoff, &p.binding.ty, target, cache);
-                }
-            }
-        }
-        TypedExprNode::Loop { params, .. } => {
-            for p in params.iter_mut() {
-                p.ty = freshen_above(cutoff, &p.ty, target, cache);
-            }
-        }
-        _ => {}
-    }
-    expr.walk_children_mut(|c| freshen_expr_types(c, cutoff, target, cache, remap));
-}
-
-/// Freshen the suspended-substitution payloads riding the freshened clone's
-/// copied bound edges — the slots [`freshen_expr_types`] cannot reach.
-///
-/// [`freshen_above`] copies each bound's *type* through the cache but carries
-/// its edge substitutions over verbatim, so a discharge's captured argument
-/// term still holds the *definition's* inference variables in its type slots.
-/// Those variables are never pinned (only the clone's freshened copies are),
-/// so when coalesce later forces the discharge, the spliced term's slots
-/// would resolve under-determined — the chained poly-calls-poly failure
-/// (`g = λys → f(ys)`: the `[xs ↦ ys]` discharge inside a `g` clone must
-/// reference the clone's `ys`, not the original definition's). Sweep every
-/// variable the freshen minted and rename each bound's discharge terms
-/// through the same cache. A worklist, run to fixpoint: freshening a captured
-/// term can itself mint cache entries whose copied bounds carry further
-/// substitutions.
-///
-/// TODO(vault: type-checker-immutable-predicate-terms): this sweep exists only
-/// because freshening is split — `freshen_above` walks *types* but a bound's
-/// suspended-discharge payload is a *term* riding the edge, so its slots are a
-/// blind spot patched here. The migration's "one uniform capture-avoiding
-/// substitution over terms and types" closes that split: freshening a bound
-/// would rename its payload's slots in the same traversal, and this separate
-/// pass goes away.
-fn freshen_bound_substs(
-    cutoff: Level,
-    target: FreshenLevel,
-    cache: &mut FreshenCache,
-    remap: &mut CellRemap,
-) {
-    let mut seen: HashSet<InferVarId> = HashSet::new();
-    loop {
-        let pending: Vec<Rc<InferVar>> = cache
-            .values()
-            .filter(|v| !seen.contains(&v.uid))
-            .cloned()
-            .collect();
-        if pending.is_empty() {
-            return;
-        }
-        for var in pending {
-            seen.insert(var.uid);
-            // Holding this var's bounds mutably is safe across the recursive
-            // freshen: a captured term's slots hold *original* (or already-
-            // freshened, cache-hit) variables, never this freshly minted one,
-            // so the recursion borrows other vars only.
-            let mut bounds = var.bounds.borrow_mut();
-            let bounds = &mut *bounds;
-            for b in bounds.lower.iter_mut().chain(bounds.upper.iter_mut()) {
-                for subst in [&mut b.self_subst, &mut b.ty_subst] {
-                    subst.for_each_discharge_term_mut(&mut |t| {
-                        freshen_expr_types(t, cutoff, target, cache, remap)
-                    });
-                }
-            }
-        }
-    }
-}
-
-/// De-alias and freshen one refinement's predicate cell, for
-/// [`freshen_expr_types`].
-///
-/// [`Refinement::predicate`] is an `Rc<RefCell<_>>` and `Expr::clone` only
-/// bumps the refcount, so every clone — and the original — share *one*
-/// predicate cell. Freshening in place would corrupt the original and
-/// entangle the specializations (one would re-freshen another's variables).
-/// De-alias: freshen an owned copy and install it under a fresh cell so this
-/// clone's predicate is freshened independently of all others.
-///
-/// Each retirement is recorded in the clone-local `remap`, which serves two
-/// purposes: anchors that shared a cell before de-aliasing keep sharing the
-/// replacement (the second sighting reuses it instead of re-freshening), and
-/// [`realias_refinement_tags`] can re-point the clone's type-borne tags —
-/// cloned cell-intact by [`freshen_above`] — at the de-aliased cells.
-fn dealias_refinement_predicate(
-    r: &mut Refinement,
-    cutoff: Level,
-    target: FreshenLevel,
-    cache: &mut FreshenCache,
-    remap: &mut CellRemap,
-) {
-    if let Some(cell) = remap.replacement(&r.predicate) {
-        r.predicate = cell.clone();
-        return;
-    }
-    let mut pred = r.predicate.borrow().clone();
-    freshen_expr_types(&mut pred, cutoff, target, cache, remap);
-    let cell = Rc::new(RefCell::new(pred));
-    remap.record(r.predicate.clone(), cell.clone());
-    r.predicate = cell;
-}
-
-/// De-alias + freshen every refinement predicate cell embedded in a
-/// *syntactic anchor* type — a `Cast` target or a user annotation — via
-/// [`dealias_refinement_predicate`].
-///
-/// Anchors are where predicates enter the tree, so they are the slots a
-/// specialized clone must own privately. Tags propagated onto *inferred*
-/// types by constrain share the anchor's original cell; the retirement
-/// recorded in `remap` lets [`realias_refinement_tags`] re-point them at the
-/// de-aliased anchor cell afterwards.
-fn dealias_anchored_predicates(
-    ty: &mut Type,
-    cutoff: Level,
-    target: FreshenLevel,
-    cache: &mut FreshenCache,
-    remap: &mut CellRemap,
-) {
-    if let Type::Refinement(_, r) = ty {
-        dealias_refinement_predicate(r, cutoff, target, cache, remap);
-    }
-    ty.walk_children_mut(|child| dealias_anchored_predicates(child, cutoff, target, cache, remap));
-}
-
-// `CellRemap` — the retired-predicate-cell remap shared with the solver —
-// lives in `simple_sub`, where `compact_type` canonicalizes every refinement
-// tag it collects through it. This pass *fills* it (privatization and
-// per-specialization de-aliasing record retirements) and runs the final
-// whole-tree re-alias over it.
-
-/// Re-point every refinement tag whose predicate cell was retired in `remap`
-/// at its (transitive) replacement cell.
-///
-/// Two callers: [`specialize_use`] restores intra-clone sharing after
-/// [`freshen_expr_types`] (de-aliasing gave each *anchor* a private,
-/// freshened cell, but tags riding inferred types — `expr.ty`, binder slots
-/// — were cloned by [`freshen_above`] cell-intact and still alias the
-/// original definition's cells, whose contents carry the original quantified
-/// variables and are never coalesced); and [`infer`]'s post-coalesce sweep
-/// re-points tags stamped before the relevant specialization existed (a type
-/// the walk read *during* coalesce materialized its tags canonically through
-/// `compact_type`, but one read before the binding's first use still aliases
-/// a retired cell). Left stale, retired cells surface unresolved-variable
-/// errors when post-inference validation walks the tags.
-///
-/// Tags whose cell was never retired are left untouched — their cells are
-/// live anchors coalesced by the main pass.
-fn realias_refinement_tags(
-    expr: &mut Expr,
-    remap: &CellRemap,
-    seen: &mut HashSet<PredicateCellId>,
-) {
-    realias_tags_in_type(&mut expr.ty, remap, seen);
-    if let Some(annotation) = &mut expr.user_annotation {
-        realias_tags_in_type(annotation, remap, seen);
-    }
-    match &mut expr.node {
-        TypedExprNode::Lambda { param, .. } => {
-            realias_tags_in_type(&mut param.ty, remap, seen);
-        }
-        TypedExprNode::Cast { target, .. } => realias_tags_in_type(target, remap, seen),
-        TypedExprNode::Let { binding, .. } => realias_tags_in_type(&mut binding.ty, remap, seen),
-        TypedExprNode::Case { branches, .. } => {
-            for b in branches.iter_mut() {
-                if let Some(p) = &mut b.pattern {
-                    realias_tags_in_type(&mut p.binding.ty, remap, seen);
-                }
-            }
-        }
-        TypedExprNode::Loop { params, .. } => {
-            for p in params.iter_mut() {
-                realias_tags_in_type(&mut p.ty, remap, seen);
-            }
-        }
-        _ => {}
-    }
-    expr.walk_children_mut(|c| realias_refinement_tags(c, remap, seen));
-}
-
-/// Re-point one tag (if its cell was retired), then descend into the (now
-/// canonical) predicate once per cell — predicates are expressions whose
-/// own type slots can carry tags needing re-pointing. `seen` guards only
-/// the descent, not the swap; `try_borrow_mut` skips a cell already being
-/// walked higher up the stack.
-fn realias_tag(r: &mut Refinement, remap: &CellRemap, seen: &mut HashSet<PredicateCellId>) {
-    if let Some(cell) = remap.resolve(&r.predicate) {
-        r.predicate = cell;
-    }
-    if seen.insert(r.cell_id())
-        && let Ok(mut pred) = r.predicate.try_borrow_mut()
-    {
-        realias_refinement_tags(&mut pred, remap, seen);
-    }
-}
-
-fn realias_tags_in_type(ty: &mut Type, remap: &CellRemap, seen: &mut HashSet<PredicateCellId>) {
-    if let Type::Refinement(_, r) = ty {
-        realias_tag(r, remap, seen);
-    }
-    ty.walk_children_mut(|child| realias_tags_in_type(child, remap, seen));
-}
-
-/// The live anchor predicate cells of a subtree, keyed by cell address —
-/// shared cells naturally dedup. Collected by [`collect_anchor_cells`] for
-/// [`privatize_refinement_cells`].
-type AnchorCells = HashMap<PredicateCellId, Rc<RefCell<Expr>>>;
-
-/// Collect a subtree's anchor predicate cells. Descends into each registered
-/// predicate, which can anchor refinements of its own (e.g. a nested
-/// comprehension inside a filter).
-fn collect_anchor_cells(expr: &Expr, cells: &mut AnchorCells) {
-    if let Some(annotation) = &expr.user_annotation {
-        collect_anchor_cells_in_type(annotation, cells);
-    }
-    if let TypedExprNode::Cast { target, .. } = &expr.node {
-        collect_anchor_cells_in_type(target, cells);
-    }
-    expr.walk_children(|c| collect_anchor_cells(c, cells));
-}
-
-fn register_anchor_cell(r: &Refinement, cells: &mut AnchorCells) {
-    if let std::collections::hash_map::Entry::Vacant(e) = cells.entry(r.cell_id()) {
-        e.insert(r.predicate.clone());
-        if let Ok(pred) = r.predicate.try_borrow() {
-            collect_anchor_cells(&pred, cells);
-        }
-    }
-}
-
-fn collect_anchor_cells_in_type(ty: &Type, cells: &mut AnchorCells) {
-    if let Type::Refinement(_, r) = ty {
-        register_anchor_cell(r, cells);
-    }
-    ty.walk_children(|child| collect_anchor_cells_in_type(child, cells));
-}
-
-/// Give a generalized definition private copies of its refinement predicate
-/// cells, before the coalesce walk runs over its `let` body.
-///
-/// The cells are shared with refinement tags on *use-site* types: each use
-/// instantiated the definition's scheme via [`freshen_above`], which clones
-/// tags cell-intact. When the `let` body is coalesced, the use sites'
-/// `coalesce_type_predicates` walks those tags and coalesces the shared
-/// cell's expression types **under-determined** (a predicate's variables are
-/// the definition's quantified variables, which carry no use-site bounds) —
-/// severing the bound-bearing `InferVar` links [`specialize_use`] later
-/// freshens and pins. Re-celling the definition's anchors (and its internal
-/// same-cell tags) keeps a pristine copy on the definition; the old cells
-/// stay on the use-site tags, and the retirements recorded in `remap` let
-/// every later read resolve those tags through the chain (original →
-/// privatized → specialized) onto the surviving anchors — `compact_type`
-/// canonicalizes tags it materializes during the walk, and [`infer`]'s final
-/// re-alias sweep re-points the rest.
-fn privatize_refinement_cells(def: &mut Expr, remap: &mut CellRemap) {
-    let mut cells = AnchorCells::new();
-    collect_anchor_cells(def, &mut cells);
-    if cells.is_empty() {
-        return;
-    }
-    for cell in cells.into_values() {
-        let copy = cell.borrow().clone();
-        remap.record(cell, Rc::new(RefCell::new(copy)));
-    }
-    realias_refinement_tags(def, remap, &mut HashSet::new());
-}
-
-/// Pre-coalesce pass: privatize the predicate cells of every generalized
-/// definition (see [`privatize_refinement_cells`]), recording the
-/// retirements in the pass remap.
-///
-/// Runs before any use-site coalescing can corrupt the shared cells (a
-/// definition's uses live in its `let` body, so privatizing the whole tree
-/// up front is equivalent to privatizing each definition just before its
-/// body coalesces). `level` mirrors the coalesce discipline — only a `let`
-/// RHS bumps it — so `should_generalize` agrees with the walk on which
-/// `let`s are polymorphic. A generalized definition is privatized as a whole
-/// and not descended into (the walk never coalesces it in place); nested
-/// generalized `let`s inside it are handled per specialized clone by
-/// [`specialize_use`].
-fn privatize_generalized_defs(expr: &mut Expr, level: Level, remap: &mut CellRemap) {
-    if let TypedExprNode::Let {
-        bound_expr, body, ..
-    } = &mut expr.node
-    {
-        if should_generalize(bound_expr, level) {
-            privatize_refinement_cells(bound_expr, remap);
-        } else {
-            privatize_generalized_defs(bound_expr, level + 1, remap);
-        }
-        privatize_generalized_defs(body, level, remap);
-        return;
-    }
-    expr.walk_children_mut(|c| privatize_generalized_defs(c, level, remap));
-}
-
 /// resolved in place during coalesce — there is no side table.
 struct SimpleSubContext {
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
@@ -704,7 +358,7 @@ impl SimpleSubContext {
     /// `Type`: every `Hole` becomes a fresh inference variable at the
     /// current level. Everything else — including existing `Infer` vars,
     /// the structural variants the solver operates on, and `Refinement`
-    /// wrappers (refinements ride the lattice as refinement tags) — is
+    /// wrappers (refinements ride the lattice as refinement witnesses) — is
     /// kept, recursing to normalize nested holes.
     fn normalize_annotation(&self, ty: &Type) -> Type {
         match ty {
@@ -712,7 +366,7 @@ impl SimpleSubContext {
             Type::Hole => fresh_var(self.level),
             // Refinements ride the lattice: keep the wrapper, normalize the
             // inner (so a `Refinement(Hole, r)` source annotation becomes
-            // `Refinement(?fresh, r)` rather than losing the tag).
+            // `Refinement(?fresh, r)` rather than losing the witness).
             Type::Refinement(inner, r) => {
                 Type::Refinement(Box::new(self.normalize_annotation(inner)), r.clone())
             }
@@ -840,9 +494,9 @@ trait Typing {
     ///
     /// Emit returns `body_ty` unchanged: the body type is an unresolved var
     /// there, and the closing runs on the *resolved* type in `coalesce_node`'s
-    /// Let arm — discharging here would clone refinement cells out of any
-    /// already-concrete body type (e.g. a lambda's `Fun`), and the clones
-    /// would escape coalesce unresolved. Check re-runs the discharge so its
+    /// Let arm — discharging here would rebuild refinement predicates out of
+    /// any already-concrete body type (e.g. a lambda's `Fun`), and the rebuilt
+    /// terms would escape coalesce unresolved. Check re-runs the discharge so its
     /// reconstruction matches the recorded (closed) node type under structural
     /// predicate equality.
     fn close_let_type(&self, name: &Name, bound_expr: &Expr, body_ty: Type) -> Type;
@@ -951,7 +605,7 @@ trait Typing {
 }
 
 /// Peel every outer [`Type::Refinement`] layer off `t`, returning the bare
-/// structural type underneath. Non-allocating — only unwraps the outer tags a
+/// structural type underneath. Non-allocating — only unwraps the outer witnesses a
 /// node acquired during solving; nested refinements are left in place.
 fn peel_refinements_outer(t: &Type) -> &Type {
     let mut cur = t;
@@ -1224,10 +878,9 @@ impl Typing for SimpleSubContext {
 /// annotation `Type`, so their expression sub-trees get inferred types.
 /// Refinement predicates are `Expr`s that mention free variables of the
 /// enclosing scope; this must run while those bindings are live (i.e.
-/// during `emit_node` of the annotated node). `try_borrow_mut` skips a
-/// predicate already being walked (the same `Rc` can recur through its own
-/// type slot).
-fn emit_annotation_predicates(ty: &Type, ctx: &mut SimpleSubContext) -> Result<(), InferError> {
+/// during `emit_node` of the annotated node). Each predicate is rebuilt in
+/// place ([`emit_bare_predicate`]) so the typed term lands on the annotation.
+fn emit_annotation_predicates(ty: &mut Type, ctx: &mut SimpleSubContext) -> Result<(), InferError> {
     match ty {
         Type::Refinement(inner, r) => {
             // The annotation's refinement is bare over REFINEMENT_BINDER, just
@@ -1245,19 +898,19 @@ fn emit_annotation_predicates(ty: &Type, ctx: &mut SimpleSubContext) -> Result<(
             emit_annotation_predicates(c, ctx)
         }
         Type::Tuple(ts) => {
-            for t in ts {
+            for t in ts.iter_mut() {
                 emit_annotation_predicates(t, ctx)?;
             }
             Ok(())
         }
         Type::Record(fs) => {
-            for (_, t) in fs {
+            for (_, t) in fs.iter_mut() {
                 emit_annotation_predicates(t, ctx)?;
             }
             Ok(())
         }
         Type::Variant(tags) => {
-            for (_, t) in tags {
+            for (_, t) in tags.iter_mut() {
                 emit_annotation_predicates(t, ctx)?;
             }
             Ok(())
@@ -1274,21 +927,22 @@ fn emit_annotation_predicates(ty: &Type, ctx: &mut SimpleSubContext) -> Result<(
 /// predicate itself must be `Bool` — exactly as `infer_lambda` binds a
 /// parameter for its body, but with the refinement doing the binding.
 ///
-/// `try_borrow_mut` is the re-entrancy guard shared with `emit_lambda` /
-/// `coalesce_type_predicates`: a predicate cell can recur through its own type
-/// slot, in which case it is already being walked (and bool-checked) by the
-/// enclosing borrow, so skipping here loses nothing.
+/// The predicate is immutable, so emission types a *copy* (which seeds the
+/// constraint graph and acquires inference-variable type slots) and reinstalls
+/// it as a fresh `Rc` on `r`. The caller holds `&mut Refinement` so the typed
+/// predicate lands on the syntactic node; the cast/annotation result type then
+/// clones the typed refinement, carrying the same slots.
 fn emit_bare_predicate<C: Typing>(
-    r: &Refinement,
+    r: &mut Refinement,
     domain: &Type,
     ctx: &mut C,
 ) -> Result<(), InferError> {
-    if let Ok(mut pred) = r.predicate.try_borrow_mut() {
-        let pred_ty = ctx.scoped(&Name::elem(), domain, |ctx| ctx.subexpr(&mut pred))?;
-        ctx.require_sub(&pred_ty, &prim(BaseType::Bool), &|| {
-            "refinement predicate".to_string()
-        })?;
-    }
+    let mut pred = (*r.predicate).clone();
+    let pred_ty = ctx.scoped(&Name::elem(), domain, |ctx| ctx.subexpr(&mut pred))?;
+    ctx.require_sub(&pred_ty, &prim(BaseType::Bool), &|| {
+        "refinement predicate".to_string()
+    })?;
+    r.predicate = Rc::new(pred);
     Ok(())
 }
 
@@ -1327,10 +981,8 @@ fn apply_unary_scheme<C: Typing>(
 /// Resolve a (possibly variable-laden) [`Type`] to a concrete type for use
 /// in error messages. Falls back to [`Type::Hole`] if coalesce fails (which
 /// can happen for types with incompatible bounds that triggered the error).
-/// Tags are rendered against an empty cell remap: error paths run during
-/// emission, before any cell is retired.
 fn coalesce_for_error(ty: &Type) -> Type {
-    resolve_var_type(ty, &CellRemap::default()).unwrap_or(Type::Hole)
+    resolve_var_type(ty).unwrap_or(Type::Hole)
 }
 
 /// Map a [`ConstrainError`] onto the public [`InferError`] enum.
@@ -1421,24 +1073,15 @@ pub fn infer(expr: &mut Expr, sources: &HashMap<String, Type>) -> Result<Type, V
     // slot in particular — this subsumed the former `saturate` pass), and
     // monomorphize generalized `let`s in the same walk: a use specializes at
     // first visit, the `let` rebuilds as its per-type specializations (see
-    // `coalesce_node`). Generalized definitions first get private predicate
-    // cells; those retirements — and the per-specialization de-aliasings made
-    // during the walk — accumulate in the remap that canonicalizes every
-    // refinement tag the walk materializes.
-    let mut remap = CellRemap::default();
-    privatize_generalized_defs(expr, 0, &mut remap);
-    let (errors, remap) = coalesce_pass(expr, remap);
+    // `coalesce_node`). Refinement predicates are immutable terms, so a
+    // specialization clone freshens its predicates as proper substitution
+    // instances and a use-site coalesce *rebuilds* a predicate rather than
+    // mutating one shared with the definition — occurrences share no mutable
+    // state, so nothing needs to be kept in sync across them.
+    let errors = coalesce_pass(expr);
     if !errors.is_empty() {
         return Err(errors);
     }
-    // A type stamped *before* the relevant specialization existed can still
-    // carry a tag aliasing a retired cell (e.g. a sibling read earlier in the
-    // walk than the binding's first use): resolve each such tag through the
-    // retirement chains onto the surviving (coalesced) anchor cells. This
-    // also consolidates aliases, so passes that rewrite a predicate cell in
-    // place (planning's point-free compilation) reach every tag of one
-    // refinement through one cell.
-    realias_refinement_tags(expr, &remap, &mut HashSet::new());
     // Stamp the resolved binder types onto free `Var` references a discharge
     // substituted into refinement predicates (see `retype_predicate_slots`).
     retype_predicate_slots(expr, &HashMap::new());
@@ -1593,15 +1236,22 @@ fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<Type, InferE
     // User-annotation check: constrain_subtype the inferred type to the user's
     // annotation. Annotation wins on success; on conflict we surface
     // AnnotationMismatch.
-    if let Some(annotation) = expr.user_annotation.clone() {
+    if expr.user_annotation.is_some() {
         // The annotation may carry refinement predicates (e.g. a
         // filter-feed source annotation `Fun(Refinement(Hole, r), Hole)`
         // from `desugar_defers`). Now that refinements ride the lattice,
         // those predicates surface on the node's coalesced type and reach
         // the post-inference checks, so their expression trees must be
-        // inferred in the current scope. (Lambda-node refinements are
-        // handled in `emit_lambda`; this covers annotation-only ones.)
-        emit_annotation_predicates(&annotation, ctx)?;
+        // inferred in the current scope and rebuilt on the annotation itself.
+        // (Lambda-node refinements are handled in `emit_lambda`; this covers
+        // annotation-only ones.)
+        if let Some(annotation) = &mut expr.user_annotation {
+            emit_annotation_predicates(annotation, ctx)?;
+        }
+        let annotation = expr
+            .user_annotation
+            .clone()
+            .expect("user_annotation is present");
         ctx.bind_annotation(&ty, &annotation)?;
     }
 
@@ -1637,7 +1287,7 @@ fn emit_lambda<C: Typing>(
     let param_simple = ctx.normalize(&param.ty);
     param.ty = param_simple.clone();
     // The param is bound in scope under the *unrefined* `param_simple`, so
-    // `Var(param)` body references stay bare; restriction tags decorate only
+    // `Var(param)` body references stay bare; restriction witnesses decorate only
     // the function boundary.
     let body_ty = ctx.scoped(&param.name, &param_simple, |ctx| ctx.subexpr(body))?;
 
@@ -1666,7 +1316,7 @@ fn emit_lambda<C: Typing>(
 /// rather than as a bare `value <: target` obligation, because the refinement
 /// lattice is strict (`unrefined ⊀ refined`) so the value cannot flow *into*
 /// the refined target by subtyping. Re-wrapping the domain stacks `r` over any
-/// tags `value` already carries, so chained casts (nested list-comprehension
+/// witnesses `value` already carries, so chained casts (nested list-comprehension
 /// filters) compose.
 ///
 /// `as_function` is the mode-generic decompose: in Emit the one-way
@@ -1680,19 +1330,27 @@ fn emit_lambda<C: Typing>(
 /// domain-refinement's bare predicate is typed by `emit_bare_predicate` (the
 /// element bound to `D`, the predicate checked `Bool`) exactly as [`emit_lambda`]
 /// handles a lambda's own refinement; `coalesce_type_predicates(&expr.ty)`
-/// resolves it later (the result shares `target`'s tag `r`).
+/// resolves it later (the result shares `target`'s witness `r`).
 ///
 /// Shared by [`emit_node`] (Emit) and [`check_node`] (Check) via [`Typing`].
-fn emit_cast<C: Typing>(value: &mut Expr, target: &Type, ctx: &mut C) -> Result<Type, InferError> {
+fn emit_cast<C: Typing>(
+    value: &mut Expr,
+    target: &mut Type,
+    ctx: &mut C,
+) -> Result<Type, InferError> {
     let value_ty = ctx.subexpr(value)?;
-    let refinement = cast_target_refinement(target);
     // Re-view `value : D ⇒ V` as `{D | r} ⇒ V` (the refinement on the domain).
     let (d, v) = ctx.as_function(&value_ty, &|| "cast value".to_string())?;
     // Type the domain-refinement's bare predicate with the implicit binder
-    // bound to the (unrefined) domain `d`, enforcing `Bool` (§6.2).
-    if let Some(r) = &refinement {
+    // bound to the (unrefined) domain `d`, enforcing `Bool` (§6.2). Rebuilding
+    // it on the `target` slot is what carries the typed predicate onto the
+    // syntactic node; the result domain below then clones the typed refinement.
+    if let Type::Fun { domain, .. } = target
+        && let Type::Refinement(_, r) = domain.as_mut()
+    {
         emit_bare_predicate(r, &d, ctx)?;
     }
+    let refinement = cast_target_refinement(target);
     let domain = match refinement {
         Some(r) => Type::Refinement(Box::new(d), r),
         None => d,
@@ -2012,13 +1670,13 @@ fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Type, Infer
     for (i, t) in tys.iter().enumerate().skip(1) {
         let (d_i, c_i) = ctx.as_function(t, &|| "Compose[i]".to_string())?;
         // Strict refinement-aware adjacency: `prev_cod <: next_dom`, refinement
-        // tags and all — no cast escape. A producer must already supply the
+        // witnesses and all — no cast escape. A producer must already supply the
         // refinement its consumer demands. Join planning surfaces the
         // join-satisfying / iterated extent on each producing morphism's
         // codomain (`planning`'s `refine_codomain` / iteration-source
         // `set_codomain`), so a `… ≫ (id ≫ cast({D|r} ⇒ V))` chain composes
         // because the upstream genuinely carries `{D | r}` — matched
-        // structurally even across the predicate cells planning re-mints.
+        // structurally even across the predicate terms planning re-mints.
         ctx.require_sub(&prev_cod, &d_i, &|| format!("Compose[{i}]"))?;
         prev_cod = c_i;
     }
@@ -2159,7 +1817,7 @@ fn emit_loop<C: Typing>(
 ///
 /// Refinement handling: Check is refinement-*aware* — it constrains the real
 /// (un-stripped) types via [`Typing::require_sub`], so the lattice's
-/// restriction-tag subsetting (`unrefined ⊀ refined`) is enforced. The explicit
+/// restriction-witness subsetting (`unrefined ⊀ refined`) is enforced. The explicit
 /// cast operator canonicalizes restriction *acquisition*, so the long-standing
 /// deep strip is gone, and the check runs both after inference *and* after
 /// join planning (`context.rs`).
@@ -2170,11 +1828,11 @@ fn emit_loop<C: Typing>(
 /// codomain (`planning`'s `refine_codomain` / iteration-source `set_codomain`),
 /// so a `… ≫ (id ≫ cast({D | r} ⇒ V))` chain composes because the upstream
 /// genuinely supplies `{D | r}`. Because planning re-mints a fresh refinement
-/// id at every marker, the producer's `{D | r}` and the consumer's contract
-/// rarely share an id; [`crate::ccl::simple_sub`]'s subset check matches them
-/// by *structural predicate equality* (not just id) so the re-minted tags
-/// still chain. (Previously this gap was papered over by a `contains_cast`
-/// peel in `emit_compose` and by leaving planning output un-checked.)
+/// `Rc` at every marker, the producer's `{D | r}` and the consumer's contract
+/// rarely share an `Rc`; [`crate::ccl::simple_sub`]'s subset check matches them
+/// by *structural predicate equality* (not just `Rc` identity) so the re-minted
+/// witnesses still chain. (Previously this gap was papered over by a
+/// `contains_cast` peel in `emit_compose` and by leaving planning output un-checked.)
 struct CheckCtx {
     schemes: OperatorSchemes,
     level: Level,
@@ -2226,7 +1884,7 @@ impl Typing for CheckCtx {
     ) -> Result<(), InferError> {
         // Delegate to the solver's `constrain_subtype` — the single source of
         // truth for width/variance and (since refinements ride the lattice as
-        // restriction tags) tag subsetting. A failure is recorded (not
+        // restriction witnesses) witness subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
         if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::new()) {
             self.errors.push(map_constrain_err(e, &at()));
@@ -2295,7 +1953,7 @@ impl Typing for CheckCtx {
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), InferError> {
         // Destructure the resolved type directly (no inference vars). Peel any
-        // outer refinement tags the function picked up during solving.
+        // outer refinement witnesses the function picked up during solving.
         match peel_refinements_outer(t) {
             Type::Fun {
                 domain: d,
@@ -2563,11 +2221,6 @@ struct CoalesceCtx {
     /// the same name (the same shadowing discipline emission's `ScopeStack`
     /// applies).
     scope: Vec<ScopeEntry>,
-    /// Pass-wide retired-cell remap. Filled by `privatize_generalized_defs`
-    /// (before the walk) and by per-specialization de-aliasing (during it);
-    /// consulted by every `resolve_var_type` so materialized refinement tags
-    /// are born canonical, and by the final `realias_refinement_tags` sweep.
-    remap: CellRemap,
     errors: Vec<InferError>,
     /// Every read the walk performed, for the end-of-pass ordering-invariant
     /// check ([`assert_reads_stable`]). Debug builds only.
@@ -2614,9 +2267,9 @@ struct ReadRecord {
 /// that later turned out to be stale, exactly the disease the integrated
 /// design exists to rule out.
 #[cfg(debug_assertions)]
-fn assert_reads_stable(reads: &[ReadRecord], remap: &CellRemap) {
+fn assert_reads_stable(reads: &[ReadRecord]) {
     for r in reads {
-        let now = resolve_var_type(&r.unresolved, remap);
+        let now = resolve_var_type(&r.unresolved);
         debug_assert!(
             matches!(&now, Ok(t) if types_agree_modulo_unread(&r.resolved, t)),
             "ordering invariant (specialization may only add bounds to \
@@ -2643,7 +2296,7 @@ fn assert_reads_stable(reads: &[ReadRecord], remap: &CellRemap) {
 ///   so nothing can have been invalidated. (`Hole` likewise, for error-path
 ///   resolutions.)
 /// - **Refinement-predicate content is not compared.** A non-vacuous
-///   discharge mints a fresh cell each time it is forced, and a later
+///   discharge rebuilds a fresh predicate term each time it is forced, and a later
 ///   specialization rewrites a predicate's interior uses (`p` → `p__mono1`)
 ///   — both lowering by the very machinery this guards, neither a stale
 ///   bound. The predicate *terms* are checked elsewhere (`check_scope_valid`
@@ -2652,7 +2305,7 @@ fn assert_reads_stable(reads: &[ReadRecord], remap: &CellRemap) {
 ///   vanishing across a pin is still caught.
 #[cfg(debug_assertions)]
 fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
-    // Peel refinement layers, counting them. The *base* under the tags is
+    // Peel refinement layers, counting them. The *base* under the witnesses is
     // what recurses structurally; predicate content is out of scope (above).
     fn peel<'t>(mut t: &'t Type, layers: &mut usize) -> &'t Type {
         while let Type::Refinement(inner, _) = t {
@@ -2725,14 +2378,15 @@ enum ScopeEntry {
 /// being coalesced.
 struct SpecializeFrame {
     name: Name,
-    /// The uncoalesced definition (anchor predicate cells already privatized
-    /// by `privatize_generalized_defs`), cloned once per distinct use type.
+    /// The uncoalesced definition, cloned (and freshened) once per distinct use
+    /// type by [`specialize_use`]. Its predicates are immutable, so a use-site
+    /// clone never disturbs it — no privatization needed.
     def: Expr,
     /// The binding's polymorphism level — the freshen cutoff: variables
     /// deeper than this are the quantified ones.
     cutoff: Level,
     /// Specializations minted so far. Scanned linearly: keyed on the use's
-    /// resolved type, whose `PartialEq` is structural (refinement tags
+    /// resolved type, whose `PartialEq` is structural (refinement witnesses
     /// compare by type-blind predicate equality), so same-typed uses share
     /// one specialization.
     specs: Vec<Specialization>,
@@ -2781,10 +2435,9 @@ fn with_shadows<R>(
     r
 }
 
-fn coalesce_pass(expr: &mut Expr, remap: CellRemap) -> (Vec<InferError>, CellRemap) {
+fn coalesce_pass(expr: &mut Expr) -> Vec<InferError> {
     let mut ctx = CoalesceCtx {
         scope: Vec::new(),
-        remap,
         errors: Vec::new(),
         #[cfg(debug_assertions)]
         reads: Vec::new(),
@@ -2800,9 +2453,9 @@ fn coalesce_pass(expr: &mut Expr, remap: CellRemap) -> (Vec<InferError>, CellRem
     // not expected to be stable).
     #[cfg(debug_assertions)]
     if ctx.errors.is_empty() {
-        assert_reads_stable(&ctx.reads, &ctx.remap);
+        assert_reads_stable(&ctx.reads);
     }
-    (ctx.errors, ctx.remap)
+    ctx.errors
 }
 
 /// The design's scope-validity check (§6.2): a coalesced node's type must be
@@ -2887,12 +2540,9 @@ fn check_scope_valid(
 }
 
 /// Resolve a type that may contain inference variables into a concrete
-/// `Type`, via the compact → simplify → coalesce pipeline. `cells`
-/// canonicalizes refinement tags whose predicate cell was retired (see
-/// [`CellRemap`]), so the materialized type points at live, specialized
-/// cells.
-fn resolve_var_type(ty: &Type, cells: &CellRemap) -> Result<Type, CoalesceError> {
-    coalesce_compact(&simplify_type(compact_type(ty, cells)))
+/// `Type`, via the compact → simplify → coalesce pipeline.
+fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
+    coalesce_compact(&simplify_type(compact_type(ty)))
 }
 
 /// Coalesce every node's `expr.ty` in place, resolving its inference variables
@@ -3001,13 +2651,10 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 specialize_lambda_domain(argument, &expected_dom);
             }
         }
-        // `target` anchors the cast's refinement predicate, so coalesce it
-        // here explicitly rather than relying on the
-        // `coalesce_type_predicates(&expr.ty)` call at the end of this
-        // function: `resolve_var_type` rebuilds `expr.ty` from variable
-        // bounds, and in a specialized clone the rebuilt tags canonicalize to
-        // the *first* specialization's cell — only this arm reliably resolves
-        // this clone's own anchor cell.
+        // The cast's refinement predicate rides the `target` type slot, which
+        // is distinct from `expr.ty`; the end-of-function
+        // `coalesce_type_predicates(&mut expr.ty)` won't reach it, so resolve
+        // its predicate slots here.
         TypedExprNode::Cast { value, target } => {
             coalesce_node(value, level, ctx);
             coalesce_type_predicates(target, level, ctx);
@@ -3022,7 +2669,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             with_shadows(ctx, [param_name], |ctx| coalesce_node(body, level, ctx));
             // `param.ty` is resolved from the lambda's coalesced domain in
             // the end-of-function block (it can't be coalesced standalone:
-            // body-usage refinement tags are negative-polarity upper-bound
+            // body-usage refinement witnesses are negative-polarity upper-bound
             // facts that only materialize in the contravariant domain
             // position of `expr.ty`). Domain-refinement predicates ride
             // `expr.ty` and are coalesced with it.
@@ -3076,7 +2723,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // resolved — rather than via an emit-time reverse-adjacency bound
             // is what keeps it robust under let-polymorphism's monomorphization
             // (which re-mints var identities a recorded bound would not follow).
-            // A morphism's coalesced type may carry *outer* refinement tags
+            // A morphism's coalesced type may carry *outer* refinement witnesses
             // it acquired during solving (`{Fun(d, c) | r}` — the same shape
             // `CheckCtx::as_function` peels); the value flowing to the next
             // morphism is still the bare codomain, so peel before
@@ -3148,7 +2795,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 // `Pattern::binding.ty`; run it through the same pipeline used
                 // for `expr.ty` so it ends up concrete.
                 if let Some(p) = &mut b.pattern {
-                    match resolve_var_type(&p.binding.ty, &ctx.remap) {
+                    match resolve_var_type(&p.binding.ty) {
                         Ok(ty) => p.binding.ty = ty,
                         Err(err) => {
                             let label = format!("Case pattern `.{}` payload", p.tag);
@@ -3195,7 +2842,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             // wrote the slot var into `params[i].ty`; run it through the
             // same pipeline used for `expr.ty` so it ends up concrete.
             for binding in params.iter_mut() {
-                match resolve_var_type(&binding.ty, &ctx.remap) {
+                match resolve_var_type(&binding.ty) {
                     Ok(ty) => binding.ty = ty,
                     Err(err) => {
                         let label = "Loop param".to_string();
@@ -3213,11 +2860,11 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // compact → simplify → coalesce pipeline to materialize a concrete
     // `Type`.
     //
-    // Refinements ride the lattice as refinement tags, so a refined
+    // Refinements ride the lattice as refinement witnesses, so a refined
     // domain coalesces straight onto `expr.ty` here — downstream passes
     // (`lambda_elim` included) read it from the type.
     let label = symbolic(expr);
-    match resolve_var_type(&expr.ty, &ctx.remap) {
+    match resolve_var_type(&expr.ty) {
         Ok(ty) => {
             // Log the graph read for the ordering-invariant check. The
             // var-laden `expr.ty` shares the live `InferVar`s, so the
@@ -3231,11 +2878,6 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         Err(err) => push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label),
     }
-
-    // A lambda's param binding slot mirrors its coalesced domain (see
-    // `refresh_lambda_param_slot`). It must be re-derived again whenever a
-    // parent arm later rewrites the domain (`specialize_lambda_domain`).
-    refresh_lambda_param_slot(expr);
 
     // Codomain extraction (design §6.2 move site): a `let x = v in body` node's
     // type is the body's type, whose refinement predicates may close over `x`.
@@ -3277,25 +2919,49 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // aren't reached through the main expression tree — e.g. a filter-feed
     // source annotation `Fun(Refinement(_, r), _)`. Their expression trees
     // were emitted (in `emit_annotation_predicates`); resolve their var
-    // slots so the post-inference checks see concrete types. `try_borrow_mut`
-    // breaks the cycle when a predicate's own type slot carries the same
-    // refinement.
-    coalesce_type_predicates(&expr.ty, level, ctx);
+    // slots so the post-inference checks see concrete types.
+    coalesce_type_predicates(&mut expr.ty, level, ctx);
+
+    // A lambda's param binding slot mirrors its coalesced domain (see
+    // `refresh_lambda_param_slot`). Run it *after* `coalesce_type_predicates`
+    // so the slot copies the domain's *resolved* refinement predicate (the
+    // immutable predicate is a distinct `Rc`, so copying it before resolution
+    // would strand the param slot on an unresolved predicate). It is re-derived
+    // again whenever a parent arm later rewrites the domain
+    // (`specialize_lambda_domain`).
+    refresh_lambda_param_slot(expr);
+
+    // A `Cast`'s `target` is the inferred cast type — exactly `expr.ty`. Point
+    // it at the fully-resolved `expr.ty` (sharing the resolved refinement `Rc`),
+    // so the cast's domain refinement carries a concrete base (lowering left it
+    // a `Hole`) and shares one predicate term with the result. Planning then
+    // compiles that one predicate once and the post-inference check reconstructs
+    // the cast from a `target` that matches what the producer supplies. (The
+    // pre-materialization `coalesce_type_predicates(target)` in the `Cast` arm
+    // resolved the predicate in scope — e.g. a generalized use inside it — but
+    // against the lowered `Hole` base; this overwrite installs the concrete one.)
+    if matches!(expr.node, TypedExprNode::Cast { .. }) {
+        let cast_ty = expr.ty.clone();
+        if let TypedExprNode::Cast { target, .. } = &mut expr.node {
+            *target = cast_ty;
+        }
+    }
 }
 
 /// Coalesce refinement predicates embedded anywhere in `ty` (see the call
-/// site in `coalesce_node`). Idempotent for predicates already resolved by
-/// the `Lambda` arm. `level` is forwarded to the predicate's own
-/// [`coalesce_node`] (a predicate is emitted in the enclosing scope), and the
-/// walk's scope travels with `ctx`, so a generalized-binding use living only
-/// inside a predicate specializes here.
-fn coalesce_type_predicates(ty: &Type, level: Level, ctx: &mut CoalesceCtx) {
+/// site in `coalesce_node`). Each predicate is an immutable term, so its var
+/// slots are resolved by coalescing a copy and reinstalling it as a fresh
+/// `Rc`. Idempotent for predicates already resolved by the `Lambda` arm.
+/// `level` is forwarded to the predicate's own [`coalesce_node`] (a predicate
+/// is emitted in the enclosing scope), and the walk's scope travels with
+/// `ctx`, so a generalized-binding use living only inside a predicate
+/// specializes here.
+fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) {
     match ty {
         Type::Refinement(inner, r) => {
-            let def = &r.predicate;
-            if let Ok(mut pred) = def.try_borrow_mut() {
-                coalesce_node(&mut pred, level, ctx);
-            }
+            let mut pred = (*r.predicate).clone();
+            coalesce_node(&mut pred, level, ctx);
+            r.predicate = Rc::new(pred);
             coalesce_type_predicates(inner, level, ctx);
         }
         Type::Fun {
@@ -3307,13 +2973,13 @@ fn coalesce_type_predicates(ty: &Type, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_type_predicates(c, level, ctx);
         }
         Type::Tuple(ts) => ts
-            .iter()
+            .iter_mut()
             .for_each(|t| coalesce_type_predicates(t, level, ctx)),
         Type::Record(fs) => fs
-            .iter()
+            .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
         Type::Variant(tags) => tags
-            .iter()
+            .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
     }
@@ -3339,7 +3005,7 @@ fn coalesce_type_predicates(ty: &Type, level: Level, ctx: &mut CoalesceCtx) {
 // pass: by coalesce time the constraint graph is complete, so a use's
 // instantiation is fully determined when the bottom-up walk reaches it, and a
 // parent `Apply`'s dependent-codomain discharge forces against the
-// specialization's resolved predicate cells instead of the definition's
+// specialization's resolved predicate terms instead of the definition's
 // quantified ones. The retired post-coalesce splice had to re-derive every
 // dependent parent type by hand — a second, graph-unreachable copy of the
 // discharge logic.
@@ -3367,9 +3033,10 @@ fn coalesce_type_predicates(ty: &Type, level: Level, ctx: &mut CoalesceCtx) {
 /// on it.
 ///
 /// On a memo miss this clones the frame's definition, freshens it
-/// independently ([`freshen_expr_types`] — quantified-variable renaming plus
-/// predicate-cell de-aliasing, recorded in the pass remap), **pins it
-/// two-way to the use's live instantiation type** (the use type is itself
+/// independently ([`freshen_expr_type_slots`] — quantified-variable renaming
+/// over every type slot, including refinement predicates and bound-edge
+/// discharge payloads), **pins it two-way to the use's live instantiation
+/// type** (the use type is itself
 /// var-laden for a use inside another clone — the chained poly-calls-poly
 /// case — and the live pin is what lets such interior uses resolve concrete),
 /// and coalesces the clone re-entrantly. The re-entrant walk runs in the
@@ -3385,7 +3052,7 @@ fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) 
     // complete (emission saw the whole program), so everything this use
     // depends on has already been constrained — including, for a use inside
     // another specialization's clone, that outer clone's pin.
-    let resolved = match resolve_var_type(&use_expr.ty, &ctx.remap) {
+    let resolved = match resolve_var_type(&use_expr.ty) {
         Ok(t) => t,
         Err(err) => {
             let label = symbolic(use_expr);
@@ -3425,29 +3092,14 @@ fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) 
 
     // Freshen an independent copy: every quantified variable (level > cutoff)
     // is renamed with its bounds copied, levels preserved so nested
-    // generalized `let`s stay recognizable; anchor predicate cells are
-    // de-aliased into clone-private ones. The clone-local remap keeps this
-    // freshen from reusing an earlier specialization's retirements; it is
-    // absorbed into the pass remap afterwards (first-wins, so orphaned tags
-    // elsewhere resolve to the first specialization's anchors).
+    // generalized `let`s stay recognizable. The freshen is uniform over terms
+    // and types — refinement predicates and the bound edges' discharge-payload
+    // terms have their type slots freshened through the same cache (see
+    // `simple_sub::freshen_expr_type_slots` / `freshen_above`), so the clone's
+    // predicates are proper freshen instances sharing no live inference state
+    // with the definition — and no mutable state to keep in sync with it.
     let mut fresh = FreshenCache::new();
-    let mut local = CellRemap::default();
-    freshen_expr_types(
-        &mut clone,
-        cutoff,
-        FreshenLevel::Preserve,
-        &mut fresh,
-        &mut local,
-    );
-    // The copied bound edges still carry emit-time substitution payloads
-    // referencing the definition's variables; rename them through the same
-    // cache so the clone shares no live inference state with the definition.
-    freshen_bound_substs(cutoff, FreshenLevel::Preserve, &mut fresh, &mut local);
-    // Freshening de-aliased the clone's *anchor* predicate cells but left
-    // type-borne tags aliasing the definition's cells; re-point them at the
-    // clone's anchors so coalescing below resolves them.
-    realias_refinement_tags(&mut clone, &local, &mut HashSet::new());
-    ctx.remap.absorb(local);
+    freshen_expr_type_slots(&mut clone, cutoff, FreshenLevel::Preserve, &mut fresh);
 
     // Pin the clone to the use's live instantiation type, two-way. Inward,
     // this drives the use site's accumulated bounds into the clone's
@@ -3464,11 +3116,6 @@ fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) 
         ctx.errors
             .push(map_constrain_err(e, "monomorphization specialization"));
     }
-
-    // The clone's interior may contain nested generalized `let`s; privatize
-    // their anchor cells before coalescing, exactly as
-    // `privatize_generalized_defs` did for the original tree.
-    privatize_generalized_defs(&mut clone, cutoff + 1, &mut ctx.remap);
 
     // Coalesce the clone re-entrantly, in the definition site's scope: every
     // entry above the frame (including the frame itself — CCL `let` is
@@ -3491,8 +3138,9 @@ fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) 
     };
     // The memo key is the *specialization's* resolved type, not this use's
     // pre-pin resolution: the two differ exactly by the canonical-chain
-    // extension above, and every later same-typed use resolves its tags
-    // through the now-extended chains — i.e. to the cells `clone.ty` carries.
+    // extension above, and every later same-typed use resolves its witnesses
+    // through the now-extended chains — i.e. to the predicate terms `clone.ty`
+    // carries.
     frame.specs.push(Specialization {
         use_ty: clone.ty.clone(),
         name: spec_name,
@@ -3615,10 +3263,10 @@ fn specialize_projection_domain(morphism: &mut Expr, input: &Type) {
 /// Overwriting (rather than merging) the base is sound: `arg <: domain` was
 /// constrained at emit, so the input satisfies every body demand.
 ///
-/// The lambda's coalesced domain may carry refinement tags (body-usage facts
+/// The lambda's coalesced domain may carry refinement witnesses (body-usage facts
 /// that exist only in this negative-polarity position); they are preserved by
-/// re-wrapping them around `input`, deduping against tags `input` already
-/// carries (structural [`Refinement`] equality). Outer refinement tags on the
+/// re-wrapping them around `input`, deduping against witnesses `input` already
+/// carries (structural [`Refinement`] equality). Outer refinement witnesses on the
 /// function type itself are likewise preserved.
 ///
 /// `input` is supplied by the use site: the argument at a direct-redex
@@ -3659,18 +3307,18 @@ fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
         dom_layers.push(r);
         base = *inner;
     }
-    // Re-wrap the collected tags around `input`, skipping tags it already
-    // carries (the argument edge may have deposited the same tag on both).
-    let mut input_tags = Vec::new();
+    // Re-wrap the collected witnesses around `input`, skipping witnesses it
+    // already carries (the argument edge may have deposited the same witness on both).
+    let mut input_witnesses = Vec::new();
     let mut t = input;
     while let Type::Refinement(inner, r) = t {
-        input_tags.push(r);
+        input_witnesses.push(r);
         t = inner;
     }
     let new_dom = dom_layers
         .into_iter()
         .rev()
-        .filter(|r| !input_tags.contains(&r))
+        .filter(|r| !input_witnesses.contains(&r))
         .fold(input.clone(), |acc, r| Type::Refinement(Box::new(acc), r));
     lambda.ty = fn_layers.into_iter().rev().fold(
         // Preserve the Pi binder: specialization rewrites only the domain
@@ -3690,7 +3338,7 @@ fn specialize_lambda_domain(lambda: &mut Expr, input: &Type) {
 /// Fill a lambda's `param.ty` binder slot from its coalesced function type's
 /// domain. Deriving the slot from the resolved domain — rather than
 /// coalescing the slot var standalone — is what preserves body-usage
-/// refinement tags, which are negative-polarity facts visible only in the
+/// refinement witnesses, which are negative-polarity facts visible only in the
 /// contravariant domain. No-op for non-lambdas and unresolved function types.
 fn refresh_lambda_param_slot(expr: &mut Expr) {
     if let TypedExprNode::Lambda { param, .. } = &mut expr.node
@@ -3717,8 +3365,19 @@ fn refresh_lambda_param_slot(expr: &mut Expr) {
 /// close over are ordinary in-scope binders, each with a single solution.)
 fn retype_predicate_slots(expr: &mut Expr, scope: &HashMap<Name, Type>) {
     retype_in_type(&mut expr.ty, scope);
+    // Retype the **binder type slots** (and a `Cast`'s `target`), not just
+    // `expr.ty`. A binder's type (`param.ty`, a `let` binding's `ty`, a `Cast`
+    // `target`) is a copy of the same refinement that also rides `expr.ty`, but
+    // an independent immutable `Rc`: rebuilding the predicate on `expr.ty` above
+    // leaves that copy stale, and [`crate::ccl::infer::check_fully_typed`] walks
+    // these slots (a lambda's `param.ty`, etc.), so an unresolved predicate slot
+    // there is a hard error. (Under the retired shared predicate cells one
+    // rewrite fixed every alias at once; immutable terms must restamp each slot.)
+    // Each binder's *own* type is in the enclosing `scope` — the binder does not
+    // bind in its own type — so it is retyped before the binder enters `scope`.
     match &mut expr.node {
         TypedExprNode::Lambda { param, body, .. } => {
+            retype_in_type(&mut param.ty, scope);
             let mut s = scope.clone();
             s.insert(param.name.clone(), param.ty.clone());
             retype_predicate_slots(body, &s);
@@ -3728,6 +3387,7 @@ fn retype_predicate_slots(expr: &mut Expr, scope: &HashMap<Name, Type>) {
             bound_expr,
             body,
         } => {
+            retype_in_type(&mut binding.ty, scope);
             retype_predicate_slots(bound_expr, scope);
             let mut s = scope.clone();
             s.insert(binding.name.clone(), binding.ty.clone());
@@ -3744,7 +3404,8 @@ fn retype_predicate_slots(expr: &mut Expr, scope: &HashMap<Name, Type>) {
                 .for_each(|a| retype_predicate_slots(a, scope));
             retype_predicate_slots(source, scope);
             let mut s = scope.clone();
-            for p in params.iter() {
+            for p in params.iter_mut() {
+                retype_in_type(&mut p.ty, scope);
                 s.insert(p.name.clone(), p.ty.clone());
             }
             retype_predicate_slots(loop_body, &s);
@@ -3758,12 +3419,17 @@ fn retype_predicate_slots(expr: &mut Expr, scope: &HashMap<Name, Type>) {
             }
             for b in branches.iter_mut() {
                 let mut s = scope.clone();
-                if let Some(p) = &b.pattern {
+                if let Some(p) = &mut b.pattern {
+                    retype_in_type(&mut p.binding.ty, scope);
                     s.insert(p.binding.name.clone(), p.binding.ty.clone());
                 }
                 retype_predicate_slots(&mut b.guard, &s);
                 retype_predicate_slots(&mut b.body, &s);
             }
+        }
+        TypedExprNode::Cast { value, target } => {
+            retype_in_type(target, scope);
+            retype_predicate_slots(value, scope);
         }
         _ => expr.walk_children_mut(|c| retype_predicate_slots(c, scope)),
     }
@@ -3784,9 +3450,9 @@ fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>) {
         Type::Variant(tags) => tags.iter_mut().for_each(|(_, t)| retype_in_type(t, scope)),
         Type::Refinement(base, r) => {
             retype_in_type(base, scope);
-            if let Ok(mut pred) = r.predicate.try_borrow_mut() {
-                retype_pred_expr(&mut pred, scope);
-            }
+            let mut pred = (*r.predicate).clone();
+            retype_pred_expr(&mut pred, scope);
+            r.predicate = Rc::new(pred);
         }
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
     }
@@ -3862,7 +3528,7 @@ mod tests {
         Type::Refinement(
             Box::new(Type::Base(BaseType::Int)),
             Refinement {
-                predicate: Rc::new(RefCell::new(pred)),
+                predicate: Rc::new(pred),
             },
         )
     }

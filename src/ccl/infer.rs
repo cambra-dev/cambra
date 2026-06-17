@@ -420,7 +420,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Ve
 /// hole-freeness + semantic check should call [`typecheck`] directly.
 pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
     let mut errors = Vec::new();
-    let mut seen: HashSet<crate::ccl::PredicateCellId> = HashSet::new();
+    let mut seen: HashSet<crate::ccl::PredicateId> = HashSet::new();
     collect_expr_errors(expr, &mut errors, &mut seen);
     if errors.is_empty() {
         Ok(())
@@ -431,16 +431,17 @@ pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
 
 /// Recursively collect all type errors from `expr` into `errors`.
 ///
-/// `seen_refinements` tracks already-visited predicate cells
-/// ([`crate::ccl::PredicateCellId`]) to break cycles when a refinement's
-/// predicate expression has a type slot containing the same refinement
-/// (post-inference, this happens when a Lambda param's refinement embeds
-/// a predicate that mentions the param — e.g. filter-feed inside a
-/// defer-mediating UDF body).
+/// `seen_refinements` tracks already-visited predicate terms
+/// ([`crate::ccl::PredicateId`]) to dedup a predicate term shared by `Rc`
+/// across occurrences when a refinement's predicate expression has a type slot
+/// carrying the same refinement (post-inference, this happens when a Lambda
+/// param's refinement embeds a predicate that mentions the param — e.g.
+/// filter-feed inside a defer-mediating UDF body). Immutable predicate terms
+/// form a DAG, so this is dedup, not cycle-breaking.
 fn collect_expr_errors(
     expr: &Expr,
     errors: &mut Vec<InferError>,
-    seen_refinements: &mut HashSet<crate::ccl::PredicateCellId>,
+    seen_refinements: &mut HashSet<crate::ccl::PredicateId>,
 ) {
     collect_type_errors(&expr.ty, &symbolic(expr), errors, seen_refinements);
     // Binder-bearing variants emit per-binding type errors before descending
@@ -501,7 +502,7 @@ fn collect_type_errors(
     ty: &Type,
     context_sym: &str,
     errors: &mut Vec<InferError>,
-    seen_refinements: &mut HashSet<crate::ccl::PredicateCellId>,
+    seen_refinements: &mut HashSet<crate::ccl::PredicateId>,
 ) {
     match ty {
         Type::Hole => errors.push(InferError::UnresolvedHole {
@@ -533,31 +534,19 @@ fn collect_type_errors(
             }
         }
         Type::Refinement(inner, refinement) => {
-            // Walk each predicate cell only once to break cycles that
-            // arise post-inference when the predicate's expressions
-            // have type slots containing the same refinement.
+            // Walk each predicate term only once: a predicate term shared by
+            // `Rc` across occurrences (its own type slots can carry the same
+            // refinement) is a DAG, so this dedups it. (Immutable predicates
+            // are acyclic — dedup, not cycle-breaking.)
             //
-            // The same visited-set cycle-handling pattern lives in
-            // [`crate::ccl::ccl_utils::count_free_in_type_with_visited`],
-            // [`crate::ccl::lambda_elim::elim_lambdas_in_type`] (both
-            // via [`crate::ccl::ccl_utils::walk_refined_predicates`]),
-            // and a try_borrow_mut fallback variant in
-            // [`crate::ccl::infer_simple_sub::coalesce_node`] and
-            // [`crate::ccl::simplify::simplify_once`].  This site
-            // doesn't share the helper because it mixes per-node
-            // error checks with the refinement walk; if drift makes
-            // the cycle logic important here, sync with those sites.
-            if seen_refinements.insert(refinement.cell_id())
-                && let Ok(def) = refinement.predicate.try_borrow()
-            {
-                // `try_borrow` (not `borrow`): this check can run *while* a
-                // predicate is mid-substitution (e.g. `lambda_elim::substitute`
-                // holds a predicate's `borrow_mut` and calls `debug_typecheck`,
-                // which lands here). A predicate's own type slots may reference
-                // this same refinement, so a panicking `borrow` would re-borrow
-                // the held cell; skipping the in-flight predicate is correct —
-                // the substitution that holds it checks it on its own.
-                collect_expr_errors(&def, errors, seen_refinements);
+            // The same visited-set pattern lives in
+            // [`crate::ccl::ccl_utils::count_free_in_type_with_visited`] and
+            // [`crate::ccl::lambda_elim::elim_lambdas_in_type`] (both via
+            // [`crate::ccl::ccl_utils::walk_refined_predicates`]). This site
+            // doesn't share the helper because it mixes per-node error checks
+            // with the refinement walk.
+            if seen_refinements.insert(refinement.predicate_id()) {
+                collect_expr_errors(&refinement.predicate, errors, seen_refinements);
             }
             collect_type_errors(inner, context_sym, errors, seen_refinements);
         }

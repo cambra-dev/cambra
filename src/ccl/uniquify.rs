@@ -24,18 +24,17 @@
 //! `Feed`/`Define` target names are *uses* of the defer-handle binder.
 //!
 //! Type-borne refinement predicates are full terms and are walked under the
-//! environment of their syntactic anchor (a `Cast` target or a user
+//! environment of their syntactic origin (a `Cast` target or a user
 //! annotation — pre-inference, predicates exist nowhere else): their free
-//! variables resolve against the anchor's lexical scope, and binders *inside*
+//! variables resolve against that origin's lexical scope, and binders *inside*
 //! a predicate mint like any other. The reserved [`crate::ccl::REFINEMENT_BINDER`] is
 //! bound by the refinement itself, never enters the environment, and stays
 //! raw — it is deliberately one shared name (see [`crate::ccl::Refinement`]).
-//! Predicates are rewritten **in place through their cells, once per cell**
-//! (visited-set on [`PredicateCellId`]): lowering's clones share predicate
-//! cells deliberately — downstream passes rewrite predicates through the
-//! shared `Rc` so every alias sees the rewrite — and re-celling here would
-//! split that sharing. (A borrow-through-cell write the immutable-predicates
-//! stage 3 will turn into a rebuild.)
+//! Predicates are immutable `Rc<TypedExpr>`, so uniquifying one **rebuilds**
+//! it. A predicate term shared by `Rc` across occurrences (lowering's clones
+//! share predicate terms deliberately) is rebuilt **once** — keyed by
+//! [`PredicateId`] in `memo` — and every occurrence is re-pointed at the same
+//! rebuilt `Rc`, preserving the sharing.
 //!
 //! A variable that resolves to no binder is left raw — it is either a
 //! reference inference will reject as unbound, or a reserved name resolved
@@ -46,7 +45,7 @@
 //! predicate; chained comparisons clone the shared middle operand). A copy
 //! made of *raw* trees would mint distinct uids per copy here, making
 //! α-equivalent copies structurally unequal — and the loop-join shape relies
-//! on the copies comparing equal (refinement-tag dedup collapses the
+//! on the copies comparing equal (witness dedup collapses the
 //! predicate's source against the body's). So lowering runs this pass on a
 //! subtree *before* cloning it (see `lower_list_comp` Phase 1), and the
 //! whole-program run treats minted names as settled: minted binding sites
@@ -58,16 +57,18 @@
 //! so the checked invariant is "every binding site is minted", not global
 //! binder uniqueness.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::ccl::{Expr, Name, PredicateCellId, Type, TypedBinding, TypedExprNode};
+use std::rc::Rc;
+
+use crate::ccl::{Expr, Name, PredicateId, Type, TypedBinding, TypedExprNode};
 
 /// α-uniquify every binder in `expr` (see module docs). Runs once per
 /// program, immediately after lowering and before defer desugaring.
 pub fn run(mut expr: Expr) -> Expr {
     let mut u = Uniquifier {
         env: HashMap::new(),
-        visited: HashSet::new(),
+        memo: HashMap::new(),
     };
     u.expr(&mut expr);
     debug_assert!(
@@ -84,9 +85,10 @@ struct Uniquifier {
     /// innermost binder last. Raw `Var`s resolve to the top of their
     /// spelling's stack.
     env: HashMap<String, Vec<Name>>,
-    /// Predicate cells already rewritten in this run — each shared cell is
-    /// minted once, at the first anchor that reaches it.
-    visited: HashSet<PredicateCellId>,
+    /// Predicates already rewritten in this run, mapped to their rebuilt `Rc`.
+    /// A predicate term shared across occurrences is uniquified once, and every
+    /// occurrence is re-pointed at the same rebuilt term.
+    memo: HashMap<PredicateId, Rc<Expr>>,
 }
 
 impl Uniquifier {
@@ -195,16 +197,22 @@ impl Uniquifier {
         }
     }
 
-    /// Walk a refinement-bearing type, rewriting each predicate in place
-    /// under the current environment — once per shared cell (see module
-    /// docs). `try_borrow_mut` skips a cell already being rewritten higher
-    /// up this same walk (a self-referential predicate type slot).
+    /// Walk a refinement-bearing type, uniquifying each predicate under the
+    /// current environment by rebuilding it — once per shared predicate term
+    /// (see module docs), with every occurrence re-pointed at the rebuilt `Rc`
+    /// via `memo`.
     fn ty(&mut self, t: &mut Type) {
-        if let Type::Refinement(_, r) = t
-            && self.visited.insert(r.cell_id())
-            && let Ok(mut pred) = r.predicate.try_borrow_mut()
-        {
-            self.expr(&mut pred);
+        if let Type::Refinement(_, r) = t {
+            let original = r.predicate_id();
+            if let Some(rebuilt) = self.memo.get(&original) {
+                r.predicate = Rc::clone(rebuilt);
+            } else {
+                let mut pred = (*r.predicate).clone();
+                self.expr(&mut pred);
+                let rebuilt = Rc::new(pred);
+                self.memo.insert(original, Rc::clone(&rebuilt));
+                r.predicate = rebuilt;
+            }
         }
         t.walk_children_mut(|c| self.ty(c));
     }
@@ -319,9 +327,7 @@ mod tests {
         fn from_ty(t: &Type, out: &mut Vec<Refinement>) {
             if let Type::Refinement(_, r) = t {
                 out.push(r.clone());
-                if let Ok(pred) = r.predicate.try_borrow() {
-                    collect_refinements(&pred, out);
-                }
+                collect_refinements(&r.predicate, out);
             }
             t.walk_children(|c| from_ty(c, out));
         }
@@ -438,7 +444,7 @@ mod tests {
         let mut refinements = Vec::new();
         collect_refinements(&expr, &mut refinements);
         assert_eq!(refinements.len(), 1);
-        let pred = refinements[0].predicate.borrow();
+        let pred = &*refinements[0].predicate;
         fn vars(e: &Expr, out: &mut Vec<Name>) {
             if let TypedExprNode::Var(n) = &e.node {
                 out.push(n.clone());
@@ -446,7 +452,7 @@ mod tests {
             e.walk_children(|c| vars(c, out));
         }
         let mut vs = Vec::new();
-        vars(&pred, &mut vs);
+        vars(pred, &mut vs);
         assert!(
             vs.iter().any(|v| v.is_elem()),
             "the element binder stays the raw reserved name"

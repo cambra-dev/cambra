@@ -10,15 +10,15 @@
 //!
 //! # Refinements
 //!
-//! Refinements ride the lattice natively as **refinement-tag sets**. A
-//! refined type `{T | S}` carries a set `S` of [`Refinement`] tags
+//! Refinements ride the lattice natively as **witness sets**. A
+//! refined type `{T | S}` carries a set `S` of [`Refinement`] witnesses
 //! (matched by structural predicate equality — see [`Refinement`]'s
 //! `PartialEq` — but never by predicate implication). Subtyping is
-//! superset-on-tags, structurally identical to record width-subtyping
-//! (`{T | p, q} <: {T | p}`, and `{T | p} <: T`); a tag set therefore
+//! superset-on-witnesses, structurally identical to record width-subtyping
+//! (`{T | p, q} <: {T | p}`, and `{T | p} <: T`); a witness set therefore
 //! merges with the same polarity rule as `rec` (positive ⇒ intersect,
 //! negative ⇒ union) and is preserved verbatim through simplification
-//! (tags are positional, never folded into a variable's identity, so
+//! (witnesses are positional, never folded into a variable's identity, so
 //! co-occurrence merging cannot move or drop them). A refinement is
 //! *required*, so `constrain_subtype` is strict in the other
 //! direction: an unrefined value does **not** flow into a refined position
@@ -26,7 +26,7 @@
 //! interpreter compiles a refinement on a *collection domain* to a runtime
 //! `Restrict`/`Filter` at the iteration boundary
 //! ([`crate::interpreter::operator_conversion`]'s `iterate_type`); it is not
-//! modelled as subsumption here. The predicate `Expr` of each tag lives in
+//! modelled as subsumption here. The predicate `Expr` of each witness lives in
 //! [`crate::ccl::Refinement`] and is inferred/coalesced like any other
 //! sub-tree.
 //!
@@ -42,7 +42,6 @@
 // therefore doesn't apply here.
 #![allow(clippy::mutable_key_type)]
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
@@ -50,8 +49,8 @@ use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
 use crate::ccl::{
-    BaseType, Bound, InferVar, InferVarId, Level, Name, PredicateCellId, Refinement, Type,
-    TypedExpr, fresh_infer_var_id,
+    BaseType, Bound, InferVar, InferVarId, Level, Name, Refinement, Type, TypedExpr, TypedExprNode,
+    fresh_infer_var_id,
 };
 
 /// Identifies a field inside a structural record/tuple, or a variant tag.
@@ -212,7 +211,12 @@ pub fn freshen_above(
     target: FreshenLevel,
     cache: &mut FreshenCache,
 ) -> Type {
-    if type_level(ty) <= lim {
+    // A `Refinement`'s `type_level` reflects only its base, but its predicate
+    // term carries its own type slots (which may hold quantified variables a
+    // low base hides). So never short-circuit a refinement on `type_level`;
+    // descend and freshen the predicate slots too (each leaf slot still
+    // short-circuits on its own level).
+    if !matches!(ty, Type::Refinement(..)) && type_level(ty) <= lim {
         return ty.clone();
     }
     match ty {
@@ -243,18 +247,13 @@ pub fn freshen_above(
         ),
         Type::Refinement(inner, r) => Type::Refinement(
             Box::new(freshen_above(lim, inner, target, cache)),
-            // O2 (deferred): the predicate is shared by `Rc` across instantiations
-            // rather than copied with its type slots freshened through this same
-            // `cache`. That is only load-bearing for a *polymorphic* (let-
-            // generalized) refined value used at several types — the prototype's
-            // scenario M. Our dependent refinements are introduced monomorphically
-            // (group-by, comprehension filters), so freshening never crosses a
-            // refined value today; the design (O2/O3) flags faithful copy-and-
-            // freshen of predicate type slots as the separable polymorphic-case
-            // requirement. Doing it safely needs a refinement-cycle guard (a
-            // predicate's slot may reference its own refined type), so it is left
-            // for the polymorphic-dependent-function work rather than rushed here.
-            r.clone(),
+            // Faithfully freshen the predicate's own type slots through the same
+            // `cache`, so a specialization's predicate is a proper freshen
+            // instance — its slots are the clone's fresh variables, driven
+            // concrete by the use's pin — rather than sharing the definition's
+            // unresolved ones. Immutable predicate terms are acyclic, so this
+            // cannot loop.
+            freshen_refinement_predicate(lim, r, target, cache),
         ),
         Type::Infer(tv) => {
             if let Some(existing) = cache.get(&tv.uid) {
@@ -275,26 +274,25 @@ pub fn freshen_above(
                 let s = tv.bounds.borrow();
                 (s.lower.clone(), s.upper.clone())
             };
-            // Freshen the bound's type; the edge substitution rides along
-            // unchanged here — a discharge payload's type slots still
-            // reference the source graph's variables after this copy. This
-            // per-type walk cannot reach them (payloads live on edges, not in
-            // any type); `infer_simple_sub::freshen_bound_substs` sweeps the
-            // cache afterwards to rename them.
+            // Freshen the bound's type *and* its edge substitutions' discharge
+            // payloads: a payload is a captured argument *term* whose type
+            // slots still reference the source graph's variables, so it is
+            // freshened through the same `cache` (the uniform term+type freshen
+            // that subsumes the old separate `freshen_bound_substs` sweep).
             let new_lows: Vec<_> = lows
                 .iter()
                 .map(|b| Bound {
-                    self_subst: b.self_subst.clone(),
+                    self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
                     ty: freshen_above(lim, &b.ty, target, cache),
-                    ty_subst: b.ty_subst.clone(),
+                    ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
                 })
                 .collect();
             let new_ups: Vec<_> = ups
                 .iter()
                 .map(|b| Bound {
-                    self_subst: b.self_subst.clone(),
+                    self_subst: freshen_subst_payloads(lim, &b.self_subst, target, cache),
                     ty: freshen_above(lim, &b.ty, target, cache),
-                    ty_subst: b.ty_subst.clone(),
+                    ty_subst: freshen_subst_payloads(lim, &b.ty_subst, target, cache),
                 })
                 .collect();
             {
@@ -305,6 +303,87 @@ pub fn freshen_above(
             Type::Infer(v)
         }
     }
+}
+
+/// Freshen a refinement's predicate: clone the (immutable) predicate term,
+/// freshen its type slots through `cache`, and install a fresh `Rc`. See
+/// [`freshen_above`]'s `Refinement` arm.
+fn freshen_refinement_predicate(
+    lim: Level,
+    r: &Refinement,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Refinement {
+    let mut pred = (*r.predicate).clone();
+    freshen_expr_type_slots(&mut pred, lim, target, cache);
+    Refinement {
+        predicate: Rc::new(pred),
+    }
+}
+
+/// Freshen every type slot reachable from an expression — `expr.ty`, the user
+/// annotation, each binder's declared type, a `Cast`'s target — through one
+/// shared [`FreshenCache`], recursing into child terms. Used to freshen a
+/// specialization clone's whole subtree (`infer_simple_sub::specialize_use`)
+/// and, via [`freshen_refinement_predicate`], a refinement predicate's slots.
+///
+/// Refinement predicates carried on those types are freshened by
+/// [`freshen_above`] (its `Refinement` arm), so this walk reaches *every* type
+/// in the AST. A definition's interior carries variables (e.g. `Proj` seeds)
+/// that never appear in its root type; missing them would leave a clone with a
+/// mix of fresh and original variables and coalesce to an unresolved type.
+pub fn freshen_expr_type_slots(
+    expr: &mut TypedExpr,
+    lim: Level,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) {
+    expr.ty = freshen_above(lim, &expr.ty, target, cache);
+    if let Some(annotation) = &mut expr.user_annotation {
+        *annotation = freshen_above(lim, annotation, target, cache);
+    }
+    match &mut expr.node {
+        TypedExprNode::Lambda { param, .. } => {
+            param.ty = freshen_above(lim, &param.ty, target, cache);
+        }
+        TypedExprNode::Cast {
+            target: cast_target,
+            ..
+        } => {
+            *cast_target = freshen_above(lim, cast_target, target, cache);
+        }
+        TypedExprNode::Let { binding, .. } => {
+            binding.ty = freshen_above(lim, &binding.ty, target, cache);
+        }
+        TypedExprNode::Case { branches, .. } => {
+            for b in branches.iter_mut() {
+                if let Some(p) = &mut b.pattern {
+                    p.binding.ty = freshen_above(lim, &p.binding.ty, target, cache);
+                }
+            }
+        }
+        TypedExprNode::Loop { params, .. } => {
+            for p in params.iter_mut() {
+                p.ty = freshen_above(lim, &p.ty, target, cache);
+            }
+        }
+        _ => {}
+    }
+    expr.walk_children_mut(|c| freshen_expr_type_slots(c, lim, target, cache));
+}
+
+/// Freshen the discharge payloads of a bound edge's substitution: each captured
+/// argument *term* has its type slots renamed through `cache`. Renames carry no
+/// term, so only [`crate::ccl::subst::Mapping::Discharge`] entries are touched.
+fn freshen_subst_payloads(
+    lim: Level,
+    subst: &Subst,
+    target: FreshenLevel,
+    cache: &mut FreshenCache,
+) -> Subst {
+    let mut subst = subst.clone();
+    subst.for_each_discharge_term_mut(&mut |t| freshen_expr_type_slots(t, lim, target, cache));
+    subst
 }
 
 // ---------------------------------------------------------------------------
@@ -685,12 +764,12 @@ fn constrain_go(
         }
 
         // Refinement subtyping:
-        //   {b₁ | S₁} <: {b₂ | S₂}  iff  b₁ <: b₂  and  σ(S₂) ⊆ σ(S₁) ∪ tags(b₁)
+        //   {b₁ | S₁} <: {b₂ | S₂}  iff  b₁ <: b₂  and  σ(S₂) ⊆ σ(S₁) ∪ witnesses(b₁)
         // (more refinements ⇒ subtype). Refinements match by [`Refinement`]'s
-        // `PartialEq` — structural predicate equality — so a tag join planning
-        // re-minted in a fresh cell still matches; never by predicate
+        // `PartialEq` — structural predicate equality — so a witness join planning
+        // rebuilt as a fresh term still matches; never by predicate
         // implication. The two sides live in different binder contexts, so an
-        // lhs tag is transported through the correspondence (`σ(S₁)`, via
+        // lhs witness is transported through the correspondence (`σ(S₁)`, via
         // [`Subst::force_refinement`]) before comparing: a predicate mentioning
         // a Pi binder matches its renamed — or, when a discharge edge composed
         // into σ on the way through a variable, *discharged* — copy on the
@@ -706,8 +785,8 @@ fn constrain_go(
         // rather than rejecting — the refinement analog of how the
         // record/function arms thread structure through variables. The
         // requirement then fails later iff the variable resolves to a concrete
-        // base lacking those tags. Without this, a value that is *already*
-        // refined could never be cast to add a further tag (nested
+        // base lacking those witnesses. Without this, a value that is *already*
+        // refined could never be cast to add a further witness (nested
         // list-comprehension filters: `{D|p} ⇒ V <: {?a|q} ⇒ V`), even though
         // the assignment `?a := {D|p}` exists.
         //
@@ -722,9 +801,9 @@ fn constrain_go(
             let (rbase, rrefs) = peel_refinements(rhs);
             // The refinements rhs requires that no transported lhs layer
             // matches (by `Refinement`'s structural `PartialEq`). Each side's
-            // tags are forced through its own morphism into the ambient frame
+            // witnesses are forced through its own morphism into the ambient frame
             // before comparing (`sl(S₁)` vs `sr(S₂)`); the deficit keeps the
-            // *untransported* rhs tags, since the recursive constraint below
+            // *untransported* rhs witnesses, since the recursive constraint below
             // carries `sr` for them.
             let lrefs_in_ambient: Vec<Refinement> =
                 lrefs.iter().map(|l| sl.force_refinement(l)).collect();
@@ -739,7 +818,7 @@ fn constrain_go(
             } else if matches!(lbase, Type::Infer(_)) {
                 // Variable base: flow the deficit onto it (`b₁ <: {b₂ | deficit}`)
                 // rather than rejecting; it fails later iff the variable
-                // resolves to a concrete base lacking those tags.
+                // resolves to a concrete base lacking those witnesses.
                 let demanded = wrap_refinements(rbase, &deficit);
                 constrain_go(lbase, &demanded, sl, sr, cache)
             } else {
@@ -758,7 +837,7 @@ fn constrain_go(
 }
 
 /// Peel all outer [`Type::Refinement`] layers, returning the bare base type
-/// and the refinement tags carried by the peeled layers (outermost first).
+/// and the refinement witnesses carried by the peeled layers (outermost first).
 fn peel_refinements(ty: &Type) -> (&Type, Vec<&Refinement>) {
     let mut refs = Vec::new();
     let mut cur = ty;
@@ -773,7 +852,7 @@ fn peel_refinements(ty: &Type) -> (&Type, Vec<&Refinement>) {
 /// outermost-first), preserving their order.
 ///
 /// Used by [`constrain_subtype`]'s refinement arm to rebuild the deficit
-/// refinement `{rbase | S₂ \ S₁}` from the rhs's own layers, so the kept tags
+/// refinement `{rbase | S₂ \ S₁}` from the rhs's own layers, so the kept witnesses
 /// retain their real [`crate::ccl::Refinement`] payloads (predicate `Rc`s).
 fn wrap_refinements(base: &Type, refs: &[&Refinement]) -> Type {
     refs.iter().rev().fold(base.clone(), |acc, r| {
@@ -1038,7 +1117,7 @@ pub struct CompactType {
     /// materialization when the codomain does not actually reference it
     /// (keeping ordinary functions `name: None`).
     pub fun: Option<(Option<Name>, Box<CompactType>, Box<CompactType>)>,
-    /// Refinement-tag contributions at this position. A set with `==`
+    /// Witness contributions at this position. A set with `==`
     /// membership (deduplicated by [`Refinement`]'s structural `PartialEq`),
     /// stored as a `Vec` in first-insertion order. A refinement-set is
     /// width-subtyped exactly like `rec`: more refinements ⇒ subtype
@@ -1101,19 +1180,19 @@ impl CompactType {
         }
     }
 
-    /// Merge two refinement-tag sets. The set-op tracks
+    /// Merge two witness sets. The set-op tracks
     /// polarity the same way `rec` does — positive ⇒ *intersect*,
     /// negative ⇒ *union* — because refinement-sets width-subtype like
     /// record fields (more refinements ⇒ subtype). At a positive
-    /// position the value reliably carries only the tags *both*
+    /// position the value reliably carries only the witnesses *both*
     /// sides guarantee; at a negative position a consumer that may
     /// impose either set imposes their union.
     fn merge_refinements(pol: bool, lhs: Vec<Refinement>, rhs: Vec<Refinement>) -> Vec<Refinement> {
         if pol {
-            // The types are being unioned, so the refinement tags should be intersected.
+            // The types are being unioned, so the refinement witnesses should be intersected.
             lhs.into_iter().filter(|r| rhs.contains(r)).collect()
         } else {
-            // The types are being intersected, so the refinement tags should be unioned.
+            // The types are being intersected, so the refinement witnesses should be unioned.
             let mut out = lhs;
             for r in rhs {
                 if !out.contains(&r) {
@@ -1232,89 +1311,6 @@ impl CompactType {
 /// recursive types at coalesce time (per plan R2), so non-empty
 /// `rec_vars` is itself an error condition unless we're handling a
 /// user-annotated recursive type — which we don't yet.
-/// Tracks retired refinement-predicate cells and their replacements, keyed
-/// by the retired cell's address ([`PredicateCellId`]).
-///
-/// Refinement identity *is* the predicate cell: tags aliasing one cell are
-/// one refinement. When a pass replaces a cell — privatizing a generalized
-/// definition's anchors or de-aliasing a specialized clone's (both in
-/// `infer_simple_sub`) — tags elsewhere still alias the retired cell. The
-/// remap is consulted in two places: [`compact_type`] *canonicalizes* each
-/// tag it collects (so a type materialized from the bound graph carries the
-/// live cell, and a suspended discharge forces from specialized — resolved —
-/// predicate content rather than a retired copy), and
-/// `infer_simple_sub::realias_refinement_tags` re-points tags on already-
-/// stamped types. Each entry keeps the retired `Rc` alive so its address
-/// cannot be reused by a newly minted cell while the remap is live (a
-/// raw-pointer key is only meaningful while its cell is).
-///
-/// A replacement may itself be retired later (a privatized anchor cell is
-/// re-celled again per specialization), so [`CellRemap::resolve`] follows
-/// the chain to the final live cell. A cell retired more than once (one
-/// privatized definition specialized at several types) keeps its *first*
-/// recording: orphaned tags resolve to the first specialization's cell —
-/// sound because tag equality is structural and type-blind, so
-/// specializations of one predicate remain one refinement under `==`.
-#[derive(Default)]
-pub struct CellRemap {
-    map: HashMap<PredicateCellId, CellRetirement>,
-}
-
-/// One [`CellRemap`] entry: the retired cell (kept alive so its address —
-/// the map key — stays unique) and its replacement.
-struct CellRetirement {
-    retired: Rc<RefCell<TypedExpr>>,
-    replacement: Rc<RefCell<TypedExpr>>,
-}
-
-impl CellRemap {
-    /// Record `retired → replacement`. First recording for a cell wins.
-    pub fn record(&mut self, retired: Rc<RefCell<TypedExpr>>, replacement: Rc<RefCell<TypedExpr>>) {
-        self.map
-            .entry(Rc::as_ptr(&retired))
-            .or_insert(CellRetirement {
-                retired,
-                replacement,
-            });
-    }
-
-    /// A cell's direct replacement, if it was retired.
-    pub fn replacement(&self, cell: &Rc<RefCell<TypedExpr>>) -> Option<&Rc<RefCell<TypedExpr>>> {
-        self.map.get(&Rc::as_ptr(cell)).map(|e| &e.replacement)
-    }
-
-    /// Resolve a cell through retirement chains to its final replacement;
-    /// `None` if it was never retired. Terminates: a replacement is freshly
-    /// allocated while every key's cell is still alive (the entries keep
-    /// them so), so no replacement can alias an earlier key — chains move
-    /// strictly forward in recording order.
-    pub fn resolve(&self, cell: &Rc<RefCell<TypedExpr>>) -> Option<Rc<RefCell<TypedExpr>>> {
-        let mut cur = self.replacement(cell)?;
-        while let Some(next) = self.replacement(cur) {
-            cur = next;
-        }
-        Some(cur.clone())
-    }
-
-    /// `r` re-pointed at its live (transitive) replacement cell, or an
-    /// unchanged clone when its cell was never retired. The canonical form
-    /// [`compact_type`] materializes for every tag it collects.
-    pub fn canonical(&self, r: &Refinement) -> Refinement {
-        let mut r = r.clone();
-        if let Some(cell) = self.resolve(&r.predicate) {
-            r.predicate = cell;
-        }
-        r
-    }
-
-    /// Fold a clone-local remap into this pass-global one (first-wins).
-    pub fn absorb(&mut self, other: CellRemap) {
-        for e in other.map.into_values() {
-            self.record(e.retired, e.replacement);
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct CompactGraph {
     pub term: CompactType,
@@ -1327,19 +1323,8 @@ pub struct CompactGraph {
 /// The `parents` set tracks variables whose bounds we are currently
 /// walking, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
-///
-/// `cells` canonicalizes each refinement tag collected along the way (see
-/// [`CellRemap`]): bound-graph entries keep aliasing whatever cell a tag had
-/// when the bound was recorded, so a tag whose cell was since retired —
-/// privatization or per-specialization de-aliasing of a generalized
-/// definition — must be re-pointed at the live cell *here*, before the
-/// accumulated substitution is forced on it. Forcing first would copy the
-/// retired cell's content, whose type slots are the definition's quantified
-/// (never-resolved) inference variables. Pass an empty remap when no cell
-/// has been retired (tests, error rendering).
-pub fn compact_type(ty: &Type, cells: &CellRemap) -> CompactGraph {
+pub fn compact_type(ty: &Type) -> CompactGraph {
     let mut st = CompactState {
-        cells,
         in_process: HashSet::new(),
         recursive: HashMap::new(),
         rec_vars: BTreeMap::new(),
@@ -1351,13 +1336,11 @@ pub fn compact_type(ty: &Type, cells: &CellRemap) -> CompactGraph {
     }
 }
 
-/// Walk-wide state threaded through [`compact_go`]: the pass's cell remap
-/// plus the cycle-tracking tables. (`parents` stays a per-path argument — it
-/// is scoped to one variable's bound chain and reset across structural
-/// boundaries — and the substitution accumulator composes per edge.)
-struct CompactState<'a> {
-    /// Canonicalizes collected refinement tags; see [`compact_type`].
-    cells: &'a CellRemap,
+/// Walk-wide state threaded through [`compact_go`]: the cycle-tracking tables.
+/// (`parents` stays a per-path argument — it is scoped to one variable's bound
+/// chain and reset across structural boundaries — and the substitution
+/// accumulator composes per edge.)
+struct CompactState {
     /// Variables whose bounds are currently being walked, per polarity.
     in_process: HashSet<(InferVarId, bool)>,
     /// Placeholder ids minted for genuinely recursive revisits.
@@ -1389,31 +1372,18 @@ fn compact_go(
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {
             CompactType::from_atom(AtomKey::from_type(ty).unwrap())
         }
-        // Refinements ride the lattice as a refinement-tag set: compact
-        // the underlying type, then attach this layer's tag. Walking a
-        // variable's bound that is `Refinement(D, r)` therefore unions `r`
-        // into that variable's compacted position — the propagation path.
-        // The tag is *canonicalized* first (a retired cell re-pointed at its
-        // live specialized replacement — see [`compact_type`]) and the
-        // accumulated substitution is then *forced* on it: it rewrites the
-        // predicate's free binders (e.g. discharging a dependent application's
-        // argument) before the tag lands in the position. Order matters: a
-        // non-vacuous force copies the cell's content, so it must read the
-        // canonical (coalesced) cell, not a retired one.
-        //
-        // TODO(vault: type-checker-immutable-predicate-terms): the
-        // canonicalization step is scaffolding for *mutable shared predicate
-        // cells* — a clone can't own its predicates without re-celling, which
-        // strands tags on retired cells that this `st.cells.canonical` chase
-        // re-points. With immutable predicate terms and one uniform
-        // capture-avoiding substitution, a clone's predicates are produced by
-        // the same substitution that freshens its other slots, so there are no
-        // cells to retire and the `CellRemap` consultation here disappears;
-        // "force reads specialized content" then falls out of the clone being
-        // a proper substitution instance.
+        // Refinements ride the lattice as a witness set: compact the underlying
+        // type, then attach this layer's witness. Walking a variable's bound
+        // that is `Refinement(D, r)` therefore unions `r` into that variable's
+        // compacted position — the propagation path. The accumulated
+        // substitution is *forced* on the witness: it rebuilds the predicate
+        // with its free binders rewritten (e.g. discharging a dependent
+        // application's argument) before the witness lands in the position.
+        // The predicate is an immutable term, so a non-vacuous force builds a
+        // fresh predicate from the (freshened) bound's content directly.
         Type::Refinement(inner, r) => {
             let mut ct = compact_go(inner, pol, subst_acc, parents, st);
-            let r = subst_acc.force_refinement(&st.cells.canonical(r));
+            let r = subst_acc.force_refinement(r);
             if !ct.refinements.contains(&r) {
                 ct.refinements.push(r);
             }
@@ -1569,7 +1539,7 @@ fn compact_go(
             // end. Seeding with `from_var` would mix the variable's *empty*
             // refinement set into the merge, and at positive polarity `merge`
             // *intersects* refinement sets (`merge_refinements`) — so the empty
-            // seed would intersect away every bound's tags (∅ is absorbing under
+            // seed would intersect away every bound's witnesses (∅ is absorbing under
             // intersection). The variable identity must be refinement-*neutral*;
             // `rec`/`var`/`fun` get this for free from their `None` merge
             // identity, but refinement sets have no such sentinel, so we keep
@@ -1666,12 +1636,12 @@ enum CoOccItem {
 /// asymmetry. It is placed between [`compact_type`] and
 /// [`coalesce_compact`] in the pipeline.
 ///
-/// **Refinements need no special handling here.** Refinement tags live on
+/// **Refinements need no special handling here.** Refinement witnesses live on
 /// each [`CompactType`] *position* (`ct.refinements`), not on variable
 /// identity, and [`simplify_reconstruct`] copies them through unchanged while
 /// `var_subst` only ever rewrites or drops variable uids. Co-occurring
 /// variables (the merge candidates) sit in the same position and therefore
-/// carry the same tags, so merging or eliminating a variable can never move
+/// carry the same witnesses, so merging or eliminating a variable can never move
 /// or lose a refinement. (The classic "merge x>0 with x<10" hazard applies
 /// only to representations that fold the predicate into the variable's
 /// identity; ours keeps them positional.)
@@ -2010,7 +1980,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         }
     };
 
-    // Re-wrap the refinement tags carried at this position. `extent_of`
+    // Re-wrap the refinement witnesses carried at this position. `extent_of`
     // and `iterate_type` both strip refinements at every depth and compose
     // the resulting `Restrict`s, so the wrap order is semantically
     // irrelevant; first-insertion order in the `Vec` makes it stable.
@@ -2199,15 +2169,14 @@ mod tests {
         }
     }
 
-    /// Build `{base | marker}` — a `Type::Refinement` whose tag's predicate
+    /// Build `{base | marker}` — a `Type::Refinement` whose witness's predicate
     /// encodes `marker` (an `Int(marker)` literal). Refinements compare by
     /// structural predicate equality (see [`Refinement`]'s `PartialEq`), so
     /// equal markers match and distinct markers stay distinct.
     fn refined(base: Type, marker: i64) -> Type {
         use crate::ccl::{Lit, TypedExpr};
-        use std::cell::RefCell;
         let r = Refinement {
-            predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Int(marker)))),
+            predicate: Rc::new(TypedExpr::lit(Lit::Int(marker))),
         };
         Type::Refinement(Box::new(base), r)
     }
@@ -2223,10 +2192,10 @@ mod tests {
     }
 
     #[test]
-    fn refined_missing_tag_is_not_subtype() {
+    fn refined_missing_witness_is_not_subtype() {
         // {Int | q} </: {Int | p}  — a q-refined value cannot stand in for a
         // p-refined one. `refined` gives p and q structurally-distinct
-        // predicates, so the tags don't match.
+        // predicates, so the witnesses don't match.
         let (p, q) = (1, 2);
         let lhs = refined(prim(BaseType::Int), q);
         let rhs = refined(prim(BaseType::Int), p);
@@ -2238,19 +2207,18 @@ mod tests {
     }
 
     #[test]
-    fn structurally_equal_predicate_matches_across_cells() {
+    fn structurally_equal_predicate_matches_across_distinct_terms() {
         // {Int | p} <: {Int | q} when p and q carry *structurally identical*
-        // predicates in distinct cells — exactly what join planning produces
+        // predicates in distinct `Rc`s — exactly what join planning produces
         // by re-minting a refinement at each marker. Equality of the
-        // predicate `Expr`, not cell identity, decides the match
+        // predicate `Expr`, not `Rc` identity, decides the match
         // (`Refinement: PartialEq`).
         use crate::ccl::{Lit, TypedExpr};
-        use std::cell::RefCell;
         let mk = || {
             Type::Refinement(
                 Box::new(prim(BaseType::Int)),
                 Refinement {
-                    predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true)))),
+                    predicate: Rc::new(TypedExpr::lit(Lit::Bool(true))),
                 },
             )
         };
@@ -2263,18 +2231,17 @@ mod tests {
     #[test]
     fn structurally_equal_refinements_hash_equal() {
         // The `Hash`/`Eq` contract: structurally-equal refinements in
-        // distinct cells are `==`, so they must also hash equal — otherwise the
+        // distinct `Rc`s are `==`, so they must also hash equal — otherwise the
         // `ConstrainCache` (`HashSet<(Type, Type)>`) cycle-break could miss a
         // match. Pins consistency between `Refinement`'s `PartialEq` and `Hash`.
         use crate::ccl::{Lit, TypedExpr};
-        use std::cell::RefCell;
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         let mk = || {
             Type::Refinement(
                 Box::new(prim(BaseType::Int)),
                 Refinement {
-                    predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true)))),
+                    predicate: Rc::new(TypedExpr::lit(Lit::Bool(true))),
                 },
             )
         };
@@ -2307,7 +2274,7 @@ mod tests {
         let c = Type::Refinement(
             Box::new(prim(BaseType::Int)),
             Refinement {
-                predicate: Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(false)))),
+                predicate: Rc::new(TypedExpr::lit(Lit::Bool(false))),
             },
         );
         assert_ne!(a, c, "distinct predicates must stay distinct");
@@ -2328,7 +2295,7 @@ mod tests {
         // {?a | q} <: {Int | p}: the explicit layer only supplies q, but the
         // base variable ?a can acquire the deficit {p}, so the constraint
         // succeeds by flowing `?a <: {Int | p}`. This is what lets a value
-        // that is *already* refined be cast to add a further tag (nested
+        // that is *already* refined be cast to add a further witness (nested
         // list-comprehension filters: `{D|p} ⇒ V <: {?a|q} ⇒ V`); a ground
         // `{p} ⊆ {q}` check would reject it.
         let (p, q) = (1, 2);
@@ -2352,7 +2319,7 @@ mod tests {
     fn refined_concrete_base_still_rejects_deficit() {
         // {Int | q} </: {Int | p}: with a *concrete* base there is nothing to
         // absorb the deficit, so the strict rejection (`{T|q} ⊀ {T|p}`) is
-        // preserved — only a variable base can acquire missing tags.
+        // preserved — only a variable base can acquire missing witnesses.
         let (p, q) = (1, 2);
         let lhs = refined(prim(BaseType::Int), q);
         let rhs = refined(prim(BaseType::Int), p);
@@ -2381,17 +2348,16 @@ mod tests {
 
     #[test]
     fn distinct_refinements_survive_simplification() {
-        // A record carrying two *different* refinement tags at two field
+        // A record carrying two *different* refinement witnesses at two field
         // positions must round-trip through compact → simplify → coalesce
-        // with both tags intact (they are positional, not folded into a
+        // with both witnesses intact (they are positional, not folded into a
         // variable identity, so co-occurrence analysis cannot merge them).
         let (p, q) = (1, 2);
         let ty = Type::Record(vec![
             ("a".to_string(), refined(prim(BaseType::Int), p)),
             ("b".to_string(), refined(prim(BaseType::Int), q)),
         ]);
-        let out =
-            coalesce_compact(&simplify_type(compact_type(&ty, &CellRemap::default()))).unwrap();
+        let out = coalesce_compact(&simplify_type(compact_type(&ty))).unwrap();
         assert_eq!(out, ty);
     }
 
@@ -2400,7 +2366,7 @@ mod tests {
         // A fresh var equated to a refined type (both bounds) must coalesce
         // *carrying* the refinement, not drop it to the bare base. Solver-level
         // property: equality bounds may still arise (e.g. `bind_annotation`,
-        // `require_eq` on list elements), so tags must survive them.
+        // `require_eq` on list elements), so witnesses must survive them.
         let p = 1;
         let v = fresh_var(0);
         let refined_int = refined(prim(BaseType::Int), p);
@@ -2408,16 +2374,18 @@ mod tests {
         // v ⟺ {Int | p}
         constrain_subtype(&v, &refined_int, &mut cache).unwrap();
         constrain_subtype(&refined_int, &v, &mut cache).unwrap();
-        let out =
-            coalesce_compact(&simplify_type(compact_type(&v, &CellRemap::default()))).unwrap();
-        assert_eq!(out, refined_int, "var equated to {{Int|p}} lost its tag");
+        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
+        assert_eq!(
+            out, refined_int,
+            "var equated to {{Int|p}} lost its witness"
+        );
     }
 
     #[test]
     fn apply_index_var_coalesces_refined() {
-        // Solver-level tag-propagation property: an index var `v` equated
+        // Solver-level witness-propagation property: an index var `v` equated
         // (both bounds) with the domain `dom` of a function shape that is
-        // itself equated with `{d | p} ⇒ cod` (d ⟺ Int). The tag `p` must
+        // itself equated with `{d | p} ⇒ cod` (d ⟺ Int). The witness `p` must
         // propagate through the var⇄var equality chain onto `v`'s coalesced
         // type, `{Int | p}` — refinements ride the lattice; they must not be
         // dropped at var merges.
@@ -2440,12 +2408,11 @@ mod tests {
         // constrain_argument(v, dom): two-way
         constrain_subtype(&v, &dom, &mut cache).unwrap();
         constrain_subtype(&dom, &v, &mut cache).unwrap();
-        let out =
-            coalesce_compact(&simplify_type(compact_type(&v, &CellRemap::default()))).unwrap();
+        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
         assert_eq!(
             out,
             refined(prim(BaseType::Int), p),
-            "Apply index var lost its tag"
+            "Apply index var lost its witness"
         );
     }
 
@@ -2576,7 +2543,7 @@ mod tests {
     fn coalesce_primitive_round_trips() {
         let s = prim(BaseType::Int);
         assert_eq!(
-            coalesce_compact(&compact_type(&s, &CellRemap::default())).unwrap(),
+            coalesce_compact(&compact_type(&s)).unwrap(),
             Type::Base(BaseType::Int)
         );
     }
@@ -2584,7 +2551,7 @@ mod tests {
     #[test]
     fn coalesce_function_preserves_shape() {
         let s = fun(prim(BaseType::Int), prim(BaseType::Bool));
-        let t = coalesce_compact(&compact_type(&s, &CellRemap::default())).unwrap();
+        let t = coalesce_compact(&compact_type(&s)).unwrap();
         assert_eq!(
             t,
             Type::Fun {
@@ -2601,7 +2568,7 @@ mod tests {
             (FieldKey::Index(0), prim(BaseType::Int)),
             (FieldKey::Index(1), prim(BaseType::String)),
         ]);
-        let t = coalesce_compact(&compact_type(&r, &CellRemap::default())).unwrap();
+        let t = coalesce_compact(&compact_type(&r)).unwrap();
         assert_eq!(
             t,
             Type::Tuple(vec![
@@ -2617,7 +2584,7 @@ mod tests {
             (FieldKey::Name("x".into()), prim(BaseType::Int)),
             (FieldKey::Name("y".into()), prim(BaseType::Bool)),
         ]);
-        let t = coalesce_compact(&compact_type(&r, &CellRemap::default())).unwrap();
+        let t = coalesce_compact(&compact_type(&r)).unwrap();
         assert_eq!(
             t,
             Type::Record(vec![
@@ -2662,7 +2629,7 @@ mod tests {
         let mut cache = ConstrainCache::new();
         constrain_subtype(&prim(BaseType::Int), &v, &mut cache).unwrap();
         assert_eq!(
-            coalesce_compact(&compact_type(&v, &CellRemap::default())).unwrap(),
+            coalesce_compact(&compact_type(&v)).unwrap(),
             Type::Base(BaseType::Int)
         );
     }
@@ -2678,7 +2645,7 @@ mod tests {
         let mut cache = ConstrainCache::new();
         constrain_subtype(&v, &prim(BaseType::Int), &mut cache).unwrap();
         assert_eq!(
-            coalesce_compact(&compact_type(&v, &CellRemap::default())).unwrap(),
+            coalesce_compact(&compact_type(&v)).unwrap(),
             Type::Base(BaseType::Int)
         );
     }
@@ -2686,7 +2653,7 @@ mod tests {
     #[test]
     fn coalesce_var_with_no_bounds_emits_infer() {
         let v = fresh_var(0);
-        match coalesce_compact(&compact_type(&v, &CellRemap::default())).unwrap() {
+        match coalesce_compact(&compact_type(&v)).unwrap() {
             Type::Infer(_) => {}
             other => panic!("expected Type::Infer, got {:?}", other),
         }
@@ -2703,7 +2670,7 @@ mod tests {
         constrain_subtype(&prim(BaseType::Int), &v, &mut cache).unwrap();
         constrain_subtype(&prim(BaseType::String), &v, &mut cache).unwrap();
         assert!(matches!(
-            coalesce_compact(&compact_type(&v, &CellRemap::default())),
+            coalesce_compact(&compact_type(&v)),
             Err(CoalesceError::IncompatibleBounds { .. })
         ));
     }
@@ -2728,7 +2695,7 @@ mod tests {
         if let Type::Infer(state) = &v {
             state.bounds.borrow_mut().lower.push(Bound::conc(v.clone()));
         }
-        match coalesce_compact(&compact_type(&v, &CellRemap::default())).unwrap() {
+        match coalesce_compact(&compact_type(&v)).unwrap() {
             Type::Infer(_) => {}
             other => panic!("expected Type::Infer for spurious self-cycle, got {other:?}"),
         }
@@ -3091,7 +3058,7 @@ mod tests {
             ("Some", prim(BaseType::Int)),
             ("None", prim(BaseType::Unit)),
         ]);
-        let scheme = simplify_type(compact_type(&v, &CellRemap::default()));
+        let scheme = simplify_type(compact_type(&v));
         let ty = coalesce_compact(&scheme).expect("coalesce ok");
         match ty {
             Type::Variant(tags) => {
@@ -3111,7 +3078,6 @@ mod tests {
 
     use crate::ccl::subst::Subst;
     use crate::ccl::{BinOpKind, CompareKind, Lit, TypedExpr};
-    use std::cell::RefCell;
     use std::rc::Rc;
 
     /// Build a refinement whose predicate is the **bare** `__elem > <rhs>` —
@@ -3124,12 +3090,12 @@ mod tests {
             rhs,
         );
         Refinement {
-            predicate: Rc::new(RefCell::new(pred)),
+            predicate: Rc::new(pred),
         }
     }
 
     fn coalesce(ty: &Type) -> Type {
-        coalesce_compact(&compact_type(ty, &CellRemap::default())).expect("coalesce")
+        coalesce_compact(&compact_type(ty)).expect("coalesce")
     }
 
     /// The refinement predicate of a `Fun(Refinement(_, r), _)`, rendered.
@@ -3140,7 +3106,7 @@ mod tests {
         let Type::Refinement(_, r) = domain.as_ref() else {
             panic!("expected refined domain, got {domain}");
         };
-        crate::ccl::symbolic::symbolic(&r.predicate.borrow())
+        crate::ccl::symbolic::symbolic(&r.predicate)
     }
 
     // L — a Pi-vs-Pi constraint DERIVES the binder correspondence `[k ↦ x]`,
@@ -3396,7 +3362,7 @@ mod tests {
         // slots differ compare equal.
         let lam = || {
             let mut l = TypedExpr::lambda("w", Type::Hole, TypedExpr::var("w"));
-            if let crate::ccl::TypedExprNode::Lambda { param, .. } = &mut l.node {
+            if let TypedExprNode::Lambda { param, .. } = &mut l.node {
                 param.ty = fresh_var(0);
             }
             Subst::discharge("k", l)

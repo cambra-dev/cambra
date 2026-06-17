@@ -2292,7 +2292,7 @@ fn lower_list_comp(comp: &Comprehension, ctx: &mut LoweringContext) -> Result<Ex
         // into both the body chain and the loop-join predicate: copies of a
         // minted tree stay structurally equal (uids are preserved by
         // cloning), which is what lets inference dedup the predicate-side
-        // refinement tags against the body-side ones. See the "mint before
+        // refinement witnesses against the body-side ones. See the "mint before
         // copy" contract in `crate::ccl::uniquify`.
         let source = uniquify::run(lower_expr(iter, ctx)?);
         let var_name = extract_name_target(target, "comprehension target")?;

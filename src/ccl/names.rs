@@ -231,6 +231,19 @@ impl Name {
     pub fn is_elem(&self) -> bool {
         matches!(self, Name::Reserved(ReservedName::Elem))
     }
+
+    /// Is this the tupled binder lambda elimination mints ([`SyntheticKind::Pair`])?
+    /// Used to assert that this `Uid::fresh()`-minted binder never survives into
+    /// an equality-compared predicate *term* (see [`crate::ccl::planning`]).
+    pub fn is_synthetic_pair(&self) -> bool {
+        matches!(
+            self,
+            Name::Synthetic {
+                kind: SyntheticKind::Pair,
+                ..
+            }
+        )
+    }
 }
 
 impl From<&str> for Name {

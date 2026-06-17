@@ -47,6 +47,9 @@
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
 //! | String add-to-concat | `Arithmetic(Add) : (String,String)→String` | `Concat` | ✓ |
 
+use std::collections::HashMap;
+
+use crate::ccl::ccl_utils::walk_refined_predicates_mut;
 use crate::ccl::infer::debug_typecheck;
 use crate::ccl::lambda_elim::{fun_ty_or_hole, id, zip_pair};
 use crate::ccl::{
@@ -141,43 +144,18 @@ pub fn simplify(mut expr: Expr) -> Expr {
 ///   the re-scan was O(n²) over the long compose chains planning emits.
 fn simplify_once(expr: &mut Expr) -> (bool, bool) {
     let mut changed = false;
-    if let Type::Fun {
-        domain,
-        codomain: _,
-        ..
-    } = &mut expr.ty
-        && let Type::Refinement(_, refinment) = &mut **domain
-    {
-        let pred = &refinment.predicate;
-        // A refinement's predicate is itself an `Expr` whose own
-        // subexpressions may carry the same refinement on their `ty`
-        // (inference shares the `Rc<RefCell<Expr>>` across all places
-        // the refined type surfaces).  If we're already simplifying
-        // this predicate higher up the call stack, `borrow_mut` would
-        // panic.  Skipping the inner attempt is sound: the outer
-        // recursion is already simplifying this predicate, and we
-        // walk to a fixed point in [`simplify`], so any rule that
-        // could fire will fire on a later pass.
-        //
-        // This try_borrow_mut fallback is the same cycle-handling
-        // mechanism used by [`crate::ccl::infer_simple_sub::coalesce_node`].
-        // A related visited-set variant lives in
-        // [`crate::ccl::ccl_utils::walk_refined_predicates`] and is
-        // used by [`crate::ccl::ccl_utils::count_free`],
-        // [`crate::ccl::infer::check_fully_typed`], and
-        // [`crate::ccl::lambda_elim::elim_lambdas_in_type`].  This
-        // site doesn't use the helper because it only targets the
-        // domain refinement on `Fun(...)` (Lambda's refinement slot
-        // shape) rather than every refinement reachable from the type.
-        if let Ok(mut p) = pred.try_borrow_mut() {
-            // A refinement predicate's own iteration-containment is irrelevant
-            // to the term-tree guard: `iterate` sources are inserted into the
-            // term tree, never inside predicates.  Discard the iteration bit
-            // here — matching the original recursive scan, which never
-            // descended into `expr.ty`.
-            changed = simplify_once(&mut p).0;
-        }
-    }
+    // A refinement's predicate is itself an immutable `Expr`; simplify *every*
+    // predicate reachable from this node's type, rebuilding each as a fresh
+    // `Rc`. With immutable predicates each occurrence is a distinct `Rc`, so
+    // simplifying only the `Fun`-domain refinement would leave a sibling
+    // occurrence (a `Cast` target, a consumer's contract) un-simplified and
+    // break the post-pass typecheck's structural match. The memo re-points
+    // occurrences that shared a predicate term. A predicate's own iteration-containment is
+    // irrelevant to the term-tree guard (`iterate` sources live in the term
+    // tree, never inside predicates), so the iteration bit is discarded here.
+    walk_refined_predicates_mut(&mut expr.ty, &mut HashMap::new(), &mut |pred, _| {
+        changed |= simplify_once(pred).0;
+    });
     let (children_changed, children_have_iteration) = recurse_simplify(expr);
     changed |= children_changed;
     let contains_iteration = children_have_iteration || is_iteration(expr);

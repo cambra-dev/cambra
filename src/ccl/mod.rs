@@ -24,7 +24,6 @@ pub mod uniquify;
 
 use std::{
     cell::RefCell,
-    collections::HashSet,
     fmt,
     rc::Rc,
     sync::atomic::{AtomicU32, Ordering},
@@ -957,8 +956,8 @@ pub enum TypedExprNode {
     /// because `{𝐷 | 𝑝} <: 𝐷` — so viewing an unrefined-domain collection
     /// function at a refined-domain type is sound.  The
     /// refinement-aware solver ([`crate::ccl::simple_sub::constrain_subtype`])
-    /// flows the tag onto the fresh target-domain variable, *stacking* it
-    /// onto any tags the value already carries, so nested casts compose
+    /// flows the witness onto the fresh target-domain variable, *stacking* it
+    /// onto any witnesses the value already carries, so nested casts compose
     /// (nested list comprehensions).  `target`'s predicate is inferred by the
     /// same `emit_annotation_predicates` / `coalesce_type_predicates` path as
     /// any refinement-bearing type.  A *covariant* refinement (e.g. casting
@@ -2179,8 +2178,11 @@ pub enum Type {
     /// once a nested refinement closes over it (dependent application).
     Fun {
         /// The Pi binder, if this function type is dependent. Bound in
-        /// `codomain`; not part of structural equality up to α-renaming once
-        /// dependent refinements consume it (see the substitution machinery).
+        /// `codomain`. The derived [`PartialEq`] *does* compare it, but the
+        /// α-aware comparisons that matter for dependent refinements strip it
+        /// first (`without_pi_names`), so two function types equal up to
+        /// renaming their Pi binder reconcile there (see the substitution
+        /// machinery).
         name: Option<Name>,
         /// The parameter (argument) type. Contravariant position.
         domain: Box<Type>,
@@ -2334,13 +2336,9 @@ impl fmt::Display for Type {
                     write!(f, "[{}]", parts.join(" | "))
                 }
             }
-            Type::Refinement(t, r) => write!(
-                f,
-                "{{{t} | {}}}",
-                r.predicate
-                    .try_borrow()
-                    .map_or_else(|_| "…".to_string(), |e| symbolic::symbolic(&e)),
-            ),
+            Type::Refinement(t, r) => {
+                write!(f, "{{{t} | {}}}", symbolic::symbolic(&r.predicate))
+            }
             Type::Hole => write!(f, "_"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
             Type::DataSource(name) => write!(f, "source({name})"),
@@ -2550,22 +2548,25 @@ impl Type {
 /// [`predicate`]: Refinement::predicate
 #[derive(Debug, Clone)]
 pub struct Refinement {
-    /// A **bare** boolean expression (not a lambda) in which
+    /// A **bare**, *immutable* boolean expression (not a lambda) in which
     /// [`REFINEMENT_BINDER`] is free. Compiled as an element-wise loop join
-    /// when its type is iterated.
-    pub predicate: Rc<RefCell<TypedExpr>>,
+    /// when its type is iterated. A rewrite produces a *new* term (structural
+    /// `Rc` sharing keeps that cheap); nothing mutates a predicate in place,
+    /// so a predicate that flows around is never resolved out from under a
+    /// hash key.
+    pub predicate: Rc<TypedExpr>,
 }
 
-/// Pointer identity of a refinement's shared predicate cell.
+/// Pointer identity of a refinement's predicate term.
 ///
-/// Traversals that descend into refinement predicates use this as their
-/// visited-set key to break cycles (a predicate's own type slots can carry
-/// the refinement that contains it): it identifies *this very cell*, unlike
+/// Traversals that descend into refinement predicates use this as a
+/// visited-set key to avoid re-walking a predicate term shared by `Rc` across
+/// several occurrences (the term graph is a DAG — immutable `Rc<TypedExpr>`
+/// cannot form a cycle). It identifies *this very `Rc`*, unlike
 /// [`Refinement`]'s structural `PartialEq`, and costs nothing to compute.
-/// Only meaningful while the cell is alive — hold it no longer than a
-/// traversal over a tree that owns the `Rc`s (a freed cell's address can be
-/// reused).
-pub type PredicateCellId = *const RefCell<TypedExpr>;
+/// Only meaningful while the `Rc` is alive — hold it no longer than a
+/// traversal over a tree that owns the `Rc`s (a freed address can be reused).
+pub type PredicateId = *const TypedExpr;
 
 /// The single reserved binder every [`Refinement`] implicitly introduces. It
 /// is free in a refinement's predicate and ranges over the refined base type.
@@ -2574,8 +2575,8 @@ pub type PredicateCellId = *const RefCell<TypedExpr>;
 pub const REFINEMENT_BINDER: &str = "__elem";
 
 impl Refinement {
-    /// The [`PredicateCellId`] of this refinement's predicate cell.
-    pub fn cell_id(&self) -> PredicateCellId {
+    /// The [`PredicateId`] of this refinement's predicate term.
+    pub fn predicate_id(&self) -> PredicateId {
         Rc::as_ptr(&self.predicate)
     }
 }
@@ -2587,76 +2588,78 @@ impl PartialEq for Refinement {
     /// predicate was constructed, so a `{D | p}` that join planning
     /// re-minted at a marker (`make_iterate` / `make_restrict` /
     /// `refine_with`) compares equal to its structural twin — which is what
-    /// lets the post-planning `typecheck` chain the re-minted tags. This is
-    /// *equality*, not implication — `{T | p}` and `{T | q}` with
+    /// lets the post-planning `typecheck` chain the re-minted witnesses. This
+    /// is *equality*, not implication — `{T | p}` and `{T | q}` with
     /// structurally-distinct predicates remain unequal.
     ///
     /// The comparison is **type-blind**: a predicate's embedded `Type`s are
-    /// inference metadata, resolved (and freshened) in place, so copies of
-    /// one predicate made along a specialization descent line — privatized,
-    /// freshened, pinned at different use types — denote the same refinement
-    /// while their type slots differ. Comparing the term and skipping the
-    /// types keeps those copies equal, exactly as the [`Hash`](std::hash::Hash)
-    /// impl keeps them hash-equal.
+    /// inference metadata, so copies of one predicate — freshened for a
+    /// specialization, rebuilt by a discharge, pinned at different use types —
+    /// denote the same refinement while their type slots differ. Comparing the
+    /// term and skipping the types keeps those copies equal, exactly as the
+    /// [`Hash`](std::hash::Hash) impl keeps them hash-equal.
     ///
     /// Every refinement binds the same reserved [`REFINEMENT_BINDER`], so
     /// equality is plain structural equality of the bare predicate — the
     /// binder appears identically on both sides, with no α-renaming to do.
     ///
-    /// Pointer-equal cells short-circuit: a refinement that merely flows
-    /// around shares its predicate `Rc`, so the common case never compares
-    /// structure.
+    /// Pointer-equal predicates short-circuit: a refinement that merely flows
+    /// around (a vacuous substitution) keeps sharing its predicate `Rc`, so
+    /// the common case never compares structure.
     fn eq(&self, other: &Self) -> bool {
         if Rc::ptr_eq(&self.predicate, &other.predicate) {
             return true;
         }
 
-        eq_refinement_predicate(&self.predicate.borrow(), &other.predicate.borrow())
+        eq_refinement_predicate(&self.predicate, &other.predicate)
     }
 }
 
 impl Eq for Refinement {}
 
-/// Type-blind structural equality of refinement predicate terms, the equality
-/// counterpart of [`hash_refinement_predicate`]: compares node shape, scalar
-/// leaves (operators, builtins, literals, names, tags), binder names, and
-/// child `Expr`s pairwise, but never the embedded `Type`s (`ty` slots,
-/// annotations, binding types — all inference metadata).
+/// The **"same-restriction" relation** on refinement predicate terms: the
+/// equality that backs [`Refinement`] and the counterpart of
+/// [`hash_refinement_predicate`]. It is *deliberately* type-blind — it compares
+/// node shape, scalar leaves (operators, builtins, literals, names, tags),
+/// binder names, and child `Expr`s pairwise, but never the embedded `Type`s
+/// (`ty` slots, annotations, binding types). Those are inference metadata, not
+/// part of what restriction a refinement imposes, and copies of one predicate
+/// legitimately differ in them (freshened for a specialization, rebuilt by a
+/// discharge, pinned at different use types). So this is a structural relation
+/// chosen for its context, not an approximation of a finer one — there is no
+/// plan to make it a derived `==` (which would wrongly compare those slots).
+///
+/// Binder names compare by equality, which coincides with α-equivalence under
+/// the Barendregt convention (uniquified, globally-distinct binders; copies
+/// preserve uids). Should a future pass need to compare predicates whose bound
+/// binders were independently minted, this is the site to make α-aware (thread
+/// a binder correspondence) rather than chase global name determinism.
 ///
 /// One type-anchored slot **is** compared: a [`TypedExprNode::Cast`]'s
 /// `target` carries the cast's domain-refinement *predicate term*
 /// ([`ccl_utils::cast_target_refinement`]) — a semantic filter, not inference
 /// metadata. Two predicates that each contain a cast and differ only in the
 /// nested filter (e.g. embedded comprehensions filtering `> 0` vs `< 0`)
-/// denote different refinements; conflating them would let tag-deficit
+/// denote different refinements; conflating them would let witness-deficit
 /// matching accept an unsatisfied demand and refinement dedup drop a runtime
-/// `Restrict`. The target's *base* types are still skipped.
-///
-/// Comparing cast targets crosses predicate-cell boundaries, so termination
-/// no longer follows from tree-shape alone: cells reached through a chain of
-/// cast targets could in principle alias back into a cell already under
-/// comparison. The `visited` set of cell-pairs makes such a revisit compare
-/// equal (coinductively) instead of diverging; within one cell the recursion
-/// is structural on a finite term as before.
+/// `Restrict`. The target's *base* types are still skipped. The recursion
+/// terminates on tree shape alone: a predicate is an immutable `Rc<TypedExpr>`,
+/// which is acyclic, so cast targets cannot cycle back into a term under
+/// comparison — no coinduction guard is needed.
 ///
 /// Everything this distinguishes beyond [`hash_refinement_predicate`]'s
 /// stream (binder names, `Source` names, record field names, pattern tags,
 /// cast-target predicates) makes eq finer than hash, preserving the
 /// `Eq`/`Hash` contract.
 fn eq_refinement_predicate(a: &TypedExpr, b: &TypedExpr) -> bool {
-    // `HashSet::new` does not allocate until first insert, so predicates
-    // containing no `Cast` pay nothing for the cycle guard.
-    eq_refinement_predicate_go(a, b, &mut HashSet::new())
+    eq_refinement_predicate_go(a, b)
 }
 
 /// Compare two cast targets' domain-refinement predicates term-wise (see
-/// [`eq_refinement_predicate`]). Pointer-equal cells short-circuit; a
-/// revisited cell-pair is coinductively equal via `visited`.
-fn eq_cast_target_predicates(
-    t1: &Type,
-    t2: &Type,
-    visited: &mut HashSet<(PredicateCellId, PredicateCellId)>,
-) -> bool {
+/// [`eq_refinement_predicate`]). Pointer-equal predicates short-circuit;
+/// otherwise the comparison recurses structurally (acyclic terms, so it
+/// terminates without a cycle guard).
+fn eq_cast_target_predicates(t1: &Type, t2: &Type) -> bool {
     match (
         ccl_utils::cast_target_refinement(t1),
         ccl_utils::cast_target_refinement(t2),
@@ -2666,33 +2669,21 @@ fn eq_cast_target_predicates(
             if Rc::ptr_eq(&r1.predicate, &r2.predicate) {
                 return true;
             }
-            if !visited.insert((r1.cell_id(), r2.cell_id())) {
-                return true;
-            }
-            eq_refinement_predicate_go(&r1.predicate.borrow(), &r2.predicate.borrow(), visited)
+            eq_refinement_predicate_go(&r1.predicate, &r2.predicate)
         }
         _ => false,
     }
 }
 
-/// Recursive worker for [`eq_refinement_predicate`]; `visited` guards the
-/// cell-boundary crossings made by [`eq_cast_target_predicates`].
-fn eq_refinement_predicate_go(
-    a: &TypedExpr,
-    b: &TypedExpr,
-    visited: &mut HashSet<(PredicateCellId, PredicateCellId)>,
-) -> bool {
+/// Recursive worker for [`eq_refinement_predicate`].
+fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
     use TypedExprNode as N;
-    fn all_eq(
-        xs: &[TypedExpr],
-        ys: &[TypedExpr],
-        visited: &mut HashSet<(PredicateCellId, PredicateCellId)>,
-    ) -> bool {
+    fn all_eq(xs: &[TypedExpr], ys: &[TypedExpr]) -> bool {
         xs.len() == ys.len()
             && xs
                 .iter()
                 .zip(ys)
-                .all(|(x, y)| eq_refinement_predicate_go(x, y, visited))
+                .all(|(x, y)| eq_refinement_predicate_go(x, y))
     }
     match (&a.node, &b.node) {
         (N::Lit(x), N::Lit(y)) => x == y,
@@ -2710,10 +2701,7 @@ fn eq_refinement_predicate_go(
                 function: f2,
                 argument: a2,
             },
-        ) => {
-            eq_refinement_predicate_go(f1, f2, visited)
-                && eq_refinement_predicate_go(a1, a2, visited)
-        }
+        ) => eq_refinement_predicate_go(f1, f2) && eq_refinement_predicate_go(a1, a2),
         (
             N::Cast {
                 value: v1,
@@ -2723,10 +2711,7 @@ fn eq_refinement_predicate_go(
                 value: v2,
                 target: t2,
             },
-        ) => {
-            eq_refinement_predicate_go(v1, v2, visited)
-                && eq_cast_target_predicates(t1, t2, visited)
-        }
+        ) => eq_refinement_predicate_go(v1, v2) && eq_cast_target_predicates(t1, t2),
         (
             N::BinOp {
                 left: l1,
@@ -2738,14 +2723,8 @@ fn eq_refinement_predicate_go(
                 op: o2,
                 right: r2,
             },
-        ) => {
-            o1 == o2
-                && eq_refinement_predicate_go(l1, l2, visited)
-                && eq_refinement_predicate_go(r1, r2, visited)
-        }
-        (N::UnaryOp(k1, e1), N::UnaryOp(k2, e2)) => {
-            k1 == k2 && eq_refinement_predicate_go(e1, e2, visited)
-        }
+        ) => o1 == o2 && eq_refinement_predicate_go(l1, l2) && eq_refinement_predicate_go(r1, r2),
+        (N::UnaryOp(k1, e1), N::UnaryOp(k2, e2)) => k1 == k2 && eq_refinement_predicate_go(e1, e2),
         (
             N::Lambda {
                 param: p1,
@@ -2757,7 +2736,7 @@ fn eq_refinement_predicate_go(
                 body: b2,
                 ..
             },
-        ) => p1.name == p2.name && eq_refinement_predicate_go(b1, b2, visited),
+        ) => p1.name == p2.name && eq_refinement_predicate_go(b1, b2),
         (
             N::Aggregate {
                 input: i1,
@@ -2767,7 +2746,7 @@ fn eq_refinement_predicate_go(
                 input: i2,
                 kind: k2,
             },
-        ) => k1 == k2 && eq_refinement_predicate_go(i1, i2, visited),
+        ) => k1 == k2 && eq_refinement_predicate_go(i1, i2),
         (
             N::Let {
                 binding: bd1,
@@ -2781,13 +2760,13 @@ fn eq_refinement_predicate_go(
             },
         ) => {
             bd1.name == bd2.name
-                && eq_refinement_predicate_go(e1, e2, visited)
-                && eq_refinement_predicate_go(b1, b2, visited)
+                && eq_refinement_predicate_go(e1, e2)
+                && eq_refinement_predicate_go(b1, b2)
         }
         (N::List(x), N::List(y))
         | (N::Tuple(x), N::Tuple(y))
         | (N::Compose(x), N::Compose(y))
-        | (N::CollectionUnion(x), N::CollectionUnion(y)) => all_eq(x, y, visited),
+        | (N::CollectionUnion(x), N::CollectionUnion(y)) => all_eq(x, y),
         (
             N::Case {
                 scrutinee: s1,
@@ -2800,7 +2779,7 @@ fn eq_refinement_predicate_go(
         ) => {
             let scrutinee_eq = match (s1, s2) {
                 (None, None) => true,
-                (Some(x), Some(y)) => eq_refinement_predicate_go(x, y, visited),
+                (Some(x), Some(y)) => eq_refinement_predicate_go(x, y),
                 _ => false,
             };
             scrutinee_eq
@@ -2812,8 +2791,8 @@ fn eq_refinement_predicate_go(
                         _ => false,
                     };
                     pattern_eq
-                        && eq_refinement_predicate_go(&x.guard, &y.guard, visited)
-                        && eq_refinement_predicate_go(&x.body, &y.body, visited)
+                        && eq_refinement_predicate_go(&x.guard, &y.guard)
+                        && eq_refinement_predicate_go(&x.body, &y.body)
                 })
         }
         (
@@ -2825,12 +2804,13 @@ fn eq_refinement_predicate_go(
                 tag: t2,
                 payload: p2,
             },
-        ) => t1 == t2 && eq_refinement_predicate_go(p1, p2, visited),
+        ) => t1 == t2 && eq_refinement_predicate_go(p1, p2),
         (N::Record(f1), N::Record(f2)) => {
             f1.len() == f2.len()
-                && f1.iter().zip(f2).all(|((n1, e1), (n2, e2))| {
-                    n1 == n2 && eq_refinement_predicate_go(e1, e2, visited)
-                })
+                && f1
+                    .iter()
+                    .zip(f2)
+                    .all(|((n1, e1), (n2, e2))| n1 == n2 && eq_refinement_predicate_go(e1, e2))
         }
         (
             N::Loop {
@@ -2848,13 +2828,12 @@ fn eq_refinement_predicate_go(
         ) => {
             p1.len() == p2.len()
                 && p1.iter().zip(p2).all(|(x, y)| x.name == y.name)
-                && all_eq(i1, i2, visited)
-                && eq_refinement_predicate_go(s1, s2, visited)
-                && eq_refinement_predicate_go(b1, b2, visited)
+                && all_eq(i1, i2)
+                && eq_refinement_predicate_go(s1, s2)
+                && eq_refinement_predicate_go(b1, b2)
         }
         (N::ExprStmt { expr: e1, body: b1 }, N::ExprStmt { expr: e2, body: b2 }) => {
-            eq_refinement_predicate_go(e1, e2, visited)
-                && eq_refinement_predicate_go(b1, b2, visited)
+            eq_refinement_predicate_go(e1, e2) && eq_refinement_predicate_go(b1, b2)
         }
         (
             N::Feed {
@@ -2875,7 +2854,7 @@ fn eq_refinement_predicate_go(
                 name: n2,
                 value: v2,
             },
-        ) => n1 == n2 && eq_refinement_predicate_go(v1, v2, visited),
+        ) => n1 == n2 && eq_refinement_predicate_go(v1, v2),
         _ => false,
     }
 }
@@ -2912,20 +2891,13 @@ impl std::hash::Hash for Refinement {
     /// Hashes the predicate's *structure* (refined `Type`s are hashed as
     /// `ConstrainCache` keys). [`hash_refinement_predicate`] hashes the
     /// predicate's node shape and scalar leaves but skips embedded `Type`s,
-    /// so the hash is stable under in-place type resolution; `==`
-    /// ([`eq_refinement_predicate`]) is the matching type-blind relation,
-    /// finer only by leaves the hash skips, which keeps the `Eq`/`Hash`
-    /// contract.
-    ///
-    /// `try_borrow` (symmetric with `PartialEq`): a cell transiently held
-    /// `borrow_mut` by a rewrite pass hashes as the empty predicate rather than
-    /// panicking. Safe because refined `Type`s are hashed only inside
-    /// `constrain_subtype`, where predicate cells are not being mutated, so the
-    /// borrow always succeeds there and the hash is stable.
+    /// so the hash is stable even though a refinement's twin may carry
+    /// differently-resolved type slots; `==` ([`eq_refinement_predicate`]) is
+    /// the matching type-blind relation, finer only by leaves the hash skips,
+    /// which keeps the `Eq`/`Hash` contract. The predicate is immutable, so a
+    /// `Type` used as a `ConstrainCache` key never re-hashes differently.
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        if let Ok(p) = self.predicate.try_borrow() {
-            hash_refinement_predicate(&p, state);
-        }
+        hash_refinement_predicate(&self.predicate, state);
     }
 }
 
@@ -3043,7 +3015,7 @@ mod tests {
             )
         };
         let refinement = |pred: TypedExpr| Refinement {
-            predicate: Rc::new(RefCell::new(pred)),
+            predicate: Rc::new(pred),
         };
 
         let gt = refinement(cast_pred(CompareKind::Greater));

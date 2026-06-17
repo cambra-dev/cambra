@@ -83,7 +83,11 @@ use crate::ccl::{
 /// are *not* folded here — `crate::ccl::simplify` handles that rewrite as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_non_iterable_lambdas(expr: Expr) -> Expr {
-    inline_impl(expr)
+    let mut expr = inline_impl(expr);
+    // Beta-reduction rebuilds predicates on `expr.ty` (immutable terms); keep
+    // each `Cast`'s `target` slot in step so the post-pass typecheck matches.
+    crate::ccl::ccl_utils::sync_cast_targets(&mut expr);
+    expr
 }
 
 // ---------------------------------------------------------------------------
@@ -452,10 +456,10 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
             |e| inline_and_beta_reduce(e, name, lambda),
         ),
 
-        // The cast target is the syntactic anchor of its refinement
-        // predicate — `lambda_elim` and operator conversion read the
-        // predicate off the target, not off `ty` — so walk it explicitly
-        // rather than relying on `ty` still aliasing the same cell.
+        // The cast target is where its refinement predicate is written —
+        // `lambda_elim` and operator conversion read the predicate off the
+        // target, not off `ty` — so walk it explicitly; `target` carries its
+        // own predicate `Rc`, independent of the one on `ty`.
         TypedExprNode::Cast { value, mut target } => {
             inline_in_type_predicates(&mut target, name, lambda);
             TypedExprNode::Cast {
@@ -487,17 +491,17 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
 }
 
 /// Run [`inline_and_beta_reduce`] on every refinement predicate embedded in
-/// `ty`, rewriting the shared predicate cells in place (every type-level
-/// alias of a predicate is the same syntactic predicate, so they all see the
-/// rewrite) — each cell once per call, via the canonical
-/// [`walk_refined_predicates_mut`] cycle discipline.
+/// `ty`, rebuilding each predicate as a fresh immutable `Rc`. Every occurrence
+/// that shared one predicate term in `ty` is re-pointed at the same rebuilt
+/// term (the memo in [`walk_refined_predicates_mut`]), so the rewrite is
+/// observed uniformly across them.
 ///
 /// This stays a pass-level walk rather than a `Subst` call because inlining
 /// inside a predicate must also *beta-reduce* the call sites it creates —
 /// substitution proper is the engine's job and runs inside
 /// [`inline_and_beta_reduce`] via `lambda_elim::substitute`.
 fn inline_in_type_predicates(ty: &mut Type, name: &Name, lambda: &Expr) {
-    walk_refined_predicates_mut(ty, &mut std::collections::HashSet::new(), &mut |pred, _| {
+    walk_refined_predicates_mut(ty, &mut std::collections::HashMap::new(), &mut |pred, _| {
         let old = std::mem::replace(pred, Expr::lit(Lit::Unit));
         *pred = inline_and_beta_reduce(old, name, lambda);
     });
@@ -597,9 +601,8 @@ mod tests {
     #[test]
     fn non_iterable_domain_refinement_wraps_non_iterable() {
         use crate::ccl::Refinement;
-        use std::cell::RefCell;
         use std::rc::Rc;
-        let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));
+        let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
         let refinement = Refinement { predicate: pred };
         let ty = Type::Refinement(Box::new(Type::Base(BaseType::Int)), refinement);
         assert!(!is_iterable_domain(&ty));
@@ -608,9 +611,8 @@ mod tests {
     #[test]
     fn iterable_domain_refinement_wraps_iterable() {
         use crate::ccl::Refinement;
-        use std::cell::RefCell;
         use std::rc::Rc;
-        let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));
+        let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
         let refinement = Refinement { predicate: pred };
         let ty = Type::Refinement(Box::new(Type::UIntRange(3)), refinement);
         assert!(is_iterable_domain(&ty));
@@ -664,9 +666,8 @@ mod tests {
         // Int → Refinement(Int → Int, pred): domain is non-iterable (Int),
         // so the function is inlined regardless of the refined codomain.
         use crate::ccl::Refinement;
-        use std::cell::RefCell;
         use std::rc::Rc;
-        let pred = Rc::new(RefCell::new(TypedExpr::lit(Lit::Bool(true))));
+        let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
         let refinement = Refinement { predicate: pred };
         let inner_fun = Type::Fun {
             name: None,

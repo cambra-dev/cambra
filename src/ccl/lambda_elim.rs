@@ -40,7 +40,6 @@
 //! | `add`/`sub`/… (and compares / logic) | `Builtin(BinOp(op))` for `op: BinOpKind` | binary scalar ops |
 //! | `neg`, `not_fn` | `Builtin(Neg)`, `Builtin(NotFn)` | unary scalar ops |
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{cast_target_refinement, is_free, is_free_in_value, typed_compose};
@@ -88,7 +87,12 @@ pub fn run(expr: Expr) -> Result<Expr, LambdaElimError> {
     // planning, which wraps each in `λ __elem → …` and runs the full lambda-elim
     // → simplify (→ planning) sub-pipeline when a refined type is iterated
     // (`planning::compile_refinement_predicates`).
-    let simplified = simplify(point_free);
+    let mut simplified = simplify(point_free);
+    // Predicate rewrites during elimination/simplification rebuild the
+    // immutable predicate on each node's `expr.ty`; re-sync every `Cast`'s
+    // `target` slot to its `expr.ty` so the post-pass typecheck's
+    // reconstruction matches the recorded type.
+    crate::ccl::ccl_utils::sync_cast_targets(&mut simplified);
     Ok(simplified)
 }
 
@@ -198,13 +202,13 @@ pub fn const_(c: Expr) -> Expr {
 /// Replace every free occurrence of `Var(name)` in `expr` with `replacement`.
 ///
 /// A thin wrapper over the uniform engine's in-place mode
-/// ([`crate::ccl::subst::Subst::rewrite_expr`]): one traversal over terms
-/// *and* type slots, predicates rewritten through their shared cells so
-/// every type-borne alias observes the rewrite, `Compose` types recomputed
-/// from the rewritten elements. Shadowing stops the descent exactly as
-/// before (an inlined copy of a lambda can rebind the same `Name`, so the
-/// discipline is still load-bearing); capture is impossible under the
-/// Barendregt convention and the engine asserts it.
+/// ([`crate::ccl::subst::Subst::discharge_in_place`]): one traversal over terms
+/// *and* type slots, each predicate rebuilt as a fresh `Rc` with the engine's
+/// memo re-pointing occurrences that shared one term so the rewrite is observed
+/// uniformly, `Compose` types recomputed from the rewritten elements. Shadowing
+/// stops the descent exactly as before (an inlined copy of a lambda can rebind
+/// the same `Name`, so the discipline is still load-bearing); capture is
+/// impossible under the Barendregt convention and the engine asserts it.
 pub(crate) fn substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
     debug_typecheck(&expr);
     let mut expr = expr;
@@ -814,7 +818,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             let source_domain = target_elim.ty.domain().unwrap();
             let source_codomain = target_elim.ty.codomain().unwrap();
             let refinement = Refinement {
-                predicate: Rc::new(RefCell::new(pred_on_source)),
+                predicate: Rc::new(pred_on_source),
             };
             let refined_domain = Type::Refinement(Box::new(source_domain), refinement);
             let refined_source = target_elim.with_ty(Type::fun(refined_domain, source_codomain));
@@ -1139,7 +1143,7 @@ mod tests {
         // a dedicated AST field. `substitute` must descend through the type
         // (via `substitute_in_type`) into the predicate body.
         let refinement = Refinement {
-            predicate: Rc::new(RefCell::new(refinement_pred)),
+            predicate: Rc::new(refinement_pred),
         };
         let refined_param = Type::Refinement(Box::new(int_ty()), refinement);
         let expr = Expr::lambda("x", int_ty(), Expr::var("x").with_ty(int_ty()))
@@ -1153,7 +1157,7 @@ mod tests {
         // verify substitution descended into it.
         let pred_after_subst = match &result.ty {
             Type::Fun { domain, .. } => match domain.as_ref() {
-                Type::Refinement(_, r) => r.predicate.borrow().clone(),
+                Type::Refinement(_, r) => (*r.predicate).clone(),
                 other => panic!("expected refined domain, got {other}"),
             },
             other => panic!("expected function type, got {other}"),
@@ -1273,7 +1277,7 @@ mod tests {
 
         // Uncorrelated refinement (a Bool constant predicate) on the param.
         let refinement = Refinement {
-            predicate: Rc::new(RefCell::new(Expr::lit(Lit::Bool(true)).with_ty(bool_ty))),
+            predicate: Rc::new(Expr::lit(Lit::Bool(true)).with_ty(bool_ty)),
         };
         let refined_y_ty = Type::Refinement(Box::new(int_ty()), refinement);
         let body = var("y").with_ty(int_ty());
@@ -1307,11 +1311,10 @@ mod tests {
     #[test]
     fn is_free_detects_var_in_partial_tuple_refinement() {
         use crate::ccl::Refinement;
-        use std::cell::RefCell;
         use std::rc::Rc;
 
         // pred = Var("x") — the refinement predicate references x.
-        let pred = Rc::new(RefCell::new(Expr::var("x")));
+        let pred = Rc::new(Expr::var("x"));
         let refinement = Refinement { predicate: pred };
 
         // Tuple([Int, Refinement(Int, pred_x)]): x only appears in the second component.

@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::Debug;
 use std::mem::take;
 use std::rc::Rc;
@@ -25,12 +24,57 @@ fn is_builtin(expr: &Expr, b: Builtin) -> bool {
     matches!(&expr.node, TypedExprNode::Builtin(x) if *x == b)
 }
 
-/// Identity key for a refinement predicate — the `Rc<RefCell<Expr>>` address.
-/// Keyed on object identity, not [`crate::ccl::RefinementId`]: a
-/// substituted/discharged refinement keeps its id but holds an independently
-/// cloned predicate that must be compiled on its own (keying by id would skip
-/// the clone and leave it in lambda form).
-type PredPtr = *const RefCell<Expr>;
+/// Identity key for a refinement predicate — the `Rc<Expr>` address. Keyed on
+/// object identity, not [`crate::ccl::RefinementId`]: a substituted/discharged
+/// refinement keeps its id but holds an independently rebuilt predicate that
+/// must be compiled on its own (keying by id would skip it and leave it in
+/// lambda form). Maps each original predicate to its compiled, point-free
+/// rebuild so every occurrence that shared one term is re-pointed at the same
+/// compiled `Rc` (and compiled exactly once).
+///
+/// Like the value-rewrite memos elsewhere (see
+/// [`ccl_utils::walk_refined_predicates_mut`]), this is a **performance /
+/// structural-sharing optimization, not a correctness requirement** — verified:
+/// the full suite passes with this dedup disabled. Compilation is effectively a
+/// value function for comparison purposes: `lambda_elim` mints a fresh `__pair`
+/// `Uid` in its nested-lambda rule, but that binder is *eliminated* within the
+/// same run, so the compiled output is point-free and carries no minted binder
+/// — two independent compilations of one predicate yield structurally-equal
+/// terms. (The convention this rests on — no pass leaves a re-minted bound
+/// binder in a term that equality later compares — is what keeps by-name
+/// equality coincide with α-equivalence; `lambda_elim` upholds it by
+/// eliminating `__pair` rather than the equality having to be α-aware.)
+type PredMemo = HashMap<*const Expr, Rc<Expr>>;
+
+/// True if a `__pair` binder ([`Name::is_synthetic_pair`]) appears anywhere in
+/// the **term** `e` — its node and child *expressions*, never its type slots.
+///
+/// Type slots are skipped on purpose: lambda elimination leaves `__pair` only
+/// as a `Fun.name` Pi binder in a type slot, which every equality path ignores
+/// (`eq_refinement_predicate` is type-blind; the structural reconcile strips Pi
+/// names via `without_pi_names`). The invariant this backs is purely about the
+/// compared term. Only reached from a `debug_assert!`, but it must compile in
+/// release too (the macro still type-checks its argument), so it is not gated.
+fn term_mentions_pair_binder(e: &Expr) -> bool {
+    let here = match &e.node {
+        TypedExprNode::Var(n) => n.is_synthetic_pair(),
+        TypedExprNode::Lambda { param, .. } => param.name.is_synthetic_pair(),
+        TypedExprNode::Let { binding, .. } => binding.name.is_synthetic_pair(),
+        TypedExprNode::Loop { params, .. } => params.iter().any(|p| p.name.is_synthetic_pair()),
+        TypedExprNode::Case { branches, .. } => branches.iter().any(|b| {
+            b.pattern
+                .as_ref()
+                .is_some_and(|p| p.binding.name.is_synthetic_pair())
+        }),
+        _ => false,
+    };
+    if here {
+        return true;
+    }
+    let mut found = false;
+    e.walk_children(|c| found |= term_mentions_pair_binder(c));
+    found
+}
 
 /// Compile every refinement predicate reachable from `expr` by running the
 /// lambda-elim → simplify sub-pipeline on it (design §6.3/§6.5).
@@ -40,9 +84,40 @@ type PredPtr = *const RefCell<Expr>;
 /// `p`, the form the recognizers and op-conversion's `Restrict` consume (it
 /// recovers `p` via `fn_of_bare_predicate` and re-wraps). Each distinct predicate
 /// `Rc` is compiled once.
-fn compile_refinement_predicates(expr: &mut Expr, seen: &mut HashSet<PredPtr>) {
-    compile_predicates_in_type(&mut expr.ty, seen);
-    expr.walk_children_mut(|child| compile_refinement_predicates(child, seen));
+///
+/// Every type slot a node carries is compiled, not just `expr.ty`: a `Cast`'s
+/// `target` and the binder-declared types (lambda param, `let` binding, etc.)
+/// carry their own predicate `Rc`s. They are independent (immutable) terms, so
+/// each must be normalized. For the common predicate (no nested lambdas)
+/// compilation is deterministic, so a `target` and its parallel `expr.ty`
+/// normalize to structurally-equal point-free predicates and still
+/// match under refinement equality; for the nested-lambda case the per-`Rc`
+/// memo keeps shared occurrences equal despite `lambda_elim`'s `__pair` minting
+/// (see [`PredMemo`]).
+fn compile_refinement_predicates(expr: &mut Expr, memo: &mut PredMemo) {
+    compile_predicates_in_type(&mut expr.ty, memo);
+    if let Some(annotation) = &mut expr.user_annotation {
+        compile_predicates_in_type(annotation, memo);
+    }
+    match &mut expr.node {
+        TypedExprNode::Lambda { param, .. } => compile_predicates_in_type(&mut param.ty, memo),
+        TypedExprNode::Cast { target, .. } => compile_predicates_in_type(target, memo),
+        TypedExprNode::Let { binding, .. } => compile_predicates_in_type(&mut binding.ty, memo),
+        TypedExprNode::Case { branches, .. } => {
+            for b in branches.iter_mut() {
+                if let Some(p) = &mut b.pattern {
+                    compile_predicates_in_type(&mut p.binding.ty, memo);
+                }
+            }
+        }
+        TypedExprNode::Loop { params, .. } => {
+            for p in params.iter_mut() {
+                compile_predicates_in_type(&mut p.ty, memo);
+            }
+        }
+        _ => {}
+    }
+    expr.walk_children_mut(|child| compile_refinement_predicates(child, memo));
 }
 
 /// The point-free predicate function `p : base ⇒ Bool` underlying a refinement's
@@ -59,22 +134,51 @@ fn fn_of_bare_predicate(base: &Type, bare: &Expr) -> Expr {
         .expect("lambda-elim of refinement predicate")
 }
 
-fn compile_predicates_in_type(ty: &mut Type, seen: &mut HashSet<PredPtr>) {
-    if let Type::Refinement(base, refinement) = ty
-        && seen.insert(Rc::as_ptr(&refinement.predicate))
-        && let Ok(mut pred) = refinement.predicate.try_borrow_mut()
-    {
-        // Normalize the bare predicate to `__elem ▷ p` with `p` point-free:
-        // recover the predicate function and re-wrap it. This keeps the stored
-        // predicate in the single bare form while pinning a point-free core, so
-        // the iterate/restrict producers (built from the same `p`) carry a
-        // structurally-identical refinement to the cast demand they satisfy.
-        let p = fn_of_bare_predicate(base, &pred);
-        *pred = ccl_utils::bare_predicate_of_fn(base, p);
+fn compile_predicates_in_type(ty: &mut Type, memo: &mut PredMemo) {
+    if let Type::Refinement(base, refinement) = ty {
+        let original = Rc::as_ptr(&refinement.predicate);
+        if let Some(compiled) = memo.get(&original) {
+            refinement.predicate = Rc::clone(compiled);
+        } else {
+            // Normalize the bare predicate to `__elem ▷ p` with `p` point-free:
+            // recover the predicate function and re-wrap it. This keeps the
+            // stored predicate in the single bare form while pinning a
+            // point-free core, so the iterate/restrict producers (built from
+            // the same `p`) carry a structurally-identical refinement to the
+            // cast demand they satisfy.
+            let p = fn_of_bare_predicate(base, &refinement.predicate);
+            let mut compiled = ccl_utils::bare_predicate_of_fn(base, p);
+            // The compiled predicate's own sub-expressions can carry *nested*
+            // refinements (a filter over an already-filtered source: the inner
+            // refinement rides a sub-expression's type slot inside this
+            // predicate). `Type::walk_children_mut` below does not descend into
+            // a predicate term, so compile those here, sharing the memo.
+            compile_refinement_predicates(&mut compiled, memo);
+            // The producer/consumer refinement match (`sum`'s domain vs. its
+            // feed, a compose adjacency) compares *distinct* predicate `Rc`s —
+            // the memo only dedups occurrences sharing one `Rc`. That match
+            // rests on compilation being a deterministic value function, which
+            // requires that lambda elimination's freshly-minted `__pair`
+            // (`Uid::fresh()`) never survive into the compared *term*. It
+            // legitimately survives as a `Fun.name` Pi binder in a type slot
+            // (which `eq_refinement_predicate` is type-blind to), so the check
+            // is term-only. Assert that load-bearing invariant rather than
+            // leaving it argued.
+            debug_assert!(
+                !term_mentions_pair_binder(&compiled),
+                "a `__pair` binder survived into a compiled predicate term, \
+                 breaking the value-function property the structural \
+                 producer/consumer match relies on: {}",
+                symbolic(&compiled)
+            );
+            let compiled = Rc::new(compiled);
+            memo.insert(original, Rc::clone(&compiled));
+            refinement.predicate = compiled;
+        }
     }
     // Recurse into structural type children (refinement base, function
     // domain/codomain, tuple/record/variant elements).
-    ty.walk_children_mut(|child| compile_predicates_in_type(child, seen));
+    ty.walk_children_mut(|child| compile_predicates_in_type(child, memo));
 }
 
 /// Materialize every iteration site in the post-lambda-elim CCL, choosing
@@ -120,6 +224,18 @@ pub fn run(mut expr: Expr) -> Expr {
     recognize_groupby_sites(&mut expr);
     let mut expr = simplify(expr);
     insert_iterate_markers(&mut expr);
+    // Normalize every remaining bare predicate tree-wide to point-free form.
+    // `wrap_with_iterate` compiles each iteration *site*'s predicate, but a
+    // refinement also rides **consumer contracts** that sit outside any site —
+    // an aggregate's domain (`sum : ({D | p} ⇒ Int) ⇒ Int`), a composition
+    // adjacency — carrying the same predicate as the producer they validate
+    // against. With immutable predicate terms those are independent `Rc`s, so
+    // the per-site compilation doesn't reach them; this whole-tree pass (one
+    // shared memo) compiles them to the *same* point-free form, so the
+    // post-planning typecheck's structural refinement match holds. It runs
+    // after the recognizers (which already consumed the bare shapes they
+    // match) and is idempotent on already-compiled predicates.
+    compile_refinement_predicates(&mut expr, &mut PredMemo::new());
     // Re-run `simplify` to absorb the `id` leaves and nested `Compose`
     // boilerplate that [`try_hash_join_rewrite`] emits via
     // [`replace_tuple_project_with_id`].  `simplify` is marker-aware: its
@@ -127,7 +243,12 @@ pub fn run(mut expr: Expr) -> Expr {
     // the `Apply(_, Iterate)` / `Apply(_, Restrict)` markers just inserted,
     // so the only rules that fire here are the always-safe cleanups (plus
     // any reduction of a fully marker-free sub-tree, which is sound).
-    simplify(expr)
+    let mut expr = simplify(expr);
+    // Compilation rebuilt the immutable predicate on each node's `expr.ty`;
+    // re-sync every `Cast`'s `target` slot so the post-planning typecheck's
+    // reconstruction (which reads `target`) matches the compiled recorded type.
+    ccl_utils::sync_cast_targets(&mut expr);
+    expr
 }
 
 /// Walks `expr` and materializes every iteration site, choosing the best
@@ -439,12 +560,13 @@ fn wrap_with_iterate(expr: &mut Expr) {
     // with a free outer binder would surface as a surviving free var, not a
     // silent miscompile.
     //
-    // The `seen` set dedups predicates *within* this site's subtree (a predicate
-    // `Rc` shared across positions is compiled once). It is fresh per site, so a
-    // predicate reachable from two sibling sites may be visited again; that is
-    // safe because `lambda_elim::run` is idempotent on an already-point-free
-    // predicate (re-running finds no lambdas to eliminate).
-    compile_refinement_predicates(expr, &mut HashSet::new());
+    // The `memo` dedups predicates *within* this site's subtree (a predicate
+    // `Rc` shared across positions is compiled once, all occurrences re-pointed
+    // at the same rebuild). It is fresh per site, so a predicate reachable from
+    // two sibling sites may be compiled again; that is safe because
+    // `lambda_elim::run` is idempotent on an already-point-free predicate
+    // (re-running finds no lambdas to eliminate).
+    compile_refinement_predicates(expr, &mut PredMemo::new());
     let Some(domain_ty) = expr.ty.domain() else {
         return;
     };
@@ -462,8 +584,7 @@ fn wrap_with_iterate(expr: &mut Expr) {
     let mut preds: Vec<Expr> = Vec::new();
     let mut current = &domain_ty;
     while let Type::Refinement(base, refinement) = current {
-        let bare = refinement.predicate.borrow();
-        preds.push(fn_of_bare_predicate(base.as_ref(), &bare));
+        preds.push(fn_of_bare_predicate(base.as_ref(), &refinement.predicate));
         current = base.as_ref();
     }
     preds.reverse();
@@ -507,10 +628,11 @@ fn wrap_with_iterate(expr: &mut Expr) {
     }
     // The override is now redundant — `source`'s domain already carries
     // the full refinement structure, so `typed_compose` derives the
-    // correct `{…} ⇒ T`.  Keep it to pin the original site's predicate
-    // cells (`make_restrict` re-mints each layer's predicate in a fresh
-    // cell; the re-mints compare equal structurally, but the override
-    // keeps downstream tags aliasing the site's own cells).
+    // correct `{…} ⇒ T`.  Keep it as a defensive pin on the site's own
+    // type: predicates are immutable terms, so the layers `make_restrict`
+    // re-mints (each rebuilt as a fresh `Rc`) compare equal structurally,
+    // and nothing downstream depends on which term instance the codomain
+    // holds.
     *expr = typed_compose(elts).with_ty(site_ty);
 }
 
@@ -664,7 +786,7 @@ fn convert_groupby_pointful(expr: &Expr) -> Option<Expr> {
     };
     // The bare predicate binds the implicit REFINEMENT_BINDER as the element:
     //   pred = (__elem ▷ c ▷ key) == <key binder>
-    let pred = refinement.predicate.borrow();
+    let pred = &*refinement.predicate;
     let TypedExprNode::BinOp {
         left,
         op: BinOpKind::Compare(CompareKind::Equals),
@@ -1579,12 +1701,12 @@ fn join_plan_to_expr(plan: &JoinPlan, types: &[Type]) -> Expr {
             let base_iteration = (|| {
                 if arms.len() == 1 {
                     if let Type::Refinement(base_ty, refinement) = &types[arms[0]] {
-                        let pred_rc = &refinement.predicate;
                         // `convert_loop_join` only reads the predicate (it
-                        // builds a new expr), so borrow rather than clone it.
-                        let pred = pred_rc.borrow();
+                        // builds a new expr), so borrow the immutable term
+                        // rather than clone it.
+                        let pred = &*refinement.predicate;
                         trace!("Attempting loop join conversion inside iteration");
-                        if let Some(transformed) = convert_loop_join(base_ty, &pred) {
+                        if let Some(transformed) = convert_loop_join(base_ty, pred) {
                             trace!(
                                 "Converted iteration to {} : {}",
                                 symbolic(&transformed),
@@ -1904,15 +2026,14 @@ fn try_hash_join_rewrite(expr: &mut Expr, domain_ty: &Type) -> bool {
     let Type::Refinement(base, refinement) = domain_ty else {
         return false;
     };
-    let pred_rc = &refinement.predicate;
     // `convert_loop_join` only reads the predicate (it builds a new expr), so
-    // borrow rather than clone it.
-    let pred = pred_rc.borrow();
+    // borrow the immutable term rather than clone it.
+    let pred = &*refinement.predicate;
     trace!(
         "Attempting hash-join rewrite at iteration site: {}",
         symbolic(expr),
     );
-    let Some(transformed) = convert_loop_join(base, &pred) else {
+    let Some(transformed) = convert_loop_join(base, pred) else {
         trace!("Hash-join pattern did not match");
         return false;
     };
@@ -2903,7 +3024,6 @@ mod tests {
     // Helpers for the iteration-insertion test group.
     // -----------------------------------------------------------------
 
-    use std::cell::RefCell;
     use std::rc::Rc;
 
     use crate::ccl::Refinement;
@@ -2921,7 +3041,7 @@ mod tests {
         Type::Refinement(
             Box::new(base),
             Refinement {
-                predicate: Rc::new(RefCell::new(predicate)),
+                predicate: Rc::new(predicate),
             },
         )
     }

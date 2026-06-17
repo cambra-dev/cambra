@@ -1,11 +1,10 @@
 //! Miscellaneous utilities for working with CCL.
 
-use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, Builtin, Expr, Lit, Name, PredicateCellId, Refinement, Type, TypedExprNode,
+    BaseType, Builtin, Expr, Lit, Name, PredicateId, Refinement, Type, TypedExprNode,
 };
 
 /// Builds an application of a primitive combinator, setting the types based on
@@ -68,9 +67,9 @@ pub fn is_trivially_true_predicate(expr: &Expr) -> bool {
 /// [`is_trivially_true_predicate`]), the output type degenerates to
 /// `D ⇒ D` with no refinement wrapper: the refinement would carry no
 /// information, and skipping it keeps program dumps and golden tests
-/// free of `{D | true ▷ const}` noise.  The refinement's predicate lives
-/// in a fresh cell — safe because tags match by structural predicate
-/// equality, while walkers key cycle detection on the cell address.
+/// free of `{D | true ▷ const}` noise.  The refinement gets a freshly
+/// built predicate term — safe because witnesses match by structural
+/// predicate equality, while walkers key DAG dedup on the [`PredicateId`].
 ///
 /// Op-conversion compiles `Apply(p, Iterate)` to an `IterateExtent` tile
 /// (plus a `Restrict` filter when the predicate is non-trivial).  The
@@ -181,7 +180,7 @@ pub fn refine_codomain(morphism: Expr, bare_predicate: &Expr) -> Expr {
     let refined = Type::Refinement(
         Box::new(codomain),
         Refinement {
-            predicate: Rc::new(RefCell::new(bare_predicate.clone())),
+            predicate: Rc::new(bare_predicate.clone()),
         },
     );
     set_codomain(morphism, refined)
@@ -249,7 +248,7 @@ fn restamp_spine_result(node: &mut Expr, new_result: Type) {
 /// `Fun(Refinement(_, _), _)` — a refinement on a function domain.  Inference
 /// no longer *requires* this (any `target` with `value_ty <: target` is a
 /// well-typed upcast), but it is the only shape lowering produces today and
-/// the one [`crate::ccl::lambda_elim`]'s groupby reconstruction reads a tag
+/// the one [`crate::ccl::lambda_elim`]'s groupby reconstruction reads a witness
 /// off of, so this asserts the lowering contract: a non-conforming target is
 /// a construction-time bug, not a user error, so it panics rather than
 /// emitting a cast `lambda_elim` would mishandle.  See [`TypedExprNode::Cast`]
@@ -264,14 +263,14 @@ pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
     Expr::cast(value, target_ty)
 }
 
-/// Read the domain refinement off a cast target type — the refinement tag a
+/// Read the domain refinement off a cast target type — the refinement witness a
 /// [`make_cast`] target carries on its `Fun(Refinement(_, r), _)` shape.
 ///
 /// [`crate::ccl::lambda_elim`]'s cast-wrapped-lambda arm calls this on a
 /// [`TypedExprNode::Cast`]'s `target` to reattach the refinement to the
 /// reconstructed `groupby` lambda.  (Inference does not need it: it types the
-/// cast as the upcast `value_ty <: target` and lets the solver carry the tag.)
-/// The returned `Refinement` shares the predicate's `Rc<RefCell<Expr>>` with
+/// cast as the upcast `value_ty <: target` and lets the solver carry the
+/// witness.) The returned `Refinement` shares the predicate's `Rc<Expr>` with
 /// `target`.
 pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
     let Type::Fun { domain, .. } = target else {
@@ -299,7 +298,7 @@ pub fn refined_fn_type(base_domain: Type, predicate: Expr, codomain: Type) -> Ty
         Type::Refinement(
             Box::new(base_domain),
             Refinement {
-                predicate: Rc::new(RefCell::new(predicate)),
+                predicate: Rc::new(predicate),
             },
         ),
         codomain,
@@ -352,6 +351,25 @@ pub fn bare_predicate_of_fn(base: &Type, predicate: Expr) -> Expr {
     Expr::apply(elem, predicate).with_ty(Type::Base(BaseType::Bool))
 }
 
+/// Re-point every [`TypedExprNode::Cast`]'s `target` type slot at the cast
+/// node's own `expr.ty`. A cast's recorded type *is* its target type, so the
+/// two are equal by construction — but the `target` carries its **own**
+/// immutable refinement-predicate `Rc`, and a predicate-rewriting pass
+/// (inlining's beta step, lambda elimination, planning's point-free
+/// compilation) rebuilds the predicate on `expr.ty` without touching `target`,
+/// so they drift apart. The post-pass `typecheck` reconstructs a cast from its
+/// `target` ([`cast_target_refinement`]) and compares against the recorded
+/// `expr.ty`; re-syncing after each such pass keeps that match exact.
+pub fn sync_cast_targets(expr: &mut Expr) {
+    if matches!(expr.node, TypedExprNode::Cast { .. }) {
+        let ty = expr.ty.clone();
+        if let TypedExprNode::Cast { target, .. } = &mut expr.node {
+            *target = ty;
+        }
+    }
+    expr.walk_children_mut(sync_cast_targets);
+}
+
 /// Wrap `base` in a fresh `Type::Refinement` whose bare predicate filters the
 /// element by the point-free function `predicate : base ⇒ Bool` (stored as
 /// `__elem ▷ predicate`, see [`bare_predicate_of_fn`]). Returns `base` unchanged
@@ -364,7 +382,7 @@ fn refine_with(base: Type, predicate: &Expr) -> Type {
     Type::Refinement(
         Box::new(base),
         Refinement {
-            predicate: Rc::new(RefCell::new(bare)),
+            predicate: Rc::new(bare),
         },
     )
 }
@@ -392,21 +410,17 @@ pub fn count_free(name: &Name, expr: &Expr) -> usize {
 }
 
 /// Recursive worker for [`count_free`].  Threads a `visited` set of
-/// already-walked predicate cells ([`PredicateCellId`]) so that
+/// already-walked predicate terms ([`PredicateId`]) so that
 /// self-referential refinements (a Lambda param `xs` whose type contains a
 /// refinement whose predicate references `xs`) terminate cleanly.  Each
-/// predicate cell is walked at most once per top-level [`count_free`] call —
+/// predicate term is walked at most once per top-level [`count_free`] call —
 /// its free-var count is collected on first encounter and short-circuited on
 /// subsequent encounters.
-fn count_free_with_visited(
-    name: &Name,
-    expr: &Expr,
-    visited: &mut HashSet<PredicateCellId>,
-) -> usize {
+fn count_free_with_visited(name: &Name, expr: &Expr, visited: &mut HashSet<PredicateId>) -> usize {
     // Every type slot of the node counts: `ty`, the user annotation, and a
-    // `Cast`'s target (the syntactic anchor of its refinement — pre-inference
-    // no `ty` tag aliases it, so it must be walked explicitly or a
-    // predicate-only occurrence goes unseen).
+    // `Cast`'s target (where its refinement is written syntactically —
+    // pre-inference no `ty` slot carries the same refinement, so it must be
+    // walked explicitly or a predicate-only occurrence goes unseen).
     let in_type = count_free_in_type_with_visited(name, &expr.ty, visited)
         + expr
             .user_annotation
@@ -635,25 +649,14 @@ pub fn is_free_in_type(name: &Name, ty: &Type) -> bool {
     count_free_in_type_with_visited(name, ty, &mut HashSet::new()) > 0
 }
 
-/// Recursive worker for the type-walking side of [`count_free`].  Same
-/// `visited` set is threaded through to break self-referential
-/// refinement cycles.
-///
-/// `try_borrow().ok()` in [`walk_refined_predicates`] silently treats a
-/// failed borrow as "zero occurrences."  This is intentional: callers
-/// run *between* CCL passes when no refinement predicate is being
-/// mutated, so a `borrow_mut` from elsewhere in the call stack
-/// shouldn't happen.  We still use `try_borrow` defensively —
-/// under-counting is a soundness issue only if a caller relies on
-/// `>= 2` to gate a substitute-vs-preserve decision, and a missed
-/// count would mean we substitute away a shared binding.  If you add
-/// a caller that walks an actively-mutating refinement, switch the
-/// helper to `borrow()` so the mistake panics rather than
-/// miscompiling.
+/// Recursive worker for the type-walking side of [`count_free`].  The
+/// `visited` set ([`walk_refined_predicates`]) dedups a predicate term shared
+/// by `Rc` across occurrences — counted once, matching the by-`Rc` dedup the
+/// substitute-vs-preserve decision keys on.
 fn count_free_in_type_with_visited(
     name: &Name,
     ty: &Type,
-    visited: &mut HashSet<PredicateCellId>,
+    visited: &mut HashSet<PredicateId>,
 ) -> usize {
     let mut count = 0;
     walk_refined_predicates(ty, visited, &mut |pred, vis| {
@@ -664,63 +667,68 @@ fn count_free_in_type_with_visited(
 
 /// Walk every [`Type::Refinement`] reachable from `ty` and invoke `f`
 /// on its predicate expression by *shared* reference.  Each predicate
-/// cell is visited at most once per call (keyed by [`PredicateCellId`]
-/// in `visited`) — this breaks cycles that arise when a refinement's
-/// predicate has type slots referencing the same refinement
-/// (e.g. inference sharing the `Rc<RefCell<Expr>>` across all places
-/// the refined value surfaces).
-///
-/// If the predicate is currently mutably borrowed higher up the call
-/// stack, the visit is silently skipped — the outer borrow is already
-/// processing it.
+/// is visited at most once per call (keyed by [`PredicateId`] in
+/// `visited`) — a predicate term may be shared by `Rc` across several
+/// occurrences (a refinement's predicate has type slots that surface the
+/// same refinement), so this dedups the DAG. (Immutable predicates cannot
+/// form a cycle, so this is dedup, not cycle-breaking.)
 ///
 /// The callback receives `visited` so it can recurse back into
-/// [`walk_refined_predicates`] (or its `_mut` variant) when the
-/// predicate's own subexpressions carry types that contain further
-/// refinements.
+/// [`walk_refined_predicates`] when the predicate's own subexpressions
+/// carry types that contain further refinements.
 ///
 /// This helper is the single source of truth for the
-/// type-walk + visited-set cycle-handling pattern used by
+/// type-walk + visited-set pattern used by
 /// [`count_free_in_type_with_visited`], [`crate::ccl::infer::check_fully_typed`],
 /// and [`crate::ccl::lambda_elim`]'s post-pass type-refinement walk.
-/// See [`walk_refined_predicates_mut`] for the mutable variant used by
-/// [`crate::ccl::lambda_elim`].
-/// A related dual-mechanism (try_borrow_mut fallback without an
-/// explicit visited set) lives in [`crate::ccl::simplify::simplify`]
-/// — see the note there for why that site can't use this helper today.
-pub fn walk_refined_predicates<F>(ty: &Type, visited: &mut HashSet<PredicateCellId>, f: &mut F)
+/// See [`walk_refined_predicates_mut`] for the rebuilding variant used by
+/// [`crate::ccl::inline`].
+pub fn walk_refined_predicates<F>(ty: &Type, visited: &mut HashSet<PredicateId>, f: &mut F)
 where
-    F: FnMut(&Expr, &mut HashSet<PredicateCellId>),
+    F: FnMut(&Expr, &mut HashSet<PredicateId>),
 {
     if let Type::Refinement(_, refinement) = ty
-        && visited.insert(refinement.cell_id())
+        && visited.insert(refinement.predicate_id())
     {
-        let pred_rc = &refinement.predicate;
-        if let Ok(p) = pred_rc.try_borrow() {
-            f(&p, visited);
-        }
+        f(&refinement.predicate, visited);
     }
     ty.walk_children(|child| walk_refined_predicates(child, visited, f));
 }
 
-/// Mutable analog of [`walk_refined_predicates`].  Uses
-/// `try_borrow_mut`; silently skips refinements whose predicate is
-/// already mutably borrowed elsewhere in the call stack (the outer
-/// pass is processing the same predicate).
+/// Rebuilding analog of [`walk_refined_predicates`]: invoke `f` on a *mutable
+/// copy* of each predicate and reinstall the (possibly rewritten) result as a
+/// fresh `Rc`. `memo` maps each original predicate's identity to its rebuilt
+/// `Rc`, so every occurrence that shared one predicate term in `ty` is
+/// re-pointed at the *same* rebuilt term. The callback receives `memo` so it
+/// can recurse when a predicate's own subexpressions carry further refinements.
+///
+/// The `memo` is a **performance / structural-sharing optimization, not a
+/// correctness requirement**: `f` is a deterministic rewrite, so rebuilding
+/// each occurrence independently would yield *value-equal* predicates (refinement
+/// equality is structural) — the memo only makes them the *same* `Rc` rather
+/// than *equal* `Rc`s, saving the recompute and keeping `ptr_eq` fast paths and
+/// any downstream `Rc`-keyed dedup effective. It keys on `Rc::as_ptr`, the one
+/// residual pointer-identity dependency, sound precisely because the rewrite is
+/// a value function. (Planning's predicate-compilation memo is the same kind of
+/// perf dedup — see [`crate::ccl::planning`]'s `PredMemo`.)
 pub fn walk_refined_predicates_mut<F>(
     ty: &mut Type,
-    visited: &mut HashSet<PredicateCellId>,
+    memo: &mut HashMap<PredicateId, Rc<Expr>>,
     f: &mut F,
 ) where
-    F: FnMut(&mut Expr, &mut HashSet<PredicateCellId>),
+    F: FnMut(&mut Expr, &mut HashMap<PredicateId, Rc<Expr>>),
 {
-    if let Type::Refinement(_, refinement) = ty
-        && visited.insert(refinement.cell_id())
-    {
-        let pred_rc = &refinement.predicate;
-        if let Ok(mut p) = pred_rc.try_borrow_mut() {
-            f(&mut p, visited);
+    if let Type::Refinement(_, refinement) = ty {
+        let original = refinement.predicate_id();
+        if let Some(rebuilt) = memo.get(&original) {
+            refinement.predicate = Rc::clone(rebuilt);
+        } else {
+            let mut pred = (*refinement.predicate).clone();
+            f(&mut pred, memo);
+            let rebuilt = Rc::new(pred);
+            memo.insert(original, Rc::clone(&rebuilt));
+            refinement.predicate = rebuilt;
         }
     }
-    ty.walk_children_mut(|child| walk_refined_predicates_mut(child, visited, f));
+    ty.walk_children_mut(|child| walk_refined_predicates_mut(child, memo, f));
 }

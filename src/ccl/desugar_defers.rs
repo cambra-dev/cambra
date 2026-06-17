@@ -79,7 +79,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::ccl::{
@@ -1856,14 +1855,10 @@ fn collect_free_vars(expr: &Expr, out: &mut HashSet<Name>) {
 /// is being walked elsewhere, so the under-count is safe in practice.
 fn collect_free_vars_in_type(ty: &Type, out: &mut HashSet<Name>) {
     if let Type::Refinement(_, refinement) = ty {
-        let pred_rc = &refinement.predicate;
-        if let Ok(pred) = pred_rc.try_borrow() {
-            // Refinement predicates are themselves CCL expressions;
-            // recurse into them through `collect_free_vars` so their
-            // own type-position predicates and shadowing are
-            // handled consistently.
-            collect_free_vars(&pred, out);
-        }
+        // Refinement predicates are themselves CCL expressions; recurse into
+        // them through `collect_free_vars` so their own type-position
+        // predicates and shadowing are handled consistently.
+        collect_free_vars(&refinement.predicate, out);
     }
     ty.walk_children(|child| collect_free_vars_in_type(child, out));
 }
@@ -2726,7 +2721,7 @@ fn extract_for_defer(
                     let pred_lambda = Expr::lambda(&param.name, param.ty.clone(), guard);
                     let pred_on_source = Expr::apply(new_argument.clone(), pred_lambda);
                     let refinement_struct = Refinement {
-                        predicate: Rc::new(RefCell::new(pred_on_source)),
+                        predicate: Rc::new(pred_on_source),
                     };
                     let mut refined_argument = new_argument.clone();
                     refined_argument.user_annotation = Some(Type::fun(
@@ -2939,7 +2934,7 @@ fn extract_for_defer(
                             let pred_on_source =
                                 Expr::compose(vec![source_prefix.clone(), pred_lambda]);
                             let refinement_struct = Refinement {
-                                predicate: Rc::new(RefCell::new(pred_on_source)),
+                                predicate: Rc::new(pred_on_source),
                             };
                             let mut refined_prefix = source_prefix.clone();
                             refined_prefix.user_annotation = Some(Type::fun(
@@ -4161,7 +4156,7 @@ mod tests {
         //   `Var("__chan")` with user_annotation = Fun(Refinement(Hole, pred(outer_n)), Hole)
         let pred = var("outer_n");
         let refinement = Refinement {
-            predicate: Rc::new(RefCell::new(pred)),
+            predicate: Rc::new(pred),
         };
         let annotated = TypedExpr {
             node: TypedExprNode::Var(Name::raw("__chan")),
@@ -4191,7 +4186,7 @@ mod tests {
     fn collect_free_vars_descends_into_ty_refinement_predicates() {
         let pred = var("inner_k");
         let refinement = Refinement {
-            predicate: Rc::new(RefCell::new(pred)),
+            predicate: Rc::new(pred),
         };
         let typed = TypedExpr {
             node: TypedExprNode::Lit(Lit::Unit),

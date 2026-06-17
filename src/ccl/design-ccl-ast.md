@@ -234,9 +234,9 @@ The result type is `Fun(K, Fun(UInt, V))` where `K` is the key type and `V` is t
 
 Lowering ([`ccl_utils::make_cast`]) emits it for list-comprehension filters, for-loop `if`-guards, and `groupby`. The only `target` shape lowering produces today is `Fun(Refinement(_, 𝑝), _)`: a function type whose domain carries the predicate `𝑝`, so the cast attaches a refinement to a collection function's domain. `target` is the lowering-time *specification* (its domain/codomain are typically `Type::Hole`, carrying only the refinement); the resolved cast type lands on `expr.ty` after inference — the same `user_annotation`-vs-`ty` split used elsewhere.
 
-`Cast` is an **upcast**: its whole typing rule is the single subtype obligation `value_ty <: target`. For the domain refinement lowering emits, that holds by contravariance — `(𝐷 ⇒ 𝑉) <: ({𝐷 | 𝑝} ⇒ 𝑉)` because `{𝐷 | 𝑝} <: 𝐷` — so viewing an unrefined-domain collection function at a refined-domain type is sound. The refinement-aware solver (`simple_sub::constrain_subtype`'s refinement arm) flows the demanded tag onto the *fresh* target-domain variable, *stacking* it onto any tags the value already carries, so chained casts (nested list comprehensions: `{𝐷|𝑝} ⇒ 𝑉 <: {?a|𝑞} ⇒ 𝑉`) compose. The result is `target`; coalesce pins its fresh vars from `value` (the domain var, in negative position, takes `value`'s domain as an upper bound; the codomain var takes `value`'s codomain as a lower bound). `target`'s predicate is inferred and coalesced by the same `emit_annotation_predicates` / `coalesce_type_predicates` path as any refinement-bearing type. A *covariant* refinement (casting `Int` to `{Int | 𝑝}`) correctly *fails* the subtype check — acquiring a value-level refinement is a runtime/SMT-checked narrowing, not an upcast.
+`Cast` is an **upcast**: its whole typing rule is the single subtype obligation `value_ty <: target`. For the domain refinement lowering emits, that holds by contravariance — `(𝐷 ⇒ 𝑉) <: ({𝐷 | 𝑝} ⇒ 𝑉)` because `{𝐷 | 𝑝} <: 𝐷` — so viewing an unrefined-domain collection function at a refined-domain type is sound. The refinement-aware solver (`simple_sub::constrain_subtype`'s refinement arm) flows the demanded witness onto the *fresh* target-domain variable, *stacking* it onto any witnesses the value already carries, so chained casts (nested list comprehensions: `{𝐷|𝑝} ⇒ 𝑉 <: {?a|𝑞} ⇒ 𝑉`) compose. The result is `target`; coalesce pins its fresh vars from `value` (the domain var, in negative position, takes `value`'s domain as an upper bound; the codomain var takes `value`'s codomain as a lower bound). `target`'s predicate is inferred and coalesced by the same `emit_annotation_predicates` / `coalesce_type_predicates` path as any refinement-bearing type. A *covariant* refinement (casting `Int` to `{Int | 𝑝}`) correctly *fails* the subtype check — acquiring a value-level refinement is a runtime/SMT-checked narrowing, not an upcast.
 
-This relies on the solver flowing a demanded refinement tag onto a *variable base* under a refinement layer (`{?a | 𝑞} <: {𝐷 | 𝑝}` records `?a <: {𝐷 | 𝑝}` rather than rejecting on `{𝑝} ⊄ {𝑞}`). An earlier implementation worked around the solver lacking this by *constructing* the refined result type from the value plus `target`'s tag; once the refinement arm learned to flow the deficit onto a variable base (the refinement analog of how the record/function arms thread structure through variables), the cast collapsed to the plain upcast above.
+This relies on the solver flowing a demanded refinement witness onto a *variable base* under a refinement layer (`{?a | 𝑞} <: {𝐷 | 𝑝}` records `?a <: {𝐷 | 𝑝}` rather than rejecting on `{𝑝} ⊄ {𝑞}`). An earlier implementation worked around the solver lacking this by *constructing* the refined result type from the value plus `target`'s witness; once the refinement arm learned to flow the deficit onto a variable base (the refinement analog of how the record/function arms thread structure through variables), the cast collapsed to the plain upcast above.
 
 `lambda_elim` recognises `Cast { value: Lambda, .. }` as the body of an outer lambda whose binder is free only in the cast's *refinement* (the group-by shape) and emits the **Pi-const** form `const(cast(<point-free inner>))` typed as a Pi `(param) ⇒ ({D | p} ⇒ V)`: the binder-dependence rides the refinement and is materialized as a `Restrict` at iteration (the dependent-application model), and planning's pointful group-by recognizer (`convert_groupby_pointful`) reads the binder off the predicate. (This replaced the former correlated-refinement uncurrying that reconstructed a `Lambda { refinement }`.) Casts that are not a lambda body — top-level filter / for-loop guards wrapping point-free code — survive `lambda_elim` (the standard structural recursion descends into `value` and keeps the wrapper) and propagate through to op-conversion, which compiles them as a pure pass-through: the refinement lives on `expr.ty` and is consumed by planning (`operator_conversion::iterate_type` turns a domain refinement into a `Restrict`) before reaching the tile graph. The migration plan toward a general `𝑈 ⇒ 𝑇` cast is in `docs/refinement-types-design.md`.
 
@@ -491,15 +491,16 @@ enum Type {
 
 /// Carries the restriction predicate for a refined domain (i.e. a filtered/joined comprehension).
 /// Equality is type-blind structural equality of the predicate term (pointer-equal
-/// cells short-circuit); traversals needing occurrence identity key on the
-/// predicate cell's address (`PredicateCellId`).
+/// predicates short-circuit); traversals needing occurrence identity key on the
+/// predicate `Rc`'s address (`PredicateId`).
 struct Refinement {
-    /// A **bare** boolean predicate (not a lambda) in which the single reserved
-    /// implicit binder `REFINEMENT_BINDER` ("__elem") is free — the element the
-    /// refinement ranges over. Every refinement shares that one binder; nested
-    /// refinements shadow it. (A predicate *function* `D ⇒ Bool` is stored bare
-    /// as `__elem ▷ p`.)
-    predicate: Rc<RefCell<TypedExpr>>,
+    /// A **bare**, *immutable* boolean predicate (not a lambda) in which the
+    /// single reserved implicit binder `REFINEMENT_BINDER` ("__elem") is free —
+    /// the element the refinement ranges over. Every refinement shares that one
+    /// binder; nested refinements shadow it. (A predicate *function* `D ⇒ Bool`
+    /// is stored bare as `__elem ▷ p`.) Rewrites rebuild a new term (structural
+    /// `Rc` sharing keeps that cheap); nothing mutates a predicate in place.
+    predicate: Rc<TypedExpr>,
 }
 ```
 

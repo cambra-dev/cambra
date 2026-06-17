@@ -458,7 +458,7 @@ groups(0)
     let Type::Refinement(_, r) = &**dom else {
         panic!("expected a refined partition domain, got {ty}");
     };
-    let pred = cambra::ccl::symbolic::symbolic(&r.predicate.borrow());
+    let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
     assert!(
         !pred.contains("__gb_k"),
         "group-by key binder should be discharged, but predicate still has it: {pred}"
@@ -499,7 +499,7 @@ apply0(groups)
     let Type::Refinement(_, r) = &**dom else {
         panic!("expected a refined partition domain, got {ty}");
     };
-    let pred = cambra::ccl::symbolic::symbolic(&r.predicate.borrow());
+    let pred = cambra::ccl::symbolic::symbolic(&r.predicate);
     assert!(
         !pred.contains("__gb_k"),
         "group-by key binder should be discharged through the higher-order apply, but: {pred}"
