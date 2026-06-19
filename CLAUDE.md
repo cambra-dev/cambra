@@ -113,7 +113,7 @@ When planning, include updates to the appropriate docs to reflect the changes; v
 When you are using compact, focus on test output and code changes.
 
 ### Git Conventions
-- Do not add "Co-Authored-By" lines attributing credit to AI models to commit messages.
+- Do not attribute authorship to AI tools or models anywhere git records it — neither commit messages nor PR descriptions. This covers any form the attribution takes: `Co-Authored-By:` trailers, "Generated with"/"Created with" footers (e.g. `🤖 Generated with [Claude Code]`), tool/model names in the body, and any future variant. The rule is the intent (no AI authorship credit), not a fixed list of strings. PR descriptions matter because this repo squash-merges, so the PR body becomes the commit message on the main branch.
 - When making changes, verify the freshness of the local repo by fetching and comparing the diff. The following commands do this, if there are differences, warn the user and ask the user whether they would like to pull or rebase.
    1. `git fetch origin`
    2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
