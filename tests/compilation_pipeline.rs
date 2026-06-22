@@ -32,6 +32,14 @@ use cambra::pretty_graph::pretty_tile_operator;
 use rstest_log::rstest;
 use smol_str::SmolStr;
 
+// Each timed test below guards against runaway / exponential / non-terminating
+// compilation via rstest's wall-clock `#[timeout]`. The budget is deliberately
+// generous: CI runs on shared VMs whose core speed varies widely — a slow instance
+// runs the heaviest compile ~13x slower (~9.5s wall) than a fast one, and the
+// original uniform 1s flaked there. (We confirmed the slowdown shows up 1:1 in
+// thread-CPU time too — ratio ≈ 1.00 — so a CPU-time bound buys nothing over wall.)
+// Most tests get 10s; the three heaviest compiles get 30s.
+
 // ---------------------------------------------------------------------------
 // Helpers — CCL pipeline path
 // ---------------------------------------------------------------------------
@@ -126,7 +134,7 @@ fn make_tuple(v: &[Value]) -> Value {
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("2", Value::Int(2))]
 #[case(r#""hello""#, Value::String("hello".into()))]
 #[case("True", Value::Bool(true))]
@@ -135,7 +143,7 @@ fn test_literals(#[case] code: &str, #[case] expected: Value) {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("[]", Tile::SealedFunction { domain: ColumnValue::UInts(vec![]), codomain: Box::new(Tile::Scalar(ColumnValue::Units(0))), domain_predicate: Predicate::True, deleted: BitSet::new() })]
 #[case("[1, 2]", make_int_list(&[1, 2]))]
 fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
@@ -147,7 +155,7 @@ fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("2 + 3", Value::Int(5))]
 #[case("4 * 5", Value::Int(20))]
 #[case("4 - 5", Value::Int(-1))]
@@ -164,7 +172,7 @@ fn test_arithmetic(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("1 == 1", Value::Bool(true))]
 #[case("'a' == 'b'", Value::Bool(false))]
 #[case("1 != 1", Value::Bool(false))]
@@ -182,7 +190,7 @@ fn test_compare(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("True & True", Value::Bool(true))]
 #[case("True | False", Value::Bool(true))]
 #[case("True ^ True", Value::Bool(false))]
@@ -259,7 +267,7 @@ fn test_unions(#[case] code: &str, #[case] expected: Tile) {
 // ---------------------------------------------------------------------------
 //
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("x = 2; x", Value::Int(2))]
 #[case("x = 2; y = x; y", Value::Int(2))]
 #[case("x = 2; y = x; y + x + 1", Value::Int(5))]
@@ -271,7 +279,7 @@ fn test_let_bindings(#[case] code: &str, #[case] expected: Value) {
 // Augmented assignment
 // ---------------------------------------------------------------------------
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("x = 0\nx += 1\nx", Value::Int(1))]
 #[case("x = 10\nx -= 3\nx", Value::Int(7))]
 #[case("x = 2\nx *= 5\nx", Value::Int(10))]
@@ -288,7 +296,7 @@ fn test_augmented_assignment(#[case] code: &str, #[case] expected: Value) {
 // More Let bindings
 // ---------------------------------------------------------------------------
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("x = [x for x in [1,2,3]]; [y for y in x]", make_int_list(&[1,2,3]))]
 #[ignore = "need first class functions for this let"]
 fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
@@ -299,7 +307,7 @@ fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
 // Tuples / record fields
 // ---------------------------------------------------------------------------
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case(
     "('a', 1)",
     make_tuple(&[Value::String("a".into()), Value::Int(1)])
@@ -325,7 +333,7 @@ fn make_record(fields: &[(&str, Value)]) -> Value {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case(
     "{x: 1, y: 2}",
     make_record(&[("x", Value::Int(1)), ("y", Value::Int(2))])
@@ -347,7 +355,7 @@ fn test_records(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("{x: 1 + 2, y: 3 * 4}", make_record(&[("x", Value::Int(3)), ("y", Value::Int(12))]))]
 #[case(r#"r = {x: 10, y: 3}; r.x - r.y"#, Value::Int(7))]
 #[case(r#"r = {x: 10, y: 3}; r.x * r.y"#, Value::Int(30))]
@@ -377,7 +385,7 @@ fn extract_record_field(tile: Tile, field: &str) -> ColumnValue {
 
 /// Project a field from an inline record literal in a list comprehension body.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("[{n: x, doubled: x * 2}.n for x in [1, 2, 3]]", make_int_list(&[1, 2, 3]))]
 #[case("[{n: x, doubled: x * 2}.doubled for x in [1, 2, 3]]", make_int_list(&[2, 4, 6]))]
 fn test_record_field_in_comp_body(#[case] code: &str, #[case] expected: Tile) {
@@ -386,7 +394,7 @@ fn test_record_field_in_comp_body(#[case] code: &str, #[case] expected: Tile) {
 
 /// List comp producing records as elements.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_comp_with_record_body() {
     let tile =
         sort_sealed_function_by_domain(run_pipeline("[{n: x, doubled: x * 2} for x in [1, 2, 3]]"));
@@ -402,7 +410,7 @@ fn test_comp_with_record_body() {
 
 /// List comp over an inline list of record literals — field access on the iteration variable.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case(
     r#"[r.x for r in [{x: 1, y: "a"}, {x: 2, y: "b"}, {x: 3, y: "c"}]]"#,
     make_int_list(&[1, 2, 3])
@@ -426,7 +434,7 @@ fn test_comp_over_record_list(#[case] code: &str, #[case] expected: Tile) {
 
 /// Filter on a record field inside a list comprehension.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_comp_filter_on_record_field() {
     let tile = sort_sealed_function_by_domain(run_pipeline(
         r#"[r.name for r in [{name: "alice", age: 30}, {name: "bob", age: 17}, {name: "carol", age: 25}] if r.age >= 18]"#,
@@ -442,7 +450,7 @@ fn test_comp_filter_on_record_field() {
 
 /// Aggregate over a field extracted from a list of record literals.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_aggregate_over_record_field() {
     check_scalar(
         r#"sum([r.score for r in [{score: 10}, {score: 20}, {score: 30}]])"#,
@@ -456,7 +464,7 @@ fn test_aggregate_over_record_field() {
 
 /// Cross-product join producing records with fields from both sides.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_join_with_record_body() {
     let tile = run_pipeline("[{a: x, b: y} for x in [1, 2] for y in [3, 4] if x + y == 5]");
     // (1,4) and (2,3) are the only pairs summing to 5.
@@ -476,7 +484,7 @@ fn test_join_with_record_body() {
 
 /// Hash-join (equality filter) producing a record output.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_hash_join_record_body() {
     let tile = sort_sealed_function_by_domain(run_pipeline(
         "[{left: x, right: y} for x in [1, 2, 3] for y in [2, 3, 4] if x == y]",
@@ -494,7 +502,7 @@ fn test_hash_join_record_body() {
 
 /// Join two data sources with named Record fields, access fields by name in the query.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_datasource_named_record_join() {
     let mut ctx = GlobalContext::default();
     let record_type = Type::Record(vec![
@@ -590,7 +598,7 @@ fn test_datasource_named_record_join() {
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("[x for x in [10, 20]]", make_int_list(&[10, 20]))]
 #[case("[42 for x in [10, 20]]", make_int_list(&[42, 42]))]
 #[case("[y for y in [x for x in [10, 20]]]", make_int_list(&[10, 20]))]
@@ -604,7 +612,7 @@ fn test_comprehensions(#[case] code: &str, #[case] expected: Tile) {
 // ---------------------------------------------------------------------------
 //
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("y = 5; [x + y for x in [10, 20]]", make_int_list(&[15, 25]))]
 #[case("y = 1; z = [1,2,3]; [x + y for x in z]", make_int_list(&[2, 3, 4]))]
 #[case("y = 1; z = [(1, 'a'),(2, 'b'),(3, 'c')]; [x[0] + y for x in z]", make_int_list(&[2, 3, 4]))]
@@ -617,7 +625,7 @@ fn test_comprehensions_let_capture(#[case] code: &str, #[case] expected: Tile) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("[(y, y)[1] for y in [10, 20]]", make_int_list(&[10, 20]))]
 #[case("[y[0] for y in [(10, 'a'), (20, 'b')]]", make_int_list(&[10, 20]))]
 #[case(
@@ -653,7 +661,7 @@ fn test_comprehensions_tuple_body(#[case] code: &str, #[case] expected: Tile) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("[x for x in [1, 2, 3] if x < 0]", make_int_list(&[]))]
 #[case("[x for x in [1, 2, 3] if x > 0]", make_int_list(&[1, 2, 3]))]
 #[case("[x for x in [1, 2, 3] if x > 10]", make_int_list(&[]))]
@@ -684,7 +692,7 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
 // refinement, not the main expression tree — exercising the coalesce walk's
 // specialization of uses reachable only through refinement predicates.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_udf_used_inside_filter_predicate() {
     let code = "f = lambda x: x > 1\n[x for x in [1, 2, 3] if f(x)]";
     check_tile(
@@ -703,7 +711,7 @@ fn test_udf_used_inside_filter_predicate() {
 // Exercises `freshen_expr_types`' predicate-cell de-aliasing for anchored
 // (cast-target) predicates.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_udf_containing_filter() {
     let code = "f = lambda xs: [x for x in xs if x > 1]\nf([1, 2, 3])";
     check_tile(
@@ -718,7 +726,7 @@ fn test_udf_containing_filter() {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case::simple_feed("x = defer(); x <<= 1; x", Tile::Scalar(ColumnValue::Ints(vec![1])))]
 #[case::two_defers_arithmetic("x = defer(); y = defer(); x <<= 1; y <<= 2; x + y", Tile::Scalar(ColumnValue::Ints(vec![3])))]
 #[case::feed_list("x = defer(); x <<= [1,2,3]; x", make_int_list(&[1, 2, 3]))]
@@ -1088,7 +1096,7 @@ d"#;
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("(x for x in [10, 20])", make_int_list(&[10, 20]))]
 #[case("(x + 2 for x in [10, 20])", make_int_list(&[12, 22]))]
 fn test_generator_expressions(#[case] code: &str, #[case] expected: Tile) {
@@ -1097,7 +1105,7 @@ fn test_generator_expressions(#[case] code: &str, #[case] expected: Tile) {
 
 // Filtered generator expression — parity with filtered list comp.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case(
     "(x for x in [1, 2, 3, 4, 5] if x > 2)",
     Tile::SealedFunction {
@@ -1118,7 +1126,7 @@ fn test_generator_expression_filtered(#[case] code: &str, #[case] expected: Tile
 // Scalar `def` calls (single- and multi-arg) work end-to-end via the
 // uncurried definition/call shape and the inline pass for scalar UDFs.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("def inc(x):\n    x + 1\ninc(4)", Value::Int(5))]
 #[case("def add(x, y):\n    x + y\nadd(3, 4)", Value::Int(7))]
 fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
@@ -1134,7 +1142,7 @@ fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
 // survives to the solver and exercises the splice path. Both results are `Bool`,
 // so they combine to a checkable scalar.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_function_def_polymorphic_used_at_two_types() {
     let code = "f = lambda x: x == x\nf(1) and f(\"foo\")";
     check_scalar(code, Value::Bool(true));
@@ -1150,7 +1158,7 @@ fn test_function_def_polymorphic_used_at_two_types() {
 // (`ccl::inline::inline_non_iterable_lambdas`), lambda elimination, and operator
 // conversion all compose correctly.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 // Simple map: yield x * 2
 #[case(
     "def doubles(xs):\n    for x in xs:\n        yield x * 2\ndoubles([1, 2, 3])",
@@ -1200,7 +1208,7 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
 // through the cyclic `Loop` lowering with the yield-defer wired in as a
 // `tap_*` field on the body Record.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case(
     r#"
 def running_totals(items):
@@ -1217,7 +1225,7 @@ fn test_generator_with_loop_carried_mutation(#[case] code: &str, #[case] expecte
 
 // Generator function composed with aggregate: sum(doubles([1, 2, 3])) == 12
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case(
     "def doubles(xs):\n    for x in xs:\n        yield x * 2\nsum(doubles([1, 2, 3]))",
     Value::Int(12)
@@ -1236,7 +1244,7 @@ fn test_generator_function_with_aggregate(#[case] code: &str, #[case] expected: 
 // *cached* rather than duplicating it — so both calls compile and run. Summing
 // the two `[Int]` results (3 ones + 2 ones) gives a single checkable scalar.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_generator_polymorphic_over_element_type() {
     let code = "def ones(xs):\n    for x in xs:\n        yield 1\nsum(ones([1, 2, 3])) + sum(ones([\"a\", \"b\"]))";
     check_scalar(code, Value::Int(5));
@@ -1254,7 +1262,7 @@ fn test_generator_polymorphic_over_element_type() {
 // Scalar poly-calls-poly at two concrete use types — the chained variant of
 // `test_function_def_polymorphic_used_at_two_types`.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_poly_calls_poly_at_two_types() {
     let code = "f = lambda x: x == x\ng = lambda y: f(y)\ng(1) and g(\"foo\")";
     check_scalar(code, Value::Bool(true));
@@ -1265,7 +1273,7 @@ fn test_poly_calls_poly_at_two_types() {
 // only ever reached through `g`'s clone — one concrete use type suffices to
 // exercise the chain.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_poly_calls_poly_list_body() {
     let code = "f = lambda x: [x, x]\ng = lambda y: f(y)\nsum(g(5))";
     check_scalar(code, Value::Int(10));
@@ -1274,7 +1282,7 @@ fn test_poly_calls_poly_list_body() {
 // Collection (comprehension) UDF chained through a poly wrapper at one
 // element type.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_collection_udf_through_poly_wrapper() {
     let code = "f = lambda xs: [x for x in xs]\ng = lambda ys: f(ys)\ng([1, 2, 3])";
     check_tile(code, make_int_list(&[1, 2, 3]));
@@ -1283,7 +1291,7 @@ fn test_collection_udf_through_poly_wrapper() {
 // Collection UDF chained through a poly wrapper at two element types — the
 // `inline`-keeps-shared path: one cached specialization per element type.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_collection_udf_through_poly_wrapper_two_element_types() {
     let code = "f = lambda xs: [1 for x in xs]\ng = lambda ys: f(ys)\nsum(g([1, 2, 3])) + sum(g([\"a\", \"b\"]))";
     check_scalar(code, Value::Int(5));
@@ -1302,7 +1310,7 @@ fn test_collection_udf_through_poly_wrapper_two_element_types() {
 // the `defer-generator-call-inside-lambda` vault issue.
 #[ignore = "desugar_defers drops a generator def's body when the call sits inside a lambda"]
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_generator_def_through_poly_wrapper_two_element_types() {
     let code = "def ones(xs):\n    for x in xs:\n        yield 1\nwrap = lambda ys: ones(ys)\nsum(wrap([1, 2, 3])) + sum(wrap([\"a\", \"b\"]))";
     check_scalar(code, Value::Int(5));
@@ -1310,7 +1318,7 @@ fn test_generator_def_through_poly_wrapper_two_element_types() {
 
 // Triple chain (poly → poly → poly) with a concrete leaf use.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_triple_poly_chain_collection() {
     let code = "f = lambda xs: [x for x in xs]\ng = lambda ys: f(ys)\nh = lambda zs: g(zs)\nsum(h([1, 2, 3]))";
     check_scalar(code, Value::Int(6));
@@ -1318,7 +1326,7 @@ fn test_triple_poly_chain_collection() {
 
 // Triple chain at two concrete leaf types: every layer specializes twice.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_triple_poly_chain_at_two_types() {
     let code = "f = lambda x: x == x\ng = lambda y: f(y)\nh = lambda z: g(z)\nh(1) and h(\"foo\")";
     check_scalar(code, Value::Bool(true));
@@ -1328,7 +1336,7 @@ fn test_triple_poly_chain_at_two_types() {
 // type. The base's specializations are demanded from two *distinct* freshly
 // minted wrapper clones, sharing one memo.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_poly_diamond() {
     let code = "f = lambda x: x == x\ng = lambda y: f(y)\nh = lambda z: f(z)\ng(1) and h(\"foo\")";
     check_scalar(code, Value::Bool(true));
@@ -1337,7 +1345,7 @@ fn test_poly_diamond() {
 // The inner UDF used both directly (concrete in the main walk) and through a
 // poly wrapper (concrete only inside the wrapper's clone).
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_poly_used_directly_and_through_wrapper() {
     let code = "f = lambda x: x == x\ng = lambda y: f(y)\nf(1) and g(\"foo\")";
     check_scalar(code, Value::Bool(true));
@@ -1347,7 +1355,7 @@ fn test_poly_used_directly_and_through_wrapper() {
 // and concrete), and is itself used at two types. The four interior `f` uses
 // collapse onto two specializations (Int, String).
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_poly_fanout_inside_wrapper() {
     let code = "f = lambda x: x == x\ng = lambda y: f(y) and f(\"z\")\ng(1) and g(\"foo\")";
     check_scalar(code, Value::Bool(true));
@@ -1358,7 +1366,7 @@ fn test_poly_fanout_inside_wrapper() {
 // specialization exercises predicate-cell de-aliasing through *two* layers of
 // cloning (the `CellRemap` retirement chains).
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_filter_udf_through_poly_wrapper() {
     let code = "f = lambda xs: [x for x in xs if x > 1]\ng = lambda ys: f(ys)\ng([1, 2, 3])";
     check_tile(
@@ -1377,7 +1385,7 @@ fn test_filter_udf_through_poly_wrapper() {
 // *another* generalized definition — the coalesce walk reaches it through the
 // wrapper clone's cast-target predicate.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_predicate_udf_used_inside_poly_wrapper_filter() {
     let code = "p = lambda x: x > 1\ng = lambda ys: [y for y in ys if p(y)]\ng([1, 2, 3])";
     check_tile(
@@ -1394,7 +1402,7 @@ fn test_predicate_udf_used_inside_poly_wrapper_filter() {
 // A multi-arg poly wrapper around a collection UDF (uncurrying composes with
 // chaining).
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_poly_chain_with_extra_param() {
     let code = "f = lambda xs: [x for x in xs]\ng = lambda ys, n: sum(f(ys)) + n\ng([1, 2], 10)";
     check_scalar(code, Value::Int(13));
@@ -1404,7 +1412,7 @@ fn test_poly_chain_with_extra_param() {
 // an *ambiguous program*: residual inference variables reach the post-infer
 // typecheck wall, which must surface a rendered diagnostic — not panic.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 fn test_unexercised_generic_definition_is_an_error_not_a_panic() {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
@@ -1419,7 +1427,7 @@ fn test_unexercised_generic_definition_is_an_error_not_a_panic() {
 // Exercises the ANF lift for defer-returning Compose sources introduced when
 // `For` was replaced with `Compose+Lambda`.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 // doubles(add_one([1,2,3])) == [4, 6, 8]
 #[case(
     r#"def add_one(xs):
@@ -1452,7 +1460,7 @@ fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case(
     r#"
 x = 0
@@ -1684,8 +1692,9 @@ fn test_mutability(#[case] code: &str, #[case] expected: Tile) {
 // because the input key domain (cross-product indices) is an implementation
 // detail.
 
+// 30s: among the heaviest compiles here; reaches ~9.5s wall on a slow CI VM, so 10s would flake.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(30))]
 #[case(
     "[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]",
     ColumnValue::strings(&["ac", "ad", "ae", "bc", "bd", "be"])
@@ -1772,7 +1781,7 @@ fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("sum([1,2,3])", Value::Int(6))]
 #[case("max([x + 1 for x in [1,2,3]])", Value::Int(4))]
 #[case("max([x + sum([1,2,3]) for x in [1,2,3]])", Value::Int(9))]
@@ -1785,7 +1794,7 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case(
     "[sum(x) for x in groupby([2,3,4,5], lambda x: x // 2)]",
     Tile::SealedFunction {
@@ -1821,7 +1830,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 /// Also confirms that updating the yield guard without adding new data does not
 /// trigger a spurious notification.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("testsource1()")]
 #[case("[x for x in testsource1()]")]
 #[case("[x + '' for x in testsource1()]")]
@@ -1930,8 +1939,9 @@ fn test_source_filter_nonterminal() {
 
 /// Test a join between two data sources, including incremental data addition
 /// and region release.
+// 30s: the original flake site; one of the heaviest compiles, ~9.5s wall on a slow CI VM.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(30))]
 #[case("[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] == y[0]]")]
 #[case(
     "[(x[0], x[1], y[1]) for x in testsource1() for y in testsource2() if x[0] <= y[0] and x[0] >= y[0]]"
@@ -2484,8 +2494,9 @@ fn test_no_fan_outs(#[case] code: &str) {
     assert!(!op_str.contains("FanOut#"), "found fan-out in {op_str}");
 }
 
+// 30s: among the heaviest compiles here; like `test_joins`, reaches ~9.5s wall on a slow CI VM.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(30))]
 #[case("1", "1:Int", Tile::Scalar(ColumnValue::Ints(vec![1])))]
 #[case("1 + 2", "(1, 2) ▷ add:Int", Tile::Scalar(ColumnValue::Ints(vec![3])))]
 #[case(
@@ -2888,7 +2899,7 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
 // ---------------------------------------------------------------------------
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("inc = lambda x: x + 1\ninc(4)", Value::Int(5))]
 #[case("double = lambda x: x * 2\ndouble(7)", Value::Int(14))]
 #[case("neg = lambda x: -x\nneg(3)", Value::Int(-3))]
@@ -2898,7 +2909,7 @@ fn test_scalar_udf(#[case] code: &str, #[case] expected: Value) {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("is_pos = lambda x: x > 0\nis_pos(5)", Value::Bool(true))]
 #[case("is_pos = lambda x: x > 0\nis_pos(-1)", Value::Bool(false))]
 fn test_udf_bool_codomain(#[case] code: &str, #[case] expected: Value) {
@@ -2906,7 +2917,7 @@ fn test_udf_bool_codomain(#[case] code: &str, #[case] expected: Value) {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 // UDF called twice: body is duplicated at each call site (acceptable trade-off).
 #[case("f = lambda x: x + 1\nf(3) + f(4)", Value::Int(9))]
 fn test_udf_called_multiple_times(#[case] code: &str, #[case] expected: Value) {
@@ -2914,7 +2925,7 @@ fn test_udf_called_multiple_times(#[case] code: &str, #[case] expected: Value) {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 // Nested call: f(f(3)) → f(6) → 12
 #[case("f = lambda x: x * 2\nf(f(3))", Value::Int(12))]
 fn test_udf_nested_calls(#[case] code: &str, #[case] expected: Value) {
@@ -2924,14 +2935,14 @@ fn test_udf_nested_calls(#[case] code: &str, #[case] expected: Value) {
 // Regression: collection and scalar lets should remain unaffected by the
 // inlining pass.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("x = 4\nx + 1", Value::Int(5))]
 fn test_scalar_let_unaffected(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("xs = [1, 2, 3]\n[x * 2 for x in xs]", make_int_list(&[2, 4, 6]))]
 fn test_collection_let_unaffected(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
@@ -2946,7 +2957,7 @@ fn test_collection_let_unaffected(#[case] code: &str, #[case] expected: Tile) {
 // (`lambda x: lambda y: ...` or explicit `curry(f)`) is still tracked as
 // follow-up work.
 #[rstest]
-#[timeout(Duration::from_secs(1))]
+#[timeout(Duration::from_secs(10))]
 #[case("add = lambda x, y: x + y\nadd(3, 4)", Value::Int(7))]
 #[case("combine = lambda a, b: a * b + 1\ncombine(3, 4)", Value::Int(13))]
 #[case("add3 = lambda x, y, z: x + y + z\nadd3(1, 2, 3)", Value::Int(6))]
