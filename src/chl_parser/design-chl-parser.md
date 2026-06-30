@@ -1,7 +1,7 @@
 # CHL Parser Design
 
 This document describes the design of the Cambra High-Level Language (CHL)
-parser introduced in `src/chl_parser/`, which is replacing the
+parser introduced in `src/chl_parser/`, which replaced the
 [`rustpython_parser`](https://crates.io/crates/rustpython-parser) front end.
 
 ## Motivation
@@ -329,7 +329,7 @@ through ariadne.
 - **Phase 2 — Cutover.** [`src/ccl/lower.rs`](../ccl/lower.rs) ported to
   consume the CHL AST directly; `rustpython-parser` and `rustpython-ast`
   removed from `Cargo.toml`; `pretty_ast.rs` deleted; all integration tests
-  switched. *(This commit.)*
+  switched. *(Landed.)*
 
 - **Phase 3 — Diagnostics.** Future work: more `.labelled(…)` annotations
   for richer expected-set categories, and a real diagnostic surface in the

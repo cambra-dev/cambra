@@ -5,7 +5,7 @@ Cambra is a programming language that abstracts over low-level concerns like mem
 ## Docs
 
 - [Design](docs/design.md) — language overview, CHL, CCL, execution pipeline
-- [Plan](docs/PLAN.md) — implementation roadmap and status
+- [Plan](docs/plan.md) — implementation roadmap and status
 - [Developer setup](docs/developer-setup-checklist.md)
 
 ## Building & CI
@@ -25,7 +25,7 @@ cargo run -- <input_file>
 
 ### Web Inspector
 
-Pass `--inspect` to start a live web dashboard that shows the program's Python AST, CCL operator graph, and runtime producer state:
+Pass `--inspect` to start a live web dashboard that shows the program's CHL AST, CCL operator graph, and runtime producer state:
 
 ```bash
 cargo run -- --inspect program.cambra

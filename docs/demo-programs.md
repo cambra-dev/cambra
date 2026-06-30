@@ -19,7 +19,7 @@ by hand:
 cargo run -- tests/programs/<name>/program.cambra
 ```
 
-To open the live web inspector while it runs (shows the parsed Python AST,
+To open the live web inspector while it runs (shows the parsed CHL AST,
 the lowered CCL, the operator graph, and runtime producer state):
 
 ```bash
@@ -45,8 +45,8 @@ Two programs need a small substitution before they'll run as-is:
   printf "hello\nworld\n" | cargo run -- tests/programs/streaming_echo/program.cambra
   ```
 
-The three `🚧 blocked` / `🐛 buggy` programs in the table will panic or
-return the documented wrong answer when run manually — that's the point.
+The three `🚧 blocked` programs in the table will panic or be rejected at
+lowering when run manually — that's the point.
 See [Known issues](#known-issues) for details on what's blocking each.
 
 ## Adding to this table
