@@ -26,10 +26,10 @@ sum : {I, S : Type,
 // Program:
 stdout =
    let stats = memo λ k : Key →                 // Memoization
-         let group = λ i | i▸key == k → i▸val   // First-class function.
+         let group = λ i | i▷key == k → i▷val   // First-class function.
          in sum(group),                         // Keyed aggregation.
-      small_avgs = λ k | k▸stats < 100 →                     // Dynamic domain.
-         k▸stats / k▸cnt                        // FK Join
+      small_avgs = λ k | k▷stats < 100 →                     // Dynamic domain.
+         k▷stats / k▷cnt                        // FK Join
    in small_avgs
 ```
 
@@ -39,7 +39,7 @@ tilings, aggregate tilings (`Count × Sum`), memoization, early termination,
 sparse functions, and refinement predicates.
 
 **Terminology note.** The predicate after a lambda's parameter (e.g.
-`| i▸key == k`) is a **refinement** — an extent predicate that restricts
+`| i▷key == k`) is a **refinement** — an extent predicate that restricts
 the domain of the function. It is _not_ a guard. Guards (semantics.md, Section 2) identify
 subtilings and are communicated during the producer/consumer protocol at
 runtime; refinements constrain which values belong to the function's domain
@@ -63,7 +63,7 @@ keys to `Count×Sum` tiles — a partial function tiling whose codomain is itsel
 an aggregate tiling. Each key's accumulator evolves independently.
 
 **Memoization shares computation.** The `memo` wrapper caches the
-`Key ⇀ Count×Sum` tiling. Both `k▸stats` nodes (in the refinement and in
+`Key ⇀ Count×Sum` tiling. Both `k▷stats` nodes (in the refinement and in
 the body of `small_avgs`) read from the same cached tile via the `stats`
 variable node, rather than recomputing the aggregate.
 
@@ -81,8 +81,8 @@ or a `nones`-predicate expansion (see [deprecation.md](deprecation.md), Section 
 it produces terminal `false` — the `small_avgs` lambda emits `None` for that
 key without waiting for `group` to finish (semantics.md, Section 3, Early Termination).
 
-**Division waits for terminal inputs.** The `/` node needs both `k▸stats`
-(tiling `Count×Sum`) and `▸ k▸cnt` (tiling `Scalar(Nat)`) to be terminal.
+**Division waits for terminal inputs.** The `/` node needs both `k▷stats`
+(tiling `Count×Sum`) and `▷ k▷cnt` (tiling `Scalar(Nat)`) to be terminal.
 Since `Count×Sum` is unsplittable (semantics.md, Section 2), `/` blocks until the full
 aggregate is available. This contrasts with `<`, which can terminate early.
 
@@ -132,7 +132,7 @@ tiles derived from `I` are intermediate — more items may still arrive.
 All tiles are intermediate. The `Count×Sum` accumulators have been updated for
 the three items seen so far.
 
-**`group_A`** (`λ i | i▸key == A → i▸val`, instantiated for `k=A`):
+**`group_A`** (`λ i | i▷key == A → i▷val`, instantiated for `k=A`):
 ```
 [i₁ ↦ 30, i₃ ↦ 25]          partial — i₅ not yet seen
 ```
@@ -150,11 +150,11 @@ independently translated and accumulated:
 [A ↦ (count=2, sum=55),  B ↦ (count=1, sum=40)]    partial function; both aggregate tiles intermediate
 ```
 
-**`A▸small_avgs`** — `< 100` is re-applied to `A▸stats = (2, 55)`. Sum is
+**`A▷small_avgs`** — `< 100` is re-applied to `A▷stats = (2, 55)`. Sum is
 55, which is below 100, but the input is not terminal — future items could push
 the sum above 100. Output: `⊥` (no conclusion yet).
 
-**`B▸small_avgs`** — same situation with `B▸stats = (1, 40)`. Output: `⊥`.
+**`B▷small_avgs`** — same situation with `B▷stats = (1, 40)`. Output: `⊥`.
 
 **`small_avgs`** tile: `⊥` — the empty partial function. No key has been
 confirmed or excluded yet.
@@ -162,20 +162,20 @@ confirmed or excluded yet.
 ### After Batch 2 — Early Termination
 
 Batch 2 contains a single item: `i₄↦(B,80)`. `sum` streams the new mapping
-into `B▸stats`:
+into `B▷stats`:
 
 ```
 group_B:  [i₂ ↦ 40, i₄ ↦ 80]        partial — i₆ still outstanding
-B▸stats:  (count=2, sum=120)          intermediate tile
+B▷stats:  (count=2, sum=120)          intermediate tile
 ```
 
-**`< 100` re-applied to `B▸stats`:** the sum is now 120 ≥ 100. Since
+**`< 100` re-applied to `B▷stats`:** the sum is now 120 ≥ 100. Since
 `V = Nat`, partial sums are non-decreasing — the `_<_` operator knows the sum
 can never fall below 120 regardless of what arrives next. It emits
 **terminal `false`**. This is early termination: the output is final even
-though `B▸stats` is not yet terminal.
+though `B▷stats` is not yet terminal.
 
-**`B▸small_avgs`** immediately resolves to terminal `None` — key B is outside
+**`B▷small_avgs`** immediately resolves to terminal `None` — key B is outside
 the domain of `small_avgs`. The `group_B` computation is no longer needed. The
 refinement predicate releases an obsolete guard `Domain(B)` on `stats`, which drops
 the mapping for `B` from its memo table via compaction and propagates the release to
@@ -202,18 +202,18 @@ Once `i-iter` signals termination, the terminal signal propagates downstream.
 [i₁ ↦ 30, i₃ ↦ 25, i₅ ↦ 20]     terminal — full domain of A-keyed items
 ```
 
-**`A▸stats`** becomes terminal (its input `group_A` is terminal):
+**`A▷stats`** becomes terminal (its input `group_A` is terminal):
 ```
 (count=3, sum=75)     terminal
 ```
 
-**`< 100` re-applied to `A▸stats`:** the terminal tile `(3, 75)` has `sum=75 <
+**`< 100` re-applied to `A▷stats`:** the terminal tile `(3, 75)` has `sum=75 <
 100` and is now terminal (the input cannot grow further). Output: **terminal
 `true`**.
 
-**`A▸small_avgs`** unblocks. Division requires both inputs to be terminal:
-- `A▸stats = (3, 75)` — terminal ✓
-- `A▸cnt = 3` — terminal from the start ✓
+**`A▷small_avgs`** unblocks. Division requires both inputs to be terminal:
+- `A▷stats = (3, 75)` — terminal ✓
+- `A▷cnt = 3` — terminal from the start ✓
 
 Result: `75 / 3 = 25` — **terminal `25`**.
 
@@ -224,11 +224,11 @@ Result: `75 / 3 = 25` — **terminal `25`**.
 
 ### Summary
 
-| Key | `k▸stats` at resolution | `k▸stats < 100` | How | `k▸small_avgs` |
+| Key | `k▷stats` at resolution | `k▷stats < 100` | How | `k▷small_avgs` |
 |---|---|---|---|---|
 | A | `(count=3, sum=75)` | terminal `true` | iterator terminates | `25` |
 | B | `(count=2, sum=120)` | terminal `false` | **early termination after i₄** | `None` |
 
-Key B's `B▸stats` tile is `(count=2, sum=120)` — only 2 of its 3 items were
+Key B's `B▷stats` tile is `(count=2, sum=120)` — only 2 of its 3 items were
 processed. Item `i₆` arrived in Batch 3 but was dropped immediately because
 B's `None` outcome had already been determined at the end of Batch 2.

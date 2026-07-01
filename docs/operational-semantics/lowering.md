@@ -51,7 +51,7 @@ the result will zip things together into the output record.
 
 let's think through cases:
 - outermost lambda: `main = λ x → <expr>` it's trivial to see the dataflow from `x` into other operators.
-- applied, static lambda: `my_x ▸ λ x → ... ` just replace with `let x = my_x in ...`
+- applied, static lambda: `my_x ▷ λ x → ... ` just replace with `let x = my_x in ...`
 - iterated, static lambda: `sum(λ i → ...)`
   - no free vars: 
 
@@ -103,7 +103,7 @@ constant across its whole domain.
 **CCL semantics**: Function composition.
 
 ```
-map(h)(f) = f ≫ h = λ i → i ▸ f ▸ h
+map(h)(f) = f ≫ h = λ i → i ▷ f ▷ h
 ```
 
 **Tiling operator**:
@@ -258,7 +258,7 @@ the Cartesian Closed Category (CCC) structure of the tiling type system.
 Following Elliot's [Compiling to Categories](http://conal.net/papers/compiling-to-categories/compiling-to-categories.pdf),
 we can eliminate lambdas from the program with the following rules, starting from the outermost term, and applied inductively:
 - `λ x → x  ⟹  id`
-- `λ x → <arg> ▸ <fn>  ⟹  ⟨λ x → <arg>, λ x → <fn>⟩ ≫ apply`
+- `λ x → <arg> ▷ <fn>  ⟹  ⟨λ x → <arg>, λ x → <fn>⟩ ≫ apply`
 - `λ x → λ y → <body>  ⟹  curry(λ (x, y) → <body>)`
 - `λ x → <expr>  ⟹ const(<expr>)` when `x ∉ fv(<expr>)`, where `fv` is "free variables of". 
   Works for both values and functions:
@@ -267,8 +267,8 @@ we can eliminate lambdas from the program with the following rules, starting fro
   Note: the identity `const(f) = curry(.1 ≫ f)` holds but need not be introduced eagerly.
 - `λ x → (<f1>, <f2>)  ⟹ ⟨λx→<f1>, λx→<f2>⟩`
 - `λ x → let <var> = <def> in <body>`
-  `  ⟹ let <var> = (λx→ <def>) in λx→ <body>[<var> ↦ x ▸ <var>]`
-- `λ x | <pred> → <body>  ⟹  (λx→ <pred>) ▸ restrict ≫ λx→ <body>`
+  `  ⟹ let <var> = (λx→ <def>) in λx→ <body>[<var> ↦ x ▷ <var>]`
+- `λ x | <pred> → <body>  ⟹  (λx→ <pred>) ▷ restrict ≫ λx→ <body>`
 - `λ x → <f> ≫ <g>  ⟹  ⟨λx→<f>, λx→<g>⟩ ≫ (≫)`
   where `(≫) : (A⇒B) × (B⇒C) ⇒ (A⇒C)` is composition as a first-class morphism.
 
@@ -312,9 +312,9 @@ eliminated by an additional set of simplifying rules:
 ### Examples of Lambda elimination, step by step
 Basic composition:
 ```
-λ i → i ▸ f ▸ g
-⟨λi→i▸f, λi→g⟩ ≫ apply                                         [λ x → arg ▸ fn]
-⟨⟨λi→i, λi→f⟩ ≫ apply, const(g)⟩ ≫ apply                       [λ x → arg ▸ fn; λ x → const]
+λ i → i ▷ f ▷ g
+⟨λi→i▷f, λi→g⟩ ≫ apply                                         [λ x → arg ▷ fn]
+⟨⟨λi→i, λi→f⟩ ≫ apply, const(g)⟩ ≫ apply                       [λ x → arg ▷ fn; λ x → const]
 ⟨⟨id, const(f)⟩ ≫ apply, const(g)⟩ ≫ apply                     [λ x → x = id; λ x → const]
 ⟨id ≫ f, const(g)⟩ ≫ apply                                      [const-apply]
 ⟨f, const(g)⟩ ≫ apply                                            [compose identity]
@@ -323,22 +323,22 @@ f ≫ g                                                             [const-apply
 
 **Curried Lambda**
 This example has a curried lambda where the inner variable `j` is unused in the body.
-We treat `a + b` as sugar for `(a, b) ▸ add` (tuple construction applied to `add`).
-The inner sub-derivation for `λ(i,j) → i ▸ c1` (where `i = .0` of the pair) is shown indented.
+We treat `a + b` as sugar for `(a, b) ▷ add` (tuple construction applied to `add`).
+The inner sub-derivation for `λ(i,j) → i ▷ c1` (where `i = .0` of the pair) is shown indented.
 
 ```
-λ i → λ j → i ▸ c1 + i ▸ c2
-curry(λ(i,j) → i ▸ c1 + i ▸ c2)                                         [λ x → λ y → body]
-curry(λ(i,j) → (i ▸ c1, i ▸ c2) ▸ add)                                  [expand +]
-curry(⟨λ(i,j) → (i ▸ c1, i ▸ c2), λ(i,j) → add⟩ ≫ apply)              [λ x → arg ▸ fn]
-curry(⟨⟨λ(i,j) → i ▸ c1, λ(i,j) → i ▸ c2⟩, const(add)⟩ ≫ apply)       [λ x → (f1,f2); λ x → const]
+λ i → λ j → i ▷ c1 + i ▷ c2
+curry(λ(i,j) → i ▷ c1 + i ▷ c2)                                         [λ x → λ y → body]
+curry(λ(i,j) → (i ▷ c1, i ▷ c2) ▷ add)                                  [expand +]
+curry(⟨λ(i,j) → (i ▷ c1, i ▷ c2), λ(i,j) → add⟩ ≫ apply)              [λ x → arg ▷ fn]
+curry(⟨⟨λ(i,j) → i ▷ c1, λ(i,j) → i ▷ c2⟩, const(add)⟩ ≫ apply)       [λ x → (f1,f2); λ x → const]
 
-  -- sub-derivation: λ(i,j) → i ▸ c1, where i = .0
-  ⟨λ(i,j) → i, λ(i,j) → c1⟩ ≫ apply                                     [λ x → arg ▸ fn]
+  -- sub-derivation: λ(i,j) → i ▷ c1, where i = .0
+  ⟨λ(i,j) → i, λ(i,j) → c1⟩ ≫ apply                                     [λ x → arg ▷ fn]
   ⟨.0, const(c1)⟩ ≫ apply                                                [λ(i,j)→i = .0; λ x → const]
   .0 ≫ c1                                                                  [const-apply]
 
-  -- similarly: λ(i,j) → i ▸ c2 = .0 ≫ c2
+  -- similarly: λ(i,j) → i ▷ c2 = .0 ≫ c2
 
 curry(⟨⟨.0 ≫ c1, .0 ≫ c2⟩, const(add)⟩ ≫ apply)
 curry(⟨.0 ≫ c1, .0 ≫ c2⟩ ≫ add)                                        [const-apply]
@@ -350,32 +350,32 @@ next example, where both components of the record are used.
 **Lambda of tuple**
 
 ```
-λ r: {I, J} → r.0 ▸ c1 + r.1 ▸ c2
-λ r → (r.0 ▸ c1, r.1 ▸ c2) ▸ add                                       [expand +]
-⟨λr → (r.0 ▸ c1, r.1 ▸ c2), λr → add⟩ ≫ apply                        [λ x → arg ▸ fn]
-⟨⟨λr → r.0 ▸ c1, λr → r.1 ▸ c2⟩, const(add)⟩ ≫ apply                 [λ x → (f1,f2); λ x → const]
+λ r: {I, J} → r.0 ▷ c1 + r.1 ▷ c2
+λ r → (r.0 ▷ c1, r.1 ▷ c2) ▷ add                                       [expand +]
+⟨λr → (r.0 ▷ c1, r.1 ▷ c2), λr → add⟩ ≫ apply                        [λ x → arg ▷ fn]
+⟨⟨λr → r.0 ▷ c1, λr → r.1 ▷ c2⟩, const(add)⟩ ≫ apply                 [λ x → (f1,f2); λ x → const]
 
-  -- sub-derivation: λr → r.0 ▸ c1, where r.0 = .0(r)
-  ⟨λr → r.0, λr → c1⟩ ≫ apply                                           [λ x → arg ▸ fn]
+  -- sub-derivation: λr → r.0 ▷ c1, where r.0 = .0(r)
+  ⟨λr → r.0, λr → c1⟩ ≫ apply                                           [λ x → arg ▷ fn]
   ⟨.0, const(c1)⟩ ≫ apply                                                [.0 projection; λ x → const]
   .0 ≫ c1                                                                  [const-apply]
 
-  -- similarly: λr → r.1 ▸ c2 = .1 ≫ c2
+  -- similarly: λr → r.1 ▷ c2 = .1 ≫ c2
 
 ⟨⟨.0 ≫ c1, .1 ≫ c2⟩, const(add)⟩ ≫ apply
 ⟨.0 ≫ c1, .1 ≫ c2⟩ ≫ add                                               [const-apply]
 ```
 
-Compare with Example 1: `λ i → λ j → i ▸ c1 + i ▸ c2` yields `curry(⟨.0 ≫ c1, .0 ≫ c2⟩ ≫ add) : I ⇒ J ⇒ T`,
+Compare with Example 1: `λ i → λ j → i ▷ c1 + i ▷ c2` yields `curry(⟨.0 ≫ c1, .0 ≫ c2⟩ ≫ add) : I ⇒ J ⇒ T`,
 a curried function that ignores its second argument. This example yields `⟨.0 ≫ c1, .1 ≫ c2⟩ ≫ add : I × J ⇒ T`,
 an uncurried function consuming both components. The CCC eliminates the lambda in both cases;
 the type difference reflects the original binding structure.
 
-**Free variable capture** — `λ i → (i, c) ▸ f` (a closed-over constant `c` is paired with the input):
+**Free variable capture** — `λ i → (i, c) ▷ f` (a closed-over constant `c` is paired with the input):
 
 ```
-λ i → (i, c) ▸ f
-⟨λi → (i, c), λi → f⟩ ≫ apply                                   [λ x → arg ▸ fn]
+λ i → (i, c) ▷ f
+⟨λi → (i, c), λi → f⟩ ≫ apply                                   [λ x → arg ▷ fn]
 ⟨⟨λi → i, λi → c⟩, const(f)⟩ ≫ apply                            [λ x → (f1,f2); λ x → const]
 ⟨⟨id, const(c)⟩, const(f)⟩ ≫ apply                              [λ x → x = id; λ x → const]
 ⟨id, const(c)⟩ ≫ f                                              [const-apply]
@@ -385,62 +385,62 @@ The result `⟨id, const(c)⟩ ≫ f` is a point-free function that pairs each i
 constant `c` and feeds the pair to `f`. In the dataflow graph, this corresponds to an edge from
 the `const(c)` node wired alongside the identity edge into `f`.
 
-**Let binding / fanout** — `λ i → let x = i ▸ f in (x, x ▸ g)` (a value used twice):
+**Let binding / fanout** — `λ i → let x = i ▷ f in (x, x ▷ g)` (a value used twice):
 
-Applying the let rule, with `<def> = i ▸ f` and `<body> = (x, x ▸ g)`. The substitution
-replaces each use of the value `x` in the body with the application `i ▸ x`, since `x` is now
+Applying the let rule, with `<def> = i ▷ f` and `<body> = (x, x ▷ g)`. The substitution
+replaces each use of the value `x` in the body with the application `i ▷ x`, since `x` is now
 a function:
 
 ```
-λ i → let x = i ▸ f in (x, x ▸ g)
-let x = (λi → i ▸ f) in λi → (i ▸ x, i ▸ x ▸ g)               [let rule, x ↦ i ▸ x]
-let x = f in λi → (i ▸ x, i ▸ x ▸ g)                           [λi→i▸f = f]
-let x = f in ⟨x, x ≫ g⟩                                        [λi→i▸x = x; λi→i▸x▸g = x ≫ g; tuple]
+λ i → let x = i ▷ f in (x, x ▷ g)
+let x = (λi → i ▷ f) in λi → (i ▷ x, i ▷ x ▷ g)               [let rule, x ↦ i ▷ x]
+let x = f in λi → (i ▷ x, i ▷ x ▷ g)                           [λi→i▷f = f]
+let x = f in ⟨x, x ≫ g⟩                                        [λi→i▷x = x; λi→i▷x▷g = x ≫ g; tuple]
 ```
 
 The `let` binding makes explicit that `f` is computed once and shared by two downstream paths.
 In the dataflow graph, the `let` becomes a `fanout` node: `f` feeds both an identity edge and `g`.
 
-**Refinement lambda** — `λ i | pred(i) → i ▸ f` (a lambda with a guard):
+**Refinement lambda** — `λ i | pred(i) → i ▷ f` (a lambda with a guard):
 
 Applying the refinement rule, then reducing the resulting trivial lambdas:
 
 ```
-λ i | pred(i) → i ▸ f
-(λi → pred(i)) ▸ restrict ≫ (λi → i ▸ f)                 [λ x | pred → body]
-pred ▸ restrict ≫ f                                      [λi→i▸h=h]
+λ i | pred(i) → i ▷ f
+(λi → pred(i)) ▷ restrict ≫ (λi → i ▷ f)                 [λ x | pred → body]
+pred ▷ restrict ≫ f                                      [λi→i▷h=h]
 ```
 
-`pred ▸ restrict ≫ f` applies `restrict` to the predicate function `pred`, producing the
+`pred ▷ restrict ≫ f` applies `restrict` to the predicate function `pred`, producing the
 filtered identity, then maps the body `f` over the surviving entries.
 
 
-**Keyed Aggregation** — `λ k → sum(λ i | i▸key == k → i▸val)`
+**Keyed Aggregation** — `λ k → sum(λ i | i▷key == k → i▷val)`
 
 This is the canonical keyed group-reduce: for each key `k`, filter the stream to items whose
 key matches and sum their values. Applying the application rule on the outer lambda, the
 curried-lambda rule to pair `k` and `i`, then the refinement rule on the inner guard:
 
 ```
-λ k → sum(λ i | i▸key == k → i▸val)
-λ k → (λ i | i▸key == k → i▸val) ▸ aggregate(+)                             [sum = aggregate(+)]
-⟨λk → (λ i | i▸key == k → i▸val), const(aggregate(+))⟩ ≫ apply             [λk→arg▸fn]
-⟨curry(λ(k,i) | i▸key == k → i▸val), const(aggregate(+))⟩ ≫ apply          [λk→λi→body = curry(λ(k,i)→body)]
+λ k → sum(λ i | i▷key == k → i▷val)
+λ k → (λ i | i▷key == k → i▷val) ▷ aggregate(+)                             [sum = aggregate(+)]
+⟨λk → (λ i | i▷key == k → i▷val), const(aggregate(+))⟩ ≫ apply             [λk→arg▷fn]
+⟨curry(λ(k,i) | i▷key == k → i▷val), const(aggregate(+))⟩ ≫ apply          [λk→λi→body = curry(λ(k,i)→body)]
 
-  -- inner sub-derivation: λ(k,i) | i▸key == k → i▸val  (i = .1, k = .0)
-  (λ(k,i) → i▸key == k) ▸ restrict ≫ (λ(k,i) → i▸val)                       [refinement rule]
+  -- inner sub-derivation: λ(k,i) | i▷key == k → i▷val  (i = .1, k = .0)
+  (λ(k,i) → i▷key == k) ▷ restrict ≫ (λ(k,i) → i▷val)                       [refinement rule]
 
-    -- λ(k,i) → i▸key == k = λ(k,i) → (i▸key, k) ▸ eq:
-    ⟨⟨key, ._0⟩, const(eq)⟩ ≫ apply                                 [λx→arg▸fn; λx→(f1,f2); λx→const]
+    -- λ(k,i) → i▷key == k = λ(k,i) → (i▷key, k) ▷ eq:
+    ⟨⟨key, ._0⟩, const(eq)⟩ ≫ apply                                 [λx→arg▷fn; λx→(f1,f2); λx→const]
     ⟨key, ._0⟩ ≫ eq                                                   [const-apply]
 
-    -- λ(k,i) → i▸val = .1 ≫ val
-    (⟨key, ._0⟩ ≫ eq) ▸ restrict ≫ (.1 ≫ val)
+    -- λ(k,i) → i▷val = .1 ≫ val
+    (⟨key, ._0⟩ ≫ eq) ▷ restrict ≫ (.1 ≫ val)
 
-⟨curry((⟨key, ._0⟩ ≫ eq) ▸ restrict ≫ .1 ≫ val), const(aggregate(+))⟩ ≫ apply          [sub-deriv]
-curry((⟨key, ._0⟩ ≫ eq) ▸ restrict ≫ .1 ≫ val) ≫ aggregate(+)                        [const-apply]
-curry((⟨key, ._0⟩ ≫ eq) ▸ restrict ≫ .1) ≫ map(val) ≫ aggregate(+)                   [curry-compose, g=val]
-converse(key) ≫ map(val) ≫ aggregate(+)                                             [curry((⟨key,._0⟩≫eq)▸restrict≫.1) = converse(key)]
+⟨curry((⟨key, ._0⟩ ≫ eq) ▷ restrict ≫ .1 ≫ val), const(aggregate(+))⟩ ≫ apply          [sub-deriv]
+curry((⟨key, ._0⟩ ≫ eq) ▷ restrict ≫ .1 ≫ val) ≫ aggregate(+)                        [const-apply]
+curry((⟨key, ._0⟩ ≫ eq) ▷ restrict ≫ .1) ≫ map(val) ≫ aggregate(+)                   [curry-compose, g=val]
+converse(key) ≫ map(val) ≫ aggregate(+)                                             [curry((⟨key,._0⟩≫eq)▷restrict≫.1) = converse(key)]
 ```
 
 The result instantiates the canonical keyed group-reduce pattern from
@@ -489,10 +489,10 @@ The program from [example.md](example.md), with typeclass-resolved operations (`
 ```
 stdout =
   let stats      = memo (λ k : Key →
-                     let group = λ i | i▸key == k → i▸val
+                     let group = λ i | i▷key == k → i▷val
                      in sum(group))
-      small_avgs = λ k | k▸stats < 100 →
-                     k▸stats / k▸cnt
+      small_avgs = λ k | k▷stats < 100 →
+                     k▷stats / k▷cnt
   in small_avgs
 ```
 
@@ -501,7 +501,7 @@ binding (no outer lambda), so the two definitions are derived independently and 
 
 **Deriving `stats-fn`:**
 
-`stats-fn = λk → sum(λi | i▸key == k → i▸val)` is exactly the keyed aggregation example
+`stats-fn = λk → sum(λi | i▷key == k → i▷val)` is exactly the keyed aggregation example
 from above, with `sum = aggregate(+)`:
 
 ```
@@ -514,23 +514,23 @@ Apply the refinement rule to `λk` while `stats` is a free variable (its sharing
 already captured by the `let` binding — no need to eliminate it):
 
 ```
-λk | k▸stats < 100 → k▸stats / k▸cnt
-= (λk → k▸stats < 100) ▸ restrict ≫ (λk → k▸stats / k▸cnt)   [refinement]
+λk | k▷stats < 100 → k▷stats / k▷cnt
+= (λk → k▷stats < 100) ▷ restrict ≫ (λk → k▷stats / k▷cnt)   [refinement]
 ```
 
 With `stats` free, each `k`-lambda reduces directly:
 
 ```
-  λk → k▸stats         = stats                    [λk→k▸f = f]
-  λk → k▸stats < 100   = stats ≫ (< 100)          [compose with (< 100)]
-  λk → k▸cnt           = cnt                      [λk→k▸f = f]
-  λk → k▸stats / k▸cnt = ⟨stats, cnt⟩ ≫ (/)       [tuple, then divide]
+  λk → k▷stats         = stats                    [λk→k▷f = f]
+  λk → k▷stats < 100   = stats ≫ (< 100)          [compose with (< 100)]
+  λk → k▷cnt           = cnt                      [λk→k▷f = f]
+  λk → k▷stats / k▷cnt = ⟨stats, cnt⟩ ≫ (/)       [tuple, then divide]
 ```
 
 Giving:
 
 ```
-small_avgs = (stats ≫ (< 100)) ▸ restrict ≫ (⟨stats, cnt⟩ ≫ (/))
+small_avgs = (stats ≫ (< 100)) ▷ restrict ≫ (⟨stats, cnt⟩ ≫ (/))
 ```
 
 The two references to `stats` — in the predicate and in the value computation — are shared
@@ -541,7 +541,7 @@ named reference.
 
 ```
 stdout = let stats      = memo(converse(key) ≫ map(val) ≫ sum)
-             small_avgs = (stats ≫ (< 100)) ▸ restrict ≫ (⟨stats, cnt⟩ ≫ (/))
+             small_avgs = (stats ≫ (< 100)) ▷ restrict ≫ (⟨stats, cnt⟩ ≫ (/))
          in small_avgs
 ```
 

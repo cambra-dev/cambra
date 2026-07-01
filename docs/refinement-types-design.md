@@ -1,5 +1,7 @@
 # Dependent Refinements via Pi Types
 
+> **Status: SUPERSEDED** by [the pi-types brainstorm](/src/ccl/brainstorm/2026-06-02-dependent-refinements-via-pi-types.md); the design is largely landed (named Pi binders, Cast machinery, simple-sub). This older pre-simple-sub draft is kept for context — durable content should be folded into design-simple-sub.md later (not done here).
+
 Status: design proposal, 2026-05-20
 
 ## Problem statement
@@ -887,8 +889,8 @@ Incremental migration from the current code, in suggested order:
 
 **Prerequisite (mechanical):** rename the existing helper
 `ccl_utils::is_free` to `is_in_free_vars`, along with its call sites in
-`src/ccl/lambda_elim.rs` (4 callers including a test) and
-`src/ccl/remove_defers.rs` (2 callers). The name `is_free` is
+`src/ccl/lambda_elim.rs` (callers including a test) and
+`src/ccl/subst.rs` (the substitution helpers). The name `is_free` is
 ambiguous between "free to use this name" and "this name appears as
 a free variable"; `is_in_free_vars` disambiguates to the latter.
 Purely a rename — no behaviour change. Landing this first means
