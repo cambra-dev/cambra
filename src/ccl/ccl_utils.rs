@@ -7,6 +7,11 @@ use crate::ccl::{
     BaseType, Builtin, Expr, Lit, Name, PredicateId, Refinement, Type, TypedExprNode,
 };
 
+/// Returns `true` if `expr` directly references the given built-in primitive.
+pub(crate) fn is_builtin(expr: &Expr, b: Builtin) -> bool {
+    matches!(&expr.node, TypedExprNode::Builtin(x) if *x == b)
+}
+
 /// Builds an application of a primitive combinator, setting the types based on
 /// the input expression's type and the provided output type.
 pub fn apply_primitive(expr: Expr, primitive: Builtin, output_ty: Type) -> Expr {

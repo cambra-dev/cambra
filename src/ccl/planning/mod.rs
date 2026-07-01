@@ -21,6 +21,9 @@ use crate::ccl::ccl_utils::{
     self, apply_function, make_iterate, make_restrict, refine_codomain, set_codomain,
     trivially_true_predicate, typed_compose,
 };
+// Re-exported so the `planning` submodules (`groupby`, `join`) can keep calling
+// `is_builtin` unqualified through their `use super::*`.
+pub(super) use crate::ccl::ccl_utils::is_builtin;
 use crate::ccl::{
     BaseType, BinOpKind, Builtin, CompareKind, Expr, Lit, LogicKind, Name, ProjKey, Type,
     TypedExprNode,
@@ -47,11 +50,6 @@ pub(crate) use iterate::insert_iterate_markers;
 pub(crate) use predicates::compile_refinement_predicates;
 #[allow(unused_imports)]
 pub(crate) use predicates::fn_of_bare_predicate;
-
-/// Returns `true` if `expr` directly references the given built-in primitive.
-pub(super) fn is_builtin(expr: &Expr, b: Builtin) -> bool {
-    matches!(&expr.node, TypedExprNode::Builtin(x) if *x == b)
-}
 
 /// Materialize every iteration site in the post-lambda-elim CCL, choosing
 /// an efficient implementation strategy at each one.
@@ -273,10 +271,6 @@ pub(crate) mod test_helpers {
         Expr::var(name)
     }
 
-    pub(crate) fn proj_idx(n: usize) -> Expr {
-        Expr::proj_index(n)
-    }
-
     pub(crate) fn int_ty() -> Type {
         Type::Base(BaseType::Int)
     }
@@ -390,13 +384,13 @@ mod tests {
 
     #[test]
     fn test_is_function_of_single_tuple_arm_on_projection() {
-        let expr = proj_idx(0);
+        let expr = Expr::proj_index(0);
         assert_eq!(is_function_of_single_tuple_arm(&expr), Some(0));
     }
 
     #[test]
     fn test_is_function_of_single_tuple_arm_on_second_index() {
-        let expr = proj_idx(1);
+        let expr = Expr::proj_index(1);
         assert_eq!(is_function_of_single_tuple_arm(&expr), Some(1));
     }
 
@@ -410,7 +404,10 @@ mod tests {
     fn test_is_function_of_single_tuple_arm_on_compose_with_projection_first() {
         let proj0_ty = fun_ty(tuple_ty(vec![int_ty(), int_ty()]), int_ty());
         let f_ty = fun_ty(int_ty(), int_ty());
-        let expr = compose(vec![proj_idx(1).with_ty(proj0_ty), var("f").with_ty(f_ty)]);
+        let expr = compose(vec![
+            Expr::proj_index(1).with_ty(proj0_ty),
+            var("f").with_ty(f_ty),
+        ]);
         assert_eq!(is_function_of_single_tuple_arm(&expr), Some(1));
     }
 
@@ -438,7 +435,7 @@ mod tests {
     #[test]
     fn test_replace_tuple_project_with_id_on_projection() {
         let int_ty_val = int_ty();
-        let mut expr = proj_idx(0);
+        let mut expr = Expr::proj_index(0);
         replace_tuple_project_with_id(&mut expr, &int_ty_val);
 
         // After replacement, should be identity function
@@ -453,7 +450,7 @@ mod tests {
         let proj0_ty = fun_ty(tuple_ty(vec![int_ty(), int_ty()]), int_ty());
         let f_ty = fun_ty(int_ty(), int_ty());
         let mut expr = compose(vec![
-            proj_idx(1).with_ty(proj0_ty),
+            Expr::proj_index(1).with_ty(proj0_ty),
             var("f").with_ty(f_ty.clone()),
         ])
         .with_ty(f_ty);
@@ -526,7 +523,7 @@ mod tests {
         );
 
         let mut expr = Expr::apply(
-            proj_idx(0).with_ty(proj_ty),
+            Expr::proj_index(0).with_ty(proj_ty),
             Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty.clone()),
         )
         .with_ty(fun_ty(
@@ -549,8 +546,8 @@ mod tests {
         let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty_val.clone());
 
         let mut expr = Expr::tuple(vec![
-            proj_idx(0).with_ty(proj_ty.clone()),
-            proj_idx(0).with_ty(proj_ty),
+            Expr::proj_index(0).with_ty(proj_ty.clone()),
+            Expr::proj_index(0).with_ty(proj_ty),
         ])
         .with_ty(tuple_ty(vec![
             fun_ty(tuple_ty_val.clone(), int_ty_val.clone()),
@@ -595,11 +592,12 @@ mod tests {
             const_fn_ty.clone(),
         );
 
-        let mut expr =
-            Expr::tuple(vec![proj_idx(0).with_ty(proj_ty), const_expr]).with_ty(tuple_ty(vec![
+        let mut expr = Expr::tuple(vec![Expr::proj_index(0).with_ty(proj_ty), const_expr]).with_ty(
+            tuple_ty(vec![
                 fun_ty(tuple_ty_val.clone(), int_ty_val.clone()),
                 const_fn_ty,
-            ]));
+            ]),
+        );
 
         replace_tuple_project_with_id(&mut expr, &int_ty_val);
 

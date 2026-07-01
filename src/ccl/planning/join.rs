@@ -1181,8 +1181,8 @@ mod tests {
 
         // Create an apply with function that is not "zip"
         let args_tuple = Expr::tuple(vec![
-            proj_idx(0).with_ty(int_ty_val.clone()),
-            proj_idx(1).with_ty(int_ty_val.clone()),
+            Expr::proj_index(0).with_ty(int_ty_val.clone()),
+            Expr::proj_index(1).with_ty(int_ty_val.clone()),
         ]);
         let non_zip_apply = Expr::apply(
             args_tuple,
@@ -1232,7 +1232,7 @@ mod tests {
         let tuple_ty_val = tuple_ty(vec![int_ty_val.clone(), int_ty_val.clone()]);
 
         // Create zip with only 1 argument (not 2)
-        let args_tuple = Expr::tuple(vec![proj_idx(0).with_ty(int_ty_val.clone())]);
+        let args_tuple = Expr::tuple(vec![Expr::proj_index(0).with_ty(int_ty_val.clone())]);
         let zip_apply = Expr::apply(
             args_tuple,
             Expr::builtin(Builtin::Zip).with_ty(fun_ty(int_ty_val.clone(), int_ty_val.clone())),
@@ -1258,8 +1258,8 @@ mod tests {
 
         // Create zip where both args project from same tuple element
         let args_tuple = Expr::tuple(vec![
-            proj_idx(0).with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
-            proj_idx(0).with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
+            Expr::proj_index(0).with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
+            Expr::proj_index(0).with_ty(fun_ty(tuple_ty_val.clone(), int_ty_val.clone())),
         ]);
         let zip_apply = Expr::apply(
             args_tuple,
@@ -1295,7 +1295,7 @@ mod tests {
         let rec_arm = |i: usize| {
             Expr::apply(
                 Expr::var(Name::elem()).with_ty(rec_ty.clone()),
-                proj_idx(i).with_ty(fun_ty(rec_ty.clone(), scalar.clone())),
+                Expr::proj_index(i).with_ty(fun_ty(rec_ty.clone(), scalar.clone())),
             )
             .with_ty(scalar.clone())
         };
@@ -1345,7 +1345,7 @@ mod tests {
             tuple_ty(vec![int_ty(), int_ty()]),
         );
         // zip(proj(0), ...) should return 0
-        let arg = proj_idx(0).with_ty(proj_ty);
+        let arg = Expr::proj_index(0).with_ty(proj_ty);
         let zip_app = Expr::apply(arg, Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty));
         assert_eq!(is_function_of_single_tuple_arm(&zip_app), Some(0));
     }
@@ -1359,7 +1359,7 @@ mod tests {
             tuple_ty(vec![int_ty(), int_ty()]),
         );
         // zip(proj(1), ...) should return 1
-        let arg = proj_idx(1).with_ty(proj_ty);
+        let arg = Expr::proj_index(1).with_ty(proj_ty);
         let zip_app = Expr::apply(arg, Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty));
         assert_eq!(is_function_of_single_tuple_arm(&zip_app), Some(1));
     }
@@ -1384,7 +1384,7 @@ mod tests {
         let tuple_ty_val = tuple_ty(vec![int_ty(), int_ty()]);
         // A tuple containing a single projection should return that projection's index
         let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty());
-        let tuple_expr = Expr::tuple(vec![proj_idx(0).with_ty(proj_ty)]);
+        let tuple_expr = Expr::tuple(vec![Expr::proj_index(0).with_ty(proj_ty)]);
         assert_eq!(is_function_of_single_tuple_arm(&tuple_expr), Some(0));
     }
 
@@ -1394,8 +1394,8 @@ mod tests {
         let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty());
         // A tuple where all non-constant elements use the same projection
         let tuple_expr = Expr::tuple(vec![
-            proj_idx(0).with_ty(proj_ty.clone()),
-            proj_idx(0).with_ty(proj_ty.clone()),
+            Expr::proj_index(0).with_ty(proj_ty.clone()),
+            Expr::proj_index(0).with_ty(proj_ty.clone()),
         ]);
         assert_eq!(is_function_of_single_tuple_arm(&tuple_expr), Some(0));
     }
@@ -1406,8 +1406,8 @@ mod tests {
         let proj_ty = fun_ty(tuple_ty_val.clone(), int_ty());
         // A tuple where elements use different projections should return None
         let tuple_expr = Expr::tuple(vec![
-            proj_idx(0).with_ty(proj_ty.clone()),
-            proj_idx(1).with_ty(proj_ty.clone()),
+            Expr::proj_index(0).with_ty(proj_ty.clone()),
+            Expr::proj_index(1).with_ty(proj_ty.clone()),
         ]);
         assert_eq!(is_function_of_single_tuple_arm(&tuple_expr), None);
     }
@@ -1419,7 +1419,7 @@ mod tests {
         let const_fn_ty = fun_ty(tuple_ty_val.clone(), int_ty());
         // A tuple with a projection and constant expressions should ignore constants
         let tuple_expr = Expr::tuple(vec![
-            proj_idx(0).with_ty(proj_ty),
+            Expr::proj_index(0).with_ty(proj_ty),
             apply_primitive(var("c").with_ty(int_ty()), Builtin::Const, const_fn_ty),
         ]);
         assert_eq!(is_function_of_single_tuple_arm(&tuple_expr), Some(0));
@@ -1601,8 +1601,8 @@ mod tests {
 
     fn make_eq_cond(tup: &Type, scalar: &Type) -> Expr {
         let args = Expr::tuple(vec![
-            proj_idx(0).with_ty(fun_ty(tup.clone(), scalar.clone())),
-            proj_idx(1).with_ty(fun_ty(tup.clone(), scalar.clone())),
+            Expr::proj_index(0).with_ty(fun_ty(tup.clone(), scalar.clone())),
+            Expr::proj_index(1).with_ty(fun_ty(tup.clone(), scalar.clone())),
         ]);
         let zip_out = fun_ty(tup.clone(), tuple_ty(vec![scalar.clone(), scalar.clone()]));
         let zipped = Expr::apply(
@@ -1626,7 +1626,7 @@ mod tests {
     fn make_filter_pred(tup: &Type, scalar: &Type, arm: usize) -> Expr {
         // proj(arm) ≫ filter_fn : tup -> scalar
         compose(vec![
-            proj_idx(arm).with_ty(fun_ty(tup.clone(), scalar.clone())),
+            Expr::proj_index(arm).with_ty(fun_ty(tup.clone(), scalar.clone())),
             var("filter_fn").with_ty(fun_ty(scalar.clone(), scalar.clone())),
         ])
         .with_ty(fun_ty(tup.clone(), scalar.clone()))
@@ -1645,7 +1645,7 @@ mod tests {
     fn test_collect_arms_used_single_proj() {
         let i = int_ty();
         let t = tuple_ty(vec![i.clone(), i.clone()]);
-        let expr = proj_idx(1).with_ty(fun_ty(t, i));
+        let expr = Expr::proj_index(1).with_ty(fun_ty(t, i));
         let mut arms = BTreeSet::new();
         collect_arms_used(&expr, &mut arms);
         assert_eq!(arms, BTreeSet::from([1]));
@@ -1715,7 +1715,7 @@ mod tests {
 
         // A pure filter predicate with no equality condition — cannot build hash join.
         let filter = compose(vec![
-            proj_idx(0).with_ty(fun_ty(t.clone(), i.clone())),
+            Expr::proj_index(0).with_ty(fun_ty(t.clone(), i.clone())),
             var("some_filter").with_ty(fun_ty(i.clone(), bool_ty_val.clone())),
         ])
         .with_ty(fun_ty(t.clone(), bool_ty_val));

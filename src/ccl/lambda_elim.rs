@@ -127,12 +127,6 @@ pub(crate) fn id() -> Expr {
     Expr::builtin(Builtin::Id)
 }
 
-/// Build `Proj(Index(n))`: the tuple projection morphism `.n`.
-#[cfg(test)]
-pub(crate) fn proj_idx(n: usize) -> Expr {
-    Expr::proj_index(n)
-}
-
 /// Build `f ≫ g`: left-to-right function composition.
 pub(crate) fn compose(f: Expr, g: Expr) -> Expr {
     Expr::compose(vec![f, g])
@@ -1008,7 +1002,7 @@ mod tests {
         .with_ty(int_ty());
         let expr = Expr::lambda("x", param_ty, body);
         let result = run(expr).unwrap();
-        assert_expr_eq(result, proj_idx(0));
+        assert_expr_eq(result, Expr::proj_index(0));
     }
 
     /// Constant (literal): λ x → 42  ⟹  const(42)
@@ -1094,7 +1088,7 @@ mod tests {
             .with_ty(fun_ty(int_ty(), int_ty()));
         let expr = Expr::lambda("x", int_ty(), inner);
         let result = run(expr).unwrap();
-        assert_expr_eq(result, curry(proj_idx(0)));
+        assert_expr_eq(result, curry(Expr::proj_index(0)));
     }
 
     /// Let binding: λ x → let v = x in v  ⟹  let v = id in v.
@@ -1220,12 +1214,12 @@ mod tests {
         // Expected: zip(.0 ≫ c1, .1 ≫ c2) ≫ add
         let r_to_int = fun_ty(r_ty.clone(), int_ty());
         let proj0_c1 = compose(
-            proj_idx(0).with_ty(proj_ty.clone()),
+            Expr::proj_index(0).with_ty(proj_ty.clone()),
             var("c1").with_ty(c_ty.clone()),
         )
         .with_ty(r_to_int.clone());
         let proj1_c2 = compose(
-            proj_idx(1).with_ty(proj_ty.clone()),
+            Expr::proj_index(1).with_ty(proj_ty.clone()),
             var("c2").with_ty(c_ty.clone()),
         )
         .with_ty(r_to_int.clone());

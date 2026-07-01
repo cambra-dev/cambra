@@ -311,6 +311,15 @@ impl LoweringContext {
         std::mem::take(&mut self.sink_bindings)
     }
 
+    /// Mint a fresh `{prefix}_{id}` name from the monotonic synthetic-id
+    /// counter, bumping it so every minted name is distinct within a lowering.
+    /// The `fresh_*` methods below wrap this, each fixing its own `prefix`.
+    fn mint_synthetic_id(&mut self, prefix: &str) -> String {
+        let id = self.next_synthetic_id;
+        self.next_synthetic_id += 1;
+        format!("{prefix}_{id}")
+    }
+
     /// Mint a fresh synthetic parameter name for a multi-arg lambda's tupled
     /// domain, e.g. `__arg_tuple_0`, `__arg_tuple_1`, …
     ///
@@ -321,9 +330,7 @@ impl LoweringContext {
     /// which user code cannot bind (double-underscore + synthetic suffix),
     /// so the substitution helper can remain non-capture-avoiding.
     pub(super) fn fresh_tuple_arg(&mut self) -> String {
-        let id = self.next_synthetic_id;
-        self.next_synthetic_id += 1;
-        format!("{TUPLE_ARG_PREFIX}_{id}")
+        self.mint_synthetic_id(TUPLE_ARG_PREFIX)
     }
 
     /// Mint a unique `__result_N` name for the defer handle in generator functions.
@@ -331,9 +338,7 @@ impl LoweringContext {
     /// Counter-minted to avoid collisions when user code contains a binding
     /// named `__result` inside the same generator body.
     pub(super) fn fresh_result_name(&mut self) -> String {
-        let id = self.next_synthetic_id;
-        self.next_synthetic_id += 1;
-        format!("__result_{id}")
+        self.mint_synthetic_id("__result")
     }
 
     /// Mint a unique `__acc_stream_N` binding name for the
@@ -343,9 +348,7 @@ impl LoweringContext {
     /// stream from this one Join (the multi-feed-per-defer subcase
     /// suffixes those as `.to_<defer>_<k>`).
     pub(super) fn fresh_acc_stream_name(&mut self) -> String {
-        let id = self.next_synthetic_id;
-        self.next_synthetic_id += 1;
-        format!("__acc_stream_{id}")
+        self.mint_synthetic_id("__acc_stream")
     }
 }
 
