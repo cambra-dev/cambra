@@ -697,36 +697,44 @@ where
 
 /// Rebuilding analog of [`walk_refined_predicates`]: invoke `f` on a *mutable
 /// copy* of each predicate and reinstall the (possibly rewritten) result as a
-/// fresh `Rc`. `memo` maps each original predicate's identity to its rebuilt
-/// `Rc`, so every occurrence that shared one predicate term in `ty` is
-/// re-pointed at the *same* rebuilt term. The callback receives `memo` so it
-/// can recurse when a predicate's own subexpressions carry further refinements.
+/// fresh `Rc`. `memo` maps each original predicate's identity to a
+/// `(keepalive, rebuilt)` pair, so every occurrence that shared one predicate
+/// term in `ty` is re-pointed at the *same* rebuilt term. The callback
+/// receives `memo` so it can recurse when a predicate's own subexpressions
+/// carry further refinements.
 ///
-/// The `memo` is a **performance / structural-sharing optimization, not a
-/// correctness requirement**: `f` is a deterministic rewrite, so rebuilding
+/// The dedup itself is a **performance / structural-sharing optimization, not
+/// a correctness requirement**: `f` is a deterministic rewrite, so rebuilding
 /// each occurrence independently would yield *value-equal* predicates (refinement
 /// equality is structural) — the memo only makes them the *same* `Rc` rather
 /// than *equal* `Rc`s, saving the recompute and keeping `ptr_eq` fast paths and
-/// any downstream `Rc`-keyed dedup effective. It keys on `Rc::as_ptr`, the one
-/// residual pointer-identity dependency, sound precisely because the rewrite is
-/// a value function. (Planning's predicate-compilation memo is the same kind of
-/// perf dedup — see [`crate::ccl::planning`]'s `PredMemo`.)
+/// any downstream `Rc`-keyed dedup effective. It keys on [`PredicateId`]
+/// (`Rc::as_ptr`), the one residual pointer-identity dependency, sound only as
+/// long as that address cannot be reused for the rest of the walk — which is
+/// exactly what the `keepalive` clone guarantees. Without it, overwriting
+/// `refinement.predicate` below would drop the original `Rc` (if this was its
+/// only strong reference), freeing an address that a later, unrelated
+/// `Rc::new` in the same walk could reclaim; a subsequent predicate landing on
+/// that address would then collide with this entry and wrongly inherit its
+/// `rebuilt` value. (Planning's predicate-compilation memo has the identical
+/// shape — see [`crate::ccl::planning`]'s `PredMemo`.)
 pub fn walk_refined_predicates_mut<F>(
     ty: &mut Type,
-    memo: &mut HashMap<PredicateId, Rc<Expr>>,
+    memo: &mut HashMap<PredicateId, (Rc<Expr>, Rc<Expr>)>,
     f: &mut F,
 ) where
-    F: FnMut(&mut Expr, &mut HashMap<PredicateId, Rc<Expr>>),
+    F: FnMut(&mut Expr, &mut HashMap<PredicateId, (Rc<Expr>, Rc<Expr>)>),
 {
     if let Type::Refinement(_, refinement) = ty {
-        let original = refinement.predicate_id();
-        if let Some(rebuilt) = memo.get(&original) {
+        let original_rc = Rc::clone(&refinement.predicate);
+        let original = Rc::as_ptr(&original_rc);
+        if let Some((_, rebuilt)) = memo.get(&original) {
             refinement.predicate = Rc::clone(rebuilt);
         } else {
             let mut pred = (*refinement.predicate).clone();
             f(&mut pred, memo);
             let rebuilt = Rc::new(pred);
-            memo.insert(original, Rc::clone(&rebuilt));
+            memo.insert(original, (original_rc, Rc::clone(&rebuilt)));
             refinement.predicate = rebuilt;
         }
     }

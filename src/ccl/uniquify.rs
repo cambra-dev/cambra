@@ -85,10 +85,20 @@ struct Uniquifier {
     /// innermost binder last. Raw `Var`s resolve to the top of their
     /// spelling's stack.
     env: HashMap<String, Vec<Name>>,
-    /// Predicates already rewritten in this run, mapped to their rebuilt `Rc`.
-    /// A predicate term shared across occurrences is uniquified once, and every
-    /// occurrence is re-pointed at the same rebuilt term.
-    memo: HashMap<PredicateId, Rc<Expr>>,
+    /// Predicates already rewritten in this run, mapped to a `(keepalive,
+    /// rebuilt)` pair. A predicate term shared across occurrences is
+    /// uniquified once, and every occurrence is re-pointed at the same
+    /// rebuilt term.
+    ///
+    /// The `keepalive` clone is load-bearing: [`Uniquifier::ty`] overwrites
+    /// `r.predicate` with the rebuilt result, which drops the *original* `Rc`
+    /// if this was its only strong reference. Without a clone held here, that
+    /// free can hand the address straight back to an unrelated `Rc::new`
+    /// later in the same walk, so a subsequent, unrelated predicate landing
+    /// on that address would collide with this entry and wrongly inherit its
+    /// `rebuilt` value — [`PredicateId`] is only a sound stand-in for
+    /// identity while the address it names cannot be reused.
+    memo: HashMap<PredicateId, (Rc<Expr>, Rc<Expr>)>,
 }
 
 impl Uniquifier {
@@ -203,14 +213,16 @@ impl Uniquifier {
     /// via `memo`.
     fn ty(&mut self, t: &mut Type) {
         if let Type::Refinement(_, r) = t {
-            let original = r.predicate_id();
-            if let Some(rebuilt) = self.memo.get(&original) {
+            let original_rc = Rc::clone(&r.predicate);
+            let original = Rc::as_ptr(&original_rc);
+            if let Some((_, rebuilt)) = self.memo.get(&original) {
                 r.predicate = Rc::clone(rebuilt);
             } else {
                 let mut pred = (*r.predicate).clone();
                 self.expr(&mut pred);
                 let rebuilt = Rc::new(pred);
-                self.memo.insert(original, Rc::clone(&rebuilt));
+                self.memo
+                    .insert(original, (original_rc, Rc::clone(&rebuilt)));
                 r.predicate = rebuilt;
             }
         }

@@ -16,23 +16,37 @@ use super::*;
 /// object identity, not [`crate::ccl::RefinementId`]: a substituted/discharged
 /// refinement keeps its id but holds an independently rebuilt predicate that
 /// must be compiled on its own (keying by id would skip it and leave it in
-/// lambda form). Maps each original predicate to its compiled, point-free
-/// rebuild so every occurrence that shared one term is re-pointed at the same
+/// lambda form). Maps each original predicate to a `(keepalive, compiled)`
+/// pair so every occurrence that shared one term is re-pointed at the same
 /// compiled `Rc` (and compiled exactly once).
 ///
-/// Like the value-rewrite memos elsewhere (see
-/// [`ccl_utils::walk_refined_predicates_mut`]), this is a **performance /
-/// structural-sharing optimization, not a correctness requirement** — verified:
-/// the full suite passes with this dedup disabled. Compilation is effectively a
-/// value function for comparison purposes: `lambda_elim` mints a fresh `__pair`
-/// `Uid` in its nested-lambda rule, but that binder is *eliminated* within the
-/// same run, so the compiled output is point-free and carries no minted binder
-/// — two independent compilations of one predicate yield structurally-equal
-/// terms. (The convention this rests on — no pass leaves a re-minted bound
-/// binder in a term that equality later compares — is what keeps by-name
-/// equality coincide with α-equivalence; `lambda_elim` upholds it by
-/// eliminating `__pair` rather than the equality having to be α-aware.)
-pub(super) type PredMemo = HashMap<*const Expr, Rc<Expr>>;
+/// The `keepalive` clone is load-bearing, not incidental: [`compile_predicates_in_type`]
+/// overwrites `refinement.predicate` with the compiled result, which drops the
+/// *original* `Rc` if this was its only strong reference. Without a clone held
+/// here, that free can hand the address straight back to an unrelated `Rc::new`
+/// later in the *same* tree walk — including one of `compile_predicates_in_type`'s
+/// own allocations — so a subsequent, unrelated predicate that happens to start
+/// life at that address collides with this entry and gets served this entry's
+/// `compiled` value instead of its own. Confirmed in practice: two structurally
+/// unrelated join predicates from different call sites landed on the same freed
+/// address and the second silently inherited the first's compiled form.
+///
+/// Like the value-rewrite memo in [`ccl_utils::walk_refined_predicates_mut`],
+/// dedup itself is a **performance / structural-sharing optimization, not a
+/// correctness requirement** — verified: the full suite passes with dedup
+/// disabled (i.e. recompiling every occurrence independently). Compilation is
+/// effectively a value function for comparison purposes: `lambda_elim` mints a
+/// fresh `__pair` `Uid` in its nested-lambda rule, but that binder is
+/// *eliminated* within the same run, so the compiled output is point-free and
+/// carries no minted binder — two independent compilations of one predicate
+/// yield structurally-equal terms. (The convention this rests on — no pass
+/// leaves a re-minted bound binder in a term that equality later compares — is
+/// what keeps by-name equality coincide with α-equivalence; `lambda_elim`
+/// upholds it by eliminating `__pair` rather than the equality having to be
+/// α-aware.) The *keying*, however — using the original `Rc`'s address as a
+/// stand-in for its identity — is only sound while that address cannot be
+/// reused, which is exactly what the keepalive guarantees.
+pub(super) type PredMemo = HashMap<*const Expr, (Rc<Expr>, Rc<Expr>)>;
 
 /// True if a `__pair` binder ([`Name::is_synthetic_pair`]) appears anywhere in
 /// the **term** `e` — its node and child *expressions*, never its type slots.
@@ -124,8 +138,14 @@ pub(crate) fn fn_of_bare_predicate(base: &Type, bare: &Expr) -> Expr {
 
 fn compile_predicates_in_type(ty: &mut Type, memo: &mut PredMemo) {
     if let Type::Refinement(base, refinement) = ty {
-        let original = Rc::as_ptr(&refinement.predicate);
-        if let Some(compiled) = memo.get(&original) {
+        // Clone before computing the pointer: the clone is the keepalive that
+        // keeps this address from being freed and reused for the rest of the
+        // walk (see [`PredMemo`]). Reading the pointer off `refinement.predicate`
+        // directly would still be correct today, but pairing the clone with the
+        // pointer it backs makes the dependency obvious at the call site.
+        let original_rc = Rc::clone(&refinement.predicate);
+        let original = Rc::as_ptr(&original_rc);
+        if let Some((_, compiled)) = memo.get(&original) {
             refinement.predicate = Rc::clone(compiled);
         } else {
             // Normalize the bare predicate to `__elem ▷ p` with `p` point-free:
@@ -160,7 +180,7 @@ fn compile_predicates_in_type(ty: &mut Type, memo: &mut PredMemo) {
                 symbolic(&compiled)
             );
             let compiled = Rc::new(compiled);
-            memo.insert(original, Rc::clone(&compiled));
+            memo.insert(original, (original_rc, Rc::clone(&compiled)));
             refinement.predicate = compiled;
         }
     }
