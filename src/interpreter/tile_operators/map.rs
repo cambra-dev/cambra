@@ -449,8 +449,8 @@ impl TileOperator for MapResultToConst {
             Box::new(consumer_wrapper.clone()),
             scheduler,
         );
-        Box::new(MapToConstProducer {
-            base: ProducerBase::new(MapToConstProducer::alloc_id(), &self.tiling),
+        Box::new(MapResultToConstProducer {
+            base: ProducerBase::new(MapResultToConstProducer::alloc_id(), &self.tiling),
             input: input_producer,
             constant: constant_producer,
             mode: self.mode,
@@ -458,14 +458,14 @@ impl TileOperator for MapResultToConst {
     }
 }
 
-struct MapToConstProducer {
+struct MapResultToConstProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     constant: Box<dyn TileProducer>,
     mode: MapResultToConstMode,
 }
 
-impl TileProducer for MapToConstProducer {
+impl TileProducer for MapResultToConstProducer {
     impl_producer_base!();
 
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {

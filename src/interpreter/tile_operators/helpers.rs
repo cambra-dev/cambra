@@ -14,7 +14,7 @@ use crate::interpreter::{ColumnValue, Extent, Value, bindings_are_list, transfor
 
 /// Repeat a scalar or record-of-scalars tile `len` times along the domain axis.
 ///
-/// Used by [`MapToConstProducer`] to broadcast a constant value across all
+/// Used by [`MapResultToConstProducer`] to broadcast a constant value across all
 /// domain elements: `Tile::Scalar(cv)` → `Tile::Scalar(cv.repeat(len))`;
 /// `Tile::Record(m)` → `Tile::Record(m.map(t → repeat_tile(t, len)))`.
 pub(crate) fn repeat_tile(tile: Tile, len: usize) -> Tile {

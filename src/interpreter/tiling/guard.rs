@@ -120,7 +120,7 @@ impl TileGuard {
         match self {
             TileGuard::Scalar(universal) | TileGuard::Aggregation(universal) => *universal,
             TileGuard::Record(m) => m.values().all(TileGuard::is_universal),
-            TileGuard::Function(g) => g.is_univeral(),
+            TileGuard::Function(g) => g.is_universal(),
             // Or is universal if any arm covers everything.
             TileGuard::Or(arms) => arms.iter().any(TileGuard::is_universal),
         }
@@ -204,7 +204,7 @@ impl FunctionGuard {
     pub fn intersect(&self, other: &FunctionGuard) -> FunctionGuard {
         match (self, other) {
             (a, _b) | (_b, a) if a.is_empty() => a.clone(),
-            (a, b) | (b, a) if a.is_univeral() => b.clone(),
+            (a, b) | (b, a) if a.is_universal() => b.clone(),
             (FunctionGuard::Domain(p1), FunctionGuard::Domain(p2)) => {
                 FunctionGuard::Domain(p1.intersect(p2))
             }
@@ -219,7 +219,7 @@ impl FunctionGuard {
     pub fn union(&self, other: &FunctionGuard) -> FunctionGuard {
         match (self, other) {
             (a, b) | (b, a) if a.is_empty() => b.clone(),
-            (a, _b) | (_b, a) if a.is_univeral() => a.clone(),
+            (a, _b) | (_b, a) if a.is_universal() => a.clone(),
             (FunctionGuard::Domain(p1), FunctionGuard::Domain(p2)) => {
                 FunctionGuard::Domain(p1.union(p2))
             }
@@ -230,7 +230,7 @@ impl FunctionGuard {
         }
     }
 
-    pub fn is_univeral(&self) -> bool {
+    pub fn is_universal(&self) -> bool {
         match self {
             FunctionGuard::Domain(p) => p.as_bool() == Some(true),
             FunctionGuard::Codomain(g) => g.is_universal(),
