@@ -1,0 +1,598 @@
+//! CHL AST → CCL lowering.
+//!
+//! Translates [`crate::chl_parser::ast`] nodes into [`crate::ccl::Expr`] trees.
+//! This is a structural lowering only — no type inference, no operator-graph
+//! construction, and no subscription. The resulting CCL tree can be inspected
+//! and tested independently before being type-checked and compiled.
+//!
+//! # Supported constructs
+//!
+//! | CHL syntax | CCL output |
+//! |--------------|-----------|
+//! | Integer / string / bool / None literals | [`TypedExprNode::Lit`] |
+//! | Variable references | [`TypedExprNode::Var`] |
+//! | Binary arithmetic (`+`, `-`, `*`, `//`) | [`TypedExprNode::BinOp`] |
+//! | Comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) | [`TypedExprNode::BinOp`] |
+//! | Chained comparisons (`a < b < c`) | nested [`TypedExprNode::BinOp`] with `and` |
+//! | Boolean operators (`and`, `or`) | left-folded [`TypedExprNode::BinOp`] chain |
+//! | List literals `[e0, e1, ...]` | [`TypedExprNode::List`] |
+//! | Single-generator list comprehensions (no `if`) | `Lambda`/`Apply` encoding |
+//! | 2-gen equality-join comprehensions (`if x.k == y.k`) | hash-join [`crate::ccl::Refinement`] predicate |
+//! | Multi-gen filtered comprehensions (non-equality or 3+ generators) | loop-join [`crate::ccl::Refinement`] predicate |
+//! | Assignment + expression blocks | nested [`TypedExprNode::Let`] |
+//! | Augmented assignment `x op= e` | desugared to [`TypedExprNode::Let`] via [`TypedExprNode::BinOp`] |
+//! | `sum(expr)` / `max(expr)` calls | [`TypedExprNode::Aggregate`] |
+//! | Lambda expressions `lambda x: body`, `lambda x, y: body` | single [`TypedExprNode::Lambda`] (tupled param when multi-arg) |
+//! | `groupby(collection, key)` calls | `Lambda`/`Apply` encoding with a refinement predicate |
+//! | Unary negation (`-x`) | [`TypedExprNode::UnaryOp`] with [`crate::ccl::UnaryOpKind::Neg`] |
+//! | Boolean negation (`not x`) | [`TypedExprNode::UnaryOp`] with [`crate::ccl::UnaryOpKind::Not`] |
+//! | Unary plus (`+x`) | identity — lowered to `x` directly |
+//! | Single-arg call `f(a)` | [`TypedExprNode::Apply`] |
+//! | Multi-arg call `f(a, b, ...)` | [`TypedExprNode::Apply`] with a tupled argument |
+//! | Annotated assignment `x: T = expr` | [`TypedExprNode::Let`] with [`crate::ccl::TypedBinding::user_annotation`] set |
+//! | Generator expressions `(expr for x in xs)` | `Lambda`/`Apply` encoding (same as list comp) |
+//! | Generator functions `def f(xs): for x in xs: yield expr` | [`TypedExprNode::Let`] + uncurried [`TypedExprNode::Lambda`] wrapping `Lambda`/`Apply` encoding |
+//! | Nested-for generator functions | same encoding as multi-generator list comprehensions |
+//! | Let-bindings in generator bodies `y = f(x); yield y` | [`TypedExprNode::Let`] interleaved in the `Lambda`/`Apply` chain |
+//! | Pre-loop lets before generator for-loop | [`TypedExprNode::Let`] wrapping the generator expression |
+//! | Regular functions `def f(x, y, ...): expr` | [`TypedExprNode::Let`] + single [`TypedExprNode::Lambda`] (tupled param when multi-arg) |
+//! | Record literals `{field: expr, ...}` (identifier keys only) | [`TypedExprNode::Record`] |
+//! | Field access `r.field` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Field`]`)` |
+//!
+//! Everything else returns [`LoweringError::Unsupported`].
+//!
+//! # Name uniqueness
+//!
+//! This pass does not guarantee unique binding names. Reassignment of the
+//! same variable (`x = 1; x = 2`) produces nested [`TypedExprNode::Let`] nodes that shadow
+//! each other (`let x = 1 in let x = 2 in ...`). The semantics are correct for
+//! sequential code — the inner `let` evaluates its value expression in the outer
+//! scope before the shadowing takes effect — but the same name may appear at
+//! multiple binding sites in the resulting tree.
+//!
+//! Lowering itself does not α-rename — unlike SSA or ANF conversion it keeps
+//! the tree shape un-normalized, preserving structure for optimization passes.
+//! Binder *identity* is handled immediately afterwards by
+//! [`crate::ccl::uniquify`], which mints a fresh [`crate::ccl::Name`] uid per
+//! binding site without touching the tree shape.
+//!
+//! # Module layout
+//!
+//! This pass is split across several submodules, all re-exported here so that
+//! the historical `crate::ccl::lower::…` paths continue to resolve:
+//!
+//! - [`stmts`] — statement-block lowering (`Let` chains, `if`/`else`, the
+//!   `http_serve` tuple-assign wiring, mutation-loop dispatch).
+//! - [`exprs`] — per-[`ChlExpr`] expression lowering (binops, comparisons,
+//!   boolean ops, calls, unary ops, feeds, defines, constants).
+//! - [`functions`] — lambda / `def` / parameter lowering (uncurrying).
+//! - [`loops`] — `for`-loop, generator, and mutation-accumulation-loop lowering.
+//! - [`comprehension`] — list-comprehension and generator-expression lowering.
+//! - [`http`] — `http_serve` recognition predicates.
+
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+
+use crate::{
+    ccl::{Branch, Expr, Lit, TypedExprNode},
+    chl_parser::ast::{
+        Expr as ChlExpr, Lit as ChlLit, RecordField, Span, Spanned, Stmt as ChlStmt,
+    },
+    interpreter::{DataSink, DataSourceDomainExtentImpl, http_server::SharedHttpServer},
+};
+
+mod comprehension;
+mod exprs;
+mod functions;
+mod http;
+mod loops;
+mod stmts;
+
+// Pull every submodule's `pub(super)` helpers into the `lower` namespace so
+// that sibling submodules can reach them via `use super::*`. The external
+// `crate::ccl::lower::…` surface (`LoweringContext`, `LoweringError`,
+// `LoweringResult`, `lower_expr`, `lower_stmts`, `http_requests_source_name`)
+// is defined directly in this module as `pub`, so these imports stay private
+// — there is nothing public left to re-export onward.
+use comprehension::*;
+use exprs::*;
+use functions::*;
+use http::*;
+use loops::*;
+use stmts::*;
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur during CHL → CCL lowering.
+///
+/// Carries the source span of the offending construct so the error can be
+/// rendered with ariadne via [`LoweringError::to_report`] / the
+/// [`crate::ccl::context::CompileError::Lower`] dispatch in
+/// [`crate::ccl::context::CompileError::render`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoweringError {
+    /// The AST node or construct is not yet supported by this lowering pass.
+    Unsupported {
+        /// Span of the offending construct (the [`Spanned<ChlExpr>`] /
+        /// [`Spanned<ChlStmt>`] / sub-node that triggered the rejection).
+        span: Span,
+        /// Human-readable description of why the construct is unsupported.
+        message: String,
+    },
+}
+
+impl LoweringError {
+    /// Construct an `Unsupported` lowering error at the given span.
+    ///
+    /// Convenience over the struct-init form so call sites read
+    /// `LoweringError::unsupported(span, "...")` rather than the verbose
+    /// `LoweringError::Unsupported { span, message: "...".into() }`.
+    pub fn unsupported(span: Span, message: impl Into<String>) -> Self {
+        LoweringError::Unsupported {
+            span,
+            message: message.into(),
+        }
+    }
+
+    /// Primary source span of this error.
+    pub fn span(&self) -> Span {
+        match self {
+            LoweringError::Unsupported { span, .. } => *span,
+        }
+    }
+
+    /// Build an ariadne [`Report`](ariadne::Report) with default (colour-on)
+    /// configuration.
+    pub fn to_report<'a>(
+        &self,
+        src_name: &'a str,
+    ) -> ariadne::Report<'a, (&'a str, std::ops::Range<usize>)> {
+        self.to_report_with_config(src_name, ariadne::Config::default())
+    }
+
+    /// Build an ariadne [`Report`](ariadne::Report) using the supplied
+    /// [`Config`](ariadne::Config). Use this to disable colour for snapshot
+    /// or log output; interactive callers should use [`Self::to_report`].
+    pub fn to_report_with_config<'a>(
+        &self,
+        src_name: &'a str,
+        config: ariadne::Config,
+    ) -> ariadne::Report<'a, (&'a str, std::ops::Range<usize>)> {
+        use ariadne::{Color, Label, Report, ReportKind};
+        match self {
+            LoweringError::Unsupported { span, message } => {
+                Report::build(ReportKind::Error, src_name, span.start)
+                    .with_config(config)
+                    .with_message("lowering error")
+                    .with_label(
+                        Label::new((src_name, (*span).into()))
+                            .with_message(message)
+                            .with_color(Color::Red),
+                    )
+                    .finish()
+            }
+        }
+    }
+}
+
+/// Output of [`lower_stmts`].
+///
+/// Mirrors the shape of [`crate::chl_parser::parser::ParseResult`]: a (possibly
+/// partial) lowered expression is returned alongside every error encountered,
+/// so callers can surface every diagnostic in one pass.  Failed sub-trees are
+/// filled with [`TypedExprNode::Error`] placeholders — these are only valid
+/// while `errors` is non-empty; callers must check `errors` before passing the
+/// tree to inference or any downstream stage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoweringResult {
+    /// The lowered expression. `Some` even on error if recovery produced
+    /// anything usable; `None` only when there is nothing structural to
+    /// return at all (e.g. an empty top-level statement list).
+    pub value: Option<Expr>,
+    /// Errors collected during lowering.  Non-empty implies `value` (if
+    /// `Some`) contains [`TypedExprNode::Error`] placeholders.
+    pub errors: Vec<LoweringError>,
+}
+
+impl LoweringResult {
+    /// `true` iff lowering succeeded with no errors at all.
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty() && self.value.is_some()
+    }
+
+    /// Collapse into a `Result`, treating any errors as failure. Convenient
+    /// for call sites that don't care about partial output (e.g. tests).
+    ///
+    /// Panics if the invariant `value.is_some() || !errors.is_empty()` is
+    /// violated. [`lower_stmts`] guarantees that invariant — either it
+    /// produces an `Expr` (possibly with `Error` placeholders) or it records
+    /// at least one error. The panic only fires on manually-constructed
+    /// `LoweringResult { value: None, errors: vec![] }`.
+    pub fn into_result(self) -> Result<Expr, Vec<LoweringError>> {
+        if !self.errors.is_empty() {
+            Err(self.errors)
+        } else {
+            Ok(self
+                .value
+                .expect("LoweringResult: empty errors but no value (invariant violation)"))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lowering context
+// ---------------------------------------------------------------------------
+
+/// Context for CHL → CCL lowering that carries registered data sources and sinks.
+///
+/// Zero-argument function calls whose name appears in `sources` are lowered to
+/// [`TypedExprNode::Source`] nodes instead of failing with an
+/// [`LoweringError::Unsupported`] error.  After `lower_stmts` returns, the
+/// caller should call [`take_sources`](Self::take_sources) and
+/// [`take_sink_bindings`](Self::take_sink_bindings) to drain both maps and
+/// register each entry with the appropriate downstream contexts.
+#[derive(Default)]
+pub struct LoweringContext {
+    /// All sources for this compilation: pre-registered (e.g. stdin, test sources)
+    /// plus any discovered during lowering (e.g. from `http_serve`).  Drained by
+    /// [`take_sources`](Self::take_sources) after `lower_stmts` returns so every
+    /// source is registered with inference and operator-conversion in one pass.
+    ///
+    /// `pub(super)` so the statement (`http_serve` wiring) and expression
+    /// (registered-source recognition) submodules can read and mutate the map
+    /// directly; external callers go through the `register_source` /
+    /// `take_sources` methods.
+    pub(super) sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+
+    /// Sink bindings discovered during lowering, keyed by the CCL `Let`-binding name
+    /// that holds the deferred responses computation (e.g. `"responses"`).  Each entry
+    /// pairs the binding name with the [`DataSink`] that should receive the computed
+    /// tiles (e.g. [`HttpServerSharedState`]).  Drained by
+    /// [`take_sink_bindings`](Self::take_sink_bindings) after `lower_stmts` returns.
+    ///
+    /// `pub(super)` so the statement submodule can inspect it when deciding
+    /// whether to wrap the program tail in the sink-binding `Record`.
+    pub(super) sink_bindings: HashMap<String, Arc<dyn DataSink>>,
+
+    /// One [`SharedHttpServer`] per TCP port, shared across all `http_serve` calls
+    /// that use the same port.  Created lazily on the first `http_serve` for a port
+    /// and reused for all subsequent ones, so only a single `tiny_http::Server`
+    /// binds each port.
+    ///
+    /// `pub(super)` so the statement submodule's `http_serve` wiring can create
+    /// and reuse the per-port server.
+    pub(super) shared_servers: HashMap<u16, Arc<SharedHttpServer>>,
+
+    /// Monotonic counter for minting unique synthetic names during lowering.
+    /// Globally unique across nested scopes so inner binders cannot capture
+    /// a reference inserted by an outer substitution.
+    next_synthetic_id: usize,
+}
+
+impl LoweringContext {
+    /// Register a data source so that `name()` lowers to `Source(name)`.
+    pub fn register_source(
+        &mut self,
+        name: impl Into<String>,
+        source: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
+    ) {
+        self.sources.insert(name.into(), source);
+    }
+
+    /// Drain all sources accumulated for this compilation.
+    ///
+    /// Returns every source that was either pre-registered (e.g. stdin, test
+    /// stubs) or discovered during lowering (e.g. from `http_serve`).  Call
+    /// after `lower_stmts` returns and pass each entry to
+    /// [`GlobalContext`](crate::ccl::context::GlobalContext) for uniform
+    /// registration with inference and operator-conversion.
+    pub fn take_sources(&mut self) -> HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>> {
+        std::mem::take(&mut self.sources)
+    }
+
+    /// Register a sink for the CCL binding named `name`.
+    ///
+    /// Called during `http_serve` lowering: the responses binding is assigned a
+    /// plain `Defer` in the CCL tree, and its [`DataSink`] is recorded here by
+    /// binding name so that the scheduler can subscribe an
+    /// `HttpServerSinkConsumer` to it after operator conversion.
+    pub fn register_sink_binding(&mut self, name: impl Into<String>, sink: Arc<dyn DataSink>) {
+        self.sink_bindings.insert(name.into(), sink);
+    }
+
+    /// Drain all sink bindings accumulated for this compilation.
+    ///
+    /// Returns every `(binding_name, DataSink)` pair discovered during lowering
+    /// (e.g. from `http_serve`).  Call after `lower_stmts` returns and pass
+    /// each entry to [`GlobalContext`](crate::ccl::context::GlobalContext) so
+    /// it can extract the corresponding expressions and subscribe them.
+    pub fn take_sink_bindings(&mut self) -> HashMap<String, Arc<dyn DataSink>> {
+        std::mem::take(&mut self.sink_bindings)
+    }
+
+    /// Mint a fresh synthetic parameter name for a multi-arg lambda's tupled
+    /// domain, e.g. `__arg_tuple_0`, `__arg_tuple_1`, …
+    ///
+    /// Each multi-arg lambda gets a distinct name so that substitutions
+    /// performed in an outer lambda — which insert `Var(outer_name)` into
+    /// the body — do not get captured by an inner lambda's binder of the
+    /// same name. All minted names share the [`TUPLE_ARG_PREFIX`] prefix,
+    /// which user code cannot bind (double-underscore + synthetic suffix),
+    /// so the substitution helper can remain non-capture-avoiding.
+    pub(super) fn fresh_tuple_arg(&mut self) -> String {
+        let id = self.next_synthetic_id;
+        self.next_synthetic_id += 1;
+        format!("{TUPLE_ARG_PREFIX}_{id}")
+    }
+
+    /// Mint a unique `__result_N` name for the defer handle in generator functions.
+    ///
+    /// Counter-minted to avoid collisions when user code contains a binding
+    /// named `__result` inside the same generator body.
+    pub(super) fn fresh_result_name(&mut self) -> String {
+        let id = self.next_synthetic_id;
+        self.next_synthetic_id += 1;
+        format!("__result_{id}")
+    }
+
+    /// Mint a unique `__acc_stream_N` binding name for the
+    /// Record-bodied Join's stream output in a feed-containing mutation
+    /// loop.  The surrounding let-binding projects `.step ▷ Last` for
+    /// the scalar accumulator and `.to_<defer>` for each per-feed
+    /// stream from this one Join (the multi-feed-per-defer subcase
+    /// suffixes those as `.to_<defer>_<k>`).
+    pub(super) fn fresh_acc_stream_name(&mut self) -> String {
+        let id = self.next_synthetic_id;
+        self.next_synthetic_id += 1;
+        format!("__acc_stream_{id}")
+    }
+}
+
+/// Prefix for synthetic parameter names representing the tupled domain of a
+/// multi-arg lambda. Each multi-arg lambda's name is this prefix followed by
+/// a unique id (see [`LoweringContext::fresh_tuple_arg`]).
+const TUPLE_ARG_PREFIX: &str = "__arg_tuple";
+
+/// Return the canonical data-source name for the requests side of
+/// `http_serve(port, method, path)`.
+///
+pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String {
+    // Sanitise path for use inside a Rust/CCL identifier.
+    let path_id = path.replace(['/', '-', '.'], "_");
+    format!("__http_requests_{port}_{method}_{path_id}")
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Lower a single CHL expression to a CCL expression.
+pub fn lower_expr(
+    expr: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    match &expr.node {
+        ChlExpr::Lit(lit) => lower_constant(lit),
+        ChlExpr::Name(id) => Ok(Expr::var(id.as_str().to_string())),
+        ChlExpr::BinOp { left, op, right } => lower_binop(left, *op, right, ctx),
+        ChlExpr::Compare {
+            left,
+            ops,
+            comparators,
+        } => lower_compare(left, ops, comparators, ctx),
+        ChlExpr::BoolOp { op, operands } => lower_boolop(expr.span, *op, operands, ctx),
+        ChlExpr::List(elts) => {
+            let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
+            Ok(Expr::list(items?))
+        }
+        ChlExpr::ListComp(comp) => lower_list_comp(comp, ctx),
+        ChlExpr::GenExp(comp) => lower_list_comp(comp, ctx),
+        ChlExpr::Call { func, args } => lower_call(func, args, ctx),
+        ChlExpr::Tuple(elts) => {
+            let items: Result<Vec<_>, _> = elts.iter().map(|e| lower_expr(e, ctx)).collect();
+            Ok(Expr::tuple(items?))
+        }
+        ChlExpr::Subscript { target, index } => match &index.node {
+            ChlExpr::Lit(ChlLit::Int(n)) => {
+                let idx: usize = (*n).try_into().map_err(|_| {
+                    LoweringError::unsupported(index.span, "tuple index must be non-negative")
+                })?;
+                Ok(Expr::apply(lower_expr(target, ctx)?, Expr::proj_index(idx)))
+            }
+            _ => Err(LoweringError::unsupported(
+                index.span,
+                "only integer subscripts are supported",
+            )),
+        },
+        // Record literal `{field: expr, ...}` — keys are bare identifiers.
+        // Lowered to a `Record` constructor: `{x: 1, y: "foo"}` becomes
+        // `Record([("x", Lit(1)), ("y", Lit("foo"))])`.
+        ChlExpr::Record(fields) => {
+            let mut out = Vec::with_capacity(fields.len());
+            for RecordField {
+                name,
+                name_span,
+                value,
+            } in fields
+            {
+                let field_name = name.as_str().to_string();
+                if out.iter().any(|(k, _)| k == &field_name) {
+                    return Err(LoweringError::unsupported(
+                        *name_span,
+                        format!("duplicate key `{field_name}` in record literal"),
+                    ));
+                }
+                out.push((field_name, lower_expr(value, ctx)?));
+            }
+            Ok(Expr::new(TypedExprNode::Record(out)))
+        }
+        // Dict literal with expression keys is not supported as a record.
+        ChlExpr::Dict(_) => Err(LoweringError::unsupported(
+            expr.span,
+            "dict literals (with non-identifier keys) are not yet supported",
+        )),
+        // Attribute access `r.field` → `Apply(r, Proj(Field("field")))`.
+        ChlExpr::Attribute { target, attr, .. } => Ok(Expr::apply(
+            lower_expr(target, ctx)?,
+            Expr::proj_field(attr.as_str()),
+        )),
+        ChlExpr::Lambda { params, body } => lower_lambda(expr.span, params, body, ctx),
+        ChlExpr::UnaryOp { op, operand } => lower_unaryop(*op, operand, ctx),
+        // Ternary `then_expr if cond else else_expr` → Case { [guard → value, true → orelse] }
+        ChlExpr::IfExp {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            let guard = lower_expr(cond, ctx)?;
+            let true_arm = lower_expr(then_expr, ctx)?;
+            let false_arm = lower_expr(else_expr, ctx)?;
+            Ok(Expr::new(TypedExprNode::Case {
+                scrutinee: None,
+                branches: vec![
+                    Branch {
+                        pattern: None,
+                        guard,
+                        body: true_arm,
+                    },
+                    Branch {
+                        pattern: None,
+                        guard: Expr::lit(Lit::Bool(true)),
+                        body: false_arm,
+                    },
+                ],
+            }))
+        }
+        // `target << value` — feed into a deferred output.
+        ChlExpr::Feed { target, value } => lower_feed(target, value, ctx),
+        // `yield e` is only valid in a generator-for body; reject elsewhere.
+        ChlExpr::Yield(_) => Err(LoweringError::unsupported(
+            expr.span,
+            "yield outside a generator for-loop context",
+        )),
+        // Parse-recovery placeholder: silently substitute a CCL placeholder so
+        // we keep lowering the rest of the tree. The parse error itself has
+        // already been reported via [`crate::chl_parser::ParseResult::errors`];
+        // adding a redundant lowering error would just clutter the diagnostic
+        // output. [`crate::ccl::context::compile_program`] guards against this
+        // placeholder ever reaching inference.
+        ChlExpr::Error => Ok(Expr::error()),
+    }
+}
+
+/// Lower a block of CHL statements to a nested CCL expression.
+///
+/// All statements except the last must be simple name assignments
+/// (`x = expr`), annotated assignments (`x: T = expr`), augmented
+/// assignments (`x op= expr`), or function definitions (`def f(...): ...`);
+/// each becomes an [`TypedExprNode::Let`] binding wrapping the rest. Function
+/// definitions are lowered via [`lower_function_body`], which detects
+/// generator functions (single `for`/`yield` body) and regular functions.
+///
+/// The last statement must be a bare expression ([`ChlStmt::Expr`])
+/// or an `if`/`else` block.
+///
+/// When sink bindings are registered during lowering (e.g. from `http_serve`),
+/// the final expression is wrapped so the program ends in
+/// `ExprStmt(<body>, Record{sink: Var(sink), …})`.  The `Record` is the
+/// sink-binding contract; each field is the name that [`crate::ccl::desugar_defers`]
+/// resolves to the computed response morphism.  After `desugar_defers` removes
+/// all `Feed` nodes, `simplify` drops the `ExprStmt`, leaving a clean
+/// `Let* Record{…}` shape for `compile_program`.
+pub fn lower_stmts(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) -> LoweringResult {
+    let mut errors: Vec<LoweringError> = Vec::new();
+    let value = lower_stmts_recovering(stmts, ctx, &mut errors);
+    LoweringResult { value, errors }
+}
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
+    //! Shared test fixtures for the `lower` submodules' inline `mod tests`.
+    use std::{cell::RefCell, rc::Rc};
+
+    use crate::{
+        ccl::{
+            Type,
+            lower::{LoweringContext, LoweringError, lower_stmts},
+        },
+        chl_parser::ast::{Expr as ChlExpr, Spanned, Stmt as ChlStmt},
+        interpreter::DataSourceDomainExtentImpl,
+    };
+
+    /// Parse a CHL expression and return the AST node.
+    pub(crate) fn parse_expr(code: &str) -> Spanned<ChlExpr> {
+        crate::chl_parser::parse_expression(code)
+            .into_result()
+            .expect("Failed to parse expression")
+    }
+
+    /// Create a minimal registered source for tests that only care about name recognition.
+    pub(crate) fn stub_source(name: &str) -> Rc<RefCell<dyn DataSourceDomainExtentImpl>> {
+        use crate::interpreter::{BaseType, Extent, TestDataSource};
+        Rc::new(RefCell::new(TestDataSource::new(
+            name,
+            Type::Base(BaseType::String),
+            Extent::Base(BaseType::String),
+        )))
+    }
+
+    /// Parse a CHL module and return the statement list.
+    pub(crate) fn parse_module(code: &str) -> Vec<Spanned<ChlStmt>> {
+        crate::chl_parser::parse_module(code)
+            .into_result()
+            .expect("Failed to parse module")
+            .body
+    }
+
+    /// Lower `stmts`, expect exactly one lowering error, and return it.
+    ///
+    /// Test-only convenience: most negative-path tests want to check the
+    /// single error they expect against a pattern, so we unpack the `Vec`
+    /// here once instead of at every call site.
+    pub(crate) fn expect_one_lowering_error(stmts: &[Spanned<ChlStmt>]) -> LoweringError {
+        let errs = lower_stmts(stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect_err("expected lowering error");
+        assert_eq!(
+            errs.len(),
+            1,
+            "expected exactly one lowering error, got {}: {errs:?}",
+            errs.len()
+        );
+        errs.into_iter().next().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `yield` without a value is rejected.
+    /// Constructs that CHL deliberately doesn't support. Each used to be
+    /// rejected by lowering (since `rustpython_parser` accepted them all);
+    /// the new CHL parser rejects them at parse time — bare `yield`,
+    /// decorators, and `for/else` because they aren't in the grammar, and
+    /// subscript / attribute assignment targets because `AssignTarget` is
+    /// restricted to bare names and tuple patterns.
+    #[test]
+    fn parser_rejects_constructs_outside_chl_grammar() {
+        let cases: &[&str] = &[
+            // Bare `yield` (no value).
+            "def bad(xs):\n    for x in xs:\n        yield\nbad",
+            // Function decorators.
+            "@some_decorator\ndef f(x):\n    x + 1\nf",
+            // `for/else`.
+            "def bad(xs):\n    for x in xs:\n        yield x\n    else:\n        pass\nbad",
+            // Subscript augmented-assignment target.
+            "x = [1]\nx[0] += 1\nx",
+            // Attribute augmented-assignment target.
+            "x = 0\nx.field += 1\nx",
+        ];
+        for code in cases {
+            let result = crate::chl_parser::parse_module(code);
+            assert!(
+                !result.errors.is_empty(),
+                "expected parse error for:\n{code}"
+            );
+        }
+    }
+}
