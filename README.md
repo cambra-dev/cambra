@@ -13,7 +13,7 @@ Cambra is a programming language that abstracts over low-level concerns like mem
 ```bash
 cargo build          # build
 cargo test           # run tests
-./ci.sh              # full CI suite (fmt + clippy + tests)
+./ci.sh              # full CI suite (fmt + clippy in debug & release + doc + tests)
 ./ci.sh --fix        # same, with auto-formatting
 ```
 

@@ -9,11 +9,14 @@ For architecture and design context, see [docs/design.md](docs/design.md).
 ```bash
 cargo fmt        # Run formatter
 cargo build      # Build the project
-cargo clippy --all-targets -- -D warnings # Run linter (part of the ci script)
-ci.sh --fix      # Runs complete CI suite, auto-formatting first
+cargo clippy --all-targets -- -D warnings            # Lint (debug) — fast inner-loop check, NOT the full gate
+cargo clippy --release --all-targets -- -D warnings  # Lint (release) — CI runs this too; catches debug-only (cfg(debug_assertions)) breakage the debug pass misses
+./ci.sh --fix    # Authoritative gate: fmt + BOTH clippy passes + doc + tests, auto-formatting first. Must pass before pushing a PR.
 cargo test -q --no-fail-fast      # Run all tests
 cargo test <name>  # Run a specific test by name
 ```
+
+CI lints in **both** debug and release (`ci_clippy` and `ci_clippy_release` in `ci.sh`). Passing the plain debug `cargo clippy` is **not** sufficient — a release-only failure (e.g. a `#[cfg(debug_assertions)]`-gated item referenced by ungated code) passes locally but fails GitHub CI. Run `./ci.sh` to catch both.
 
 ## General Instructions
 
@@ -105,7 +108,7 @@ Both `⇒` and `→` are right-associative. They are distinct: `⇒` is for *typ
 Do not render type information as Rust struct syntax (e.g., `Fun { name: Some("k"), domain: K, codomain: ... }`) when prose calls for symbolic notation — the struct form is appropriate inside fenced ` ```rust ` blocks that show actual Rust source, but in symbolic positions use the arrow / refinement-bracket notation above.
 
 ### Workflow
-After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds, then progress to CI.
+After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. **Before creating or pushing a PR, run `./ci.sh` and confirm it is clean** — GitHub CI gates on the same checks, and `./ci.sh` runs the parts no single `cargo` command covers: clippy in *both* debug and release mode plus the doc build. A green debug `cargo clippy` is not enough (see Build Commands above).
 
 When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md`, `docs/plan.md`, and other `*/design-*.md` files close to source files that were changed.
 
@@ -127,6 +130,8 @@ gh api repos/OWNER/REPO/pulls/PR_NUMBER --method PATCH --field body="..." --jq .
 
 ### Stacked PRs with git-spice
 This repo uses [git-spice](https://abhinav.github.io/git-spice/) (`gs`) for stacked PRs. Workflow for creating a new PR in a stack:
+
+> **Before submitting:** run `./ci.sh` and confirm it passes. `gs branch submit` runs no checks of its own, so this is the only gate before GitHub CI sees the branch — and it lints in both debug *and* release (an un-run release clippy pass is the most common way CI fails after a green local `cargo clippy`).
 
 **Option A — git-spice branch creation** (stage changes first, then):
 ```bash
