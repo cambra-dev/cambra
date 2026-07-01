@@ -9,7 +9,7 @@ use crate::ccl::AggregateKind;
 /// Primitive base types shared between the CCL type system and the interpreter.
 ///
 /// Defined here (in `ccl`) and re-exported by the interpreter so that
-/// `ccl` does not depend upward on `interpreter`. See `interpreter/types.rs`.
+/// `ccl` does not depend upward on `interpreter`. See `interpreter/types/`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BaseType {
     /// Signed 64-bit integer.
