@@ -1,0 +1,549 @@
+//! Multi-generator comprehensions / joins, aggregates, group-by, and the
+//! `test_new_compile` symbolic-CCL parity matrix (asserting both the lowered
+//! CCL shape and the runtime tile).
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::time::Duration;
+
+use bit_set::BitSet;
+use bit_vec::BitVec;
+use cambra::ccl::Type;
+use cambra::ccl::context::GlobalContext;
+use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
+use cambra::interpreter::{
+    BaseType, ColumnValue, Extent, Predicate, TestDataSource, Tile, Value,
+    sort_sealed_function_by_domain,
+};
+use rstest_log::rstest;
+
+use crate::helpers::*;
+
+// ---------------------------------------------------------------------------
+// Multi-generator comprehensions / joins
+// ---------------------------------------------------------------------------
+//
+// The join tests check only the `outputs` of the resulting `FunctionBindings`
+// because the input key domain (cross-product indices) is an implementation
+// detail.
+
+// 30s: among the heaviest compiles here; reaches ~9.5s wall on a slow CI VM, so 10s would flake.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case(
+    "[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]",
+    ColumnValue::strings(&["ac", "ad", "ae", "bc", "bd", "be"])
+)]
+#[case(
+    "[x + '_' for x in ['a', 'b'] for y in [True, False]]",
+    ColumnValue::strings(&["a_", "a_", "b_", "b_"])
+)]
+#[case(
+    "[x + z + y for x in ['a', 'b'] for y in ['c', 'd'] for z in ['e', 'f']]",
+    ColumnValue::strings(&["aec", "afc", "aed", "afd", "bec", "bfc", "bed", "bfd"])
+)]
+#[case(
+    "[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'e', 'f'] if x == y]",
+    ColumnValue::strings(&["bb", "cc"])
+)]
+#[case(
+    "[x + y for x in [1, 1] for y in [2, 2, 3] if x + 1 == y]",
+    ColumnValue::Ints(vec![3, 3, 3, 3])
+)]
+#[case(
+    "[x for x in [y for y in ['a', 'b', 'c', 'd'] if y != 'b'] if x < 'c']",
+    ColumnValue::strings(&["a"])
+)]
+#[case(
+    "[x + y for x in ['a', 'b', 'c'] for y in ['b', 'c', 'd'] if x < y]",
+    ColumnValue::strings(&["ab", "ac", "ad", "bc", "bd", "cd"])
+)]
+#[case(
+    "[x + y for x in ['a', 'b'] for y in ['c', 'd'] if x == y]",
+    ColumnValue::strings(&[])
+)]
+#[case(
+    "[x + y + z for x in ['a', 'b'] for y in ['b', 'c'] for z in ['b', 'c'] if x != y if y == z]",
+    ColumnValue::strings(&["abb", "acc", "bcc"])
+)]
+#[case(
+    "[x + y for x in ['a', 'b', 'c'] for y in ['a', 'b', 'c'] if x == y if x < 'c']",
+    ColumnValue::strings(&["aa", "bb"])
+)]
+#[case(
+    "y = 'b'; [x for x in ['a', 'b', 'c'] for z in ['b', 'c'] if x == y]",
+    ColumnValue::strings(&["b", "b"])
+)]
+#[case(
+    "[a + b
+        for a in [c + d for c in ['a'] for d in ['b', 'c'] if c < d]
+        for b in [e + f for e in ['d', 'e'] for f in ['f'] if e < f]
+    if a != b]",
+    ColumnValue::strings(&["abdf", "abef", "acdf", "acef"])
+)]
+#[case(
+    "a = [1,2]; b = [10, 20]; [x + y for x in a for y in b]",
+    ColumnValue::Ints(vec![11, 21, 12, 22])
+)]
+#[case(
+    "a = [1,2]; b = [10, 20]; [x + y for x in a for y in b if x == y // 10]",
+    ColumnValue::Ints(vec![11, 22])
+)]
+// Probe for a suspicious `zip`-substitution in the optimizer that
+// `case_27` of `test_new_compile` (above) hinted at: under simple-sub's
+// tighter types, the optimizer rewrote a `cross × filter[a==b]` shape
+// into `(.0, .1) ▷ zip`. That happens to be sound when the two
+// iterables align element-wise, but `[1, 3] × [1, 2, 3] if a == b`
+// breaks that alignment — the only equal pairs are `(1, 1)` and
+// `(3, 3)`, so the correct answer is `[2, 6]`, not `zip`'s
+// `[(1,1), (3,2)] ▷ filter → [(1,1)] → [2]`.
+#[case(
+    "[a + b for a in [1, 3] for b in [1, 2, 3] if a == b]",
+    ColumnValue::Ints(vec![2, 6])
+)]
+fn test_joins(#[case] code: &str, #[case] expected: ColumnValue) {
+    let result = sort_sealed_function_by_domain(run_pipeline(code));
+    match result {
+        Tile::SealedFunction { codomain, .. } => {
+            assert_eq!(scalar_tile_to_column_value(*codomain), expected);
+        }
+        other => panic!("expected FunctionBindings, got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregates
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case("sum([1,2,3])", Value::Int(6))]
+#[case("max([x + 1 for x in [1,2,3]])", Value::Int(4))]
+#[case("max([x + sum([1,2,3]) for x in [1,2,3]])", Value::Int(9))]
+fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Groupby
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case(
+    "[sum(x) for x in groupby([2,3,4,5], lambda x: x // 2)]",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![1, 2]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 9]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], lambda x: x // 2)]",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![6, 7]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![25, 29]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
+    check_tile(code, expected);
+}
+// 30s: among the heaviest compiles here; like `test_joins`, reaches ~9.5s wall on a slow CI VM.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case("1", "1:Int", Tile::Scalar(ColumnValue::Ints(vec![1])))]
+#[case("1 + 2", "(1, 2) ▷ add:Int", Tile::Scalar(ColumnValue::Ints(vec![3])))]
+#[case(
+    "1 + 2 - 3 * 4",
+    "((1, 2) ▷ add, (3, 4) ▷ mul) ▷ sub:Int",
+    Tile::Scalar(ColumnValue::Ints(vec![-9]))
+)]
+#[case(
+    "[1,2,3]",
+    "iterate ≫ [1, 2, 3]:([0, 2] ⇒ Int)",
+    make_int_list(&[1,2,3])
+)]
+#[case(
+    "x = [1,2,3]; x",
+    "let x : ([0, 2] ⇒ Int) = iterate ≫ [1, 2, 3]\nin x:([0, 2] ⇒ Int)",
+    make_int_list(&[1,2,3])
+)]
+#[case(
+    "x = [1,2,3]; [y + 10 for y in x]",
+    "let x : ([0, 2] ⇒ Int) = iterate ≫ [1, 2, 3]\nin x ≫ (id, 10 ▷ const) ▷ zip ≫ add:([0, 2] ⇒ Int)",
+    make_int_list(&[11,12,13])
+)]
+#[case(
+    "[x + 10 + x for x in [1,2,3]]",
+    "iterate ≫ [1, 2, 3] ≫ ((id, 10 ▷ const) ▷ zip ≫ add, id) ▷ zip ≫ add:([0, 2] ⇒ Int)",
+    make_int_list(&[12,14,16])
+)]
+#[case(
+    "y = 10; [x + y for x in [1,2,3]]",
+    "let y : Int = 10\nin iterate ≫ [1, 2, 3] ≫ (id, y ▷ const) ▷ zip ≫ add:([0, 2] ⇒ Int)",
+    make_int_list(&[11,12,13])
+)]
+#[case(
+    "[x for x in [False,True] if x]",
+    "iterate ▷ ([false, true] ▷ restrict) ≫ cast([false, true]):({[0, 1] | __elem ▷ [false, true]} ⇒ Bool)",
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![1]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Bools(BitVec::from_elem(1, true)))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    },
+)]
+#[case(
+    "[x + 10 for x in [1,2,3] if x == 2]",
+    "iterate ▷ (([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq) ▷ restrict) ≫ cast([1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add):({[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq)} ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![1]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![12]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    },
+)]
+#[case(
+    "[x + y for x in [1,2,3] for y in [10,20]]",
+    "iterate ≫ (.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:(([0, 2], [0, 1]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![11, 21, 12, 22, 13, 23]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[(x, y) for x in [1,2,3] for y in [10,20]]",
+    "iterate ≫ (.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip:(([0, 2], [0, 1]) ⇒ (Int, Int))",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1])),
+        ])),
+        codomain: Box::new( Tile::Record(HashMap::from([
+            ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 20, 10, 20, 10, 20]))),
+            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 2, 3, 3]))),
+        ]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x for x in [1,2,3] for y in [10,20]]",
+    "iterate ≫ .0 ≫ [1, 2, 3]:(([0, 2], [0, 1]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 0, 1, 0, 1])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 2, 3, 3]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y for x in [1,2,3] if x == 2 for y in [10,20] if y == 10]",
+    "iterate ▷ ((((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add):({([0, 2], [0, 1]) | __elem ▷ (((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and)} ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![1])),
+            ("_1".into(), ColumnValue::UInts(vec![0])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![12]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x for x in [x for x in [x for x in [1,2,3]]]]",
+    "iterate ≫ [1, 2, 3]:([0, 2] ⇒ Int)",
+    make_int_list(&[1,2,3])
+)]
+#[case(
+    "[x for x in [y for y in [1,2,3] if y < 3] if x < 2]",
+    "iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(cast([1, 2, 3])):({{[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} | __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⇒ Int)",
+    make_int_list(&[1])
+)]
+#[case(
+    "[(x, x) for x in [(x, x) for x in [1,2,3]]]",
+    "iterate ≫ [1, 2, 3] ≫ (id, id) ▷ zip ≫ (id, id) ▷ zip:([0, 2] ⇒ ((Int, Int), (Int, Int)))",
+    Tile::SealedFunction {
+        domain: ColumnValue::UInts(vec![0, 1, 2]),
+        codomain: Box::new(Tile::Record(HashMap::from([
+            ("_1".into(), Tile::Record(HashMap::from([
+                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+                ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            ]))),
+            ("_0".into(), Tile::Record(HashMap::from([
+                ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+                ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            ]))),
+        ]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]",
+    "iterate ≫ (.0 ≫ [\"a\", \"b\"], .1 ≫ [\"c\", \"d\", \"e\"]) ▷ zip ≫ concat:(([0, 1], [0, 2]) ⇒ String)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0, 0, 0, 1, 1, 1])),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1, 2, 0, 1, 2])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::strings(&["ac", "ad", "ae", "bc", "bd", "be"]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + 10 for x in testsource1() if x < 15]",
+    "iterate ▷ ((source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add):({source(testsource1) | __elem ▷ (source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt)} ⇒ Int)",
+    make_int_list(&[10, 20])
+)]
+#[case("sum([1,2,3])", "(iterate ≫ [1, 2, 3]) ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]
+#[case(
+    "[sum(x) for x in groupby([1,2,3,4], lambda y: y // 2)]",
+    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:(Int ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Ints(vec![0, 1, 2]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    })]
+#[case(
+    "[x + y for x in [1,2,3] for y in [2,3,4,5] if x == y]",
+    "(iterate ≫ [1, 2, 3] ≫ (iterate ≫ [2, 3, 4, 5]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add):(([0, 2], [0, 3]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![1, 2])),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y for x in [1,2,3] for y in [2,3,4,5] if y == x]",
+    "(iterate ≫ [1, 2, 3] ≫ (iterate ≫ [2, 3, 4, 5]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add):(([0, 2], [0, 3]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![1, 2])),
+            ("_1".into(), ColumnValue::UInts(vec![0, 1])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![4, 6]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y + 1 for x in [1,2,3] for y in [2,3,4,5] if y - 2 == x + 2]",
+    "(iterate ≫ ([1, 2, 3], 2 ▷ const) ▷ zip ≫ add ≫ (iterate ≫ ([2, 3, 4, 5], 2 ▷ const) ▷ zip ≫ sub) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast(((.0 ≫ [1, 2, 3], .1 ≫ [2, 3, 4, 5]) ▷ zip ≫ add, 1 ▷ const) ▷ zip ≫ add):(([0, 2], [0, 3]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_1".into(), ColumnValue::UInts(vec![3])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == y and y == z]",
+    "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_1".into(), ColumnValue::UInts(vec![0])),
+            ("_2".into(), ColumnValue::UInts(vec![0])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+            ("_2".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+// x==z precedes y==z, so BFS visits z (arm 2) before y (arm 1), producing arm_order=[0,2,1].
+// The permute_domain step in convert_loop_join restores canonical domain order.
+#[case(
+    "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z]",
+    "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2, 3] ≫ (iterate ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_1".into(), ColumnValue::UInts(vec![0])),
+            ("_2".into(), ColumnValue::UInts(vec![0])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+            ("_2".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y for x in [2] for y in [a + b for a in [1, 2] for b in [1, 2, 3] if a == b] if x == y]",
+    "(iterate ≫ [2] ≫ ((iterate ≫ [1, 2] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ converse) ▷ uncurry ▷ map_domain ≫ cast((.0 ≫ [2], .1 ≫ cast((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ add)) ▷ zip ≫ add):(([0, 0], {([0, 1], [0, 2]) | __elem ▷ ((.0 ≫ [1, 2], .1 ≫ [1, 2, 3]) ▷ zip ≫ eq)}) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_1".into(), ColumnValue::Records(HashMap::from([
+                ("_0".into(), ColumnValue::UInts(vec![0])),
+                ("_1".into(), ColumnValue::UInts(vec![0])),
+            ]))),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![4]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and x + 1 == y]",
+    "((iterate ≫ [1] ≫ (iterate ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .1 ≫ [1, 2, 3] ≫ (iterate ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ ([0] ▷ flatten_domain) ▷ map_domain ▷ (((.0 ≫ ([1], 1 ▷ const) ▷ zip ≫ add, .2 ≫ [1, 2]) ▷ zip ≫ eq) ▷ restrict) ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![])),
+            ("_1".into(), ColumnValue::UInts(vec![])),
+            ("_2".into(), ColumnValue::UInts(vec![])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+            ("_2".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and y < 2]",
+    "(iterate ≫ [1] ≫ ((iterate ≫ [1, 2, 3] ≫ (iterate ▷ ((([1, 2], 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ [1, 2]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [1, 2, 3]) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ▷ ([0, 2, 1] ▷ permute_domain) ▷ map_domain ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):(([0, 0], [0, 1], [0, 2]) ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_1".into(), ColumnValue::UInts(vec![0])),
+            ("_2".into(), ColumnValue::UInts(vec![0])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+            ("_2".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+#[case(
+    "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and x + y == z + 1]",
+    "iterate ▷ (((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ ((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and)} ⇒ Int)",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0])),
+            ("_1".into(), ColumnValue::UInts(vec![0])),
+            ("_2".into(), ColumnValue::UInts(vec![0])),
+        ])),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![3]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+            ("_2".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+/// Join where `y` acts as a lookup table connecting `x`-values to `z`-values via projections.
+///
+/// Verifies that multi-site tuple-element projection constraints (`y[0]` and `y[1]`)
+/// are correctly inferred: `y` acquires type `Tuple([Int, Int])` from the list element type,
+/// enabling both projections to type-check as `Int`.
+#[case(
+    "[(x , z) for x in [1,2,3] for y in [(3, 30), (2, 20), (1, 10)] for z in [20, 10, 30] if z == y[1] and y[0] == x]",
+    "(iterate ≫ [1, 2, 3] ≫ ((iterate ≫ [(3, 30), (2, 20), (1, 10)] ≫ .1 ≫ (iterate ≫ [20, 10, 30]) ▷ converse) ▷ uncurry ▷ map_domain ≫ .0 ≫ [(3, 30), (2, 20), (1, 10)] ≫ .0) ▷ converse) ▷ uncurry ▷ ([1] ▷ flatten_domain) ▷ map_domain ≫ cast((.0 ≫ [1, 2, 3], .2 ≫ [20, 10, 30]) ▷ zip):(([0, 2], [0, 2], [0, 2]) ⇒ (Int, Int))",
+    Tile::SealedFunction {
+        domain: ColumnValue::Records(HashMap::from([
+            ("_0".into(), ColumnValue::UInts(vec![0, 1, 2])),
+            ("_1".into(), ColumnValue::UInts(vec![2, 1, 0])),
+            ("_2".into(), ColumnValue::UInts(vec![1, 0, 2])),
+        ])),
+        codomain: Box::new(Tile::Record(HashMap::from([
+            ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
+        ]))),
+        domain_predicate: Predicate::Record(HashMap::from([
+            ("_0".into(), Predicate::True),
+            ("_1".into(), Predicate::True),
+            ("_2".into(), Predicate::True),
+        ])),
+        deleted: BitSet::new(),
+    }
+)]
+fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expected_result: Tile) {
+    use cambra::ccl::symbolic::symbolic;
+
+    let mut ctx = GlobalContext::default();
+
+    // Register testsource1 for source-based test cases.
+    let data_source = Rc::new(RefCell::new(TestDataSource::new(
+        "testsource1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    data_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(0)),
+        (Value::UInt(1), Value::Int(10)),
+        (Value::UInt(2), Value::Int(20)),
+    ]);
+    data_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.register_source(data_source);
+
+    let (expr, result) = run_pipeline_with_ctx(&mut ctx, code);
+    assert_eq!(format!("{}:{}", symbolic(&expr), expr.ty), expected_ccl);
+    assert_eq!(
+        sort_sealed_function_by_domain(result),
+        sort_sealed_function_by_domain(expected_result)
+    );
+}
