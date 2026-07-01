@@ -62,14 +62,6 @@ impl TestDataSource {
         self.has_data = true;
     }
 
-    pub fn output_extent(&self) -> Extent {
-        self.output_extent.clone()
-    }
-
-    pub fn output_type(&self) -> Type {
-        self.output_type.clone()
-    }
-
     /// Returns a predicate corresponding to the data that has been entirely released from the source.
     pub fn get_released_predicate(&self) -> Predicate {
         let mut result = Predicate::True;

@@ -21,11 +21,6 @@ impl Scheduler {
         Self::default()
     }
 
-    /// Use when the scheduler will be intentionally unused.
-    pub fn noop() -> Self {
-        Self::default()
-    }
-
     pub fn add_source_handle(
         &mut self,
         handle: Rc<RefCell<dyn DataSourceDomainExtentImpl>>,
