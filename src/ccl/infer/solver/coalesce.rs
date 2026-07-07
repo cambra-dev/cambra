@@ -95,6 +95,16 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
 }
 
 fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, CoalesceError> {
+    // Transparent read at joins: a feed handle meeting *non-feed*
+    // contributions at one position is being read — `x + 1` joins x's
+    // payload with `Int` through a shared join variable, so the handle
+    // dissolves into its payload before the contribution count below
+    // (otherwise `feed(Int)` and `Int` would spuriously collide). A feed
+    // handle alone at a position keeps its constructor; so do two handles
+    // meeting (their `chan` slots merged upstream). This is the
+    // join-variable counterpart of `constrain_go`'s direct
+    // `Feed(a) <: T ⇒ a <: T` rule.
+    let ct = &dissolve_read_feeds(ct.clone(), polarity);
     // Count concrete (non-variable) contributions to pick the output
     // type. With multiple distinct contributions, we would need
     // a Union/Intersection — we error instead.
@@ -121,6 +131,17 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
             name: kept_name,
             domain: Box::new(d),
             codomain: Box::new(c),
+        });
+    }
+    if let Some(chan) = &ct.chan {
+        shapes.push(Type::Feed(Box::new(coalesce_compact_go(chan, polarity)?)));
+    }
+    if let Some((value, domain)) = &ct.mut_slot {
+        // Both children materialize at the same polarity, mirroring `chan`
+        // (invariant — both directions were resolved at constraint time).
+        shapes.push(Type::Mut {
+            value: Box::new(coalesce_compact_go(value, polarity)?),
+            domain: Box::new(coalesce_compact_go(domain, polarity)?),
         });
     }
 
@@ -161,6 +182,23 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         .iter()
         .fold(inner, |acc, r| Type::Refinement(Box::new(acc), r.clone()));
     Ok(out)
+}
+
+/// Dissolve a position's `chan` slot into its other contributions when both
+/// are present — see the transparent-read comment in [`coalesce_compact_go`].
+/// Loops because a dissolved payload may itself carry a feed handle alongside
+/// other content (a chained defer read through a join).
+fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
+    while let Some(chan) = ct.chan.take() {
+        let has_other =
+            !ct.atoms.is_empty() || ct.rec.is_some() || ct.var.is_some() || ct.fun.is_some();
+        if !has_other {
+            ct.chan = Some(chan);
+            break;
+        }
+        ct = CompactType::merge(polarity, ct, *chan);
+    }
+    ct
 }
 
 /// Materialize a variant-tag map into [`Type::Variant`], preserving tag

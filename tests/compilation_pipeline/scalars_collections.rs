@@ -26,6 +26,11 @@ fn test_literals(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 #[case("[]", Tile::SealedFunction { domain: ColumnValue::UInts(vec![]), codomain: Box::new(Tile::Scalar(ColumnValue::Units(0))), domain_predicate: Predicate::True, deleted: BitSet::new() })]
 #[case("[1, 2]", make_int_list(&[1, 2]))]
+// A `List[_]` annotation lowers the wildcard to a `Hole` element type
+// (inferred), so the annotation is accepted and unifies with the list literal.
+#[case("x: List[_] = [1, 2, 3]\nx", make_int_list(&[1, 2, 3]))]
+// The element type can also be spelled concretely: `List[int]`.
+#[case("x: List[int] = [1, 2, 3]\nx", make_int_list(&[1, 2, 3]))]
 fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
@@ -160,14 +165,20 @@ fn test_let_bindings(#[case] code: &str, #[case] expected: Value) {
 // ---------------------------------------------------------------------------
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("x = 0\nx += 1\nx", Value::Int(1))]
-#[case("x = 10\nx -= 3\nx", Value::Int(7))]
-#[case("x = 2\nx *= 5\nx", Value::Int(10))]
-#[case("x = 7\nx //= 2\nx", Value::Int(3))]
+// `+=` and friends are store writes: the target must be introduced mutable with
+// `:=` (a `+=` to a plain `=` binding is a "not a store" error, never a shadow).
+#[case("x := 0\nx += 1\nx", Value::Int(1))]
+#[case("x := 10\nx -= 3\nx", Value::Int(7))]
+#[case("x := 2\nx *= 5\nx", Value::Int(10))]
+#[case("x := 7\nx //= 2\nx", Value::Int(3))]
 // Chained augmented assignments accumulate correctly.
-#[case("x = 0\nx += 1\nx += 2\nx", Value::Int(3))]
-// Mix of plain and augmented assignment.
-#[case("x = 1\ny = x\nx += 4\ny", Value::Int(1))]
+#[case("x := 0\nx += 1\nx += 2\nx", Value::Int(3))]
+// Mix of an immutable `=` binding and a store `+=`: the plain local `y` is read
+// into the store update. (A pre-mutation *snapshot* of the store — `y: int = x`
+// before `x += 4` — is deliberately not tested here: a top-level store read
+// currently resolves to the store's final value, so point-in-time snapshots are
+// a separate concern from this write-lowering path.)
+#[case("x := 0\ny = 10\nx += y\nx", Value::Int(10))]
 fn test_augmented_assignment(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

@@ -8,9 +8,28 @@ use std::collections::HashSet;
 
 use super::*;
 use crate::{
-    ccl::{Expr, Name, Type},
+    ccl::{Expr, Name, Type, TypedExprNode},
     chl_parser::ast::{Param, Span, Spanned},
 };
+
+/// If `param` is annotated `Mut[V]` (a pass-by-reference store parameter),
+/// return the store type `Mut[V, D]` with an inferred sequencing domain
+/// (`D = Hole` → a fresh inference variable, generalized per call site so one
+/// `def bump(c: Mut[Int])` serves an induction accumulator whose domain is the
+/// loop it runs over). Returns `None` for any non-`Mut` annotation (or an
+/// unannotated parameter). Mirrors the `Mut[…]` stamping of an induction
+/// introduction (`lower/stmts.rs :: mut_annotation_value_type`).
+fn mut_param_store_type(param: &Param) -> Option<Result<Type, LoweringError>> {
+    let annotation = param.annotation.as_ref()?;
+    match mut_annotation_value_type(annotation) {
+        Some(Ok(value)) => Some(Ok(Type::Mut {
+            value: Box::new(value),
+            domain: Box::new(Type::Hole),
+        })),
+        Some(Err(e)) => Some(Err(e)),
+        None => None,
+    }
+}
 
 /// Validate that the function or lambda has at least one parameter.
 ///
@@ -26,6 +45,25 @@ pub(super) fn validate_function_params(
         return Err(LoweringError::unsupported(
             fn_span,
             "function/lambda with no parameters not supported",
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a multi-parameter function/lambda carrying any `Mut` (pass-by-reference)
+/// parameter. Single-parameter pass-by-reference works on this branch; the
+/// multi-parameter case (`def transfer(src: Mut[_], dst: Mut[_], amt)`) lands
+/// with the transaction work, where a `Mut` param is lowered as a *named*
+/// curried binder. A `Mut` param must be a named binder because inlining renames
+/// the callee's `MutWrite` target to the caller's store, and a tuple projection
+/// (the uncurried multi-arg encoding) is not a `Name` — so silently uncurrying a
+/// `Mut` param would drop the callee's store writes. Reject rather than mislower.
+fn reject_multiparam_mut(span: Span, params: &[Param]) -> Result<(), LoweringError> {
+    if params.len() > 1 && params.iter().any(|p| mut_param_store_type(p).is_some()) {
+        return Err(LoweringError::unsupported(
+            span,
+            "multi-parameter pass-by-reference (a `Mut` parameter alongside other \
+             parameters) is not supported yet",
         ));
     }
     Ok(())
@@ -63,10 +101,36 @@ pub(super) fn validate_function_params(
 /// `lambda x, y: …` and `def f(x, y): …` pair with [`lower_call`]'s
 /// tupled-argument shape and never emit a curried `Expr::Lambda` chain that
 /// `lambda_elim` would fold into an unsupported `curry(body)`.
-pub(super) fn uncurry_params(params: &[Param], body_expr: Expr, ctx: &mut LoweringContext) -> Expr {
+pub(super) fn uncurry_params(
+    span: Span,
+    params: &[Param],
+    body_expr: Expr,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
     if params.len() == 1 {
-        return Expr::lambda(params[0].name.as_str(), Type::Hole, body_expr);
+        // A `Mut[…]`-annotated single parameter is a pass-by-reference store:
+        // bind it at `Mut[V, D]` so body references carry `Mut` (reads deref,
+        // writes lower to `MutWrite`) and inference generalizes its domain per
+        // call site. The annotation rides `user_annotation` too, so the
+        // discipline check's rule 3 (no *unannotated* `Mut` binding) treats it
+        // as the deliberate declaration it is. Non-`Mut` params stay `Hole`
+        // (inferred), as before. Multi-arg pass-by-ref lands with transactions.
+        let param_ty = match mut_param_store_type(&params[0]) {
+            Some(Ok(mut_ty)) => mut_ty,
+            _ => Type::Hole,
+        };
+        let mut lam = Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr);
+        if matches!(param_ty, Type::Mut { .. })
+            && let TypedExprNode::Lambda { param, .. } = &mut lam.node
+        {
+            param.user_annotation = Some(param_ty);
+        }
+        return Ok(lam);
     }
+    // Backstop for the lambda path (`lower_lambda`), whose body is an
+    // expression and so lowers without tripping `lower_function_body`'s early
+    // reject; a `def` is already rejected before its body is lowered.
+    reject_multiparam_mut(span, params)?;
     // Mint the tuple name after `body_expr` is lowered so that inner
     // multi-arg lambdas (which bump the counter during body lowering)
     // receive strictly smaller ids than the outer lambda. Together with
@@ -79,7 +143,7 @@ pub(super) fn uncurry_params(params: &[Param], body_expr: Expr, ctx: &mut Loweri
         let proj = Expr::apply(Expr::var(&tuple_name), Expr::proj_index(i));
         substitute_param_in_body(acc, &Name::raw(arg.name.as_str()), &proj)
     });
-    Expr::lambda(&tuple_name, Type::Hole, body_with_subs)
+    Ok(Expr::lambda(&tuple_name, Type::Hole, body_with_subs))
 }
 
 /// Lower a CHL lambda expression to an [`Expr::Lambda`] via
@@ -100,8 +164,13 @@ pub(super) fn lower_lambda(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     validate_function_params(lambda_span, params)?;
+    // No store book-keeping here: store-ness is the parameter's *type*. A
+    // parameter spelled like an outer store is a distinct binding with its own
+    // (non-`Mut`) type, so a body write to it is rejected by the post-inference
+    // check, not silently absorbed. `uncurry_params` stamps a `Mut[…]`-annotated
+    // parameter's `Mut` type.
     let body_expr = lower_expr(body, ctx)?;
-    Ok(uncurry_params(params, body_expr, ctx))
+    uncurry_params(lambda_span, params, body_expr, ctx)
 }
 
 /// Replace every free occurrence of `Var(name)` in `expr` with `replacement`,
@@ -140,11 +209,30 @@ pub(super) fn lower_function_body(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     validate_function_params(fn_span, params)?;
+    // A `Mut` parameter alongside others (multi-param pass-by-reference) is not
+    // supported on this branch — reject *before* lowering the body, so the error
+    // names the real limitation rather than a downstream "last statement must be
+    // a bare expression" symptom from the store write failing to be a `MutWrite`.
+    reject_multiparam_mut(fn_span, params)?;
+    // Surface a malformed `Mut[…]` parameter annotation eagerly: `uncurry_params`
+    // (which stamps a pass-by-reference parameter's `Mut` type from its
+    // annotation) treats a non-`Mut`/`Err` annotation as an inferred hole, so
+    // without this the malformed-annotation error would be swallowed.
+    for p in params {
+        if let Some(Err(e)) = mut_param_store_type(p) {
+            return Err(e);
+        }
+    }
     let outer_bindings: HashSet<String> =
         params.iter().map(|p| p.name.as_str().to_string()).collect();
-    // http_serve is not permitted inside function bodies.
-    let body_expr = lower_stmts_inner(body, &outer_bindings, ctx, false)?;
-    Ok(uncurry_params(params, body_expr, ctx))
+
+    // No store book-keeping: store-ness is a parameter's *type* (a `Mut[…]`
+    // annotation, stamped by `uncurry_params`), known post-inference. A plain
+    // parameter spelled like an outer store is a distinct binding with its own
+    // non-`Mut` type, so a body write to it is rejected by the check rather than
+    // masked here. http_serve is not permitted inside function bodies.
+    let body_result = lower_stmts_inner(body, &outer_bindings, ctx, false)?;
+    uncurry_params(fn_span, params, body_result, ctx)
 }
 
 #[cfg(test)]

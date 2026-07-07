@@ -139,6 +139,16 @@ pub fn freshen_above(
                 .map(|(k, t)| (k.clone(), freshen_above(lim, t, target, cache)))
                 .collect(),
         ),
+        // Freshening is polarity-free (it copies structure, not constraints),
+        // so the invariant payload recurses like any other position.
+        Type::Feed(payload) => Type::Feed(Box::new(freshen_above(lim, payload, target, cache))),
+        // Both children recurse (mirror `Fun`): freshening the `domain` is
+        // what lets a `Mut` param's fresh domain var generalize, so each call
+        // site instantiates its own domain (induction index vs. `Txn`).
+        Type::Mut { value, domain } => Type::Mut {
+            value: Box::new(freshen_above(lim, value, target, cache)),
+            domain: Box::new(freshen_above(lim, domain, target, cache)),
+        },
         Type::Refinement(inner, r) => Type::Refinement(
             Box::new(freshen_above(lim, inner, target, cache)),
             // Faithfully freshen the predicate's own type slots through the same
@@ -260,6 +270,14 @@ pub fn freshen_expr_type_slots(
             for p in params.iter_mut() {
                 p.ty = freshen_above(lim, &p.ty, target, cache);
             }
+        }
+        TypedExprNode::LetRec { bindings, .. } => {
+            for (b, _) in bindings.iter_mut() {
+                b.ty = freshen_above(lim, &b.ty, target, cache);
+            }
+        }
+        TypedExprNode::For { target: t, .. } => {
+            t.ty = freshen_above(lim, &t.ty, target, cache);
         }
         _ => {}
     }

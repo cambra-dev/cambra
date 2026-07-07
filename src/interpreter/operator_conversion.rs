@@ -688,6 +688,24 @@ fn convert_impl(
             Ok(Box::new(ExtractLast::new(stream_op, default_op)))
         }
 
+        // `GetPrevSeq` is a letrec guard accessor, never compiled directly:
+        // pattern recognition (a `get_prev_seq`-guarded self-cycle → the
+        // `Recurse` engine) consumes it before op-conversion. Reaching this
+        // arm means a `LetRec` group escaped recognition — a compiler bug,
+        // reported explicitly rather than falling through to the generic
+        // Apply arm. Recognition lands with the unified phase
+        // (`src/ccl/design-mut-txn-feed.md`).
+        TypedExprNode::Apply { function, .. }
+            if as_builtin(function) == Some(Builtin::GetPrevSeq) =>
+        {
+            Err(ConversionError::Unsupported(
+                "get_prev_seq reached operator conversion — letrec pattern \
+                 recognition (the unified phase, src/ccl/design-mut-txn-feed.md) \
+                 must consume it before this pass"
+                    .into(),
+            ))
+        }
+
         TypedExprNode::Apply { function, argument } if is_applied_flatten_domain(function) => {
             expect_no_input(input, "flatten_domain")?;
             convert_flatten_domain(function, argument, ctx)
@@ -902,6 +920,19 @@ fn convert_impl(
             // would.)
             Ok(loop_op)
         }
+
+        // A raw `LetRec` never compiles directly: op-conversion *recognizes
+        // patterns* in the group (a `get_prev_seq`-guarded self-cycle → the
+        // `Recurse` engine, commit-record shapes → the commit operator) and
+        // an unrecognized group is a compile error, never a silent fallback.
+        // Recognition lands with the unified phase
+        // (`src/ccl/design-mut-txn-feed.md`).
+        TypedExprNode::LetRec { .. } => Err(ConversionError::Unsupported(
+            "LetRec reached operator conversion without pattern recognition — \
+             the unified phase and its recognizers \
+             (src/ccl/design-mut-txn-feed.md) land in a later step"
+                .into(),
+        )),
 
         other => Err(ConversionError::Unsupported(format!(
             "CCL node {other:?} is not yet supported in operator_conversion"

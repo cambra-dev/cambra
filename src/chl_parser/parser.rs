@@ -881,11 +881,29 @@ where
                 just(Token::Eq)
                     .ignore_then(expr.clone())
                     .map(AssignTail::Plain),
+                // `: ty = value` (immutable) or `: ty := value` (mutable): parse
+                // the annotation, then branch on the assignment operator.
                 just(Token::Colon)
                     .ignore_then(expr.clone())
-                    .then_ignore(just(Token::Eq))
-                    .then(expr.clone())
-                    .map(|(ann, val)| AssignTail::Annotated(ann, val)),
+                    .then(choice((
+                        just(Token::Eq)
+                            .ignore_then(expr.clone())
+                            .map(|v| (false, v)),
+                        just(Token::ColonEq)
+                            .ignore_then(expr.clone())
+                            .map(|v| (true, v)),
+                    )))
+                    .map(|(ann, (mutable, val))| {
+                        if mutable {
+                            AssignTail::MutAnnotated(ann, val)
+                        } else {
+                            AssignTail::Annotated(ann, val)
+                        }
+                    }),
+                // `:= value` — a bare mutable assignment (no annotation).
+                just(Token::ColonEq)
+                    .ignore_then(expr.clone())
+                    .map(AssignTail::MutPlain),
                 aug_op
                     .then(expr.clone())
                     .map(|(op, val)| AssignTail::Aug(op, val)),
@@ -912,6 +930,16 @@ where
                     AssignTail::Annotated(ann, val) => Stmt::AnnAssign {
                         target: to_target(target)?,
                         annotation: ann,
+                        value: val,
+                    },
+                    AssignTail::MutPlain(value) => Stmt::MutAssign {
+                        target: to_target(target)?,
+                        annotation: None,
+                        value,
+                    },
+                    AssignTail::MutAnnotated(ann, val) => Stmt::MutAssign {
+                        target: to_target(target)?,
+                        annotation: Some(ann),
                         value: val,
                     },
                     AssignTail::Aug(op, val) => Stmt::AugAssign {
@@ -994,6 +1022,11 @@ where
 enum AssignTail {
     Plain(Spanned<Expr>),
     Annotated(Spanned<Expr>, Spanned<Expr>),
+    /// `:= value` — a bare mutable assignment (`MutAssign` with no annotation).
+    MutPlain(Spanned<Expr>),
+    /// `: ty := value` — an annotated mutable assignment (`MutAssign` carrying
+    /// the annotation, e.g. `Mut[V, Txn]`).
+    MutAnnotated(Spanned<Expr>, Spanned<Expr>),
     Aug(AugOp, Spanned<Expr>),
     Define(Spanned<Expr>),
     None,
@@ -1234,6 +1267,42 @@ mod tests {
     fn annotated_assignment() {
         let m = parse_m("x: int = 1\n");
         assert!(matches!(m.body[0].node, Stmt::AnnAssign { .. }));
+    }
+
+    #[test]
+    fn mutable_assignment_bare() {
+        // `x := 0` — a bare mutable assignment, no annotation.
+        let m = parse_m("x := 0\n");
+        assert!(matches!(
+            m.body[0].node,
+            Stmt::MutAssign {
+                annotation: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mutable_assignment_annotated() {
+        // `x: Mut[int] := 0` — the annotation still rides `:=` (carrying the
+        // value type / domain), it's just no longer required to signal
+        // mutability. (Two-arg `Mut[int, Txn]` is a transactional/top-PR form.)
+        let m = parse_m("x: Mut[int] := 0\n");
+        assert!(matches!(
+            m.body[0].node,
+            Stmt::MutAssign {
+                annotation: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn mutable_write_is_mut_assign_not_plain() {
+        // A subsequent `x := x + 1` is a `MutAssign`, distinct from a plain `=`
+        // rebinding — the syntactic signal lowering keys on.
+        let m = parse_m("x := x + 1\n");
+        assert!(matches!(m.body[0].node, Stmt::MutAssign { .. }));
     }
 
     #[test]

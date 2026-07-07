@@ -119,8 +119,11 @@ impl Uniquifier {
                 }
             }
 
-            // The target name is a use of the defer-handle binder.
-            TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
+            // The target name is a use of the defer-handle binder
+            // (Feed/Define) or of the mutable variable's `let` (MutWrite).
+            TypedExprNode::Feed { name, value }
+            | TypedExprNode::Define { name, value }
+            | TypedExprNode::MutWrite { name, value } => {
                 if let Some(m) = self.resolve(name) {
                     *name = m;
                 }
@@ -130,6 +133,16 @@ impl Uniquifier {
             TypedExprNode::Lambda { param, body } => {
                 self.binding_tys(param);
                 let base = self.bind(param);
+                self.expr(body);
+                self.unbind(base);
+            }
+
+            // The loop target binds only in the body; the source sees the
+            // outer scope.
+            TypedExprNode::For { target, iter, body } => {
+                self.expr(iter);
+                self.binding_tys(target);
+                let base = self.bind(target);
                 self.expr(body);
                 self.unbind(base);
             }
@@ -165,6 +178,26 @@ impl Uniquifier {
                     })
                     .collect();
                 self.expr(loop_body);
+                for base in bases.into_iter().rev() {
+                    self.unbind(base);
+                }
+            }
+
+            // Mutual recursion: mint *all* group binders before walking any
+            // binding body, so a reference to any group name — in any body or
+            // in the letrec body — resolves to its group binder.
+            TypedExprNode::LetRec { bindings, body } => {
+                let bases: Vec<Option<String>> = bindings
+                    .iter_mut()
+                    .map(|(b, _)| {
+                        self.binding_tys(b);
+                        self.bind(b)
+                    })
+                    .collect();
+                for (_, def) in bindings.iter_mut() {
+                    self.expr(def);
+                }
+                self.expr(body);
                 for base in bases.into_iter().rev() {
                     self.unbind(base);
                 }
@@ -300,6 +333,8 @@ fn assert_all_binders_minted(expr: &Expr) {
             TypedExprNode::Lambda { param, .. } => check(param),
             TypedExprNode::Let { binding, .. } => check(binding),
             TypedExprNode::Loop { params, .. } => params.iter().for_each(check),
+            TypedExprNode::LetRec { bindings, .. } => bindings.iter().for_each(|(b, _)| check(b)),
+            TypedExprNode::For { target, .. } => check(target),
             TypedExprNode::Case { branches, .. } => {
                 for b in branches {
                     if let Some(p) = &b.pattern {
@@ -513,5 +548,70 @@ mod tests {
         };
         assert!(n.is_raw());
         assert_eq!(n.base(), "never_bound");
+    }
+
+    // LetRec α-renames without capture: the group binders shadow an outer
+    // same-spelling binder across every binding body and the letrec body,
+    // and mutual references resolve to the *group* binders (all minted
+    // before any body is walked). Constructed directly — nothing lowers to
+    // LetRec yet.
+    #[test]
+    fn letrec_group_binders_shadow_and_resolve_mutually() {
+        use crate::ccl::TypedBinding;
+        // let f = 1 in
+        // letrec f = g ▷ f; g = λ x → f in f
+        let expr = run(Expr::let_bind(
+            "f",
+            Expr::lit(Lit::Int(1)),
+            Expr::letrec(
+                vec![
+                    (
+                        TypedBinding::new_unannotated("f"),
+                        Expr::apply(Expr::var("g"), Expr::var("f")),
+                    ),
+                    (
+                        TypedBinding::new_unannotated("g"),
+                        Expr::lambda("x", Type::Hole, Expr::var("f")),
+                    ),
+                ],
+                Expr::var("f"),
+            ),
+        ));
+        let TypedExprNode::Let { binding, body, .. } = &expr.node else {
+            panic!("expected outer let");
+        };
+        let outer_f = binding.name.clone();
+        let TypedExprNode::LetRec {
+            bindings,
+            body: rec_body,
+        } = &body.node
+        else {
+            panic!("expected letrec");
+        };
+        let (f_rec, g_rec) = (&bindings[0].0.name, &bindings[1].0.name);
+        assert!(!f_rec.is_raw() && !g_rec.is_raw(), "group binders minted");
+        assert_ne!(
+            *f_rec, outer_f,
+            "letrec's f is a fresh binder, not the outer let's"
+        );
+        // f's def `g ▷ f`: both references resolve to *group* binders — g
+        // forward-references the later binding, f self-references, and
+        // neither is captured by the outer let's f.
+        let TypedExprNode::Apply { function, argument } = &bindings[0].1.node else {
+            panic!("expected apply in f's def");
+        };
+        assert_eq!(function.node, TypedExprNode::Var(f_rec.clone()));
+        assert_eq!(argument.node, TypedExprNode::Var(g_rec.clone()));
+        // g's def `λ x → f`: the reference under an inner binder still
+        // resolves to the group's f.
+        let TypedExprNode::Lambda {
+            body: lambda_body, ..
+        } = &bindings[1].1.node
+        else {
+            panic!("expected lambda in g's def");
+        };
+        assert_eq!(lambda_body.node, TypedExprNode::Var(f_rec.clone()));
+        // The letrec body's f is the group's, shadowing the outer let.
+        assert_eq!(rec_body.node, TypedExprNode::Var(f_rec.clone()));
     }
 }

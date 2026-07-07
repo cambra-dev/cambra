@@ -49,6 +49,12 @@ pub struct OperatorSchemes {
     /// is required because both vars are shared across positions, which
     /// `normalize_annotation` (one fresh var per `Hole`) can't express.
     last_or_default: PolyScheme,
+    /// `∀ι ν. ((ι → ν), ι, ν) → ν` — the history value at the predecessor
+    /// of the given position, or the default at the first position (the
+    /// letrec guard accessor, [`Builtin::GetPrevSeq`]). Inline-built for
+    /// the same reason as `last_or_default`: the domain `ι` and value `ν`
+    /// are each shared across positions.
+    get_prev_seq: PolyScheme,
 }
 
 impl OperatorSchemes {
@@ -115,6 +121,15 @@ impl OperatorSchemes {
         tup.insert(FieldKey::Index(1), beta.clone());
         let last_or_default = PolyScheme::poly(SCHEME_LEVEL, fun(product(tup), beta));
 
+        // GetPrevSeq: ∀ι ν. ((ι → ν), ι, ν) → ν — history, position, default.
+        let iota = fresh_var(BODY_LEVEL);
+        let nu = fresh_var(BODY_LEVEL);
+        let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
+        tup.insert(FieldKey::Index(0), fun(iota.clone(), nu.clone()));
+        tup.insert(FieldKey::Index(1), iota);
+        tup.insert(FieldKey::Index(2), nu.clone());
+        let get_prev_seq = PolyScheme::poly(SCHEME_LEVEL, fun(product(tup), nu));
+
         Self {
             arithmetic,
             compare,
@@ -125,6 +140,7 @@ impl OperatorSchemes {
             aggregate_sum,
             aggregate_max,
             last_or_default,
+            get_prev_seq,
         }
     }
 
@@ -159,6 +175,7 @@ impl OperatorSchemes {
     pub(super) fn builtin(&self, b: Builtin) -> Option<&PolyScheme> {
         match b {
             Builtin::LastOrDefault => Some(&self.last_or_default),
+            Builtin::GetPrevSeq => Some(&self.get_prev_seq),
             _ => None,
         }
     }

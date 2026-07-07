@@ -104,7 +104,7 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
 #[case(
     r#"
 def running_totals(items):
-    total = 0
+    total := 0
     for item in items:
         total += item
         yield total

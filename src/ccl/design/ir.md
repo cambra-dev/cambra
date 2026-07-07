@@ -87,9 +87,19 @@ CHL mutation-accumulation `for` loops are lowered to an explicit `Loop` node rat
 
 `Loop` is a bounded iteration with explicit loop-carried accumulators: `params` lists the accumulator slots (one or more), `init_args` supplies their starting values in declaration order, `source` drives the iteration, and `loop_body` computes each new accumulator value from `(prev_acc_0, …, prev_acc_{n-1}, item)`.  The accumulator slots are only in scope inside `loop_body`; `init_args` is evaluated outside the loop's param scope.  There is no `Jump` node: the loop has a single entry (`init_args`) and the runtime iterates the body until the source is exhausted, so labelled tail-calls aren't needed.  `continue`-style "skip the rest of this iteration" semantics fall out as conditional `Case`-on-old-vs-new in the body, again without an AST extension.  General `while` loops with explicit restart/break would need a richer encoding (a body-tail-call form for `continue`, runtime support in `Recurse` for `break`), but those are future work.
 
-The mutation-loop pattern emitted by `lower_mutation_loop` is currently the only `Loop` shape consumed end-to-end: `emit_loop` and `operator_conversion`'s `Loop` arm both pattern-match on `Loop { params: [acc_0…], init_args: [init_0…], source: Fun(D, item_ty), loop_body: Lambda(p, …) }` with `params.len() == init_args.len()`, and reject anything else.  Any combination of accumulator count and per-iteration channel count is supported: single- or multi-accumulator, with or without feeds (the body Record's field set is the source of truth).  Future work (general `while` loops, generators with internal mutable state) will extend these passes to handle additional shapes.
+The mutation-loop pattern that `letrec_phase::recognize` lowers onto `Loop` (from the guarded `LetRec` the mutability phase emits — see below and [design-mut-txn-feed.md](../design-mut-txn-feed.md)) is currently the only `Loop` shape consumed end-to-end: `emit_loop` and `operator_conversion`'s `Loop` arm both pattern-match on `Loop { params: [acc_0…], init_args: [init_0…], source: Fun(D, item_ty), loop_body: Lambda(p, …) }` with `params.len() == init_args.len()`, and reject anything else.  Any combination of accumulator count and per-iteration channel count is supported: single- or multi-accumulator, with or without feeds (the body Record's field set is the source of truth).  Future work (general `while` loops, generators with internal mutable state) will extend these passes to handle additional shapes.
 
 Rationale: encoding loops as recursive lambdas requires detecting recursive bindings by scanning the tree for forward references. `Loop` makes the loop structure explicit, simplifying both the lowering pass and optimization passes targeting iterate/feedback operators.
+
+### `LetRec` — guarded mutually recursive definition groups
+
+`LetRec { bindings: Vec<(TypedBinding, TypedExpr)>, body }` is a mutually recursive definition group: every binding's name is in scope in **every** binding's body and in `body`. It is the node the mutability/transactions/feeds redesign targets — a mutable variable's history becomes an ordinary letrec binding whose recurrence reads *strictly earlier* positions through a guard accessor (`get_prev_seq` for an induction domain; `get_prev_txn` for the transaction domain). The full model is [design-mut-txn-feed.md](../design-mut-txn-feed.md); the essentials for the AST reference:
+
+- **The unified letrec phase** (`ccl/letrec_phase.rs`, after inlining, before `desugar_defers`) emits one `LetRec` per mutation loop: the accumulators become a history binding `𝐷 ⇒ {step, to_<feed>*}` guarded by `get_prev_seq`, trailing reads become `last_or_default`, and each in-loop feed is hoisted to an ordinary `Feed(defer, __hist ▷ .to_<feed>)`. `letrec_phase::recognize` then lowers each group onto the `Loop` node above, so planning and op-conversion run unchanged. `Loop` is the recurrence *carrier*: recognition keys on the pointful group shape (so it must precede `lambda_elim`), and op-conversion is lambda-free, so a carrier node is required between them.
+- **Well-formedness is guardedness** (`ccl/letrec.rs`): on every cycle of the group's reference graph at least one edge must sit in a `get_prev_*` accessor's history slot. Op-conversion errors on a raw `LetRec` or an applied `GetPrevSeq` — recognition consumes them; an unguarded group is a compile error, never a silent fallback.
+- **Scoping** is mutual throughout: uniquify mints all group binders before walking any body, and substitution/freeness treat a matching group binder as shadowing everywhere inside the group.
+
+Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 
 ### `TypedExpr` — type slot on every node
 
@@ -99,18 +109,22 @@ Every CCL expression is wrapped in `TypedExpr { node: TypedExprNode, ty: Type, u
 - `ty` starts as `Type::Hole` (stamped by `TypedExpr::new()`); the inference pass converts it to a registered `Type::Infer` variable then fills it with the concrete type before compilation.
 - `user_annotation` carries an explicit annotation from the source (e.g. a `cast` call). Inference checks it for compatibility with the inferred type and uses it as the final type if present.
 
-### `Type::Hole` and `Type::Infer` 
+### `Type::Hole`, `Type::Infer`, `Type::Feed`, and `Type::Mut` — the transient variants
 
-The type system uses two distinct pre-/post-inference placeholders with strict ownership:
+The type system uses distinct transient placeholders with strict ownership:
 
 | Variant | Owner | Meaning | Eliminated by |
 |---|---|---|---|
 | `Type::Hole` | Lowering | "This slot needs a type; not yet known" | Constraint emission  |
-| `Type::Infer(id)` | Type checker only | "Inference variable N, produced by the solver" | Constraint solution |
+| `Type::Infer(id)` | Type checker only | "Inference variable N, produced by the solver" | Constraint solution (a defer channel's *domain* stays `Infer` until desugaring) |
+| `Type::Feed(payload)` | Type checker only | "Feed handle whose payload is the defer binding's post-desugar type" | `desugar_defers` (runs after inference on this branch; erased with the defer constructs) |
+| `Type::Mut { value, domain }` | Type checker only | "Mutable reference: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`letrec_phase` / `transact_phase`, before `desugar_defers`) |
 
 **`Type::Hole`** is stamped by `TypedExpr::new()` and `TypedBinding::new_unannotated()`. It is a structural placeholder that carries no identity. The inference pass eliminates all `Hole` placeholders and replaces them with concrete types or `Type::Infer` variables. `fresh_infer_var_id()` must not be called from lowering code; use `Type::Hole` instead.
 
-**`Type::Infer(id)`** is produced by the inference pass (`ccl/infer/`) when a type cannot yet be determined. Any `Infer` remaining after inference represents an ambiguous type. Inference is the sole creator of `Infer` variables; lowering always uses `Type::Hole`.
+**`Type::Infer(id)`** is produced by the inference pass (`ccl/infer/`) when a type cannot yet be determined. Any `Infer` remaining after inference represents an ambiguous type — except a defer channel's domain, which only `desugar_defers` can resolve. Inference is the sole creator of `Infer` variables; lowering always uses `Type::Hole`.
+
+**`Type::Feed`** and **`Type::Mut`** are the deferred-output and mutable-store handles; both are transient and eliminated before `operator_conversion` (Feed by `desugar_defers`; Mut by the mutability phase — see [design-mut-txn-feed.md](../design-mut-txn-feed.md)).
 
 This separation makes test expression construction straightforward: tests that build expressions without running inference use `Type::Hole` (via `TypedExpr::new()`) and never need to synthesize `InferVarId` values.
 ---

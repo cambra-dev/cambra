@@ -350,6 +350,51 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             )
         }
 
+        // Mutually recursive group: `letrec b₁ = e₁; …; bₙ = eₙ in body`,
+        // bindings separated by `; `, with the `in` continuation on its own
+        // line matching the `Let` rendering. Binding names carry ` : ty`
+        // when the declared type is known, like other typed binders.
+        TypedExprNode::LetRec { bindings, body } => {
+            let binding_strs: Vec<_> = bindings
+                .iter()
+                .map(|(b, def)| {
+                    let ty_str = if !matches!(b.ty, Type::Hole | Type::Infer(_)) {
+                        format!(" : {}", b.ty)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{}{ty_str} = {}",
+                        b.name,
+                        fmt(def, Precedence::Lowest, opts)
+                    )
+                })
+                .collect();
+            let body_str = fmt(body, Precedence::Lowest, opts);
+            (
+                Precedence::Lowest,
+                format!("letrec {}\nin {body_str}", binding_strs.join("; ")),
+            )
+        }
+
+        // Direct-mirror statement loop: `for i in xs do body`.
+        TypedExprNode::For { target, iter, body } => (
+            Precedence::Lowest,
+            format!(
+                "for {} in {} do {}",
+                target.name,
+                fmt(iter, Precedence::Apply, opts),
+                fmt(body, Precedence::Lowest, opts)
+            ),
+        ),
+
+        // Mutable-variable write: `x := e` — distinct from let-binding `=`
+        // (the name references its introduction; it is not a fresh binder).
+        TypedExprNode::MutWrite { name, value } => (
+            Precedence::Lowest,
+            format!("{} := {}", name, fmt(value, Precedence::Lowest, opts)),
+        ),
+
         TypedExprNode::Source(name) => (Precedence::Atom, format!("source({name})")),
 
         // N-ary compose: render as `f₀ ≫ f₁ ≫ … ≫ fₙ₋₁` at Compose precedence.
@@ -780,6 +825,36 @@ in x"
             loop_body: Box::new(Expr::tuple(vec![Expr::var("x"), Expr::var("y")])),
         }),
         "loop (x = 0, y = 1) over xs do (x, y)"
+    )]
+    // LetRec: bindings separated by `; `, `in` continuation as in Let
+    #[case(
+        Expr::letrec(
+            vec![
+                (TypedBinding::new_unannotated("x"), Expr::lit(Lit::Int(0))),
+                (TypedBinding::new_unannotated("y"), Expr::var("x")),
+            ],
+            Expr::var("y"),
+        ),
+        "\
+letrec x = 0; y = x
+in y"
+    )]
+    // LetRec with a resolved binding type: the binder carries ` : ty`
+    #[case(
+        Expr::letrec(
+            vec![(
+                TypedBinding {
+                    name: "x".into(),
+                    ty: Type::Base(BaseType::Int),
+                    user_annotation: None,
+                },
+                Expr::lit(Lit::Int(0)),
+            )],
+            Expr::var("x"),
+        ),
+        "\
+letrec x : Int = 0
+in x"
     )]
     fn test_symbolic_expr(#[case] expr: Expr, #[case] expected: &str) {
         assert_eq!(symbolic(&expr), expected);

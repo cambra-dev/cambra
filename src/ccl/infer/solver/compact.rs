@@ -123,6 +123,24 @@ pub struct CompactType {
     /// [`CompactType::merge`]). The stored [`Refinement`] is the payload
     /// carried to coalesce.
     pub refinements: Vec<Refinement>,
+    /// Feed-handle payload, if a [`Type::Feed`] contributed here.
+    ///
+    /// The payload recurses at the **same polarity** as the feed handle
+    /// itself: `Feed` is invariant at the constraint level (`constrain_go`
+    /// checks both directions when two feed handles meet), so by the time
+    /// compaction runs, both directions' information has already been
+    /// propagated onto the payload's variables — compaction only needs a
+    /// deterministic materialization, not a second polarity analysis.
+    pub chan: Option<Box<CompactType>>,
+    /// Mutable-reference `(value, domain)`, if a [`Type::Mut`] contributed
+    /// here.
+    ///
+    /// Mirrors [`chan`](Self::chan): `Mut` is invariant in both children at
+    /// the constraint level, so both recurse at the **same polarity** as the
+    /// reference itself — by the time compaction runs, both directions'
+    /// information has already been propagated onto each child's variables,
+    /// and compaction only needs a deterministic materialization.
+    pub mut_slot: Option<(Box<CompactType>, Box<CompactType>)>,
 }
 
 impl CompactType {
@@ -138,7 +156,7 @@ impl CompactType {
     ///   *union* keys.
     /// - `fun`: recursively merge each side, flipping polarity on the
     ///   domain.
-    fn merge(pol: bool, lhs: CompactType, rhs: CompactType) -> CompactType {
+    pub(super) fn merge(pol: bool, lhs: CompactType, rhs: CompactType) -> CompactType {
         let mut vars = lhs.vars;
         vars.extend(rhs.vars);
         let mut atoms = lhs.atoms;
@@ -167,6 +185,22 @@ impl CompactType {
             )),
         };
         let refinements = Self::merge_refinements(pol, lhs.refinements, rhs.refinements);
+        // Feed payloads merge at the outer polarity (covariant depth for
+        // materialization purposes — see the `chan` field docs; invariance
+        // was already enforced when the constraint edges were recorded).
+        let chan = match (lhs.chan, rhs.chan) {
+            (None, c) | (c, None) => c,
+            (Some(a), Some(b)) => Some(Box::new(Self::merge(pol, *a, *b))),
+        };
+        // `Mut` children merge componentwise at the outer polarity, exactly
+        // like `chan` (invariance was enforced at constraint time).
+        let mut_slot = match (lhs.mut_slot, rhs.mut_slot) {
+            (None, m) | (m, None) => m,
+            (Some((va, da)), Some((vb, db))) => Some((
+                Box::new(Self::merge(pol, *va, *vb)),
+                Box::new(Self::merge(pol, *da, *db)),
+            )),
+        };
         CompactType {
             vars,
             atoms,
@@ -174,6 +208,8 @@ impl CompactType {
             var,
             fun,
             refinements,
+            chan,
+            mut_slot,
         }
     }
 
@@ -456,6 +492,27 @@ fn compact_go(
                 ..Default::default()
             }
         }
+        // Feed payloads compact at the same polarity — invariance was
+        // enforced at constraint time, so this is materialization only
+        // (see the `CompactType::chan` docs). Fresh `parents` per child,
+        // like the other structural constructors.
+        Type::Feed(payload) => {
+            let inner = compact_go(payload, pol, subst_acc, &BTreeSet::new(), st);
+            CompactType {
+                chan: Some(Box::new(inner)),
+                ..Default::default()
+            }
+        }
+        // `Mut` children compact at the same polarity as the reference —
+        // invariant, like `Feed`'s payload. Fresh `parents` per child.
+        Type::Mut { value, domain } => {
+            let value = compact_go(value, pol, subst_acc, &BTreeSet::new(), st);
+            let domain = compact_go(domain, pol, subst_acc, &BTreeSet::new(), st);
+            CompactType {
+                mut_slot: Some((Box::new(value), Box::new(domain))),
+                ..Default::default()
+            }
+        }
         Type::Infer(state) => {
             let uid = state.uid;
             let key = (uid, pol);
@@ -566,9 +623,13 @@ fn compact_go(
             // coalesce-time read of monomorphization; it is sound because every
             // var reaching coalesce is monomorphically determined (one type or
             // an `IncompatibleBounds` error). See the rationale above.
-            let no_concrete = bound
-                .as_ref()
-                .is_none_or(|b| b.atoms.is_empty() && b.rec.is_none() && b.fun.is_none());
+            let no_concrete = bound.as_ref().is_none_or(|b| {
+                b.atoms.is_empty()
+                    && b.rec.is_none()
+                    && b.fun.is_none()
+                    && b.chan.is_none()
+                    && b.mut_slot.is_none()
+            });
             if no_concrete {
                 for b in &opposite_bounds {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);

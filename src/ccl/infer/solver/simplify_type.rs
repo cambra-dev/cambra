@@ -264,6 +264,37 @@ fn simplify_analyze(
             co_occurrences,
         );
     }
+    // Feed payloads recurse at the same polarity (materialization-only
+    // depth; see `CompactType::chan`).
+    if let Some(chan) = &ct.chan {
+        simplify_analyze(
+            chan,
+            pol,
+            input_rec_vars,
+            all_vars,
+            rec_processed,
+            co_occurrences,
+        );
+    }
+    // `Mut` children recurse at the same polarity, like `chan`.
+    if let Some((value, domain)) = &ct.mut_slot {
+        simplify_analyze(
+            value,
+            pol,
+            input_rec_vars,
+            all_vars,
+            rec_processed,
+            co_occurrences,
+        );
+        simplify_analyze(
+            domain,
+            pol,
+            input_rec_vars,
+            all_vars,
+            rec_processed,
+            co_occurrences,
+        );
+    }
 }
 
 /// Apply `var_subst` to a [`CompactType`], producing the simplified version.
@@ -302,6 +333,17 @@ fn simplify_reconstruct(
         )
     });
 
+    let new_chan = ct
+        .chan
+        .map(|chan| Box::new(simplify_reconstruct(*chan, var_subst)));
+
+    let new_mut_slot = ct.mut_slot.map(|(value, domain)| {
+        (
+            Box::new(simplify_reconstruct(*value, var_subst)),
+            Box::new(simplify_reconstruct(*domain, var_subst)),
+        )
+    });
+
     CompactType {
         vars: new_vars,
         atoms: ct.atoms,
@@ -309,6 +351,8 @@ fn simplify_reconstruct(
         var: new_var,
         fun: new_fun,
         refinements: ct.refinements,
+        chan: new_chan,
+        mut_slot: new_mut_slot,
     }
 }
 

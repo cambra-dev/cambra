@@ -12,15 +12,42 @@ CHL has three deferred-collection operators — `x = defer()`, `x << v`,
 and `x <<= v` — that lower to three CCL AST nodes
 ([`TypedExprNode::Defer`], [`TypedExprNode::Feed`], and
 [`TypedExprNode::Define`]) plus [`TypedExprNode::ExprStmt`] for
-statement sequencing.  Those four variants are *placeholders*: they
-don't denote pure values, and the type system has no rules for them.
+statement sequencing.  Inference types them directly (`Defer` mints a
+feed-handle type `Type::Feed(ρ)`, feeds/defines contribute into `ρ`,
+reads discharge through the handle — see design-simple-sub.md §"Feed
+handles"), so type errors are reported against the user's program
+shape.
 
-`desugar_defers::run` runs **after lowering and before inference** and
-eliminates all four variants.  After it returns, no `Defer`/`Feed`/
-`Define`/`ExprStmt` nodes remain anywhere in the tree, and every
-downstream pass (`infer`, `inline`, `lambda_elim`, `simplify`,
-`operator_conversion`) treats those variants as
-`unreachable!`.
+`desugar_defers::run` runs **after inference and after the induction
+`letrec_phase`** (`compile_program`: parse → lower → infer → inline →
+letrec_phase → recognize → desugar → strict typecheck → …) and eliminates
+all four variants *and* their transient `Feed` / `Infer`-channel-
+domain types.  Running after the phase means an in-loop feed has already
+been hoisted to an ordinary feed of the loop's history, so desugar sees
+only top-level defer chains.  After it returns, no
+`Defer`/`Feed`/`Define`/`ExprStmt` nodes — and no `Feed`/`Hole`/`Infer`
+types — remain anywhere in the tree, and every downstream pass
+(`lambda_elim`, `simplify`, `operator_conversion`) treats those variants
+as `unreachable!`.  (`inline` runs *before* desugar, not after, so it
+still sees `Defer`/`Feed`/`Define` — see the `inline` module docs.)
+
+**The pass is type-preserving.**  The input tree arrives fully typed;
+desugar follows a small discipline — constructed nodes carry `Hole`,
+nodes whose children it restructures reset their stale recorded type
+(`invalidate_ty`), rewritten handle parameters are stamped `Unit`
+(`stamp_handle_param`), filter-feed sources get their refined domain
+stamped directly (`refine_source_domain`) — and ends with
+[`crate::ccl::infer_simple_sub::retype`], a solver-free bottom-up
+synthesis that re-derives every residue type from the surviving
+concrete types (iterated to a bounded fixpoint so call-site argument
+types can resolve a monomorphized generator parameter's channel
+domain).  The strict post-desugar `typecheck` in `compile_program` is
+the release-visible enforcement of this contract; `run` additionally
+asserts residue-freeness in debug builds.
+
+(The pass also still supports untyped input — `run(expr, false)` — for
+its own structural unit tests; in that legacy mode the type-synthesis
+steps are skipped entirely.)
 
 The output is a plain CCL expression in which:
 
@@ -41,14 +68,16 @@ The output is a plain CCL expression in which:
 
 ## Two-phase structure
 
-`run` is two passes over the tree:
+`run` is two passes over the tree (plus, on typed input, the closing
+type synthesis):
 
 ```
-run(expr) = expr
+run(expr, input_typed) = expr
   |> rewrite_chains_in_scope      // Phase 1: defer-mediating UDF call rewriting
   |> desugar                      // Phase 2: cluster channelization
   |> drop_expr_stmts               // post-pass: ExprStmt cleanup
   |> assert_no_defer_residue       // invariant check
+  |> retype                        // typed order only: re-derive residue types
 ```
 
 Phase 1 rewrites call chains that touch defer-mediating functions so
@@ -299,15 +328,17 @@ For a 2-arm Case `λp → Case { guard → Feed(d, V); true → Unit }`:
 
 ```text
 pred_on_source = source ≫ (λp → guard)
-refined_source = source with user_annotation = Fun(Refinement(_, pred_on_source), _)
+refined_source = source with ty = Fun(Refinement(D, pred_on_source), V)
 channel = refined_source ≫ (λp → V)
 ```
 
-The original Lambda's body collapses to `Unit`.  Inference treats
-the refinement-typed source as a filtered iteration; `planning`'s
-`insert_iterate_markers` pass reifies the refinement into an explicit
-`Apply(guard, Iterate)` at the iteration site, which op-conversion
-compiles to an `IterateExtent` + `Restrict` filter pair.
+The original Lambda's body collapses to `Unit`, and
+[`refine_source_domain`] stamps the refined domain type directly off
+the source's inferred `Fun(D, V)` (the legacy untyped order parks the
+same refinement in `user_annotation` for inference to consume).
+`planning`'s `insert_iterate_markers` pass reifies the refinement into
+an explicit `Apply(guard, Iterate)` at the iteration site, which
+op-conversion compiles to an `IterateExtent` + `Restrict` filter pair.
 
 #### Case-arm fan-out (multi-arm Case with feeds)
 
@@ -318,9 +349,11 @@ wrapped in `Record({result, to_<d>})`:
 - Feeding arm: `to_d` = combined feed values
 - Empty arm: `to_d` = [`empty_channel()`] = `Lit::Unit`
 
-This path is **known broken** — see [Future work](#known-gaps--future-work).
-The realistic 2-arm shape uses `try_extract_filter_feed` and avoids
-the issue.
+Under the typed (post-inference) order a partial-feed fan-out is
+rejected up front with `DeferError::PartialFeedCaseUnsupported` — the
+`Unit` placeholder would be ill-typed against the feeding arms — see
+[Future work](#known-gaps--future-work).  The realistic 2-arm shape
+uses `try_extract_filter_feed` and avoids the issue.
 
 #### Smart-walker for defer-mediating UDF calls — return-value design
 
@@ -392,7 +425,7 @@ let y = (let x = Defer in body_x) in body_y
   ⟹  let y = Defer in body_x[x → y]    with terminal Var(y) replaced by body_y
 ```
 
-`pre_infer_substitute` (a thin wrapper over the uniform engine,
+`desugar_substitute` (a thin wrapper over the uniform engine,
 `ccl::subst::Subst::rewrite_expr`) renames `Feed("x", …)` and
 `Define("x", …)` target names to `y` so the outer cluster picks them
 up — and, through the engine, also rewrites type-carried refinement
@@ -408,7 +441,7 @@ so a subsequent `try_lift_defer` pass can fire.
 
 `let y = Var(x) in body` where the body contains
 `Feed(y, …)`/`Define(y, …)` is α-renamed to `body[y → x]` (with
-`pre_infer_substitute` retargeting the Feed/Define names to `x`).
+`desugar_substitute` retargeting the Feed/Define names to `x`).
 Runs *before* defer channelization so the cluster walker sees the
 real defer name.
 
@@ -440,9 +473,19 @@ shape the pass didn't recognise — reported as
 | `NestedDefinition`                   | `Define(d, …)` inside a Loop body, Compose element, Case branch, or Lambda            |
 | `UnboundDeferHandle(name)`           | `Feed`/`Define` references a name never bound by `let d = Defer`                      |
 | `MutuallyRecursiveCycle(name)`       | Cluster defers reference each other cyclically (`x ≪= y; y ≪= x`)                     |
+| `PartialFeedCaseUnsupported(name)`   | A multi-arm `Case` feeds `d` in some arms but not others (no typed empty channel yet) |
 
 All variants are propagated to `CompileError::DesugarDefers` and
-surfaced to the user via `CompileError::render`.
+surfaced to the user via `CompileError::render`.  Because the pass runs
+after inference, *type* errors surface first: a program with both a
+type error and a structural defer error reports only the type error,
+and a never-bound feed target now arrives as
+`InferError::UnboundVariable` from the `Feed`/`Define` typing rules
+(`UnboundDeferHandle` remains as the pass's own residue tripwire).  One
+ordering nuance: a scalar `Define` mixed with `Feed`s on the same defer
+collides in the feed-handle payload during inference
+(`IncompatibleBounds`) before `FeedsAndDefinesMixed`'s clearer message
+is reached.
 
 ---
 
@@ -450,15 +493,23 @@ surfaced to the user via `CompileError::render`.
 
 ### 1. Filter-feed refinement doesn't reach `operator_conversion`
 
-[`try_extract_filter_feed`] attaches a `Refinement` to the source's
-`user_annotation` so the source is treated as filtered iteration.
-With the return-value design, the filter-feed path runs *inside*
+[`try_extract_filter_feed`] stamps a `Refinement` onto the source's
+domain type ([`refine_source_domain`]; under the legacy untyped order
+it rides `user_annotation` instead) so the source is treated as
+filtered iteration.  Under the desugar-after-inference order the
+top-level filter-feed path is currently blocked one step later:
+`retype` cannot re-derive the refined source's *predicate term* (its
+embedded compose keeps a `Hole` slot the strict post-desugar typecheck
+rejects), so the `feed_with_if` pipeline case stays `#[ignore]`d —
+reconciling the filter-feed refined-source emission with the immutable
+predicate representation is the open piece.  With the return-value
+design, the filter-feed path can also run *inside*
 [`build_contributions_record`] when rewriting a function body, and
 the refined source ends up inside the function's returned `Record`.
-After inference, the refinement carries through to the
-cluster-binding's type — but the value expression at the binding
-site is now `Apply(call_expr, Proj("to_<target>"))`, which doesn't
-expose the refinement on its own `expr.ty`.
+The refinement then surfaces on the cluster-binding's type — but the
+value expression at the binding site is
+`Apply(call_expr, Proj("to_<target>"))`, which doesn't expose the
+refinement on its own `expr.ty`.
 
 `planning`'s `insert_iterate_markers` pass walks each function-typed
 expression and reifies its domain refinement into a chain-head
@@ -484,14 +535,16 @@ from).  Once that lands:
   refinement is already in the right place; only the consumer
   needs updating.
 
-### 2. Case-arm fan-out is broken (`empty_channel` limitation)
+### 2. Case-arm fan-out rejects partial feeds (`empty_channel` limitation)
 
 When a Case has 3+ arms with feeds in some-but-not-all, the
-Case-arm fan-out path is taken: each arm publishes a
-`Record({result, to_d})` where the no-feed arm's `to_d` is
-[`empty_channel()`] = `Lit::Unit`.  Feeding arms publish a typed
-scalar (e.g. `Var(x) : Int`).  Inference rejects the Case because
-arm Record types don't unify.
+Case-arm fan-out path would publish a `Record({result, to_d})` per
+arm, with the no-feed arm's `to_d` being [`empty_channel()`] =
+`Lit::Unit` — which doesn't match the feeding arms' channel type.
+Since the pass now runs after inference and must be type-preserving,
+it rejects the shape up front with
+`DeferError::PartialFeedCaseUnsupported` rather than handing the
+strict post-desugar typecheck an ill-typed fan-out.
 
 Patching the type slot (e.g. via a `TypedExprNode::EmptyValue`
 with fresh `Type::Infer`) was considered and rejected: it fixes
@@ -591,10 +644,10 @@ For navigating the source ([src/ccl/desugar_defers.rs](desugar_defers.rs)):
 | Filter-feed (2-arm Case)                   | `try_extract_filter_feed`                             |
 | Defer-returning let lift                   | `try_lift_defer`                                      |
 | Loop body absorption                       | `process_loop_for_defer` + `augment_loop_body_record_*` |
-| Case-arm fan-out (broken)                  | `empty_channel` + `augment_terminal_with_channel`     |
+| Case-arm fan-out (partial feeds rejected)  | `empty_channel` + `augment_terminal_with_channel`     |
 | Cluster topo-sort                          | `topo_sort_cluster`                                   |
 | Channel binding emission                   | `channelize_cluster` + `rename_shadows_then_bind`     |
 | Shadow detection                           | `compute_protected_set` + `collect_free_vars`         |
-| Substitution                               | `pre_infer_substitute` (wraps `ccl::subst`)           |
+| Substitution                               | `desugar_substitute` (wraps `ccl::subst`)           |
 | Final cleanup                              | `drop_expr_stmts`                                     |
 | Invariant check                            | `assert_no_defer_residue`                             |

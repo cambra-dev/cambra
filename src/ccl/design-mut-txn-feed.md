@@ -1,0 +1,600 @@
+# Mutability, transactions, and feeds
+
+Cambra's surface language (CHL) is Pythonic: programs reassign variables, accumulate
+in loops, run transactions, and stream replies out to sinks. The runtime is a pure
+dataflow graph over *tilings* — there is no mutable cell anywhere. This document explains
+how the two are reconciled: the semantic model that makes mutation, transactions, and
+feeds one idea, the surface syntax, and how the compiler realizes them.
+
+## The idea in one line
+
+A mutable variable **is** a function from a **sequencing domain** (a time axis) to a value.
+"Mutation" is the incremental revelation of that function's values as the domain advances;
+"reading the variable" is looking up a value at a position. Sequential rebinding, loop
+accumulation, and concurrent transactions are then *one* model over three domains, not three
+mechanisms — and a feed (a reply or yield) is just an output of that model, a function over
+the same domain.
+
+This rests on the existing extent-vs-tiling correspondence
+([operational-semantics/summary.md](../../docs/operational-semantics/summary.md)) applied to a
+time domain: a value type's *extent* is its set of final values; its *tiling* is the progress
+algebra of partial states. A mutable variable's extent is the set of total functions `𝐷 ⇒ 𝑉`;
+its tiling is the accumulating partial function `𝐷 ⇀ 𝑉`, each mutation a `⊕`-extension by one
+position. The tiling *implements* the function; it does not redefine it.
+
+## The model: histories and guarded recursion
+
+A mutable variable of value type `𝑉` over sequencing domain `𝐷` denotes a total function
+`𝐷 ⇒ 𝑉`: its **history**. The history functions of a program's mutable variables form one
+**mutually recursive definition group** (a `letrec`), well-founded because every recursive
+reference is **guarded** — it consults only *strictly earlier* positions of the domain, through
+one of two accessor builtins:
+
+- `get_prev_seq(ℎ, 𝑖, 𝑑)` — for an **induction domain** (a loop's iteration index): the value of
+  history `ℎ` at the predecessor of `𝑖`, or the default `𝑑` at the first position.
+- `get_prev_txn(𝑤, 𝑡, 𝑑)` — for the **transaction domain** `Txn` (a total order of commit times):
+  the value carried by the latest commit in stream `𝑤` at a time *strictly before* `𝑡`, or the
+  default `𝑑` if there is none.
+
+Because every cycle in the group crosses a guard, values at any position depend only on strictly
+earlier positions, and the group has a unique solution by induction along the domain order.
+
+### Sequencing domains
+
+| Mutation context | Sequencing domain | Guard |
+|---|---|---|
+| Sequential statements | degenerate (each position used once) | plain `let` shadowing; no letrec binding |
+| `for` loop | the iteration source's domain (`UIntRange` for a literal list, a `DataSource` domain for a stream) | `get_prev_seq` |
+| `with begin():` transaction | `Txn`, an anonymous total order issued by the runtime | `get_prev_txn` |
+| `while` loop *(future)* | a prefix of `Nat` bounded by the running condition | `get_prev_seq` over a self-ceiling domain |
+
+The structural difference between the two guards mirrors a difference between the two kinds of
+variable:
+
+- An **induction variable** has exactly one writer (its loop), and its domain *is* that writer's
+  domain. Its history binding is directly the recurrence:
+  `cnt = λ 𝑟 → get_prev_seq(cnt, 𝑟, init) + 1`.
+- A **transactional variable**'s domain (`Txn`) is *not* any writer's domain — writers iterate
+  request streams, and an oracle assigns each transaction a commit time. So its history is defined
+  *indirectly*, through **commit records**: each writing site produces one `{time, write}` record
+  per iteration, and the variable's history searches those records by time. The commit-time oracle
+  is a per-site builtin `begin_<site> : 𝐼 ⇒ Txn` mapping the site's iteration index to the
+  transaction's position in the commit order.
+
+Feeds are the letrec's **outputs**: the body of the letrec is a record of channels (one field per
+defer/sink), each a function over its contributing loop's domain, free to reference the letrec's
+bindings.
+
+## Surface language
+
+### Mutability is explicit, by the `:=` operator
+
+A variable is mutable **by the operator that introduces it**: `:=` introduces (and writes) a
+mutable store; plain `=` is an ordinary immutable binding and *never* mutates. The `Mut[…]`
+annotation is **optional** — it carries the value type and, for the transactional case, the
+sequencing domain — but it is `:=`, not the annotation, that makes a variable a store.
+
+```python
+cnt := 0                     # loop accumulator; value type and sequencing domain both inferred
+cnt: Mut[Int] := 0           # same, with the value type spelled explicitly
+store: Mut[Int, Txn] := 0    # transactional register over the commit order
+out: Feed[_]                 # a feed (deferred output); no initializer
+```
+
+- `:=` — the mutation operator, for both the initial introduction (`cnt := 0`) and every
+  subsequent write (`cnt := cnt + 1`), inside a loop or transaction or at the top level. `+=` is
+  its compound shorthand. A plain `=` binds immutably: `x = 0; x = x + 1` is ordinary `let`
+  shadowing, and a plain `=` to a name bound outside a loop is a lowering error that points at
+  `:=`.
+- `Mut[𝑉]` / `Mut[𝑉, 𝐷]` — the optional store annotation. `𝑉` is the value type (inferred if
+  omitted, i.e. a bare `cnt := 0`); the second parameter `𝐷` is the sequencing domain, omitted
+  (or `_`) it is inferred as the domain of the loop that writes the variable. `Txn` — the
+  transactional case — is **never inferred**: sharing a variable across concurrent writers or
+  endpoints is a semantic commitment the program must spell, so a transactional register is
+  introduced with `store: Mut[𝑉, Txn] := …`. `Mut[…]` is also legal as a function *parameter*
+  annotation — pass-by-reference, under the downward-only discipline in
+  [`Mut` is a CCL type](#mut-is-a-ccl-type). A `Mut[…]` annotation with a plain `=`
+  (`x: Mut[Int] = 0`) is contradictory and rejected — use `:=`.
+- `Feed[𝑉]` — a deferred output channel, fed with `<<`. Introduced by a bare annotation
+  (`out: Feed[_]`, no value), or arriving from a builtin (`http_serve` returns its response
+  channel at a `Feed` type).
+- `_` is a **wildcard** accepted anywhere in a user type annotation, meaning "infer this slot."
+  `Mut[_]`, `Feed[_]`, `Mut[_, Txn]`, `List[_]` are all legal.
+
+A name needs `:=` exactly when its history spans iterations or transactions; a value that is
+computed once and never re-stored stays a plain `=` binding.
+
+### Transactions
+
+A transaction is a `with begin():` block, usable anywhere a statement can appear — as a loop body
+(one transaction per iteration) or standalone (a single transaction):
+
+```python
+for req in incr_reqs:
+    with begin():
+        store += 1
+```
+
+`begin()` is the transaction marker. The handle form `with t = begin():` binds `t` to the
+transaction's commit time (a `Txn` value): `t` *is* the position `begin_<site>(𝑟)` the letrec
+manipulates. Writes to `Txn`-domain variables are legal only inside a `with begin():` block; all
+writes in one block commit atomically. Nested transactions are rejected — a block commits as one
+unit, so a `with` inside it has no coherent meaning.
+
+### Reads
+
+- **Inside the mutating context** — a bare reference denotes the value at the current position:
+  the previous iteration's value, or, after a write in the same iteration/block, the written value
+  (read-your-writes).
+- **After a loop** — a bare trailing read of an induction variable is its final value
+  (`last_or_default` over the completed history; the loop has ended, so "latest" is unambiguous).
+- **A `Txn` register is read only inside a `with begin():` block.** A bare read outside one is an
+  error (hint: "read transactional variable `x` inside a `with begin():` block"). Reading inside a
+  block pins a snapshot-consistent view — several `Txn` reads in one block see one commit snapshot,
+  which is the point of requiring the block. A read fed out of a block that does *not* write that
+  store is a **live as-of read**: `for r in reqs: with begin(): out << store` reads the store's
+  latest committed value as of each request and replies indexed by the *request loop* (the outer
+  context), not the commit clock — the live cross-endpoint read. The **terminal** read is the
+  degenerate case: a trailing standalone `with begin(): out << store` latches the store's final
+  value once its writers complete (`out` is the one-element stream `[final]`). Both are the same
+  as-of read.
+
+## CCL representation
+
+### Direct-mirror nodes: `For`, `MutWrite`
+
+Lowering emits nodes that mirror the CHL statements, doing no semantic work — it changes
+representation only, leaving structure for the type checker and the unified phase to interpret:
+
+- `For { target, iter, body }` — **every** statement `for` loop, generator / side-effecting /
+  mutation alike (comprehensions keep their expression lowering). Lowering does *not* distinguish
+  the loop kinds — that classification is the phase's, post-inference (see
+  [Store-ness is the type](#store-ness-is-the-type-no-lowering-registry)). Value `Unit`;
+  `iter : 𝐼 ⇒ 𝑇`, `target : 𝑇` bound in `body`.
+- `MutWrite { name, value }` — one write to a variable. Value `Unit`. Its target **must** be
+  `Mut`-typed: inference peels the target's `Mut[𝑉, 𝐷]` and requires `value ⊑ 𝑉`; a write whose
+  target is *not* `Mut` is a **type error**, never a shadowing rebind (`x += e` on a plain `x` is
+  rejected, not silently turned into `x = x + e`). `x += e` lowers to `MutWrite(x, x + e)`, the
+  embedded read being the in-context read.
+- `Feed { name, value }` / `Defer` — a `<<` feed and its channel. These survive into inference (so
+  a defer binding is typed, at `Feed[𝑉]`) and are eliminated by the unified phase.
+
+`For`/`MutWrite`/`Feed`/`Defer` are **pre-phase surface-structure nodes**: pure placeholders no
+pass executes, eliminated wholesale by the unified phase. The purity invariant
+([src/ccl/CLAUDE.md](CLAUDE.md)) holds the same way it does for `Defer` — the phase asserts no
+residue, and planning/op-conversion never see them.
+
+### Store-ness is the type (no lowering registry)
+
+Whether a name denotes a mutable store is carried **only** by `Type::Mut`, and is therefore known
+only after inference. Lowering never tracks it — there is no lowering-side store registry. This is
+what keeps lowering a pure representation change: it emits the markers above by *shape and scope
+alone*, and every decision that needs store-ness happens later, keyed on the type.
+
+Lowering's two choices, both scope-only:
+
+- **Introduction vs. write.** `x := e` where `x` is *not* in scope is an introduction — a
+  `let x = e` whose binding is stamped `Mut[𝑉, 𝐷]` (`𝐷 = Txn` iff annotated `Mut[𝑉, Txn]`, else a
+  `Hole` the phase resolves). `x := e` / `x += e` where `x` *is* in scope is a write — a bare
+  `MutWrite(x, e)`. The choice is membership in the ambient scope set (which lowering already
+  threads for other reasons); it consults no mutability record.
+- **Loop shape.** Every `for` becomes a `For` marker (above). Lowering does not decide
+  generator-vs-mutation.
+
+Everything store-dependent is then a post-inference decision on `Type::Mut`:
+
+1. **Writes require a mutable** (`MutWrite` target must be `Mut`, above). A `+=` / `:=` to a plain
+   binding is a type error, not a shadow. This is the single rule that makes "declare it with `:=`"
+   a real discipline rather than a lowering-time heuristic.
+2. **Pass-by-reference requires the `Mut[…]` annotation.** The annotation is *what gives the
+   parameter `Type::Mut`*, so its body writes type-check (rule 1) and the phase can classify the
+   writer; an unannotated parameter is non-`Mut`, so writing it is rejected by rule 1. Carrying the
+   annotation means store-ness is present in the type from the parameter inward through the whole
+   pipeline — inlining, the phase, planning — with nothing to reconstruct.
+3. **Loop routing is the phase's** (see [The unified phase](#the-unified-phase)): a `For` whose body
+   writes a `Mut` store bound outside the loop is an accumulator recurrence; any other `For` (only
+   feeds/yields, or writes to loop-local stores) is a plain map — rebuilt as the
+   `Compose([iter, λ target → body])` generator shape. Transactional-context checks (a `Txn`
+   register written outside `with begin():`, an induction store written inside one) are likewise
+   post-inference, dispatching on `Mut`'s domain.
+
+The payoff: lowering has one loop path and one write path, no `is_mutable`/`with_shadowed`
+book-keeping, and no base-name scoping scaffolding — a shadowing parameter spelled like an outer
+store is just a different binding with its own (non-`Mut`) type, handled by ordinary inference.
+
+### `Mut` is a CCL type
+
+`Type::Mut { value: 𝑉, domain: 𝐷 }` — a wrapper variant carried on the introduction's binding and
+on every reference to it. Making mutability a real type buys two things:
+
+- **Pass-by-reference.** A function can take a mutable variable as a parameter
+  (`def bump(c: Mut[Int]): c += 1`) and write *the caller's* variable. Because the unified phase
+  runs after inlining, this needs no new machinery: beta-reduction substitutes the argument
+  variable for the parameter, so the callee's `MutWrite`s land at the call site naming the actual
+  store — the same route by which `Feed`-parameter UDFs work. The cross-function transactional
+  writer falls out:
+
+  ```python
+  def transfer(src: Mut[Int, Txn], dst: Mut[Int, Txn], amt: Int):
+      with begin():
+          src -= amt
+          dst += amt
+  ```
+
+- **Mutability survives α-renaming structurally** — a type rides the binding through every rename.
+
+Typing:
+
+- **Reads are implicit derefs**: `Mut[𝑉, 𝐷]` coerces to `𝑉` wherever a non-`Mut` type is demanded
+  (a coercion arm in `constrain`, not structural subtyping). `cnt + 1`, `f(cnt)` for an `Int`
+  parameter, and a trailing `cnt` all read; only a position that *expects* `Mut` (a `Mut`-annotated
+  parameter) receives the handle. After inlining, no `Mut`-expecting positions remain, so the
+  phase's rewrite is purely structural — every surviving `Mut`-typed occurrence is a write target
+  or a read, decided by context.
+- A parameter `Mut[Int]` means `Mut[Int, _]`; the domain instantiates per call site through the
+  let-generalization of UDF bindings. Whether a write site requires `Txn` is the phase's structural
+  check, post-inline — so one `bump` can serve an induction accumulator and a transactional
+  register.
+
+**No aliasing: `Mut` values are second-class (downward-only).** Passing a reference *down* is safe
+exactly as long as the compiler can statically resolve which introduction every write targets. The
+discipline:
+
+1. A `Mut`-typed expression must be a **bare variable reference** — an argument to a `Mut`
+   parameter is a variable, never a conditional or computed expression.
+2. `Mut` may not appear **inside any composite type** — tuples, records, lists, function codomains
+   (so it is never a return type), `Feed` payloads, or another `Mut`.
+3. An **unannotated binding may not have `Mut` type**: `b = a` is an error, not an alias. To copy
+   the current value, demand the deref (`b: Int = a`); to seed a *new* store from it, introduce one
+   with `:=` (`b: Mut[Int] := a`, the initializer being a read).
+
+One structural check after inference enforces all three. `Feed` deliberately stays more
+first-class (it is returned in `http_serve`'s tuple): aliasing a feed is benign — multiple feeders
+are already the semantics, merged by `++` — whereas a last-write-wins register needs its writer set
+known statically.
+
+`Mut`-parameter functions must reach their call sites, so they must be inlineable — the stance the
+pipeline already takes for writers and `Feed`-mediating UDFs. (When general recursion lands,
+recursive functions that don't fully inline need either the letrec treatment or a ban on `Mut`
+parameters — deferred to that design.)
+
+### `Feed` is a CCL type
+
+`Type::Feed(𝑉)` — the type of a feed handle: what a bare `out: Feed[_]` introduces, what
+`http_serve`'s response half returns, what a defer-mediating UDF parameter (`λ out → out << e`)
+carries. Feed handles are fully first-class — returnable and tuple-packable — because feed aliasing
+is benign (multiple feeders union by `++`). The unified phase eliminates every `Feed`-typed term
+when it resolves channels, so no `Feed` type survives to planning.
+
+### `Txn` is a CCL type
+
+`Type::Txn` — the commit-time domain: an anonymous total order issued by the runtime. It is the
+domain of transactional histories (`Txn ⇒ 𝑉`), the codomain of the `begin_<site>` oracles, and the
+type of a transaction handle. Like a `DataSource` domain, it has no enumerable static extent; its
+positions exist only in the tile.
+
+### `LetRec`
+
+```rust
+LetRec {
+    /// The mutually recursive definition group. Every binding's name is in
+    /// scope in every binding's body (and in `body`). Each binding carries
+    /// its full type (generated by the unified phase; always concrete).
+    bindings: Vec<(TypedBinding, TypedExpr)>,
+    /// The continuation, with the group in scope.
+    body: Box<TypedExpr>,
+}
+```
+
+Typing: with `Γ, 𝑏₁ : 𝑇₁, …, 𝑏ₙ : 𝑇ₙ` check each binding body against its declared `𝑇ᵢ` and
+synthesize the letrec body as usual. The phase generates the binding types itself (from inferred
+loop-source domains and value types), so the post-phase strict `typecheck` validates them directly.
+
+**Well-formedness (guardedness).** In the reference graph over the group, an edge is *guarded* when
+the reference is the history argument of a `get_prev_*` call; unguarded references must be
+position-non-increasing (they pass the ambient position through, as `store(𝑡)` does inside the
+commit record for time `𝑡`). Every cycle must contain a guarded edge — equivalently, the
+unguarded-reference subgraph is acyclic. A structural check enforces this; op-conversion treats an
+unrecognized unguarded cycle as a compile error rather than attempting fixpoint iteration.
+
+`LetRec` is deliberately more general than mutability needs: `while` loops (recursion over a
+condition-bounded prefix of `Nat`), recursively-defined collections, and general structural
+recursion all target the same node.
+
+Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
+
+### Builtins
+
+| Builtin | Type | Meaning |
+|---|---|---|
+| `get_prev_seq` | `(𝐼 ⇒ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
+| `get_prev_txn` | `(𝐼 ⇒ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
+| `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
+
+`begin()` never reaches CCL — lowering records the block structure, and the phase mints one
+`begin_<site>` per site. The oracles are opaque, strictly monotone in arrival order (which is what
+gives cross-endpoint external consistency), with pairwise-disjoint ranges; the commit engine
+realizes them by tick allocation, not by computing anything.
+
+Multi-variable atomic blocks produce one shared record `{time, writes: {𝑘₁: 𝑉₁, …}}` per commit,
+and each variable's history reads it through a per-key view — atomicity by construction, since one
+record either exists or does not. A conditional write (`with begin(): if 𝑝: x = 𝑒`) adds a
+`commit: Bool` field that `get_prev_txn` filters on. Multiple writer sites for one variable merge
+their commit streams (ordered by time) before the search.
+
+## Compilation pipeline
+
+```
+CHL source
+  → parse              (annotations incl. _, Mut[…]/Feed[…]/Txn forms, with begin())
+  → lower              (direct mirror: For / MutWrite / Feed / Defer; Mut/Feed types from annotations;
+                        NO store classification — every loop is a `For`, intro-vs-write is scope-only)
+  → uniquify
+  → infer + check      (on the direct-mirror tree; Feed[V] types the defers)
+  → inline             (UDFs — incl. writers and defer-mediating lambdas — reach their call sites)
+  → UNIFIED PHASE      (collect mutable state + route feeds + emit let/letrec;
+                        eliminates For / MutWrite / Feed / Defer)
+  → typecheck          (strict wall; the letrec rule)
+  → lambda_elim → planning → simplify
+  → operator_conversion (recognize letrec patterns → engines)
+```
+
+Inlining runs **before** the phase: a UDF that writes a `Mut` parameter or feeds a `Feed` parameter
+is beta-reduced to its call site, where the phase sees its writes and feeds in the scope of the
+store and channels they target. Generators survive inlining because direct-mirror lowering leaves
+nothing to lose — a generator body is `For` + `Feed` nodes against an implicit result feed,
+substituted wholesale.
+
+### The unified phase
+
+Input: a typed, inlined, direct-mirror tree. Output: `let`/`letrec` algebra with every
+`For`/`MutWrite`/`Feed`/`Defer` eliminated. It:
+
+0. **Normalizes to the flat-spine invariant** (`flatten_spine`). Inlining a pass-by-reference
+   writer splices its body — a bare `MutWrite`, possibly a multi-statement `ExprStmt` chain — at
+   the call site, which can bury a store write off the statement spine: under another `ExprStmt`
+   (`bump2(cnt)` with a two-write body), as a `Let` bound-expression (`y = bump(cnt)`), or in
+   terminal/value position (a trailing `cnt += 1`). Commuting conversions (gated on the moved
+   effect being a `MutWrite`, so `Feed`/`Define` chains and unrelated `Let` subplans are untouched)
+   push every write back to a direct `ExprStmt` effect; a value-position write terminalizes to
+   `ExprStmt(MutWrite, unit)` (its store's final state is unobserved, so its value is `unit`).
+   Downstream collection and read-your-writes rewriting then see only on-spine writes.
+1. **Collects** the `Mut` introductions and each variable's writing sites (loops, `with begin():`
+   blocks — post-inline, so writes through `Mut` parameters have landed), and each feed's sites.
+2. **Resolves domains**: an induction variable takes its writing loop's source domain; a `Txn`
+   variable takes `Txn`.
+3. **Builds bindings**: per induction variable, the direct recurrence (in-context reads replaced by
+   `get_prev_seq` / read-your-writes shadows); per `with begin():` site, a commit-record binding
+   over the site's loop domain; per `Txn` variable, the history
+   `λ 𝑡 → get_prev_txn(view, 𝑡, init)` over the (merged, per-key-viewed) commit streams.
+4. **Routes feeds**: each channel becomes a letrec-body output — a function over its contributing
+   loop's domain, unioned (`++`) across sites. A feed inside a `with begin():` block reads its
+   value off the commit record (a per-commit tap).
+5. **Routes loops and rewrites reads**: a `For` whose body writes a `Mut` store bound outside it is
+   an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
+   `Compose([iter, λ target → body])`, with feeds/yields already routed in step 4 — so a generator
+   or bare side-effect loop needs no letrec at all. Trailing induction reads → `last_or_default(history,
+   init)`; a `Txn` read fed out of a read-only block → a broadcast of the store history over the
+   enclosing loop, which planning latches through the as-of read.
+
+Stateless programs never build a letrec — the phase degenerates to plain feed routing.
+
+## Worked example
+
+A transactional register and an induction counter shared across two HTTP endpoints:
+
+```python
+incr_reqs, incr_resps = http_serve("8080", "POST", "/incr")
+get_reqs,  get_resps  = http_serve("8080", "GET",  "/get")
+
+store: Mut[Int, Txn] := 0
+cnt: Mut[Int] := 0
+
+for req in incr_reqs:
+    with begin():
+        store += 1
+        cnt += 1
+    incr_resps << "ok {cnt}\n"
+
+for req in get_reqs:
+    with begin():
+        get_resps << store
+```
+
+Note the mix: `store` is transactional; `cnt` is a plain induction accumulator *written inside* the
+transaction block. That is legal — `cnt`'s writes sequence on the incr loop's induction domain,
+independent of the commit order — and the lowering makes the difference literal. (A write to
+`store` outside a `with begin():` would be rejected.)
+
+After the unified phase (with `IncrIdx`/`GetIdx` the two request-source domains):
+
+```
+letrec
+    store: Txn ⇒ Int =
+        λ t → get_prev_txn(incr_commits, t, 0)
+
+    cnt: IncrIdx ⇒ Int =
+        λ r → get_prev_seq(cnt, r, 0) + 1
+
+    incr_commits: IncrIdx ⇒ {time: Txn, write: Int} =
+        λ r → let t = begin_incr(r) in
+              {time: t, write: store(t) + 1}
+in
+    { incr_resps: λ r → incr_commits(r) ▷ (λ c → "ok " + cnt(r) + "\n"),
+      get_resps:  begin_get ≫ store }
+```
+
+Reading it off:
+
+- **`incr_commits`** — one commit record per POST. `begin_incr(𝑟)` is where request `𝑟`'s
+  transaction lands in the commit order; `store(𝑡)` reads the snapshot (resolving, via `store`'s own
+  definition, to the latest commit *strictly before* `𝑡` — no self-reference), and `+ 1` is the
+  write.
+- **`store`** — the register's history: at any `𝑡`, the latest earlier commit's write, else the
+  initializer. The `store ↔ incr_commits` cycle is well-founded — the trip around it crosses
+  `get_prev_txn` once, so position strictly decreases.
+- **`cnt`** — the induction recurrence, self-guarded by `get_prev_seq`; its domain is `IncrIdx`, not
+  `Txn`, because its annotation said so.
+- **`incr_resps`** — the reply for `𝑟` depends on `incr_commits(𝑟)` (then discards it): the reply is
+  sequenced after the commit, so a client that receives `ok 2` then GETs observes `≥ 2` (external
+  consistency, given the oracles' arrival-order monotonicity).
+- **`get_resps`** — the live read: assign the GET a commit time, read the store's history there,
+  reply indexed by the GET request loop. No commit record, no write set — composition.
+
+## Semantics
+
+- **Serial denotation, concurrent engine.** The letrec denotes a *serial* execution: `Txn` is a
+  total order, and each transaction reads exactly the prefix strictly before its own time.
+  Optimistic concurrency — snapshots, backward validation, retry — is engine implementation,
+  correct iff observationally equivalent to the serial denotation.
+- **Atomicity is representational**: one commit record per block. There is no partially visible
+  commit because no term denotes one.
+- **Read-your-writes** within a block is `let` shadowing inside the record body.
+- **Deny** (`if` around a write) is `commit: false` on the record; `get_prev_txn` skips it. A denied
+  transaction contributes no visible write and no reply.
+- **Induction and transaction domains are independent.** In the worked example `cnt` advances per
+  request even though its write sits inside the block; only `Txn`-domain variables participate in
+  the atomic commit. A program that needs the counter transactionally consistent with the store
+  declares it `Mut[Int, Txn]`.
+- **Liveness.** Induction domains are finite or stream-complete; `Txn` histories complete when all
+  writer sources do. A terminal read resolves only on a complete history; a live read reads as-of
+  its own position and does not wait for completeness.
+
+## Op-conversion: recognizing letrec patterns
+
+Recognition runs where the letrec meets the operator layer. It **must precede `lambda_elim`**,
+because it keys on the pointful shape of the group, and op-conversion operates on lambda-free CCL —
+so it cannot re-derive a recurrence from a point-free tree. The recognized recurrence therefore
+travels to op-conversion on a **carrier node**, the domain-parameterized
+`Transact { keys, writers, domain }`: explicit key/writer header slots plus an opaque writer-body
+lambda, which is exactly what lets `lambda_elim` point-free the body, `planning` iterate-wrap the
+writer source, and op-conversion build the engine. One carrier serves both domains — there is no
+separate loop node.
+
+Recognition is anchored on the builtins (`get_prev_seq`, `get_prev_txn`, `begin_<site>`) — opaque,
+like aggregates, so `lambda_elim`/`planning`/`simplify` normalize *around* them without destroying
+them.
+
+| Letrec pattern | Engine |
+|---|---|
+| a binding referenced only via `get_prev_seq(𝑏, …)`, over a finite/stream induction domain | `Recurse` — the sequential loop engine |
+| commit-record bindings + `begin_<site>` oracles + `Txn` histories read via `get_prev_txn` | the commit operator (`CommitOperator`, `TransactWriter`, cyclic `FanOut`, `StoreValueStream`) |
+| a `Txn` history read out of a read-only block (`begin_<site> ≫ store`) | the as-of read (`AsOf`), latching the store's latest-decided commit, indexed by the outer trigger loop |
+| an unguarded cycle, or a guarded shape the recognizer does not know | compile error (no silent fallback) |
+
+### The runtime engines
+
+- **`Recurse`** — the induction loop. It emits the prev-accumulator stream `𝐷 ⇀ 𝑉` (`init` at
+  position 0, the body's output at `𝑖-1` for `𝑖 > 0`), internalizing the cycle in a cyclic `FanOut`
+  so the static operator graph stays acyclic. A single always-commit writer over a finite domain.
+- **The commit operator** — the concurrent generalization of `Recurse`, for the `Txn` domain. The
+  store is an MVCC commit log `Txn ⇀ (Key ⇀ Value)`. A writer reads a snapshot of its footprint,
+  runs its pure body, and proposes `{reads, writes}`; the operator validates the read set against
+  the current store (backward / optimistic concurrency) *before* allocating a timestamp — a valid
+  proposal commits and consumes a tick, a stale one is skipped and retries against the advanced
+  snapshot. Disjoint footprints commit concurrently; overlapping ones serialize. `release` is the
+  commit acknowledgment (the retry signal rides the existing producer/consumer channel). The store
+  compacts by the MVCC law and GCs the released prefix.
+- **`AsOf`** — the as-of (temporal) join, for a live cross-endpoint read. Given a *trigger* (the
+  request stream — the positions to sample at) and a *source* (a store's `StoreValueStream`), it
+  latches, for each trigger position, the source's latest-decided value at the moment that position
+  is first observed. The output is indexed by the **trigger** (the outer request loop), not the
+  commit clock — which is why a live reply matches its request by position and needs no explicit
+  correlation id. It is the dual of the commit `Recurse`: `Recurse` latches a private accumulator
+  per source step; `AsOf` latches a foreign stream's head per trigger step. The terminal read is
+  the degenerate case — a standalone read-only transaction's singleton trigger latches the final
+  committed value.
+
+The two loop engines are **not interchangeable**: the commit operator is built for an open commit
+clock and mis-drives an incremental/live source, while `Recurse` is the ordered loop recurrence.
+Dispatch on the sequencing domain is load-bearing, not an optimization.
+
+### Watermarks
+
+A consumer reading "as of `𝑡`" must know no further commits will land at `≤ 𝑡`. The runtime already
+carries this: function tiles hold a `domain_predicate` marking the complete region of the domain. A
+watermark *is* a `domain_predicate` advancing over `Txn`. Conflict validation — which depends on
+which value combinations were observed — is deliberately engine-level, above the tiling algebra,
+because that is exactly what extent predicates cannot express.
+
+## Concurrency and distribution
+
+The transactional case is the concurrent sequencing domain, and most of it falls out of the
+algebra: out-of-order commits are fine (`⊕` is commutative; writes at distinct timestamps are
+compatible tiles), and watermarks are `domain_predicate`s over `Txn`. What is *not* in the algebra
+is conflict validation (read-set dependence), which is the engine's job. The design generalizes to
+distributed execution with no model change: the compiler knows the full set of writes a transaction
+*could* perform, so distributed commit can be decided from complete local knowledge rather than a
+two-phase handshake. Serializable is the default (working hypothesis: the only level needed), made
+affordable by that complete compile-time knowledge.
+
+## Future work
+
+- **`while` loops** — a letrec binding over a condition-bounded prefix of `Nat`; the self-ceiling
+  domain is a new *domain*, not a new construct.
+- **Nested `for` loops** — lexicographic product domains; data-dependent bounds meet the
+  refinement-types work as dependent sums.
+- **Mutable collections** — sigma types (`List[𝑇] = Σ 𝐼 . 𝐼 ⤇ 𝑇`) as letrec bindings; the
+  append-only `Appendable` case first, as a commit stream whose history *is* the collection. This
+  is also what first-class `Mut` (returning or storing references) needs: carrying store identity in
+  types is a sigma/index-types question. Until then the second-class discipline is the aliasing
+  firewall.
+- **History access / auditing** — `get_prev_*` generalized to user-facing reads at explicit
+  positions; the transaction handle (`t = begin()`) already names the position.
+- **Recursively-defined values** generally — the `LetRec` node and guardedness check are the general
+  mechanism; only recognition patterns need to grow.
+
+## Implementation status
+
+This branch delivers the **induction** slice of the model — mutable accumulators, generators with
+loop-carried state, in-loop feeds, first-class `Type::Mut`, and single-parameter pass-by-reference
+*induction* writers. The **transactional** slice (`Txn` registers, concurrent writers, batch and
+live cross-endpoint reads) and the `http_serve` programs that exercise it land on the **stacked PR**
+(`transact_phase`). The design body above describes the intended end state across the whole stack,
+not what runs on this branch alone.
+
+Working end-to-end on this branch: induction accumulators and generators, single- and
+multi-accumulator, genuinely letrec-based (`For`/`MutWrite` → the unified phase → a
+`get_prev_seq`-guarded `LetRec` → `recognize` → `Loop` → `Recurse`); in-loop feeds and
+mutation-generators (`o << x` / `yield` in the body), hoisted by the phase to ordinary feeds of the
+loop's history; and pass-by-ref induction writers driven by a loop of `bump(cnt)` calls.
+
+Realized on this branch:
+
+- **`Type::Mut` is first-class.** Mutability rides the introduction's binding and every reference as
+  `Type::Mut { value, domain }` (so it survives α-renaming structurally), reads deref through the
+  coercion arm, and the second-class discipline is enforced post-inference (`check_mut_discipline`).
+- **Store-ness is the type — the lowering-side induction registry is gone.** `mutable_vars` and its
+  `is_mutable` / `register` / `snapshot` / mask machinery are deleted. Lowering makes only
+  scope-based choices: a `:=` to a fresh name is a `let`-`Mut` introduction, a `:=` / `+=` to an
+  in-scope name is a `MutWrite`; loop routing is `find_mutation_loop_vars` (scope-only). A write to a
+  non-store is a post-inference type error (`check_mut_write_targets`), so `x = 0; x += 1` is
+  rejected, never a shadow. Single-parameter pass-by-reference writers still work — the parameter's
+  `Mut` type (from its annotation) is what makes its body writes valid.
+- **Loop routing takes the scope-only form**, not the fuller "every loop is a `For`" of
+  [Store-ness is the type](#store-ness-is-the-type-no-lowering-registry): a loop that writes an
+  outer-scope name lowers to a `For`, a pure generator/side-effect loop still lowers directly to
+  `Compose` (`lower_generator_for`). This is registry-free but keeps two loop paths at lowering.
+
+Remaining to reach the model above:
+
+- **Full loop-routing deferral (approach A).** Lower *every* loop to a `For` and teach the phase's
+  step 5 to rebuild the `Compose` generator shape (defer allocation + feed hoisting) for a
+  non-accumulator `For`, deleting `lower_generator_for`. The chief cost/risk is that generator/yield
+  machinery moving into the phase; the scope-only routing above is the working, registry-free
+  alternative, so this is an optional further simplification (one loop path), not a correctness gap.
+- **Transactional by type (stacked PR).** The transactional slice still carries a `transactional_vars`
+  registry and `with_shadowed` read/write gate. Drop them: classify register writes by
+  `Type::Mut { domain: Txn }` in the phase, and relocate the store-write-context checks
+  (register-outside-block, induction-inside-block) to post-inference type+context checks.
+
+Not yet implemented on this branch (arrives on the stacked PR or later):
+
+- **Transactions.** `with begin():` does not parse yet; there is no `get_prev_txn` builtin, no
+  `Transact` engine, no `AsOf` (live cross-endpoint read), and no transactional `Mut[V, Txn]` domain.
+  These, and the fold-to-`Transact` / `AsOf`-recognition generation path, land with `transact_phase`.
+- **Multi-parameter / cross-function transactional writers** (`transfer(src, dst, amt)`).
+- **The `http_serve` programs** (`http_accumulator`, `http_counter`) that drive the transactional
+  path over a real server.
+- **`while` loops** (parse error today), **nested `for` loops** with loop-carried variables,
+  **mutable collections** (pending sigma types), and **history/auditing reads**.

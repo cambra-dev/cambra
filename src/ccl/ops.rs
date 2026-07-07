@@ -300,6 +300,29 @@ pub enum Builtin {
     /// by sorted domain value.
     LastOrDefault,
 
+    /// `get_prev_seq : Tuple(Fun(I, V), I, V) → V` — the history value at
+    /// the *predecessor* of the given position, or the default at the first
+    /// position.
+    ///
+    /// Applied as a tupled argument, same convention as [`Self::LastOrDefault`]:
+    /// `Apply(Tuple([history, position, default]), Builtin(GetPrevSeq))`.
+    /// The polymorphic scheme `∀ι ν. ((ι ⇒ ν), ι, ν) ⇒ ν` lives in
+    /// [`crate::ccl::infer::OperatorSchemes`] (shared variables
+    /// across positions, like `LastOrDefault`).
+    ///
+    /// This is the **guard accessor** for induction-domain recursion in a
+    /// [`crate::ccl::TypedExprNode::LetRec`]: a binding whose self-reference
+    /// is consumed only as the history argument of `get_prev_seq` depends
+    /// only on strictly earlier positions, which is what makes the group
+    /// well-founded (see `src/ccl/design-mut-txn-feed.md`, "The model" /
+    /// "New builtins", and [`crate::ccl::letrec::check_letrec_guarded`]).
+    ///
+    /// Op-conversion never compiles this builtin directly: letrec pattern
+    /// recognition consumes it (the guarded self-cycle becomes the `Recurse`
+    /// engine), so its op-conversion arm is a deliberate error, like
+    /// `LetRec`'s.
+    GetPrevSeq,
+
     /// `collection_union : (Fun(A, B), Fun(C, D)) → Fun(Union(A, C), dedup(B, D))`
     ///
     /// Merges two function-typed (collection) values into a single collection whose
@@ -334,6 +357,7 @@ impl Builtin {
             Self::Sum => "sum",
             Self::Max => "max",
             Self::LastOrDefault => "last_or_default",
+            Self::GetPrevSeq => "get_prev_seq",
             Self::CollectionUnion => "collection_union",
         }
     }
@@ -396,7 +420,13 @@ impl Builtin {
                 | Self::PermuteDomain
                 | Self::FlattenDomain
                 | Self::CollectionUnion
+                // `GetPrevSeq` shares `LastOrDefault`'s classification (a
+                // scalar-result builtin over a tuple whose stream sub-part
+                // self-iterates), but op-conversion never sees it: letrec
+                // pattern recognition consumes it first, and the op-conv arm
+                // errors deliberately (see the variant doc).
                 | Self::LastOrDefault
+                | Self::GetPrevSeq
         )
     }
 }

@@ -2,11 +2,16 @@
 //! let-chain bindings, per-scope `to_<defer>` Record fields, and
 //! refined-source channels.
 //!
-//! Runs **after** [`crate::ccl::lower`] and **before** [`crate::ccl::infer`].
-//! After this pass, no [`TypedExprNode::Defer`], [`TypedExprNode::Feed`],
-//! [`TypedExprNode::Define`], or [`TypedExprNode::ExprStmt`] nodes remain
-//! in the tree — every downstream pass treats those variants as
-//! `unreachable!`.
+//! Runs **after** [`crate::ccl::infer`] — type errors report against the
+//! user-shaped tree (inference types the defer constructs directly: see
+//! `design/type-inference.md` §"Feed handles") — and the pass is
+//! **type-preserving**: it ends with a retype synthesis
+//! ([`crate::ccl::infer::retype`]) that erases the transient
+//! `Feed` / `Infer`-channel-domain types along with the nodes.  After
+//! this pass, no [`TypedExprNode::Defer`], [`TypedExprNode::Feed`],
+//! [`TypedExprNode::Define`], or [`TypedExprNode::ExprStmt`] nodes — and
+//! no `Feed`/`Hole`/`Infer` types — remain in the tree; every downstream
+//! pass treats those variants as `unreachable!`.
 //!
 //! # Prototype status
 //!
@@ -82,8 +87,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, Branch, Expr, Lit, Name, Pattern, Refinement, Type, TypedExpr, TypedExprNode,
-    ccl_utils::count_free, walk_loop_children,
+    BaseType, Branch, Expr, Lit, Name, Pattern, Refinement, Type, TypedBinding, TypedExpr,
+    TypedExprNode, ccl_utils::count_free, walk_loop_children,
 };
 
 /// Errors that can arise while desugaring `Defer`/`Feed`/`Define` nodes.
@@ -106,6 +111,13 @@ pub enum DeferError {
     /// require letrec semantics that CCL does not yet support.  The
     /// payload names one of the defers on the cycle.
     MutuallyRecursiveCycle(String),
+    /// A multi-arm `Case` feeds a defer in some arms but not others.
+    /// The fan-out rewrite would need a *typed* empty channel for the
+    /// non-feeding arms (the planned refinement-based N-arm fan-out;
+    /// see the design doc's known-gaps section); until then the shape
+    /// is rejected rather than miscompiled. Unreachable from CHL today
+    /// — lowering rejects `elif` inside generator bodies first.
+    PartialFeedCaseUnsupported(String),
 }
 
 impl fmt::Display for DeferError {
@@ -132,6 +144,13 @@ impl fmt::Display for DeferError {
                     "deferred bindings form a mutually recursive cycle through '{name}'"
                 )
             }
+            DeferError::PartialFeedCaseUnsupported(name) => {
+                write!(
+                    f,
+                    "deferred binding '{name}' is fed from some but not all branches of a \
+                     multi-way conditional; this shape is not supported yet"
+                )
+            }
         }
     }
 }
@@ -140,7 +159,7 @@ impl fmt::Display for DeferError {
 /// `{guard → Feed(defer_name, V); true → Unit}`.  Returns
 /// `Some((guard, V))` on a match, `None` otherwise.
 ///
-/// This is the desugar-pre-inference counterpart of `lambda_elim`'s
+/// This is the desugar-stage counterpart of `lambda_elim`'s
 /// `is_filter_case_body`: pre-elim Lambdas wrapping such a Case need
 /// their channel emitted as a refined Lambda rather than a Record-
 /// over-Cases (which would produce a `to_d: V` vs `to_d: Unit` arm
@@ -187,7 +206,7 @@ fn try_extract_filter_feed(body: &Expr, defer_name: &Name) -> Option<(Expr, Expr
 ///
 /// Rewrites to: `let y = Defer in body_x[x → y] with Var(y) replaced
 /// by body_y`.  The substitution `x → Var(y)` is done via
-/// [`pre_infer_substitute`], which also renames the *target* name of
+/// [`desugar_substitute`], which also renames the *target* name of
 /// `Feed`/`Define` nodes when the replacement is a `Var` — so
 /// `Feed("x", …)` becomes `Feed("y", …)` automatically.
 ///
@@ -220,7 +239,7 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
 
     // `body_x[x → y]` — also renames Feed/Define targets named `x` to `y`.
     let y_var = Expr::var(binding_name);
-    let inner_subst = pre_infer_substitute(inner_body_x, &inner_name, &y_var);
+    let inner_subst = desugar_substitute(inner_body_x, &inner_name, &y_var);
 
     // Wrap `body_y` with the prefix (renaming stale feed targets to `y`).
     let mut new_outer_body = body.clone();
@@ -439,8 +458,7 @@ fn extract_defer_binding(body: Expr) -> Option<(Expr, Name)> {
                 // Found it.  Rename binding.name → __floated_<name>
                 // throughout the inner body.
                 let floated_name = Name::floated();
-                let renamed =
-                    pre_infer_substitute(*inner, &binding.name, &Expr::var(&floated_name));
+                let renamed = desugar_substitute(*inner, &binding.name, &Expr::var(&floated_name));
                 return Some((renamed, floated_name));
             }
             // Not the Defer-let — descend into inner, keeping this
@@ -790,7 +808,7 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
                 let TypedExprNode::Lambda { param, body, .. } = &finfo.lambda.node else {
                     unreachable!("VarBody classifier guarantees Lambda")
                 };
-                return pre_infer_substitute((**body).clone(), &param.name, &argument);
+                return desugar_substitute((**body).clone(), &param.name, &argument);
             }
             TypedExprNode::Apply {
                 function: Box::new(function),
@@ -884,6 +902,20 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
             name,
             value: Box::new(rewrite_chains_in_scope(*value, ctx)),
         },
+        // Pre-phase markers: `letrec_phase` runs *before* `desugar_defers` and
+        // rewrites every `For`/`MutWrite` (feed-free, feeding, and yielding
+        // loops alike) into a `LetRec`, so neither reaches this walk on the
+        // current pipeline. These arms remain a defensive total-walk fallback;
+        // structural recursion keeps the walk total.
+        TypedExprNode::For { target, iter, body } => TypedExprNode::For {
+            target,
+            iter: Box::new(rewrite_chains_in_scope(*iter, ctx)),
+            body: Box::new(rewrite_chains_in_scope(*body, ctx)),
+        },
+        TypedExprNode::MutWrite { name, value } => TypedExprNode::MutWrite {
+            name,
+            value: Box::new(rewrite_chains_in_scope(*value, ctx)),
+        },
         leaf @ (TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
@@ -896,6 +928,19 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
         // runs on the lowered AST so it cannot see them today.
         TypedExprNode::VariantCtor { .. } => {
             unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
+        }
+        // Chain detection interacts with the function registry's scoping,
+        // which this pass only threads through `Let`/`Lambda`; rather than
+        // guess how a recursive group participates, reject it. `letrec_phase`
+        // *does* emit `LetRec`, but `letrec_phase::recognize` lowers every
+        // recognized group onto the transitional `Loop` node before this pass,
+        // so no `LetRec` reaches desugar today.
+        TypedExprNode::LetRec { .. } => {
+            unreachable!(
+                "desugar_defers: a LetRec reached this pass — letrec_phase::recognize \
+                 should have lowered every recognized group onto a Loop first \
+                 (src/ccl/design-mut-txn-feed.md)"
+            )
         }
     };
     TypedExpr {
@@ -979,8 +1024,8 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
 
 /// Substitute every free `Var(name)` in `expr` with `replacement`.
 ///
-/// Replace every free occurrence of `Var(name)` with `replacement` in a
-/// pre-inference tree, renaming `Feed`/`Define` targets along the way: when
+/// Replace every free occurrence of `Var(name)` with `replacement` during
+/// desugaring, renaming `Feed`/`Define` targets along the way: when
 /// `replacement` is a `Var(new_name)`, handle uses of `name` become
 /// `new_name` — the α-renaming that makes alias-inlining for defer handles
 /// correct.
@@ -992,7 +1037,7 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
 /// predicate that closes over the renamed binder instead of leaving a stale
 /// reference; and a `Case` pattern binding correctly shadows `name` in its
 /// branch.
-fn pre_infer_substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
+fn desugar_substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
     let mut expr = expr;
     crate::ccl::subst::Subst::discharge_in_place(&mut expr, name, replacement);
     expr
@@ -1048,12 +1093,18 @@ struct DesugarCtx {
     /// is saved and restored on scope exit so shadowing is handled
     /// correctly.
     functions: HashMap<Name, FunctionInfo>,
+    /// Whether the input tree was type-inferred before this pass (the
+    /// desugar-after-inference order — see [`run`]). Gates the type
+    /// stamps: under the legacy untyped order they would change what
+    /// inference later sees.
+    input_typed: bool,
 }
 
 impl DesugarCtx {
     fn new() -> Self {
         Self {
             functions: HashMap::new(),
+            input_typed: false,
         }
     }
 
@@ -1102,8 +1153,15 @@ fn channel_field_name(defer_name: &Name) -> String {
 /// `Unit`-typed value that can be dropped.  Doing this in `desugar_defers`
 /// (rather than leaving it for `simplify`) means no later pass needs to
 /// pattern-match `ExprStmt`.
-pub fn run(expr: Expr) -> Result<Expr, DeferError> {
+pub fn run(expr: Expr, input_typed: bool) -> Result<Expr, DeferError> {
+    // `input_typed` says whether the tree was already type-inferred (the
+    // desugar-after-inference pipeline order). It cannot be sniffed from the
+    // tree — lowering stamps concrete types on some nodes (lambdas,
+    // comprehension domains) — so the caller states it. In the legacy
+    // pre-inference order the pass is purely structural and the
+    // type-synthesis step below is skipped.
     let mut ctx = DesugarCtx::new();
+    ctx.input_typed = input_typed;
     // Phase 1: chain-rewrite defer-mediating UDF call sites.  Walks
     // the tree top-down registering defer-mediating functions and
     // wrapping their direct call chains with `let fresh = Defer in
@@ -1119,9 +1177,115 @@ pub fn run(expr: Expr) -> Result<Expr, DeferError> {
     // (`extract_for_defer`) can match `Apply(Var(d), Var(g))` and
     // `Apply(Var(d), Apply(arg, Var(f)))` forms produced by Phase 1.
     let rewritten = desugar(rewritten, &mut ctx)?;
-    let rewritten = drop_expr_stmts(rewritten);
+    let mut rewritten = drop_expr_stmts(rewritten);
     assert_no_defer_residue(&rewritten)?;
+    if input_typed {
+        // Synthesize the types this pass left as residue — `Hole` on
+        // constructed/invalidated nodes, the erased `Feed` / channel-domain
+        // `Infer` types on defer reads — from the surviving inferred types.
+        // A failure here is a compiler bug (desugar produced a shape the
+        // synthesizer can't type), not a user error; the strict post-desugar
+        // `typecheck` in `compile_program` backstops the same invariant.
+        if let Err(errs) = crate::ccl::infer::retype(&mut rewritten) {
+            panic!("desugar_defers: retype failed on the desugared tree: {errs:#?}");
+        }
+        #[cfg(debug_assertions)]
+        assert_no_type_residue(&rewritten);
+    }
     Ok(rewritten)
+}
+
+/// Debug-only invariant: after [`run`] on a typed input, no expression or
+/// binder slot may still carry a `Hole`, `Infer`, or `Feed` type — desugar
+/// erased the defer constructs, so their transient types must be gone too.
+/// (Refinement predicates are checked by the strict `typecheck` instead;
+/// walking them here would need the cycle guards it already has.)
+#[cfg(debug_assertions)]
+fn assert_no_type_residue(expr: &Expr) {
+    use crate::ccl::infer::has_type_residue;
+    assert!(
+        !has_type_residue(&expr.ty),
+        "type residue survived desugar_defers on `{}` : {}",
+        crate::ccl::symbolic::symbolic(expr),
+        expr.ty
+    );
+    match &expr.node {
+        TypedExprNode::Lambda { param, .. } => assert!(
+            !has_type_residue(&param.ty),
+            "type residue survived desugar_defers on lambda param `{}` : {}",
+            param.name,
+            param.ty
+        ),
+        TypedExprNode::Let { binding, .. } => assert!(
+            !has_type_residue(&binding.ty),
+            "type residue survived desugar_defers on let binding `{}` : {}",
+            binding.name,
+            binding.ty
+        ),
+        TypedExprNode::Loop { params, .. } => {
+            for p in params {
+                assert!(
+                    !has_type_residue(&p.ty),
+                    "type residue survived desugar_defers on loop param `{}` : {}",
+                    p.name,
+                    p.ty
+                );
+            }
+        }
+        _ => {}
+    }
+    expr.walk_children(assert_no_type_residue);
+}
+
+/// Reset a recorded type that went stale because the node's children were
+/// restructured (a `to_<defer>` field appended beneath it, a terminal
+/// wrapped in a Record). The retype pass at the end of [`run`] re-derives
+/// invalidated slots; under the legacy pre-inference order every type is
+/// already `Hole`, so this is a no-op there.
+fn invalidate_ty(_stale: Type) -> Type {
+    Type::Hole
+}
+
+/// Attach the filter-feed guard refinement to a channel source's *domain*.
+///
+/// Under the typed order the refined function type is stamped directly on
+/// `source.ty` — inference has already run, so nothing would consume an
+/// annotation. Under the legacy order it rides `user_annotation` for the
+/// upcoming inference pass to unify and carry.
+fn refine_source_domain(source: &mut Expr, refinement: Refinement, ctx: &DesugarCtx) {
+    if ctx.input_typed
+        && let Type::Fun {
+            name,
+            domain,
+            codomain,
+        } = &source.ty
+    {
+        source.ty = Type::Fun {
+            name: name.clone(),
+            domain: Box::new(Type::Refinement(domain.clone(), refinement)),
+            codomain: codomain.clone(),
+        };
+        return;
+    }
+    source.user_annotation = Some(Type::fun(
+        Type::Refinement(Box::new(Type::Hole), refinement),
+        Type::Hole,
+    ));
+}
+
+/// Stamp a rewritten defer-mediating lambda's handle parameter with its
+/// post-desugar type, `Unit`: every call site substitutes `unit` for the
+/// handle argument — the contribution flows back through the returned
+/// `Record({to_<target>: …})`, not through the parameter. Unconditional on
+/// the rewritten lambda because the recorded param type is always wrong
+/// afterwards, whatever shape inference left it (a `Feed`, the dissolved
+/// channel view, or the floated param's `Hole`). Gated on the typed order:
+/// under the legacy untyped order the stamp would pre-empt what inference
+/// later derives.
+fn stamp_handle_param(param: &mut TypedBinding, ctx: &DesugarCtx) {
+    if ctx.input_typed {
+        param.ty = Type::Base(BaseType::Unit);
+    }
 }
 
 /// Collapse every `ExprStmt(e, b)` to `b`, recursing structurally.
@@ -1136,6 +1300,15 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         user_annotation,
     } = expr;
     let new_node = match node {
+        // An effect subtree carrying a `For`/`MutWrite` is a pre-phase
+        // marker the unified letrec phase consumes (design-mut-txn-feed.md)
+        // — the statement is load-bearing, not extracted-feed residue.
+        TypedExprNode::ExprStmt { expr: effect, body } if contains_phase_marker(&effect) => {
+            TypedExprNode::ExprStmt {
+                expr: Box::new(drop_expr_stmts(*effect)),
+                body: Box::new(drop_expr_stmts(*body)),
+            }
+        }
         TypedExprNode::ExprStmt { body, .. } => return drop_expr_stmts(*body),
         TypedExprNode::Let {
             binding,
@@ -1213,6 +1386,26 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
             source: Box::new(drop_expr_stmts(*source)),
             loop_body: Box::new(drop_expr_stmts(*loop_body)),
         },
+        // Pure structural recursion: no ExprStmt can hide from the walk
+        // inside a binding body.
+        TypedExprNode::LetRec { bindings, body } => TypedExprNode::LetRec {
+            bindings: bindings
+                .into_iter()
+                .map(|(b, def)| (b, drop_expr_stmts(def)))
+                .collect(),
+            body: Box::new(drop_expr_stmts(*body)),
+        },
+        // Pre-phase markers: preserved for the unified letrec phase (their
+        // interior ExprStmt chains are kept by the marker-bearing arm above).
+        TypedExprNode::For { target, iter, body } => TypedExprNode::For {
+            target,
+            iter: Box::new(drop_expr_stmts(*iter)),
+            body: Box::new(drop_expr_stmts(*body)),
+        },
+        TypedExprNode::MutWrite { name, value } => TypedExprNode::MutWrite {
+            name,
+            value: Box::new(drop_expr_stmts(*value)),
+        },
         // Feed/Define get caught by assert_no_defer_residue downstream.
         node @ (TypedExprNode::Feed { .. }
         | TypedExprNode::Define { .. }
@@ -1232,6 +1425,21 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         ty,
         user_annotation,
     }
+}
+
+/// Whether the subtree contains a pre-phase marker node (`For`/`MutWrite`)
+/// that the unified letrec phase consumes downstream of desugar. Used to
+/// keep marker-bearing `ExprStmt`s alive through [`drop_expr_stmts`].
+fn contains_phase_marker(expr: &Expr) -> bool {
+    if matches!(
+        expr.node,
+        TypedExprNode::For { .. } | TypedExprNode::MutWrite { .. }
+    ) {
+        return true;
+    }
+    let mut found = false;
+    expr.walk_children(|c| found = found || contains_phase_marker(c));
+    found
 }
 
 /// Confirm that no `Defer`/`Feed`/`Define` nodes remain after desugar.
@@ -1293,6 +1501,20 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
             assert_no_defer_residue(expr)?;
             assert_no_defer_residue(body)
         }
+        // Pure structural check over the group's bodies.
+        TypedExprNode::LetRec { bindings, body } => {
+            bindings
+                .iter()
+                .try_for_each(|(_, def)| assert_no_defer_residue(def))?;
+            assert_no_defer_residue(body)
+        }
+        // Pre-phase markers are not defer residue (v1 lowering guarantees no
+        // defer nodes inside them); check their subtrees structurally.
+        TypedExprNode::For { iter, body, .. } => {
+            assert_no_defer_residue(iter)?;
+            assert_no_defer_residue(body)
+        }
+        TypedExprNode::MutWrite { value, .. } => assert_no_defer_residue(value),
         TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
         | TypedExprNode::Builtin(_)
@@ -1480,7 +1702,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 // Rename inner_name → binding.name in the spliced body
                 // so the inner defer is exposed under the outer let-y
                 // name for subsequent passes.
-                let renamed = pre_infer_substitute(spliced, &inner_name, &Expr::var(&binding.name));
+                let renamed = desugar_substitute(spliced, &inner_name, &Expr::var(&binding.name));
                 let collapsed = Expr::let_bind(binding.name.clone(), inner_be, renamed);
                 return desugar(collapsed, ctx);
             }
@@ -1493,7 +1715,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // `Feed(y, …)` nodes (which really write to the upstream
             // defer `x`) are recognized.
             //
-            // [`pre_infer_substitute`] renames the *target* name of
+            // [`desugar_substitute`] renames the *target* name of
             // `Feed`/`Define` nodes when the replacement is a `Var`,
             // so `Feed("y", …)` becomes `Feed("x", …)` automatically.
             //
@@ -1507,7 +1729,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 && contains_feed_or_define_for(&body, &binding.name)
                 && !rebinds(&body, source_name)
             {
-                let substituted = pre_infer_substitute(body, &binding.name, &bound_expr);
+                let substituted = desugar_substitute(body, &binding.name, &bound_expr);
                 return Ok(substituted);
             }
             Ok(TypedExpr {
@@ -1639,8 +1861,8 @@ fn rename_shadows_then_bind(
             // `(__acc_stream_1 ≫ .step, x) ▷ last_or_default` where `x`
             // is the outer binding) resolve outward correctly.
             let fresh = Name::shadow_rename();
-            let new_body = pre_infer_substitute(*body, &binding.name, &Expr::var(&fresh));
-            let new_binding = crate::ccl::TypedBinding {
+            let new_body = desugar_substitute(*body, &binding.name, &Expr::var(&fresh));
+            let new_binding = TypedBinding {
                 name: fresh,
                 ty: binding.ty,
                 user_annotation: binding.user_annotation,
@@ -2026,6 +2248,29 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(e, bound, out);
                 rec(body, bound, out);
             }
+            // Every group binder shadows across all binding bodies and the
+            // letrec body (mutual recursion).
+            TypedExprNode::LetRec { bindings, body } => {
+                for (b, _) in bindings {
+                    bound.push(b.name.clone());
+                }
+                for (_, def) in bindings {
+                    rec(def, bound, out);
+                }
+                rec(body, bound, out);
+                for _ in bindings {
+                    bound.pop();
+                }
+            }
+            // Pre-phase markers: the target binder scopes the loop body; a
+            // `MutWrite` names a mutable variable, not a feed target.
+            TypedExprNode::For { target, iter, body } => {
+                rec(iter, bound, out);
+                bound.push(target.name.clone());
+                rec(body, bound, out);
+                bound.pop();
+            }
+            TypedExprNode::MutWrite { value, .. } => rec(value, bound, out),
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
@@ -2093,16 +2338,24 @@ fn rewrite_lambda_to_return_contributions(
         user_annotation,
     } = lambda;
     match (class, node) {
-        (LambdaClass::ParamAsTarget, TypedExprNode::Lambda { param, body }) => {
+        (LambdaClass::ParamAsTarget, TypedExprNode::Lambda { mut param, body }) => {
             let primary_target = param.name.clone();
             let cr = build_contributions_record(*body, &primary_target, ctx)?;
+            // The handle parameter's post-desugar type: call sites
+            // substitute `unit` for the handle argument (the contribution
+            // flows through the returned Record instead).
+            stamp_handle_param(&mut param, ctx);
             Ok(RewrittenFunction {
                 lambda: TypedExpr {
                     node: TypedExprNode::Lambda {
                         param,
                         body: Box::new(cr.body),
                     },
-                    ty,
+                    // The body was rewritten from its original value to a
+                    // contributions Record, so the lambda's codomain changed;
+                    // invalidate the stale recorded type so the typed-order
+                    // `retype` re-synthesizes it (the legacy order ignores it).
+                    ty: invalidate_ty(ty),
                     user_annotation,
                 },
                 targets: cr.targets,
@@ -2122,7 +2375,7 @@ fn rewrite_lambda_to_return_contributions(
                 user_annotation: outer_body_ann,
             } = *outer_body;
             let TypedExprNode::Lambda {
-                param: inner_param,
+                param: mut inner_param,
                 body: inner_body,
             } = outer_body_node
             else {
@@ -2130,12 +2383,17 @@ fn rewrite_lambda_to_return_contributions(
             };
             let primary_target = inner_param.name.clone();
             let cr = build_contributions_record(*inner_body, &primary_target, ctx)?;
+            // The floated handle parameter receives `unit` at every call
+            // site (see [`stamp_handle_param`]).
+            stamp_handle_param(&mut inner_param, ctx);
             let new_inner = TypedExpr {
                 node: TypedExprNode::Lambda {
                     param: inner_param,
                     body: Box::new(cr.body),
                 },
-                ty: outer_body_ty,
+                // Inner body rewritten to a contributions Record — its codomain
+                // changed, so invalidate for `retype` (see the ParamAsTarget arm).
+                ty: invalidate_ty(outer_body_ty),
                 user_annotation: outer_body_ann,
             };
             Ok(RewrittenFunction {
@@ -2144,7 +2402,9 @@ fn rewrite_lambda_to_return_contributions(
                         param: outer_param,
                         body: Box::new(new_inner),
                     },
-                    ty,
+                    // Outer codomain is the rewritten inner lambda, so it too is
+                    // stale; invalidate so `retype` rebuilds the full arrow.
+                    ty: invalidate_ty(ty),
                     user_annotation,
                 },
                 targets: cr.targets,
@@ -2325,7 +2585,7 @@ fn smart_walk_synthesize_call_contributions(
     // Replace `Var(defer_name)` with `Lit::Unit` in the call
     // expression to avoid self-referential channel bindings.  See the
     // doc comment for the full rationale.
-    let neutered_call = pre_infer_substitute(call_expr.clone(), defer_name, &Expr::lit(Lit::Unit));
+    let neutered_call = desugar_substitute(call_expr.clone(), defer_name, &Expr::lit(Lit::Unit));
     // Project the current target's field into `feeds`.  We project
     // only if the function actually has a `to_<current_target>` field
     // (closure-captured targets may exist without the function
@@ -2527,8 +2787,19 @@ fn extract_for_defer(
             // Compose/Loop machinery already provides the function shape,
             // so we leave the value scalar — the Compose-with-Lambda case
             // above wraps it with its own `λ x → V` companion.
+            //
+            // A feed whose value is *already* a collection (`Fun(D, T)`)
+            // contributes its whole extent — a top-level `o << (h ≫ .to_o)`
+            // hoisted out of a loop by the letrec phase, or any collection
+            // feed. It is not lifted (that would double-wrap it as
+            // `Fun(Unit, Fun(D, T))`); it joins the channel union directly.
             let value = *value;
-            let lifted = if in_inner_scope {
+            let mut vty = &value.ty;
+            while let Type::Refinement(inner, _) = vty {
+                vty = inner;
+            }
+            let is_collection = matches!(vty, Type::Fun { .. });
+            let lifted = if in_inner_scope || is_collection {
                 value
             } else {
                 Expr::lambda("__unused", Type::Base(BaseType::Unit), value)
@@ -2724,10 +2995,7 @@ fn extract_for_defer(
                         predicate: Rc::new(pred_on_source),
                     };
                     let mut refined_argument = new_argument.clone();
-                    refined_argument.user_annotation = Some(Type::fun(
-                        Type::Refinement(Box::new(Type::Hole), refinement_struct),
-                        Type::Hole,
-                    ));
+                    refine_source_domain(&mut refined_argument, refinement_struct, ctx);
                     let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), feed_value);
                     let channel = Expr::apply(refined_argument, channel_lambda);
                     feeds.push(channel);
@@ -2937,10 +3205,7 @@ fn extract_for_defer(
                                 predicate: Rc::new(pred_on_source),
                             };
                             let mut refined_prefix = source_prefix.clone();
-                            refined_prefix.user_annotation = Some(Type::fun(
-                                Type::Refinement(Box::new(Type::Hole), refinement_struct),
-                                Type::Hole,
-                            ));
+                            refine_source_domain(&mut refined_prefix, refinement_struct, ctx);
                             let channel_lambda =
                                 Expr::lambda(&param.name, param.ty.clone(), feed_value);
                             let channel_expr = Expr::compose(vec![refined_prefix, channel_lambda]);
@@ -3117,6 +3382,16 @@ fn extract_for_defer(
                 per_branch.push((pattern, guard, branch_feeds, body));
             }
             if any_feed {
+                // A typed empty channel for the non-feeding arms does not
+                // exist yet (known gap: refinement-based N-arm fan-out), so
+                // under the typed order the partial shape is rejected
+                // up front rather than handing the strict post-desugar
+                // typecheck an ill-typed Record fan-out (an ICE).
+                if ctx.input_typed && per_branch.iter().any(|(_, _, feeds, _)| feeds.is_empty()) {
+                    return Err(DeferError::PartialFeedCaseUnsupported(
+                        defer_name.to_string(),
+                    ));
+                }
                 let new_branches: Vec<Branch> = per_branch
                     .into_iter()
                     .map(|(pattern, guard, branch_feeds, body)| {
@@ -3139,7 +3414,9 @@ fn extract_for_defer(
                         scrutinee: scrutinee.clone(),
                         branches: new_branches,
                     },
-                    ty: ty.clone(),
+                    // Every arm's terminal became a Record — the recorded
+                    // Case type is stale.
+                    ty: invalidate_ty(ty.clone()),
                     user_annotation: user_annotation.clone(),
                 };
                 feeds.push(Expr::apply(
@@ -3185,6 +3462,34 @@ fn extract_for_defer(
         TypedExprNode::VariantCtor { .. } => {
             unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
         }
+        // Feed extraction has load-bearing per-variant scope rules
+        // (`in_inner_scope`, the Loop `to_<defer>` machinery); how a
+        // recursive group would participate is exactly what the unified
+        // phase defines — reject rather than guess.
+        TypedExprNode::LetRec { .. } => {
+            unreachable!(
+                "LetRec is not emitted before desugar_defers yet — the unified phase \
+                 (src/ccl/design-mut-txn-feed.md) lands it and replaces this pass"
+            )
+        }
+        // Pre-phase markers: v1 lowering guarantees no feeds inside a
+        // `For` body or `MutWrite` value, so there is nothing to extract —
+        // pass them through untouched (debug-checked).
+        node @ (TypedExprNode::For { .. } | TypedExprNode::MutWrite { .. }) => {
+            debug_assert!(
+                {
+                    let probe = TypedExpr {
+                        node: node.clone(),
+                        ty: ty.clone(),
+                        user_annotation: user_annotation.clone(),
+                    };
+                    collect_feed_target_names(&probe).is_empty()
+                },
+                "feed inside a For/MutWrite marker — v1 lowering must route \
+                 feed-bearing loops through the Loop path"
+            );
+            node
+        }
     };
     Ok(TypedExpr {
         node,
@@ -3214,7 +3519,9 @@ fn augment_terminal_with_channel(expr: Expr, defer_name: &Name, channel: Expr) -
                 bound_expr,
                 body: Box::new(augment_terminal_with_channel(*body, defer_name, channel)),
             },
-            ty,
+            // The terminal below this spine became a Record — the recorded
+            // body-typed spine types are stale.
+            ty: invalidate_ty(ty),
             user_annotation,
         },
         TypedExprNode::ExprStmt { expr: e, body } => TypedExpr {
@@ -3222,7 +3529,7 @@ fn augment_terminal_with_channel(expr: Expr, defer_name: &Name, channel: Expr) -
                 expr: e,
                 body: Box::new(augment_terminal_with_channel(*body, defer_name, channel)),
             },
-            ty,
+            ty: invalidate_ty(ty),
             user_annotation,
         },
         other => {
@@ -3399,7 +3706,9 @@ fn process_loop_for_defer(
             source: new_source,
             loop_body: Box::new(new_body),
         },
-        ty,
+        // The body's terminal Record gained `to_<defer>_<k>` fields, so the
+        // loop's recorded codomain is stale.
+        ty: invalidate_ty(ty),
         user_annotation,
     };
     // Build the outer channel: one `Var(binding) ▷ Proj("to_<d>_<k>")`
@@ -3484,7 +3793,9 @@ fn augment_loop_body_record_named(
     };
     Ok(TypedExpr {
         node,
-        ty,
+        // The terminal Record below (or at) this node gained a field; every
+        // recorded type on the walked spine is stale.
+        ty: invalidate_ty(ty),
         user_annotation,
     })
 }
@@ -3936,7 +4247,7 @@ mod tests {
     fn run_single_feed() {
         let body = Expr::expr_stmt(Expr::feed("d", lit(1)), var("d"));
         let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
-        let result = run(expr).unwrap();
+        let result = run(expr, false).unwrap();
         // After desugar: let __scope_out_d_0 = (Unit; Record({result: d, to_d: 1})) in
         //                let d = __scope_out_d_0.to_d in
         //                __scope_out_d_0.result
@@ -3954,7 +4265,7 @@ mod tests {
     fn run_define_replaces_directly() {
         let body = Expr::expr_stmt(Expr::define("d", lit(42)), var("d"));
         let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
-        let result = run(expr).unwrap();
+        let result = run(expr, false).unwrap();
         let s = symbolic(&result);
         assert!(
             s.contains("42"),
@@ -3969,7 +4280,7 @@ mod tests {
     fn run_no_feed_is_error() {
         let body = var("d");
         let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
-        let err = run(expr).unwrap_err();
+        let err = run(expr, false).unwrap_err();
         assert_eq!(err, DeferError::NoFeedOrDefine("d".into()));
     }
 
@@ -3981,7 +4292,7 @@ mod tests {
             Expr::expr_stmt(Expr::feed("d", lit(2)), var("d")),
         );
         let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
-        let result = run(expr).unwrap();
+        let result = run(expr, false).unwrap();
         let s = symbolic(&result);
         assert!(
             s.contains("⊎") || s.contains("Union"),
@@ -4025,7 +4336,7 @@ mod tests {
         let with_c = Expr::let_bind("c", Expr::new(TypedExprNode::Defer), inner);
         let with_b = Expr::let_bind("b", Expr::new(TypedExprNode::Defer), with_c);
         let with_a = Expr::let_bind("a", Expr::new(TypedExprNode::Defer), with_b);
-        let result = run(with_a).expect("topological resolution should succeed");
+        let result = run(with_a, false).expect("topological resolution should succeed");
         let s = symbolic(&result);
         // The emitted chain should mention all three names; `c` is the
         // sink (depends on nobody), so it must come before `b`, which
@@ -4048,7 +4359,7 @@ mod tests {
         );
         let with_b = Expr::let_bind("b", Expr::new(TypedExprNode::Defer), inner);
         let with_a = Expr::let_bind("a", Expr::new(TypedExprNode::Defer), with_b);
-        let err = run(with_a).unwrap_err();
+        let err = run(with_a, false).unwrap_err();
         assert!(
             matches!(err, DeferError::MutuallyRecursiveCycle(_)),
             "expected MutuallyRecursiveCycle, got {err:?}"
@@ -4088,7 +4399,7 @@ mod tests {
         // `process_loop_for_defer`.
         let with_stream = Expr::let_bind("stream", loop_expr, Expr::var("stream"));
         let with_d = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), with_stream);
-        let result = run(with_d).expect("loop-with-two-feeds should desugar");
+        let result = run(with_d, false).expect("loop-with-two-feeds should desugar");
         let s = symbolic(&result);
         assert!(s.contains("to_d_0"), "missing to_d_0 field: {s}");
         assert!(s.contains("to_d_1"), "missing to_d_1 field: {s}");
@@ -4132,7 +4443,7 @@ mod tests {
         let source = Expr::list(vec![lit(1), lit(-1), lit(2)]);
         let apply = Expr::apply(source, body_lambda);
         let with_d = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), apply);
-        let result = run(with_d).expect("case-branch feed should desugar");
+        let result = run(with_d, false).expect("case-branch feed should desugar");
         let s = symbolic(&result);
         // After desugar each arm publishes a Record({result, to_d: …}).
         assert!(s.contains("to_d"), "expected to_d field in output: {s}");

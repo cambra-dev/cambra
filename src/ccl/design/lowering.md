@@ -162,14 +162,14 @@ in ExprStmt(Define(x, 1), x)    # x <<= 1; x
 
 ### The `desugar_defers` pass
 
-The pass runs **after** `lower` and **before** `infer`.  Because it runs pre-inference, `Defer`/`Feed`/`Define`/`ExprStmt` nodes never reach any later pass — those passes can treat the variants as `unreachable!`.
+The pass runs **after** `infer` (and after `inline` + the `letrec_phase`), and is **type-preserving**: inference types the `Defer`/`Feed`/`Define` constructs directly (so type errors report against the user-shaped tree), and the pass ends with a retype synthesis that erases the transient `Feed` / `Infer`-channel-domain types along with the nodes. No pass *downstream* of desugar sees `Defer`/`Feed`/`Define`/`ExprStmt` — those can treat the variants as `unreachable!`. (See [desugar-defers.md](desugar-defers.md) for why the pass moved after inference.)
 
 In broad strokes, for each cluster of consecutive `let d_i = Defer in …` bindings the pass walks the cluster body to extract every `Feed(d_i, V)` and the (at most one) `Define(d_i, V)`, combines the extracted values via `++` (`TypedExprNode::CollectionUnion`), and emits the cluster's bindings at the body's terminal in topological order so cross-defer references (`x ≪= y; y ≪= …`) resolve without `letrec`.  Special handling exists for per-iteration feeds (Compose/Apply with iteration lambda), Loop bodies (per-iteration `to_<defer>` Record fields), filter-feed Cases, defer-mediating UDF calls (`y = f(arg)` where `f` introduces or manipulates a defer), and a handful of structural rewrites (defer-returning let lift, alias inlining for defer handles).
 
 The full mechanism — the two-phase structure (chain rewriter + cluster walker), the smart-walker for defer-mediating UDF calls, the shadow-renaming step, error modes, known gaps, and a navigation map for the source — lives in **[desugar-defers.md](desugar-defers.md)**.
 
-### Inference after desugaring
+### Inference before desugaring
 
-Because `desugar_defers` runs first, the inference pass never sees `Defer`/`Feed`/`Define` nodes.  Channel values appear as ordinary expressions (Apply/Compose/Loop), and the resolved defer is just a `Let` binding whose `bound_expr` is the assembled channel.  No special `DeferredCollectionDomain` type or per-feed unification step is needed — standard inference does the job.
+The inference pass types `Defer`/`Feed`/`Define` directly — `Defer : Feed(ρ)`, `Feed`/`Define : Unit` with their contributions constrained into `ρ` (see [type-inference.md](type-inference.md) §"Feed handles"). `desugar_defers` then rewrites each resolved defer into an ordinary `Let` binding whose `bound_expr` is the assembled channel (Apply/Compose/Loop), erasing the transient `Feed`/`Infer`-domain types. No special `DeferredCollectionDomain` type is needed — standard inference does the job, and the post-desugar retype re-derives the concrete channel types.
 
 Mutation-loop inference (`emit_loop`) learns the loop body's full Record codomain from the body itself via a one-way subtyping constraint: `require_sub(body_codomain, product({step: σ}))` pins the `step` field while width-subtyping lets the body's Record literal supply whatever `to_<defer>` fields it carries. This is the general pattern for "a known core plus an open set of additional fields" — an open record demanded by `require_sub`, not a dedicated partial-record type.

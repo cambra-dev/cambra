@@ -239,6 +239,19 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
                     .zip(ys)
                     .all(|((kx, x), (ky, y))| kx == ky && types_agree_modulo_unread(x, y))
         }
+        // A defer's `Feed` handle reads through to its payload transparently
+        // (the solver's read-through rule, mirrored in `provide_function`), so
+        // a read agrees with its handle's payload, and two feed handles agree
+        // iff their payloads do. A handle's channel-domain `Infer` stays
+        // unresolved until `retype`; the `Infer` arm above already tolerates
+        // that.
+        (Type::Feed(a), other) | (other, Type::Feed(a)) => types_agree_modulo_unread(a, other),
+        // A `Mut` reference reads through to its `value` transparently (the
+        // deref coercion), mirroring `Feed`: a read agrees with the reference's
+        // value, and two references agree iff their values do.
+        (Type::Mut { value, .. }, other) | (other, Type::Mut { value, .. }) => {
+            types_agree_modulo_unread(value, other)
+        }
         _ => false,
     }
 }
@@ -415,6 +428,22 @@ pub(super) fn check_scope_valid(
                 check_scope_valid(&b.guard, &s, errors);
                 check_scope_valid(&b.body, &s, errors);
             }
+        }
+        // Mutual recursion: the whole group is in scope in every binding
+        // body and in the letrec body.
+        TypedExprNode::LetRec { bindings, body } => {
+            let mut s = scope.clone();
+            s.extend(bindings.iter().map(|(b, _)| b.name.clone()));
+            for (_, def) in bindings {
+                check_scope_valid(def, &s, errors);
+            }
+            check_scope_valid(body, &s, errors);
+        }
+        TypedExprNode::For { target, iter, body } => {
+            check_scope_valid(iter, scope, errors);
+            let mut s = scope.clone();
+            s.insert(target.name.clone());
+            check_scope_valid(body, &s, errors);
         }
         _ => expr.walk_children(|c| check_scope_valid(c, scope, errors)),
     }
@@ -697,13 +726,30 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_node(e, level, ctx);
             coalesce_node(body, level, ctx);
         }
-        // Defer/Feed/Define are eliminated by `desugar_defers` before
-        // inference runs, so coalesce never sees them.
-        TypedExprNode::Feed { .. } | TypedExprNode::Define { .. } | TypedExprNode::Defer => {
-            unreachable!(
-                "Defer/Feed/Define survived desugar_defers and reached coalesce: {:?}",
-                expr.node
-            )
+        // A `Defer` leaf's `Feed(ρ)` resolves through the standard
+        // end-of-function `resolve_var_type` like any other node type.
+        TypedExprNode::Defer => {}
+        // Feed/Define/MutWrite: recurse into the contributed/written value;
+        // the node's own `Unit` type needs no resolution.
+        TypedExprNode::Feed { value, .. }
+        | TypedExprNode::Define { value, .. }
+        | TypedExprNode::MutWrite { value, .. } => {
+            coalesce_node(value, level, ctx);
+        }
+        TypedExprNode::For { target, iter, body } => {
+            coalesce_node(iter, level, ctx);
+            // The loop target binds only inside the body.
+            let target_name = target.name.clone();
+            with_shadows(ctx, [target_name], |ctx| coalesce_node(body, level, ctx));
+            // Binder slot: resolve the target's element type in place, like
+            // `Loop` params (`emit_for` wrote the slot var).
+            match resolve_var_type(&target.ty) {
+                Ok(ty) => target.ty = ty,
+                Err(err) => {
+                    let label = "For target".to_string();
+                    push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
+                }
+            }
         }
         TypedExprNode::Loop {
             params,
@@ -727,6 +773,30 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                     Ok(ty) => binding.ty = ty,
                     Err(err) => {
                         let label = "Loop param".to_string();
+                        push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
+                    }
+                }
+            }
+        }
+
+        TypedExprNode::LetRec { bindings, body } => {
+            // Every group binder scopes every binding body and the letrec
+            // body (mutual recursion), so all of them shadow outer
+            // generalized bindings throughout the group.
+            let names: Vec<Name> = bindings.iter().map(|(b, _)| b.name.clone()).collect();
+            with_shadows(ctx, names, |ctx| {
+                for (_, def) in bindings.iter_mut() {
+                    coalesce_node(def, level, ctx);
+                }
+                coalesce_node(body, level, ctx);
+            });
+            // Binder slots: resolve each declared type in place (`emit_letrec`
+            // normalized the slot, possibly to a fresh var for a `Hole`).
+            for (binding, _) in bindings.iter_mut() {
+                match resolve_var_type(&binding.ty) {
+                    Ok(ty) => binding.ty = ty,
+                    Err(err) => {
+                        let label = format!("LetRec binding `{}`", binding.name);
                         push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
                     }
                 }
@@ -862,6 +932,11 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
         Type::Variant(tags) => tags
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
+        Type::Feed(payload) => coalesce_type_predicates(payload, level, ctx),
+        Type::Mut { value, domain } => {
+            coalesce_type_predicates(value, level, ctx);
+            coalesce_type_predicates(domain, level, ctx);
+        }
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
     }
 }
@@ -1330,6 +1405,11 @@ fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>) {
             let mut pred = (*r.predicate).clone();
             retype_pred_expr(&mut pred, scope);
             r.predicate = Rc::new(pred);
+        }
+        Type::Feed(payload) => retype_in_type(payload, scope),
+        Type::Mut { value, domain } => {
+            retype_in_type(value, scope);
+            retype_in_type(domain, scope);
         }
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
     }

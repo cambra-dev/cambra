@@ -340,16 +340,6 @@ impl LoweringContext {
     pub(super) fn fresh_result_name(&mut self) -> String {
         self.mint_synthetic_id("__result")
     }
-
-    /// Mint a unique `__acc_stream_N` binding name for the
-    /// Record-bodied Join's stream output in a feed-containing mutation
-    /// loop.  The surrounding let-binding projects `.step ▷ Last` for
-    /// the scalar accumulator and `.to_<defer>` for each per-feed
-    /// stream from this one Join (the multi-feed-per-defer subcase
-    /// suffixes those as `.to_<defer>_<k>`).
-    pub(super) fn fresh_acc_stream_name(&mut self) -> String {
-        self.mint_synthetic_id("__acc_stream")
-    }
 }
 
 /// Prefix for synthetic parameter names representing the tupled domain of a

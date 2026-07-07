@@ -38,12 +38,14 @@ impl fmt::Display for FieldKey {
 ///
 /// Appears on [`TypedExpr`] nodes and as the output of type inference.
 ///
-/// The two pre-/post-inference variants divide ownership cleanly:
+/// The transient variants divide ownership cleanly:
 ///
 /// | Variant | Owner | Meaning | Must be eliminated by |
 /// |---|---|---|---|
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
-/// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`) |
+/// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); a defer channel's *domain* is necessarily `Infer` until desugaring (see `Strictness::PreDesugar`) |
+/// | `Feed` | Type checker only | "Feed handle whose payload is the defer binding's post-desugar type" | `desugar_defers` (which runs after inference; a survivor downstream is a compiler bug) |
+/// | `Mut` | Type checker only | "Mutable reference: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `letrec_phase`, which runs *before* `desugar_defers`; a survivor downstream is a compiler bug) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// A primitive base type.
@@ -133,6 +135,49 @@ pub enum Type {
     /// resolves this to a concrete `Extent::DataSourceDomain(rc)` at compilation time
     /// by looking the name up in its source-domain-extent registry.
     DataSource(String),
+    /// The type of a feed handle: `let d = Defer in body` gives `d` the type
+    /// `Feed(ρ)` where `ρ` is the *post-desugar result type* of the binding —
+    /// a `Fun(D, T)` channel for fed defers, or the defined value's type for
+    /// `<<=`-defined defers.
+    ///
+    /// `Feed` is **invariant** in its payload: feeding is a contravariant
+    /// capability (a feed contributes an element type *into* the channel)
+    /// while reading is covariant, so a feed handle flowing through a
+    /// function parameter must propagate feed contributions backwards to
+    /// the caller's channel. See `constrain_go` in [`crate::ccl::infer::solver`].
+    ///
+    /// Like `Hole` and `Infer`, this is a transient variant: it exists only
+    /// between type inference (which mints it for `Defer` bindings) and
+    /// `desugar_defers` (which eliminates every defer construct and erases
+    /// the feed types). No pass downstream of desugar may observe it.
+    Feed(Box<Type>),
+    /// The type of a mutable reference: a `value` cell whose successive
+    /// states are indexed by `domain` (a loop index for induction
+    /// accumulators, a transaction time for `Txn` registers).
+    ///
+    /// Shaped like [`Type::Feed`] — a transient, structural type inference
+    /// mints and threads — but with **two** children and a **deref
+    /// coercion**: a reference reads through to its `value` (`cnt + 1` reads
+    /// the `Int` behind `Mut[Int, D]`). `Mut` is **invariant** in both
+    /// children, for the same reason `Feed` is invariant in its payload:
+    /// a mutable reference flowing through a function parameter both reads
+    /// (covariant) and writes (contravariant) the cell.
+    ///
+    /// Like `Hole`, `Infer`, and `Feed`, this is a transient variant: it
+    /// exists only between type inference (which stamps it on mutable
+    /// bindings/params and every reference) and the **unified phase**
+    /// (`transact_phase` / `letrec_phase`), which rewrites every mutable
+    /// read and write and erases the `Mut` types. It runs *before*
+    /// `desugar_defers`, so no pass from desugar onward may observe a `Mut`;
+    /// a survivor at the strict wall is a compiler bug (see
+    /// `collect_type_errors` under `Strictness::Strict`).
+    Mut {
+        /// The type of the cell's value. Read through by the deref coercion.
+        value: Box<Type>,
+        /// The index the cell's states are tracked over (loop index or
+        /// transaction time).
+        domain: Box<Type>,
+    },
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
     // Refinement { base: Box<Type>, predicate: Box<Expr> }
@@ -233,6 +278,8 @@ impl fmt::Display for Type {
             Type::Hole => write!(f, "_"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
             Type::DataSource(name) => write!(f, "source({name})"),
+            Type::Feed(payload) => write!(f, "feed({payload})"),
+            Type::Mut { value, domain } => write!(f, "Mut[{value}, {domain}]"),
         }
     }
 }
@@ -313,6 +360,11 @@ impl Type {
             Type::Refinement(base, r) => {
                 Type::Refinement(Box::new(base.without_pi_names()), r.clone())
             }
+            Type::Feed(payload) => Type::Feed(Box::new(payload.without_pi_names())),
+            Type::Mut { value, domain } => Type::Mut {
+                value: Box::new(value.without_pi_names()),
+                domain: Box::new(domain.without_pi_names()),
+            },
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
@@ -367,6 +419,11 @@ impl Type {
                 }
             }
             Type::Refinement(base, _) => f(base),
+            Type::Feed(payload) => f(payload),
+            Type::Mut { value, domain } => {
+                f(value);
+                f(domain);
+            }
             Type::Variant(tags) => {
                 for (_, t) in tags {
                     f(t);
@@ -402,6 +459,11 @@ impl Type {
                 }
             }
             Type::Refinement(base, _) => f(base),
+            Type::Feed(payload) => f(payload),
+            Type::Mut { value, domain } => {
+                f(value);
+                f(domain);
+            }
             Type::Variant(tags) => {
                 for (_, t) in tags {
                     f(t);

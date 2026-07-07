@@ -28,7 +28,7 @@ The runtime's formal model lives under
 
 ## Pass pipeline
 
-The pass order (parse → lower → uniquify → desugar_defers → infer → inline →
-lambda_elim → planning → operator_conversion) and the file
+The pass order (parse → lower → uniquify → infer → inline → letrec_phase →
+desugar_defers → lambda_elim → planning → operator_conversion) and the file
 implementing each pass are listed in
 [docs/design.md](/docs/design.md#program-execution-pipeline).

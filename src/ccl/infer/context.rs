@@ -133,6 +133,14 @@ impl InferCtx {
                     .map(|(k, t)| (k.clone(), self.normalize_annotation(t)))
                     .collect(),
             ),
+            Type::Feed(payload) => Type::Feed(Box::new(self.normalize_annotation(payload))),
+            // Structural recursion like `Fun` — normalizing each child turns a
+            // nested `Hole` into a fresh var. (No `Mut`-specific `Hole` logic
+            // here; that belongs to a later increment.)
+            Type::Mut { value, domain } => Type::Mut {
+                value: Box::new(self.normalize_annotation(value)),
+                domain: Box::new(self.normalize_annotation(domain)),
+            },
             // Leaves and existing inference vars pass through unchanged.
             Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Infer(_) => ty.clone(),
         }

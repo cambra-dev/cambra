@@ -11,9 +11,10 @@ CHL source
   → parse             (chl_parser)                    — CHL source → CHL AST
   → lower             (ccl/lower/)                     — CHL AST → CCL Expr          →  lowering.md
   → uniquify          (ccl/uniquify.rs)                — α-uniquify binders           →  lowering.md
-  → desugar_defers    (ccl/desugar_defers.rs)          — Defer/Feed/Define → channels →  desugar-defers.md
   → infer             (ccl/infer/ → ccl/infer/solver/) — type inference + refinements →  type-inference.md
   → inline            (ccl/inline.rs)                  — inline scalar/UDF lets       →  optimization.md
+  → letrec_phase      (ccl/letrec_phase.rs)            — mutation loops → guarded LetRec (get_prev_seq), then recognize → Loop  →  ../design-mut-txn-feed.md
+  → desugar_defers    (ccl/desugar_defers.rs)          — Defer/Feed/Define → channels (after infer + letrec_phase; type-preserving)  →  desugar-defers.md
   → lambda_elim       (ccl/lambda_elim.rs)             — λ → point-free combinators (runs simplify internally)  →  optimization.md
   → planning          (ccl/planning/)                  — hash-join / keyed-aggregate; brackets its marker pass with simplify (ccl/simplify.rs)  →  optimization.md
   → operator_conversion (interpreter/)                 — point-free CCL → tile ops     →  optimization.md
@@ -23,7 +24,7 @@ CHL source
 
 | Doc | Covers |
 | --- | --- |
-| [ir.md](ir.md) | The typed AST: `TypedExpr`/`Type`, the purity invariant, structured names & α-uniquification, the Lambda/Apply iteration encoding, the `Aggregate`/`Cast`/`Case`/`Loop` nodes, `TypedBinding`, and the `Hole`/`Infer` split. |
+| [ir.md](ir.md) | The typed AST: `TypedExpr`/`Type`, the purity invariant, structured names & α-uniquification, the Lambda/Apply iteration encoding, the `Aggregate`/`Cast`/`Case`/`Loop`/`LetRec` nodes, `TypedBinding`, and the transient `Hole`/`Infer`/`Feed`/`Mut` variants. |
 | [type-inference.md](type-inference.md) | Cambra's inference algorithm: the two-pass emit → coalesce engine (`ccl/infer/`), the constraint solver (`ccl/infer/solver/`), let-polymorphism, dependent Pi types and refinements, and post-inference validation. |
 | [lowering.md](lowering.md) | CHL → CCL lowering: how comprehensions, lambdas, `def`s, and generators become CCL shapes, and the surface syntax of the deferred-collection operators. |
 | [desugar-defers.md](desugar-defers.md) | The `desugar_defers` pass in depth — how `Defer`/`Feed`/`Define` clusters become let-chains and record channels. *(Active prototype; see the doc's own status notes.)* |

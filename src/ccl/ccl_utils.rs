@@ -316,7 +316,7 @@ pub fn refined_fn_type(base_domain: Type, predicate: Expr, codomain: Type) -> Ty
 /// the two sides may carry the same predicate at different compilation stages
 /// (bare `__elem ▷ p` before vs after planning normalizes `p` to point-free),
 /// so refinements must not participate in the comparison at any depth.
-fn strip_refinements(ty: &Type) -> Type {
+pub(crate) fn strip_refinements(ty: &Type) -> Type {
     match ty {
         Type::Refinement(base, _) => strip_refinements(base),
         Type::Fun {
@@ -339,6 +339,11 @@ fn strip_refinements(ty: &Type) -> Type {
                 .map(|(k, t)| (k.clone(), strip_refinements(t)))
                 .collect(),
         ),
+        Type::Feed(payload) => Type::Feed(Box::new(strip_refinements(payload))),
+        Type::Mut { value, domain } => Type::Mut {
+            value: Box::new(strip_refinements(value)),
+            domain: Box::new(strip_refinements(domain)),
+        },
         Type::Base(_) | Type::UIntRange(_) | Type::Hole | Type::Infer(_) | Type::DataSource(_) => {
             ty.clone()
         }
@@ -492,9 +497,25 @@ fn count_free_with_visited(name: &Name, expr: &Expr, visited: &mut HashSet<Predi
                     .sum::<usize>()
         }
 
-        // The `name` field of Feed/Define is a *use* of the defer handle
-        // variable — `Feed("x", v)` is a write to the defer `x`, so `x`
-        // is free here in addition to any free uses inside `value`.
+        // Mutual recursion: every group binder scopes every binding body
+        // and the letrec body, so a group binder matching `name` shadows it
+        // across the whole group.
+        TypedExprNode::LetRec { bindings, body } => {
+            if bindings.iter().any(|(b, _)| &b.name == name) {
+                0
+            } else {
+                bindings
+                    .iter()
+                    .map(|(_, def)| count_free_with_visited(name, def, visited))
+                    .sum::<usize>()
+                    + count_free_with_visited(name, body, visited)
+            }
+        }
+
+        // The `name` field of Feed/Define/MutWrite is a *use* of the defer
+        // handle / mutable variable — `Feed("x", v)` (and `x := v`) is a
+        // write to `x`, so `x` is free here in addition to any free uses
+        // inside `value`.
         TypedExprNode::Feed {
             name: handle,
             value,
@@ -502,7 +523,22 @@ fn count_free_with_visited(name: &Name, expr: &Expr, visited: &mut HashSet<Predi
         | TypedExprNode::Define {
             name: handle,
             value,
+        }
+        | TypedExprNode::MutWrite {
+            name: handle,
+            value,
         } => (handle == name) as usize + count_free_with_visited(name, value, visited),
+
+        // The loop target shadows `name` inside the body only; the source
+        // is evaluated in the outer scope.
+        TypedExprNode::For { target, iter, body } => {
+            count_free_with_visited(name, iter, visited)
+                + if &target.name == name {
+                    0
+                } else {
+                    count_free_with_visited(name, body, visited)
+                }
+        }
 
         // A `Case` branch's structural pattern binds its payload name,
         // shadowing `name` inside that branch's guard and body.
@@ -607,6 +643,19 @@ fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
                     .map(|a| count_free_in_value(name, a))
                     .sum::<usize>()
         }
+        // See the LetRec arm of `count_free_with_visited`: group binders
+        // shadow `name` across every binding body and the letrec body.
+        TypedExprNode::LetRec { bindings, body } => {
+            if bindings.iter().any(|(b, _)| &b.name == name) {
+                0
+            } else {
+                bindings
+                    .iter()
+                    .map(|(_, def)| count_free_in_value(name, def))
+                    .sum::<usize>()
+                    + count_free_in_value(name, body)
+            }
+        }
         TypedExprNode::Feed {
             name: handle,
             value,
@@ -614,7 +663,20 @@ fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
         | TypedExprNode::Define {
             name: handle,
             value,
+        }
+        | TypedExprNode::MutWrite {
+            name: handle,
+            value,
         } => (handle == name) as usize + count_free_in_value(name, value),
+        // The loop target shadows `name` in the body only.
+        TypedExprNode::For { target, iter, body } => {
+            count_free_in_value(name, iter)
+                + if &target.name == name {
+                    0
+                } else {
+                    count_free_in_value(name, body)
+                }
+        }
         TypedExprNode::Case {
             scrutinee,
             branches,

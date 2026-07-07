@@ -333,6 +333,86 @@ pub enum TypedExprNode {
         loop_body: Box<TypedExpr>,
     },
 
+    /// A mutually recursive definition group:
+    /// `letrec b₁ = e₁; …; bₙ = eₙ in body`.
+    ///
+    /// Every binding's name is in scope in **every** binding's body and in
+    /// `body` — mutual recursion.  Well-formedness requires the recursion to
+    /// be *guarded*: on every cycle of the group's reference graph at least
+    /// one reference must go through a "previous value" accessor
+    /// ([`Builtin::GetPrevSeq`], and later `get_prev_txn`), so values at any
+    /// position of the sequencing domain depend only on strictly earlier
+    /// positions.  [`crate::ccl::letrec::check_letrec_guarded`] enforces
+    /// this; see `src/ccl/design-mut-txn-feed.md` ("The model" / "`LetRec`").
+    ///
+    /// This is the general node for loops, transactions, and future
+    /// recursive definitions: the unified phase (design doc, "The unified
+    /// phase") rewrites every mutable variable's history, commit-record
+    /// stream, and feed output into one letrec, and operator conversion
+    /// *recognizes patterns* in the group (a `get_prev_seq`-guarded
+    /// self-cycle is a fold; a commit-record binding read through
+    /// `get_prev_txn` is a transactional store) to pick the engine.
+    /// On this branch the induction `letrec_phase` emits it (rewriting every
+    /// mutation loop into a guarded group); the transactional `Mut[V, Txn]`
+    /// emission arrives with the stacked `transact_phase`. `letrec_phase::recognize`
+    /// then lowers every recognized group onto the transitional `Loop` node
+    /// before `desugar_defers`, so a `LetRec` does not survive to the later
+    /// passes today — those that would need pattern knowledge it doesn't yet
+    /// carry treat a surviving group as unreachable rather than guessing.
+    ///
+    /// The node denotes a pure value (the unique solution of the guarded
+    /// group, by induction along the domain order), so it satisfies the CCL
+    /// purity invariant.
+    LetRec {
+        /// The mutually recursive definition group. Every binding's name is
+        /// in scope in every binding's body (and in `body`). Each binding
+        /// carries its full type (generated concretely by the unified phase).
+        bindings: Vec<(TypedBinding, TypedExpr)>,
+        /// The continuation, with the whole group in scope.
+        body: Box<TypedExpr>,
+    },
+
+    /// A statement `for` loop, mirroring the CHL construct directly:
+    /// `for target in iter: body`. Value `Unit`.
+    ///
+    /// A **pre-phase surface-structure node** in the same transient class as
+    /// [`TypedExprNode::Defer`]: a pure placeholder no pass executes,
+    /// eliminated wholesale by the unified letrec phase
+    /// (src/ccl/design-mut-txn-feed.md, "The unified phase"). Lowering emits
+    /// it for mutation loops whose bodies carry no feeds or yields; the
+    /// phase rewrites it — with the [`TypedExprNode::MutWrite`]s inside —
+    /// into a guarded [`TypedExprNode::LetRec`]. No pass downstream of the
+    /// phase may observe it; operator conversion rejects it explicitly.
+    For {
+        /// The iteration binder, bound in `body` to each source element.
+        target: TypedBinding,
+        /// The iteration source — a `Fun(D, T)` whose domain drives the loop.
+        iter: Box<TypedExpr>,
+        /// The per-iteration statement chain (`Let`s / `ExprStmt`-sequenced
+        /// `MutWrite`s), value `Unit`. Reads of mutable variables are bare
+        /// `Var`s — read-your-writes shadowing is the phase's job, not
+        /// lowering's.
+        body: Box<TypedExpr>,
+    },
+
+    /// One write to a `Mut`-declared variable: `name = value` inside a
+    /// [`TypedExprNode::For`] body. Value `Unit`.
+    ///
+    /// `name` is a *reference* to the enclosing plain-`let` binding that
+    /// introduced the variable (not a binder): uniquify and substitution
+    /// treat it exactly like a `Var` use. Bare `Var(name)` reads inside
+    /// `value` are ordinary reads of that binding — the value *before* this
+    /// write.
+    ///
+    /// Same transient class as [`TypedExprNode::For`] — eliminated by the
+    /// unified phase, which threads the write through the letrec recurrence.
+    MutWrite {
+        /// The mutable variable being written.
+        name: Name,
+        /// The written value; must be a subtype of the variable's type.
+        value: Box<TypedExpr>,
+    },
+
     /// A tuple constructor: `(e0, e1, ...)`.
     ///
     /// Compiles to a [`crate::interpreter::tile_operators::FanIn`] record with fields
@@ -540,6 +620,13 @@ impl TypedExpr {
     }
 
     /// Construct a feed expression.
+    pub fn mut_write(name: impl Into<Name>, value: Self) -> Self {
+        Self::new(TypedExprNode::MutWrite {
+            name: name.into(),
+            value: Box::new(value),
+        })
+    }
+
     pub fn feed(name: impl Into<Name>, value: Self) -> Self {
         Self::new(TypedExprNode::Feed {
             name: name.into(),
@@ -720,6 +807,19 @@ impl TypedExpr {
         Self::new(TypedExprNode::Let {
             binding: TypedBinding::new_annotated(name, annotation),
             bound_expr: Box::new(bound_expr),
+            body: Box::new(body),
+        })
+    }
+
+    /// Construct a [`TypedExprNode::LetRec`] group.
+    ///
+    /// Every binding's name is in scope in every binding's body and in
+    /// `body` (mutual recursion); the caller is responsible for the
+    /// guardedness well-formedness condition
+    /// ([`crate::ccl::letrec::check_letrec_guarded`]).
+    pub fn letrec(bindings: Vec<(TypedBinding, Self)>, body: Self) -> Self {
+        Self::new(TypedExprNode::LetRec {
+            bindings,
             body: Box::new(body),
         })
     }
@@ -947,11 +1047,23 @@ impl TypedExpr {
                 }
                 f(loop_body);
             }
+            TypedExprNode::LetRec { bindings, body } => {
+                for (_, def) in bindings {
+                    f(def);
+                }
+                f(body);
+            }
+            TypedExprNode::For { iter, body, .. } => {
+                f(iter);
+                f(body);
+            }
             TypedExprNode::ExprStmt { expr, body } => {
                 f(expr);
                 f(body);
             }
-            TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => f(value),
+            TypedExprNode::Feed { value, .. }
+            | TypedExprNode::Define { value, .. }
+            | TypedExprNode::MutWrite { value, .. } => f(value),
         }
     }
 
@@ -1088,11 +1200,23 @@ impl TypedExpr {
                 }
                 f(loop_body);
             }
+            TypedExprNode::LetRec { bindings, body } => {
+                for (_, def) in bindings {
+                    f(def);
+                }
+                f(body);
+            }
+            TypedExprNode::For { iter, body, .. } => {
+                f(iter);
+                f(body);
+            }
             TypedExprNode::ExprStmt { expr, body } => {
                 f(expr);
                 f(body);
             }
-            TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => f(value),
+            TypedExprNode::Feed { value, .. }
+            | TypedExprNode::Define { value, .. }
+            | TypedExprNode::MutWrite { value, .. } => f(value),
         }
     }
 

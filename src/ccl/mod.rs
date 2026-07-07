@@ -12,6 +12,8 @@ pub mod desugar_defers;
 pub mod infer;
 pub mod inline;
 pub mod lambda_elim;
+pub mod letrec;
+pub mod letrec_phase;
 pub mod lower;
 pub mod names;
 pub mod planning;

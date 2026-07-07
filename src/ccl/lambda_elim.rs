@@ -679,13 +679,15 @@ fn elim_lambda_impl(
         }
 
         // `Defer`, `Feed`, `Define`, and `ExprStmt` are eliminated by
-        // `desugar_defers` before inference; by the time `lambda_elim`
-        // runs they cannot appear.
+        // `desugar_defers`, which runs before lambda-elim; by the time
+        // `lambda_elim` runs they cannot appear.
         TypedExprNode::Feed { .. }
         | TypedExprNode::Define { .. }
         | TypedExprNode::Defer
         | TypedExprNode::ExprStmt { .. } => {
-            unreachable!("Defer/Feed/Define/ExprStmt eliminated by desugar_defers before inference")
+            unreachable!(
+                "Defer/Feed/Define/ExprStmt eliminated by desugar_defers, which runs before lambda-elim"
+            )
         }
 
         // Loop: eliminate `param` from sub-expressions, respecting shadowing
