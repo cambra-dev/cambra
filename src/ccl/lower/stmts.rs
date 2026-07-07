@@ -37,6 +37,12 @@ pub(super) fn lower_stmts_recovering(
         return None;
     }
     let outer_bindings = HashSet::new();
+    // Pre-register transactional registers and `Mut`-parameter `def`s in this
+    // (top-level) block before lowering right-to-left: a call site or a
+    // register-writing loop is lowered before the `:=` / `def` that precedes it
+    // textually. (No transactional-registry snapshot here — the top level is the
+    // outermost scope, so nothing to restore to.)
+    pre_register_txn_decls(stmts, ctx);
     let (last, rest) = stmts.split_last().unwrap();
 
     // Final statement: recover by substituting Expr::error() on failure.
@@ -156,21 +162,31 @@ pub(super) fn lower_stmts_inner(
         "lower_stmts_inner: empty nested block (parser invariant violated)"
     );
 
+    // A nested block is its own scope: snapshot the transactional registry so a
+    // `Mut[…, Txn]` register declared local to this block reverts on exit and
+    // does not leak into a sibling scope. Induction store-ness carries no
+    // lowering-time registry (it is the `Type::Mut` on the binding, checked
+    // post-inference), so only the transactional set is scoped here. Restored on
+    // both the success and error paths below.
+    let snapshot = ctx.snapshot_transactional();
+    pre_register_txn_decls(stmts, ctx);
     let (last, rest) = stmts.split_last().unwrap();
 
     // The final statement must be a bare expression, an if/else block, or
     // a for-loop that contains a yield chain (generator pattern). Wrap the
     // preceding assignments and function definitions in Let bindings,
-    // innermost-first. (No store registry to scope: store-ness is carried by
-    // `Type::Mut`, and introduction-vs-write is decided by lexical scope.)
-    lower_final_stmt(last, rest, outer_bindings, ctx).and_then(|final_expr| {
+    // innermost-first. (Store-ness is carried by `Type::Mut` and checked
+    // post-inference; introduction-vs-write is decided by lexical scope.)
+    let result = lower_final_stmt(last, rest, outer_bindings, ctx).and_then(|final_expr| {
         rest.iter()
             .enumerate()
             .rev()
             .try_fold(final_expr, |acc, (i, stmt)| {
                 lower_middle_stmt(stmt, &rest[..i], acc, outer_bindings, ctx, is_top_level)
             })
-    })
+    });
+    ctx.restore_transactional(snapshot);
+    result
 }
 
 /// Lower the final statement in a block, which must be a bare expression, an if/else block,
@@ -193,38 +209,50 @@ pub(super) fn lower_final_stmt(
             collect_stmt_names(preceding, &mut scope);
             lower_if(last.span, branches, else_body.as_deref(), &scope, ctx)
         }
-        ChlStmt::For { target, iter, body } => {
+        ChlStmt::For {
+            target,
+            iter,
+            body: for_body,
+        } => {
+            // A `for r in xs: with begin(): …` loop as the program's final
+            // statement — one transaction per iteration (e.g. an HTTP GET loop
+            // feeding a live as-of read). Its continuation is `Unit`: the loop is
+            // a statement and its replies ride the feed, not a return value.
+            if for_body_is_transaction(for_body) {
+                return lower_transaction_loop(target, iter, for_body, Expr::lit(Lit::Unit), ctx);
+            }
             // Build outer bindings: caller's bindings + all names from rest.
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
-
             // A non-yielding loop that mutates a declared `Mut[…]`
             // accumulator is a valid *final* statement — the loop runs and its
             // final store value is simply unobserved (`Unit`). Mirror
             // `lower_middle_stmt`'s mutation-loop dispatch here, with `Unit` as
-            // the continuation. (A *yielding* loop — a generator, with or
-            // without loop-carried mutation — falls through to
-            // `lower_generator_for`, whose value is the collected yields; a
-            // bare non-accumulating loop keeps its existing "must end in a
-            // yield/feed" rejection there too.)
-            if !for_body_has_yield(body) {
+            // the continuation. This subsumes the feed-only accumulator (an
+            // HTTP loop whose `<<` reply is not a `yield`, which
+            // `lower_generator_for`'s yield-gated mutation path would miss). (A
+            // *yielding* loop — a generator, with or without loop-carried
+            // mutation — falls through to `lower_generator_for`, whose value is
+            // the collected yields; a bare non-accumulating loop keeps its
+            // existing "must end in a yield/feed" rejection there too.)
+            if !for_body_has_yield(for_body) {
                 // Any `:=` / `+=` to an outer-scope name is a loop-carried store
                 // write (store-ness is checked post-inference; a non-store write
                 // is rejected there, not here). A plain `=` to an outer name is
                 // caught separately by the generator path below.
-                let acc_names = find_mutation_loop_vars(body, &scope);
+                let acc_names = find_mutation_loop_vars(for_body, &scope);
                 if !acc_names.is_empty() {
                     return lower_generator_or_mutation_loop(
                         target,
                         iter,
-                        body,
+                        for_body,
                         &acc_names,
                         Expr::lit(Lit::Unit),
                         ctx,
                     );
                 }
             }
-            lower_generator_for(target, iter, body, &scope, ctx)
+            lower_generator_for(target, iter, for_body, &scope, ctx)
         }
         // A `+=` as the final statement is a store write — a pass-by-reference
         // writer body (`def bump(c): c += 1`) or a program ending in a store
@@ -235,6 +263,7 @@ pub(super) fn lower_final_stmt(
         // "must end in a value" error below, never this arm.)
         ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
+            check_store_write_context(&name, last.span, ctx)?;
             let val = lower_aug_binop(&name, *op, value, ctx)?;
             Ok(Expr::mut_write(name, val))
         }
@@ -255,9 +284,15 @@ pub(super) fn lower_final_stmt(
         }) =>
         {
             let name = extract_name_target(target, "mutable assignment")?;
+            check_store_write_context(&name, last.span, ctx)?;
             let val = lower_expr(value, ctx)?;
             Ok(Expr::mut_write(name, val))
         }
+        // A standalone `with begin():` as the program's final statement: one
+        // transaction whose value is `Unit` (a trailing transaction produces no
+        // value — its replies ride the feed, and a program that wants a committed
+        // value reads it inside a `with begin():` block that feeds it out).
+        ChlStmt::With { .. } => lower_standalone_transaction(last, Expr::lit(Lit::Unit), ctx),
         // Parse-recovery placeholder: silently substitute. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(Expr::error()),
         _ => Err(LoweringError::unsupported(
@@ -366,18 +401,21 @@ pub(super) fn lower_middle_stmt(
             value,
         } => {
             let name = extract_name_target(target, "annotated assignment")?;
-            if mut_annotation_value_type(annotation).is_some() {
-                // `x: Mut[V] = init` — a `Mut` annotation with the *immutable*
-                // `=` operator. This is contradictory under the cutover: `=` is
-                // a plain immutable binding, and mutables are introduced solely
-                // with the `:=` operator. Reject and point at `:=` (the value
-                // type still rides the annotation: `x: Mut[V] := init`).
+            if mut_annotation_parts(annotation).is_some() {
+                // `x: Mut[V] = init` / `x: Mut[V, Txn] = init` — a `Mut`
+                // annotation with the *immutable* `=` operator. This is
+                // contradictory under the cutover: `=` is a plain immutable
+                // binding, and every mutable (induction or transactional) is
+                // introduced solely with `:=`. Reject and point at `:=` (the
+                // value type — and `Txn` — still ride the annotation:
+                // `x: Mut[V] := init`, `x: Mut[V, Txn] := init`).
                 return Err(LoweringError::unsupported(
                     stmt.span,
                     format!(
                         "`{name}: Mut[…] = …` introduces a mutable with the immutable \
                          `=` operator; use `:=` instead (e.g. `{name}: Mut[V] := init`, \
-                         or a bare `{name} := init` to infer the value type)"
+                         `{name}: Mut[V, Txn] := init`, or a bare `{name} := init` to \
+                         infer the value type)"
                     ),
                 ));
             }
@@ -401,7 +439,23 @@ pub(super) fn lower_middle_stmt(
             value,
         } => {
             let name = extract_name_target(target, "mutable assignment")?;
+            // A *bare* `x := e` (no annotation) to an already-live store is a
+            // write / sequential re-bind, not a declaration: gate it like any
+            // store write. A transactional register written here (outside a
+            // `with begin():` block) is rejected; an induction store re-bind
+            // passes (`check_store_write_context` is a no-op for it). An
+            // *annotated* `:=` is the introduction and needs no gate.
+            if annotation.is_none() {
+                check_store_write_context(&name, stmt.span, ctx)?;
+            }
             let val = lower_expr(value, ctx)?;
+            // A bare `x := e` where `x` is already in scope is a *write*, not a
+            // declaration: emit a `MutWrite` marker (store-ness checked
+            // post-inference; the unified phase turns it into a recurrence in a
+            // loop or a shadowing advance at the top level). A transactional
+            // register write here was already rejected by
+            // `check_store_write_context` above (a register write must sit inside
+            // a `with begin():` block).
             if annotation.is_none() {
                 let mut scope = outer_bindings.clone();
                 collect_stmt_names(preceding, &mut scope);
@@ -409,17 +463,36 @@ pub(super) fn lower_middle_stmt(
                     return Ok(Expr::expr_stmt(Expr::mut_write(name, val), body));
                 }
             }
-            let value_ty = match annotation {
-                None => Type::Hole,
-                // `x: Mut[V] := e` → `V`; `x: T := e` → `T`.
-                Some(ann) => match mut_annotation_value_type(ann) {
-                    Some(v) => v?,
-                    None => lower_type_annotation(ann)?,
+            // Otherwise this is an *introduction*. Resolve the optional
+            // annotation to `(value type, transactional?)`:
+            //   (none)             → induction store, value type inferred
+            //   `x: Mut[V] := e`   → induction store at value type `V`
+            //   `x: Mut[V, Txn]`   → transactional register at value type `V`
+            //   `x: T := e`        → induction store at value type `T`
+            let (value_ty, is_txn) = match annotation {
+                None => (Type::Hole, false),
+                Some(ann) => match mut_annotation_parts(ann) {
+                    Some(parts) => parts?,
+                    None => (lower_type_annotation(ann)?, false),
                 },
+            };
+            // Stamp the binding `Mut[V, D]` (so inference binds `x` at `Mut` and
+            // its references deref to `V`). `D = Txn` for a transactional register
+            // (fixed here, never inferred), which also registers `x` so its
+            // `with begin():` writes lower to `MutWrite` and its bare reads are
+            // gated. An induction store gets `D = Hole` and carries *no* lowering
+            // registry — its store-ness is this `Mut` type, checked
+            // post-inference; its domain is the loop it accumulates over, which
+            // the unified phase resolves. See src/ccl/design-mut-txn-feed.md.
+            let domain = if is_txn {
+                ctx.register_transactional(name.clone());
+                Type::Txn
+            } else {
+                Type::Hole
             };
             let mut_ty = Type::Mut {
                 value: Box::new(value_ty),
-                domain: Box::new(Type::Hole),
+                domain: Box::new(domain),
             };
             Ok(Expr::let_bind_annotated(name, val, body, mut_ty))
         }
@@ -430,6 +503,11 @@ pub(super) fn lower_middle_stmt(
         // targets are supported; tuple-destructuring `(a, b) += …` is Unsupported.
         ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
+            // A `+=` to a transactional register outside a `with begin():` block
+            // is rejected here (a register write must commit inside a block);
+            // otherwise it is a bare store write whose target-is-a-store check
+            // runs post-inference.
+            check_store_write_context(&name, stmt.span, ctx)?;
             let val = lower_aug_binop(&name, *op, value, ctx)?;
             Ok(Expr::expr_stmt(Expr::mut_write(name, val), body))
         }
@@ -455,6 +533,14 @@ pub(super) fn lower_middle_stmt(
             body: for_body,
             ..
         } => {
+            // A `for r in xs: with begin(): …` loop is one transaction per
+            // iteration; the loop source drives the writer. Recognized before
+            // mutation-loop classification (its store writes sit inside the
+            // `with begin():` block, not at the loop body's top level).
+            if for_body_is_transaction(for_body) {
+                return lower_transaction_loop(target, iter, for_body, body, ctx);
+            }
+
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
 
@@ -533,6 +619,10 @@ pub(super) fn lower_middle_stmt(
             lower_final_stmt(stmt, preceding, outer_bindings, ctx)?,
             body,
         )),
+        // A standalone `with begin():` transaction — one commit over a
+        // synthesized singleton source, `transact_phase` folds it into the
+        // shared commit store (see src/ccl/design-mut-txn-feed.md).
+        ChlStmt::With { .. } => lower_standalone_transaction(stmt, body, ctx),
         // Parse-recovery placeholder: silently drop the broken statement and
         // pass the continuation through. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(body),
@@ -597,17 +687,53 @@ pub(super) fn name_target_as_name(target: &Spanned<AssignTarget>) -> Option<&str
     }
 }
 
-/// If `annotation` is a `Mut[…]` form, extract the declared *value* type:
-/// `Mut[V]` → `V` via [`lower_type_annotation`], so `Mut[_]` → [`Type::Hole`]
-/// (value type inferred). Returns `None` for any non-`Mut` annotation.
+/// Reject a `Mut[V, Txn]` **register** write that lands *outside* a `with
+/// begin():` block — the write-side mirror of the out-of-block read gate in
+/// [`super::lower_expr`]. A register's history is the commit order, so a bare
+/// write outside a block would become a plain sequential `let` shadow that
+/// silently hides every committed value from subsequent reads; require the
+/// write to sit inside a block.
 ///
-/// The two-slot form `Mut[V, D]` (an explicit sequencing domain, e.g. the
-/// transactional `Txn`) does not parse yet — the subscript index is a single
-/// expression — and arrives with transactional mutability; see
-/// src/ccl/design-mut-txn-feed.md.
-pub(super) fn mut_annotation_value_type(
+/// A name shadowed by an inner local binder is a genuine local (its α-unique
+/// binder wins), not the register, so it is never gated — mirroring the read
+/// gate's `is_shadowed` guard against the base-name registry.
+///
+/// The dual case — an induction `Mut[V]` store written *inside* a block, which
+/// `transact_phase` would silently swallow — is rejected at the block-body write
+/// site in [`super::transactions::write_or_let`]; that check needs no induction
+/// registry, because inside a block the only legal `:=` / `+=` target is a
+/// transactional register.
+pub(super) fn check_store_write_context(
+    name: &str,
+    span: Span,
+    ctx: &LoweringContext,
+) -> Result<(), LoweringError> {
+    if ctx.is_shadowed(name) {
+        return Ok(());
+    }
+    if ctx.is_transactional_store(name) && !ctx.in_tx_body {
+        return Err(LoweringError::unsupported(
+            span,
+            format!("write transactional variable `{name}` inside a `with begin():` block"),
+        ));
+    }
+    Ok(())
+}
+
+/// If `annotation` is a `Mut[…]` form, extract its declared *value* type and
+/// whether it is **transactional** (`Mut[V, Txn]`).
+///
+/// - `Mut[V]` / `Mut[_]` → `(V, false)` — an induction-domain accumulator whose
+///   sequencing domain is inferred from its writing loop (`Mut[_]` → `(Hole,
+///   false)`, value type inferred).
+/// - `Mut[V, Txn]` → `(V, true)` — a transactional register over the commit
+///   order (the two-slot form parses as a tuple index `(V, Txn)`).
+///
+/// `Txn` is the only explicit sequencing domain supported; any other second
+/// slot is a lowering error. Returns `None` for a non-`Mut` annotation.
+pub(super) fn mut_annotation_parts(
     annotation: &Spanned<ChlExpr>,
-) -> Option<Result<Type, LoweringError>> {
+) -> Option<Result<(Type, bool), LoweringError>> {
     let ChlExpr::Subscript { target, index } = &annotation.node else {
         return None;
     };
@@ -617,7 +743,85 @@ pub(super) fn mut_annotation_value_type(
     if head.as_str() != "Mut" {
         return None;
     }
-    Some(lower_type_annotation(index))
+    // `Mut[V, Txn]` parses as a tuple index `(V, Txn)`.
+    if let ChlExpr::Tuple(parts) = &index.node {
+        if parts.len() != 2 {
+            return Some(Err(LoweringError::unsupported(
+                annotation.span,
+                "Mut[…] takes one or two arguments: `Mut[V]` or `Mut[V, Txn]`",
+            )));
+        }
+        let value_ty = match lower_type_annotation(&parts[0]) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+        return Some(match &parts[1].node {
+            ChlExpr::Name(d) if d.as_str() == "Txn" => Ok((value_ty, true)),
+            _ => Err(LoweringError::unsupported(
+                parts[1].span,
+                "the only explicit `Mut` sequencing domain is `Txn` (`Mut[V, Txn]`); \
+                 omit it (`Mut[V]`) to infer a loop's induction domain",
+            )),
+        });
+    }
+    Some(lower_type_annotation(index).map(|t| (t, false)))
+}
+
+/// Pre-register every `x: Mut[V, Txn] := e` transactional-register introduction
+/// (and every pass-by-reference-`Mut` `def`) in `stmts` with the lowering
+/// context.
+///
+/// Statement blocks lower right-to-left (the continuation is built first), so a
+/// for-loop is lowered *before* the `:=` introduction that precedes it
+/// textually; pre-registering per block makes a transactional register visible
+/// (for the read/write gate) when the loop that writes it inside a `with
+/// begin():` block is lowered. Induction stores carry no lowering registry —
+/// their store-ness is the `Type::Mut` on the binding, checked post-inference —
+/// so only transactional registers and `Mut`-parameter `def`s are pre-registered
+/// here.
+pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) {
+    for stmt in stmts {
+        match &stmt.node {
+            // `x: Mut[V, Txn] := e` — a transactional-register introduction.
+            // Register `x` so a following loop's `with begin(): x := …` write is
+            // recognised as a commit and a bare read of `x` is gated. A bare
+            // `:=`, `x: T := e`, or `x: Mut[V] := e` is an induction store and is
+            // intentionally *not* registered (its store-ness is checked
+            // post-inference).
+            ChlStmt::MutAssign {
+                target,
+                annotation: Some(annotation),
+                ..
+            } => {
+                let AssignTarget::Name(id) = &target.node else {
+                    continue;
+                };
+                // A malformed `Mut[…]` annotation (`Err`) surfaces its real error
+                // when the `MutAssign` itself is lowered; not registering it here
+                // is harmless.
+                if matches!(mut_annotation_parts(annotation), Some(Ok((_, true)))) {
+                    ctx.register_transactional(id.as_str());
+                }
+            }
+            // A `def` with a pass-by-reference `Mut` parameter is lowered and
+            // applied curried. Blocks lower right-to-left, so a call site is
+            // lowered *before* the `def` preceding it textually — pre-register
+            // the name here so [`lower_call`] picks the curried shape.
+            ChlStmt::FunctionDef { name, params, .. }
+                if params
+                    .iter()
+                    .any(|p| p.annotation.as_ref().is_some_and(is_mut_annotation)) =>
+            {
+                ctx.register_mut_param_fn(name.as_str());
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether a type annotation is a pass-by-reference `Mut[…]` form.
+fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
+    mut_annotation_parts(annotation).is_some()
 }
 
 /// Lower a CHL type annotation expression to a CCL [`Type`].
@@ -661,7 +865,7 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
                     codomain: Box::new(lower_type_annotation(index)?),
                 }),
                 // `Mut[…]` in annotation position is handled by
-                // `mut_annotation_value_type` before this function is reached;
+                // `mut_annotation_parts` before this function is reached;
                 // seeing it here means a `Mut[…]` nested inside another type,
                 // which is not supported yet.
                 other => Err(LoweringError::unsupported(

@@ -10,7 +10,7 @@ use crate::ccl::{BaseType, Expr, Level, Name, Type, TypedExprNode};
 use super::emit::{
     emit_aggregate, emit_apply, emit_binop, emit_case, emit_cast, emit_collection_union,
     emit_compose, emit_expr_stmt, emit_for, emit_lambda, emit_let, emit_letrec, emit_list,
-    emit_loop, emit_proj, emit_record, emit_tuple, emit_unary, emit_variant_ctor,
+    emit_proj, emit_record, emit_transact, emit_tuple, emit_unary, emit_variant_ctor,
 };
 use super::schemes::OperatorSchemes;
 use super::typing::{Typing, peel_refinements_outer};
@@ -317,12 +317,11 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
 
         TypedExprNode::CollectionUnion(exprs) => emit_collection_union(exprs, ctx)?,
 
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => emit_loop(params, init_args, source, loop_body, ctx)?,
+        TypedExprNode::Transact {
+            keys,
+            writers,
+            domain,
+        } => emit_transact(keys, writers, domain, ctx)?,
 
         TypedExprNode::LetRec { bindings, body } => emit_letrec(bindings, body, ctx)?,
 

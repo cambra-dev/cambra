@@ -88,7 +88,7 @@ use std::rc::Rc;
 
 use crate::ccl::{
     BaseType, Branch, Expr, Lit, Name, Pattern, Refinement, Type, TypedBinding, TypedExpr,
-    TypedExprNode, ccl_utils::count_free, walk_loop_children,
+    TypedExprNode, ccl_utils::count_free, try_walk_transact, walk_transact,
 };
 
 /// Errors that can arise while desugaring `Defer`/`Feed`/`Define` nodes.
@@ -882,14 +882,11 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
                 )
                 .collect(),
         },
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => walk_loop_children(params, init_args, source, loop_body, None, |e| {
-            rewrite_chains_in_scope(e, ctx)
-        }),
+        TypedExprNode::Transact {
+            keys,
+            writers,
+            domain,
+        } => walk_transact(keys, writers, domain, |e| rewrite_chains_in_scope(e, ctx)),
         TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
             expr: Box::new(rewrite_chains_in_scope(*expr, ctx)),
             body: Box::new(rewrite_chains_in_scope(*body, ctx)),
@@ -969,7 +966,6 @@ fn rebinds(expr: &Expr, name: &Name) -> bool {
     let here = match &expr.node {
         TypedExprNode::Let { binding, .. } => &binding.name == name,
         TypedExprNode::Lambda { param, .. } => &param.name == name,
-        TypedExprNode::Loop { params, .. } => params.iter().any(|p| &p.name == name),
         TypedExprNode::Case { branches, .. } => branches
             .iter()
             .any(|b| b.pattern.as_ref().is_some_and(|p| &p.binding.name == name)),
@@ -1003,20 +999,6 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
         }
         TypedExprNode::Lambda { param, body, .. } => {
             &param.name != name && contains_feed_or_define_for(body, name)
-        }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-            ..
-        } => {
-            init_args
-                .iter()
-                .any(|e| contains_feed_or_define_for(e, name))
-                || contains_feed_or_define_for(source, name)
-                || (!params.iter().any(|p| &p.name == name)
-                    && contains_feed_or_define_for(loop_body, name))
         }
         _ => expr.any_child(|c| contains_feed_or_define_for(c, name)),
     }
@@ -1222,16 +1204,6 @@ fn assert_no_type_residue(expr: &Expr) {
             binding.name,
             binding.ty
         ),
-        TypedExprNode::Loop { params, .. } => {
-            for p in params {
-                assert!(
-                    !has_type_residue(&p.ty),
-                    "type residue survived desugar_defers on loop param `{}` : {}",
-                    p.name,
-                    p.ty
-                );
-            }
-        }
         _ => {}
     }
     expr.walk_children(assert_no_type_residue);
@@ -1375,17 +1347,11 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
                 })
                 .collect(),
         },
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => TypedExprNode::Loop {
-            params,
-            init_args: init_args.into_iter().map(drop_expr_stmts).collect(),
-            source: Box::new(drop_expr_stmts(*source)),
-            loop_body: Box::new(drop_expr_stmts(*loop_body)),
-        },
+        TypedExprNode::Transact {
+            keys,
+            writers,
+            domain,
+        } => walk_transact(keys, writers, domain, drop_expr_stmts),
         // Pure structural recursion: no ExprStmt can hide from the walk
         // inside a binding body.
         TypedExprNode::LetRec { bindings, body } => TypedExprNode::LetRec {
@@ -1487,15 +1453,13 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
                 assert_no_defer_residue(&b.body)
             })
         }
-        TypedExprNode::Loop {
-            init_args,
-            source,
-            loop_body,
-            ..
-        } => {
-            init_args.iter().try_for_each(assert_no_defer_residue)?;
-            assert_no_defer_residue(source)?;
-            assert_no_defer_residue(loop_body)
+        TypedExprNode::Transact { keys, writers, .. } => {
+            keys.iter()
+                .try_for_each(|k| assert_no_defer_residue(&k.init))?;
+            writers.iter().try_for_each(|w| {
+                assert_no_defer_residue(&w.source)?;
+                assert_no_defer_residue(&w.body)
+            })
         }
         TypedExprNode::ExprStmt { expr, body } => {
             assert_no_defer_residue(expr)?;
@@ -2041,25 +2005,6 @@ fn collect_free_vars(expr: &Expr, out: &mut HashSet<Name>) {
                 rec(body, bound, out);
                 bound.pop();
             }
-            TypedExprNode::Loop {
-                params,
-                init_args,
-                source,
-                loop_body,
-                ..
-            } => {
-                for e in init_args {
-                    rec(e, bound, out);
-                }
-                rec(source, bound, out);
-                for p in params {
-                    bound.push(p.name.clone());
-                }
-                rec(loop_body, bound, out);
-                for _ in params {
-                    bound.pop();
-                }
-            }
             _ => expr.walk_children(|c| rec(c, bound, out)),
         }
     }
@@ -2225,23 +2170,15 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                     }
                 }
             }
-            TypedExprNode::Loop {
-                params,
-                init_args,
-                source,
-                loop_body,
-                ..
-            } => {
-                for e in init_args {
-                    rec(e, bound, out);
+            // Store keys are labels, not feed targets; each writer body is a
+            // lambda that shadows its own binders via the `Lambda`/`Let` arms.
+            TypedExprNode::Transact { keys, writers, .. } => {
+                for k in keys {
+                    rec(&k.init, bound, out);
                 }
-                rec(source, bound, out);
-                for p in params {
-                    bound.push(p.name.clone());
-                }
-                rec(loop_body, bound, out);
-                for _ in params {
-                    bound.pop();
+                for w in writers {
+                    rec(&w.source, bound, out);
+                    rec(&w.body, bound, out);
                 }
             }
             TypedExprNode::ExprStmt { expr: e, body } => {
@@ -2760,10 +2697,9 @@ fn try_smart_walk_di(
 /// The walk respects shadowing: a nested `let defer_name = …` (binding the
 /// same name) stops the search inside that binding's body.
 ///
-/// `in_inner_scope` is `true` when the walk has crossed a [`TypedExprNode::Lambda`],
-/// [`TypedExprNode::Loop`] (body), or [`TypedExprNode::Case`] branch boundary —
-/// `Define` is disallowed in those contexts since the desugared binding
-/// would need to escape the inner scope.
+/// `in_inner_scope` is `true` when the walk has crossed a [`TypedExprNode::Lambda`]
+/// or [`TypedExprNode::Case`] branch boundary — `Define` is disallowed in those
+/// contexts since the desugared binding would need to escape the inner scope.
 fn extract_for_defer(
     expr: Expr,
     defer_name: &Name,
@@ -2825,68 +2761,38 @@ fn extract_for_defer(
             bound_expr,
             body,
         } => {
-            // Special case: `let bind = Loop {...} in body`.  Process the
-            // Loop's body for feeds and augment its result Record with a
-            // `to_<defer>` field if any are found; emit the channel
-            // contribution as `Var(bind) ▷ Proj("to_<defer>")` so the
-            // loop expression appears only once in the tree.  Without
-            // this special case the generic Loop arm clones the Loop
-            // into the channel projection, duplicating the entire
-            // recurrence cycle in the operator graph.
-            if matches!(bound_expr.node, TypedExprNode::Loop { .. }) && &binding.name != defer_name
-            {
-                let new_bound_expr = process_loop_for_defer(
-                    *bound_expr,
-                    defer_name,
-                    Some(&binding.name),
-                    feeds,
-                    ctx,
-                )?;
-                let body =
-                    extract_for_defer(*body, defer_name, feeds, define, in_inner_scope, ctx)?;
-                TypedExprNode::Let {
-                    binding,
-                    bound_expr: Box::new(new_bound_expr),
-                    body: Box::new(body),
-                }
+            let bound_expr =
+                extract_for_defer(*bound_expr, defer_name, feeds, define, in_inner_scope, ctx)?;
+            let body = if &binding.name == defer_name {
+                // Inner let shadows the defer name; do not descend.
+                *body
             } else {
-                let bound_expr =
-                    extract_for_defer(*bound_expr, defer_name, feeds, define, in_inner_scope, ctx)?;
-                let body = if &binding.name == defer_name {
-                    // Inner let shadows the defer name; do not descend.
-                    *body
-                } else {
-                    // Track which feeds get added during the body
-                    // walk so we can wrap them with this let's
-                    // binding if their free vars reference it.
-                    // Without this, an extracted channel like
-                    // `Apply(src, λx → V_with_n)` (from a generator
-                    // function body with `let n = … in for-loop`)
-                    // would float out to the cluster's bind site
-                    // with `n` unbound.
-                    let prev_len = feeds.len();
-                    let new_body =
-                        extract_for_defer(*body, defer_name, feeds, define, in_inner_scope, ctx)?;
-                    // Wrap each feed extracted during the body walk
-                    // with this let-binding.  We always wrap (rather
-                    // than testing `count_free`) because the binding
-                    // may be referenced through `user_annotation`
-                    // refinements (e.g. filter-feed guards) that
-                    // `count_free` doesn't currently traverse; if the
-                    // binding turns out to be unused in a feed, later
-                    // simplification can drop it.
-                    for feed in feeds.iter_mut().skip(prev_len) {
-                        let placeholder = Expr::new(TypedExprNode::Lit(Lit::Unit));
-                        let original = std::mem::replace(feed, placeholder);
-                        *feed = Expr::let_bind(binding.name.clone(), bound_expr.clone(), original);
-                    }
-                    new_body
-                };
-                TypedExprNode::Let {
-                    binding,
-                    bound_expr: Box::new(bound_expr),
-                    body: Box::new(body),
+                // Track which feeds get added during the body walk so we can
+                // wrap them with this let's binding if their free vars
+                // reference it. Without this, an extracted channel like
+                // `Apply(src, λx → V_with_n)` (from a generator function body
+                // with `let n = … in for-loop`) would float out to the
+                // cluster's bind site with `n` unbound.
+                let prev_len = feeds.len();
+                let new_body =
+                    extract_for_defer(*body, defer_name, feeds, define, in_inner_scope, ctx)?;
+                // Wrap each feed extracted during the body walk with this
+                // let-binding. We always wrap (rather than testing
+                // `count_free`) because the binding may be referenced through
+                // `user_annotation` refinements (e.g. filter-feed guards) that
+                // `count_free` doesn't currently traverse; if the binding turns
+                // out to be unused in a feed, later simplification can drop it.
+                for feed in feeds.iter_mut().skip(prev_len) {
+                    let placeholder = Expr::new(TypedExprNode::Lit(Lit::Unit));
+                    let original = std::mem::replace(feed, placeholder);
+                    *feed = Expr::let_bind(binding.name.clone(), bound_expr.clone(), original);
                 }
+                new_body
+            };
+            TypedExprNode::Let {
+                binding,
+                bound_expr: Box::new(bound_expr),
+                body: Box::new(body),
             }
         }
         TypedExprNode::ExprStmt { expr: e, body } => TypedExprNode::ExprStmt {
@@ -3437,20 +3343,18 @@ fn extract_for_defer(
                     .collect(),
             }
         }
-        loop_node @ TypedExprNode::Loop { .. } => {
-            // A bare Loop without an enclosing `let bind = Loop {...}`
-            // wrapper.  In practice [`crate::ccl::lower::lower_mutation_loop`]
-            // always binds the Loop to a fresh name, so this path
-            // duplicates the recurrence cycle and is undesirable.  Delegate
-            // to [`process_loop_for_defer`] with no binding name, which
-            // pushes the cloned loop as the channel value.
-            let loop_expr = TypedExpr {
-                node: loop_node,
-                ty,
-                user_annotation,
-            };
-            return process_loop_for_defer(loop_expr, defer_name, None, feeds, ctx);
-        }
+        // Feeds are hoisted out of writer bodies before recognition, so a
+        // `Transact` carries no `Feed`/`Define` for any defer (a per-iteration
+        // feed rides the store body as `Feed(defer, __store.to_<defer>)`,
+        // handled by the top-level `Feed` arm). Recurse structurally; each
+        // writer body is a `Lambda`, so its own arm supplies the inner scope.
+        TypedExprNode::Transact {
+            keys,
+            writers,
+            domain,
+        } => try_walk_transact(keys, writers, domain, |c| {
+            extract_for_defer(c, defer_name, feeds, define, in_inner_scope, ctx)
+        })?,
         // Leaf nodes — no feeds possible.
         node @ (TypedExprNode::Lit(_)
         | TypedExprNode::Var(_)
@@ -3544,260 +3448,6 @@ fn augment_terminal_with_channel(expr: Expr, defer_name: &Name, channel: Expr) -
             ]))
         }
     }
-}
-
-/// Process a `Loop` expression for `defer_name`, optionally using
-/// `binding_name` to reference the loop's bound name when emitting the
-/// channel projection.
-///
-/// - Walks the loop body for `Feed(defer_name, V)` nodes.
-/// - If found, augments the body's terminal `Record({step, …})` with a
-///   `to_<defer>: V` field (using [`augment_loop_body_record`]).
-/// - Pushes `Var(binding) ▷ Proj("to_<defer>")` (or the cloned loop value
-///   when no binding name is available) into `feeds` as the loop's
-///   per-iteration channel contribution to the enclosing scope.
-///
-/// Init args and source are evaluated outside the loop's parameter scope;
-/// feeds inside them contribute directly to the enclosing scope and are
-/// extracted by recursing through [`extract_for_defer`].
-fn process_loop_for_defer(
-    loop_expr: Expr,
-    defer_name: &Name,
-    binding_name: Option<&Name>,
-    feeds: &mut Vec<Expr>,
-    ctx: &DesugarCtx,
-) -> Result<Expr, DeferError> {
-    let TypedExpr {
-        node,
-        ty,
-        user_annotation,
-    } = loop_expr;
-    let TypedExprNode::Loop {
-        params,
-        init_args,
-        source,
-        loop_body,
-    } = node
-    else {
-        unreachable!("process_loop_for_defer called on non-Loop")
-    };
-    let mut local_feeds: Vec<Expr> = Vec::new();
-    let mut local_define: Option<Expr> = None;
-    let new_init: Vec<Expr> = init_args
-        .into_iter()
-        .map(|e| extract_for_defer(e, defer_name, feeds, &mut local_define, false, ctx))
-        .collect::<Result<_, _>>()?;
-    if local_define.is_some() {
-        return Err(DeferError::NestedDefinition);
-    }
-    let new_source = Box::new(extract_for_defer(
-        *source,
-        defer_name,
-        feeds,
-        &mut local_define,
-        false,
-        ctx,
-    )?);
-    if local_define.is_some() {
-        return Err(DeferError::NestedDefinition);
-    }
-    let body_shadows = params.iter().any(|p| &p.name == defer_name);
-    if body_shadows {
-        return Ok(TypedExpr {
-            node: TypedExprNode::Loop {
-                params,
-                init_args: new_init,
-                source: new_source,
-                loop_body,
-            },
-            ty,
-            user_annotation,
-        });
-    }
-    // Loop bodies are always emitted as `Lambda(p, inner)` by
-    // [`crate::ccl::lower::lower_mutation_loop`].  We descend INTO that
-    // Lambda's body to extract feeds without re-wrapping them in the
-    // same Lambda — the Lambda is the iteration's domain, not an outer
-    // function scope, so per-iteration feed values stay raw and get
-    // placed directly into the body's terminal Record via
-    // [`augment_loop_body_record`].
-    let TypedExpr {
-        node: loop_body_node,
-        ty: loop_body_ty,
-        user_annotation: loop_body_ann,
-    } = *loop_body;
-    let (new_loop_body, body_feeds) = match loop_body_node {
-        TypedExprNode::Lambda { param, body } => {
-            let mut body_feeds: Vec<Expr> = Vec::new();
-            let mut body_define: Option<Expr> = None;
-            let new_inner = extract_for_defer(
-                *body,
-                defer_name,
-                &mut body_feeds,
-                &mut body_define,
-                true,
-                ctx,
-            )?;
-            if body_define.is_some() {
-                return Err(DeferError::NestedDefinition);
-            }
-            let new_lambda = TypedExpr {
-                node: TypedExprNode::Lambda {
-                    param,
-                    body: Box::new(new_inner),
-                },
-                ty: loop_body_ty,
-                user_annotation: loop_body_ann,
-            };
-            (new_lambda, body_feeds)
-        }
-        other => {
-            // Non-Lambda loop body — defer to the generic path.  Should
-            // not happen in practice with current lowering.
-            let mut body_feeds: Vec<Expr> = Vec::new();
-            let mut body_define: Option<Expr> = None;
-            let body_expr = TypedExpr {
-                node: other,
-                ty: loop_body_ty,
-                user_annotation: loop_body_ann,
-            };
-            let new_body = extract_for_defer(
-                body_expr,
-                defer_name,
-                &mut body_feeds,
-                &mut body_define,
-                true,
-                ctx,
-            )?;
-            if body_define.is_some() {
-                return Err(DeferError::NestedDefinition);
-            }
-            (new_body, body_feeds)
-        }
-    };
-    if body_feeds.is_empty() {
-        feeds.append(&mut local_feeds);
-        return Ok(TypedExpr {
-            node: TypedExprNode::Loop {
-                params,
-                init_args: new_init,
-                source: new_source,
-                loop_body: Box::new(new_loop_body),
-            },
-            ty,
-            user_annotation,
-        });
-    }
-    // Each feed-site inside the loop body contributes a separate
-    // per-iteration stream over the loop's domain.  We can't combine the
-    // raw scalar values inside the body via `++` (collection union expects
-    // function-typed operands), so we emit one `to_<defer>_<k>` field per
-    // feed site and union the resulting outer projections instead.
-    let n_feeds = body_feeds.len();
-    let tap_fields: Vec<String> = (0..n_feeds)
-        .map(|k| format!("{}_{}", channel_field_name(defer_name), k))
-        .collect();
-    let new_body =
-        augment_loop_body_record_multi(new_loop_body, tap_fields.iter().zip(body_feeds))?;
-    let new_loop = TypedExpr {
-        node: TypedExprNode::Loop {
-            params,
-            init_args: new_init,
-            source: new_source,
-            loop_body: Box::new(new_body),
-        },
-        // The body's terminal Record gained `to_<defer>_<k>` fields, so the
-        // loop's recorded codomain is stale.
-        ty: invalidate_ty(ty),
-        user_annotation,
-    };
-    // Build the outer channel: one `Var(binding) ▷ Proj("to_<d>_<k>")`
-    // projection per feed, unioned via `++`.  When there's no binding to
-    // reference the loop by, we clone the loop into each projection —
-    // this duplicates the recurrence cycle but [`lower_mutation_loop`]
-    // always binds the loop to a fresh name in practice.
-    let channels: Vec<Expr> = tap_fields
-        .iter()
-        .map(|field| match binding_name {
-            Some(name) => Expr::compose(vec![Expr::var(name), Expr::proj_field(field)]),
-            None => Expr::compose(vec![new_loop.clone(), Expr::proj_field(field)]),
-        })
-        .collect();
-    let combined = combine_feed_values(channels);
-    feeds.push(combined);
-    feeds.append(&mut local_feeds);
-    Ok(new_loop)
-}
-
-/// Augment a loop body's terminal Record with multiple per-feed fields
-/// in one walk.  Each `(field_name, value)` pair contributes one Record
-/// field; subsequent fields are appended to the same terminal Record.
-fn augment_loop_body_record_multi<'a, I>(expr: Expr, fields: I) -> Result<Expr, DeferError>
-where
-    I: IntoIterator<Item = (&'a String, Expr)>,
-{
-    let mut result = expr;
-    for (field_name, value) in fields {
-        result = augment_loop_body_record_named(result, field_name, value)?;
-    }
-    Ok(result)
-}
-
-/// Augment a loop body's terminal Record with an additional field of the
-/// given name.  Walks through `Let`/`ExprStmt`/`Lambda` wrappers to the
-/// deepest `Record` literal.
-fn augment_loop_body_record_named(
-    expr: Expr,
-    field_name: &str,
-    value: Expr,
-) -> Result<Expr, DeferError> {
-    let TypedExpr {
-        node,
-        ty,
-        user_annotation,
-    } = expr;
-    let node = match node {
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
-        } => TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body: Box::new(augment_loop_body_record_named(*body, field_name, value)?),
-        },
-        TypedExprNode::ExprStmt { expr: e, body } => TypedExprNode::ExprStmt {
-            expr: e,
-            body: Box::new(augment_loop_body_record_named(*body, field_name, value)?),
-        },
-        TypedExprNode::Lambda { param, body } => TypedExprNode::Lambda {
-            param,
-            body: Box::new(augment_loop_body_record_named(*body, field_name, value)?),
-        },
-        TypedExprNode::Record(mut fields) => {
-            fields.push((field_name.to_string(), value));
-            TypedExprNode::Record(fields)
-        }
-        other => {
-            // Not a Record literal — wrap.
-            let terminal = TypedExpr {
-                node: other,
-                ty: ty.clone(),
-                user_annotation: user_annotation.clone(),
-            };
-            return Ok(Expr::new(TypedExprNode::Record(vec![
-                ("result".to_string(), terminal),
-                (field_name.to_string(), value),
-            ])));
-        }
-    };
-    Ok(TypedExpr {
-        node,
-        // The terminal Record below (or at) this node gained a field; every
-        // recorded type on the walked spine is stale.
-        ty: invalidate_ty(ty),
-        user_annotation,
-    })
 }
 
 /// Build an "empty" channel value for Case branches that don't directly
@@ -4301,11 +3951,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `run`-boundary tests for the cluster algorithm, multi-feed Loop,
-    // and filter-feed Case shapes.  These exercise the bulk of
-    // `extract_for_defer` / `channelize_cluster` / `process_loop_for_defer`
-    // / `rename_shadows_then_bind` without going through the full
-    // pipeline.
+    // `run`-boundary tests for the cluster algorithm and filter-feed Case
+    // shapes.  These exercise the bulk of `extract_for_defer` /
+    // `channelize_cluster` / `rename_shadows_then_bind` without going
+    // through the full pipeline.
     // -----------------------------------------------------------------
 
     /// Cluster of three defers where channels reference each other in a
@@ -4364,47 +4013,6 @@ mod tests {
             matches!(err, DeferError::MutuallyRecursiveCycle(_)),
             "expected MutuallyRecursiveCycle, got {err:?}"
         );
-    }
-
-    /// A `Loop` body that feeds the same defer at two distinct sites
-    /// must surface as two `to_<defer>_<k>` Record fields (one per
-    /// site) plus an outer union of the two projections — neither feed
-    /// can collide with the other.
-    #[test]
-    fn run_loop_with_two_feeds_emits_indexed_record_fields() {
-        // λp → ExprStmt(Feed("d", 1),
-        //      ExprStmt(Feed("d", 2),
-        //        Record({step: Var(p)})))
-        let inner_record = Expr::new(TypedExprNode::Record(vec![("step".into(), var("p"))]));
-        let with_two_feeds = Expr::expr_stmt(
-            Expr::feed("d", lit(1)),
-            Expr::expr_stmt(Expr::feed("d", lit(2)), inner_record),
-        );
-        let body_lambda = Expr::lambda("p", Type::Hole, with_two_feeds);
-        let loop_expr = Expr::loop_node(
-            vec!["acc".into()],
-            vec![lit(0)],
-            Expr::list(vec![lit(10), lit(20)]),
-            body_lambda,
-        );
-        // ```
-        // let d = Defer in
-        // let stream = Loop { body Feeds d twice } in
-        // stream
-        // ```
-        // The defer is bound *outside* the loop's let so the loop's
-        // body is in `d`'s scope; the cluster algorithm walks the
-        // `let stream = Loop` binding via `extract_for_defer`'s
-        // Let-of-Loop special case, which delegates to
-        // `process_loop_for_defer`.
-        let with_stream = Expr::let_bind("stream", loop_expr, Expr::var("stream"));
-        let with_d = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), with_stream);
-        let result = run(with_d, false).expect("loop-with-two-feeds should desugar");
-        let s = symbolic(&result);
-        assert!(s.contains("to_d_0"), "missing to_d_0 field: {s}");
-        assert!(s.contains("to_d_1"), "missing to_d_1 field: {s}");
-        assert!(!s.contains("defer"), "no Defer should remain: {s}");
-        assert!(!s.contains("feed"), "no Feed should remain: {s}");
     }
 
     /// Three-arm Case (so the `try_extract_filter_feed` two-arm

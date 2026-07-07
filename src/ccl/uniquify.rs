@@ -160,29 +160,6 @@ impl Uniquifier {
                 self.unbind(base);
             }
 
-            TypedExprNode::Loop {
-                params,
-                init_args,
-                source,
-                loop_body,
-            } => {
-                for a in init_args {
-                    self.expr(a);
-                }
-                self.expr(source);
-                let bases: Vec<Option<String>> = params
-                    .iter_mut()
-                    .map(|p| {
-                        self.binding_tys(p);
-                        self.bind(p)
-                    })
-                    .collect();
-                self.expr(loop_body);
-                for base in bases.into_iter().rev() {
-                    self.unbind(base);
-                }
-            }
-
             // Mutual recursion: mint *all* group binders before walking any
             // binding body, so a reference to any group name — in any body or
             // in the letrec body — resolves to its group binder.
@@ -332,7 +309,6 @@ fn assert_all_binders_minted(expr: &Expr) {
         match &e.node {
             TypedExprNode::Lambda { param, .. } => check(param),
             TypedExprNode::Let { binding, .. } => check(binding),
-            TypedExprNode::Loop { params, .. } => params.iter().for_each(check),
             TypedExprNode::LetRec { bindings, .. } => bindings.iter().for_each(|(b, _)| check(b)),
             TypedExprNode::For { target, .. } => check(target),
             TypedExprNode::Case { branches, .. } => {

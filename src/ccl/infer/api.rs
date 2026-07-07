@@ -611,14 +611,8 @@ fn collect_expr_errors(
                 collect_expr_errors(&b.body, strictness, errors, seen_refinements);
             }
         }
-        TypedExprNode::Loop { params, .. } => {
-            for p in params {
-                collect_type_errors(&p.ty, p.name.base(), strictness, errors, seen_refinements);
-            }
-            expr.walk_children(|e| collect_expr_errors(e, strictness, errors, seen_refinements));
-        }
         // LetRec bindings carry declared types on `TypedBinding` slots that
-        // `walk_children` never reaches — check them like `Loop`'s params.
+        // `walk_children` never reaches — check them like a lambda param.
         TypedExprNode::LetRec { bindings, .. } => {
             for (b, _) in bindings {
                 collect_type_errors(&b.ty, b.name.base(), strictness, errors, seen_refinements);
@@ -730,7 +724,7 @@ fn collect_type_errors(
             }
             collect_type_errors(inner, context_sym, strictness, errors, seen_refinements);
         }
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {}
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn => {}
     }
 }
 
@@ -1015,11 +1009,6 @@ fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
         TypedExprNode::Let { binding, .. } => check_binder(binding, errors),
         TypedExprNode::Lambda { param, .. } => check_binder(param, errors),
         TypedExprNode::For { target, .. } => check_binder(target, errors),
-        TypedExprNode::Loop { params, .. } => {
-            for p in params {
-                check_binder(p, errors);
-            }
-        }
         TypedExprNode::LetRec { bindings, .. } => {
             for (b, _) in bindings {
                 check_binder(b, errors);
@@ -1086,11 +1075,6 @@ fn collect_store_binders(expr: &Expr, out: &mut HashMap<Name, bool>) {
         }
         TypedExprNode::For { target, .. } => {
             out.insert(target.name.clone(), binder_is_store(target));
-        }
-        TypedExprNode::Loop { params, .. } => {
-            for b in params {
-                out.insert(b.name.clone(), binder_is_store(b));
-            }
         }
         TypedExprNode::LetRec { bindings, .. } => {
             for (b, _) in bindings {

@@ -20,7 +20,7 @@ use crate::{
         lower::{LoweringContext, LoweringError, lower_stmts},
         planning,
         symbolic::{symbolic, symbolic_typed},
-        uniquify,
+        transact_phase, uniquify,
     },
     interpreter::{
         Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
@@ -84,6 +84,13 @@ pub enum CompileError {
     LambdaElim(lambda_elim::LambdaElimError),
     /// Operator-graph conversion failed.
     Conversion(ConversionError),
+    /// A post-inference phase rejected the program for a semantic reason that
+    /// only becomes visible after inlining / type inference — a nested
+    /// transaction reaching a `with begin():` block via a function call, or a
+    /// live cross-endpoint read in a shape the as-of rewrite cannot stage. These
+    /// run on a lambda-free / inlined tree whose nodes carry no source span, so
+    /// they render as a plain `error: …` line rather than an ariadne report.
+    Unsupported(String),
 }
 
 impl CompileError {
@@ -124,6 +131,9 @@ impl CompileError {
                 buf.extend_from_slice(
                     format!("error: operator-graph conversion: {e:?}\n").as_bytes(),
                 );
+            }
+            CompileError::Unsupported(msg) => {
+                buf.extend_from_slice(format!("error: {msg}\n").as_bytes());
             }
         }
         String::from_utf8_lossy(&buf).into_owned()
@@ -572,6 +582,31 @@ pub fn compile_program(
         }
     })?;
 
+    // Transactional slice of the unified phase: rewrite every `with begin():`
+    // writer of a `Mut[_, Txn]` store into a `get_prev_txn`-guarded `LetRec`
+    // (histories + commit records over the commit domain), which
+    // `letrec_phase::recognize` destructures into the `Transact{…, Txn}` node
+    // op-conversion compiles to the commit engine — unifying the transaction and
+    // induction paths on one `LetRec` + recognition representation. Runs *before*
+    // `letrec_phase` so the induction phase never sees a transaction loop. See
+    // src/ccl/design-mut-txn-feed.md.
+    //
+    // Store identity is the `Mut[_, Txn]` type on the α-unique binding, gathered
+    // from the *inlined, typed* tree — so a cross-function writer's stores (its
+    // `transfer(a, b)` writes already beta-reduced to name `a`/`b`) are seen, and
+    // an unrelated local merely spelled like a register is not (its binder is a
+    // distinct `Name`). This replaces the lowering-time base-name registry.
+    let txn_stores = transact_phase::collect_txn_stores(&expr);
+    // A transactional writer reaching a `with begin():` block via a function call
+    // is a nested transaction — the callee's inlined `For` would otherwise be
+    // silently absorbed into the outer block's read-your-writes env, dropping its
+    // commit. Reject it before the phase strips the sites.
+    transact_phase::check_no_nested_transactions(&expr, &txn_stores)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    expr = transact_phase::run(expr, &txn_stores);
+    debug!("Transact phase CCL:\n{}", symbolic(&expr));
+    check_pre_desugar(&expr).expect("transact phase produced an inconsistent tree");
+
     // The unified letrec phase: direct-mirror mutation loops (`For` /
     // `MutWrite`) become guarded `LetRec` groups — mutable histories over
     // the induction domain, per src/ccl/design-mut-txn-feed.md. Runs after
@@ -584,10 +619,11 @@ pub fn compile_program(
     debug!("Letrec phase CCL:\n{}", symbolic(&phase_out));
     check_pre_desugar(&phase_out).expect("letrec phase produced an inconsistent tree");
 
-    // Transitional recognition: lower each recognized group onto the
-    // existing `Loop`/`Recurse` machinery so planning and operator
-    // conversion run unchanged. Moves to operator conversion when the
-    // `Loop` node retires (see the letrec_phase module docs).
+    // Recognition: lower each guarded group onto the domain-parameterized
+    // `Transact` carrier (a `get_prev_txn` transaction group → `Transact{Txn}`;
+    // a `get_prev_seq` induction group → `Transact{iteration extent}`) so
+    // planning and operator conversion pick the engine on the domain. See the
+    // `letrec_phase` module docs.
     let recognized = letrec_phase::recognize(phase_out);
     debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
     check_pre_desugar(&recognized).expect("letrec recognition produced an inconsistent tree");
@@ -600,9 +636,23 @@ pub fn compile_program(
     // After this, no Defer/Feed/Define nodes — and no `Feed`/`Infer` types —
     // remain: the pass is type-preserving (it ends with a retype synthesis),
     // and the strict `typecheck` below is the release-visible enforcement.
-    let desugared = desugar_defers::run(recognized, /* input_typed= */ true).errs()?;
+    let mut desugared = desugar_defers::run(recognized, /* input_typed= */ true).errs()?;
     debug!("Desugared:\n{}", symbolic(&desugared));
     typecheck(&desugared).expect("desugar_defers produced an ill-typed tree");
+
+    // Live cross-endpoint reads: rewrite a read-only reply that broadcasts a
+    // live store's terminal read over a request loop into an outer-indexed as-of
+    // join, *before* lambda elimination — so a computed reply (`resp << store +
+    // 1`) stays a lambda the elim pass point-frees, rather than a point-free
+    // `const` a planning-time recognizer would have to reject. See
+    // `transact_phase::rewrite_live_reads`.
+    transact_phase::rewrite_live_reads(&mut desugared);
+    // A live read the rewrite could not resolve (a multi-register reply) would
+    // otherwise compile to a never-terminating `ExtractLast` — reject it with a
+    // clear error rather than hang the endpoint. See `check_live_reads_resolved`.
+    transact_phase::check_live_reads_resolved(&desugared)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    typecheck(&desugared).expect("live-read rewrite produced an ill-typed tree");
 
     let lambda_elim = lambda_elim::run(desugared).errs()?;
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));

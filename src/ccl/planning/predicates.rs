@@ -62,7 +62,6 @@ fn term_mentions_pair_binder(e: &Expr) -> bool {
         TypedExprNode::Var(n) => n.is_synthetic_pair(),
         TypedExprNode::Lambda { param, .. } => param.name.is_synthetic_pair(),
         TypedExprNode::Let { binding, .. } => binding.name.is_synthetic_pair(),
-        TypedExprNode::Loop { params, .. } => params.iter().any(|p| p.name.is_synthetic_pair()),
         TypedExprNode::LetRec { bindings, .. } => {
             bindings.iter().any(|(b, _)| b.name.is_synthetic_pair())
         }
@@ -115,11 +114,6 @@ pub(crate) fn compile_refinement_predicates(expr: &mut Expr, memo: &mut PredMemo
                 if let Some(p) = &mut b.pattern {
                     compile_predicates_in_type(&mut p.binding.ty, memo);
                 }
-            }
-        }
-        TypedExprNode::Loop { params, .. } => {
-            for p in params.iter_mut() {
-                compile_predicates_in_type(&mut p.ty, memo);
             }
         }
         TypedExprNode::LetRec { bindings, .. } => {

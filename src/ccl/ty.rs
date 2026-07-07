@@ -135,6 +135,13 @@ pub enum Type {
     /// resolves this to a concrete `Extent::DataSourceDomain(rc)` at compilation time
     /// by looking the name up in its source-domain-extent registry.
     DataSource(String),
+    /// The transaction-commit domain: an anonymous total order of commit times
+    /// issued by the runtime (the prototype's `CommitTime`). It is the domain of
+    /// transactional histories (`Txn ⇒ V`), the codomain of the per-site
+    /// `begin_<site>` oracles, and the type of a transaction handle. Like
+    /// `DataSource`, it has no enumerable static extent — its positions exist only
+    /// in the tile. See src/ccl/design-mut-txn-feed.md.
+    Txn,
     /// The type of a feed handle: `let d = Defer in body` gives `d` the type
     /// `Feed(ρ)` where `ρ` is the *post-desugar result type* of the binding —
     /// a `Fun(D, T)` channel for fed defers, or the defined value's type for
@@ -278,6 +285,7 @@ impl fmt::Display for Type {
             Type::Hole => write!(f, "_"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
             Type::DataSource(name) => write!(f, "source({name})"),
+            Type::Txn => write!(f, "Txn"),
             Type::Feed(payload) => write!(f, "feed({payload})"),
             Type::Mut { value, domain } => write!(f, "Mut[{value}, {domain}]"),
         }
@@ -318,6 +326,43 @@ impl Type {
             Some(codomain.as_ref().clone())
         } else {
             None
+        }
+    }
+
+    /// Whether this type's positions can be statically enumerated — i.e. a
+    /// terminal reduction over a `Fun` of this domain converges. A live commit
+    /// history (`Txn`) has **no** enumerable extent: its positions are revealed
+    /// only as commits land, so a `last_or_default` over one never resolves.
+    /// `transact_phase::rewrite_live_reads` uses this to detect that a broadcast
+    /// read's store is a live commit log (`Txn`) and rewrite it to an as-of join
+    /// instead of broadcasting a never-resolving terminal render.
+    ///
+    /// The match is **exhaustive on purpose** (no `_` arm): the predicate is
+    /// load-bearing, so a new abstract domain whose elements live in a producer
+    /// must make an explicit decision here rather than silently defaulting to
+    /// enumerable. `DataSource` is enumerable-from-the-type (its extent resolves
+    /// from the registered source); only `Txn` is genuinely non-enumerable.
+    pub fn has_enumerable_extent(&self) -> bool {
+        match self {
+            Type::Txn => false,
+            Type::Tuple(ts) => ts.iter().all(Type::has_enumerable_extent),
+            Type::Record(fields) => fields.iter().all(|(_, t)| t.has_enumerable_extent()),
+            Type::Variant(tags) => tags.iter().all(|(_, t)| t.has_enumerable_extent()),
+            Type::Refinement(inner, _) => inner.has_enumerable_extent(),
+            // Erased by `desugar_defers`, which runs before the pass that consults
+            // this predicate (planning's live-read rewrite); observing one here is
+            // a compiler bug.
+            Type::Feed(_) => unreachable!("Type::Feed survived desugar_defers"),
+            // Erased by the unified phase (`letrec_phase`/`transact_phase`), which
+            // runs before planning; observing one here is a compiler bug.
+            Type::Mut { .. } => unreachable!("Type::Mut survived the unified phase"),
+            // Concrete or type-resolvable domains: enumerable from the type alone.
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::Fun { .. }
+            | Type::DataSource(_)
+            | Type::Hole
+            | Type::Infer(_) => true,
         }
     }
 
@@ -369,7 +414,8 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
-            | Type::DataSource(_) => self.clone(),
+            | Type::DataSource(_)
+            | Type::Txn => self.clone(),
         }
     }
 
@@ -401,7 +447,8 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
-            | Type::DataSource(_) => {}
+            | Type::DataSource(_)
+            | Type::Txn => {}
             Type::Fun {
                 domain, codomain, ..
             } => {
@@ -441,7 +488,8 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
-            | Type::DataSource(_) => {}
+            | Type::DataSource(_)
+            | Type::Txn => {}
             Type::Fun {
                 domain, codomain, ..
             } => {
@@ -765,26 +813,6 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                     .zip(f2)
                     .all(|((n1, e1), (n2, e2))| n1 == n2 && eq_refinement_predicate_go(e1, e2))
         }
-        (
-            N::Loop {
-                params: p1,
-                init_args: i1,
-                source: s1,
-                loop_body: b1,
-            },
-            N::Loop {
-                params: p2,
-                init_args: i2,
-                source: s2,
-                loop_body: b2,
-            },
-        ) => {
-            p1.len() == p2.len()
-                && p1.iter().zip(p2).all(|(x, y)| x.name == y.name)
-                && all_eq(i1, i2)
-                && eq_refinement_predicate_go(s1, s2)
-                && eq_refinement_predicate_go(b1, b2)
-        }
         (N::ExprStmt { expr: e1, body: b1 }, N::ExprStmt { expr: e2, body: b2 }) => {
             eq_refinement_predicate_go(e1, e2) && eq_refinement_predicate_go(b1, b2)
         }
@@ -894,6 +922,17 @@ mod tests {
         assert_ne!(
             gt, lt,
             "casts differing only in the target's nested filter are distinct refinements"
+        );
+    }
+
+    /// The transaction-commit domain renders by its bare name (mirrors the
+    /// prototype's `CommitTime` Display), including as a function domain.
+    #[test]
+    fn txn_type_display() {
+        assert_eq!(Type::Txn.to_string(), "Txn");
+        assert_eq!(
+            Type::fun(Type::Txn, Type::Base(BaseType::Int)).to_string(),
+            "(Txn ⇒ Int)"
         );
     }
 }

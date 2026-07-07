@@ -41,6 +41,7 @@ use crate::ccl::infer::solver::{fun, prim};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{BaseType, Expr, Name, ProjKey, Type, TypedExprNode};
 
+use super::emit::writer_tap_fields;
 use super::solve::{specialize_lambda_domain, specialize_projection_domain};
 use super::typing::peel_refinements_outer;
 use super::{lit_base, variant_type};
@@ -477,30 +478,35 @@ fn retype_node_synth(
             None
         }
 
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
+        // `Transact` is born by recognition (before desugar), so retype (at the
+        // end of desugar) sees it. Recurse into each key's `init` and each
+        // writer's `source`/`body` to retype any residue, then re-derive the
+        // store record from the retyped children — the key histories
+        // `Fun(domain, V)` plus the per-position `to_<defer>` virtual keys the
+        // writer decision records carry (mirrors `emit_transact`; desugar's
+        // `to_<defer>` routing may have left a provisional store type stale).
+        TypedExprNode::Transact {
+            keys,
+            writers,
+            domain,
         } => {
-            retype_node_synth(source, scope, call_args, errors);
-            for a in init_args.iter_mut() {
-                retype_node_synth(a, scope, call_args, errors);
+            for k in keys.iter_mut() {
+                retype_node_synth(&mut k.init, scope, call_args, errors);
             }
-            for (p, init) in params.iter_mut().zip(init_args.iter()) {
-                if has_type_residue(&p.ty) {
-                    p.ty = init.ty.clone();
+            for w in writers.iter_mut() {
+                retype_node_synth(&mut w.source, scope, call_args, errors);
+                retype_node_synth(&mut w.body, scope, call_args, errors);
+            }
+            let mut fields: Vec<(String, Type)> = keys
+                .iter()
+                .map(|k| (k.name.field_key(), fun(domain.clone(), k.init.ty.clone())))
+                .collect();
+            for w in writers.iter() {
+                for (field, value_ty) in writer_tap_fields(&w.body.ty) {
+                    fields.push((field, fun(domain.clone(), value_ty)));
                 }
             }
-            retype_node_synth(loop_body, scope, call_args, errors);
-            // Mirror `emit_loop`'s result: Fun(source domain, body codomain).
-            match (
-                peel_refinements_outer(&source.ty),
-                fn_codomain(&loop_body.ty),
-            ) {
-                (Type::Fun { domain, .. }, Some(cod)) => Some(fun((**domain).clone(), cod)),
-                _ => None,
-            }
+            Some(Type::Record(fields))
         }
 
         // Structural recursion with the whole group in scope (mutual

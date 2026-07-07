@@ -221,6 +221,21 @@ impl Name {
         }
     }
 
+    /// A globally-distinct string key for this name, suitable as a **store
+    /// record field label** for a [`crate::ccl::TypedExprNode::Transact`] key.
+    /// Unlike [`base`](Self::base) it folds the `uid` in, so two distinct
+    /// binders sharing a spelling (e.g. accumulators in sibling loops) get
+    /// distinct keys. A variable read of a store key projects this field of
+    /// the store record (`__store.field_key`).
+    pub fn field_key(&self) -> String {
+        match self {
+            Name::Raw(s) => s.clone(),
+            Name::Unique { base, uid } => format!("{base}#{}", uid.0),
+            Name::Synthetic { kind, uid } => format!("{}#{}", kind.stem(), uid.0),
+            Name::Reserved(r) => r.spelling().to_string(),
+        }
+    }
+
     /// Is this a raw (un-uniquified) lowering name? The "still needs minting"
     /// sentinel uniquification keys on.
     pub fn is_raw(&self) -> bool {

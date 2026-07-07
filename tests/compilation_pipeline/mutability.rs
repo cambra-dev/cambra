@@ -470,18 +470,22 @@ fn mut_collection_as_for_source_derefs() {
         cambra::interpreter::Value::Int(6),
     );
 }
+// Multi-parameter pass-by-reference: a `Mut` parameter alongside a plain one is
+// curried into a chain of named lambdas (a `Mut` param must stay a named binder
+// so inlining renames its `MutWrite` target to the caller's store) and inlined
+// at the call site. The plain parameter rides the same call.
 #[test]
-fn multi_param_mut_assign_rejected() {
-    expect_mut_discipline_error(
+fn multi_param_pass_by_ref_assign_works() {
+    check_scalar(
         "def add_to(c: Mut[int], amt: int):\n    c := c + amt\ncnt: Mut[int] := 0\nadd_to(cnt, 5)\ncnt",
-        "multi-parameter",
+        cambra::interpreter::Value::Int(5),
     );
 }
 #[test]
-fn multi_param_mut_augassign_rejected() {
-    expect_mut_discipline_error(
-        "def f(c: Mut[int], d: int):\n    c += 5\n    d\nf",
-        "multi-parameter",
+fn multi_param_pass_by_ref_augassign_works() {
+    check_scalar(
+        "def f(c: Mut[int], d: int):\n    c += d\ncnt: Mut[int] := 0\nf(cnt, 7)\ncnt",
+        cambra::interpreter::Value::Int(7),
     );
 }
 #[test]

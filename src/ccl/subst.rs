@@ -436,26 +436,6 @@ impl Subst {
                 }
             }
 
-            Loop {
-                params,
-                init_args,
-                source,
-                loop_body,
-            } => {
-                // `init_args` / `source` sit outside the loop-param scope.
-                let init_args = init_args.iter().map(|a| self.apply_expr(a)).collect();
-                let source = Box::new(self.apply_expr(source));
-                // Shadow every loop param inside the body.
-                let inner = params.iter().fold(self.clone(), |s, p| s.shadow(&p.name));
-                let loop_body = Box::new(inner.apply_expr(loop_body));
-                Loop {
-                    params: params.clone(),
-                    init_args,
-                    source,
-                    loop_body,
-                }
-            }
-
             LetRec { bindings, body } => {
                 // Mutual recursion: every group binder is in scope in every
                 // binding body AND the letrec body, so all of them shadow the
@@ -621,23 +601,6 @@ impl Subst {
                 self.under_binder_mut(&binding.name, body, memo);
             }
 
-            TypedExprNode::Loop {
-                params,
-                init_args,
-                source,
-                loop_body,
-            } => {
-                for a in init_args.iter_mut() {
-                    self.rewrite_expr_go(a, memo);
-                }
-                self.rewrite_expr_go(source, memo);
-                let inner = params.iter().fold(self.clone(), |s, p| s.shadow(&p.name));
-                for p in params.iter() {
-                    inner.assert_no_capture(&p.name);
-                }
-                inner.rewrite_expr_go(loop_body, memo);
-            }
-
             TypedExprNode::LetRec { bindings, body } => {
                 // Every group binder scopes every binding body and the letrec
                 // body (mutual recursion) — shadow them all before descending
@@ -734,6 +697,7 @@ impl Subst {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
+            | Type::Txn
             | Type::Hole
             | Type::Infer(_) => {}
 
@@ -897,6 +861,7 @@ impl Subst {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
+            | Type::Txn
             | Type::Hole
             | Type::Infer(_) => ty.clone(),
 
@@ -1015,7 +980,12 @@ fn collect_type_fv(
     out: &mut BTreeSet<Binder>,
 ) {
     match ty {
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::Infer(_) => {}
         Type::Fun {
             name,
             domain,
@@ -1087,20 +1057,6 @@ fn collect_expr_fv(
             collect_expr_fv(bound_expr, bound, visited, out);
             with_binders(bound, [binding.name.clone()], |bnd| {
                 collect_expr_fv(body, bnd, visited, out)
-            });
-        }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            init_args
-                .iter()
-                .for_each(|a| collect_expr_fv(a, bound, visited, out));
-            collect_expr_fv(source, bound, visited, out);
-            with_binders(bound, params.iter().map(|p| p.name.clone()), |bnd| {
-                collect_expr_fv(loop_body, bnd, visited, out)
             });
         }
         // Mutual recursion: every group binder is bound in every binding

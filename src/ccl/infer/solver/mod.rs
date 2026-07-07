@@ -78,7 +78,7 @@ pub fn type_level(ty: &Type) -> Level {
         // `domain`'s level surfacing here, so a fresh domain var pins the
         // level of the enclosing `Mut`.
         Type::Mut { value, domain } => type_level(value).max(type_level(domain)),
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => 0,
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => 0,
     }
 }
 

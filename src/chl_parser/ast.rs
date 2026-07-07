@@ -221,6 +221,17 @@ pub enum Stmt {
         body: Vec<Spanned<Stmt>>,
     },
 
+    /// `with <binding> = <context>: body` — a transaction block. The context
+    /// is `begin()` (the transaction marker); `binding`, when present, names
+    /// the transaction's commit time (`with t = begin(): …`) — parsed but not
+    /// yet consumed by lowering (reserved for transaction-handle operations).
+    /// See src/ccl/design-mut-txn-feed.md.
+    With {
+        binding: Option<SmolStr>,
+        context: Spanned<Expr>,
+        body: Vec<Spanned<Stmt>>,
+    },
+
     /// `return value` (only valid inside a function body; not enforced here).
     Return(Option<Spanned<Expr>>),
 

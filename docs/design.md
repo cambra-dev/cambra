@@ -34,16 +34,22 @@ CHL source
   → inline           (ccl/inline.rs: inline UDF Let bindings with non-iterable domains; beta-reduce at
                       call sites. Runs *before* desugar_defers so the letrec phase can route an in-loop
                       feed against inlined pass-by-ref writers; it therefore still sees Defer/Feed/Define)
-  → letrec_phase     (ccl/letrec_phase.rs: the induction mutability phase — every mutation loop
-                      (For/MutWrite markers, feed-free or feeding) becomes a guarded LetRec group over the
-                      induction domain (get_prev_seq recurrence, last_or_default trailing read); see
-                      src/ccl/design-mut-txn-feed.md. Runs before desugar_defers so a per-iteration feed
-                      inside a loop is hoisted to an ordinary feed of the loop's history. Then `recognize`
-                      lowers each group onto the Loop/Recurse machinery so planning + op-conversion run
-                      unchanged. Loop is the recurrence carrier from recognition (pre-lambda_elim) to
-                      op-conversion: recognition must precede lambda_elim, and op-conversion is lambda-free,
-                      so a carrier node is required. The transactional Mut[V, Txn] phase (transact_phase)
-                      lands with the stacked PR; this branch delivers induction mutability only)
+  → transact_phase   (ccl/transact_phase.rs: each `with begin():` block over Mut[V, Txn] stores folds into
+                      a get_prev_txn-guarded LetRec over the commit domain (per-key histories + per-site
+                      commit records). Runs *before* letrec_phase so the induction phase never sees a
+                      transaction loop; store identity is the Mut[_, Txn] type on the α-unique binding.
+                      See src/ccl/design-mut-txn-feed.md)
+  → letrec_phase     (ccl/letrec_phase.rs: the induction mutability phase — every non-transactional
+                      mutation loop (For/MutWrite markers, feed-free or feeding) becomes a guarded LetRec
+                      group over the induction domain (get_prev_seq recurrence, last_or_default trailing
+                      read); see src/ccl/design-mut-txn-feed.md. Runs before desugar_defers so a
+                      per-iteration feed inside a loop is hoisted to an ordinary feed of the loop's history)
+  → recognize        (ccl/letrec_phase.rs::recognize: lower each guarded LetRec group onto the
+                      domain-parameterized Transact carrier — induction domain → Recurse, Txn domain →
+                      commit operator — so planning + op-conversion run unchanged. Transact is the
+                      recurrence carrier from recognition (pre-lambda_elim) to op-conversion: recognition
+                      must precede lambda_elim, and op-conversion is lambda-free, so a carrier node is
+                      required. Both domains share the one carrier)
   → desugar_defers   (ccl/desugar_defers.rs: Defer/Feed/Define → let-chain + Record channels;
                       type-preserving — erases the transient Feed/Infer-domain defer types. Runs after the
                       letrec phase, so an in-loop feed is already hoisted to a feed of the loop's history)

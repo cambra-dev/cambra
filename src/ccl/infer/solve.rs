@@ -206,6 +206,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
         (Type::Base(a), Type::Base(b)) => a == b,
         (Type::UIntRange(a), Type::UIntRange(b)) => a == b,
         (Type::DataSource(a), Type::DataSource(b)) => a == b,
+        (Type::Txn, Type::Txn) => true,
         (
             Type::Fun {
                 name: n1,
@@ -398,20 +399,6 @@ pub(super) fn check_scope_valid(
             let mut s = scope.clone();
             s.insert(binding.name.clone());
             check_scope_valid(body, &s, errors);
-        }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            init_args
-                .iter()
-                .for_each(|a| check_scope_valid(a, scope, errors));
-            check_scope_valid(source, scope, errors);
-            let mut s = scope.clone();
-            s.extend(params.iter().map(|p| p.name.clone()));
-            check_scope_valid(loop_body, &s, errors);
         }
         TypedExprNode::Case {
             scrutinee,
@@ -751,32 +738,12 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 }
             }
         }
-        TypedExprNode::Loop {
-            params,
-            source,
-            init_args,
-            loop_body,
-            ..
-        } => {
-            coalesce_node(source, level, ctx);
-            for a in init_args.iter_mut() {
-                coalesce_node(a, level, ctx);
-            }
-            // Accumulator params are bound only inside the loop body.
-            let param_names: Vec<Name> = params.iter().map(|p| p.name.clone()).collect();
-            with_shadows(ctx, param_names, |ctx| coalesce_node(loop_body, level, ctx));
-            // Resolve each accumulator-slot type in place. `emit_loop`
-            // wrote the slot var into `params[i].ty`; run it through the
-            // same pipeline used for `expr.ty` so it ends up concrete.
-            for binding in params.iter_mut() {
-                match resolve_var_type(&binding.ty) {
-                    Ok(ty) => binding.ty = ty,
-                    Err(err) => {
-                        let label = "Loop param".to_string();
-                        push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
-                    }
-                }
-            }
+        // `Transact` is born by `letrec_phase::recognize`, after inference (and
+        // so after coalesce), so a `Transact` never reaches here.
+        TypedExprNode::Transact { .. } => {
+            unreachable!(
+                "Transact is born post-inference by letrec recognition; Coalesce never sees it"
+            )
         }
 
         TypedExprNode::LetRec { bindings, body } => {
@@ -937,7 +904,12 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
             coalesce_type_predicates(value, level, ctx);
             coalesce_type_predicates(domain, level, ctx);
         }
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::Infer(_) => {}
     }
 }
 
@@ -1345,23 +1317,6 @@ pub(super) fn retype_predicate_slots(expr: &mut Expr, scope: &HashMap<Name, Type
             s.insert(binding.name.clone(), binding.ty.clone());
             retype_predicate_slots(body, &s);
         }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            init_args
-                .iter_mut()
-                .for_each(|a| retype_predicate_slots(a, scope));
-            retype_predicate_slots(source, scope);
-            let mut s = scope.clone();
-            for p in params.iter_mut() {
-                retype_in_type(&mut p.ty, scope);
-                s.insert(p.name.clone(), p.ty.clone());
-            }
-            retype_predicate_slots(loop_body, &s);
-        }
         TypedExprNode::Case {
             scrutinee,
             branches,
@@ -1411,7 +1366,12 @@ fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>) {
             retype_in_type(value, scope);
             retype_in_type(domain, scope);
         }
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::Infer(_) => {}
     }
 }
 

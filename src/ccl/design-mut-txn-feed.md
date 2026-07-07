@@ -318,7 +318,7 @@ realizes them by tick allocation, not by computing anything.
 
 Multi-variable atomic blocks produce one shared record `{time, writes: {𝑘₁: 𝑉₁, …}}` per commit,
 and each variable's history reads it through a per-key view — atomicity by construction, since one
-record either exists or does not. A conditional write (`with begin(): if 𝑝: x = 𝑒`) adds a
+record either exists or does not. A conditional write (`with begin(): if 𝑝: x := 𝑒`) adds a
 `commit: Bool` field that `get_prev_txn` filters on. Multiple writer sites for one variable merge
 their commit streams (ordered by time) before the search.
 
@@ -546,55 +546,129 @@ affordable by that complete compile-time knowledge.
 
 ## Implementation status
 
-This branch delivers the **induction** slice of the model — mutable accumulators, generators with
-loop-carried state, in-loop feeds, first-class `Type::Mut`, and single-parameter pass-by-reference
-*induction* writers. The **transactional** slice (`Txn` registers, concurrent writers, batch and
-live cross-endpoint reads) and the `http_serve` programs that exercise it land on the **stacked PR**
-(`transact_phase`). The design body above describes the intended end state across the whole stack,
-not what runs on this branch alone.
+Working end-to-end: induction accumulators and generators (`Recurse`); feeds, including per-commit
+feeds inside a transaction block; batch transactions over finite sources — single- and
+multi-variable, atomic multi-write, conditional grant/deny, read-your-writes; the cross-function
+transactional writer `def transfer(src, dst: Mut[_, Txn], amt)` applied to two registers (a
+multi-`Mut`-parameter pass-by-reference writer, inlined to name the caller's stores); and live
+cross-endpoint reads (the `AsOf` path). **Both** the induction and transaction paths are genuinely
+letrec-based, and share one representation: `For`/`MutWrite` → the unified phase → a guarded
+`LetRec` → recognition → `Transact` → engine. The induction path guards with `get_prev_seq` (→
+`Recurse`); the transaction path (`transact_phase`) emits the `get_prev_txn`-guarded `store ↔
+commits` cycle of the worked example — one history binding `store_k = λ t → get_prev_txn(view, t,
+init)` per key, one commit-record binding `commits_j = λ r → let t = begin(r) in {time,
+write_targets, decision}` per `with begin():` site (the decision is the writer body applied to the
+store snapshot `(store_rk(t) …, source(r))` at the commit time `begin(r)`) — and recognition
+(`letrec_phase::recognize`) destructures it back into the `Transact{domain: Txn}` the commit engine
+consumes. Two HTTP programs run over a real server: `http_accumulator` (an induction accumulator
+replying per request) and `http_counter` (a `POST` writing a `Txn` register, a `GET` reading it
+live).
 
-Working end-to-end on this branch: induction accumulators and generators, single- and
-multi-accumulator, genuinely letrec-based (`For`/`MutWrite` → the unified phase → a
-`get_prev_seq`-guarded `LetRec` → `recognize` → `Loop` → `Recurse`); in-loop feeds and
-mutation-generators (`o << x` / `yield` in the body), hoisted by the phase to ordinary feeds of the
-loop's history; and pass-by-ref induction writers driven by a loop of `bump(cnt)` calls.
+The `begin_<site>` oracle is realized as a single shared `Builtin::BeginTxn` applied once per site
+(the site identity recognition needs — the writer's source stream and iteration domain — lives in
+the commit-record binding, not the oracle). Like `get_prev_seq`/`get_prev_txn` it is minted after
+inference, carries no inference scheme, and is consumed by recognition before op-conversion (a
+deliberate op-conversion error arm guards the invariant).
+
+The commit log is **bounded** under live workloads. Every writer releases its store branch — a
+collection-append (empty read set) releases the whole decided prefix; a register drawdown (non-empty
+read set) releases strictly below the oldest tick it read — and the `FanOut`-intersected
+`gc_released_prefix` reclaims the released prefix (always keeping each key's latest write). A live
+`AsOf` reader still pins its own branch while active (it may answer an as-of query at any past
+request position), so a store that is *only* read live retains its history; a store with a writing
+endpoint sheds its superseded prefix.
 
 Realized on this branch:
 
-- **`Type::Mut` is first-class.** Mutability rides the introduction's binding and every reference as
-  `Type::Mut { value, domain }` (so it survives α-renaming structurally), reads deref through the
-  coercion arm, and the second-class discipline is enforced post-inference (`check_mut_discipline`).
-- **Store-ness is the type — the lowering-side induction registry is gone.** `mutable_vars` and its
-  `is_mutable` / `register` / `snapshot` / mask machinery are deleted. Lowering makes only
-  scope-based choices: a `:=` to a fresh name is a `let`-`Mut` introduction, a `:=` / `+=` to an
-  in-scope name is a `MutWrite`; loop routing is `find_mutation_loop_vars` (scope-only). A write to a
-  non-store is a post-inference type error (`check_mut_write_targets`), so `x = 0; x += 1` is
-  rejected, never a shadow. Single-parameter pass-by-reference writers still work — the parameter's
-  `Mut` type (from its annotation) is what makes its body writes valid.
+- **`Type::Mut` is first-class; induction store-ness is the type, transactional identity is the type.**
+  Mutability rides the introduction's binding and every reference as `Type::Mut { value, domain }` (so
+  it survives α-renaming structurally), reads deref through the coercion arm, and the second-class
+  discipline is enforced post-inference (`check_mut_discipline`). Both introduction forms stamp the
+  binding: `x: Mut[V]` → `Mut[V, _]` (induction, domain inferred to the writing loop's extent) and
+  `x: Mut[V, Txn]` → `Mut[V, Txn]` (a transactional register).
+- **The lowering-side *induction* registry is gone.** `mutable_vars` and its `is_mutable` / `register` /
+  `snapshot` / mask machinery are deleted. Lowering makes only scope-based choices: a `:=` to a fresh
+  name is a `let`-`Mut` introduction, a `:=` / `+=` to an in-scope name is a `MutWrite`; loop routing
+  is `find_mutation_loop_vars` (scope-only). A write to a non-store is a post-inference type error
+  (`check_mut_write_targets`), so `x = 0; x += 1` is rejected, never a shadow.
+- **Pass-by-reference writers** work for **both** induction and transactions, single- and
+  multi-parameter: `def bump(c: Mut[Int]): c += 1` and
+  `def transfer(src, dst: Mut[Int, Txn], amt): with begin(): …` lower their bodies to `MutWrite`s on
+  the `Mut`-typed parameters, and the call beta-reduces at the call site, renaming each write target to
+  the caller's store. A multi-`Mut`-parameter function is lowered — and applied — *curried* (a chain of
+  named lambdas) rather than tupled, because a `Mut` parameter must stay a named binder for that rename
+  (a tuple projection cannot be a `MutWrite` target); such functions are always inlined, so the curried
+  chain never reaches `lambda_elim`. `transact_phase` identifies transactional stores by the
+  `Mut[_, Txn]` type on the **α-unique binding** (`collect_txn_stores` over the inlined, typed tree —
+  which sees cross-function writers' stores and is immune to a local merely spelled like a register),
+  *not* by a base-name registry.
+- **A transactional-only registry survives at lowering — by necessity, not as a bridge.** Unlike
+  induction store-ness, which the post-inference `Type::Mut` check recovers, a `with begin():` block's
+  structure is *erased* by lowering: the `MutWrite`-vs-`Let` shape decision inside a block, the loop's
+  `with begin():` classification, and the out-of-block read/write gate all have to be made at lowering
+  time, when the block scoping is still visible. These are driven by a small `transactional_vars` set
+  (base-name keyed, scope-disciplined via `snapshot_transactional` and the `with_shadowed` shadow
+  stack) that records only `Mut[_, Txn]` registers and is *not* handed to the phase (which keys on the
+  type). The induction dual — an induction store written *inside* a block, which the phase would
+  swallow — is rejected at the block-body write site (`transactions::write_or_let`) with no registry at
+  all: inside a block the only legal `:=` / `+=` target is a transactional register, so a
+  non-register, non-shadowed write is always the error.
 - **Loop routing takes the scope-only form**, not the fuller "every loop is a `For`" of
   [Store-ness is the type](#store-ness-is-the-type-no-lowering-registry): a loop that writes an
   outer-scope name lowers to a `For`, a pure generator/side-effect loop still lowers directly to
-  `Compose` (`lower_generator_for`). This is registry-free but keeps two loop paths at lowering.
+  `Compose` (`lower_generator_for`). This is registry-free (for induction) but keeps two loop paths at
+  lowering.
+- **Reads require a `with begin():` block for `Txn` variables**, and the terminal read is the
+  standalone read-only transaction's as-of read — there is no separate terminal-read operator.
+- **The in-transaction guard is deny-only** (implemented); general conditional logic is designed
+  but blocked on a missing primitive. Today a bare `if 𝑝: …` is a deny guard (the transaction
+  commits iff `𝑝` holds over its snapshot); an `elif` chain or an `else` that writes is rejected at
+  lowering. The **intended** end state is a uniform *path-based* model: walking a block threads a
+  path condition (a branch guard `𝑔` extends it to `path ∧ 𝑔`), and the block denotes
+  `snapshot ⇒ {commit, writes, to_<defer>*}` where **`commit` is the disjunction of the
+  path-conditions of every store-write and feed** (an empty taken path — no write or feed, including
+  a missing `else` — denies), and **each write key is a `Case` merged over the branch structure**
+  (read-your-writes; a branch that doesn't write a key keeps its snapshot value). This is
+  keyword-free, subsumes the current deny (`if 𝑝: x = 𝑒` → one write at path `𝑝` → `commit = 𝑝`),
+  and admits value-selection, cross-key routing, `elif`, nesting (conjunction) and sequencing
+  (independent commits). One restriction rides with it: a reply must be delivered on *every*
+  committing path (fed on all committing branches); conditional reply *presence* would need a
+  tap-present flag in the decision record.
+  **Blocker:** the model needs a *value-selecting* `Case` (`x = if 𝑝: 𝑒₁ else: 𝑒₂`) to be a
+  compiled construct, but only the *filter* `Case` (`[𝑔 → action, true → unit]` → `Restrict`)
+  compiles today; a value `Case` errors at `lambda_elim`. This is the same missing primitive as the
+  **N-arm Case-with-feeds gap** (`docs/plan.md`; `multi_arm_case_with_some_feeding_branches_is_a_known_gap`),
+  whose planned fix — refinement-based fan-out, lowering a value `Case` to a union of restricts
+  `⧺ᵢ (source | pathᵢ ≫ 𝑒ᵢ)` — unblocks both the feeds gap and transaction conditionals. Deferred to
+  that work; `transact_phase` then emits the `Case`-merged decision (recognition lifts it verbatim,
+  so it needs no change).
+- **Multi-register *live* reads are snapshot-consistent.** The model (§"Reads") promises that
+  several `Txn` reads in one `with begin():` block observe *one* commit snapshot. A **multi-register
+  live** read — a live reply reading two registers, `resp << a + b` — is served by a **single bundled
+  `as_of((trigger, __store))`** over the whole store: `transact_phase::rewrite_live_reads` collects
+  the chain of live reads feeding the reply and, when the reply reads more than one register, emits
+  `as_of((trigger, __store)) ≫ (λ snap → e[a ↦ snap.a, b ↦ snap.b])`. The record-valued `AsOf`
+  latches a whole-store **snapshot record** per request, folding every field from *one* source render
+  at one commit frontier (`store_current` over the same `Tile::Store`), so `a` and `b` are read
+  atomically; the reply projects each register off the latched snapshot. This preserves the **outer
+  (request) indexing** an `AsOf` gives. A single-register read stays a scalar `AsOf`; a batch read
+  (`[unit]` trigger) still resolves through the terminal `ExtractLast`. What remains unsupported is a
+  reply that combines the request element *with* a store read (`resp << store + req`): the response is
+  then a function of both the trigger and the store, wanting a `zip(trigger, as_of)` shape, so
+  `check_live_reads_resolved` **rejects** it (a surviving used live `last_or_default` beside a live
+  `DataSource`-triggered broadcast) rather than emitting a silent hang.
 
-Remaining to reach the model above:
-
-- **Full loop-routing deferral (approach A).** Lower *every* loop to a `For` and teach the phase's
-  step 5 to rebuild the `Compose` generator shape (defer allocation + feed hoisting) for a
-  non-accumulator `For`, deleting `lower_generator_for`. The chief cost/risk is that generator/yield
-  machinery moving into the phase; the scope-only routing above is the working, registry-free
-  alternative, so this is an optional further simplification (one loop path), not a correctness gap.
-- **Transactional by type (stacked PR).** The transactional slice still carries a `transactional_vars`
-  registry and `with_shadowed` read/write gate. Drop them: classify register writes by
-  `Type::Mut { domain: Txn }` in the phase, and relocate the store-write-context checks
-  (register-outside-block, induction-inside-block) to post-inference type+context checks.
-
-Not yet implemented on this branch (arrives on the stacked PR or later):
-
-- **Transactions.** `with begin():` does not parse yet; there is no `get_prev_txn` builtin, no
-  `Transact` engine, no `AsOf` (live cross-endpoint read), and no transactional `Mut[V, Txn]` domain.
-  These, and the fold-to-`Transact` / `AsOf`-recognition generation path, land with `transact_phase`.
-- **Multi-parameter / cross-function transactional writers** (`transfer(src, dst, amt)`).
-- **The `http_serve` programs** (`http_accumulator`, `http_counter`) that drive the transactional
-  path over a real server.
-- **`while` loops** (parse error today), **nested `for` loops** with loop-carried variables,
-  **mutable collections** (pending sigma types), and **history/auditing reads**.
+  **Live-read recognition moved into `transact_phase` (pre-lambda-elim).** It previously lived at the
+  *end of planning* (`planning::rewrite_live_reads`), matching the point-free `iterate(B) ≫
+  const(page)` broadcast — which forced a **computed** live read (`resp << store + 1`, whose
+  const-arg is `page + 1`, not a bare `page`) to be *rejected* by a `check_live_reads_resolved`
+  band-aid, because lifting the `+ 1` back into a per-request map after lambda elimination would mean
+  synthesizing a combinator by hand. Recognizing the reply `let x = last_or_default(…) in trigger ≫
+  (λ r → e)` *before* lambda elimination keeps `e` a lambda: the rewrite emits `as_of((trigger,
+  store_k)) ≫ (λ x → e)` and the elim pass point-frees `e` for free, so computed live reads now
+  compile. `planning::rewrite_live_reads`, `make_as_of`, `match_live_read`, and
+  `check_live_reads_resolved` are retired; planning's `insert_iterate_markers` /
+  `is_iteration_bearing` treat `as_of` as an iteration-bearing source (staging the trigger inside its
+  tuple, never prepending an `iterate`).
+- **Not yet implemented**: `while` loops (parse error today), nested `for` loops with loop-carried
+  variables, mutable collections (pending sigma types), and history/auditing reads.

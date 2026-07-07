@@ -13,7 +13,8 @@ use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, Branch, Expr, Name, ProjKey, Refinement, Type, TypedBinding, TypedExprNode,
+    BaseType, Branch, Expr, Name, ProjKey, Refinement, TransactKey, TransactWriter, Type,
+    TypedBinding, TypedExprNode,
 };
 
 use super::context::InferCtx;
@@ -144,12 +145,14 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
 
         TypedExprNode::CollectionUnion(exprs) => emit_collection_union(exprs, ctx)?,
 
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => emit_loop(params, init_args, source, loop_body, ctx)?,
+        // `Transact` is born by `letrec_phase::recognize`, which runs *after*
+        // inference, so constraint emission never sees one. Gathered
+        // `Transact` nodes are typed in the Check pass (`emit_transact`).
+        TypedExprNode::Transact { .. } => {
+            unreachable!(
+                "Transact is born post-inference by letrec recognition; Emit never sees it"
+            )
+        }
 
         TypedExprNode::LetRec { bindings, body } => emit_letrec(bindings, body, ctx)?,
 
@@ -261,9 +264,12 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), I
             emit_annotation_predicates(value, ctx)?;
             emit_annotation_predicates(domain, ctx)
         }
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {
-            Ok(())
-        }
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::Infer(_) => Ok(()),
     }
 }
 
@@ -1003,100 +1009,143 @@ pub(super) fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<
     })
 }
 
-/// Emit inference constraints for a `Loop` node and return its outer type
-/// `Fun(D, Record({step: σ, tap_k: τ_k}))`.
+/// The body domain for a mutation loop accumulator step and a transaction
+/// writer: `Tuple(slot_0, …, slot_{n-1}, item)` — the read-set snapshot slots
+/// followed by the iteration item, matching the body lambda's `let s_i = p.i …
+/// let item = p.n` destructuring.
+fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) -> Type {
+    let mut dom: BTreeMap<FieldKey, Type> = BTreeMap::new();
+    for (i, slot) in slots.into_iter().enumerate() {
+        dom.insert(FieldKey::Index(i), slot);
+    }
+    let item_index = dom.len();
+    dom.insert(FieldKey::Index(item_index), item);
+    product(dom)
+}
+
+/// The per-position `to_<defer>` output fields a writer's decision record
+/// carries beyond `{commit, writes}`, read off the writer body's codomain —
+/// `(field, value_ty)`. Each becomes a virtual store-record key `to_<defer>:
+/// Fun(domain, value_ty)` (the per-position feed output stream).
+pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
+    let Some(codom) = body_ty.codomain() else {
+        return Vec::new();
+    };
+    let Type::Record(fields) = peel_refinements_outer(&codom) else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .filter(|(f, _)| f != crate::ccl::F_COMMIT && f != crate::ccl::F_WRITES)
+        .map(|(f, t)| (f.clone(), t.clone()))
+        .collect()
+}
+
+/// Type one transaction writer against the store's per-key value types.
 ///
-/// The Loop's typing rule (mirroring the paper's `App` shape — fresh
-/// variables for each "guess" position, one-way `constrain_subtype` calls
-/// throughout — see Parreaux 2020 Fig 9, p. 124:9):
-///
-/// - `source` is a stream `Fun(D, item)`; we mint fresh `D` and `item`
-///   and constrain_subtype the inferred source type to fit.
-/// - Each accumulator slot `params[i]` gets a fresh var `α_i`. The
-///   `init_args[i]` value flows in as a lower bound: `init <: α_i`.
-/// - `loop_body` is a Lambda whose input is `Tuple(α_0, …, α_{n-1}, item)`
-///   and whose output is `Record({step: σ, tap_k: τ_k})`. We mint `σ`
-///   and one `τ_k` per `body_taps` entry and constrain_subtype the inferred body
-///   type against the expected shape.
-/// - The recurrence wires the step output back to the accumulator slots:
-///   single-acc → `σ <: α_0`; multi-acc → `σ <: Tuple(α_0, …, α_{n-1})`
-///   (which depth-decomposes into `σ.i <: α_i`).
-///
-/// The accumulator vars are structurally shared across iterations by
-/// construction — there's exactly one `α_i` per slot, and `init`, the
-/// body's reads of `p.i`, and `σ` all flow into the same variable. No
-/// separate "iterations agree" constraint is needed.
-///
-/// `params[i].name` is bound inside `loop_body` only via the body's own
-/// let-chain (`let acc_i = p.i in …`), so we do not push the params
-/// into `ctx.scopes` here.
-pub(super) fn emit_loop<C: Typing>(
-    params: &mut [TypedBinding],
-    init_args: &mut [Expr],
-    source: &mut Expr,
-    loop_body: &mut Expr,
+/// `key_types` maps each store key to the type of one committed value. The body
+/// is `Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), {commit: Bool, writes:
+/// Tuple(new_{w₀}, …), to_<defer>*})`, where snapshot position `i` is
+/// `read_keys[i]`'s value type and each `writes` entry `new_j <: write_keys[j]`'s
+/// value type. `commit` gates the whole (atomic) write set; any extra
+/// `to_<defer>` fields ride along as width-subtyped taps.
+fn emit_transact_writer<C: Typing>(
+    writer: &mut TransactWriter,
+    key_types: &std::collections::HashMap<Name, Type>,
     ctx: &mut C,
-) -> Result<Type, InferError> {
-    debug_assert_eq!(
-        params.len(),
-        init_args.len(),
-        "Loop: params and init_args must have equal length"
+) -> Result<(), InferError> {
+    let s_ty = ctx.subexpr(&mut writer.source)?;
+    let (_d, item) = ctx.as_function(&s_ty, &|| "transaction source".to_string())?;
+
+    let mut snaps: Vec<Type> = Vec::with_capacity(writer.read_keys.len());
+    for rk in &writer.read_keys {
+        let snap = key_types
+            .get(rk)
+            .cloned()
+            .ok_or_else(|| InferError::Unsupported(format!("read key {rk} is not a store key")))?;
+        snaps.push(snap);
+    }
+    let body_dom = accumulator_body_domain(snaps, item);
+
+    // Body codomain: `{commit: Bool, writes: Tuple(new_j…)}`, with `new_j` a
+    // fresh var bounded above by `write_keys[j]`'s value type. `writes` is a
+    // positional tuple built directly (not via `product`, whose empty case
+    // collapses to `Record([])`): even a single-key write set is `Tuple([_])`.
+    let mut new_tys: Vec<Type> = Vec::with_capacity(writer.write_keys.len());
+    let mut news: Vec<(Type, Type)> = Vec::with_capacity(writer.write_keys.len());
+    for wk in &writer.write_keys {
+        let new = ctx.fresh();
+        let bound = key_types
+            .get(wk)
+            .cloned()
+            .ok_or_else(|| InferError::Unsupported(format!("write key {wk} is not a store key")))?;
+        new_tys.push(new.clone());
+        news.push((new, bound));
+    }
+    let mut codom: BTreeMap<FieldKey, Type> = BTreeMap::new();
+    codom.insert(
+        FieldKey::Name(SmolStr::from(crate::ccl::F_COMMIT)),
+        prim(BaseType::Bool),
+    );
+    codom.insert(
+        FieldKey::Name(SmolStr::from(crate::ccl::F_WRITES)),
+        Type::Tuple(new_tys),
     );
 
-    // Source: Fun(D, item).
-    let s_ty = ctx.subexpr(source)?;
-    let (d, item) = ctx.as_function(&s_ty, &|| "Loop source".to_string())?;
-
-    // Accumulator slots: one var α per `params[i]` (Emit mints it and writes
-    // it into the binder; Check reads the resolved accumulator type back);
-    // `init_args[i] <: α_i`.
-    let alphas: Vec<Type> = params
-        .iter_mut()
-        .map(|p| ctx.binding_slot(&mut p.ty))
-        .collect();
-    for (i, init) in init_args.iter_mut().enumerate() {
-        let init_ty = ctx.subexpr(init)?;
-        ctx.require_sub(&init_ty, &alphas[i], &|| "Loop init".to_string())?;
-    }
-
-    // Body codomain: Record carrying at least `{step: σ}`.  Tap fields
-    // (`to_<defer>`) are not named at this level — `desugar_defers` runs
-    // *after* inference and folds them into the body's literal Record
-    // later (its retype pass re-derives the loop's codomain then); we let
-    // the actual body record flow into `actual_cod` as a lower bound and
-    // use that as the Loop's outer codomain, so the post-desugar
-    // projections on `to_<defer>` synthesize against the right fields.
-    let sigma = ctx.fresh();
-    let actual_cod = ctx.fresh();
-    let mut cod_fields: BTreeMap<FieldKey, Type> = BTreeMap::new();
-    cod_fields.insert(FieldKey::Name(SmolStr::from("step")), sigma.clone());
-    let step_record = product(cod_fields);
-
-    // Body domain: Tuple(α_0, …, α_{n-1}, item).
-    let mut dom_fields: BTreeMap<FieldKey, Type> = BTreeMap::new();
-    for (i, alpha) in alphas.iter().enumerate() {
-        dom_fields.insert(FieldKey::Index(i), alpha.clone());
-    }
-    dom_fields.insert(FieldKey::Index(alphas.len()), item.clone());
-    let body_dom = product(dom_fields);
-
-    let body_ty = ctx.subexpr(loop_body)?;
-    ctx.require_sub(&body_ty, &fun(body_dom, actual_cod.clone()), &|| {
-        "Loop body".to_string()
+    let body_ty = ctx.subexpr(&mut writer.body)?;
+    ctx.require_sub(&body_ty, &fun(body_dom, product(codom)), &|| {
+        "transaction body".to_string()
     })?;
-    // The body's codomain must at least carry `step: σ`.
-    ctx.require_sub(&actual_cod, &step_record, &|| "Loop body step".to_string())?;
-
-    // Recurrence: σ <: α_0 (single) or σ <: Tuple(α_0, …, α_{n-1}) (multi).
-    if alphas.len() == 1 {
-        ctx.require_sub(&sigma, &alphas[0], &|| "Loop recurrence".to_string())?;
-    } else {
-        let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
-        for (i, alpha) in alphas.iter().enumerate() {
-            tup.insert(FieldKey::Index(i), alpha.clone());
-        }
-        ctx.require_sub(&sigma, &product(tup), &|| "Loop recurrence".to_string())?;
+    for (new, contrib) in news {
+        ctx.require_sub(&new, &contrib, &|| "transaction write".to_string())?;
     }
+    Ok(())
+}
 
-    Ok(fun(d, actual_cod))
+/// Type a [`TypedExprNode::Transact`] (Check-pass rule).
+///
+/// The node denotes the store **record** `{key: ⟦key⟧}` — each key's read type
+/// `Fun(domain, α)` (the value's history over the store's sequencing domain),
+/// what a variable projection `__store.key` yields; a read reduces it to the
+/// latest `α` via `last_or_default(history, init)`. The init is the position-0
+/// value, so it bounds the codomain `α` (`init <: α`), not the whole stream.
+/// There is no recurrence *fixpoint* over a step type — the store↔writer cycle
+/// is realized operationally at op-conversion — so no `σ <: α` constraint, just
+/// each writer's per-key store round-trip.
+///
+/// `Transact` is born by `letrec_phase::recognize` after inference, so this
+/// rule runs only in the Check pass; it never mints constraints that must
+/// coalesce.
+pub(super) fn emit_transact<C: Typing>(
+    keys: &mut [TransactKey],
+    writers: &mut [TransactWriter],
+    domain: &Type,
+    ctx: &mut C,
+) -> Result<Type, InferError> {
+    use std::collections::HashMap;
+    let mut fields: Vec<(String, Type)> = Vec::with_capacity(keys.len());
+    // key Name → the type of one committed value (a writer's snapshot / write
+    // bound) — the codomain of the key's history.
+    let mut key_types: HashMap<Name, Type> = HashMap::with_capacity(keys.len());
+    for k in keys.iter_mut() {
+        // The store-record field is the value's history `Fun(domain, α)` over
+        // the store's sequencing domain; `last_or_default` reads it back to the
+        // latest `α`.
+        let value_ty = ctx.fresh();
+        let read_ty = fun(domain.clone(), value_ty.clone());
+        let init_ty = ctx.subexpr(&mut k.init)?;
+        ctx.require_sub(&init_ty, &value_ty, &|| "transact init".to_string())?;
+        fields.push((k.name.field_key(), read_ty));
+        key_types.insert(k.name.clone(), value_ty);
+    }
+    for w in writers.iter_mut() {
+        emit_transact_writer(w, &key_types, ctx)?;
+        // A `to_<defer>` field on the writer's decision record becomes a virtual
+        // store key `to_<defer>: Fun(domain, value_ty)` the consumer reads as
+        // `__store.to_…`.
+        for (field, value_ty) in writer_tap_fields(&w.body.ty) {
+            fields.push((field, fun(domain.clone(), value_ty)));
+        }
+    }
+    Ok(Type::Record(fields))
 }

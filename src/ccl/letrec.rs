@@ -45,11 +45,13 @@ impl std::fmt::Display for LetRecGuardError {
 }
 
 /// Builtins whose application guards a recursive reference when the
-/// reference is the **history argument** (first tuple element). Today that
-/// is [`Builtin::GetPrevSeq`]; `get_prev_txn` slots in here when the
-/// transactional accessor lands.
+/// reference is the **history argument** (first tuple element):
+/// [`Builtin::GetPrevSeq`] (induction domain) and [`Builtin::GetPrevTxn`]
+/// (transaction domain). In both, a reference consumed only through the
+/// accessor's history slot depends only on strictly earlier positions, so it
+/// is guarded (design doc `src/ccl/design-mut-txn-feed.md`, "New builtins").
 fn is_guard_builtin(b: Builtin) -> bool {
-    matches!(b, Builtin::GetPrevSeq)
+    matches!(b, Builtin::GetPrevSeq | Builtin::GetPrevTxn)
 }
 
 /// Check the guardedness well-formedness condition for a letrec binding
@@ -170,21 +172,6 @@ fn collect_unguarded_refs(e: &TypedExpr, live: &BTreeSet<Name>, out: &mut BTreeS
             collect_unguarded_refs(bound_expr, live, out);
             with_shadowed(live, std::slice::from_ref(&binding.name), |inner| {
                 collect_unguarded_refs(body, inner, out)
-            });
-        }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            for a in init_args {
-                collect_unguarded_refs(a, live, out);
-            }
-            collect_unguarded_refs(source, live, out);
-            let names: Vec<Name> = params.iter().map(|p| p.name.clone()).collect();
-            with_shadowed(live, &names, |inner| {
-                collect_unguarded_refs(loop_body, inner, out)
             });
         }
         // A nested letrec's binders shadow the outer group across the whole
@@ -319,6 +306,15 @@ mod tests {
         )
     }
 
+    /// `get_prev_txn((history, time, default))` — the transaction-domain guard
+    /// accessor, same tupled-argument convention as [`get_prev_seq`].
+    fn get_prev_txn(history: Expr, time: Expr, default: Expr) -> Expr {
+        Expr::apply(
+            Expr::tuple(vec![history, time, default]),
+            Expr::builtin(Builtin::GetPrevTxn),
+        )
+    }
+
     fn add(l: Expr, r: Expr) -> Expr {
         Expr::binop(l, BinOpKind::Arithmetic(ArithmeticKind::Add), r)
     }
@@ -374,6 +370,47 @@ mod tests {
             binding("incr_commits", incr_commits),
         ];
         assert_eq!(check_letrec_guarded(&bindings), Ok(()));
+    }
+
+    /// The design's transactional `store ↔ incr_commits` shape: `store` reads
+    /// the commit-record binding `incr_commits` through `get_prev_txn` (its
+    /// history slot — guarded), and `incr_commits` reads `store` bare. The trip
+    /// around the cycle crosses one `get_prev_txn` guard, so the unguarded
+    /// subgraph has only the `incr_commits → store` edge, which is acyclic.
+    /// This is the transaction-domain analog of
+    /// [`two_binding_cycle_with_one_guarded_edge_is_ok`] and, because it relies
+    /// on `get_prev_txn` guarding the `store → incr_commits` edge, is what
+    /// confirms `GetPrevTxn` is wired into [`is_guard_builtin`].
+    #[test]
+    fn get_prev_txn_two_binding_cycle_is_guarded() {
+        let store = Expr::lambda(
+            "t",
+            Type::Hole,
+            get_prev_txn(Expr::var("incr_commits"), Expr::var("t"), int(0)),
+        );
+        let incr_commits = Expr::lambda(
+            "r",
+            Type::Hole,
+            add(Expr::apply(Expr::var("r"), Expr::var("store")), int(1)),
+        );
+        let bindings = vec![
+            binding("store", store),
+            binding("incr_commits", incr_commits),
+        ];
+        assert_eq!(check_letrec_guarded(&bindings), Ok(()));
+    }
+
+    /// `get_prev_txn` guards only its *history* slot: `x = get_prev_txn(x, x, 0)`
+    /// has the first `x` guarded but the second (the time/position slot) bare,
+    /// so it is still an unguarded self-loop — the transaction-domain twin of
+    /// [`non_history_slots_of_a_guard_call_are_unguarded`].
+    #[test]
+    fn get_prev_txn_bare_self_cycle_is_rejected() {
+        let def = get_prev_txn(Expr::var("x"), Expr::var("x"), int(0));
+        let bindings = vec![binding("x", def)];
+        let errs = check_letrec_guarded(&bindings).expect_err("time slot is unguarded");
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].cycle, vec![Name::raw("x")]);
     }
 
     /// A fully-unguarded two-binding cycle is rejected, reporting both names.

@@ -370,10 +370,25 @@ where
             .collect::<Vec<_>>()
             .delimited_by(just(Token::LParen), just(Token::RParen))
             .map(PostfixOp::Call);
+        // A subscript index is a comma-separated list: a single element is
+        // the index itself (`xs[0]`); several become a tuple (`Mut[int, Txn]`
+        // — the multi-argument type-annotation form), matching Python's
+        // `a[i, j]` tuple-index convention.
         let subscript = expr
             .clone()
+            .separated_by(just(Token::Comma))
+            .allow_trailing()
+            .at_least(1)
+            .collect::<Vec<_>>()
             .delimited_by(just(Token::LBracket), just(Token::RBracket))
-            .map(|idx| PostfixOp::Subscript(Box::new(idx)));
+            .map_with(|mut idxs, e| {
+                let idx = if idxs.len() == 1 {
+                    idxs.pop().unwrap()
+                } else {
+                    Spanned::new(e.span(), Expr::Tuple(idxs))
+                };
+                PostfixOp::Subscript(Box::new(idx))
+            });
         let attribute = just(Token::Dot)
             .ignore_then(ident_only)
             .map(|(name, span)| PostfixOp::Attribute(name, span));
@@ -814,6 +829,30 @@ where
                 Spanned::new(e.span(), Stmt::For { target, iter, body })
             });
 
+        // ---- with <binding> = begin(): body -------------------------
+        // The transaction form `with t = begin():` binds `t` to the commit
+        // time; the binding prefix backtracks (`.or_not()`) so a bare
+        // `with begin():` still parses. The context is a call expression
+        // (`begin()`); lowering validates it.
+        let with_binding = select! { Token::Ident(s) => s }
+            .then_ignore(just(Token::Eq))
+            .or_not();
+        let with_stmt = just(Token::With)
+            .ignore_then(with_binding)
+            .then(expr.clone())
+            .then_ignore(just(Token::Colon))
+            .then(block.clone())
+            .map_with(|((binding, context), body), e| {
+                Spanned::new(
+                    e.span(),
+                    Stmt::With {
+                        binding,
+                        context,
+                        body,
+                    },
+                )
+            });
+
         // ---- def name(params): body ---------------------------------
         let param = select! { Token::Ident(s) => s }
             .map_with(|s, e| (s, e.span()))
@@ -1009,7 +1048,7 @@ where
             .then(skip_indented_block)
             .map_with(|_, e| Spanned::new(e.span(), Stmt::Error));
 
-        choice((if_stmt, for_stmt, def_stmt, simple_stmt))
+        choice((if_stmt, for_stmt, with_stmt, def_stmt, simple_stmt))
             .labelled("statement")
             .as_context()
             .recover_with(via_parser(stmt_recovery))

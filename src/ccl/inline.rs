@@ -194,8 +194,6 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
         // A Lambda param shadows `name` inside the body — treat it as a binding
         // site so we don't substitute through it.
         TypedExprNode::Lambda { param, .. } if &param.name == name => true,
-        // A Loop with any param matching `name` is a definitive bind site.
-        TypedExprNode::Loop { params, .. } if params.iter().any(|p| &p.name == name) => true,
         // A LetRec with any group binder matching `name` is a definitive
         // bind site (the group scopes every binding body and the letrec body).
         TypedExprNode::LetRec { bindings, .. } if bindings.iter().any(|(b, _)| &b.name == name) => {
@@ -460,27 +458,6 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
                 body: Box::new(new_body),
             }
         }
-
-        // Loop param shadowing matters here — we're substituting `name`
-        // throughout, but if the loop's params bind `name`, the body sees
-        // the param's value, not the substituted one.  walk_children_mut
-        // would visit `loop_body` unconditionally, so handle Loop explicitly.
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => crate::ccl::walk_loop_children(
-            params,
-            init_args,
-            source,
-            loop_body,
-            // Param shadowing matters here — we're substituting `name`
-            // throughout, but if the loop's param binds `name`, the body
-            // sees the param's value, not the substituted one.
-            Some(name),
-            |e| inline_and_beta_reduce(e, name, lambda),
-        ),
 
         // LetRec group binders shadow `name` across every binding body AND
         // the letrec body (mutual recursion), so a matching binder stops the

@@ -114,7 +114,9 @@ pub fn freshen_above(
         return ty.clone();
     }
     match ty {
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => ty.clone(),
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => {
+            ty.clone()
+        }
         Type::Fun {
             name,
             domain: d,
@@ -264,11 +266,6 @@ pub fn freshen_expr_type_slots(
                 if let Some(p) = &mut b.pattern {
                     p.binding.ty = freshen_above(lim, &p.binding.ty, target, cache);
                 }
-            }
-        }
-        TypedExprNode::Loop { params, .. } => {
-            for p in params.iter_mut() {
-                p.ty = freshen_above(lim, &p.ty, target, cache);
             }
         }
         TypedExprNode::LetRec { bindings, .. } => {

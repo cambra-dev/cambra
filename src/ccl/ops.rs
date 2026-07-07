@@ -323,12 +323,79 @@ pub enum Builtin {
     /// `LetRec`'s.
     GetPrevSeq,
 
+    /// `get_prev_txn : Tuple(Fun(Txn, {time: Txn, write: V}), Txn, V) → V` —
+    /// the write carried by the latest commit in the history stream *strictly
+    /// before* the given time, or the default if none.
+    ///
+    /// Applied as a tupled argument, same convention as [`Self::GetPrevSeq`]:
+    /// `Apply(Tuple([history, time, default]), Builtin(GetPrevTxn))`. Its
+    /// polymorphic scheme `∀ν. ((Txn ⇒ {time: Txn, write: ν}), Txn, ν) ⇒ ν`
+    /// lives in [`crate::ccl::infer::OperatorSchemes`].
+    ///
+    /// This is the **transaction-domain guard accessor** for a
+    /// [`crate::ccl::TypedExprNode::LetRec`]: a binding whose reference to a
+    /// commit-record binding is consumed only as the history argument depends
+    /// only on strictly earlier commit times, which is what makes the
+    /// `store ↔ commits` cycle well-founded (see
+    /// `src/ccl/design-mut-txn-feed.md`, "New builtins", and
+    /// [`crate::ccl::letrec::check_letrec_guarded`]).
+    ///
+    /// Op-conversion never compiles this builtin directly — like
+    /// [`Self::GetPrevSeq`], letrec pattern recognition (the commit-operator
+    /// complex) consumes it, so its op-conversion arm is a deliberate error.
+    GetPrevTxn,
+
+    /// `begin_<site> : 𝐼 ⇒ Txn` — the commit-time **oracle** for one `with
+    /// begin():` site: where the site's iteration `𝑟` lands in the global
+    /// commit order. Applied as `begin(r)` (`Apply(Var(r), Builtin(BeginTxn))`)
+    /// inside a commit-record binding, it produces the transaction's commit time
+    /// `t`, at which that writer's store snapshots are read (`store(t)`).
+    ///
+    /// Minted by [`crate::ccl::transact_phase`] — one application per site,
+    /// *after* inference, so it carries no scheme in
+    /// [`crate::ccl::infer::OperatorSchemes`]; its type `𝐼 ⇒ Txn` is
+    /// stamped on the node at emission and the post-phase CHECK-mode `typecheck`
+    /// (which trusts a builtin's recorded type) validates it directly. Opaque
+    /// and consumed by [`crate::ccl::letrec_phase::recognize`], which reads the
+    /// writer's source and body off the commit-record binding and discards the
+    /// `begin`/`store(t)` plumbing. Like [`Self::GetPrevSeq`] /
+    /// [`Self::GetPrevTxn`] it never reaches op-conversion, so its op-conversion
+    /// arm is a deliberate error. A single shared builtin serves every site: the
+    /// site identity recognition needs (the source stream + iteration domain)
+    /// lives in the commit-record binding, not in the oracle.
+    BeginTxn,
+
     /// `collection_union : (Fun(A, B), Fun(C, D)) → Fun(Union(A, C), dedup(B, D))`
     ///
     /// Merges two function-typed (collection) values into a single collection whose
     /// domain is the discriminated union of both input domains and whose codomain is
     /// the deduplicated union of both input codomains.  Lowered from Python `a @ b`.
     CollectionUnion,
+
+    /// `as_of : Tuple(Fun(B, _), Fun(Txn, V)) → Fun(B, V)` — the **as-of
+    /// (temporal) join**, the live cross-endpoint read. Applied as a tupled
+    /// argument `Apply(Tuple([trigger, source]), Builtin(AsOf))`: for each
+    /// `trigger` (request-loop) position, latch `source`'s (a transactional
+    /// store's running render, `Fun(Txn, V)`) latest-decided value as of that
+    /// position. The reply is indexed by the *trigger* (the enclosing request
+    /// loop), not the commit clock — an outer-indexed read.
+    ///
+    /// Born in [`crate::ccl::transact_phase`]'s `rewrite_live_reads`, run
+    /// **pre-lambda-elim** (after `desugar_defers`): it recognizes a read-only
+    /// reply — a chain of live-store reads `let k₁ = last_or_default((store.f₁, _))
+    /// in … in trigger ≫ (λ r → e)` — and rewrites it, dropping the never-resolving
+    /// `last_or_default`s. Reading **one** register → `as_of((trigger, store.f)) ≫
+    /// (λ k → e)`; reading **several** → `as_of((trigger, store)) ≫ (λ snap → e[kᵢ
+    /// ↦ snap.fᵢ])`, a single snapshot record folded at one commit frontier so the
+    /// registers are read atomically (§I-c). Running before lambda elimination
+    /// keeps a computed reply (`e = k + 1`) a lambda the elim pass point-frees,
+    /// rather than a point-free `const` that could only be broadcast. Compiles to
+    /// the [`crate::interpreter::commit_operator`] `AsOf` tile operator (scalar- or
+    /// record-valued). It carries its **own recorded type** (no inference scheme):
+    /// op-conversion and every post-phase `typecheck` read `.ty` directly, and
+    /// planning treats it as an iteration-bearing source (it stages the trigger
+    /// inside its tuple rather than prepending an `iterate`).
+    AsOf,
 }
 
 impl Builtin {
@@ -358,7 +425,10 @@ impl Builtin {
             Self::Max => "max",
             Self::LastOrDefault => "last_or_default",
             Self::GetPrevSeq => "get_prev_seq",
+            Self::GetPrevTxn => "get_prev_txn",
+            Self::BeginTxn => "begin",
             Self::CollectionUnion => "collection_union",
+            Self::AsOf => "as_of",
         }
     }
 
@@ -420,13 +490,14 @@ impl Builtin {
                 | Self::PermuteDomain
                 | Self::FlattenDomain
                 | Self::CollectionUnion
-                // `GetPrevSeq` shares `LastOrDefault`'s classification (a
-                // scalar-result builtin over a tuple whose stream sub-part
-                // self-iterates), but op-conversion never sees it: letrec
-                // pattern recognition consumes it first, and the op-conv arm
-                // errors deliberately (see the variant doc).
+                // `GetPrevSeq`/`GetPrevTxn` share `LastOrDefault`'s
+                // classification (a scalar-result builtin over a tuple whose
+                // stream sub-part self-iterates), but op-conversion never sees
+                // them: letrec pattern recognition consumes them first, and the
+                // op-conv arm errors deliberately (see the variant docs).
                 | Self::LastOrDefault
                 | Self::GetPrevSeq
+                | Self::GetPrevTxn
         )
     }
 }

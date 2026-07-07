@@ -118,6 +118,9 @@ pub fn run(mut expr: Expr) -> Expr {
     // re-sync every `Cast`'s `target` slot so the post-planning typecheck's
     // reconstruction (which reads `target`) matches the compiled recorded type.
     ccl_utils::sync_cast_targets(&mut expr);
+    // Live cross-endpoint reads are recognized earlier, in
+    // `transact_phase::rewrite_live_reads` (pre-lambda-elim), so by here every
+    // such read is already an `as_of` join — nothing to do at planning time.
     expr
 }
 

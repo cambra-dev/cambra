@@ -12,20 +12,29 @@ use crate::{
     chl_parser::ast::{Param, Span, Spanned},
 };
 
-/// If `param` is annotated `Mut[V]` (a pass-by-reference store parameter),
-/// return the store type `Mut[V, D]` with an inferred sequencing domain
-/// (`D = Hole` → a fresh inference variable, generalized per call site so one
-/// `def bump(c: Mut[Int])` serves an induction accumulator whose domain is the
-/// loop it runs over). Returns `None` for any non-`Mut` annotation (or an
+/// If `param` is annotated `Mut[…]` (a pass-by-reference store parameter),
+/// return its store type `Mut[V, D]` and whether it is **transactional**
+/// (`Mut[V, Txn]`). Returns `None` for any non-`Mut` annotation (or an
 /// unannotated parameter). Mirrors the `Mut[…]` stamping of an induction
-/// introduction (`lower/stmts.rs :: mut_annotation_value_type`).
-fn mut_param_store_type(param: &Param) -> Option<Result<Type, LoweringError>> {
+/// introduction (`lower/stmts.rs :: mut_annotation_parts`).
+///
+/// The sequencing domain is left inferred (`D = Hole` → a fresh variable,
+/// generalized per call site) even for a `Txn` register param: the call-site
+/// argument's `Mut[_, Txn]` type pins `D = Txn` by the invariant `(Mut, Mut)`
+/// edge, and leaving it open lets one `def bump(c: Mut[Int])` serve both an
+/// induction accumulator and a register. The transactional flag *is* returned
+/// so the body's `with begin():` writes register as transactional at lowering
+/// time (the block-classification decision runs before inference).
+fn mut_param_store_type(param: &Param) -> Option<Result<(Type, bool), LoweringError>> {
     let annotation = param.annotation.as_ref()?;
-    match mut_annotation_value_type(annotation) {
-        Some(Ok(value)) => Some(Ok(Type::Mut {
-            value: Box::new(value),
-            domain: Box::new(Type::Hole),
-        })),
+    match mut_annotation_parts(annotation) {
+        Some(Ok((value, is_txn))) => Some(Ok((
+            Type::Mut {
+                value: Box::new(value),
+                domain: Box::new(Type::Hole),
+            },
+            is_txn,
+        ))),
         Some(Err(e)) => Some(Err(e)),
         None => None,
     }
@@ -45,25 +54,6 @@ pub(super) fn validate_function_params(
         return Err(LoweringError::unsupported(
             fn_span,
             "function/lambda with no parameters not supported",
-        ));
-    }
-    Ok(())
-}
-
-/// Reject a multi-parameter function/lambda carrying any `Mut` (pass-by-reference)
-/// parameter. Single-parameter pass-by-reference works on this branch; the
-/// multi-parameter case (`def transfer(src: Mut[_], dst: Mut[_], amt)`) lands
-/// with the transaction work, where a `Mut` param is lowered as a *named*
-/// curried binder. A `Mut` param must be a named binder because inlining renames
-/// the callee's `MutWrite` target to the caller's store, and a tuple projection
-/// (the uncurried multi-arg encoding) is not a `Name` — so silently uncurrying a
-/// `Mut` param would drop the callee's store writes. Reject rather than mislower.
-fn reject_multiparam_mut(span: Span, params: &[Param]) -> Result<(), LoweringError> {
-    if params.len() > 1 && params.iter().any(|p| mut_param_store_type(p).is_some()) {
-        return Err(LoweringError::unsupported(
-            span,
-            "multi-parameter pass-by-reference (a `Mut` parameter alongside other \
-             parameters) is not supported yet",
         ));
     }
     Ok(())
@@ -100,9 +90,11 @@ fn reject_multiparam_mut(span: Span, params: &[Param]) -> Result<(), LoweringErr
 /// Shared between [`lower_lambda`] and [`lower_function_body`] so that both
 /// `lambda x, y: …` and `def f(x, y): …` pair with [`lower_call`]'s
 /// tupled-argument shape and never emit a curried `Expr::Lambda` chain that
-/// `lambda_elim` would fold into an unsupported `curry(body)`.
+/// `lambda_elim` would fold into an unsupported `curry(body)` — the one
+/// exception being a pass-by-reference `Mut` parameter, which stays a *named*
+/// curried binder (see the `Mut`-param arm below); such functions are always
+/// inlined, so their curried chain never reaches `lambda_elim`.
 pub(super) fn uncurry_params(
-    span: Span,
     params: &[Param],
     body_expr: Expr,
     ctx: &mut LoweringContext,
@@ -116,7 +108,7 @@ pub(super) fn uncurry_params(
         // as the deliberate declaration it is. Non-`Mut` params stay `Hole`
         // (inferred), as before. Multi-arg pass-by-ref lands with transactions.
         let param_ty = match mut_param_store_type(&params[0]) {
-            Some(Ok(mut_ty)) => mut_ty,
+            Some(Ok((mut_ty, _is_txn))) => mut_ty,
             _ => Type::Hole,
         };
         let mut lam = Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr);
@@ -127,10 +119,30 @@ pub(super) fn uncurry_params(
         }
         return Ok(lam);
     }
-    // Backstop for the lambda path (`lower_lambda`), whose body is an
-    // expression and so lowers without tripping `lower_function_body`'s early
-    // reject; a `def` is already rejected before its body is lowered.
-    reject_multiparam_mut(span, params)?;
+    // A function with a pass-by-reference `Mut` parameter is curried into a
+    // chain of *named* lambdas rather than tupled: a `Mut` parameter must stay a
+    // named binder so inlining renames the callee's `MutWrite` target to the
+    // caller's store (a tuple projection cannot be a write target — the
+    // cross-function transactional writer `def transfer(src, dst, amt)`). Such
+    // functions are always inlined (a `Mut`-param function must reach its call
+    // sites), so the curried chain never survives to `lambda_elim`. Call sites
+    // apply curried to match (see `lower_call`, keyed on `mut_param_fns`).
+    if params.iter().any(|p| mut_param_store_type(p).is_some()) {
+        return Ok(params.iter().rev().fold(body_expr, |acc, param| {
+            let param_ty = match mut_param_store_type(param) {
+                Some(Ok((mut_ty, _is_txn))) => mut_ty,
+                _ => Type::Hole,
+            };
+            let mut lam = Expr::lambda(param.name.as_str(), param_ty.clone(), acc);
+            if matches!(param_ty, Type::Mut { .. })
+                && let TypedExprNode::Lambda { param: p, .. } = &mut lam.node
+            {
+                p.user_annotation = Some(param_ty);
+            }
+            lam
+        }));
+    }
+
     // Mint the tuple name after `body_expr` is lowered so that inner
     // multi-arg lambdas (which bump the counter during body lowering)
     // receive strictly smaller ids than the outer lambda. Together with
@@ -164,13 +176,16 @@ pub(super) fn lower_lambda(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     validate_function_params(lambda_span, params)?;
-    // No store book-keeping here: store-ness is the parameter's *type*. A
-    // parameter spelled like an outer store is a distinct binding with its own
-    // (non-`Mut`) type, so a body write to it is rejected by the post-inference
-    // check, not silently absorbed. `uncurry_params` stamps a `Mut[…]`-annotated
-    // parameter's `Mut` type.
-    let body_expr = lower_expr(body, ctx)?;
-    uncurry_params(lambda_span, params, body_expr, ctx)
+    // Store-ness of a `Mut[…]`-annotated parameter is its *type* (stamped by
+    // `uncurry_params`), checked post-inference — there is no induction registry
+    // to mask here. But a plain parameter spelled like an outer transactional
+    // register is a genuine local, so SHADOW every parameter over the body
+    // (popped on exit) to skip the out-of-block read gate for it — mirroring how
+    // `uniquify` threads its env stack so a shadowed name reverts to its outer
+    // meaning. The shadow set is keyed by pre-uniquify base name.
+    let param_names: Vec<String> = params.iter().map(|p| p.name.as_str().to_string()).collect();
+    let body_expr = ctx.with_shadowed(param_names, |ctx| lower_expr(body, ctx));
+    uncurry_params(params, body_expr?, ctx)
 }
 
 /// Replace every free occurrence of `Var(name)` in `expr` with `replacement`,
@@ -209,30 +224,63 @@ pub(super) fn lower_function_body(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     validate_function_params(fn_span, params)?;
-    // A `Mut` parameter alongside others (multi-param pass-by-reference) is not
-    // supported on this branch — reject *before* lowering the body, so the error
-    // names the real limitation rather than a downstream "last statement must be
-    // a bare expression" symptom from the store write failing to be a `MutWrite`.
-    reject_multiparam_mut(fn_span, params)?;
-    // Surface a malformed `Mut[…]` parameter annotation eagerly: `uncurry_params`
-    // (which stamps a pass-by-reference parameter's `Mut` type from its
-    // annotation) treats a non-`Mut`/`Err` annotation as an inferred hole, so
-    // without this the malformed-annotation error would be swallowed.
-    for p in params {
-        if let Some(Err(e)) = mut_param_store_type(p) {
-            return Err(e);
-        }
-    }
     let outer_bindings: HashSet<String> =
         params.iter().map(|p| p.name.as_str().to_string()).collect();
 
-    // No store book-keeping: store-ness is a parameter's *type* (a `Mut[…]`
-    // annotation, stamped by `uncurry_params`), known post-inference. A plain
-    // parameter spelled like an outer store is a distinct binding with its own
-    // non-`Mut` type, so a body write to it is rejected by the check rather than
-    // masked here. http_serve is not permitted inside function bodies.
-    let body_result = lower_stmts_inner(body, &outer_bindings, ctx, false)?;
-    uncurry_params(fn_span, params, body_result, ctx)
+    // Scope every parameter's transactional registration to the body (restored
+    // on exit), keyed on the pre-uniquify name a sibling function or outer
+    // binding could reuse.
+    //
+    //  - A `Mut[_, Txn]`-annotated parameter is a pass-by-reference transactional
+    //    register: register it so a body `x := …` / `x += …` inside a `with
+    //    begin():` block is classified as a commit (the cross-function writer
+    //    `def transfer(src, dst: Mut[_, Txn], …)`), and a bare read of it is gated.
+    //  - An induction `Mut[V]` parameter needs no registry — its store-ness is
+    //    its `Type::Mut` (stamped by `uncurry_params`), checked post-inference. It
+    //    is recorded here only so it is *not* shadowed below: a store keeps its
+    //    gate, a plain local does not. A malformed `Mut[…]` annotation surfaces
+    //    its error eagerly (before the body lowers).
+    let snapshot = ctx.snapshot_transactional();
+    let mut mut_param_names: HashSet<String> = HashSet::new();
+    for param in params {
+        if let Some(res) = mut_param_store_type(param) {
+            let (_, is_txn) = match res {
+                Ok(v) => v,
+                Err(e) => {
+                    ctx.restore_transactional(snapshot);
+                    return Err(e);
+                }
+            };
+            let name = param.name.as_str().to_string();
+            if is_txn {
+                ctx.register_transactional(name.clone());
+            }
+            mut_param_names.insert(name);
+        }
+    }
+
+    // Shadow only the *non*-`Mut` parameters over the body: a plain param
+    // spelled like an outer transactional register is a genuine local, so the
+    // out-of-block read gate must skip it. A `Mut` param is a store in its own
+    // right, so it keeps its gate — reading a `Mut[_, Txn]` param outside a `with
+    // begin():` block in the body is still an error.
+    let shadowed_params: Vec<String> = outer_bindings
+        .iter()
+        .filter(|n| !mut_param_names.contains(n.as_str()))
+        .cloned()
+        .collect();
+
+    // http_serve is not permitted inside function bodies.
+    let body_result = ctx.with_shadowed(shadowed_params, |ctx| {
+        lower_stmts_inner(body, &outer_bindings, ctx, false)
+    });
+
+    // Revert the transactional registry — drop every `Mut[_, Txn]` param
+    // registration and any `Mut[_, Txn]` local the body declared, keyed on the
+    // pre-uniquify name a sibling function could reuse.
+    ctx.restore_transactional(snapshot);
+
+    uncurry_params(params, body_result?, ctx)
 }
 
 #[cfg(test)]

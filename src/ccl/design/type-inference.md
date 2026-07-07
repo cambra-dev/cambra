@@ -220,11 +220,11 @@ The solver's single-sided `Var <: Var` constrain rule leaves a few *structural* 
 
 **Binder slots — filled during the coalesce walk (no lexical scope needed).** A `Var` use needs *no* scope lookup: it shares its binder's inference variable — a monomorphic `let` binds verbatim (`instantiate` freshens nothing) so every use coalesces to exactly what the binder coalesces to, and a *generalized* `let`'s uses are rewritten by the walk itself to reference per-type specializations (which does carry a scope — the walk's stack of specialization frames and shadow markers; see §3.1).
 
-What the bottom-up `expr.ty` resolution *doesn't* reach is the **binder slots**: a binder carries a type that is not any node's `expr.ty` — a `Lambda`'s `param.ty`, a `Let`'s `binding.ty`, a `Case` pattern's `binding.ty`, a `Loop`'s param slots. Each is resolved explicitly in `coalesce_node`, mirroring its definition:
+What the bottom-up `expr.ty` resolution *doesn't* reach is the **binder slots**: a binder carries a type that is not any node's `expr.ty` — a `Lambda`'s `param.ty`, a `Let`'s `binding.ty`, a `Case` pattern's `binding.ty`, a `For`'s target slot. Each is resolved explicitly in `coalesce_node`, mirroring its definition (inference runs before the mutability/transaction phases, so the recurrence carriers `LetRec`/`Transact` never reach coalesce):
 
 * **`Lambda` `param.ty`** — derived from the lambda's coalesced domain (so body-usage restriction witnesses, which are negative-polarity facts visible only in the contravariant domain, survive), and re-derived whenever a parent arm specializes the domain (`refresh_lambda_param_slot`).
 * **`Let` `binding.ty`** — the (already-coalesced) bound expression's type. emit never constrains the binding slot and the generic `expr.ty` resolution skips it, so without this line a `let`-bound `Var`'s **binder slot** (not its uses) stays `Type::Hole`.
-* **`Case` / `Loop` slots** — run through `resolve_var_type` like any `expr.ty`.
+* **`Case` / `For` slots** — run through `resolve_var_type` like any `expr.ty`.
 
 Refinement predicates are coalesced by recursing into them (in the `Lambda` arm and `coalesce_type_predicates`); their free variables share the enclosing bindings' vars and coalesce identically, just like ordinary `Var` uses — and their projections recover their domains through the same `Apply`/`Compose` arms (see §2).
 

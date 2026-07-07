@@ -344,9 +344,12 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
             value: Box::new(strip_refinements(value)),
             domain: Box::new(strip_refinements(domain)),
         },
-        Type::Base(_) | Type::UIntRange(_) | Type::Hole | Type::Infer(_) | Type::DataSource(_) => {
-            ty.clone()
-        }
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::Hole
+        | Type::Infer(_)
+        | Type::DataSource(_)
+        | Type::Txn => ty.clone(),
     }
 }
 
@@ -470,31 +473,6 @@ fn count_free_with_visited(name: &Name, expr: &Expr, visited: &mut HashSet<Predi
                 } else {
                     count_free_with_visited(name, body, visited)
                 }
-        }
-
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-            ..
-        } => {
-            // `init_args` and `source` are evaluated outside the loop's
-            // param scope, so they're always counted.  `loop_body` is
-            // inside the param scope; if any `params` shadow `name`,
-            // its body uses don't count.
-            let shadowed = params.iter().any(|p| &p.name == name);
-            let in_body = if shadowed {
-                0
-            } else {
-                count_free_with_visited(name, loop_body, visited)
-            };
-            in_body
-                + count_free_with_visited(name, source, visited)
-                + init_args
-                    .iter()
-                    .map(|a| count_free_with_visited(name, a, visited))
-                    .sum::<usize>()
         }
 
         // Mutual recursion: every group binder scopes every binding body
@@ -625,23 +603,6 @@ fn count_free_in_value(name: &Name, expr: &Expr) -> usize {
                 } else {
                     count_free_in_value(name, body)
                 }
-        }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            let shadowed = params.iter().any(|p| &p.name == name);
-            (if shadowed {
-                0
-            } else {
-                count_free_in_value(name, loop_body)
-            }) + count_free_in_value(name, source)
-                + init_args
-                    .iter()
-                    .map(|a| count_free_in_value(name, a))
-                    .sum::<usize>()
         }
         // See the LetRec arm of `count_free_with_visited`: group binders
         // shadow `name` across every binding body and the letrec body.
