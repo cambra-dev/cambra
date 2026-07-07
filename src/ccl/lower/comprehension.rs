@@ -170,7 +170,7 @@ pub(super) fn lower_list_comp(
         // A refined parameter lowers to a `cast(refined_fn_type, λ outer_var →
         // body_expr)` — a pure type-level assertion of the predicate-refined
         // domain.  The refinement is carried by the cast's target type; the
-        // Cast Apply arm in `infer_simple_sub` constructs the refined result
+        // Cast Apply arm in `infer::emit` constructs the refined result
         // from it, and the generic annotation handler infers the predicate's
         // sub-expressions.
         let unrefined_lambda = Expr::lambda(outer_var, Type::Hole, body_expr);

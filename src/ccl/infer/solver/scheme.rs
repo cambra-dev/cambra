@@ -32,8 +32,8 @@ use super::type_level;
 /// `Proj(Index n) : ∀α. {n: α, …} → α`, etc.), built once in
 /// `OperatorSchemes`; and (2) let-generalization — a multi-use function
 /// binding is generalized into a `PolyScheme` at its binding level
-/// (`infer_simple_sub::scoped_let`) and `instantiate`d per use. See
-/// `design-simple-sub.md` for the rationale.
+/// (`infer::context::scoped_let`) and `instantiate`d per use. See
+/// `design/type-inference.md` for the rationale.
 #[derive(Debug, Clone)]
 pub struct PolyScheme {
     /// Quantification cutoff: vars in `body` at level > `self.level`
@@ -86,7 +86,7 @@ pub enum FreshenLevel {
     At(Level),
     /// Mint each fresh variable at its *original* variable's level, preserving
     /// the relative level structure. Per-type specialization
-    /// (`infer_simple_sub::specialize_use`) wants this: a definition may
+    /// (`infer::solve::specialize_use`) wants this: a definition may
     /// contain nested generalized `let`s whose deeper levels must survive, or
     /// the inner generalization stops being recognized.
     Preserve,
@@ -218,7 +218,7 @@ fn freshen_refinement_predicate(
 /// Freshen every type slot reachable from an expression — `expr.ty`, the user
 /// annotation, each binder's declared type, a `Cast`'s target — through one
 /// shared [`FreshenCache`], recursing into child terms. Used to freshen a
-/// specialization clone's whole subtree (`infer_simple_sub::specialize_use`)
+/// specialization clone's whole subtree (`infer::solve::specialize_use`)
 /// and, via [`freshen_refinement_predicate`], a refinement predicate's slots.
 ///
 /// Refinement predicates carried on those types are freshened by

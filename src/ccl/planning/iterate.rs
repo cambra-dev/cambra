@@ -452,8 +452,8 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
+    use crate::ccl::FieldKey;
     use crate::ccl::ccl_utils::is_trivially_true_predicate;
-    use crate::ccl::simple_sub::FieldKey;
     use crate::ccl::symbolic::symbolic;
     // `super::*` also glob-imports `lambda_elim::compose`; name the test-helper
     // `compose` (`Expr::compose`) explicitly so it wins over the glob.

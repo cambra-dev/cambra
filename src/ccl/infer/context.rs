@@ -1,11 +1,11 @@
 // ---------------------------------------------------------------------------
-// SimpleSubContext (Step 7c)
+// InferCtx (Step 7c)
 // ---------------------------------------------------------------------------
 
 use std::collections::HashMap;
 
 use crate::ccl::infer::InferError;
-use crate::ccl::simple_sub::{
+use crate::ccl::infer::solver::{
     ConstrainCache, PolyScheme, constrain_subtype, fresh_var, fun, type_level,
 };
 use crate::ccl::{Expr, Level, Name, Type, TypedExprNode};
@@ -57,12 +57,12 @@ pub(super) fn should_generalize(def: &Expr, level: Level) -> bool {
     matches!(def.node, TypedExprNode::Lambda { .. }) && type_level(&def.ty) > level
 }
 
-/// Emission context for simple-sub inference (Pass 1).
+/// Emission context for Cambra's inference algorithm (Pass 1).
 ///
 /// The solver works directly on [`Type`]: each node's inferred type is written
 /// into the AST during emission and resolved in place during coalesce — there
 /// is no side table.
-pub(super) struct SimpleSubContext {
+pub(super) struct InferCtx {
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
     /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
     /// polymorphic `let` additionally stashes its typed definition subtree so
@@ -82,7 +82,7 @@ pub(super) struct SimpleSubContext {
     pub(super) level: Level,
 }
 
-impl SimpleSubContext {
+impl InferCtx {
     pub(super) fn new(sources: HashMap<String, Type>) -> Self {
         Self {
             scopes: ScopeStack::default(),
@@ -139,7 +139,7 @@ impl SimpleSubContext {
     }
 }
 
-impl Typing for SimpleSubContext {
+impl Typing for InferCtx {
     fn subexpr(&mut self, child: &mut Expr) -> Result<Type, InferError> {
         emit_node(child, self)
     }
@@ -277,7 +277,7 @@ impl Typing for SimpleSubContext {
         // inference core, untestable from source today; make it one-way, with
         // AST-level tests, when variant/range annotations become
         // source-reachable. (The `#[ignore]`d `variant_param_accepts_subtype`
-        // in `tests/simple_sub_variants.rs` exercises the widening at an apply
+        // in `tests/inference_variants.rs` exercises the widening at an apply
         // site; with the Apply edges now one-way it infers the widened variant
         // correctly and fails only on variant tag *ordering*.)
         let ann_simple = self.normalize_annotation(ann);

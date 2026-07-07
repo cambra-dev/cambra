@@ -1,4 +1,4 @@
-//! Simple-sub algorithm core: the constraint solver.
+//! The constraint solver at the core of Cambra's inference algorithm.
 //!
 //! The solver operates **directly on [`crate::ccl::Type`]** — there is no
 //! separate internal type representation. An inference variable is a
@@ -25,18 +25,18 @@
 //! direction: an unrefined value does **not** flow into a refined position
 //! (`T ⊀ {T | p}`). Acquiring a refinement is an explicit operation — the
 //! interpreter compiles a refinement on a *collection domain* to a runtime
-//! `Restrict`/`Filter` at the iteration boundary
-//! ([`crate::interpreter::operator_conversion`]'s `iterate_type`); it is not
-//! modelled as subsumption here. The predicate `Expr` of each witness lives in
+//! `Restrict`/`Filter` at the iteration boundary (the `Iterate`/`Restrict`
+//! arms of [`crate::interpreter::operator_conversion`], where `extent_of`
+//! strips the domain refinement into a `Restrict`); it is not modelled as
+//! subsumption here. The predicate `Expr` of each witness lives in
 //! [`crate::ccl::Refinement`] and is inferred/coalesced like any other
 //! sub-tree.
 //!
 //! # Reference
 //!
-//! Implements the algorithm from Parreaux, "The Simple Essence of Algebraic
-//! Subtyping" (ICFP 2020).
-
-use smol_str::SmolStr;
+//! Cambra's solver is originally based on Parreaux, "The Simple Essence of
+//! Algebraic Subtyping" (ICFP 2020), extended here with Pi types and
+//! refinements.
 
 use crate::ccl::{BaseType, InferVar, Level, Type};
 
@@ -47,45 +47,18 @@ pub mod scheme;
 pub mod simplify_type;
 
 // Re-export every symbol that external modules reach through the
-// `crate::ccl::simple_sub::…` path (chiefly `infer_simple_sub`, plus
-// `FieldKey` from `ccl::mod` and `ccl::planning`), so the directory split is
-// path-transparent.
+// `crate::ccl::infer::solver::…` path (chiefly the inference engine), so the
+// directory split is path-transparent.
 pub use coalesce::{CoalesceError, coalesce_compact};
 pub use compact::{CompactGraph, CompactType, compact_type};
 pub use constrain::{ConstrainCache, ConstrainError, ExtrudeCache, constrain_subtype, extrude};
 pub use scheme::{FreshenCache, FreshenLevel, PolyScheme, freshen_above, freshen_expr_type_slots};
 pub use simplify_type::simplify_type;
 
-/// Identifies a field inside a structural record/tuple, or a variant tag.
-///
-/// `Index` is used for tuple-shaped records (positional projection);
-/// `Name` for named-field records. The constrain_subtype solver treats them
-/// uniformly under width-subtyping; the closed-tuple-vs-record
-/// distinction is materialized only at coalesce time.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum FieldKey {
-    /// Positional field (tuple index).
-    Index(usize),
-    /// Named field.
-    Name(SmolStr),
-}
-
-impl std::fmt::Display for FieldKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            // Positional keys render as a bare index, matching tuple/record
-            // projection (`.0`, `.1`); the dot prefix in tag/field contexts
-            // is supplied by the caller, so a positional sum reads `.0`, `.1`.
-            FieldKey::Index(n) => write!(f, "{n}"),
-            FieldKey::Name(s) => write!(f, "{s}"),
-        }
-    }
-}
-
 /// The level of `ty` — the maximum scope level of any inference variable
 /// occurring inside it. Leaves and `Hole` are level 0; `Refinement` defers
 /// to its inner type (refinements are lattice-blind). Used by `extrude` and by
-/// let-generalization (`infer_simple_sub::should_generalize`, which generalizes
+/// let-generalization (`infer::context::should_generalize`, which generalizes
 /// a binding when its type's level exceeds the binding level).
 pub fn type_level(ty: &Type) -> Level {
     match ty {
@@ -130,8 +103,7 @@ pub(crate) mod test_helpers {
 
     use smol_str::SmolStr;
 
-    use super::FieldKey;
-    use crate::ccl::{Refinement, Type};
+    use crate::ccl::{FieldKey, Refinement, Type};
 
     /// Build a `Type` from `FieldKey`-keyed fields: all-`Name` → `Record`,
     /// otherwise a dense `Tuple` (the only product shapes `ccl::Type` has).

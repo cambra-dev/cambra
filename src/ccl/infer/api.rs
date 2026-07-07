@@ -3,17 +3,18 @@
 //! Sits between lowering (`ccl::lower`) and compilation (`interpreter::compile_ccl`):
 //!
 //! ```text
-//! Python source
+//! CHL source
 //!   → lower (ccl/lower.rs)            — structural, no type reasoning
-//!   → infer  (ccl/infer.rs)           — type inference entry point
-//!       → infer_simple_sub.rs         — simple-sub constraint-based inference
+//!   → infer  (ccl/infer/)             — Cambra's inference algorithm
+//!       → infer/solver/               — the constraint solver
 //!   → compile (interpreter/compile_ccl.rs)  — CCL → dataflow operators
 //! ```
 //!
 //! # Type inference
 //!
-//! The public entry point is [`infer`], which delegates to
-//! [`crate::ccl::infer_simple_sub`]. This module also provides post-inference
+//! The public entry point is [`infer`], which runs the two-pass
+//! emit→coalesce engine over the constraint solver in
+//! [`crate::ccl::infer::solver`]. This module also provides post-inference
 //! validation ([`check_fully_typed`], [`typecheck`]) and the
 //! [`TypeInferenceContext`] that holds source-type registrations used by
 //! both inference and compilation.
@@ -38,7 +39,7 @@ use crate::util::ScopeStack;
 ///
 /// # Why this exists
 ///
-/// The simple-sub solver records `α <: β` by pushing `Type::Infer(β)` into
+/// The solver records `α <: β` by pushing `Type::Infer(β)` into
 /// `α`'s bounds and `Type::Infer(α)` into `β`'s bounds. Mutual constraints
 /// (and self-recursive ones) therefore make each [`crate::ccl::InferVar`]
 /// hold a strong `Rc` to the others through its `RefCell<InferBounds>`. Once
@@ -77,7 +78,7 @@ use crate::util::ScopeStack;
 /// # Rejected alternative: `Weak` back-edges
 ///
 /// We could instead make one direction of each bound edge a
-/// `Weak<InferVar>`, so the cycle is never strong. Rejected: simple-sub
+/// `Weak<InferVar>`, so the cycle is never strong. Rejected: the solver
 /// constraints are *symmetric* mutual references with no natural "back
 /// edge" to demote, so we'd be upgrading `Weak`s and handling the `None`
 /// case throughout the constraint/coalesce hot path. The arena instead pays
@@ -134,7 +135,7 @@ impl Drop for InferArena {
 ///
 /// Combines a lexical scope stack (for lambda parameters and let bindings)
 /// and a registry of externally-registered data-source types. Type inference
-/// is performed by the simple-sub pass ([`crate::ccl::infer_simple_sub`]).
+/// is performed by the inference pass ([`crate::ccl::infer`]).
 ///
 /// Scopes are entered and exited exclusively via [`enter_scope`](TypeInferenceContext::enter_scope);
 /// each lambda body and let binding gets its own scope.
@@ -293,14 +294,14 @@ pub enum InferError {
         /// predicates.
         unbound: Vec<String>,
     },
-    /// An incompatible-bounds conflict from simple-sub coalescing.
+    /// An incompatible-bounds conflict from coalescing.
     /// The solver rejects unions/intersections of distinct concrete types.
     IncompatibleBounds {
         /// `true` = positive polarity (lower-bound union); `false` = negative (upper-bound intersection).
         polarity: bool,
         /// Display string of the conflicting types, e.g. `"handle(0) | handle(1)"`.
         conflicting: String,
-        /// UIDs of the simple-sub variables whose bounds conflicted.
+        /// UIDs of the inference variables whose bounds conflicted.
         vars: Vec<InferVarId>,
         /// The innermost expression label where the conflict was first detected.
         origin: String,
@@ -392,10 +393,10 @@ impl std::fmt::Debug for InferError {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Run type inference on `expr` using the simple-sub algorithm.
+/// Run type inference on `expr` using Cambra's inference algorithm.
 ///
 /// Public entry point for the CCL type-inference pass. Delegates entirely to
-/// [`crate::ccl::infer_simple_sub::infer`]. After this call returns `Ok`, the
+/// [`crate::ccl::infer::infer`]. After this call returns `Ok`, the
 /// tree is fully annotated and contains no `Type::Hole` or `Type::Infer`
 /// placeholders.
 pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Vec<InferError>> {
@@ -406,7 +407,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Ve
     // variable's bounds, breaking the `Rc` cycles that would otherwise leak
     // the whole variable graph. See [`InferArena`].
     let _arena = InferArena::new();
-    crate::ccl::infer_simple_sub::infer(expr, &ctx.source_types)
+    super::run(expr, &ctx.source_types)
 }
 
 /// Check that every [`crate::ccl::TypedExpr::ty`] and [`crate::ccl::TypedBinding::ty`]
@@ -577,7 +578,7 @@ fn collect_type_errors(
 /// `Err(errs)`.
 pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
     check_fully_typed(expr)?;
-    crate::ccl::infer_simple_sub::check(expr)
+    super::check(expr)
 }
 
 /// In debug mode only, typecheck the expression and panic if any errors are found.
@@ -709,9 +710,9 @@ mod tests {
     fn test_infer_cannot_infer_param() {
         let mut ctx = TypeInferenceContext::new();
         // λ x → x  — standalone; x is referenced but never used as an Apply argument.
-        // simple-sub permits unconstrained lambdas; returns Fun(Infer, Infer).
+        // inference permits unconstrained lambdas; returns Fun(Infer, Infer).
         let mut expr = Expr::lambda("x", Type::infer(), Expr::var("x"));
-        let ty = infer(&mut expr, &mut ctx).expect("simple-sub allows unconstrained λ x → x");
+        let ty = infer(&mut expr, &mut ctx).expect("inference allows unconstrained λ x → x");
         assert!(
             matches!(
                 ty,
@@ -736,7 +737,7 @@ mod tests {
     fn test_cannot_infer_nested_tuple_param() {
         let mut ctx = TypeInferenceContext::new();
         // λ p → p._0  where p : (_, _)
-        // simple-sub permits partially-inferred params; body constrains p._0 to Int
+        // inference permits partially-inferred params; body constrains p._0 to Int
         // but leaves p._1 unconstrained — returns a Fun rather than erroring.
         let body = Expr::apply(Expr::var("p"), Expr::proj_index(0));
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
@@ -747,8 +748,7 @@ mod tests {
             },
             body: Box::new(body),
         });
-        let ty =
-            infer(&mut expr, &mut ctx).expect("simple-sub allows partially-constrained params");
+        let ty = infer(&mut expr, &mut ctx).expect("inference allows partially-constrained params");
         assert!(
             matches!(
                 ty,
@@ -905,7 +905,7 @@ mod tests {
     fn test_infer_type_annotation_mismatch() {
         let mut ctx = TypeInferenceContext::new();
         // (42 : String)  =>  annotation conflict
-        // simple-sub surfaces annotation conflicts as AnnotationMismatch
+        // inference surfaces annotation conflicts as AnnotationMismatch
         let mut expr = Expr::lit(Lit::Int(42)).with_user_annotation(Type::Base(BaseType::String));
         let errs = infer(&mut expr, &mut ctx).unwrap_err();
         assert!(
@@ -1026,9 +1026,9 @@ mod tests {
             ),
         );
         let mut ctx = TypeInferenceContext::new();
-        // simple-sub catches the mismatch at the Apply site.
+        // inference catches the mismatch at the Apply site.
         let errs = infer(&mut expr, &mut ctx)
-            .expect_err("expected TypeMismatch Int/String under simple-sub");
+            .expect_err("expected TypeMismatch Int/String under inference");
         assert!(
             errs.iter().any(|e| matches!(
                 e,
@@ -1132,7 +1132,7 @@ mod tests {
     #[test]
     fn test_binop_type_mismatch() {
         let mut ctx = TypeInferenceContext::new();
-        // Int + Bool → type error; Int ⊔ Bool is inexpressible under simple-sub.
+        // Int + Bool → type error; Int ⊔ Bool is inexpressible under inference.
         let mut expr = Expr::binop(
             Expr::lit(Lit::Int(1)),
             BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -1274,7 +1274,7 @@ mod tests {
     fn test_infer_aggregate_non_function_input_mismatch() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::aggregate(Expr::lit(Lit::Int(42)), AggregateKind::Sum);
-        // HM produces TypeMismatch; simple-sub's map_constrain_err detects that the
+        // HM produces TypeMismatch; inference's map_constrain_err detects that the
         // rhs is a Fun and lhs is not, promoting it to ExpectedFunction.
         let errs = infer(&mut expr, &mut ctx).expect_err("expected error for non-function input");
         assert!(
@@ -1473,7 +1473,7 @@ mod tests {
     /// `Apply(λ [x : annotated String] → x, 42)` — argument is Int but annotation says String.
     ///
     /// HM: catches the conflict as `AnnotationMismatch` at the lambda-param annotation check.
-    /// simple-sub: the annotation pins the param to String; the Apply then fails to constrain
+    /// the solver: the annotation pins the param to String; the Apply then fails to constrain
     /// `Int ≤ String` and surfaces as `TypeMismatch{Apply, Int, String}`.
     #[test]
     fn test_infer_apply_annotation_mismatch() {
@@ -1489,9 +1489,9 @@ mod tests {
             })),
             argument: Box::new(Expr::lit(Lit::Int(42))),
         });
-        // simple-sub: the annotation pins the param to String; the Apply then fails to
+        // the solver: the annotation pins the param to String; the Apply then fails to
         // constrain Int ≤ String and surfaces as TypeMismatch.
-        let errs = infer(&mut expr, &mut ctx).expect_err("expected error under simple-sub");
+        let errs = infer(&mut expr, &mut ctx).expect_err("expected error under inference");
         assert!(
             errs.iter()
                 .any(|e| matches!(e, InferError::TypeMismatch { .. })),
@@ -1610,8 +1610,8 @@ mod tests {
         use crate::ccl::UnaryOpKind;
         // -true → TypeMismatch(Bool, Int).
         let mut expr = Expr::unary(UnaryOpKind::Neg, Expr::lit(Lit::Bool(true)));
-        let errs = infer(&mut expr, &mut ctx)
-            .expect_err("expected TypeMismatch Bool/Int under simple-sub");
+        let errs =
+            infer(&mut expr, &mut ctx).expect_err("expected TypeMismatch Bool/Int under inference");
         assert!(
             errs.iter().any(|e| matches!(
                 e,
@@ -1647,7 +1647,7 @@ mod tests {
         );
     }
 
-    /// An empty record: simple-sub cannot distinguish an empty `Record` from an empty
+    /// An empty record: the solver cannot distinguish an empty `Record` from an empty
     /// `Tuple` at coalesce time (both compact to a `CompactType` with an empty field map)
     /// and produces `Tuple([])`.
     #[test]

@@ -131,7 +131,7 @@ impl Subst {
     /// term). For specialization freshening: a suspended discharge's term was
     /// captured at emit with the definition's inference variables in its type
     /// slots, and a freshened clone must rename those alongside every other
-    /// slot it copies — see `simple_sub::freshen_subst_payloads`, called from
+    /// slot it copies — see `solver::scheme::freshen_subst_payloads`, called from
     /// `freshen_above`'s bound-copying arm.
     pub fn for_each_discharge_term_mut(&mut self, f: &mut impl FnMut(&mut TypedExpr)) {
         for m in self.0.values_mut() {
@@ -144,7 +144,7 @@ impl Subst {
     /// Split into the rename entries and the discharge entries — a variant
     /// partition, exact by construction (see [`Mapping`]). The two act on
     /// disjoint binders, so the original is their parallel union; this is the
-    /// factoring [`crate::ccl::simple_sub`]'s closure bridge uses to
+    /// factoring [`crate::ccl::infer::solver`]'s closure bridge uses to
     /// reconcile two composite holder-side morphisms that share their
     /// discharge part but differ in correspondence renames.
     pub fn split_renames(&self) -> (Subst, Subst) {

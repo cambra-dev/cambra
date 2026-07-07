@@ -14,10 +14,9 @@
 use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
-    Type,
+    FieldKey, Type,
     infer::{InferError, TypeInferenceContext, infer},
     lower::{LoweringContext, lower_stmts},
-    simple_sub::FieldKey,
 };
 use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
@@ -595,7 +594,7 @@ fn test_self_application_types() {
     // cleanly: the unconstrained `α` leg drops and the lambda infers as
     // `(?a ⇒ ?b) ⇒ ?c`, carrying unresolved `Infer` vars like any other
     // unapplied lambda. *Misusing* a self-applicator still errors — see
-    // `self_application_rejected_without_panic` in `infer_simple_sub.rs`.
+    // `self_application_rejected_without_panic` in `infer/solve.rs`.
     let ty = infer_program("lambda x: x(x)");
     assert!(
         matches!(&ty, Type::Fun { domain: d, .. } if matches!(&**d, Type::Fun { .. })),
@@ -625,7 +624,7 @@ fn test_lambda_unapplied(#[case] code: &str, #[case] expected: Type) {
 #[test]
 fn test_generic_identity() {
     // f = lambda x: x; f -> Fun(?a, ?b)
-    // simple-sub allows unconstrained parameters to remain unresolved.
+    // inference allows unconstrained parameters to remain unresolved.
     let ty = infer_program("f = lambda x: x\nf");
     if let Type::Fun {
         domain: dom,

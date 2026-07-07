@@ -22,7 +22,8 @@ use smol_str::SmolStr;
 use crate::ccl::subst::Subst;
 use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type};
 
-use super::{FieldKey, type_level};
+use super::type_level;
+use crate::ccl::FieldKey;
 
 // ---------------------------------------------------------------------------
 // Constraint solver
@@ -609,8 +610,8 @@ mod tests {
     use smol_str::SmolStr;
 
     use super::*;
-    use crate::ccl::simple_sub::test_helpers::{record, refined, variant};
-    use crate::ccl::simple_sub::{coalesce_compact, compact_type, fresh_var, fun, prim};
+    use crate::ccl::infer::solver::test_helpers::{record, refined, variant};
+    use crate::ccl::infer::solver::{coalesce_compact, compact_type, fresh_var, fun, prim};
     use crate::ccl::subst::Subst;
     use crate::ccl::{
         BaseType, BinOpKind, CompareKind, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode,
@@ -881,7 +882,7 @@ mod tests {
     fn constrain_var_to_var_records_bound_without_immediate_propagation() {
         // Setup: α has upper Int. Then β <: α.
         //
-        // Note: simple-sub's constrain_subtype rule, when both sides are
+        // Note: the solver's constrain_subtype rule, when both sides are
         // variables, fires the Var-on-lhs branch first and registers
         // rhs (α) directly in lhs (β)'s upper bounds. α's existing
         // uppers are NOT eagerly transferred to β — that transitive

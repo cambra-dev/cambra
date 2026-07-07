@@ -22,7 +22,7 @@ r#"x = defer()
 for i in [1,2,3]:
   x << i
 x"#, make_int_list(&[1, 2, 3]))]
-#[ignore = "known failing simple-sub case with predicates"]
+#[ignore = "known failing inference case with predicates"]
 #[case::feed_with_if(
 r#"x = defer()
 for i in [0,1,2,3]:

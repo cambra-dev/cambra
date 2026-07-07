@@ -1,7 +1,7 @@
 //! Inference type variables and the per-thread inference arena.
 //!
 //! Holds the [`InferVarId`] identity machinery, the subtyping [`Bound`] /
-//! [`InferBounds`] / [`InferVar`] structures the simple-sub solver mutates in
+//! [`InferBounds`] / [`InferVar`] structures the solver mutates in
 //! place, and the thread-local [`ACTIVE_ARENA`] that owns every variable minted
 //! during an inference run so their `Rc` cycles can be broken at teardown.
 
@@ -37,7 +37,7 @@ static INFER_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// Allocate a fresh, globally-unique [`InferVarId`].
 ///
 /// Called by [`Type::infer`] (test helper) and
-/// [`crate::ccl::simple_sub::coalesce`] (which mints fresh ids for
+/// [`crate::ccl::infer::solver::coalesce`] (which mints fresh ids for
 /// any inference variable that survives simplification).
 pub(crate) fn fresh_infer_var_id() -> InferVarId {
     InferVarId(INFER_VAR_COUNTER.fetch_add(1, Ordering::Relaxed))
@@ -186,7 +186,7 @@ impl Bound {
 /// The mutable bound lists of an [`InferVar`].
 ///
 /// `lower` are types that flow *into* the variable (`L <: α`); `upper` are
-/// types it must flow into (`α <: U`). The simple-sub solver appends to
+/// types it must flow into (`α <: U`). The solver appends to
 /// these in place via the variable's [`RefCell`]; coalescing reads them to
 /// materialize a concrete [`Type`]. Each entry is a [`Bound`] carrying the
 /// substitution on its constraint edge.

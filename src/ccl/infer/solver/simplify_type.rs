@@ -1,4 +1,4 @@
-//! Simple-sub type simplification: polar co-occurrence analysis.
+//! Type simplification: polar co-occurrence analysis.
 //!
 //! [`simplify_type`] sits between [`super::compact::compact_type`] and
 //! [`super::coalesce::coalesce_compact`], merging or dropping inference

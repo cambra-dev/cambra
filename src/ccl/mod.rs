@@ -4,19 +4,17 @@
 //! lowered into CCL, where it is type-checked and optimized, then compiled
 //! to the dataflow operator graph for execution.
 //!
-//! See `docs/design-ccl-ast.md` for the full design rationale.
+//! See the design docs in `src/ccl/design/` for the full design rationale.
 
 pub mod ccl_utils;
 pub mod context;
 pub mod desugar_defers;
 pub mod infer;
-pub mod infer_simple_sub;
 pub mod inline;
 pub mod lambda_elim;
 pub mod lower;
 pub mod names;
 pub mod planning;
-pub mod simple_sub;
 pub mod simplify;
 pub mod subst;
 pub mod symbolic;
@@ -46,7 +44,7 @@ pub use ty::*;
 // `pub` items), so they are re-exported explicitly here to preserve their
 // `crate::ccl::X` paths:
 //   - `arena_enter` / `arena_exit` are used by `infer.rs`;
-//   - `fresh_infer_var_id` is used by `simple_sub.rs`;
+//   - `fresh_infer_var_id` is used by `solver`;
 //   - `eq_refinement_predicate` is used by `subst.rs`.
 pub(crate) use infer_var::{arena_enter, arena_exit, fresh_infer_var_id};
 pub(crate) use ty::eq_refinement_predicate;

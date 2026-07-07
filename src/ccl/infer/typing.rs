@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::infer::InferError;
-use crate::ccl::simple_sub::PolyScheme;
+use crate::ccl::infer::solver::PolyScheme;
 use crate::ccl::{Expr, Name, Type};
 
 /// The operations a typing rule needs from its surrounding pass.
@@ -16,7 +16,7 @@ use crate::ccl::{Expr, Name, Type};
 /// the rule body keeps each node's typing rule in exactly one place rather
 /// than duplicated across the two passes.
 ///
-/// Implemented by [`SimpleSubContext`](super::context::SimpleSubContext) (Emit)
+/// Implemented by [`InferCtx`](super::context::InferCtx) (Emit)
 /// and [`CheckCtx`](super::check::CheckCtx) (Check).
 pub(super) trait Typing {
     /// Obtain the type of a child sub-expression. In Emit mode this recurses
@@ -32,7 +32,7 @@ pub(super) trait Typing {
 
     /// Normalize a user annotation / binder type into a solver-ready `Type`
     /// (holes → fresh vars; refinements kept). See
-    /// [`SimpleSubContext::normalize_annotation`](super::context::SimpleSubContext::normalize_annotation).
+    /// [`InferCtx::normalize_annotation`](super::context::InferCtx::normalize_annotation).
     fn normalize(&mut self, ann: &Type) -> Type;
 
     /// Require `sub <: sup`. `at` lazily produces an error-context label,

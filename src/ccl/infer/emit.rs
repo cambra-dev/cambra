@@ -7,22 +7,23 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
+use crate::ccl::FieldKey;
 use crate::ccl::ccl_utils::cast_target_refinement;
 use crate::ccl::infer::InferError;
-use crate::ccl::simple_sub::{FieldKey, PolyScheme, fun, prim};
+use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     BaseType, Branch, Expr, Name, ProjKey, Refinement, Type, TypedBinding, TypedExprNode,
 };
 
-use super::context::SimpleSubContext;
+use super::context::InferCtx;
 use super::typing::{Typing, peel_refinements_outer};
 use super::{lit_base, product, variant_type};
 
 /// Walk one expression node, emit constraints for it, write its inferred
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
 /// their `Type`s are stored on their own nodes the same way.
-pub(super) fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<Type, InferError> {
+pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, InferError> {
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
     let ty = match &mut expr.node {
@@ -176,7 +177,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut SimpleSubContext) -> Result<T
 /// enclosing scope; this must run while those bindings are live (i.e.
 /// during `emit_node` of the annotated node). Each predicate is rebuilt in
 /// place ([`emit_bare_predicate`]) so the typed term lands on the annotation.
-fn emit_annotation_predicates(ty: &mut Type, ctx: &mut SimpleSubContext) -> Result<(), InferError> {
+fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), InferError> {
     match ty {
         Type::Refinement(inner, r) => {
             // The annotation's refinement is bare over REFINEMENT_BINDER, just
@@ -713,7 +714,7 @@ pub(super) fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<
     })
 }
 
-/// Emit Simple-sub constraints for a `Loop` node and return its outer type
+/// Emit inference constraints for a `Loop` node and return its outer type
 /// `Fun(D, Record({step: σ, tap_k: τ_k}))`.
 ///
 /// The Loop's typing rule (mirroring the paper's `App` shape — fresh

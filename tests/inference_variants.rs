@@ -1,6 +1,6 @@
 //! Integration tests for tagged variants.
 //!
-//! Builds [`TypedExpr`] trees directly (mirroring `tests/simple_sub_differential.rs`)
+//! Builds [`TypedExpr`] trees directly
 //! and runs them through the public `cambra::ccl::infer::infer` entry point.
 //! These tests exercise the variant lattice (`Type::Variant`), the new
 //! AST nodes (`VariantCtor`, `Match`), and their constraint/coalesce
@@ -8,9 +8,8 @@
 //! (which is a separate workstream).
 
 use cambra::ccl::{
-    Branch, Lit, Pattern, Type, TypedBinding, TypedExpr, TypedExprNode,
+    Branch, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExpr, TypedExprNode,
     infer::{InferError, TypeInferenceContext, infer},
-    simple_sub::FieldKey,
 };
 use cambra::interpreter::BaseType;
 

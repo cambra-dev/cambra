@@ -1,4 +1,4 @@
-//! Simple-sub-based type inference.
+//! Cambra's inference algorithm — the constraint-emission and coalescing engine.
 //!
 //! The canonical type inference implementation, invoked via
 //! [`crate::ccl::infer::infer`].
@@ -17,7 +17,7 @@
 //!    `cast` Apply arm), so they flow through the solver structurally.
 //! 2. **Coalesce + write-back + monomorphize**: walk the tree again and, for
 //!    each node, run
-//!    [`coalesce_compact`](crate::ccl::simple_sub::coalesce_compact) to
+//!    [`coalesce_compact`](crate::ccl::infer::solver::coalesce_compact) to
 //!    resolve the inference variables in its `expr.ty` in place. The same
 //!    walk lowers let-polymorphism: a use of a generalized `let` is
 //!    specialized at first visit, memoized per distinct resolved type
@@ -29,7 +29,7 @@
 //!
 //! A `let` whose RHS is a *function definition* is **generalized**: its RHS is
 //! emitted one level deeper (`in_let_rhs`), then generalized into a
-//! [`PolyScheme`](crate::ccl::simple_sub::PolyScheme) at the binding site (`scoped_let`), so each use instantiates
+//! [`PolyScheme`](crate::ccl::infer::solver::PolyScheme) at the binding site (`scoped_let`), so each use instantiates
 //! fresh quantified variables and is constrained independently. This is what
 //! lets `let id = λx.x in (id 1, id "a")` type-check
 //! where a monomorphic `let` would collide.
@@ -57,7 +57,7 @@
 //! duplicate it, which the feed/define and join-planning machinery is sensitive
 //! to.
 //!
-//! The [`OperatorSchemes`] registry additionally contains [`PolyScheme`](crate::ccl::simple_sub::PolyScheme)s for
+//! The [`OperatorSchemes`] registry additionally contains [`PolyScheme`](crate::ccl::infer::solver::PolyScheme)s for
 //! the handful of operator/projection cases that are inherently polymorphic
 //! (`Compare : ∀α. α → α → Bool`, `Max : ∀α γ. (α → γ) → γ`, etc.). Each scheme
 //! is `instantiate`d at every use site, minting fresh vars per use.
@@ -69,25 +69,28 @@
 //! `lower_mutation_loop`); those have entries in [`OperatorSchemes`] and
 //! are freshened at each use site like any other scheme.
 
+mod api;
 mod check;
 mod context;
 mod emit;
 mod schemes;
 mod solve;
+pub mod solver;
 mod typing;
 
 // Public surface (consumed by `crate::ccl::infer`): the two entry points and
 // the operator-scheme registry.
+pub use api::*;
 pub use check::check;
 pub use schemes::OperatorSchemes;
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::ccl::infer::InferError;
-use crate::ccl::simple_sub::{CoalesceError, ConstrainError, FieldKey, prim};
+use crate::ccl::FieldKey;
+use crate::ccl::infer::solver::{CoalesceError, ConstrainError, prim};
 use crate::ccl::{BaseType, Lit, Type};
 
-use context::SimpleSubContext;
+use context::InferCtx;
 use emit::emit_node;
 use solve::{coalesce_pass, resolve_var_type, retype_predicate_slots};
 
@@ -201,20 +204,23 @@ pub(super) fn lit_base(lit: &Lit) -> Type {
     }
 }
 
-/// Run simple-sub type inference on `expr`.
+/// Run Cambra's type inference on `expr`.
 ///
 /// Two-pass: emit constraints, then coalesce. Source types come from
 /// the public [`crate::ccl::infer::TypeInferenceContext`] and are
 /// normalized (holes → fresh vars) up front.
-pub fn infer(expr: &mut Expr, sources: &HashMap<String, Type>) -> Result<Type, Vec<InferError>> {
+pub(crate) fn run(
+    expr: &mut Expr,
+    sources: &HashMap<String, Type>,
+) -> Result<Type, Vec<InferError>> {
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
-        let pre = SimpleSubContext::new(HashMap::new());
+        let pre = InferCtx::new(HashMap::new());
         let translated: HashMap<String, Type> = sources
             .iter()
             .map(|(k, v)| (k.clone(), pre.normalize_annotation(v)))
             .collect();
-        SimpleSubContext::new(translated)
+        InferCtx::new(translated)
     };
 
     // Pass 1: emit constraints.
@@ -278,9 +284,9 @@ pub(crate) mod test_helpers {
         TypedExpr::new(TypedExprNode::Lit(Lit::String(s.into())))
     }
 
-    pub(crate) fn run_simple_sub(expr: &mut Expr) -> Result<Type, Vec<InferError>> {
+    pub(crate) fn run_inference(expr: &mut Expr) -> Result<Type, Vec<InferError>> {
         let mut ctx = TypeInferenceContext::new();
-        crate::ccl::infer::infer(expr, &mut ctx)
+        infer(expr, &mut ctx)
     }
 
     /// `{Int | __elem > rhs}` — a refinement whose bare predicate compares
@@ -388,14 +394,14 @@ mod tests {
             argument: Box::new(lit_int(42)),
         });
         let mut e = app;
-        let ty = run_simple_sub(&mut e).expect("inference succeeds");
+        let ty = run_inference(&mut e).expect("inference succeeds");
         assert_eq!(ty, Type::Base(BaseType::Int));
     }
 
     #[test]
     fn smoke_tuple_literal() {
         let mut e = TypedExpr::new(TypedExprNode::Tuple(vec![lit_int(1), lit_string("x")]));
-        let ty = run_simple_sub(&mut e).expect("inference succeeds");
+        let ty = run_inference(&mut e).expect("inference succeeds");
         assert_eq!(
             ty,
             Type::Tuple(vec![
@@ -411,7 +417,7 @@ mod tests {
             ("a".to_string(), lit_int(1)),
             ("b".to_string(), lit_string("x")),
         ]));
-        let ty = run_simple_sub(&mut e).expect("inference succeeds");
+        let ty = run_inference(&mut e).expect("inference succeeds");
         assert_eq!(
             ty,
             Type::Record(vec![
@@ -433,7 +439,7 @@ mod tests {
             bound_expr: Box::new(lit_int(42)),
             body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),
         });
-        let ty = run_simple_sub(&mut e).expect("inference succeeds");
+        let ty = run_inference(&mut e).expect("inference succeeds");
         assert_eq!(ty, Type::Base(BaseType::Int));
     }
 }

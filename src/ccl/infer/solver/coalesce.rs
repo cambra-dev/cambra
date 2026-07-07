@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 
 use crate::ccl::{InferVar, InferVarId, Type};
 
-use super::FieldKey;
 use super::compact::{CompactGraph, CompactType};
+use crate::ccl::FieldKey;
 
 // ---------------------------------------------------------------------------
 // Coalesce errors
@@ -33,7 +33,7 @@ pub enum CoalesceError {
         /// `true` = positive polarity (lower bounds forming a union);
         /// `false` = negative polarity (upper bounds forming an intersection).
         polarity: bool,
-        /// UIDs of the simple-sub variables that contributed these bounds.
+        /// UIDs of the inference variables that contributed these bounds.
         vars: Vec<InferVarId>,
         /// Pretty representation of the conflicting bounds.
         details: String,
@@ -153,9 +153,9 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
     };
 
     // Re-wrap the refinement witnesses carried at this position. `extent_of`
-    // and `iterate_type` both strip refinements at every depth and compose
-    // the resulting `Restrict`s, so the wrap order is semantically
-    // irrelevant; first-insertion order in the `Vec` makes it stable.
+    // strips refinements at every depth and composes the resulting
+    // `Restrict`s, so the wrap order is semantically irrelevant;
+    // first-insertion order in the `Vec` makes it stable.
     let out = ct
         .refinements
         .iter()
@@ -259,13 +259,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::ccl::simple_sub::compact::{AtomKey, CompactGraph, CompactType};
-    use crate::ccl::simple_sub::test_helpers::{record, refined, variant};
-    use crate::ccl::simple_sub::{
-        ConstrainCache, FieldKey, compact_type, constrain_subtype, fresh_var, fun, prim,
-        simplify_type,
+    use crate::ccl::infer::solver::compact::{AtomKey, CompactGraph, CompactType};
+    use crate::ccl::infer::solver::test_helpers::{record, refined, variant};
+    use crate::ccl::infer::solver::{
+        ConstrainCache, compact_type, constrain_subtype, fresh_var, fun, prim, simplify_type,
     };
-    use crate::ccl::{BaseType, Bound, Type};
+    use crate::ccl::{BaseType, Bound, FieldKey, Type};
 
     #[test]
     fn coalesce_primitive_round_trips() {

@@ -243,7 +243,7 @@ fn restamp_spine_result(node: &mut Expr, new_result: Type) {
 /// Construct a [`TypedExprNode::Cast`], a pure type-level assertion that
 /// re-views `value` under `target_ty`.
 ///
-/// `cast` is an upcast: [`crate::ccl::infer_simple_sub`]'s `Cast` arm types it
+/// `cast` is an upcast: [`crate::ccl::infer`]'s `Cast` arm types it
 /// by the single obligation `value_ty <: target_ty`.
 ///
 /// Op-conversion treats `cast` as a no-op — see [`TypedExprNode::Cast`] — so

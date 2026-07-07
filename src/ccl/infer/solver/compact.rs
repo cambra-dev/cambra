@@ -13,7 +13,7 @@ use smol_str::SmolStr;
 use crate::ccl::subst::Subst;
 use crate::ccl::{BaseType, InferVarId, Name, Refinement, Type, fresh_infer_var_id};
 
-use super::FieldKey;
+use crate::ccl::FieldKey;
 
 // ---------------------------------------------------------------------------
 // CompactType + compact_type: bound-graph flattening
@@ -495,7 +495,7 @@ fn compact_go(
             // its bounds collide into `IncompatibleBounds` (never a silent
             // mis-type). This invariant is the structural-collision check; it
             // predates let-polymorphism. A generalized binding's definition is
-            // never coalesced in place (`infer_simple_sub` keeps it aside and
+            // never coalesced in place (the inference engine keeps it aside and
             // coalesces per-use *clones* pinned to one resolved use type);
             // only those clones and the per-use instantiations reach here,
             // each fixed by a single use site.
@@ -521,7 +521,7 @@ fn compact_go(
             // by `coalesce_node`'s `specialize_projection_domain` /
             // `specialize_lambda_domain`. Both Apply edges are one-way (no
             // emit-time reverse whose eager cross-component propagation would
-            // cover these halves); see `design-simple-sub.md` ("Apply is
+            // cover these halves); see `design/type-inference.md` ("Apply is
             // one-way" and "Closing the single-sided blind spots").
             let primary_bounds = primary.clone();
             let opposite_bounds = if pol {

@@ -4,14 +4,15 @@
 
 use std::collections::BTreeMap;
 
-use crate::ccl::simple_sub::{FieldKey, PolyScheme, fresh_var, fun, prim};
+use crate::ccl::FieldKey;
+use crate::ccl::infer::solver::{PolyScheme, fresh_var, fun, prim};
 use crate::ccl::{AggregateKind, BaseType, BinOpKind, Builtin, Level, Type, UnaryOpKind};
 
 use super::product;
 
 /// Schemes for operators that lift cleanly to fixed signatures.
 ///
-/// Each scheme is built once per [`SimpleSubContext`](super::context::SimpleSubContext);
+/// Each scheme is built once per [`InferCtx`](super::context::InferCtx);
 /// `instantiate` runs at every use site to mint fresh quantified variables.
 /// Operators with structural result types (`BinOp::CollectionUnion`) and nodes
 /// whose typing rules require AST-level reasoning (`Apply`, `Lambda`,
@@ -205,7 +206,7 @@ mod tests {
             ]))),
         });
         let mut e = TypedExpr::aggregate(lam, AggregateKind::Max);
-        let ty = run_simple_sub(&mut e).expect("inference succeeds (the bug under test)");
+        let ty = run_inference(&mut e).expect("inference succeeds (the bug under test)");
         // Buggy current behavior: the non-orderable tuple codomain is accepted.
         assert_eq!(
             ty,

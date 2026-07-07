@@ -4,8 +4,35 @@
 use std::fmt;
 use std::rc::Rc;
 
-use crate::ccl::simple_sub::FieldKey;
+use smol_str::SmolStr;
+
 use crate::ccl::{BaseType, InferVar, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils, symbolic};
+
+/// Identifies a field inside a structural record/tuple, or a variant tag.
+///
+/// `Index` is used for tuple-shaped records (positional projection);
+/// `Name` for named-field records. The `constrain_subtype` solver treats them
+/// uniformly under width-subtyping; the closed-tuple-vs-record
+/// distinction is materialized only at coalesce time.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FieldKey {
+    /// Positional field (tuple index).
+    Index(usize),
+    /// Named field.
+    Name(SmolStr),
+}
+
+impl fmt::Display for FieldKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Positional keys render as a bare index, matching tuple/record
+            // projection (`.0`, `.1`); the dot prefix in tag/field contexts
+            // is supplied by the caller, so a positional sum reads `.0`, `.1`.
+            FieldKey::Index(n) => write!(f, "{n}"),
+            FieldKey::Name(s) => write!(f, "{s}"),
+        }
+    }
+}
 
 /// A CCL type annotation.
 ///
@@ -16,7 +43,7 @@ use crate::ccl::{BaseType, InferVar, Lit, ProjKey, TypedExpr, TypedExprNode, ccl
 /// | Variant | Owner | Meaning | Must be eliminated by |
 /// |---|---|---|---|
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
-/// | `Infer(id)` | Type checker only | "Inference variable N from simple-sub coalesce" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`) |
+/// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// A primitive base type.
@@ -74,7 +101,7 @@ pub enum Type {
     ///
     /// Invariant: every `Hole` must be eliminated by the end of inference.
     /// `Hole` carries no identity — it's a structural "fill this in later"
-    /// marker. The simple-sub pass replaces it either with a concrete type
+    /// marker. The inference pass replaces it either with a concrete type
     /// or with a `Type::Infer` variable. A surviving `Hole` means inference
     /// never visited the node, and is reported by `collect_type_errors` as
     /// `UnresolvedHole` (treat as a compiler bug, not a user-facing error).
@@ -82,8 +109,8 @@ pub enum Type {
     Hole,
     /// Unresolved type variable, identified by a unique [`crate::ccl::InferVarId`].
     ///
-    /// Created during inference by the simple-sub pass
-    /// ([`crate::ccl::infer_simple_sub`]) when coalescing a constraint
+    /// Created during inference by the inference pass
+    /// ([`crate::ccl::infer`]) when coalescing a constraint
     /// variable whose bounds left it genuinely unconstrained (e.g. an
     /// identity lambda's parameter with no call-site usage).
     ///
@@ -94,7 +121,7 @@ pub enum Type {
     /// `f = lambda x: x` that is never applied).
     ///
     /// Carries the mutable [`InferVar`] (id + level + bounds) that the
-    /// simple-sub solver constrains in place. A *coalesced* `Infer` (one
+    /// solver constrains in place. A *coalesced* `Infer` (one
     /// surviving inference) has empty bounds and matters only for its
     /// `uid`; the solver guarantees no still-mutating variable escapes
     /// into a downstream pass.

@@ -91,7 +91,7 @@ use crate::helpers::*;
     ColumnValue::Ints(vec![11, 22])
 )]
 // Probe for a suspicious `zip`-substitution in the optimizer that
-// `case_27` of `test_new_compile` (above) hinted at: under simple-sub's
+// `case_27` of `test_new_compile` (above) hinted at: under inference's
 // tighter types, the optimizer rewrote a `cross × filter[a==b]` shape
 // into `(.0, .1) ▷ zip`. That happens to be sound when the two
 // iterables align element-wise, but `[1, 3] × [1, 2, 3] if a == b`

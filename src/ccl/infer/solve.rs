@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ccl::infer::InferError;
-use crate::ccl::simple_sub::{
+use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, coalesce_compact, compact_type,
     constrain_subtype, freshen_expr_type_slots, simplify_type,
 };
@@ -586,7 +586,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             for e in elts.iter_mut() {
                 coalesce_node(e, level, ctx);
             }
-            // Compose morphism-domain reconstruction. simple-sub coalesces
+            // Compose morphism-domain reconstruction. inference coalesces
             // each morphism's domain independently — the `Var <: Var`
             // constrain rule is single-sided, so a fresh negative-position
             // domain var only ever receives what the morphism's own body
@@ -922,7 +922,7 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
 /// written, not to a same-named binder introduced between definition and use.
 // `ConstrainCache` keys on `Type`, whose `Refinement` predicates carry interior
 // mutability; the solver relies on identity-by-`uid`, not the mutable payload
-// (matching `simple_sub`'s module-level allow).
+// (matching the solver's module-level allow).
 #[allow(clippy::mutable_key_type)]
 pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) {
     // The use's instantiation type, resolved off the live graph. The graph is
@@ -972,7 +972,7 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // generalized `let`s stay recognizable. The freshen is uniform over terms
     // and types — refinement predicates and the bound edges' discharge-payload
     // terms have their type slots freshened through the same cache (see
-    // `simple_sub::freshen_expr_type_slots` / `freshen_above`), so the clone's
+    // `solver::freshen_expr_type_slots` / `freshen_above`), so the clone's
     // predicates are proper freshen instances sharing no live inference state
     // with the definition — and no mutable state to keep in sync with it.
     let mut fresh = FreshenCache::new();
@@ -1095,7 +1095,7 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
 /// [`specialize_use`].
 ///
 /// A projection `.i` is a *polymorphic* morphism: its principal type is
-/// `∀ρ. ρ ⇒ ρ.i` for any record/tuple `ρ` carrying field `i`. simple-sub never
+/// `∀ρ. ρ ⇒ ρ.i` for any record/tuple `ρ` carrying field `i`. the solver never
 /// generalizes it (it is a builtin, not a `let`) and its single-sided
 /// `Var <: Var` rule feeds the domain var only the one field the projection
 /// touches, so the domain coalesces under-determined. Recovering it from the
@@ -1444,7 +1444,7 @@ mod tests {
         let use_str = TypedExpr::apply(lit_string("a"), TypedExpr::var("id"));
         let body = TypedExpr::new(TypedExprNode::Tuple(vec![use_int, use_str]));
         let mut e = TypedExpr::let_bind("id", id, body);
-        let ty = run_simple_sub(&mut e).expect("polymorphic identity type-checks");
+        let ty = run_inference(&mut e).expect("polymorphic identity type-checks");
         assert_eq!(
             ty,
             Type::Tuple(vec![
@@ -1469,7 +1469,7 @@ mod tests {
             TypedExpr::apply(lit_string("a"), TypedExpr::var("f")),
         ]));
         let mut e = TypedExpr::let_bind("f", f, body);
-        let ty = run_simple_sub(&mut e).expect("type-checks");
+        let ty = run_inference(&mut e).expect("type-checks");
         assert_eq!(
             ty,
             Type::Tuple(vec![
@@ -1515,7 +1515,7 @@ mod tests {
             TypedExpr::apply(lit_string("a"), TypedExpr::var("g")),
         ]));
         let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
-        let ty = run_simple_sub(&mut e).expect("chained poly-calls-poly type-checks");
+        let ty = run_inference(&mut e).expect("chained poly-calls-poly type-checks");
         let pair = |b: BaseType| Type::Tuple(vec![Type::Base(b.clone()), Type::Base(b)]);
         assert_eq!(
             ty,
@@ -1555,7 +1555,7 @@ mod tests {
             TypedExpr::apply(lit_string("a"), TypedExpr::var("g")),
         ]));
         let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
-        run_simple_sub(&mut e).expect("chained poly with shared uses type-checks");
+        run_inference(&mut e).expect("chained poly with shared uses type-checks");
         let (specializations, used_names) = specialization_stats(&e);
         assert_eq!(
             specializations, 4,
@@ -1599,7 +1599,7 @@ mod tests {
             f,
             TypedExpr::let_bind("g", g, TypedExpr::let_bind("h", h, uses)),
         );
-        let ty = run_simple_sub(&mut e).expect("triple poly chain type-checks");
+        let ty = run_inference(&mut e).expect("triple poly chain type-checks");
         let pair = |b: BaseType| Type::Tuple(vec![Type::Base(b.clone()), Type::Base(b)]);
         assert_eq!(
             ty,
@@ -1637,7 +1637,7 @@ mod tests {
             TypedExpr::apply(lit_string("a"), TypedExpr::var("g")),
         ]));
         let mut e = TypedExpr::let_bind("f", f, TypedExpr::let_bind("g", g, uses));
-        run_simple_sub(&mut e).expect("mixed direct + chained uses type-check");
+        run_inference(&mut e).expect("mixed direct + chained uses type-check");
         let (specializations, used_names) = specialization_stats(&e);
         assert_eq!(
             specializations, 4,
@@ -1670,7 +1670,7 @@ mod tests {
             f,
             TypedExpr::let_bind("g", g, TypedExpr::apply(lit_int(1), TypedExpr::var("g"))),
         );
-        let ty = run_simple_sub(&mut e).expect("unexercised generic use is tolerated");
+        let ty = run_inference(&mut e).expect("unexercised generic use is tolerated");
         // The result is the unapplied `f` specialization: a function type
         // whose domain/codomain stay unresolved.
         assert!(
@@ -1713,7 +1713,7 @@ mod tests {
             outer_f,
             TypedExpr::let_bind("g", g, TypedExpr::let_bind("f", inner_f, uses)),
         );
-        let ty = run_simple_sub(&mut e).expect("shadowed generalized bindings type-check");
+        let ty = run_inference(&mut e).expect("shadowed generalized bindings type-check");
         assert_eq!(
             ty,
             Type::Tuple(vec![
@@ -1747,7 +1747,7 @@ mod tests {
         let outer = TypedExpr::lambda("outer", Type::Hole, outer_body);
         let id = TypedExpr::lambda("z", Type::Hole, TypedExpr::var("z"));
         let mut e = TypedExpr::apply(id, outer);
-        let ty = run_simple_sub(&mut e).expect("captured-var application type-checks");
+        let ty = run_inference(&mut e).expect("captured-var application type-checks");
         assert_eq!(ty, Type::Base(BaseType::Int));
     }
 
@@ -1771,7 +1771,7 @@ mod tests {
         let id = TypedExpr::lambda("z", Type::Hole, TypedExpr::var("z"));
         let applied = TypedExpr::apply(lit_int(5), TypedExpr::apply(id, TypedExpr::var("mk")));
         let mut e = TypedExpr::let_bind("mk", mk, applied);
-        let ty = run_simple_sub(&mut e).expect("two-level nested generalization type-checks");
+        let ty = run_inference(&mut e).expect("two-level nested generalization type-checks");
         assert_eq!(ty, Type::Base(BaseType::Int));
     }
 
@@ -1804,7 +1804,7 @@ mod tests {
             outer,
             TypedExpr::apply(lit_string("a"), TypedExpr::var("outer")),
         );
-        let ty = run_simple_sub(&mut e).expect("nested generalization type-checks");
+        let ty = run_inference(&mut e).expect("nested generalization type-checks");
         assert_eq!(
             ty,
             Type::Tuple(vec![
@@ -1854,7 +1854,7 @@ mod tests {
             TypedExpr::apply(lit_int(1), TypedExpr::var("g")),
         );
         assert!(
-            run_simple_sub(&mut e).is_err(),
+            run_inference(&mut e).is_err(),
             "self-application must be rejected, not accepted or panic"
         );
     }

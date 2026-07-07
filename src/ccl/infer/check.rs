@@ -3,7 +3,7 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::infer::InferError;
-use crate::ccl::simple_sub::{ConstrainCache, PolyScheme, constrain_subtype, fresh_var};
+use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fresh_var};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{Expr, Level, Name, Type, TypedExprNode};
 
@@ -20,7 +20,7 @@ use super::{lit_base, map_constrain_err};
 ///
 /// Runs the *same* per-node rules as inference (the `emit_*` family) over a
 /// tree whose `Type`s are already resolved, verifying that each node's typing
-/// rule still holds. Where Emit ([`SimpleSubContext`](super::context::SimpleSubContext))
+/// rule still holds. Where Emit ([`InferCtx`](super::context::InferCtx))
 /// mints fresh vars and fails fast, Check reads the recorded `Type`s and
 /// *accumulates* every error:
 /// [`Typing::require_sub`] records a mismatch and returns `Ok` (so a rule never
@@ -44,7 +44,7 @@ use super::{lit_base, map_constrain_err};
 /// so a `… ≫ (id ≫ cast({D | r} ⇒ V))` chain composes because the upstream
 /// genuinely supplies `{D | r}`. Because planning re-mints a fresh refinement
 /// `Rc` at every marker, the producer's `{D | r}` and the consumer's contract
-/// rarely share an `Rc`; [`crate::ccl::simple_sub`]'s subset check matches them
+/// rarely share an `Rc`; [`crate::ccl::infer::solver`]'s subset check matches them
 /// by *structural predicate equality* (not just `Rc` identity) so the re-minted
 /// witnesses still chain. (Previously this gap was papered over by a
 /// `contains_cast` peel in `emit_compose` and by leaving planning output un-checked.)
