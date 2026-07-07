@@ -1,0 +1,33 @@
+# Transitive closure as a recursive query, two ways.  Recursion is an explicit
+# binding form: `rec` marks a self-referential (fixpoint) definition, so it
+# isn't misread as an assignment that references an empty set.  The `Set(...)`
+# annotation is the convergence mechanism: a set dedups, so the union stops
+# growing once no new pair appears (as a list it would be multiset semantics —
+# the same pair re-derived via every path — and never terminate).
+
+edges = [
+    (src=1, dst=2),
+    (src=2, dst=3),
+    (src=3, dst=4),
+    (src=2, dst=5),
+]
+
+# With a recursive set comprehension:
+rec reach_comp: Set({src: Int, dst: Int}) = set(edges ++ [
+    (src=a.src, dst=b.dst)
+    for a in reach_comp
+    for b in reach_comp
+    if a.dst == b.src
+])
+
+# With feeds: the recursion is expressed by feeding `reach_feed` from a loop
+# over `reach_feed` itself — the self-feed is the cycle, so no `rec` is needed.
+reach_feed: Set({src: Int, dst: Int})
+
+for e in edges:
+    reach_feed << e
+
+for a in reach_feed:
+    for b in reach_feed:
+        if a.dst == b.src:
+            reach_feed << (src=a.src, dst=b.dst)

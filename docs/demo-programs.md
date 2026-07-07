@@ -45,7 +45,7 @@ Two programs need a small substitution before they'll run as-is:
   printf "hello\nworld\n" | cargo run -- tests/programs/streaming_echo/program.cambra
   ```
 
-The three `🚧 blocked` programs in the table will panic or be rejected at
+The `🚧 blocked` programs in the table will panic or be rejected at
 lowering when run manually — that's the point.
 See [Known issues](#known-issues) for details on what's blocking each.
 
@@ -72,6 +72,9 @@ HTTP-sink and subprocess utilities).
 | [streaming_echo](../tests/programs/streaming_echo/) | Prefix each stdin line with "> " | `stdin()` source, list comprehension | ✅ working | Tested via subprocess so the real OS stdin file descriptor is exercised; substring-matched against captured stdout. |
 | [for_accumulator](../tests/programs/for_accumulator/) | Fold via mutable accumulator | for-loop with loop-carried state | 🚧 blocked | [plan.md → Mutability → "for loop with loop-carried mutable variables"](plan.md). Currently rejected at lowering. |
 | [while_counter](../tests/programs/while_counter/) | Count up with a while loop | `while`, mutability | 🚧 blocked | [plan.md → Mutability → "while loop lowering"](plan.md). Currently rejected at lowering. |
+| [reachability](../tests/programs/reachability/) | Transitive closure (recursive query) | self-referential binding, `Set(T)` dedup-by-type, `++`, hash-join in a cycle | 🚧 blocked | North-star recursive query. Parse-blocked on record-term syntax `(src=1, dst=2)`; then `Set(T)` + the self-referential (recursive) binding. |
+| [fanout](../tests/programs/fanout/) | Polymorphic sink constructor (fan-out pipe head) | `Feed(_)` type, `<<` feed, annotation-only forward decl, element polymorphism | 🚧 blocked | `Feed(_)` annotation unsupported; the forward declaration doesn't parse. Not Unix `tee` — returns the writable *head*. |
+| [txn_kv](../tests/programs/txn_kv/) | Transactional KV store over HTTP + a stream-aggregate `/stats` endpoint | `requires Transaction`, `with begin()`, `abort()`, `Mut(..., Txn)`, atomic read-modify-write, `Option` lookup, `match`, `λ`/`restrict`/`count`, structured requests | 🚧 blocked | Lexer rejects `λ` (the `/stats` aggregate), the first of a stack of blockers. Subsumes the former standalone `kv_store` (concurrent handlers share state → must be transactional) and `hit_counter` (the request-stream aggregate). |
 
 ## Known issues surfaced by these programs
 
@@ -97,12 +100,6 @@ Expected output once unblocked:
 Programs we want eventually but haven't written yet — these are good seeds for
 when you go to add more.
 
-- **Echo server with state** — extend `http_greeter` to keep a hit counter and
-  serve it on a `/stats` endpoint.  Needs: shared mutable state across HTTP
-  handlers, which presumably builds on the for-loop-carried-state work above.
-- **Streaming word count** — `stdin()` → split → `sum` per word group.  Needs:
-  `split`/tokenize built-in, group-by aggregate, and a sink that writes to
-  stdout.
 - **Two-input join over HTTP** — register two `http_serve` endpoints, join
   their inputs by a shared key, return the combined response.  Needs:
   multi-way join planning (in progress) and a way to express the join over
@@ -115,3 +112,10 @@ when you go to add more.
   large literal lists (replacement for the deleted `examples/slow.cambra`).
   Measures how cross-product compilation scales; ideally paired with a
   benchmark harness.
+- **Version upgrade (a v2 of `txn_kv`)** — the same program with `put`'s
+  computation changed, exercising version dispatch over persistent
+  transactional state at the `t_new` branch point.  Long-term we want a v2 of
+  *every* program (a diffing dimension across the corpus).  Deferred pending a
+  decision on how a diff is represented in the gallery (two files? a
+  directive?) and the `Versioned` node shape; branch/merge is out of scope for
+  now.
