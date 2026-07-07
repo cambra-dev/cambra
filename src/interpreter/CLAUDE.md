@@ -81,10 +81,10 @@ the monotonicity invariant.
 ### Workflow
 When changing operator semantics, surface area, or tile shape, update
 [`design-operators.md`](./design-operators.md) — it is the runtime
-counterpart of `ccl/design-ccl-ast.md` and the operator-spec entry
+counterpart of `ccl/design/optimization.md` and the operator-spec entry
 point for new readers.  If a change crosses the CCL ↔ interpreter
 boundary (e.g., a new `Builtin` that maps to a new tile operator),
-update both `design-operators.md` and `ccl/design-ccl-ast.md`.
+update both `design-operators.md` and `ccl/design/optimization.md`.
 
 When in doubt about the protocol, consult the formal definitions in
 [`semantics.md`](/docs/operational-semantics/semantics.md) rather than

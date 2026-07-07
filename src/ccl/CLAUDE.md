@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Concretely: no `TypedExprNode` variant may represent an effectful operation that is executed by the CCL pipeline itself (type inference, lambda elimination, join planning, simplification).  Side-effecting operations such as I/O, network calls, or sink dispatch must be modelled as data-source/sink registrations in `LoweringContext` and wired into the interpreter at the boundary (`ccl/context.rs :: compile_program`), not as AST nodes that carry runtime behaviour.
 
-Historically, `TypedExprNode::Sink(String)` violated this invariant: it embedded an I/O dispatch operation directly in the AST, which caused correctness issues when optimization passes duplicated or reordered nodes.  The refactor that removed it replaced the variant with a `Defer`/sink-binding pair — `Defer` is a pure placeholder, and the actual dispatch is assembled out-of-band by `compile_program`.
+For example, an effectful `Sink(String)` node embedding an I/O dispatch would violate this invariant: optimization passes could duplicate or reorder it, causing skipped or double-fired responses.  Sink dispatch is instead modelled as a pure `Defer` placeholder plus an out-of-band sink-binding pair — `Defer` carries no behaviour, and the actual dispatch is assembled by `compile_program` at the boundary.
 
 If you find yourself adding a new `TypedExprNode` variant that "does something" at runtime rather than representing a value to be computed, stop and reconsider.  Model the effect at the boundary instead.
 
@@ -16,4 +16,4 @@ If you find yourself adding a new `TypedExprNode` variant that "does something" 
 ## General Instructions
 
 ### Workflow
-When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `design-ccl-ast.md` and other `*/design-*.md` files close to source files that were changed.
+When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes the CCL design docs in `design/` (`ir.md`, `type-inference.md`, `lowering.md`, `optimization.md`, `desugar-defers.md`) and other `*/design-*.md` files close to source files that were changed.

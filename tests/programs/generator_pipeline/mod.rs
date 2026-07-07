@@ -21,7 +21,7 @@ use super::common::expect_scalar;
 // the `#[ignore]` here — no changes are expected in desugar itself.
 // Same root cause as
 // `tests/compilation_pipeline.rs::test_generator_function::positives`;
-// see `src/ccl/design-desugar-defers.md` "Known gaps & future work"
+// see `src/ccl/design/desugar-defers.md` "Known gaps & future work"
 // for the longer write-up.
 #[test]
 #[ignore]

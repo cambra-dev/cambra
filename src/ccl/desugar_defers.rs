@@ -71,7 +71,7 @@
 //! iteration lambdas, Loop body absorption, filter-feed Case, Case-arm
 //! fan-out, defer-mediating UDF smart walker, defer-returning lift,
 //! alias inlining), error modes, known gaps, and a navigation map for
-//! the source — lives in `src/ccl/design-desugar-defers.md`.
+//! the source — lives in `src/ccl/design/desugar-defers.md`.
 //!
 //! The function-level docs in this file explain individual moving
 //! parts; this module comment is the entry point.
@@ -1000,7 +1000,7 @@ fn pre_infer_substitute(expr: Expr, name: &Name, replacement: &Expr) -> Expr {
 
 /// Recorded information about a defer-mediating function currently in
 /// scope.  Lives in [`DesugarCtx::functions`].  See the design doc at
-/// `src/ccl/design-desugar-defers.md` for the chain rewriter and
+/// `src/ccl/design/desugar-defers.md` for the chain rewriter and
 /// smart-walker mechanics.
 #[derive(Clone)]
 struct FunctionInfo {
@@ -1372,7 +1372,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // [`DesugarCtx::functions`] so the chain rewriter +
             // smart cluster walker (in [`extract_for_defer`]) can
             // handle calls to it without leaving copies of the body
-            // in the final AST.  See `src/ccl/design-desugar-defers.md`
+            // in the final AST.  See `src/ccl/design/desugar-defers.md`
             // for the mechanism + known gaps (notably the higher-order
             // use case and the `count_free`-based binding drop).
             //
@@ -1406,7 +1406,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                     // contributions.  The function now returns
                     // contributions instead of its defer-handle param;
                     // call sites project the relevant field.  See
-                    // `src/ccl/design-desugar-defers.md` for the full
+                    // `src/ccl/design/desugar-defers.md` for the full
                     // mechanism.
                     let rewritten =
                         rewrite_lambda_to_return_contributions(floated_lambda, class, ctx)?;

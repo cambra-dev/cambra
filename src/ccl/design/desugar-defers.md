@@ -2,7 +2,7 @@
 
 This doc describes how `src/ccl/desugar_defers.rs` actually works, the
 invariants it maintains, and the limitations it still carries.  Read
-[design-ccl-ast.md §Defer](design-ccl-ast.md#defer--feed--define--deferred-collection-operators-cccldesugar_deferrs)
+[lowering.md — deferred collection operators](lowering.md#deferred-collection-operators--defer----)
 first for the surface-syntax background; this doc picks up where that
 section ends.
 

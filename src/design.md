@@ -8,7 +8,7 @@ language overview, CHL/CCL split, and the end-to-end execution pipeline, see
 
 | Path | Role | Design docs |
 | --- | --- | --- |
-| `ccl/` | Cambra Core Language: lowering (CHL AST → CCL), type inference (simple-sub), the optimization/compilation passes, and the typed AST programs lower into. | [design-ccl-ast.md](ccl/design-ccl-ast.md), [design-simple-sub.md](ccl/design-simple-sub.md), [design-desugar-defers.md](ccl/design-desugar-defers.md), [CLAUDE.md](ccl/CLAUDE.md) |
+| `ccl/` | Cambra Core Language: lowering (CHL AST → CCL), type inference, the optimization/compilation passes, and the typed AST programs lower into. | [design/](ccl/design/README.md) — IR, type inference, lowering, desugar-defers, optimization; [CLAUDE.md](ccl/CLAUDE.md) |
 | `chl_parser/` | Parser for the Cambra High-level Language: lexer, grammar, AST, and error recovery. | [design-chl-parser.md](chl_parser/design-chl-parser.md) |
 | `interpreter/` | Dataflow runtime: the tile producer/consumer operators, tilings, the scheduler, and data sources/sinks. | [design-operators.md](interpreter/design-operators.md), [design-http-server.md](interpreter/design-http-server.md), [CLAUDE.md](interpreter/CLAUDE.md) |
 | `pretty_graph.rs`, `pretty_tree.rs` | Human-readable rendering of the operator graph and AST trees (debug / inspector output). | — |
@@ -29,6 +29,6 @@ The runtime's formal model lives under
 ## Pass pipeline
 
 The pass order (parse → lower → uniquify → desugar_defers → infer → inline →
-lambda_elim → planning → simplify → operator_conversion) and the file
+lambda_elim → planning → operator_conversion) and the file
 implementing each pass are listed in
 [docs/design.md](/docs/design.md#program-execution-pipeline).

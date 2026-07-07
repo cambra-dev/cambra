@@ -128,7 +128,7 @@ pub enum TypedExprNode {
     /// emits, that holds by contravariance — `(𝐷 ⇒ 𝑉) <: ({𝐷 | 𝑝} ⇒ 𝑉)`
     /// because `{𝐷 | 𝑝} <: 𝐷` — so viewing an unrefined-domain collection
     /// function at a refined-domain type is sound.  The
-    /// refinement-aware solver ([`crate::ccl::simple_sub::constrain_subtype`])
+    /// refinement-aware solver ([`crate::ccl::infer::solver::constrain_subtype`])
     /// flows the witness onto the fresh target-domain variable, *stacking* it
     /// onto any witnesses the value already carries, so nested casts compose
     /// (nested list comprehensions).  `target`'s predicate is inferred by the
@@ -152,7 +152,7 @@ pub enum TypedExprNode {
     /// implementation, which only honours `Fun(Refinement(_, _), _)`
     /// targets.  Either generalize to the full `𝑈 ⇒ 𝑇` semantics or
     /// rename narrower (`Refine`, `AssertDomain`).  See
-    /// `docs/refinement-types-design.md` for the migration plan.
+    /// `src/ccl/design/type-inference.md` for the migration plan.
     Cast {
         /// The value being re-viewed under `target`.
         value: Box<TypedExpr>,
@@ -178,7 +178,7 @@ pub enum TypedExprNode {
     ///
     /// The bound parameter and its type are carried by a [`TypedBinding`].
     /// `param.ty` starts as [`Type::Hole`] on unannotated lambdas from
-    /// lowering; [`crate::ccl::infer::infer`] (via simple-sub) fills it with the
+    /// lowering; [`crate::ccl::infer::infer`] (via Cambra's inference algorithm) fills it with the
     /// inferred concrete type or a `Type::Infer` variable before
     /// compilation.
     ///
