@@ -10,6 +10,8 @@ The operational semantics is very unlike the lambda calculus: rather than operat
 
 Programs are written in a Pythonic syntax, called CHL, that uses for-comprehensions for the definition of collection-level logic. CHL is lowered to the Cambra Core Language (CCL), where it is typechecked and interpreted.
 
+The surface language is specified in [chl-spec.md](chl-spec.md), which separates implemented behaviour from decided-but-unimplemented direction via status markers; the Pythonic look is itself transitional (see the syntax-convergence notes there).
+
 CHL ↔ Python interop is planned in the future, but not part of the MVP.
 
 ## Cambra Core Language (CCL)
