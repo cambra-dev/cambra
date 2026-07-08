@@ -59,11 +59,13 @@ Comment when the *why* is non-obvious — a hidden constraint, a load-bearing in
 Avoid comments that describe the history of the codebase.  Comments should explain how and why the code works.  If there is an alternative approach that seems reasonable but doesn't work, it's ok to describe that, but the comments should always fully make sense just by looking at the current version of the code.
 
 ### Referencing docs and sections
+
 Cross-references into the docs are checked by `./ci.sh doc_refs` (Markdown
 links/anchors between docs, and `<name>.md` citations in Rust comments) and a
 broken one fails CI. Two rules keep references from rotting:
 
 **Use a checkable form.**
+
 - *Doc → doc*: a Markdown link — `[text](path.md#anchor)`. The `#anchor` is
   validated against the target's headings.
 - *Code → doc*: the doc path followed by the section's **exact heading text** in
@@ -74,6 +76,7 @@ broken one fails CI. Two rules keep references from rotting:
 
 **Never reference something uncheckable — it rots silently because nothing can
 validate it.** Specifically avoid:
+
 - *Section numbers across docs* (`§4.6`) — cite the heading (anchor link or
   quoted title) instead. (Existing `§`-refs are being migrated to links as a
   follow-up; don't add new ones.)
@@ -98,7 +101,7 @@ Vocabulary, matching `src/ccl/symbolic.rs`:
 - **Lambda**: `λ x → body`. With annotated param: `λ x : T → body`. With refinement: `λ x : {T | predicate} → body` (an unresolved refined base renders by its own type form: `{_ | predicate}` for a `Hole`, `{?N | predicate}` for an `Infer`). The refinement rides the param *type* — there is no separate lambda refinement slot — and the predicate appears bare inside the braces; do not write `{T | Refined(p)}`.
 - **Let**: `let x = e in body`.
 - **Aggregate**: `Sum(input)`, `Max(input)`, etc. — the kind name then parens.
-- **LetRec** (causal mutually-recursive group): `letrec b₁ = e₁; …; bₙ = eₙ in body` (bindings separated by `; `) — what the mutability-elimination phases (`mut_elim` for overwrite, `channelize` for append) emit before loop planning.
+- **LetRec** (causal mutually-recursive group): `letrec b₁ = e₁; …; bₙ = eₙ in body` (bindings separated by `;`) — what the mutability-elimination phases (`mut_elim` for overwrite, `channelize` for append) emit before loop planning.
 - **Transact** (the domain-parameterized recurrence carrier `plan_loops` produces from a `LetRec`): `transact (k₁ = init₁, …) { [reads]⇒[writes] over source do body; … }` — the store keys with their seeds, then one writer per site (its read/write footprint, iteration source, and decision body). `Transact` is born by loop planning (`plan_loops`, in `planning/loops.rs`) *after* `lambda_elim` (its writer bodies are already point-free); op-conversion dispatches on the domain: a concrete iteration extent → `Recurse`, `Txn` → the commit operator. (The former `Loop` carrier is retired — do not render it.)
 - **Literals**: `1`, `true`/`false`, `"str"`, `unit`.
 - **Binops**: standard infix with precedence parens (`a + b`, `x == y`, `p and q`, etc.).
@@ -168,13 +171,17 @@ When you are using compact, focus on test output and code changes.
 gh api repos/OWNER/REPO/pulls/PR_NUMBER --method PATCH --field body="..." --jq .number
 ```
 
-### Stacked PRs with git-spice
+### Stack Management & Rebasing (jj vs git-spice)
 
-This repo uses [git-spice](https://abhinav.github.io/git-spice/) (`gs`) for stacked PRs. Workflow for creating a new PR in a stack:
+Engineers in this repo manage and rebase stacked PRs using either `jj` (jujutsu) or `git-spice` (`gs`). **Default to trying `jj` first** for stack operations, but consult your memory files, environment-specific prompts, or the current repository state (e.g. active git branches vs. jj bookmarks) to verify if the engineer is actively using `git-spice`.
+
+#### Option A: Stacked PRs with git-spice
+
+This repo uses [git-spice](https://abhinav.github.io/git-spice/) (`gs`) for stacked PRs when working with standard Git branches. Workflow for creating a new PR in a stack:
 
 > **Before submitting:** run `./ci.sh` and confirm it passes. `gs branch submit` runs no checks of its own, so this is the only gate before GitHub CI sees the branch — and it lints in both debug *and* release (an un-run release clippy pass is the most common way CI fails after a green local `cargo clippy`).
 
-**Option A — git-spice branch creation** (stage changes first, then):
+**git-spice branch creation** (stage changes first, then):
 
 ```bash
 gs branch create -m "commit message"   # creates branch + commit in one step
@@ -182,7 +189,7 @@ gs branch submit --fill --no-draft     # submit to GitHub
 gs stack submit --update-only          # add nav comments to all PRs in stack
 ```
 
-**Option B — plain git then track** (more control over commit flow):
+**Plain git then track** (more control over commit flow):
 
 ```bash
 git checkout -b <branch-name>
@@ -198,3 +205,47 @@ Notes:
 - For a PR stacked on `main`, `--base main` is implicit; for stacked PRs use `--base <parent-branch>`.
 - `gs stack submit` discovers existing PRs by branch name and adds navigation comments. Use `--update-only` to skip prompts for branches without PRs yet.
 - To view the current stack: `gs log long`
+
+#### Option B: Rebasing a stack with jujutsu (jj)
+
+`jj` (jujutsu, currently 0.43) is initialized over the same git repo as git-spice. Unlike `git rebase`/`gs`, jj records conflicts *inside* commits and does not stop mid-rebase, so the whole stack moves in one command and you resolve conflicts afterward, bottom→tip, with automatic propagation.
+
+Mental model:
+
+- jj **bookmarks** are git branches. Each git-spice branch head appears as a bookmark on the matching commit; `main@origin`, `<name>@origin` are remote-tracking. `@` is the working-copy commit (itself a real, editable commit).
+- Every operation is recorded in the **op log** — `jj op log` — and any prior state is recoverable with `jj op restore <op-id>`. This is your undo; there is no "rebase --abort" because a rebase never leaves you detached.
+
+Workflow (validated rebasing the inspector stack onto `dmills/txn-mutability`):
+
+1. **Sync + validate.** `jj git fetch`. If a local bookmark is stale, move it: `jj bookmark set <name> -r <name>@origin --allow-backwards`. Cross-check the stack against `gs ll` — every git-spice branch should be a bookmark on the expected commit, with matching per-branch commit counts.
+2. **Check base lineage before rebasing.** `jj log -r 'main..<target>'` and confirm the target descends from what your stack assumes. A target that predates a layout-affecting change your stack is written against (e.g. a directory rename) causes *silent* structural breakage jj will not flag as a conflict — verify the file layout matches (`git ls-tree`) first.
+3. **Checkpoint.** `jj op log --limit 1` — note the op id to `jj op restore` back to if needed.
+4. **Rebase the whole stack in one command:** `jj rebase -s <stack-base-change-id> -d <target-bookmark>`. `-s` moves that commit and *all* descendants (bookmarks + working copy ride along). Conflicts are recorded in-commit; jj reports which commits are conflicted and does not stop.
+5. **Resolve bottom→tip.** `jj edit <change-id>` enters a commit; `jj resolve --list` lists its conflicts; edit files to remove markers (jj uses git-style `<<<<<<<`/`>>>>>>>` plus diff-style `%%%%%%%`/`+++++++` hunks). Run `cargo build` before moving up — resolving a parent auto-propagates and shrinks descendants' conflicts. Aim for each stack commit (each is a PR head) to build green.
+6. **Verify at the tip:** `jj edit <tip-bookmark>` then `./ci.sh` (the same authoritative gate as any push — both clippy passes + doc + tests).
+
+Gotchas:
+
+- **Conflict propagation:** after `jj rebase`, *every* descendant of the first conflicted commit shows "(conflict)" — most of that is the parent's conflict propagated down, and clears when you resolve the parent. Don't resolve the same hunk in five commits; fix it once at the lowest commit that owns it.
+- **Required-field fallout is not a conflict:** adding a required struct field low in the stack breaks construction sites in files with no textual conflict (including the new base's code). These surface as compile errors, not conflict markers — resolve them in the commit that introduced the field so that commit builds.
+- **Stale editor diagnostics:** LSP/rustc diagnostics can lag the working copy after `jj edit` hops between commits — a reported conflict marker or missing field may be from a commit you already moved off of. Confirm ground truth with `jj status` / `grep` / a real `cargo build` before acting on a surprising diagnostic.
+- **Bookmarks ride their commits automatically** — never move them by hand during a rebase.
+- **No concurrent mutators:** never run two agents (or an agent + yourself) mutating the same jj working copy at once — the shared commit graph will corrupt. Read-only investigation in parallel is fine.
+- jj resolves are amended in place (no separate "continue" step); the op log is the only undo you need.
+
+### Parallel Workspaces (Multi-Tasking)
+
+This repository supports parallel development using native `jj` workspaces (the `jj` equivalent of Git worktrees).
+
+- **Create a workspace:** `jj workspace add ../cambra-feature --name feature`
+- **List workspaces:** `jj workspace list`
+- **Remove a workspace:** `jj workspace forget <name>` then `rm -rf ../path`
+
+#### Stale Working Copies
+
+Because all workspaces share a unified history graph, editing or rebasing an ancestor commit from Workspace A will cause Workspace B to become "stale" if its current commit depends on that ancestor.
+
+If a workspace reports it is stale or blocks commands, synchronize its filesystem by running:
+
+```bash
+jj workspace update-stale
