@@ -44,6 +44,8 @@ pub enum AtomKey {
     UIntRange(usize),
     /// Externally-registered data source.
     Source(SmolStr),
+    /// The transaction-commit domain (nullary, like a base type).
+    Txn,
 }
 
 impl AtomKey {
@@ -52,6 +54,7 @@ impl AtomKey {
             Type::Base(b) => Some(AtomKey::Prim(b.clone())),
             Type::UIntRange(n) => Some(AtomKey::UIntRange(*n)),
             Type::DataSource(n) => Some(AtomKey::Source(SmolStr::from(n.as_str()))),
+            Type::Txn => Some(AtomKey::Txn),
             _ => None,
         }
     }
@@ -61,6 +64,7 @@ impl AtomKey {
             AtomKey::Prim(b) => Type::Base(b.clone()),
             AtomKey::UIntRange(n) => Type::UIntRange(*n),
             AtomKey::Source(n) => Type::DataSource(n.to_string()),
+            AtomKey::Txn => Type::Txn,
         }
     }
 }
@@ -394,7 +398,7 @@ fn compact_go(
     match ty {
         // Atomic types contribute a single atom. A term substitution never
         // touches an atom, so `subst_acc` is irrelevant here.
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn => {
             CompactType::from_atom(AtomKey::from_type(ty).unwrap())
         }
         // Refinements ride the lattice as a witness set: compact the underlying

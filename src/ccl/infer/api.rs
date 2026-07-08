@@ -692,7 +692,7 @@ fn collect_type_errors(
         } => {
             // A history handle at the strict wall is a compiler bug — a `Feed`
             // history should have been erased by `channelize`, a `Store`
-            // history by the unified phase (`letrec_phase`).
+            // history by the unified phase (`transact_phase` / `letrec_phase`).
             if strictness == Strictness::Strict {
                 let what = match kind {
                     HistoryKind::Feed => "feed handle type survived channelize",
@@ -722,7 +722,7 @@ fn collect_type_errors(
             }
             collect_type_errors(inner, context_sym, strictness, errors, seen_refinements);
         }
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {}
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn => {}
     }
 }
 

@@ -115,11 +115,13 @@ for req in incr_reqs:
         store += 1
 ```
 
-`begin()` is the transaction marker. The handle form `with t = begin():` binds `t` to the
-transaction's commit time (a `Txn` value): `t` *is* the position `begin_<site>(𝑟)` the letrec
-manipulates. Writes to `Txn`-domain variables are legal only inside a `with begin():` block; all
-writes in one block commit atomically. Nested transactions are rejected — a block commits as one
-unit, so a `with` inside it has no coherent meaning.
+`begin()` is the transaction marker. The handle form `with t = begin():` is **designed but not yet
+implemented** — it is rejected at lowering today (`with t = begin():` transaction handle is not
+supported yet; use a bare `with begin():`). In the intended design it binds `t` to the transaction's
+commit time (a `Txn` value): `t` *is* the position `begin_<site>(𝑟)` the letrec manipulates. Writes
+to `Txn`-domain variables are legal only inside a `with begin():` block; all writes in one block
+commit atomically. Nested transactions are rejected — a block commits as one unit, so a `with`
+inside it has no coherent meaning.
 
 ### Reads
 
@@ -408,10 +410,14 @@ for req in get_reqs:
         get_resps << store
 ```
 
-Note the mix: `store` is transactional; `cnt` is a plain induction accumulator *written inside* the
-transaction block. That is legal — `cnt`'s writes sequence on the incr loop's induction domain,
-independent of the commit order — and the lowering makes the difference literal. (A write to
-`store` outside a `with begin():` would be rejected.)
+Note the mix: `store` is transactional; `cnt` is a plain induction accumulator whose write here sits
+*inside* the transaction block. **In the model** this is legal — `cnt`'s writes sequence on the incr
+loop's induction domain, independent of the commit order, so `cnt` does not join `store` in the
+atomic commit (it is absent from `incr_commits` below). **The current lowering does not yet accept
+this mix**, though: an induction store written inside a `with begin():` block is rejected at lowering
+(see [Implementation status](#implementation-status)) — write `cnt += 1` in the loop body *outside*
+the block for the same result today. (A write to `store` *outside* a `with begin():` block is
+rejected in both the model and the implementation.)
 
 After the unified phase (with `IncrIdx`/`GetIdx` the two request-source domains):
 
@@ -459,10 +465,11 @@ Reading it off:
 - **Read-your-writes** within a block is `let` shadowing inside the record body.
 - **Deny** (`if` around a write) is `commit: false` on the record; `get_prev_txn` skips it. A denied
   transaction contributes no visible write and no reply.
-- **Induction and transaction domains are independent.** In the worked example `cnt` advances per
-  request even though its write sits inside the block; only `Txn`-domain variables participate in
-  the atomic commit. A program that needs the counter transactionally consistent with the store
-  declares it `Mut[Int, Txn]`.
+- **Induction and transaction domains are independent.** In the worked example's model form `cnt`
+  advances per request even though its write sits inside the block (a mix the current lowering
+  rejects — see the caveat there); only `Txn`-domain variables participate in the atomic commit. A
+  program that needs the counter transactionally consistent with the store declares it
+  `Mut[Int, Txn]`.
 - **Liveness.** Induction domains are finite or stream-complete; `Txn` histories complete when all
   writer sources do. A terminal read resolves only on a complete history; a live read reads as-of
   its own position and does not wait for completeness.

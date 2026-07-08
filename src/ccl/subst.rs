@@ -697,6 +697,7 @@ impl Subst {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
+            | Type::Txn
             | Type::Hole
             | Type::Infer(_) => {}
 
@@ -859,6 +860,7 @@ impl Subst {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
+            | Type::Txn
             | Type::Hole
             | Type::Infer(_) => ty.clone(),
 
@@ -981,7 +983,12 @@ fn collect_type_fv(
     out: &mut BTreeSet<Binder>,
 ) {
     match ty {
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::Infer(_) => {}
         Type::Fun {
             name,
             domain,

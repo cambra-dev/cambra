@@ -146,7 +146,11 @@ impl InferCtx {
                 kind: *kind,
             },
             // Leaves and existing inference vars pass through unchanged.
-            Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Infer(_) => ty.clone(),
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::DataSource(_)
+            | Type::Txn
+            | Type::Infer(_) => ty.clone(),
         }
     }
 }

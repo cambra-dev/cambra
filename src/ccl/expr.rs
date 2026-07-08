@@ -14,6 +14,27 @@ pub const F_COMMIT: &str = "commit";
 /// element even for a single-key write set.
 pub const F_WRITES: &str = "writes";
 
+// Field names of a **commit-record** binding — the intermediate representation
+// [`crate::ccl::transact_phase`] emits and [`crate::ccl::letrec_phase::recognize`]
+// consumes. A commit-record binding `commits : 𝐼 ⇒ {time, write_targets, decision}`
+// per `with begin():` site carries: the commit time `begin(r)` (`time`), the
+// history bindings of the write-set keys (`write_targets`, so recognition can
+// recover the writer's `write_keys` without a per-key merge), and the writer's
+// verbatim `{commit, writes, to_<defer>*}` decision applied to the store
+// snapshot at that time (`decision`). Only `write_targets`/`decision` reach
+// recognition; `time` records the commit clock for the model's honesty.
+/// The `time` field of a commit-record binding — the transaction's commit time
+/// `begin(r)`, at which the writer's store snapshots are read.
+pub const F_TIME: &str = "time";
+/// The `write_targets` field of a commit-record binding — a positional tuple of
+/// the write-set keys' history bindings (`write_targets.i` is the history of
+/// `write_keys[i]`), the encoding recognition reads a site's `write_keys` off.
+pub const F_WRITE_TARGETS: &str = "write_targets";
+/// The `decision` field of a commit-record binding — the writer's verbatim
+/// `{commit, writes, to_<defer>*}` decision record, applied to the store
+/// snapshot at the commit time. Recognition lifts the writer body out of it.
+pub const F_DECISION: &str = "decision";
+
 /// A typed binding site: a named variable together with its type.
 ///
 /// Used in [`TypedExprNode::Lambda`] and [`TypedExprNode::Let`] to carry
@@ -282,9 +303,9 @@ pub enum TypedExprNode {
         payload: Box<TypedExpr>,
     },
 
-    /// A mutable store: a set of scalar-register **keys** sharing one
-    /// sequencing domain, driven by a **writer** that reads the shared store and
-    /// proposes per-position writes.
+    /// A transactional store: a set of scalar-register **keys** sharing one
+    /// sequencing domain, driven by concurrent **writers** that read the
+    /// shared store and propose per-position writes.
     ///
     /// The **domain-parameterized recurrence carrier**, born in
     /// [`crate::ccl::letrec_phase::recognize`] and consumed at operator
@@ -297,9 +318,9 @@ pub enum TypedExprNode {
     ///
     /// Op-conversion dispatches on [`domain`](Self::Transact::domain): a
     /// concrete iteration extent → the sequential `Recurse` (the induction case
-    /// — one always-commit writer over a `mut` loop). This is the only shape the
-    /// pipeline produces today; the node keeps its multi-writer / general-domain
-    /// structure so a concurrent commit engine can be reintroduced on it.
+    /// — one always-commit writer, the degenerate no-conflict case of the
+    /// commit contract; this is all the pipeline emits today). [`Type::Txn`] →
+    /// the concurrent commit operator (a later increment).
     Transact {
         /// The store's keys — one per scalar register sharing this store's
         /// sequencing domain. Each carries its position-0 `init` (the seed,
@@ -315,8 +336,9 @@ pub enum TypedExprNode {
         writers: Vec<TransactWriter>,
         /// The store's **sequencing domain** — the index of every key's history
         /// `Fun(domain, V)`. A concrete iteration extent for a `mut`
-        /// accumulator (the loop's induction domain). Op-conversion dispatches
-        /// the engine on it.
+        /// accumulator (the loop's induction domain); [`Type::Txn`] for a
+        /// transactional commit clock (later increment). Op-conversion
+        /// dispatches the engine on it.
         domain: Type,
     },
 
@@ -327,22 +349,25 @@ pub enum TypedExprNode {
     /// `body` — mutual recursion.  Well-formedness requires the recursion to
     /// be *guarded*: on every cycle of the group's reference graph at least
     /// one reference must go through a "previous value" accessor
-    /// ([`Builtin::GetPrevSeq`]), so values at any position of the sequencing
-    /// domain depend only on strictly earlier positions.
-    /// [`crate::ccl::letrec::check_letrec_guarded`] enforces this; see
-    /// `src/ccl/design/mutability.md` ("The model" / "`LetRec`").
+    /// ([`Builtin::GetPrevSeq`], and later `get_prev_txn`), so values at any
+    /// position of the sequencing domain depend only on strictly earlier
+    /// positions.  [`crate::ccl::letrec::check_letrec_guarded`] enforces
+    /// this; see `src/ccl/design/mutability.md` ("The model" / "`LetRec`").
     ///
-    /// This is the general node for loops and future recursive definitions: the
-    /// unified phase (design doc, "The unified phase") rewrites every mutable
-    /// variable's history and feed output into one letrec, and operator
-    /// conversion *recognizes patterns* in the group (a `get_prev_seq`-guarded
-    /// self-cycle is a fold) to pick the engine. `letrec_phase` emits it for
-    /// every mutation loop as a guarded group, then `letrec_phase::recognize`
-    /// lowers every recognized group onto the domain-parameterized
-    /// [`Transact`](Self::Transact) carrier before `channelize`, so a
-    /// `LetRec` does not survive to the later passes — those that would need
-    /// pattern knowledge it doesn't carry treat a surviving group as unreachable
-    /// rather than guessing.
+    /// This is the general node for loops, transactions, and future
+    /// recursive definitions: the unified phase (design doc, "The unified
+    /// phase") rewrites every mutable variable's history, commit-record
+    /// stream, and feed output into one letrec, and operator conversion
+    /// *recognizes patterns* in the group (a `get_prev_seq`-guarded
+    /// self-cycle is a fold; a commit-record binding read through
+    /// `get_prev_txn` is a transactional store) to pick the engine.
+    /// The induction `letrec_phase` emits it for every mutation loop, and
+    /// `transact_phase` emits it for every `Mut[V, Txn]` transaction block, both
+    /// as guarded groups. `letrec_phase::recognize` then lowers every recognized
+    /// group onto the domain-parameterized [`Transact`](Self::Transact) carrier
+    /// before `channelize`, so a `LetRec` does not survive to the later
+    /// passes — those that would need pattern knowledge it doesn't carry treat a
+    /// surviving group as unreachable rather than guessing.
     ///
     /// The node denotes a pure value (the unique solution of the guarded
     /// group, by induction along the domain order), so it satisfies the CCL

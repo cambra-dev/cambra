@@ -55,6 +55,14 @@ pub struct OperatorSchemes {
     /// the same reason as `last_or_default`: the domain `ι` and value `ν`
     /// are each shared across positions.
     get_prev_seq: PolyScheme,
+    /// `∀ι ν. ((ι → {time: Txn, write: ν}), Txn, ν) → ν` — the write carried
+    /// by the latest commit strictly before the given time, or the default if
+    /// none (the transaction-domain guard accessor, [`Builtin::GetPrevTxn`]).
+    /// The history domain `ι` (the writer's iteration domain) and the value `ν`
+    /// are quantified; the search position and the record's `time` field are the
+    /// concrete commit-time `Txn`. `ν` is shared across the `write` field, the
+    /// default, and the result, so this is inline-built like `get_prev_seq`.
+    get_prev_txn: PolyScheme,
 }
 
 impl OperatorSchemes {
@@ -130,6 +138,29 @@ impl OperatorSchemes {
         tup.insert(FieldKey::Index(2), nu.clone());
         let get_prev_seq = PolyScheme::poly(SCHEME_LEVEL, fun(product(tup), nu));
 
+        // GetPrevTxn: ∀ι ν. ((ι → {time: Txn, write: ν}), Txn, ν) → ν. The commit
+        // stream is indexed by the writer's *iteration* domain `ι` (a UIntRange /
+        // DataSource — the site's source, *not* `Txn`, per the builtin table in
+        // design/mutability.md and the view type `transact_phase` stamps); the
+        // search position and the record's `time` field are the concrete
+        // commit-time `Txn`, and the carried write value `ν` is shared across the
+        // record's `write` field, the default, and the result. Quantifying `ι`
+        // (rather than pinning it to `Txn`, as `get_prev_seq` quantifies its
+        // domain) keeps the scheme faithful to the site-indexed stream, so a
+        // future routing of it through inference would not reject the real
+        // commit view — inline-built like `get_prev_seq`.
+        let iota = fresh_var(BODY_LEVEL);
+        let nu = fresh_var(BODY_LEVEL);
+        let commit_record = Type::Record(vec![
+            ("time".to_string(), Type::Txn),
+            ("write".to_string(), nu.clone()),
+        ]);
+        let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
+        tup.insert(FieldKey::Index(0), fun(iota, commit_record));
+        tup.insert(FieldKey::Index(1), Type::Txn);
+        tup.insert(FieldKey::Index(2), nu.clone());
+        let get_prev_txn = PolyScheme::poly(SCHEME_LEVEL, fun(product(tup), nu));
+
         Self {
             arithmetic,
             compare,
@@ -141,6 +172,7 @@ impl OperatorSchemes {
             aggregate_max,
             last_or_default,
             get_prev_seq,
+            get_prev_txn,
         }
     }
 
@@ -176,6 +208,7 @@ impl OperatorSchemes {
         match b {
             Builtin::LastOrDefault => Some(&self.last_or_default),
             Builtin::GetPrevSeq => Some(&self.get_prev_seq),
+            Builtin::GetPrevTxn => Some(&self.get_prev_txn),
             _ => None,
         }
     }
@@ -190,7 +223,72 @@ impl Default for OperatorSchemes {
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
-    use crate::ccl::{AggregateKind, BaseType, Type, TypedBinding, TypedExpr, TypedExprNode};
+    use super::OperatorSchemes;
+    use crate::ccl::{
+        AggregateKind, BaseType, Builtin, Type, TypedBinding, TypedExpr, TypedExprNode,
+    };
+
+    /// `GetPrevTxn`'s scheme instantiates to
+    /// `((ι ⇒ {time: Txn, write: ν}), Txn, ν) ⇒ ν`: the history domain `ι` is a
+    /// fresh variable (the writer's iteration domain — *not* `Txn`), while the
+    /// `time` field and the search position are the concrete commit-time `Txn`,
+    /// and the carried write value / default / result share one variable `ν`.
+    #[test]
+    fn get_prev_txn_scheme_shape() {
+        let schemes = OperatorSchemes::new();
+        let scheme = schemes
+            .builtin(Builtin::GetPrevTxn)
+            .expect("GetPrevTxn has a scheme");
+        let inst = scheme.instantiate(0);
+
+        let Type::Fun {
+            domain, codomain, ..
+        } = &inst
+        else {
+            panic!("expected a function type, got {inst}");
+        };
+        let Type::Tuple(args) = domain.as_ref() else {
+            panic!("expected a tupled argument, got {domain}");
+        };
+        assert_eq!(args.len(), 3, "history, time, default");
+
+        // arg 0: Txn ⇒ {time: Txn, write: ν}
+        let Type::Fun {
+            domain: hist_dom,
+            codomain: rec,
+            ..
+        } = &args[0]
+        else {
+            panic!("history must be a function, got {}", args[0]);
+        };
+        // The history domain is the writer's iteration domain — a fresh
+        // quantified variable, distinct from the write value `ν` — not `Txn`.
+        assert!(
+            matches!(**hist_dom, Type::Infer(_)),
+            "history domain is a fresh variable ι, got {hist_dom}"
+        );
+        assert_ne!(
+            **hist_dom,
+            Type::Txn,
+            "history domain is ι (iteration domain), not Txn"
+        );
+        let Type::Record(fields) = rec.as_ref() else {
+            panic!("history codomain must be a record, got {rec}");
+        };
+        assert_eq!(fields[0].0, "time");
+        assert_eq!(fields[0].1, Type::Txn, "time field is Txn");
+        assert_eq!(fields[1].0, "write");
+
+        // arg 1 (position) is Txn; the write field, the default (arg 2), and
+        // the result all share the same freshened variable ν, distinct from ι.
+        assert_eq!(args[1], Type::Txn, "position is Txn");
+        assert_eq!(fields[1].1, args[2], "write field and default share ν");
+        assert_eq!(**codomain, args[2], "result and default share ν");
+        assert_ne!(
+            **hist_dom, args[2],
+            "history domain ι is distinct from the write value ν"
+        );
+    }
 
     /// TRIPWIRE — documents a known soundness gap, NOT desired behavior.
     ///

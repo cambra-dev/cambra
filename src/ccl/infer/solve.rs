@@ -206,6 +206,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
         (Type::Base(a), Type::Base(b)) => a == b,
         (Type::UIntRange(a), Type::UIntRange(b)) => a == b,
         (Type::DataSource(a), Type::DataSource(b)) => a == b,
+        (Type::Txn, Type::Txn) => true,
         (
             Type::Fun {
                 name: n1,
@@ -925,7 +926,12 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
             coalesce_type_predicates(value, level, ctx);
             coalesce_type_predicates(domain, level, ctx);
         }
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::Infer(_) => {}
     }
 }
 
@@ -1381,7 +1387,12 @@ fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>) {
             retype_in_type(value, scope);
             retype_in_type(domain, scope);
         }
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::Infer(_) => {}
     }
 }
 

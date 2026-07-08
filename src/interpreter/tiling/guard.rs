@@ -152,10 +152,13 @@ impl TileGuard {
             (TileGuard::Aggregation(_), Tiling::Aggregation { .. }) => true,
 
             // SealedFunction tilings can have domain guards which are always allowed, or
-            // codomain guards which match their codomain tiling.
+            // codomain guards which match their codomain tiling. A Store shares the
+            // function shape: consumers release a prefix of its commit-time domain
+            // (a `Domain` guard) — that is its only release form (a store's
+            // `to_guard` is `Function(Domain(_))`), so no `Codomain` arm.
             (
                 TileGuard::Function(FunctionGuard::Domain(pred)),
-                Tiling::SealedFunction { domain, .. },
+                Tiling::SealedFunction { domain, .. } | Tiling::Store { domain, .. },
             ) => pred.is_applicable_to(domain),
             (
                 TileGuard::Function(FunctionGuard::Codomain(g)),

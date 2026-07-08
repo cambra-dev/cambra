@@ -143,13 +143,16 @@ pub(super) fn lower_generator_for(
         let frame_introduced = HashSet::from([iter_var.clone()]);
         // Plain yield without loop-carried mutation: desugar yield → defer + feed.
         let defer_name = ctx.fresh_result_name();
-        let for_body = lower_for_body_stmts(
-            body,
-            Some(&defer_name),
-            outer_bindings,
-            frame_introduced,
-            ctx,
-        )?;
+        // The loop target shadows a like-named transactional register in the body.
+        let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
+            lower_for_body_stmts(
+                body,
+                Some(&defer_name),
+                outer_bindings,
+                frame_introduced,
+                ctx,
+            )
+        })?;
         let for_node = Expr::for_loop(iter_var, source, for_body);
         let seq = Expr::expr_stmt(for_node, Expr::var(defer_name.clone()));
         Ok(Expr::let_bind(
@@ -160,7 +163,10 @@ pub(super) fn lower_generator_for(
     } else {
         let source = lower_expr(iter, ctx)?;
         let frame_introduced = HashSet::from([iter_var.clone()]);
-        let for_body = lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)?;
+        // The loop target shadows a like-named transactional register in the body.
+        let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
+            lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)
+        })?;
         Ok(Expr::for_loop(iter_var, source, for_body))
     }
 }
@@ -286,6 +292,16 @@ fn lower_for_body_stmts(
                 frame_introduced.insert(name_str.clone());
                 bindings.push((name_str, func_expr, None));
             }
+            // A `with begin():` transaction inside a *generator* loop body is a
+            // later increment; top-level and simple `for … with begin():` loops
+            // are lowered in `stmts.rs`/`transactions.rs`.
+            ChlStmt::With { .. } => {
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    "a `with begin():` transaction inside a generator/nested for-loop body \
+                     is not yet supported",
+                ));
+            }
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
@@ -402,10 +418,20 @@ fn lower_for_body_terminal(
             let mut inner_mutation_scope = mutation_scope.clone();
             inner_mutation_scope.extend(frame_introduced.iter().cloned());
             let inner_frame = HashSet::from([inner_var.clone()]);
-            let inner_body =
-                lower_for_body_stmts(body, defer_name, &inner_mutation_scope, inner_frame, ctx)?;
+            // The inner loop target shadows a like-named transactional register.
+            let inner_body = ctx.with_shadowed([inner_var.clone()], |ctx| {
+                lower_for_body_stmts(body, defer_name, &inner_mutation_scope, inner_frame, ctx)
+            })?;
             Ok(Expr::for_loop(inner_var, inner_source, inner_body))
         }
+        // A `with begin():` transaction as a *generator* loop-body terminal is a
+        // later increment; top-level and simple `for … with begin():` loops are
+        // lowered in `stmts.rs`/`transactions.rs`.
+        ChlStmt::With { .. } => Err(LoweringError::unsupported(
+            stmt.span,
+            "a `with begin():` transaction inside a generator/nested for-loop body \
+             is not yet supported",
+        )),
         _ => Err(LoweringError::unsupported(
             stmt.span,
             "for-loop body must end in a yield, `<<` feed, nested for, or if-guard",
@@ -567,8 +593,10 @@ pub(super) fn lower_direct_mirror_loop(
     let source = lower_expr(iter, ctx)?;
 
     // Build the statement chain right-to-left, ending in Unit (the For's
-    // body is a statement, not a value).
-    let chain = {
+    // body is a statement, not a value). The loop target is in scope over the
+    // body — shadow it so a body read of a like-named transactional register is
+    // read as the loop local, not gated as an out-of-block store read.
+    let chain = ctx.with_shadowed([iter_var.clone()], |ctx| {
         let mut chain = Expr::lit(Lit::Unit);
         for stmt in body_stmts.iter().rev() {
             chain = match &stmt.node {
@@ -578,11 +606,13 @@ pub(super) fn lower_direct_mirror_loop(
                 // / `+=`). A loop-carried accumulator therefore never appears here.
                 ChlStmt::Assign { target, value } => {
                     let name = extract_name_target(target, "assignment")?;
+                    check_store_write_context(&name, stmt.span, ctx)?;
                     let val = lower_expr(value, ctx)?;
                     Expr::let_bind(name, val, chain)
                 }
                 ChlStmt::AugAssign { target, op, value } => {
                     let name = extract_name_target(target, "augmented assignment")?;
+                    check_store_write_context(&name, stmt.span, ctx)?;
                     let val = lower_aug_binop(&name, *op, value, ctx)?;
                     if acc_names.contains(&name) {
                         Expr::expr_stmt(Expr::mut_write(name, val), chain)
@@ -609,6 +639,7 @@ pub(super) fn lower_direct_mirror_loop(
                              supported; declare the accumulator before the loop",
                         ));
                     }
+                    check_store_write_context(&name, stmt.span, ctx)?;
                     let val = lower_expr(value, ctx)?;
                     if acc_names.contains(&name) {
                         Expr::expr_stmt(Expr::mut_write(name, val), chain)
@@ -690,8 +721,8 @@ pub(super) fn lower_direct_mirror_loop(
                 }
             };
         }
-        chain
-    };
+        Ok::<Expr, LoweringError>(chain)
+    })?;
 
     let for_node = Expr::new(TypedExprNode::For {
         target: TypedBinding {
@@ -898,6 +929,41 @@ in guarded_let"
     // -----------------------------------------------------------------------
     // Generator function negative / mutation-loop tests
     // -----------------------------------------------------------------------
+
+    /// A `with begin():` block that neither writes a transactional store nor
+    /// feeds a read does nothing observable and is rejected. Covers standalone,
+    /// middle, and loop-body positions — here `x`/`y` are plain locals, not
+    /// `Mut[_, Txn]` stores, and there is no feed.
+    #[test]
+    fn test_with_begin_requires_effect() {
+        for code in [
+            "with begin():\n    x = 1\nx",
+            "with begin():\n    x = 1\ny = 2\ny",
+            "for r in [1]:\n    with begin():\n        x = 1\nx",
+        ] {
+            let stmts = parse_module(code);
+            let err = expect_one_lowering_error(&stmts);
+            let LoweringError::Unsupported { message: msg, .. } = &err;
+            assert!(
+                msg.contains("must do something"),
+                "expected a `with begin()` no-effect error, got: {msg}"
+            );
+        }
+    }
+
+    /// `store: Mut[int, Txn] := 0` lowers as a plain `let store = 0`, registering
+    /// `store` transactional. A *bare* trailing read is then rejected — a
+    /// transactional register may be read only inside a `with begin():` block.
+    #[test]
+    fn test_mut_txn_bare_read_rejected() {
+        let stmts = parse_module("store: Mut[int, Txn] := 0\nstore");
+        let err = expect_one_lowering_error(&stmts);
+        let LoweringError::Unsupported { message: msg, .. } = &err;
+        assert!(
+            msg.contains("inside a `with begin():` block"),
+            "expected a `with begin():` hint for a bare transactional read, got: {msg}"
+        );
+    }
 
     /// Augmented assignment to iter var (shadowing) in a generator for-loop.
     /// This is NOT a yield — the for-loop body ends in `bad` (the bare var),

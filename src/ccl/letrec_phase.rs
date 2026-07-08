@@ -41,9 +41,9 @@
 use std::collections::HashMap;
 
 use crate::ccl::{
-    BaseType, Builtin, Expr, HistoryKind, Lit, Name, ProjKey, TransactKey, TransactWriter, Type,
-    TypedBinding, TypedExprNode, ccl_utils::count_free, letrec::check_letrec_guarded,
-    symbolic::symbolic,
+    BaseType, Builtin, Expr, F_DECISION, F_WRITE_TARGETS, HistoryKind, Lit, Name, ProjKey,
+    TransactKey, TransactWriter, Type, TypedBinding, TypedExprNode, ccl_utils::count_free,
+    letrec::check_letrec_guarded, symbolic::symbolic,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,8 +69,9 @@ pub fn run(expr: Expr) -> Expr {
     // binding and any surviving reference (e.g. a trailing read the recurrence
     // re-points to the extracted final value) are stale afterward. Erase them
     // so no store history reaches the strict `typecheck` (mirroring how
-    // `channelize` erases a feed history). Every store is an induction
-    // store consumed here.
+    // `channelize` erases a feed history). On this branch every store is an
+    // induction store consumed here; the transactional `Mut[V, Txn]` erasure
+    // lands with `transact_phase`.
     erase_mut(&mut out);
     // Release-mode post-conditions (not `debug_assert!`): these are the phase's
     // contract with every downstream pass — a leaked `For`/`MutWrite` marker or
@@ -546,11 +547,12 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     let mut accs: Vec<(Name, Type)> = Vec::new();
     collect_writes(&loop_body, &mut accs);
     if accs.is_empty() {
-        // A loop with no accumulator. If its body feeds — a stateless generator
-        // (`for r in iter: out << value`, feeding but writing nothing) — it's the
-        // design's "plain map" path: each in-loop feed becomes an ordinary map of
-        // the loop source. Otherwise the body inlined to neither a write nor a
-        // feed (a `for x: pure_call()` whose call didn't mutate) —
+        // A loop with no accumulator. If its body feeds — a stateless generator,
+        // or a `with begin():` read-only transaction (`for r in iter: with
+        // begin(): out << store` reads a store and feeds it, writing nothing) —
+        // it's the design's "plain map" path: each in-block feed becomes an
+        // ordinary map of the loop source. Otherwise the body inlined to neither
+        // a write nor a feed (a `for x: pure_call()` whose call didn't mutate) —
         // observationally a no-op; drop the loop and keep the continuation.
         if body_has_feed(&loop_body) {
             return transform_feed_only_loop(target, iter, loop_body, cont);
@@ -736,11 +738,19 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     }
 }
 
-/// Rewrite an accumulator-free loop fed out (`for target in iter: out << value`)
-/// to the plain-map form. Each in-loop feed becomes `Feed(defer, iter ≫ (λ
-/// target → value))`: the loop source mapped through the fed value at each
-/// position, hoisted out of the loop for `channelize` to route as an
-/// ordinary channel contribution. There is no history binding and no letrec.
+/// Rewrite an accumulator-free loop — a read-only `with begin():` transaction
+/// fed out (`for target in iter: out << value`) — to the plain-map form. Each
+/// in-block feed becomes `Feed(defer, iter ≫ (λ target → value))`: the loop
+/// source mapped through the fed value at each position, hoisted out of the loop
+/// for `channelize` to route as an ordinary channel contribution. There is
+/// no history binding and no letrec.
+///
+/// When `value` is a read of a transactional store (a `Var` `transact_phase`
+/// rebound to `last_or_default(__store.k, init)`, constant in `target`), the map
+/// broadcasts the store's terminal render to every loop position;
+/// `transact_phase::rewrite_live_reads` (post-`channelize`, pre-lambda-elim)
+/// then turns that broadcast over a live (non-enumerable `Txn`) store into an
+/// outer-indexed as-of join — the request-loop-indexed live cross-endpoint read.
 fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr) -> Expr {
     let (domain_ty, _item_ty) = fun_parts(&iter.ty);
     let mut env: HashMap<Name, Expr> = HashMap::new();
@@ -748,8 +758,8 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
     collect_feed_only(loop_body, &mut env, &mut feeds);
     debug_assert!(
         !feeds.is_empty(),
-        "letrec phase: accumulator-free loop reached transform_feed_only_loop \
-         without a feed — the caller dispatches here only when the body feeds"
+        "letrec phase: accumulator-free loop with no feed — lowering rejects an empty \
+         `with begin():` block, so a `For` here always carries a feed"
     );
     let mut body_out = rewrite(cont);
     // Emit in reverse so the first source feed ends up outermost — desugar
@@ -958,10 +968,13 @@ fn subst_env(mut e: Expr, env: &HashMap<Name, Expr>) -> Expr {
 /// phase and this recognizer are co-designed, so a mismatch is a bug here,
 /// not in the program.
 ///
-/// One shape is recognized: a single-binding **induction** group (a
-/// `get_prev_seq`-guarded self-cycle from [`transform_loop`]) →
-/// `Transact{domain: iteration extent}` (the `Recurse` engine). Op-conversion
-/// picks the engine on the domain.
+/// Two shapes are recognized, dispatched on the guard: a **transaction** group
+/// (a `get_prev_txn`-guarded `store ↔ commits` cycle from
+/// [`crate::ccl::transact_phase`]) → `Transact{domain: Txn}` (the commit
+/// engine); a single-binding **induction** group (a `get_prev_seq`-guarded
+/// self-cycle from [`transform_loop`]) → `Transact{domain: iteration extent}`
+/// (the `Recurse` engine). Both travel the same carrier; op-conversion picks the
+/// engine on the domain.
 pub fn recognize(expr: Expr) -> Expr {
     let mut expr = expr;
     if let TypedExprNode::LetRec { .. } = &expr.node {
@@ -969,18 +982,306 @@ pub fn recognize(expr: Expr) -> Expr {
             unreachable!("guarded above")
         };
         // Recurse into the continuation first (later loops / nested groups nest
-        // there — e.g. one induction loop after another).
+        // there — e.g. an induction loop after a transaction).
         let body = recognize(*body);
+        if is_txn_group(&bindings) {
+            return recognize_txn_group(bindings, body);
+        }
         assert_eq!(
             bindings.len(),
             1,
-            "letrec recognition: a group must be a single-binding induction group in v1"
+            "letrec recognition: a non-transaction group must be a single-binding \
+             induction group in v1"
         );
         let (h, def) = bindings.into_iter().next().unwrap();
         return recognize_group(h, def, body);
     }
     expr.map_children(recognize);
     expr
+}
+
+/// Whether a `LetRec` group is a transaction group — some binding is guarded by
+/// [`Builtin::GetPrevTxn`] (the `store ↔ commits` cycle). Induction groups guard
+/// with `get_prev_seq` instead, so the two shapes never overlap.
+fn is_txn_group(bindings: &[(TypedBinding, Expr)]) -> bool {
+    fn uses_get_prev_txn(e: &Expr) -> bool {
+        if matches!(&e.node, TypedExprNode::Builtin(Builtin::GetPrevTxn)) {
+            return true;
+        }
+        let mut found = false;
+        e.walk_children(|c| found = found || uses_get_prev_txn(c));
+        found
+    }
+    bindings.iter().any(|(_, def)| uses_get_prev_txn(def))
+}
+
+/// Which binding a transaction `LetRec` binding is (dispatched on its body's
+/// shape — see [`recognize_txn_group`]).
+enum TxnBinding {
+    /// `store_k : Txn ⇒ V = λ t → get_prev_txn((view, t, init))`.
+    History,
+    /// `commits_j : 𝐼 ⇒ {time, write_targets, decision} = λ r → let t =
+    /// begin(r) in {…}`.
+    Commit,
+    /// `to_<defer> : 𝐼 ⇒ V = commits_j ≫ .decision ≫ .field`.
+    Tap,
+}
+
+/// Classify a transaction `LetRec` binding by its body shape.
+fn classify_txn_binding(def: &Expr) -> TxnBinding {
+    match &def.node {
+        // A tap view is the only non-lambda binding.
+        TypedExprNode::Compose(_) => TxnBinding::Tap,
+        TypedExprNode::Lambda { body, .. } => match &body.node {
+            TypedExprNode::Apply { function, .. }
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::GetPrevTxn)) =>
+            {
+                TxnBinding::History
+            }
+            _ => TxnBinding::Commit,
+        },
+        _ => panic!(
+            "letrec recognition: unexpected transaction binding shape: {}",
+            symbolic(def)
+        ),
+    }
+}
+
+/// The `init` (default) of a history binding `λ t → get_prev_txn((view, t,
+/// init))` — the store key's tick-0 seed.
+fn history_init(def: Expr) -> Expr {
+    let TypedExprNode::Lambda { body, .. } = def.node else {
+        panic!("letrec recognition: history binding is not a lambda");
+    };
+    let TypedExprNode::Apply { argument, .. } = body.node else {
+        panic!("letrec recognition: history body is not a get_prev_txn application");
+    };
+    let TypedExprNode::Tuple(mut args) = argument.node else {
+        panic!("letrec recognition: get_prev_txn takes a tupled argument");
+    };
+    assert_eq!(args.len(), 3, "get_prev_txn arity (history, time, default)");
+    args.pop().expect("default present")
+}
+
+/// Recover a [`TransactWriter`] from a commit-record binding `λ r → let t =
+/// begin(r) in {time, write_targets, decision}`. The writer's `source` (the
+/// item element of `decision`'s snapshot tuple), `read_keys` (the snapshot's
+/// `store_rk(t)` elements), `body` (the `▷` function, verbatim), and
+/// `write_keys` (the `write_targets` history vars) are lifted straight out — the
+/// `begin`/`store(t)` plumbing is discarded, since the commit engine feeds the
+/// body its snapshot through a buffer.
+///
+/// **Inverse of `transact_phase::build_letrec`**, which emits exactly this
+/// commit-record shape; the two must stay in structural lockstep (shared `F_*`
+/// field-name constants pin the field names, but the tuple positions and nesting
+/// are pinned only by these two sites). Any shape mismatch surfaces as one of the
+/// `panic!`s below, not a compile error. (Planned simplification #3 in
+/// `design/mutability.md` removes this round-trip by recognizing on the
+/// point-free `LetRec` directly.)
+fn recover_writer(def: Expr) -> TransactWriter {
+    let TypedExprNode::Lambda { body, .. } = def.node else {
+        panic!("letrec recognition: commit-record binding is not a lambda");
+    };
+    let TypedExprNode::Let { body: rec, .. } = body.node else {
+        panic!("letrec recognition: commit-record body is not a `let t = begin(r) in …`");
+    };
+    let TypedExprNode::Record(fields) = rec.node else {
+        panic!("letrec recognition: commit-record body is not a record");
+    };
+    let mut write_targets = None;
+    let mut decision = None;
+    for (name, val) in fields {
+        match name.as_str() {
+            F_WRITE_TARGETS => write_targets = Some(val),
+            F_DECISION => decision = Some(val),
+            // `time` records the commit clock for the model; recognition ignores it.
+            _ => {}
+        }
+    }
+    let write_targets = write_targets.expect("commit record carries write_targets");
+    let decision = decision.expect("commit record carries a decision");
+
+    // write_keys: each `write_targets` element is the write-set key's history var.
+    let TypedExprNode::Tuple(wt) = write_targets.node else {
+        panic!("letrec recognition: write_targets is not a tuple");
+    };
+    let write_keys: Vec<Name> = wt
+        .into_iter()
+        .map(|e| match e.node {
+            TypedExprNode::Var(n) => n,
+            _ => panic!("letrec recognition: write_targets element is not a store key var"),
+        })
+        .collect();
+
+    // decision = (store_rk(t) …, source(r)) ▷ body.
+    let TypedExprNode::Apply {
+        argument: snap,
+        function: body,
+    } = decision.node
+    else {
+        panic!("letrec recognition: decision is not `snapshot ▷ body`");
+    };
+    let TypedExprNode::Tuple(mut snap) = snap.node else {
+        panic!("letrec recognition: writer snapshot is not a tuple");
+    };
+    // Last snapshot element is the loop item `source(r)` — its `▷` function is
+    // the writer source.
+    let item = snap.pop().expect("snapshot carries the loop item");
+    let TypedExprNode::Apply {
+        function: source, ..
+    } = item.node
+    else {
+        panic!("letrec recognition: item element is not `r ▷ source`");
+    };
+    // The remaining elements are read-footprint snapshots `store_rk(t)` — each a
+    // read key's history var in the `▷` function.
+    let read_keys: Vec<Name> = snap
+        .into_iter()
+        .map(|e| match e.node {
+            TypedExprNode::Apply { function, .. } => match function.node {
+                TypedExprNode::Var(n) => n,
+                _ => panic!("letrec recognition: read snapshot function is not a store key var"),
+            },
+            _ => panic!("letrec recognition: read snapshot is not `t ▷ store_rk`"),
+        })
+        .collect();
+
+    TransactWriter {
+        read_keys,
+        write_keys,
+        source: *source,
+        body: *body,
+    }
+}
+
+/// The store-record tap field a tap binding `commits_j ≫ .decision ≫ .field`
+/// projects — its trailing field projection.
+fn tap_field(def: &Expr) -> String {
+    let TypedExprNode::Compose(elts) = &def.node else {
+        panic!("letrec recognition: tap binding is not a composition");
+    };
+    match elts.last().map(|e| &e.node) {
+        Some(TypedExprNode::Proj(ProjKey::Field(f))) => f.clone(),
+        _ => panic!("letrec recognition: tap binding does not end in a field projection"),
+    }
+}
+
+/// Destructure a transaction `LetRec` (from [`crate::ccl::transact_phase`]) back
+/// into the `Transact{keys, writers, domain: Txn}` carrier — the exact fold the
+/// direct transaction phase used to build, now reconstructed from the letrec so
+/// the transaction path shares the induction path's `LetRec` + recognition
+/// representation. The commit engine (`build_commit_store`) is unchanged, so
+/// this is observationally equivalent to the old direct fold.
+///
+/// The group's bindings, by shape ([`classify_txn_binding`]):
+/// - **history** `store_k : Txn ⇒ V = λ t → get_prev_txn((view, t, init))` — one
+///   per store key; the key's `init` is the accessor's default.
+/// - **commit-record** `commits_j : 𝐼 ⇒ {time, write_targets, decision}` — one
+///   per `with begin():` site; `decision = (store_rk(t) …, source(r)) ▷ body`
+///   yields the writer's `read_keys`/`source`/`body`, and `write_targets` its
+///   `write_keys` ([`recover_writer`]).
+/// - **tap** `to_<defer> : 𝐼 ⇒ V = commits_j ≫ .decision ≫ .field` — one per
+///   in-block feed.
+///
+/// A read of a history / tap binding in the continuation becomes a store-record
+/// projection `__store.field`, exactly as the induction recognizer rewrites
+/// `__hist ▷ .step`.
+fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr {
+    let mut keys: Vec<TransactKey> = Vec::new();
+    // Key history-binding name → value type (for the store record + read types).
+    let mut key_ty: Vec<(Name, Type)> = Vec::new();
+    let mut writers: Vec<TransactWriter> = Vec::new();
+    // Tap binding name → (store-record field, value type).
+    let mut taps: Vec<(Name, String, Type)> = Vec::new();
+    // Every binding name, to assert the continuation has no dangling references.
+    let mut binding_names: Vec<Name> = Vec::with_capacity(bindings.len());
+
+    for (b, def) in bindings {
+        binding_names.push(b.name.clone());
+        match classify_txn_binding(&def) {
+            TxnBinding::History => {
+                let init = history_init(def);
+                key_ty.push((b.name.clone(), init.ty.clone()));
+                keys.push(TransactKey { name: b.name, init });
+            }
+            TxnBinding::Commit => writers.push(recover_writer(def)),
+            TxnBinding::Tap => {
+                let vty = fun_parts(&b.ty).1;
+                taps.push((b.name, tap_field(&def), vty));
+            }
+        }
+    }
+
+    // Store record `{key.field_key(): Fun(Txn, V), …, to_<defer>: Fun(Txn, V)}`
+    // — register keys (key order) then tap virtual keys (feed order), the exact
+    // field order op-conversion's `emit_transact`/`build_commit_store` produce.
+    let mut store_field_tys: Vec<(String, Type)> = key_ty
+        .iter()
+        .map(|(n, v)| (n.field_key(), Type::fun(Type::Txn, v.clone())))
+        .collect();
+    for (_, field, v) in &taps {
+        store_field_tys.push((field.clone(), Type::fun(Type::Txn, v.clone())));
+    }
+    let store_ty = Type::Record(store_field_tys);
+
+    let mut transact = Expr::new(TypedExprNode::Transact {
+        keys,
+        writers,
+        domain: Type::Txn,
+    });
+    transact.ty = store_ty.clone();
+
+    // Continuation reads: each history / tap binding reference is a store-record
+    // projection `__store.field : Fun(Txn, V)` (a scalar read's surrounding
+    // `last_or_default` then reduces it; a hoisted feed reads the whole stream).
+    let mut read_map: HashMap<Name, (String, Type)> = HashMap::new();
+    for (n, v) in &key_ty {
+        read_map.insert(n.clone(), (n.field_key(), Type::fun(Type::Txn, v.clone())));
+    }
+    for (n, field, v) in &taps {
+        read_map.insert(n.clone(), (field.clone(), Type::fun(Type::Txn, v.clone())));
+    }
+
+    let store = Name::fresh("__store");
+    let mut body = body;
+    rewrite_txn_reads(&mut body, &store, &store_ty, &read_map);
+    for n in &binding_names {
+        assert_eq!(
+            count_free(n, &body),
+            0,
+            "letrec recognition: dangling reference to transaction binding `{n}` in the \
+             continuation"
+        );
+    }
+
+    let ty = body.ty.clone();
+    Expr {
+        node: TypedExprNode::Let {
+            binding: binding(store, store_ty),
+            bound_expr: Box::new(transact),
+            body: Box::new(body),
+        },
+        ty,
+        user_annotation: None,
+    }
+}
+
+/// Rewrite every history / tap binding reference in the continuation to a
+/// store-record projection `__store.field`, then drop the letrec (its bindings
+/// are now carried by the `Transact`). Mirrors [`rewrite_hist_reads`].
+fn rewrite_txn_reads(
+    e: &mut Expr,
+    store: &Name,
+    store_ty: &Type,
+    read_map: &HashMap<Name, (String, Type)>,
+) {
+    if let TypedExprNode::Var(n) = &e.node
+        && let Some((field, field_ty)) = read_map.get(n)
+    {
+        *e = store_field_read(store, store_ty, field.clone(), field_ty.clone());
+        return;
+    }
+    e.walk_children_mut(|c| rewrite_txn_reads(c, store, store_ty, read_map));
 }
 
 /// Destructure the phase's binding shape and rebuild it as a `Transact`.

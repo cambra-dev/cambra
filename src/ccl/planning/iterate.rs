@@ -140,6 +140,22 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
                 wrap_with_iterate(stream);
             }
         }
+        // `as_of` takes `Tuple([trigger, source])` — the `trigger` is the
+        // iteration site (op-conversion compiles it with `input=None`), so wrap
+        // it; the `source` is a store read (`__store.k`), not an iteration source,
+        // and is left alone. A `Var` trigger is already iterate-wrapped at its
+        // let-site, so `wrap_with_iterate`'s `is_iteration_bearing` check makes
+        // this a no-op there; a raw `[unit]` singleton (the standalone terminal
+        // read) is the case that genuinely needs the wrap.
+        TypedExprNode::Apply { argument, function }
+            if matches!(&function.node, TypedExprNode::Builtin(Builtin::AsOf)) =>
+        {
+            if let TypedExprNode::Tuple(elts) = &mut argument.node
+                && let Some(trigger) = elts.first_mut()
+            {
+                wrap_with_iterate(trigger);
+            }
+        }
         // `CollectionUnion`'s function form: argument is `Tuple(ops...)`
         // and op-conversion compiles each operand with `input=None` — wrap
         // each.
@@ -441,7 +457,14 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
             // (`make_restrict` only wraps an iteration source), so a
             // restrict-led chain must be recognised too — otherwise
             // re-running the marker pass would double-wrap refined sites.
-            Some(b) => matches!(b, Builtin::Iterate | Builtin::Restrict) || b.iterates_arg(),
+            // `AsOf` is a self-contained source — it produces its own `Fun(B, V)`
+            // over the trigger and op-conversion rejects a non-empty input — so an
+            // as-of-led chain is already iteration-bearing; prepending an
+            // `iterate` would strand the as_of mid-chain.
+            Some(b) => {
+                matches!(b, Builtin::Iterate | Builtin::Restrict | Builtin::AsOf)
+                    || b.iterates_arg()
+            }
             // Non-builtin function position (`Proj`, `Var`, curried
             // `Apply`, …): op-conversion's catch-all `Apply` arm
             // rejects `input=Some`, so wrapping would break compilation.

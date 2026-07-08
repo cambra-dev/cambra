@@ -20,6 +20,7 @@ pub mod planning;
 pub mod simplify;
 pub mod subst;
 pub mod symbolic;
+pub mod transact_phase;
 pub mod uniquify;
 
 // Core type definitions, split out of this crate-root module. Each submodule

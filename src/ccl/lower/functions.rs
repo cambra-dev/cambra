@@ -13,22 +13,29 @@ use crate::{
 };
 
 /// If `param` is annotated `Mut[…]` (a pass-by-reference store parameter),
-/// return its store type `Mut[V, _]`. Returns `None` for any non-`Mut`
-/// annotation (or an unannotated parameter). Mirrors the `Mut[…]` stamping of an
-/// induction introduction (`lower/stmts.rs :: mut_annotation_parts`).
+/// return its store type `Mut[V, D]` and whether it is **transactional**
+/// (`Mut[V, Txn]`). Returns `None` for any non-`Mut` annotation (or an
+/// unannotated parameter). Mirrors the `Mut[…]` stamping of an induction
+/// introduction (`lower/stmts.rs :: mut_annotation_parts`).
 ///
 /// The sequencing domain is left inferred (`D = Hole` → a fresh variable,
-/// generalized per call site): the call-site argument's `Mut` type pins `D` by
-/// the invariant `(Mut, Mut)` edge, and leaving it open lets one
-/// `def bump(c: Mut[Int])` serve every induction accumulator.
-fn mut_param_store_type(param: &Param) -> Option<Result<Type, LoweringError>> {
+/// generalized per call site) even for a `Txn` register param: the call-site
+/// argument's `Mut[_, Txn]` type pins `D = Txn` by the invariant `(Mut, Mut)`
+/// edge, and leaving it open lets one `def bump(c: Mut[Int])` serve both an
+/// induction accumulator and a register. The transactional flag *is* returned
+/// so the body's `with begin():` writes register as transactional at lowering
+/// time (the block-classification decision runs before inference).
+fn mut_param_store_type(param: &Param) -> Option<Result<(Type, bool), LoweringError>> {
     let annotation = param.annotation.as_ref()?;
     match mut_annotation_parts(annotation) {
-        Some(Ok(value)) => Some(Ok(Type::History {
-            value: Box::new(value),
-            domain: Box::new(Type::Hole),
-            kind: crate::ccl::HistoryKind::Store,
-        })),
+        Some(Ok((value, is_txn))) => Some(Ok((
+            Type::History {
+                value: Box::new(value),
+                domain: Box::new(Type::Hole),
+                kind: crate::ccl::HistoryKind::Store,
+            },
+            is_txn,
+        ))),
         Some(Err(e)) => Some(Err(e)),
         None => None,
     }
@@ -100,9 +107,9 @@ pub(super) fn uncurry_params(
         // call site. The annotation rides `user_annotation` too, so the
         // discipline check's rule 3 (no *unannotated* `Mut` binding) treats it
         // as the deliberate declaration it is. Non-`Mut` params stay `Hole`
-        // (inferred), as before.
+        // (inferred), as before. Multi-arg pass-by-ref lands with transactions.
         let param_ty = match mut_param_store_type(&params[0]) {
-            Some(Ok(mut_ty)) => mut_ty,
+            Some(Ok((mut_ty, _is_txn))) => mut_ty,
             _ => Type::Hole,
         };
         let mut lam = Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr);
@@ -124,7 +131,7 @@ pub(super) fn uncurry_params(
     if params.iter().any(|p| mut_param_store_type(p).is_some()) {
         return Ok(params.iter().rev().fold(body_expr, |acc, param| {
             let param_ty = match mut_param_store_type(param) {
-                Some(Ok(mut_ty)) => mut_ty,
+                Some(Ok((mut_ty, _is_txn))) => mut_ty,
                 _ => Type::Hole,
             };
             let mut lam = Expr::lambda(param.name.as_str(), param_ty.clone(), acc);
@@ -171,8 +178,14 @@ pub(super) fn lower_lambda(
 ) -> Result<Expr, LoweringError> {
     validate_function_params(lambda_span, params)?;
     // Store-ness of a `Mut[…]`-annotated parameter is its *type* (stamped by
-    // `uncurry_params`), checked post-inference.
-    let body_expr = lower_expr(body, ctx);
+    // `uncurry_params`), checked post-inference — there is no induction registry
+    // to mask here. But a plain parameter spelled like an outer transactional
+    // register is a genuine local, so SHADOW every parameter over the body
+    // (popped on exit) to skip the out-of-block read gate for it — mirroring how
+    // `uniquify` threads its env stack so a shadowed name reverts to its outer
+    // meaning. The shadow set is keyed by pre-uniquify base name.
+    let param_names: Vec<String> = params.iter().map(|p| p.name.as_str().to_string()).collect();
+    let body_expr = ctx.with_shadowed(param_names, |ctx| lower_expr(body, ctx));
     uncurry_params(params, body_expr?, ctx)
 }
 
@@ -215,17 +228,59 @@ pub(super) fn lower_function_body(
     let outer_bindings: HashSet<String> =
         params.iter().map(|p| p.name.as_str().to_string()).collect();
 
-    // Surface a malformed `Mut[…]` parameter annotation eagerly: `uncurry_params`
-    // treats a `Some(Err(_))` store type as an unannotated `Hole` parameter, so
-    // without this the real error would be silently swallowed.
+    // Scope every parameter's transactional registration to the body (restored
+    // on exit), keyed on the pre-uniquify name a sibling function or outer
+    // binding could reuse.
+    //
+    //  - A `Mut[_, Txn]`-annotated parameter is a pass-by-reference transactional
+    //    register: register it so a body `x := …` / `x += …` inside a `with
+    //    begin():` block is classified as a commit (the cross-function writer
+    //    `def transfer(src, dst: Mut[_, Txn], …)`), and a bare read of it is gated.
+    //  - An induction `Mut[V]` parameter needs no registry — its store-ness is
+    //    its `Type::History` (stamped by `uncurry_params`), checked post-inference. It
+    //    is recorded here only so it is *not* shadowed below: a store keeps its
+    //    gate, a plain local does not. A malformed `Mut[…]` annotation surfaces
+    //    its error eagerly (before the body lowers).
+    let snapshot = ctx.snapshot_transactional();
+    let mut mut_param_names: HashSet<String> = HashSet::new();
     for param in params {
-        if let Some(Err(e)) = mut_param_store_type(param) {
-            return Err(e);
+        if let Some(res) = mut_param_store_type(param) {
+            let (_, is_txn) = match res {
+                Ok(v) => v,
+                Err(e) => {
+                    ctx.restore_transactional(snapshot);
+                    return Err(e);
+                }
+            };
+            let name = param.name.as_str().to_string();
+            if is_txn {
+                ctx.register_transactional(name.clone());
+            }
+            mut_param_names.insert(name);
         }
     }
 
+    // Shadow only the *non*-`Mut` parameters over the body: a plain param
+    // spelled like an outer transactional register is a genuine local, so the
+    // out-of-block read gate must skip it. A `Mut` param is a store in its own
+    // right, so it keeps its gate — reading a `Mut[_, Txn]` param outside a `with
+    // begin():` block in the body is still an error.
+    let shadowed_params: Vec<String> = outer_bindings
+        .iter()
+        .filter(|n| !mut_param_names.contains(n.as_str()))
+        .cloned()
+        .collect();
+
     // http_serve is not permitted inside function bodies.
-    let body_result = lower_stmts_inner(body, &outer_bindings, ctx, false);
+    let body_result = ctx.with_shadowed(shadowed_params, |ctx| {
+        lower_stmts_inner(body, &outer_bindings, ctx, false)
+    });
+
+    // Revert the transactional registry — drop every `Mut[_, Txn]` param
+    // registration and any `Mut[_, Txn]` local the body declared, keyed on the
+    // pre-uniquify name a sibling function could reuse.
+    ctx.restore_transactional(snapshot);
+
     uncurry_params(params, body_result?, ctx)
 }
 

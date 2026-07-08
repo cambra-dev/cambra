@@ -829,6 +829,30 @@ where
                 Spanned::new(e.span(), Stmt::For { target, iter, body })
             });
 
+        // ---- with <binding> = begin(): body -------------------------
+        // The transaction form `with t = begin():` binds `t` to the commit
+        // time; the binding prefix backtracks (`.or_not()`) so a bare
+        // `with begin():` still parses. The context is a call expression
+        // (`begin()`); lowering validates it.
+        let with_binding = select! { Token::Ident(s) => s }
+            .then_ignore(just(Token::Eq))
+            .or_not();
+        let with_stmt = just(Token::With)
+            .ignore_then(with_binding)
+            .then(expr.clone())
+            .then_ignore(just(Token::Colon))
+            .then(block.clone())
+            .map_with(|((binding, context), body), e| {
+                Spanned::new(
+                    e.span(),
+                    Stmt::With {
+                        binding,
+                        context,
+                        body,
+                    },
+                )
+            });
+
         // ---- def name(params): body ---------------------------------
         let param = select! { Token::Ident(s) => s }
             .map_with(|s, e| (s, e.span()))
@@ -1024,7 +1048,7 @@ where
             .then(skip_indented_block)
             .map_with(|_, e| Spanned::new(e.span(), Stmt::Error));
 
-        choice((if_stmt, for_stmt, def_stmt, simple_stmt))
+        choice((if_stmt, for_stmt, with_stmt, def_stmt, simple_stmt))
             .labelled("statement")
             .as_context()
             .recover_with(via_parser(stmt_recovery))

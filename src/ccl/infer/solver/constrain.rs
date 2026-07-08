@@ -270,6 +270,9 @@ fn constrain_go(
         (Type::Base(a), Type::Base(b)) if a == b => Ok(()),
         (Type::UIntRange(a), Type::UIntRange(b)) if a == b => Ok(()),
         (Type::DataSource(a), Type::DataSource(b)) if a == b => Ok(()),
+        // `Txn` is a nullary leaf: reflexively equal to itself, incomparable
+        // to every other type (the catch-all `Mismatch` below).
+        (Type::Txn, Type::Txn) => Ok(()),
 
         // Function: contravariant on domain, covariant on codomain. The
         // codomain edge *derives* the binder correspondence — aligning the two
@@ -667,7 +670,9 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         return ty.clone();
     }
     match ty {
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => ty.clone(),
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => {
+            ty.clone()
+        }
         Type::Fun {
             name,
             domain: d,

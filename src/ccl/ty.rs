@@ -44,7 +44,7 @@ impl fmt::Display for FieldKey {
 /// |---|---|---|---|
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
 /// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); a defer channel's *domain* is necessarily `Infer` until desugaring (see `Strictness::PreDesugar`) |
-/// | `History` (`kind: Store`) | Type checker only | "Mutable store: a `value` cell tracked over a `domain` (loop index)" | the unified phase (`letrec_phase`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
+/// | `History` (`kind: Store`) | Type checker only | "Mutable store: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `letrec_phase`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
 /// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
@@ -135,6 +135,13 @@ pub enum Type {
     /// resolves this to a concrete `Extent::DataSourceDomain(rc)` at compilation time
     /// by looking the name up in its source-domain-extent registry.
     DataSource(String),
+    /// The transaction-commit domain: an anonymous total order of commit times
+    /// issued by the runtime (the prototype's `CommitTime`). It is the domain of
+    /// transactional histories (`Txn ⇒ V`), the codomain of the per-site
+    /// `begin_<site>` oracles, and the type of a transaction handle. Like
+    /// `DataSource`, it has no enumerable static extent — its positions exist only
+    /// in the tile. See src/ccl/design/mutability.md.
+    Txn,
     /// The type of a **history** handle: a function `domain ⇒ value` that a
     /// `:=` store or a `defer`/`<<` channel writes incrementally. One variant
     /// for both — a mutable store and a feed channel are the same object (an
@@ -145,7 +152,7 @@ pub enum Type {
     ///   reads through to its `value` (the scalar behind `Mut[Int, D]`; `cnt + 1`
     ///   reads the `Int`), its writes may read the previous position
     ///   (`get_prev_seq` recurrence), and its trailing read is `last_or_default`
-    ///   (a scalar). `letrec_phase` materializes it with a carry-forward arm.
+    ///   (a scalar). The unified phase materializes it with a carry-forward arm.
     /// - [`HistoryKind::Feed`] — a **feed channel** (`defer` / `<<` / `<<=`). A
     ///   reference reads the whole stream (`domain ⇒ value`), off-path positions
     ///   are absent (no carry-forward), and `channelize` resolves it to the
@@ -156,7 +163,7 @@ pub enum Type {
     /// **transient** variant like `Hole` / `Infer`: it exists only between type
     /// inference (which stamps it on `:=` / `defer` introductions and every
     /// reference) and the passes that erase it — the unified phase
-    /// (`letrec_phase`) for `Store` histories, `channelize`
+    /// (`transact_phase` / `letrec_phase`) for `Store` histories, `channelize`
     /// for `Feed` ones. Both erase it to a bare `Type::Fun`; no pass downstream
     /// may observe a `History` (a survivor at the strict wall is a compiler bug —
     /// see `collect_type_errors`). See src/ccl/design/mutability.md.
@@ -183,7 +190,7 @@ pub enum Type {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HistoryKind {
     /// A mutable store introduced by `:=` — deref-on-read to the scalar `value`,
-    /// a `get_prev_seq` recurrence, a `last_or_default` trailing
+    /// a `get_prev_seq` / `get_prev_txn` recurrence, a `last_or_default` trailing
     /// read, and a carry-forward arm for off-path positions.
     Store,
     /// A feed channel introduced by `defer` and written with `<<` / `<<=` — read
@@ -286,6 +293,7 @@ impl fmt::Display for Type {
             Type::Hole => write!(f, "_"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
             Type::DataSource(name) => write!(f, "source({name})"),
+            Type::Txn => write!(f, "Txn"),
             Type::History {
                 value,
                 domain,
@@ -335,6 +343,42 @@ impl Type {
             Some(codomain.as_ref().clone())
         } else {
             None
+        }
+    }
+
+    /// Whether this type's positions can be statically enumerated — i.e. a
+    /// terminal reduction over a `Fun` of this domain converges. A live commit
+    /// history (`Txn`) has **no** enumerable extent: its positions are revealed
+    /// only as commits land, so a `last_or_default` over one never resolves.
+    /// `transact_phase::rewrite_live_reads` uses this to detect that a broadcast
+    /// read's store is a live commit log (`Txn`) and rewrite it to an as-of join
+    /// instead of broadcasting a never-resolving terminal render.
+    ///
+    /// The match is **exhaustive on purpose** (no `_` arm): the predicate is
+    /// load-bearing, so a new abstract domain whose elements live in a producer
+    /// must make an explicit decision here rather than silently defaulting to
+    /// enumerable. `DataSource` is enumerable-from-the-type (its extent resolves
+    /// from the registered source); only `Txn` is genuinely non-enumerable.
+    pub fn has_enumerable_extent(&self) -> bool {
+        match self {
+            Type::Txn => false,
+            Type::Tuple(ts) => ts.iter().all(Type::has_enumerable_extent),
+            Type::Record(fields) => fields.iter().all(|(_, t)| t.has_enumerable_extent()),
+            Type::Variant(tags) => tags.iter().all(|(_, t)| t.has_enumerable_extent()),
+            Type::Refinement(inner, _) => inner.has_enumerable_extent(),
+            // Erased by `channelize`, which runs before the pass that consults
+            // this predicate (planning's live-read rewrite); observing one here is
+            // a compiler bug.
+            // Erased by the unified phase (`letrec_phase`/`transact_phase`), which
+            // runs before planning; observing one here is a compiler bug.
+            Type::History { .. } => unreachable!("Type::History survived its erasing phase"),
+            // Concrete or type-resolvable domains: enumerable from the type alone.
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::Fun { .. }
+            | Type::DataSource(_)
+            | Type::Hole
+            | Type::Infer(_) => true,
         }
     }
 
@@ -390,7 +434,8 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
-            | Type::DataSource(_) => self.clone(),
+            | Type::DataSource(_)
+            | Type::Txn => self.clone(),
         }
     }
 
@@ -422,7 +467,8 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
-            | Type::DataSource(_) => {}
+            | Type::DataSource(_)
+            | Type::Txn => {}
             Type::Fun {
                 domain, codomain, ..
             } => {
@@ -461,7 +507,8 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
-            | Type::DataSource(_) => {}
+            | Type::DataSource(_)
+            | Type::Txn => {}
             Type::Fun {
                 domain, codomain, ..
             } => {
@@ -893,6 +940,17 @@ mod tests {
         assert_ne!(
             gt, lt,
             "casts differing only in the target's nested filter are distinct refinements"
+        );
+    }
+
+    /// The transaction-commit domain renders by its bare name (mirrors the
+    /// prototype's `CommitTime` Display), including as a function domain.
+    #[test]
+    fn txn_type_display() {
+        assert_eq!(Type::Txn.to_string(), "Txn");
+        assert_eq!(
+            Type::fun(Type::Txn, Type::Base(BaseType::Int)).to_string(),
+            "(Txn ⇒ Int)"
         );
     }
 }

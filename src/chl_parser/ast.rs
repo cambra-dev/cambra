@@ -181,8 +181,8 @@ pub enum Stmt {
     /// assignment as a store introduction (first `:=` to a name) or a store write
     /// (subsequent), so lowering never has to guess `MutWrite`-vs-`Let` from a
     /// name registry. The annotation is optional: bare `x := 0` is an induction
-    /// accumulator (value type and domain inferred), `x: Mut[V] := 0` fixes the
-    /// value type `V` (its domain is still the loop it accumulates over).
+    /// accumulator (domain inferred), `x: Mut[V, Txn] := 0` a transactional
+    /// register (the annotation carries the `Txn` domain, exactly as before).
     MutAssign {
         target: Spanned<AssignTarget>,
         annotation: Option<Spanned<Expr>>,
@@ -218,6 +218,17 @@ pub enum Stmt {
     FunctionDef {
         name: SmolStr,
         params: Vec<Param>,
+        body: Vec<Spanned<Stmt>>,
+    },
+
+    /// `with <binding> = <context>: body` — a transaction block. The context
+    /// is `begin()` (the transaction marker); `binding`, when present, names
+    /// the transaction's commit time (`with t = begin(): …`) — parsed but not
+    /// yet consumed by lowering (reserved for transaction-handle operations).
+    /// See src/ccl/design/mutability.md.
+    With {
+        binding: Option<SmolStr>,
+        context: Spanned<Expr>,
         body: Vec<Spanned<Stmt>>,
     },
 

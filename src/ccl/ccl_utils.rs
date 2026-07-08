@@ -348,9 +348,12 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
             domain: Box::new(strip_refinements(domain)),
             kind: *kind,
         },
-        Type::Base(_) | Type::UIntRange(_) | Type::Hole | Type::Infer(_) | Type::DataSource(_) => {
-            ty.clone()
-        }
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::Hole
+        | Type::Infer(_)
+        | Type::DataSource(_)
+        | Type::Txn => ty.clone(),
     }
 }
 

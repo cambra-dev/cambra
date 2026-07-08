@@ -114,7 +114,9 @@ pub fn freshen_above(
         return ty.clone();
     }
     match ty {
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => ty.clone(),
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => {
+            ty.clone()
+        }
         Type::Fun {
             name,
             domain: d,
