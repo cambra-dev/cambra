@@ -262,7 +262,7 @@ fn restamp_spine_result(node: &mut Expr, new_result: Type) {
 /// refinement code in lambda_elim.
 pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
     assert!(
-        matches!(&target_ty, Type::Fun { domain: d, codomain: _, .. } if matches!(d.as_ref(), Type::Refinement(..))),
+        matches!(&target_ty, Type::Fun { domain: d, .. } if matches!(d.as_ref(), Type::Refinement(..))),
         "make_cast target_ty must be Fun(Refinement(_, _), _), got {target_ty}"
     );
     Expr::cast(value, target_ty)

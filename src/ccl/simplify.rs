@@ -233,11 +233,7 @@ fn try_string_add_to_concat(expr: &mut Expr) -> bool {
         TypedExprNode::Builtin(Builtin::BinOp(op))
             if *op == BinOpKind::Arithmetic(ArithmeticKind::Add) =>
         {
-            if let Type::Fun {
-                domain: arg_ty,
-                codomain: _,
-                ..
-            } = &expr.ty
+            if let Type::Fun { domain: arg_ty, .. } = &expr.ty
                 && let Type::Tuple(elts) = arg_ty.as_ref()
                 && elts.first() == Some(&Type::Base(BaseType::String))
             {
@@ -849,11 +845,7 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
             // Compute types for the composed expressions
             let g_ty = match (&left.ty, &g.ty) {
                 (
-                    Type::Fun {
-                        domain: dom,
-                        codomain: _,
-                        ..
-                    },
+                    Type::Fun { domain: dom, .. },
                     Type::Fun {
                         domain: _,
                         codomain: cod,
@@ -864,11 +856,7 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
             };
             let h_ty = match (&left.ty, &h.ty) {
                 (
-                    Type::Fun {
-                        domain: dom,
-                        codomain: _,
-                        ..
-                    },
+                    Type::Fun { domain: dom, .. },
                     Type::Fun {
                         domain: _,
                         codomain: cod,

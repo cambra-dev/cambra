@@ -160,10 +160,7 @@ impl TileProducer for ToScalarProducer {
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let input_result = self.input.get(self.input.tiling().universal_guard());
         let Tile::SealedFunction {
-            domain,
-            codomain,
-            domain_predicate: _,
-            ..
+            domain, codomain, ..
         } = input_result
         else {
             panic!("ToScalarProducer expected SealedFunction")

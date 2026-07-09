@@ -156,7 +156,7 @@ pub fn apply_binop_column(op: BinOpKind, left: ColumnValue, right: &ColumnValue)
         (BinOpKind::Compare(op), ColumnValue::Bools(l), ColumnValue::Bools(r)) => {
             ColumnValue::Bools(zip_bool_compare(op, l, r))
         }
-        (op, left, right) => panic!("Unsupported binop: {:?} on {:?}, {:?}", op, left, &right),
+        (op, left, right) => panic!("Unsupported binop: {:?} on {:?}, {:?}", op, left, right),
     }
 }
 

@@ -467,7 +467,7 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
         ChlExpr::Lit(ChlLit::None) => Ok(Type::Base(BaseType::Unit)),
         _ => Err(LoweringError::unsupported(
             annotation.span,
-            format!("unsupported type annotation form: {:?}", &annotation.node),
+            format!("unsupported type annotation form: {:?}", annotation.node),
         )),
     }
 }

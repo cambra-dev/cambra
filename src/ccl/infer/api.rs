@@ -714,14 +714,7 @@ mod tests {
         let mut expr = Expr::lambda("x", Type::infer(), Expr::var("x"));
         let ty = infer(&mut expr, &mut ctx).expect("inference allows unconstrained λ x → x");
         assert!(
-            matches!(
-                ty,
-                Type::Fun {
-                    domain: _,
-                    codomain: _,
-                    ..
-                }
-            ),
+            matches!(ty, Type::Fun { .. }),
             "expected Fun type, got {ty:?}"
         );
     }
@@ -750,14 +743,7 @@ mod tests {
         });
         let ty = infer(&mut expr, &mut ctx).expect("inference allows partially-constrained params");
         assert!(
-            matches!(
-                ty,
-                Type::Fun {
-                    domain: _,
-                    codomain: _,
-                    ..
-                }
-            ),
+            matches!(ty, Type::Fun { .. }),
             "expected Fun type, got {ty:?}"
         );
     }
@@ -2168,12 +2154,7 @@ mod tests {
         ]));
         let mut expr = Expr::lambda("p", Type::infer(), body);
         let ty = infer(&mut expr, &mut ctx).unwrap();
-        if let Type::Fun {
-            domain,
-            codomain: _,
-            ..
-        } = ty
-        {
+        if let Type::Fun { domain, .. } = ty {
             match *domain {
                 Type::Tuple(ref elts) if elts.len() == 2 => {
                     assert_eq!(

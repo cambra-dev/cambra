@@ -175,13 +175,12 @@ pub(super) fn is_function_of_single_tuple_arm(expr: &Expr) -> Option<usize> {
                 if is_constant(elt) {
                     continue;
                 }
-                if let Some(idx) = is_function_of_single_tuple_arm(elt) {
+                {
+                    let idx = is_function_of_single_tuple_arm(elt)?;
                     if result.is_some_and(|x| x != idx) {
                         return None;
                     }
                     result = Some(idx);
-                } else {
-                    return None;
                 }
             }
             result
@@ -192,11 +191,7 @@ pub(super) fn is_function_of_single_tuple_arm(expr: &Expr) -> Option<usize> {
 
 pub(super) fn set_domain_ty(fun_ty: &mut Type, ty: &Type) {
     match fun_ty {
-        Type::Fun {
-            domain,
-            codomain: _,
-            ..
-        } => {
+        Type::Fun { domain, .. } => {
             **domain = ty.clone();
         }
         _ => panic!("Not function type: {}", fun_ty),
@@ -234,11 +229,7 @@ pub(super) fn replace_tuple_project_with_id(expr: &mut Expr, ty: &Type) {
         TypedExprNode::Tuple(_) => {
             if let Type::Tuple(elts) = &mut expr.ty {
                 elts.iter_mut().for_each(|elt| match elt {
-                    Type::Fun {
-                        domain,
-                        codomain: _,
-                        ..
-                    } => {
+                    Type::Fun { domain, .. } => {
                         **domain = ty.clone();
                     }
                     _ => panic!(),
@@ -563,11 +554,7 @@ mod tests {
         if let Type::Tuple(ref elts) = expr.ty {
             for elt in elts {
                 match elt {
-                    Type::Fun {
-                        domain,
-                        codomain: _,
-                        ..
-                    } => {
+                    Type::Fun { domain, .. } => {
                         assert_eq!(**domain, int_ty_val);
                     }
                     _ => panic!("Expected function type in tuple"),
@@ -621,12 +608,7 @@ mod tests {
         replace_constant_domain_type(&mut expr, &int_ty_val);
 
         // After replacement, domain should be updated
-        if let Type::Fun {
-            domain,
-            codomain: _,
-            ..
-        } = &expr.ty
-        {
+        if let Type::Fun { domain, .. } = &expr.ty {
             assert_eq!(**domain, int_ty_val);
         } else {
             panic!("Expected function type");
@@ -652,12 +634,7 @@ mod tests {
         replace_constant_domain_type(&mut expr, &int_ty_val);
 
         // After replacement, domain should be updated
-        if let Type::Fun {
-            domain,
-            codomain: _,
-            ..
-        } = &expr.ty
-        {
+        if let Type::Fun { domain, .. } = &expr.ty {
             assert_eq!(**domain, int_ty_val);
         } else {
             panic!("Expected function type");

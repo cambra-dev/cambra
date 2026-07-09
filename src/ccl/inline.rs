@@ -122,11 +122,7 @@ fn is_iterable_domain(ty: &Type) -> bool {
         Type::UIntRange(_) | Type::DataSource(_) => true,
         // There are infinitely many possible functions for any given function
         // type, so function-typed domains cannot be enumerated.
-        Type::Fun {
-            domain: _,
-            codomain: _,
-            ..
-        } => false,
+        Type::Fun { .. } => false,
         _ => true,
     }
 }
@@ -149,11 +145,7 @@ fn is_iterable_domain(ty: &Type) -> bool {
 /// from sharing, so they are left intact.
 fn should_inline(bound_ty: &Type) -> bool {
     match bound_ty {
-        Type::Fun {
-            domain,
-            codomain: _,
-            ..
-        } => !is_iterable_domain(domain),
+        Type::Fun { domain, .. } => !is_iterable_domain(domain),
         _ => false,
     }
 }

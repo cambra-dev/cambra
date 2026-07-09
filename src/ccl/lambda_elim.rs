@@ -513,11 +513,7 @@ fn elim_lambda_impl(
                     } => match cod.as_ref() {
                         Type::Tuple(elts) if elts.len() == 2 => match (&elts[0], &elts[1]) {
                             (
-                                Type::Fun {
-                                    domain: a,
-                                    codomain: _,
-                                    ..
-                                },
+                                Type::Fun { domain: a, .. },
                                 Type::Fun {
                                     domain: _,
                                     codomain: c,
