@@ -1,0 +1,22 @@
+# A tiny guestbook service: POST a message and get back the whole guestbook so
+# far. State lives in `entries`, a string the request loop accumulates across
+# requests (a pure induction accumulator — `Mut[_]`, NOT transactional), and each
+# request's response is the running text — so the same endpoint both *adds* an
+# entry and *displays* the collected data. This is the induction + per-request
+# feed path (no transaction, no cross-endpoint read).
+#
+# Manual smoke test (replace {PORT} with a literal, e.g. 8080):
+#
+#     cargo run -- tests/programs/http_accumulator/program.cambra
+#     # in another terminal:
+#     curl -X POST -d 'alice: hi'   localhost:8080/sign
+#     curl -X POST -d 'bob: hello'  localhost:8080/sign
+#     # second response shows both entries
+
+entries := ""
+
+sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
+
+for entry in sign_reqs:
+    entries := entries + entry + "\n"
+    sign_resps << entries

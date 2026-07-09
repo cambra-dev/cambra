@@ -69,7 +69,8 @@ Vocabulary, matching `src/ccl/symbolic.rs`:
 - **Lambda**: `λ x → body`. With annotated param: `λ x : T → body`. With refinement: `λ x : {T | predicate} → body` (an unresolved refined base renders by its own type form: `{_ | predicate}` for a `Hole`, `{?N | predicate}` for an `Infer`). The refinement rides the param *type* — there is no separate lambda refinement slot — and the predicate appears bare inside the braces; do not write `{T | Refined(p)}`.
 - **Let**: `let x = e in body`.
 - **Aggregate**: `Sum(input)`, `Max(input)`, etc. — the kind name then parens.
-- **Loop**: `loop i = 0 over xs do body` (single accumulator), `loop (x = 0, y = 1) over xs do (x, y)` (multi).
+- **LetRec** (guarded mutually-recursive group): `letrec b₁ = e₁; …; bₙ = eₙ in body` (bindings separated by `; `) — what the mutability/transaction phases emit before recognition.
+- **Transact** (the domain-parameterized recurrence carrier `recognize` produces from a `LetRec`): `transact (k₁ = init₁, …) { [reads]⇒[writes] over source do body; … }` — the store keys with their seeds, then one writer per site (its read/write footprint, iteration source, and decision body). Op-conversion dispatches on the domain: a concrete iteration extent → `Recurse`, `Txn` → the commit operator. (The former `Loop` carrier is retired — do not render it.)
 - **Literals**: `1`, `true`/`false`, `"str"`, `unit`.
 - **Binops**: standard infix with precedence parens (`a + b`, `x == y`, `p and q`, etc.).
 - **Unary**: `-x`, `not x`.
@@ -85,6 +86,9 @@ Types (from `Display for Type` in `src/ccl/mod.rs`):
 - **Infer**: `?N` (where `N` is the variable id).
 - **DataSource**: `source(name)`.
 - **Union**: `T1 | T2`.
+- **Feed**: `Feed[T]` — a transient deferred-output type inference threads and `desugar_defers` erases.
+- **Mut**: `Mut[value, domain]` — a transient mutable-variable type inference threads and the mutability/transaction phases erase; the domain is an induction extent or `Txn`.
+- **Txn**: `Txn` — the (nullary) transaction-commit sequencing domain, the second slot of a `Mut[V, Txn]` register.
 
 Do **not** write `Apply { function: ..., argument: ... }`, `Apply(f, x)`, `Compose([f, g])`, or other constructor-style forms — those are AST node names, not the rendering. Do **not** fall back to source syntax when the point is what the *AST* looks like. Only deviate if explicitly asked (e.g. "show me the Debug form", "give me the source").
 

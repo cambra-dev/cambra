@@ -38,12 +38,14 @@ impl fmt::Display for FieldKey {
 ///
 /// Appears on [`TypedExpr`] nodes and as the output of type inference.
 ///
-/// The two pre-/post-inference variants divide ownership cleanly:
+/// The transient variants divide ownership cleanly:
 ///
 /// | Variant | Owner | Meaning | Must be eliminated by |
 /// |---|---|---|---|
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
-/// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`) |
+/// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); a defer channel's *domain* is necessarily `Infer` until desugaring (see `Strictness::PreDesugar`) |
+/// | `History` (`kind: Store`) | Type checker only | "Mutable store: a `value` cell tracked over a `domain` (loop index)" | the unified phase (`letrec_phase`, which runs *before* `desugar_defers`; a survivor downstream is a compiler bug) |
+/// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `desugar_defers` (which runs after inference; a survivor downstream is a compiler bug) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// A primitive base type.
@@ -133,9 +135,60 @@ pub enum Type {
     /// resolves this to a concrete `Extent::DataSourceDomain(rc)` at compilation time
     /// by looking the name up in its source-domain-extent registry.
     DataSource(String),
+    /// The type of a **history** handle: a function `domain ⇒ value` that a
+    /// `:=` store or a `defer`/`<<` channel writes incrementally. One variant
+    /// for both — a mutable store and a feed channel are the same object (an
+    /// invariant, deref-transparent `domain ⇒ value`); they differ only in the
+    /// [`HistoryKind`]:
+    ///
+    /// - [`HistoryKind::Store`] — a **mutable store** (`:=` / `+=`). A reference
+    ///   reads through to its `value` (the scalar behind `Mut[Int, D]`; `cnt + 1`
+    ///   reads the `Int`), its writes may read the previous position
+    ///   (`get_prev_seq` recurrence), and its trailing read is `last_or_default`
+    ///   (a scalar). `letrec_phase` materializes it with a carry-forward arm.
+    /// - [`HistoryKind::Feed`] — a **feed channel** (`defer` / `<<` / `<<=`). A
+    ///   reference reads the whole stream (`domain ⇒ value`), off-path positions
+    ///   are absent (no carry-forward), and `desugar_defers` resolves it to the
+    ///   collected channel.
+    ///
+    /// Either way it is **invariant** in both children (a history flowing
+    /// through a function parameter both reads and writes), and it is a
+    /// **transient** variant like `Hole` / `Infer`: it exists only between type
+    /// inference (which stamps it on `:=` / `defer` introductions and every
+    /// reference) and the passes that erase it — the unified phase
+    /// (`letrec_phase`) for `Store` histories, `desugar_defers`
+    /// for `Feed` ones. Both erase it to a bare `Type::Fun`; no pass downstream
+    /// may observe a `History` (a survivor at the strict wall is a compiler bug —
+    /// see `collect_type_errors`). See src/ccl/design/mutability.md.
+    History {
+        /// The type of the history's value (a position's cell / element). Read
+        /// through by the deref coercion for a [`HistoryKind::Store`] reference.
+        value: Box<Type>,
+        /// The index the history's positions are tracked over (loop index,
+        /// transaction time, or a feed channel's collection domain).
+        domain: Box<Type>,
+        /// Whether this is a mutable store or a feed channel — selects the read
+        /// mode (scalar-last vs whole-stream) and, in the unified phase, whether
+        /// off-path positions carry forward.
+        kind: HistoryKind,
+    },
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
     // Refinement { base: Box<Type>, predicate: Box<Expr> }
+}
+
+/// Which flavour of [`Type::History`] a handle is — a mutable store (`:=`) or a
+/// feed channel (`defer` / `<<`). The two are the same object (a `domain ⇒
+/// value` history) but read and materialize differently; see [`Type::History`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoryKind {
+    /// A mutable store introduced by `:=` — deref-on-read to the scalar `value`,
+    /// a `get_prev_seq` recurrence, a `last_or_default` trailing
+    /// read, and a carry-forward arm for off-path positions.
+    Store,
+    /// A feed channel introduced by `defer` and written with `<<` / `<<=` — read
+    /// as the whole `domain ⇒ value` stream, with off-path positions absent.
+    Feed,
 }
 
 /// If every tag in `tags` is an anonymous positional [`FieldKey::Index`]
@@ -233,6 +286,17 @@ impl fmt::Display for Type {
             Type::Hole => write!(f, "_"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
             Type::DataSource(name) => write!(f, "source({name})"),
+            Type::History {
+                value,
+                domain,
+                kind,
+            } => {
+                if *kind == HistoryKind::Store {
+                    write!(f, "Mut[{value}, {domain}]")
+                } else {
+                    write!(f, "feed({domain} ⇒ {value})")
+                }
+            }
         }
     }
 }
@@ -313,6 +377,15 @@ impl Type {
             Type::Refinement(base, r) => {
                 Type::Refinement(Box::new(base.without_pi_names()), r.clone())
             }
+            Type::History {
+                value,
+                domain,
+                kind,
+            } => Type::History {
+                value: Box::new(value.without_pi_names()),
+                domain: Box::new(domain.without_pi_names()),
+                kind: *kind,
+            },
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
@@ -367,6 +440,10 @@ impl Type {
                 }
             }
             Type::Refinement(base, _) => f(base),
+            Type::History { value, domain, .. } => {
+                f(value);
+                f(domain);
+            }
             Type::Variant(tags) => {
                 for (_, t) in tags {
                     f(t);
@@ -402,6 +479,10 @@ impl Type {
                 }
             }
             Type::Refinement(base, _) => f(base),
+            Type::History { value, domain, .. } => {
+                f(value);
+                f(domain);
+            }
             Type::Variant(tags) => {
                 for (_, t) in tags {
                     f(t);
@@ -702,26 +783,6 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                     .iter()
                     .zip(f2)
                     .all(|((n1, e1), (n2, e2))| n1 == n2 && eq_refinement_predicate_go(e1, e2))
-        }
-        (
-            N::Loop {
-                params: p1,
-                init_args: i1,
-                source: s1,
-                loop_body: b1,
-            },
-            N::Loop {
-                params: p2,
-                init_args: i2,
-                source: s2,
-                loop_body: b2,
-            },
-        ) => {
-            p1.len() == p2.len()
-                && p1.iter().zip(p2).all(|(x, y)| x.name == y.name)
-                && all_eq(i1, i2)
-                && eq_refinement_predicate_go(s1, s2)
-                && eq_refinement_predicate_go(b1, b2)
         }
         (N::ExprStmt { expr: e1, body: b1 }, N::ExprStmt { expr: e2, body: b2 }) => {
             eq_refinement_predicate_go(e1, e2) && eq_refinement_predicate_go(b1, b2)

@@ -169,10 +169,13 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         {
             wrap_with_iterate(argument);
         }
-        // Mutation-loop sources are iterated internally by [`Recurse`];
-        // op-conversion's `Loop` arm compiles `source` with `input=None`.
-        TypedExprNode::Loop { source, .. } => {
-            wrap_with_iterate(source);
+        // Each transaction writer's source is iterated internally by the
+        // store engine (`Recurse` for an induction store); op-conversion
+        // compiles it with `input=None`, so wrap it like a loop source.
+        TypedExprNode::Transact { writers, .. } => {
+            for w in writers.iter_mut() {
+                wrap_with_iterate(&mut w.source);
+            }
         }
         // Value-position `Record` literals (not the special-cased
         // `Apply(Record, Zip)` form, which `Zip`'s arm handles via fan-out):
@@ -971,44 +974,45 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_iterate_recurse_loop_wraps_source() {
-        // `Loop`'s `source` is iterated by `Recurse` at runtime, and
-        // op-conversion compiles it with `input=None` — wrap it here.
+    fn test_insert_iterate_recurse_transact_wraps_writer_source() {
+        use crate::ccl::{TransactKey, TransactWriter};
+        // A `Transact` writer's `source` is iterated by the store engine at
+        // runtime (op-conversion compiles it with `input=None`), so it must be
+        // iterate-wrapped here — the same as a loop source was.
         let int = int_ty();
         let list_ty = fun_ty(Type::UIntRange(3), int.clone());
-        // Build a minimal Loop with one accumulator and a body that just
-        // re-emits the previous accumulator value.  The exact body shape
-        // doesn't matter for this test — we're only checking the
-        // `source` field gets iterate-wrapped.
-        let body = Expr::new(TypedExprNode::Record(vec![(
-            "step".to_string(),
-            Expr::proj_index(0).with_ty(fun_ty(
-                Type::Tuple(vec![int.clone(), int.clone()]),
-                int.clone(),
-            )),
-        )]))
-        .with_ty(Type::Record(vec![(
-            "step".to_string(),
-            fun_ty(Type::Tuple(vec![int.clone(), int.clone()]), int.clone()),
-        )]));
-
-        let mut expr = Expr::loop_node(
-            vec!["acc".into()],
-            vec![Expr::lit(Lit::Int(0)).with_ty(int.clone())],
-            list_123().with_ty(list_ty.clone()),
-            body,
-        )
-        .with_ty(list_ty);
+        // A minimal induction store: one key, one writer whose body is a bare
+        // previous-accumulator read.  The exact body shape doesn't matter for
+        // this test — we only check the writer `source` gets iterate-wrapped.
+        let body = Expr::var("acc").with_ty(int.clone());
+        let store_ty = Type::Record(vec![(
+            "acc".to_string(),
+            fun_ty(Type::UIntRange(3), int.clone()),
+        )]);
+        let mut expr = Expr::new(TypedExprNode::Transact {
+            keys: vec![TransactKey {
+                name: "acc".into(),
+                init: Expr::lit(Lit::Int(0)).with_ty(int.clone()),
+            }],
+            writers: vec![TransactWriter {
+                read_keys: vec!["acc".into()],
+                write_keys: vec!["acc".into()],
+                source: list_123().with_ty(list_ty.clone()),
+                body,
+            }],
+            domain: Type::UIntRange(3),
+        })
+        .with_ty(store_ty);
 
         insert_iterate_recurse(&mut expr);
 
-        let TypedExprNode::Loop { source, .. } = &expr.node else {
-            panic!("expected Loop, got: {}", symbolic(&expr));
+        let TypedExprNode::Transact { writers, .. } = &expr.node else {
+            panic!("expected Transact, got: {}", symbolic(&expr));
         };
         assert!(
-            is_iterate_apply(chain_head(source)),
-            "Loop's source should be iterate-led, got: {}",
-            symbolic(source)
+            is_iterate_apply(chain_head(&writers[0].source)),
+            "Transact writer source should be iterate-led, got: {}",
+            symbolic(&writers[0].source)
         );
     }
 

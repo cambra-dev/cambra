@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bit_set::BitSet;
-use cambra::interpreter::{ColumnValue, Predicate, Tile};
+use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program, render_errors};
+use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile};
 use rstest_log::rstest;
 
 use crate::helpers::*;
@@ -14,7 +15,27 @@ use crate::helpers::*;
 #[timeout(Duration::from_secs(10))]
 #[case(
     r#"
-x = 0
+x := 0
+for i in [1, 2, 3]:
+    x += i
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![6]))
+)]
+// The `:=` operator marks mutability syntactically — a bare `x := 0` induction
+// accumulator (no `Mut[…]` annotation) written with `x := x + i`.
+#[case(
+    r#"
+x := 0
+for i in [1, 2, 3]:
+    x := x + i
+x"#,
+    Tile::Scalar(ColumnValue::Ints(vec![6]))
+)]
+// The accumulator's value type can be spelled concretely: `Mut[int]`
+// annotates the binding at `int` (checked against init and updates).
+#[case(
+    r#"
+x: Mut[int] := 0
 for i in [1, 2, 3]:
     x += i
 x"#,
@@ -22,7 +43,7 @@ x"#,
 )]
 #[case(
     r#"
-x = 0
+x := 0
 for i in []:
     x += 1
 x"#,
@@ -30,32 +51,32 @@ x"#,
 )]
 #[case(
     r#"
-x = 0
+x := 0
 for i in [1, 2, 3]:
-    x = x + i + 1
+    x := x + i + 1
 x"#,
     Tile::Scalar(ColumnValue::Ints(vec![9]))
 )]
 #[case(
     r#"
-x = 0
+x := 0
 o = defer()
 for i in [1, 2, 3]:
-    x = x + i
+    x := x + i
     o << x
 o"#,
     make_int_list(&[1,3,6])
 )]
 #[case(
     r#"
-x = 0
+x := 0
 o = defer()
 o << x
 for i in [1, 2, 3]:
-    x = x + i
+    x := x + i
     o << x
 for j in [4, 5]:
-    x = x + j
+    x := x + j
     o << x
 o"#,
     Tile::SealedFunction {
@@ -80,10 +101,10 @@ o"#,
 // — without it, op-conversion tries to const-lift a function-tiled value.
 #[case(
     r#"
-x = 0
+x := 0
 for i in [1, 2, 3]:
     y = x + 1
-    x = y * 2
+    x := y * 2
 x"#,
     Tile::Scalar(ColumnValue::Ints(vec![14]))
 )]
@@ -94,20 +115,20 @@ x"#,
 // stream.
 #[case(
     r#"
-x = 0
+x := 0
 for i in [1, 2, 3]:
     y = x + i
-    x = y * 2
+    x := y * 2
 x"#,
     Tile::Scalar(ColumnValue::Ints(vec![22]))
 )]
 #[case(
     r#"
-x = 1
-y = 0
+x := 1
+y := 0
 for i in [1, 2, 3]:
-    y = y + i
-    x = x * i
+    y := y + i
+    x := x * i
 (x, y, x + y)"#,
     Tile::Record(HashMap::from([
         ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![6]))),
@@ -121,12 +142,12 @@ for i in [1, 2, 3]:
 //   iter 2 (i=3): y=3+3=6, x=2*3=6, feed: 6+6=12
 #[case(
     r#"
-x = 1
-y = 0
+x := 1
+y := 0
 o = defer()
 for i in [1, 2, 3]:
-    y = y + i
-    x = x * i
+    y := y + i
+    x := x * i
     o << x + y
 o"#,
     make_int_list(&[2, 5, 12])
@@ -138,13 +159,13 @@ o"#,
 //   iter 2 (i=3): feed prev: 4+20=24; x=4+3=7, y=20*3=60
 #[case(
     r#"
-x = 1
-y = 10
+x := 1
+y := 10
 o = defer()
 for i in [1, 2, 3]:
     o << x + y
-    x = x + i
-    y = y * i
+    x := x + i
+    y := y * i
 o"#,
     make_int_list(&[11, 12, 24])
 )]
@@ -158,10 +179,10 @@ o"#,
 // The two feeds form variants 0 and 1 of the resulting union.
 #[case(
     r#"
-x = 0
+x := 0
 o = defer()
 for i in [1, 2, 3]:
-    x = x + i
+    x := x + i
     o << x
     o << x + 100
 o"#,
@@ -187,12 +208,12 @@ o"#,
 //   iter 2 (i=3): prev_x=3 → feed_pre=3; x=3+3=6; feed_post=6*10=60
 #[case(
     r#"
-x = 0
+x := 0
 o = defer()
 o << x
 for i in [1, 2, 3]:
     o << x
-    x = x + i
+    x := x + i
     o << x * 10
 o"#,
     Tile::SealedFunction {
@@ -209,28 +230,293 @@ o"#,
         deleted: BitSet::new(),
     }
 )]
+// Pass-by-reference `Mut` param, driven by a loop: `bump(c)` writes its
+// pass-by-ref store on each iteration. `bump(cnt)` inlines to `MutWrite(cnt,
+// cnt + 1)`, and the letrec phase reads the hidden write off the `For` marker
+// as an accumulator recurrence: 0 → 1 → 2 → 3 over [1, 2, 3].
+#[case(
+    r#"
+def bump(c: Mut[int]):
+    c += 1
+cnt: Mut[int] := 0
+for x in [1, 2, 3]:
+    bump(cnt)
+cnt"#,
+    Tile::Scalar(ColumnValue::Ints(vec![3]))
+)]
+// The same pass-by-ref writer applied once, outside any loop: the inlined
+// `MutWrite(cnt, cnt + 1)` normalizes to a shadowing `let`, so `cnt` reads 1.
+#[case(
+    r#"
+def bump(c: Mut[int]):
+    c += 1
+cnt: Mut[int] := 0
+bump(cnt)
+cnt"#,
+    Tile::Scalar(ColumnValue::Ints(vec![1]))
+)]
+// Two independent mutation loops of *different* domain lengths, both read in
+// one trailing expression. `a` accumulates over [0,1] (→ 2), `b` over [0,2]
+// (100 → 103). Regression: combining the two extracted finals must wait for
+// *both* loops to converge — the shorter loop (`a`) converging first must not
+// declare the whole result terminal and read `b` as an empty (→ 0) arm.
+#[case(
+    r#"
+a := 0
+b := 100
+for x in [1, 2]:
+    a += 1
+for x in [1, 2, 3]:
+    b += 1
+a * 1000 + b"#,
+    Tile::Scalar(ColumnValue::Ints(vec![2103]))
+)]
+// As above, but the longer loop reads the shorter loop's final store value:
+// `b += a` broadcasts `a` (= 2) across [0,2]: 100 → 102 → 104 → 106.
+// Broadcasting the not-yet-converged `a` must yield an empty (non-terminal)
+// contribution, not panic on a `repeat`-of-empty.
+#[case(
+    r#"
+a := 0
+b := 100
+for x in [1, 2]:
+    a += 1
+for x in [1, 2, 3]:
+    b += a
+a * 1000 + b"#,
+    Tile::Scalar(ColumnValue::Ints(vec![2106]))
+)]
+// A pass-by-ref writer whose body is *two* statements, applied once outside a
+// loop. Inlining splices `ExprStmt(ExprStmt(cnt := cnt+1, cnt := cnt+2), cnt)`;
+// flat-spine normalization un-nests it so both writes land on the spine.
+#[case(
+    r#"
+def bump2(c: Mut[int]):
+    c += 1
+    c += 2
+cnt: Mut[int] := 0
+bump2(cnt)
+cnt"#,
+    Tile::Scalar(ColumnValue::Ints(vec![3]))
+)]
+// A pass-by-ref writer applied in *value* position (`y = bump(cnt)`). Inlining
+// binds `y` to a bare `MutWrite`; flat-spine normalization hoists the write onto
+// the spine (its value is `unit`), so the store advance reaches the trailing read.
+#[case(
+    r#"
+def bump(c: Mut[int]):
+    c += 1
+cnt: Mut[int] := 0
+y = bump(cnt)
+cnt"#,
+    Tile::Scalar(ColumnValue::Ints(vec![1]))
+)]
+// A top-level store write followed by a read: the terminal-write path shadows
+// `cnt` so the read observes the advanced value.
+#[case(
+    r#"
+cnt := 0
+cnt += 1
+cnt"#,
+    Tile::Scalar(ColumnValue::Ints(vec![1]))
+)]
+// I1(b): a non-`Mut` annotated local (`y: int = …`) inside a mutation-loop
+// body lowers as an ordinary per-iteration annotated `let`, not rejected.
+// Per iter: y = 2·i; acc += y over [1,2,3] → 2+4+6 = 12.
+#[case(
+    r#"
+acc := 0
+for i in [1, 2, 3]:
+    y: int = i * 2
+    acc += y
+acc"#,
+    Tile::Scalar(ColumnValue::Ints(vec![12]))
+)]
 #[ignore] // TODO support nested loops with mutations.
 #[case(
     r#"
-x = 0
+x := 0
 for i in [1, 2]:
     for j in [10, 20]:
-        x = x + i + j
+        x := x + i + j
 x"#,
     Tile::Scalar(ColumnValue::Ints(vec![33]))
 )]
 #[ignore] // TODO support nested loops with mutations.
 #[case(
     r#"
-x = 0
+x := 0
 o = defer()
 for i in [1, 2]:
     for j in [10, 20]:
-        x = x + i + j
+        x := x + i + j
         o << x
 o"#,
     Tile::Scalar(ColumnValue::Strings(vec!["TODO".into()]))
 )]
 fn test_mutability(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Second-class `Mut` discipline (design doc, "No aliasing: `Mut` values are
+// second-class"). A mutable value must stay traceable to one introduction:
+// it may only be a bare variable reference (rule 1), never nested in a
+// composite type or returned from a function (rule 2), and an unannotated
+// binding may not have `Mut` type (rule 3).
+// ---------------------------------------------------------------------------
+
+/// Compile `code`, expect failure, and assert the rendered errors contain
+/// `needle`.
+fn expect_mut_discipline_error(code: &str, needle: &str) {
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let errs = match compile_program(&mut ctx, code, consumer) {
+        Ok(_) => panic!(
+            "expected a Mut-discipline error containing {needle:?}, but the program compiled"
+        ),
+        Err(e) => e,
+    };
+    let rendered = render_errors(&errs, "<mut-discipline-test>", code);
+    assert!(
+        rendered.contains(needle),
+        "expected a Mut-discipline error containing {needle:?}, got:\n{rendered}"
+    );
+}
+
+/// A `+=` (or `:=` write) to a plain `=` binding is rejected: writes require a
+/// mutable store, they never mean shadowing. Introduce the store with `:=`.
+#[test]
+fn augmented_assignment_to_non_store_rejected() {
+    expect_mut_discipline_error("x = 0\nx += 1\nx", "not a mutable store");
+}
+
+/// Rule 3: an unannotated copy of a store (`b = a`) aliases it — rejected, to
+/// force the author to disambiguate a value copy (`b: int = a`) from seeding a
+/// new store (`b: Mut[int] := a`).
+#[test]
+fn rule3_unannotated_mut_alias_is_rejected() {
+    expect_mut_discipline_error("a := 0\nb = a\nb", "not annotated `Mut`");
+}
+
+/// Rule 2: a function may not return a `Mut` — the store reference would
+/// escape where its writer set is no longer statically known.
+#[test]
+fn rule2_function_returning_mut_is_rejected() {
+    expect_mut_discipline_error("x := 0\nf = lambda z: x\nf", "inside a composite type");
+}
+
+/// Rule 1: a `Mut` value must be a bare variable reference, so a conditional
+/// selecting between two stores (which store does the result alias?) is
+/// rejected.
+#[test]
+fn rule1_computed_mut_is_rejected() {
+    expect_mut_discipline_error(
+        "x := 0\ny := 1\nx if True else y",
+        "bare variable reference",
+    );
+}
+
+/// The dual of rule 2's tuple rejection: a tuple of *bare store reads* is a
+/// tuple of their **values** (reads deref in composite positions), so its
+/// type is `(int, int)` with no `Mut` nested — it compiles cleanly. (`case_09`
+/// exercises the running result end-to-end; this pins that the discipline pass
+/// itself does not reject it.)
+#[test]
+fn tuple_of_mut_reads_compiles_as_values() {
+    let code = "x := 1\ny := 0\nfor i in [1, 2, 3]:\n    y := y + i\n    x := x * i\n(x, y)";
+    let mut ctx = GlobalContext::default();
+    compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<tuple-mut-reads>", code);
+}
+
+/// A top-level store write as the program's *final* statement — no trailing
+/// read. Flat-spine normalization terminalizes the bare `MutWrite` to
+/// `ExprStmt(MutWrite, unit)`, so the program is `Unit`-valued (the store's
+/// final state is simply unobserved) and compiles rather than tripping the
+/// strict-typecheck wall the raw bare-final write used to hit.
+#[test]
+fn final_store_write_with_no_read_compiles_as_unit() {
+    let code = "cnt := 0\ncnt += 1";
+    let mut ctx = GlobalContext::default();
+    compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<final-store-write>", code);
+}
+
+/// I1(a): a `Mut[…]` accumulator loop as the program's *final* statement, with
+/// no trailing read, is a valid mutation loop — `lower_final_stmt` now mirrors
+/// `lower_middle_stmt`'s mutation-loop dispatch (continuation `Unit`) instead
+/// of routing to the generator-for fallback, whose "must end in a yield/feed"
+/// rejection produced a confusing error here. The loop's final value is simply
+/// unobserved (`Unit`), so the program compiles.
+#[test]
+fn final_mutation_loop_with_no_read_compiles_as_unit() {
+    let code = "total := 0\nfor i in [1, 2, 3]:\n    total += i";
+    let mut ctx = GlobalContext::default();
+    compile_program(&mut ctx, code, Box::new(|| {}))
+        .unwrap_or_render("<final-mutation-loop>", code);
+}
+
+// ===== Bottom-PR review regressions: Mut scoping / guards =====
+#[test]
+fn mut_registry_does_not_leak_into_a_shadowing_param() {
+    check_scalar(
+        "n: Mut[int] := 0\ndef h(n: int):\n    n = n + 1\n    n\nh(10)",
+        cambra::interpreter::Value::Int(11),
+    );
+}
+#[test]
+fn mut_collection_as_for_source_derefs() {
+    check_scalar(
+        "xs := [1, 2, 3]\ntotal := 0\nfor i in xs:\n    total := total + i\ntotal",
+        cambra::interpreter::Value::Int(6),
+    );
+}
+// Multi-parameter pass-by-reference: a `Mut` parameter alongside a plain one is
+// curried into a chain of named lambdas (a `Mut` param must stay a named binder
+// so inlining renames its `MutWrite` target to the caller's store) and inlined
+// at the call site. The plain parameter rides the same call.
+#[test]
+fn multi_param_pass_by_ref_assign_works() {
+    check_scalar(
+        "def add_to(c: Mut[int], amt: int):\n    c := c + amt\ncnt: Mut[int] := 0\nadd_to(cnt, 5)\ncnt",
+        cambra::interpreter::Value::Int(5),
+    );
+}
+#[test]
+fn multi_param_pass_by_ref_augassign_works() {
+    check_scalar(
+        "def f(c: Mut[int], d: int):\n    c += d\ncnt: Mut[int] := 0\nf(cnt, 7)\ncnt",
+        cambra::interpreter::Value::Int(7),
+    );
+}
+#[test]
+fn mut_arg_must_be_a_store_not_a_plain_value() {
+    expect_mut_discipline_error(
+        "x = 7\ndef bump(c: Mut[int]):\n    c := c + 1\nbump(x)\nx",
+        "mutable variable",
+    );
+}
+#[test]
+fn single_param_pass_by_ref_still_works() {
+    check_scalar(
+        "cnt: Mut[int] := 0\ndef bump(c: Mut[int]):\n    c := c + 1\nbump(cnt)\ncnt",
+        cambra::interpreter::Value::Int(1),
+    );
+}
+#[test]
+fn wildcard_annotated_mut_alias_rejected() {
+    expect_mut_discipline_error("a: Mut[int] := 0\nb: _ = a\nb", "not annotated `Mut`");
+}
+#[test]
+fn typed_deref_copy_of_mut_still_works() {
+    check_scalar(
+        "a: Mut[int] := 5\nb: int = a\nb",
+        cambra::interpreter::Value::Int(5),
+    );
+}
+#[test]
+fn genuine_store_still_accumulates() {
+    check_scalar(
+        "x: Mut[int] := 0\nfor i in [1, 2, 3]:\n    x += i\nx",
+        cambra::interpreter::Value::Int(6),
+    );
 }

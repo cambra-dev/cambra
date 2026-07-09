@@ -152,7 +152,7 @@ impl TileGuard {
             (TileGuard::Aggregation(_), Tiling::Aggregation { .. }) => true,
 
             // SealedFunction tilings can have domain guards which are always allowed, or
-            // codomain guards which match their codomain tiling
+            // codomain guards which match their codomain tiling.
             (
                 TileGuard::Function(FunctionGuard::Domain(pred)),
                 Tiling::SealedFunction { domain, .. },

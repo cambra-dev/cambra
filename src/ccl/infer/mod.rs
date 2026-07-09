@@ -73,15 +73,18 @@ mod api;
 mod check;
 mod context;
 mod emit;
+mod retype;
 mod schemes;
 mod solve;
 pub mod solver;
 mod typing;
 
-// Public surface (consumed by `crate::ccl::infer`): the two entry points and
-// the operator-scheme registry.
+// Public surface (consumed by `crate::ccl::infer` and — for the post-desugar
+// type synthesis — `crate::ccl::desugar_defers`): the entry points, the check
+// and retype passes, and the operator-scheme registry.
 pub use api::*;
 pub use check::check;
+pub use retype::{has_type_residue, retype};
 pub use schemes::OperatorSchemes;
 
 use std::collections::{BTreeMap, HashMap};
@@ -165,6 +168,11 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             ctx: format!("{ctx_label} (variant tag .{tag} not accepted)"),
             type_a: coalesce_for_error(&in_type),
             type_b: Type::Hole,
+        },
+        ConstrainError::NotAFeed { found, required } => InferError::TypeMismatch {
+            ctx: format!("{ctx_label} (a feed handle is required here, but the value is not one)"),
+            type_a: coalesce_for_error(&found),
+            type_b: coalesce_for_error(&required),
         },
     }
 }

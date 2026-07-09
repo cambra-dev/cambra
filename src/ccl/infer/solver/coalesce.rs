@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ccl::{InferVar, InferVarId, Type};
+use crate::ccl::{HistoryKind, InferVar, InferVarId, Type};
 
 use super::compact::{CompactGraph, CompactType};
 use crate::ccl::FieldKey;
@@ -95,6 +95,16 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
 }
 
 fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, CoalesceError> {
+    // Transparent read at joins: a feed handle meeting *non-feed*
+    // contributions at one position is being read — `x + 1` joins x's
+    // payload with `Int` through a shared join variable, so the handle
+    // dissolves into its payload before the contribution count below
+    // (otherwise `feed(Int)` and `Int` would spuriously collide). A feed
+    // handle alone at a position keeps its constructor; so do two handles
+    // meeting (their `history_slot`s merged upstream). This is the
+    // join-variable counterpart of `constrain_go`'s direct feed read-through
+    // rule (a feed history `<: T` reads through to its stream `domain ⇒ value`).
+    let ct = &dissolve_read_feeds(ct.clone(), polarity);
     // Count concrete (non-variable) contributions to pick the output
     // type. With multiple distinct contributions, we would need
     // a Union/Intersection — we error instead.
@@ -121,6 +131,16 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
             name: kept_name,
             domain: Box::new(d),
             codomain: Box::new(c),
+        });
+    }
+    if let Some((value, domain, kind)) = &ct.history_slot {
+        // Both children materialize at the same polarity (invariant — both
+        // directions were resolved at constraint time). The `kind` rides through
+        // from compaction so a feed rebuilds as a feed, a store as a store.
+        shapes.push(Type::History {
+            value: Box::new(coalesce_compact_go(value, polarity)?),
+            domain: Box::new(coalesce_compact_go(domain, polarity)?),
+            kind: *kind,
         });
     }
 
@@ -161,6 +181,36 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         .iter()
         .fold(inner, |acc, r| Type::Refinement(Box::new(acc), r.clone()));
     Ok(out)
+}
+
+/// Dissolve a position's feed `history_slot` into its other contributions when
+/// both are present — see the transparent-read comment in [`coalesce_compact_go`].
+/// Loops because a dissolved payload may itself carry a feed handle alongside
+/// other content (a chained defer read through a join).
+fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
+    while let Some((value, domain, kind)) = ct.history_slot.take() {
+        // Only a *feed channel* dissolves into a read view; a store is read as
+        // its scalar value, never merged into the surrounding type.
+        if kind != HistoryKind::Feed {
+            ct.history_slot = Some((value, domain, kind));
+            break;
+        }
+        let has_other =
+            !ct.atoms.is_empty() || ct.rec.is_some() || ct.var.is_some() || ct.fun.is_some();
+        if !has_other {
+            ct.history_slot = Some((value, domain, kind));
+            break;
+        }
+        // The channel is the `domain ⇒ value` function; reconstruct it as a
+        // `fun`-slot CompactType (exactly what the old single-payload slot held)
+        // and merge it into the read view.
+        let chan = CompactType {
+            fun: Some((None, domain, value)),
+            ..Default::default()
+        };
+        ct = CompactType::merge(polarity, ct, chan);
+    }
+    ct
 }
 
 /// Materialize a variant-tag map into [`Type::Variant`], preserving tag

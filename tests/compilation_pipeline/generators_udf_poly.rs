@@ -61,20 +61,11 @@ fn test_function_def_polymorphic_used_at_two_types() {
     "def add_to(xs, n):\n    for x in xs:\n        yield x + n\nadd_to([1, 2, 3], 10)",
     make_int_list(&[11, 12, 13])
 )]
-// Filter via if-guard.
-//
-// **Currently ignored** — Short version: in the return-value
-// desugar design, the function body's filter-feed pattern attaches a
-// `Refinement` to the source's `user_annotation`; after inference the
-// refinement lands on the cluster binding's *type*, but the
-// value-expression at the binding (a `Record` projection) doesn't
-// carry the refinement on its own `expr.ty`.
-// `planning::insert_iterate_markers` only reads the refinement from
-// the value-expression's type when deciding what predicate to feed
-// into `Apply(p, Iterate)`, so the filter never lands in an iterate
-// marker — the program currently produces `[-1, 2, -3, 4]` instead of
-// the expected `[2, 4]`.
-#[ignore]
+// Filter via if-guard. The generator body's filter-feed lowers to a
+// refined-source channel whose domain carries the bare element predicate
+// `__elem ▷ source ▷ (λ x → x > n)` (the same form a filtered comprehension
+// builds), so planning reifies it into an `IterateExtent` + `Restrict` and
+// only guard-passing elements are yielded.
 #[case(
     r#"
 def positives(xs):
@@ -104,7 +95,7 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
 #[case(
     r#"
 def running_totals(items):
-    total = 0
+    total := 0
     for item in items:
         total += item
         yield total

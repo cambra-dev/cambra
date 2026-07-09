@@ -54,6 +54,14 @@ fn zip_arithmetic<T: Copy + AddAssign<T> + SubAssign<T> + MulAssign<T> + DivAssi
     mut l: Vec<T>,
     r: &[T],
 ) -> Vec<T> {
+    // Combine only co-present positions — element-wise over the common
+    // prefix, `min(l.len(), r.len())`. `zip` already stops at the shorter
+    // side, but it leaves a *longer* `l`'s tail untouched and returns it, so
+    // without this truncate `l op r` with `r` shorter would emit `l`'s surplus
+    // verbatim. That misfires when `r` is a value that has not yet converged
+    // (e.g. a sibling induction loop's still-empty final read): the result
+    // would fabricate `l`'s tail and read as terminal instead of waiting.
+    l.truncate(r.len());
     match op {
         ArithmeticKind::Add => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a += *b),
         ArithmeticKind::Sub => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a -= *b),

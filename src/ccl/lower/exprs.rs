@@ -116,7 +116,24 @@ pub(super) fn lower_call(
                     format!("unknown zero-argument function: {name}; register it as a data source"),
                 ));
             }
-            // Single-arg call: direct application `f(a)` → `Apply(a, f)`.
+            // A `def` with a pass-by-reference `Mut` parameter is lowered
+            // curried (named lambdas), so its call is a curried application:
+            // `f(a, b, c)` → `c ▷ (b ▷ (a ▷ f))` (forward-apply, outermost
+            // parameter first). Beta-reduction on inlining then substitutes each
+            // argument variable into the named parameter — the route by which a
+            // `MutWrite` to a `Mut` parameter lands on the caller's store.
+            if ctx.is_mut_param_fn(name) {
+                let mut acc = Expr::var(name.to_string());
+                for arg in args {
+                    acc = Expr::apply(lower_call_arg(arg, ctx)?, acc);
+                }
+                return Ok(acc);
+            }
+            // Single-arg call: direct application `f(a)` → `Apply(a, f)`. The
+            // argument is an ordinary value, so it lowers through `lower_expr` —
+            // where the out-of-block transactional read gate applies. (Only a
+            // `Mut`-param callee, handled above, accepts a bare register pass and
+            // bypasses the gate.)
             if args.len() == 1 {
                 let arg = lower_expr(&args[0], ctx)?;
                 return Ok(Expr::apply(arg, Expr::var(name.to_string())));
@@ -125,11 +142,32 @@ pub(super) fn lower_call(
             // `f(a, b, ...)` → `Apply(Tuple([a, b, ...]), f)`. This pairs with
             // the uncurried multi-arg lambda lowering in [`lower_lambda`] so
             // that syntactic multi-arg functions compile without any `curry`
-            // combinator appearing in the tree.
+            // combinator appearing in the tree. Arguments lower through the gated
+            // `lower_expr` for the same reason as the single-arg case.
             let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
             let arg_tuple = Expr::tuple(tupled?);
             Ok(Expr::apply(arg_tuple, Expr::var(name.to_string())))
         }
+    }
+}
+
+/// Lower a user-function call argument. A **bare variable** argument is the only
+/// shape a pass-by-reference `Mut` parameter accepts (design doc
+/// `src/ccl/design/mutability.md`, rule 1: "a `Mut`-typed value must be a bare
+/// variable reference"), so it is lowered directly to a `Var`. Whether it is a
+/// by-reference store pass (e.g. `bump(cnt)` for `cnt: Mut[Int]`) or an ordinary
+/// value read is decided downstream by the callee's inferred parameter type;
+/// lowering cannot know the signature (it runs before inference). A non-bare
+/// argument is a computed value expression and lowers through
+/// [`super::lower_expr`].
+fn lower_call_arg(
+    arg: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    if let ChlExpr::Name(id) = &arg.node {
+        Ok(Expr::var(id.as_str().to_string()))
+    } else {
+        lower_expr(arg, ctx)
     }
 }
 

@@ -679,36 +679,30 @@ fn elim_lambda_impl(
         }
 
         // `Defer`, `Feed`, `Define`, and `ExprStmt` are eliminated by
-        // `desugar_defers` before inference; by the time `lambda_elim`
-        // runs they cannot appear.
+        // `desugar_defers`, which runs before lambda-elim; by the time
+        // `lambda_elim` runs they cannot appear.
         TypedExprNode::Feed { .. }
         | TypedExprNode::Define { .. }
         | TypedExprNode::Defer
         | TypedExprNode::ExprStmt { .. } => {
-            unreachable!("Defer/Feed/Define/ExprStmt eliminated by desugar_defers before inference")
+            unreachable!(
+                "Defer/Feed/Define/ExprStmt eliminated by desugar_defers, which runs before lambda-elim"
+            )
         }
 
-        // Loop: eliminate `param` from sub-expressions, respecting shadowing
-        // by the Loop's own params.  The mutation-loop-shaped Loop produced
-        // by [`crate::ccl::lower::lower_mutation_loop`] uses `Compose` and
-        // `Lambda` inside its `loop_body`; standard recursion handles those.
-        // `init_args` and `source` sit outside the loop's param scope and
-        // are always recursed into via `walk_loop_children`.
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
+        // Transact: point-free each key `init` and each writer `source`/`body`
+        // w.r.t. `param` (the free-param case — a `param`-free store is
+        // const-wrapped above). Store keys are labels, never `param`; each
+        // writer body is a `Lambda` whose own binder shadows via its arm.
+        TypedExprNode::Transact {
+            keys,
+            writers,
+            domain,
         } => Ok(TypedExpr {
             ty: result_ty,
-            node: crate::ccl::try_walk_loop_children(
-                params,
-                init_args,
-                source,
-                loop_body,
-                Some(param),
-                |e| elim_lambda(ctx, param, param_ty, e),
-            )?,
+            node: crate::ccl::try_walk_transact(keys, writers, domain, |e| {
+                elim_lambda(ctx, param, param_ty, e)
+            })?,
             user_annotation: None,
         }),
 

@@ -20,7 +20,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type};
+use crate::ccl::{Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
 
 use super::type_level;
 use crate::ccl::FieldKey;
@@ -63,6 +63,17 @@ pub enum ConstrainError {
         tag: FieldKey,
         /// The rhs variant that should have accepted the tag.
         in_type: Type,
+    },
+    /// A non-feed type flowed into a [`Type::History`] requirement — e.g.
+    /// a plain value passed to a function that feeds its parameter. The
+    /// reverse direction is fine (a feed handle is transparently readable
+    /// as its payload); only the write capability cannot be conjured from
+    /// a plain value.
+    NotAFeed {
+        /// The non-feed type that was required to be a feed handle.
+        found: Type,
+        /// The feed type demanded.
+        required: Type,
     },
 }
 
@@ -338,6 +349,53 @@ fn constrain_go(
             Ok(())
         }
 
+        // A mutable handle is invariant in BOTH value and domain: a `Mut`
+        // parameter both reads its value (covariant) and writes it
+        // (contravariant), so the values equate; and the domain must equate so a
+        // `Mut` param's fresh per-call domain resolves to the argument store's
+        // domain (pass-by-reference — the two-way edge is what carries the
+        // resolution back to the caller). Value/domain edges run under *identity*
+        // like a `Feed` payload: a `Mut`'s value and domain are plain types, not
+        // content in a Pi binder's scope, so discharges accumulated on the way to
+        // the handle do not transport in.
+        // Two histories of the **same kind** equate invariantly in both value
+        // and domain (a store param reads *and* writes; a feed handle both feeds
+        // and is read). A cross-kind pair (a store demanded as a feed, or vice
+        // versa) is *not* matched here: it falls through to the deref arms below,
+        // where a store demanded as a feed lands in `NotAFeed` — the type-level
+        // guardrail that `<<` targets a `defer` channel, not a `:=` store.
+        (
+            Type::History {
+                value: v0,
+                domain: d0,
+                kind: k0,
+            },
+            Type::History {
+                value: v1,
+                domain: d1,
+                kind: k1,
+            },
+        ) if k0 == k1 => {
+            constrain_go(v0, v1, &Subst::id(), &Subst::id(), cache)?;
+            constrain_go(v1, v0, &Subst::id(), &Subst::id(), cache)?;
+            constrain_go(d0, d1, &Subst::id(), &Subst::id(), cache)?;
+            constrain_go(d1, d0, &Subst::id(), &Subst::id(), cache)
+        }
+        // Implicit deref (read): a `Mut` handle meeting any non-`Mut` demand —
+        // concrete OR an inference variable — reads its value. This MUST precede
+        // the `Infer` arms below: `+`/`<` etc. are polymorphic (`∀α. α → α → α`),
+        // so `cnt + 1` emits `Mut[Int, D] <: ?α`; dereffing here flows `Int` onto
+        // `?α`, whereas the `(_, Infer)` arm would record the handle itself as a
+        // lower bound and coalesce `?α` to a `Mut`.
+        (
+            Type::History {
+                value,
+                kind: HistoryKind::Store,
+                ..
+            },
+            _,
+        ) => constrain_go(value, rhs, sl, sr, cache),
+
         // Variable on lhs, rhs has compatible level: record the upper edge in
         // native form (`V‹sl› <: rhs‹sr›`, no inversion), then close each
         // existing lower (`low.ty‹low.ty_subst› <: V‹low.self_subst›`) against
@@ -401,6 +459,97 @@ fn constrain_go(
             let new_lhs = extrude(lhs, true, rv.level, &mut ExtrudeCache::new());
             constrain_go(&new_lhs, rhs, sl, sr, cache)
         }
+
+        // Feed handles are invariant in the payload: feeding writes into
+        // the channel (contravariant capability) while reading consumes it
+        // (covariant), so a feed handle meeting a feed handle equates the
+        // payloads. The bidirectional edge is what carries a feed
+        // contribution made through a function parameter back to the
+        // caller's channel — with a one-way edge the callee's contribution
+        // would land on the parameter variable and never reach the
+        // argument's payload.
+        // The payload edges run under *identity* morphisms: a feed handle's
+        // payload is the channel's plain value type, not content living
+        // inside a Pi binder's scope, so apply-site discharges accumulated
+        // on the way to the handle do not transport into it. (They also
+        // must not: the invariant two-way edge would make two distinct
+        // discharges meet at one payload variable — the non-invertible
+        // bridge corner — for ordinary chained defer functions. The cost is
+        // that a binder-dependent refinement *inside* a fed value's type is
+        // not discharged across the handle — out of scope alongside the
+        // filter-feed-through-UDF gaps in design/desugar-defers.md.)
+        // Transparent read: a non-store consumer of a feed channel consumes its
+        // whole stream `domain ⇒ value` (`sum(d)`, `d + 1`, a `x <<= y` chain
+        // feeding one defer from another). Unlike a store (dereffed to its scalar
+        // `value` above), a feed reads as the reconstructed channel function.
+        (
+            Type::History {
+                value,
+                domain,
+                kind: HistoryKind::Feed,
+            },
+            _,
+        ) => {
+            let chan = Type::Fun {
+                name: None,
+                domain: domain.clone(),
+                codomain: value.clone(),
+            };
+            constrain_go(&chan, rhs, sl, sr, cache)
+        }
+        // A *channel-shaped* lhs meeting a feed requirement is the read view of
+        // that handle: a use position that both held the handle and was read
+        // coalesces to the bare channel, and monomorphization's two-way pin then
+        // meets that view against the definition's feed channel. Align it with
+        // the reconstructed channel function. Structural validation of *genuine*
+        // misuse (feeding a plain collection) still lands in desugar's checks.
+        (
+            Type::Fun { .. },
+            Type::History {
+                value,
+                domain,
+                kind: HistoryKind::Feed,
+            },
+        ) => {
+            let chan = Type::Fun {
+                name: None,
+                domain: domain.clone(),
+                codomain: value.clone(),
+            };
+            constrain_go(lhs, &chan, sl, sr, cache)
+        }
+        // Any other plain value can never satisfy a feed requirement: reading is
+        // transparent, but the write capability cannot be conjured (`g(5)` where
+        // `g` feeds its parameter, or a `<<` targeting a `:=` store — which the
+        // store deref above reduced to `(value, feed)` landing here).
+        (
+            _,
+            Type::History {
+                kind: HistoryKind::Feed,
+                ..
+            },
+        ) => Err(ConstrainError::NotAFeed {
+            found: lhs.clone(),
+            required: rhs.clone(),
+        }),
+
+        // A non-`Mut` value meeting a `Mut` demand: deref the demand to its
+        // value. `x: Int = cnt` copies the current value; `MutWrite`
+        // reconciliation flows a written value into the store's value. Unlike a
+        // feed (where the write capability can't be conjured), a `Mut` demand is
+        // satisfied structurally by its value here, and the *second-class
+        // discipline check* — not the solver — is what rejects passing a
+        // non-variable (`bump(5)`, `bump(a + b)`) to a `Mut` parameter. (A
+        // `Mut`-lhs was already dereffed above; an `Infer`-lhs recorded the `Mut`
+        // as an upper bound — the `Mut`-param-via-variable case.)
+        (
+            _,
+            Type::History {
+                value,
+                kind: HistoryKind::Store,
+                ..
+            },
+        ) => constrain_go(lhs, value, sl, sr, cache),
 
         // Refinement subtyping:
         //   {b₁ | S₁} <: {b₂ | S₂}  iff  b₁ <: b₂  and  σ(S₂) ⊆ σ(S₁) ∪ witnesses(b₁)
@@ -547,6 +696,18 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             Box::new(extrude(inner, pol, target_level, cache)),
             r.clone(),
         ),
+        // Invariant payload: polarity is meaningless under invariance, so
+        // both children are extruded with two-way proxies (a history is read
+        // *and* written) instead of the polar one-way approximation below.
+        Type::History {
+            value,
+            domain,
+            kind,
+        } => Type::History {
+            value: Box::new(extrude_invariant(value, target_level, cache)),
+            domain: Box::new(extrude_invariant(domain, target_level, cache)),
+            kind: *kind,
+        },
         Type::Infer(tv) => {
             if let Some(existing) = cache.get(&(tv.uid, pol)) {
                 return Type::Infer(Rc::clone(existing));
@@ -599,6 +760,125 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 nvs.bounds.borrow_mut().upper = new_ups;
             }
             Type::Infer(nvs)
+        }
+    }
+}
+
+/// Extrusion for an *invariant* position — a [`Type::History`] payload.
+///
+/// The polar extrusion above approximates a variable one-directionally
+/// (positive keeps lower bounds, negative keeps upper). Under invariance the
+/// proxy must track the original in **both** directions, so every variable
+/// gets a single fresh proxy at the target level linked to the original by
+/// both a lower and an upper bound. The standard lower×upper closure in
+/// `constrain_go` then keeps the pair equated: every future bound recorded
+/// on the original closes against the proxy edge and lands on the proxy
+/// (and vice versa for reads through the original), so neither side's
+/// constraints are lost. Structural recursion does not flip polarity —
+/// equality is symmetric in every position.
+fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -> Type {
+    if type_level(ty) <= target_level {
+        return ty.clone();
+    }
+    match ty {
+        Type::Infer(tv) => {
+            // The proxy is polarity-agnostic and must be linked to the original
+            // in BOTH directions. Two cache states can precede us:
+            //
+            //  * A prior *invariant* extrusion of this variable registered one
+            //    two-way proxy under both keys — reuse it wholesale.
+            //  * A prior *polar* extrusion (`extrude` above) minted a proxy
+            //    under a single key with only *one* bound link. Reusing that
+            //    proxy naively — as this branch used to — would hand the
+            //    invariant position a one-way proxy, silently dropping the
+            //    other bound direction across the level boundary. Instead,
+            //    reuse the proxy (it is the same original variable) but add the
+            //    link the polar extrusion omitted, upgrading it to two-way.
+            let cached_pos = cache.get(&(tv.uid, true)).cloned();
+            let cached_neg = cache.get(&(tv.uid, false)).cloned();
+            if let (Some(p), Some(n)) = (&cached_pos, &cached_neg)
+                && Rc::ptr_eq(p, n)
+            {
+                // Already two-way (a prior invariant extrusion).
+                return Type::Infer(Rc::clone(p));
+            }
+
+            // Reuse a one-way polar proxy if present (prefer the positive-key
+            // one; either is the same original variable), else mint fresh.
+            let nvs = cached_pos
+                .clone()
+                .or_else(|| cached_neg.clone())
+                .unwrap_or_else(|| InferVar::fresh(target_level));
+            // Which bound links does the reused proxy already carry? A polar
+            // proxy under the `true` key has the positive link (`tv <: proxy`);
+            // under the `false` key, the negative link (`proxy <: tv`). A fresh
+            // proxy has neither.
+            let has_pos_link = cached_pos.as_ref().is_some_and(|p| Rc::ptr_eq(p, &nvs));
+            let has_neg_link = cached_neg.as_ref().is_some_and(|n| Rc::ptr_eq(n, &nvs));
+            cache.insert((tv.uid, true), Rc::clone(&nvs));
+            cache.insert((tv.uid, false), Rc::clone(&nvs));
+
+            // Snapshot the original's bounds, excluding any edge that already
+            // points at this proxy (a polar extrusion pushed one such link into
+            // `tv`); re-seeding from it would create a spurious `proxy <: proxy`
+            // self-edge.
+            let (lows, ups) = {
+                let s = tv.bounds.borrow();
+                let not_proxy = |b: &Bound| !matches!(&b.ty, Type::Infer(v) if v.uid == nvs.uid);
+                (
+                    s.lower
+                        .iter()
+                        .filter(|b| not_proxy(b))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    s.upper
+                        .iter()
+                        .filter(|b| not_proxy(b))
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            };
+            // Positive link: `tv <: proxy`; proxy inherits `tv`'s lower bounds.
+            if !has_pos_link {
+                tv.bounds
+                    .borrow_mut()
+                    .upper
+                    .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
+                let new_lows: Vec<_> = lows
+                    .iter()
+                    .map(|b| Bound {
+                        self_subst: b.self_subst.clone(),
+                        ty: extrude(&b.ty, true, target_level, cache),
+                        ty_subst: b.ty_subst.clone(),
+                    })
+                    .collect();
+                nvs.bounds.borrow_mut().lower.extend(new_lows);
+            }
+            // Negative link: `proxy <: tv`; proxy inherits `tv`'s upper bounds.
+            if !has_neg_link {
+                tv.bounds
+                    .borrow_mut()
+                    .lower
+                    .push(Bound::conc(Type::Infer(Rc::clone(&nvs))));
+                let new_ups: Vec<_> = ups
+                    .iter()
+                    .map(|b| Bound {
+                        self_subst: b.self_subst.clone(),
+                        ty: extrude(&b.ty, false, target_level, cache),
+                        ty_subst: b.ty_subst.clone(),
+                    })
+                    .collect();
+                nvs.bounds.borrow_mut().upper.extend(new_ups);
+            }
+            Type::Infer(nvs)
+        }
+        // Every structural position under an invariant constructor is
+        // itself invariant; refinement predicates are not walked (same as
+        // the polar extrusion).
+        _ => {
+            let mut out = ty.clone();
+            out.walk_children_mut(|t| *t = extrude_invariant(t, target_level, cache));
+            out
         }
     }
 }
@@ -990,6 +1270,302 @@ mod tests {
         let concrete_bad = variant([("A", prim(BaseType::Int)), ("B", prim(BaseType::String))]);
         constrain_subtype(&concrete_bad, &v2, &mut cache2)
             .expect_err("[A, B] must not flow into v whose upper is [A]");
+    }
+
+    // --- Feed handles (`Type::History { kind: Feed }`) ---
+
+    /// A feed history over `domain ⇒ value`. Its read view is the whole
+    /// stream `Fun { domain, value }` (unlike a `Store`, which derefs to the
+    /// scalar `value`); the invariant `constrain` arms treat it as that `Fun`.
+    fn feed_ty(domain: Type, value: Type) -> Type {
+        Type::History {
+            value: Box::new(value),
+            domain: Box::new(domain),
+            kind: HistoryKind::Feed,
+        }
+    }
+
+    #[test]
+    fn feed_meets_feed_invariantly() {
+        // feed(D, a) <: feed(D, b) equates value and domain: a contribution
+        // that later lands on b (the function-parameter side) must reach a (the
+        // caller's argument) — and an incompatible read off a must then fail.
+        let a = fresh_var(0);
+        let b = fresh_var(0);
+        let d = fresh_var(0);
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(
+            &feed_ty(d.clone(), a.clone()),
+            &feed_ty(d.clone(), b.clone()),
+            &mut cache,
+        )
+        .unwrap();
+        // The callee feeds an Int into its parameter's value.
+        constrain_subtype(&prim(BaseType::Int), &b, &mut cache).unwrap();
+        // Reading the caller's value as a String must now fail: the Int
+        // contribution flowed backwards through the invariant edge.
+        assert!(matches!(
+            constrain_subtype(&a, &prim(BaseType::String), &mut cache),
+            Err(ConstrainError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn feed_reads_transparently_as_stream() {
+        // feed(D, Int) <: (D ⇒ Int) — a non-feed consumer reads the whole
+        // stream…
+        let d = Type::UIntRange(3);
+        let mut cache = ConstrainCache::new();
+        assert!(
+            constrain_subtype(
+                &feed_ty(d.clone(), prim(BaseType::Int)),
+                &fun(d.clone(), prim(BaseType::Int)),
+                &mut cache
+            )
+            .is_ok()
+        );
+        // …but the stream's value still has to match the consumer.
+        let mut cache = ConstrainCache::new();
+        assert!(matches!(
+            constrain_subtype(
+                &feed_ty(d.clone(), prim(BaseType::Int)),
+                &fun(d, prim(BaseType::String)),
+                &mut cache
+            ),
+            Err(ConstrainError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn plain_value_is_not_a_feed() {
+        // Int </: feed(D, Int) — reading a feed handle is transparent, but the
+        // write capability cannot be conjured from a plain (non-stream) value.
+        // A `Fun` LHS aligns into the feed (that is how `x << stream` works);
+        // only a scalar hits the `NotAFeed` arm.
+        let mut cache = ConstrainCache::new();
+        assert!(matches!(
+            constrain_subtype(
+                &prim(BaseType::Int),
+                &feed_ty(Type::UIntRange(3), prim(BaseType::Int)),
+                &mut cache
+            ),
+            Err(ConstrainError::NotAFeed { .. })
+        ));
+    }
+
+    #[test]
+    fn feed_in_var_bounds_discharges_through_read() {
+        // `x << y` chains feed(D, ρ_y) as a lower bound of ρ_x; a later read
+        // `ρ_x <: (D ⇒ Int)` must discharge through the feed handle
+        // transparently.
+        let d = Type::UIntRange(3);
+        let x = fresh_var(0);
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&feed_ty(d.clone(), prim(BaseType::Int)), &x, &mut cache).unwrap();
+        assert!(constrain_subtype(&x, &fun(d, prim(BaseType::Int)), &mut cache).is_ok());
+    }
+
+    #[test]
+    fn feed_var_coalesces_to_feed() {
+        // A var bounded by feed(D, Int) coalesces carrying the Feed
+        // constructor (the `history_slot` survives compact → simplify →
+        // coalesce). Contrast `mut_derefs_at_a_variable_not_the_handle`, where
+        // the deref arm collapses a `Store` var to its bare value.
+        use crate::ccl::infer::solver::simplify_type;
+        let v = fresh_var(0);
+        let h = feed_ty(Type::UIntRange(3), prim(BaseType::Int));
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&h, &v, &mut cache).unwrap();
+        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
+        assert_eq!(out, h);
+    }
+
+    #[test]
+    fn feed_payload_level_and_freshen() {
+        // `type_level` sees through the value; freshening a quantified value
+        // var mints a fresh one (freshening is polarity-free).
+        use crate::ccl::infer::solver::{FreshenCache, FreshenLevel, freshen_above};
+        let v1 = fresh_var(1);
+        let h = feed_ty(Type::UIntRange(3), v1.clone());
+        assert_eq!(type_level(&h), 1);
+        let inst = freshen_above(0, &h, FreshenLevel::At(0), &mut FreshenCache::new());
+        assert_eq!(type_level(&inst), 0);
+        let Type::History { value, .. } = &inst else {
+            panic!("freshen changed the constructor: {inst}");
+        };
+        let (Type::Infer(orig), Type::Infer(minted)) = (&v1, value.as_ref()) else {
+            unreachable!("fresh_var yields Type::Infer");
+        };
+        assert_ne!(
+            orig.uid, minted.uid,
+            "quantified value var must be freshened"
+        );
+    }
+
+    #[test]
+    fn feed_extrudes_with_two_way_proxy() {
+        // Extruding feed(D, ?v@1) to level 0 must produce feed(D, ?proxy@0)
+        // with the original linked to the proxy in BOTH directions — the
+        // invariant value may neither lose writes (lower) nor reads (upper)
+        // across the level boundary.
+        let v1 = fresh_var(1);
+        let h = feed_ty(Type::UIntRange(3), v1.clone());
+        let out = extrude(&h, true, 0, &mut ExtrudeCache::new());
+        let Type::History { value, .. } = &out else {
+            panic!("extrude changed the constructor: {out}");
+        };
+        let Type::Infer(proxy) = value.as_ref() else {
+            panic!("extruded value should be the proxy var, got {value}");
+        };
+        assert_eq!(proxy.level, 0);
+        let Type::Infer(orig) = &v1 else {
+            unreachable!("fresh_var yields Type::Infer");
+        };
+        let bounds = orig.bounds.borrow();
+        let proxy_ty = Type::Infer(Rc::clone(proxy));
+        assert!(
+            bounds.upper.iter().any(|b| b.ty == proxy_ty),
+            "original value var is missing the upper link to its proxy"
+        );
+        assert!(
+            bounds.lower.iter().any(|b| b.ty == proxy_ty),
+            "original value var is missing the lower link to its proxy"
+        );
+    }
+
+    #[test]
+    fn invariant_extrude_upgrades_a_one_way_polar_cache_hit() {
+        // The same variable appears in BOTH a polar position and an invariant
+        // (`Feed` value) payload within one type. The structural walk extrudes
+        // the polar occurrence first — minting a *one-way* proxy cached under
+        // that polarity — then reaches the `Feed` value, whose
+        // `extrude_invariant` hits the cache. The cached proxy must be upgraded
+        // to link the original in BOTH directions; otherwise the invariant
+        // payload silently loses one bound direction across the level boundary.
+        let v1 = fresh_var(1);
+        let Type::Infer(orig) = &v1 else {
+            unreachable!("fresh_var yields Type::Infer");
+        };
+        // Tuple element 0 (covariant, polar) extrudes before element 1's `Feed`
+        // value (invariant), so the one-way polar proxy lands in the cache
+        // first and the `Feed` extrusion is the cache hit under test.
+        let ty = Type::Tuple(vec![v1.clone(), feed_ty(Type::UIntRange(3), v1.clone())]);
+        let out = extrude(&ty, true, 0, &mut ExtrudeCache::new());
+        let Type::Tuple(elems) = &out else {
+            panic!("extrude changed the constructor: {out}");
+        };
+        let Type::Infer(polar_proxy) = &elems[0] else {
+            panic!(
+                "polar element should extrude to a proxy var, got {}",
+                elems[0]
+            );
+        };
+        let Type::History { value, .. } = &elems[1] else {
+            panic!("second element should stay a Feed, got {}", elems[1]);
+        };
+        let Type::Infer(feed_proxy) = value.as_ref() else {
+            panic!("feed value should extrude to a proxy var, got {value}");
+        };
+        // The invariant position must reuse the polar proxy — same original
+        // variable — not mint a disconnected second one.
+        assert!(
+            Rc::ptr_eq(polar_proxy, feed_proxy),
+            "invariant position minted a second proxy instead of reusing the polar one"
+        );
+        // Both bound directions must survive the cache hit.
+        let proxy_ty = Type::Infer(Rc::clone(feed_proxy));
+        let bounds = orig.bounds.borrow();
+        assert!(
+            bounds.upper.iter().any(|b| b.ty == proxy_ty),
+            "original is missing the upper (positive) link to its proxy"
+        );
+        assert!(
+            bounds.lower.iter().any(|b| b.ty == proxy_ty),
+            "original is missing the lower (negative) link after the cache hit"
+        );
+    }
+
+    // --- Mutable handles (`Type::History { kind: Store }`) ---
+
+    fn mut_ty(value: Type, domain: Type) -> Type {
+        Type::History {
+            value: Box::new(value),
+            domain: Box::new(domain),
+            kind: HistoryKind::Store,
+        }
+    }
+
+    #[test]
+    fn mut_reads_transparently_as_value() {
+        // Mut[Int, D] <: Int — a read derefs to the value…
+        let m = mut_ty(prim(BaseType::Int), prim(BaseType::UInt));
+        let mut cache = ConstrainCache::new();
+        assert!(constrain_subtype(&m, &prim(BaseType::Int), &mut cache).is_ok());
+        // …but the value still has to match the consumer.
+        let mut cache = ConstrainCache::new();
+        assert!(matches!(
+            constrain_subtype(&m, &prim(BaseType::String), &mut cache),
+            Err(ConstrainError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn mut_derefs_at_a_variable_not_the_handle() {
+        // THE crux (plan decision #1): `cnt + 1` emits `Mut[Int, D] <: ?α`. The
+        // deref arm fires *before* the `Infer` arm, so `?α` coalesces to `Int`,
+        // NOT to a `Mut` handle — the deliberate contrast with
+        // `feed_var_coalesces_to_feed`. If the deref arm were placed after the
+        // `Infer` arms, `?α` would carry the `Mut` constructor and reads would
+        // break.
+        use crate::ccl::infer::solver::simplify_type;
+        let v = fresh_var(0);
+        let m = mut_ty(prim(BaseType::Int), prim(BaseType::UInt));
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&m, &v, &mut cache).unwrap();
+        let out = coalesce_compact(&simplify_type(compact_type(&v))).unwrap();
+        assert_eq!(out, prim(BaseType::Int));
+    }
+
+    #[test]
+    fn mut_meets_mut_invariantly() {
+        // Mut[?v0,?d0] <: Mut[?v1,?d1] equates values AND domains (pass-by-ref):
+        // the callee's per-call domain resolves to the argument store's domain,
+        // and the value is invariant (read + write). A value flowing into v1
+        // reaches v0 through the two-way edge, so a conflicting read of v0 fails.
+        let (v0, d0, v1, d1) = (fresh_var(0), fresh_var(0), fresh_var(0), fresh_var(0));
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(
+            &mut_ty(v0.clone(), d0.clone()),
+            &mut_ty(v1.clone(), d1.clone()),
+            &mut cache,
+        )
+        .unwrap();
+        constrain_subtype(&prim(BaseType::Int), &v1, &mut cache).unwrap();
+        assert!(matches!(
+            constrain_subtype(&v0, &prim(BaseType::String), &mut cache),
+            Err(ConstrainError::Mismatch { .. })
+        ));
+        // The domains equated too: a value pinned on d1 conflicts on d0.
+        constrain_subtype(&prim(BaseType::UInt), &d1, &mut cache).unwrap();
+        assert!(matches!(
+            constrain_subtype(&d0, &prim(BaseType::String), &mut cache),
+            Err(ConstrainError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn value_meets_mut_demand_derefs() {
+        // Int <: Mut[Int, D] — a plain value meeting a `Mut` demand derefs to the
+        // value (the discipline check, not the solver, rejects passing a
+        // non-variable to a `Mut` parameter). A conflicting value still fails.
+        let m = mut_ty(prim(BaseType::Int), prim(BaseType::UInt));
+        let mut cache = ConstrainCache::new();
+        assert!(constrain_subtype(&prim(BaseType::Int), &m, &mut cache).is_ok());
+        let mut cache = ConstrainCache::new();
+        assert!(matches!(
+            constrain_subtype(&prim(BaseType::String), &m, &mut cache),
+            Err(ConstrainError::Mismatch { .. })
+        ));
     }
 
     /// Build a refinement whose predicate is the **bare** `__elem > <rhs>` —

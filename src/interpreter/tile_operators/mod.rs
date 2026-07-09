@@ -137,7 +137,7 @@ pub struct ProducerBase {
 }
 
 impl ProducerBase {
-    fn new(id: usize, tiling: &Tiling) -> Self {
+    pub(crate) fn new(id: usize, tiling: &Tiling) -> Self {
         Self {
             id,
             tiling: tiling.clone(),

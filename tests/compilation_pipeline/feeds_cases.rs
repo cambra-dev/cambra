@@ -12,8 +12,6 @@ use crate::helpers::*;
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::simple_feed("x = defer(); x <<= 1; x", Tile::Scalar(ColumnValue::Ints(vec![1])))]
-#[case::two_defers_arithmetic("x = defer(); y = defer(); x <<= 1; y <<= 2; x + y", Tile::Scalar(ColumnValue::Ints(vec![3])))]
 #[case::feed_list("x = defer(); x <<= [1,2,3]; x", make_int_list(&[1, 2, 3]))]
 #[case::feed_scalar_to_defer("x = defer(); x << 1; x", Tile::SealedFunction { domain: ColumnValue::Units(1), codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))), domain_predicate: Predicate::True, deleted: BitSet::new() })]
 #[case::feed_in_comprehension("x = defer(); [x << i for i in [1,2,3]]; x", make_int_list(&[1, 2, 3]))]
@@ -22,7 +20,12 @@ r#"x = defer()
 for i in [1,2,3]:
   x << i
 x"#, make_int_list(&[1, 2, 3]))]
-#[ignore = "known failing inference case with predicates"]
+// Filter-feed inside a defer: `if cond: d << v` in a loop lowers to a
+// refined-source channel whose domain carries the bare predicate
+// `__elem ▷ source ▷ (λ p → guard)` (the same element form a filtered
+// comprehension `[v for p in source if guard]` builds), so planning reifies it
+// into an `IterateExtent` + `Restrict` and only guard-passing indices reach
+// the channel.
 #[case::feed_with_if(
 r#"x = defer()
 for i in [0,1,2,3]:
@@ -299,18 +302,19 @@ fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
 ///    this restriction is lifted, the desugar-pass gaps below are
 ///    unreachable via real CHL programs.
 ///
-/// 2. **`desugar_defers::empty_channel` typecheck mismatch.**  Once
+/// 2. **`desugar_defers` rejects the partial-feed fan-out.**  Once
 ///    lowering accepts `elif`, the lambda body becomes
 ///    `Case { g_0 → Feed(d, v_0); g_1 → Feed(d, v_1); true → Unit }`.
-///    `extract_for_defer`'s Case-arm fan-out wraps each arm's
+///    `extract_for_defer`'s Case-arm fan-out would wrap each arm's
 ///    terminal in `Record({result, to_d: <channel>})`, where the
-///    no-feed arm publishes `empty_channel()` (currently `Lit::Unit`).
-///    Feeding arms publish a typed scalar (e.g. `Var(x) : Int`).
-///    Inference rejects the Case because `Unit` doesn't unify with
-///    `Int` across arms.  This is purely a typecheck failure — even
-///    if we patched the type (e.g. via a synthesized
-///    `TypedExprNode::EmptyValue` with fresh `Type::Infer`), the
-///    runtime semantics in (3) below would still be wrong.
+///    no-feed arm has no typed channel to publish (`empty_channel()`
+///    is `Lit::Unit`, which doesn't match the feeding arms' channel
+///    type).  Desugar now runs *after* inference and must be
+///    type-preserving, so it rejects the shape up front with
+///    `DeferError::PartialFeedCaseUnsupported` instead of handing the
+///    strict post-desugar typecheck an ill-typed Record fan-out.
+///    Even with a typed placeholder, the runtime semantics in (3)
+///    below would still be wrong.
 ///
 /// 3. **Runtime semantics — the no-feed arm leaks a placeholder
 ///    value into the stream.**  Even with the type mismatch fixed,
@@ -374,4 +378,51 @@ d"#;
         !rendered.is_empty(),
         "expected non-empty rendered error message"
     );
+}
+
+/// `<<=` sets a channel's whole stream, so its RHS must be a collection
+/// (a `Fun`). A scalar RHS is rejected by typing — the discipline that keeps
+/// every feed history a genuine `domain ⇒ value` stream (scalar values belong
+/// in a plain `let` binding or a `:=` register, not a feed channel).
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn scalar_define_into_defer_is_rejected() {
+    let code = "x = defer()\nx <<= 1\nx";
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let result = compile_program(&mut ctx, code, consumer);
+    assert!(
+        result.is_err(),
+        "a scalar defined into a feed channel must be a type error"
+    );
+}
+
+/// Type errors in defer programs are reported against the *user's* program
+/// shape: inference now runs before `desugar_defers`, so the rendered
+/// message must not leak desugar artifacts (floated parameters, `to_<defer>`
+/// record fields, channel unions, scope-out bindings).
+#[rstest]
+#[timeout(Duration::from_secs(1))]
+fn defer_type_errors_render_against_user_shape() {
+    let code = r#"x = defer()
+x << 1
+x << "s"
+x"#;
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let errs = match compile_program(&mut ctx, code, consumer) {
+        Ok(_) => panic!("an Int and a String fed into one defer must be a type error"),
+        Err(e) => e,
+    };
+    let rendered = render_errors(&errs, "<defer-error-shape-test>", code);
+    assert!(
+        rendered.contains("Int") && rendered.contains("String"),
+        "expected the conflicting element types in the message, got:\n{rendered}"
+    );
+    for artifact in ["__floated", "to_x", "__scope_out", "⊎", "CollectionUnion"] {
+        assert!(
+            !rendered.contains(artifact),
+            "desugar artifact `{artifact}` leaked into a user-facing type error:\n{rendered}"
+        );
+    }
 }

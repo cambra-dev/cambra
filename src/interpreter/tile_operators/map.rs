@@ -489,6 +489,16 @@ impl TileProducer for MapResultToConstProducer {
         let input_tile = self.input.get(input_guard);
         let constant_tile = self.constant.get(c_tiling.universal_guard());
 
+        // The broadcast value must be fully known before we can replicate it
+        // across the input's domain: `repeat` fabricates nothing, it copies a
+        // single present value. A constant that is still absent (e.g. a scalar
+        // read from a sibling induction loop that has not yet converged) yields
+        // an empty (non-terminal) output — the consumer re-pulls once it lands,
+        // rather than us inventing a value for the unknown positions.
+        if !constant_tile.is_terminal() {
+            return self.tiling().empty_tile();
+        }
+
         let mode = self.mode;
         process_tile_result(self.tiling(), input_tile, move |codomain| {
             let const_tile = repeat_tile(constant_tile, codomain.len());

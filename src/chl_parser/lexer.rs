@@ -145,6 +145,11 @@ pub enum Token {
     Comma,
     #[token(":")]
     Colon,
+    /// Mutable-assignment operator `:=` (initial + subsequent). Longer-match wins
+    /// over `Colon` + `Eq`, so `x := e` lexes as one `ColonEq`, while an annotated
+    /// mutable intro `x: T := e` is `Colon` (before `T`) then `ColonEq`.
+    #[token(":=")]
+    ColonEq,
     #[token(".")]
     Dot,
     #[token(";")]
@@ -233,6 +238,7 @@ impl fmt::Display for Token {
             Token::RBrace => "}",
             Token::Comma => ",",
             Token::Colon => ":",
+            Token::ColonEq => ":=",
             Token::Dot => ".",
             Token::Semi => ";",
             // Value-carrying tokens — chumsky's `select!` matches the

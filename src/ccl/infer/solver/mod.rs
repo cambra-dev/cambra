@@ -72,6 +72,11 @@ pub fn type_level(ty: &Type) -> Level {
         Type::Record(fs) => fs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Variant(tags) => tags.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Refinement(inner, _) => type_level(inner),
+        // Combine both children like `Fun` (domain + codomain): a later
+        // increment's per-call-site domain generalization depends on the
+        // `domain`'s level surfacing here, so a fresh domain var pins the
+        // level of the enclosing `Mut`.
+        Type::History { value, domain, .. } => type_level(value).max(type_level(domain)),
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => 0,
     }
 }

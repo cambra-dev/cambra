@@ -103,7 +103,7 @@ impl Tiling {
     }
 
     /// Return the domain extent if the the tiling represents a function.  This returns Some
-    /// for Scalar(Function), SealedFunction, and CurriedFunction
+    /// for Scalar(Function), SealedFunction, and CurriedFunction.
     pub fn domain_extent(&self) -> Option<Extent> {
         match self {
             Tiling::Scalar(Extent::Function { domain, .. }) => Some(*domain.clone()),

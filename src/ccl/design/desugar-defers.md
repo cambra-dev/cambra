@@ -12,15 +12,40 @@ CHL has three deferred-collection operators — `x = defer()`, `x << v`,
 and `x <<= v` — that lower to three CCL AST nodes
 ([`TypedExprNode::Defer`], [`TypedExprNode::Feed`], and
 [`TypedExprNode::Define`]) plus [`TypedExprNode::ExprStmt`] for
-statement sequencing.  Those four variants are *placeholders*: they
-don't denote pure values, and the type system has no rules for them.
+statement sequencing.  Inference types them directly (`Defer` mints a
+feed-handle type `Type::Feed(ρ)`, feeds/defines contribute into `ρ`,
+reads discharge through the handle — see design-simple-sub.md §"Feed
+handles"), so type errors are reported against the user's program
+shape.
 
-`desugar_defers::run` runs **after lowering and before inference** and
-eliminates all four variants.  After it returns, no `Defer`/`Feed`/
-`Define`/`ExprStmt` nodes remain anywhere in the tree, and every
-downstream pass (`infer`, `inline`, `lambda_elim`, `simplify`,
-`operator_conversion`) treats those variants as
-`unreachable!`.
+`desugar_defers::run` runs **after inference and after the induction
+`letrec_phase`** (`compile_program`: parse → lower → infer → inline →
+letrec_phase → recognize → desugar → strict typecheck → …) and eliminates
+all four variants *and* their transient `Feed` / `Infer`-channel-
+domain types.  Running after the phase means an in-loop feed has already
+been hoisted to an ordinary feed of the loop's history, so desugar sees
+only top-level defer chains.  After it returns, no
+`Defer`/`Feed`/`Define`/`ExprStmt` nodes — and no `Feed`/`Hole`/`Infer`
+types — remain anywhere in the tree, and every downstream pass
+(`lambda_elim`, `simplify`, `operator_conversion`) treats those variants
+as `unreachable!`.  (`inline` runs *before* desugar, not after, so it
+still sees `Defer`/`Feed`/`Define` — see the `inline` module docs.)
+
+**The pass is type-preserving.**  The input tree arrives fully typed;
+desugar follows a small discipline — constructed nodes carry `Hole`,
+filter-feed sources get their refined domain and (fully-typed) predicate
+stamped directly (`refine_source_domain`) — and ends with
+[`crate::ccl::infer_simple_sub::retype`], a solver-free bottom-up
+synthesis that re-derives every residue type from the surviving
+concrete types (iterated to a bounded fixpoint so call-site argument
+types can resolve a monomorphized generator parameter's channel
+domain).  The strict post-desugar `typecheck` in `compile_program` is
+the release-visible enforcement of this contract; `run` additionally
+asserts residue-freeness in debug builds.
+
+(The pass also still supports untyped input — `run(expr, false)` — for
+its own structural unit tests; in that legacy mode the type-synthesis
+steps are skipped entirely.)
 
 The output is a plain CCL expression in which:
 
@@ -32,129 +57,48 @@ The output is a plain CCL expression in which:
   `TypedExprNode::CollectionUnion` (the surface `++` operator).
 - Cross-defer references resolve through topological ordering of
   cluster bindings.
-- Defer-mediating UDF calls (`y = f(x)` where `f` takes/returns a
-  defer) are reduced at the call site **without inlining** the
-  function body.  The function's body is rewritten at its binding
-  site to return a `Record({to_<target>: contribs, …})`; each call
-  site contributes `Apply(call_expr, Proj("to_<target>"))` to the
-  surrounding cluster's channel.
 
-## Two-phase structure
+**A note on scope — the pass was slimmed to a single phase.**
+`desugar_defers` used to carry a second phase: a chain rewriter that
+reduced *defer-mediating UDF* calls (calls of a function that takes or
+returns a `defer` handle) at their call sites, rewriting the function
+body to return a contributions `Record` rather than inlining it.  That
+machinery — lambda classification, the `Defer`-float transformation,
+DI-chain wrapping, the return-`Record` body rewrite, and the call-site
+"smart walker" — is **gone**.  [`crate::ccl::inline`] runs *before*
+this pass and beta-reduces every defer-mediating UDF at its call site,
+so by the time desugar runs there are no such calls left: it only ever
+sees flattened `let d = Defer in …` chains.  What remains is a
+**single-phase cluster channelizer**.
 
-`run` is two passes over the tree:
+The broader goal is to retire this pass entirely — folding channel
+assembly into the unified sequencing phase so feeds lower through the
+same road as stores.  See [`mutability.md`](mutability.md) §4 "Retire
+`desugar_defers`" for the target design and current status.
+
+## Pipeline
+
+`run` is a single structural pass over the tree (plus, on typed input,
+the closing type synthesis):
 
 ```
-run(expr) = expr
-  |> rewrite_chains_in_scope      // Phase 1: defer-mediating UDF call rewriting
-  |> desugar                      // Phase 2: cluster channelization
+run(expr, input_typed) = expr
+  |> desugar                       // cluster channelization
   |> drop_expr_stmts               // post-pass: ExprStmt cleanup
   |> assert_no_defer_residue       // invariant check
+  |> retype                        // typed order only: re-derive residue types
 ```
 
-Phase 1 rewrites call chains that touch defer-mediating functions so
-the cluster algorithm in Phase 2 can see uniform shapes.  Phase 2
-walks each `let d = Defer in …` cluster and emits the channelized
-form.
+[`desugar`] walks each `let d = Defer in …` cluster and emits the
+channelized form; the remaining steps drop the now-pure `ExprStmt`
+residue, assert no defer nodes survived, and re-synthesize the types
+the walk disturbed.
 
 ---
 
-## Phase 1 — chain rewriter
+## Cluster channelization
 
-### Lambda classification
-
-A let-bound lambda is classified by its defer interaction
-([`LambdaClass`]):
-
-| Class               | Body shape (post-float for `DeferIntroducing`) | Example                                       |
-|---------------------|------------------------------------------------|-----------------------------------------------|
-| `VarBody`           | `λp → Var(name)`                               | `def f(x): return x`                          |
-| `ParamAsTarget`     | `λp → body` where `body` has `Feed(p, …)`      | `def g(c): c << 100; c`                       |
-| `DeferIntroducing`  | `λp → let x = Defer in body` (pre-float)       | `def f(n): x = defer(); x << n; x`            |
-| `Plain`             | Anything else (no defer interaction)           | `def add(a, b): return a + b`                 |
-
-Classification is done in order of structural specificity: `VarBody`
-first, then `DeferIntroducing` (must float before treating as
-anything else), then `ParamAsTarget`, then `Plain`.  See
-[`classify_lambda`].
-
-### The float transformation
-
-A `DeferIntroducing` lambda is *floated* before any rewriting:
-
-```text
-λp → let x = Defer in body[x]
-  ⟹  λp → λ__floated_x → body[x → __floated_x]
-```
-
-[`float_defer_in_lambda`] does this in place at the lambda's
-definition site.  The internal `Defer` becomes a second explicit
-parameter, named `__floated_<x>` (a breadcrumb of the original
-name).  The class of the post-float lambda is still
-`DeferIntroducing`, but now the body shape is `λp → λ__floated →
-body` — recognisable by the classifier's "curried two-lambda"
-arm.
-
-### Chain wrapping
-
-The chain rewriter walks the tree top-down, registering each
-defer-mediating function in a lexically-scoped `HashMap` on
-`DesugarCtx`.  When it finds an `Apply` chain that touches a registered
-function ([`chain_has_di`] returns true), it rewrites the chain.
-
-The structural rewrite: each direct call `Apply(arg, Var(f))` of a
-floated `DeferIntroducing` function gets the missing second
-application of a fresh defer handle:
-
-```text
-Apply { function: Var(f), argument: arg }
-  ⟹  Apply { function: Apply { function: Var(f), argument: arg },
-             argument: Var(<defer_name>) }
-```
-
-The reasoning: the user wrote `f(arg)` expecting a defer back, but
-the floated `f` takes two args (`p` and `__floated`).  Inserting
-`Var(<defer_name>)` as the second application supplies the missing
-floated handle.
-
-For the **outermost** DI call in a chain, `<defer_name>` is the
-let-binding's name (the user's `y` in `let y = f(arg) in …`).  For
-**inner** DI calls in composed chains, [`wrap_di_calls_in_chain`]
-mints a fresh `FloatedDefer` synthetic name (`Name::floated()`, displayed
-`__floated`) and returns it for the caller to allocate via
-`let __floated = Defer in …`.
-
-After wrapping, the let becomes:
-
-```text
-let <outermost_defer> = Defer in
-let __floated = Defer in
-…
-ExprStmt(<wrapped chain>, <body>)
-```
-
-The wrapped chain is now in a shape Phase 2 can walk.
-
-### What gets rewritten where
-
-`rewrite_chains_in_scope` has two trigger paths:
-
-1. **`let y = <chain>`** — if `<chain>` contains a DI call, use `y` as
-   the outermost defer name and emit a `let y = Defer in …` prefix.
-2. **`<chain>` at expression position** — not let-bound; allocate a
-   fresh `FloatedDefer` synthetic (`Name::floated()`) and emit it as both
-   the outermost defer and the chain's reduction target.
-
-A `let f = lambda in body` where the lambda is defer-mediating
-registers `f` in the function context, recurses into the body
-(which may contain calls to `f`), and **keeps the `let f = …`
-binding intact in the output** of this phase.  Phase 2 may drop it
-later (see below).
-
----
-
-## Phase 2 — cluster channelization
-
-[`desugar`] walks the rewritten tree once.  Most arms recurse
+[`desugar`] walks the tree once.  Most arms recurse
 structurally; the load-bearing arms are:
 
 ### `let d = Defer in body` — cluster detection
@@ -299,88 +243,27 @@ For a 2-arm Case `λp → Case { guard → Feed(d, V); true → Unit }`:
 
 ```text
 pred_on_source = source ≫ (λp → guard)
-refined_source = source with user_annotation = Fun(Refinement(_, pred_on_source), _)
+refined_source = source with ty = Fun(Refinement(D, pred_on_source), V)
 channel = refined_source ≫ (λp → V)
 ```
 
-The original Lambda's body collapses to `Unit`.  Inference treats
-the refinement-typed source as a filtered iteration; `planning`'s
-`insert_iterate_markers` pass reifies the refinement into an explicit
-`Apply(guard, Iterate)` at the iteration site, which op-conversion
-compiles to an `IterateExtent` + `Restrict` filter pair.
+The original Lambda's body collapses to `Unit`, and
+[`refine_source_domain`] stamps the refined domain type directly off
+the source's inferred `Fun(D, V)` (the legacy untyped order parks the
+same refinement in `user_annotation` for inference to consume).
+`planning`'s `insert_iterate_markers` pass reifies the refinement into
+an explicit `Apply(guard, Iterate)` at the iteration site, which
+op-conversion compiles to an `IterateExtent` + `Restrict` filter pair.
 
-#### Case-arm fan-out (multi-arm Case with feeds)
+#### Multi-arm Case with feeds
 
-When a Case with 3+ arms has feeds in some-but-not-all arms (so
-`try_extract_filter_feed` doesn't match), each arm's terminal is
-wrapped in `Record({result, to_<d>})`:
-
-- Feeding arm: `to_d` = combined feed values
-- Empty arm: `to_d` = [`empty_channel()`] = `Lit::Unit`
-
-This path is **known broken** — see [Future work](#known-gaps--future-work).
-The realistic 2-arm shape uses `try_extract_filter_feed` and avoids
-the issue.
-
-#### Smart-walker for defer-mediating UDF calls — return-value design
-
-A defer-mediating function `f` is registered in `DesugarCtx` along
-with the set of defer targets its body feeds.  At its `let f = …`
-binding site, [`rewrite_lambda_to_return_contributions`] replaces
-the lambda's body with a `Record({to_<target_k>: contribs_k, …})`
-(see [`build_contributions_record`]).  The function returns the
-contributions Record, computed in terms of the function's own
-params, rather than returning its defer-handle param.
-
-At each call site of `f`, the smart walker
-([`try_smart_walk_pat`] / [`try_smart_walk_di`]) fires.  Both share
-[`smart_walk_synthesize_call_contributions`], which:
-
-1. Looks up `f`'s [`FunctionInfo`] in `DesugarCtx` —
-   `feed_targets` and `primary_target` are populated at Phase 2
-   registration time.
-2. Pushes `Apply(call_expr, Proj("to_<current_target>"))` into the
-   surrounding cluster's `feeds` Vec.  At runtime this projects the
-   primary target's contribution out of the call's Record return.
-3. For every other target the function feeds (closure-captured
-   defers — names cross the function boundary unchanged),
-   synthesizes a `Feed(<other_target>, Apply(call_expr, Proj("to_<other_target>")))`
-   at the call site.  Those Feed nodes get picked up by their own
-   clusters' standard walks.
-4. Returns the chain `ExprStmt(feed_0, ExprStmt(feed_1, …, Var(<defer_name>)))`
-   as the call's residue.  The final `Var(<defer_name>)` is the
-   call's reduction value (defer-handle returns of PaT/DI both
-   reduce to the cluster's defer-handle variable).
-
-The function is **not duplicated** at the call site: the call
-expression itself stays in the output and is type-inferred normally.
-Only the call's *projections* live in the cluster channels, and
-they reference a single shared `call_expr` subtree per call site.
-At runtime each `Apply(call_expr, Proj("to_X"))` evaluates the
-function once and pulls out the requested field.
-
-**`Var(<defer>)` substitution.**  The chain rewriter wraps every DI
-call with `Var(<defer>)` as the second argument so the curried
-`λp → λ__floated → body` reduces.  In the return-value design
-`__floated` is unused inside the rewritten body — the body's feeds
-contribute to Record fields rather than referencing `__floated`
-directly.  Keeping the `Var(<defer>)` in the projection
-expression would build a self-referential
-`let <defer> = … Var(<defer>) … in …` binding (the channel
-expression references the very binding it constructs), which CCL
-doesn't support without letrec.  The synthesizer substitutes
-`Var(<defer>) → Lit::Unit` inside the call expression before
-projecting; the rewritten body discards that argument anyway.  Same
-fix applies to PaT calls.
-
-**Defer-introducing functions with no feeds.**  A function like
-`def f(n): x = defer(); x` (DI, but the body never feeds `x`) has
-an empty `feed_targets`.  Its rewritten body is `Record({})`,
-which has no fields to project from.  The synthesizer detects
-`feed_targets.is_empty()` and skips both the primary projection
-and any closure-capture synthesis — the call contributes nothing,
-and the surrounding cluster gathers its feeds from outside the
-function (typical: `let y = f(10) in for i in src: y << i`).
+A multi-arm `Case` that feeds the defer in some arm (so it is *not* the two-arm
+filter shape `try_extract_filter_feed` handles) is rejected with
+`DeferError::PartialFeedCaseUnsupported`. The former Record-based fan-out (each
+arm publishing `Record({result, to_<d>})`, no-feed arms getting an ill-typed
+`Unit` placeholder) is retired in favour of the N-arm refinement fan-out — not
+yet built. See [Future work](#known-gaps--future-work). The realistic 2-arm
+shape goes through `try_extract_filter_feed` (gap #1) and is unaffected.
 
 #### Defer-returning let-lift — `try_lift_defer`
 
@@ -392,7 +275,7 @@ let y = (let x = Defer in body_x) in body_y
   ⟹  let y = Defer in body_x[x → y]    with terminal Var(y) replaced by body_y
 ```
 
-`pre_infer_substitute` (a thin wrapper over the uniform engine,
+`desugar_substitute` (a thin wrapper over the uniform engine,
 `ccl::subst::Subst::rewrite_expr`) renames `Feed("x", …)` and
 `Define("x", …)` target names to `y` so the outer cluster picks them
 up — and, through the engine, also rewrites type-carried refinement
@@ -408,7 +291,7 @@ so a subsequent `try_lift_defer` pass can fire.
 
 `let y = Var(x) in body` where the body contains
 `Feed(y, …)`/`Define(y, …)` is α-renamed to `body[y → x]` (with
-`pre_infer_substitute` retargeting the Feed/Define names to `x`).
+`desugar_substitute` retargeting the Feed/Define names to `x`).
 Runs *before* defer channelization so the cluster walker sees the
 real defer name.
 
@@ -440,122 +323,73 @@ shape the pass didn't recognise — reported as
 | `NestedDefinition`                   | `Define(d, …)` inside a Loop body, Compose element, Case branch, or Lambda            |
 | `UnboundDeferHandle(name)`           | `Feed`/`Define` references a name never bound by `let d = Defer`                      |
 | `MutuallyRecursiveCycle(name)`       | Cluster defers reference each other cyclically (`x ≪= y; y ≪= x`)                     |
+| `PartialFeedCaseUnsupported(name)`   | A multi-arm `Case` feeds `d` in some arms but not others (no typed empty channel yet) |
 
 All variants are propagated to `CompileError::DesugarDefers` and
-surfaced to the user via `CompileError::render`.
+surfaced to the user via `CompileError::render`.  Because the pass runs
+after inference, *type* errors surface first: a program with both a
+type error and a structural defer error reports only the type error,
+and a never-bound feed target now arrives as
+`InferError::UnboundVariable` from the `Feed`/`Define` typing rules
+(`UnboundDeferHandle` remains as the pass's own residue tripwire).  One
+ordering nuance: a scalar `Define` mixed with `Feed`s on the same defer
+collides in the feed-handle payload during inference
+(`IncompatibleBounds`) before `FeedsAndDefinesMixed`'s clearer message
+is reached.
 
 ---
 
 ## Known gaps & future work
 
-### 1. Filter-feed refinement doesn't reach `operator_conversion`
+### 1. Filter-feed refinement — resolved
 
-[`try_extract_filter_feed`] attaches a `Refinement` to the source's
-`user_annotation` so the source is treated as filtered iteration.
-With the return-value design, the filter-feed path runs *inside*
-[`build_contributions_record`] when rewriting a function body, and
-the refined source ends up inside the function's returned `Record`.
-After inference, the refinement carries through to the
-cluster-binding's type — but the value expression at the binding
-site is now `Apply(call_expr, Proj("to_<target>"))`, which doesn't
-expose the refinement on its own `expr.ty`.
+The two-arm filter-feed (`if guard: d << v` in a loop / generator) now compiles
+end-to-end. [`try_extract_filter_feed`] recognises the shape and the caller
+builds the channel's refined source with the **bare element predicate**
+`__elem ▷ source ▷ (λ p → guard)` — the same form a filtered comprehension
+`[v for p in source if guard]` builds ([`crate::ccl::lower::comprehension`]) —
+fully typed at construction, then [`refine_source_domain`] wraps the source's
+domain in `Refinement(_, pred)`. `planning`'s `insert_iterate_markers` reifies
+that domain refinement into a chain-head `Apply(true ▷ const, Iterate)` with one
+`restrict(p)` per layer, which op-conversion compiles to an `IterateExtent` plus
+a `Restrict` tile.
 
-`planning`'s `insert_iterate_markers` pass walks each function-typed
-expression and reifies its domain refinement into a chain-head
-`Apply(true ▷ const, Iterate)` source with one `restrict(p)` *applied*
-per refinement layer (`iterate ▷ (p ▷ restrict) ▷ …`), which
-op-conversion compiles to an `IterateExtent` plus one `Restrict` tile
-per layer.  Today the pass reads the
-refinement from the value-expression's type (the wrapped function
-value); it does not look at any refinement attached to the surrounding
-let-binding's type, so a refinement that only surfaces on the binding
-(the cluster binding's type after inference) is silently dropped — and
-end-to-end, the `test_generator_function::positives` case currently
-produces the unfiltered list.
+Two earlier bugs are corrected by this: (a) the predicate compose was left
+`Hole`-typed, and — since a `Refinement` predicate is immutable, `retype` never
+re-derives it — the `Hole` reached the strict post-desugar typecheck; (b) the
+predicate was built in the point-free `source ≫ (λ p → guard)` form, which is
+constant in `__elem`, so `planning::compile_refinement_predicates` η-collapsed it
+to `const(_)` and dropped the per-element test. The element form
+`__elem ▷ source ▷ (λ p → guard)` fixes both. `feed_with_if`,
+`test_generator_function::positives`, and the `generator_pipeline` program are
+un-`#[ignore]`d.
 
-A known TODO is extending the planning walk to honour refinements
-attached to let-binding types (the cluster binding's type carries
-the refinement after inference; that's the right place to read it
-from).  Once that lands:
+### 2. Multi-arm Case-with-feeds fan-out (N-arm) not yet supported
 
-- Drop the `if code.contains("def positives")` skip guard at the
-  top of [`tests/compilation_pipeline.rs::test_generator_function`].
-- No changes are needed to `desugar_defers` itself — the
-  refinement is already in the right place; only the consumer
-  needs updating.
+A multi-arm `Case` that feeds the defer in one or more arms is rejected up
+front with `DeferError::PartialFeedCaseUnsupported`. The two-arm filter shape
+`{guard → d << v; true → unit}` is *not* affected — it is handled earlier as a
+refined-source channel (gap #1, `try_extract_filter_feed`); this covers only the
+residual N-arm case.
 
-### 2. Case-arm fan-out is broken (`empty_channel` limitation)
+The former Record-based fan-out (each arm published a `Record({result, to_d})`,
+with no-feed arms getting an `empty_channel()` = `Lit::Unit`) has been
+**retired**: that `Unit` placeholder didn't match the feeding arms' channel type
+(an ill-typed fan-out, or — had the type slot been patched — a silent miscompile
+leaking a placeholder into the consumer's stream every iteration). Rejecting is
+strictly safer.
 
-When a Case has 3+ arms with feeds in some-but-not-all, the
-Case-arm fan-out path is taken: each arm publishes a
-`Record({result, to_d})` where the no-feed arm's `to_d` is
-[`empty_channel()`] = `Lit::Unit`.  Feeding arms publish a typed
-scalar (e.g. `Var(x) : Int`).  Inference rejects the Case because
-arm Record types don't unify.
-
-Patching the type slot (e.g. via a `TypedExprNode::EmptyValue`
-with fresh `Type::Infer`) was considered and rejected: it fixes
-the typecheck error but trades it for a silent miscompile — the
-Case fan-out would still produce a per-iteration `to_d` for every
-iteration, including no-feed arms, leaking placeholder values
-into the consumer's stream.
-
-**Proper fix: refinement-based fan-out** (generalize
-[`try_extract_filter_feed`] to N arms).  For each feeding arm
-`i`, build a refined source with predicate `¬g_0 ∧ ¬g_1 ∧ … ∧
-¬g_{i-1} ∧ g_i` (Case's "first matching guard wins" semantics)
-and contribute `refined_source ≫ (λp → feed_value)` to the
-cluster channel.  Arms without feeds contribute nothing — no
-empty-channel placeholder needed.  Both the typecheck and
-runtime gaps vanish together.
-
-This path is unreachable from CHL today because lowering rejects
-`elif` inside generator-for-loop bodies — the multi-arm Case
-form never gets constructed from source.  Tracked end-to-end in
+**Proper fix: extend the refinement fan-out of gap #1 to N arms.**  For each
+feeding arm `i`, build a refined source with predicate
+`¬g₀ ∧ ¬g₁ ∧ … ∧ ¬g_{i-1} ∧ gᵢ` (Case's "first matching guard wins") and
+contribute `refined_source ≫ (λ p → feed_value)` to the cluster channel via
+`++` — the same element-form predicate the two-arm case now builds, with no
+empty-channel placeholder. Unreachable from CHL today: lowering rejects `elif`
+inside generator-for-loop bodies, so a multi-arm feed `Case` never reaches this
+pass. Tracked by
 [`tests/compilation_pipeline.rs::multi_arm_case_with_some_feeding_branches_is_a_known_gap`].
 
-### 3. Higher-order use of defer-mediating functions
-
-In the return-value design, a defer-mediating function's body is
-rewritten at its binding site to return `Record({to_<target>: …, …})`.
-Direct calls of the form `Apply(arg, Var(f))` (or the DI two-step
-shape) are handled by the smart walker, which projects the
-relevant `to_<target>` field at each call site.
-
-If `f` is referenced indirectly — passed as a value into `map`,
-aliased through `let g = f`, anything outside the recognized call
-shapes — the call doesn't go through the smart walker.  The
-surviving call evaluates the rewritten function, which now
-*returns a Record* instead of its original defer-handle param.
-Callers expecting the original signature get a type mismatch at
-inference time.
-
-No test exercises this today; the gap is latent.  A real fix
-would either:
-
-- Detect higher-order use at the binding site (look for
-  `count_free(f, body)` references that are *not* in an
-  `Apply(_, Var(f))` chain) and synthesize a wrapper lambda that
-  unpacks the contributions Record into per-target Feed sites at
-  the call site.
-- Reject higher-order use of defer-mediating functions at
-  lowering with a clear diagnostic.
-
-### 4. Non-trivial return values from defer-mediating UDFs
-
-`try_smart_walk_pat` reduces a `ParamAsTarget` call to
-`Var(<defer_name>)`, on the assumption that `g`'s body returns its
-param.  For bodies like `def g(c): c << 100; c + 1` (returning a
-non-param value), this is wrong — the call's value is the
-substituted return expression.  The smart walker silently
-discards the body's tail.
-
-Not currently exercised by tests; tracked in the implementation
-as a known limitation.  A real fix would have the smart walker
-return the substituted body's terminal (with `Feed`/`Define`
-already stripped) instead of `Var(<defer_name>)`.
-
-### 5. `try_lift_defer` covers only a single nesting level
+### 3. `try_lift_defer` covers only a single nesting level
 
 The lift handles `let y = (let x = Defer in body_x) in body_y`
 and the let-of-defer-returning-let collapse, but deeper
@@ -576,25 +410,14 @@ For navigating the source ([src/ccl/desugar_defers.rs](desugar_defers.rs)):
 | Concern                                    | Function                                              |
 |--------------------------------------------|-------------------------------------------------------|
 | Entry point                                | `run`                                                 |
-| Phase 1 chain rewriter                     | `rewrite_chains_in_scope`                             |
-| Phase 2 cluster walk                       | `desugar`                                             |
-| Lambda classification                      | `classify_lambda`                                     |
-| Defer float                                | `float_defer_in_lambda` + `extract_defer_binding`     |
-| DI chain wrap                              | `wrap_di_calls_in_chain` + `wrap_di_calls_helper`     |
-| DI chain detection                         | `chain_has_di`                                        |
+| Cluster walk                               | `desugar`                                             |
 | Per-defer feed extraction                  | `extract_for_defer`                                   |
-| Lambda body rewrite (returns Record)       | `rewrite_lambda_to_return_contributions`              |
-| Per-target contribution Record build       | `build_contributions_record`                          |
-| Smart-walker for PaT calls                 | `try_smart_walk_pat`                                  |
-| Smart-walker for DI calls                  | `try_smart_walk_di`                                   |
-| Call-site contribution synthesis           | `smart_walk_synthesize_call_contributions`            |
-| Filter-feed (2-arm Case)                   | `try_extract_filter_feed`                             |
+| Filter-feed (2-arm Case)                   | `try_extract_filter_feed` + `refine_source_domain`    |
 | Defer-returning let lift                   | `try_lift_defer`                                      |
-| Loop body absorption                       | `process_loop_for_defer` + `augment_loop_body_record_*` |
-| Case-arm fan-out (broken)                  | `empty_channel` + `augment_terminal_with_channel`     |
+| Multi-arm Case feed (rejected, N-arm TODO) | `extract_for_defer` Case arm                          |
 | Cluster topo-sort                          | `topo_sort_cluster`                                   |
 | Channel binding emission                   | `channelize_cluster` + `rename_shadows_then_bind`     |
 | Shadow detection                           | `compute_protected_set` + `collect_free_vars`         |
-| Substitution                               | `pre_infer_substitute` (wraps `ccl::subst`)           |
+| Substitution                               | `desugar_substitute` (wraps `ccl::subst`)           |
 | Final cleanup                              | `drop_expr_stmts`                                     |
 | Invariant check                            | `assert_no_defer_residue`                             |
