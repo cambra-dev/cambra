@@ -343,38 +343,38 @@ fn lower_for_body_terminal(
                      use a plain if-guard (no else branch)",
                 ));
             }
-            if branches.len() != 1 {
-                return Err(LoweringError::unsupported(
-                    stmt.span,
-                    "if/elif inside generator for-loop body is not supported; \
-                     use a plain if-guard (no elif/else branches)",
-                ));
+            // `if` / `elif` (no `else`): one `Case` branch per guard, in source
+            // order, then a trailing `true → Unit` fallthrough. A feeding
+            // multi-arm `Case` is fanned out by `desugar_defers` into one
+            // refined-source channel per feeding arm (predicate
+            // `gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`, encoding "first matching guard wins"), so `elif`
+            // is no longer gated here.
+            let mut out_branches = Vec::with_capacity(branches.len() + 1);
+            for branch in branches {
+                let cond = lower_expr(&branch.cond, ctx)?;
+                // Same frame: pass through mutation_scope and frame_introduced
+                // unchanged so the iter_var remains shadowable inside the guard.
+                let arm = lower_for_body_stmts(
+                    &branch.body,
+                    defer_name,
+                    mutation_scope,
+                    frame_introduced.clone(),
+                    ctx,
+                )?;
+                out_branches.push(Branch {
+                    pattern: None,
+                    guard: cond,
+                    body: arm,
+                });
             }
-            let branch = &branches[0];
-            let cond = lower_expr(&branch.cond, ctx)?;
-            // Same frame: pass through mutation_scope and frame_introduced
-            // unchanged so that the iter_var remains shadowable inside the guard.
-            let true_arm = lower_for_body_stmts(
-                &branch.body,
-                defer_name,
-                mutation_scope,
-                frame_introduced.clone(),
-                ctx,
-            )?;
+            out_branches.push(Branch {
+                pattern: None,
+                guard: Expr::lit(Lit::Bool(true)),
+                body: Expr::lit(Lit::Unit),
+            });
             Ok(Expr::new(TypedExprNode::Case {
                 scrutinee: None,
-                branches: vec![
-                    Branch {
-                        pattern: None,
-                        guard: cond,
-                        body: true_arm,
-                    },
-                    Branch {
-                        pattern: None,
-                        guard: Expr::lit(Lit::Bool(true)),
-                        body: Expr::lit(Lit::Unit),
-                    },
-                ],
+                branches: out_branches,
             }))
         }
         ChlStmt::For { target, iter, body } => {

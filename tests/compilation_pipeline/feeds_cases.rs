@@ -290,70 +290,21 @@ fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
-/// Multi-arm `if/elif` inside a for-loop body, with feeds in some
-/// branches and not others.  Pins the *first* gap that blocks this
-/// pattern from working end-to-end.
+/// Multi-arm `if`/`elif` inside a for-loop body, feeding the defer in some
+/// arms and not others. Each feeding arm fans out to its own refined-source
+/// channel — arm `i`'s source restricted to the element predicate
+/// `gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ` (encoding `Case`'s "first matching guard wins"), the arm's
+/// value composed on top (`refined_source ≫ (λ p → vᵢ)`) — and the channels are
+/// unioned via `++`. Iterations matching no feeding arm contribute nothing
+/// (no placeholder), so the two-arm `if g: d << v` shape is just the
+/// one-feeding-arm case ([`try_extract_fanout_feed`] /
+/// [`synthesize_arm_predicate`] in `desugar_defers`).
 ///
-/// # Stacked gaps
-///
-/// 1. **Lowering** (current failure point).  `lower_generator_for`
-///    rejects `elif` inside a generator-for-loop body — the multi-arm
-///    Case form never gets constructed from CHL source today.  Until
-///    this restriction is lifted, the desugar-pass gaps below are
-///    unreachable via real CHL programs.
-///
-/// 2. **`desugar_defers` rejects the partial-feed fan-out.**  Once
-///    lowering accepts `elif`, the lambda body becomes
-///    `Case { g_0 → Feed(d, v_0); g_1 → Feed(d, v_1); true → Unit }`.
-///    `extract_for_defer`'s Case-arm fan-out would wrap each arm's
-///    terminal in `Record({result, to_d: <channel>})`, where the
-///    no-feed arm has no typed channel to publish (`empty_channel()`
-///    is `Lit::Unit`, which doesn't match the feeding arms' channel
-///    type).  Desugar now runs *after* inference and must be
-///    type-preserving, so it rejects the shape up front with
-///    `DeferError::PartialFeedCaseUnsupported` instead of handing the
-///    strict post-desugar typecheck an ill-typed Record fan-out.
-///    Even with a typed placeholder, the runtime semantics in (3)
-///    below would still be wrong.
-///
-/// 3. **Runtime semantics — the no-feed arm leaks a placeholder
-///    value into the stream.**  Even with the type mismatch fixed,
-///    the Case fan-out produces a per-iteration `to_d` value for
-///    *every* iteration, including ones where the implicit
-///    `true → unit` arm fires.  For the example below the resulting
-///    `d` channel stream would be `[10, 40, <placeholder for x=3>]`
-///    when the user expects `[10, 40]`.
-///
-/// # The proper fix: refinement-based fan-out
-///
-/// The right solution generalizes the existing
-/// [`try_extract_filter_feed`] (which handles the two-arm
-/// `if cond: d << x` shape) to N arms.  For each arm `i` with feeds,
-/// build a *refined source* whose predicate is
-/// `¬g_0 ∧ ¬g_1 ∧ … ∧ ¬g_{i-1} ∧ g_i` (encoding Case's "first
-/// matching guard wins" semantics).  Each arm contributes
-/// `refined_source ≫ (λ p → feed_value)` to the cluster channel
-/// via `++`.  Arms without feeds contribute nothing.  This makes
-/// gaps (2) and (3) disappear together — no empty-channel
-/// placeholder is needed because empty arms don't produce a
-/// contribution at all.
-///
-/// See [docs/plan.md] under "Tech Debt" → "Generalize filter-pattern
-/// recognition" for the broader design context.
-///
-/// # Test behaviour
-///
-/// Asserts the program fails to compile, regardless of *which*
-/// stage produces the error.  When a future change lifts gap (1),
-/// this test will likely start surfacing gap (2) — and when the
-/// refinement-based fan-out lands, the `expect_err` flip will
-/// signal it's time to convert this into a success assertion.
-///
-/// The realistic two-arm `if cond: d << x` shape compiles cleanly
-/// via [`try_extract_filter_feed`]; see the existing case in
-/// [`test_feed_and_define_operators`].
-#[test]
-fn multi_arm_case_with_some_feeding_branches_is_a_known_gap() {
+/// For the program below: `x == 1` fires arm 0 (`10`), `x == 2` fires arm 1
+/// (`40`), and `x == 3` matches neither, so the channel is `[10, 40]`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn multi_arm_if_elif_feeds_fan_out() {
     let code = r#"d = defer()
 for x in [1, 2, 3]:
     if x == 1:
@@ -361,22 +312,22 @@ for x in [1, 2, 3]:
     elif x == 2:
         d << x * 20
 d"#;
-    let mut ctx = GlobalContext::default();
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let result = compile_program(&mut ctx, code, consumer);
-    let err = match result {
-        Ok(_) => panic!(
-            "multi-arm case with feeds in some branches should fail today — \
-             if this is no longer the case, walk through the stacked-gap doc \
-             on this test and convert to a success assertion with the expected \
-             Tile (e.g. [10, 40] for the example above)"
-        ),
-        Err(e) => e,
-    };
-    let rendered = render_errors(&err, "<multi-arm-feed-test>", code);
-    assert!(
-        !rendered.is_empty(),
-        "expected non-empty rendered error message"
+    // Two feeding arms → two refined-source channels unioned via `++`: arm 0
+    // (`x == 1`) restricts `[1,2,3]` to index {0} yielding `10`; arm 1
+    // (`x == 2 ∧ ¬(x == 1)`) restricts to index {1} yielding `40`; `x == 3`
+    // matches neither. The `++` gives a tagged-union domain, exactly as the
+    // `two_feeds` case above.
+    check_tile(
+        code,
+        Tile::SealedFunction {
+            domain: ColumnValue::Union {
+                tags: vec![0, 1],
+                variants: vec![ColumnValue::UInts(vec![0]), ColumnValue::UInts(vec![1])],
+            },
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 40]))),
+            domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+            deleted: BitSet::new(),
+        },
     );
 }
 

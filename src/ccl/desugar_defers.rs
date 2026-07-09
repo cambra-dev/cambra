@@ -15,13 +15,15 @@
 //!
 //! # Prototype status
 //!
-//! **This pass is a prototype.**  The shapes it handles cover the
-//! current end-to-end test corpus, but an open design question
-//! remains — the N-arm (`if`/`elif`) Case-with-feeds fan-out (rejected
-//! today with `DeferError::PartialFeedCaseUnsupported`; see the Case arm
-//! of [`extract_for_defer`]).  Expect the algorithm to be reworked
-//! rather than incrementally patched.  The umbrella tracking entry lives
-//! in `docs/plan.md` under "Tech Debt — `desugar_defers` prototype".
+//! **This pass is a prototype.**  It is slated for removal: the design
+//! (`src/ccl/design/mutability.md` §4) folds feed channelization into the
+//! unified `letrec_phase`, at which point this module is deleted. A loop-sourced
+//! multi-arm (`if`/`elif`) feed `Case` now fans out into one refined-source
+//! channel per feeding arm ([`try_extract_fanout_feed`]); only a *source-less*
+//! conditional feed (a feeding `Case` outside any iteration) is still rejected,
+//! with `DeferError::PartialFeedCaseUnsupported` (see the `Case` arm of
+//! [`extract_for_defer`]).  The umbrella tracking entry lives in `docs/plan.md`
+//! under "Tech Debt — `desugar_defers` prototype".
 //!
 //! # Vocabulary
 //!
@@ -88,8 +90,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, Branch, Expr, Lit, Name, Pattern, Refinement, Type, TypedBinding, TypedExpr,
-    TypedExprNode,
+    BaseType, BinOpKind, Branch, Expr, Lit, LogicKind, Name, Pattern, Refinement, Type,
+    TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
     ccl_utils::{count_free, typed_compose},
     try_walk_transact, walk_transact,
 };
@@ -114,12 +116,12 @@ pub enum DeferError {
     /// require letrec semantics that CCL does not yet support.  The
     /// payload names one of the defers on the cycle.
     MutuallyRecursiveCycle(String),
-    /// A multi-arm `Case` feeds a defer in some arms but not others.
-    /// The fan-out rewrite would need a *typed* empty channel for the
-    /// non-feeding arms (the planned refinement-based N-arm fan-out;
-    /// see the design doc's known-gaps section); until then the shape
-    /// is rejected rather than miscompiled. Unreachable from CHL today
-    /// — lowering rejects `elif` inside generator bodies first.
+    /// A feeding `Case` reached the generic structural recursion — a
+    /// conditional feed with no enclosing iteration source to restrict per arm
+    /// (the loop-sourced multi-arm case is fanned out at the `Compose`/`Apply`
+    /// sites via [`try_extract_fanout_feed`]). A source-less conditional feed
+    /// has no refinement to hang the guard on, so it is rejected rather than
+    /// miscompiled. The payload names the defer.
     PartialFeedCaseUnsupported(String),
 }
 
@@ -158,47 +160,76 @@ impl fmt::Display for DeferError {
     }
 }
 
-/// Recognise the filter-feed pattern: a two-branch `Case` matching
-/// `{guard → Feed(defer_name, V); true → Unit}`.  Returns
-/// `Some((guard, V))` on a match, `None` otherwise.
+/// Recognize a guard-only `Case` that feeds `defer_name` in one or more arms —
+/// the desugar-stage counterpart of `lambda_elim`'s `is_filter_case_body`.
 ///
-/// This is the desugar-stage counterpart of `lambda_elim`'s
-/// `is_filter_case_body`: pre-elim Lambdas wrapping such a Case need
-/// their channel emitted as a refined Lambda rather than a Record-
-/// over-Cases (which would produce a `to_d: V` vs `to_d: Unit` arm
-/// shape mismatch).
+/// Shape (as lowered from `if g₀: d << v₀ elif g₁: d << v₁ …` in a for-loop
+/// body): `Case { None, [g₀ → body₀; …; gₙ₋₁ → bodyₙ₋₁; true → unit] }`, where
+/// each non-trailing `bodyᵢ` is either `Feed(defer_name, vᵢ)` (a feeding arm)
+/// or `Unit` (a non-feeding arm), and the trailing arm is the implicit
+/// `true → unit` fallthrough.
 ///
-/// FIXME(desugar_defers-prototype): only the 2-arm shape is recognised;
-/// 3+-arm Cases with feeds in some-but-not-all arms are rejected with
-/// `DeferError::PartialFeedCaseUnsupported`.  See the umbrella entry in
-/// `docs/plan.md` ("Tech Debt — `desugar_defers` prototype") for the planned
-/// N-arm refinement-based fan-out (an extension of this two-arm path).
-fn try_extract_filter_feed(body: &Expr, defer_name: &Name) -> Option<(Expr, Expr)> {
-    let branches = match &body.node {
-        // The filter-feed shape is a guard-only `if` (no scrutinee).
-        TypedExprNode::Case {
-            scrutinee: None,
-            branches,
-        } => branches,
-        _ => return None,
+/// Returns each non-trailing arm's `(guard, feed_value?)` in source order —
+/// `feed_value` is `None` for a non-feeding arm, whose guard still participates
+/// in later arms' predicate synthesis ([`synthesize_arm_predicate`]). Returns
+/// `None` (not fannable) if there is a scrutinee, no `true → unit` fallthrough,
+/// an arm binds a pattern, or an arm body is neither this defer's feed nor
+/// `Unit` — so a `Case` mixing this defer's feeds with other effects falls
+/// through to the generic handling rather than being silently collapsed.
+fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, Option<Expr>)>> {
+    let TypedExprNode::Case {
+        scrutinee: None,
+        branches,
+    } = &body.node
+    else {
+        return None;
     };
-    if branches.len() != 2 {
+    if branches.len() < 2 {
         return None;
     }
-    let arm1 = &branches[1];
-    if !matches!(&arm1.guard.node, TypedExprNode::Lit(Lit::Bool(true))) {
-        return None;
-    }
-    if !matches!(&arm1.body.node, TypedExprNode::Lit(Lit::Unit)) {
-        return None;
-    }
-    let arm0 = &branches[0];
-    if let TypedExprNode::Feed { name, value } = &arm0.body.node
-        && name == defer_name
+    let (last, rest) = branches.split_last().expect("len >= 2");
+    // The trailing arm must be the implicit `true → unit` fallthrough.
+    if !matches!(&last.guard.node, TypedExprNode::Lit(Lit::Bool(true)))
+        || !matches!(&last.body.node, TypedExprNode::Lit(Lit::Unit))
     {
-        return Some((arm0.guard.clone(), (**value).clone()));
+        return None;
     }
-    None
+    let mut arms = Vec::with_capacity(rest.len());
+    let mut any_feed = false;
+    for b in rest {
+        // A guard-only arm never binds a pattern.
+        if b.pattern.is_some() {
+            return None;
+        }
+        match &b.body.node {
+            TypedExprNode::Feed { name, value } if name == defer_name => {
+                any_feed = true;
+                arms.push((b.guard.clone(), Some((**value).clone())));
+            }
+            TypedExprNode::Lit(Lit::Unit) => arms.push((b.guard.clone(), None)),
+            _ => return None,
+        }
+    }
+    any_feed.then_some(arms)
+}
+
+/// Build arm `i`'s effective predicate `gᵢ ∧ ¬g₀ ∧ … ∧ ¬gᵢ₋₁`, encoding a
+/// `Case`'s "first matching guard wins" semantics: arm `i` fires only where its
+/// own guard holds and no earlier arm's did. `prior` holds `g₀ … gᵢ₋₁` in
+/// order; `guard` is `gᵢ`. Every guard is a `Bool`-typed expression over the
+/// same loop element, so the synthesized conjunction is `Bool` too — typed here
+/// (desugar runs post-inference and must be type-preserving).
+fn synthesize_arm_predicate(guard: &Expr, prior: &[Expr]) -> Expr {
+    let bool_ty = Type::Base(BaseType::Bool);
+    let mut pred = guard.clone();
+    for g in prior {
+        let mut neg = Expr::unary(UnaryOpKind::Not, g.clone());
+        neg.ty = bool_ty.clone();
+        let mut conj = Expr::binop(pred, BinOpKind::BoolLogic(LogicKind::And), neg);
+        conj.ty = bool_ty.clone();
+        pred = conj;
+    }
+    pred
 }
 
 /// Attempt to apply the defer-returning lift to a `Let` binding.
@@ -1588,8 +1619,7 @@ fn extract_for_defer(
                 // both arms in mismatched Records (`to_d: V` vs `to_d: unit`)
                 // which
                 // fails inference.
-                if let Some((guard, feed_value)) = try_extract_filter_feed(&lambda_body, defer_name)
-                {
+                if let Some(fanout_arms) = try_extract_fanout_feed(&lambda_body, defer_name) {
                     let new_argument = extract_for_defer(
                         *argument.clone(),
                         defer_name,
@@ -1598,27 +1628,36 @@ fn extract_for_defer(
                         in_inner_scope,
                         ctx,
                     )?;
-                    // Same refinement strategy as the Compose case above: the
-                    // bare predicate `__elem ▷ source ▷ (λ p → guard)` (the
-                    // element form planning expects — see that case and
-                    // `lower::comprehension`), fully typed, then wrap the
-                    // source's *domain* in `Refinement(_, pred)`. The channel is
-                    // `refined_source ▷ (λ p → V)`.
+                    // Same fan-out as the Compose case above (differing only in
+                    // that the channel applies the value lambda to the refined
+                    // source, `refined_source ▷ (λ p → vᵢ)`, rather than
+                    // composing): one refined-source channel per feeding arm
+                    // (predicate `gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`, the bare element form
+                    // `__elem ▷ source ▷ (λ p → predᵢ)`), unioned via `++`. The
+                    // two-arm `if g: d << v` shape is the one-feeding-arm case.
                     let src_domain = new_argument.ty.domain().unwrap_or(Type::Hole);
                     let src_item = new_argument.ty.codomain().unwrap_or(Type::Hole);
-                    let elem = Expr::var(Name::elem()).with_ty(src_domain);
-                    let source_at_elem = Expr::apply(elem, new_argument.clone()).with_ty(src_item);
-                    let pred_lambda = Expr::lambda(&param.name, param.ty.clone(), guard);
-                    let pred_on_source = Expr::apply(source_at_elem, pred_lambda)
-                        .with_ty(Type::Base(BaseType::Bool));
-                    let refinement_struct = Refinement {
-                        predicate: Rc::new(pred_on_source),
-                    };
-                    let mut refined_argument = new_argument.clone();
-                    refine_source_domain(&mut refined_argument, refinement_struct, ctx);
-                    let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), feed_value);
-                    let channel = Expr::apply(refined_argument, channel_lambda);
-                    feeds.push(channel);
+                    let mut prior: Vec<Expr> = Vec::new();
+                    for (guard, feed_value) in fanout_arms {
+                        if let Some(value) = feed_value {
+                            let pred = synthesize_arm_predicate(&guard, &prior);
+                            let elem = Expr::var(Name::elem()).with_ty(src_domain.clone());
+                            let source_at_elem =
+                                Expr::apply(elem, new_argument.clone()).with_ty(src_item.clone());
+                            let pred_lambda = Expr::lambda(&param.name, param.ty.clone(), pred);
+                            let pred_on_source = Expr::apply(source_at_elem, pred_lambda)
+                                .with_ty(Type::Base(BaseType::Bool));
+                            let refinement_struct = Refinement {
+                                predicate: Rc::new(pred_on_source),
+                            };
+                            let mut refined_argument = new_argument.clone();
+                            refine_source_domain(&mut refined_argument, refinement_struct, ctx);
+                            let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), value);
+                            let channel = Expr::apply(refined_argument, channel_lambda);
+                            feeds.push(channel);
+                        }
+                        prior.push(guard);
+                    }
                     let unit_body = Expr::lit(Lit::Unit);
                     let new_function = Expr::lambda(&param.name, param.ty.clone(), unit_body);
                     return Ok(TypedExpr {
@@ -1764,30 +1803,34 @@ fn extract_for_defer(
                 let elt_user_ann = elt.user_annotation.clone();
                 match elt.node {
                     TypedExprNode::Lambda { param, body } if &param.name != defer_name => {
-                        // Filter-feed: `λ p → Case({g → Feed(d, V); true →
-                        // Unit})` becomes a refined-Lambda channel
-                        // (`λ p with {g} → V`) plus a Lambda whose body
-                        // is `Unit`.  See [`try_extract_filter_feed`].
-                        if let Some((guard, feed_value)) =
-                            try_extract_filter_feed(&body, defer_name)
-                        {
-                            // Construct the refined source exactly as a
-                            // filtered comprehension does (`lower::comprehension`
-                            // / `lower::exprs`): a *bare* predicate
-                            // `__elem ▷ source ▷ (λ p → guard)` referencing the
-                            // domain element `__elem`, then wrap the source's
-                            // *domain* in `Refinement(_, pred)` so planning
-                            // restricts the iteration to guard-passing indices.
+                        // Feeding `λ p → Case({g₀ → Feed(d, v₀); …; true → Unit})`
+                        // becomes one refined-source channel per feeding arm
+                        // plus a Lambda whose body collapses to `Unit`.  See
+                        // [`try_extract_fanout_feed`].
+                        if let Some(fanout_arms) = try_extract_fanout_feed(&body, defer_name) {
+                            // Fan the feeding arms out into one refined-source
+                            // channel each (unioned via `++` at the cluster bind
+                            // site), encoding the `Case`'s first-match order:
+                            // arm `i`'s source is restricted to `gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`
+                            // ([`synthesize_arm_predicate`]). The two-arm
+                            // `if g: d << v` shape is the degenerate
+                            // one-feeding-arm case.
                             //
-                            // The predicate MUST reference `__elem` in this
-                            // element form: planning's
-                            // `compile_refinement_predicates` η-expands
-                            // `λ __elem → pred` and lambda-eliminates it, so a
-                            // predicate constant in `__elem` (e.g. the point-free
-                            // `source ≫ guard`) collapses to `const(_)` and drops
-                            // the per-element test. It is also fully typed here —
-                            // a `Refinement` predicate is immutable, so `retype`
-                            // never re-derives it.
+                            // Each channel's restriction is the *bare* element
+                            // predicate `__elem ▷ source ▷ (λ p → predᵢ)`
+                            // referencing the domain element `__elem` (the same
+                            // form a filtered comprehension builds — see
+                            // `lower::comprehension`), then wraps the source's
+                            // *domain* in `Refinement(_, pred)` so planning
+                            // restricts the iteration to passing indices. The
+                            // predicate MUST reference `__elem` in this element
+                            // form: planning's `compile_refinement_predicates`
+                            // η-expands `λ __elem → pred` and lambda-eliminates
+                            // it, so a predicate constant in `__elem` (e.g. a
+                            // point-free `source ≫ guard`) collapses to
+                            // `const(_)` and drops the per-element test. It is
+                            // also fully typed here — a `Refinement` predicate is
+                            // immutable, so `retype` never re-derives it.
                             let source_prefix = if new_elts.len() == 1 {
                                 new_elts[0].clone()
                             } else {
@@ -1795,26 +1838,38 @@ fn extract_for_defer(
                             };
                             let src_domain = source_prefix.ty.domain().unwrap_or(Type::Hole);
                             let src_item = source_prefix.ty.codomain().unwrap_or(Type::Hole);
-                            let elem = Expr::var(Name::elem()).with_ty(src_domain);
-                            let source_at_elem =
-                                Expr::apply(elem, source_prefix.clone()).with_ty(src_item);
-                            let pred_lambda = Expr::lambda(&param.name, param.ty.clone(), guard);
-                            let pred_on_source = Expr::apply(source_at_elem, pred_lambda)
-                                .with_ty(Type::Base(BaseType::Bool));
-                            let refinement_struct = Refinement {
-                                predicate: Rc::new(pred_on_source),
-                            };
-                            let mut refined_prefix = source_prefix.clone();
-                            refine_source_domain(&mut refined_prefix, refinement_struct, ctx);
-                            let channel_lambda =
-                                Expr::lambda(&param.name, param.ty.clone(), feed_value);
-                            let channel_expr = Expr::compose(vec![refined_prefix, channel_lambda]);
-                            feeds.push(channel_expr);
-                            // The original Lambda's body becomes `Unit`
-                            // (matching the Case's non-feeding-arm
-                            // value); after lambda elim it composes
-                            // with the unrefined source to a no-op
-                            // iteration.
+                            let mut prior: Vec<Expr> = Vec::new();
+                            for (guard, feed_value) in fanout_arms {
+                                if let Some(value) = feed_value {
+                                    let pred = synthesize_arm_predicate(&guard, &prior);
+                                    let elem = Expr::var(Name::elem()).with_ty(src_domain.clone());
+                                    let source_at_elem = Expr::apply(elem, source_prefix.clone())
+                                        .with_ty(src_item.clone());
+                                    let pred_lambda =
+                                        Expr::lambda(&param.name, param.ty.clone(), pred);
+                                    let pred_on_source = Expr::apply(source_at_elem, pred_lambda)
+                                        .with_ty(Type::Base(BaseType::Bool));
+                                    let refinement_struct = Refinement {
+                                        predicate: Rc::new(pred_on_source),
+                                    };
+                                    let mut refined_prefix = source_prefix.clone();
+                                    refine_source_domain(
+                                        &mut refined_prefix,
+                                        refinement_struct,
+                                        ctx,
+                                    );
+                                    let channel_lambda =
+                                        Expr::lambda(&param.name, param.ty.clone(), value);
+                                    let channel_expr =
+                                        Expr::compose(vec![refined_prefix, channel_lambda]);
+                                    feeds.push(channel_expr);
+                                }
+                                prior.push(guard);
+                            }
+                            // Every feed for this defer is extracted; the
+                            // original lambda body collapses to `Unit` (after
+                            // lambda elim it composes with the unrefined source
+                            // to a no-op iteration).
                             let new_lambda = TypedExpr {
                                 node: TypedExprNode::Lambda {
                                     param,
@@ -1982,18 +2037,18 @@ fn extract_for_defer(
                 per_branch.push((pattern, guard, branch_feeds, body));
             }
             if any_feed {
-                // A multi-arm `Case` that feeds the defer in one or more arms.
-                // The two-arm filter shape `{guard → d << v; true → unit}` is
-                // handled earlier as a refined-source channel
-                // (`try_extract_filter_feed`); anything else is the N-arm fan-out
-                // — not yet supported. The proper lowering is to extend that
-                // refinement fan-out to N arms (a refined source per arm `i`
-                // predicated on `¬g₀ ∧ … ∧ ¬g_{i-1} ∧ gᵢ`); the former
-                // Record-based fan-out is retired (it published an ill-typed
-                // `Unit` empty-channel for no-feed arms — a silent miscompile).
-                // Reject up front rather than mishandle. Unreachable from CHL
-                // today: lowering rejects `elif` inside a generator for-loop
-                // body, so a multi-arm feed `Case` never reaches here.
+                // A feeding `Case` that reached the generic structural recursion
+                // — i.e. one *not* wrapped in the iteration `Compose`/`Apply`
+                // that the fan-out sites above intercept, so there is no
+                // iteration source to restrict per arm. The loop-sourced
+                // multi-arm fan-out (`if g: d << v` and `if/elif` in a for-loop
+                // body) is handled at those sites via `try_extract_fanout_feed`,
+                // one refined-source channel per arm `i` predicated on
+                // `gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`. A *source-less* conditional feed has no
+                // refinement to hang the guard on, so reject it rather than
+                // mishandle. (The former Record-based fan-out is retired — it
+                // published an ill-typed `Unit` empty-channel for no-feed arms,
+                // a silent miscompile.)
                 return Err(DeferError::PartialFeedCaseUnsupported(
                     defer_name.to_string(),
                 ));
@@ -2203,12 +2258,15 @@ mod tests {
         );
     }
 
-    /// A multi-arm `Case` that feeds the defer in some arm is rejected with
-    /// `PartialFeedCaseUnsupported` (the former Record-based fan-out, which
-    /// published an ill-typed empty channel for no-feed arms, is retired — the
-    /// N-arm refinement fan-out that will replace it is not built yet).
+    /// A multi-arm `Case` feeding the defer in some arm, wrapped in an
+    /// `Apply(source, λ …)` iteration, fans out into one refined-source channel
+    /// per feeding arm (`try_extract_fanout_feed`) — the former
+    /// `PartialFeedCaseUnsupported` rejection is retired. Here the sole feeding
+    /// arm (`x > 0`) yields a refined channel; the `false` arm contributes
+    /// nothing. (Exercises the `Apply`-site fan-out; the `Compose`-site path has
+    /// end-to-end coverage in `tests/compilation_pipeline/feeds_cases.rs`.)
     #[test]
-    fn run_multi_arm_case_feed_is_rejected() {
+    fn run_multi_arm_case_feed_fans_out() {
         let guard = Expr::new(TypedExprNode::BinOp {
             left: Box::new(var("x")),
             op: BinOpKind::Compare(crate::ccl::CompareKind::Greater),
@@ -2238,11 +2296,8 @@ mod tests {
         let apply = Expr::apply(source, body_lambda);
         let with_d = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), apply);
         assert!(
-            matches!(
-                run(with_d, false),
-                Err(DeferError::PartialFeedCaseUnsupported(_))
-            ),
-            "a multi-arm Case feeding the defer must be rejected"
+            run(with_d, false).is_ok(),
+            "a multi-arm Case feeding the defer must fan out, not be rejected"
         );
     }
 

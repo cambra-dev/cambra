@@ -609,6 +609,22 @@ channel is simply a `Feed`-kind letrec binding, read as a stream instead of scal
 
 ### 2. Unify conditional writes and conditional feeds (one fan-out)
 
+**Status: feed half landed; write half is an open question.** The N-arm conditional *feed* fan-out
+is implemented: a feeding `if`/`elif` in a for-loop body fans out to one refined-source channel per
+feeding arm, restricted to `gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ` (first-match order) and unioned via `++`
+(`synthesize_arm_predicate` / `try_extract_fanout_feed` in `desugar_defers`; the `elif`-in-generator
+lowering gate is lifted). Conditional *writes* are **not** landed, and the sketch below turns out to
+under-specify them: a store is a **shared recurrence** — every arm reads `get_prev_seq(total, 𝑟)`, so
+the arms are *not* independent. The literal `⧺`-union with a carry-forward arm therefore has a
+cross-arm dependency (the taken arm needs `total` at the off-path positions and vice-versa) that a
+plain union cannot compute — the `Recurse` engine would have to interleave the arms in domain order.
+The alternative — a value-`Case` recurrence step — is rejected by `lambda_elim` (only the 2-arm
+filter shape `{𝑔 → action; true → unit}` → a *restricted* source survives, which drops the off-guard
+positions: correct for a partial feed, wrong for a total store). So enabling conditional writes needs
+new machinery (a `lambda_elim` extension for the carry-forward step, or engine interleaving) — not
+the mechanical reuse this section implies. The unification is real at the **predicate** level (both
+use the path-condition fan-out); it is the store's carry-forward that is not a mere extra union arm.
+
 A conditional write (`if 𝑝: total += x`) carries the previous value forward off-path; a conditional
 feed (`if 𝑝: o << x`) is absent off-path. These are **not two mechanisms** — both are the same
 refinement fan-out over the branch path conditions, which is exactly the value-`Case` lowering the
@@ -664,16 +680,25 @@ and retiring `Transact` as a second representation of the same group.
   deleted. It was dead against every real program: `inline` beta-reduces every defer-mediating UDF at
   its call site *before* desugar runs, so desugar only ever sees flattened `let d = defer in …`
   chains. `desugar_defers` is now a single-phase cluster channelizer.
-- The conditional feed (`if guard: d << v` in a loop) now compiles end-to-end. Desugar emits its
-  refined-source channel with the *bare element predicate* `__elem ▷ source ▷ (λ p → guard)` — the
-  same form a filtered comprehension `[v for p in source if guard]` builds
-  ([`lower::comprehension`]) — fully typed at construction (a `Refinement` predicate is immutable, so
-  `retype` never re-derives it). Planning reifies it into an `IterateExtent` + `Restrict`. This is
-  the two-arm case of [#2](#2-unify-conditional-writes-and-conditional-feeds-one-fan-out).
+- The conditional feed (`if guard: d << v` in a loop) compiles end-to-end, now generalized to the
+  **N-arm** (`if`/`elif`) case: each feeding arm `i` fans out to a refined-source channel with the
+  *bare element predicate* `__elem ▷ source ▷ (λ p → gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ)` — the same element form a
+  filtered comprehension `[v for p in source if guard]` builds ([`lower::comprehension`]), fully
+  typed at construction (a `Refinement` predicate is immutable, so `retype` never re-derives it) —
+  and the channels are unioned via `++`. Planning reifies each into an `IterateExtent` + `Restrict`.
+  The `elif`-in-generator lowering gate is lifted; the former two-arm `try_extract_filter_feed` is
+  the degenerate one-feeding-arm case of `try_extract_fanout_feed`. This completes the feed half of
+  [#2](#2-unify-conditional-writes-and-conditional-feeds-one-fan-out).
 
-**Remaining:** the N-arm (`if/elif`) fan-out — still gated at *lowering* (`elif` inside a generator
-for-loop body is rejected today), tracked by `multi_arm_case_with_some_feeding_branches_is_a_known_gap`;
-and relocating the live channel assembly into the sequencing phase so the pass disappears entirely.
+**Remaining:** relocating the live channel assembly — feed extraction, `++` union, topological
+ordering, α-renaming, defer-returning normalization, and channel-domain resolution — into the
+sequencing phase so `desugar_defers` disappears entirely, and `retype` with it. This is the large
+refactor the rest of this section targets. `retype` is heavily load-bearing on the *current* desugar
+(with it disabled, ~all feed and generator programs fail the strict post-desugar typecheck), so it
+can only be retired once the relocated assembly is type-preserving *by construction* — as the
+conditional-feed fan-out already is. Conditional *writes* (the store half of
+[#2](#2-unify-conditional-writes-and-conditional-feeds-one-fan-out)) stay gated at lowering pending
+that section's design resolution.
 The rest of this section is the target design.
 
 *(Depends on 1 and 2; the payoff the whole unification is for.)* `desugar_defers` is a bespoke
