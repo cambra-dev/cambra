@@ -86,7 +86,7 @@ Types (from `Display for Type` in `src/ccl/mod.rs`):
 - **Infer**: `?N` (where `N` is the variable id).
 - **DataSource**: `source(name)`.
 - **Union**: `T1 | T2`.
-- **Feed**: `Feed[T]` — a transient deferred-output type inference threads and `desugar_defers` erases.
+- **Feed**: `Feed[T]` — a transient deferred-output type inference threads and `channelize` erases.
 - **Mut**: `Mut[value, domain]` — a transient mutable-variable type inference threads and the mutability/transaction phases erase; the domain is an induction extent or `Txn`.
 - **Txn**: `Txn` — the (nullary) transaction-commit sequencing domain, the second slot of a `Mut[V, Txn]` register.
 

@@ -270,7 +270,7 @@ returns, what a defer-mediating UDF parameter (`λ out → out << e`) carries. I
 `Type::History` variant a store uses, under the `Feed` kind (see
 [#1](#1-collapse-mut--feed-into-one-history-variant)); unlike a store it reads as its whole stream
 `𝐷 ⇒ 𝑉`, not a scalar deref. Feed handles are fully first-class — returnable and tuple-packable —
-because feed aliasing is benign (multiple feeders union by `++`). `desugar_defers` eliminates every
+because feed aliasing is benign (multiple feeders union by `++`). `channelize` eliminates every
 feed-typed term when it resolves channels, so no history type survives to planning.
 
 ### `Txn` is a CCL type
@@ -575,7 +575,7 @@ function `𝐷 ⇒ 𝑉` plus a two-valued marker. `Store` is a mutable store (d
 `𝑉`, carry-forward terminal, scalar-last read); `Feed` is a feed channel (read as the whole stream
 `𝐷 ⇒ 𝑉`, stream terminal). Lowering stamps `Store` on a `:=` introduction and `Feed` on a `defer`;
 the store histories are erased to a bare `Type::Fun` by the unified phase (`letrec_phase` /
-`transact_phase`) and the feed histories by `desugar_defers` — exactly as `Mut`/`Feed` were erased
+`transact_phase`) and the feed histories by `channelize` — exactly as `Mut`/`Feed` were erased
 before — so no history type survives to planning and "later stages are just `Fun`" holds. (A
 `history` *field* on the universal `Type::Fun` was considered and rejected: it would thread a
 rarely-set marker through ~150 construction sites — every lambda, collection, and morphism — and
@@ -612,7 +612,7 @@ channel is simply a `Feed`-kind letrec binding, read as a stream instead of scal
 **Status: feed half landed; write half is an open question.** The N-arm conditional *feed* fan-out
 is implemented: a feeding `if`/`elif` in a for-loop body fans out to one refined-source channel per
 feeding arm, restricted to `gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ` (first-match order) and unioned via `++`
-(`synthesize_arm_predicate` / `try_extract_fanout_feed` in `desugar_defers`; the `elif`-in-generator
+(`synthesize_arm_predicate` / `try_extract_fanout_feed` in `channelize`; the `elif`-in-generator
 lowering gate is lifted). Conditional *writes* are **not** landed, and the sketch below turns out to
 under-specify them: a store is a **shared recurrence** — every arm reads `get_prev_seq(total, 𝑟)`, so
 the arms are *not* independent. The literal `⧺`-union with a carry-forward arm therefore has a
@@ -661,7 +661,7 @@ carries forward on `¬commit`; feeds fire on their arms and are absent otherwise
 Two consequences: **domain totality is not a separate property** — "store total / channel partial" is
 exactly the presence or absence of the carry-forward arm. And **multi-site channels** (`o << x` in one
 loop, `o << y` in another) are just more union arms, so the current `++` cross-site channel assembly
-in `desugar_defers` is the same fan-out — which is how a defer channel folds into the letrec model.
+in `channelize` is the same fan-out — which is how a defer channel folds into the letrec model.
 
 ### 3. Retire the `Transact` carrier; keep `LetRec` through op-conversion
 
@@ -673,33 +673,65 @@ and retiring `Transact` as a second representation of the same group.
 
 ### 4. Retire `desugar_defers`: feeds lower through the unified phase
 
-**Status: in progress.** Landed so far:
+**Status: landed (the concrete win; full store-machinery subsumption is future work).**
 
 - The entire defer-mediating-UDF machinery (the Phase-1 chain rewriter, lambda classification,
   DI-chain wrapping, return-Record body rewrite, and the call-site smart walker, ~1700 lines) is
   deleted. It was dead against every real program: `inline` beta-reduces every defer-mediating UDF at
-  its call site *before* desugar runs, so desugar only ever sees flattened `let d = defer in …`
-  chains. `desugar_defers` is now a single-phase cluster channelizer.
-- The conditional feed (`if guard: d << v` in a loop) compiles end-to-end, now generalized to the
+  its call site *before* channelization runs, so it only ever sees flattened `let d = defer in …`
+  chains.
+- The conditional feed (`if guard: d << v` in a loop) compiles end-to-end, generalized to the
   **N-arm** (`if`/`elif`) case: each feeding arm `i` fans out to a refined-source channel with the
   *bare element predicate* `__elem ▷ source ▷ (λ p → gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ)` — the same element form a
   filtered comprehension `[v for p in source if guard]` builds ([`lower::comprehension`]), fully
-  typed at construction (a `Refinement` predicate is immutable, so `retype` never re-derives it) —
-  and the channels are unioned via `++`. Planning reifies each into an `IterateExtent` + `Restrict`.
-  The `elif`-in-generator lowering gate is lifted; the former two-arm `try_extract_filter_feed` is
-  the degenerate one-feeding-arm case of `try_extract_fanout_feed`. This completes the feed half of
+  typed at construction — and the channels are unioned via `++`. Planning reifies each into an
+  `IterateExtent` + `Restrict`. The `elif`-in-generator lowering gate is lifted; the former two-arm
+  `try_extract_filter_feed` is the degenerate one-feeding-arm case of `try_extract_fanout_feed`. This
+  completes the feed half of
   [#2](#2-unify-conditional-writes-and-conditional-feeds-one-fan-out).
+- **The standalone `desugar_defers` pass and the `retype` pass are both gone.** The channel assembly
+  — feed extraction, `++` union, topological ordering, α-renaming, defer-returning normalization,
+  per-shape extraction — was **relocated** into `src/ccl/channelize.rs`, the *feed-routing step of the
+  unified phase*: it runs immediately after `letrec_phase::run` / `recognize` in `compile_program`,
+  on the already-hoisted tree (the phase turns every in-loop feed into a top-level
+  `Feed(defer, view)`, so channelization is origin-agnostic — it never distinguishes an
+  accumulator-loop feed from a feed-only-loop or scalar feed). Assembly is now **type-preserving by
+  construction**: every channel node is stamped from its children's concrete types, exactly as
+  `letrec_phase` stamps a `LetRec`.
+- **`retype` (the third, general, solver-free type-synthesis walk in `infer`) is deleted.** It was
+  load-bearing only because the *old* assembly left `Hole`s on constructed nodes; with construction
+  now type-preserving, the only surviving residue is the defer **reads** — a `Var(d)` still carries
+  the inference-time `feed(?⇒V)` handle, and the pre-existing nodes that consume a read (`d ++ d`,
+  `sum(d)`, the trailing `let`/`;` spine) carry the unresolved `Infer` channel domain that rode the
+  read up. `channelize::resolve_read_types` is a **bounded, feed-specific** fixup for exactly those:
+  rebind each read to its channel's concrete type and recompute the residue-typed ancestors
+  bottom-up. It is *not* the old general re-inference — no constraint solver, no fixpoint, no
+  call-site argument collection.
 
-**Remaining:** relocating the live channel assembly — feed extraction, `++` union, topological
-ordering, α-renaming, defer-returning normalization, and channel-domain resolution — into the
-sequencing phase so `desugar_defers` disappears entirely, and `retype` with it. This is the large
-refactor the rest of this section targets. `retype` is heavily load-bearing on the *current* desugar
-(with it disabled, ~all feed and generator programs fail the strict post-desugar typecheck), so it
-can only be retired once the relocated assembly is type-preserving *by construction* — as the
-conditional-feed fan-out already is. Conditional *writes* (the store half of
+**Honest caveat — reads are not fully "no synthesis," and the store-machinery subsumption is
+aspirational.** The bullet points below argue every desugar step has a store-path counterpart, so
+feeds could travel the *same* `For`/`MutWrite` → `LetRec` → recognition road as stores with *zero*
+re-derivation. That is **not** what landed, and the gap is structural, not just unfinished work:
+
+- A **store** read derefs to a concrete *scalar* `𝑉` at inference (via the coercion arm), so its
+  ancestors (`store + 1`) are already concrete and `erase_mut` — a pure type-substitution — suffices.
+  A **feed** read is its whole *stream* `𝐷 ⇒ 𝑉` with `𝐷` unresolved (only channelization knows the
+  contribution domains), so its ancestors carry that unresolved domain. And a consuming node like
+  `d ++ d` gets its domain from `emit_collection_union` via a **subtyping** edge, not an equality, so
+  the union's domain vars are *not* the same solver class as the read's — a pure domain-substitution
+  cannot fix them. Recomputing them is genuine (if bounded and solver-free) bottom-up re-derivation.
+- Channelization therefore remains a **distinct relocated step**, not folded into the store recurrence
+  (`LetRec`/`Transact`) machinery. The concrete, delivered win is *relocation + type-preserving
+  construction + no separate `retype` pass*; full subsumption (a `Feed`-kind `LetRec` binding
+  recognized alongside stores) would additionally require resolving the channel domain into the feed
+  history type at the phase, so that reads carry `feed(𝐷 ⇒ 𝑉)` with `𝐷` concrete and an `erase_feed`
+  substitution closes it — the store-symmetric path, left as future work.
+
+Conditional *writes* (the store half of
 [#2](#2-unify-conditional-writes-and-conditional-feeds-one-fan-out)) stay gated at lowering pending
 that section's design resolution.
-The rest of this section is the target design.
+The rest of this section is the original target design (feeds fully subsumed by the store machinery),
+retained as the aspiration the caveat above measures against.
 
 *(Depends on 1 and 2; the payoff the whole unification is for.)* `desugar_defers` is a bespoke
 *second* lowering of exactly the machinery the unified phase already runs. It walks a cluster of

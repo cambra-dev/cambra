@@ -279,7 +279,7 @@ impl Typing for InferCtx {
         // (`lower.rs`) only lowers `int`/`str`/`bool`/`None` annotations from
         // source, all of which are `Type::Base` leaves where two-way ≡ one-way
         // (distinct bases are incomparable; equal bases compare reflexively).
-        // The other annotation producer — `desugar_defers`' filter-feed
+        // The other annotation producer — `channelize`' filter-feed
         // `Fun(Refinement(Hole, r), Hole)` shapes — is Hole-based: normalized
         // Holes become fresh vars, where the two directions record symmetric
         // bounds (the intended "annotation wins" propagation) rather than

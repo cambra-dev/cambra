@@ -105,7 +105,7 @@ pub(super) fn lower_stmts_recovering(
 /// those inner bindings, making their names unbound.
 ///
 /// The `ExprStmt` node "drives the feed": `simplify` drops it once
-/// [`crate::ccl::desugar_defers`] has extracted all `Feed` nodes from the body,
+/// [`crate::ccl::channelize`] has extracted all `Feed` nodes from the body,
 /// leaving a clean `Let* Record{…}` shape that `compile_program` can pattern-match on.
 fn append_record_at_tail(expr: Expr, record: Expr) -> Expr {
     match expr.node {
@@ -162,7 +162,13 @@ pub(super) fn lower_stmts_inner(
 
     // Pre-register `Mut`-parameter `def`s so a call site (lowered before the
     // `def` preceding it textually, since blocks lower right-to-left) picks the
-    // curried application shape.
+    // curried application shape. Snapshot the set first and restore it once the
+    // block is lowered: registrations are block-scoped, so a `Mut`-param `def`
+    // local to this block cannot leak its curried shape onto a same-named
+    // `def`/call in an enclosing or sibling scope. (This block's `def`s still
+    // shadow outer same-named ones *within* the block, as pre-registration
+    // overwrites them here and the restore reinstates the outer ones on exit.)
+    let saved_mut_param_fns = ctx.mut_param_fns.clone();
     pre_register_mut_param_fns(stmts, ctx);
     let (last, rest) = stmts.split_last().unwrap();
 
@@ -171,14 +177,16 @@ pub(super) fn lower_stmts_inner(
     // preceding assignments and function definitions in Let bindings,
     // innermost-first. (Store-ness is carried by `Type::History` and checked
     // post-inference; introduction-vs-write is decided by lexical scope.)
-    lower_final_stmt(last, rest, outer_bindings, ctx).and_then(|final_expr| {
+    let result = lower_final_stmt(last, rest, outer_bindings, ctx).and_then(|final_expr| {
         rest.iter()
             .enumerate()
             .rev()
             .try_fold(final_expr, |acc, (i, stmt)| {
                 lower_middle_stmt(stmt, &rest[..i], acc, outer_bindings, ctx, is_top_level)
             })
-    })
+    });
+    ctx.mut_param_fns = saved_mut_param_fns;
+    result
 }
 
 /// Lower the final statement in a block, which must be a bare expression, an if/else block,
@@ -233,6 +241,30 @@ pub(super) fn lower_final_stmt(
                         for_body,
                         &acc_names,
                         Expr::lit(Lit::Unit),
+                        ctx,
+                    );
+                }
+                // A non-yielding, non-feeding loop whose body's terminal
+                // statement is a bare *effect* expression — a call that may hide
+                // a pass-by-reference store write (`for x in xs: bump(cnt)`),
+                // invisible pre-inference — is a valid final statement: the loop
+                // runs and its store value is simply unobserved (`Unit`). Mirror
+                // `lower_middle_stmt`'s hidden-writer path (with `Unit` as the
+                // continuation) and let the letrec phase classify it (a call that
+                // beta-reduces to a `MutWrite` → an accumulator; a pure body → a
+                // dropped no-op). Without this it wrongly hit the generator path's
+                // "must end in a yield/feed" rejection. A terminal that reassigns
+                // the loop variable (`x += 1`) or a non-store is *not* a bare
+                // effect, so it stays rejected by the generator path below — it is
+                // a likely-mistaken no-op, not a hidden writer.
+                if !for_body_has_feed(for_body) && for_body_terminal_is_bare_effect(for_body) {
+                    return lower_direct_mirror_loop(
+                        target,
+                        iter,
+                        for_body,
+                        &[],
+                        Expr::lit(Lit::Unit),
+                        None,
                         ctx,
                     );
                 }
@@ -663,18 +695,29 @@ pub(super) fn mut_annotation_parts(
 /// call site is lowered *before* the `def` that precedes it textually;
 /// pre-registering per block makes a `Mut`-parameter `def` visible (so
 /// [`lower_call`] picks the curried application shape) at each call site.
+///
+/// The registration is per-name and **last definition wins**: a later non-`Mut`
+/// `def` shadowing an earlier `Mut`-param one of the same name *clears* the
+/// registration, so its calls lower with the ordinary tupled shape (matching
+/// CHL's redefinition-shadows semantics). The caller ([`lower_stmts_inner`])
+/// scopes the whole set to the block, so this only ever resolves same-name
+/// definitions *within* one block, never across scopes.
 pub(super) fn pre_register_mut_param_fns(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) {
     for stmt in stmts {
         // A `def` with a pass-by-reference `Mut` parameter is lowered and applied
         // curried. Blocks lower right-to-left, so a call site is lowered *before*
         // the `def` preceding it textually — pre-register the name here so
-        // [`lower_call`] picks the curried shape.
-        if let ChlStmt::FunctionDef { name, params, .. } = &stmt.node
-            && params
+        // [`lower_call`] picks the curried shape. Register or unregister per the
+        // definition's mut-ness so the last `def` of a name in the block wins.
+        if let ChlStmt::FunctionDef { name, params, .. } = &stmt.node {
+            let has_mut_param = params
                 .iter()
-                .any(|p| p.annotation.as_ref().is_some_and(is_mut_annotation))
-        {
-            ctx.register_mut_param_fn(name.as_str());
+                .any(|p| p.annotation.as_ref().is_some_and(is_mut_annotation));
+            if has_mut_param {
+                ctx.register_mut_param_fn(name.as_str());
+            } else {
+                ctx.unregister_mut_param_fn(name.as_str());
+            }
         }
     }
 }

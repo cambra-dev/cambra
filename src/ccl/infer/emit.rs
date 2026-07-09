@@ -193,7 +193,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
     if expr.user_annotation.is_some() {
         // The annotation may carry refinement predicates (e.g. a
         // filter-feed source annotation `Fun(Refinement(Hole, r), Hole)`
-        // from `desugar_defers`). Now that refinements ride the lattice,
+        // from `channelize`). Now that refinements ride the lattice,
         // those predicates surface on the node's coalesced type and reach
         // the post-inference checks, so their expression trees must be
         // inferred in the current scope and rebuilt on the annotation itself.

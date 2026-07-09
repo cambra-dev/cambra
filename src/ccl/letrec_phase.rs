@@ -69,7 +69,7 @@ pub fn run(expr: Expr) -> Expr {
     // binding and any surviving reference (e.g. a trailing read the recurrence
     // re-points to the extracted final value) are stale afterward. Erase them
     // so no store history reaches the strict `typecheck` (mirroring how
-    // `desugar_defers` erases a feed history). Every store is an induction
+    // `channelize` erases a feed history). Every store is an induction
     // store consumed here.
     erase_mut(&mut out);
     // Release-mode post-conditions (not `debug_assert!`): these are the phase's
@@ -106,7 +106,7 @@ fn contains_marker(expr: &Expr) -> bool {
 /// Whether any reachable type slot (node type, binder slot, or user
 /// annotation) still carries a mutable-**store** `Type::History` — the
 /// post-condition [`erase_mut`] establishes. A `Feed` history is *not* the
-/// phase's concern (it is erased later by `desugar_defers`), so only
+/// phase's concern (it is erased later by `channelize`), so only
 /// [`HistoryKind::Store`] counts here.
 fn contains_mut_type(expr: &Expr) -> bool {
     fn ty_has_mut(ty: &Type) -> bool {
@@ -140,7 +140,7 @@ fn contains_mut_type(expr: &Expr) -> bool {
 
 /// Replace every transient mutable-**store** `Type::History { value, .. }` in
 /// `ty` with its value type (recursively), leaving all other structure intact.
-/// A `Feed` history is left untouched — `desugar_defers` erases it later — but
+/// A `Feed` history is left untouched — `channelize` erases it later — but
 /// its children are still walked (a store nested in a feed payload, though not
 /// expected, is erased for totality).
 fn erase_mut_in_type(ty: &mut Type) {
@@ -261,6 +261,18 @@ fn is_mut_write(e: &Expr) -> bool {
 /// evaluation order and `𝑥`'s scope are preserved. After this pass the only
 /// `MutWrite`s in the tree are `ExprStmt` effects, so `rewrite` and
 /// `transform_chain` never meet a store write in value position.
+/// Whether `e`'s statement spine *heads* a store write: a bare `MutWrite`, or an
+/// `ExprStmt` whose effect (recursively, through any leading nesting) heads one.
+/// This is the flat-spine head invariant `flatten_spine`'s hoist relies on; used
+/// only to assert it (see the `debug_assert!` in the `Let`-hoist branch).
+fn spine_heads_store_write(e: &Expr) -> bool {
+    match &e.node {
+        TypedExprNode::MutWrite { .. } => true,
+        TypedExprNode::ExprStmt { expr, .. } => spine_heads_store_write(expr),
+        _ => false,
+    }
+}
+
 fn flatten_spine(mut e: Expr) -> Expr {
     // Un-nest a *store-write-headed* nested sequence (a spliced multi-statement
     // writer body). A Feed/Define-headed nested `ExprStmt` keeps its nesting.
@@ -284,6 +296,23 @@ fn flatten_spine(mut e: Expr) -> Expr {
             TypedExprNode::MutWrite { .. } => true,
             _ => false,
         };
+        // Invariant: a spliced pass-by-reference writer body is a *right*-nested
+        // `ExprStmt(MutWrite, …)` chain headed by a bare `MutWrite`, so the match
+        // above catches every store write a `Let` bound expr heads. A store write
+        // buried below the head by extra nesting (`ExprStmt(ExprStmt(MutWrite,…),…)`,
+        // the shape conversion 1 above normalizes) slips past `hoist`: the
+        // `map_children` recursion at the tail of this pass un-nests it *within*
+        // the bound expr, but by then the hoist decision is made, so the write
+        // stays inside the `Let` and `rewrite` mis-normalizes it as a sequential
+        // shadow (`normalize_bare_write`) instead of hoisting it — a silent
+        // miscompile leaving no marker for `run`'s post-condition to catch.
+        // Lowering never emits that shape (writer bodies head with a bare
+        // `MutWrite`); assert it so a future lowering change fails loudly here.
+        debug_assert!(
+            hoist || !spine_heads_store_write(bound_expr),
+            "letrec phase: store write buried below the head of a `Let` bound \
+             expression — the flat-spine hoist misses it (see flatten_spine)"
+        );
         if hoist {
             let TypedExprNode::Let {
                 binding,
@@ -477,7 +506,7 @@ fn hist_field_view(
 }
 
 /// Wrap `body` in one `Feed(defer, view)` per collected in-body feed, so
-/// `desugar_defers` routes each per-position value stream to its channel. Each
+/// `channelize` routes each per-position value stream to its channel. Each
 /// `view` is the feed's value stream over its contributing domain — for an
 /// induction loop, `__hist ▷ .to_<feed>` (see [`hist_field_view`]); for a `with
 /// begin():` block, a commit-record tap binding. Both the mutation-loop phase
@@ -486,7 +515,7 @@ fn hist_field_view(
 ///
 /// **Invariant (load-bearing): source order is preserved.** Feeds are wrapped in
 /// reverse, so the first source feed becomes the *outermost* `ExprStmt`.
-/// `desugar_defers` collects feeds outermost-first into a channel's union, so
+/// `channelize` collects feeds outermost-first into a channel's union, so
 /// this ordering is what fixes the union's variant tags when several feeds
 /// target one defer. Pass `feeds` in source order.
 pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<(Name, Expr)>) -> Expr {
@@ -585,6 +614,18 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
         t.ty = packed_ty.clone();
         t
     };
+    // Accumulator *arity* is encoded structurally in this default and recovered
+    // by `recover_writer` (recognition), which reads single-vs-multi off
+    // `default.node == Tuple`. A single accumulator's default is therefore a bare
+    // `Var` referencing its pre-loop value — never an inlined `Tuple` literal,
+    // even when the accumulator's value type *is* a tuple — so a tuple-valued
+    // single accumulator is not misread as several. Assert both directions so a
+    // future change to either side fails loudly rather than silently misclassifying.
+    debug_assert!(
+        single != matches!(default_expr.node, TypedExprNode::Tuple(_)),
+        "letrec phase: accumulator-arity encoding broken — recover_writer reads \
+         single-vs-multi off `default.node == Tuple` (single={single})"
+    );
     let guard = {
         let mut arg = Expr::tuple(vec![
             step_view.clone(),
@@ -698,7 +739,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
 /// Rewrite an accumulator-free loop fed out (`for target in iter: out << value`)
 /// to the plain-map form. Each in-loop feed becomes `Feed(defer, iter ≫ (λ
 /// target → value))`: the loop source mapped through the fed value at each
-/// position, hoisted out of the loop for `desugar_defers` to route as an
+/// position, hoisted out of the loop for `channelize` to route as an
 /// ordinary channel contribution. There is no history binding and no letrec.
 fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr) -> Expr {
     let (domain_ty, _item_ty) = fun_parts(&iter.ty);
@@ -1011,10 +1052,12 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     assert_eq!(guard_args.len(), 3, "get_prev_seq arity");
     let default = guard_args.pop().unwrap();
 
-    // Accumulator params and inits. Single acc: the guard binding *is* the
-    // param and the default is its init. Multi: the packed guard binding is
-    // followed by one destructuring let per accumulator, and the default
-    // tuple's elements are the inits.
+    // Accumulator params and inits. Arity is read off the default's shape (the
+    // encoding `transform_loop` asserts): a `Tuple` default means several
+    // accumulators — the packed guard binding is followed by one destructuring
+    // let per accumulator, and the default tuple's elements are the inits — while
+    // any non-`Tuple` default means a single accumulator whose guard binding *is*
+    // the param and whose default *is* its init.
     let (params, init_args): (Vec<TypedBinding>, Vec<Expr>) = match &default.node {
         TypedExprNode::Tuple(_) => {
             let TypedExprNode::Tuple(inits) = default.node else {

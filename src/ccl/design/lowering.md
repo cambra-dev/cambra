@@ -45,75 +45,30 @@ let f = λ params →
 
 ### Mutation-accumulation loops
 
-**Mutation accumulation loops** (`x = 0; for i in src: x += i; x`) are detected in `lower.rs` and lowered to a [`TypedExprNode::Loop`](ir.md#loop-for-mutation-accumulation-iteration) node rather than a `For` node.  `lower_middle_stmt` calls `find_mutation_loop_vars` (which scans the body for *every* outer-scope name that gets mutated, in first-mention order — handles `x = x + i; o << x` shapes and multi-accumulator bodies like `y = y + i; x = x * i`), then `lower_mutation_loop` builds:
+A mutation-accumulation loop (`x := 0; for i in src: x += i; x`) lowers to the
+**direct-mirror markers**, not a bespoke loop node: a `TypedExprNode::For` whose
+body carries `TypedExprNode::MutWrite` store writes. `lower_middle_stmt` /
+`lower_generator_or_mutation_loop` detect the loop-carried `:=` / `+=` writes
+(`find_mutation_loop_vars`, which scans the body for every mutated outer-scope
+name in first-mention order) and emit that `For`/`MutWrite` shape; store-ness of
+each write is checked post-inference, not at lowering, and a plain `=` to an
+outer-scope name is a lowering error that points at `:=`.
 
-```text
-let x = Loop {
-  params: [x],
-  init_args: [Var(x)],          // outer x's pre-loop value
-  source: <iteration source>,
-  loop_body: λ p → let x = p ▷ Proj(0) in
-                   let i = p ▷ Proj(1) in
-                   step,
-} in body
-```
+The recurrence is **not** built at lowering. The unified `letrec_phase` rewrites
+every `For`+`MutWrite` loop into a guarded `LetRec` — the accumulators' history
+over the loop's induction domain, guarded by `get_prev_seq`, with trailing reads
+lowered to `last_or_default` — and `letrec_phase::recognize` lowers that onto the
+domain-parameterized `Transact` carrier, which operator conversion compiles to a
+`Recurse`. In-loop feeds (`<<`, and `yield` in a generator) are hoisted to
+`Feed(defer, view)` and routed as ordinary channels by `channelize`, the
+feed-routing step of the unified phase. A generator with loop-carried state
+(`total := 0; for x in xs: total += x; yield total`) is the same shape — `yield e`
+is a `<<` against a synthesized result defer.
 
-`lower_mutation_loop_body` walks the for-body sequentially, building a flat let-chain of every assignment and snapshotting each `<<` feed value with the let-chain that preceded it.  Feeds anywhere in the body are supported — pre-mutation, between mutations, or post-mutation — and each captures exactly the SSA-style scope its Python source intended.  See "Record body shape" below for how feeds are surfaced.
-
-Operator conversion realises the loop as a `Recurse` operator wrapped in a `FanOut`.  All dataflow stays in `Tile`s — no shared cache is exposed across operator boundaries.
-
-```text
-              ┌──────────────────────────────────────────────────────────┐
-              │                                                          │
-init ──┐      ▼                                                          │
-        ├──→ Recurse ──→ FanOut ──┬──→ FanIn ──→ body ──→ FanOut(Memo) ──┤
-domain ─┘                         │                  │                   │
-                                  │   source ────────┘                   │
-                                  │                                      │
-                                  └── (acc_var reads from this branch)   │
-                                                                         │
-                                            .step ◀────────── (cycle) ───┘
-                                                                         │
-                                       external Record stream ◀──────────┘
-                                       ((Proj("step"), init) ▷ LastOrDefault
-                                        + Proj("to_<defer>*"))
-```
-
-- **Inputs**: `init` carries the accumulator's starting value (scalar for one param, packed `Record({_i: Scalar(T_i)})` via `ScalarFanIn` for multi-var); `domain` is an `IterateExtent` over the source's domain; `recursive_input` is the body fan-out's `.step` branch back into the cycle, wired in by `recursive_input_setter` after body compilation.
-- **`Recurse` output**: emits the accumulator *shifted forward by one in the domain* — `init` at position 0, `recursive_input[i-1]` at position `i > 0`.  Wrapped in a `FanOut` so that the body's tuple input (the first arm of a `fan_in(prev_acc, source)`) and the loop's external output can share the stream.
-- **Loop body** is compiled with `Some(fan_in([prev_acc_fan.branch(), source_op]))` as its input — a `SealedFunction(D, Record{_0: AccType, _1: item_ty})` matching the body's CCL type `Fun(Tuple(AccType, item_ty), Record({step, to_<defer>*}))`.  The body's lambda projects `acc_var` and `iter_var` out of the input record.  Its codomain is always `Record({step: <step_shape>, to_<defer>*: T_*})` (with the `to_<defer>` fields possibly empty).  The body's output is wrapped in `FanOut(Memo(…))`: one branch is projected to `.step` and closes the cycle via `recursive_input_setter`, the other is the Loop's external output exposed directly as the body Record stream.
-- **External output**: the body fan-out's external branch is exposed directly as the body Record stream.  Downstream lowering picks each accumulator off via `(Proj("step") [▷ Proj(i)], init_arg) ▷ LastOrDefault` (so an empty source yields `init_arg`, not a panic) and each per-iteration channel via `Proj("to_<defer>")`.
-
-#### Record body shape
-
-`lower_mutation_loop` emits one Loop whose body terminates in a Record carrying the recurrence value, with feeds left as `ExprStmt(Feed(d, V), …)` wrappers around the Record:
-
-```text
-let acc_stream = Loop {
-  params: [acc_name],
-  init_args: [Var(acc_name)],   // pre-loop value
-  loop_body: λp →
-    let acc = p ▷ Proj(0) in
-    let i = p ▷ Proj(1) in
-    ExprStmt(Feed(defer_0, <feed_value_0>),
-    ExprStmt(Feed(defer_1, <feed_value_1>),
-      Record({ step: <full let-chain> Var(acc_name) }))),
-} in
-let acc_name = (acc_stream ▷ Proj("step"), Var(acc_name)) ▷ LastOrDefault in
-continuation
-```
-
-`desugar_defers` then absorbs each `Feed(defer_k, V)` into a `to_<defer_k>` field on the body's terminal Record, drops the `ExprStmt` wrappers, and binds the per-iteration channel via `let defer_k = Var(acc_stream) ▷ Proj("to_<defer_k>")` in the surrounding cluster.  No `body_taps` field is needed — the Record's field set is the source of truth.
-
-- **`step`**'s type is the scalar accumulator type for a single param, or a positional `Tuple(T_0, …, T_{n-1})` for multi-var.  Multi-var lowering finishes each accumulator's chain with an extra `▷ Proj(i)` before the `LastOrDefault` pair.
-- **`Builtin::LastOrDefault`** is the explicit stream-to-scalar primitive (`Tuple(Fun(D, T), T) → T`) used for the post-loop accumulator extraction.  Compiles directly to `ExtractLast`, which receives both the stream and the default operator and falls back to the default when the source domain is empty (the loop body ran zero times).  The default at each accumulator's call site is the pre-loop binding `Var(acc_name)`, which resolves to the outer scope because the surrounding `let acc_name = …` shadows it only inside its own body.  It is *not* an `AggregateKind` because there is no fold / identity element; lambda-elim handles it via the polymorphic-builtin Apply rule, mirroring `Zip`.
-- **Op-conversion**: the Loop arm always projects `.step` from a fan-out branch of the body's output before feeding to `recursive_input_setter` so the cycle carries only the recurrence value; the full Record stream is exposed as the Loop's external output.
-
-This shape compiles to **exactly one `Recurse`** per source-level mutation loop, regardless of how many feeds the body contains or whether the after-loop scalar accumulator is also consumed.  Multiple sequential mutation loops sharing one defer still build up a Union-domain `SealedFunction` via `CollectionUnion` — `desugar_defers` collects every `Feed(defer_k, …)` for a given defer and unions their stream values at the defer's resolution site.  Because the desugaring runs pre-inference, the `let acc_stream = Loop` binding stays as a plain shared `Let` and gets normal scope-sharing via inference and lambda-elim, with no per-pass duplication-preservation machinery.
-
-Each feed's value lives inside the body's lambda scope, so its references to `acc` and `iter_var` resolve against the body's per-iteration projections — exactly what the original `o << e` meant.  Pre-mutation feeds capture the empty let-chain (acc = `p.0`, the prev-iteration value); post-mutation feeds capture the chain up to the mutation.
-
-**Generators with loop-carried state** (`running_totals`: `total = 0; for x in xs: total += x; yield total`; brainstorm `2026-04-06-mutability.md` §4b) reuse this same `Loop` lowering — `yield e` is just `<<` against a synthesised generator defer.  `lower_generator_or_mutation_loop` allocates `__result_N = Defer` outside the loop, passes its name into `lower_mutation_loop_body` as `yield_defer`, and each `yield e` is emitted as a raw `Feed(__result_N, …)` inline at the yield site with the same let-chain snapshotting as an explicit `<<`.  `desugar_defers` then absorbs every such feed into a `to_<defer>` field on the body Record.  The surrounding generator-function context already wraps the loop in `let __result_N = Defer in …` so the collected yields surface as the function's stream return value.  Both `lower_generator_for` (final-statement path) and `lower_middle_stmt` (middle-statement path) detect mutation independently of `yield` and dispatch through this same helper — they only differ in what continuation is passed in (`Var(__result_N)` for the final-statement case, the surrounding `body` for the middle case).
+The design of record for the recurrence construction and feed routing is
+[mutability.md](mutability.md) ("The model", "The unified phase", and §4); the
+implementation lives in `src/ccl/letrec_phase.rs` (the `For`/`MutWrite` → `LetRec`
+→ `Transact` recognition) and `src/ccl/channelize.rs` (feed routing).
 
 **Let-bindings in generator bodies** (`y = f(x); yield y`) lower to nested `Let` nodes inside the Lambda body, evaluated once per iteration of the enclosing loop.
 
@@ -127,7 +82,7 @@ Generator expressions `(expr for x in xs)` are lowered via `lower_list_comp` to 
 
 ## Deferred collection operators — `defer` / `<<` / `<<=`
 
-`defer()`, `<<`, and `<<=` are CHL-level operators that let a block accumulate a result value progressively. They are reified as three CCL AST nodes (`Defer`, `Feed`, `Define`) during lowering, then **eliminated** before type inference by `desugar_defers::run`.
+`defer()`, `<<`, and `<<=` are CHL-level operators that let a block accumulate a result value progressively. They are reified as three CCL AST nodes (`Defer`, `Feed`, `Define`) during lowering, then **eliminated** — after type inference and the unified phase — by the feed-channelization step `channelize::run` (§"The `channelize` step" below).
 
 > TODO: `x = defer()` should be replaced with `deferred x` once we implement a custom parser and aren't stuck with CHL parsing rules.
 
@@ -160,16 +115,16 @@ let x = defer
 in ExprStmt(Define(x, 1), x)    # x <<= 1; x
 ```
 
-### The `desugar_defers` pass
+### The `channelize` step (feed channelization)
 
-The pass runs **after** `infer` (and after `inline` + the `letrec_phase`), and is **type-preserving**: inference types the `Defer`/`Feed`/`Define` constructs directly (so type errors report against the user-shaped tree), and the pass ends with a retype synthesis that erases the transient `Feed` / `Infer`-channel-domain types along with the nodes. No pass *downstream* of desugar sees `Defer`/`Feed`/`Define`/`ExprStmt` — those can treat the variants as `unreachable!`. (See [desugar-defers.md](desugar-defers.md) for why the pass moved after inference.)
+Feed channelization runs **after** `infer` (and after `inline` + the `letrec_phase` / `recognize`), as the feed-routing step of the unified phase, and is **type-preserving by construction**: inference types the `Defer`/`Feed`/`Define` constructs directly (so type errors report against the user-shaped tree), and every channel node the step builds is stamped from its children's concrete types. The one residue construction cannot type away — the defer *reads* (`Var(d)` at the inference-time `feed(?⇒V)` handle) and the pre-existing nodes that consume them — is fixed by a bounded, feed-specific read-rebinding (`resolve_read_types`), *not* a general re-typing pass. No pass *downstream* sees `Defer`/`Feed`/`Define`/`ExprStmt` — those can treat the variants as `unreachable!`. (See [type-inference.md](type-inference.md) for why inference runs before channelization.)
 
-In broad strokes, for each cluster of consecutive `let d_i = Defer in …` bindings the pass walks the cluster body to extract every `Feed(d_i, V)` and the (at most one) `Define(d_i, V)`, combines the extracted values via `++` (`TypedExprNode::CollectionUnion`), and emits the cluster's bindings at the body's terminal in topological order so cross-defer references (`x ≪= y; y ≪= …`) resolve without `letrec`.  Special handling exists for per-iteration feeds (Compose/Apply with iteration lambda), Loop bodies (per-iteration `to_<defer>` Record fields), filter-feed Cases, defer-mediating UDF calls (`y = f(arg)` where `f` introduces or manipulates a defer), and a handful of structural rewrites (defer-returning let lift, alias inlining for defer handles).
+In broad strokes, for each cluster of consecutive `let d_i = Defer in …` bindings the step walks the cluster body to extract every `Feed(d_i, V)` and the (at most one) `Define(d_i, V)`, combines the extracted values via `++` (`TypedExprNode::CollectionUnion`), and emits the cluster's bindings at the body's terminal in topological order so cross-defer references (`x ≪= y; y ≪= …`) resolve without `letrec`.  Special handling exists for per-iteration feeds (Compose/Apply with iteration lambda), N-arm filter-feed Cases (`if`/`elif` fan-out to refined-source channels), and a handful of structural rewrites (defer-returning let lift, alias inlining for defer handles). Because `letrec_phase` hoists every in-loop feed to a top-level `Feed(defer, view)` before this step runs, channelization is origin-agnostic — it never distinguishes an accumulator-loop feed from a feed-only-loop or scalar feed.
 
-The full mechanism — the two-phase structure (chain rewriter + cluster walker), the smart-walker for defer-mediating UDF calls, the shadow-renaming step, error modes, known gaps, and a navigation map for the source — lives in **[desugar-defers.md](desugar-defers.md)**.
+The design of record — where this step sits in the unified phase and why `desugar_defers`/`retype` were retired — is **[mutability.md](mutability.md) §4**; the in-depth implementation notes (extraction paths, shadow-renaming, error modes, navigation map) live in the `ccl/channelize.rs` module rustdoc.
 
 ### Inference before desugaring
 
-The inference pass types `Defer`/`Feed`/`Define` directly — `Defer : Feed(ρ)`, `Feed`/`Define : Unit` with their contributions constrained into `ρ` (see [type-inference.md](type-inference.md) §"Feed handles"). `desugar_defers` then rewrites each resolved defer into an ordinary `Let` binding whose `bound_expr` is the assembled channel (Apply/Compose/Loop), erasing the transient `Feed`/`Infer`-domain types. No special `DeferredCollectionDomain` type is needed — standard inference does the job, and the post-desugar retype re-derives the concrete channel types.
+The inference pass types `Defer`/`Feed`/`Define` directly — `Defer : Feed(ρ)`, `Feed`/`Define : Unit` with their contributions constrained into `ρ` (see [type-inference.md](type-inference.md) §"Feed handles"). `channelize` then rewrites each resolved defer into an ordinary `Let` binding whose `bound_expr` is the assembled channel (Apply/Compose), erasing the transient `Feed`/`Infer`-domain types. No special `DeferredCollectionDomain` type is needed — standard inference does the job, and every channel node is typed by construction; only the defer reads (and the residue-typed nodes that consume them) get a bounded fixup by `channelize::resolve_read_types` (there is no separate `retype` pass).
 
 Mutation-loop inference (`emit_loop`) learns the loop body's full Record codomain from the body itself via a one-way subtyping constraint: `require_sub(body_codomain, product({step: σ}))` pins the `step` field while width-subtyping lets the body's Record literal supply whatever `to_<defer>` fields it carries. This is the general pattern for "a known core plus an open set of additional fields" — an open record demanded by `require_sub`, not a dedicated partial-record type.

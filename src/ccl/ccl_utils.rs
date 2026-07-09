@@ -413,7 +413,7 @@ fn refine_with(base: Type, predicate: &Expr) -> Type {
 ///
 /// Used by:
 /// - [`is_free`] — the bool wrapper for "does `name` appear at all?"
-/// - [`crate::ccl::desugar_defers`] — to detect when a defer's value
+/// - [`crate::ccl::channelize`] — to detect when a defer's value
 ///   references another defer in the same cluster, and to decide
 ///   whether feed values reference other channels (cluster membership).
 /// - [`crate::ccl::lambda_elim`] — to decide whether a lambda's body

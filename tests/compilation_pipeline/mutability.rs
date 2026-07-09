@@ -520,3 +520,58 @@ fn genuine_store_still_accumulates() {
         cambra::interpreter::Value::Int(6),
     );
 }
+
+// ---------------------------------------------------------------------------
+// Curried-vs-tupled call-shape scoping (`mut_param_fns`). A `def` with a
+// pass-by-reference `Mut` parameter lowers curried; every other `def` lowers
+// tupled. The registry keying that choice is block-scoped and last-def-wins,
+// so a `Mut`-param `def` cannot force the curried shape onto a same-named
+// non-`Mut` `def`/call in a sibling/enclosing scope or after a redefinition.
+// ---------------------------------------------------------------------------
+
+/// Regression: a non-`Mut` `def` that redefines an earlier `Mut`-param `def` of
+/// the same name in one block must lower its calls *tupled* (last definition
+/// wins). Before the fix the earlier `Mut` registration stuck, so `f(10, 20)`
+/// lowered curried (`20 ▷ (10 ▷ f)`) against a 2-tuple lambda — a miscompile.
+#[test]
+fn non_mut_redef_shadows_mut_param_fn_lowers_tupled() {
+    check_scalar(
+        "def f(c: Mut[int]):\n    c += 1\ndef f(a, b):\n    a + b\nf(10, 20)",
+        cambra::interpreter::Value::Int(30),
+    );
+}
+
+/// Regression: a `Mut`-param `def` local to a nested scope (here a function
+/// body) must not leak its curried call shape to a same-named top-level `def`.
+/// Statement blocks lower right-to-left, so the top-level `bump(3, 4)` call is
+/// lowered *after* `outer`'s body registers a nested `Mut`-param `bump`; without
+/// block-scoping the leak made that call lower curried against the 2-tuple
+/// top-level `bump`. `r = bump(3,4) = 7`; `outer(100)` bumps `y` once then adds
+/// 100 → 101; total 108.
+#[test]
+fn nested_mut_param_fn_does_not_leak_to_outer_same_named_call() {
+    check_scalar(
+        "def bump(a, b):\n    a + b\nr = bump(3, 4)\ndef outer(z):\n    def bump(c: Mut[int]):\n        c += 1\n    y: Mut[int] := 0\n    bump(y)\n    y + z\nr + outer(100)",
+        cambra::interpreter::Value::Int(108),
+    );
+}
+
+/// Regression: a pass-by-reference writer loop as the program's *final*
+/// statement (its store value unobserved) must lower — mirroring the same loop
+/// in middle position. Before the fix `lower_final_stmt` lacked the hidden-writer
+/// fallback and rejected it with "must end in a yield/feed".
+#[test]
+fn trailing_hidden_writer_loop_compiles() {
+    let code = "def bump(c: Mut[int]):\n    c += 1\ncnt: Mut[int] := 0\nfor x in [1, 2, 3]:\n    bump(cnt)";
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let result = compile_program(&mut ctx, code, consumer);
+    assert!(
+        result.is_ok(),
+        "expected a trailing hidden-writer loop to compile, got:\n{}",
+        result
+            .err()
+            .map(|e| render_errors(&e, "<test>", code))
+            .unwrap_or_default()
+    );
+}

@@ -56,6 +56,26 @@ fn test_function_def_polymorphic_used_at_two_types() {
     "def doubles(xs):\n    for x in xs:\n        yield x * 2\ndoubles([1, 2, 3])",
     make_int_list(&[2, 4, 6])
 )]
+// Same generator, but its result is *bound* to a variable before use
+// (`y = doubles(...)` then `y`) rather than called inline. `inline` expands
+// the call to `let y = (let __result = defer in … __result) in y`, and
+// `channelize::try_lift_defer` lifts the inner result-defer scope out so the
+// feeds land on `y`. The inline form above never reaches that path, so this
+// case is its regression guard.
+#[case(
+    "def doubles(xs):\n    for x in xs:\n        yield x * 2\ny = doubles([1, 2, 3])\ny",
+    make_int_list(&[2, 4, 6])
+)]
+// A UDF that binds another generator's result to a local and returns it
+// (`def wrap(xs): z = doubles(xs); z`). After inlining, `y = wrap(...)`
+// becomes `let y = (let z = <doubles inlined> in z) in y` — the inner
+// bound-expr contains a defer but is not itself `Defer`, so
+// `channelize`'s defer-returning-let *collapse* fires (surfacing the inner
+// defer for a subsequent `try_lift_defer`). Regression guard for that path.
+#[case(
+    "def doubles(xs):\n    for x in xs:\n        yield x * 2\ndef wrap(xs):\n    z = doubles(xs)\n    z\ny = wrap([1, 2, 3])\ny",
+    make_int_list(&[2, 4, 6])
+)]
 // Map with captured parameter
 #[case(
     "def add_to(xs, n):\n    for x in xs:\n        yield x + n\nadd_to([1, 2, 3], 10)",
@@ -183,7 +203,7 @@ fn test_collection_udf_through_poly_wrapper_two_element_types() {
 // Generator `def` chained through a poly wrapper at two element types — the
 // chained variant of `test_generator_polymorphic_over_element_type`.
 //
-// **Currently ignored** — pre-existing `desugar_defers` bug, independent of
+// **Currently ignored** — pre-existing `channelize` bug, independent of
 // monomorphization: a yield-based generator `def` *invoked inside a lambda
 // body* desugars to `λ ys → λ __floated___floated_chain_0 → ()` — the
 // generator's body is lost and the wrapper returns unit, so inference rejects
@@ -191,7 +211,7 @@ fn test_collection_udf_through_poly_wrapper_two_element_types() {
 // Int". The defer/feed plumbing assumes a generator call's result is
 // consumed at the statement level, not captured under a binder. Tracked in
 // the `defer-generator-call-inside-lambda` vault issue.
-#[ignore = "desugar_defers drops a generator def's body when the call sits inside a lambda"]
+#[ignore = "channelize drops a generator def's body when the call sits inside a lambda"]
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_generator_def_through_poly_wrapper_two_element_types() {

@@ -1,29 +1,48 @@
-//! Desugar `Defer`/`Feed`/`Define`/`ExprStmt` nodes into structural
-//! let-chain bindings, per-scope `to_<defer>` Record fields, and
-//! refined-source channels.
+//! Feed channelization — the feed-routing step of the unified phase.
 //!
-//! Runs **after** [`crate::ccl::infer`] — type errors report against the
-//! user-shaped tree (inference types the defer constructs directly: see
-//! `design/type-inference.md` §"Feed handles") — and the pass is
-//! **type-preserving**: it ends with a retype synthesis
-//! ([`crate::ccl::infer::retype`]) that erases the transient
-//! `Feed` / `Infer`-channel-domain types along with the nodes.  After
-//! this pass, no [`TypedExprNode::Defer`], [`TypedExprNode::Feed`],
-//! [`TypedExprNode::Define`], or [`TypedExprNode::ExprStmt`] nodes — and
-//! no `Feed`/`Hole`/`Infer` types — remain in the tree; every downstream
-//! pass treats those variants as `unreachable!`.
+//! Eliminates `Defer`/`Feed`/`Define`/`ExprStmt` nodes by assembling each
+//! `defer` channel from its `<<` / `<<=` contributions: a `let d = Defer in …`
+//! becomes `let d = <channel> in …`, where `<channel>` is the `++`-union of the
+//! defer's per-site contributions (a plain, unguarded `let`, since a feed
+//! channel is non-recursive).
 //!
-//! # Prototype status
+//! Runs **immediately after the unified phase** ([`crate::ccl::letrec_phase`]
+//! and its `recognize` step) in [`crate::ccl::context::compile_program`], on a
+//! typed, inlined tree. The phase has already hoisted every in-loop feed to an
+//! ordinary top-level `Feed(defer, view)` of the loop's history
+//! ([`crate::ccl::letrec_phase::hoist_feeds`]), so channelization sees only
+//! top-level defer chains and is **origin-agnostic**: it never distinguishes an
+//! accumulator-loop feed from a feed-only-loop or scalar feed.
 //!
-//! **This pass is a prototype.**  It is slated for removal: the design
-//! (`src/ccl/design/mutability.md` §4) folds feed channelization into the
-//! unified `letrec_phase`, at which point this module is deleted. A loop-sourced
-//! multi-arm (`if`/`elif`) feed `Case` now fans out into one refined-source
-//! channel per feeding arm ([`try_extract_fanout_feed`]); only a *source-less*
-//! conditional feed (a feeding `Case` outside any iteration) is still rejected,
-//! with `DeferError::PartialFeedCaseUnsupported` (see the `Case` arm of
-//! [`extract_for_defer`]).  The umbrella tracking entry lives in `docs/plan.md`
-//! under "Tech Debt — `desugar_defers` prototype".
+//! Type errors report against the user-shaped tree (inference types the defer
+//! constructs directly: see `design/type-inference.md` §"Feed handles"), so this
+//! step never fails on a user error — it only rejects internally-inconsistent
+//! shapes.
+//!
+//! **Type-preserving by construction.** Every channel node this module builds is
+//! stamped with its concrete type from its children (mirroring how
+//! [`crate::ccl::letrec_phase`] emits a well-typed `LetRec`). The one residue
+//! that construction cannot type away is the defer **reads**: a `Var(d)` still
+//! carries the inference-time `feed(?⇒V)` handle, and the pre-existing nodes that
+//! consume a read (`d ++ d`, `sum(d)`, the trailing spine) carry the unresolved
+//! `Infer` channel domain that rode the read up — because a feed reads as its
+//! whole *stream*, whose domain only channelization resolves (unlike a store,
+//! which derefs to a concrete scalar at inference). [`resolve_read_types`] is the
+//! bounded, feed-specific fixup for exactly those: rebind each read to its
+//! channel's concrete type and recompute the residue-typed ancestors bottom-up.
+//! There is no constraint solver and no separate re-typing pass; the strict
+//! post-channelization `typecheck` in `compile_program` backstops the invariant.
+//!
+//! After this step, no [`TypedExprNode::Defer`], [`TypedExprNode::Feed`],
+//! [`TypedExprNode::Define`], or [`TypedExprNode::ExprStmt`] nodes — and no
+//! `Feed`/`Hole`/`Infer` types — remain in the tree; every downstream pass treats
+//! those variants as `unreachable!`.
+//!
+//! A loop-sourced multi-arm (`if`/`elif`) feed `Case` fans out into one
+//! refined-source channel per feeding arm ([`try_extract_fanout_feed`]); only a
+//! *source-less* conditional feed (a feeding `Case` outside any iteration) is
+//! rejected, with `DeferError::PartialFeedCaseUnsupported` (see the `Case` arm of
+//! [`extract_for_defer`]).
 //!
 //! # Vocabulary
 //!
@@ -39,7 +58,7 @@
 //! # Transformation (cluster algorithm)
 //!
 //! For a cluster of consecutive `let d_i = Defer in …` bindings,
-//! `desugar` performs four steps:
+//! `desugar` performs three steps:
 //!
 //! 1. **Feed extraction.**  Walk the cluster body and collect every
 //!    `Feed(d_i, V)` / `Define(d_i, V)` plus the iteration context
@@ -49,22 +68,24 @@
 //!    `++` ([`TypedExprNode::CollectionUnion`]); lift scalar feeds
 //!    to `Fun(Unit, T)`; emit refined-source channels for filter-feed
 //!    Case shapes.
-//! 3. **α-renaming downstream of the cluster wrap.**  When a channel
-//!    captures a free variable whose name is rebound by a `Let`
-//!    *between* the cluster wrap site and the original feed
-//!    position, [`rename_shadows_then_bind`] α-renames the shadow so
-//!    the channel keeps referring to the value it saw at the feed.
-//! 4. **Topological emission.**  Emit the cluster's `let d_i =
+//! 3. **Topological emission.**  Emit the cluster's `let d_i =
 //!    <channel_i> in …` bindings at the cluster wrap site in
 //!    topological order — a defer whose channel references another
-//!    cluster defer is bound *after* the one it references.
+//!    cluster defer is bound *after* the one it references
+//!    ([`bind_cluster_at_scope`]).
+//!
+//! There is deliberately no α-renaming step: uniquification runs before
+//! channelization, so a channel's captured free variable can never be shadowed
+//! by a `Let` on the wrap-to-feed spine (a body binder and a captured outer
+//! variable never share a `uid`). [`assert_no_shadowed_captures`] enforces this
+//! in debug builds.
 //!
 //! ## Cross-cluster sequencing
 //!
 //! Defers separated by intervening non-`Defer` lets (`let d_1 = D in
 //! let z = E in let d_2 = D in …`) form *separate* clusters.  Each
 //! is processed innermost-first.  When the outer cluster's
-//! [`rename_shadows_then_bind`] walks the post-inner-processing chain
+//! [`bind_cluster_at_scope`] walks the post-inner-processing chain
 //! and finds a `Let` whose `bound_expr` references one of its own
 //! cluster names, the outer cluster's bindings are emitted at that
 //! `Let`'s position rather than at the body's terminal — so a defer
@@ -72,17 +93,11 @@
 //!
 //! # Where to read more
 //!
-//! The full design — the cluster channelization algorithm, per-shape
-//! extraction paths (Compose/Apply iteration lambdas, Loop body
-//! absorption, filter-feed Case, Case-arm fan-out, defer-returning
-//! lift, alias inlining), error modes, known gaps, and a navigation
-//! map for the source — lives in `src/ccl/design/desugar-defers.md`.
-//! (That doc still describes the retired defer-mediating-UDF chain
-//! rewriter / smart walker; `inline` now beta-reduces those UDFs
-//! before this pass, so that machinery no longer exists here.)
-//!
-//! The function-level docs in this file explain individual moving
-//! parts; this module comment is the entry point.
+//! `src/ccl/design/mutability.md` §4 ("Retire `desugar_defers`") is the design
+//! of record for this step and where it sits in the unified phase. The
+//! function-level docs in this file explain individual moving parts (the cluster
+//! channelization algorithm, per-shape extraction paths, defer-returning lift,
+//! alias inlining, error modes); this module comment is the entry point.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -90,11 +105,36 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, BinOpKind, Branch, Expr, Lit, LogicKind, Name, Pattern, Refinement, Type,
-    TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
+    BaseType, BinOpKind, Branch, Expr, HistoryKind, Lit, LogicKind, Name, Pattern, Refinement,
+    Type, TypedExpr, TypedExprNode, UnaryOpKind,
     ccl_utils::{count_free, typed_compose},
     try_walk_transact, walk_transact,
 };
+
+/// `true` when `ty` carries channelization-erasable residue — a `Hole` stamped
+/// on a node this pass constructed or invalidated, an unresolved `Infer` channel
+/// domain, or a `Feed` history the defer elimination dissolves. Walks type
+/// structure only; refinement *predicates* carry no such residue (their terms are
+/// immutable and kept type-consistent by the substitution engine), so they are
+/// not inspected.
+///
+/// This was `infer::retype::has_type_residue`; it moved here with the last
+/// consumer when the standalone `retype` pass was retired.
+fn has_type_residue(ty: &Type) -> bool {
+    match ty {
+        Type::Hole
+        | Type::Infer(_)
+        | Type::History {
+            kind: HistoryKind::Feed,
+            ..
+        } => true,
+        _ => {
+            let mut found = false;
+            ty.walk_children(|t| found = found || has_type_residue(t));
+            found
+        }
+    }
+}
 
 /// Errors that can arise while desugaring `Defer`/`Feed`/`Define` nodes.
 #[derive(Debug, PartialEq)]
@@ -365,30 +405,13 @@ fn contains_defer(expr: &Expr) -> bool {
     matches!(expr.node, TypedExprNode::Defer) || expr.any_child(contains_defer)
 }
 
-/// Return `true` if any nested `Let` or `Lambda` inside `expr` rebinds
-/// `name` (shadowing it).  Used by the alias-inline check to avoid
-/// substituting an alias name with a source name that would be captured
-/// by a shadowing rebind inside the body.
-fn rebinds(expr: &Expr, name: &Name) -> bool {
-    // Recognise binder variants that introduce `name` directly.  Lambda's
-    // refinement and Let's bound_expr live in the outer scope (not bound
-    // by the param/binding), but if they themselves contain a rebind of
-    // `name` further down, `any_child` finds it via structural recursion
-    // below — no need to short-circuit on the binder structure here.
-    let here = match &expr.node {
-        TypedExprNode::Let { binding, .. } => &binding.name == name,
-        TypedExprNode::Lambda { param, .. } => &param.name == name,
-        TypedExprNode::Case { branches, .. } => branches
-            .iter()
-            .any(|b| b.pattern.as_ref().is_some_and(|p| &p.binding.name == name)),
-        _ => false,
-    };
-    here || expr.any_child(|c| rebinds(c, name))
-}
-
 /// Return `true` if `expr` contains any `Feed(target, …)` or
 /// `Define(target, …)` node where `target == name`, respecting shadowing
 /// by `Let`/`Lambda` bindings that rebind `name`.
+///
+/// Debug-only: the sole caller is the `desugar` invariant assert that a
+/// bare-`Var` defer alias never survives `inline` into channelize.
+#[cfg(debug_assertions)]
 fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
     match &expr.node {
         // Hit: the Feed/Define's target name matches.  Also recurse into
@@ -467,7 +490,7 @@ impl DesugarCtx {
 /// variant only existed as a vehicle for surfacing `Feed`/`Define` sites
 /// in statement position; once those have been extracted into source
 /// channels, the surrounding `ExprStmt`'s `e` argument is a pure
-/// `Unit`-typed value that can be dropped.  Doing this in `desugar_defers`
+/// `Unit`-typed value that can be dropped.  Doing this in `channelize`
 /// (rather than leaving it for `simplify`) means no later pass needs to
 /// pattern-match `ExprStmt`.
 pub fn run(expr: Expr, input_typed: bool) -> Result<Expr, DeferError> {
@@ -492,19 +515,284 @@ pub fn run(expr: Expr, input_typed: bool) -> Result<Expr, DeferError> {
     let mut rewritten = drop_expr_stmts(rewritten);
     assert_no_defer_residue(&rewritten)?;
     if input_typed {
-        // Synthesize the types this pass left as residue — `Hole` on
-        // constructed/invalidated nodes, the erased `Feed` / channel-domain
-        // `Infer` types on defer reads — from the surviving inferred types.
-        // A failure here is a compiler bug (desugar produced a shape the
-        // synthesizer can't type), not a user error; the strict post-desugar
-        // `typecheck` in `compile_program` backstops the same invariant.
-        if let Err(errs) = crate::ccl::infer::retype(&mut rewritten) {
-            panic!("desugar_defers: retype failed on the desugared tree: {errs:#?}");
-        }
+        // Channel *construction* is type-preserving (every node desugar builds
+        // is stamped from its children's concrete types). The only residue left
+        // is the defer **reads**: a `Var(d)` still carries the inference-time
+        // `feed(?⇒V)` handle type, and the pre-existing nodes that consume a
+        // read (`d ++ d`, `sum(d)`, the trailing `let`/`;` spine) carry the
+        // unresolved `Infer` channel domain that rode the read up. Those nodes
+        // are *not* built by desugar, and — unlike a store, which derefs to a
+        // concrete scalar at inference — a feed reads as its whole stream, whose
+        // domain only channelization resolves. So they need a bounded, local
+        // re-derivation: rebind each read to its channel's concrete type and
+        // recompute the residue-typed ancestors bottom-up. `resolve_read_types`
+        // is that fixup — a feed-specific read-rebinding, not a general
+        // re-inference (no constraint solving, no fixpoint). The strict
+        // post-desugar `typecheck` in `compile_program` backstops the invariant.
+        resolve_read_types(&mut rewritten);
         #[cfg(debug_assertions)]
         assert_no_type_residue(&rewritten);
     }
     Ok(rewritten)
+}
+
+/// Rebind defer **reads** to their channel types and recompute the residue-typed
+/// nodes that consume them.
+///
+/// After channelization every constructed channel node is concrete, and each
+/// `let d = <channel>` binding is stamped with the channel's type. What remains
+/// residue is a `Var(d)` read (still the inference-time `feed(?⇒V)` handle) and
+/// any ancestor whose type was a function of that read (`d ++ d`, `sum(d)`, the
+/// trailing spine). This is a **scope-aware, residue-gated, bottom-up** walk:
+///
+/// - a `Var` is re-resolved from the concrete type its binding now carries
+///   (mirrors the post-desugar invariant `Var.ty == binding.ty`);
+/// - every other node's type is recomputed from its (already-fixed) children
+///   *only when the recorded type still carries residue* — a concrete recorded
+///   type is what inference established and is left untouched.
+///
+/// There is no constraint solving and no fixpoint: channels are concrete before
+/// this runs, so one bottom-up pass suffices.
+fn resolve_read_types(expr: &mut Expr) {
+    synth_reads(expr, &HashMap::new());
+}
+
+/// The codomain of `ty` viewed as a function, peeling outer refinements.
+fn fun_codomain(ty: &Type) -> Option<Type> {
+    match peel_refinements(ty) {
+        Type::Fun { codomain, .. } => Some((**codomain).clone()),
+        _ => None,
+    }
+}
+
+/// The domain of `ty` viewed as a function, peeling outer refinements.
+fn fun_domain(ty: &Type) -> Option<Type> {
+    match peel_refinements(ty) {
+        Type::Fun { domain, .. } => Some((**domain).clone()),
+        _ => None,
+    }
+}
+
+/// Bottom-up synthesis walk for [`resolve_read_types`]. `scope` maps in-scope
+/// binders to their (concrete) types; it is consulted for `Var` reads. Every
+/// node recurses into its children first, then recomputes its own type from
+/// them — but the recomputed type is written back only when the recorded type
+/// carries residue (a `Var` always follows its binding, per the invariant).
+fn synth_reads(expr: &mut Expr, scope: &HashMap<Name, Type>) {
+    let synthesized: Option<Type> = match &mut expr.node {
+        // A read follows its binding's (now concrete) type. Out-of-scope names
+        // (sources, builtins bound elsewhere) keep their recorded concrete type.
+        TypedExprNode::Var(name) => scope.get(name).cloned(),
+
+        // Leaves whose types are concrete and never carry defer residue.
+        TypedExprNode::Lit(_)
+        | TypedExprNode::Builtin(_)
+        | TypedExprNode::Source(_)
+        | TypedExprNode::Proj(_) => None,
+
+        TypedExprNode::Lambda { param, body } => {
+            let mut inner = scope.clone();
+            inner.insert(param.name.clone(), param.ty.clone());
+            synth_reads(body, &inner);
+            Some(Type::fun(param.ty.clone(), body.ty.clone()))
+        }
+
+        TypedExprNode::Apply { function, argument } => {
+            synth_reads(argument, scope);
+            synth_reads(function, scope);
+            fun_codomain(&function.ty)
+        }
+
+        TypedExprNode::Compose(elts) => {
+            for e in elts.iter_mut() {
+                synth_reads(e, scope);
+            }
+            match (elts.first(), elts.last()) {
+                (Some(first), Some(last)) => {
+                    match (fun_domain(&first.ty), fun_codomain(&last.ty)) {
+                        (Some(d), Some(c)) => Some(Type::fun(d, c)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            synth_reads(bound_expr, scope);
+            // A `let` binding mirrors its bound expression's type; the node
+            // itself is typed as its continuation.
+            binding.ty = bound_expr.ty.clone();
+            let mut inner = scope.clone();
+            inner.insert(binding.name.clone(), binding.ty.clone());
+            synth_reads(body, &inner);
+            // Let-closing (design §6.2, mirrored from the strict checker): the
+            // node's type discharges `[name ↦ bound_expr]` into any refinement
+            // predicate in the body type that closes over the binder — e.g. a
+            // filter-feed channel `{D | x > n}` whose guard captured an outer
+            // `n = 0` must read `{D | x > 0}` here to match the checker.
+            Some(
+                crate::ccl::subst::Subst::discharge(&binding.name, (**bound_expr).clone())
+                    .apply_type(&body.ty),
+            )
+        }
+
+        TypedExprNode::ExprStmt { expr: e, body } => {
+            synth_reads(e, scope);
+            synth_reads(body, scope);
+            Some(body.ty.clone())
+        }
+
+        TypedExprNode::CollectionUnion(elts) => {
+            for e in elts.iter_mut() {
+                synth_reads(e, scope);
+            }
+            let ty = collection_union_type(elts);
+            (!has_type_residue(&ty)).then_some(ty)
+        }
+
+        TypedExprNode::Aggregate { input, .. } => {
+            synth_reads(input, scope);
+            // `Sum`/`Max` : (D ⇒ V) ⇒ V — the input collection's element type.
+            fun_codomain(&input.ty)
+        }
+
+        TypedExprNode::Tuple(elts) => {
+            for e in elts.iter_mut() {
+                synth_reads(e, scope);
+            }
+            Some(Type::Tuple(elts.iter().map(|e| e.ty.clone()).collect()))
+        }
+
+        TypedExprNode::Record(fields) => {
+            for (_, e) in fields.iter_mut() {
+                synth_reads(e, scope);
+            }
+            Some(Type::Record(
+                fields
+                    .iter()
+                    .map(|(n, e)| (n.clone(), e.ty.clone()))
+                    .collect(),
+            ))
+        }
+
+        TypedExprNode::List(elts) => {
+            for e in elts.iter_mut() {
+                synth_reads(e, scope);
+            }
+            elts.first()
+                .map(|first| Type::fun(Type::UIntRange(elts.len()), first.ty.clone()))
+        }
+
+        TypedExprNode::BinOp { left, op, right } => {
+            synth_reads(left, scope);
+            synth_reads(right, scope);
+            use crate::ccl::BinOpKind;
+            Some(match op {
+                BinOpKind::Compare(_) | BinOpKind::BoolLogic(_) => Type::Base(BaseType::Bool),
+                BinOpKind::Arithmetic(_) | BinOpKind::Concat => peel_refinements(&left.ty).clone(),
+            })
+        }
+
+        TypedExprNode::UnaryOp(op, inner) => {
+            synth_reads(inner, scope);
+            use crate::ccl::UnaryOpKind;
+            Some(match op {
+                UnaryOpKind::Not => Type::Base(BaseType::Bool),
+                UnaryOpKind::Neg => peel_refinements(&inner.ty).clone(),
+            })
+        }
+
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => {
+            if let Some(s) = scrutinee {
+                synth_reads(s, scope);
+            }
+            for b in branches.iter_mut() {
+                let mut inner = scope.clone();
+                if let Some(p) = &b.pattern {
+                    inner.insert(p.binding.name.clone(), p.binding.ty.clone());
+                }
+                synth_reads(&mut b.guard, &inner);
+                synth_reads(&mut b.body, &inner);
+            }
+            // Arms are mutually constrained at inference; the first arm's
+            // (synthesized) body type stands for the join.
+            branches.first().map(|b| b.body.ty.clone())
+        }
+
+        // A feed read never lands inside these (feeds are hoisted out of loop
+        // bodies before recognition, and the store/recurrence carriers are built
+        // concrete by the phase). Recurse structurally so any residue below is
+        // still visited, but never overwrite their concrete recorded type.
+        TypedExprNode::Cast { value, .. } => {
+            synth_reads(value, scope);
+            None
+        }
+        TypedExprNode::LetRec { bindings, body } => {
+            let mut inner = scope.clone();
+            for (b, _) in bindings.iter() {
+                inner.insert(b.name.clone(), b.ty.clone());
+            }
+            for (_, def) in bindings.iter_mut() {
+                synth_reads(def, &inner);
+            }
+            synth_reads(body, &inner);
+            None
+        }
+        TypedExprNode::Transact {
+            keys,
+            writers,
+            domain: _,
+        } => {
+            for k in keys.iter_mut() {
+                synth_reads(&mut k.init, scope);
+            }
+            for w in writers.iter_mut() {
+                synth_reads(&mut w.source, scope);
+                synth_reads(&mut w.body, scope);
+            }
+            None
+        }
+        TypedExprNode::For { target, iter, body } => {
+            synth_reads(iter, scope);
+            let mut inner = scope.clone();
+            inner.insert(target.name.clone(), target.ty.clone());
+            synth_reads(body, &inner);
+            None
+        }
+        TypedExprNode::MutWrite { value, .. } => {
+            synth_reads(value, scope);
+            None
+        }
+
+        TypedExprNode::VariantCtor { payload, .. } => {
+            synth_reads(payload, scope);
+            None
+        }
+
+        TypedExprNode::Feed { .. } | TypedExprNode::Define { .. } | TypedExprNode::Defer => {
+            unreachable!("resolve_read_types runs after desugar eliminated Defer/Feed/Define")
+        }
+        TypedExprNode::Error => crate::unexpected_error_node!(),
+    };
+
+    // Write-back: a `Var` always follows its binding (its recorded type aliases
+    // the binding's); every other node keeps a concrete recorded type — what
+    // inference established — and is rewritten only when residue remains.
+    let force = matches!(expr.node, TypedExprNode::Var(_));
+    if (has_type_residue(&expr.ty) || force)
+        && let Some(ty) = synthesized
+        && !has_type_residue(&ty)
+    {
+        expr.ty = ty;
+    }
 }
 
 /// Debug-only invariant: after [`run`] on a typed input, no expression or
@@ -514,23 +802,22 @@ pub fn run(expr: Expr, input_typed: bool) -> Result<Expr, DeferError> {
 /// walking them here would need the cycle guards it already has.)
 #[cfg(debug_assertions)]
 fn assert_no_type_residue(expr: &Expr) {
-    use crate::ccl::infer::has_type_residue;
     assert!(
         !has_type_residue(&expr.ty),
-        "type residue survived desugar_defers on `{}` : {}",
+        "type residue survived channelize on `{}` : {}",
         crate::ccl::symbolic::symbolic(expr),
         expr.ty
     );
     match &expr.node {
         TypedExprNode::Lambda { param, .. } => assert!(
             !has_type_residue(&param.ty),
-            "type residue survived desugar_defers on lambda param `{}` : {}",
+            "type residue survived channelize on lambda param `{}` : {}",
             param.name,
             param.ty
         ),
         TypedExprNode::Let { binding, .. } => assert!(
             !has_type_residue(&binding.ty),
-            "type residue survived desugar_defers on let binding `{}` : {}",
+            "type residue survived channelize on let binding `{}` : {}",
             binding.name,
             binding.ty
         ),
@@ -560,6 +847,18 @@ fn refine_source_domain(source: &mut Expr, refinement: Refinement, ctx: &Desugar
         };
         return;
     }
+    // A typed-order channel source is always a concrete function type, stamped
+    // above. Reaching here under the typed order means a residue-typed source
+    // whose filter would be *silently dropped*: planning reifies the refinement
+    // off `expr.ty.domain()`, never `user_annotation`, and no inference runs
+    // after channelize to consume one. Assert rather than drop it; the
+    // `user_annotation` write below is the legacy (pre-inference) path only.
+    debug_assert!(
+        !ctx.input_typed,
+        "refine_source_domain: typed-order channel source is not a function type \
+         ({}); its filter refinement would be silently dropped",
+        source.ty
+    );
     source.user_annotation = Some(Type::fun(
         Type::Refinement(Box::new(Type::Hole), refinement),
         Type::Hole,
@@ -578,9 +877,12 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         user_annotation,
     } = expr;
     let new_node = match node {
-        // An effect subtree carrying a `For`/`MutWrite` is a pre-phase
-        // marker the unified letrec phase consumes (design/mutability.md)
-        // — the statement is load-bearing, not extracted-feed residue.
+        // Defensive: a `For`/`MutWrite` marker is load-bearing structure, not
+        // extracted-feed residue, so keep the `ExprStmt` rather than dropping
+        // its effect. `letrec_phase` + `recognize` (run before channelize)
+        // eliminate every marker, so this arm is unreachable in the production
+        // pipeline; keeping it means a stray marker is passed through to the
+        // strict `typecheck` backstop instead of being silently discarded.
         TypedExprNode::ExprStmt { expr: effect, body } if contains_phase_marker(&effect) => {
             TypedExprNode::ExprStmt {
                 expr: Box::new(drop_expr_stmts(*effect)),
@@ -667,8 +969,10 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
                 .collect(),
             body: Box::new(drop_expr_stmts(*body)),
         },
-        // Pre-phase markers: preserved for the unified letrec phase (their
-        // interior ExprStmt chains are kept by the marker-bearing arm above).
+        // Pre-phase markers: `letrec_phase` + `recognize` eliminate these before
+        // channelize, so these arms are defensive (a stray marker recurses
+        // structurally and reaches the strict `typecheck` backstop; its interior
+        // ExprStmt chain is kept by the marker-bearing arm above).
         TypedExprNode::For { target, iter, body } => TypedExprNode::For {
             target,
             iter: Box::new(drop_expr_stmts(*iter)),
@@ -689,7 +993,7 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         | TypedExprNode::Source(_)) => node,
         TypedExprNode::Error => crate::unexpected_error_node!(),
         TypedExprNode::VariantCtor { .. } => {
-            unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
+            unreachable!("channelize: VariantCtor not yet emitted by lowering")
         }
     };
     TypedExpr {
@@ -792,7 +1096,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
         | TypedExprNode::Source(_) => Ok(()),
         TypedExprNode::Error => crate::unexpected_error_node!(),
         TypedExprNode::VariantCtor { .. } => {
-            unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
+            unreachable!("channelize: VariantCtor not yet emitted by lowering")
         }
     }
 }
@@ -906,27 +1210,27 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // resolved before we check this outer binding.
             let bound_expr = desugar(*bound_expr, ctx)?;
             let body = desugar(*body, ctx)?;
-            // Alias inlining: `let y = Var(x) in body` becomes
-            // `body[y → x]`.  Needed before defer channelization so
-            // `Feed(y, …)` nodes (which really write to the upstream
-            // defer `x`) are recognized.
-            //
-            // [`desugar_substitute`] renames the *target* name of
-            // `Feed`/`Define` nodes when the replacement is a `Var`,
-            // so `Feed("y", …)` becomes `Feed("x", …)` automatically.
-            //
-            // Only fires when:
-            //   (1) the body contains a `Feed/Define` for this
-            //       binding (so the alias is being used as a defer
-            //       handle), AND
-            //   (2) the body doesn't rebind the source variable (so
-            //       the α-renaming is capture-safe).
-            if let TypedExprNode::Var(source_name) = &bound_expr.node
-                && contains_feed_or_define_for(&body, &binding.name)
-                && !rebinds(&body, source_name)
+            // Alias inlining (`let y = Var(x) in body` → `body[y → x]`) is
+            // `inline`'s job, not channelize's: `inline` unconditionally collapses
+            // a bare-`Var` alias before this pass runs — post-uniquify its
+            // `!is_let_bound(x)` guard always holds, since a unique `x` is never
+            // re-bound in the body. So a bare-`Var` alias whose body feeds the
+            // alias handle must never reach here; a survivor would silently
+            // mis-route `Feed(y, …)` to the wrong handle. Assert that loudly in
+            // debug rather than re-implementing the collapse. (The defer-*returning*
+            // lifts above — `try_lift_defer` / the collapse — survive `inline`
+            // because their bound-expr is a `let`, not a bare `Var`.)
+            #[cfg(debug_assertions)]
             {
-                let substituted = desugar_substitute(body, &binding.name, &bound_expr);
-                return Ok(substituted);
+                if matches!(&bound_expr.node, TypedExprNode::Var(_)) {
+                    debug_assert!(
+                        !contains_feed_or_define_for(&body, &binding.name),
+                        "channelize: a defer alias `let {} = <var>` with a feed for \
+                         it survived inline — expected `inline` to collapse it (see \
+                         module docs)",
+                        binding.name
+                    );
+                }
             }
             Ok(TypedExpr {
                 node: TypedExprNode::Let {
@@ -999,47 +1303,60 @@ fn channelize_cluster(
     // Topologically order the bindings: a defer whose channel references
     // another cluster defer is bound after that defer.
     let order = topo_sort_cluster(defer_names, &channels)?;
-    // Wrap the body's terminal with the cluster's let-chain in order —
-    // first α-renaming any downstream Let-shadows of channel free
-    // variables so the channels keep referring to the values they
-    // captured at their original feed positions.
-    let protected: HashSet<Name> = compute_protected_set(&rewritten, &channels);
-    Ok(rename_shadows_then_bind(
-        rewritten, &order, channels, &protected,
-    ))
+    // Uniquification runs before channelization, so a channel's captured free
+    // variable is never shadowed by a `Let` on the wrap-to-feed spine (a body
+    // binder and a captured outer variable never share a `uid`). Enforce that
+    // invariant in debug, then bind the cluster's let-chain at the correct
+    // scope in topological order.
+    #[cfg(debug_assertions)]
+    assert_no_shadowed_captures(&rewritten, &channels);
+    Ok(bind_cluster_at_scope(rewritten, &order, channels))
 }
 
-/// Compute the set of variable names that channel expressions reference
-/// and that are also free in `body` — i.e., names defined *outside*
-/// `body` whose values channels were captured from.  Any `Let n = …`
-/// inside `body` that rebinds such a name is a shadow that must be
-/// α-renamed before the cluster wrap, otherwise channels would
-/// silently read the rebound value instead of the captured one.
-///
-/// Channel-only free variables (e.g. `__acc_stream_N` bindings
-/// introduced *inside* `body` by `lower_mutation_loop`) are excluded
-/// because the channel's reference correctly resolves to the binding
-/// inside `body`; renaming would break the link.
-fn compute_protected_set(body: &Expr, channels: &HashMap<Name, Expr>) -> HashSet<Name> {
+/// Debug invariant: channelization relies on **Barendregt uniqueness**
+/// (`uniquify` runs before it), so a channel's captured free variable is never
+/// rebound by a `Let` on the wrap-to-feed spine — a body binder and a captured
+/// outer variable never share a `uid`, so the emitted `let d = channel` can't
+/// be shadow-captured. (A channel legitimately referencing a body-*internal*
+/// binding — e.g. an accumulator stream — is excluded: such a name is bound in
+/// `body`, hence not free in it, so it never lands in the checked set.) A
+/// violation would mean a duplicate binder `uid` reached channelization (e.g. an
+/// un-freshened `inline` duplication); catch it loudly here rather than silently
+/// mis-scoping a channel.
+#[cfg(debug_assertions)]
+fn assert_no_shadowed_captures(body: &Expr, channels: &HashMap<Name, Expr>) {
     let mut channel_fvs: HashSet<Name> = HashSet::new();
     for c in channels.values() {
         collect_free_vars(c, &mut channel_fvs);
     }
     let mut body_fvs: HashSet<Name> = HashSet::new();
     collect_free_vars(body, &mut body_fvs);
-    channel_fvs.intersection(&body_fvs).cloned().collect()
+    let protected: HashSet<Name> = channel_fvs.intersection(&body_fvs).cloned().collect();
+    fn walk(e: &Expr, protected: &HashSet<Name>) {
+        if let TypedExprNode::Let { binding, .. } = &e.node {
+            debug_assert!(
+                !protected.contains(&binding.name),
+                "channelize: body binding `{}` shadows a channel-captured free \
+                 variable — uniquification invariant violated (see module docs)",
+                binding.name
+            );
+        }
+        e.walk_children(|c| walk(c, protected));
+    }
+    walk(body, &protected);
 }
 
-/// Walk `expr` through `Let`/`ExprStmt` bodies to its terminal,
-/// α-renaming any `Let n = E in inner` where `n ∈ protected_set` so
-/// the inner shadowing is broken.  At the terminal, emit the cluster's
-/// let-chain in topological order.
-fn rename_shadows_then_bind(
-    expr: Expr,
-    order: &[Name],
-    channels: HashMap<Name, Expr>,
-    protected: &HashSet<Name>,
-) -> Expr {
+/// Walk `expr` through `Let` / `ExprStmt` bodies to the scope where the
+/// cluster's `let d_i = channel_i` bindings belong, then emit them there in
+/// topological order ([`emit_cluster_then`]). The bindings land at the body's
+/// terminal, *or* earlier — just above the first `Let` whose bound expression
+/// references a cluster name — so a cross-referencing defer is always bound
+/// before its use (the cross-cluster case in the module docs).
+///
+/// There is no shadow α-renaming: uniquification guarantees a channel's captured
+/// free variable is never rebound on this spine
+/// ([`assert_no_shadowed_captures`] checks it in debug).
+fn bind_cluster_at_scope(expr: Expr, order: &[Name], channels: HashMap<Name, Expr>) -> Expr {
     let TypedExpr {
         node,
         ty,
@@ -1050,50 +1367,19 @@ fn rename_shadows_then_bind(
             binding,
             bound_expr,
             body,
-        } if protected.contains(&binding.name) => {
-            // Shadow: rename to a fresh name and α-substitute the body so
-            // any inner references use the new name.  The bound_expr is
-            // left alone — its references to `binding.name` (e.g.
-            // `(__acc_stream_1 ≫ .step, x) ▷ last_or_default` where `x`
-            // is the outer binding) resolve outward correctly.
-            let fresh = Name::shadow_rename();
-            let new_body = desugar_substitute(*body, &binding.name, &Expr::var(&fresh));
-            let new_binding = TypedBinding {
-                name: fresh,
-                ty: binding.ty,
-                user_annotation: binding.user_annotation,
-            };
-            TypedExpr {
-                node: TypedExprNode::Let {
-                    binding: new_binding,
-                    bound_expr,
-                    body: Box::new(rename_shadows_then_bind(
-                        new_body, order, channels, protected,
-                    )),
-                },
-                ty,
-                user_annotation,
-            }
-        }
-        TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body,
         } => {
-            // If this Let's `bound_expr` references any of the
-            // cluster's binding names, emit the cluster's bindings
-            // *here* (before this Let) rather than continuing down
-            // to the body's terminal — otherwise the cluster binding
-            // would be lexically after the reference and unbound at
-            // its use site.
+            // If this Let's `bound_expr` references any of the cluster's binding
+            // names, emit the cluster's bindings *here* (before this Let) rather
+            // than continuing to the body's terminal — otherwise the cluster
+            // binding would be lexically after the reference and unbound at its
+            // use site.
             //
-            // Triggered most commonly when an *inner* cluster's
-            // processing left a `let y = Var(x)` in the chain
-            // (`y`'s channel was `Var(x)` of an outer defer) and the
-            // outer cluster's wrap now needs to put `let x = …`
-            // before that `let y`.  See `test_feed_and_define_operators`
-            // cases 10–11 for the cross-cluster-references-through-
-            // intervening-let pattern this targets.
+            // Triggered most commonly when an *inner* cluster's processing left a
+            // `let y = Var(x)` in the chain (`y`'s channel was `Var(x)` of an
+            // outer defer) and the outer cluster's wrap now needs to put
+            // `let x = …` before that `let y`. See `test_feed_and_define_operators`
+            // cases 10–11 for the cross-cluster-references-through-intervening-let
+            // pattern this targets.
             let references_cluster = order
                 .iter()
                 .any(|n| channels.contains_key(n) && count_free(n, &bound_expr) > 0);
@@ -1113,7 +1399,7 @@ fn rename_shadows_then_bind(
                 node: TypedExprNode::Let {
                     binding,
                     bound_expr,
-                    body: Box::new(rename_shadows_then_bind(*body, order, channels, protected)),
+                    body: Box::new(bind_cluster_at_scope(*body, order, channels)),
                 },
                 ty,
                 user_annotation,
@@ -1122,7 +1408,7 @@ fn rename_shadows_then_bind(
         TypedExprNode::ExprStmt { expr: e, body } => TypedExpr {
             node: TypedExprNode::ExprStmt {
                 expr: e,
-                body: Box::new(rename_shadows_then_bind(*body, order, channels, protected)),
+                body: Box::new(bind_cluster_at_scope(*body, order, channels)),
             },
             ty,
             user_annotation,
@@ -1144,7 +1430,13 @@ fn emit_cluster_then(inner: Expr, order: &[Name], mut channels: HashMap<Name, Ex
     let mut result = inner;
     for name in order.iter().rev() {
         if let Some(channel) = channels.remove(name) {
-            result = Expr::let_bind(name.clone(), channel, result);
+            // `let name = channel in result` is typed as its body. `let_bind`
+            // already mirrors `binding.ty = channel.ty`; a `let` node itself is
+            // typed as its continuation. A channel that is still a defer-read
+            // residue (an alias `x <<= y`) leaves the binding residue-typed for
+            // [`resolve_read_types`] to resolve.
+            let body_ty = result.ty.clone();
+            result = Expr::let_bind(name.clone(), channel, result).with_ty(body_ty);
         }
     }
     result
@@ -1160,7 +1452,7 @@ fn emit_cluster_then(inner: Expr, order: &[Name], mut channels: HashMap<Name, Ex
 ///
 /// Without these, a channel that references an outer let-binding only
 /// through a refinement predicate would be missed by
-/// [`compute_protected_set`], leaving a downstream `Let` shadow
+/// [`assert_no_shadowed_captures`], leaving a downstream `Let` shadow
 /// undetected and the channel silently reading the wrong value at the
 /// cluster bind site.
 ///
@@ -1417,7 +1709,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             | TypedExprNode::Defer => {}
             TypedExprNode::Error => crate::unexpected_error_node!(),
             TypedExprNode::VariantCtor { .. } => {
-                unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
+                unreachable!("channelize: VariantCtor not yet emitted by lowering")
             }
         }
     }
@@ -1433,12 +1725,70 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
 /// are merged via [`TypedExprNode::CollectionUnion`] — the dedicated
 /// N-ary collection-union node — which compiles to a `UnionOperator`
 /// downstream.
+///
+/// The union is stamped with its type at construction (mirroring
+/// `emit_collection_union`): one `FieldKey::Index(i)` domain tag per operand
+/// `i`, over the shared element codomain. Operands whose domain is still a
+/// defer-read residue (`feed(?⇒V)` / an `Infer` channel domain) leave the
+/// union's own type as residue too — [`resolve_read_types`] re-derives it once
+/// the reads are rebound to their concrete channel types.
 fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
     debug_assert!(!feeds.is_empty());
     if feeds.len() == 1 {
         return feeds.pop().unwrap();
     }
-    Expr::collection_union(feeds)
+    let ty = collection_union_type(&feeds);
+    Expr::collection_union(feeds).with_ty(ty)
+}
+
+/// The type of an N-ary channel union: `Variant[Index(i) ↦ domainᵢ] ⇒ cod`,
+/// where each operand contributes its domain as tag `i` and they share a
+/// common element codomain. Returns [`Type::Hole`] when an operand is not (yet)
+/// a concrete function — a defer-read operand still typed `feed(?⇒V)` — so the
+/// residue is visible to [`resolve_read_types`], which re-derives the union
+/// after rebinding the reads.
+fn collection_union_type(feeds: &[Expr]) -> Type {
+    let mut tags: Vec<(crate::ccl::FieldKey, Type)> = Vec::with_capacity(feeds.len());
+    let mut cod: Option<Type> = None;
+    for (i, f) in feeds.iter().enumerate() {
+        match peel_refinements(&f.ty) {
+            Type::Fun {
+                domain, codomain, ..
+            } => {
+                tags.push((crate::ccl::FieldKey::Index(i), (**domain).clone()));
+                cod.get_or_insert_with(|| (**codomain).clone());
+            }
+            _ => return Type::Hole,
+        }
+    }
+    match cod {
+        Some(c) => Type::fun(Type::Variant(tags), c),
+        None => Type::Hole,
+    }
+}
+
+/// Peel outer `Refinement` wrappers off a type, returning the underlying type.
+fn peel_refinements(ty: &Type) -> &Type {
+    let mut t = ty;
+    while let Type::Refinement(inner, _) = t {
+        t = inner;
+    }
+    t
+}
+
+/// Build a [`TypedExprNode::Compose`] typed `Fun(first-domain, last-codomain)`,
+/// or [`Type::Hole`] when either end is not (yet) a concrete function — a
+/// channel prefix that is still an unresolved defer read (a nested generator's
+/// inner channel block). Unlike [`typed_compose`], this never panics on residue;
+/// [`resolve_read_types`] recomputes the `Hole` once the reads are rebound.
+fn compose_typed_or_hole(elts: Vec<Expr>) -> Expr {
+    let d = elts.first().and_then(|e| fun_domain(&e.ty));
+    let c = elts.last().and_then(|e| fun_codomain(&e.ty));
+    let ty = match (d, c) {
+        (Some(d), Some(c)) => Type::fun(d, c),
+        _ => Type::Hole,
+    };
+    Expr::compose(elts).with_ty(ty)
 }
 
 /// Walk `expr` collecting `Feed`/`Define` nodes for `defer_name`.
@@ -1692,8 +2042,13 @@ fn extract_for_defer(
                     ctx,
                 )?;
                 for v in lambda_feeds {
+                    // `Apply { argument: source-element, function: λ p → v }`
+                    // applies the value lambda to the per-element source, so the
+                    // companion channel's type is the lambda's codomain `v.ty`
+                    // (the argument matches `param.ty`). Typed at construction.
+                    let v_ty = v.ty.clone();
                     let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
-                    let channel = Expr::apply(new_argument.clone(), channel_lambda);
+                    let channel = Expr::apply(new_argument.clone(), channel_lambda).with_ty(v_ty);
                     feeds.push(channel);
                 }
                 let new_function = TypedExpr {
@@ -1900,7 +2255,15 @@ fn extract_for_defer(
                         // exactly the surrounding context the feed value
                         // needs.
                         for v in lambda_feeds {
-                            let channel_lambda = Expr::lambda(&param.name, Type::Hole, v);
+                            // `Expr::lambda` stamps `Fun(param.ty, v.ty)`; the
+                            // param carries the matched lambda's own (concrete)
+                            // type, so the companion value lambda is fully typed.
+                            // The compose type is `Fun(prefix-domain, v.ty)` —
+                            // but a prefix that is itself an as-yet-unresolved
+                            // defer read (a nested generator's inner channel
+                            // block) is still residue here, so type the compose
+                            // defensively and let `resolve_read_types` finish it.
+                            let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
                             let mut channel_elts = new_elts.clone();
                             channel_elts.push(channel_lambda);
                             // A single-element "compose" is just that
@@ -1908,7 +2271,7 @@ fn extract_for_defer(
                             let channel_expr = if channel_elts.len() == 1 {
                                 channel_elts.into_iter().next().unwrap()
                             } else {
-                                Expr::compose(channel_elts)
+                                compose_typed_or_hole(channel_elts)
                             };
                             feeds.push(channel_expr);
                         }
@@ -2086,16 +2449,16 @@ fn extract_for_defer(
         | TypedExprNode::Defer) => node,
         TypedExprNode::Error => crate::unexpected_error_node!(),
         TypedExprNode::VariantCtor { .. } => {
-            unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
+            unreachable!("channelize: VariantCtor not yet emitted by lowering")
         }
-        // Feed extraction has load-bearing per-variant scope rules
-        // (`in_inner_scope`, the Loop `to_<defer>` machinery); how a
-        // recursive group would participate is exactly what the unified
-        // phase defines — reject rather than guess.
+        // `recognize` (run before channelize in `compile_program`) lowers every
+        // guarded `LetRec` onto the `Transact` carrier, so none reaches feed
+        // extraction. A surviving `LetRec` is a recognition bug, not an
+        // unhandled feed-extraction case.
         TypedExprNode::LetRec { .. } => {
             unreachable!(
-                "LetRec is not emitted before desugar_defers yet — the unified phase \
-                 (src/ccl/design/mutability.md) lands it and replaces this pass"
+                "channelize: LetRec survived recognition — `recognize` lowers \
+                 every guarded group onto the Transact carrier before channelize"
             )
         }
         // Pre-phase markers: v1 lowering guarantees no feeds inside a
@@ -2196,7 +2559,7 @@ mod tests {
     // -----------------------------------------------------------------
     // `run`-boundary tests for the cluster algorithm and filter-feed Case
     // shapes.  These exercise the bulk of `extract_for_defer` /
-    // `channelize_cluster` / `rename_shadows_then_bind` without going
+    // `channelize_cluster` / `bind_cluster_at_scope` without going
     // through the full pipeline.
     // -----------------------------------------------------------------
 
@@ -2308,7 +2671,7 @@ mod tests {
     /// `collect_free_vars` must descend into `user_annotation`
     /// refinement predicates.  Otherwise filter-feed channels (which
     /// stash a `Refinement(_, pred)` in `user_annotation`) hide their
-    /// outer-let references from [`compute_protected_set`], and a
+    /// outer-let references from [`assert_no_shadowed_captures`], and a
     /// downstream shadow goes undetected.
     #[test]
     fn collect_free_vars_descends_into_user_annotation_predicates() {
@@ -2364,5 +2727,105 @@ mod tests {
             free.contains(&Name::raw("inner_k")),
             "expr.ty predicate reference should be collected: got {free:?}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `resolve_read_types` — the defer-read rebinding that replaces the
+    // retired `infer::retype` pass. Channel *construction* is type-preserving,
+    // so these exercise the one residue it fixes: a `Var(d)` read still at the
+    // `feed(?⇒V)` handle, and the residue-typed nodes that consume it.
+    // -----------------------------------------------------------------
+
+    fn feed_ty(domain: Type, value: Type) -> Type {
+        Type::History {
+            value: Box::new(value),
+            domain: Box::new(domain),
+            kind: HistoryKind::Feed,
+        }
+    }
+
+    fn infer(n: u32) -> Type {
+        crate::ccl::infer::solver::fresh_var(n)
+    }
+
+    /// A defer read bound to a concrete channel is rebound from its `feed(?⇒V)`
+    /// handle to the channel's type, and the enclosing `let` node follows.
+    #[test]
+    fn resolve_read_types_rebinds_read_to_channel() {
+        let int = Type::Base(BaseType::Int);
+        let chan_ty = Type::fun(Type::UIntRange(2), int.clone());
+        // A concrete channel (stand-in for the assembled `++`/compose) bound to
+        // `d`; the read still carries the inference-time feed handle with an
+        // unresolved `Infer` domain, as does the `let` node (its body's type).
+        let channel = var("src").with_ty(chan_ty.clone());
+        let read = var("d").with_ty(feed_ty(infer(7), int.clone()));
+        let mut expr = Expr::let_bind("d", channel, read).with_ty(feed_ty(infer(7), int.clone()));
+
+        resolve_read_types(&mut expr);
+
+        assert_eq!(expr.ty, chan_ty, "let node follows its rebound body");
+        let TypedExprNode::Let { binding, body, .. } = &expr.node else {
+            unreachable!()
+        };
+        assert_eq!(binding.ty, chan_ty);
+        assert_eq!(body.ty, chan_ty, "the read is rebound to the channel type");
+    }
+
+    /// A `d ++ d` ancestor — whose domain vars are *fresh* (a subtyping edge in
+    /// `emit_collection_union`, not the reads' vars) — is recomputed bottom-up
+    /// once the reads are rebound, since a domain substitution alone can't reach
+    /// it. This is the case that makes the fixup a re-derivation, not a rename.
+    #[test]
+    fn resolve_read_types_recomputes_union_ancestor() {
+        use crate::ccl::FieldKey;
+        let int = Type::Base(BaseType::Int);
+        let chan_ty = Type::fun(Type::UIntRange(2), int.clone());
+        let channel = var("src").with_ty(chan_ty.clone());
+        let r0 = var("d").with_ty(feed_ty(infer(1), int.clone()));
+        let r1 = var("d").with_ty(feed_ty(infer(2), int.clone()));
+        // The union carries independent (fresh) `Infer` domain tags — residue.
+        let residue_union = Type::fun(
+            Type::Variant(vec![
+                (FieldKey::Index(0), infer(3)),
+                (FieldKey::Index(1), infer(4)),
+            ]),
+            int.clone(),
+        );
+        let union = Expr::collection_union(vec![r0, r1]).with_ty(residue_union.clone());
+        let mut expr = Expr::let_bind("d", channel, union).with_ty(residue_union);
+
+        resolve_read_types(&mut expr);
+
+        // Reads rebound to `chan_ty`, so each union tag is that channel's domain.
+        let expected = Type::fun(
+            Type::Variant(vec![
+                (FieldKey::Index(0), Type::UIntRange(2)),
+                (FieldKey::Index(1), Type::UIntRange(2)),
+            ]),
+            int.clone(),
+        );
+        assert_eq!(expr.ty, expected, "let node follows the recomputed union");
+        let TypedExprNode::Let { body, .. } = &expr.node else {
+            unreachable!()
+        };
+        assert_eq!(
+            body.ty, expected,
+            "the union is recomputed from rebound reads"
+        );
+    }
+
+    /// A fully concrete tree carries no residue, so the fixup is a no-op — it
+    /// never rewrites a type inference already established.
+    #[test]
+    fn resolve_read_types_leaves_concrete_tree_unchanged() {
+        let int = Type::Base(BaseType::Int);
+        let chan_ty = Type::fun(Type::UIntRange(2), int.clone());
+        let channel = var("src").with_ty(chan_ty.clone());
+        let read = var("d").with_ty(chan_ty.clone());
+        let mut expr = Expr::let_bind("d", channel, read).with_ty(chan_ty.clone());
+
+        resolve_read_types(&mut expr);
+
+        assert_eq!(expr.ty, chan_ty);
     }
 }

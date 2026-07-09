@@ -11,7 +11,7 @@ use log::debug;
 
 use crate::{
     ccl::{
-        Expr, Type, desugar_defers,
+        Expr, Type, channelize,
         infer::{
             InferError, TypeInferenceContext, check_mut_discipline, check_mut_write_targets,
             check_pre_desugar, infer, typecheck,
@@ -77,7 +77,7 @@ pub enum CompileError {
     /// the user's program shape); a program with both a type error and a
     /// structural defer error therefore surfaces only the type error
     /// first.
-    DesugarDefers(desugar_defers::DeferError),
+    DesugarDefers(channelize::DeferError),
     /// Type inference rejected one expression.
     Infer(InferError),
     /// Lambda elimination failed.
@@ -188,8 +188,8 @@ impl From<lambda_elim::LambdaElimError> for CompileError {
     }
 }
 
-impl From<desugar_defers::DeferError> for CompileError {
-    fn from(e: desugar_defers::DeferError) -> Self {
+impl From<channelize::DeferError> for CompileError {
+    fn from(e: channelize::DeferError) -> Self {
         Self::DesugarDefers(e)
     }
 }
@@ -223,7 +223,7 @@ impl IntoCompileErrors for lambda_elim::LambdaElimError {
     }
 }
 
-impl IntoCompileErrors for desugar_defers::DeferError {
+impl IntoCompileErrors for channelize::DeferError {
     fn into_compile_errors(self) -> Vec<CompileError> {
         vec![CompileError::DesugarDefers(self)]
     }
@@ -512,7 +512,7 @@ pub fn compile_program(
         ctx.conversion_ctx().register_source(name, source);
     }
 
-    // Inference runs on the user-shaped tree — before desugar_defers — so
+    // Inference runs on the user-shaped tree — before channelize — so
     // type errors are reported against the program the user wrote, not the
     // channelized rewrite. Defer reads necessarily carry `Feed` types with
     // `Infer` channel domains here (only desugar can know the domains), so
@@ -521,7 +521,7 @@ pub fn compile_program(
     infer(&mut expr, infer_ctx).errs()?;
     debug!("Inferred:\n{}", symbolic(&expr));
     debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
-    // Consistency wall between `infer` and `desugar_defers`. It is the relaxed
+    // Consistency wall between `infer` and `channelize`. It is the relaxed
     // *pre-desugar* check (`check_pre_desugar`), which permits the transient
     // `Feed` / `Infer`-channel-domain types only desugar can erase. A failure
     // here is a compiler bug — with one exception: residual `Type::Infer`
@@ -584,7 +584,7 @@ pub fn compile_program(
     // `MutWrite`) become guarded `LetRec` groups — mutable histories over
     // the induction domain, per src/ccl/design/mutability.md. Runs after
     // inlining (so cross-function writers land at their call sites) and
-    // *before* desugar_defers, so a per-iteration feed inside a loop is
+    // *before* channelize, so a per-iteration feed inside a loop is
     // hoisted to an ordinary feed of the loop's history for desugar to route.
     // The tree still carries Defer/Feed here, so the walls are the relaxed
     // pre-desugar check.
@@ -600,17 +600,18 @@ pub fn compile_program(
     debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
     check_pre_desugar(&recognized).expect("letrec recognition produced an inconsistent tree");
 
-    // Desugar Defer/Feed/Define after the letrec phase: every `let d = Defer in
-    // body` is rewritten so the body publishes its contribution to `d` via a
-    // `Record({result, to_d})` at its terminal, with the defer-bind site
-    // consuming the `to_d` projection. Running after the phase lets a loop's
+    // Feed channelization — the feed-routing step of the unified phase, run
+    // immediately after recognition. Every `let d = Defer in body` is rewritten
+    // to `let d = <channel> in body`, where `<channel>` is the `++`-union of the
+    // defer's `<<` / `<<=` contributions. Running after the phase lets a loop's
     // hoisted in-loop feed be routed here as an ordinary channel contribution.
     // After this, no Defer/Feed/Define nodes — and no `Feed`/`Infer` types —
-    // remain: the pass is type-preserving (it ends with a retype synthesis),
+    // remain: channelization is type-preserving by construction (it rebinds defer
+    // reads and recomputes their residue ancestors itself — no `retype` pass),
     // and the strict `typecheck` below is the release-visible enforcement.
-    let desugared = desugar_defers::run(recognized, /* input_typed= */ true).errs()?;
-    debug!("Desugared:\n{}", symbolic(&desugared));
-    typecheck(&desugared).expect("desugar_defers produced an ill-typed tree");
+    let desugared = channelize::run(recognized, /* input_typed= */ true).errs()?;
+    debug!("Channelized:\n{}", symbolic(&desugared));
+    typecheck(&desugared).expect("channelize produced an ill-typed tree");
 
     let lambda_elim = lambda_elim::run(desugared).errs()?;
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));

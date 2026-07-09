@@ -477,7 +477,8 @@ fn constrain_go(
         // bridge corner — for ordinary chained defer functions. The cost is
         // that a binder-dependent refinement *inside* a fed value's type is
         // not discharged across the handle — out of scope alongside the
-        // filter-feed-through-UDF gaps in design/desugar-defers.md.)
+        // filter-feed-through-UDF gaps (see design/mutability.md §4 and the
+        // `ccl/channelize.rs` module docs).)
         // Transparent read: a non-store consumer of a feed channel consumes its
         // whole stream `domain ⇒ value` (`sum(d)`, `d + 1`, a `x <<= y` chain
         // feeding one defer from another). Unlike a store (dereffed to its scalar

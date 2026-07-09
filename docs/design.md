@@ -34,7 +34,7 @@ CHL source
   → infer            (ccl/infer/: type inference; delegates to ccl/infer/solver/, the constraint solver;
                       runs on the user-shaped tree so type errors report against the program as written)
   → inline           (ccl/inline.rs: inline UDF Let bindings with non-iterable domains; beta-reduce at
-                      call sites. Runs *before* desugar_defers so the letrec phase can route an in-loop
+                      call sites. Runs *before* channelize so the letrec phase can route an in-loop
                       feed against inlined pass-by-ref writers; it therefore still sees Defer/Feed/Define)
   → transact_phase   (ccl/transact_phase.rs: each `with begin():` block over Mut[V, Txn] stores folds into
                       a get_prev_txn-guarded LetRec over the commit domain (per-key histories + per-site
@@ -44,7 +44,7 @@ CHL source
   → letrec_phase     (ccl/letrec_phase.rs: the induction mutability phase — every non-transactional
                       mutation loop (For/MutWrite markers, feed-free or feeding) becomes a guarded LetRec
                       group over the induction domain (get_prev_seq recurrence, last_or_default trailing
-                      read); see src/ccl/design/mutability.md. Runs before desugar_defers so a
+                      read); see src/ccl/design/mutability.md. Runs before channelize so a
                       per-iteration feed inside a loop is hoisted to an ordinary feed of the loop's history)
   → recognize        (ccl/letrec_phase.rs::recognize: lower each guarded LetRec group onto the
                       domain-parameterized Transact carrier — induction domain → Recurse, Txn domain →
@@ -52,9 +52,11 @@ CHL source
                       recurrence carrier from recognition (pre-lambda_elim) to op-conversion: recognition
                       must precede lambda_elim, and op-conversion is lambda-free, so a carrier node is
                       required. Both domains share the one carrier)
-  → desugar_defers   (ccl/desugar_defers.rs: Defer/Feed/Define → let-chain + Record channels;
-                      type-preserving — erases the transient Feed/Infer-domain defer types. Runs after the
-                      letrec phase, so an in-loop feed is already hoisted to a feed of the loop's history)
+  → channelize       (ccl/channelize.rs: Defer/Feed/Define → `++`-union channel let-bindings; the
+                      feed-routing step of the unified phase, type-preserving by construction (a bounded
+                      resolve_read_types fixup rebinds the defer reads — no separate retype pass). Runs
+                      after the letrec phase, so an in-loop feed is already hoisted to a feed of the loop's
+                      history)
   → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators, then CCC-simplified)
   → planning        (ccl/planning/: hash-join and keyed aggregate optimization; brackets iteration-marking with ccl/simplify.rs)
   → operator_conversion  (interpreter/operator_conversion.rs: λ-free CCL → tile operators)

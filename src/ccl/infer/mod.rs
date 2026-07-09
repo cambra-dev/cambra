@@ -73,18 +73,18 @@ mod api;
 mod check;
 mod context;
 mod emit;
-mod retype;
 mod schemes;
 mod solve;
 pub mod solver;
 mod typing;
 
-// Public surface (consumed by `crate::ccl::infer` and — for the post-desugar
-// type synthesis — `crate::ccl::desugar_defers`): the entry points, the check
-// and retype passes, and the operator-scheme registry.
+// Public surface (consumed by `crate::ccl::infer`): the entry points, the check
+// pass, and the operator-scheme registry. (The former post-desugar type
+// synthesis `retype` was retired when feed channelization became
+// type-preserving; `crate::ccl::channelize` now does its own bounded read-type
+// fixup.)
 pub use api::*;
 pub use check::check;
-pub use retype::{has_type_residue, retype};
 pub use schemes::OperatorSchemes;
 
 use std::collections::{BTreeMap, HashMap};

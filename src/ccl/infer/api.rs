@@ -489,7 +489,7 @@ impl std::fmt::Debug for InferError {
 /// [`crate::ccl::infer::infer`]. After this call returns `Ok`, the
 /// tree is fully annotated and contains no `Type::Hole`; defer constructs
 /// may still carry `Type::History` (feed) types with `Type::Infer` channel domains
-/// — those are erased by `desugar_defers`, which runs next (see
+/// — those are erased by `channelize`, which runs next (see
 /// [`Strictness::PreDesugar`]).
 pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Vec<InferError>> {
     // The arena owns every inference variable minted by the passes below
@@ -506,7 +506,7 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Ve
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strictness {
     /// No `Hole`, `Infer`, or `Feed` anywhere — the contract downstream of
-    /// `desugar_defers`.
+    /// `channelize`.
     Strict,
     /// `Hole` is still a bug (coalesce replaces every slot it visits), but
     /// `Infer` and `Feed` are permitted: before desugaring, defer reads
@@ -691,11 +691,11 @@ fn collect_type_errors(
             kind,
         } => {
             // A history handle at the strict wall is a compiler bug — a `Feed`
-            // history should have been erased by `desugar_defers`, a `Store`
+            // history should have been erased by `channelize`, a `Store`
             // history by the unified phase (`letrec_phase`).
             if strictness == Strictness::Strict {
                 let what = match kind {
-                    HistoryKind::Feed => "feed handle type survived desugar_defers",
+                    HistoryKind::Feed => "feed handle type survived channelize",
                     HistoryKind::Store => "mutable-reference type survived the unified phase",
                 };
                 errors.push(InferError::Unsupported(format!(
@@ -752,7 +752,7 @@ pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
     super::check(expr)
 }
 
-/// [`typecheck`] for the window between inference and `desugar_defers`:
+/// [`typecheck`] for the window between inference and `channelize`:
 /// the same hole-freeness and semantic checks, but `Infer` channel domains
 /// and `Feed` types are permitted — they are defer artifacts that only
 /// the desugar pass can erase (see [`Strictness::PreDesugar`]).

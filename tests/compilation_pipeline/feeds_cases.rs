@@ -298,7 +298,7 @@ fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
 /// unioned via `++`. Iterations matching no feeding arm contribute nothing
 /// (no placeholder), so the two-arm `if g: d << v` shape is just the
 /// one-feeding-arm case ([`try_extract_fanout_feed`] /
-/// [`synthesize_arm_predicate`] in `desugar_defers`).
+/// [`synthesize_arm_predicate`] in `channelize`).
 ///
 /// For the program below: `x == 1` fires arm 0 (`10`), `x == 2` fires arm 1
 /// (`40`), and `x == 3` matches neither, so the channel is `[10, 40]`.
@@ -349,7 +349,7 @@ fn scalar_define_into_defer_is_rejected() {
 }
 
 /// Type errors in defer programs are reported against the *user's* program
-/// shape: inference now runs before `desugar_defers`, so the rendered
+/// shape: inference now runs before `channelize`, so the rendered
 /// message must not leak desugar artifacts (floated parameters, `to_<defer>`
 /// record fields, channel unions, scope-out bindings).
 #[rstest]

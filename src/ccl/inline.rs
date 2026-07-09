@@ -50,7 +50,7 @@
 //! `const(x)` wrappers, which would otherwise require special
 //! recognition downstream.
 //!
-//! This pass runs **before** [`crate::ccl::desugar_defers`] (so the unified
+//! This pass runs **before** [`crate::ccl::channelize`] (so the unified
 //! letrec phase can route an in-loop feed against inlined writers, and a
 //! defer-mediating UDF reaches its call site before desugar routes it), so it
 //! *does* see [`Defer`]/[`Feed`]/[`Define`] nodes and `Type::History` (feed) domains.
@@ -136,7 +136,7 @@ fn is_iterable_domain(ty: &Type) -> bool {
         // A history-typed domain has no enumerable extent — treat it
         // non-iterable like a function so a history-param UDF is inlined; the
         // `_ => true` fallthrough would otherwise strand it. Two cases reach
-        // here, both pre-erasure (inlining runs before `desugar_defers` and the
+        // here, both pre-erasure (inlining runs before `channelize` and the
         // unified phase): a `Feed` defer-handle domain (a defer-mediating UDF
         // `λ out → out << e` has domain `feed(ρ)`; its call sites beta-reduce,
         // renaming the fed-to handle — see `Subst::handle_target`), and a
@@ -232,11 +232,11 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
 /// [`crate::ccl::lambda_elim`] prevents the let-in-lambda rewrite from
 /// wrapping aliases in `const(…)`.
 ///
-/// This pass runs **before** [`crate::ccl::desugar_defers`] (see the module
+/// This pass runs **before** [`crate::ccl::channelize`] (see the module
 /// docs), so it *does* encounter `Defer`/`Feed`/`Define` nodes; beta-reduction
 /// routes them through the defer-aware [`crate::ccl::subst::Subst`] engine,
 /// which renames a fed-to handle when a defer-mediating UDF is inlined. The
-/// defer-returning lift itself lives in `desugar_defers::try_lift_defer`.
+/// defer-returning lift itself lives in `channelize::try_lift_defer`.
 fn inline_impl(expr: Expr) -> Expr {
     let Expr {
         node,
@@ -294,7 +294,7 @@ fn inline_impl(expr: Expr) -> Expr {
         // expression, wrap it in a fresh `let __for_src_N = source` binding so
         // that `try_lift_defer` can physically rename its inner defer handle,
         // preventing two same-named `__result` defers from coexisting in
-        // `desugar_defers`. Re-running `inline_impl` on the wrapping `Let`
+        // `channelize`. Re-running `inline_impl` on the wrapping `Let`
         // triggers `try_lift_defer` on the new binding.
         TypedExprNode::Compose(terms) => {
             TypedExprNode::Compose(terms.into_iter().map(inline_impl).collect())

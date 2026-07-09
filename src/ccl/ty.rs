@@ -44,8 +44,8 @@ impl fmt::Display for FieldKey {
 /// |---|---|---|---|
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
 /// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); a defer channel's *domain* is necessarily `Infer` until desugaring (see `Strictness::PreDesugar`) |
-/// | `History` (`kind: Store`) | Type checker only | "Mutable store: a `value` cell tracked over a `domain` (loop index)" | the unified phase (`letrec_phase`, which runs *before* `desugar_defers`; a survivor downstream is a compiler bug) |
-/// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `desugar_defers` (which runs after inference; a survivor downstream is a compiler bug) |
+/// | `History` (`kind: Store`) | Type checker only | "Mutable store: a `value` cell tracked over a `domain` (loop index)" | the unified phase (`letrec_phase`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
+/// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// A primitive base type.
@@ -148,7 +148,7 @@ pub enum Type {
     ///   (a scalar). `letrec_phase` materializes it with a carry-forward arm.
     /// - [`HistoryKind::Feed`] — a **feed channel** (`defer` / `<<` / `<<=`). A
     ///   reference reads the whole stream (`domain ⇒ value`), off-path positions
-    ///   are absent (no carry-forward), and `desugar_defers` resolves it to the
+    ///   are absent (no carry-forward), and `channelize` resolves it to the
     ///   collected channel.
     ///
     /// Either way it is **invariant** in both children (a history flowing
@@ -156,7 +156,7 @@ pub enum Type {
     /// **transient** variant like `Hole` / `Infer`: it exists only between type
     /// inference (which stamps it on `:=` / `defer` introductions and every
     /// reference) and the passes that erase it — the unified phase
-    /// (`letrec_phase`) for `Store` histories, `desugar_defers`
+    /// (`letrec_phase`) for `Store` histories, `channelize`
     /// for `Feed` ones. Both erase it to a bare `Type::Fun`; no pass downstream
     /// may observe a `History` (a survivor at the strict wall is a compiler bug —
     /// see `collect_type_errors`). See src/ccl/design/mutability.md.

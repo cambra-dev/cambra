@@ -281,6 +281,13 @@ pub struct LoweringContext {
     /// to the caller's store (a tuple projection cannot be a write target). Its
     /// call sites must apply curried to match — recorded here (the `def` lowers
     /// before its calls) so [`lower_call`] can pick the matching shape.
+    ///
+    /// **Block-scoped.** Keyed on the surface name (lowering precedes uniquify,
+    /// so no α-unique name exists yet), the set is snapshot/restored around every
+    /// nested block ([`lower_stmts_inner`]) so a `Mut`-param `def` local to one
+    /// scope cannot leak its curried shape onto a same-named `def`/call in an
+    /// enclosing or sibling scope. Within a block, the *last* definition of a name
+    /// wins (see [`pre_register_mut_param_fns`]).
     pub(super) mut_param_fns: HashSet<String>,
 }
 
@@ -338,6 +345,14 @@ impl LoweringContext {
     /// is lowered — and applied — curried (see [`mut_param_fns`](Self::mut_param_fns)).
     pub(super) fn register_mut_param_fn(&mut self, name: impl Into<String>) {
         self.mut_param_fns.insert(name.into());
+    }
+
+    /// Undo a [`register_mut_param_fn`](Self::register_mut_param_fn): `name`'s
+    /// calls lower with the ordinary (tupled) shape. Used when a later `def` in a
+    /// block redefines an earlier `Mut`-param `def` with a non-`Mut` signature
+    /// (last definition wins, matching CHL's shadowing).
+    pub(super) fn unregister_mut_param_fn(&mut self, name: &str) {
+        self.mut_param_fns.remove(name);
     }
 
     /// Whether `name` is a `def` with a pass-by-reference `Mut` parameter (so
@@ -515,8 +530,8 @@ pub fn lower_expr(
 /// When sink bindings are registered during lowering (e.g. from `http_serve`),
 /// the final expression is wrapped so the program ends in
 /// `ExprStmt(<body>, Record{sink: Var(sink), …})`.  The `Record` is the
-/// sink-binding contract; each field is the name that [`crate::ccl::desugar_defers`]
-/// resolves to the computed response morphism.  After `desugar_defers` removes
+/// sink-binding contract; each field is the name that [`crate::ccl::channelize`]
+/// resolves to the computed response morphism.  After `channelize` removes
 /// all `Feed` nodes, `simplify` drops the `ExprStmt`, leaving a clean
 /// `Let* Record{…}` shape for `compile_program`.
 pub fn lower_stmts(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) -> LoweringResult {

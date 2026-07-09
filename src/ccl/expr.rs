@@ -339,7 +339,7 @@ pub enum TypedExprNode {
     /// self-cycle is a fold) to pick the engine. `letrec_phase` emits it for
     /// every mutation loop as a guarded group, then `letrec_phase::recognize`
     /// lowers every recognized group onto the domain-parameterized
-    /// [`Transact`](Self::Transact) carrier before `desugar_defers`, so a
+    /// [`Transact`](Self::Transact) carrier before `channelize`, so a
     /// `LetRec` does not survive to the later passes — those that would need
     /// pattern knowledge it doesn't carry treat a surviving group as unreachable
     /// rather than guessing.
@@ -475,19 +475,19 @@ pub enum TypedExprNode {
 
     /// Feed a value into a deferred output: `x << value`.
     /// Lowers from the `<<` (LShift) binary operator when the LHS names a defer.
-    /// Has type `Unit`; the value is collected by [`crate::ccl::desugar_defers`]
+    /// Has type `Unit`; the value is collected by [`crate::ccl::channelize`]
     /// and unioned into the source channel that resolves the defer.
     Feed { name: Name, value: Box<Expr> },
 
     /// Define a deferred output to a specific value: `x <<= value`.
     /// Lowers from the `<<=` (AugAssign LShift) statement when the LHS names a defer.
-    /// Has type `Unit`; the value is collected by [`crate::ccl::desugar_defers`]
+    /// Has type `Unit`; the value is collected by [`crate::ccl::channelize`]
     /// and replaces the surrounding `Defer` binding.
     Define { name: Name, value: Box<Expr> },
 
     /// Placeholder for an output accumulator introduced by `x = defer()`.
     /// The bound name is resolved by the surrounding `Let` binding.
-    /// Eliminated by [`crate::ccl::desugar_defers`] before type inference.
+    /// Eliminated by [`crate::ccl::channelize`] before type inference.
     Defer,
 
     /// Recovery placeholder inserted by lowering when a sub-expression or

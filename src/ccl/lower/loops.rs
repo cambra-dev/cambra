@@ -64,6 +64,23 @@ fn stmt_has_feed(stmt: &Spanned<ChlStmt>) -> bool {
     }
 }
 
+/// Return `true` if the loop body's **terminal** statement is a bare *effect*
+/// expression — a call (or other expression) that is neither a `yield` nor a
+/// `<<` feed, e.g. `for x in xs: bump(cnt)`. Such a terminal is a hidden-writer
+/// / side-effect statement (a pass-by-reference call may write an outer store,
+/// invisible pre-inference), which [`lower_direct_mirror_loop`] carries. A
+/// terminal that reassigns the loop variable (`x += 1`) or a non-store is *not*
+/// a bare effect and stays rejected by the generator path. Gates the
+/// final-statement hidden-writer fallback in [`super::stmts::lower_final_stmt`];
+/// mirrors the non-yield/non-feed `ChlStmt::Expr` arm of `lower_for_body_terminal`.
+pub(super) fn for_body_terminal_is_bare_effect(stmts: &[Spanned<ChlStmt>]) -> bool {
+    matches!(
+        stmts.last().map(|s| &s.node),
+        Some(ChlStmt::Expr(value))
+            if !matches!(&value.node, ChlExpr::Yield(_) | ChlExpr::Feed { .. })
+    )
+}
+
 /// Lower a `for` statement to a `Compose([src, Lambda(x, body)])` CCL expression.
 ///
 /// When the body contains `yield`, the loop is desugared:
@@ -345,7 +362,7 @@ fn lower_for_body_terminal(
             }
             // `if` / `elif` (no `else`): one `Case` branch per guard, in source
             // order, then a trailing `true → Unit` fallthrough. A feeding
-            // multi-arm `Case` is fanned out by `desugar_defers` into one
+            // multi-arm `Case` is fanned out by `channelize` into one
             // refined-source channel per feeding arm (predicate
             // `gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`, encoding "first matching guard wins"), so `elif`
             // is no longer gated here.
@@ -900,7 +917,7 @@ bad";
     /// Brainstorm §4b — a generator with loop-carried state lowers to a
     /// `Loop` whose body contains a raw `Feed(__result_*, …)` followed by
     /// a `(step: …)` Record, with the surrounding `let __result = defer`
-    /// collecting the yields.  [`crate::ccl::desugar_defers`] absorbs
+    /// collecting the yields.  [`crate::ccl::channelize`] absorbs
     /// the raw `Feed` into a `to_<defer>` field on the same Record
     /// before inference.
     #[test]

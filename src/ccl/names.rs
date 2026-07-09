@@ -98,8 +98,6 @@ pub enum SyntheticKind {
     /// `Name` may itself be a `Synthetic` carrying a `SyntheticKind`, so the
     /// reference must be indirected to keep the type finite-sized.)
     Mono(Box<Name>),
-    /// A defer handle renamed to dodge a shadow during channelization.
-    ShadowRename,
     /// A lambda/binding floated out during defer desugaring.
     FloatedDefer,
     /// The fresh binder the solver mints for a dependent application's
@@ -115,7 +113,6 @@ impl SyntheticKind {
         match self {
             SyntheticKind::Pair => "__pair",
             SyntheticKind::Mono(_) => "__mono",
-            SyntheticKind::ShadowRename => "__shadowed",
             SyntheticKind::FloatedDefer => "__floated",
             SyntheticKind::SolverArg => "__arg",
         }
@@ -192,11 +189,6 @@ impl Name {
     /// `source` — its name rides on the `kind` as provenance.
     pub fn mono(source: Name) -> Self {
         Self::synthetic(SyntheticKind::Mono(Box::new(source)))
-    }
-
-    /// A defer handle renamed to dodge a shadow (channelization).
-    pub fn shadow_rename() -> Self {
-        Self::synthetic(SyntheticKind::ShadowRename)
     }
 
     /// A lambda/binding floated out during defer desugaring.
@@ -339,7 +331,6 @@ mod tests {
                 ..
             } if *src == Name::raw("f")
         ));
-        assert_eq!(Name::shadow_rename().base(), "__shadowed");
         assert_eq!(Name::floated().base(), "__floated");
         assert_eq!(Name::solver_arg().base(), "__arg");
         // Different kinds never collide even if uids ever coincided.

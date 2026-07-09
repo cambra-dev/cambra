@@ -244,8 +244,9 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
         // handle's read view, and two handles agree iff their read views do.
         // The read view is kind-specific — a `Feed` reads as its whole stream
         // `domain ⇒ value`, a `Store` derefs to its scalar `value`. A `Feed`
-        // channel-domain `Infer` stays unresolved until `retype`; the `Infer`
-        // arm above already tolerates that.
+        // channel-domain `Infer` stays unresolved until channelization resolves
+        // the reads (`channelize::resolve_read_types`); the `Infer` arm above
+        // already tolerates that.
         (
             Type::History {
                 value,
