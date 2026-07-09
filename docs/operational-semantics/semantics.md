@@ -214,6 +214,8 @@ useful intermediate decomposition.
 **not cancellative** (`(1, 5) ⊕ (1, 3) = (2, 5) = (1, 5) ⊕ (1, 4)`), and lacks sub-tile meet.
 Just like `Count × Sum`, `Count × Max` only supports the trivial guard algebra.
 
+These count-augmented carriers are the formal tilings that justify monotonicity and early termination. The runtime realizes an aggregate tiling as `Tiling::Aggregation { kind, accumulator }` with a `terminal` flag standing in for `count == N`, rather than storing an explicit count.
+
 
 
 ### Kinds of Guards

@@ -77,9 +77,8 @@ pub trait TileOperator {
     /// * `intent_guard` - The region of the operator's extent that the consumer
     ///   is interested in
     /// * `consumer` - The consumer that will receive notifications when data is ready
-    /// * `var_scope` - The variable scope for looking up variables, wrapped in Rc
-    ///   to match the internal parent representation and allow cheap sharing
-    ///   (e.g., Lambda stores the scope for child scope construction).
+    /// * `scheduler` - The scheduler that coordinates source triggering and
+    ///   inter-operator work during execution.
     ///
     /// # Returns
     /// A producer that provides access to the data and allows releasing regions

@@ -20,7 +20,7 @@ in D are final" — but this is a statement about *progress*, not a predicate on
 *value*. Trying to interpret such a statement for a value, rather than the steps along the way
 to computing the value, makes the guard vacuous.
 
-Because of this confusing, the code currently conflates extents and tilings. The new model
+Because of this confusion, the previous model conflated extents and tilings. The current model
 distinguishes them more clearly.
 
 ---
@@ -55,7 +55,7 @@ sparse_apply : { SparseFn(T, U), T } ⇒ functionTiling(T, Option(U)).Tile
 ```
 
 `SparseFn` implements the partial function tiling for `T ⇒ Option(U)`, but with a more compact
-representation than mapping every element of the domain.
+representation than mapping every element of the domain. In the implementation this is `Tile::SealedFunction { domain, codomain, domain_predicate, deleted }`: `somes` are the `domain → codomain` mappings and `nones` is the `domain_predicate` seal (the region known to yield no further values).
 This tiling has universal split-determinism, as all partial-function tilings do.
 
 This representation allows consumers to split on the function's domain and receive a compact
@@ -89,18 +89,18 @@ The producer/consumer protocol, stated in terms of tiles and guards:
 
 ```
 // Operator creates the dataflow link
-Operator::subscribe(intent: Guard, consumer: Consumer, var_scope: VarScope) -> Producer
+Operator::subscribe(intent: Guard, consumer: Consumer, scheduler: Scheduler) -> Producer
 
 // Producer pushes notifications to consumer
 Consumer::notify()
     // New tile available — consumer should call get()
 
 // Consumer pulls data and manages lifecycle
-Producer::get(projection: Guard) -> GetResult { compact_obsolete, relevant }
-    // Returns the producer's current state, projected by the consumer's projection guards:
-    //   compact_obsolete: compacted summary of tiles the consumer has released
-    //   relevant: the non-released tile within the consumer's intent subtiling
-Producer::release(obsolete: Guard) -> Guard
+Producer::get(projection: Guard) -> Tile
+    // Returns the producer's current tile, projected by the consumer's projection guard.
+    // (The obsolete region the consumer has released is tracked internally by the
+    //  producer and read back via obsolete_guard().)
+Producer::release(obsolete: Guard)
     // Consumer retracts interest; producer may compact and reclaim resources
 ```
 

@@ -1,8 +1,8 @@
-//! Round-trip parsing tests for the new CHL parser.
+//! Round-trip parsing tests for the CHL parser.
 //!
 //! Each test picks a representative CHL program from the existing test
-//! suite (currently parsed by `rustpython_parser`) and checks that the new
-//! parser produces a well-formed AST without errors. We deliberately don't
+//! corpus and checks that the CHL parser produces a well-formed AST without
+//! errors. We deliberately don't
 //! assert exact AST structure here — that's the job of the unit tests
 //! inside `chl_parser::parser`. These integration tests are guardrails:
 //! "is the surface syntax we already use still parseable?"

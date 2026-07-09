@@ -8,7 +8,7 @@ See also:
 
 ## Overview
 
-Lowering a CCL program to an executable dataflow graph proceeds in two steps, across two
+Lowering a CCL program to an executable dataflow graph proceeds in two steps, across three
 distinct layers of abstraction.
 
 **Layer 1 — Arbitrary CCL**: CCL programs are typed lambda calculus terms, including lambdas, refinements,
@@ -134,7 +134,7 @@ converse(key) =  λ k → (λ i | key(i) = k → i)
 **Tiling operator**:
 
 ```
-converse(key) : K × I ⇀ I
+converse(key) : K ⇀ (I ⇀ I)
 ```
 
 Each new mapping `(k, i) ↦ i` is immediately routed to the fiber at `key(i)`. `converse` is a
@@ -159,7 +159,7 @@ aggregate(op) : (I ⇀ Agg) ⇒ Agg
 
 Each new input mapping independently updates the running aggregate via `⊕`. `aggregate` can be a
 **homomorphism to the aggregate tiling**, in which case it streams. The aggregate tiling type (`Count×Sum`,
-`Count×Max`, etc.) is determined by the combining operation.
+`Count×Max`, etc.) is determined by the combining operation. In the current implementation the monoid is fixed per aggregate kind rather than user-supplied — `sum` (`⊕ = +`) and `max` (`Builtin::Sum`/`Builtin::Max`); `aggregate(op)` is the general primitive these instantiate.
 
 NOTE: Even if an aggregation streams, the projection that _extracts_ the aggregate may not be a 
 homomorphism, and therefore not stream. For example, `sum(nums) > 100` streams into the `Count×Sum`
@@ -300,12 +300,15 @@ eliminated by an additional set of simplifying rules:
 - **Curry-compose**: `curry(f ≫ g)  ⟹  curry(f) ≫ map(g)`. Follows from
   `map(g)(h) = h ≫ g`: the curried function `curry(f)(k) = λi → f(k,i)` post-composed with
   `g` is `λi → g(f(k,i))`, which is exactly `curry(f ≫ g)(k)`. This lets a suffix of the
-  curried body be pulled out as a `map`.
+  curried body be pulled out as a `map`. (Unlike the other rules here, the `simplify` pass
+  does **not** apply curry-compose — splitting a `curry` defeats `exponential_beta`'s redex
+  recognition. It is a sound identity used in the derivation below, but the `converse ≫ map`
+  form it would produce is emitted directly by planning's group-by recognizer instead.)
 - **Const-apply**: `⟨f, const(g)⟩ ≫ apply  ⟹  f ≫ g`. Direct consequence of
   `const(g) = curry(.1 ≫ g)`, exponential beta, and product beta. When a function slot holds
   a constant (e.g. a typeclass-resolved operation like `sum` or `cnt` that does not vary with
   the current key), the `apply` collapses to plain composition.
-- **Product eta**: `⟨f ≫ .0, f ≫ ._1⟩  ⟹  f`. Collapses a zip that merely destructs and
+- **Product eta**: `⟨f ≫ .0, f ≫ .1⟩  ⟹  f`. Collapses a zip that merely destructs and
   re-pairs the same source morphism. Analogous to the function-type eta rule
   `λ x → f x  ⟹  f`.
 
@@ -431,22 +434,30 @@ curried-lambda rule to pair `k` and `i`, then the refinement rule on the inner g
   (λ(k,i) → i▷key == k) ▷ restrict ≫ (λ(k,i) → i▷val)                       [refinement rule]
 
     -- λ(k,i) → i▷key == k = λ(k,i) → (i▷key, k) ▷ eq:
-    ⟨⟨key, ._0⟩, const(eq)⟩ ≫ apply                                 [λx→arg▷fn; λx→(f1,f2); λx→const]
-    ⟨key, ._0⟩ ≫ eq                                                   [const-apply]
+    ⟨⟨key, .0⟩, const(eq)⟩ ≫ apply                                 [λx→arg▷fn; λx→(f1,f2); λx→const]
+    ⟨key, .0⟩ ≫ eq                                                   [const-apply]
 
     -- λ(k,i) → i▷val = .1 ≫ val
-    (⟨key, ._0⟩ ≫ eq) ▷ restrict ≫ (.1 ≫ val)
+    (⟨key, .0⟩ ≫ eq) ▷ restrict ≫ (.1 ≫ val)
 
-⟨curry((⟨key, ._0⟩ ≫ eq) ▷ restrict ≫ .1 ≫ val), const(aggregate(+))⟩ ≫ apply          [sub-deriv]
-curry((⟨key, ._0⟩ ≫ eq) ▷ restrict ≫ .1 ≫ val) ≫ aggregate(+)                        [const-apply]
-curry((⟨key, ._0⟩ ≫ eq) ▷ restrict ≫ .1) ≫ map(val) ≫ aggregate(+)                   [curry-compose, g=val]
-converse(key) ≫ map(val) ≫ aggregate(+)                                             [curry((⟨key,._0⟩≫eq)▷restrict≫.1) = converse(key)]
+⟨curry((⟨key, .0⟩ ≫ eq) ▷ restrict ≫ .1 ≫ val), const(aggregate(+))⟩ ≫ apply          [sub-deriv]
+curry((⟨key, .0⟩ ≫ eq) ▷ restrict ≫ .1 ≫ val) ≫ aggregate(+)                        [const-apply]
+curry((⟨key, .0⟩ ≫ eq) ▷ restrict ≫ .1) ≫ map(val) ≫ aggregate(+)                   [curry-compose, g=val]
+converse(key) ≫ map(val) ≫ aggregate(+)                                             [curry((⟨key,.0⟩≫eq)▷restrict≫.1) = converse(key)]
 ```
 
 The result instantiates the canonical keyed group-reduce pattern from
 [Primitive Combinators](#primitive-combinators): `converse(key)` groups items into per-key
 fibers, `map(val)` value-projects each fiber, and `aggregate(+)` reduces each fiber to a running
-sum. 
+sum.
+
+> **Derivation vs. pipeline.** The steps above are a categorical *proof* that this lowering is
+> sound — each is a valid CCC identity. They are **not** the literal rewrite sequence the compiler
+> runs: `simplify` deliberately omits curry-compose (above), so it never derives `converse ≫ map`
+> this way. Instead, planning's group-by recognizer emits the
+> `converse(key) ≫ map(val) ≫ aggregate(+)` form directly (see
+> [/src/ccl/design/optimization.md](/src/ccl/design/optimization.md)); this derivation explains
+> *why* that emission is correct.
 
 ---
 

@@ -90,7 +90,10 @@ public entry points:
 - `parse_expression(&str)` — a single expression (used by the lowering
   tests that build expressions in isolation).
 - `ParseError` — a uniform error type wrapping either a `LexError` or a
-  rendered chumsky error with its `Span`.
+  structured chumsky error (`ParseErrorInfo`) carrying its span, found token, and
+  categorised expected set. The diagnostics types (`ParseError`, `ParseErrorInfo`,
+  `ParseResult`, `CATEGORIES`) live in the `parser/error.rs` submodule, re-exported
+  from `parser.rs`.
 
 The grammar is precedence-climbed for binary operators. From lowest to
 highest precedence:
@@ -272,7 +275,7 @@ span, so ariadne renders it as a secondary underline like
 **3. Category collapsing in `collect_errors`.** Errors that survive label
 processing can still list 20+ tokens as valid continuations (e.g. every
 binary operator after `if x` where a `:` was expected). The
-`CATEGORIES` table in `parser.rs` defines disjoint operator buckets
+`CATEGORIES` table in `parser/error.rs` defines disjoint operator buckets
 (`binary operator`, `comparison operator`, `boolean operator`,
 `postfix operation`, `augmented-assignment operator`). When the
 "expected" set contains *every* member of a category, those members are
@@ -326,7 +329,7 @@ through ariadne.
   that nothing consumes yet; `rustpython_parser` remains the authoritative
   input to lowering. *(Landed.)*
 
-- **Phase 2 — Cutover.** [`src/ccl/lower.rs`](../ccl/lower.rs) ported to
+- **Phase 2 — Cutover.** [`src/ccl/lower/`](../ccl/lower/) ported to
   consume the CHL AST directly; `rustpython-parser` and `rustpython-ast`
   removed from `Cargo.toml`; `pretty_ast.rs` deleted; all integration tests
   switched. *(Landed.)*

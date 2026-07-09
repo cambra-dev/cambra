@@ -174,7 +174,7 @@ impl TileProducer for MapResultProducer {
         let f_tiling = self.function.tiling().clone();
         assert!(
             f_tiling.is_function(),
-            "MapApply expected function tiling, Got {f_tiling:?}"
+            "MapResult expected function tiling, Got {f_tiling:?}"
         );
         let f_extent = f_tiling.extent();
         let (f_domain_extent, f_codomain_extent) = f_extent.split_function().unwrap();
@@ -477,7 +477,7 @@ impl TileProducer for MapResultToConstProducer {
         let c_tiling = self.constant.tiling();
         assert!(
             c_tiling.is_scalar(),
-            "MapToConst expected scalar tiling, Got {c_tiling:?}"
+            "MapResultToConst expected scalar tiling, Got {c_tiling:?}"
         );
         let i_tiling = self.input.tiling().clone();
         let input_guard = match projection_guard {

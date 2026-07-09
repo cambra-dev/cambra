@@ -74,7 +74,7 @@ Each request is assigned a monotonically-increasing integer index by `UIntStream
 
 ## Multi-endpoint programs
 
-Multiple `http_serve` calls each produce an independent `Source`/`Defer` pair and a separate entry in `sink_bindings_registry`.
+Multiple `http_serve` calls each produce an independent `Source`/`Defer` pair and a separate entry in `LoweringContext::sink_bindings`.
 
 ---
 
