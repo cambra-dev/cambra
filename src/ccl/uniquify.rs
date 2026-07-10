@@ -66,6 +66,11 @@ use crate::ccl::{Expr, Name, PredicateId, Type, TypedBinding, TypedExprNode};
 /// α-uniquify every binder in `expr` (see module docs). Runs once per
 /// program, immediately after lowering and before defer desugaring.
 pub fn run(mut expr: Expr) -> Expr {
+    // Snapshot every node's provenance id before the rename so we can assert
+    // it survives unchanged (collected only under debug_assertions).
+    #[cfg(debug_assertions)]
+    let before_ids = collect_node_ids(&expr);
+
     let mut u = Uniquifier {
         env: HashMap::new(),
         memo: HashMap::new(),
@@ -77,6 +82,15 @@ pub fn run(mut expr: Expr) -> Expr {
     );
     #[cfg(debug_assertions)]
     assert_all_binders_minted(&expr);
+    #[cfg(debug_assertions)]
+    {
+        let after_ids = collect_node_ids(&expr);
+        debug_assert_eq!(
+            before_ids, after_ids,
+            "uniquify must preserve every NodeId (1:1 in-place rename); \
+             provenance ids are stable across this pass"
+        );
+    }
     expr
 }
 
@@ -296,6 +310,45 @@ impl Uniquifier {
 /// uid may occur at several binding sites; the convention is "distinct
 /// derivations get distinct uids, copies share," which is not a tree-checkable
 /// property.
+/// Collect the sorted multiset of every node's [`NodeId`] reachable from
+/// `expr`, mirroring the exact set of nodes [`Uniquifier::expr`] visits —
+/// the main expression tree *and* the [`TypedExpr`]s living inside type-borne
+/// refinement predicates (which uniquify rebuilds in place). Sorting makes the
+/// result order-independent so the before/after comparison checks set identity
+/// with 1:1 multiplicity, not traversal order. Compiled under `debug_assertions`
+/// (where `run` asserts with it) or `test` (where the preservation tests call
+/// it); a release build with neither pays nothing.
+#[cfg(any(debug_assertions, test))]
+fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
+    use crate::ccl::provenance::NodeId;
+
+    fn from_ty(t: &Type, out: &mut Vec<NodeId>) {
+        if let Type::Refinement(_, r) = t {
+            from_expr(&r.predicate, out);
+        }
+        t.walk_children(|c| from_ty(c, out));
+    }
+
+    fn from_expr(e: &Expr, out: &mut Vec<NodeId>) {
+        out.push(e.node_id());
+        from_ty(&e.ty, out);
+        if let Some(ann) = &e.user_annotation {
+            from_ty(ann, out);
+        }
+        // `Cast`'s target is a type slot `walk_children` skips; its refinement
+        // predicate is an anchor uniquify rebuilds, so walk it explicitly.
+        if let TypedExprNode::Cast { target, .. } = &e.node {
+            from_ty(target, out);
+        }
+        e.walk_children(|c| from_expr(c, out));
+    }
+
+    let mut out = Vec::new();
+    from_expr(expr, &mut out);
+    out.sort_unstable();
+    out
+}
+
 #[cfg(debug_assertions)]
 fn assert_all_binders_minted(expr: &Expr) {
     fn go(e: &Expr) {
@@ -331,8 +384,8 @@ mod tests {
     use crate::ccl::lower::{LoweringContext, lower_stmts};
     use crate::ccl::{Expr, Lit, Refinement};
 
-    /// Parse, lower, and uniquify a CHL program.
-    fn pipeline_front(code: &str) -> Expr {
+    /// Parse and lower a CHL program, *without* uniquifying.
+    fn lower_only(code: &str) -> Expr {
         let mut ctx = LoweringContext::default();
         let stmts = crate::chl_parser::parse_module(code)
             .into_result()
@@ -340,7 +393,12 @@ mod tests {
             .body;
         let lowered = lower_stmts(&stmts, &mut ctx);
         assert!(lowered.errors.is_empty(), "{:?}", lowered.errors);
-        run(lowered.value.expect("lowering produced no value"))
+        lowered.value.expect("lowering produced no value")
+    }
+
+    /// Parse, lower, and uniquify a CHL program.
+    fn pipeline_front(code: &str) -> Expr {
+        run(lower_only(code))
     }
 
     /// Every refinement reachable from `e`'s types (Cast targets,
@@ -514,6 +572,41 @@ mod tests {
         let expr = pipeline_front("k = 1\n[x for x in [1, 2, 3] if x > k]\n");
         let again = run(expr.clone());
         assert_eq!(expr, again, "uniquify must be idempotent");
+    }
+
+    // uniquify is a 1:1 in-place rename, so it must preserve every node's
+    // provenance `NodeId` — none added, dropped, or changed. Mirrors the
+    // before/after set checked by the in-pass debug_assert in `run`.
+    #[test]
+    fn uniquify_preserves_every_node_id() {
+        use crate::ccl::provenance::NodeId;
+        use std::collections::HashSet;
+
+        // `let x = 1 in let x = x in x` — two shadowing `x` binders plus uses,
+        // so the rename actually rewrites `Var` names. Lower *without*
+        // uniquifying so we capture ids before the rename.
+        let expr = lower_only("x = 1\nx = x\nx\n");
+
+        let before: HashSet<NodeId> = collect_node_ids(&expr).into_iter().collect();
+        // Pin a known structural position: the id of the root `Let` node.
+        assert!(
+            matches!(expr.node, TypedExprNode::Let { .. }),
+            "expected a root Let"
+        );
+        let root_id = expr.node_id();
+
+        let after_expr = run(expr);
+        let after: HashSet<NodeId> = collect_node_ids(&after_expr).into_iter().collect();
+
+        assert_eq!(
+            before, after,
+            "uniquify must preserve the exact set of NodeIds (none added, dropped, or changed)"
+        );
+        assert_eq!(
+            after_expr.node_id(),
+            root_id,
+            "the root Let's NodeId is unchanged across the rename"
+        );
     }
 
     #[test]

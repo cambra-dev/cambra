@@ -78,7 +78,10 @@ use std::{
 };
 
 use crate::{
-    ccl::{Branch, Expr, Lit, TypedExprNode},
+    ccl::{
+        Branch, Expr, Lit, TypedExprNode,
+        provenance::{Provenance, ProvenanceTable},
+    },
     chl_parser::ast::{
         Expr as ChlExpr, Lit as ChlLit, RecordField, Span, Spanned, Stmt as ChlStmt,
     },
@@ -317,6 +320,14 @@ pub struct LoweringContext {
     /// call sites must apply curried to match — recorded here (the `def` lowers
     /// before its calls) so [`lower_call`] can pick the matching shape.
     pub(super) mut_param_fns: HashSet<String>,
+
+    /// Provenance side table populated during lowering: each lowered node's
+    /// [`NodeId`] is mapped to a [`Provenance::source`] entry recording the
+    /// source span it lowered from. Drained by
+    /// [`take_provenance`](Self::take_provenance) after lowering completes so
+    /// the compiled program can retain it (see
+    /// [`crate::ccl::context::CompiledProgram::provenance`]).
+    provenance: ProvenanceTable,
 }
 
 impl LoweringContext {
@@ -358,6 +369,30 @@ impl LoweringContext {
     /// it can extract the corresponding expressions and subscribe them.
     pub fn take_sink_bindings(&mut self) -> HashMap<String, Arc<dyn DataSink>> {
         std::mem::take(&mut self.sink_bindings)
+    }
+
+    /// Drain the provenance side table accumulated during lowering.
+    ///
+    /// Mirrors [`take_sources`](Self::take_sources) /
+    /// [`take_sink_bindings`](Self::take_sink_bindings): call after lowering
+    /// returns and retain the table on the compiled program so the inspector
+    /// and diagnostics can `resolve` lowered nodes back to source spans.
+    pub fn take_provenance(&mut self) -> ProvenanceTable {
+        std::mem::take(&mut self.provenance)
+    }
+
+    /// Record `expr` as lowered directly from `span` (a
+    /// [`Derivation::Source`](crate::ccl::provenance::Derivation::Source) entry)
+    /// and return it, for chaining at construction sites.
+    ///
+    /// Used for `Let`/`Lambda`/function-wrapper nodes built outside
+    /// [`lower_expr`] (statement-level constructs), where the nearest source
+    /// span is the enclosing statement/construct rather than a
+    /// [`Spanned<ChlExpr>`].
+    pub(super) fn tag_source(&mut self, expr: Expr, span: Span) -> Expr {
+        self.provenance
+            .insert(expr.node_id(), Provenance::source(span));
+        expr
     }
 
     /// Mint a fresh `{prefix}_{id}` name from the monotonic synthetic-id
@@ -498,8 +533,25 @@ pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Lower a single CHL expression to a CCL expression.
+/// Lower a single CHL expression to a CCL expression, tagging the root of the
+/// lowered subtree with the source span it came from.
+///
+/// The recursion proper lives in [`lower_expr_inner`]; this thin wrapper records
+/// `expr.span` against the returned node's [`NodeId`](crate::ccl::provenance::NodeId) in the provenance side
+/// table. Each `lower_expr` call tags the one node it returns, so every source
+/// expression contributes exactly one blame-level entry — recursive children are
+/// tagged by their own `lower_expr` calls. Synthetic interior nodes a single arm
+/// builds (e.g. the `Proj` inside a subscript `Apply`, the `Case` scaffolding for
+/// a ternary) are intentionally left untagged and resolve to `None` gracefully.
 pub fn lower_expr(
+    expr: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let lowered = lower_expr_inner(expr, ctx)?;
+    Ok(ctx.tag_source(lowered, expr.span))
+}
+
+fn lower_expr_inner(
     expr: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {

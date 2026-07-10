@@ -3,6 +3,7 @@
 //! the [`Branch`] / [`Pattern`] / [`TransactKey`] / [`TransactWriter`] support
 //! types.
 
+use crate::ccl::provenance::NodeId;
 use crate::ccl::{AggregateKind, BinOpKind, Builtin, Lit, Name, ProjKey, Type, UnaryOpKind};
 
 /// The `commit` field of a [`TransactWriter`] decision record — the boolean
@@ -529,6 +530,47 @@ pub enum TypedExprNode {
     Error,
 }
 
+impl TypedExprNode {
+    /// The variant's name as a stable, allocation-free string — for provenance /
+    /// invariant diagnostics (e.g. the node-id uniqueness tripwire) that name a
+    /// node by kind without dumping its contents. Exhaustive on purpose so a new
+    /// variant forces an entry here.
+    // Called from compile_program's id-uniqueness tripwire, introduced upstack.
+    #[allow(dead_code)]
+    pub(crate) fn kind_name(&self) -> &'static str {
+        match self {
+            TypedExprNode::Lit(_) => "Lit",
+            TypedExprNode::Var(_) => "Var",
+            TypedExprNode::Builtin(_) => "Builtin",
+            TypedExprNode::Apply { .. } => "Apply",
+            TypedExprNode::Cast { .. } => "Cast",
+            TypedExprNode::BinOp { .. } => "BinOp",
+            TypedExprNode::UnaryOp { .. } => "UnaryOp",
+            TypedExprNode::Lambda { .. } => "Lambda",
+            TypedExprNode::Aggregate { .. } => "Aggregate",
+            TypedExprNode::Let { .. } => "Let",
+            TypedExprNode::List(_) => "List",
+            TypedExprNode::Case { .. } => "Case",
+            TypedExprNode::VariantCtor { .. } => "VariantCtor",
+            TypedExprNode::Transact { .. } => "Transact",
+            TypedExprNode::LetRec { .. } => "LetRec",
+            TypedExprNode::For { .. } => "For",
+            TypedExprNode::MutWrite { .. } => "MutWrite",
+            TypedExprNode::Tuple(_) => "Tuple",
+            TypedExprNode::Proj(_) => "Proj",
+            TypedExprNode::Record(_) => "Record",
+            TypedExprNode::Source(_) => "Source",
+            TypedExprNode::Compose(_) => "Compose",
+            TypedExprNode::CollectionUnion { .. } => "CollectionUnion",
+            TypedExprNode::ExprStmt { .. } => "ExprStmt",
+            TypedExprNode::Feed { .. } => "Feed",
+            TypedExprNode::Define { .. } => "Define",
+            TypedExprNode::Defer => "Defer",
+            TypedExprNode::Error => "Error",
+        }
+    }
+}
+
 /// A CCL expression with a type slot on every node.
 ///
 /// Every node starts with `ty: Type::Hole`; the inference pass
@@ -538,7 +580,11 @@ pub enum TypedExprNode {
 /// `user_annotation` carries an explicit type annotation written by the user
 /// (e.g. from a Python `cast(T, expr)` or an annotated binding site). The
 /// inference pass checks that the inferred type is compatible with it.
-#[derive(Debug, Clone, PartialEq)]
+/// `PartialEq` is hand-written (see the `impl` below) rather than derived: it
+/// deliberately ignores `node_id`. Provenance is metadata, not part of a node's
+/// value, so two structurally-equal nodes must compare equal even with distinct
+/// ids.
+#[derive(Debug, Clone)]
 pub struct TypedExpr {
     /// The inferred type of this expression.
     ///
@@ -552,10 +598,39 @@ pub struct TypedExpr {
     /// Checked against the inferred type by [`crate::ccl::infer::infer`]; `None` for all
     /// nodes produced by the current lowering pass.
     pub user_annotation: Option<Type>,
+    /// Stable provenance identity for this node, minted fresh at construction
+    /// (see [`crate::ccl::provenance`]). Excluded from [`PartialEq`] because
+    /// provenance is metadata, not part of the node's value.
+    ///
+    /// `Clone` copies `node_id`, so a cloned node *shares* its source's id;
+    /// freshening a clone's id is a deliberate later step, done where it
+    /// matters (monomorphization calls [`freshen_node_id`](Self::freshen_node_id)
+    /// or [`freshen_node_ids_deep`](Self::freshen_node_ids_deep) explicitly).
+    ///
+    /// `pub(super)` (visible within `crate::ccl`) so the pass submodules that
+    /// build `TypedExpr` struct literals directly (`desugar_defers`, `inline`,
+    /// `lambda_elim`, …) can set it; external crates still go through the
+    /// accessor methods.
+    pub(super) node_id: NodeId,
 }
 
 /// Type alias for backward compatibility. `Expr` is now [`TypedExpr`].
 pub type Expr = TypedExpr;
+
+/// Hand-written to **exclude `node_id`** from equality.
+///
+/// `node_id` is provenance metadata, not part of a node's value: two nodes that
+/// are structurally equal as values must compare equal even when they carry
+/// different ids. A derived `PartialEq` would instead make every freshly-minted
+/// node compare unequal, breaking value-comparison in tests and pass logic.
+/// Only `ty`, `node`, and `user_annotation` participate.
+impl PartialEq for TypedExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty
+            && self.node == other.node
+            && self.user_annotation == other.user_annotation
+    }
+}
 
 impl TypedExpr {
     /// Construct a new [`TypedExpr`] with a [`Type::Hole`] placeholder and no user annotation.
@@ -567,7 +642,101 @@ impl TypedExpr {
             node,
             ty: Type::Hole,
             user_annotation: None,
+            node_id: NodeId::fresh(),
         }
+    }
+
+    /// The stable provenance id of this node (see [`crate::ccl::provenance`]).
+    pub fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Mint a fresh [`NodeId`] for this node, returning `(old, new)`. For
+    /// monomorphization clone freshening only: a cloned subtree shares the
+    /// original's ids, which must be made unique. Returns
+    /// both ids so the caller can record the remap (`new → old`) used to carry
+    /// the original node's provenance onto the clone.
+    ///
+    /// Deliberately fresh-only — there is no `set_node_id(arbitrary)`. Ids are
+    /// minted at construction; the one legitimate later mutation is re-minting
+    /// a clone's copied id.
+    pub(crate) fn freshen_node_id(&mut self) -> (NodeId, NodeId) {
+        let old = self.node_id;
+        let new = NodeId::fresh();
+        self.node_id = new;
+        (old, new)
+    }
+
+    /// Carry an *existing* [`NodeId`] onto this node, consuming and returning
+    /// it. Unlike [`freshen_node_id`](Self::freshen_node_id) (which mints), this
+    /// transplants an id already minted elsewhere — the legitimate use is a
+    /// merge/restructure pass (e.g. `desugar_defers`'s cluster collapse)
+    /// carrying the surviving input node's id onto a rebuilt node so its
+    /// provenance survives by construction. There is deliberately no
+    /// arbitrary-`u64` setter; ids only ever come from `fresh` or another node.
+    pub(crate) fn with_node_id(mut self, id: NodeId) -> Self {
+        self.node_id = id;
+        self
+    }
+
+    /// Deep-freshen every [`NodeId`] in this expression's node-set, invoking
+    /// `on_freshen(old, new)` for each node re-minted (in walk order).
+    ///
+    /// Walks the **same node-set as [`crate::ccl::uniquify`]'s `collect_node_ids`**:
+    /// the main expression tree *and* the [`TypedExpr`]s living inside type-borne
+    /// refinement predicates — reached through `self.ty`, the user annotation, and
+    /// a [`TypedExprNode::Cast`]'s target type. Predicate `Rc`s are split via
+    /// [`Rc::make_mut`](std::rc::Rc::make_mut) (clone-on-write) so freshening a
+    /// copy never mutates a predicate term still shared by another tree; a
+    /// [`PredicateId`](crate::ccl::PredicateId) visited-set freshens each such
+    /// term exactly once (so an `Rc` reachable through several type slots is not
+    /// re-walked or re-minted, keeping the freshen 1:1 per node).
+    ///
+    /// This is the single deep-freshen walk shared by monomorphization's clone
+    /// freshening (`infer::solve::freshen_clone_node_ids`, which records the
+    /// `(new, old)` remap) and the transact/letrec phases' `subst_env` copy
+    /// freshening (which discard the pairs — their copies are unattributed). Do
+    /// not hand-roll a second walk over this node-set; they must stay in lockstep.
+    pub(crate) fn freshen_node_ids_deep(&mut self, mut on_freshen: impl FnMut(NodeId, NodeId)) {
+        use std::collections::HashSet;
+
+        fn from_ty(
+            t: &mut Type,
+            on: &mut impl FnMut(NodeId, NodeId),
+            seen: &mut HashSet<crate::ccl::PredicateId>,
+        ) {
+            if let Type::Refinement(_, r) = t {
+                // The same predicate `Rc` may be reachable through several type
+                // slots; guard on pointer identity so it is freshened once.
+                if seen.insert(r.predicate_id()) {
+                    let pred = std::rc::Rc::make_mut(&mut r.predicate);
+                    from_expr(pred, on, seen);
+                }
+            }
+            t.walk_children_mut(|c| from_ty(c, on, seen));
+        }
+
+        fn from_expr(
+            e: &mut TypedExpr,
+            on: &mut impl FnMut(NodeId, NodeId),
+            seen: &mut HashSet<crate::ccl::PredicateId>,
+        ) {
+            let (old, new) = e.freshen_node_id();
+            on(old, new);
+            from_ty(&mut e.ty, on, seen);
+            if let Some(ann) = &mut e.user_annotation {
+                from_ty(ann, on, seen);
+            }
+            // `Cast`'s target is a type slot `walk_children_mut` skips; walk it
+            // explicitly so its refinement predicate's nodes are freshened.
+            if let TypedExprNode::Cast { target, .. } = &mut e.node {
+                from_ty(target, on, seen);
+            }
+            e.walk_children_mut(|c| from_expr(c, on, seen));
+        }
+
+        let mut seen = HashSet::new();
+        from_expr(self, &mut on_freshen, &mut seen);
     }
 
     /// Set the inferred type on this expression, consuming and returning it.
@@ -881,7 +1050,17 @@ impl TypedExpr {
     /// shadowing (e.g. stopping at a [`TypedExprNode::Lambda`] whose param
     /// matches a target name) must still handle the binder variants
     /// explicitly rather than relying on this method.
-    pub fn walk_children(&self, mut f: impl FnMut(&TypedExpr)) {
+    /// Collect borrows of the direct child expressions, in the same order as
+    /// [`walk_children`](Self::walk_children).
+    ///
+    /// The borrow-returning sibling of [`walk_children`](Self::walk_children):
+    /// where `walk_children` hands each child to a closure under a fresh
+    /// short-lived borrow (so a found child cannot escape the call), this returns
+    /// the children as `&Self`-lifetime borrows. Use it when a traversal needs to
+    /// *return* a child reference (e.g. find-node-by-id), which the closure form
+    /// structurally cannot express.
+    pub fn child_exprs(&self) -> Vec<&TypedExpr> {
+        let mut out = Vec::new();
         match &self.node {
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
@@ -891,79 +1070,86 @@ impl TypedExpr {
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
-                f(function);
-                f(argument);
+                out.push(function.as_ref());
+                out.push(argument.as_ref());
             }
-            // Only `value` is an expression child; `target` is a type (its
-            // refinement predicate is reached via type walks, not here).
-            TypedExprNode::Cast { value, .. } => f(value),
+            TypedExprNode::Cast { value, .. } => out.push(value.as_ref()),
             TypedExprNode::BinOp { left, right, .. } => {
-                f(left);
-                f(right);
+                out.push(left.as_ref());
+                out.push(right.as_ref());
             }
-            TypedExprNode::UnaryOp(_, inner) => f(inner),
-            TypedExprNode::Lambda { body, .. } => f(body),
-            TypedExprNode::Aggregate { input, .. } => f(input),
+            TypedExprNode::UnaryOp(_, inner) => out.push(inner.as_ref()),
+            TypedExprNode::Lambda { body, .. } => out.push(body.as_ref()),
+            TypedExprNode::Aggregate { input, .. } => out.push(input.as_ref()),
             TypedExprNode::Let {
                 bound_expr, body, ..
             } => {
-                f(bound_expr);
-                f(body);
+                out.push(bound_expr.as_ref());
+                out.push(body.as_ref());
             }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
-            | TypedExprNode::CollectionUnion(elts) => {
-                for e in elts {
-                    f(e);
-                }
-            }
+            | TypedExprNode::CollectionUnion(elts) => out.extend(elts.iter()),
             TypedExprNode::Case {
                 scrutinee,
                 branches,
             } => {
                 if let Some(s) = scrutinee {
-                    f(s);
+                    out.push(s.as_ref());
                 }
                 for b in branches {
-                    f(&b.guard);
-                    f(&b.body);
+                    out.push(&b.guard);
+                    out.push(&b.body);
                 }
             }
-            TypedExprNode::VariantCtor { payload, .. } => f(payload),
-            TypedExprNode::Record(fields) => {
-                for (_, e) in fields {
-                    f(e);
-                }
-            }
+            TypedExprNode::VariantCtor { payload, .. } => out.push(payload.as_ref()),
+            TypedExprNode::Record(fields) => out.extend(fields.iter().map(|(_, e)| e)),
             // `domain` is a `Type`, not an `Expr` child, so the expr-walker
-            // skips it (its type residue is reached via `expr.ty` walks).
+            // skips it (its type residue is reached via `expr.ty` walks). Child
+            // order mirrors `walk_transact`: each key's init, then each writer's
+            // source and body.
             TypedExprNode::Transact { keys, writers, .. } => {
                 for k in keys {
-                    f(&k.init);
+                    out.push(&k.init);
                 }
                 for w in writers {
-                    f(&w.source);
-                    f(&w.body);
+                    out.push(&w.source);
+                    out.push(&w.body);
                 }
             }
             TypedExprNode::LetRec { bindings, body } => {
                 for (_, def) in bindings {
-                    f(def);
+                    out.push(def);
                 }
-                f(body);
+                out.push(body.as_ref());
             }
             TypedExprNode::For { iter, body, .. } => {
-                f(iter);
-                f(body);
+                out.push(iter.as_ref());
+                out.push(body.as_ref());
             }
             TypedExprNode::ExprStmt { expr, body } => {
-                f(expr);
-                f(body);
+                out.push(expr.as_ref());
+                out.push(body.as_ref());
             }
             TypedExprNode::Feed { value, .. }
             | TypedExprNode::Define { value, .. }
-            | TypedExprNode::MutWrite { value, .. } => f(value),
+            | TypedExprNode::MutWrite { value, .. } => out.push(value.as_ref()),
+        }
+        out
+    }
+
+    /// Invoke `f` on each direct child Expr by shared reference, in child order.
+    ///
+    /// Delegates to [`child_exprs`](Self::child_exprs) — the single immutable
+    /// child-structure definition — so the two cannot drift out of sync. Leaf
+    /// nodes yield an empty `Vec` (no allocation); only internal nodes pay a
+    /// small transient `Vec`, which is immaterial for compile-time tree walks.
+    /// Does not descend through type refinement predicates or visit binder
+    /// name/type fields (see [`child_exprs`](Self::child_exprs)).
+    pub fn walk_children(&self, mut f: impl FnMut(&TypedExpr)) {
+        for child in self.child_exprs() {
+            f(child);
         }
     }
 
@@ -1025,15 +1211,18 @@ impl TypedExpr {
         acc.expect("fold_children: walk_children dropped accumulator")
     }
 
-    /// Mutable analog of [`walk_children`](Self::walk_children).
+    /// Collect mutable borrows of the direct child expressions, in the same
+    /// order as [`child_exprs`](Self::child_exprs).
     ///
-    /// Invokes `f` on each direct child Expr by mutable reference, in the same
-    /// order as `walk_children`.  Same caveats apply: does not descend through
-    /// type refinement predicates and does not visit binder name/type fields.
-    /// Pure-mutator passes that need to mutate `Lambda.param.ty`,
-    /// `Let.binding.ty`, or the refinement predicate must handle those
-    /// explicitly before (or after) calling this method.
-    pub fn walk_children_mut(&mut self, mut f: impl FnMut(&mut TypedExpr)) {
+    /// The `&mut` sibling of [`child_exprs`](Self::child_exprs) and the single
+    /// mutable child-structure definition (`walk_children_mut`/`map_children`/
+    /// `try_map_children` all route through it). The immutable and mutable
+    /// primitives are necessarily distinct arms — Rust's borrow rules forbid one
+    /// `&`/`&mut`-generic body — so they are the two (and, short of a codegen
+    /// macro, irreducible) match arms over the node's children. Does not descend
+    /// through type refinement predicates or visit binder name/type fields.
+    pub fn child_exprs_mut(&mut self) -> Vec<&mut TypedExpr> {
+        let mut out: Vec<&mut TypedExpr> = Vec::new();
         match &mut self.node {
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
@@ -1043,77 +1232,86 @@ impl TypedExpr {
             | TypedExprNode::Defer
             | TypedExprNode::Error => {}
             TypedExprNode::Apply { function, argument } => {
-                f(function);
-                f(argument);
+                out.push(function.as_mut());
+                out.push(argument.as_mut());
             }
             // Only `value` is an expression child; `target` is a type (its
             // refinement predicate is reached via type walks, not here).
-            TypedExprNode::Cast { value, .. } => f(value),
+            TypedExprNode::Cast { value, .. } => out.push(value.as_mut()),
             TypedExprNode::BinOp { left, right, .. } => {
-                f(left);
-                f(right);
+                out.push(left.as_mut());
+                out.push(right.as_mut());
             }
-            TypedExprNode::UnaryOp(_, inner) => f(inner),
-            TypedExprNode::Lambda { body, .. } => f(body),
-            TypedExprNode::Aggregate { input, .. } => f(input),
+            TypedExprNode::UnaryOp(_, inner) => out.push(inner.as_mut()),
+            TypedExprNode::Lambda { body, .. } => out.push(body.as_mut()),
+            TypedExprNode::Aggregate { input, .. } => out.push(input.as_mut()),
             TypedExprNode::Let {
                 bound_expr, body, ..
             } => {
-                f(bound_expr);
-                f(body);
+                out.push(bound_expr.as_mut());
+                out.push(body.as_mut());
             }
             TypedExprNode::List(elts)
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
-            | TypedExprNode::CollectionUnion(elts) => {
-                for e in elts {
-                    f(e);
-                }
-            }
+            | TypedExprNode::CollectionUnion(elts) => out.extend(elts.iter_mut()),
             TypedExprNode::Case {
                 scrutinee,
                 branches,
             } => {
                 if let Some(s) = scrutinee {
-                    f(s);
+                    out.push(s.as_mut());
                 }
                 for b in branches {
-                    f(&mut b.guard);
-                    f(&mut b.body);
+                    out.push(&mut b.guard);
+                    out.push(&mut b.body);
                 }
             }
-            TypedExprNode::VariantCtor { payload, .. } => f(payload),
-            TypedExprNode::Record(fields) => {
-                for (_, e) in fields {
-                    f(e);
-                }
-            }
+            TypedExprNode::VariantCtor { payload, .. } => out.push(payload.as_mut()),
+            TypedExprNode::Record(fields) => out.extend(fields.iter_mut().map(|(_, e)| e)),
+            // `domain` is a `Type`, not an `Expr` child (see `child_exprs`).
+            // Child order mirrors `walk_transact`.
             TypedExprNode::Transact { keys, writers, .. } => {
                 for k in keys {
-                    f(&mut k.init);
+                    out.push(&mut k.init);
                 }
                 for w in writers {
-                    f(&mut w.source);
-                    f(&mut w.body);
+                    out.push(&mut w.source);
+                    out.push(&mut w.body);
                 }
             }
             TypedExprNode::LetRec { bindings, body } => {
                 for (_, def) in bindings {
-                    f(def);
+                    out.push(def);
                 }
-                f(body);
+                out.push(body.as_mut());
             }
             TypedExprNode::For { iter, body, .. } => {
-                f(iter);
-                f(body);
+                out.push(iter.as_mut());
+                out.push(body.as_mut());
             }
             TypedExprNode::ExprStmt { expr, body } => {
-                f(expr);
-                f(body);
+                out.push(expr.as_mut());
+                out.push(body.as_mut());
             }
             TypedExprNode::Feed { value, .. }
             | TypedExprNode::Define { value, .. }
-            | TypedExprNode::MutWrite { value, .. } => f(value),
+            | TypedExprNode::MutWrite { value, .. } => out.push(value.as_mut()),
+        }
+        out
+    }
+
+    /// Mutable analog of [`walk_children`](Self::walk_children).
+    ///
+    /// Delegates to [`child_exprs_mut`](Self::child_exprs_mut) so the mutable
+    /// child structure lives in exactly one place. Same caveats as
+    /// `walk_children`: does not descend through type refinement predicates and
+    /// does not visit binder name/type fields. Pure-mutator passes that need to
+    /// mutate `Lambda.param.ty`, `Let.binding.ty`, or the refinement predicate
+    /// must handle those explicitly before (or after) calling this method.
+    pub fn walk_children_mut(&mut self, mut f: impl FnMut(&mut TypedExpr)) {
+        for child in self.child_exprs_mut() {
+            f(child);
         }
     }
 
@@ -1177,6 +1375,26 @@ impl TypedExpr {
             }
         });
         err
+    }
+
+    /// Transform this node's [`TypedExprNode`] while preserving its identity
+    /// envelope (`node_id`, `ty`, `user_annotation`).
+    ///
+    /// The owned-rebuild sibling of in-place mutation — completes the
+    /// `walk_children`/`map_children`/`map_node` family. Use in owned-transform
+    /// passes (e.g. `desugar_defers`) so a structural rewrite preserves
+    /// provenance by construction: the rebuilt node keeps the original's
+    /// [`NodeId`] rather than minting a fresh one via [`TypedExpr::new`].
+    ///
+    /// Currently unused in-tree: the desugar spine rewrites that used it now go
+    /// through explicit envelope reconstruction (they must also re-synthesize a
+    /// stale `ty`, which this envelope-preserving form cannot express). Retained
+    /// as the owned-transform member of the traversal family for the pending
+    /// NodeRecorder adoption (see `design-provenance.md`).
+    #[allow(dead_code)]
+    pub(crate) fn map_node(mut self, f: impl FnOnce(TypedExprNode) -> TypedExprNode) -> Self {
+        self.node = f(self.node);
+        self
     }
 }
 

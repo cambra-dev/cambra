@@ -103,6 +103,23 @@ pub(super) struct CoalesceCtx {
     /// applies).
     scope: Vec<ScopeEntry>,
     errors: Vec<InferError>,
+    /// Provenance remap for monomorphization: each specialization clone
+    /// shares the original definition's `NodeId`s, so [`specialize_use`]
+    /// freshens every cloned node's id and records the `(new, old)` pair here.
+    /// `compile_program` drains this and, for each pair, tags `new` with the
+    /// original lowered node's provenance as `Derived { via: Mono }`.
+    ///
+    /// A clone is coalesced re-entrantly, so a nested generalized `let` inside
+    /// it specializes recursively and pushes its own pairs — meaning `old` may
+    /// itself be a `new` from an earlier (outer) specialization. The chain
+    /// `new → old → … → original_lowered_id` is resolved transitively by the
+    /// application step. Not behind `#[cfg(debug_assertions)]` — this is
+    /// load-bearing (it is what makes specialization ids globally unique and
+    /// resolvable).
+    mono_remap: Vec<(
+        crate::ccl::provenance::NodeId,
+        crate::ccl::provenance::NodeId,
+    )>,
     /// Every read the walk performed, for the end-of-pass ordering-invariant
     /// check ([`assert_reads_stable`]). Debug builds only.
     #[cfg(debug_assertions)]
@@ -330,10 +347,19 @@ fn with_shadows<R>(
     r
 }
 
-pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<InferError> {
+/// The remap of `(fresh_clone_id, source_clone_id)` pairs monomorphization
+/// produced — see [`CoalesceCtx::mono_remap`]. `compile_program` resolves each
+/// chain transitively against the provenance table.
+pub(super) type MonoRemap = Vec<(
+    crate::ccl::provenance::NodeId,
+    crate::ccl::provenance::NodeId,
+)>;
+
+pub(super) fn coalesce_pass(expr: &mut Expr) -> (Vec<InferError>, MonoRemap) {
     let mut ctx = CoalesceCtx {
         scope: Vec::new(),
         errors: Vec::new(),
+        mono_remap: Vec::new(),
         #[cfg(debug_assertions)]
         reads: Vec::new(),
     };
@@ -350,7 +376,7 @@ pub(super) fn coalesce_pass(expr: &mut Expr) -> Vec<InferError> {
     if ctx.errors.is_empty() {
         assert_reads_stable(&ctx.reads);
     }
-    ctx.errors
+    (ctx.errors, ctx.mono_remap)
 }
 
 /// The design's scope-validity check (§6.2): a coalesced node's type must be
@@ -970,6 +996,30 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
 // `ConstrainCache` keys on `Type`, whose `Refinement` predicates carry interior
 // mutability; the solver relies on identity-by-`uid`, not the mutable payload
 // (matching the solver's module-level allow).
+/// Mint a fresh [`NodeId`](crate::ccl::provenance::NodeId) for every node in a
+/// monomorphization clone, pushing each `(new, old)` pair into `remap`.
+///
+/// Walks the same node-set as `uniquify::collect_node_ids`: the main expression
+/// tree *and* the [`TypedExpr`]s living inside type-borne refinement predicates
+/// (reached through `expr.ty`, the user annotation, and a `Cast`'s target
+/// type). After `freshen_expr_type_slots` those predicate
+/// `Rc<TypedExpr>`s are fresh copies that still carry the *original* ids, so
+/// they must be freshened here too — otherwise predicate-embedded clone nodes
+/// would collide across specializations exactly like the main-tree nodes do.
+///
+/// A predicate term shared by `Rc` across several type slots is freshened once;
+/// a visited-set keyed by [`PredicateId`](crate::ccl::PredicateId) (pointer
+/// identity) prevents re-walking it (and re-minting its ids), so the remap stays
+/// 1:1 per node.
+fn freshen_clone_node_ids(expr: &mut Expr, remap: &mut MonoRemap) {
+    // The deep walk (main tree + predicate `Rc`s via `make_mut` + `Cast`
+    // targets) lives on `TypedExpr::freshen_node_ids_deep`, shared with the
+    // transact/letrec `subst_env` copy-freshening. Mono is the recording
+    // consumer: it keeps each `(new, old)` pair as the `Derived { via: Mono }`
+    // remap (fresh clone id → the id it was cloned from).
+    expr.freshen_node_ids_deep(|old, new| remap.push((new, old)));
+}
+
 #[allow(clippy::mutable_key_type)]
 pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut CoalesceCtx) {
     // The use's instantiation type, resolved off the live graph. The graph is
@@ -1024,6 +1074,22 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // with the definition — and no mutable state to keep in sync with it.
     let mut fresh = FreshenCache::new();
     freshen_expr_type_slots(&mut clone, cutoff, FreshenLevel::Preserve, &mut fresh);
+
+    // `Clone` copies `node_id`, so every node in this clone currently shares
+    // the original definition's id — N specializations would collide on one id,
+    // breaking any post-inference index keyed by `NodeId`. Mint a fresh id for
+    // every cloned node and record the `(new, old)` pair so `compile_program`
+    // can carry the original node's provenance onto the clone as
+    // `Derived { via: Mono }`. This is a dedicated walk scoped to
+    // monomorphization (not folded into the shared `freshen_expr_type_slots`,
+    // which also runs on refinement-predicate copies outside any mono context).
+    // It mirrors `uniquify::collect_node_ids`'s traversal so predicate-embedded
+    // clone nodes (reached only through type slots / `Cast` targets) are
+    // freshened too. The coalesce below runs re-entrantly on the clone, so any
+    // nested generalized `let`'s own specializations push further pairs whose
+    // `old` is one of *these* fresh ids — the chain is resolved transitively
+    // downstream.
+    freshen_clone_node_ids(&mut clone, &mut ctx.mono_remap);
 
     // Pin the clone to the use's live instantiation type, two-way. Inward,
     // this drives the use site's accumulated bounds into the clone's
@@ -1087,6 +1153,13 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
 /// definition is dead code.
 pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     let saved_annotation = expr.user_annotation.take();
+    // The original generalized-`let`'s id, captured before the rebuild below
+    // overwrites `expr`. Only `expr.node` is consumed here; `expr.node_id()` is
+    // still the lowered/desugared id the provenance table is keyed on, so each
+    // freshly-minted specialization-wrapper `Let` can blame it (via the mono
+    // remap) instead of being swept untagged. This is both the provenance tag
+    // for the wrapper and the desugar⇄inference stage-adjacency edge for it.
+    let original_let_id = expr.node_id();
     let node = std::mem::replace(&mut expr.node, TypedExprNode::Error);
     let TypedExprNode::Let {
         binding,
@@ -1132,6 +1205,11 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
             body: Box::new(result),
         })
         .with_ty(body_ty);
+        // Blame this synthesized wrapper on the original generalized `let`
+        // (resolved transitively to its source span by `apply_mono_remap`,
+        // tagging it `Derived { via: Mono }`). Mirrors the clone freshening in
+        // `freshen_clone_node_ids`: `(new, old)` = (wrapper, original).
+        ctx.mono_remap.push((result.node_id(), original_let_id));
     }
     *expr = result;
     expr.user_annotation = saved_annotation;
@@ -1524,6 +1602,82 @@ mod tests {
             used_names.len(),
             2,
             "the three uses collapse onto two specializations"
+        );
+    }
+
+    /// Collect every node's `NodeId` reachable from `expr` (main tree +
+    /// type-borne refinement-predicate nodes), mirroring
+    /// `uniquify::collect_node_ids` so the multiset matches what the inspector
+    /// would index.
+    fn collect_all_node_ids(expr: &TypedExpr) -> Vec<crate::ccl::provenance::NodeId> {
+        use crate::ccl::provenance::NodeId;
+        fn from_ty(t: &Type, out: &mut Vec<NodeId>) {
+            if let Type::Refinement(_, r) = t {
+                from_expr(&r.predicate, out);
+            }
+            t.walk_children(|c| from_ty(c, out));
+        }
+        fn from_expr(e: &TypedExpr, out: &mut Vec<NodeId>) {
+            out.push(e.node_id());
+            from_ty(&e.ty, out);
+            if let Some(ann) = &e.user_annotation {
+                from_ty(ann, out);
+            }
+            if let TypedExprNode::Cast { target, .. } = &e.node {
+                from_ty(target, out);
+            }
+            e.walk_children(|c| from_expr(c, out));
+        }
+        let mut out = Vec::new();
+        from_expr(expr, &mut out);
+        out
+    }
+
+    /// Monomorphization freshens every cloned node's `NodeId` and surfaces a
+    /// `(fresh, source)` remap. Checks this directly at the inference seam:
+    /// after `id` is specialized at two distinct types, (a) every node in the
+    /// inferred tree has a *unique* id — clones never collide on the original
+    /// definition's ids — and (b) the surfaced remap is non-empty with unique
+    /// `fresh` ids (one per cloned node, no collisions).
+    #[test]
+    fn monomorphization_freshens_node_ids_and_surfaces_remap() {
+        use crate::ccl::infer::TypeInferenceContext;
+        use std::collections::HashSet;
+
+        // let id = λx. x in (id 1, id "a")  →  two specializations of `id`.
+        let id = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
+        let body = TypedExpr::new(TypedExprNode::Tuple(vec![
+            TypedExpr::apply(lit_int(1), TypedExpr::var("id")),
+            TypedExpr::apply(lit_string("a"), TypedExpr::var("id")),
+        ]));
+        let mut e = TypedExpr::let_bind("id", id, body);
+
+        let mut ctx = TypeInferenceContext::new();
+        crate::ccl::infer::infer(&mut e, &mut ctx).expect("type-checks");
+        let remap = ctx.take_mono_remap();
+
+        // (b) The remap was populated and its `fresh` ids are all distinct.
+        assert!(
+            !remap.is_empty(),
+            "monomorphization must surface a non-empty remap"
+        );
+        let fresh: Vec<_> = remap.iter().map(|&(f, _)| f).collect();
+        let fresh_set: HashSet<_> = fresh.iter().copied().collect();
+        assert_eq!(
+            fresh.len(),
+            fresh_set.len(),
+            "every fresh clone id is minted exactly once (no collisions)"
+        );
+
+        // (a) No id collides anywhere in the inferred tree: without freshening,
+        // the two `id` specializations would share the definition's ids and the
+        // multiset would have duplicates.
+        let ids = collect_all_node_ids(&e);
+        let unique: HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "every node in the specialized tree has a unique NodeId"
         );
     }
 

@@ -64,9 +64,14 @@
 //! [`Feed`]: crate::ccl::TypedExprNode::Feed
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
+use std::collections::HashSet;
+
 use crate::ccl::{
-    Expr, Lit, Name, Type, TypedExprNode, ccl_utils::walk_refined_predicates_mut,
+    Expr, Lit, Name, Type, TypedExprNode,
+    ccl_utils::walk_refined_predicates_mut,
     lambda_elim::substitute,
+    node_recorder::NodeRecorder,
+    provenance::{NodeId, Pass},
 };
 
 // ---------------------------------------------------------------------------
@@ -89,11 +94,44 @@ use crate::ccl::{
 /// are *not* folded here — `crate::ccl::simplify` handles that rewrite as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_non_iterable_lambdas(expr: Expr) -> Expr {
-    let mut expr = inline_impl(expr);
+    inline_with_records(expr).0
+}
+
+/// Inline as [`inline_non_iterable_lambdas`], but also return the
+/// [`NodeRecorder`] describing this pass's construction edges (see
+/// [`crate::ccl::node_recorder`]).
+///
+/// Inline is **id-preserving**: a rebuilt node carries its input [`NodeId`], so
+/// most of the tree is an implicit Preserve (nothing recorded). The only
+/// recorded deviations are:
+///
+/// * [`Discarded`](crate::ccl::node_recorder::NodeRecord::Discarded) — the `Let`
+///   wrappers, beta-reduction redexes, lambda wrappers, and `Var` occurrences a
+///   rewrite removes. Recorded at each inlining site by diffing the subtree it
+///   consumes against the subtree it produces (see [`record_drops`]).
+/// * [`Replicated`](crate::ccl::node_recorder::NodeRecord::Replicated) — the
+///   fan-out at a multi-use call site. A UDF/alias used N times duplicates its
+///   body/value N times; [`dedup_and_record`] keeps the first occurrence (the
+///   input id survives = a Preserve) and freshens the rest, recording each as a
+///   copy of the input node it mirrors.
+///
+/// There is intentionally no `Minted` and no `Fused`: inline neither invents
+/// nodes nor collapses clusters (tuple-projection folding lives in
+/// `crate::ccl::simplify`).
+pub(crate) fn inline_with_records(expr: Expr) -> (Expr, NodeRecorder) {
+    let mut rec = NodeRecorder::new(Pass::Inline, &expr);
+    let mut expr = inline_impl(expr, &mut rec);
     // Beta-reduction rebuilds predicates on `expr.ty` (immutable terms); keep
     // each `Cast`'s `target` slot in step so the post-pass typecheck matches.
     crate::ccl::ccl_utils::sync_cast_targets(&mut expr);
-    expr
+    // Restore id uniqueness last. Throughout the walk every node keeps an input
+    // id (fan-out duplicates it in place, so the tree carries repeated input
+    // ids but never a fresh one); this single sweep is the *only* place a fresh
+    // id is minted, and every one is recorded as a `Replicated` copy. Running it
+    // once over the final tree makes the first occurrence of each id — anywhere
+    // — the preserved one, which is what `reconcile` checks.
+    dedup_and_record(&mut expr, &mut rec);
+    (expr, rec)
 }
 
 // ---------------------------------------------------------------------------
@@ -240,11 +278,15 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
 /// routes them through the defer-aware [`crate::ccl::subst::Subst`] engine,
 /// which renames a fed-to handle when a defer-mediating UDF is inlined. The
 /// defer-returning lift itself lives in `desugar_defers::try_lift_defer`.
-fn inline_impl(expr: Expr) -> Expr {
+fn inline_impl(expr: Expr, rec: &mut NodeRecorder) -> Expr {
+    // Carry `node_id` through every rebuild: reconstructing a node with
+    // inlined children is a Preserve (the same node, same identity), so the
+    // input id must flow onto the rebuilt `Expr` rather than being re-minted.
     let Expr {
         node,
         ty,
         user_annotation,
+        node_id,
     } = expr;
 
     let new_node = match node {
@@ -253,8 +295,8 @@ fn inline_impl(expr: Expr) -> Expr {
             bound_expr,
             body,
         } => {
-            let bound_expr = inline_impl(*bound_expr);
-            let body = inline_impl(*body);
+            let bound_expr = inline_impl(*bound_expr, rec);
+            let body = inline_impl(*body, rec);
 
             // Alias: `let y = x` is pure α-renaming — substitute y → x in body
             // and drop the Let.  This must run before lambda_elim so that the
@@ -267,7 +309,14 @@ fn inline_impl(expr: Expr) -> Expr {
             if let TypedExprNode::Var(repl_name) = &bound_expr.node
                 && !is_let_bound(repl_name, &body)
             {
-                return substitute(body, &binding.name, &bound_expr);
+                // The `Let` wrapper and every `Var(binding.name)` occurrence
+                // vanish (each occurrence is overwritten by a copy of the
+                // `Var(x)` bound expr, whose own id survives via those copies —
+                // or is dropped when the alias is unused).
+                let consumed = consumed_subtree_ids(node_id, &bound_expr, &body);
+                let result = substitute(body, &binding.name, &bound_expr);
+                record_drops(&consumed, &result, rec);
+                return result;
             }
 
             if should_inline(&bound_expr.ty) {
@@ -279,11 +328,22 @@ fn inline_impl(expr: Expr) -> Expr {
                 // scope — no free variable in `bound_expr` can shadow a binder
                 // introduced in `body`.
                 //
+                // The `Let` wrapper, the lambda wrapper + `Apply` redex consumed
+                // at each beta-reduced site, and every `Var(binding.name)`
+                // occurrence vanish; the lambda *body*'s ids survive via
+                // substitution (fanned out to N sites, deduped later). Diffing
+                // the consumed subtree against the reduced result records
+                // exactly those drops — including the whole bound lambda when
+                // the binding is unused.
+                let consumed = consumed_subtree_ids(node_id, &bound_expr, &body);
+                let reduced = inline_and_beta_reduce(body, &binding.name, &bound_expr);
+                record_drops(&consumed, &reduced, rec);
                 // Re-run inline_impl after beta-reduction so that newly created
                 // Let bindings (e.g. `let y = (let x = Defer in …) in …` after
                 // expanding a defer-returning UDF) are eligible for the alias
-                // and lift rewrites on the second pass.
-                return inline_impl(inline_and_beta_reduce(body, &binding.name, &bound_expr));
+                // and lift rewrites on the second pass; that recursion records
+                // its own drops at the nested sites.
+                return inline_impl(reduced, rec);
             }
             TypedExprNode::Let {
                 binding,
@@ -300,25 +360,27 @@ fn inline_impl(expr: Expr) -> Expr {
         // `desugar_defers`. Re-running `inline_impl` on the wrapping `Let`
         // triggers `try_lift_defer` on the new binding.
         TypedExprNode::Compose(terms) => {
-            TypedExprNode::Compose(terms.into_iter().map(inline_impl).collect())
+            TypedExprNode::Compose(terms.into_iter().map(|t| inline_impl(t, rec)).collect())
         }
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
 
-        // All remaining variants: pure structural recursion.  Atoms have
-        // no children, so this is a no-op for them.
+        // All remaining variants: pure structural recursion, carrying the input
+        // id (a Preserve).  Atoms have no children, so this is a no-op for them.
         node => {
             let mut expr = Expr {
+                node_id,
                 node,
                 ty,
                 user_annotation,
             };
-            expr.map_children(inline_impl);
+            expr.map_children(|child| inline_impl(child, rec));
             return expr;
         }
     };
 
     Expr {
+        node_id,
         node: new_node,
         ty,
         user_annotation,
@@ -370,6 +432,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
             node,
             ty,
             user_annotation,
+            node_id,
         } = expr;
         let (function, argument) = match node {
             TypedExprNode::Apply { function, argument } => (function, argument),
@@ -405,9 +468,11 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
             }
             // Not a Lambda (e.g. the bound expression is Var("id") rather
             // than a literal lambda) — skip beta-reduction and reconstruct
-            // the Apply with the substituted subexpressions.
+            // the Apply (a Preserve: same node, substituted children) with its
+            // input id carried through.
             _ => {
                 return Expr {
+                    node_id,
                     node: TypedExprNode::Apply {
                         function: Box::new(function),
                         argument: Box::new(argument),
@@ -422,11 +487,13 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
     // Not a call site of `name`: recurse into sub-expressions. Each recursion
     // carries the same (name, lambda) so that deeper call sites still
     // beta-reduce. This mirrors [`crate::ccl::lambda_elim::substitute`] but
-    // preserves the specialised Apply-chain detection above.
+    // preserves the specialised Apply-chain detection above. Rebuilding a node
+    // with substituted children is a Preserve, so its input id is carried.
     let Expr {
         node,
         ty,
         user_annotation,
+        node_id,
     } = expr;
     let new_node = match node {
         TypedExprNode::Lambda { param, body } => {
@@ -508,6 +575,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
         // `let`, so only its `value` child needs the walk.)
         node => {
             let mut expr = Expr {
+                node_id,
                 node,
                 ty,
                 user_annotation,
@@ -518,6 +586,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
     };
 
     Expr {
+        node_id,
         node: new_node,
         ty,
         user_annotation,
@@ -551,6 +620,79 @@ fn is_name_in_function_position(expr: &Expr, name: &Name) -> bool {
         TypedExprNode::Apply { function, .. } => is_name_in_function_position(function, name),
         _ => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Provenance recording: drops and fan-out
+// ---------------------------------------------------------------------------
+
+/// Collect every main-tree [`NodeId`] reachable in `expr` (itself and all
+/// descendants).
+///
+/// Mirrors `node_recorder`'s own collector: it walks `child_exprs` and so
+/// **skips type-refinement predicates** — exactly the node set
+/// [`NodeRecorder::reconcile`] reasons about, so drop/replicate accounting done
+/// against this set lines up with reconciliation.
+fn collect_ids(expr: &Expr, acc: &mut HashSet<NodeId>) {
+    acc.insert(expr.node_id());
+    expr.walk_children(|child| collect_ids(child, acc));
+}
+
+/// The ids an inlining rewrite *consumes*: the `Let` wrapper (`let_id`) plus
+/// every id in the (already-inlined) `bound_expr` and `body` it is about to
+/// rewrite away. Diffed against the produced result to find the dropped ids.
+fn consumed_subtree_ids(let_id: NodeId, bound_expr: &Expr, body: &Expr) -> HashSet<NodeId> {
+    let mut ids = HashSet::new();
+    ids.insert(let_id);
+    collect_ids(bound_expr, &mut ids);
+    collect_ids(body, &mut ids);
+    ids
+}
+
+/// Record as [`Discarded`](crate::ccl::node_recorder::NodeRecord::Discarded)
+/// every consumed id absent from `result` — the nodes this rewrite removed with
+/// no surviving counterpart (`Let` wrappers, beta redexes, lambda wrappers, and
+/// the `Var` occurrences overwritten by substitution).
+///
+/// This diff *is* "discard exactly the ids that vanish": a consumed id survives
+/// iff it (or its first fan-out copy) still appears in `result`. Every id in
+/// `consumed` is a genuine pass input — inline mints no fresh id until the final
+/// [`dedup_and_record`] sweep — so the `discarded` input-membership invariant
+/// holds by construction.
+fn record_drops(consumed: &HashSet<NodeId>, result: &Expr, rec: &mut NodeRecorder) {
+    let mut surviving = HashSet::new();
+    collect_ids(result, &mut surviving);
+    for id in consumed {
+        if !surviving.contains(id) {
+            rec.discarded(*id);
+        }
+    }
+}
+
+/// Restore id uniqueness after fan-out, recording each duplicate as a
+/// [`Replicated`](crate::ccl::node_recorder::NodeRecord::Replicated) copy.
+///
+/// Fan-out (an alias/UDF used N times) duplicates a subtree in place, so the
+/// tree carries the same input id on N nodes. This single top-of-tree sweep
+/// keeps the **first** occurrence of each id (an implicit Preserve — the input
+/// id survives) and freshens every later occurrence, recording
+/// `replicated(original, [fresh])` so the copy mirrors the node it came from.
+/// It walks the main tree only (`walk_children_mut` skips predicates), matching
+/// the node set reconciliation checks.
+fn dedup_and_record(expr: &mut Expr, rec: &mut NodeRecorder) {
+    let mut seen = HashSet::new();
+    dedup_go(expr, &mut seen, rec);
+}
+
+fn dedup_go(expr: &mut Expr, seen: &mut HashSet<NodeId>, rec: &mut NodeRecorder) {
+    if !seen.insert(expr.node_id()) {
+        // Second or later occurrence of this id: this node is a fan-out copy.
+        // Freshen it and record it as a replica of the input node it mirrors.
+        let (original, fresh) = expr.freshen_node_id();
+        rec.replicated(original, [fresh]);
+        seen.insert(fresh);
+    }
+    expr.walk_children_mut(|child| dedup_go(child, seen, rec));
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,5 +1492,137 @@ mod tests {
         })
         .with_ty(int);
         assert_eq!(result, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // NodeRecorder adoption: reconcile must be clean for every rewrite shape.
+    //
+    // A clean `reconcile` is the definition of done for the record set: every
+    // output id is explained (preserve-by-presence or a `Replicated` copy) and
+    // every dropped input is declared `Discarded`. Inline emits no `Minted`
+    // and no `Fused`.
+    // -----------------------------------------------------------------------
+
+    /// Collect every main-tree id in `expr` (the node set reconcile reasons
+    /// about).
+    fn ids(expr: &Expr) -> HashSet<NodeId> {
+        let mut acc = HashSet::new();
+        collect_ids(expr, &mut acc);
+        acc
+    }
+
+    #[test]
+    fn records_udf_used_once_is_pure_preserve_and_discards() {
+        // let f: Int → Int = λ x → x in Apply(3, f)  — a single use.
+        // Beta-reduces to `3`; the `Let`, the `Apply` redex, the lambda
+        // wrapper, its body `Var x` and the `Var f` occurrence all vanish, and
+        // no subtree is duplicated.
+        let int = Type::Base(BaseType::Int);
+        let lambda = TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
+            .with_ty(fn_ty(int.clone(), int.clone()));
+        let call = TypedExpr::apply(
+            TypedExpr::lit(Lit::Int(3)).with_ty(int.clone()),
+            TypedExpr::var("f").with_ty(fn_ty(int.clone(), int.clone())),
+        )
+        .with_ty(int.clone());
+        let expr = TypedExpr::let_bind("f", lambda, call);
+
+        let (output, rec) = inline_with_records(expr);
+        assert_eq!(rec.reconcile(&output), Ok(()));
+        // A single use fans nothing out: no Replicated (or any) stage edge.
+        assert!(
+            rec.stage_remap().is_empty(),
+            "single-use inline must record no replicate edges, got {:?}",
+            rec.stage_remap()
+        );
+    }
+
+    #[test]
+    fn records_udf_used_twice_fans_out_and_reconciles() {
+        // let f: Int → Int = λ x → x in Tuple[f, f]  — two *bare* uses, so each
+        // occurrence gets a full copy of the lambda that survives into the
+        // output (unlike a call site, which the beta-reduction consumes).
+        let int = Type::Base(BaseType::Int);
+        let fun = fn_ty(int.clone(), int.clone());
+        let lambda = TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
+            .with_ty(fun.clone());
+        let body = TypedExpr::tuple(vec![
+            TypedExpr::var("f").with_ty(fun.clone()),
+            TypedExpr::var("f").with_ty(fun.clone()),
+        ])
+        .with_ty(Type::Tuple(vec![fun.clone(), fun.clone()]));
+        // Capture the lambda's input ids: one of them must survive as the
+        // preserved "origin" of the fan-out.
+        let lambda_ids = ids(&lambda);
+        let expr = TypedExpr::let_bind("f", lambda, body);
+
+        let (output, rec) = inline_with_records(expr);
+        assert_eq!(rec.reconcile(&output), Ok(()));
+
+        // Fan-out: at least one `(copy, origin)` edge, every origin an input
+        // lambda id, and every origin still present in the output (preserve-one).
+        let remap = rec.stage_remap();
+        assert!(
+            !remap.is_empty(),
+            "a >=2-use inline must record replicate edges"
+        );
+        let out_ids = ids(&output);
+        for (copy, origin) in &remap {
+            assert!(
+                lambda_ids.contains(origin),
+                "replicate origin {origin:?} must be an input lambda id"
+            );
+            assert!(
+                out_ids.contains(origin),
+                "the origin id {origin:?} must survive (preserve-one)"
+            );
+            assert!(
+                out_ids.contains(copy),
+                "the freshened copy {copy:?} must be present in the output"
+            );
+        }
+    }
+
+    #[test]
+    fn records_alias_reconciles() {
+        // let f = id in f  — pure alias α-rename; the `Let` and the `Var f`
+        // occurrence vanish, `id` survives.
+        let fun = fn_ty(Type::UIntRange(3), Type::Base(BaseType::Int));
+        let id_expr = TypedExpr::var("id").with_ty(fun.clone());
+        let body = TypedExpr::var("f").with_ty(fun);
+        let expr = TypedExpr::let_bind("f", id_expr, body);
+
+        let (output, rec) = inline_with_records(expr);
+        assert_eq!(rec.reconcile(&output), Ok(()));
+    }
+
+    #[test]
+    fn records_unused_let_discards_everything() {
+        // let f: Int → Int = id in Lit(42)  — f never used, so the whole
+        // binding (the `Let` and the bound `Var id`) is discarded; only Lit(42)
+        // survives.
+        let int = Type::Base(BaseType::Int);
+        let id_expr = TypedExpr::var("id").with_ty(fn_ty(int.clone(), int.clone()));
+        let body = TypedExpr::lit(Lit::Int(42)).with_ty(int);
+        let expr = TypedExpr::let_bind("f", id_expr, body);
+
+        let (output, rec) = inline_with_records(expr);
+        assert_eq!(rec.reconcile(&output), Ok(()));
+        // Nothing fans out or is minted.
+        assert!(rec.stage_remap().is_empty());
+    }
+
+    #[test]
+    fn preserves_ids_on_untouched_program() {
+        // A program with nothing to inline (scalar `let x = 2 in x + 1`) is
+        // reproduced verbatim, ids and all — id preservation is behaviour-neutral.
+        let expr = scalar_let();
+        let input_ids = ids(&expr);
+
+        let (output, rec) = inline_with_records(expr);
+        assert_eq!(rec.reconcile(&output), Ok(()));
+        // Every input id survives with its identity intact (no fresh mints, no
+        // drops): the id set is preserved exactly.
+        assert_eq!(ids(&output), input_ids);
     }
 }

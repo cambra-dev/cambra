@@ -32,8 +32,8 @@
 //! that feed's value (possibly `Unit`-lifted to `Fun(Unit, T)` at
 //! top level); for multiple feeds it is their `++`-union; for feeds
 //! inside an iteration scope it is the companion `Apply`/`Compose`/
-//! `Loop` that mirrors the iteration shape and yields the feed value
-//! instead of `Unit`.
+//! `Transact` writer that mirrors the iteration shape and yields the
+//! feed value instead of `Unit`.
 //!
 //! # Transformation (cluster algorithm)
 //!
@@ -42,7 +42,7 @@
 //!
 //! 1. **Feed extraction.**  Walk the cluster body and collect every
 //!    `Feed(d_i, V)` / `Define(d_i, V)` plus the iteration context
-//!    they sit in (Compose/Apply/Loop/Case), producing a channel
+//!    they sit in (Compose/Apply/Transact/Case), producing a channel
 //!    expression for each `d_i`.
 //! 2. **Channel assembly.**  Combine multiple feeds per defer via
 //!    `++` ([`TypedExprNode::CollectionUnion`]); lift scalar feeds
@@ -73,7 +73,7 @@
 //!
 //! The full design — two-phase structure (chain rewriter +
 //! cluster channelization), per-shape extraction paths (Compose/Apply
-//! iteration lambdas, Loop body absorption, filter-feed Case, Case-arm
+//! iteration lambdas, Transact writer-body absorption, filter-feed Case, Case-arm
 //! fan-out, defer-mediating UDF smart walker, defer-returning lift,
 //! alias inlining), error modes, known gaps, and a navigation map for
 //! the source — lives in `src/ccl/design/desugar-defers.md`.
@@ -101,7 +101,7 @@ pub enum DeferError {
     /// Both `Feed` and `Define` were found for the same deferred binding.
     FeedsAndDefinesMixed(String),
     /// A `Define` appeared inside a context where it is not allowed
-    /// (e.g. inside a Loop body, Compose element, or Case branch).
+    /// (e.g. inside a Transact writer body, Compose element, or Case branch).
     NestedDefinition,
     /// A `Feed` references a defer-handle that was never bound by a
     /// surrounding `let d = Defer`.
@@ -244,8 +244,15 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
     // Wrap `body_y` with the prefix (renaming stale feed targets to `y`).
     let mut new_outer_body = body.clone();
     for head in prefix.into_iter().rev() {
+        // (P) A lifted `Feed`/`Define` head is the *same logical node* the user
+        // wrote — only its target handle is renamed `x → y` — so it carries the
+        // original id through. Re-minting here (the former behavior) severed the
+        // node's lowered `Source` span (keyed on its id) and let the desugar
+        // synthetic sweep mislabel it `Synthetic { via: Desugar }`.
+        let head_id = head.node_id();
         let renamed_head = match head.node {
             TypedExprNode::Feed { name: _, value } => TypedExpr {
+                node_id: head_id,
                 ty: head.ty,
                 node: TypedExprNode::Feed {
                     name: binding_name.clone(),
@@ -254,6 +261,7 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
                 user_annotation: None,
             },
             TypedExprNode::Define { name: _, value } => TypedExpr {
+                node_id: head_id,
                 ty: head.ty,
                 node: TypedExprNode::Define {
                     name: binding_name.clone(),
@@ -296,10 +304,15 @@ fn is_defer_returning(expr: &Expr, name: &Name) -> bool {
 /// Caller is responsible for ensuring `expr` actually ends in a
 /// `Var` (e.g. via [`is_defer_returning`]).
 fn replace_result_var(expr: Expr, replacement: Expr) -> Expr {
+    // (P) The Let/ExprStmt spine is restructured 1:1 (only the body recurses);
+    // keep each node's id. The terminal `Var` is *replaced* wholesale by
+    // `replacement`, which carries its own id.
+    let node_id = expr.node_id();
     let TypedExpr {
         node,
         ty,
         user_annotation,
+        ..
     } = expr;
     let new_node = match node {
         TypedExprNode::Var(_) => return replacement,
@@ -319,6 +332,7 @@ fn replace_result_var(expr: Expr, replacement: Expr) -> Expr {
         _ => panic!("replace_result_var: expression doesn't end in a Var"),
     };
     TypedExpr {
+        node_id,
         node: new_node,
         ty,
         user_annotation,
@@ -414,13 +428,20 @@ fn float_defer_in_lambda(lambda: Expr) -> Option<Expr> {
         node,
         ty,
         user_annotation,
+        node_id,
     } = lambda;
     let TypedExprNode::Lambda { param, body } = node else {
         return None;
     };
     let (modified_body, floated_name) = extract_defer_binding(*body)?;
     let inner_lambda = Expr::lambda(&floated_name, Type::Hole, modified_body);
+    // Preserve the original lambda's node id: this is the *same* user lambda,
+    // only gaining a floated second parameter — its identity carries through, so
+    // provenance keeps blaming the source `def`. Re-minting a fresh id here (the
+    // former behavior) severed that link and let the desugar synthetic-sweep
+    // mislabel the lambda as machinery.
     let outer_lambda = TypedExpr {
+        node_id,
         node: TypedExprNode::Lambda {
             param,
             body: Box::new(inner_lambda),
@@ -447,6 +468,7 @@ fn extract_defer_binding(body: Expr) -> Option<(Expr, Name)> {
         node,
         ty,
         user_annotation,
+        node_id,
     } = body;
     match node {
         TypedExprNode::Let {
@@ -464,7 +486,11 @@ fn extract_defer_binding(body: Expr) -> Option<(Expr, Name)> {
             // Not the Defer-let — descend into inner, keeping this
             // let in place.
             let (modified_inner, floated_name) = extract_defer_binding(*inner)?;
+            // (P) 1:1 structural transform: only the inner body recurses;
+            // binding/bound_expr/ty/user_annotation are carried verbatim, so the
+            // original node id must be preserved (see provenance substrate).
             let new_body = TypedExpr {
+                node_id,
                 node: TypedExprNode::Let {
                     binding,
                     bound_expr,
@@ -481,7 +507,11 @@ fn extract_defer_binding(body: Expr) -> Option<(Expr, Name)> {
             // inside an iteration's side-effect chain rather than the
             // function's own structural defer.
             let (modified_inner, floated_name) = extract_defer_binding(*inner)?;
+            // (P) 1:1 structural transform: only the inner body recurses; `expr`
+            // and ty/user_annotation are carried verbatim, so the original node
+            // id must be preserved (see provenance substrate).
             let new_body = TypedExpr {
+                node_id,
                 node: TypedExprNode::ExprStmt {
                     expr,
                     body: Box::new(modified_inner),
@@ -587,10 +617,12 @@ fn wrap_di_calls_helper(
     fresh_defers: &mut Vec<Name>,
     ctx: &mut DesugarCtx,
 ) -> Expr {
+    let node_id = expr.node_id();
     let TypedExpr {
         node,
         ty,
         user_annotation,
+        ..
     } = expr;
     match node {
         TypedExprNode::Apply { function, argument } => {
@@ -625,6 +657,7 @@ fn wrap_di_calls_helper(
                 ctx,
             );
             let inner = TypedExpr {
+                node_id: crate::ccl::provenance::NodeId::fresh(),
                 node: TypedExprNode::Apply {
                     function: Box::new(function),
                     argument: Box::new(argument),
@@ -634,6 +667,7 @@ fn wrap_di_calls_helper(
             };
             match this_defer {
                 Some(defer) => TypedExpr {
+                    node_id: crate::ccl::provenance::NodeId::fresh(),
                     node: TypedExprNode::Apply {
                         function: Box::new(inner),
                         argument: Box::new(Expr::var(&defer)),
@@ -644,7 +678,11 @@ fn wrap_di_calls_helper(
                 None => inner,
             }
         }
+        // (P) 1:1 pass-through: a non-`Apply` node is moved wholesale (children
+        // untouched), so it still denotes the same construct and must carry its
+        // `node_id` through — preserving the node's lowered provenance.
         other => TypedExpr {
+            node_id,
             node: other,
             ty,
             user_annotation,
@@ -677,10 +715,16 @@ fn wrap_di_calls_helper(
 /// patches.  See the umbrella entry in `docs/plan.md` ("Tech Debt —
 /// `desugar_defers` prototype").
 fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
+    // (P) For non-defer code (and the structural arms of defer code) this is a
+    // 1:1 transform, so the rebuilt node keeps the original's id. The chain
+    // arms that *do* synthesize (`let fresh = Defer in …` wrappers) early-return
+    // their own freshly-minted shapes and never reach the final reconstruct.
+    let node_id = expr.node_id();
     let TypedExpr {
         node,
         ty,
         user_annotation,
+        ..
     } = expr;
     let new_node = match node {
         TypedExprNode::Let {
@@ -718,7 +762,13 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
                     let prev = ctx.register_function(binding.name.clone(), info);
                     let new_body = rewrite_chains_in_scope(*body, ctx);
                     ctx.unregister_function(&binding.name, prev);
-                    return Expr::let_bind(binding.name.clone(), lambda, new_body);
+                    // (P) The binder still names the same `let` the user wrote
+                    // (only its body-lambda is float-rewritten), so it carries
+                    // the original id through. This keeps the def's `Source` span
+                    // reachable — monomorphization later blames the specialization
+                    // wrapper on this binder (`coalesce_generalized_let`).
+                    return Expr::let_bind(binding.name.clone(), lambda, new_body)
+                        .with_node_id(node_id);
                 }
             }
             // Check chain status BEFORE recursing — we want to use
@@ -766,6 +816,7 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
             // are wrapped with the SAME fresh defer (via
             // [`wrap_di_calls_in_chain`]).
             let expr_for_check = TypedExpr {
+                node_id,
                 node: TypedExprNode::Apply { function, argument },
                 ty: ty.clone(),
                 user_annotation: user_annotation.clone(),
@@ -930,17 +981,18 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
         // which this pass only threads through `Let`/`Lambda`; rather than
         // guess how a recursive group participates, reject it. `letrec_phase`
         // *does* emit `LetRec`, but `letrec_phase::recognize` lowers every
-        // recognized group onto the transitional `Loop` node before this pass,
-        // so no `LetRec` reaches desugar today.
+        // recognized group onto `Transact` before this pass runs, so no
+        // `LetRec` reaches desugar today.
         TypedExprNode::LetRec { .. } => {
             unreachable!(
                 "desugar_defers: a LetRec reached this pass — letrec_phase::recognize \
-                 should have lowered every recognized group onto a Loop first \
+                 should have lowered every recognized group onto Transact first \
                  (src/ccl/design-mut-txn-feed.md)"
             )
         }
     };
     TypedExpr {
+        node_id,
         node: new_node,
         ty,
         user_annotation,
@@ -951,6 +1003,22 @@ fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
 /// (transitively).
 fn contains_defer(expr: &Expr) -> bool {
     matches!(expr.node, TypedExprNode::Defer) || expr.any_child(contains_defer)
+}
+
+/// Whether `expr` carries any defer-channel node (`Defer`/`Feed`/`Define`) — the
+/// nodes whose presence makes this pass channelize (`desugar_substitute`) rather
+/// than run as a pure 1:1 transform. `compile_program`'s post-desugar id-
+/// uniqueness tripwire gates on the *absence* of these: `desugar_substitute`
+/// legitimately leaves duplicate ids on defer-bearing programs until the
+/// channelization rewrite lands (the same exemption `is_pure_structural` /
+/// `run_with_provenance`'s preservation assert already carve out).
+// Called from compile_program's id-uniqueness tripwire, introduced upstack.
+#[allow(dead_code)]
+pub(crate) fn contains_defer_nodes(expr: &Expr) -> bool {
+    matches!(
+        expr.node,
+        TypedExprNode::Defer | TypedExprNode::Feed { .. } | TypedExprNode::Define { .. }
+    ) || expr.any_child(contains_defer_nodes)
 }
 
 /// Return `true` if any nested `Let` or `Lambda` inside `expr` rebinds
@@ -1080,6 +1148,36 @@ struct DesugarCtx {
     /// stamps: under the legacy untyped order they would change what
     /// inference later sees.
     input_typed: bool,
+    /// Fan-in provenance records emitted by synthesis sites (currently the
+    /// channel `CollectionUnion` built by [`combine_feed_values`]). Each
+    /// names the synthesized node and the source nodes (feed values) whose
+    /// origins it aggregates — the many-to-one feed→channel lineage. Drained
+    /// by [`run_with_provenance`] and resolved against the retained provenance
+    /// table in `compile_program` (the table holds the source ids' origins).
+    /// `desugar` stays decoupled from `ProvenanceTable` — it emits ids only.
+    fanins: Vec<DesugarFanin>,
+}
+
+/// A synthesized fan-in node and the source node ids whose origins it
+/// aggregates (see [`DesugarCtx::fanins`]).
+#[derive(Debug, Clone)]
+pub(crate) struct DesugarFanin {
+    /// The synthesized node (e.g. a channel `CollectionUnion`).
+    // Read by compile_program's provenance application, introduced upstack.
+    #[allow(dead_code)]
+    pub target: crate::ccl::provenance::NodeId,
+    /// One entry per feed value, each a *pre-order* id list of that feed's
+    /// subtree (root first, then descendants). A feed's own root is often a
+    /// freshly synthesized wrapper (`λ __unused → V`, a `Compose` over the
+    /// source) with no provenance; its source-tagged content lives deeper. So
+    /// the resolver walks each feed's list front-to-back and takes the *first*
+    /// id that resolves — the feed-value span the user wrote (`sum(readings)`,
+    /// the `x` of `totals << x`) — rather than every descendant span (which
+    /// would also blame sub-expressions like `readings` inside `sum(readings)`).
+    /// The union of one span per feed is the many-to-one feed→channel lineage.
+    // Read by compile_program's provenance application, introduced upstack.
+    #[allow(dead_code)]
+    pub sources: Vec<Rc<[crate::ccl::provenance::NodeId]>>,
 }
 
 impl DesugarCtx {
@@ -1087,6 +1185,7 @@ impl DesugarCtx {
         Self {
             functions: HashMap::new(),
             input_typed: false,
+            fanins: Vec::new(),
         }
     }
 
@@ -1142,6 +1241,45 @@ pub fn run(expr: Expr, input_typed: bool) -> Result<Expr, DeferError> {
     // comprehension domains) — so the caller states it. In the legacy
     // pre-inference order the pass is purely structural and the
     // type-synthesis step below is skipped.
+    run_with_provenance(expr, input_typed).map(|(e, _)| e)
+}
+
+/// The provenance records `desugar_defers` emits for its synthesized nodes,
+/// surfaced from [`run_with_provenance`] for `compile_program` to apply against
+/// the retained table. The fan-ins apply *after* the monomorphization remap —
+/// their `sources` name post-mono content, so they resolve only once the mono
+/// clones are tagged (see `apply_desugar_records` in
+/// [`crate::ccl::context`] for the dataflow-derived application order).
+#[derive(Debug, Default)]
+pub(crate) struct DesugarProvenance {
+    /// Channel `CollectionUnion` fan-ins (see [`DesugarCtx::fanins`]).
+    // Read by compile_program's provenance application, introduced upstack.
+    #[allow(dead_code)]
+    pub fanins: Vec<DesugarFanin>,
+}
+
+/// Like [`run`] but also surfaces the provenance records emitted by synthesis
+/// sites (see [`DesugarProvenance`]). `compile_program` uses this entry point so
+/// it can tag the channelized plumbing against the retained provenance table;
+/// ordinary callers/tests use [`run`].
+pub(crate) fn run_with_provenance(
+    expr: Expr,
+    input_typed: bool,
+) -> Result<(Expr, DesugarProvenance), DeferError> {
+    // Snapshot every input node's provenance id so we can assert the pass
+    // *preserves* them at its (P) 1:1 sites. For a *purely structural* input
+    // (no defers and no defer-mediating UDFs) the pass is a pure 1:1 transform,
+    // so the id set is identical before and after (strict). Inputs with defers
+    // legitimately drop ids (the `Defer` leaves, collapsed `ExprStmt`
+    // envelopes) and add synthesized ones; inputs with defer-mediating UDFs
+    // β-substitute call sites (dropping nodes, keeping the argument's id), so
+    // the strict check is gated on `is_pure_structural`. Behind
+    // `debug_assertions` so release pays nothing.
+    #[cfg(debug_assertions)]
+    let before_ids = collect_node_ids(&expr);
+    #[cfg(debug_assertions)]
+    let input_was_pure_structural = is_pure_structural(&expr);
+
     let mut ctx = DesugarCtx::new();
     ctx.input_typed = input_typed;
     // Phase 1: chain-rewrite defer-mediating UDF call sites.  Walks
@@ -1174,7 +1312,72 @@ pub fn run(expr: Expr, input_typed: bool) -> Result<Expr, DeferError> {
         #[cfg(debug_assertions)]
         assert_no_type_residue(&rewritten);
     }
-    Ok(rewritten)
+
+    // For a purely structural input the pass preserves the exact id set (it is
+    // a pure 1:1 transform). This is the property the provenance substrate
+    // relies on: lowered `Source(span)` tags stay valid against the
+    // post-desugar tree.
+    #[cfg(debug_assertions)]
+    if input_was_pure_structural {
+        let after_ids = collect_node_ids(&rewritten);
+        debug_assert_eq!(
+            before_ids, after_ids,
+            "desugar_defers must preserve every NodeId on a purely structural \
+             program (pure 1:1 transform); provenance ids are stable across this pass"
+        );
+    }
+
+    Ok((rewritten, DesugarProvenance { fanins: ctx.fanins }))
+}
+
+/// Whether `expr` is *purely structural* for this pass: it contains no
+/// `Defer`/`Feed`/`Define`/`ExprStmt` node (so no channelization or statement
+/// collapse) **and** no defer-mediating UDF (a `let`-bound lambda the pass
+/// would β-substitute at its call sites, dropping nodes). On such an input the
+/// pass is a pure 1:1 transform, so its `NodeId` set is preserved exactly —
+/// the property the `run_with_provenance` preservation assert (debug-only)
+/// checks strictly.
+#[cfg(debug_assertions)]
+fn is_pure_structural(expr: &Expr) -> bool {
+    if matches!(
+        expr.node,
+        TypedExprNode::Defer
+            | TypedExprNode::Feed { .. }
+            | TypedExprNode::Define { .. }
+            | TypedExprNode::ExprStmt { .. }
+    ) {
+        return false;
+    }
+    // A let-bound non-`Plain` lambda is a defer-mediating UDF; its calls are
+    // β-substituted (VarBody α-rename, DI/PaT rewrite), which is not 1:1.
+    if let TypedExprNode::Let { bound_expr, .. } = &expr.node
+        && matches!(bound_expr.node, TypedExprNode::Lambda { .. })
+        && classify_lambda(bound_expr) != LambdaClass::Plain
+    {
+        return false;
+    }
+    let mut pure = true;
+    expr.walk_children(|c| pure &= is_pure_structural(c));
+    pure
+}
+
+/// The sorted multiset of every node's [`NodeId`] reachable from `expr`,
+/// mirroring `desugar`'s own term traversal (the main tree; type-borne
+/// predicates are not rewritten by this pass, so they are not included).
+/// Sorting makes the before/after comparison order-independent. Compiled under
+/// `debug_assertions` (where `run_with_provenance` asserts with it) or `test`
+/// (where the preservation tests call it); a release build with neither pays
+/// nothing.
+#[cfg(any(debug_assertions, test))]
+fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
+    fn go(e: &Expr, out: &mut Vec<crate::ccl::provenance::NodeId>) {
+        out.push(e.node_id());
+        e.walk_children(|c| go(c, out));
+    }
+    let mut out = Vec::new();
+    go(expr, &mut out);
+    out.sort_unstable();
+    out
 }
 
 /// Debug-only invariant: after [`run`] on a typed input, no expression or
@@ -1270,6 +1473,7 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         node,
         ty,
         user_annotation,
+        node_id,
     } = expr;
     let new_node = match node {
         // An effect subtree carrying a `For`/`MutWrite` is a pre-phase
@@ -1386,10 +1590,14 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
             unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
         }
     };
+    // (P) Every node is preserved 1:1 — carry the original `node_id` onto the
+    // rebuilt envelope so lowered `Source(span)` tags stay valid. `ExprStmt`
+    // collapse early-returns above, keeping the surviving body's own id.
     TypedExpr {
         node: new_node,
         ty,
         user_annotation,
+        node_id,
     }
 }
 
@@ -1500,10 +1708,16 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
     if matches!(expr.node, TypedExprNode::Error) {
         crate::unexpected_error_node!();
     }
+    // Capture the node identity envelope so (P) 1:1 sites can reconstruct the
+    // node keeping its original `NodeId` (provenance preservation) rather than
+    // minting a fresh id. `node_id` is the load-bearing piece — `ty` /
+    // `user_annotation` ride along on the moved fields below.
+    let node_id = expr.node_id();
     let TypedExpr {
         node,
         ty,
         user_annotation,
+        ..
     } = expr;
     match node {
         TypedExprNode::Let {
@@ -1521,20 +1735,30 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // processing order breaks for at least one of `x ≪= y; y ≪=
             // [0,1]` (where x depends on y) or `x ≪= [0,1]; y ≪= x`
             // (where y depends on x) — the wrap site doesn't know which.
-            let mut defer_names = vec![binding.name];
+            // (M) Each `let d_i = Defer` node is collapsed away during the
+            // peel; thread its `NodeId` alongside the name so the rebuilt
+            // `let d_i = channel_i` in `channelize_cluster` can carry the
+            // original defer-binding's id (single-origin blame to the
+            // construct the user wrote). The cluster head's id is `node_id`.
+            let mut defer_names: Vec<(Name, crate::ccl::provenance::NodeId)> =
+                vec![(binding.name, node_id)];
             let mut current_body = *body;
             loop {
+                // Match on the node by value but preserve the envelope: peel
+                // only re-wraps the *terminal* (a (P) node), so keep its id.
+                let cb_id = current_body.node_id();
                 match current_body.node {
                     TypedExprNode::Let {
                         binding: b,
                         bound_expr: be,
                         body: inner,
                     } if matches!(be.node, TypedExprNode::Defer) => {
-                        defer_names.push(b.name);
+                        defer_names.push((b.name, cb_id));
                         current_body = *inner;
                     }
                     other => {
                         current_body = TypedExpr {
+                            node_id: cb_id,
                             node: other,
                             ty: current_body.ty,
                             user_annotation: current_body.user_annotation,
@@ -1596,6 +1820,9 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                     // mechanism.
                     let rewritten =
                         rewrite_lambda_to_return_contributions(floated_lambda, class, ctx)?;
+                    // The rewritten lambda is both registered (for the smart
+                    // cluster walker to match call sites) and kept as the (P)
+                    // `Let` shell's bound expr below.
                     let rewritten_lambda = rewritten.lambda.clone();
                     let info = FunctionInfo {
                         class,
@@ -1617,7 +1844,10 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                     if count_free(&binding.name, &desugared_body) == 0 {
                         return Ok(desugared_body);
                     }
+                    // (P) The `Let` shell is the original binding restructured
+                    // (its lambda rewritten, body desugared) — keep its id.
                     return Ok(TypedExpr {
+                        node_id,
                         node: TypedExprNode::Let {
                             binding,
                             bound_expr: Box::new(rewritten_lambda),
@@ -1696,7 +1926,10 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 let substituted = desugar_substitute(body, &binding.name, &bound_expr);
                 return Ok(substituted);
             }
+            // (P) 1:1 restructure of an ordinary `Let`: keep the original
+            // node's identity envelope so its provenance survives the pass.
             Ok(TypedExpr {
+                node_id,
                 node: TypedExprNode::Let {
                     binding,
                     bound_expr: Box::new(bound_expr),
@@ -1706,12 +1939,13 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                 user_annotation,
             })
         }
-        // All other variants (Apply/BinOp/Lambda/Loop/…, leaves, and the
+        // (P) All other variants (Apply/BinOp/Lambda/Transact/…, leaves, and the
         // Feed/Define pass-through that gets caught by
         // [`assert_no_defer_residue`] if it survives) just recurse
-        // structurally into every child.
+        // structurally into every child, preserving the original `NodeId`.
         other => {
             let mut expr = TypedExpr {
+                node_id,
                 node: other,
                 ty,
                 user_annotation,
@@ -1737,10 +1971,18 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
 /// used directly, and top-level scalar feeds are lifted to `Fun(Unit,
 /// T)` via the `λ __unused → V` wrap inside `extract_for_defer`.
 fn channelize_cluster(
-    defer_names: &[Name],
+    defer_names: &[(Name, crate::ccl::provenance::NodeId)],
     body: Expr,
     ctx: &mut DesugarCtx,
 ) -> Result<Expr, DeferError> {
+    // (M) The `NodeId` of each defer's original `let d_i = Defer` binding,
+    // carried onto the rebuilt `let d_i = channel_i` so that node's
+    // provenance (single-origin blame to the user's `d_i ≪= …` construct)
+    // survives the rewrite. Names alone drive topo-sort / channel keying.
+    let defer_ids: HashMap<Name, crate::ccl::provenance::NodeId> =
+        defer_names.iter().cloned().collect();
+    let defer_names: Vec<Name> = defer_names.iter().map(|(n, _)| n.clone()).collect();
+    let defer_names = defer_names.as_slice();
     // Extract feeds/defines for each defer.  `rewritten` accumulates the
     // body's Feed/Define replacements as we process each defer in turn.
     let mut channels: HashMap<Name, Expr> = HashMap::new();
@@ -1757,7 +1999,7 @@ fn channelize_cluster(
         let channel = match (feeds.is_empty(), define) {
             (true, None) => return Err(DeferError::NoFeedOrDefine(name.base().to_string())),
             (true, Some(d)) => d,
-            (false, None) => combine_feed_values(feeds),
+            (false, None) => combine_feed_values(feeds, ctx),
             (false, Some(_)) => {
                 return Err(DeferError::FeedsAndDefinesMixed(name.base().to_string()));
             }
@@ -1773,7 +2015,7 @@ fn channelize_cluster(
     // captured at their original feed positions.
     let protected: HashSet<Name> = compute_protected_set(&rewritten, &channels);
     Ok(rename_shadows_then_bind(
-        rewritten, &order, channels, &protected,
+        rewritten, &order, channels, &protected, &defer_ids,
     ))
 }
 
@@ -1807,11 +2049,17 @@ fn rename_shadows_then_bind(
     order: &[Name],
     channels: HashMap<Name, Expr>,
     protected: &HashSet<Name>,
+    defer_ids: &HashMap<Name, crate::ccl::provenance::NodeId>,
 ) -> Expr {
+    // (P) Every spine node this walk reconstructs *is* an input node
+    // restructured (shadow-rename, body recursion, terminal wrap), so keep
+    // its identity envelope.
+    let node_id = expr.node_id();
     let TypedExpr {
         node,
         ty,
         user_annotation,
+        ..
     } = expr;
     match node {
         TypedExprNode::Let {
@@ -1832,11 +2080,12 @@ fn rename_shadows_then_bind(
                 user_annotation: binding.user_annotation,
             };
             TypedExpr {
+                node_id,
                 node: TypedExprNode::Let {
                     binding: new_binding,
                     bound_expr,
                     body: Box::new(rename_shadows_then_bind(
-                        new_body, order, channels, protected,
+                        new_body, order, channels, protected, defer_ids,
                     )),
                 },
                 ty,
@@ -1866,7 +2115,9 @@ fn rename_shadows_then_bind(
                 .iter()
                 .any(|n| channels.contains_key(n) && count_free(n, &bound_expr) > 0);
             if references_cluster {
+                // (P) The Let itself is unchanged structurally — keep its id.
                 let original_let = TypedExpr {
+                    node_id,
                     node: TypedExprNode::Let {
                         binding,
                         bound_expr,
@@ -1875,33 +2126,41 @@ fn rename_shadows_then_bind(
                     ty,
                     user_annotation,
                 };
-                return emit_cluster_then(original_let, order, channels);
+                return emit_cluster_then(original_let, order, channels, defer_ids);
             }
             TypedExpr {
+                node_id,
                 node: TypedExprNode::Let {
                     binding,
                     bound_expr,
-                    body: Box::new(rename_shadows_then_bind(*body, order, channels, protected)),
+                    body: Box::new(rename_shadows_then_bind(
+                        *body, order, channels, protected, defer_ids,
+                    )),
                 },
                 ty,
                 user_annotation,
             }
         }
         TypedExprNode::ExprStmt { expr: e, body } => TypedExpr {
+            node_id,
             node: TypedExprNode::ExprStmt {
                 expr: e,
-                body: Box::new(rename_shadows_then_bind(*body, order, channels, protected)),
+                body: Box::new(rename_shadows_then_bind(
+                    *body, order, channels, protected, defer_ids,
+                )),
             },
             ty,
             user_annotation,
         },
         other => {
+            // (P) The terminal node is an input node — keep its id.
             let terminal = TypedExpr {
+                node_id,
                 node: other,
                 ty,
                 user_annotation,
             };
-            emit_cluster_then(terminal, order, channels)
+            emit_cluster_then(terminal, order, channels, defer_ids)
         }
     }
 }
@@ -1938,11 +2197,27 @@ fn wrap_with_let_prefix(prefix: &[(Name, Expr)], inner: Expr) -> Expr {
 
 /// Wrap `inner` with the cluster's `let n_i = channel_i in …` bindings
 /// in topological order (so dependencies are bound before dependents).
-fn emit_cluster_then(inner: Expr, order: &[Name], mut channels: HashMap<Name, Expr>) -> Expr {
+///
+/// (M) Each emitted `let n_i = channel_i` carries the [`NodeId`] of the
+/// original `let n_i = Defer` binding (via `defer_ids`) — single-origin blame
+/// to the user's `n_i ≪= …` construct. The merged-away `Defer` node's id is
+/// dropped (the channel value and feeds are tagged separately).
+fn emit_cluster_then(
+    inner: Expr,
+    order: &[Name],
+    mut channels: HashMap<Name, Expr>,
+    defer_ids: &HashMap<Name, crate::ccl::provenance::NodeId>,
+) -> Expr {
     let mut result = inner;
     for name in order.iter().rev() {
         if let Some(channel) = channels.remove(name) {
-            result = Expr::let_bind(name.clone(), channel, result);
+            let mut binding = Expr::let_bind(name.clone(), channel, result);
+            if let Some(&id) = defer_ids.get(name) {
+                // Reuse the original `let n_i = Defer` node's id on the rebuilt
+                // `let n_i = channel_i` — single-origin blame (M).
+                binding = binding.with_node_id(id);
+            }
+            result = binding;
         }
     }
     result
@@ -2273,6 +2548,7 @@ fn rewrite_lambda_to_return_contributions(
         node,
         ty,
         user_annotation,
+        ..
     } = lambda;
     match (class, node) {
         (LambdaClass::ParamAsTarget, TypedExprNode::Lambda { mut param, body }) => {
@@ -2284,6 +2560,7 @@ fn rewrite_lambda_to_return_contributions(
             stamp_handle_param(&mut param, ctx);
             Ok(RewrittenFunction {
                 lambda: TypedExpr {
+                    node_id: crate::ccl::provenance::NodeId::fresh(),
                     node: TypedExprNode::Lambda {
                         param,
                         body: Box::new(cr.body),
@@ -2310,6 +2587,7 @@ fn rewrite_lambda_to_return_contributions(
                 node: outer_body_node,
                 ty: outer_body_ty,
                 user_annotation: outer_body_ann,
+                ..
             } = *outer_body;
             let TypedExprNode::Lambda {
                 param: mut inner_param,
@@ -2324,6 +2602,7 @@ fn rewrite_lambda_to_return_contributions(
             // site (see [`stamp_handle_param`]).
             stamp_handle_param(&mut inner_param, ctx);
             let new_inner = TypedExpr {
+                node_id: crate::ccl::provenance::NodeId::fresh(),
                 node: TypedExprNode::Lambda {
                     param: inner_param,
                     body: Box::new(cr.body),
@@ -2335,6 +2614,7 @@ fn rewrite_lambda_to_return_contributions(
             };
             Ok(RewrittenFunction {
                 lambda: TypedExpr {
+                    node_id: crate::ccl::provenance::NodeId::fresh(),
                     node: TypedExprNode::Lambda {
                         param: outer_param,
                         body: Box::new(new_inner),
@@ -2413,7 +2693,7 @@ fn build_contributions_record(
         let contribution = match (feeds.is_empty(), define) {
             (true, None) => continue, // target was collected but no feeds for it — skip.
             (true, Some(d)) => d,
-            (false, None) => combine_feed_values(feeds),
+            (false, None) => combine_feed_values(feeds, ctx),
             (false, Some(_)) => {
                 return Err(DeferError::FeedsAndDefinesMixed(target.base().to_string()));
             }
@@ -2421,7 +2701,7 @@ fn build_contributions_record(
         fields.push((channel_field_name(target), contribution));
     }
     // The stripped body may carry a let-chain prefix (typically `let
-    // __acc_stream_N = Loop {…} in …` from generator-with-mutation
+    // __acc_stream_N = Transact {…} in …` from generator-with-mutation
     // lowering; sometimes plain user `let n = 0`s) whose bindings the
     // contributions reference.  We're discarding `current_body` —
     // the function's new body is the contributions Record — so wrap
@@ -2438,11 +2718,71 @@ fn build_contributions_record(
     Ok(ContributionsRecord { body, targets })
 }
 
+/// Every node id reachable from `expr` (itself included), in pre-order.
+///
+/// Used to seed a [`DesugarFanin`]'s `sources` with a whole subtree, so the
+/// source-tagged interior nodes are reachable even when the subtree's root is a
+/// freshly synthesized wrapper: in [`combine_feed_values`] (the feed subtree, to
+/// find the feed-site content). The resolver takes the
+/// *first* id that resolves, so pre-order matters (nearest-to-root wins).
+/// Distinct from the debug-only [`collect_node_ids`] (which sorts for set
+/// comparison); this keeps pre-order and is always compiled.
+fn descendant_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
+    fn go(e: &Expr, out: &mut Vec<crate::ccl::provenance::NodeId>) {
+        out.push(e.node_id());
+        e.walk_children(|c| go(c, out));
+    }
+    let mut out = Vec::new();
+    go(expr, &mut out);
+    out
+}
+
 /// A single feed value passes through unchanged.  Multiple feed values
 /// are merged via [`TypedExprNode::CollectionUnion`] — the dedicated
 /// N-ary collection-union node — which compiles to a `UnionOperator`
 /// downstream.
-fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
+fn combine_feed_values(mut feeds: Vec<Expr>, ctx: &mut DesugarCtx) -> Expr {
+    debug_assert!(!feeds.is_empty());
+    if feeds.len() == 1 {
+        // A single feed passes through unchanged — its own node (id preserved
+        // upstream) *is* the channel, so no synthesis and no tag.
+        return feeds.pop().unwrap();
+    }
+    // (S) fan-in: the union is a new node aggregating N feed values. Record the
+    // many-to-one lineage (feed source ids → this union) so `compile_program`
+    // can resolve it to a multi-origin `Derived { via: Desugar }`.
+    //
+    // A feed value is rarely a single source-tagged node: it is the wrapped
+    // contribution the cluster builds — a `λ __unused → V` scalar lift, a
+    // `Compose`/`Apply` over the iteration source, etc. — whose own root is
+    // freshly synthesized (untagged) but whose *interior* still carries the
+    // source-tagged content the user wrote (`sum(readings)`, the `x` of
+    // `totals << x`). So we record each feed's pre-order id list, and the
+    // resolver takes the first id that resolves (the feed-value span), landing
+    // the union's blame on the real feed-site spans rather than an empty set.
+    let sources: Vec<Rc<[crate::ccl::provenance::NodeId]>> = feeds
+        .iter()
+        .map(|f| descendant_node_ids(f).into())
+        .collect();
+    let union = Expr::collection_union(feeds);
+    ctx.fanins.push(DesugarFanin {
+        target: union.node_id(),
+        sources,
+    });
+    union
+}
+
+/// Like [`combine_feed_values`] but without emitting a fan-in provenance
+/// record. Used at the Case-arm fan-in site, which runs under an immutable
+/// [`DesugarCtx`] borrow (`extract_for_defer` only reads `ctx.functions`). The
+/// resulting union node is still tagged — by the generic
+/// `Synthetic { via: Desugar }` sweep in `compile_program` — so it is never
+/// left `None`.
+// TODO(provenance): multi-origin enrichment — thread a `&mut DesugarCtx`
+// (or a dedicated fan-in collector) through `extract_for_defer` so these
+// unions also record the feed→channel many-to-one lineage as
+// `Derived { via: Desugar }` rather than the coarser `Synthetic` default.
+fn combine_feed_values_untracked(mut feeds: Vec<Expr>) -> Expr {
     debug_assert!(!feeds.is_empty());
     if feeds.len() == 1 {
         return feeds.pop().unwrap();
@@ -2504,6 +2844,7 @@ fn smart_walk_synthesize_call_contributions(
     // `Var(defer_name)`, since the cluster's defer-handle binding
     // carries the same type.
     let residue_var = || TypedExpr {
+        node_id: crate::ccl::provenance::NodeId::fresh(),
         node: TypedExprNode::Var(defer_name.clone()),
         ty: call_expr.ty.clone(),
         user_annotation: call_expr.user_annotation.clone(),
@@ -2597,6 +2938,7 @@ fn try_smart_walk_pat(
     // contributions Record; projections of `to_<target>` fields give
     // each target's contribution.
     let call_expr = TypedExpr {
+        node_id: crate::ccl::provenance::NodeId::fresh(),
         node: TypedExprNode::Apply {
             function: Box::new(function.clone()),
             argument: Box::new(argument.clone()),
@@ -2666,6 +3008,7 @@ fn try_smart_walk_di(
         return None;
     }
     let call_expr = TypedExpr {
+        node_id: crate::ccl::provenance::NodeId::fresh(),
         node: TypedExprNode::Apply {
             function: Box::new(function.clone()),
             argument: Box::new(argument.clone()),
@@ -2708,10 +3051,17 @@ fn extract_for_defer(
     in_inner_scope: bool,
     ctx: &DesugarCtx,
 ) -> Result<Expr, DeferError> {
+    // (P) This walk transforms the cluster body 1:1 (recursing structurally,
+    // replacing only `Feed`/`Define` nodes for `defer_name` with `Unit`), so
+    // the rebuilt node keeps the original's id — preserving the body's source
+    // provenance. A `Feed`→`Unit` swap inherits the feed node's id (it stands
+    // in for the construct the user wrote at that position).
+    let node_id = expr.node_id();
     let TypedExpr {
         node,
         ty,
         user_annotation,
+        ..
     } = expr;
     let node = match node {
         TypedExprNode::Feed { name, value } if &name == defer_name => {
@@ -2719,10 +3069,11 @@ fn extract_for_defer(
             // lifting to `Fun(Unit, T)` to match the defer-handle's
             // expected function shape (the consumer compiles to a
             // SealedFunction operator with Unit domain).  Inside an
-            // iteration scope (Lambda body / Loop body), the surrounding
-            // Compose/Loop machinery already provides the function shape,
-            // so we leave the value scalar — the Compose-with-Lambda case
-            // above wraps it with its own `λ x → V` companion.
+            // iteration scope (Lambda body / Transact writer body), the
+            // surrounding Compose/Transact machinery already provides the
+            // function shape, so we leave the value scalar — the
+            // Compose-with-Lambda case above wraps it with its own
+            // `λ x → V` companion.
             //
             // A feed whose value is *already* a collection (`Fun(D, T)`)
             // contributes its whole extent — a top-level `o << (h ≫ .to_o)`
@@ -2867,6 +3218,7 @@ fn extract_for_defer(
                         },
                     ty: function_ty,
                     user_annotation: function_user_annotation,
+                    ..
                 } = *function
                 else {
                     unreachable!("peeked above as a lambda whose param is not the defer binder")
@@ -2908,6 +3260,7 @@ fn extract_for_defer(
                     let unit_body = Expr::lit(Lit::Unit);
                     let new_function = Expr::lambda(&param.name, param.ty.clone(), unit_body);
                     return Ok(TypedExpr {
+                        node_id: crate::ccl::provenance::NodeId::fresh(),
                         node: TypedExprNode::Apply {
                             function: Box::new(new_function),
                             argument: Box::new(new_argument),
@@ -2944,6 +3297,7 @@ fn extract_for_defer(
                     feeds.push(channel);
                 }
                 let new_function = TypedExpr {
+                    node_id: crate::ccl::provenance::NodeId::fresh(),
                     node: TypedExprNode::Lambda {
                         param,
                         body: Box::new(new_lambda_body),
@@ -3122,6 +3476,7 @@ fn extract_for_defer(
                             // with the unrefined source to a no-op
                             // iteration.
                             let new_lambda = TypedExpr {
+                                node_id: crate::ccl::provenance::NodeId::fresh(),
                                 node: TypedExprNode::Lambda {
                                     param,
                                     body: Box::new(Expr::lit(Lit::Unit)),
@@ -3164,6 +3519,7 @@ fn extract_for_defer(
                             feeds.push(channel_expr);
                         }
                         new_elts.push(TypedExpr {
+                            node_id: crate::ccl::provenance::NodeId::fresh(),
                             node: TypedExprNode::Lambda {
                                 param,
                                 body: Box::new(new_body),
@@ -3174,6 +3530,7 @@ fn extract_for_defer(
                     }
                     other => {
                         let elt = TypedExpr {
+                            node_id: crate::ccl::provenance::NodeId::fresh(),
                             node: other,
                             ty: elt_ty,
                             user_annotation: elt_user_ann,
@@ -3304,7 +3661,7 @@ fn extract_for_defer(
                         let channel = if branch_feeds.is_empty() {
                             empty_channel()
                         } else {
-                            combine_feed_values(branch_feeds)
+                            combine_feed_values_untracked(branch_feeds)
                         };
                         // Build the arm's per-branch Record at its terminal.
                         let wrapped = augment_terminal_with_channel(body, defer_name, channel);
@@ -3316,6 +3673,7 @@ fn extract_for_defer(
                     })
                     .collect();
                 let case_expr = TypedExpr {
+                    node_id: crate::ccl::provenance::NodeId::fresh(),
                     node: TypedExprNode::Case {
                         scrutinee: scrutinee.clone(),
                         branches: new_branches,
@@ -3367,13 +3725,14 @@ fn extract_for_defer(
             unreachable!("desugar_defers: VariantCtor not yet emitted by lowering")
         }
         // Feed extraction has load-bearing per-variant scope rules
-        // (`in_inner_scope`, the Loop `to_<defer>` machinery); how a
-        // recursive group would participate is exactly what the unified
-        // phase defines — reject rather than guess.
+        // (`in_inner_scope`, the Transact writer `to_<defer>` machinery); how a
+        // recursive group would participate is exactly what `letrec_phase`
+        // defines — reject rather than guess.
         TypedExprNode::LetRec { .. } => {
             unreachable!(
-                "LetRec is not emitted before desugar_defers yet — the unified phase \
-                 (src/ccl/design-mut-txn-feed.md) lands it and replaces this pass"
+                "LetRec reached extract_for_defer — letrec_phase::recognize should have \
+                 lowered every recognized group onto Transact first \
+                 (src/ccl/design-mut-txn-feed.md)"
             )
         }
         // Pre-phase markers: v1 lowering guarantees no feeds inside a
@@ -3386,16 +3745,18 @@ fn extract_for_defer(
                         node: node.clone(),
                         ty: ty.clone(),
                         user_annotation: user_annotation.clone(),
+                        node_id,
                     };
                     collect_feed_target_names(&probe).is_empty()
                 },
                 "feed inside a For/MutWrite marker — v1 lowering must route \
-                 feed-bearing loops through the Loop path"
+                 feed-bearing loops through the Transact path"
             );
             node
         }
     };
     Ok(TypedExpr {
+        node_id,
         node,
         ty,
         user_annotation,
@@ -3411,8 +3772,13 @@ fn augment_terminal_with_channel(expr: Expr, defer_name: &Name, channel: Expr) -
         node,
         ty,
         user_annotation,
+        node_id,
     } = expr;
     match node {
+        // (P) The Let/ExprStmt spine nodes are input nodes restructured (only
+        // their body recurses) — carry each one's id onto the rebuilt envelope.
+        // The terminal below the spine became a Record, so the recorded
+        // body-typed spine types are stale and must be re-synthesized (retype).
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -3423,10 +3789,9 @@ fn augment_terminal_with_channel(expr: Expr, defer_name: &Name, channel: Expr) -
                 bound_expr,
                 body: Box::new(augment_terminal_with_channel(*body, defer_name, channel)),
             },
-            // The terminal below this spine became a Record — the recorded
-            // body-typed spine types are stale.
             ty: invalidate_ty(ty),
             user_annotation,
+            node_id,
         },
         TypedExprNode::ExprStmt { expr: e, body } => TypedExpr {
             node: TypedExprNode::ExprStmt {
@@ -3435,12 +3800,17 @@ fn augment_terminal_with_channel(expr: Expr, defer_name: &Name, channel: Expr) -
             },
             ty: invalidate_ty(ty),
             user_annotation,
+            node_id,
         },
+        // (S) The terminal-wrapping Record is brand-new plumbing (tagged
+        // `Synthetic { via: Desugar }` by the sweep); the wrapped terminal keeps
+        // its own preserved id.
         other => {
             let terminal = TypedExpr {
                 node: other,
                 ty,
                 user_annotation,
+                node_id,
             };
             Expr::new(TypedExprNode::Record(vec![
                 ("result".to_string(), terminal),
@@ -3675,6 +4045,135 @@ mod tests {
             panic!()
         };
         assert_eq!(name, floated);
+    }
+
+    /// Regression for the `extract_defer_binding` (P) id-preservation bug.
+    ///
+    /// A non-defer prefix binding sitting *before* the `Defer` let is a 1:1
+    /// structural transform: `extract_defer_binding` rebuilds the prefix `Let`
+    /// (and `ExprStmt`) carrying `binding`/`bound_expr`/`expr`/`ty` verbatim and
+    /// recursing only into the inner body — so it MUST preserve the node's id.
+    /// The bug rebuilt these prefixes with `NodeId::fresh()`, severing each
+    /// node from its lowered `Source` tag (which keys on the original id) and
+    /// thereby from the provenance substrate's id-identity backbone between the
+    /// post-desugar and post-inference trees.
+    ///
+    /// This drives `extract_defer_binding` directly (the only caller is
+    /// `float_defer_in_lambda`) over `let n = 0 in (feed(x, n); let x = Defer in
+    /// feed(x, n); x)` and asserts both prefix nodes' ids survive the rewrite.
+    /// It fails on the `NodeId::fresh()` form and passes with the fix.
+    #[test]
+    fn extract_defer_binding_preserves_prefix_node_ids() {
+        use crate::ccl::provenance::NodeId;
+
+        // Inner: `let x = Defer in (feed(x, n); x)`.
+        let defer_let = Expr::let_bind(
+            "x",
+            Expr::new(TypedExprNode::Defer),
+            Expr::expr_stmt(Expr::feed("x", var("n")), var("x")),
+        );
+        // Prefix ExprStmt: `feed(x, n); <defer_let>`, with a known id.
+        let exprstmt_id = NodeId::fresh();
+        let prefix_stmt =
+            Expr::expr_stmt(Expr::feed("x", var("n")), defer_let).with_node_id(exprstmt_id);
+        // Outermost prefix `let n = 0 in <prefix_stmt>`, with a known id.
+        let let_id = NodeId::fresh();
+        let body = Expr::let_bind("n", lit(0), prefix_stmt).with_node_id(let_id);
+
+        let (rewritten, _floated) =
+            extract_defer_binding(body).expect("a Defer binding under the prefix is found");
+
+        // Top node is the prefix `Let` — its id must be preserved (P).
+        let TypedExprNode::Let { body: let_body, .. } = &rewritten.node else {
+            panic!("expected prefix Let preserved at the root");
+        };
+        assert_eq!(
+            rewritten.node_id(),
+            let_id,
+            "the prefix `let n` is a (P) 1:1 transform and must keep its node id"
+        );
+        // Its body is the prefix `ExprStmt` — its id must be preserved too.
+        assert!(
+            matches!(let_body.node, TypedExprNode::ExprStmt { .. }),
+            "expected the prefix ExprStmt under the let"
+        );
+        assert_eq!(
+            let_body.node_id(),
+            exprstmt_id,
+            "the prefix `ExprStmt` is a (P) 1:1 transform and must keep its node id"
+        );
+    }
+
+    /// `try_lift_defer` must preserve the id of a lifted `Feed`/`Define`
+    /// prefix head.
+    ///
+    /// The lift fires on `let y = (feed(x, V); let x = Defer in x) in body_y`
+    /// (the shape UDF-inlining of a defer-returning function produces): the
+    /// inner and outer defer scopes merge into `let y = Defer in feed(y, V);
+    /// body_y`. The lifted `feed(y, V)` head is the *same logical node* the user
+    /// wrote — only its target handle is renamed `x → y` — so it must carry the
+    /// input head's id. Re-minting it with `NodeId::fresh()` would sever the
+    /// node's lowered `Source` span (which keys on the original id): the
+    /// post-desugar span index could no longer resolve it and the synthetic
+    /// sweep would mislabel it `Synthetic { via: Desugar }` with empty origins.
+    ///
+    /// Asserts BOTH:
+    /// a. **Preservation** — the lifted head keeps the input head's id.
+    /// b. **Uniqueness** — no id occurs twice in the lifted tree. Carrying an
+    ///    existing id into the rebuilt position is only sound because the lift
+    ///    *replaces* (consumes) the original head rather than copying it; if it
+    ///    ever copied instead, this would introduce a duplicate, and the
+    ///    post-desugar tripwire is gated off for defer-bearing programs so
+    ///    nothing else would catch it.
+    #[test]
+    fn try_lift_defer_preserves_lifted_feed_head_id() {
+        use crate::ccl::provenance::NodeId;
+        use std::collections::HashSet;
+
+        // Prefix `Feed` head with a known id — the node whose identity must
+        // survive the lift.
+        let feed_id = NodeId::fresh();
+        let feed_head = Expr::feed("x", lit(1)).with_node_id(feed_id);
+        // Inner defer-returning scope: `let x = Defer in x`.
+        let defer_let = Expr::let_bind("x", Expr::new(TypedExprNode::Defer), var("x"));
+        // `bound_expr` = `feed(x, 1); let x = Defer in x`.
+        let bound_expr = Expr::expr_stmt(feed_head, defer_let);
+        let body = var("y");
+
+        let lifted = try_lift_defer(&Name::raw("y"), &bound_expr, &body)
+            .expect("the defer-returning-let-with-prefix shape lifts");
+
+        // Output shape: `let y = Defer in (feed(y, 1); y)`. Navigate to the
+        // lifted `Feed` head under the `Defer` let's body `ExprStmt`.
+        let TypedExprNode::Let { body: ly_body, .. } = &lifted.node else {
+            panic!("expected `let y = Defer in …` at the root");
+        };
+        let TypedExprNode::ExprStmt { expr: head, .. } = &ly_body.node else {
+            panic!("expected the lifted prefix `ExprStmt` under the defer let");
+        };
+        let TypedExprNode::Feed { name, .. } = &head.node else {
+            panic!("expected the lifted `Feed` head");
+        };
+        assert_eq!(*name, Name::raw("y"), "the feed target is renamed x → y");
+
+        // (a) Preservation: the lifted head is the same logical node — its id
+        // must survive the lift.
+        assert_eq!(
+            head.node_id(),
+            feed_id,
+            "the lifted feed head is a (P) 1:1 transform (only its target handle \
+             is renamed) and must keep its node id"
+        );
+
+        // (b) Uniqueness: the preserved id must not collide with any other node
+        // in the rebuilt tree (confirms the lift replaced the original head).
+        let ids = collect_node_ids(&lifted);
+        let unique: HashSet<NodeId> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "the lifted tree must carry no duplicate node ids"
+        );
     }
 
     /// Post-float curried form: `λn → λ__floated_x → __floated_x`
@@ -3934,6 +4433,78 @@ mod tests {
         assert_eq!(err, DeferError::NoFeedOrDefine("d".into()));
     }
 
+    /// A defer-free program preserves its full `NodeId` set across the pass —
+    /// the (P) 1:1 property the provenance substrate relies on (lowered
+    /// `Source(span)` tags stay valid against the post-desugar tree). Mirrors
+    /// `uniquify`'s `uniquify_preserves_every_node_id`. The strict before==after
+    /// check also runs as a `#[cfg(debug_assertions)]` assert inside `run`.
+    #[test]
+    fn desugar_preserves_every_node_id_on_defer_free_program() {
+        use crate::ccl::provenance::NodeId;
+        use std::collections::HashSet;
+
+        // `let f = λx → (x + 1) in let y = f in (y, y)` — Let/Lambda/BinOp/
+        // Apply/Tuple/Var/Lit, no Defer/Feed/Define/ExprStmt anywhere.
+        let f = Expr::lambda(
+            "x",
+            Type::Hole,
+            Expr::new(TypedExprNode::BinOp {
+                left: Box::new(var("x")),
+                op: BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
+                right: Box::new(lit(1)),
+            }),
+        );
+        let body = Expr::new(TypedExprNode::Tuple(vec![var("y"), var("y")]));
+        let expr = Expr::let_bind("f", f, Expr::let_bind("y", var("f"), body));
+
+        let before: HashSet<NodeId> = collect_node_ids(&expr).into_iter().collect();
+        let root_id = expr.node_id();
+
+        let result = run(expr, false).unwrap();
+        let after: HashSet<NodeId> = collect_node_ids(&result).into_iter().collect();
+
+        assert_eq!(
+            before, after,
+            "desugar must preserve the exact NodeId set on a defer-free program"
+        );
+        assert_eq!(
+            result.node_id(),
+            root_id,
+            "the root node's NodeId is unchanged across the pass"
+        );
+    }
+
+    /// A defer-using program emits a fan-in provenance record for its channel
+    /// `CollectionUnion` (the many-to-one feed→channel lineage): the union's
+    /// `target` id names a node in the output tree, and its `sources` are the
+    /// feed-value node ids it aggregates.
+    #[test]
+    fn desugar_emits_fanin_record_for_multi_feed_channel() {
+        // `let d = Defer in feed(d, 1); feed(d, 2); d` — two feeds union into
+        // one channel.
+        let body = Expr::expr_stmt(
+            Expr::feed("d", lit(1)),
+            Expr::expr_stmt(Expr::feed("d", lit(2)), var("d")),
+        );
+        let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
+
+        let (result, prov) = run_with_provenance(expr, false).unwrap();
+        let fanins = prov.fanins;
+        assert_eq!(fanins.len(), 1, "one channel union → one fan-in record");
+        let fanin = &fanins[0];
+        assert_eq!(
+            fanin.sources.len(),
+            2,
+            "the union aggregates both feed values (many-to-one)"
+        );
+        // The fan-in target is a real node in the output tree.
+        let ids: HashSet<_> = collect_node_ids(&result).into_iter().collect();
+        assert!(
+            ids.contains(&fanin.target),
+            "the fan-in target id is present in the desugared tree"
+        );
+    }
+
     /// Multiple feeds: union'd via collection_union.
     #[test]
     fn run_multiple_feeds_use_collection_union() {
@@ -4078,6 +4649,7 @@ mod tests {
             predicate: Rc::new(pred),
         };
         let annotated = TypedExpr {
+            node_id: crate::ccl::provenance::NodeId::fresh(),
             node: TypedExprNode::Var(Name::raw("__chan")),
             ty: Type::Hole,
             user_annotation: Some(Type::fun(
@@ -4108,6 +4680,7 @@ mod tests {
             predicate: Rc::new(pred),
         };
         let typed = TypedExpr {
+            node_id: crate::ccl::provenance::NodeId::fresh(),
             node: TypedExprNode::Lit(Lit::Unit),
             ty: Type::Fun {
                 name: None,

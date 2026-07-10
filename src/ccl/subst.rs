@@ -489,6 +489,7 @@ impl Subst {
             }
         };
         TypedExpr {
+            node_id: crate::ccl::provenance::NodeId::fresh(),
             node,
             ty: self.apply_type(&e.ty),
             user_annotation: e.user_annotation.as_ref().map(|t| self.apply_type(t)),

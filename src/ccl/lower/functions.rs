@@ -280,7 +280,11 @@ pub(super) fn lower_function_body(
     // pre-uniquify name a sibling function could reuse.
     ctx.restore_transactional(snapshot);
 
-    uncurry_params(params, body_result?, ctx)
+    // Tag the function's lambda wrapper with the `def` span. (The synthetic
+    // tuple-arg lambda for the multi-param case is the user's function node,
+    // so the def span is the right blame here.)
+    let func = uncurry_params(params, body_result?, ctx)?;
+    Ok(ctx.tag_source(func, fn_span))
 }
 
 #[cfg(test)]

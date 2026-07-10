@@ -381,11 +381,16 @@ pub(super) fn lower_middle_stmt(
             // binding name so the scheduler can subscribe it independently.
             let responses_expr = Expr::new(TypedExprNode::Defer);
             ctx.register_sink_binding(resp_name.clone(), sink);
-            Ok(Expr::let_bind(
+            // Tag the outer `requests` binding with the assignment statement's
+            // span (the real source construct). The inner `responses` Defer let,
+            // the Source node, and the Defer are synthetic plumbing and are left
+            // untagged (resolve to `None` gracefully).
+            let let_expr = Expr::let_bind(
                 req_name,
                 requests_expr,
                 Expr::let_bind(resp_name, responses_expr, body),
-            ))
+            );
+            Ok(ctx.tag_source(let_expr, stmt.span))
         }
         // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a
         // store write (the mutation operators are `:=` and `+=`), so even a
@@ -393,7 +398,7 @@ pub(super) fn lower_middle_stmt(
         ChlStmt::Assign { target, value } => {
             let name = extract_name_target(target, "assignment")?;
             let val = lower_expr(value, ctx)?;
-            Ok(Expr::let_bind(name, val, body))
+            Ok(ctx.tag_source(Expr::let_bind(name, val, body), stmt.span))
         }
         ChlStmt::AnnAssign {
             target,
@@ -421,7 +426,10 @@ pub(super) fn lower_middle_stmt(
             }
             let annotation_ty = lower_type_annotation(annotation)?;
             let val = lower_expr(value, ctx)?;
-            Ok(Expr::let_bind_annotated(name, val, body, annotation_ty))
+            Ok(ctx.tag_source(
+                Expr::let_bind_annotated(name, val, body, annotation_ty),
+                stmt.span,
+            ))
         }
         // `x := e` — a mutable **introduction** or **write**, split by scope:
         //  - a bare `x := e` where `x` is already in scope is a *write* — a
@@ -509,7 +517,7 @@ pub(super) fn lower_middle_stmt(
             // runs post-inference.
             check_store_write_context(&name, stmt.span, ctx)?;
             let val = lower_aug_binop(&name, *op, value, ctx)?;
-            Ok(Expr::expr_stmt(Expr::mut_write(name, val), body))
+            Ok(ctx.tag_source(Expr::expr_stmt(Expr::mut_write(name, val), body), stmt.span))
         }
         // `x <<= e` — defer-define statement, distinct from AugAssign.
         ChlStmt::Define { target, value } => {
@@ -522,7 +530,10 @@ pub(super) fn lower_middle_stmt(
             body: fn_body,
         } => {
             let func_expr = lower_function_body(stmt.span, params, fn_body, ctx)?;
-            Ok(Expr::let_bind(name.as_str().to_string(), func_expr, body))
+            Ok(ctx.tag_source(
+                Expr::let_bind(name.as_str().to_string(), func_expr, body),
+                stmt.span,
+            ))
         }
         // For a for-loop in the middle of a block, check whether it is a mutation
         // accumulation loop (lowered to `Loop`) or a side-effecting streaming
@@ -1206,5 +1217,63 @@ x";
         let stmts = parse_module("if x:\n    1");
         let err = expect_one_lowering_error(&stmts);
         assert!(matches!(err, LoweringError::Unsupported { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Provenance side-table population (S2b)
+    // -----------------------------------------------------------------------
+
+    /// Lowering populates the provenance table so that the root `Let` (a
+    /// statement-level construct) and a nested expression node both round-trip
+    /// through `resolve` back to their exact source spans as `Source` entries.
+    #[test]
+    fn lowering_tags_nodes_with_source_spans() {
+        use crate::ccl::TypedExprNode;
+        use crate::ccl::provenance::Derivation;
+        use crate::chl_parser::ast::Span;
+
+        // `x = 1` is the first statement (spans bytes 0..5); `x + 2` is the
+        // final bare expression (spans bytes 6..11). The source-byte offsets are
+        // load-bearing: the test asserts the exact origin span of each node.
+        let src = "x = 1\nx + 2\n";
+        let stmts = parse_module(src);
+        assert_eq!(stmts[0].span, Span::new(0, 5), "stmt `x = 1` span");
+        let final_expr_span = stmts[1].span;
+        assert_eq!(final_expr_span, Span::new(6, 11), "expr `x + 2` span");
+
+        let mut ctx = LoweringContext::default();
+        let lowered = lower_stmts(&stmts, &mut ctx)
+            .into_result()
+            .expect("lowering succeeds");
+        let table = ctx.take_provenance();
+
+        // Root node is the `let x = 1 in (x + 2)` binding, tagged with the
+        // assignment statement's span.
+        let TypedExprNode::Let {
+            bound_expr, body, ..
+        } = &lowered.node
+        else {
+            panic!("expected a Let at the root, got {:?}", lowered.node);
+        };
+        let root_prov = table
+            .resolve(lowered.node_id())
+            .expect("root Let node has provenance");
+        assert_eq!(root_prov.kind, Derivation::Source);
+        assert_eq!(root_prov.origins, vec![Span::new(0, 5)]);
+
+        // The bound expression `1` is tagged with the RHS literal's span.
+        assert_eq!(
+            table.origins(bound_expr.node_id()),
+            Some(&[Span::new(4, 5)][..]),
+            "bound `1` traces to its literal span"
+        );
+
+        // A nested node round-trips: the final `x + 2` BinOp carries the
+        // expression statement's span.
+        let nested_prov = table
+            .resolve(body.node_id())
+            .expect("nested `x + 2` node has provenance");
+        assert_eq!(nested_prov.kind, Derivation::Source);
+        assert_eq!(nested_prov.origins, vec![final_expr_span]);
     }
 }

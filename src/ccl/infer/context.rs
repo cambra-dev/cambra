@@ -80,6 +80,13 @@ pub(super) struct InferCtx {
     /// `in_let_rhs`) so RHS-local variables are minted deeper than the
     /// defining scope and become generalizable at the binding site.
     pub(super) level: Level,
+    /// The `NodeId` of the node currently being emitted, maintained by the
+    /// [`emit_node`](super::emit::emit_node) wrapper: set on entry, *restored
+    /// only on success* so that on the fail-fast error path it is left pointing
+    /// at the innermost node that failed. This is provenance metadata for
+    /// diagnostics, surfaced to the `compile_program` boundary via the public
+    /// `infer`'s side-channel — it never influences inference itself.
+    pub(super) current_node_id: Option<crate::ccl::provenance::NodeId>,
 }
 
 impl InferCtx {
@@ -90,6 +97,7 @@ impl InferCtx {
             cache: ConstrainCache::new(),
             schemes: OperatorSchemes::new(),
             level: 0,
+            current_node_id: None,
         }
     }
 

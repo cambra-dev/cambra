@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use crate::ccl::{
     BaseType, Builtin, Expr, F_DECISION, F_WRITE_TARGETS, Lit, Name, ProjKey, TransactKey,
     TransactWriter, Type, TypedBinding, TypedExprNode, ccl_utils::count_free,
-    letrec::check_letrec_guarded, symbolic::symbolic,
+    letrec::check_letrec_guarded, provenance::NodeId, symbolic::symbolic,
 };
 
 // ---------------------------------------------------------------------------
@@ -180,6 +180,21 @@ fn erase_mut(expr: &mut Expr) {
     expr.walk_children_mut(erase_mut);
 }
 
+/// An id-freshened copy of `e` — every node re-minted (the shared deep walk).
+///
+/// The phase splices some template expressions (the history `step` view, the
+/// loop source) into the output at several positions; a bare `clone` would stamp
+/// the *same* NodeIds at each, breaking the tree's id-uniqueness invariant. Each
+/// spliced copy is freshened so the positions carry distinct ids. Copies stay
+/// unattributed (swept `Synthetic{via:Desugar}`) — recorder attribution for this
+/// phase is a documented follow-up (`design-provenance.md`); this restores
+/// uniqueness only. Safe because no downstream pass reads `node_id` and
+/// `inline::dedup` (the one consumer of shared ids) ran before this phase.
+fn fresh_copy(mut e: Expr) -> Expr {
+    e.freshen_node_ids_deep(|_, _| {});
+    e
+}
+
 /// A `Unit` literal stamped with `Base(Unit)` — the value of a store write.
 fn unit_expr() -> Expr {
     let mut u = Expr::new(TypedExprNode::Lit(Lit::Unit));
@@ -198,6 +213,7 @@ fn expr_stmt_typed(effect: Expr, body: Expr) -> Expr {
         },
         ty,
         user_annotation: None,
+        node_id: NodeId::fresh(),
     }
 }
 
@@ -278,18 +294,27 @@ fn flatten_spine(mut e: Expr) -> Expr {
                 unreachable!()
             };
             let bound_expr = *bound_expr;
-            let (bty, bua) = (bound_expr.ty, bound_expr.user_annotation);
+            let (bty, bua, bid) = (
+                bound_expr.ty,
+                bound_expr.user_annotation,
+                bound_expr.node_id,
+            );
             return match bound_expr.node {
                 TypedExprNode::ExprStmt { expr: w, body: u } => {
                     let inner = let_in(binding, *u, *body);
                     flatten_spine(expr_stmt_typed(*w, inner))
                 }
-                // A bare writer bound to `x`: its value is `unit`.
+                // A bare writer bound to `x`: its value is `unit`. This rebuilds
+                // the *same logical write* at a new spine position, so carry the
+                // input node's id (a preserve, not a mint) — freshening here
+                // would sever the write's source span from the post-desugar tree
+                // and duplicate the id if the original ever also survived.
                 TypedExprNode::MutWrite { name, value } => {
                     let write = Expr {
                         node: TypedExprNode::MutWrite { name, value },
                         ty: bty,
                         user_annotation: bua,
+                        node_id: bid,
                     };
                     let inner = let_in(binding, unit_expr(), *body);
                     flatten_spine(expr_stmt_typed(write, inner))
@@ -433,6 +458,7 @@ fn let_in(name: TypedBinding, def: Expr, body: Expr) -> Expr {
         },
         ty,
         user_annotation: None,
+        node_id: NodeId::fresh(),
     }
 }
 
@@ -565,7 +591,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     };
     let guard = {
         let mut arg = Expr::tuple(vec![
-            step_view.clone(),
+            fresh_copy(step_view.clone()),
             tvar(&r, domain_ty.clone()),
             default_expr,
         ]);
@@ -617,11 +643,11 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     let mut final_lets: Vec<(TypedBinding, Expr)> = Vec::new();
     for (i, (acc, vty)) in accs.iter().enumerate() {
         let view = if single {
-            step_view.clone()
+            fresh_copy(step_view.clone())
         } else {
             let mut proj = Expr::proj_index(i);
             proj.ty = Type::fun(packed_ty.clone(), vty.clone());
-            let mut comp = Expr::compose(vec![step_view.clone(), proj]);
+            let mut comp = Expr::compose(vec![fresh_copy(step_view.clone()), proj]);
             comp.ty = Type::fun(domain_ty.clone(), vty.clone());
             comp
         };
@@ -670,6 +696,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
         },
         ty,
         user_annotation: None,
+        node_id: NodeId::fresh(),
     }
 }
 
@@ -704,7 +731,9 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
         let value_ty = value.ty.clone();
         let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), value);
         lambda.ty = Type::fun(target.ty.clone(), value_ty.clone());
-        let mut map = Expr::compose(vec![iter.clone(), lambda]);
+        // Each feed maps its own copy of the loop source; freshen so the copies
+        // do not share the source's node ids across feeds.
+        let mut map = Expr::compose(vec![fresh_copy(iter.clone()), lambda]);
         map.ty = Type::fun(domain_ty.clone(), value_ty);
         let mut feed = Expr::feed(defer, map);
         feed.ty = Type::Base(BaseType::Unit);
@@ -740,7 +769,8 @@ fn collect_feed_only(expr: Expr, env: &mut HashMap<Name, Expr>, feeds: &mut Vec<
                     symbolic(&Expr {
                         node: other,
                         ty: Type::Hole,
-                        user_annotation: None
+                        user_annotation: None,
+                        node_id: NodeId::fresh(),
                     })
                 ),
             }
@@ -752,7 +782,8 @@ fn collect_feed_only(expr: Expr, env: &mut HashMap<Name, Expr>, feeds: &mut Vec<
             symbolic(&Expr {
                 node: other,
                 ty: expr.ty,
-                user_annotation: expr.user_annotation
+                user_annotation: expr.user_annotation,
+                node_id: NodeId::fresh(),
             })
         ),
     }
@@ -825,7 +856,8 @@ fn transform_chain(
                     symbolic(&Expr {
                         node: other,
                         ty: Type::Hole,
-                        user_annotation: None
+                        user_annotation: None,
+                        node_id: NodeId::fresh(),
                     })
                 ),
             }
@@ -861,7 +893,8 @@ fn transform_chain(
             symbolic(&Expr {
                 node: other,
                 ty: expr.ty,
-                user_annotation: expr.user_annotation
+                user_annotation: expr.user_annotation,
+                node_id: NodeId::fresh(),
             })
         ),
     }
@@ -887,7 +920,18 @@ fn subst_env(mut e: Expr, env: &HashMap<Name, Expr>) -> Expr {
     if let TypedExprNode::Var(n) = &e.node
         && let Some(rep) = env.get(n)
     {
-        return rep.clone();
+        // A stored env value is substituted at every read site; a bare
+        // `rep.clone()` would stamp the *same* NodeIds into each copy, breaking
+        // the tree's id-uniqueness invariant. Freshen each copy's ids (the
+        // shared deep walk — main tree + predicate `Rc`s + `Cast` targets). The
+        // copies stay unattributed: they fall to the desugar `Synthetic` sweep
+        // (recorder-based attribution for these phases is a documented
+        // follow-up, `design-provenance.md`). Dropping the `(old, new)` pairs is
+        // safe here — no downstream pass reads `node_id`, and inline::dedup (the
+        // one consumer that exploited shared ids) ran before this phase.
+        let mut copy = rep.clone();
+        copy.freshen_node_ids_deep(|_, _| {});
+        return copy;
     }
     e.map_children(|c| subst_env(c, env));
     e
@@ -1190,6 +1234,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
         },
         ty,
         user_annotation: None,
+        node_id: NodeId::fresh(),
     }
 }
 
@@ -1425,6 +1470,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         },
         ty,
         user_annotation: None,
+        node_id: NodeId::fresh(),
     }
 }
 
@@ -1631,6 +1677,149 @@ mod tests {
         assert!(
             s.contains("__store.") && s.contains("last_or_default"),
             "trailing read must project the store record and reduce it: {s}"
+        );
+    }
+
+    /// Every duplicated NodeId over the main tree (`walk_children` node-set).
+    fn duplicate_ids(expr: &Expr) -> Vec<NodeId> {
+        fn walk(e: &Expr, seen: &mut std::collections::HashSet<NodeId>, dups: &mut Vec<NodeId>) {
+            if !seen.insert(e.node_id()) {
+                dups.push(e.node_id());
+            }
+            e.walk_children(|c| walk(c, seen, dups));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut dups = Vec::new();
+        walk(expr, &mut seen, &mut dups);
+        dups
+    }
+
+    /// The typed direct-mirror tree for `x := 0; for i in [1,2,3]: x := x + x; x`
+    /// — the loop body reads the accumulator at **two** sites (`x + x`), so
+    /// [`transform_chain`]'s `subst_env` substitutes the read-your-writes value at
+    /// both. Before the freshen fix the two copies shared NodeIds.
+    fn loop_two_reads() -> Expr {
+        let int = Type::Base(BaseType::Int);
+        let list_ty = Type::fun(Type::UIntRange(3), int.clone());
+        let x = Name::fresh("x");
+        let i = Name::fresh("i");
+
+        let mut list = Expr::new(TypedExprNode::List(
+            [1, 2, 3]
+                .iter()
+                .map(|n| {
+                    let mut l = Expr::new(TypedExprNode::Lit(Lit::Int(*n)));
+                    l.ty = int.clone();
+                    l
+                })
+                .collect(),
+        ));
+        list.ty = list_ty;
+
+        // x + x — two reads of the accumulator in one write value.
+        let mut sum = Expr::new(TypedExprNode::BinOp {
+            left: Box::new(tvar(&x, int.clone())),
+            op: crate::ccl::BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
+            right: Box::new(tvar(&x, int.clone())),
+        });
+        sum.ty = int.clone();
+        let mut write = Expr::mut_write(x.clone(), sum);
+        write.ty = Type::Base(BaseType::Unit);
+        let mut unit = Expr::new(TypedExprNode::Lit(Lit::Unit));
+        unit.ty = Type::Base(BaseType::Unit);
+        let mut body = Expr::expr_stmt(write, unit);
+        body.ty = Type::Base(BaseType::Unit);
+
+        let mut for_node = Expr::new(TypedExprNode::For {
+            target: TypedBinding {
+                name: i,
+                ty: int.clone(),
+                user_annotation: None,
+            },
+            iter: Box::new(list),
+            body: Box::new(body),
+        });
+        for_node.ty = Type::Base(BaseType::Unit);
+
+        let mut stmt = Expr::expr_stmt(for_node, tvar(&x, int.clone()));
+        stmt.ty = int.clone();
+        let mut init = Expr::new(TypedExprNode::Lit(Lit::Int(0)));
+        init.ty = int.clone();
+        let mut tree = Expr::let_bind(x, init, stmt);
+        tree.ty = int;
+        tree
+    }
+
+    /// RT-4a (letrec-flavored sibling): the induction phase preserves
+    /// id-uniqueness when a loop body reads the accumulator at multiple sites.
+    /// `transform_chain`'s `subst_env` substitutes the read-your-writes value at
+    /// each read; before the freshen fix the copies shared NodeIds, and the
+    /// `step_view` template cloned into the guard + trailing reads shared ids too.
+    /// (Asserted at the phase boundary for the same reason as the transact
+    /// sibling: a runnable loop program's `post_desugar_ir` is defer-bearing.)
+    #[test]
+    fn subst_env_and_scaffolding_keep_ids_unique() {
+        let out = run(loop_two_reads());
+        let dups = duplicate_ids(&out);
+        assert!(
+            dups.is_empty(),
+            "letrec phase left duplicate NodeIds (subst_env copies / step_view \
+             clones must be freshened): {dups:?}"
+        );
+        // Recognition must also keep the tree unique — it is a tripwire boundary.
+        let recognized = recognize(run(loop_two_reads()));
+        let dups = duplicate_ids(&recognized);
+        assert!(
+            dups.is_empty(),
+            "letrec recognition left duplicate NodeIds: {dups:?}"
+        );
+    }
+
+    /// RT-4b: the `flatten_spine` bare-writer arm — `Let(x, MutWrite(..), k)` (a
+    /// value-position writer whose body is a bare write, e.g. an inlined
+    /// `y = bump(c)`) — carries the input write's NodeId onto the repositioned
+    /// write rather than minting a fresh one. This is the preserve-id fix: a mint
+    /// would sever the write's source span and could duplicate the id.
+    ///
+    /// Unit-test form at the letrec boundary (the plan's RT-4b fallback): the
+    /// bare-writer `MutWrite` is consumed by the loop rewrite and does not survive
+    /// into `post_desugar_ir` as a span-indexable `MutWrite`, so id preservation
+    /// through the phase is asserted directly here.
+    #[test]
+    fn flatten_spine_bare_writer_preserves_id() {
+        let int = Type::Base(BaseType::Int);
+        let c = Name::fresh("c");
+        let x = Name::fresh("x");
+
+        // The bare write `c := 1`.
+        let mut one = Expr::new(TypedExprNode::Lit(Lit::Int(1)));
+        one.ty = int.clone();
+        let mut write = Expr::mut_write(c, one);
+        write.ty = Type::Base(BaseType::Unit);
+        let write_id = write.node_id();
+
+        // `let x = (c := 1) in x` — the value-position bare-writer shape.
+        let tree = Expr::let_bind(x.clone(), write, tvar(&x, Type::Base(BaseType::Unit)));
+
+        let out = flatten_spine(tree);
+
+        // Find the (single) MutWrite in the output and assert its id is preserved.
+        fn find_mut_write(e: &Expr) -> Option<NodeId> {
+            if matches!(e.node, TypedExprNode::MutWrite { .. }) {
+                return Some(e.node_id());
+            }
+            let mut found = None;
+            e.walk_children(|c| found = found.or_else(|| find_mut_write(c)));
+            found
+        }
+        let out_id = find_mut_write(&out).expect("the write survives flatten_spine");
+        assert_eq!(
+            out_id, write_id,
+            "flatten_spine must carry the bare writer's NodeId (preserve, not mint)"
+        );
+        assert!(
+            duplicate_ids(&out).is_empty(),
+            "flatten_spine must not introduce duplicate ids"
         );
     }
 }

@@ -60,7 +60,7 @@ use std::collections::HashMap;
 use crate::ccl::{
     BaseType, Builtin, Expr, F_COMMIT, F_DECISION, F_TIME, F_WRITE_TARGETS, F_WRITES, Lit, Name,
     ProjKey, TransactWriter, Type, TypedBinding, TypedExprNode, ccl_utils::is_free_in_value,
-    letrec::check_letrec_guarded, letrec_phase::hoist_feeds,
+    letrec::check_letrec_guarded, letrec_phase::hoist_feeds, provenance::NodeId,
 };
 
 /// Recognize a **live cross-endpoint read** and rewrite it to an as-of join,
@@ -705,6 +705,23 @@ fn tvar(name: &Name, ty: Type) -> Expr {
     e
 }
 
+/// An id-freshened copy of `e` — every node re-minted (the shared deep walk).
+///
+/// Each store key's `init` is spliced into the output at two positions (the
+/// history `get_prev_txn` default *and* the continuation's `last_or_default`
+/// rebind), and `subst_env` copies of an env value land at every read site; a
+/// bare `clone` would stamp the *same* NodeIds at each, breaking the tree's
+/// id-uniqueness invariant. Each spliced copy is freshened so the positions
+/// carry distinct ids. Copies stay unattributed (swept `Synthetic{via:Desugar}`)
+/// — recorder attribution for this phase is a documented follow-up
+/// (`design-provenance.md`); this restores uniqueness only. Safe because no
+/// downstream pass reads `node_id` and `inline::dedup` (the one consumer of
+/// shared ids) ran before this phase.
+fn fresh_copy(mut e: Expr) -> Expr {
+    e.freshen_node_ids_deep(|_, _| {});
+    e
+}
+
 /// `p ▷ .i : elt_ty` — projection of the writer body's tuple parameter.
 fn proj_tuple(p: &Name, tuple_ty: &Type, i: usize, elt_ty: Type) -> Expr {
     let mut proj = Expr::proj_index(i);
@@ -938,7 +955,18 @@ fn subst_env(e: &Expr, env: &HashMap<Name, Expr>) -> Expr {
     if let TypedExprNode::Var(n) = &e.node
         && let Some(rep) = env.get(n)
     {
-        return rep.clone();
+        // A stored env value is substituted at every read site; a bare
+        // `rep.clone()` would stamp the *same* NodeIds into each copy, breaking
+        // the tree's id-uniqueness invariant. Freshen each copy's ids (the
+        // shared deep walk — main tree + predicate `Rc`s + `Cast` targets). The
+        // copies stay unattributed: they fall to the desugar `Synthetic` sweep
+        // (recorder-based attribution for these phases is a documented
+        // follow-up, `design-provenance.md`). Dropping the `(old, new)` pairs is
+        // safe here — no downstream pass reads `node_id`, and inline::dedup (the
+        // one consumer that exploited shared ids) ran before this phase.
+        let mut copy = rep.clone();
+        copy.freshen_node_ids_deep(|_, _| {});
+        return copy;
     }
     let mut out = e.clone();
     out.map_children(|c| subst_env(&c, env));
@@ -989,6 +1017,7 @@ fn let_typed(name: Name, name_ty: Type, def: Expr, body: Expr) -> Expr {
         },
         ty,
         user_annotation: None,
+        node_id: NodeId::fresh(),
     }
 }
 
@@ -1222,7 +1251,9 @@ fn build_letrec(
         let v = value_ty(k);
         let store_k = hist[k].clone();
         let t = Name::fresh("__t");
-        let init = key_init.get(k).cloned().expect("key init present");
+        // Freshen: this key's `init` is also spliced at the continuation rebind
+        // (`splice_letrec`), so the two copies must not share ids.
+        let init = fresh_copy(key_init.get(k).cloned().expect("key init present"));
         // The `get_prev_txn` history slot: the writing site's commit stream
         // (guarded cycle) or the key itself (read-only, self-guarded).
         //
@@ -1297,6 +1328,7 @@ fn rebind_letrec(
         node,
         ty,
         user_annotation,
+        node_id,
     } = expr;
     match node {
         TypedExprNode::Let {
@@ -1320,6 +1352,7 @@ fn rebind_letrec(
                     },
                     ty,
                     user_annotation,
+                    node_id,
                 }
             }
         }
@@ -1329,6 +1362,7 @@ fn rebind_letrec(
                 node: other,
                 ty,
                 user_annotation,
+                node_id,
             },
             key_names,
             hist,
@@ -1363,7 +1397,9 @@ fn splice_letrec(
         // it defensively. `erase_mut` sweeps any surviving `Var(x)` reference type.
         let v = store_value_ty(&key_init[k].ty);
         let stream = tvar(&hist[k], history_ty(&v));
-        let init = key_init.get(k).cloned().expect("key init present");
+        // Freshen: the same `init` is also spliced at the history binding's
+        // `get_prev_txn` default (`build_letrec`), so the copies must not share ids.
+        let init = fresh_copy(key_init.get(k).cloned().expect("key init present"));
         let bound = last_or_default_read(stream, init, v.clone());
         inner = let_typed(k.clone(), v, bound, inner);
     }
@@ -1380,6 +1416,7 @@ fn splice_letrec(
         },
         ty,
         user_annotation: None,
+        node_id: NodeId::fresh(),
     }
 }
 
@@ -1477,6 +1514,94 @@ mod tests {
             check_letrec_guarded(&bindings),
             Ok(()),
             "the emitted transaction letrec must be guarded"
+        );
+    }
+
+    /// The typed direct-mirror tree for a `with begin():` writer that reads the
+    /// store at **two** sites: `pool: Mut[int, Txn] := 100; with begin(): pool :=
+    /// pool + pool`. Both `pool` reads are substituted from the read-your-writes
+    /// environment by [`subst_env`]; before the freshen fix the two copies shared
+    /// NodeIds, duplicating ids into the phase output.
+    fn txn_two_reads() -> (Expr, Name) {
+        let int = Type::Base(BaseType::Int);
+        let list_ty = Type::fun(Type::UIntRange(1), int.clone());
+        let pool = Name::fresh("pool");
+        let r = Name::fresh("r");
+
+        let mut ten = Expr::new(TypedExprNode::Lit(Lit::Int(10)));
+        ten.ty = int.clone();
+        let mut list = Expr::new(TypedExprNode::List(vec![ten]));
+        list.ty = list_ty;
+
+        // pool + pool — two reads of the store in one write value.
+        let mut add = Expr::new(TypedExprNode::BinOp {
+            left: Box::new(tvar(&pool, int.clone())),
+            op: BinOpKind::Arithmetic(ArithmeticKind::Add),
+            right: Box::new(tvar(&pool, int.clone())),
+        });
+        add.ty = int.clone();
+        let mut write = Expr::mut_write(pool.clone(), add);
+        write.ty = Type::Base(BaseType::Unit);
+        let mut unit = Expr::new(TypedExprNode::Lit(Lit::Unit));
+        unit.ty = Type::Base(BaseType::Unit);
+        let mut block = Expr::expr_stmt(write, unit);
+        block.ty = Type::Base(BaseType::Unit);
+
+        let mut for_node = Expr::new(TypedExprNode::For {
+            target: binding(r, int.clone()),
+            iter: Box::new(list),
+            body: Box::new(block),
+        });
+        for_node.ty = Type::Base(BaseType::Unit);
+
+        let mut cont = Expr::new(TypedExprNode::Lit(Lit::Unit));
+        cont.ty = Type::Base(BaseType::Unit);
+        let mut stmt = Expr::expr_stmt(for_node, cont);
+        stmt.ty = Type::Base(BaseType::Unit);
+        let mut init = Expr::new(TypedExprNode::Lit(Lit::Int(100)));
+        init.ty = int;
+        let mut tree = Expr::let_bind(pool.clone(), init, stmt);
+        tree.ty = Type::Base(BaseType::Unit);
+        (tree, pool)
+    }
+
+    /// Every duplicated NodeId over the main tree (`walk_children` node-set), for
+    /// the id-uniqueness regression assertions.
+    fn duplicate_ids(expr: &Expr) -> Vec<NodeId> {
+        fn walk(e: &Expr, seen: &mut std::collections::HashSet<NodeId>, dups: &mut Vec<NodeId>) {
+            if !seen.insert(e.node_id()) {
+                dups.push(e.node_id());
+            }
+            e.walk_children(|c| walk(c, seen, dups));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut dups = Vec::new();
+        walk(expr, &mut seen, &mut dups);
+        dups
+    }
+
+    /// RT-4a: the transaction phase preserves the tree's id-uniqueness invariant
+    /// even when a `with begin():` block reads the store at multiple sites.
+    ///
+    /// `subst_env` substitutes the read-your-writes snapshot at every store read;
+    /// a bare `clone` at each site stamped the *same* NodeIds into the output, so
+    /// before the freshen fix `run`'s output carried duplicate ids. The assertion
+    /// is made at the transact-phase boundary rather than `post_desugar_ir`: a
+    /// runnable txn program requires an `out << ` feed to surface output, which
+    /// makes `desugar_defers` channelize, and `desugar_substitute` legitimately
+    /// leaves duplicate ids on defer-bearing programs (the post-desugar tripwire
+    /// is gated off there). This isolates the subst_env fix at the boundary that
+    /// establishes uniqueness.
+    #[test]
+    fn subst_env_copies_keep_ids_unique() {
+        let (tree, pool) = txn_two_reads();
+        let names = std::collections::HashSet::from([pool]);
+        let out = run(tree, &names);
+        let dups = duplicate_ids(&out);
+        assert!(
+            dups.is_empty(),
+            "transact phase left duplicate NodeIds after substituting a store read at \
+             multiple sites (subst_env must freshen each copy): {dups:?}"
         );
     }
 }
