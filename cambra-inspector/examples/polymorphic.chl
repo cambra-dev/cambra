@@ -1,0 +1,9 @@
+# Let-polymorphism + monomorphization. `dup` is used at two distinct types, so
+# inference specializes it into two clones. The post-desugar (pre-inference)
+# body `(x, x)` carries a hole; downstream it resolves to a *set* of tuple types
+# (Int and Bool) — the B5 hole->downstream-type stitch, and the mono fan-out
+# that makes `stageLinks` non-empty.
+dup = lambda x: (x, x)
+a = dup(1)
+b = dup(2 == 2)
+a

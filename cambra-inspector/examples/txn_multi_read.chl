@@ -1,0 +1,13 @@
+# Transactional store read at multiple sites (RT-4a shape). Each `with begin():`
+# block reads `pool` twice — once in the guard, once in the write value — so the
+# transact phase substitutes the read-your-writes snapshot at two sites; the
+# substituted copies must carry freshened (unique) NodeIds.
+out = defer()
+pool: Mut[int, Txn] := 100
+for r in [10, 20, 30]:
+    with begin():
+        if pool > r:
+            pool := pool - r
+with begin():
+    out << pool
+out

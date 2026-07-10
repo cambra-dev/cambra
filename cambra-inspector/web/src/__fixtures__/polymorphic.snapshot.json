@@ -1,0 +1,1610 @@
+{
+    "source": {
+        "name": "cambra-inspector/examples/polymorphic.chl",
+        "text": "# Let-polymorphism + monomorphization. `dup` is used at two distinct types, so\n# inference specializes it into two clones. The post-desugar (pre-inference)\n# body `(x, x)` carries a hole; downstream it resolves to a *set* of tuple types\n# (Int and Bool) \u2014 the B5 hole->downstream-type stitch, and the mono fan-out\n# that makes `stageLinks` non-empty.\ndup = lambda x: (x, x)\na = dup(1)\nb = dup(2 == 2)\na\n"
+    },
+    "definitions": [
+        {
+            "useSpan": {
+                "start": 370,
+                "end": 371
+            },
+            "defSpan": {
+                "start": 366,
+                "end": 367
+            },
+            "name": "x"
+        },
+        {
+            "useSpan": {
+                "start": 373,
+                "end": 374
+            },
+            "defSpan": {
+                "start": 366,
+                "end": 367
+            },
+            "name": "x"
+        },
+        {
+            "useSpan": {
+                "start": 380,
+                "end": 383
+            },
+            "defSpan": {
+                "start": 353,
+                "end": 356
+            },
+            "name": "dup"
+        },
+        {
+            "useSpan": {
+                "start": 391,
+                "end": 394
+            },
+            "defSpan": {
+                "start": 353,
+                "end": 356
+            },
+            "name": "dup"
+        },
+        {
+            "useSpan": {
+                "start": 403,
+                "end": 404
+            },
+            "defSpan": {
+                "start": 376,
+                "end": 377
+            },
+            "name": "a"
+        }
+    ],
+    "scopes": [
+        {
+            "span": {
+                "start": 370,
+                "end": 375
+            },
+            "bindings": [
+                {
+                    "name": "x",
+                    "defSpan": {
+                        "start": 366,
+                        "end": 367
+                    },
+                    "type": "(Int \u21d2 (Int, Int))"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 370,
+                "end": 371
+            },
+            "bindings": [
+                {
+                    "name": "x",
+                    "defSpan": {
+                        "start": 366,
+                        "end": 367
+                    },
+                    "type": "(Int \u21d2 (Int, Int))"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 373,
+                "end": 374
+            },
+            "bindings": [
+                {
+                    "name": "x",
+                    "defSpan": {
+                        "start": 366,
+                        "end": 367
+                    },
+                    "type": "(Int \u21d2 (Int, Int))"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 376,
+                "end": 386
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 380,
+                "end": 386
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 380,
+                "end": 383
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 384,
+                "end": 385
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 387,
+                "end": 402
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                },
+                {
+                    "name": "a",
+                    "defSpan": {
+                        "start": 376,
+                        "end": 377
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 391,
+                "end": 402
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                },
+                {
+                    "name": "a",
+                    "defSpan": {
+                        "start": 376,
+                        "end": 377
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 391,
+                "end": 394
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                },
+                {
+                    "name": "a",
+                    "defSpan": {
+                        "start": 376,
+                        "end": 377
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 395,
+                "end": 401
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                },
+                {
+                    "name": "a",
+                    "defSpan": {
+                        "start": 376,
+                        "end": 377
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 395,
+                "end": 396
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                },
+                {
+                    "name": "a",
+                    "defSpan": {
+                        "start": 376,
+                        "end": 377
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 400,
+                "end": 401
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                },
+                {
+                    "name": "a",
+                    "defSpan": {
+                        "start": 376,
+                        "end": 377
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 403,
+                "end": 404
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                },
+                {
+                    "name": "a",
+                    "defSpan": {
+                        "start": 376,
+                        "end": 377
+                    },
+                    "type": "(Int, Int)"
+                },
+                {
+                    "name": "b",
+                    "defSpan": {
+                        "start": 387,
+                        "end": 388
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        },
+        {
+            "span": {
+                "start": 403,
+                "end": 404
+            },
+            "bindings": [
+                {
+                    "name": "dup",
+                    "defSpan": {
+                        "start": 353,
+                        "end": 356
+                    },
+                    "type": "(Int, Int)"
+                },
+                {
+                    "name": "a",
+                    "defSpan": {
+                        "start": 376,
+                        "end": 377
+                    },
+                    "type": "(Int, Int)"
+                },
+                {
+                    "name": "b",
+                    "defSpan": {
+                        "start": 387,
+                        "end": 388
+                    },
+                    "type": "(Int, Int)"
+                }
+            ]
+        }
+    ],
+    "diagnostics": [],
+    "meta": {
+        "tick": null,
+        "snapshotKind": "post-inference",
+        "schema": 2
+    },
+    "stages": [
+        {
+            "id": "pre-inference",
+            "label": "IR (PRE-INFERENCE)",
+            "kind": "holes",
+            "ir": {
+                "label": "Let(dup)",
+                "annotations": [],
+                "nodeId": 16,
+                "span": {
+                    "start": 353,
+                    "end": 375
+                },
+                "provenance": "Source",
+                "type": "_",
+                "tiling": null,
+                "children": [
+                    {
+                        "edge": "0",
+                        "node": {
+                            "label": "Lambda(x)",
+                            "annotations": [],
+                            "nodeId": 15,
+                            "span": {
+                                "start": 359,
+                                "end": 375
+                            },
+                            "provenance": "Source",
+                            "type": "(_ \u21d2 _)",
+                            "tiling": null,
+                            "children": [
+                                {
+                                    "edge": "0",
+                                    "node": {
+                                        "label": "Tuple",
+                                        "annotations": [],
+                                        "nodeId": 14,
+                                        "span": {
+                                            "start": 370,
+                                            "end": 375
+                                        },
+                                        "provenance": "Source",
+                                        "type": "_",
+                                        "tiling": null,
+                                        "children": [
+                                            {
+                                                "edge": "0",
+                                                "node": {
+                                                    "label": "Var(x)",
+                                                    "annotations": [],
+                                                    "nodeId": 12,
+                                                    "span": {
+                                                        "start": 370,
+                                                        "end": 371
+                                                    },
+                                                    "provenance": "Source",
+                                                    "type": "_",
+                                                    "tiling": null,
+                                                    "children": []
+                                                }
+                                            },
+                                            {
+                                                "edge": "1",
+                                                "node": {
+                                                    "label": "Var(x)",
+                                                    "annotations": [],
+                                                    "nodeId": 13,
+                                                    "span": {
+                                                        "start": 373,
+                                                        "end": 374
+                                                    },
+                                                    "provenance": "Source",
+                                                    "type": "_",
+                                                    "tiling": null,
+                                                    "children": []
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "edge": "1",
+                        "node": {
+                            "label": "Let(a)",
+                            "annotations": [],
+                            "nodeId": 11,
+                            "span": {
+                                "start": 376,
+                                "end": 386
+                            },
+                            "provenance": "Source",
+                            "type": "_",
+                            "tiling": null,
+                            "children": [
+                                {
+                                    "edge": "0",
+                                    "node": {
+                                        "label": "Apply",
+                                        "annotations": [],
+                                        "nodeId": 10,
+                                        "span": {
+                                            "start": 380,
+                                            "end": 386
+                                        },
+                                        "provenance": "Source",
+                                        "type": "_",
+                                        "tiling": null,
+                                        "children": [
+                                            {
+                                                "edge": "0",
+                                                "node": {
+                                                    "label": "Var(dup)",
+                                                    "annotations": [],
+                                                    "nodeId": 9,
+                                                    "span": null,
+                                                    "provenance": null,
+                                                    "type": "_",
+                                                    "tiling": null,
+                                                    "children": []
+                                                }
+                                            },
+                                            {
+                                                "edge": "1",
+                                                "node": {
+                                                    "label": "Lit(Int(1))",
+                                                    "annotations": [],
+                                                    "nodeId": 8,
+                                                    "span": {
+                                                        "start": 384,
+                                                        "end": 385
+                                                    },
+                                                    "provenance": "Source",
+                                                    "type": "_",
+                                                    "tiling": null,
+                                                    "children": []
+                                                }
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "edge": "1",
+                                    "node": {
+                                        "label": "Let(b)",
+                                        "annotations": [],
+                                        "nodeId": 7,
+                                        "span": {
+                                            "start": 387,
+                                            "end": 402
+                                        },
+                                        "provenance": "Source",
+                                        "type": "_",
+                                        "tiling": null,
+                                        "children": [
+                                            {
+                                                "edge": "0",
+                                                "node": {
+                                                    "label": "Apply",
+                                                    "annotations": [],
+                                                    "nodeId": 6,
+                                                    "span": {
+                                                        "start": 391,
+                                                        "end": 402
+                                                    },
+                                                    "provenance": "Source",
+                                                    "type": "_",
+                                                    "tiling": null,
+                                                    "children": [
+                                                        {
+                                                            "edge": "0",
+                                                            "node": {
+                                                                "label": "Var(dup)",
+                                                                "annotations": [],
+                                                                "nodeId": 5,
+                                                                "span": null,
+                                                                "provenance": null,
+                                                                "type": "_",
+                                                                "tiling": null,
+                                                                "children": []
+                                                            }
+                                                        },
+                                                        {
+                                                            "edge": "1",
+                                                            "node": {
+                                                                "label": "BinOp(Compare(Equals))",
+                                                                "annotations": [],
+                                                                "nodeId": 4,
+                                                                "span": {
+                                                                    "start": 395,
+                                                                    "end": 401
+                                                                },
+                                                                "provenance": "Source",
+                                                                "type": "_",
+                                                                "tiling": null,
+                                                                "children": [
+                                                                    {
+                                                                        "edge": "0",
+                                                                        "node": {
+                                                                            "label": "Lit(Int(2))",
+                                                                            "annotations": [],
+                                                                            "nodeId": 2,
+                                                                            "span": {
+                                                                                "start": 395,
+                                                                                "end": 396
+                                                                            },
+                                                                            "provenance": "Source",
+                                                                            "type": "_",
+                                                                            "tiling": null,
+                                                                            "children": []
+                                                                        }
+                                                                    },
+                                                                    {
+                                                                        "edge": "1",
+                                                                        "node": {
+                                                                            "label": "Lit(Int(2))",
+                                                                            "annotations": [],
+                                                                            "nodeId": 3,
+                                                                            "span": {
+                                                                                "start": 400,
+                                                                                "end": 401
+                                                                            },
+                                                                            "provenance": "Source",
+                                                                            "type": "_",
+                                                                            "tiling": null,
+                                                                            "children": []
+                                                                        }
+                                                                    }
+                                                                ]
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            },
+                                            {
+                                                "edge": "1",
+                                                "node": {
+                                                    "label": "Var(a)",
+                                                    "annotations": [],
+                                                    "nodeId": 1,
+                                                    "span": {
+                                                        "start": 403,
+                                                        "end": 404
+                                                    },
+                                                    "provenance": "Source",
+                                                    "type": "_",
+                                                    "tiling": null,
+                                                    "children": []
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            "spanIndex": [
+                {
+                    "span": {
+                        "start": 353,
+                        "end": 375
+                    },
+                    "nodeId": 16
+                },
+                {
+                    "span": {
+                        "start": 359,
+                        "end": 375
+                    },
+                    "nodeId": 15
+                },
+                {
+                    "span": {
+                        "start": 370,
+                        "end": 375
+                    },
+                    "nodeId": 14
+                },
+                {
+                    "span": {
+                        "start": 370,
+                        "end": 371
+                    },
+                    "nodeId": 12
+                },
+                {
+                    "span": {
+                        "start": 373,
+                        "end": 374
+                    },
+                    "nodeId": 13
+                },
+                {
+                    "span": {
+                        "start": 376,
+                        "end": 386
+                    },
+                    "nodeId": 11
+                },
+                {
+                    "span": {
+                        "start": 380,
+                        "end": 386
+                    },
+                    "nodeId": 10
+                },
+                {
+                    "span": {
+                        "start": 384,
+                        "end": 385
+                    },
+                    "nodeId": 8
+                },
+                {
+                    "span": {
+                        "start": 387,
+                        "end": 402
+                    },
+                    "nodeId": 7
+                },
+                {
+                    "span": {
+                        "start": 391,
+                        "end": 402
+                    },
+                    "nodeId": 6
+                },
+                {
+                    "span": {
+                        "start": 395,
+                        "end": 401
+                    },
+                    "nodeId": 4
+                },
+                {
+                    "span": {
+                        "start": 395,
+                        "end": 396
+                    },
+                    "nodeId": 2
+                },
+                {
+                    "span": {
+                        "start": 400,
+                        "end": 401
+                    },
+                    "nodeId": 3
+                },
+                {
+                    "span": {
+                        "start": 403,
+                        "end": 404
+                    },
+                    "nodeId": 1
+                }
+            ]
+        },
+        {
+            "id": "post-inference",
+            "label": "IR (POST-INFERENCE)",
+            "kind": "typed",
+            "ir": {
+                "label": "Let(__mono)",
+                "annotations": [],
+                "nodeId": 26,
+                "span": {
+                    "start": 353,
+                    "end": 375
+                },
+                "provenance": "Derived(Mono)",
+                "type": "(Int, Int)",
+                "tiling": null,
+                "children": [
+                    {
+                        "edge": "0",
+                        "node": {
+                            "label": "Lambda(x)",
+                            "annotations": [],
+                            "nodeId": 17,
+                            "span": {
+                                "start": 359,
+                                "end": 375
+                            },
+                            "provenance": "Derived(Mono)",
+                            "type": "(Int \u21d2 (Int, Int))",
+                            "tiling": null,
+                            "children": [
+                                {
+                                    "edge": "0",
+                                    "node": {
+                                        "label": "Tuple",
+                                        "annotations": [],
+                                        "nodeId": 18,
+                                        "span": {
+                                            "start": 370,
+                                            "end": 375
+                                        },
+                                        "provenance": "Derived(Mono)",
+                                        "type": "(Int, Int)",
+                                        "tiling": null,
+                                        "children": [
+                                            {
+                                                "edge": "0",
+                                                "node": {
+                                                    "label": "Var(x)",
+                                                    "annotations": [],
+                                                    "nodeId": 19,
+                                                    "span": {
+                                                        "start": 370,
+                                                        "end": 371
+                                                    },
+                                                    "provenance": "Derived(Mono)",
+                                                    "type": "Int",
+                                                    "tiling": null,
+                                                    "children": []
+                                                }
+                                            },
+                                            {
+                                                "edge": "1",
+                                                "node": {
+                                                    "label": "Var(x)",
+                                                    "annotations": [],
+                                                    "nodeId": 20,
+                                                    "span": {
+                                                        "start": 373,
+                                                        "end": 374
+                                                    },
+                                                    "provenance": "Derived(Mono)",
+                                                    "type": "Int",
+                                                    "tiling": null,
+                                                    "children": []
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "edge": "1",
+                        "node": {
+                            "label": "Let(__mono)",
+                            "annotations": [],
+                            "nodeId": 25,
+                            "span": {
+                                "start": 353,
+                                "end": 375
+                            },
+                            "provenance": "Derived(Mono)",
+                            "type": "(Int, Int)",
+                            "tiling": null,
+                            "children": [
+                                {
+                                    "edge": "0",
+                                    "node": {
+                                        "label": "Lambda(x)",
+                                        "annotations": [],
+                                        "nodeId": 21,
+                                        "span": {
+                                            "start": 359,
+                                            "end": 375
+                                        },
+                                        "provenance": "Derived(Mono)",
+                                        "type": "(Bool \u21d2 (Bool, Bool))",
+                                        "tiling": null,
+                                        "children": [
+                                            {
+                                                "edge": "0",
+                                                "node": {
+                                                    "label": "Tuple",
+                                                    "annotations": [],
+                                                    "nodeId": 22,
+                                                    "span": {
+                                                        "start": 370,
+                                                        "end": 375
+                                                    },
+                                                    "provenance": "Derived(Mono)",
+                                                    "type": "(Bool, Bool)",
+                                                    "tiling": null,
+                                                    "children": [
+                                                        {
+                                                            "edge": "0",
+                                                            "node": {
+                                                                "label": "Var(x)",
+                                                                "annotations": [],
+                                                                "nodeId": 23,
+                                                                "span": {
+                                                                    "start": 370,
+                                                                    "end": 371
+                                                                },
+                                                                "provenance": "Derived(Mono)",
+                                                                "type": "Bool",
+                                                                "tiling": null,
+                                                                "children": []
+                                                            }
+                                                        },
+                                                        {
+                                                            "edge": "1",
+                                                            "node": {
+                                                                "label": "Var(x)",
+                                                                "annotations": [],
+                                                                "nodeId": 24,
+                                                                "span": {
+                                                                    "start": 373,
+                                                                    "end": 374
+                                                                },
+                                                                "provenance": "Derived(Mono)",
+                                                                "type": "Bool",
+                                                                "tiling": null,
+                                                                "children": []
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "edge": "1",
+                                    "node": {
+                                        "label": "Let(a)",
+                                        "annotations": [],
+                                        "nodeId": 11,
+                                        "span": {
+                                            "start": 376,
+                                            "end": 386
+                                        },
+                                        "provenance": "Source",
+                                        "type": "(Int, Int)",
+                                        "tiling": null,
+                                        "children": [
+                                            {
+                                                "edge": "0",
+                                                "node": {
+                                                    "label": "Apply",
+                                                    "annotations": [],
+                                                    "nodeId": 10,
+                                                    "span": {
+                                                        "start": 380,
+                                                        "end": 386
+                                                    },
+                                                    "provenance": "Source",
+                                                    "type": "(Int, Int)",
+                                                    "tiling": null,
+                                                    "children": [
+                                                        {
+                                                            "edge": "0",
+                                                            "node": {
+                                                                "label": "Var(__mono)",
+                                                                "annotations": [],
+                                                                "nodeId": 9,
+                                                                "span": null,
+                                                                "provenance": null,
+                                                                "type": "(Int \u21d2 (Int, Int))",
+                                                                "tiling": null,
+                                                                "children": []
+                                                            }
+                                                        },
+                                                        {
+                                                            "edge": "1",
+                                                            "node": {
+                                                                "label": "Lit(Int(1))",
+                                                                "annotations": [],
+                                                                "nodeId": 8,
+                                                                "span": {
+                                                                    "start": 384,
+                                                                    "end": 385
+                                                                },
+                                                                "provenance": "Source",
+                                                                "type": "Int",
+                                                                "tiling": null,
+                                                                "children": []
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            },
+                                            {
+                                                "edge": "1",
+                                                "node": {
+                                                    "label": "Let(b)",
+                                                    "annotations": [],
+                                                    "nodeId": 7,
+                                                    "span": {
+                                                        "start": 387,
+                                                        "end": 402
+                                                    },
+                                                    "provenance": "Source",
+                                                    "type": "(Int, Int)",
+                                                    "tiling": null,
+                                                    "children": [
+                                                        {
+                                                            "edge": "0",
+                                                            "node": {
+                                                                "label": "Apply",
+                                                                "annotations": [],
+                                                                "nodeId": 6,
+                                                                "span": {
+                                                                    "start": 391,
+                                                                    "end": 402
+                                                                },
+                                                                "provenance": "Source",
+                                                                "type": "(Bool, Bool)",
+                                                                "tiling": null,
+                                                                "children": [
+                                                                    {
+                                                                        "edge": "0",
+                                                                        "node": {
+                                                                            "label": "Var(__mono)",
+                                                                            "annotations": [],
+                                                                            "nodeId": 5,
+                                                                            "span": null,
+                                                                            "provenance": null,
+                                                                            "type": "(Bool \u21d2 (Bool, Bool))",
+                                                                            "tiling": null,
+                                                                            "children": []
+                                                                        }
+                                                                    },
+                                                                    {
+                                                                        "edge": "1",
+                                                                        "node": {
+                                                                            "label": "BinOp(Compare(Equals))",
+                                                                            "annotations": [],
+                                                                            "nodeId": 4,
+                                                                            "span": {
+                                                                                "start": 395,
+                                                                                "end": 401
+                                                                            },
+                                                                            "provenance": "Source",
+                                                                            "type": "Bool",
+                                                                            "tiling": null,
+                                                                            "children": [
+                                                                                {
+                                                                                    "edge": "0",
+                                                                                    "node": {
+                                                                                        "label": "Lit(Int(2))",
+                                                                                        "annotations": [],
+                                                                                        "nodeId": 2,
+                                                                                        "span": {
+                                                                                            "start": 395,
+                                                                                            "end": 396
+                                                                                        },
+                                                                                        "provenance": "Source",
+                                                                                        "type": "Int",
+                                                                                        "tiling": null,
+                                                                                        "children": []
+                                                                                    }
+                                                                                },
+                                                                                {
+                                                                                    "edge": "1",
+                                                                                    "node": {
+                                                                                        "label": "Lit(Int(2))",
+                                                                                        "annotations": [],
+                                                                                        "nodeId": 3,
+                                                                                        "span": {
+                                                                                            "start": 400,
+                                                                                            "end": 401
+                                                                                        },
+                                                                                        "provenance": "Source",
+                                                                                        "type": "Int",
+                                                                                        "tiling": null,
+                                                                                        "children": []
+                                                                                    }
+                                                                                }
+                                                                            ]
+                                                                        }
+                                                                    }
+                                                                ]
+                                                            }
+                                                        },
+                                                        {
+                                                            "edge": "1",
+                                                            "node": {
+                                                                "label": "Var(a)",
+                                                                "annotations": [],
+                                                                "nodeId": 1,
+                                                                "span": {
+                                                                    "start": 403,
+                                                                    "end": 404
+                                                                },
+                                                                "provenance": "Source",
+                                                                "type": "(Int, Int)",
+                                                                "tiling": null,
+                                                                "children": []
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            "spanIndex": [
+                {
+                    "span": {
+                        "start": 353,
+                        "end": 375
+                    },
+                    "nodeId": 26
+                },
+                {
+                    "span": {
+                        "start": 359,
+                        "end": 375
+                    },
+                    "nodeId": 17
+                },
+                {
+                    "span": {
+                        "start": 370,
+                        "end": 375
+                    },
+                    "nodeId": 18
+                },
+                {
+                    "span": {
+                        "start": 370,
+                        "end": 371
+                    },
+                    "nodeId": 19
+                },
+                {
+                    "span": {
+                        "start": 373,
+                        "end": 374
+                    },
+                    "nodeId": 20
+                },
+                {
+                    "span": {
+                        "start": 353,
+                        "end": 375
+                    },
+                    "nodeId": 25
+                },
+                {
+                    "span": {
+                        "start": 359,
+                        "end": 375
+                    },
+                    "nodeId": 21
+                },
+                {
+                    "span": {
+                        "start": 370,
+                        "end": 375
+                    },
+                    "nodeId": 22
+                },
+                {
+                    "span": {
+                        "start": 370,
+                        "end": 371
+                    },
+                    "nodeId": 23
+                },
+                {
+                    "span": {
+                        "start": 373,
+                        "end": 374
+                    },
+                    "nodeId": 24
+                },
+                {
+                    "span": {
+                        "start": 376,
+                        "end": 386
+                    },
+                    "nodeId": 11
+                },
+                {
+                    "span": {
+                        "start": 380,
+                        "end": 386
+                    },
+                    "nodeId": 10
+                },
+                {
+                    "span": {
+                        "start": 384,
+                        "end": 385
+                    },
+                    "nodeId": 8
+                },
+                {
+                    "span": {
+                        "start": 387,
+                        "end": 402
+                    },
+                    "nodeId": 7
+                },
+                {
+                    "span": {
+                        "start": 391,
+                        "end": 402
+                    },
+                    "nodeId": 6
+                },
+                {
+                    "span": {
+                        "start": 395,
+                        "end": 401
+                    },
+                    "nodeId": 4
+                },
+                {
+                    "span": {
+                        "start": 395,
+                        "end": 396
+                    },
+                    "nodeId": 2
+                },
+                {
+                    "span": {
+                        "start": 400,
+                        "end": 401
+                    },
+                    "nodeId": 3
+                },
+                {
+                    "span": {
+                        "start": 403,
+                        "end": 404
+                    },
+                    "nodeId": 1
+                }
+            ]
+        },
+        {
+            "id": "post-desugar",
+            "label": "IR (POST-DESUGAR)",
+            "kind": "typed",
+            "ir": {
+                "label": "Let(a)",
+                "annotations": [],
+                "nodeId": 11,
+                "span": {
+                    "start": 376,
+                    "end": 386
+                },
+                "provenance": "Source",
+                "type": "(Int, Int)",
+                "tiling": null,
+                "children": [
+                    {
+                        "edge": "0",
+                        "node": {
+                            "label": "Tuple",
+                            "annotations": [],
+                            "nodeId": 18,
+                            "span": {
+                                "start": 370,
+                                "end": 375
+                            },
+                            "provenance": "Derived(Mono)",
+                            "type": "(Int, Int)",
+                            "tiling": null,
+                            "children": [
+                                {
+                                    "edge": "0",
+                                    "node": {
+                                        "label": "Lit(Int(1))",
+                                        "annotations": [],
+                                        "nodeId": 8,
+                                        "span": {
+                                            "start": 384,
+                                            "end": 385
+                                        },
+                                        "provenance": "Source",
+                                        "type": "Int",
+                                        "tiling": null,
+                                        "children": []
+                                    }
+                                },
+                                {
+                                    "edge": "1",
+                                    "node": {
+                                        "label": "Lit(Int(1))",
+                                        "annotations": [],
+                                        "nodeId": 65,
+                                        "span": {
+                                            "start": 384,
+                                            "end": 385
+                                        },
+                                        "provenance": "Derived(Inline)",
+                                        "type": "Int",
+                                        "tiling": null,
+                                        "children": []
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    {
+                        "edge": "1",
+                        "node": {
+                            "label": "Let(b)",
+                            "annotations": [],
+                            "nodeId": 7,
+                            "span": {
+                                "start": 387,
+                                "end": 402
+                            },
+                            "provenance": "Source",
+                            "type": "(Int, Int)",
+                            "tiling": null,
+                            "children": [
+                                {
+                                    "edge": "0",
+                                    "node": {
+                                        "label": "Tuple",
+                                        "annotations": [],
+                                        "nodeId": 22,
+                                        "span": {
+                                            "start": 370,
+                                            "end": 375
+                                        },
+                                        "provenance": "Derived(Mono)",
+                                        "type": "(Bool, Bool)",
+                                        "tiling": null,
+                                        "children": [
+                                            {
+                                                "edge": "0",
+                                                "node": {
+                                                    "label": "BinOp(Compare(Equals))",
+                                                    "annotations": [],
+                                                    "nodeId": 4,
+                                                    "span": {
+                                                        "start": 395,
+                                                        "end": 401
+                                                    },
+                                                    "provenance": "Source",
+                                                    "type": "Bool",
+                                                    "tiling": null,
+                                                    "children": [
+                                                        {
+                                                            "edge": "0",
+                                                            "node": {
+                                                                "label": "Lit(Int(2))",
+                                                                "annotations": [],
+                                                                "nodeId": 2,
+                                                                "span": {
+                                                                    "start": 395,
+                                                                    "end": 396
+                                                                },
+                                                                "provenance": "Source",
+                                                                "type": "Int",
+                                                                "tiling": null,
+                                                                "children": []
+                                                            }
+                                                        },
+                                                        {
+                                                            "edge": "1",
+                                                            "node": {
+                                                                "label": "Lit(Int(2))",
+                                                                "annotations": [],
+                                                                "nodeId": 3,
+                                                                "span": {
+                                                                    "start": 400,
+                                                                    "end": 401
+                                                                },
+                                                                "provenance": "Source",
+                                                                "type": "Int",
+                                                                "tiling": null,
+                                                                "children": []
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            },
+                                            {
+                                                "edge": "1",
+                                                "node": {
+                                                    "label": "BinOp(Compare(Equals))",
+                                                    "annotations": [],
+                                                    "nodeId": 66,
+                                                    "span": {
+                                                        "start": 395,
+                                                        "end": 401
+                                                    },
+                                                    "provenance": "Derived(Inline)",
+                                                    "type": "Bool",
+                                                    "tiling": null,
+                                                    "children": [
+                                                        {
+                                                            "edge": "0",
+                                                            "node": {
+                                                                "label": "Lit(Int(2))",
+                                                                "annotations": [],
+                                                                "nodeId": 67,
+                                                                "span": {
+                                                                    "start": 395,
+                                                                    "end": 396
+                                                                },
+                                                                "provenance": "Derived(Inline)",
+                                                                "type": "Int",
+                                                                "tiling": null,
+                                                                "children": []
+                                                            }
+                                                        },
+                                                        {
+                                                            "edge": "1",
+                                                            "node": {
+                                                                "label": "Lit(Int(2))",
+                                                                "annotations": [],
+                                                                "nodeId": 68,
+                                                                "span": {
+                                                                    "start": 400,
+                                                                    "end": 401
+                                                                },
+                                                                "provenance": "Derived(Inline)",
+                                                                "type": "Int",
+                                                                "tiling": null,
+                                                                "children": []
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }
+                                        ]
+                                    }
+                                },
+                                {
+                                    "edge": "1",
+                                    "node": {
+                                        "label": "Var(a)",
+                                        "annotations": [],
+                                        "nodeId": 1,
+                                        "span": {
+                                            "start": 403,
+                                            "end": 404
+                                        },
+                                        "provenance": "Source",
+                                        "type": "(Int, Int)",
+                                        "tiling": null,
+                                        "children": []
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            "spanIndex": [
+                {
+                    "span": {
+                        "start": 376,
+                        "end": 386
+                    },
+                    "nodeId": 11
+                },
+                {
+                    "span": {
+                        "start": 370,
+                        "end": 375
+                    },
+                    "nodeId": 18
+                },
+                {
+                    "span": {
+                        "start": 384,
+                        "end": 385
+                    },
+                    "nodeId": 8
+                },
+                {
+                    "span": {
+                        "start": 384,
+                        "end": 385
+                    },
+                    "nodeId": 65
+                },
+                {
+                    "span": {
+                        "start": 387,
+                        "end": 402
+                    },
+                    "nodeId": 7
+                },
+                {
+                    "span": {
+                        "start": 370,
+                        "end": 375
+                    },
+                    "nodeId": 22
+                },
+                {
+                    "span": {
+                        "start": 395,
+                        "end": 401
+                    },
+                    "nodeId": 4
+                },
+                {
+                    "span": {
+                        "start": 395,
+                        "end": 396
+                    },
+                    "nodeId": 2
+                },
+                {
+                    "span": {
+                        "start": 400,
+                        "end": 401
+                    },
+                    "nodeId": 3
+                },
+                {
+                    "span": {
+                        "start": 395,
+                        "end": 401
+                    },
+                    "nodeId": 66
+                },
+                {
+                    "span": {
+                        "start": 395,
+                        "end": 396
+                    },
+                    "nodeId": 67
+                },
+                {
+                    "span": {
+                        "start": 400,
+                        "end": 401
+                    },
+                    "nodeId": 68
+                },
+                {
+                    "span": {
+                        "start": 403,
+                        "end": 404
+                    },
+                    "nodeId": 1
+                }
+            ]
+        }
+    ],
+    "stageLinks": [
+        {
+            "from": "pre-inference",
+            "to": "post-inference",
+            "edges": [
+                [
+                    12,
+                    19
+                ],
+                [
+                    12,
+                    23
+                ],
+                [
+                    13,
+                    20
+                ],
+                [
+                    13,
+                    24
+                ],
+                [
+                    14,
+                    18
+                ],
+                [
+                    14,
+                    22
+                ],
+                [
+                    15,
+                    17
+                ],
+                [
+                    15,
+                    21
+                ],
+                [
+                    16,
+                    25
+                ],
+                [
+                    16,
+                    26
+                ]
+            ]
+        },
+        {
+            "from": "post-inference",
+            "to": "post-desugar",
+            "edges": [
+                [
+                    2,
+                    67
+                ],
+                [
+                    3,
+                    68
+                ],
+                [
+                    4,
+                    66
+                ],
+                [
+                    8,
+                    65
+                ]
+            ]
+        }
+    ]
+}
