@@ -40,6 +40,17 @@ pub enum Tiling {
         kind: AggregateKind,
         accumulator: Extent,
     },
+    /// A transactional store — the static shape of a [`Tile::Store`]: a step
+    /// function from the commit-time domain to a per-key state record. Its
+    /// extent is `Fun(domain, codomain)`, identical to a `SealedFunction`; the
+    /// distinction is the runtime step semantics (see [`Tile::Store`]).
+    Store {
+        /// The commit-time domain (`Txn`).
+        domain: Extent,
+        /// The per-key state record `{key: value}` the store maps each commit
+        /// time to.
+        codomain: Box<Tiling>,
+    },
 }
 
 impl Tiling {
@@ -47,10 +58,12 @@ impl Tiling {
         match self {
             Tiling::Scalar(e) => e.clone(),
             Tiling::Record(m) => Extent::Record(transform_hashmap_values(m, Tiling::extent)),
-            Tiling::SealedFunction { domain, codomain } => Extent::Function {
-                domain: Box::new(domain.clone()),
-                codomain: Box::new(codomain.extent()),
-            },
+            Tiling::SealedFunction { domain, codomain } | Tiling::Store { domain, codomain } => {
+                Extent::Function {
+                    domain: Box::new(domain.clone()),
+                    codomain: Box::new(codomain.extent()),
+                }
+            }
             Tiling::CurriedFunction {
                 domain1,
                 domain2,
@@ -72,9 +85,9 @@ impl Tiling {
             Tiling::Record(m) => {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.universal_guard()))
             }
-            Tiling::SealedFunction { .. } | Tiling::CurriedFunction { .. } => {
-                TileGuard::Function(FunctionGuard::Domain(Predicate::True))
-            }
+            Tiling::SealedFunction { .. }
+            | Tiling::CurriedFunction { .. }
+            | Tiling::Store { .. } => TileGuard::Function(FunctionGuard::Domain(Predicate::True)),
             Tiling::Aggregation { .. } => TileGuard::Aggregation(true),
         }
     }
@@ -85,9 +98,9 @@ impl Tiling {
             Tiling::Record(m) => {
                 TileGuard::Record(transform_hashmap_values(m, |t| t.empty_guard()))
             }
-            Tiling::SealedFunction { .. } | Tiling::CurriedFunction { .. } => {
-                TileGuard::Function(FunctionGuard::Domain(Predicate::False))
-            }
+            Tiling::SealedFunction { .. }
+            | Tiling::CurriedFunction { .. }
+            | Tiling::Store { .. } => TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
             Tiling::Aggregation { .. } => TileGuard::Aggregation(false),
         }
     }
@@ -97,17 +110,21 @@ impl Tiling {
             Tiling::Scalar(Extent::Function { codomain, .. }) => {
                 Some(Tiling::Scalar(*codomain.clone()))
             }
-            Tiling::SealedFunction { codomain, .. } => Some(*codomain.clone()),
+            Tiling::SealedFunction { codomain, .. } | Tiling::Store { codomain, .. } => {
+                Some(*codomain.clone())
+            }
             _ => None,
         }
     }
 
     /// Return the domain extent if the the tiling represents a function.  This returns Some
-    /// for Scalar(Function), SealedFunction, and CurriedFunction
+    /// for Scalar(Function), SealedFunction, CurriedFunction, and Store.
     pub fn domain_extent(&self) -> Option<Extent> {
         match self {
             Tiling::Scalar(Extent::Function { domain, .. }) => Some(*domain.clone()),
-            Tiling::SealedFunction { domain, .. } => Some(domain.clone()),
+            Tiling::SealedFunction { domain, .. } | Tiling::Store { domain, .. } => {
+                Some(domain.clone())
+            }
             Tiling::CurriedFunction { domain1, .. } => Some(domain1.clone()),
             _ => None,
         }
@@ -119,7 +136,7 @@ impl Tiling {
             Tiling::Scalar(Extent::Function { domain, codomain }) => {
                 Some((*domain.clone(), *codomain.clone()))
             }
-            Tiling::SealedFunction { domain, codomain } => {
+            Tiling::SealedFunction { domain, codomain } | Tiling::Store { domain, codomain } => {
                 Some((domain.clone(), codomain.extent()))
             }
             _ => None,
@@ -152,6 +169,12 @@ impl Tiling {
                 kind: *kind,
                 terminal: ColumnValue::Bools(BitVec::new()),
                 accumulator: ColumnValue::from_values(Vec::new(), accumulator),
+            },
+            // An empty store: no change events yet, frontier undecided.
+            Tiling::Store { domain, .. } => Tile::Store {
+                changes: ColumnValue::from_values(Vec::new(), domain),
+                deltas: ColumnValue::Variants(Vec::new()),
+                frontier: Predicate::False,
             },
         }
     }
@@ -202,6 +225,7 @@ impl fmt::Display for Tiling {
             Tiling::Scalar(e) => write!(f, "{e:?}"),
             Tiling::Record(fields) => fmt_record(f, fields),
             Tiling::SealedFunction { domain, codomain } => write!(f, "SF({domain:?} → {codomain})"),
+            Tiling::Store { domain, codomain } => write!(f, "Store({domain:?} → {codomain})"),
             Tiling::CurriedFunction {
                 domain1,
                 domain2,

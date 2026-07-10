@@ -388,6 +388,14 @@ impl Subst {
                 let (name, value) = self.apply_handle_use(name, value);
                 Define { name, value }
             }
+            // The write target is a use of the mutable variable's binding,
+            // renamed exactly like a Feed target (a discharge to a
+            // non-variable term keeps the stale name for the phase's own
+            // residue checks to report).
+            MutWrite { name, value } => {
+                let (name, value) = self.apply_handle_use(name, value);
+                MutWrite { name, value }
+            }
 
             Lambda { param, body } => {
                 // Domain refinements ride the param's *type* (a
@@ -398,6 +406,17 @@ impl Subst {
                 let mut param = param.clone();
                 param.name = param_name;
                 Lambda { param, body }
+            }
+
+            // The loop target binds only in the body; the source sees the
+            // outer scope — same discipline as `Lambda`.
+            For { target, iter, body } => {
+                let iter = Box::new(self.apply_expr(iter));
+                let (target_name, inner) = self.under_binder(&target.name, body);
+                let body = Box::new(inner.apply_expr(body));
+                let mut target = target.clone();
+                target.name = target_name;
+                For { target, iter, body }
             }
 
             Let {
@@ -417,23 +436,19 @@ impl Subst {
                 }
             }
 
-            Loop {
-                params,
-                init_args,
-                source,
-                loop_body,
-            } => {
-                // `init_args` / `source` sit outside the loop-param scope.
-                let init_args = init_args.iter().map(|a| self.apply_expr(a)).collect();
-                let source = Box::new(self.apply_expr(source));
-                // Shadow every loop param inside the body.
-                let inner = params.iter().fold(self.clone(), |s, p| s.shadow(&p.name));
-                let loop_body = Box::new(inner.apply_expr(loop_body));
-                Loop {
-                    params: params.clone(),
-                    init_args,
-                    source,
-                    loop_body,
+            LetRec { bindings, body } => {
+                // Mutual recursion: every group binder is in scope in every
+                // binding body AND the letrec body, so all of them shadow the
+                // substitution throughout the group.
+                let inner = bindings
+                    .iter()
+                    .fold(self.clone(), |s, (b, _)| s.shadow(&b.name));
+                LetRec {
+                    bindings: bindings
+                        .iter()
+                        .map(|(b, def)| (b.clone(), inner.apply_expr(def)))
+                        .collect(),
+                    body: Box::new(inner.apply_expr(body)),
                 }
             }
 
@@ -558,7 +573,9 @@ impl Subst {
                 self.rewrite_expr_go(value, memo);
             }
 
-            TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
+            TypedExprNode::Feed { name, value }
+            | TypedExprNode::Define { name, value }
+            | TypedExprNode::MutWrite { name, value } => {
                 *name = self.handle_target(name);
                 self.rewrite_expr_go(value, memo);
             }
@@ -570,6 +587,11 @@ impl Subst {
                 self.under_binder_mut(&param.name, body, memo);
             }
 
+            TypedExprNode::For { target, iter, body } => {
+                self.rewrite_expr_go(iter, memo);
+                self.under_binder_mut(&target.name, body, memo);
+            }
+
             TypedExprNode::Let {
                 binding,
                 bound_expr,
@@ -579,21 +601,20 @@ impl Subst {
                 self.under_binder_mut(&binding.name, body, memo);
             }
 
-            TypedExprNode::Loop {
-                params,
-                init_args,
-                source,
-                loop_body,
-            } => {
-                for a in init_args.iter_mut() {
-                    self.rewrite_expr_go(a, memo);
+            TypedExprNode::LetRec { bindings, body } => {
+                // Every group binder scopes every binding body and the letrec
+                // body (mutual recursion) — shadow them all before descending
+                // anywhere inside the group.
+                let inner = bindings
+                    .iter()
+                    .fold(self.clone(), |s, (b, _)| s.shadow(&b.name));
+                for (b, _) in bindings.iter() {
+                    inner.assert_no_capture(&b.name);
                 }
-                self.rewrite_expr_go(source, memo);
-                let inner = params.iter().fold(self.clone(), |s, p| s.shadow(&p.name));
-                for p in params.iter() {
-                    inner.assert_no_capture(&p.name);
+                for (_, def) in bindings.iter_mut() {
+                    inner.rewrite_expr_go(def, memo);
                 }
-                inner.rewrite_expr_go(loop_body, memo);
+                inner.rewrite_expr_go(body, memo);
             }
 
             TypedExprNode::Case {
@@ -676,8 +697,23 @@ impl Subst {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
+            | Type::Txn
             | Type::Hole
             | Type::Infer(_) => {}
+
+            // a nominal channel domain names its defer
+            // binder, so a handle rename (`x ↦ y` on beta-reduction /
+            // alias-inlining) must retarget it exactly like a `Feed` target —
+            // otherwise the type slot would keep naming the dead binder.
+            Type::ChanDom(name, _) => *name = self.handle_target(name),
+
+            // A transient history handle (a `Store` erased by the unified phase,
+            // a `Feed` by `channelize`): rewrite both children in place. Renaming
+            // does not cross the kind — the value and domain are ordinary types.
+            Type::History { value, domain, .. } => {
+                self.rewrite_type_go(value, memo);
+                self.rewrite_type_go(domain, memo);
+            }
 
             Type::Fun {
                 name: None,
@@ -828,8 +864,13 @@ impl Subst {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
+            | Type::Txn
             | Type::Hole
             | Type::Infer(_) => ty.clone(),
+
+            // rename the named defer binder, mirroring the
+            // in-place mode (`rewrite_type_go`).
+            Type::ChanDom(name, lvl) => Type::ChanDom(self.handle_target(name), *lvl),
 
             Type::Fun {
                 name: None,
@@ -874,6 +915,15 @@ impl Subst {
                     .map(|(k, t)| (k.clone(), self.apply_type(t)))
                     .collect(),
             ),
+            Type::History {
+                value,
+                domain,
+                kind,
+            } => Type::History {
+                value: Box::new(self.apply_type(value)),
+                domain: Box::new(self.apply_type(domain)),
+                kind: *kind,
+            },
         }
     }
 
@@ -941,7 +991,13 @@ fn collect_type_fv(
     out: &mut BTreeSet<Binder>,
 ) {
     match ty {
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::ChanDom(..)
+        | Type::Txn
+        | Type::Hole
+        | Type::Infer(_) => {}
         Type::Fun {
             name,
             domain,
@@ -974,6 +1030,10 @@ fn collect_type_fv(
         Type::Variant(tags) => tags
             .iter()
             .for_each(|(_, t)| collect_type_fv(t, bound, visited, out)),
+        Type::History { value, domain, .. } => {
+            collect_type_fv(value, bound, visited, out);
+            collect_type_fv(domain, bound, visited, out);
+        }
     }
 }
 
@@ -1010,26 +1070,32 @@ fn collect_expr_fv(
                 collect_expr_fv(body, bnd, visited, out)
             });
         }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            init_args
-                .iter()
-                .for_each(|a| collect_expr_fv(a, bound, visited, out));
-            collect_expr_fv(source, bound, visited, out);
-            with_binders(bound, params.iter().map(|p| p.name.clone()), |bnd| {
-                collect_expr_fv(loop_body, bnd, visited, out)
+        // Mutual recursion: every group binder is bound in every binding
+        // body and in the letrec body.
+        TypedExprNode::LetRec { bindings, body } => {
+            with_binders(bound, bindings.iter().map(|(b, _)| b.name.clone()), |bnd| {
+                for (_, def) in bindings {
+                    collect_expr_fv(def, bnd, visited, out);
+                }
+                collect_expr_fv(body, bnd, visited, out);
             });
         }
-        // The `name` of Feed/Define is a *use* of the defer handle variable.
-        TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
+        // The `name` of Feed/Define/MutWrite is a *use* of the defer handle
+        // / mutable variable.
+        TypedExprNode::Feed { name, value }
+        | TypedExprNode::Define { name, value }
+        | TypedExprNode::MutWrite { name, value } => {
             if !bound.contains(name) {
                 out.insert(name.clone());
             }
             collect_expr_fv(value, bound, visited, out);
+        }
+        // The loop target binds only in the body.
+        TypedExprNode::For { target, iter, body } => {
+            collect_expr_fv(iter, bound, visited, out);
+            with_binders(bound, [target.name.clone()], |bnd| {
+                collect_expr_fv(body, bnd, visited, out);
+            });
         }
         TypedExprNode::Case {
             scrutinee,
@@ -1363,6 +1429,50 @@ mod rewrite_tests {
         };
         assert_eq!(param.name, a, "the copied binding site is untouched");
         assert!(!is_free(&a, &e), "no free occurrence survives");
+    }
+
+    // A LetRec group binder shadows the substitution across *every* binding
+    // body and the letrec body — a copied group re-binding the discharged
+    // name (inlining duplicates subtrees with their uids) must keep all of
+    // its internal references pointing at the group binder.
+    #[test]
+    fn rewrite_respects_letrec_group_shadowing() {
+        use crate::ccl::TypedBinding;
+        let x = Name::fresh("x");
+        // letrec x = x + 1; y = x in x   (all references are the group's x)
+        let letrec = TypedExpr::letrec(
+            vec![
+                (
+                    TypedBinding::new_unannotated(x.clone()),
+                    gt(TypedExpr::var(x.clone()), int(1)),
+                ),
+                (
+                    TypedBinding::new_unannotated(Name::fresh("y")),
+                    TypedExpr::var(x.clone()),
+                ),
+            ],
+            TypedExpr::var(x.clone()),
+        );
+        let mut shadowed = letrec.clone();
+        Subst::discharge(x.clone(), int(3)).rewrite_expr(&mut shadowed);
+        assert_eq!(
+            shadowed, letrec,
+            "a group binder matching the discharged name blocks the \
+             substitution throughout the group"
+        );
+
+        // Control: with no matching group binder, free occurrences in every
+        // binding body and the letrec body are substituted.
+        let z = Name::fresh("z");
+        let mut open = TypedExpr::letrec(
+            vec![(
+                TypedBinding::new_unannotated(z.clone()),
+                gt(TypedExpr::var(x.clone()), int(0)),
+            )],
+            TypedExpr::var(x.clone()),
+        );
+        Subst::discharge(x.clone(), int(3)).rewrite_expr(&mut open);
+        assert!(!is_free(&x, &open), "free occurrences are discharged");
     }
 
     // Feed/Define handles rename through var-shaped mappings and survive a

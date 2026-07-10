@@ -1,0 +1,1553 @@
+//! The unified letrec phase (v1) and its recognition-to-`Transact` step.
+//!
+//! Rewrites every direct-mirror mutation loop — `ExprStmt(For {…}, cont)`
+//! with [`TypedExprNode::MutWrite`]s in the body — into a **guarded
+//! `LetRec`**: the accumulators' history over the loop's induction domain,
+//! recursion guarded by [`Builtin::GetPrevSeq`], trailing reads rewritten to
+//! `last_or_default` over the completed history. This is the induction slice
+//! of the unified phase in `src/ccl/design/mutability.md` ("The unified
+//! phase"); transactions join it in a later step.
+//!
+//! The phase runs **after inlining** on a fully-typed tree and is
+//! type-preserving: every constructed node is stamped with its concrete
+//! type, and `compile_program` re-runs the strict `typecheck` behind it.
+//!
+//! The phase emits each binding **decision-factored** — the writer body is an
+//! opaque tuple-param lambda applied to a `(guard, source)` snapshot, exactly
+//! the shape `transact_phase` emits for a commit decision — so after
+//! `lambda_elim` both domains share one normal form and recognition never has
+//! to rebuild a body. See [`transform_loop`] for the emitted shape.
+//!
+//! [`recognize`] runs **after `lambda_elim`**, on the group's point-free
+//! normal form, and lowers each group onto the domain-parameterized
+//! [`TypedExprNode::Transact`] carrier (`let __store = Transact{…} in …`),
+//! whose induction domain op-conversion compiles to the `Recurse` recurrence
+//! (the `Txn` domain, to the commit operator — the transactional slice).
+//!
+//! **Why one `LetRec` travels post-elim, and why `Transact` still exists.**
+//! Recognition anchors on the guard builtins (`get_prev_seq` / `get_prev_txn`
+//! / `begin_<site>`), which are opaque like aggregates — `channelize`,
+//! `lambda_elim`, `simplify` normalize *around* them without destroying the
+//! scaffold. So one `LetRec` (bodies point-freed, group intact) travels from
+//! the phase through `channelize` and `lambda_elim`, and recognition splits
+//! each binding into its guard scaffold and its already-point-free writer body
+//! (lifted verbatim) — retiring the former pointful/point-free double
+//! representation and the encode⇄decode lockstep it required. Guardedness is
+//! re-checked at recognition's wall by the point-free matcher
+//! ([`crate::ccl::letrec::check_letrec_guarded`]).
+//!
+//! `Transact` is recognition's **output** carrier, born post-elim and spanning
+//! recognition → planning → op-conversion: it separates the store's *keys*
+//! (each with its `init`) from the *writer body*, which is what lets `planning`
+//! iterate-wrap the writer source and op-conversion build the engine. (Retiring
+//! the node entirely would mean teaching planning's iteration staging to find
+//! writer sources inside letrec bindings — deferred until something needs it.)
+
+use std::collections::HashMap;
+
+use crate::ccl::{
+    BaseType, Builtin, Expr, F_COMMIT, F_WRITES, HistoryKind, Lit, Name, ProjKey, TransactKey,
+    TransactWriter, Type, TypedBinding, TypedExprNode, ccl_utils::count_free,
+    letrec::check_letrec_guarded, symbolic::symbolic,
+};
+
+// ---------------------------------------------------------------------------
+// Phase: For/MutWrite → LetRec
+// ---------------------------------------------------------------------------
+
+/// Rewrite every direct-mirror loop in `expr` into a guarded `LetRec`.
+/// Trees without `For` nodes pass through untouched. Panics on malformed
+/// marker shapes — lowering guarantees them, so a violation is a compiler
+/// bug, not a user error.
+pub fn run(expr: Expr) -> Expr {
+    // Restore the flat-spine invariant first: inlining a `def`-bodied
+    // pass-by-reference writer at a call site can bury a `MutWrite` under
+    // another `ExprStmt` or inside a `Let`/terminal bound-expression, where
+    // the main `rewrite`/`transform_chain` would mistake it for a pure value
+    // and drop its store advance. `flatten_spine` commutes those shapes back
+    // onto the spine so every store effect is a direct `ExprStmt` child.
+    let expr = flatten_spine(expr);
+    let mut out = rewrite(expr);
+    // The rewrite turns every mutable read/write into an ordinary recurrence
+    // read/commit at the store's *value* type, but the transient store
+    // `Type::History { kind: Store }` wrappers that rode the accumulator's
+    // binding and any surviving reference (e.g. a trailing read the recurrence
+    // re-points to the extracted final value) are stale afterward. Erase them
+    // so no store history reaches the strict `typecheck` (mirroring how
+    // `channelize` erases a feed history). On this branch every store is an
+    // induction store consumed here; the transactional `Mut[V, Txn]` erasure
+    // lands with `transact_phase`.
+    erase_mut(&mut out);
+    // Release-mode post-conditions (not `debug_assert!`): these are the phase's
+    // contract with every downstream pass — a leaked `For`/`MutWrite` marker or
+    // a surviving store history is a miscompile, not a debug-only sanity check,
+    // and `lambda_elim`'s catch-all would otherwise pass a leaked marker through
+    // silently in a release build. Both are single O(n) tree walks. A reachable
+    // program tripped the marker-residue invariant during review, so the
+    // contract is enforced in all builds.
+    assert!(
+        !contains_marker(&out),
+        "letrec phase post-condition violated: a For/MutWrite marker survived the phase"
+    );
+    assert!(
+        !contains_mut_type(&out),
+        "letrec phase post-condition violated: a store history survived the phase"
+    );
+    out
+}
+
+/// Whether the subtree still contains a pre-phase marker node.
+fn contains_marker(expr: &Expr) -> bool {
+    if matches!(
+        expr.node,
+        TypedExprNode::For { .. } | TypedExprNode::MutWrite { .. }
+    ) {
+        return true;
+    }
+    let mut found = false;
+    expr.walk_children(|c| found = found || contains_marker(c));
+    found
+}
+
+/// Whether any reachable type slot (node type, binder slot, or user
+/// annotation) still carries a mutable-**store** `Type::History` — the
+/// post-condition [`erase_mut`] establishes. A `Feed` history is *not* the
+/// phase's concern (it is erased later by `channelize`), so only
+/// [`HistoryKind::Store`] counts here.
+fn contains_mut_type(expr: &Expr) -> bool {
+    fn ty_has_mut(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::History {
+                kind: HistoryKind::Store,
+                ..
+            }
+        ) || ty.fold_children(false, |acc, t| acc || ty_has_mut(t))
+    }
+    let binder_has_mut =
+        |b: &TypedBinding| ty_has_mut(&b.ty) || b.user_annotation.as_ref().is_some_and(ty_has_mut);
+    let node_binders = match &expr.node {
+        TypedExprNode::Lambda { param, .. }
+        | TypedExprNode::Let { binding: param, .. }
+        | TypedExprNode::For { target: param, .. } => binder_has_mut(param),
+        TypedExprNode::LetRec { bindings, .. } => bindings.iter().any(|(b, _)| binder_has_mut(b)),
+        TypedExprNode::Case { branches, .. } => branches.iter().any(|b| {
+            b.pattern
+                .as_ref()
+                .is_some_and(|p| binder_has_mut(&p.binding))
+        }),
+        _ => false,
+    };
+    ty_has_mut(&expr.ty)
+        || expr.user_annotation.as_ref().is_some_and(ty_has_mut)
+        || node_binders
+        || expr.any_child(contains_mut_type)
+}
+
+/// Replace every transient mutable-**store** `Type::History { value, .. }` in
+/// `ty` with its value type (recursively), leaving all other structure intact.
+/// A `Feed` history is left untouched — `channelize` erases it later — but
+/// its children are still walked (a store nested in a feed payload, though not
+/// expected, is erased for totality).
+fn erase_mut_in_type(ty: &mut Type) {
+    if let Type::History {
+        value,
+        kind: HistoryKind::Store,
+        ..
+    } = ty
+    {
+        *ty = std::mem::replace(value.as_mut(), Type::Hole);
+        // The unwrapped value may itself be `Mut` (nested handles are not
+        // expected, but erasure is total either way) — re-check this slot.
+        return erase_mut_in_type(ty);
+    }
+    ty.walk_children_mut(erase_mut_in_type);
+}
+
+/// Erase `Type::History` on a binder slot (its declared type and any annotation).
+fn erase_mut_in_binding(b: &mut TypedBinding) {
+    erase_mut_in_type(&mut b.ty);
+    if let Some(ann) = &mut b.user_annotation {
+        erase_mut_in_type(ann);
+    }
+}
+
+/// Erase every `Type::History` throughout `expr`: node types, user annotations, and
+/// the binder slots `walk_children_mut` does not reach (`walk_binders_mut`,
+/// mirroring the binder coverage of `infer::collect_expr_errors`, the
+/// strict-wall checker this keeps happy).
+fn erase_mut(expr: &mut Expr) {
+    erase_mut_in_type(&mut expr.ty);
+    if let Some(ann) = &mut expr.user_annotation {
+        erase_mut_in_type(ann);
+    }
+    expr.walk_binders_mut(erase_mut_in_binding);
+    expr.walk_children_mut(erase_mut);
+}
+
+/// A `Unit` literal stamped with `Base(Unit)` — the value of a store write.
+fn unit_expr() -> Expr {
+    let mut u = Expr::new(TypedExprNode::Lit(Lit::Unit));
+    u.ty = Type::Base(BaseType::Unit);
+    u
+}
+
+/// `ExprStmt(effect, body)`, typed as `body` (a statement sequences before
+/// the value it precedes).
+fn expr_stmt_typed(effect: Expr, body: Expr) -> Expr {
+    let ty = body.ty.clone();
+    Expr {
+        node: TypedExprNode::ExprStmt {
+            expr: Box::new(effect),
+            body: Box::new(body),
+        },
+        ty,
+        user_annotation: None,
+    }
+}
+
+/// Whether `e` is a bare store write.
+fn is_mut_write(e: &Expr) -> bool {
+    matches!(e.node, TypedExprNode::MutWrite { .. })
+}
+
+/// Whether `e`'s statement spine performs a store write, following `ExprStmt`
+/// effects/bodies and `Let` continuations. Broader than "heads a write": a
+/// pass-by-reference writer that computes an intermediate first
+/// (`tmp = c + 1; c := tmp`) splices as a `Let`-headed body whose write sits
+/// *past* the leading binding. Used to gate `flatten_spine`'s `Let`-hoist — it
+/// fires only for genuine writer bodies, never for a pure `Let` (a join subplan
+/// spine holds no `MutWrite`, so its reassociation is left undisturbed).
+fn spine_writes_store(e: &Expr) -> bool {
+    match &e.node {
+        TypedExprNode::MutWrite { .. } => true,
+        TypedExprNode::ExprStmt { expr, body } => is_mut_write(expr) || spine_writes_store(body),
+        TypedExprNode::Let { body, .. } => spine_writes_store(body),
+        _ => false,
+    }
+}
+
+/// Splice `let binding = ⟨terminal⟩ in body` into the *terminal* position of a
+/// spliced pass-by-reference writer body, lifting every leading statement
+/// (`ExprStmt` effect) and intermediate binding (`Let`) onto the outer
+/// statement spine in order. The writer body's terminal value becomes
+/// `binding`'s bound value; a body ending in a bare `MutWrite` has value `unit`
+/// (its store's final state is unobserved through the binding).
+///
+/// This is the general form of the flat-spine hoist. Widening an intermediate
+/// binding's scope over `body` is sound post-uniquify: the intermediate is a
+/// fresh callee-local, and `body` (the caller's continuation) never references
+/// it. The writes are sequenced *before* binding — a store write reads the
+/// *previous* value, so it never observes the binder — preserving evaluation
+/// order and scope.
+fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr) -> Expr {
+    match writer_body.node {
+        TypedExprNode::ExprStmt {
+            expr: effect,
+            body: cont,
+        } => expr_stmt_typed(*effect, hoist_writer_body(binding, *cont, body)),
+        TypedExprNode::Let {
+            binding: inner,
+            bound_expr: def,
+            body: cont,
+        } => let_in(inner, *def, hoist_writer_body(binding, *cont, body)),
+        // A bare writer terminal: its value is `unit`.
+        TypedExprNode::MutWrite { name, value } => {
+            let write = Expr {
+                node: TypedExprNode::MutWrite { name, value },
+                ty: writer_body.ty,
+                user_annotation: writer_body.user_annotation,
+            };
+            expr_stmt_typed(write, let_in(binding, unit_expr(), body))
+        }
+        // A pure terminal value: bind it directly.
+        node => {
+            let terminal = Expr {
+                node,
+                ty: writer_body.ty,
+                user_annotation: writer_body.user_annotation,
+            };
+            let_in(binding, terminal, body)
+        }
+    }
+}
+
+/// **Flat-spine invariant (load-bearing).** On every statement spine, each
+/// store write (`MutWrite`) must appear as the *direct* `expr` child of an
+/// `ExprStmt` — never buried under another `ExprStmt`, nor as a `Let`/terminal
+/// bound-expression.
+///
+/// Lowering emits a *bare* `MutWrite` (no continuation) for a pass-by-reference
+/// writer's final statement so inlining can splice the writer's body into its
+/// call site (see `lower_final_stmt`). Post-inline, that splice can land the
+/// write off the spine in several shapes; `flatten_spine` commutes each back on
+/// via conversions applied to a fixpoint:
+///
+/// - `ExprStmt(ExprStmt(𝑤, 𝑏), 𝑐)  →  ExprStmt(𝑤, ExprStmt(𝑏, 𝑐))` — a
+///   multi-statement writer body (`def f(c): c += 1; c += 2`) spliced as one
+///   effect.
+/// - A `Let` bound to a *value-position* writer body (`y = f(c)`) whose spine
+///   performs a store write: `hoist_writer_body` splices `let y = ⟨terminal⟩ in
+///   k` into the body's terminal position, lifting its leading statements and
+///   intermediate bindings onto the outer spine. This subsumes the direct
+///   cases `Let(𝑥, ExprStmt(𝑤, 𝑢), 𝑘)` and `Let(𝑥, MutWrite(..), 𝑘)` and the
+///   *intermediate-first* case `Let(𝑥, Let(tmp, 𝑒, 𝑤), 𝑘)`
+///   (`def f(c): tmp = c + 1; c := tmp`), which the earlier head-only hoist
+///   missed — leaving the write trapped in the bound expression and silently
+///   mis-normalized (or surviving the phase as a marker).
+///
+/// and terminalizes a value-position write (a trailing `cnt += 1` with no
+/// read, whose final state is unobserved):
+///
+/// - `MutWrite(..)                  →  ExprStmt(MutWrite(..), unit)`.
+///
+/// The `Let`-hoist is gated on `spine_writes_store`: only a genuine writer body
+/// is reassociated. `Feed`/`Define`-headed `ExprStmt` chains keep their nesting
+/// — desugar collects feeds outermost-first, so reassociating them would
+/// reorder channel contributions — and a pure `Let` (e.g. a join subplan) holds
+/// no `MutWrite` on its spine, so it is left undisturbed. After this pass the
+/// only `MutWrite`s in the tree are `ExprStmt` effects, so `rewrite` and
+/// `transform_chain` never meet a store write in value position.
+fn flatten_spine(mut e: Expr) -> Expr {
+    // Un-nest a *store-write-headed* nested sequence (a spliced multi-statement
+    // writer body). A Feed/Define-headed nested `ExprStmt` keeps its nesting.
+    if let TypedExprNode::ExprStmt { expr: effect, .. } = &e.node
+        && let TypedExprNode::ExprStmt { expr: a, .. } = &effect.node
+        && is_mut_write(a)
+    {
+        let TypedExprNode::ExprStmt { expr: effect, body } = e.node else {
+            unreachable!()
+        };
+        let TypedExprNode::ExprStmt { expr: a, body: b } = effect.node else {
+            unreachable!()
+        };
+        let inner = expr_stmt_typed(*b, *body);
+        return flatten_spine(expr_stmt_typed(*a, inner));
+    }
+    // Lift a writer body's leading binding out of *effect* position. A
+    // pass-by-reference writer called as a bare statement (`f(cnt)`) whose body
+    // computes an intermediate first splices as `ExprStmt(Let(tmp, e, …write…),
+    // cont)` — a `Let`-chain in effect position. Re-associate the binding onto
+    // the spine (`Let(tmp, e, ExprStmt(…write…, cont))`) so the write lands as a
+    // direct `ExprStmt` effect; recursion handles further nesting. Gated on the
+    // effect performing a store write, so an ordinary `ExprStmt(let-subplan, …)`
+    // (which holds no `MutWrite`) is untouched.
+    if let TypedExprNode::ExprStmt { expr: effect, .. } = &e.node
+        && matches!(effect.node, TypedExprNode::Let { .. })
+        && spine_writes_store(effect)
+    {
+        let TypedExprNode::ExprStmt {
+            expr: effect,
+            body: cont,
+        } = e.node
+        else {
+            unreachable!()
+        };
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body: rest,
+        } = effect.node
+        else {
+            unreachable!()
+        };
+        let inner = expr_stmt_typed(*rest, *cont);
+        return flatten_spine(let_in(binding, *bound_expr, inner));
+    }
+    // Hoist store writes out of a value-position writer body bound by a `Let`
+    // (`y = f(c)`). `spine_writes_store` fires for a genuine writer body only —
+    // one that heads the write, sequences it after siblings, or computes an
+    // intermediate first — never for a pure `Let`.
+    if let TypedExprNode::Let { bound_expr, .. } = &e.node
+        && spine_writes_store(bound_expr)
+    {
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = e.node
+        else {
+            unreachable!()
+        };
+        return flatten_spine(hoist_writer_body(binding, *bound_expr, *body));
+    }
+    // A bare write reached in value/terminal position: it is a `Unit`-valued
+    // statement, not a value to bind.
+    if is_mut_write(&e) {
+        return flatten_spine(expr_stmt_typed(e, unit_expr()));
+    }
+    // Pass-through — recurse in place so this node's own `ty`/annotation are
+    // preserved (rebuilding would drop them, corrupting e.g. join subplans).
+    // An `ExprStmt` needs its effect handled specially: a `MutWrite` effect is
+    // already on-spine, so we flatten *within* it rather than passing the write
+    // itself to `flatten_spine` (which would wrongly terminalize it).
+    if let TypedExprNode::ExprStmt { expr: effect, body } = &mut e.node {
+        effect.map_children(flatten_spine);
+        let taken = std::mem::take(&mut **body);
+        **body = flatten_spine(taken);
+        return e;
+    }
+    e.map_children(flatten_spine);
+    e
+}
+
+fn rewrite(mut expr: Expr) -> Expr {
+    if let TypedExprNode::ExprStmt { expr: effect, body } = expr.node {
+        if let TypedExprNode::For {
+            target,
+            iter,
+            body: loop_body,
+        } = effect.node
+        {
+            return transform_loop(target, *iter, *loop_body, *body);
+        }
+        // A `MutWrite` outside any `For` is a *sequential* store mutation — a
+        // top-level `cnt += 1`, or an inlined pass-by-reference writer
+        // (`bump(cnt)`) spliced between statements. There is no recurrence to
+        // build; normalize it to a shadowing `let` (see `normalize_bare_write`).
+        if let TypedExprNode::MutWrite { name, value } = effect.node {
+            return normalize_bare_write(name, *value, *body);
+        }
+        // Not a loop/write statement: rebuild and recurse.
+        expr.node = TypedExprNode::ExprStmt {
+            expr: Box::new(rewrite(*effect)),
+            body: Box::new(rewrite(*body)),
+        };
+        return expr;
+    }
+    // A bare `MutWrite` never reaches value position here: `flatten_spine`
+    // (run first in `run`) commutes every store write onto the spine as a
+    // direct `ExprStmt` effect, terminalizing a value-position write to
+    // `ExprStmt(MutWrite, unit)`. Meeting one now means the flat-spine
+    // invariant was violated upstream.
+    debug_assert!(
+        !matches!(expr.node, TypedExprNode::MutWrite { .. }),
+        "letrec phase: bare MutWrite in value position — flat-spine invariant violated"
+    );
+    expr.map_children(rewrite);
+    expr
+}
+
+/// Normalize a store write outside any loop — `ExprStmt(MutWrite(name, value),
+/// cont)` — to sequential mutation: `let name' = value in rewrite(cont)`, with
+/// every read of `name` in `cont` (and any later `MutWrite` target) advanced to
+/// the fresh binder `name'`. `value` reads the *previous* store value, so it is
+/// left un-renamed. `name` is globally unique post-uniquify, so the fresh
+/// shadow cannot capture an unrelated binding.
+fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
+    let value = rewrite(value);
+    let vty = value.ty.clone();
+    let fresh = Name::fresh(name.base());
+    let mut cont = cont;
+    rename_uses(&mut cont, &name, &fresh);
+    let cont = rewrite(cont);
+    let_in(binding(fresh, vty), value, cont)
+}
+
+/// A `Var` reference stamped with its concrete type.
+fn tvar(name: &Name, ty: Type) -> Expr {
+    let mut e = Expr::var(name.clone());
+    e.ty = ty;
+    e
+}
+
+/// Destructure a (possibly refinement- or `Mut`-wrapped) function type.
+///
+/// A `Mut`-typed collection used as a loop source (`xs := [..]; for i in
+/// xs`) is read (dereferenced) to its underlying `D ⇒ V` collection — the
+/// store's value type; `erase_mut` clears the residual `Mut` on the source node
+/// at the end of the phase.
+fn fun_parts(ty: &Type) -> (Type, Type) {
+    let mut t = ty;
+    loop {
+        match t {
+            Type::Refinement(inner, _) => t = inner,
+            // Only a mutable-store collection derefs to its `D ⇒ V` value here;
+            // a feed reads as its whole stream and never reaches this phase's
+            // loop-source destructuring.
+            Type::History {
+                value,
+                kind: HistoryKind::Store,
+                ..
+            } => t = value,
+            _ => break,
+        }
+    }
+    match t {
+        Type::Fun {
+            domain, codomain, ..
+        } => ((**domain).clone(), (**codomain).clone()),
+        other => panic!("letrec phase: loop source is not a function: {other}"),
+    }
+}
+
+/// A per-iteration feed collected from a loop body: the target defer, the
+/// fresh record field carrying its per-iteration value, and that value
+/// (already resolved in the read-your-writes environment at the feed site).
+/// The loop's history binding computes the field alongside the recurrence;
+/// the phase hoists `Feed(defer, __hist ▷ .field)` out of the loop so desugar
+/// routes it as an ordinary channel contribution.
+struct FeedSite {
+    defer: Name,
+    field: String,
+    value: Expr,
+}
+
+/// `p ▷ .i : elt_ty` — projection of a tuple-typed variable (a writer-body
+/// snapshot slot or the packed previous-values tuple). Mirrors
+/// `transact_phase`'s `proj_tuple`.
+fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
+    let mut proj = Expr::proj_index(i);
+    proj.ty = Type::fun(tuple_ty.clone(), elt_ty.clone());
+    let mut app = Expr::apply(tvar(p, tuple_ty.clone()), proj);
+    app.ty = elt_ty.clone();
+    app
+}
+
+/// `__hist ≫ .writes ≫ .i : domain ⇒ vty` — the accumulator-`i` slice of the
+/// history's proposed-write stream, built as one flat three-element compose so
+/// recognition (and the guarded-slot grammar) match it structurally.
+fn writes_index_view(
+    h: &Name,
+    hist_ty: &Type,
+    domain_ty: &Type,
+    writes_ty: &Type,
+    decision_ty: &Type,
+    i: usize,
+    vty: &Type,
+) -> Expr {
+    let mut wproj = Expr::proj_field(F_WRITES);
+    wproj.ty = Type::fun(decision_ty.clone(), writes_ty.clone());
+    let mut iproj = Expr::proj_index(i);
+    iproj.ty = Type::fun(writes_ty.clone(), vty.clone());
+    let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), wproj, iproj]);
+    comp.ty = Type::fun(domain_ty.clone(), vty.clone());
+    comp
+}
+
+/// A `Var(name) : ty`.
+fn binding(name: Name, ty: Type) -> TypedBinding {
+    TypedBinding {
+        name,
+        ty,
+        user_annotation: None,
+    }
+}
+
+/// `let name = def in body`, typed as `body`.
+fn let_in(name: TypedBinding, def: Expr, body: Expr) -> Expr {
+    let ty = body.ty.clone();
+    Expr {
+        node: TypedExprNode::Let {
+            binding: name,
+            bound_expr: Box::new(def),
+            body: Box::new(body),
+        },
+        ty,
+        user_annotation: None,
+    }
+}
+
+/// `__hist ▷ .field : domain ⇒ field_ty` — a projected view of the history's
+/// `{step, to_<feed>*}` record codomain.
+fn hist_field_view(
+    h: &Name,
+    hist_ty: &Type,
+    domain_ty: &Type,
+    field: &str,
+    field_ty: &Type,
+    record_ty: &Type,
+) -> Expr {
+    let mut proj = Expr::proj_field(field);
+    proj.ty = Type::fun(record_ty.clone(), field_ty.clone());
+    let mut comp = Expr::compose(vec![tvar(h, hist_ty.clone()), proj]);
+    comp.ty = Type::fun(domain_ty.clone(), field_ty.clone());
+    comp
+}
+
+/// Wrap `body` in one `Feed(defer, view)` per collected in-body feed, so
+/// `channelize` routes each per-position value stream to its channel. Each
+/// `view` is the feed's value stream over its contributing domain — for an
+/// induction loop, `__hist ▷ .to_<feed>` (see [`hist_field_view`]); for a `with
+/// begin():` block, a commit-record tap binding. Both the mutation-loop phase
+/// and the transaction phase collect their feeds differently but hoist them
+/// through this one routine.
+///
+/// **Invariant (load-bearing): source order is preserved.** Feeds are wrapped in
+/// reverse, so the first source feed becomes the *outermost* `ExprStmt`.
+/// `channelize` collects feeds outermost-first into a channel's union, so
+/// this ordering is what fixes the union's variant tags when several feeds
+/// target one defer. Pass `feeds` in source order.
+pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<(Name, Expr)>) -> Expr {
+    for (defer, view) in feeds.into_iter().rev() {
+        let mut feed = Expr::feed(defer, view);
+        feed.ty = Type::Base(BaseType::Unit);
+        let body_ty = body.ty.clone();
+        body = Expr::expr_stmt(feed, body);
+        body.ty = body_ty;
+    }
+    body
+}
+
+/// Rewrite one loop. `cont` is the raw continuation after the loop
+/// statement; trailing reads of each accumulator inside it are re-pointed
+/// at the extracted final value, and only then is the continuation itself
+/// recursed into (so a later loop over the same variable sees the
+/// extracted value as its own pre-loop binding).
+///
+/// The binding is emitted **decision-factored** — the writer body is an
+/// opaque lambda applied to a snapshot tuple, exactly the shape
+/// `transact_phase` emits for a commit decision:
+///
+/// ```text
+/// __hist : D ⇒ {commit: Bool, writes: (V₀, …), to_<feed>*} =
+///   λ r → let __prev = get_prev_seq((__hist ≫ .writes, r, (init₀, …)))
+///         in (__prev.0, …, r ▷ iter) ▷ (λ __p → ⟨RYW chain over __p⟩
+///                                       ending in {commit: true, writes, to_*})
+/// ```
+///
+/// Factoring here — where the pointful information exists — is what lets
+/// induction and transaction bindings share ONE post-`lambda_elim` normal
+/// form (`(guard, source) ▷ zip ≫ body`), so recognition splits snapshot
+/// from body structurally and never rebuilds either. `writes` is always a
+/// positional tuple (one element even for a single accumulator), matching
+/// the transaction decision convention; the guard reads the *writes
+/// projection* of the history (guarded — see `check_letrec_guarded`); each
+/// feed rides the decision as a `to_<feed>` field, hoisted to
+/// `Feed(defer, __hist ≫ .to_<feed>)` for `channelize` to route.
+fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr) -> Expr {
+    // Accumulators in first-write order, with their value types.
+    let mut accs: Vec<(Name, Type)> = Vec::new();
+    collect_writes(&loop_body, &mut accs);
+    if accs.is_empty() {
+        // A loop with no accumulator. If its body feeds — a stateless generator,
+        // or a `with begin():` read-only transaction (`for r in iter: with
+        // begin(): out << store` reads a store and feeds it, writing nothing) —
+        // it's the design's "plain map" path: each in-block feed becomes an
+        // ordinary map of the loop source. Otherwise the body inlined to neither
+        // a write nor a feed (a `for x: pure_call()` whose call didn't mutate) —
+        // observationally a no-op; drop the loop and keep the continuation.
+        if body_has_feed(&loop_body) {
+            return transform_feed_only_loop(target, iter, loop_body, cont);
+        }
+        return rewrite(cont);
+    }
+
+    let (domain_ty, item_ty) = fun_parts(&iter.ty);
+    let acc_tys: Vec<Type> = accs.iter().map(|(_, t)| t.clone()).collect();
+    // The proposed write set — always a positional tuple, one element even
+    // for a single accumulator (the transaction decision convention).
+    let writes_ty = Type::Tuple(acc_tys.clone());
+
+    let h = Name::fresh("__hist");
+    let r = Name::fresh("__pos");
+    let p = Name::fresh("__p");
+    let prev = Name::fresh("__prev");
+
+    // The writer-body tuple parameter: each accumulator's snapshot slot, then
+    // the loop item — matching `transact_phase::build_writer`'s convention.
+    let mut p_tys = acc_tys.clone();
+    p_tys.push(item_ty.clone());
+    let p_ty = Type::Tuple(p_tys);
+
+    // Seed the read-your-writes environment by direct substitution (no
+    // destructuring lets): each accumulator reads its snapshot slot
+    // `__p ▷ .i`, the loop binder reads the item slot `__p ▷ .k`.
+    let mut env: HashMap<Name, Expr> = HashMap::new();
+    for (i, (acc, ty)) in accs.iter().enumerate() {
+        env.insert(acc.clone(), proj_of(&p, &p_ty, i, ty));
+    }
+    env.insert(
+        target.name.clone(),
+        proj_of(&p, &p_ty, accs.len(), &item_ty),
+    );
+
+    // Walk the body: build the RYW chain, collect feeds, and produce the
+    // terminal `{commit: true, writes, to_<feed>*}` decision record.
+    let mut feeds: Vec<FeedSite> = Vec::new();
+    let chain = transform_chain(loop_body, &mut env, &accs, &writes_ty, &mut feeds);
+
+    // The decision codomain: `{commit, writes}` plus one field per feed site.
+    let mut decision_fields: Vec<(String, Type)> = vec![
+        (F_COMMIT.to_string(), Type::Base(BaseType::Bool)),
+        (F_WRITES.to_string(), writes_ty.clone()),
+    ];
+    for f in &feeds {
+        decision_fields.push((f.field.clone(), f.value.ty.clone()));
+    }
+    let decision_ty = Type::Record(decision_fields);
+    let hist_ty = Type::fun(domain_ty.clone(), decision_ty.clone());
+
+    // The opaque writer body: `λ __p → ⟨chain⟩ ending in the decision`.
+    let mut body_lam = Expr::lambda(p, p_ty.clone(), chain);
+    body_lam.ty = Type::fun(p_ty.clone(), decision_ty.clone());
+
+    // The recurrence guard reads the *writes projection* of the history:
+    // `get_prev_seq((__hist ≫ .writes, r, (init₀, …)))` — a projection of the
+    // history is a guarded reference (see `check_letrec_guarded`); the
+    // defaults are the accumulators' pre-loop bindings, tupled.
+    let writes_view = hist_field_view(&h, &hist_ty, &domain_ty, F_WRITES, &writes_ty, &decision_ty);
+    let mut defaults = Expr::tuple(accs.iter().map(|(n, ty)| tvar(n, ty.clone())).collect());
+    defaults.ty = writes_ty.clone();
+    let guard = {
+        let mut arg = Expr::tuple(vec![writes_view, tvar(&r, domain_ty.clone()), defaults]);
+        arg.ty = Type::Tuple(vec![
+            Type::fun(domain_ty.clone(), writes_ty.clone()),
+            domain_ty.clone(),
+            writes_ty.clone(),
+        ]);
+        let mut f = Expr::builtin(Builtin::GetPrevSeq);
+        f.ty = Type::fun(arg.ty.clone(), writes_ty.clone());
+        let mut app = Expr::apply(arg, f);
+        app.ty = writes_ty.clone();
+        app
+    };
+
+    // λ r → let __prev = ⟨guard⟩ in (__prev.0, …, r ▷ iter) ▷ __body
+    let mut snap_elts: Vec<Expr> = (0..accs.len())
+        .map(|i| proj_of(&prev, &writes_ty, i, &acc_tys[i]))
+        .collect();
+    let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), iter);
+    item_read.ty = item_ty.clone();
+    snap_elts.push(item_read);
+    let mut snap = Expr::tuple(snap_elts);
+    snap.ty = p_ty.clone();
+    let mut decision = Expr::apply(snap, body_lam);
+    decision.ty = decision_ty.clone();
+    let lambda_body = let_in(binding(prev, writes_ty.clone()), guard, decision);
+    let mut lambda = Expr::lambda(r.clone(), domain_ty.clone(), lambda_body);
+    lambda.ty = hist_ty.clone();
+
+    // Trailing reads: one extracted final value per accumulator —
+    // `(__hist ≫ .writes ≫ .i, x0) ▷ last_or_default` — and the continuation
+    // re-pointed at it (`rename_uses` also renames MutWrite targets, so a
+    // later loop over the same variable accumulates from the extracted value).
+    let mut cont = cont;
+    let mut final_lets: Vec<(TypedBinding, Expr)> = Vec::new();
+    for (i, (acc, vty)) in accs.iter().enumerate() {
+        let view = writes_index_view(&h, &hist_ty, &domain_ty, &writes_ty, &decision_ty, i, vty);
+        let view_ty = view.ty.clone();
+        let mut arg = Expr::tuple(vec![view, tvar(acc, vty.clone())]);
+        arg.ty = Type::Tuple(vec![view_ty, vty.clone()]);
+        let mut f = Expr::builtin(Builtin::LastOrDefault);
+        f.ty = Type::fun(arg.ty.clone(), vty.clone());
+        let mut read = Expr::apply(arg, f);
+        read.ty = vty.clone();
+
+        let x_final = Name::fresh(acc.base());
+        rename_uses(&mut cont, acc, &x_final);
+        final_lets.push((binding(x_final, vty.clone()), read));
+    }
+
+    // Only now recurse into the continuation (a later loop over the same
+    // variable has been re-pointed at the extracted value).
+    let mut body_out = rewrite(cont);
+    for (b, def) in final_lets.into_iter().rev() {
+        body_out = let_in(b, def, body_out);
+    }
+
+    // Hoist each in-loop feed to an ordinary feed of the history's tap field
+    // (`Feed(defer, __hist ▷ .to_<feed>)`) for desugar to route as a channel
+    // contribution. `feeds` is in source order; `hoist_feeds` preserves it.
+    let feed_views = feeds
+        .iter()
+        .map(|f| {
+            let view = hist_field_view(
+                &h,
+                &hist_ty,
+                &domain_ty,
+                &f.field,
+                &f.value.ty,
+                &decision_ty,
+            );
+            (f.defer.clone(), view)
+        })
+        .collect();
+    body_out = hoist_feeds(body_out, feed_views);
+
+    let bindings = vec![(binding(h, hist_ty), lambda)];
+    debug_assert!(
+        check_letrec_guarded(&bindings).is_ok(),
+        "letrec phase emitted an unguarded group"
+    );
+    let ty = body_out.ty.clone();
+    Expr {
+        node: TypedExprNode::LetRec {
+            bindings,
+            body: Box::new(body_out),
+        },
+        ty,
+        user_annotation: None,
+    }
+}
+
+/// Rewrite an accumulator-free loop — a read-only `with begin():` transaction
+/// fed out (`for target in iter: out << value`) — to the plain-map form. Each
+/// in-block feed becomes `Feed(defer, iter ≫ (λ target → value))`: the loop
+/// source mapped through the fed value at each position, hoisted out of the loop
+/// for `channelize` to route as an ordinary channel contribution. There is
+/// no history binding and no letrec.
+///
+/// When `value` is a read of a transactional store (a `Var` `transact_phase`
+/// rebound to `last_or_default(__store.k, init)`, constant in `target`), the map
+/// broadcasts the store's terminal render to every loop position;
+/// `transact_phase::rewrite_live_reads` (post-`channelize`, pre-lambda-elim)
+/// then turns that broadcast over a live (non-enumerable `Txn`) store into an
+/// outer-indexed as-of join — the request-loop-indexed live cross-endpoint read.
+fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr) -> Expr {
+    let (domain_ty, _item_ty) = fun_parts(&iter.ty);
+    let mut env: HashMap<Name, Expr> = HashMap::new();
+    let mut feeds: Vec<(Name, Expr)> = Vec::new();
+    collect_feed_only(loop_body, &mut env, &mut feeds);
+    debug_assert!(
+        !feeds.is_empty(),
+        "letrec phase: accumulator-free loop with no feed — lowering rejects an empty \
+         `with begin():` block, so a `For` here always carries a feed"
+    );
+    let mut body_out = rewrite(cont);
+    // Emit in reverse so the first source feed ends up outermost — desugar
+    // collects feeds outermost-first into the channel union, preserving source
+    // order (mirrors the accumulator path's hoist ordering).
+    for (defer, value) in feeds.into_iter().rev() {
+        let value_ty = value.ty.clone();
+        let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), value);
+        lambda.ty = Type::fun(target.ty.clone(), value_ty.clone());
+        let mut map = Expr::compose(vec![iter.clone(), lambda]);
+        map.ty = Type::fun(domain_ty.clone(), value_ty);
+        let mut feed = Expr::feed(defer, map);
+        feed.ty = Type::Base(BaseType::Unit);
+        let cont_ty = body_out.ty.clone();
+        body_out = Expr::expr_stmt(feed, body_out);
+        body_out.ty = cont_ty;
+    }
+    body_out
+}
+
+/// Walk an accumulator-free loop body (a read-only `with begin():` block:
+/// `Let`s, `Feed`s, terminal `Unit` — no `MutWrite`), threading `Let` values
+/// through `env` and collecting each feed's `(defer, env-resolved value)`.
+fn collect_feed_only(expr: Expr, env: &mut HashMap<Name, Expr>, feeds: &mut Vec<(Name, Expr)>) {
+    match expr.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            let bound = subst_env(*bound_expr, env);
+            env.insert(binding.name, bound);
+            collect_feed_only(*body, env, feeds);
+        }
+        TypedExprNode::ExprStmt { expr: effect, body } => {
+            match effect.node {
+                TypedExprNode::Feed { name, value } => {
+                    let val = subst_env(*value, env);
+                    feeds.push((name, val));
+                }
+                other => panic!(
+                    "letrec phase: unexpected statement in read-only `with begin():` block: {}",
+                    symbolic(&Expr {
+                        node: other,
+                        ty: Type::Hole,
+                        user_annotation: None
+                    })
+                ),
+            }
+            collect_feed_only(*body, env, feeds);
+        }
+        TypedExprNode::Lit(Lit::Unit) => {}
+        other => panic!(
+            "letrec phase: unexpected node in read-only `with begin():` block: {}",
+            symbolic(&Expr {
+                node: other,
+                ty: expr.ty,
+                user_annotation: expr.user_annotation
+            })
+        ),
+    }
+}
+
+/// Collect `MutWrite` targets in first-write order with their written types.
+fn collect_writes(expr: &Expr, out: &mut Vec<(Name, Type)>) {
+    if let TypedExprNode::MutWrite { name, value } = &expr.node
+        && !out.iter().any(|(n, _)| n == name)
+    {
+        out.push((name.clone(), value.ty.clone()));
+    }
+    expr.walk_children(|c| collect_writes(c, out));
+}
+
+/// Whether `expr` contains a `Feed` marker (backs the no-op-loop invariant
+/// check in [`transform_loop`]).
+fn body_has_feed(expr: &Expr) -> bool {
+    matches!(expr.node, TypedExprNode::Feed { .. }) || expr.any_child(body_has_feed)
+}
+
+/// Walk the direct-mirror statement chain, threading the read-your-writes
+/// environment: `Let`s pass through (values substituted), each `MutWrite`
+/// becomes a fresh shadowing `Let` that advances the environment, each
+/// `Feed` records its (env-resolved) value into `feeds` and drops out of the
+/// chain, and the terminal `Unit` becomes the writer decision record
+/// `{commit: true, writes: (…), to_<feed>*}`.
+fn transform_chain(
+    expr: Expr,
+    env: &mut HashMap<Name, Expr>,
+    accs: &[(Name, Type)],
+    writes_ty: &Type,
+    feeds: &mut Vec<FeedSite>,
+) -> Expr {
+    match expr.node {
+        TypedExprNode::Let {
+            binding: b,
+            bound_expr,
+            body,
+        } => {
+            let bound = subst_env(*bound_expr, env);
+            let rest = transform_chain(*body, env, accs, writes_ty, feeds);
+            let_in(b, bound, rest)
+        }
+        TypedExprNode::ExprStmt { expr: effect, body } => {
+            match effect.node {
+                // A write advances the read-your-writes environment.
+                TypedExprNode::MutWrite { name, value } => {
+                    let val = subst_env(*value, env);
+                    let vty = val.ty.clone();
+                    let fresh = Name::fresh(name.base());
+                    env.insert(name.clone(), tvar(&fresh, vty.clone()));
+                    let rest = transform_chain(*body, env, accs, writes_ty, feeds);
+                    let_in(binding(fresh, vty), val, rest)
+                }
+                // A feed is captured (value resolved in the current env) and
+                // dropped from the chain; it becomes a `to_<feed>` field on
+                // the terminal record, hoisted out of the loop by the caller.
+                TypedExprNode::Feed { name, value } => {
+                    let val = subst_env(*value, env);
+                    let field = format!("to_{}_{}", name.base(), feeds.len());
+                    feeds.push(FeedSite {
+                        defer: name,
+                        field,
+                        value: val,
+                    });
+                    transform_chain(*body, env, accs, writes_ty, feeds)
+                }
+                // A bare `unit` statement is a no-op: drop it and continue. This
+                // is the discarded terminal of a spliced pass-by-reference writer
+                // body — inlining a `def f(…): …` whose body ends in a value-less
+                // statement leaves a `unit` before the call site's continuation
+                // (a `unit; unit` tail when the writer body's own terminal meets
+                // the loop-body continuation), which `flatten_spine` right-
+                // associates onto the spine but does not elide.
+                TypedExprNode::Lit(Lit::Unit) => {
+                    transform_chain(*body, env, accs, writes_ty, feeds)
+                }
+                // A nested statement sequence spliced as one effect — an inlined
+                // writer body whose head is *not* a `MutWrite` (e.g. a `Feed`, so
+                // `flatten_spine`'s store-write-headed un-nest leaves it nested).
+                // Splice it onto the spine before the continuation; sequencing is
+                // associative, so `(a; b); c` ≡ `a; (b; c)` preserves order.
+                TypedExprNode::ExprStmt {
+                    expr: inner_e,
+                    body: inner_b,
+                } => {
+                    let spliced = expr_stmt_typed(*inner_e, expr_stmt_typed(*inner_b, *body));
+                    transform_chain(spliced, env, accs, writes_ty, feeds)
+                }
+                other => panic!(
+                    "letrec phase: unexpected statement in loop body: {}",
+                    symbolic(&Expr {
+                        node: other,
+                        ty: Type::Hole,
+                        user_annotation: None
+                    })
+                ),
+            }
+        }
+        TypedExprNode::Lit(Lit::Unit) => {
+            // Terminal: the writer decision `{commit: true, writes: (…),
+            // to_<feed>*}` — always-commit, the latest value of each
+            // accumulator as the positional write set (one element even for a
+            // single accumulator), and each captured feed value as a tap.
+            let current = |acc: &Name| {
+                env.get(acc)
+                    .expect("letrec phase: accumulator missing from RYW environment")
+                    .clone()
+            };
+            let mut writes = Expr::tuple(accs.iter().map(|(n, _)| current(n)).collect());
+            writes.ty = writes_ty.clone();
+            let mut commit = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
+            commit.ty = Type::Base(BaseType::Bool);
+            let mut fields: Vec<(String, Expr)> = vec![
+                (F_COMMIT.to_string(), commit),
+                (F_WRITES.to_string(), writes),
+            ];
+            let mut field_tys: Vec<(String, Type)> = vec![
+                (F_COMMIT.to_string(), Type::Base(BaseType::Bool)),
+                (F_WRITES.to_string(), writes_ty.clone()),
+            ];
+            for f in feeds.iter() {
+                fields.push((f.field.clone(), f.value.clone()));
+                field_tys.push((f.field.clone(), f.value.ty.clone()));
+            }
+            let mut rec = Expr::new(TypedExprNode::Record(fields));
+            rec.ty = Type::Record(field_tys);
+            rec
+        }
+        other => panic!(
+            "letrec phase: unexpected node in loop-body chain: {}",
+            symbolic(&Expr {
+                node: other,
+                ty: expr.ty,
+                user_annotation: expr.user_annotation
+            })
+        ),
+    }
+}
+
+/// Rename every use of `from` (bare `Var`s and `MutWrite` targets) to `to`,
+/// **preserving recorded types** — `Subst::rename` materializes renamed
+/// variables with `Hole` types (it serves pre-inference transports), which
+/// would strand residue on the fully-typed tree the phase rewrites. `from`
+/// is a post-uniquify unique name, so nothing shadows it.
+fn rename_uses(e: &mut Expr, from: &Name, to: &Name) {
+    match &mut e.node {
+        TypedExprNode::Var(n) if n == from => *n = to.clone(),
+        TypedExprNode::MutWrite { name, .. } if name == from => *name = to.clone(),
+        _ => {}
+    }
+    e.walk_children_mut(|c| rename_uses(c, from, to));
+}
+
+/// Replace free accumulator reads by their current environment value.
+/// Names are globally unique post-uniquify, so no capture is possible.
+fn subst_env(mut e: Expr, env: &HashMap<Name, Expr>) -> Expr {
+    if let TypedExprNode::Var(n) = &e.node
+        && let Some(rep) = env.get(n)
+    {
+        return rep.clone();
+    }
+    e.map_children(|c| subst_env(c, env));
+    e
+}
+
+// ---------------------------------------------------------------------------
+// Recognition: point-free LetRec → Transact (the carrier planning stages and
+// op-conversion compiles)
+// ---------------------------------------------------------------------------
+
+/// Lower every phase-emitted `LetRec` — **after `lambda_elim`**, on its
+/// point-free normal form — onto the [`TypedExprNode::Transact`] carrier:
+/// `let __store = Transact{…} in <reads off __store.field>`. An unrecognized
+/// group is a compile-time panic (no silent fallback) — the phases and this
+/// recognizer are co-designed against the point-free normal forms, exercised
+/// end-to-end by the induction suite (`tests/compilation_pipeline/mutability.rs`),
+/// so a mismatch is a bug here, not in the program.
+///
+/// Running post-elim is what retires the pointful/point-free double
+/// representation: one `LetRec` travels from the unified phase through
+/// `channelize` and `lambda_elim`; recognition then splits each binding into
+/// its guard scaffold and its **verbatim, already point-free writer body**
+/// (the decision-factored form the phases emit), so nothing is rebuilt.
+/// Planning stages the carrier's writer sources (its `Transact` arm) and
+/// op-conversion picks the engine on the domain, both unchanged.
+///
+/// Two shapes are recognized, dispatched on the guard: a **transaction**
+/// group (`get_prev_txn`-guarded `store ↔ commits` cycles from
+/// `transact_phase`) → `Transact{domain: Txn}`; a
+/// single-binding **induction** group (a `get_prev_seq`-guarded self-cycle
+/// from [`transform_loop`]) → `Transact{domain: iteration extent}`.
+pub fn recognize(expr: Expr) -> Expr {
+    let mut expr = expr;
+    if let TypedExprNode::LetRec { .. } = &expr.node {
+        let TypedExprNode::LetRec { bindings, body } = expr.node else {
+            unreachable!("guarded above")
+        };
+        // The point-free guard matcher backs this in all builds — recognition
+        // is the wall between "phase emitted" and "engine consumed", with
+        // channelize and lambda_elim in between.
+        if let Err(errs) = check_letrec_guarded(&bindings) {
+            panic!(
+                "letrec recognition: unguarded group reached recognition: {}",
+                errs[0]
+            );
+        }
+        // Recurse into the continuation first (later loops / nested groups
+        // nest there — e.g. an induction loop after a transaction).
+        let body = recognize(*body);
+        // A **channel group** — `Feed`-kind bindings channelize emitted as a
+        // mutually-scoped cluster — carries no guard at all. There is no
+        // engine to build: the group is acyclic (the guardedness wall above,
+        // with no guards, is exactly an acyclicity check), so flatten it back
+        // to plain `let`s in dependency order for planning.
+        if !group_has_guard(&bindings) {
+            let bindings = bindings
+                .into_iter()
+                .map(|(b, def)| (b, recognize(def)))
+                .collect();
+            return flatten_channel_group(bindings, body);
+        }
+        assert_eq!(
+            bindings.len(),
+            1,
+            "letrec recognition: a non-transaction group must be a single-binding \
+             induction group in v1"
+        );
+        let (h, def) = bindings.into_iter().next().unwrap();
+        return recognize_group(h, def, body);
+    }
+    expr.map_children(recognize);
+    expr
+}
+
+/// Whether any binding of the group applies a `get_prev_*` guard — i.e. the
+/// group carries recurrent state. A guard-free group is a channel cluster.
+fn group_has_guard(bindings: &[(TypedBinding, Expr)]) -> bool {
+    bindings.iter().any(|(_, def)| {
+        uses_builtin(def, Builtin::GetPrevSeq) || uses_builtin(def, Builtin::GetPrevTxn)
+    })
+}
+
+/// Whether the subtree mentions builtin `b`.
+fn uses_builtin(e: &Expr, b: Builtin) -> bool {
+    if matches!(&e.node, TypedExprNode::Builtin(x) if *x == b) {
+        return true;
+    }
+    let mut found = false;
+    e.walk_children(|c| found = found || uses_builtin(c, b));
+    found
+}
+
+/// Flatten an acyclic channel group to plain `let`s, dependencies bound before
+/// dependents (Kahn's algorithm over the group's reference edges — the group
+/// passed the guardedness wall with no guards, so a source always exists).
+fn flatten_channel_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr {
+    let mut remaining = bindings;
+    let mut ordered: Vec<(TypedBinding, Expr)> = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let i = (0..remaining.len())
+            .find(|&i| {
+                remaining
+                    .iter()
+                    .enumerate()
+                    .all(|(j, (b, _))| j == i || count_free(&b.name, &remaining[i].1) == 0)
+            })
+            .expect("letrec recognition: acyclic channel group has a dependency-free binding");
+        ordered.push(remaining.remove(i));
+    }
+    let mut out = body;
+    for (b, def) in ordered.into_iter().rev() {
+        out = let_in(b, def, out);
+    }
+    out
+}
+
+/// Unwrap the post-elim constant-stream wrapper `x ▷ const`, returning `x`.
+fn unwrap_const(e: Expr) -> Expr {
+    let TypedExprNode::Apply { argument, function } = e.node else {
+        panic!("letrec recognition: expected `x ▷ const`, got a non-application");
+    };
+    assert!(
+        matches!(function.node, TypedExprNode::Builtin(Builtin::Const)),
+        "letrec recognition: expected `x ▷ const`"
+    );
+    *argument
+}
+
+/// Destructure the post-elim guard compose
+/// `(⟨view⟩ ▷ const, ⟨pos⟩, ⟨default⟩ ▷ const) ▷ zip ≫ get_prev_*`,
+/// returning `(default, which-guard)`. The view slot (the guarded history
+/// read) is validated by `check_letrec_guarded` and discarded here — the
+/// engine reconstructs every read from the store itself.
+fn split_guard_compose(guard: Expr) -> (Expr, Builtin) {
+    let TypedExprNode::Compose(mut elts) = guard.node else {
+        panic!("letrec recognition: guard is not a compose");
+    };
+    let last = elts.pop().expect("guard compose has a tail");
+    let TypedExprNode::Builtin(b) = last.node else {
+        panic!("letrec recognition: guard compose does not end in a builtin");
+    };
+    assert!(
+        matches!(b, Builtin::GetPrevSeq | Builtin::GetPrevTxn),
+        "letrec recognition: guard compose does not end in get_prev_*"
+    );
+    assert_eq!(
+        elts.len(),
+        1,
+        "letrec recognition: guard compose has unexpected middle elements"
+    );
+    let head = elts.pop().expect("guard compose head");
+    let TypedExprNode::Apply { argument, function } = head.node else {
+        panic!("letrec recognition: guard head is not a zip application");
+    };
+    assert!(
+        matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)),
+        "letrec recognition: guard head is not zipped"
+    );
+    let TypedExprNode::Tuple(mut slots) = argument.node else {
+        panic!("letrec recognition: guard zip takes a tuple");
+    };
+    assert_eq!(slots.len(), 3, "guard arity (history, position, default)");
+    let default = unwrap_const(slots.pop().expect("default slot"));
+    (default, b)
+}
+
+/// Destructure a post-elim decision compose
+/// `(⟨slot₀⟩, …, ⟨source⟩) ▷ zip ≫ ⟨body…⟩` into its snapshot slots, the
+/// trailing source, and the writer body (the tail elements re-composed,
+/// verbatim). `p_tys` are the body's tuple-parameter element types (snapshot
+/// value types then the item), used only to stamp the rebuilt body compose.
+fn split_decision_compose(decision: Expr, decision_ty: &Type) -> (Vec<Expr>, Expr, Expr) {
+    if !matches!(decision.node, TypedExprNode::Compose(_)) {
+        panic!(
+            "letrec recognition: decision is not a compose: {}",
+            symbolic(&decision)
+        );
+    }
+    let TypedExprNode::Compose(mut elts) = decision.node else {
+        unreachable!("guarded above")
+    };
+    assert!(
+        elts.len() >= 2,
+        "letrec recognition: decision compose needs a snapshot head and a body tail"
+    );
+    let tail: Vec<Expr> = elts.split_off(1);
+    let head = elts.pop().expect("decision head");
+    let TypedExprNode::Apply { argument, function } = head.node else {
+        panic!("letrec recognition: decision head is not a zip application");
+    };
+    assert!(
+        matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)),
+        "letrec recognition: decision head is not zipped"
+    );
+    let TypedExprNode::Tuple(mut slots) = argument.node else {
+        panic!("letrec recognition: decision snapshot is not a tuple");
+    };
+    let source = slots.pop().expect("snapshot carries the source");
+    let slot_val_ty = |e: &Expr| {
+        e.ty.codomain()
+            .expect("letrec recognition: snapshot slot is a stream")
+    };
+    let mut p_tys: Vec<Type> = slots.iter().map(slot_val_ty).collect();
+    p_tys.push(slot_val_ty(&source));
+    let body = if tail.len() == 1 {
+        tail.into_iter().next().expect("single body element")
+    } else {
+        let mut c = Expr::compose(tail);
+        c.ty = Type::fun(Type::Tuple(p_tys), decision_ty.clone());
+        c
+    };
+    (slots, source, body)
+}
+
+/// Destructure the phase\'s decision-factored induction binding (post-elim)
+/// and rebuild it as a `Transact`:
+///
+/// ```text
+/// __hist = let __prev = (⟨view⟩ ▷ const, id, (init…) ▷ const) ▷ zip ≫ get_prev_seq
+///          in (__prev ≫ .0, …, ⟨source⟩) ▷ zip ≫ ⟨body⟩
+/// ```
+///
+/// The writer `body` is lifted verbatim; keys\' inits come off the guard\'s
+/// defaults tuple; the source off the snapshot\'s trailing slot. Reads of
+/// `__hist` in the letrec body (`__hist ≫ .writes ≫ .i` extracts and
+/// `__hist ≫ .to_<feed>` taps) become store-record projections.
+fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
+    let (domain_ty, decision_ty) = fun_parts(&h.ty);
+    let Type::Record(decision_field_tys) = &decision_ty else {
+        panic!("letrec recognition: history codomain is not a record: {decision_ty}");
+    };
+    let feed_fields: Vec<(String, Type)> = decision_field_tys
+        .iter()
+        .filter(|(n, _)| n != F_COMMIT && n != F_WRITES)
+        .cloned()
+        .collect();
+
+    let TypedExprNode::Let {
+        bound_expr: guard,
+        body: applied,
+        ..
+    } = def.node
+    else {
+        panic!(
+            "letrec recognition: induction binding is not the factored `let __prev = ⟨guard⟩ …` \
+             shape"
+        );
+    };
+    let (defaults, which) = split_guard_compose(*guard);
+    assert!(
+        matches!(which, Builtin::GetPrevSeq),
+        "letrec recognition: induction history guarded by get_prev_txn"
+    );
+    let TypedExprNode::Tuple(inits) = defaults.node else {
+        panic!("letrec recognition: guard defaults are not the tupled inits");
+    };
+
+    let (prev_slots, source, writer_body) = split_decision_compose(*applied, &decision_ty);
+    assert_eq!(
+        prev_slots.len(),
+        inits.len(),
+        "letrec recognition: snapshot slots must match the key inits"
+    );
+    let acc_tys: Vec<Type> = prev_slots
+        .iter()
+        .map(|e| {
+            e.ty.codomain()
+                .expect("letrec recognition: previous-value slot is a stream")
+        })
+        .collect();
+
+    // One store key per accumulator. Names are fresh labels: every read is
+    // positional (`__hist ≫ .writes ≫ .i`), so only field order is
+    // load-bearing.
+    let keys: Vec<TransactKey> = inits
+        .into_iter()
+        .map(|init| TransactKey {
+            name: Name::fresh("acc"),
+            init,
+        })
+        .collect();
+    let key_names: Vec<Name> = keys.iter().map(|k| k.name.clone()).collect();
+
+    let mut store_field_tys: Vec<(String, Type)> = keys
+        .iter()
+        .zip(&acc_tys)
+        .map(|(k, vty)| {
+            (
+                k.name.field_key(),
+                Type::fun(domain_ty.clone(), vty.clone()),
+            )
+        })
+        .collect();
+    for (f, vty) in &feed_fields {
+        store_field_tys.push((f.clone(), Type::fun(domain_ty.clone(), vty.clone())));
+    }
+    let store_ty = Type::Record(store_field_tys);
+
+    let writer = TransactWriter {
+        read_keys: key_names.clone(),
+        write_keys: key_names,
+        source,
+        body: writer_body,
+    };
+    let keys_for_reads = keys.clone();
+    let mut transact = Expr::new(TypedExprNode::Transact {
+        keys,
+        writers: vec![writer],
+        domain: domain_ty.clone(),
+    });
+    transact.ty = store_ty.clone();
+
+    let store = Name::fresh("__store");
+    let mut body = letrec_body;
+    rewrite_hist_reads(
+        &mut body,
+        &h.name,
+        &store,
+        &store_ty,
+        &keys_for_reads,
+        &acc_tys,
+        &domain_ty,
+    );
+    assert_eq!(
+        count_free(&h.name, &body),
+        0,
+        "letrec recognition: unhandled history read of `{}`",
+        h.name
+    );
+
+    let ty = body.ty.clone();
+    Expr {
+        node: TypedExprNode::Let {
+            binding: binding(store, store_ty),
+            bound_expr: Box::new(transact),
+            body: Box::new(body),
+        },
+        ty,
+        user_annotation: None,
+    }
+}
+
+/// `__store.field = Apply(Var(__store), Proj(Field(field)))` — a store-record
+/// projection reading key `field`\'s history `Fun(D, V)`.
+fn store_field_read(store: &Name, store_ty: &Type, field: String, field_ty: Type) -> Expr {
+    let mut proj = Expr::proj_field(field);
+    proj.ty = Type::fun(store_ty.clone(), field_ty.clone());
+    let mut app = Expr::apply(tvar(store, store_ty.clone()), proj);
+    app.ty = field_ty;
+    app
+}
+
+/// Rewrite every `__hist` view in the letrec body to a store-record
+/// projection `__store.field`. The phase builds accumulator reads as the flat
+/// compose `__hist ≫ .writes ≫ .i` and feed reads as `__hist ≫ .to_<feed>`;
+/// downstream normalization may extend those composes (`__hist ≫ .to ≫ f`),
+/// so the match is on the *prefix*, keeping any tail elements.
+fn rewrite_hist_reads(
+    e: &mut Expr,
+    h: &Name,
+    store: &Name,
+    store_ty: &Type,
+    keys: &[TransactKey],
+    acc_tys: &[Type],
+    domain_ty: &Type,
+) {
+    if let TypedExprNode::Compose(elts) = &e.node
+        && matches!(elts.first().map(|x| &x.node), Some(TypedExprNode::Var(n)) if n == h)
+    {
+        // The store read replacing the matched prefix, plus how many compose
+        // elements the prefix covered.
+        let replacement: Option<(Expr, usize)> =
+            match (elts.get(1).map(|x| &x.node), elts.get(2).map(|x| &x.node)) {
+                (
+                    Some(TypedExprNode::Proj(ProjKey::Field(f))),
+                    Some(TypedExprNode::Proj(ProjKey::Index(i))),
+                ) if f == F_WRITES => {
+                    let field = keys[*i].name.field_key();
+                    let field_ty = Type::fun(domain_ty.clone(), acc_tys[*i].clone());
+                    Some((store_field_read(store, store_ty, field, field_ty), 3))
+                }
+                (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
+                    // A tap read `__hist ≫ .to_<feed>`: its stream type is the
+                    // store record\'s field type.
+                    let field = f.clone();
+                    let field_ty = store_ty_field(store_ty, &field);
+                    Some((store_field_read(store, store_ty, field, field_ty), 2))
+                }
+                _ => None,
+            };
+        if let Some((read, covered)) = replacement {
+            let rest: Vec<Expr> = elts[covered..].to_vec();
+            if rest.is_empty() {
+                let outer_ty = e.ty.clone();
+                *e = read;
+                e.ty = outer_ty;
+            } else {
+                let mut new_elts = vec![read];
+                new_elts.extend(rest);
+                let outer_ty = e.ty.clone();
+                *e = Expr::compose(new_elts);
+                e.ty = outer_ty;
+            }
+            return;
+        }
+    }
+    e.walk_children_mut(|c| rewrite_hist_reads(c, h, store, store_ty, keys, acc_tys, domain_ty));
+}
+
+/// The declared type of `field` on the store record.
+fn store_ty_field(store_ty: &Type, field: &str) -> Type {
+    let Type::Record(fs) = store_ty else {
+        panic!("letrec recognition: store type is not a record");
+    };
+    fs.iter()
+        .find(|(n, _)| n == field)
+        .unwrap_or_else(|| panic!("letrec recognition: store record lacks field `{field}`"))
+        .1
+        .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::BaseType;
+
+    /// Build the typed direct-mirror tree for
+    /// `x := 0; for i in [1,2,3]: x += i; x` as lowering + inference
+    /// leave it: `let x = 0 in ExprStmt(For{i, [1,2,3], x := x+i}, x)`.
+    fn direct_mirror_sum() -> (Expr, Name, Name) {
+        let int = Type::Base(BaseType::Int);
+        let list_ty = Type::fun(Type::UIntRange(3), int.clone());
+        let x = Name::fresh("x");
+        let i = Name::fresh("i");
+
+        let mut list = Expr::new(TypedExprNode::List(
+            [1, 2, 3]
+                .iter()
+                .map(|n| {
+                    let mut l = Expr::new(TypedExprNode::Lit(Lit::Int(*n)));
+                    l.ty = int.clone();
+                    l
+                })
+                .collect(),
+        ));
+        list.ty = list_ty;
+
+        let mut sum = Expr::new(TypedExprNode::BinOp {
+            left: Box::new(tvar(&x, int.clone())),
+            op: crate::ccl::BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
+            right: Box::new(tvar(&i, int.clone())),
+        });
+        sum.ty = int.clone();
+        let mut write = Expr::mut_write(x.clone(), sum);
+        write.ty = Type::Base(BaseType::Unit);
+        let mut unit = Expr::new(TypedExprNode::Lit(Lit::Unit));
+        unit.ty = Type::Base(BaseType::Unit);
+        let mut body = Expr::expr_stmt(write, unit);
+        body.ty = Type::Base(BaseType::Unit);
+
+        let mut for_node = Expr::new(TypedExprNode::For {
+            target: TypedBinding {
+                name: i.clone(),
+                ty: int.clone(),
+                user_annotation: None,
+            },
+            iter: Box::new(list),
+            body: Box::new(body),
+        });
+        for_node.ty = Type::Base(BaseType::Unit);
+
+        let mut stmt = Expr::expr_stmt(for_node, tvar(&x, int.clone()));
+        stmt.ty = int.clone();
+        let mut init = Expr::new(TypedExprNode::Lit(Lit::Int(0)));
+        init.ty = int.clone();
+        let mut tree = Expr::let_bind(x.clone(), init, stmt);
+        tree.ty = int;
+        (tree, x, i)
+    }
+
+    /// The phase turns the loop into a guarded letrec: the history binding
+    /// guarded by `get_prev_seq`, the trailing read via `last_or_default`,
+    /// and no marker residue.
+    #[test]
+    fn phase_emits_guarded_letrec() {
+        let (tree, _, _) = direct_mirror_sum();
+        let out = run(tree);
+        let s = symbolic(&out);
+        assert!(s.contains("letrec"), "should emit a letrec: {s}");
+        assert!(s.contains("get_prev_seq"), "recursion must be guarded: {s}");
+        assert!(
+            s.contains("last_or_default"),
+            "trailing read must extract the final value: {s}"
+        );
+        assert!(!contains_marker(&out), "no For/MutWrite residue: {s}");
+    }
+
+    /// Recognition lowers the group onto the domain-parameterized `Transact`
+    /// carrier: `let __store = transact (x = x) { [x]⇒[x] over … do λ __p → …
+    /// {commit: true, writes: (x)} } in (__store.x, x) ▷ last_or_default`, with
+    /// the key `init` read from the pre-loop binding and each accumulator read
+    /// rewritten to a store-record projection.
+    #[test]
+    fn recognition_builds_the_transact_carrier() {
+        let (tree, _, _) = direct_mirror_sum();
+        // Recognition consumes the point-free normal form, so run the elim
+        // (+simplify) pass between the phase and the recognizer, as the
+        // pipeline does.
+        let elim = crate::ccl::lambda_elim::run(run(tree)).expect("lambda elimination");
+        let out = recognize(elim);
+        let s = symbolic(&out);
+        assert!(!s.contains("letrec"), "letrec must be consumed: {s}");
+        assert!(!s.contains("get_prev_seq"), "guard must be consumed: {s}");
+        assert!(!s.contains("loop"), "the Loop carrier is retired: {s}");
+        assert!(
+            s.contains("transact"),
+            "should build a Transact carrier: {s}"
+        );
+        assert!(
+            s.contains("commit: true") && s.contains("writes:"),
+            "writer body must terminate in a `{{commit, writes}}` decision: {s}"
+        );
+        assert!(
+            s.contains("__store.") && s.contains("last_or_default"),
+            "trailing read must project the store record and reduce it: {s}"
+        );
+    }
+}

@@ -54,6 +54,16 @@ fn zip_arithmetic<T: Copy + AddAssign<T> + SubAssign<T> + MulAssign<T> + DivAssi
     mut l: Vec<T>,
     r: &[T],
 ) -> Vec<T> {
+    // Combine only co-present positions — element-wise over the common
+    // prefix, `min(l.len(), r.len())`. `zip` already stops at the shorter
+    // side, but it leaves a *longer* `l`'s tail untouched and returns it, so
+    // without this truncate `l op r` with `r` shorter would emit `l`'s surplus
+    // verbatim. That misfires when `r` is a value that has not yet converged
+    // (e.g. a sibling induction loop's still-empty final read): the result
+    // would fabricate `l`'s tail and read as terminal instead of waiting.
+    // (Sibling half of this invariant: `MapResultToConstProducer` emits an
+    // empty non-terminal tile rather than broadcasting an absent constant.)
+    l.truncate(r.len());
     match op {
         ArithmeticKind::Add => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a += *b),
         ArithmeticKind::Sub => l.iter_mut().zip(r.iter()).for_each(|(a, b)| *a -= *b),
@@ -64,6 +74,11 @@ fn zip_arithmetic<T: Copy + AddAssign<T> + SubAssign<T> + MulAssign<T> + DivAssi
 }
 
 fn zip_concat(mut l: Vec<SmolStr>, r: &[SmolStr]) -> Vec<SmolStr> {
+    // Combine only co-present positions — see `zip_arithmetic`. Without this,
+    // `l ++ r` with `r` shorter would return `l`'s surplus tail verbatim,
+    // fabricating values for positions the other operand has not yet reached
+    // (e.g. a still-converging sibling read) and reading terminal too early.
+    l.truncate(r.len());
     l.iter_mut().zip(r.iter()).for_each(|(a, b)| {
         *a = {
             let mut builder = SmolStrBuilder::new();
@@ -86,8 +101,27 @@ fn zip_compare<T: PartialEq + PartialOrd>(op: CompareKind, l: Vec<T>, r: &[T]) -
     }
 }
 
+/// Align two bit-vectors to their common-prefix length. `BitVec`'s in-place set
+/// ops (`and`/`or`/`xor`/…) assert *equal* length, so a still-converging operand
+/// (one side ahead of the other — the co-presence case `zip_arithmetic` handles
+/// by truncation) would panic without this. `l` is truncated in place; `r` is
+/// returned truncated, cloned into `scratch` only when it is the longer side.
+fn align_common<'a>(l: &mut BitVec, r: &'a BitVec, scratch: &'a mut Option<BitVec>) -> &'a BitVec {
+    let n = l.len().min(r.len());
+    l.truncate(n);
+    if r.len() == n {
+        r
+    } else {
+        let mut c = r.clone();
+        c.truncate(n);
+        &*scratch.insert(c)
+    }
+}
+
 fn zip_bool_compare(op: CompareKind, mut l: BitVec, r: &BitVec) -> BitVec {
     // Boolean ordering: false < true (0 < 1).
+    let mut scratch = None;
+    let r = align_common(&mut l, r, &mut scratch);
     match op {
         CompareKind::Equals => l.xnor(r),
         CompareKind::NotEquals => l.xor(r),
@@ -118,6 +152,8 @@ fn zip_bool_compare(op: CompareKind, mut l: BitVec, r: &BitVec) -> BitVec {
 }
 
 fn zip_bool_logic(op: LogicKind, mut l: BitVec, r: &BitVec) -> BitVec {
+    let mut scratch = None;
+    let r = align_common(&mut l, r, &mut scratch);
     match op {
         LogicKind::And => l.and(r),
         LogicKind::Nand => l.nand(r),
@@ -212,6 +248,66 @@ mod tests {
         assert!(!cmp(CompareKind::Equals, false, true));
         assert!(!cmp(CompareKind::NotEquals, true, true));
         assert!(cmp(CompareKind::NotEquals, false, true));
+    }
+
+    /// Operands of unequal length (one side still converging) combine only over
+    /// their common prefix — the surplus tail is dropped, never fabricated.
+    /// Regression for the string-concat co-presence bug (`zip_concat` returned
+    /// the longer operand's tail verbatim) and the bool-op equal-length panic.
+    #[test]
+    fn binop_unequal_lengths_combine_common_prefix_only() {
+        use bit_vec::BitVec;
+        use smol_str::SmolStr;
+
+        // String concat: `l` longer than `r` → result is the 2-element prefix.
+        let l = ColumnValue::Strings(
+            ["a", "b", "c"]
+                .into_iter()
+                .map(SmolStr::new)
+                .collect::<Vec<_>>(),
+        );
+        let r = ColumnValue::Strings(["1", "2"].into_iter().map(SmolStr::new).collect::<Vec<_>>());
+        match apply_binop_column(BinOpKind::Concat, l, &r) {
+            ColumnValue::Strings(v) => {
+                assert_eq!(v, vec![SmolStr::new("a1"), SmolStr::new("b2")]);
+            }
+            other => panic!("expected Strings, got {other:?}"),
+        }
+
+        // Arithmetic: `r` longer than `l` → result is the 1-element prefix.
+        match apply_binop_column(
+            BinOpKind::Arithmetic(ArithmeticKind::Add),
+            ColumnValue::Ints(vec![10]),
+            &ColumnValue::Ints(vec![1, 2, 3]),
+        ) {
+            ColumnValue::Ints(v) => assert_eq!(v, vec![11]),
+            other => panic!("expected Ints, got {other:?}"),
+        }
+
+        // Bool ops must not panic on unequal lengths (BitVec set ops assert
+        // equal length); they align to the common prefix instead.
+        match apply_binop_column(
+            BinOpKind::Compare(CompareKind::Less),
+            ColumnValue::Bools(BitVec::from_elem(3, false)),
+            &ColumnValue::Bools(BitVec::from_elem(1, true)),
+        ) {
+            ColumnValue::Bools(v) => {
+                assert_eq!(v.len(), 1);
+                assert!(v[0]); // false < true
+            }
+            other => panic!("expected Bools, got {other:?}"),
+        }
+        match apply_binop_column(
+            BinOpKind::BoolLogic(LogicKind::And),
+            ColumnValue::Bools(BitVec::from_elem(1, true)),
+            &ColumnValue::Bools(BitVec::from_elem(4, true)),
+        ) {
+            ColumnValue::Bools(v) => {
+                assert_eq!(v.len(), 1);
+                assert!(v[0]);
+            }
+            other => panic!("expected Bools, got {other:?}"),
+        }
     }
 
     #[test]

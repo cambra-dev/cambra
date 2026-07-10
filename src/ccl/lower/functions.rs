@@ -8,9 +8,30 @@ use std::collections::HashSet;
 
 use super::*;
 use crate::{
-    ccl::{Expr, Name, Type},
+    ccl::{Expr, Name, Type, TypedExprNode},
     chl_parser::ast::{Param, Span, Spanned},
 };
+
+/// If `param` is annotated `Mut[…]` (a pass-by-reference store parameter),
+/// return its store type `Mut[V, D]`. Returns `None` for any non-`Mut`
+/// annotation (or an unannotated parameter). Mirrors the `Mut[…]` stamping of
+/// an induction introduction (`lower/stmts.rs :: mut_annotation_parts`).
+///
+/// The sequencing domain is left inferred (`D = Hole` → a fresh variable,
+/// generalized per call site): the store's domain is the loop it accumulates
+/// over, resolved by the unified phase per call site.
+fn mut_param_store_type(param: &Param) -> Option<Result<Type, LoweringError>> {
+    let annotation = param.annotation.as_ref()?;
+    match mut_annotation_parts(annotation) {
+        Some(Ok(value)) => Some(Ok(Type::History {
+            value: Box::new(value),
+            domain: Box::new(Type::Hole),
+            kind: crate::ccl::HistoryKind::Store,
+        })),
+        Some(Err(e)) => Some(Err(e)),
+        None => None,
+    }
+}
 
 /// Validate that the function or lambda has at least one parameter.
 ///
@@ -62,11 +83,59 @@ pub(super) fn validate_function_params(
 /// Shared between [`lower_lambda`] and [`lower_function_body`] so that both
 /// `lambda x, y: …` and `def f(x, y): …` pair with [`lower_call`]'s
 /// tupled-argument shape and never emit a curried `Expr::Lambda` chain that
-/// `lambda_elim` would fold into an unsupported `curry(body)`.
-pub(super) fn uncurry_params(params: &[Param], body_expr: Expr, ctx: &mut LoweringContext) -> Expr {
+/// `lambda_elim` would fold into an unsupported `curry(body)` — the one
+/// exception being a pass-by-reference `Mut` parameter, which stays a *named*
+/// curried binder (see the `Mut`-param arm below); such functions are always
+/// inlined, so their curried chain never reaches `lambda_elim`.
+pub(super) fn uncurry_params(
+    params: &[Param],
+    body_expr: Expr,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
     if params.len() == 1 {
-        return Expr::lambda(params[0].name.as_str(), Type::Hole, body_expr);
+        // A `Mut[…]`-annotated single parameter is a pass-by-reference store:
+        // bind it at `Mut[V, D]` so body references carry `Mut` (reads deref,
+        // writes lower to `MutWrite`) and inference generalizes its domain per
+        // call site. The annotation rides `user_annotation` too, so the
+        // discipline check's rule 3 (no *unannotated* `Mut` binding) treats it
+        // as the deliberate declaration it is. Non-`Mut` params stay `Hole`
+        // (inferred), as before. Multi-arg pass-by-ref lands with transactions.
+        let param_ty = match mut_param_store_type(&params[0]) {
+            Some(Ok(mut_ty)) => mut_ty,
+            _ => Type::Hole,
+        };
+        let mut lam = Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr);
+        if matches!(param_ty, Type::History { .. })
+            && let TypedExprNode::Lambda { param, .. } = &mut lam.node
+        {
+            param.user_annotation = Some(param_ty);
+        }
+        return Ok(lam);
     }
+    // A function with a pass-by-reference `Mut` parameter is curried into a
+    // chain of *named* lambdas rather than tupled: a `Mut` parameter must stay a
+    // named binder so inlining renames the callee's `MutWrite` target to the
+    // caller's store (a tuple projection cannot be a write target — the
+    // cross-function transactional writer `def transfer(src, dst, amt)`). Such
+    // functions are always inlined (a `Mut`-param function must reach its call
+    // sites), so the curried chain never survives to `lambda_elim`. Call sites
+    // apply curried to match (see `lower_call`, keyed on `mut_param_fns`).
+    if params.iter().any(|p| mut_param_store_type(p).is_some()) {
+        return Ok(params.iter().rev().fold(body_expr, |acc, param| {
+            let param_ty = match mut_param_store_type(param) {
+                Some(Ok(mut_ty)) => mut_ty,
+                _ => Type::Hole,
+            };
+            let mut lam = Expr::lambda(param.name.as_str(), param_ty.clone(), acc);
+            if matches!(param_ty, Type::History { .. })
+                && let TypedExprNode::Lambda { param: p, .. } = &mut lam.node
+            {
+                p.user_annotation = Some(param_ty);
+            }
+            lam
+        }));
+    }
+
     // Mint the tuple name after `body_expr` is lowered so that inner
     // multi-arg lambdas (which bump the counter during body lowering)
     // receive strictly smaller ids than the outer lambda. Together with
@@ -79,7 +148,7 @@ pub(super) fn uncurry_params(params: &[Param], body_expr: Expr, ctx: &mut Loweri
         let proj = Expr::apply(Expr::var(&tuple_name), Expr::proj_index(i));
         substitute_param_in_body(acc, &Name::raw(arg.name.as_str()), &proj)
     });
-    Expr::lambda(&tuple_name, Type::Hole, body_with_subs)
+    Ok(Expr::lambda(&tuple_name, Type::Hole, body_with_subs))
 }
 
 /// Lower a CHL lambda expression to an [`Expr::Lambda`] via
@@ -100,8 +169,11 @@ pub(super) fn lower_lambda(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     validate_function_params(lambda_span, params)?;
-    let body_expr = lower_expr(body, ctx)?;
-    Ok(uncurry_params(params, body_expr, ctx))
+    // Store-ness of a `Mut[…]`-annotated parameter is its *type* (stamped by
+    // `uncurry_params`), checked post-inference — there is no induction registry
+    // to mask here.
+    let body_expr = lower_expr(body, ctx);
+    uncurry_params(params, body_expr?, ctx)
 }
 
 /// Replace every free occurrence of `Var(name)` in `expr` with `replacement`,
@@ -142,9 +214,20 @@ pub(super) fn lower_function_body(
     validate_function_params(fn_span, params)?;
     let outer_bindings: HashSet<String> =
         params.iter().map(|p| p.name.as_str().to_string()).collect();
+
+    // Validate each `Mut[…]` parameter annotation eagerly, before the body
+    // lowers. Store-ness of a `Mut[…]` parameter is its `Type::History` (stamped
+    // by `uncurry_params`), checked post-inference — there is no registry here.
+    for param in params {
+        if let Some(res) = mut_param_store_type(param) {
+            res?;
+        }
+    }
+
     // http_serve is not permitted inside function bodies.
-    let body_expr = lower_stmts_inner(body, &outer_bindings, ctx, false)?;
-    Ok(uncurry_params(params, body_expr, ctx))
+    let body_result = lower_stmts_inner(body, &outer_bindings, ctx, false);
+
+    uncurry_params(params, body_result?, ctx)
 }
 
 #[cfg(test)]

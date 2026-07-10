@@ -1,12 +1,49 @@
 //! The CCL expression AST: [`TypedExpr`] / [`TypedExprNode`], the
 //! [`TypedBinding`] binding-site struct, the structural traversal helpers, and
-//! the [`Branch`] / [`Pattern`] / `Loop`-shape support types.
+//! the [`Branch`] / [`Pattern`] / [`TransactKey`] / [`TransactWriter`] support
+//! types.
 
 use crate::ccl::{AggregateKind, BinOpKind, Builtin, Lit, Name, ProjKey, Type, UnaryOpKind};
 
+/// The `commit` field of a [`TransactWriter`] decision record — the boolean
+/// grant/deny gating the whole (atomic) write set. Always `true` for the
+/// induction (`mut`-loop) case.
+pub const F_COMMIT: &str = "commit";
+/// The `writes` field of a [`TransactWriter`] decision record — the positional
+/// tuple of proposed per-key new values (`writes.i` for `write_keys[i]`), one
+/// element even for a single-key write set.
+pub const F_WRITES: &str = "writes";
+
+// Field names of a **commit-record** binding — the intermediate representation
+// [`crate::ccl::transact_phase`] emits and [`crate::ccl::letrec_phase::recognize`]
+// consumes. A commit-record binding `commits : 𝐼 ⇒ {time, write_targets, decision}`
+// per `with begin():` site carries: the commit time `begin(r)` (`time`), the
+// history bindings of the write-set keys (`write_targets`, so recognition can
+// recover the writer's `write_keys` without a per-key merge), and the writer's
+// verbatim `{commit, writes, to_<defer>*}` decision applied to the store
+// snapshot at that time (`decision`). Only `write_targets`/`decision` reach
+// recognition; `time` records the commit clock for the model's honesty.
+/// The `time` field of a commit-record binding — the transaction's commit time
+/// `begin(r)`, at which the writer's store snapshots are read.
+pub const F_TIME: &str = "time";
+/// The `write_targets` field of a commit-record binding — a positional tuple of
+/// the write-set keys' history bindings (`write_targets.i` is the history of
+/// `write_keys[i]`), the encoding recognition reads a site's `write_keys` off.
+pub const F_WRITE_TARGETS: &str = "write_targets";
+/// The `decision` field of a commit-record binding — the writer's verbatim
+/// `{commit, writes, to_<defer>*}` decision record, applied to the store
+/// snapshot at the commit time. Recognition lifts the writer body out of it.
+pub const F_DECISION: &str = "decision";
+/// The `write` field of a **per-key commit view** — the single value a site's
+/// commit proposes for one store key (`decision.writes.i`, re-projected). A
+/// key's history binding searches the `⧺`-merged per-key views of every site
+/// writing it: `{time, commit, write}` per commit, the exact record shape the
+/// design doc gives `get_prev_txn`'s history argument.
+pub const F_WRITE: &str = "write";
+
 /// A typed binding site: a named variable together with its type.
 ///
-/// Used in [`TypedExprNode::Lambda`], [`TypedExprNode::Loop`], and [`TypedExprNode::Let`] to carry
+/// Used in [`TypedExprNode::Lambda`] and [`TypedExprNode::Let`] to carry
 /// both the inferred type and any user-written annotation at each binding site.
 ///
 /// `ty` starts as [`Type::Hole`] (lowering placeholder) and is converted to a
@@ -272,65 +309,124 @@ pub enum TypedExprNode {
         payload: Box<TypedExpr>,
     },
 
-    /// A bounded iteration loop with explicit loop-carried accumulators.
+    /// A transactional store: a set of scalar-register **keys** sharing one
+    /// sequencing domain, driven by concurrent **writers** that read the
+    /// shared store and propose per-position writes.
     ///
-    /// Each iteration:
-    /// 1. The `source` morphism produces the next element from its domain.
-    /// 2. `loop_body` is invoked with a tuple `(param_0, …, param_{n-1}, item)`,
-    ///    where `param_k` are the previous-iteration accumulator values and
-    ///    `item` is the source element.  Its result is a
-    ///    `Record({step, to_<defer>*})` whose `step` field carries the next
-    ///    accumulator value(s) and whose `to_<defer>` fields (one per
-    ///    `<<` feed inside the body, emitted by `desugar_defers`) carry
-    ///    the per-iteration channel values.
-    /// 3. The Loop's value is the running body stream `Fun(D,
-    ///    Record({step, to_<defer>*}))`; surrounding lowering picks each
-    ///    accumulator off with `Proj("step") [▷ Proj(i)] ▷ Last` and
-    ///    each channel with `Proj("to_<defer>")`.
+    /// The **domain-parameterized recurrence carrier**, born in
+    /// [`crate::ccl::letrec_phase::recognize`] and consumed at operator
+    /// conversion. It denotes a pure value — the store **record** `{key:
+    /// ⟦key⟧}`, each field a key's history `Fun(domain, V)` — so a variable
+    /// read is the record projection `__store.key` (an `Apply` of `Proj(field)`
+    /// to the `__store` binder). Serialization and the store↔writer cycle are
+    /// the *operator's* runtime behaviour (a cyclic `FanOut`), not the node's
+    /// denotation — exactly as `Recurse` realizes the recurrence.
     ///
-    /// The accumulator slots in `params` are only in scope inside `loop_body`;
-    /// they are *not* visible from `init_args` (which sits outside the loop
-    /// scope and supplies their starting values).  Surrounding `Let`
-    /// bindings name the loop's result.
+    /// Op-conversion dispatches on [`domain`](Self::Transact::domain): a
+    /// concrete iteration extent → the sequential `Recurse` (the induction case
+    /// — one always-commit writer, the degenerate no-conflict case of the
+    /// commit contract; this is all the pipeline emits today). [`Type::Txn`] →
+    /// the concurrent commit operator (a later increment).
+    Transact {
+        /// The store's keys — one per scalar register sharing this store's
+        /// sequencing domain. Each carries its position-0 `init` (the seed,
+        /// evaluated once outside every writer's parameter scope). The node
+        /// denotes the store **record** `{key.field_key(): Fun(domain, V)}`; a
+        /// variable read is a projection `__store.key`. A single-key store is
+        /// the one-accumulator case.
+        keys: Vec<TransactKey>,
+        /// The writers, in declaration order. Each reads/writes a footprint of
+        /// keys (its read-set / write-set) and proposes a per-position decision
+        /// record. An induction-domain store has exactly one writer (a `mut`
+        /// loop, whose footprint is all its accumulators).
+        writers: Vec<TransactWriter>,
+        /// The store's **sequencing domain** — the index of every key's history
+        /// `Fun(domain, V)`. A concrete iteration extent for a `mut`
+        /// accumulator (the loop's induction domain); [`Type::Txn`] for a
+        /// transactional commit clock (later increment). Op-conversion
+        /// dispatches the engine on it.
+        domain: Type,
+    },
+
+    /// A mutually recursive definition group:
+    /// `letrec b₁ = e₁; …; bₙ = eₙ in body`.
     ///
-    /// Compiles to iterate/feedback operators in the dataflow graph: a
-    /// `Recurse` over `source`'s domain whose `recursive_input` is the
-    /// `.step` projection of the body fed by `zip(Recurse, source)`.
-    Loop {
-        /// The loop-carried variable slots, in declaration order.  Each
-        /// is bound inside `loop_body` to the previous iteration's value
-        /// (or the corresponding `init_args[i]` on the first iteration).
-        params: Vec<TypedBinding>,
-        /// Initial accumulator values, one per `params` entry.  Evaluated
-        /// once before the loop starts; not in the scope where `params`
-        /// are bound.
-        init_args: Vec<TypedExpr>,
-        /// Iteration source — a `Fun(D, item_ty)` whose domain `D` drives the
-        /// loop and whose codomain values are passed to `loop_body` alongside
-        /// the loop-carried params.
-        source: Box<TypedExpr>,
-        /// The per-iteration step — a `Fun(Tuple(param_tys…, item_ty), Codomain)`
-        /// taking a tuple of the current loop params and the source element
-        /// and returning the next param value(s).
-        ///
-        /// The Loop's body codomain is always
-        /// `Record({step: <step_shape>, to_<defer>: T_*})` (with any
-        /// number of `to_<defer>` fields, possibly zero).  The `step`
-        /// field carries the recurrence (a scalar for `params.len() ==
-        /// 1`, a positional `Tuple(T_0, …, T_{n-1})` for multi-var);
-        /// each `to_<defer>` field carries a per-iteration `<<` feed
-        /// value picked up by [`crate::ccl::desugar_defers`].
-        /// Op-conversion always cycles on `.step` and exposes the body
-        /// stream as the external output; surrounding lowering
-        /// finishes with `Proj("step") [▷ Proj(i)] ▷ Last` per
-        /// accumulator and `Proj("to_<defer>")` per feed.
-        ///
-        /// Building the params into the input tuple (rather than capturing
-        /// them as free variables from outer scope) keeps op-conversion
-        /// straightforward: `acc_var` is just `p ▷ Proj(0)`, with no
-        /// special "scalar-CCL-type but function-tiled-op" detection
-        /// needed.
-        loop_body: Box<TypedExpr>,
+    /// Every binding's name is in scope in **every** binding's body and in
+    /// `body` — mutual recursion.  Well-formedness requires the recursion to
+    /// be *guarded*: on every cycle of the group's reference graph at least
+    /// one reference must go through a "previous value" accessor
+    /// ([`Builtin::GetPrevSeq`], and later `get_prev_txn`), so values at any
+    /// position of the sequencing domain depend only on strictly earlier
+    /// positions.  [`crate::ccl::letrec::check_letrec_guarded`] enforces
+    /// this; see `src/ccl/design/mutability.md` ("The model" / "`LetRec`").
+    ///
+    /// This is the general node for loops, transactions, and future
+    /// recursive definitions: the unified phase (design doc, "The unified
+    /// phase") rewrites every mutable variable's history, commit-record
+    /// stream, and feed output into one letrec, and recognition
+    /// *recognizes patterns* in the group (a `get_prev_seq`-guarded
+    /// self-cycle is a fold; a commit-record binding read through
+    /// `get_prev_txn` is a transactional store) to pick the engine.
+    /// The induction `letrec_phase` emits it for every mutation loop (the
+    /// transactional slice — a later PR on this stack — adds `Mut[V, Txn]`
+    /// blocks). The group then travels — bodies point-freed — through
+    /// `channelize` and `lambda_elim`; `letrec_phase::recognize` runs *after*
+    /// `lambda_elim` on the point-free normal form and lowers every recognized
+    /// group onto the domain-parameterized [`Transact`](Self::Transact) carrier.
+    /// A `LetRec` therefore does not survive to planning — a group reaching
+    /// op-conversion unrecognized is treated as unreachable rather than guessed.
+    ///
+    /// The node denotes a pure value (the unique solution of the guarded
+    /// group, by induction along the domain order), so it satisfies the CCL
+    /// purity invariant.
+    LetRec {
+        /// The mutually recursive definition group. Every binding's name is
+        /// in scope in every binding's body (and in `body`). Each binding
+        /// carries its full type (generated concretely by the unified phase).
+        bindings: Vec<(TypedBinding, TypedExpr)>,
+        /// The continuation, with the whole group in scope.
+        body: Box<TypedExpr>,
+    },
+
+    /// A statement `for` loop, mirroring the CHL construct directly:
+    /// `for target in iter: body`. Value `Unit`.
+    ///
+    /// A **pre-phase surface-structure node** in the same transient class as
+    /// [`TypedExprNode::Defer`]: a pure placeholder no pass executes,
+    /// eliminated wholesale by the unified letrec phase
+    /// (src/ccl/design/mutability.md, "The unified phase"). Lowering emits
+    /// it for mutation loops whose bodies carry no feeds or yields; the
+    /// phase rewrites it — with the [`TypedExprNode::MutWrite`]s inside —
+    /// into a guarded [`TypedExprNode::LetRec`]. No pass downstream of the
+    /// phase may observe it; operator conversion rejects it explicitly.
+    For {
+        /// The iteration binder, bound in `body` to each source element.
+        target: TypedBinding,
+        /// The iteration source — a `Fun(D, T)` whose domain drives the loop.
+        iter: Box<TypedExpr>,
+        /// The per-iteration statement chain (`Let`s / `ExprStmt`-sequenced
+        /// `MutWrite`s), value `Unit`. Reads of mutable variables are bare
+        /// `Var`s — read-your-writes shadowing is the phase's job, not
+        /// lowering's.
+        body: Box<TypedExpr>,
+    },
+
+    /// One write to a `Mut`-declared variable: `name = value` inside a
+    /// [`TypedExprNode::For`] body. Value `Unit`.
+    ///
+    /// `name` is a *reference* to the enclosing plain-`let` binding that
+    /// introduced the variable (not a binder): uniquify and substitution
+    /// treat it exactly like a `Var` use. Bare `Var(name)` reads inside
+    /// `value` are ordinary reads of that binding — the value *before* this
+    /// write.
+    ///
+    /// Same transient class as [`TypedExprNode::For`] — eliminated by the
+    /// unified phase, which threads the write through the letrec recurrence.
+    MutWrite {
+        /// The mutable variable being written.
+        name: Name,
+        /// The written value; must be a subtype of the variable's type.
+        value: Box<TypedExpr>,
     },
 
     /// A tuple constructor: `(e0, e1, ...)`.
@@ -411,19 +507,19 @@ pub enum TypedExprNode {
 
     /// Feed a value into a deferred output: `x << value`.
     /// Lowers from the `<<` (LShift) binary operator when the LHS names a defer.
-    /// Has type `Unit`; the value is collected by [`crate::ccl::desugar_defers`]
+    /// Has type `Unit`; the value is collected by [`crate::ccl::channelize`]
     /// and unioned into the source channel that resolves the defer.
     Feed { name: Name, value: Box<Expr> },
 
     /// Define a deferred output to a specific value: `x <<= value`.
     /// Lowers from the `<<=` (AugAssign LShift) statement when the LHS names a defer.
-    /// Has type `Unit`; the value is collected by [`crate::ccl::desugar_defers`]
+    /// Has type `Unit`; the value is collected by [`crate::ccl::channelize`]
     /// and replaces the surrounding `Defer` binding.
     Define { name: Name, value: Box<Expr> },
 
     /// Placeholder for an output accumulator introduced by `x = defer()`.
     /// The bound name is resolved by the surrounding `Let` binding.
-    /// Eliminated by [`crate::ccl::desugar_defers`] before type inference.
+    /// Eliminated by [`crate::ccl::channelize`] before type inference.
     Defer,
 
     /// Recovery placeholder inserted by lowering when a sub-expression or
@@ -540,6 +636,13 @@ impl TypedExpr {
     }
 
     /// Construct a feed expression.
+    pub fn mut_write(name: impl Into<Name>, value: Self) -> Self {
+        Self::new(TypedExprNode::MutWrite {
+            name: name.into(),
+            value: Box::new(value),
+        })
+    }
+
     pub fn feed(name: impl Into<Name>, value: Self) -> Self {
         Self::new(TypedExprNode::Feed {
             name: name.into(),
@@ -552,114 +655,6 @@ impl TypedExpr {
         Self::new(TypedExprNode::Define {
             name: name.into(),
             value: Box::new(value),
-        })
-    }
-
-    /// Construct a [`TypedExprNode::Loop`] header.
-    ///
-    /// `param_names` become the loop-carried bindings (each stamped with
-    /// [`Type::Hole`]; inference fills in the type).  `init_args`
-    /// supplies the starting value for each param, in declaration order.
-    /// `source` is the iteration source (`Fun(D, item_ty)`).  `loop_body`
-    /// is the per-iteration step
-    /// (`Fun(Tuple(param_tys…, item_ty), Record({step, to_<defer>*}))`).
-    /// The body always returns `Record({step: <step_shape>,
-    /// to_<defer_0>: T_0, …, to_<defer_k>: T_k})` — the `step` field
-    /// carries the recurrence (a scalar for one param, a positional
-    /// `Tuple` for multiple); `to_<defer>` fields are added by
-    /// [`crate::ccl::desugar_defers`] for each `<<` feed inside the
-    /// loop body (zero if there are no feeds).
-    pub fn loop_node(
-        param_names: Vec<Name>,
-        init_args: Vec<Self>,
-        source: Self,
-        loop_body: Self,
-    ) -> Self {
-        assert_eq!(
-            param_names.len(),
-            init_args.len(),
-            "Loop: param_names and init_args must have the same length",
-        );
-        Self::new(TypedExprNode::Loop {
-            params: param_names
-                .into_iter()
-                .map(|n| TypedBinding {
-                    name: n,
-                    ty: Type::Hole,
-                    user_annotation: None,
-                })
-                .collect(),
-            init_args,
-            source: Box::new(source),
-            loop_body: Box::new(loop_body),
-        })
-    }
-
-    /// If this expression is a [`TypedExprNode::Loop`] in the
-    /// mutation-loop shape (at least one loop-carried accumulator with a
-    /// matching count of `init_args`), return a borrowed view of its
-    /// fields.  Otherwise return [`None`].
-    ///
-    /// This is the **single source of truth** for the mutation-loop shape
-    /// contract.  `lower_mutation_loop` in [`crate::ccl::lower`] is the only
-    /// producer of this shape; [`crate::ccl::infer`] and
-    /// [`crate::interpreter::operator_conversion`] are the two consumers
-    /// that pattern-match it.  Both consumers call this helper (or the
-    /// mutable [`Self::as_mutation_loop_mut`] sibling) to keep the shape
-    /// definition in one place — anyone changing the lowering shape only
-    /// has to update these matchers and the callers will fall out of sync
-    /// visibly (no silent acceptance of malformed ASTs).
-    ///
-    /// The matcher does *not* assert that `loop_body` is a particular
-    /// pre-/post-lambda-elim form, since different passes see it at
-    /// different stages of point-free reduction.  Callers that depend on
-    /// the pre-lambda-elim `Compose([source, Lambda(...)])` shape must
-    /// validate that separately.
-    pub fn as_mutation_loop(&self) -> Option<MutationLoopShape<'_>> {
-        let TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } = &self.node
-        else {
-            return None;
-        };
-        if params.is_empty() || params.len() != init_args.len() {
-            return None;
-        }
-        Some(MutationLoopShape {
-            acc_vars: params,
-            init_args,
-            source,
-            loop_body,
-        })
-    }
-
-    /// Mutable companion to [`Self::as_mutation_loop`].
-    ///
-    /// Inference calls `infer_expr(&mut ...)` on the source, each init
-    /// arg, and the body; returning `&mut` borrows lets it do that
-    /// through the same shape check the immutable variant performs.
-    /// The shape contract is identical.
-    pub fn as_mutation_loop_mut(&mut self) -> Option<MutationLoopShapeMut<'_>> {
-        let TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } = &mut self.node
-        else {
-            return None;
-        };
-        if params.is_empty() || params.len() != init_args.len() {
-            return None;
-        }
-        Some(MutationLoopShapeMut {
-            acc_vars: params.as_mut_slice(),
-            init_args: init_args.as_mut_slice(),
-            source,
-            loop_body,
         })
     }
 
@@ -720,6 +715,19 @@ impl TypedExpr {
         Self::new(TypedExprNode::Let {
             binding: TypedBinding::new_annotated(name, annotation),
             bound_expr: Box::new(bound_expr),
+            body: Box::new(body),
+        })
+    }
+
+    /// Construct a [`TypedExprNode::LetRec`] group.
+    ///
+    /// Every binding's name is in scope in every binding's body and in
+    /// `body` (mutual recursion); the caller is responsible for the
+    /// guardedness well-formedness condition
+    /// ([`crate::ccl::letrec::check_letrec_guarded`]).
+    pub fn letrec(bindings: Vec<(TypedBinding, Self)>, body: Self) -> Self {
+        Self::new(TypedExprNode::LetRec {
+            bindings,
             body: Box::new(body),
         })
     }
@@ -935,23 +943,34 @@ impl TypedExpr {
                     f(e);
                 }
             }
-            TypedExprNode::Loop {
-                source,
-                init_args,
-                loop_body,
-                ..
-            } => {
-                f(source);
-                for a in init_args {
-                    f(a);
+            // `domain` is a `Type`, not an `Expr` child, so the expr-walker
+            // skips it (its type residue is reached via `expr.ty` walks).
+            TypedExprNode::Transact { keys, writers, .. } => {
+                for k in keys {
+                    f(&k.init);
                 }
-                f(loop_body);
+                for w in writers {
+                    f(&w.source);
+                    f(&w.body);
+                }
+            }
+            TypedExprNode::LetRec { bindings, body } => {
+                for (_, def) in bindings {
+                    f(def);
+                }
+                f(body);
+            }
+            TypedExprNode::For { iter, body, .. } => {
+                f(iter);
+                f(body);
             }
             TypedExprNode::ExprStmt { expr, body } => {
                 f(expr);
                 f(body);
             }
-            TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => f(value),
+            TypedExprNode::Feed { value, .. }
+            | TypedExprNode::Define { value, .. }
+            | TypedExprNode::MutWrite { value, .. } => f(value),
         }
     }
 
@@ -1076,23 +1095,84 @@ impl TypedExpr {
                     f(e);
                 }
             }
-            TypedExprNode::Loop {
-                source,
-                init_args,
-                loop_body,
-                ..
-            } => {
-                f(source);
-                for a in init_args {
-                    f(a);
+            TypedExprNode::Transact { keys, writers, .. } => {
+                for k in keys {
+                    f(&mut k.init);
                 }
-                f(loop_body);
+                for w in writers {
+                    f(&mut w.source);
+                    f(&mut w.body);
+                }
+            }
+            TypedExprNode::LetRec { bindings, body } => {
+                for (_, def) in bindings {
+                    f(def);
+                }
+                f(body);
+            }
+            TypedExprNode::For { iter, body, .. } => {
+                f(iter);
+                f(body);
             }
             TypedExprNode::ExprStmt { expr, body } => {
                 f(expr);
                 f(body);
             }
-            TypedExprNode::Feed { value, .. } | TypedExprNode::Define { value, .. } => f(value),
+            TypedExprNode::Feed { value, .. }
+            | TypedExprNode::Define { value, .. }
+            | TypedExprNode::MutWrite { value, .. } => f(value),
+        }
+    }
+
+    /// Invoke `f` on each [`TypedBinding`] this node introduces directly — the
+    /// binder slots [`walk_children_mut`](Self::walk_children_mut) deliberately
+    /// does **not** visit: a `Lambda`/`Let`/`For` binder, each `LetRec` group
+    /// binder, and each `Case` branch's pattern binder. Does not recurse into
+    /// child expressions.
+    ///
+    /// This is the single source of truth for "which nodes bind names", so a
+    /// pass that must cover every binder's type slot (a type-erasing pass, an
+    /// α-renamer) enumerates them here rather than re-deriving the set — adding
+    /// a new binding node updates this one match instead of every such pass.
+    /// Immutable analog of [`walk_binders_mut`](Self::walk_binders_mut): visit
+    /// each `TypedBinding` this node declares (the single source of truth for
+    /// binder-slot coverage, for read-only passes). Kept in lockstep with the
+    /// mutable version — any new binder-bearing variant must appear in both.
+    pub fn walk_binders(&self, mut f: impl FnMut(&TypedBinding)) {
+        match &self.node {
+            TypedExprNode::Lambda { param, .. }
+            | TypedExprNode::Let { binding: param, .. }
+            | TypedExprNode::For { target: param, .. } => f(param),
+            TypedExprNode::LetRec { bindings, .. } => {
+                bindings.iter().for_each(|(b, _)| f(b));
+            }
+            TypedExprNode::Case { branches, .. } => {
+                for b in branches {
+                    if let Some(p) = &b.pattern {
+                        f(&p.binding);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn walk_binders_mut(&mut self, mut f: impl FnMut(&mut TypedBinding)) {
+        match &mut self.node {
+            TypedExprNode::Lambda { param, .. }
+            | TypedExprNode::Let { binding: param, .. }
+            | TypedExprNode::For { target: param, .. } => f(param),
+            TypedExprNode::LetRec { bindings, .. } => {
+                bindings.iter_mut().for_each(|(b, _)| f(b));
+            }
+            TypedExprNode::Case { branches, .. } => {
+                for b in branches {
+                    if let Some(p) = &mut b.pattern {
+                        f(&mut p.binding);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1166,113 +1246,45 @@ impl Default for TypedExpr {
     }
 }
 
-/// Reconstruct a [`TypedExprNode::Loop`] by recursing into its children
-/// via `recurse`, respecting `params` shadowing of `shadowed_name`.
-///
-/// If `shadowed_name` is `Some(n)` and `n` matches a name in `params`,
-/// `loop_body` is returned unchanged — the param's binding shadows `n`
-/// inside the body, so substitution-style passes must not recurse into
-/// it.  `source` and `init_args` are evaluated outside the loop's
-/// parameter scope and are always recursed into.
-///
-/// Pass `None` for `shadowed_name` when the recursion is structural
-/// (i.e. not driven by a substitution of a specific name).
-///
-/// This helper is the single source of truth for the Loop walk rule —
-/// the substitute / inline / lambda-elim passes all delegate here so a
-/// shadow-check fix lands in one place.
-// Params mirror the `Loop` node's boxed fields so callers pass them verbatim
-// (and `loop_body` is returned boxed in the shadow case); unboxing only `source`
-// would be an inconsistent API for no real gain.
-#[allow(clippy::boxed_local)]
-pub fn walk_loop_children<F>(
-    params: Vec<TypedBinding>,
-    init_args: Vec<TypedExpr>,
-    source: Box<TypedExpr>,
-    loop_body: Box<TypedExpr>,
-    shadowed_name: Option<&Name>,
-    mut recurse: F,
-) -> TypedExprNode
-where
-    F: FnMut(TypedExpr) -> TypedExpr,
-{
-    let shadowed = shadowed_name.is_some_and(|n| params.iter().any(|p| &p.name == n));
-    TypedExprNode::Loop {
-        // `source` and `init_args` sit *outside* the loop's parameter
-        // scope, so they always get recursed into.  Only `loop_body`
-        // is gated by the shadow check.
-        source: Box::new(recurse(*source)),
-        init_args: init_args.into_iter().map(&mut recurse).collect(),
-        loop_body: if shadowed {
-            loop_body
-        } else {
-            Box::new(recurse(*loop_body))
-        },
-        params,
-    }
+/// One key of a [`TypedExprNode::Transact`] — a single scalar register sharing
+/// the store's sequencing domain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransactKey {
+    /// The key — the (α-uniquified) `Name` of the register. A read of the
+    /// variable projects [`Name::field_key`] of the store record (`__store.k`).
+    pub name: Name,
+    /// The position-0 initial value (the scalar seed), evaluated once outside
+    /// every writer's scope. The key's history is `Fun(domain, V)`; a read is
+    /// its latest value `V` (`last_or_default(history, init)`, defaulting to
+    /// `init` when the store ran zero positions).
+    pub init: TypedExpr,
 }
 
-/// Fallible variant of [`walk_loop_children`] for passes whose recursion
-/// function returns a `Result`.
-#[allow(clippy::boxed_local)]
-pub fn try_walk_loop_children<F, E>(
-    params: Vec<TypedBinding>,
-    init_args: Vec<TypedExpr>,
-    source: Box<TypedExpr>,
-    loop_body: Box<TypedExpr>,
-    shadowed_name: Option<&Name>,
-    mut recurse: F,
-) -> Result<TypedExprNode, E>
-where
-    F: FnMut(TypedExpr) -> Result<TypedExpr, E>,
-{
-    let shadowed = shadowed_name.is_some_and(|n| params.iter().any(|p| &p.name == n));
-    let new_source = Box::new(recurse(*source)?);
-    let new_init_args: Vec<TypedExpr> = init_args
-        .into_iter()
-        .map(&mut recurse)
-        .collect::<Result<_, _>>()?;
-    let new_loop_body = if shadowed {
-        loop_body
-    } else {
-        Box::new(recurse(*loop_body)?)
-    };
-    Ok(TypedExprNode::Loop {
-        source: new_source,
-        init_args: new_init_args,
-        loop_body: new_loop_body,
-        params,
-    })
-}
-
-/// Borrowed view of a mutation-loop-shaped [`TypedExprNode::Loop`].  See
-/// [`TypedExpr::as_mutation_loop`] for the matching rules.
-pub struct MutationLoopShape<'a> {
-    /// The loop-carried accumulator bindings, in declaration order.
-    /// Mirrors the order of `init_args`.
-    pub acc_vars: &'a [TypedBinding],
-    /// The initial accumulator values, one per [`Self::acc_vars`] entry.
-    /// Evaluated outside the loop's param scope.
-    pub init_args: &'a [Expr],
-    /// The iteration source (`Fun(D, item_ty)` once inference has run).
-    pub source: &'a Expr,
-    /// The per-iteration step.  For `n` accumulators, the body's
-    /// `Fun(Tuple(acc_ty_1, …, acc_ty_n, item_ty), <step or Record>)`.
-    /// At inference time this is `Lambda(p, let acc_1 = p.0 in … let
-    /// iter_var = p.n in step)`; after lambda elimination it is the same
-    /// in point-free form.
-    pub loop_body: &'a Expr,
-}
-
-/// Mutable companion to [`MutationLoopShape`].  Returned by
-/// [`TypedExpr::as_mutation_loop_mut`] for passes that need to mutate
-/// the matched sub-expressions in place (e.g. inference filling in
-/// the `ty` slots).
-pub struct MutationLoopShapeMut<'a> {
-    pub acc_vars: &'a mut [TypedBinding],
-    pub init_args: &'a mut [Expr],
-    pub source: &'a mut Expr,
-    pub loop_body: &'a mut Expr,
+/// One writer of a [`TypedExprNode::Transact`] — loop-shaped, mirroring a
+/// mutation-loop accumulator arm but reading the *shared* store rather than a
+/// private accumulator.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TransactWriter {
+    /// The writer's **read-set**: the store keys whose snapshot value the body
+    /// reads, in body-parameter order. The body is fed `(snap_{k₀}, …,
+    /// snap_{k_{r-1}}, item)` — each `read_keys[i]` bound as position `i` — so
+    /// an in-body read of a store variable resolves to its snapshot by lexical
+    /// shadowing (the accumulator pattern, generalized to several keys).
+    pub read_keys: Vec<Name>,
+    /// The writer's **write-set**: the store keys the body proposes new values
+    /// for, in the order of the decision's `writes` tuple (`writes.i` is the
+    /// new value for `write_keys[i]`).
+    pub write_keys: Vec<Name>,
+    /// Iteration source — a `Fun(D, item)` whose domain drives this writer and
+    /// whose codomain elements are passed to [`Self::body`]. Sits *outside* the
+    /// snapshot-parameter scope.
+    pub source: TypedExpr,
+    /// The per-position decision — `Fun(Tuple(snap…, item), {commit: Bool,
+    /// writes: Tuple(new…), to_<defer>*})`: reads the store snapshot, returns a
+    /// grant/deny (`commit`) with the proposed per-key write set (`writes`) and
+    /// any per-position `to_<defer>` feed taps. `commit` is always `true` for
+    /// the induction (`mut`-loop) case.
+    pub body: TypedExpr,
 }
 
 /// A single branch in a [`TypedExprNode::Case`] expression.

@@ -264,6 +264,27 @@ fn simplify_analyze(
             co_occurrences,
         );
     }
+    // A history's children (value + domain) recurse at the same polarity
+    // (invariant payload, materialization-only depth; see
+    // `CompactType::history_slot`).
+    if let Some((value, domain, _)) = &ct.history_slot {
+        simplify_analyze(
+            value,
+            pol,
+            input_rec_vars,
+            all_vars,
+            rec_processed,
+            co_occurrences,
+        );
+        simplify_analyze(
+            domain,
+            pol,
+            input_rec_vars,
+            all_vars,
+            rec_processed,
+            co_occurrences,
+        );
+    }
 }
 
 /// Apply `var_subst` to a [`CompactType`], producing the simplified version.
@@ -302,6 +323,14 @@ fn simplify_reconstruct(
         )
     });
 
+    let new_history_slot = ct.history_slot.map(|(value, domain, kind)| {
+        (
+            Box::new(simplify_reconstruct(*value, var_subst)),
+            Box::new(simplify_reconstruct(*domain, var_subst)),
+            kind,
+        )
+    });
+
     CompactType {
         vars: new_vars,
         atoms: ct.atoms,
@@ -309,6 +338,7 @@ fn simplify_reconstruct(
         var: new_var,
         fun: new_fun,
         refinements: ct.refinements,
+        history_slot: new_history_slot,
     }
 }
 

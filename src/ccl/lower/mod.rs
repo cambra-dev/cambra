@@ -70,7 +70,12 @@
 //! - [`comprehension`] — list-comprehension and generator-expression lowering.
 //! - [`http`] — `http_serve` recognition predicates.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    sync::Arc,
+};
 
 use crate::{
     ccl::{Branch, Expr, Lit, TypedExprNode},
@@ -268,6 +273,22 @@ pub struct LoweringContext {
     /// Globally unique across nested scopes so inner binders cannot capture
     /// a reference inserted by an outer substitution.
     next_synthetic_id: usize,
+
+    /// Names of `def`s that carry a pass-by-reference `Mut` parameter. Such a
+    /// function is lowered as a **curried** chain of named lambdas rather than
+    /// the usual single tupled-parameter lambda, because a `Mut` parameter must
+    /// stay a named binder for inlining to rename the callee's `MutWrite` target
+    /// to the caller's store (a tuple projection cannot be a write target). Its
+    /// call sites must apply curried to match — recorded here (the `def` lowers
+    /// before its calls) so [`lower_call`] can pick the matching shape.
+    ///
+    /// **Block-scoped.** Keyed on the surface name (lowering precedes uniquify,
+    /// so no α-unique name exists yet), the set is snapshot/restored around every
+    /// nested block ([`lower_stmts_inner`]) so a `Mut`-param `def` local to one
+    /// scope cannot leak its curried shape onto a same-named `def`/call in an
+    /// enclosing or sibling scope. Within a block, the *last* definition of a name
+    /// wins (see [`pre_register_mut_param_fns`]).
+    pub(super) mut_param_fns: HashSet<String>,
 }
 
 impl LoweringContext {
@@ -320,6 +341,26 @@ impl LoweringContext {
         format!("{prefix}_{id}")
     }
 
+    /// Record that `def name` carries a pass-by-reference `Mut` parameter, so it
+    /// is lowered — and applied — curried (see [`mut_param_fns`](Self::mut_param_fns)).
+    pub(super) fn register_mut_param_fn(&mut self, name: impl Into<String>) {
+        self.mut_param_fns.insert(name.into());
+    }
+
+    /// Undo a [`register_mut_param_fn`](Self::register_mut_param_fn): `name`'s
+    /// calls lower with the ordinary (tupled) shape. Used when a later `def` in a
+    /// block redefines an earlier `Mut`-param `def` with a non-`Mut` signature
+    /// (last definition wins, matching CHL's shadowing).
+    pub(super) fn unregister_mut_param_fn(&mut self, name: &str) {
+        self.mut_param_fns.remove(name);
+    }
+
+    /// Whether `name` is a `def` with a pass-by-reference `Mut` parameter (so
+    /// its calls must be lowered as curried applications).
+    pub(super) fn is_mut_param_fn(&self, name: &str) -> bool {
+        self.mut_param_fns.contains(name)
+    }
+
     /// Mint a fresh synthetic parameter name for a multi-arg lambda's tupled
     /// domain, e.g. `__arg_tuple_0`, `__arg_tuple_1`, …
     ///
@@ -339,16 +380,6 @@ impl LoweringContext {
     /// named `__result` inside the same generator body.
     pub(super) fn fresh_result_name(&mut self) -> String {
         self.mint_synthetic_id("__result")
-    }
-
-    /// Mint a unique `__acc_stream_N` binding name for the
-    /// Record-bodied Join's stream output in a feed-containing mutation
-    /// loop.  The surrounding let-binding projects `.step ▷ Last` for
-    /// the scalar accumulator and `.to_<defer>` for each per-feed
-    /// stream from this one Join (the multi-feed-per-defer subcase
-    /// suffixes those as `.to_<defer>_<k>`).
-    pub(super) fn fresh_acc_stream_name(&mut self) -> String {
-        self.mint_synthetic_id("__acc_stream")
     }
 }
 
@@ -499,8 +530,8 @@ pub fn lower_expr(
 /// When sink bindings are registered during lowering (e.g. from `http_serve`),
 /// the final expression is wrapped so the program ends in
 /// `ExprStmt(<body>, Record{sink: Var(sink), …})`.  The `Record` is the
-/// sink-binding contract; each field is the name that [`crate::ccl::desugar_defers`]
-/// resolves to the computed response morphism.  After `desugar_defers` removes
+/// sink-binding contract; each field is the name that [`crate::ccl::channelize`]
+/// resolves to the computed response morphism.  After `channelize` removes
 /// all `Feed` nodes, `simplify` drops the `ExprStmt`, leaving a clean
 /// `Let* Record{…}` shape for `compile_program`.
 pub fn lower_stmts(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) -> LoweringResult {

@@ -7,11 +7,13 @@
 //! See the design docs in `src/ccl/design/` for the full design rationale.
 
 pub mod ccl_utils;
+pub mod channelize;
 pub mod context;
-pub mod desugar_defers;
 pub mod infer;
 pub mod inline;
 pub mod lambda_elim;
+pub mod letrec;
+pub mod letrec_phase;
 pub mod lower;
 pub mod names;
 pub mod planning;

@@ -514,9 +514,9 @@ fn test_incremental_global_aggregate() {
 #[test_log::test]
 fn test_incremental_mutation_loop() {
     let code = "\
-x = 0
+x := 0
 for i in source1():
-    x = x + i
+    x := x + i
 x";
     let mut ctx = GlobalContext::default();
 

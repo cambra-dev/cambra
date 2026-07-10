@@ -37,6 +37,12 @@ pub(super) fn lower_stmts_recovering(
         return None;
     }
     let outer_bindings = HashSet::new();
+    // Pre-register transactional registers and `Mut`-parameter `def`s in this
+    // (top-level) block before lowering right-to-left: a call site or a
+    // register-writing loop is lowered before the `:=` / `def` that precedes it
+    // textually. (No transactional-registry snapshot here — the top level is the
+    // outermost scope, so nothing to restore to.)
+    pre_register_mut_param_defs(stmts, ctx);
     let (last, rest) = stmts.split_last().unwrap();
 
     // Final statement: recover by substituting Expr::error() on failure.
@@ -101,7 +107,7 @@ pub(super) fn lower_stmts_recovering(
 /// those inner bindings, making their names unbound.
 ///
 /// The `ExprStmt` node "drives the feed": `simplify` drops it once
-/// [`crate::ccl::desugar_defers`] has extracted all `Feed` nodes from the body,
+/// [`crate::ccl::channelize`] has extracted all `Feed` nodes from the body,
 /// leaving a clean `Let* Record{…}` shape that `compile_program` can pattern-match on.
 fn append_record_at_tail(expr: Expr, record: Expr) -> Expr {
     match expr.node {
@@ -156,20 +162,34 @@ pub(super) fn lower_stmts_inner(
         "lower_stmts_inner: empty nested block (parser invariant violated)"
     );
 
+    // A nested block is its own scope: snapshot *both* the transactional
+    // registry and the `mut_param_fns` set so declarations local to this block —
+    // a `Mut[…, Txn]` register, or a `Mut`-param `def`'s curried call shape —
+    // revert on exit and do not leak into an enclosing or sibling scope.
+    // Induction store-ness carries no lowering-time registry (it is the
+    // `Type::History` on the binding, checked post-inference). This block's
+    // `def`s still shadow outer same-named ones *within* the block (pre-register
+    // overwrites them here; the restore reinstates the outer ones on exit).
+    // Restored on both the success and error paths below.
+    let saved_mut_param_fns = ctx.mut_param_fns.clone();
+    pre_register_mut_param_defs(stmts, ctx);
     let (last, rest) = stmts.split_last().unwrap();
 
     // The final statement must be a bare expression, an if/else block, or
-    // a for-loop that contains a yield chain (generator pattern).
-    let final_expr = lower_final_stmt(last, rest, outer_bindings, ctx)?;
-
-    // Wrap preceding assignments and function definitions in Let bindings,
-    // innermost-first.
-    rest.iter()
-        .enumerate()
-        .rev()
-        .try_fold(final_expr, |acc, (i, stmt)| {
-            lower_middle_stmt(stmt, &rest[..i], acc, outer_bindings, ctx, is_top_level)
-        })
+    // a for-loop that contains a yield chain (generator pattern). Wrap the
+    // preceding assignments and function definitions in Let bindings,
+    // innermost-first. (Store-ness is carried by `Type::History` and checked
+    // post-inference; introduction-vs-write is decided by lexical scope.)
+    let result = lower_final_stmt(last, rest, outer_bindings, ctx).and_then(|final_expr| {
+        rest.iter()
+            .enumerate()
+            .rev()
+            .try_fold(final_expr, |acc, (i, stmt)| {
+                lower_middle_stmt(stmt, &rest[..i], acc, outer_bindings, ctx, is_top_level)
+            })
+    });
+    ctx.mut_param_fns = saved_mut_param_fns;
+    result
 }
 
 /// Lower the final statement in a block, which must be a bare expression, an if/else block,
@@ -192,11 +212,124 @@ pub(super) fn lower_final_stmt(
             collect_stmt_names(preceding, &mut scope);
             lower_if(last.span, branches, else_body.as_deref(), &scope, ctx)
         }
-        ChlStmt::For { target, iter, body } => {
+        ChlStmt::For {
+            target,
+            iter,
+            body: for_body,
+        } => {
             // Build outer bindings: caller's bindings + all names from rest.
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
-            lower_generator_for(target, iter, body, &scope, ctx)
+            // A non-yielding loop that mutates a declared `Mut[…]`
+            // accumulator is a valid *final* statement — the loop runs and its
+            // final store value is simply unobserved (`Unit`). Mirror
+            // `lower_middle_stmt`'s mutation-loop dispatch here, with `Unit` as
+            // the continuation. This subsumes the feed-only accumulator (an
+            // HTTP loop whose `<<` reply is not a `yield`, which
+            // `lower_generator_for`'s yield-gated mutation path would miss). (A
+            // *yielding* loop — a generator, with or without loop-carried
+            // mutation — falls through to `lower_generator_for`, whose value is
+            // the collected yields; a bare non-accumulating loop keeps its
+            // existing "must end in a yield/feed" rejection there too.)
+            if !for_body_has_yield(for_body) {
+                // Any `:=` / `+=` to an outer-scope name is a loop-carried store
+                // write (store-ness is checked post-inference; a non-store write
+                // is rejected there, not here). A plain `=` to an outer name is
+                // caught separately by the generator path below.
+                let acc_names = find_mutation_loop_vars(for_body, &scope);
+                if !acc_names.is_empty() {
+                    return lower_generator_or_mutation_loop(
+                        target,
+                        iter,
+                        for_body,
+                        &acc_names,
+                        Expr::lit(Lit::Unit),
+                        ctx,
+                    );
+                }
+                // Mirror `lower_middle_stmt`'s remaining mutation guards before
+                // the hidden-writer fallback below — the final-position path must
+                // reject the same mistaken shapes, not silently swallow them as
+                // no-op `For`s. A *nested* mutation of an outer name (under an
+                // `if`/inner `for`) is unsupported; a *plain* `=` to an outer name
+                // is a mistaken accumulator (`=` binds immutably, so it would be a
+                // per-iteration shadow silently discarding each update). Both
+                // otherwise reach the bare-effect hidden-writer path and compile
+                // to a silent no-op — the exact gap the generator path catches
+                // when a trailing read makes the loop non-final.
+                if let Some(nested) = find_nested_mutation_var(for_body, &scope) {
+                    return Err(LoweringError::unsupported(
+                        last.span,
+                        format!(
+                            "mutation of `{nested}` is nested inside an `if` or \
+                             inner `for` in this for-loop body; only top-level \
+                             mutations of outer-scope variables are supported \
+                             today.  Move the mutation to the top of the loop \
+                             body, or rewrite using a generator expression."
+                        ),
+                    ));
+                }
+                if let Some(name) = first_outer_plain_assign(for_body, &scope) {
+                    return Err(outer_binding_write_error(last.span, name));
+                }
+                // A non-yielding, non-feeding loop whose body's terminal
+                // statement is a bare *effect* expression — a call that may hide
+                // a pass-by-reference store write (`for x in xs: bump(cnt)`),
+                // invisible pre-inference — is a valid final statement: the loop
+                // runs and its store value is simply unobserved (`Unit`). Mirror
+                // `lower_middle_stmt`'s hidden-writer path (with `Unit` as the
+                // continuation) and let the letrec phase classify it (a call that
+                // beta-reduces to a `MutWrite` → an accumulator; a pure body → a
+                // dropped no-op). Without this it wrongly hit the generator path's
+                // "must end in a yield/feed" rejection. A terminal that reassigns
+                // the loop variable (`x += 1`) or a non-store is *not* a bare
+                // effect, so it stays rejected by the generator path below — it is
+                // a likely-mistaken no-op, not a hidden writer.
+                if !for_body_has_feed(for_body) && for_body_terminal_is_bare_effect(for_body) {
+                    return lower_direct_mirror_loop(
+                        target,
+                        iter,
+                        for_body,
+                        &[],
+                        Expr::lit(Lit::Unit),
+                        None,
+                        ctx,
+                    );
+                }
+            }
+            lower_generator_for(target, iter, for_body, &scope, ctx)
+        }
+        // A `+=` as the final statement is a store write — a pass-by-reference
+        // writer body (`def bump(c): c += 1`) or a program ending in a store
+        // update with no trailing read. Emit a *bare* `MutWrite` (no
+        // continuation) so inlining splices it into the caller's sequence and
+        // the letrec phase normalizes it; the check requires the target to be a
+        // store. (A plain `=` is an immutable binding and reaches the
+        // "must end in a value" error below, never this arm.)
+        ChlStmt::AugAssign { target, op, value } => {
+            let name = extract_name_target(target, "augmented assignment")?;
+            let val = lower_aug_binop(&name, *op, value, ctx)?;
+            Ok(Expr::mut_write(name, val))
+        }
+        // A bare `x := e` as the final statement is a store *write* when `x` is
+        // already in scope (a mutation-loop body's terminal write, an inlined
+        // pass-by-ref writer, or a program ending in a store update): a bare
+        // `MutWrite` the letrec phase normalizes. A `:=` *introduction* (a fresh
+        // name) can't be a value-producing final statement — it falls through to
+        // the "must end in a value" error. Store-ness is checked post-inference.
+        ChlStmt::MutAssign {
+            target,
+            annotation: None,
+            value,
+        } if name_target_as_name(target).is_some_and(|n| {
+            let mut scope = outer_bindings.clone();
+            collect_stmt_names(preceding, &mut scope);
+            scope.contains(n)
+        }) =>
+        {
+            let name = extract_name_target(target, "mutable assignment")?;
+            let val = lower_expr(value, ctx)?;
+            Ok(Expr::mut_write(name, val))
         }
         // Parse-recovery placeholder: silently substitute. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(Expr::error()),
@@ -292,6 +425,9 @@ pub(super) fn lower_middle_stmt(
                 Expr::let_bind(resp_name, responses_expr, body),
             ))
         }
+        // `x = e` — a plain immutable binding: a shadowing `let`. `=` is never a
+        // store write (the mutation operators are `:=` and `+=`), so even a
+        // top-level `=` to a name that is *also* a live store just shadows it.
         ChlStmt::Assign { target, value } => {
             let name = extract_name_target(target, "assignment")?;
             let val = lower_expr(value, ctx)?;
@@ -303,18 +439,92 @@ pub(super) fn lower_middle_stmt(
             value,
         } => {
             let name = extract_name_target(target, "annotated assignment")?;
+            if mut_annotation_parts(annotation).is_some() {
+                // `x: Mut[V] = init` / `x: Mut[V, Txn] = init` — a `Mut`
+                // annotation with the *immutable* `=` operator. This is
+                // contradictory under the cutover: `=` is a plain immutable
+                // binding, and every mutable (induction or transactional) is
+                // introduced solely with `:=`. Reject and point at `:=` (the
+                // value type — and `Txn` — still ride the annotation:
+                // `x: Mut[V] := init`, `x: Mut[V, Txn] := init`).
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    format!(
+                        "`{name}: Mut[…] = …` introduces a mutable with the immutable \
+                         `=` operator; use `:=` instead (e.g. `{name}: Mut[V] := init`, \
+                         `{name}: Mut[V, Txn] := init`, or a bare `{name} := init` to \
+                         infer the value type)"
+                    ),
+                ));
+            }
             let annotation_ty = lower_type_annotation(annotation)?;
             let val = lower_expr(value, ctx)?;
             Ok(Expr::let_bind_annotated(name, val, body, annotation_ty))
         }
-        // Desugar `x op= e` → `x = x op e` and lower as a Let binding.
-        //
-        // Only simple name targets are supported; tuple-destructuring
-        // augmented assignment (e.g. `(a, b) += ...`) returns Unsupported.
+        // `x := e` — a mutable **introduction** or **write**, split by scope:
+        //  - a bare `x := e` where `x` is already in scope is a *write* — a
+        //    `MutWrite` marker (which the check requires to target a store, and
+        //    the unified phase normalizes: a recurrence in a loop, a shadowing
+        //    advance at the top level);
+        //  - otherwise (a fresh name, or an annotated `x: T := e` / `x: Mut[V] := e`
+        //    declaration) it is an *introduction* — a `let` whose binding is
+        //    stamped `Mut[V, _]` so inference binds `x` at `Mut` and reads deref
+        //    (domain inferred for an induction accumulator).
+        // In-loop writes are handled by `lower_direct_mirror_loop`, not here.
+        ChlStmt::MutAssign {
+            target,
+            annotation,
+            value,
+        } => {
+            let name = extract_name_target(target, "mutable assignment")?;
+            let val = lower_expr(value, ctx)?;
+            // A bare `x := e` where `x` is already in scope is a *write*, not a
+            // declaration: emit a `MutWrite` marker (store-ness checked
+            // post-inference; the unified phase turns it into a recurrence in a
+            // loop or a shadowing advance at the top level).
+            if annotation.is_none() {
+                let mut scope = outer_bindings.clone();
+                collect_stmt_names(preceding, &mut scope);
+                if scope.contains(&name) {
+                    return Ok(Expr::expr_stmt(Expr::mut_write(name, val), body));
+                }
+            }
+            // Otherwise this is an *introduction*. Resolve the optional
+            // annotation to the declared value type:
+            //   (none)           → induction store, value type inferred
+            //   `x: Mut[V] := e` → induction store at value type `V`
+            //   `x: T := e`      → induction store at value type `T`
+            let value_ty = match annotation {
+                None => Type::Hole,
+                Some(ann) => match mut_annotation_parts(ann) {
+                    Some(parts) => parts?,
+                    None => lower_type_annotation(ann)?,
+                },
+            };
+            // Stamp the binding `Mut[V, D]` (so inference binds `x` at `Mut` and
+            // its references deref to `V`). The store carries *no* lowering
+            // registry — its store-ness is this `Mut` type, checked
+            // post-inference; its domain is the loop it accumulates over, which
+            // the unified phase resolves. See src/ccl/design/mutability.md.
+            let domain = Type::Hole;
+            let mut_ty = Type::History {
+                value: Box::new(value_ty),
+                domain: Box::new(domain),
+                kind: crate::ccl::HistoryKind::Store,
+            };
+            Ok(Expr::let_bind_annotated(name, val, body, mut_ty))
+        }
+        // Desugar `x op= e` → `MutWrite(x, x op e)`. `+=` is a store write: the
+        // check requires `x` to be a mutable store (never a shadowing rebind of
+        // an immutable), and the unified phase turns the marker into a recurrence
+        // (in a loop) or a shadowing advance (outside one). Only simple name
+        // targets are supported; tuple-destructuring `(a, b) += …` is Unsupported.
         ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
+            // A bare store write whose target-is-a-store check runs
+            // post-inference.
             let val = lower_aug_binop(&name, *op, value, ctx)?;
-            Ok(Expr::let_bind(name, val, body))
+            Ok(Expr::expr_stmt(Expr::mut_write(name, val), body))
         }
         // `x <<= e` — defer-define statement, distinct from AugAssign.
         ChlStmt::Define { target, value } => {
@@ -341,17 +551,21 @@ pub(super) fn lower_middle_stmt(
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
 
-            // Detect a mutation loop: at least one top-level assignment to
-            // a variable from the outer scope.  Yields are not a barrier
-            // — a generator with loop-carried state (brainstorm §4b's
-            // `running_totals` shape) is just a mutation loop whose body
-            // also feeds an auto-generated defer.  The surrounding `body`
-            // (the continuation) is threaded into `lower_mutation_loop`
-            // so it can lift post-mutation feeds outside the loop and
-            // wrap the continuation in the right sequence of `Let` /
-            // `ExprStmt(Feed(...))` nodes.
+            // Detect a mutation loop: at least one `:=` / `+=` to a variable
+            // from the outer scope.  Yields are not a barrier — a generator with
+            // loop-carried state (brainstorm §4b's `running_totals` shape) is
+            // just a mutation loop whose body also feeds an auto-generated defer.
+            // The surrounding `body` (the continuation) is threaded into
+            // `lower_mutation_loop` so it can lift post-mutation feeds outside
+            // the loop and wrap the continuation. Store-ness of each write is
+            // checked post-inference; a `:=` / `+=` to a non-store surfaces there.
             let acc_names = find_mutation_loop_vars(for_body, &scope);
             if !acc_names.is_empty() {
+                // All mutation loops — feedless, feeding, and yielding — take
+                // the direct-mirror `For`/`MutWrite`/`Feed` path; the unified
+                // letrec phase (src/ccl/design/mutability.md) builds the
+                // recurrence and hoists any in-loop feed to an ordinary feed
+                // of the loop's history.
                 return lower_generator_or_mutation_loop(
                     target, iter, for_body, &acc_names, body, ctx,
                 );
@@ -376,7 +590,33 @@ pub(super) fn lower_middle_stmt(
                 ));
             }
 
-            // Otherwise treat as a side-effecting for loop.
+            // A plain `=` to a name bound *outside* the loop is not a store
+            // write — `=` binds immutably, so it would be a per-iteration
+            // shadow that silently discards each update (a mistaken
+            // accumulator). The hidden-writer path below would accept it as a
+            // no-op `For`, so reject it here and point at `:=`, mirroring the
+            // generator-loop guard in `lower_for_body_stmts`.
+            if let Some(name) = first_outer_plain_assign(for_body, &scope) {
+                return Err(outer_binding_write_error(stmt.span, name));
+            }
+
+            // A loop with no visible accumulator, no `<<` feed, and no `yield`
+            // still may mutate a `Mut` store through a *call* — `for x:
+            // bump(cnt)`, where `bump(c: Mut[…])` writes `c`. Lowering runs
+            // before inference, so we can't see the write hidden inside the
+            // call; emit a direct-mirror `For` marker (its body a plain
+            // side-effect statement) and let the post-inline letrec phase
+            // classify it: a call that beta-reduces to a `MutWrite` makes it an
+            // accumulator loop; a genuinely pure body leaves it write-free and
+            // the phase drops it as a no-op. (`Expr::for_loop` builds a
+            // *`Compose`*, a stateless map that cannot thread the accumulator,
+            // so a hidden writer must take the `For` path, not that one.)
+            if !for_body_has_yield(for_body) && !for_body_has_feed(for_body) {
+                return lower_direct_mirror_loop(target, iter, for_body, &[], body, None, ctx);
+            }
+
+            // A feed/yield loop with no accumulator is a side-effecting
+            // `Compose` (desugar routes its feeds).
             Ok(Expr::expr_stmt(
                 lower_generator_for(target, iter, for_body, &scope, ctx)?,
                 body,
@@ -405,6 +645,7 @@ pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet
             ChlStmt::Assign { target, .. }
             | ChlStmt::AnnAssign { target, .. }
             | ChlStmt::AugAssign { target, .. }
+            | ChlStmt::MutAssign { target, .. }
             | ChlStmt::Define { target, .. } => {
                 if let AssignTarget::Name(id) = &target.node {
                     names.insert(id.as_str().to_string());
@@ -449,22 +690,134 @@ pub(super) fn name_target_as_name(target: &Spanned<AssignTarget>) -> Option<&str
     }
 }
 
+/// If `annotation` is a `Mut[…]` form, extract its declared *value* type.
+///
+/// - `Mut[V]` / `Mut[_]` → `V` — an induction-domain accumulator whose
+///   sequencing domain is inferred from its writing loop by the unified phase
+///   (`Mut[_]` → `Hole`, value type inferred).
+/// - A multi-argument `Mut[…]` (the `Mut[V, Txn]` transactional-register form)
+///   parses as a tuple index and is rejected here — the transactional store is
+///   not part of this layer.
+///
+/// Returns `None` for a non-`Mut` annotation.
+pub(super) fn mut_annotation_parts(
+    annotation: &Spanned<ChlExpr>,
+) -> Option<Result<Type, LoweringError>> {
+    let ChlExpr::Subscript { target, index } = &annotation.node else {
+        return None;
+    };
+    let ChlExpr::Name(head) = &target.node else {
+        return None;
+    };
+    if head.as_str() != "Mut" {
+        return None;
+    }
+    // A multi-argument `Mut[…]` subscript parses as a tuple index.
+    if let ChlExpr::Tuple(_) = &index.node {
+        return Some(Err(LoweringError::unsupported(
+            annotation.span,
+            "Mut[…] takes one argument: `Mut[V]` (the sequencing domain is the \
+             loop the store accumulates over, inferred by the unified phase)",
+        )));
+    }
+    Some(lower_type_annotation(index))
+}
+
+/// Pre-register every `Mut`-parameter `def` in a block
+/// (and every pass-by-reference-`Mut` `def`) in `stmts` with the lowering
+/// context.
+///
+/// for-loop is lowered *before* the `:=` introduction that precedes it
+/// textually; pre-registering per block makes a transactional register visible
+/// (for the read/write gate) when the loop that writes it inside a `with
+/// begin():` block is lowered. Induction stores carry no lowering registry —
+/// their store-ness is the `Type::History` on the binding, checked post-inference —
+/// so only transactional registers and `Mut`-parameter `def`s are pre-registered
+/// here.
+///
+/// The `Mut`-param `def` registration is per-name and **last definition wins**:
+/// a later non-`Mut` `def` shadowing an earlier `Mut`-param one of the same name
+/// *clears* the registration, so its calls lower with the ordinary tupled shape
+/// (matching CHL's redefinition-shadows semantics). The caller
+/// ([`lower_stmts_inner`]) scopes the whole set to the block, so this only
+/// resolves same-name definitions *within* one block, never across scopes.
+pub(super) fn pre_register_mut_param_defs(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) {
+    for stmt in stmts {
+        // A `def` with a pass-by-reference `Mut` parameter is lowered and
+        // applied curried. Blocks lower right-to-left, so a call site is
+        // lowered *before* the `def` preceding it textually — pre-register
+        // the name here so [`lower_call`] picks the curried shape. Register
+        // or unregister per the definition's mut-ness so the last `def` of a
+        // name in the block wins (a non-`Mut` redefinition clears an earlier
+        // `Mut` one, so its calls lower tupled).
+        if let ChlStmt::FunctionDef { name, params, .. } = &stmt.node {
+            let has_mut_param = params
+                .iter()
+                .any(|p| p.annotation.as_ref().is_some_and(is_mut_annotation));
+            if has_mut_param {
+                ctx.register_mut_param_fn(name.as_str());
+            } else {
+                ctx.unregister_mut_param_fn(name.as_str());
+            }
+        }
+    }
+}
+
+/// Whether a type annotation is a pass-by-reference `Mut[…]` form.
+fn is_mut_annotation(annotation: &Spanned<ChlExpr>) -> bool {
+    mut_annotation_parts(annotation).is_some()
+}
+
 /// Lower a CHL type annotation expression to a CCL [`Type`].
 ///
 /// Handles the primitive type names: `int` → [`Type::Base`]([`BaseType::Int`]),
-/// `str` → `String`, `bool` → `Bool`, and `None` (the constant) → `Unit`.
+/// `str` → `String`, `bool` → `Bool`, `None` (the constant) → `Unit`, and the
+/// wildcard `_` → [`Type::Hole`] ("infer this slot" — inference normalizes an
+/// annotation `Hole` to a fresh variable, so the slot is unconstrained; see
+/// `bind_annotation`).
 pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Type, LoweringError> {
     match &annotation.node {
         ChlExpr::Name(id) => match id.as_str() {
             "int" => Ok(Type::Base(BaseType::Int)),
             "str" => Ok(Type::Base(BaseType::String)),
             "bool" => Ok(Type::Base(BaseType::Bool)),
+            "_" => Ok(Type::Hole),
             _ => Err(LoweringError::unsupported(
                 annotation.span,
                 format!("unknown type annotation: {id}"),
             )),
         },
         ChlExpr::Lit(ChlLit::None) => Ok(Type::Base(BaseType::Unit)),
+        // Subscripted type constructors, e.g. `List[T]`. The wildcard is
+        // accepted anywhere, so `List[_]` recurses to an element `Hole`.
+        ChlExpr::Subscript { target, index } => {
+            let ChlExpr::Name(head) = &target.node else {
+                return Err(LoweringError::unsupported(
+                    target.span,
+                    "subscripted type annotation must have a simple name head \
+                     (e.g. `List[…]`)",
+                ));
+            };
+            match head.as_str() {
+                // A list type is a mapping `index-range ⇒ element`; the length
+                // (domain) is unknown at annotation time, so it is a `Hole`
+                // (inferred, like the value slot of a bare `_`). The element
+                // type is the subscript index lowered recursively.
+                "List" => Ok(Type::Fun {
+                    name: None,
+                    domain: Box::new(Type::Hole),
+                    codomain: Box::new(lower_type_annotation(index)?),
+                }),
+                // `Mut[…]` in annotation position is handled by
+                // `mut_annotation_parts` before this function is reached;
+                // seeing it here means a `Mut[…]` nested inside another type,
+                // which is not supported yet.
+                other => Err(LoweringError::unsupported(
+                    annotation.span,
+                    format!("unknown subscripted type annotation: `{other}[…]`"),
+                )),
+            }
+        }
         _ => Err(LoweringError::unsupported(
             annotation.span,
             format!("unsupported type annotation form: {:?}", annotation.node),
@@ -569,59 +922,54 @@ let x = 2 + 3
 in let x = x * 4
 in x"
     )]
-    // Augmented assignment: `x op= e` desugars to `x = x op e`.
+    // Augmented assignment: `x op= e` is a store write (`MutWrite`) — the target
+    // must be introduced mutable with `:=`.
     #[case(
         "\
-x = 0
+x := 0
 x += 1
 x",
         "\
 let x = 0
-in let x = x + 1
-in x"
+in x := x + 1; x"
     )]
     #[case(
         "\
-x = 10
+x := 10
 x -= 3
 x",
         "\
 let x = 10
-in let x = x - 3
-in x"
+in x := x - 3; x"
     )]
     #[case(
         "\
-x = 2
+x := 2
 x *= 5
 x",
         "\
 let x = 2
-in let x = x * 5
-in x"
+in x := x * 5; x"
     )]
     #[case(
         "\
-x = 7
+x := 7
 x //= 2
 x",
         "\
 let x = 7
-in let x = x // 2
-in x"
+in x := x // 2; x"
     )]
-    // Chained augmented assignments shadow in sequence.
+    // Chained augmented assignments are a sequence of store writes.
     #[case(
         "\
-x = 0
+x := 0
 x += 1
 x += 2
 x",
         "\
 let x = 0
-in let x = x + 1
-in let x = x + 2
-in x"
+in x := x + 1; x := x + 2; x"
     )]
     // defer() introduces a Defer node.
     #[case(

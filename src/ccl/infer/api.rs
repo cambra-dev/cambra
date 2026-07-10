@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 
 use crate::ccl::symbolic::{symbolic, symbolic_typed};
-use crate::ccl::{Expr, InferVarId, Name, Type, TypedExprNode};
+use crate::ccl::{Expr, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode};
 use crate::util::ScopeStack;
 
 // ---------------------------------------------------------------------------
@@ -308,6 +308,58 @@ pub enum InferError {
         /// Enclosing expression labels, innermost-first.
         context: Vec<String>,
     },
+    /// A [`Type::History`]-typed expression appears in a value position but is not
+    /// a bare variable reference — the second-class discipline's rule 1 (see
+    /// `src/ccl/design/mutability.md`, "No aliasing"). A mutable value must
+    /// be traceable to a single introduction, so a computed/conditional
+    /// expression of `Mut` type (or a non-variable argument to a `Mut`
+    /// parameter) is rejected. Reported by [`check_mut_discipline`].
+    MutNotBareVariable {
+        /// Symbolic label of the offending expression.
+        at: String,
+    },
+    /// A [`Type::History`] appears nested inside a composite type — the
+    /// second-class discipline's rule 2. `Mut` is legal only at a top-level
+    /// binding/parameter/expression position and at a function *domain*
+    /// (pass-by-reference); a `Mut` in a tuple/record/variant payload, a
+    /// `Feed` payload, a function *codomain* (never a return type), or as a
+    /// child of another `Mut` breaks the "writer set is statically known"
+    /// guarantee. Reported by [`check_mut_discipline`].
+    MutInCompositeType {
+        /// Symbolic label of the expression or binding whose type is offending.
+        at: String,
+        /// The composite type that illegally contains a `Mut`.
+        ty: Type,
+    },
+    /// An *unannotated* binding was inferred to have [`Type::History`] type — the
+    /// second-class discipline's rule 3. `b = a` where `a` is mutable would
+    /// alias the store; the design forbids it. To copy the current value,
+    /// annotate the deref (`b: Int = a`); to seed a new store, introduce one
+    /// with `:=` (`b: Mut[Int] := a`). Reported by [`check_mut_discipline`].
+    UnannotatedMutBinding {
+        /// The base name of the offending binding.
+        name: String,
+    },
+    /// A bare-variable argument to a `Mut` parameter does not name a store — its
+    /// (peeled) type is not [`Type::History`]. The second-class discipline's rule 1:
+    /// a `Mut` argument must be a `Mut`-*introduced* variable, so the callee's
+    /// writes advance a real store the caller shares. A plain value would
+    /// otherwise satisfy the lenient pass-by-reference coercion (`V <: Mut[V,
+    /// D]`) and be silently mutated in name only. Reported by
+    /// [`check_mut_discipline`].
+    MutArgNotStore {
+        /// Symbolic label of the offending argument.
+        at: String,
+    },
+    /// A `MutWrite` (`:=` / `+=`) targets a binding whose resolved type is not
+    /// [`Type::History`] — a write to something that was never introduced as a
+    /// mutable store. Writes require a mutable (they never mean "shadow an
+    /// immutable"); introduce the store with `:=` (or annotate a pass-by-reference
+    /// parameter `Mut[…]`). Reported by [`check_mut_write_targets`].
+    MutWriteToNonStore {
+        /// The base name of the write target.
+        name: String,
+    },
 }
 
 impl std::fmt::Debug for InferError {
@@ -385,6 +437,44 @@ impl std::fmt::Debug for InferError {
                 }
                 Ok(())
             }
+            InferError::MutNotBareVariable { at } => {
+                write!(
+                    f,
+                    "a mutable-reference value must be a bare variable reference \
+                     (Mut second-class rule 1): {at}"
+                )
+            }
+            InferError::MutInCompositeType { at, ty } => {
+                write!(
+                    f,
+                    "a mutable-reference type may not appear inside a composite type \
+                     (Mut second-class rule 2): {ty} at {at}"
+                )
+            }
+            InferError::UnannotatedMutBinding { name } => {
+                write!(
+                    f,
+                    "binding `{name}` is a mutable reference but is not annotated `Mut` \
+                     (Mut second-class rule 3): to copy the current value annotate \
+                     `{name}: <value type>`; to introduce a new store annotate \
+                     `{name}: Mut[...]`"
+                )
+            }
+            InferError::MutArgNotStore { at } => {
+                write!(
+                    f,
+                    "argument to a `Mut` parameter must be a mutable variable, not a \
+                     plain value (Mut second-class rule 1): {at}"
+                )
+            }
+            InferError::MutWriteToNonStore { name } => {
+                write!(
+                    f,
+                    "cannot write `{name}` with `:=` / `+=`: `{name}` is not a mutable \
+                     store. Introduce it with `:=` (or, for a pass-by-reference \
+                     parameter, annotate it `Mut[...]`)"
+                )
+            }
         }
     }
 }
@@ -397,8 +487,10 @@ impl std::fmt::Debug for InferError {
 ///
 /// Public entry point for the CCL type-inference pass. Delegates entirely to
 /// [`crate::ccl::infer::infer`]. After this call returns `Ok`, the
-/// tree is fully annotated and contains no `Type::Hole` or `Type::Infer`
-/// placeholders.
+/// tree is fully annotated and contains no `Type::Hole`; defer constructs
+/// may still carry `Type::History` (feed) types with `Type::Infer` channel domains
+/// — those are erased by `channelize`, which runs next (see
+/// [`Strictness::PreDesugar`]).
 pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Vec<InferError>> {
     // The arena owns every inference variable minted by the passes below
     // (captured through the thread-local mint sink). Its lifetime spans both
@@ -408,6 +500,21 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Ve
     // the whole variable graph. See [`InferArena`].
     let _arena = InferArena::new();
     super::run(expr, &ctx.source_types)
+}
+
+/// How the annotation checks treat inference-transient type variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strictness {
+    /// No `Hole`, `Infer`, or `Feed` anywhere — the contract downstream of
+    /// `channelize`.
+    Strict,
+    /// `Hole` is still a bug (coalesce replaces every slot it visits), but
+    /// `Infer`, `Feed`/`Store` histories, and `ChanDom` channel domains are
+    /// permitted: between inference and channelize the tree carries feed
+    /// channels (`Feed` histories with a rigid `ChanDom(d)` domain) and
+    /// induction stores (`Store` histories whose `Infer` domain the unified
+    /// phase resolves), none of which are erased yet.
+    PreDesugar,
 }
 
 /// Check that every [`crate::ccl::TypedExpr::ty`] and [`crate::ccl::TypedBinding::ty`]
@@ -420,9 +527,14 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Ve
 /// Runs as the first phase of [`typecheck`]; callers that want the combined
 /// hole-freeness + semantic check should call [`typecheck`] directly.
 pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
+    check_annotated(expr, Strictness::Strict)
+}
+
+/// [`check_fully_typed`] at the given [`Strictness`].
+fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<InferError>> {
     let mut errors = Vec::new();
     let mut seen: HashSet<crate::ccl::PredicateId> = HashSet::new();
-    collect_expr_errors(expr, &mut errors, &mut seen);
+    collect_expr_errors(expr, strictness, &mut errors, &mut seen);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -441,23 +553,42 @@ pub fn check_fully_typed(expr: &Expr) -> Result<(), Vec<InferError>> {
 /// form a DAG, so this is dedup, not cycle-breaking.
 fn collect_expr_errors(
     expr: &Expr,
+    strictness: Strictness,
     errors: &mut Vec<InferError>,
     seen_refinements: &mut HashSet<crate::ccl::PredicateId>,
 ) {
-    collect_type_errors(&expr.ty, &symbolic(expr), errors, seen_refinements);
+    collect_type_errors(
+        &expr.ty,
+        &symbolic(expr),
+        strictness,
+        errors,
+        seen_refinements,
+    );
     // Binder-bearing variants emit per-binding type errors before descending
     // into their children; everything else just visits its direct children.
     match &expr.node {
         TypedExprNode::Lambda { param, body, .. } => {
-            collect_type_errors(&param.ty, param.name.base(), errors, seen_refinements);
-            collect_expr_errors(body, errors, seen_refinements);
+            collect_type_errors(
+                &param.ty,
+                param.name.base(),
+                strictness,
+                errors,
+                seen_refinements,
+            );
+            collect_expr_errors(body, strictness, errors, seen_refinements);
         }
         TypedExprNode::Let { binding, .. } => {
-            collect_type_errors(&binding.ty, binding.name.base(), errors, seen_refinements);
-            expr.walk_children(|e| collect_expr_errors(e, errors, seen_refinements));
+            collect_type_errors(
+                &binding.ty,
+                binding.name.base(),
+                strictness,
+                errors,
+                seen_refinements,
+            );
+            expr.walk_children(|e| collect_expr_errors(e, strictness, errors, seen_refinements));
         }
         TypedExprNode::VariantCtor { payload, .. } => {
-            collect_expr_errors(payload, errors, seen_refinements);
+            collect_expr_errors(payload, strictness, errors, seen_refinements);
         }
         // `Case` carries per-branch pattern bindings on `TypedBinding`
         // (not reached by `walk_children`), so check their types here.
@@ -466,29 +597,44 @@ fn collect_expr_errors(
             branches,
         } => {
             if let Some(s) = scrutinee {
-                collect_expr_errors(s, errors, seen_refinements);
+                collect_expr_errors(s, strictness, errors, seen_refinements);
             }
             for b in branches {
                 if let Some(p) = &b.pattern {
                     collect_type_errors(
                         &p.binding.ty,
                         p.binding.name.base(),
+                        strictness,
                         errors,
                         seen_refinements,
                     );
                 }
-                collect_expr_errors(&b.guard, errors, seen_refinements);
-                collect_expr_errors(&b.body, errors, seen_refinements);
+                collect_expr_errors(&b.guard, strictness, errors, seen_refinements);
+                collect_expr_errors(&b.body, strictness, errors, seen_refinements);
             }
         }
-        TypedExprNode::Loop { params, .. } => {
-            for p in params {
-                collect_type_errors(&p.ty, p.name.base(), errors, seen_refinements);
+        // LetRec bindings carry declared types on `TypedBinding` slots that
+        // `walk_children` never reaches — check them like a lambda param.
+        TypedExprNode::LetRec { bindings, .. } => {
+            for (b, _) in bindings {
+                collect_type_errors(&b.ty, b.name.base(), strictness, errors, seen_refinements);
             }
-            expr.walk_children(|e| collect_expr_errors(e, errors, seen_refinements));
+            expr.walk_children(|e| collect_expr_errors(e, strictness, errors, seen_refinements));
+        }
+        // The For target's binder slot is likewise unreachable by
+        // `walk_children`.
+        TypedExprNode::For { target, .. } => {
+            collect_type_errors(
+                &target.ty,
+                target.name.base(),
+                strictness,
+                errors,
+                seen_refinements,
+            );
+            expr.walk_children(|e| collect_expr_errors(e, strictness, errors, seen_refinements));
         }
         TypedExprNode::Error => crate::unexpected_error_node!(),
-        _ => expr.walk_children(|e| collect_expr_errors(e, errors, seen_refinements)),
+        _ => expr.walk_children(|e| collect_expr_errors(e, strictness, errors, seen_refinements)),
     }
 }
 
@@ -502,6 +648,7 @@ fn collect_expr_errors(
 fn collect_type_errors(
     ty: &Type,
     context_sym: &str,
+    strictness: Strictness,
     errors: &mut Vec<InferError>,
     seen_refinements: &mut HashSet<crate::ccl::PredicateId>,
 ) {
@@ -509,30 +656,69 @@ fn collect_type_errors(
         Type::Hole => errors.push(InferError::UnresolvedHole {
             at: context_sym.to_string(),
         }),
-        Type::Infer(var) => errors.push(InferError::UnresolvedInfer {
-            id: var.uid,
-            at: context_sym.to_string(),
-        }),
+        Type::Infer(var) => {
+            // Pre-desugar, an induction store's domain is still `Infer` (a
+            // `Mut[V]` with no annotated domain — the unified phase resolves it
+            // to the writing loop's extent); the relaxation tolerates it (see
+            // [`Strictness`]). Feed channel domains are the rigid `ChanDom`
+            // handled below, not `Infer`.
+            if strictness == Strictness::Strict {
+                errors.push(InferError::UnresolvedInfer {
+                    id: var.uid,
+                    at: context_sym.to_string(),
+                });
+            }
+        }
+        // a nominal channel domain is a pre-desugar artifact
+        // exactly like an `Infer` channel domain — `channelize` must
+        // substitute it away; a survivor at the strict wall is a compiler bug.
+        Type::ChanDom(name, _) => {
+            if strictness == Strictness::Strict {
+                errors.push(InferError::Unsupported(format!(
+                    "channel domain chan({name}) survived channelize at `{context_sym}`"
+                )));
+            }
+        }
         Type::Fun {
             domain, codomain, ..
         } => {
-            collect_type_errors(domain, context_sym, errors, seen_refinements);
-            collect_type_errors(codomain, context_sym, errors, seen_refinements);
+            collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
+            collect_type_errors(codomain, context_sym, strictness, errors, seen_refinements);
         }
         Type::Tuple(elems) => {
             for elem in elems {
-                collect_type_errors(elem, context_sym, errors, seen_refinements);
+                collect_type_errors(elem, context_sym, strictness, errors, seen_refinements);
             }
         }
         Type::Record(fields) => {
             for (_, ty) in fields {
-                collect_type_errors(ty, context_sym, errors, seen_refinements);
+                collect_type_errors(ty, context_sym, strictness, errors, seen_refinements);
             }
         }
         Type::Variant(tags) => {
             for (_, payload) in tags {
-                collect_type_errors(payload, context_sym, errors, seen_refinements);
+                collect_type_errors(payload, context_sym, strictness, errors, seen_refinements);
             }
+        }
+        Type::History {
+            value,
+            domain,
+            kind,
+        } => {
+            // A history handle at the strict wall is a compiler bug — a `Feed`
+            // history should have been erased by `channelize`, a `Store`
+            // history by the unified phase (`transact_phase` / `letrec_phase`).
+            if strictness == Strictness::Strict {
+                let what = match kind {
+                    HistoryKind::Feed => "feed handle type survived channelize",
+                    HistoryKind::Store => "mutable-reference type survived the unified phase",
+                };
+                errors.push(InferError::Unsupported(format!(
+                    "{what} at `{context_sym}`"
+                )));
+            }
+            collect_type_errors(value, context_sym, strictness, errors, seen_refinements);
+            collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
         }
         Type::Refinement(inner, refinement) => {
             // Walk each predicate term only once: a predicate term shared by
@@ -547,11 +733,11 @@ fn collect_type_errors(
             // doesn't share the helper because it mixes per-node error checks
             // with the refinement walk.
             if seen_refinements.insert(refinement.predicate_id()) {
-                collect_expr_errors(&refinement.predicate, errors, seen_refinements);
+                collect_expr_errors(&refinement.predicate, strictness, errors, seen_refinements);
             }
-            collect_type_errors(inner, context_sym, errors, seen_refinements);
+            collect_type_errors(inner, context_sym, strictness, errors, seen_refinements);
         }
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {}
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn => {}
     }
 }
 
@@ -581,12 +767,411 @@ pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
     super::check(expr)
 }
 
+/// [`typecheck`] for the window between inference and `channelize`:
+/// the same hole-freeness and semantic checks, but transient histories
+/// (`Feed` channels with a `ChanDom` domain, `Store`s with an `Infer` domain)
+/// are permitted — the unified phase and `channelize` erase them (see
+/// [`Strictness::PreDesugar`]).
+pub fn check_pre_desugar(expr: &Expr) -> Result<(), Vec<InferError>> {
+    // The relaxation applies only when the tree carries transient histories
+    // (feed/store machinery). A program with none should be fully resolved
+    // after inference, so a residual `Infer` there is an ambiguous program
+    // (e.g. an unexercised generic) — check it strictly so it surfaces as an
+    // `UnresolvedInfer` diagnostic.
+    let strictness = if has_pre_desugar_artifacts(expr) {
+        Strictness::PreDesugar
+    } else {
+        Strictness::Strict
+    };
+    check_annotated(expr, strictness)?;
+    crate::ccl::infer::check(expr)
+}
+
+/// Whether the tree carries pre-desugar artifacts: a `Defer`/`Feed`/
+/// `Define` node, **or** a transient [`Type::History`] (a feed channel or a
+/// mutable store) in any reachable type slot — and hence the channel
+/// `Feed`/`ChanDom` (and store `Infer`-domain) types the pre-desugar check
+/// tolerates.
+///
+/// The transient-*type* check matters because a defer-read *alias* (`Var(x) :
+/// feed(_)`) carries a `Feed` type with no defer *node*. Inline runs before
+/// desugar, so its beta-reduction ([`crate::ccl::lambda_elim::substitute`])
+/// can hand such an alias to [`debug_typecheck`] as a standalone subtree;
+/// keying only on defer nodes would wrongly check it strictly and reject the
+/// legitimate channel type. `Mut` is analogous: a mutable reference carries a
+/// `Mut` type whose `Infer` domain the pre-desugar relaxation must tolerate
+/// until the unified phase resolves it.
+///
+/// The transient type can live on a **binder slot** rather than a node type — a
+/// dead store `let cnt: Mut[Int, _] = 0 in (cnt := 1)` carries `Mut` only on the
+/// `Let` binding (the `MutWrite` target is a bare `Name`, the value is `Int`,
+/// the `Let` node's type is `Unit`). The strict checker inspects binder types
+/// (`check_binder`), so the selector must too, or it under-detects and drives
+/// such a subtree to the strict arm — a spurious `debug_typecheck` panic.
+fn has_pre_desugar_artifacts(expr: &Expr) -> bool {
+    fn ty_has_transient(ty: &Type) -> bool {
+        if matches!(ty, Type::History { .. }) {
+            return true;
+        }
+        let mut found = false;
+        ty.walk_children(|t| found |= ty_has_transient(t));
+        found
+    }
+    fn binder_has_transient(expr: &Expr) -> bool {
+        let mut found = false;
+        expr.walk_binders(|b| {
+            found |= ty_has_transient(&b.ty);
+            if let Some(ann) = &b.user_annotation {
+                found |= ty_has_transient(ann);
+            }
+        });
+        found
+    }
+    matches!(
+        expr.node,
+        TypedExprNode::Defer | TypedExprNode::Feed { .. } | TypedExprNode::Define { .. }
+    ) || ty_has_transient(&expr.ty)
+        || binder_has_transient(expr)
+        || expr.any_child(has_pre_desugar_artifacts)
+}
+
+// ---------------------------------------------------------------------------
+// Second-class `Mut` discipline
+// ---------------------------------------------------------------------------
+
+/// Strip outer [`Type::Refinement`] layers and, if a mutable **store**
+/// (a [`HistoryKind::Store`] history) is underneath, return its `(value,
+/// domain)` children.
+///
+/// Only a `Store` history is a `Mut` for the second-class discipline — a
+/// `Feed` history is a feed channel, not a mutable store, and is transparent
+/// to these rules. Outer refinements are transparent to mutability: a witness
+/// a store's reference acquired during solving does not change that it *is* a
+/// store. Returns `None` for any non-store type.
+fn peel_mut(ty: &Type) -> Option<(&Type, &Type)> {
+    match ty {
+        Type::History {
+            value,
+            domain,
+            kind: HistoryKind::Store,
+        } => Some((value, domain)),
+        Type::Refinement(inner, _) => peel_mut(inner),
+        _ => None,
+    }
+}
+
+/// Whether a user annotation is a bare inference hole once outer
+/// [`Type::Refinement`] layers are stripped — i.e. `_` (or a refined `_`).
+///
+/// Rule 3 treats such an annotation as *unspecified*: it names no concrete
+/// type, so it does not disambiguate a value-copy from a store re-seed the way
+/// `b: Int = a` / `b: Mut[Int] := a` do.
+fn annotation_peels_to_hole(ty: &Type) -> bool {
+    match ty {
+        Type::Hole => true,
+        Type::Refinement(inner, _) => annotation_peels_to_hole(inner),
+        _ => false,
+    }
+}
+
+/// Enforce the second-class `Mut` discipline (design doc
+/// `src/ccl/design/mutability.md`, "No aliasing: `Mut` values are
+/// second-class"): a post-inference structural pass over the fully-typed,
+/// still-`Mut`-bearing tree. Runs *after* [`check_pre_desugar`] and *before*
+/// `inline`, so it sees the pre-inline `Apply`/parameter structure (rule 1's
+/// argument check) and the coalesced `.ty` slots plus each binder's
+/// [`TypedBinding::user_annotation`].
+///
+/// The three rules, all of which keep a mutable value statically traceable to
+/// a single introduction (so the writer set of every store is known):
+///
+/// 1. A `Mut`-typed *value* must be a bare variable reference — no computed or
+///    conditional expression of `Mut` type, and no non-variable argument to a
+///    `Mut` parameter ([`InferError::MutNotBareVariable`]).
+/// 2. `Mut` may not appear inside any composite type — only at a top-level
+///    binding/parameter/expression position or a function *domain*
+///    ([`InferError::MutInCompositeType`]).
+/// 3. An *unannotated* binding may not have `Mut` type — `b = a` aliases a
+///    store and is rejected ([`InferError::UnannotatedMutBinding`]).
+pub fn check_mut_discipline(expr: &Expr) -> Result<(), Vec<InferError>> {
+    let mut errors = Vec::new();
+    check_mut_discipline_go(expr, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Rule 2's position-aware type walk. `allow_mut` is `true` only where a `Mut`
+/// is legal: at the root of a checked type and at a function *domain*
+/// (pass-by-reference). Every other position — a `Fun` codomain, a
+/// `Tuple`/`Record`/`Variant` element, a `Feed` payload, or either child of a
+/// `Mut` — sets it `false`, so a `Mut` seen there is reported.
+///
+/// A `Refinement` passes `allow_mut` *through* to its base (mirroring
+/// [`peel_mut`]): a refined store at a legal position stays legal, while a
+/// refined `Mut` buried in a composite is still caught because the enclosing
+/// composite already set `allow_mut = false`.
+fn check_no_nested_mut(
+    ty: &Type,
+    allow_mut: bool,
+    at: &dyn Fn() -> String,
+    errors: &mut Vec<InferError>,
+) {
+    match ty {
+        // Only a `Store` history is a `Mut` for rule 2; a `Feed` history is a
+        // feed channel (legal nested — e.g. a feed handle in a function
+        // codomain or a tuple), so it falls through to the composite `_` arm
+        // below, whose children are still walked with `allow_mut = false` (a
+        // `Store` buried in a feed's value/domain is a nested violation).
+        Type::History {
+            value,
+            domain,
+            kind: HistoryKind::Store,
+        } => {
+            if !allow_mut {
+                errors.push(InferError::MutInCompositeType {
+                    at: at(),
+                    ty: ty.clone(),
+                });
+            }
+            // Either child of a `Mut` is a nested (illegal) position.
+            check_no_nested_mut(value, false, at, errors);
+            check_no_nested_mut(domain, false, at, errors);
+        }
+        Type::Fun {
+            domain, codomain, ..
+        } => {
+            check_no_nested_mut(domain, true, at, errors);
+            check_no_nested_mut(codomain, false, at, errors);
+        }
+        Type::Refinement(base, _) => check_no_nested_mut(base, allow_mut, at, errors),
+        // Tuple / Record / Variant / feed-history payloads (and inert leaves): a
+        // `Mut` anywhere below here is nested, so drop `allow_mut` to `false`.
+        _ => ty.walk_children(|c| check_no_nested_mut(c, false, at, errors)),
+    }
+}
+
+/// Rule 3 (unannotated `Mut` binding) plus rule 2 (no nested `Mut`) on a single
+/// binder slot. `Loop`, `For`, `Case`-pattern, `LetRec`, `Lambda`, and `Let`
+/// binder types are unreachable by `walk_children`, so the caller invokes this
+/// on each explicitly.
+fn check_binder(binding: &TypedBinding, errors: &mut Vec<InferError>) {
+    // Rule 3: an *unspecified* binder whose resolved type is a store is an
+    // alias (`b = a`) — rejected, to force disambiguation between copying the
+    // value and seeding a new store. A *concrete* annotation is a deliberate
+    // choice and is allowed: `y: Mut[V] := cnt` seeds a new store (the `:=`
+    // binder carries a `Mut` annotation); `y: Int = cnt` copies the value. The
+    // value-copy's slot can still *coalesce* to `Mut`
+    // (coalesce mirrors the RHS node's `Mut` type onto the binding slot, and the
+    // unified phase peels it later), so keying rule 3 on the slot's `Mut`-ness
+    // would flag that benign artifact — hence the gate is the *absence of a
+    // concrete annotation*, not the slot type.
+    //
+    // A bare `_` (`b: _ = a`, `user_annotation == Some(Hole)`) is not a concrete
+    // choice — it requests inference, exactly like no annotation — so it must
+    // fire rule 3 too; otherwise `b: _ = a` slips through and aliases the store.
+    let annotation_is_unspecified = match &binding.user_annotation {
+        None => true,
+        Some(ann) => annotation_peels_to_hole(ann),
+    };
+    if annotation_is_unspecified && peel_mut(&binding.ty).is_some() {
+        errors.push(InferError::UnannotatedMutBinding {
+            name: binding.name.base().to_string(),
+        });
+    }
+    // A binder slot is a top-level type position, so `Mut` itself is legal;
+    // only a `Mut` *nested* in the declared type is a rule-2 violation.
+    check_no_nested_mut(
+        &binding.ty,
+        true,
+        &|| binding.name.base().to_string(),
+        errors,
+    );
+}
+
+fn check_mut_discipline_go(expr: &Expr, errors: &mut Vec<InferError>) {
+    // The `symbolic(expr)` render for error labels is computed *lazily* — only
+    // in the branches that actually raise an error — because this walk visits
+    // every node and the no-error path is overwhelmingly common; rendering the
+    // whole subtree at each node was quadratic for no diagnostic benefit.
+
+    // `Let` and `ExprStmt` *forward* their value (and hence their type) from a
+    // tail sub-expression that this walk visits and checks on its own. They
+    // are therefore transparent to the value-position rules below: a `Mut` (or
+    // a composite carrying one) reaching them via a trailing read is checked
+    // at the node that actually reads/constructs it, not re-reported at every
+    // forwarding ancestor.
+    let forwards_tail = matches!(
+        expr.node,
+        TypedExprNode::Let { .. } | TypedExprNode::ExprStmt { .. }
+    );
+
+    // Rule 1(a): a `Mut`-typed value must be a bare variable reference. `Var`
+    // is the traceable base case; a forwarder is transparent (see above).
+    // Everything else with a `Mut` type computes or selects it (a conditional
+    // `Case`, a `Tuple`/`Apply`/`Cast`, …) and is rejected. A `MutWrite`'s
+    // target is a `Name`, not a child node, so it never surfaces here.
+    if peel_mut(&expr.ty).is_some() && !forwards_tail && !matches!(expr.node, TypedExprNode::Var(_))
+    {
+        errors.push(InferError::MutNotBareVariable { at: symbolic(expr) });
+    }
+
+    // Rule 2 on this node's own type. A forwarder's type is its tail's, so the
+    // tail's own check already covers it — skip to avoid ancestor-chain dupes.
+    if !forwards_tail {
+        check_no_nested_mut(&expr.ty, true, &|| symbolic(expr), errors);
+    }
+
+    // Rule 1(b): an argument passed to a `Mut` parameter must name a real store
+    // — a bare variable whose own (peeled) type is `Mut`. A non-variable (a
+    // computed/selected `Mut`) has no single introduction to trace; a bare
+    // variable of *non*-`Mut` type is a plain value that the lenient
+    // pass-by-reference coercion (`V <: Mut[V, D]`) would otherwise let a callee
+    // "mutate" in name only, since the caller holds no store to observe the
+    // write. Both break the design's "a `Mut` argument is a `Mut`-introduced
+    // variable" guarantee.
+    if let TypedExprNode::Apply { function, argument } = &expr.node {
+        let mut fn_ty = &function.ty;
+        while let Type::Refinement(inner, _) = fn_ty {
+            fn_ty = inner;
+        }
+        if let Type::Fun { domain, .. } = fn_ty
+            && peel_mut(domain).is_some()
+        {
+            if !matches!(argument.node, TypedExprNode::Var(_)) {
+                errors.push(InferError::MutNotBareVariable {
+                    at: symbolic(argument),
+                });
+            } else if peel_mut(&argument.ty).is_none() {
+                errors.push(InferError::MutArgNotStore {
+                    at: symbolic(argument),
+                });
+            }
+        }
+    }
+
+    // Rules 3 + 2 on binder slots `walk_children` does not reach.
+    match &expr.node {
+        TypedExprNode::Let { binding, .. } => check_binder(binding, errors),
+        TypedExprNode::Lambda { param, .. } => check_binder(param, errors),
+        TypedExprNode::For { target, .. } => check_binder(target, errors),
+        TypedExprNode::LetRec { bindings, .. } => {
+            for (b, _) in bindings {
+                check_binder(b, errors);
+            }
+        }
+        TypedExprNode::Case { branches, .. } => {
+            for b in branches {
+                if let Some(p) = &b.pattern {
+                    check_binder(&p.binding, errors);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    expr.walk_children(|e| check_mut_discipline_go(e, errors));
+}
+
+/// Enforce that every [`TypedExprNode::MutWrite`] (`:=` / `+=`) targets a
+/// `Mut`-typed binding — a write requires a mutable store, never a shadowing
+/// rebind of an immutable (`x += 1` on a plain `x` is an error, not `x = x + 1`).
+///
+/// Runs after inference, so binder types are resolved, and after `uniquify`,
+/// which rewrites each `MutWrite` target to its binder's α-unique `Name` (see
+/// `uniquify.rs`). Names are therefore unique, so a flat `Name → Type` map over
+/// the tree's binders resolves each write target unambiguously — no lexical
+/// scope stack, and shadowing is handled for free. A target whose peeled type
+/// is not `Mut` is [`InferError::MutWriteToNonStore`]; a target absent from the
+/// map is an unbound write inference already rejected, and is skipped.
+pub fn check_mut_write_targets(expr: &Expr) -> Result<(), Vec<InferError>> {
+    let mut stores: HashMap<Name, bool> = HashMap::new();
+    collect_store_binders(expr, &mut stores);
+    let mut errors = Vec::new();
+    check_mut_write_targets_go(expr, &stores, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Whether a binder denotes a mutable store. An **explicit annotation is
+/// authoritative**: `x := e` and pass-by-reference `Mut[…]` parameters stamp
+/// `Mut` on `user_annotation` (while the coalesced `.ty` slot is the value type
+/// — reads deref), and a *non-`Mut`* annotation (`y: int = x`) declares a value,
+/// so the binding is not a store even if a write-site demand coalesced its `.ty`
+/// to `Mut`. Only when there is no annotation does `.ty` witness store-ness (a
+/// coalesced alias). Reading the annotation first is what makes `y += 1` on a
+/// `y: int = x` deref-copy the "not a mutable store" error the discipline
+/// promises, rather than a silently-accepted write.
+fn binder_is_store(b: &TypedBinding) -> bool {
+    match &b.user_annotation {
+        Some(a) => peel_mut(a).is_some(),
+        None => peel_mut(&b.ty).is_some(),
+    }
+}
+
+/// Record every binder's `name → is-a-store`. Binder-typed slots are unreachable
+/// by `walk_children` (mirroring [`check_binder`]'s call sites), so each binder
+/// node is handled explicitly before recursing into children.
+fn collect_store_binders(expr: &Expr, out: &mut HashMap<Name, bool>) {
+    match &expr.node {
+        TypedExprNode::Let { binding, .. } => {
+            out.insert(binding.name.clone(), binder_is_store(binding));
+        }
+        TypedExprNode::Lambda { param, .. } => {
+            out.insert(param.name.clone(), binder_is_store(param));
+        }
+        TypedExprNode::For { target, .. } => {
+            out.insert(target.name.clone(), binder_is_store(target));
+        }
+        TypedExprNode::LetRec { bindings, .. } => {
+            for (b, _) in bindings {
+                out.insert(b.name.clone(), binder_is_store(b));
+            }
+        }
+        TypedExprNode::Case { branches, .. } => {
+            for br in branches {
+                if let Some(p) = &br.pattern {
+                    out.insert(p.binding.name.clone(), binder_is_store(&p.binding));
+                }
+            }
+        }
+        _ => {}
+    }
+    expr.walk_children(|c| collect_store_binders(c, out));
+}
+
+fn check_mut_write_targets_go(
+    expr: &Expr,
+    stores: &HashMap<Name, bool>,
+    errors: &mut Vec<InferError>,
+) {
+    if let TypedExprNode::MutWrite { name, .. } = &expr.node
+        && stores.get(name) == Some(&false)
+    {
+        errors.push(InferError::MutWriteToNonStore {
+            name: name.base().to_string(),
+        });
+    }
+    expr.walk_children(|c| check_mut_write_targets_go(c, stores, errors));
+}
+
 /// In debug mode only, typecheck the expression and panic if any errors are found.
+///
+/// Routes through [`check_pre_desugar`], which self-selects strictness: a
+/// (sub)tree carrying defer artifacts (a `Feed`/`Infer` channel type — which
+/// `substitute` now sees, since inline runs before desugar) is checked at the
+/// relaxed `PreDesugar` level; a fully-desugared tree is checked strictly (the
+/// `typecheck` bar).
 pub fn debug_typecheck(expr: &Expr) {
     debug_assert_eq!(
-        typecheck(expr),
+        check_pre_desugar(expr),
         Ok(()),
-        "Failed to typecheck result: {}",
+        "Failed post-transform typecheck: {}",
         symbolic_typed(expr)
     );
 }
@@ -949,6 +1534,49 @@ mod tests {
                 inferred: Type::Base(BaseType::Int),
             }])
         );
+    }
+
+    /// A `MutWrite` whose target binding is not `Mut`-typed is rejected — the
+    /// invariant that lets lowering emit writes uniformly and stop tracking
+    /// store-ness (see src/ccl/design/mutability.md, "Store-ness is the type").
+    #[test]
+    fn mut_write_to_non_store_rejected() {
+        // let x : Int = 0 in (x := 5)  =>  MutWriteToNonStore
+        let expr = TypedExpr::new(TypedExprNode::Let {
+            binding: TypedBinding {
+                name: "x".into(),
+                ty: Type::Base(BaseType::Int),
+                user_annotation: None,
+            },
+            bound_expr: Box::new(Expr::lit(Lit::Int(0))),
+            body: Box::new(Expr::mut_write("x", Expr::lit(Lit::Int(5)))),
+        });
+        assert_eq!(
+            check_mut_write_targets(&expr),
+            Err(vec![InferError::MutWriteToNonStore {
+                name: "x".to_string(),
+            }])
+        );
+    }
+
+    /// A `MutWrite` to a `Mut`-typed binding is accepted.
+    #[test]
+    fn mut_write_to_store_ok() {
+        // let x : Mut[Int, _] = 0 in (x := 5)  =>  Ok
+        let expr = TypedExpr::new(TypedExprNode::Let {
+            binding: TypedBinding {
+                name: "x".into(),
+                ty: Type::History {
+                    value: Box::new(Type::Base(BaseType::Int)),
+                    domain: Box::new(Type::Hole),
+                    kind: HistoryKind::Store,
+                },
+                user_annotation: None,
+            },
+            bound_expr: Box::new(Expr::lit(Lit::Int(0))),
+            body: Box::new(Expr::mut_write("x", Expr::lit(Lit::Int(5)))),
+        });
+        assert_eq!(check_mut_write_targets(&expr), Ok(()));
     }
 
     #[test]

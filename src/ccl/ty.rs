@@ -8,6 +8,37 @@ use smol_str::SmolStr;
 
 use crate::ccl::{BaseType, InferVar, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils, symbolic};
 
+/// The introduction level riding a [`Type::ChanDom`] — deliberately
+/// **identity-transparent**: two channel domains denote the same channel iff
+/// their *names* match. The level is bookkeeping for `freshen_above`'s
+/// quantification decision only, and one name is legitimately observed at
+/// different levels (a pass-1 `At(use)` instantiation and a pass-2 `Preserve`
+/// clone rename of the same logical instantiation). Comparing or hashing it
+/// would split one channel into two atoms — every `PartialEq`/`Ord`/`Hash`
+/// here says "equal".
+#[derive(Debug, Clone, Copy)]
+pub struct ChanLevel(pub crate::ccl::Level);
+
+impl PartialEq for ChanLevel {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for ChanLevel {}
+impl PartialOrd for ChanLevel {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ChanLevel {
+    fn cmp(&self, _: &Self) -> std::cmp::Ordering {
+        std::cmp::Ordering::Equal
+    }
+}
+impl std::hash::Hash for ChanLevel {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
+}
+
 /// Identifies a field inside a structural record/tuple, or a variant tag.
 ///
 /// `Index` is used for tuple-shaped records (positional projection);
@@ -38,12 +69,15 @@ impl fmt::Display for FieldKey {
 ///
 /// Appears on [`TypedExpr`] nodes and as the output of type inference.
 ///
-/// The two pre-/post-inference variants divide ownership cleanly:
+/// The transient variants divide ownership cleanly:
 ///
 /// | Variant | Owner | Meaning | Must be eliminated by |
 /// |---|---|---|---|
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
-/// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`) |
+/// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); an induction store's *domain* is necessarily `Infer` until the unified phase resolves it (see `Strictness::PreDesugar`) |
+/// | `History` (`kind: Store`) | Type checker only | "Mutable store: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `letrec_phase`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
+/// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
+/// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its extent resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     /// A primitive base type.
@@ -133,9 +167,86 @@ pub enum Type {
     /// resolves this to a concrete `Extent::DataSourceDomain(rc)` at compilation time
     /// by looking the name up in its source-domain-extent registry.
     DataSource(String),
+    /// the nominal, rigid domain of a feed channel, named by
+    /// its defer binder. Minted by inference when it types a `let d = Defer`
+    /// binding (instead of a fresh `Infer` domain), so every consumer of a
+    /// read of `d` types *concretely* against `ChanDom(d)` and no `Infer`
+    /// channel-domain residue forms. `channelize` erases it with a whole-tree
+    /// substitution `ChanDom(d) ↦ <concrete channel domain>` once the channel
+    /// is assembled. Like [`Type::DataSource`], it is a nominal leaf whose
+    /// extent resolves later; unlike it, it is *transient* — no pass after
+    /// `channelize` may observe one.
+    ///
+    /// The second field is the domain's **introduction level** (the inference
+    /// level of the `let d = Defer` RHS that minted it). It makes channel
+    /// identity *per-instantiation*: `freshen_above` renames a `ChanDom`
+    /// above its cutoff exactly as it freshens a quantified variable, so a
+    /// defer inside a generalized definition names a distinct channel per
+    /// specialization, while a captured outer channel (level ≤ cutoff) stays
+    /// shared. Identity-transparent (see [`ChanLevel`]) and inference-only —
+    /// dead weight after `channelize` erases the type.
+    ChanDom(crate::ccl::Name, ChanLevel),
+    /// The transaction-commit domain: an anonymous total order of commit times
+    /// issued by the runtime (the prototype's `CommitTime`). It is the domain of
+    /// transactional histories (`Txn ⇒ V`), the codomain of the per-site
+    /// `begin_<site>` oracles, and the type of a transaction handle. Like
+    /// `DataSource`, it has no enumerable static extent — its positions exist only
+    /// in the tile. See src/ccl/design/mutability.md.
+    Txn,
+    /// The type of a **history** handle: a function `domain ⇒ value` that a
+    /// `:=` store or a `defer`/`<<` channel writes incrementally. One variant
+    /// for both — a mutable store and a feed channel are the same object (an
+    /// invariant, deref-transparent `domain ⇒ value`); they differ only in the
+    /// [`HistoryKind`]:
+    ///
+    /// - [`HistoryKind::Store`] — a **mutable store** (`:=` / `+=`). A reference
+    ///   reads through to its `value` (the scalar behind `Mut[Int, D]`; `cnt + 1`
+    ///   reads the `Int`), its writes may read the previous position
+    ///   (`get_prev_seq` recurrence), and its trailing read is `last_or_default`
+    ///   (a scalar). The unified phase materializes it with a carry-forward arm.
+    /// - [`HistoryKind::Feed`] — a **feed channel** (`defer` / `<<` / `<<=`). A
+    ///   reference reads the whole stream (`domain ⇒ value`), off-path positions
+    ///   are absent (no carry-forward), and `channelize` resolves it to the
+    ///   collected channel.
+    ///
+    /// Either way it is **invariant** in both children (a history flowing
+    /// through a function parameter both reads and writes), and it is a
+    /// **transient** variant like `Hole` / `Infer`: it exists only between type
+    /// inference (which stamps it on `:=` / `defer` introductions and every
+    /// reference) and the passes that erase it — the unified phase
+    /// (`transact_phase` / `letrec_phase`) for `Store` histories, `channelize`
+    /// for `Feed` ones. Both erase it to a bare `Type::Fun`; no pass downstream
+    /// may observe a `History` (a survivor at the strict wall is a compiler bug —
+    /// see `collect_type_errors`). See src/ccl/design/mutability.md.
+    History {
+        /// The type of the history's value (a position's cell / element). Read
+        /// through by the deref coercion for a [`HistoryKind::Store`] reference.
+        value: Box<Type>,
+        /// The index the history's positions are tracked over (loop index,
+        /// transaction time, or a feed channel's collection domain).
+        domain: Box<Type>,
+        /// Whether this is a mutable store or a feed channel — selects the read
+        /// mode (scalar-last vs whole-stream) and, in the unified phase, whether
+        /// off-path positions carry forward.
+        kind: HistoryKind,
+    },
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
     // Refinement { base: Box<Type>, predicate: Box<Expr> }
+}
+
+/// Which flavour of [`Type::History`] a handle is — a mutable store (`:=`) or a
+/// feed channel (`defer` / `<<`). The two are the same object (a `domain ⇒
+/// value` history) but read and materialize differently; see [`Type::History`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HistoryKind {
+    /// A mutable store introduced by `:=` — deref-on-read to the scalar `value`,
+    /// a `get_prev_seq` / `get_prev_txn` recurrence, a `last_or_default` trailing
+    /// read, and a carry-forward arm for off-path positions.
+    Store,
+    /// A feed channel introduced by `defer` and written with `<<` / `<<=` — read
+    /// as the whole `domain ⇒ value` stream, with off-path positions absent.
+    Feed,
 }
 
 /// If every tag in `tags` is an anonymous positional [`FieldKey::Index`]
@@ -233,6 +344,19 @@ impl fmt::Display for Type {
             Type::Hole => write!(f, "_"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
             Type::DataSource(name) => write!(f, "source({name})"),
+            Type::ChanDom(name, _) => write!(f, "chan({name})"),
+            Type::Txn => write!(f, "Txn"),
+            Type::History {
+                value,
+                domain,
+                kind,
+            } => {
+                if *kind == HistoryKind::Store {
+                    write!(f, "Mut[{value}, {domain}]")
+                } else {
+                    write!(f, "feed({domain} ⇒ {value})")
+                }
+            }
         }
     }
 }
@@ -271,6 +395,51 @@ impl Type {
             Some(codomain.as_ref().clone())
         } else {
             None
+        }
+    }
+
+    /// Whether this type's positions can be statically enumerated — i.e. a
+    /// terminal reduction over a `Fun` of this domain converges. A live commit
+    /// history (`Txn`) has **no** enumerable extent: its positions are revealed
+    /// only as commits land, so a `last_or_default` over one never resolves.
+    /// `transact_phase::rewrite_live_reads` uses this to detect that a broadcast
+    /// read's store is a live commit log (`Txn`) and rewrite it to an as-of join
+    /// instead of broadcasting a never-resolving terminal render.
+    ///
+    /// The match is **exhaustive on purpose** (no `_` arm): the predicate is
+    /// load-bearing, so a new abstract domain whose elements live in a producer
+    /// must make an explicit decision here rather than silently defaulting to
+    /// enumerable. `DataSource` is enumerable-from-the-type (its extent resolves
+    /// from the registered source); only `Txn` is genuinely non-enumerable.
+    ///
+    /// A `Fun` defers to its **domain**: iterating a function converges iff its
+    /// domain does. This is what makes the predicate safe to call on a whole
+    /// history function (`Txn ⇒ V` → non-enumerable), not just an extracted
+    /// domain — a store history is exactly a `Fun { domain: Txn, .. }`, so a
+    /// blanket `Fun ⇒ true` would have mis-answered the very case this exists to
+    /// detect.
+    pub fn has_enumerable_extent(&self) -> bool {
+        match self {
+            Type::Txn => false,
+            Type::Fun { domain, .. } => domain.has_enumerable_extent(),
+            Type::Tuple(ts) => ts.iter().all(Type::has_enumerable_extent),
+            Type::Record(fields) => fields.iter().all(|(_, t)| t.has_enumerable_extent()),
+            Type::Variant(tags) => tags.iter().all(|(_, t)| t.has_enumerable_extent()),
+            Type::Refinement(inner, _) => inner.has_enumerable_extent(),
+            // A store history is erased by the unified phase
+            // (`letrec_phase`/`transact_phase`) and a feed history by `channelize`,
+            // both before planning consults this predicate; observing one here is
+            // a compiler bug.
+            Type::History { .. } => unreachable!("Type::History survived its erasing phase"),
+            // Erased by `channelize` (before planning); a survivor here
+            // is a compiler bug, same as `History`.
+            Type::ChanDom(..) => unreachable!("Type::ChanDom survived channelize"),
+            // Concrete or type-resolvable domains: enumerable from the type alone.
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::DataSource(_)
+            | Type::Hole
+            | Type::Infer(_) => true,
         }
     }
 
@@ -313,11 +482,22 @@ impl Type {
             Type::Refinement(base, r) => {
                 Type::Refinement(Box::new(base.without_pi_names()), r.clone())
             }
+            Type::History {
+                value,
+                domain,
+                kind,
+            } => Type::History {
+                value: Box::new(value.without_pi_names()),
+                domain: Box::new(domain.without_pi_names()),
+                kind: *kind,
+            },
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
-            | Type::DataSource(_) => self.clone(),
+            | Type::DataSource(_)
+            | Type::ChanDom(..)
+            | Type::Txn => self.clone(),
         }
     }
 
@@ -349,7 +529,9 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
-            | Type::DataSource(_) => {}
+            | Type::DataSource(_)
+            | Type::ChanDom(..)
+            | Type::Txn => {}
             Type::Fun {
                 domain, codomain, ..
             } => {
@@ -367,6 +549,10 @@ impl Type {
                 }
             }
             Type::Refinement(base, _) => f(base),
+            Type::History { value, domain, .. } => {
+                f(value);
+                f(domain);
+            }
             Type::Variant(tags) => {
                 for (_, t) in tags {
                     f(t);
@@ -384,7 +570,9 @@ impl Type {
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
-            | Type::DataSource(_) => {}
+            | Type::DataSource(_)
+            | Type::ChanDom(..)
+            | Type::Txn => {}
             Type::Fun {
                 domain, codomain, ..
             } => {
@@ -402,6 +590,10 @@ impl Type {
                 }
             }
             Type::Refinement(base, _) => f(base),
+            Type::History { value, domain, .. } => {
+                f(value);
+                f(domain);
+            }
             Type::Variant(tags) => {
                 for (_, t) in tags {
                     f(t);
@@ -703,26 +895,6 @@ fn eq_refinement_predicate_go(a: &TypedExpr, b: &TypedExpr) -> bool {
                     .zip(f2)
                     .all(|((n1, e1), (n2, e2))| n1 == n2 && eq_refinement_predicate_go(e1, e2))
         }
-        (
-            N::Loop {
-                params: p1,
-                init_args: i1,
-                source: s1,
-                loop_body: b1,
-            },
-            N::Loop {
-                params: p2,
-                init_args: i2,
-                source: s2,
-                loop_body: b2,
-            },
-        ) => {
-            p1.len() == p2.len()
-                && p1.iter().zip(p2).all(|(x, y)| x.name == y.name)
-                && all_eq(i1, i2)
-                && eq_refinement_predicate_go(s1, s2)
-                && eq_refinement_predicate_go(b1, b2)
-        }
         (N::ExprStmt { expr: e1, body: b1 }, N::ExprStmt { expr: e2, body: b2 }) => {
             eq_refinement_predicate_go(e1, e2) && eq_refinement_predicate_go(b1, b2)
         }
@@ -832,6 +1004,17 @@ mod tests {
         assert_ne!(
             gt, lt,
             "casts differing only in the target's nested filter are distinct refinements"
+        );
+    }
+
+    /// The transaction-commit domain renders by its bare name (mirrors the
+    /// prototype's `CommitTime` Display), including as a function domain.
+    #[test]
+    fn txn_type_display() {
+        assert_eq!(Type::Txn.to_string(), "Txn");
+        assert_eq!(
+            Type::fun(Type::Txn, Type::Base(BaseType::Int)).to_string(),
+            "(Txn ⇒ Int)"
         );
     }
 }

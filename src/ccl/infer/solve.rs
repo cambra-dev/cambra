@@ -24,7 +24,7 @@ use std::rc::Rc;
 use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, coalesce_compact, compact_type,
-    constrain_subtype, freshen_expr_type_slots, simplify_type,
+    constrain_subtype, freshen_expr_type_slots, seed_chan_dom_pairings, simplify_type,
 };
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{Expr, Level, Name, Type, TypedBinding, TypedExprNode};
@@ -206,6 +206,10 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
         (Type::Base(a), Type::Base(b)) => a == b,
         (Type::UIntRange(a), Type::UIntRange(b)) => a == b,
         (Type::DataSource(a), Type::DataSource(b)) => a == b,
+        (Type::Txn, Type::Txn) => true,
+        // Nominal channel domains agree by name (the level is freshening
+        // bookkeeping, not identity - see `ChanLevel`).
+        (Type::ChanDom(a, _), Type::ChanDom(b, _)) => a == b,
         (
             Type::Fun {
                 name: n1,
@@ -239,6 +243,50 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
                     .zip(ys)
                     .all(|((kx, x), (ky, y))| kx == ky && types_agree_modulo_unread(x, y))
         }
+        // Two histories of *different* kinds never agree — a `Store` and a
+        // `Feed` are distinct handles even if their read views coincidentally
+        // line up. Reject explicitly rather than letting the or-pattern below
+        // bind `kind` from whichever side matched first (which would compare one
+        // side's read view against the other's raw handle, an asymmetric and
+        // potentially-permissive result on a mis-kinded tree). Same-kind pairs
+        // fall through to the read-through arm.
+        (Type::History { kind: k0, .. }, Type::History { kind: k1, .. }) if k0 != k1 => false,
+        // A history reads through transparently (the solver's read-through
+        // rule, mirrored in `provide_function`): a read agrees with the
+        // handle's read view, and two handles agree iff their read views do.
+        // The read view is kind-specific — a `Feed` reads as its whole stream
+        // `domain ⇒ value`, a `Store` derefs to its scalar `value`. A `Feed`
+        // channel domain is the rigid nominal `ChanDom(d)`, which `channelize`
+        // erases to the concrete channel domain by substitution; the `ChanDom`
+        // arm above agrees it by name.
+        (
+            Type::History {
+                value,
+                domain,
+                kind,
+            },
+            other,
+        )
+        | (
+            other,
+            Type::History {
+                value,
+                domain,
+                kind,
+            },
+        ) => match kind {
+            // Used only in this `#[cfg(debug_assertions)]` helper, so qualify
+            // rather than adding a top-level import that is unused in release.
+            crate::ccl::HistoryKind::Feed => {
+                let stream = Type::Fun {
+                    name: None,
+                    domain: domain.clone(),
+                    codomain: value.clone(),
+                };
+                types_agree_modulo_unread(&stream, other)
+            }
+            crate::ccl::HistoryKind::Store => types_agree_modulo_unread(value, other),
+        },
         _ => false,
     }
 }
@@ -386,20 +434,6 @@ pub(super) fn check_scope_valid(
             s.insert(binding.name.clone());
             check_scope_valid(body, &s, errors);
         }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            init_args
-                .iter()
-                .for_each(|a| check_scope_valid(a, scope, errors));
-            check_scope_valid(source, scope, errors);
-            let mut s = scope.clone();
-            s.extend(params.iter().map(|p| p.name.clone()));
-            check_scope_valid(loop_body, &s, errors);
-        }
         TypedExprNode::Case {
             scrutinee,
             branches,
@@ -415,6 +449,22 @@ pub(super) fn check_scope_valid(
                 check_scope_valid(&b.guard, &s, errors);
                 check_scope_valid(&b.body, &s, errors);
             }
+        }
+        // Mutual recursion: the whole group is in scope in every binding
+        // body and in the letrec body.
+        TypedExprNode::LetRec { bindings, body } => {
+            let mut s = scope.clone();
+            s.extend(bindings.iter().map(|(b, _)| b.name.clone()));
+            for (_, def) in bindings {
+                check_scope_valid(def, &s, errors);
+            }
+            check_scope_valid(body, &s, errors);
+        }
+        TypedExprNode::For { target, iter, body } => {
+            check_scope_valid(iter, scope, errors);
+            let mut s = scope.clone();
+            s.insert(target.name.clone());
+            check_scope_valid(body, &s, errors);
         }
         _ => expr.walk_children(|c| check_scope_valid(c, scope, errors)),
     }
@@ -697,36 +747,57 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_node(e, level, ctx);
             coalesce_node(body, level, ctx);
         }
-        // Defer/Feed/Define are eliminated by `desugar_defers` before
-        // inference runs, so coalesce never sees them.
-        TypedExprNode::Feed { .. } | TypedExprNode::Define { .. } | TypedExprNode::Defer => {
+        // A `Defer` leaf's `Feed(ρ)` resolves through the standard
+        // end-of-function `resolve_var_type` like any other node type.
+        TypedExprNode::Defer => {}
+        // Feed/Define/MutWrite: recurse into the contributed/written value;
+        // the node's own `Unit` type needs no resolution.
+        TypedExprNode::Feed { value, .. }
+        | TypedExprNode::Define { value, .. }
+        | TypedExprNode::MutWrite { value, .. } => {
+            coalesce_node(value, level, ctx);
+        }
+        TypedExprNode::For { target, iter, body } => {
+            coalesce_node(iter, level, ctx);
+            // The loop target binds only inside the body.
+            let target_name = target.name.clone();
+            with_shadows(ctx, [target_name], |ctx| coalesce_node(body, level, ctx));
+            // Binder slot: resolve the target's element type in place, like
+            // `Loop` params (`emit_for` wrote the slot var).
+            match resolve_var_type(&target.ty) {
+                Ok(ty) => target.ty = ty,
+                Err(err) => {
+                    let label = "For target".to_string();
+                    push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
+                }
+            }
+        }
+        // `Transact` is born by `letrec_phase::recognize`, after inference (and
+        // so after coalesce), so a `Transact` never reaches here.
+        TypedExprNode::Transact { .. } => {
             unreachable!(
-                "Defer/Feed/Define survived desugar_defers and reached coalesce: {:?}",
-                expr.node
+                "Transact is born post-inference by letrec recognition; Coalesce never sees it"
             )
         }
-        TypedExprNode::Loop {
-            params,
-            source,
-            init_args,
-            loop_body,
-            ..
-        } => {
-            coalesce_node(source, level, ctx);
-            for a in init_args.iter_mut() {
-                coalesce_node(a, level, ctx);
-            }
-            // Accumulator params are bound only inside the loop body.
-            let param_names: Vec<Name> = params.iter().map(|p| p.name.clone()).collect();
-            with_shadows(ctx, param_names, |ctx| coalesce_node(loop_body, level, ctx));
-            // Resolve each accumulator-slot type in place. `emit_loop`
-            // wrote the slot var into `params[i].ty`; run it through the
-            // same pipeline used for `expr.ty` so it ends up concrete.
-            for binding in params.iter_mut() {
+
+        TypedExprNode::LetRec { bindings, body } => {
+            // Every group binder scopes every binding body and the letrec
+            // body (mutual recursion), so all of them shadow outer
+            // generalized bindings throughout the group.
+            let names: Vec<Name> = bindings.iter().map(|(b, _)| b.name.clone()).collect();
+            with_shadows(ctx, names, |ctx| {
+                for (_, def) in bindings.iter_mut() {
+                    coalesce_node(def, level, ctx);
+                }
+                coalesce_node(body, level, ctx);
+            });
+            // Binder slots: resolve each declared type in place (`emit_letrec`
+            // normalized the slot, possibly to a fresh var for a `Hole`).
+            for (binding, _) in bindings.iter_mut() {
                 match resolve_var_type(&binding.ty) {
                     Ok(ty) => binding.ty = ty,
                     Err(err) => {
-                        let label = "Loop param".to_string();
+                        let label = format!("LetRec binding `{}`", binding.name);
                         push_coalesce_err(&mut ctx.errors, map_coalesce_err(err, &label), label);
                     }
                 }
@@ -862,7 +933,17 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
         Type::Variant(tags) => tags
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates(t, level, ctx)),
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+        Type::History { value, domain, .. } => {
+            coalesce_type_predicates(value, level, ctx);
+            coalesce_type_predicates(domain, level, ctx);
+        }
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::ChanDom(..)
+        | Type::Txn
+        | Type::Hole
+        | Type::Infer(_) => {}
     }
 }
 
@@ -976,6 +1057,14 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // predicates are proper freshen instances sharing no live inference state
     // with the definition — and no mutable state to keep in sync with it.
     let mut fresh = FreshenCache::new();
+    // Quantified channel-domain names must instantiate to the SAME names the
+    // use site's pass-1 instantiation minted — a rigid name, unlike a
+    // variable, cannot be identified with its instantiation through the
+    // two-way pin below. Pair the use's resolved type against the (still
+    // unfreshened) definition type and seed the cache, so the clone-wide
+    // freshen renames them consistently everywhere it reaches (node types,
+    // binder slots, predicate slots, and bound edges alike).
+    seed_chan_dom_pairings(&resolved, &clone.ty, cutoff, &mut fresh.chan_doms);
     freshen_expr_type_slots(&mut clone, cutoff, FreshenLevel::Preserve, &mut fresh);
 
     // Pin the clone to the use's live instantiation type, two-way. Inward,
@@ -1270,23 +1359,6 @@ pub(super) fn retype_predicate_slots(expr: &mut Expr, scope: &HashMap<Name, Type
             s.insert(binding.name.clone(), binding.ty.clone());
             retype_predicate_slots(body, &s);
         }
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => {
-            init_args
-                .iter_mut()
-                .for_each(|a| retype_predicate_slots(a, scope));
-            retype_predicate_slots(source, scope);
-            let mut s = scope.clone();
-            for p in params.iter_mut() {
-                retype_in_type(&mut p.ty, scope);
-                s.insert(p.name.clone(), p.ty.clone());
-            }
-            retype_predicate_slots(loop_body, &s);
-        }
         TypedExprNode::Case {
             scrutinee,
             branches,
@@ -1331,7 +1403,17 @@ fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>) {
             retype_pred_expr(&mut pred, scope);
             r.predicate = Rc::new(pred);
         }
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {}
+        Type::History { value, domain, .. } => {
+            retype_in_type(value, scope);
+            retype_in_type(domain, scope);
+        }
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::ChanDom(..)
+        | Type::Txn
+        | Type::Hole
+        | Type::Infer(_) => {}
     }
 }
 

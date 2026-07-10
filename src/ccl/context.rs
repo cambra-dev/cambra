@@ -11,9 +11,12 @@ use log::debug;
 
 use crate::{
     ccl::{
-        Expr, Type, desugar_defers,
-        infer::{InferError, TypeInferenceContext, infer, typecheck},
-        inline, lambda_elim,
+        Expr, Type, channelize,
+        infer::{
+            InferError, TypeInferenceContext, check_mut_discipline, check_mut_write_targets,
+            check_pre_desugar, infer, typecheck,
+        },
+        inline, lambda_elim, letrec_phase,
         lower::{LoweringContext, LoweringError, lower_stmts},
         planning,
         symbolic::{symbolic, symbolic_typed},
@@ -69,13 +72,25 @@ pub enum CompileError {
     /// Defer/Feed/Define desugaring rejected the program (e.g. a defer
     /// binding with no feeds, mixed `<<`/`<<=` on the same handle, or a
     /// `<<=` inside a non-top-level scope).
-    DesugarDefers(desugar_defers::DeferError),
+    ///
+    /// Desugaring runs *after* inference (so type errors report against
+    /// the user's program shape); a program with both a type error and a
+    /// structural defer error therefore surfaces only the type error
+    /// first.
+    DesugarDefers(channelize::DeferError),
     /// Type inference rejected one expression.
     Infer(InferError),
     /// Lambda elimination failed.
     LambdaElim(lambda_elim::LambdaElimError),
     /// Operator-graph conversion failed.
     Conversion(ConversionError),
+    /// A post-inference phase rejected the program for a semantic reason that
+    /// only becomes visible after inlining / type inference — a nested
+    /// transaction reaching a `with begin():` block via a function call, or a
+    /// live cross-endpoint read in a shape the as-of rewrite cannot stage. These
+    /// run on a lambda-free / inlined tree whose nodes carry no source span, so
+    /// they render as a plain `error: …` line rather than an ariadne report.
+    Unsupported(String),
 }
 
 impl CompileError {
@@ -116,6 +131,9 @@ impl CompileError {
                 buf.extend_from_slice(
                     format!("error: operator-graph conversion: {e:?}\n").as_bytes(),
                 );
+            }
+            CompileError::Unsupported(msg) => {
+                buf.extend_from_slice(format!("error: {msg}\n").as_bytes());
             }
         }
         String::from_utf8_lossy(&buf).into_owned()
@@ -172,8 +190,8 @@ impl From<lambda_elim::LambdaElimError> for CompileError {
     }
 }
 
-impl From<desugar_defers::DeferError> for CompileError {
-    fn from(e: desugar_defers::DeferError) -> Self {
+impl From<channelize::DeferError> for CompileError {
+    fn from(e: channelize::DeferError) -> Self {
         Self::DesugarDefers(e)
     }
 }
@@ -207,7 +225,7 @@ impl IntoCompileErrors for lambda_elim::LambdaElimError {
     }
 }
 
-impl IntoCompileErrors for desugar_defers::DeferError {
+impl IntoCompileErrors for channelize::DeferError {
     fn into_compile_errors(self) -> Vec<CompileError> {
         vec![CompileError::DesugarDefers(self)]
     }
@@ -477,15 +495,8 @@ pub fn compile_program(
     // a globally fresh `Name` uid, so shadowing ceases to exist before any
     // pass that compares names. Must run before defer desugaring — desugar's
     // rewrites splice and rename terms under the assumption that distinct
-    // binders are distinct names.
+    // binders are distinct names. (Desugar now runs after inference; see below.)
     expr = uniquify::run(expr);
-
-    // Desugar Defer/Feed/Define before inference: every `let d = Defer in body`
-    // gets rewritten so the body publishes its contribution to d via a
-    // `Record({result, to_d})` at the body's terminal, with the defer-bind
-    // site consuming the `to_d` projection.  After this, no Defer/Feed/Define
-    // nodes remain.
-    expr = desugar_defers::run(expr).errs()?;
 
     // Register every source (pre-registered + discovered during lowering) with
     // inference and operator-conversion now that the full source set is known.
@@ -503,19 +514,24 @@ pub fn compile_program(
         ctx.conversion_ctx().register_source(name, source);
     }
 
-    debug!("Lowered:\n{}", symbolic(&expr));
-
+    // Inference runs on the user-shaped tree — before channelize — so
+    // type errors are reported against the program the user wrote, not the
+    // channelized rewrite. Defer reads necessarily carry `Feed` types with
+    // `Infer` channel domains here (only desugar can know the domains), so
+    // the post-inference consistency check is the relaxed pre-desugar one.
     let infer_ctx = ctx.inference_ctx();
     infer(&mut expr, infer_ctx).errs()?;
     debug!("Inferred:\n{}", symbolic(&expr));
     debug!("Inferred (typed):\n{}", symbolic_typed(&expr));
-    // Typecheck wall between `infer` and the rewriting passes. A failure here
-    // is a compiler bug — with one exception: residual `Type::Infer`
+    // Consistency wall between `infer` and `channelize`. It is the relaxed
+    // *pre-desugar* check (`check_pre_desugar`), which permits the transient
+    // `Feed` / `Infer`-channel-domain types only desugar can erase. A failure
+    // here is a compiler bug — with one exception: residual `Type::Infer`
     // variables, which inference deliberately tolerates for a generalized
     // definition the program never exercises at a concrete type (see
     // `Type::Infer`'s invariant). That residue is an *ambiguous program* — a
     // user error — so it is rendered as a diagnostic; anything else panics.
-    typecheck(&expr).map_err(|errs| {
+    check_pre_desugar(&expr).map_err(|errs| {
         if errs
             .iter()
             .all(|e| matches!(e, InferError::UnresolvedInfer { .. }))
@@ -526,17 +542,73 @@ pub fn compile_program(
         }
     })?;
 
-    // Inline UDFs: substitute both scalar and list-producing UDF Let bindings
-    // and beta-reduce at each call site before lambda elimination.  This
-    // strips the outer user-parameter lambda from list-producing UDFs so the
-    // remaining Lambda layer matches the list-comprehension shape that
-    // lambda-elim handles, and avoids a runtime panic when operator conversion
-    // would otherwise try to iterate over a scalar's infinite domain.
-    let udfs_inlined = inline::inline_non_iterable_lambdas(expr);
-    debug!("UDFs inlined CCL:\n{}", symbolic(&udfs_inlined));
-    typecheck(&udfs_inlined).expect("type error after UDF inlining");
+    // Enforce the second-class `Mut` discipline (design doc, "No aliasing:
+    // `Mut` values are second-class") on the fully-typed, still-`Mut`-bearing
+    // tree — after the consistency wall, before inlining. It needs the
+    // pre-inline `Apply`/parameter structure (rule 1's argument check) and the
+    // coalesced `.ty` slots and `user_annotation`s. Unlike the surrounding
+    // `check_pre_desugar` walls (compiler-bug backstops), these are user
+    // errors: aliasing or nesting a mutable reference.
+    check_mut_discipline(&expr).map_err(|errs| errs.into_compile_errors())?;
 
-    let lambda_elim = lambda_elim::run(udfs_inlined).errs()?;
+    // Enforce that every `:=` / `+=` write targets a mutable store (a write is
+    // never a shadowing rebind of an immutable). Post-inference so binder types
+    // are resolved, post-`uniquify` so write targets carry their binder's
+    // α-unique name — see `check_mut_write_targets`. (Currently satisfied by
+    // construction, since lowering only emits `MutWrite` for registered stores;
+    // it becomes load-bearing once lowering emits writes uniformly and drops the
+    // registry — see src/ccl/design/mutability.md, "Store-ness is the type".)
+    check_mut_write_targets(&expr).map_err(|errs| errs.into_compile_errors())?;
+
+    // Inline UDFs *before* desugar: a defer-mediating UDF (`λ out → out << e`)
+    // or a cross-function writer is beta-reduced to its call site before
+    // desugar routes feeds and before the unified letrec phase folds writers,
+    // both of which need their targets lexically present. Inlining runs on the
+    // still-defer-bearing tree (Defer/Feed nodes and `Feed` types present) via
+    // the defer-aware `Subst` engine (which renames a fed-to handle on
+    // beta-reduction) and preserves defer-returning generators, so the
+    // post-inline wall is the relaxed `check_pre_desugar`, not strict
+    // `typecheck`.
+    expr = inline::inline_non_iterable_lambdas(expr);
+    debug!("UDFs inlined CCL:\n{}", symbolic(&expr));
+    check_pre_desugar(&expr).map_err(|errs| {
+        if errs
+            .iter()
+            .all(|e| matches!(e, InferError::UnresolvedInfer { .. }))
+        {
+            errs.into_compile_errors()
+        } else {
+            panic!("UDF inlining created invalid expr: {errs:?}")
+        }
+    })?;
+
+    // The unified letrec phase: direct-mirror mutation loops (`For` /
+    // `MutWrite`) become guarded `LetRec` groups — mutable histories over
+    // the induction domain, per src/ccl/design/mutability.md. Runs after
+    // inlining (so cross-function writers land at their call sites) and
+    // *before* channelize, so a per-iteration feed inside a loop is
+    // hoisted to an ordinary feed of the loop's history for desugar to route.
+    // The tree still carries Defer/Feed here, so the walls are the relaxed
+    // pre-desugar check.
+    let phase_out = letrec_phase::run(expr);
+    debug!("Letrec phase CCL:\n{}", symbolic(&phase_out));
+    check_pre_desugar(&phase_out).expect("letrec phase produced an inconsistent tree");
+
+    // Feed channelization — the feed-routing step of the unified phase, run on
+    // the phase-emitted `LetRec` tree (recognition happens *after*
+    // `lambda_elim`, below). Every `let d = Defer in body` is rewritten to
+    // `let d = <channel> in body`, where `<channel>` is the `++`-union of the
+    // defer's `<<` / `<<=` contributions; a channel assembled from a group's
+    // taps binds inside the letrec body, below the binders it captures.
+    // After this, no Defer/Feed/Define nodes — and no `Feed`/`ChanDom` types —
+    // remain: channelization is type-preserving by construction and closes
+    // channel domains by substitution; the strict `typecheck` below is the
+    // release-visible enforcement.
+    let desugared = channelize::run(phase_out, /* input_typed= */ true).errs()?;
+    debug!("Channelized:\n{}", symbolic(&desugared));
+    typecheck(&desugared).expect("channelize produced an ill-typed tree");
+
+    let lambda_elim = lambda_elim::run(desugared).errs()?;
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
     debug!("λ-eliminated typed CCL:\n{}", symbolic_typed(&lambda_elim));
 
@@ -544,7 +616,19 @@ pub fn compile_program(
     // `check_fully_typed` call is no longer needed here.
     typecheck(&lambda_elim).expect("type error after lambda elimination");
 
-    let join_planned = planning::run(lambda_elim);
+    // Recognition: lower each guarded group — now in its point-free normal
+    // form — onto the domain-parameterized `Transact` carrier (a
+    // `get_prev_txn` transaction group → `Transact{Txn}`; a `get_prev_seq`
+    // induction group → `Transact{iteration extent}`) so planning stages the
+    // writer sources and operator conversion picks the engine on the domain.
+    // Running post-elim is what keeps ONE letrec representation through
+    // channelize and lambda_elim; the point-free guard matcher re-checks
+    // guardedness at this wall. See the `letrec_phase` recognition docs.
+    let recognized = letrec_phase::recognize(lambda_elim);
+    debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
+    typecheck(&recognized).expect("letrec recognition produced an ill-typed tree");
+
+    let join_planned = planning::run(recognized);
     debug!(
         "Join-planned CCL:\n{} : {}",
         symbolic(&join_planned),

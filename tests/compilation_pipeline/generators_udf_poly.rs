@@ -56,25 +56,36 @@ fn test_function_def_polymorphic_used_at_two_types() {
     "def doubles(xs):\n    for x in xs:\n        yield x * 2\ndoubles([1, 2, 3])",
     make_int_list(&[2, 4, 6])
 )]
+// Same generator, but its result is *bound* to a variable before use
+// (`y = doubles(...)` then `y`) rather than called inline. `inline` expands
+// the call to `let y = (let __result = defer in … __result) in y`, and
+// `channelize::try_lift_defer` lifts the inner result-defer scope out so the
+// feeds land on `y`. The inline form above never reaches that path, so this
+// case is its regression guard.
+#[case(
+    "def doubles(xs):\n    for x in xs:\n        yield x * 2\ny = doubles([1, 2, 3])\ny",
+    make_int_list(&[2, 4, 6])
+)]
+// A UDF that binds another generator's result to a local and returns it
+// (`def wrap(xs): z = doubles(xs); z`). After inlining, `y = wrap(...)`
+// becomes `let y = (let z = <doubles inlined> in z) in y` — the inner
+// bound-expr contains a defer but is not itself `Defer`, so
+// `channelize`'s defer-returning-let *collapse* fires (surfacing the inner
+// defer for a subsequent `try_lift_defer`). Regression guard for that path.
+#[case(
+    "def doubles(xs):\n    for x in xs:\n        yield x * 2\ndef wrap(xs):\n    z = doubles(xs)\n    z\ny = wrap([1, 2, 3])\ny",
+    make_int_list(&[2, 4, 6])
+)]
 // Map with captured parameter
 #[case(
     "def add_to(xs, n):\n    for x in xs:\n        yield x + n\nadd_to([1, 2, 3], 10)",
     make_int_list(&[11, 12, 13])
 )]
-// Filter via if-guard.
-//
-// **Currently ignored** — Short version: in the return-value
-// desugar design, the function body's filter-feed pattern attaches a
-// `Refinement` to the source's `user_annotation`; after inference the
-// refinement lands on the cluster binding's *type*, but the
-// value-expression at the binding (a `Record` projection) doesn't
-// carry the refinement on its own `expr.ty`.
-// `planning::insert_iterate_markers` only reads the refinement from
-// the value-expression's type when deciding what predicate to feed
-// into `Apply(p, Iterate)`, so the filter never lands in an iterate
-// marker — the program currently produces `[-1, 2, -3, 4]` instead of
-// the expected `[2, 4]`.
-#[ignore]
+// Filter via if-guard. The generator body's filter-feed lowers to a
+// refined-source channel whose domain carries the bare element predicate
+// `__elem ▷ source ▷ (λ x → x > n)` (the same form a filtered comprehension
+// builds), so planning reifies it into an `IterateExtent` + `Restrict` and
+// only guard-passing elements are yielded.
 #[case(
     r#"
 def positives(xs):
@@ -97,14 +108,15 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
 // Brainstorm §4b — generator with loop-carried mutable state.  The body
 // mutates a pre-loop variable (`total += item`) and yields its updated
 // value each iteration, producing a running-total stream.  This routes
-// through the cyclic `Loop` lowering with the yield-defer wired in as a
-// `tap_*` field on the body Record.
+// through the guarded `LetRec` the unified phase emits (recognized onto the
+// `Transact` carrier, then `Recurse`), with the yield-defer hoisted out as a
+// `to_*` feed field on the history record.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
     r#"
 def running_totals(items):
-    total = 0
+    total := 0
     for item in items:
         total += item
         yield total
@@ -192,7 +204,7 @@ fn test_collection_udf_through_poly_wrapper_two_element_types() {
 // Generator `def` chained through a poly wrapper at two element types — the
 // chained variant of `test_generator_polymorphic_over_element_type`.
 //
-// **Currently ignored** — pre-existing `desugar_defers` bug, independent of
+// **Currently ignored** — pre-existing `channelize` bug, independent of
 // monomorphization: a yield-based generator `def` *invoked inside a lambda
 // body* desugars to `λ ys → λ __floated___floated_chain_0 → ()` — the
 // generator's body is lost and the wrapper returns unit, so inference rejects
@@ -200,7 +212,7 @@ fn test_collection_udf_through_poly_wrapper_two_element_types() {
 // Int". The defer/feed plumbing assumes a generator call's result is
 // consumed at the statement level, not captured under a binder. Tracked in
 // the `defer-generator-call-inside-lambda` vault issue.
-#[ignore = "desugar_defers drops a generator def's body when the call sits inside a lambda"]
+#[ignore = "channelize drops a generator def's body when the call sits inside a lambda"]
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_generator_def_through_poly_wrapper_two_element_types() {

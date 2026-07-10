@@ -11,9 +11,11 @@ CHL source
   → parse             (chl_parser)                    — CHL source → CHL AST
   → lower             (ccl/lower/)                     — CHL AST → CCL Expr          →  lowering.md
   → uniquify          (ccl/uniquify.rs)                — α-uniquify binders           →  lowering.md
-  → desugar_defers    (ccl/desugar_defers.rs)          — Defer/Feed/Define → channels →  desugar-defers.md
   → infer             (ccl/infer/ → ccl/infer/solver/) — type inference + refinements →  type-inference.md
   → inline            (ccl/inline.rs)                  — inline scalar/UDF lets       →  optimization.md
+  → transact_phase    (ccl/transact_phase.rs)          — with begin(): Mut[V,Txn] loops → get_prev_txn-guarded LetRec  →  mutability.md
+  → letrec_phase      (ccl/letrec_phase.rs)            — induction mutation loops → get_prev_seq-guarded LetRec, then recognize → Transact  →  mutability.md
+  → channelize        (ccl/channelize.rs)              — Defer/Feed/Define → channels; feed-routing step of the unified phase (after infer + the mutability phases; type-preserving)  →  mutability.md §4
   → lambda_elim       (ccl/lambda_elim.rs)             — λ → point-free combinators (runs simplify internally)  →  optimization.md
   → planning          (ccl/planning/)                  — hash-join / keyed-aggregate; brackets its marker pass with simplify (ccl/simplify.rs)  →  optimization.md
   → operator_conversion (interpreter/)                 — point-free CCL → tile ops     →  optimization.md
@@ -23,11 +25,15 @@ CHL source
 
 | Doc | Covers |
 | --- | --- |
-| [ir.md](ir.md) | The typed AST: `TypedExpr`/`Type`, the purity invariant, structured names & α-uniquification, the Lambda/Apply iteration encoding, the `Aggregate`/`Cast`/`Case`/`Loop` nodes, `TypedBinding`, and the `Hole`/`Infer` split. |
+| [ir.md](ir.md) | The typed AST: `TypedExpr`/`Type`, the purity invariant, structured names & α-uniquification, the Lambda/Apply iteration encoding, the `Aggregate`/`Cast`/`Case`/`Transact`/`LetRec` nodes, `TypedBinding`, and the transient `Hole`/`Infer`/`Feed`/`Mut` variants. |
 | [type-inference.md](type-inference.md) | Cambra's inference algorithm: the two-pass emit → coalesce engine (`ccl/infer/`), the constraint solver (`ccl/infer/solver/`), let-polymorphism, dependent Pi types and refinements, and post-inference validation. |
 | [lowering.md](lowering.md) | CHL → CCL lowering: how comprehensions, lambdas, `def`s, and generators become CCL shapes, and the surface syntax of the deferred-collection operators. |
-| [desugar-defers.md](desugar-defers.md) | The `desugar_defers` pass in depth — how `Defer`/`Feed`/`Define` clusters become let-chains and record channels. *(Active prototype; see the doc's own status notes.)* |
 | [optimization.md](optimization.md) | The optimization/compilation passes: inlining, lambda elimination, join/aggregate planning, algebraic simplification, and conversion to tile operators. |
+
+The feed-channelization step (`ccl/channelize.rs`) has no dedicated design doc: its design of
+record is [mutability.md](mutability.md) §4 ("Retire `desugar_defers`"), and the in-depth
+implementation notes (cluster algorithm, per-shape extraction, error modes, navigation map) live in
+the module's own rustdoc.
 
 ## Companion docs (elsewhere)
 
