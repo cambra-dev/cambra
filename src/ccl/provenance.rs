@@ -313,9 +313,7 @@ impl ProvenanceTable {
     /// otherwise resolved by id, not enumerated). Used by monomorphization
     /// tests to assert that specialization clones were tagged
     /// `Derived { via: Mono }`.
-    // The monomorphization tests arrive with an upstack commit.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn iter_provenances(&self) -> impl Iterator<Item = &Provenance> {
         self.entries.values()
     }

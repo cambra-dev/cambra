@@ -535,8 +535,6 @@ impl TypedExprNode {
     /// invariant diagnostics (e.g. the node-id uniqueness tripwire) that name a
     /// node by kind without dumping its contents. Exhaustive on purpose so a new
     /// variant forces an entry here.
-    // Called from compile_program's id-uniqueness tripwire, introduced upstack.
-    #[allow(dead_code)]
     pub(crate) fn kind_name(&self) -> &'static str {
         match self {
             TypedExprNode::Lit(_) => "Lit",

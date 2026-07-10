@@ -1012,8 +1012,6 @@ fn contains_defer(expr: &Expr) -> bool {
 /// legitimately leaves duplicate ids on defer-bearing programs until the
 /// channelization rewrite lands (the same exemption `is_pure_structural` /
 /// `run_with_provenance`'s preservation assert already carve out).
-// Called from compile_program's id-uniqueness tripwire, introduced upstack.
-#[allow(dead_code)]
 pub(crate) fn contains_defer_nodes(expr: &Expr) -> bool {
     matches!(
         expr.node,
@@ -1163,8 +1161,6 @@ struct DesugarCtx {
 #[derive(Debug, Clone)]
 pub(crate) struct DesugarFanin {
     /// The synthesized node (e.g. a channel `CollectionUnion`).
-    // Read by compile_program's provenance application, introduced upstack.
-    #[allow(dead_code)]
     pub target: crate::ccl::provenance::NodeId,
     /// One entry per feed value, each a *pre-order* id list of that feed's
     /// subtree (root first, then descendants). A feed's own root is often a
@@ -1175,8 +1171,6 @@ pub(crate) struct DesugarFanin {
     /// the `x` of `totals << x`) — rather than every descendant span (which
     /// would also blame sub-expressions like `readings` inside `sum(readings)`).
     /// The union of one span per feed is the many-to-one feed→channel lineage.
-    // Read by compile_program's provenance application, introduced upstack.
-    #[allow(dead_code)]
     pub sources: Vec<Rc<[crate::ccl::provenance::NodeId]>>,
 }
 
@@ -1253,8 +1247,6 @@ pub fn run(expr: Expr, input_typed: bool) -> Result<Expr, DeferError> {
 #[derive(Debug, Default)]
 pub(crate) struct DesugarProvenance {
     /// Channel `CollectionUnion` fan-ins (see [`DesugarCtx::fanins`]).
-    // Read by compile_program's provenance application, introduced upstack.
-    #[allow(dead_code)]
     pub fanins: Vec<DesugarFanin>,
 }
 

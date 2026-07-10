@@ -361,8 +361,6 @@ impl NodeRecorder {
     ///   origin)` for each copy (each copy points back at the duplicated origin).
     /// * [`Preserved`](NodeRecord::Preserved) is an identity edge and is OMITTED
     ///   — the `StageAdjacency` consumer recomputes identity edges.
-    // Called from compile_program's provenance application, introduced upstack.
-    #[allow(dead_code)]
     pub(crate) fn stage_remap(&self) -> Vec<(NodeId, NodeId)> {
         let mut remap = Vec::new();
         for record in &self.records {
@@ -431,8 +429,6 @@ impl NodeRecorder {
     ///   neither a `Fused.from` nor a [`Discarded`](NodeRecord::Discarded).
     ///
     /// Leaks are returned sorted for deterministic reporting.
-    // Called from compile_program's provenance application, introduced upstack.
-    #[allow(dead_code)]
     pub(crate) fn reconcile(&self, output: &Expr) -> Result<(), Vec<Leak>> {
         let own = self.ownership(output);
 
@@ -510,8 +506,6 @@ impl NodeRecorder {
     /// Interior = the same subtree walk (with the same stops) as
     /// [`reconcile`](Self::reconcile) — the walk helper is shared so the two
     /// cannot drift.
-    // Called from compile_program's provenance application, introduced upstack.
-    #[allow(dead_code)]
     pub(crate) fn to_provenance_entries(
         &self,
         output: &Expr,
