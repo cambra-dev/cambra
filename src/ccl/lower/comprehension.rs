@@ -79,17 +79,24 @@ pub(super) fn lower_list_comp(
     }
 
     // ---- Phase 2: Lower body and all predicates to CCL -------------------------
+    // The generator variables are in scope over the element and guards — shadow
+    // them so a body/guard read of a like-named transactional register is read
+    // as the comprehension local, not gated as an out-of-block store read
+    // (`[store for store in xs]`).
     let chl_preds: Vec<&Spanned<ChlExpr>> = generators
         .iter()
         .flat_map(|(_, _, ifs)| ifs.iter().copied())
         .collect();
-    let body = lower_expr(&comp.element, ctx)?;
-    // We hold on to the original CHL guard nodes only to build human-readable
-    // description strings; all detection logic operates on the lowered CCL.
-    let lowered_preds: Vec<Expr> = chl_preds
-        .iter()
-        .map(|e| lower_expr(e, ctx))
-        .collect::<Result<_, _>>()?;
+    let (body, lowered_preds) = ctx.with_shadowed(gen_iter_vars.clone(), |ctx| {
+        let body = lower_expr(&comp.element, ctx)?;
+        // We hold on to the original CHL guard nodes only to build human-readable
+        // description strings; all detection logic operates on the lowered CCL.
+        let lowered_preds: Vec<Expr> = chl_preds
+            .iter()
+            .map(|e| lower_expr(e, ctx))
+            .collect::<Result<_, _>>()?;
+        Ok::<(Expr, Vec<Expr>), LoweringError>((body, lowered_preds))
+    })?;
 
     // Combine all `if` guards into a single loop-join predicate (used when hash
     // join is not applicable — non-equality, 3+ generators, or multiple predicates).

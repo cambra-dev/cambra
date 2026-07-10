@@ -4,6 +4,7 @@
 //! Execution proceeds via the tile producer/consumer protocol using guards and tilings.
 
 mod binop;
+pub mod commit_operator;
 pub mod http_server;
 pub mod operator_conversion;
 mod scheduler;

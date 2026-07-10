@@ -122,6 +122,8 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
 
         TypedExprNode::Defer => emit_defer(ctx),
 
+        TypedExprNode::Begin { body } => emit_begin(body, ctx)?,
+
         // The feed/define target lookup is Emit-specific (Check maintains no
         // scope): resolve the feed handle's type from the environment exactly
         // as a `Var` use would. Instantiation is a no-op for the common
@@ -919,6 +921,16 @@ pub(super) fn emit_for<C: Typing>(
     }
 
     ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))?;
+    Ok(Type::Base(BaseType::Unit))
+}
+
+/// Type a `Begin { body }` transaction-block marker: emit the per-transaction
+/// body chain and give the block itself type `Unit`. The block introduces no
+/// binder or scope — in-block store reads/writes/feeds are typed by their own
+/// `Var`/`MutWrite`/`Feed` rules. Shared by Emit and Check via [`Typing`], like
+/// [`emit_for`].
+pub(super) fn emit_begin<C: Typing>(body: &mut Expr, ctx: &mut C) -> Result<Type, InferError> {
+    ctx.subexpr(body)?;
     Ok(Type::Base(BaseType::Unit))
 }
 

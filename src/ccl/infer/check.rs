@@ -8,9 +8,10 @@ use crate::ccl::symbolic::symbolic;
 use crate::ccl::{BaseType, Expr, HistoryKind, Level, Name, Type, TypedExprNode};
 
 use super::emit::{
-    emit_aggregate, emit_apply, emit_binop, emit_case, emit_cast, emit_collection_union,
-    emit_compose, emit_expr_stmt, emit_for, emit_lambda, emit_let, emit_letrec, emit_list,
-    emit_proj, emit_record, emit_transact, emit_tuple, emit_unary, emit_variant_ctor,
+    emit_aggregate, emit_apply, emit_begin, emit_binop, emit_case, emit_cast,
+    emit_collection_union, emit_compose, emit_expr_stmt, emit_for, emit_lambda, emit_let,
+    emit_letrec, emit_list, emit_proj, emit_record, emit_transact, emit_tuple, emit_unary,
+    emit_variant_ctor,
 };
 use super::schemes::OperatorSchemes;
 use super::typing::{Typing, peel_refinements_outer};
@@ -353,6 +354,8 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
             ctx.subexpr(value)?;
             prim(BaseType::Unit)
         }
+
+        TypedExprNode::Begin { body } => emit_begin(body, ctx)?,
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
     };

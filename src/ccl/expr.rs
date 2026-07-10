@@ -325,8 +325,8 @@ pub enum TypedExprNode {
     /// Op-conversion dispatches on [`domain`](Self::Transact::domain): a
     /// concrete iteration extent → the sequential `Recurse` (the induction case
     /// — one always-commit writer, the degenerate no-conflict case of the
-    /// commit contract; this is all the pipeline emits today). [`Type::Txn`] →
-    /// the concurrent commit operator (a later increment).
+    /// commit contract); [`Type::Txn`] → the concurrent commit operator
+    /// (multiple writers, serialize + retry).
     Transact {
         /// The store's keys — one per scalar register sharing this store's
         /// sequencing domain. Each carries its position-0 `init` (the seed,
@@ -363,13 +363,13 @@ pub enum TypedExprNode {
     /// This is the general node for loops, transactions, and future
     /// recursive definitions: the unified phase (design doc, "The unified
     /// phase") rewrites every mutable variable's history, commit-record
-    /// stream, and feed output into one letrec, and recognition
+    /// stream, and feed output into one letrec, and operator conversion
     /// *recognizes patterns* in the group (a `get_prev_seq`-guarded
     /// self-cycle is a fold; a commit-record binding read through
     /// `get_prev_txn` is a transactional store) to pick the engine.
-    /// The induction `mut_elim` emits it for every mutation loop (the
-    /// transactional slice — a later PR on this stack — adds `Mut[V, Txn]`
-    /// blocks). The group then travels — bodies point-freed — through
+    /// The induction `mut_elim` emits it for every mutation loop, and
+    /// `transact_phase` emits it for every `Mut[V, Txn]` transaction block, both
+    /// as causal groups. The group then travels — bodies point-freed — through
     /// `channelize` and `lambda_elim`; `planning::plan_loops` runs *after*
     /// `lambda_elim` on the point-free normal form and lowers every recognized
     /// group onto the domain-parameterized [`Transact`](Self::Transact) carrier.
@@ -522,6 +522,22 @@ pub enum TypedExprNode {
     /// Eliminated by [`crate::ccl::channelize`] before type inference.
     Defer,
 
+    /// A `with begin():` transaction block, as **one statement** (value `Unit`).
+    /// `body` is the per-transaction statement chain lowering builds (a
+    /// `Let`/`MutWrite`/`Case`/`Feed` chain ending in `Unit`) — the block's
+    /// atomic writes, reads, guards, and per-commit feeds.
+    ///
+    /// A pre-phase surface marker in the same transient class as
+    /// [`For`](TypedExprNode::For)/[`Feed`](TypedExprNode::Feed)/
+    /// [`Defer`](TypedExprNode::Defer): it binds no name and carries no runtime
+    /// behaviour. [`crate::ccl::transact_phase`] eliminates it wholesale —
+    /// stripping each `Begin` (keyed on the enclosing loop) into a commit-record
+    /// site — so it never reaches lambda elimination, recognition, or planning.
+    /// Making the block a statement (rather than *being* the whole `For` body)
+    /// is what lets one loop body mix a transaction with sibling induction
+    /// writes and feeds.
+    Begin { body: Box<TypedExpr> },
+
     /// Recovery placeholder inserted by lowering when a sub-expression or
     /// statement could not be lowered (either because it came from a parser
     /// recovery hole — [`crate::chl_parser::ast::Expr::Error`] /
@@ -655,6 +671,13 @@ impl TypedExpr {
         Self::new(TypedExprNode::Define {
             name: name.into(),
             value: Box::new(value),
+        })
+    }
+
+    /// Construct a `with begin():` transaction-block marker over `body`.
+    pub fn begin(body: Self) -> Self {
+        Self::new(TypedExprNode::Begin {
+            body: Box::new(body),
         })
     }
 
@@ -971,6 +994,7 @@ impl TypedExpr {
             TypedExprNode::Feed { value, .. }
             | TypedExprNode::Define { value, .. }
             | TypedExprNode::MutWrite { value, .. } => f(value),
+            TypedExprNode::Begin { body } => f(body),
         }
     }
 
@@ -1121,6 +1145,7 @@ impl TypedExpr {
             TypedExprNode::Feed { value, .. }
             | TypedExprNode::Define { value, .. }
             | TypedExprNode::MutWrite { value, .. } => f(value),
+            TypedExprNode::Begin { body } => f(body),
         }
     }
 

@@ -351,7 +351,7 @@ pub enum Builtin {
     /// inside a commit-record binding, it produces the transaction's commit time
     /// `t`, at which that writer's store snapshots are read (`store(t)`).
     ///
-    /// Minted by `transact_phase` — one application per site,
+    /// Minted by [`crate::ccl::transact_phase`] — one application per site,
     /// *after* inference, so it carries no scheme in
     /// [`crate::ccl::infer::OperatorSchemes`]; its type `𝐼 ⇒ Txn` is
     /// stamped on the node at emission and the post-phase CHECK-mode `typecheck`
@@ -380,7 +380,7 @@ pub enum Builtin {
     /// position. The reply is indexed by the *trigger* (the enclosing request
     /// loop), not the commit clock — an outer-indexed read.
     ///
-    /// Born in `transact_phase`'s `rewrite_live_reads`, run
+    /// Born in [`crate::ccl::transact_phase`]'s `rewrite_live_reads`, run
     /// **pre-lambda-elim** (after `channelize`): it recognizes a read-only
     /// reply — a chain of live-store reads `let k₁ = last_or_default((store.f₁, _))
     /// in … in trigger ≫ (λ r → e)` — and rewrites it, dropping the never-resolving
@@ -390,7 +390,7 @@ pub enum Builtin {
     /// registers are read atomically (§I-c). Running before lambda elimination
     /// keeps a computed reply (`e = k + 1`) a lambda the elim pass point-frees,
     /// rather than a point-free `const` that could only be broadcast. Compiles to
-    /// the `commit_operator` `AsOf` tile operator (scalar- or
+    /// the [`crate::interpreter::commit_operator`] `AsOf` tile operator (scalar- or
     /// record-valued). It carries its **own recorded type** (no inference scheme):
     /// op-conversion and every post-phase `typecheck` read `.ty` directly, and
     /// planning treats it as an iteration-bearing source (it stages the trigger

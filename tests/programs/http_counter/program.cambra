@@ -1,0 +1,39 @@
+# A scalar transactional register shared *live* across two endpoints: POST /set
+# overwrites `last` (a `Mut[str, Txn]` scalar store) and replies "ok"; GET /get
+# reads the current value cross-endpoint inside a read-only `with begin():` block.
+#
+# The GET read is a **live cross-endpoint read**: a transactional register may be
+# read only inside a `with begin():` block, and a read fed out of a block that
+# does not write `last` is a live as-of read — it reads `last`'s latest committed
+# value as of the reading request, indexed by the GET request loop (the outer
+# context), not the commit clock. Planning latches it through the as-of join
+# (`Builtin::AsOf`), the path that resolves over a *live* store (an `ExtractLast`
+# terminal read never would).
+#
+# The POST reply `set_resps << "ok\n"` is a sibling of the `with begin():` block,
+# so it rides the POST request loop (request-indexed), matching how the HTTP
+# response sink dispatches replies to their requests.
+#
+# `last` is declared after the `http_serve` bindings: its writer iterates
+# `set_reqs`, so `set_reqs` must be in scope.
+#
+# Manual smoke test (replace {PORT} with e.g. 8080):
+#
+#     cargo run -- tests/programs/http_counter/program.cambra
+#     curl -X POST -d 'alice' localhost:8080/set
+#     curl -X POST -d 'bob'   localhost:8080/set
+#     curl localhost:8080/get        # -> bob
+
+set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
+get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
+
+last: Mut[str, Txn] := "(none)"
+
+for msg in set_reqs:
+    with begin():
+        last := msg
+    set_resps << "ok\n"
+
+for req in get_reqs:
+    with begin():
+        get_resps << last

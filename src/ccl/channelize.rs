@@ -973,6 +973,9 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
             name,
             value: Box::new(drop_expr_stmts(*value)),
         },
+        TypedExprNode::Begin { body } => TypedExprNode::Begin {
+            body: Box::new(drop_expr_stmts(*body)),
+        },
         // Feed/Define get caught by assert_no_defer_residue downstream.
         node @ (TypedExprNode::Feed { .. }
         | TypedExprNode::Define { .. }
@@ -1027,6 +1030,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
             assert_no_defer_residue(argument)
         }
         TypedExprNode::Cast { value, .. } => assert_no_defer_residue(value),
+        TypedExprNode::Begin { body } => assert_no_defer_residue(body),
         TypedExprNode::BinOp { left, right, .. } => {
             assert_no_defer_residue(left)?;
             assert_no_defer_residue(right)
@@ -1676,6 +1680,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(argument, bound, out);
             }
             TypedExprNode::Cast { value, .. } => rec(value, bound, out),
+            TypedExprNode::Begin { body } => rec(body, bound, out),
             TypedExprNode::BinOp { left, right, .. } => {
                 rec(left, bound, out);
                 rec(right, bound, out);
@@ -1925,6 +1930,19 @@ fn extract_for_defer(
         // Pass through Feed/Define for *other* defers — they'll be processed
         // by a different `channelize_defer` call.
         node @ (TypedExprNode::Feed { .. } | TypedExprNode::Define { .. }) => node,
+        // Defensive: `transact_phase` strips every `Begin` before channelize, so
+        // this is unreachable in the pipeline; recurse structurally if a stray
+        // one survives (reaching the strict typecheck backstop).
+        TypedExprNode::Begin { body } => TypedExprNode::Begin {
+            body: Box::new(extract_for_defer(
+                *body,
+                defer_name,
+                feeds,
+                define,
+                in_inner_scope,
+                ctx,
+            )?),
+        },
         TypedExprNode::Let {
             binding,
             bound_expr,

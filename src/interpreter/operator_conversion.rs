@@ -6,9 +6,24 @@ use crate::{
         TypedExprNode, WriterSite, ccl_utils::is_trivially_true_predicate, symbolic::symbolic,
     },
     interpreter::{
-        ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
-        DataSourceDomainExtentImpl, Extent, FuncBinding, FunctionDef, LogicKind, UnaryOpKind,
+        ArithmeticKind,
+        BaseType,
+        BinOpKind as InterpreterBinOp,
+        CompareKind,
+        DataSourceDomainExtentImpl,
+        Extent,
+        FuncBinding,
+        FunctionDef,
+        LogicKind,
+        UnaryOpKind,
         Value,
+        // The runtime commit engine. Its `TransactWriter` is the *operator*
+        // (aliased `CommitWriter` to avoid clashing with the CCL `TransactWriter`
+        // node-field carrier imported from `ccl` above).
+        commit_operator::{
+            AsOf, AsOfField, BodyInputBuffer, BodyInputSource, CommitOperator, StoreValueStream,
+            TransactWriter as CommitWriter, WriterBuffer,
+        },
         tile_operators::{
             Aggregate, Constant, Converse, ExtractAggregate, ExtractLast, FanOut,
             FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
@@ -205,13 +220,38 @@ pub(crate) enum BindingKind {
     Free,
 }
 
+/// Which engine backs a transactional store, and so how each per-variable read
+/// projects it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoreReadKind {
+    /// A [`Type::Txn`] store: the fan wraps a [`CommitOperator`]; a read is a
+    /// [`StoreValueStream`] over the commit-log map (keyed by `runtime_key`).
+    Commit,
+    /// An induction-domain store (a `mut` loop): the fan wraps a [`Recurse`]
+    /// whose body stream is `D ⇀ {commit, writes}`; a read projects
+    /// `.writes.(index)` — the accumulator's history `D ⇀ V`, reduced to its
+    /// last value downstream.
+    Induction,
+}
+
 /// How to read one key (variable) of a transactional store. The scalar-read
 /// reduction to the current/final value (`last_or_default` → `ExtractLast`) is
 /// expressed in the CCL, not here.
 struct KeyReadInfo {
+    /// The runtime key the variable's value lives under in the commit store map
+    /// (`Commit` stores only; `Value::Unit` for induction stores).
+    runtime_key: Value,
+    /// The per-commit value extent for [`StoreValueStream`] (`Commit` stores
+    /// only; the accumulator value extent for induction stores).
+    value_extent: Extent,
     /// The key's position in the writer's `writes` tuple: `__store.k` projects
-    /// `.writes.(index)` off the store body stream.
+    /// `.writes.(index)` off the store body stream (`Induction` stores).
     index: usize,
+    /// Whether the key's value carries forward across commit ticks that don't
+    /// write it (`Commit` stores): `true` for a register (persistent value),
+    /// `false` for a reply tap (a per-commit event). See
+    /// [`StoreValueStream::carry_forward`].
+    carry_forward: bool,
 }
 
 /// A built transactional store, registered under its `__store` binder so each
@@ -224,6 +264,8 @@ struct StoreReadInfo {
     fan: Rc<FanOut>,
     /// Per-variable read info, keyed by the variable's [`Name::field_key`].
     keys: HashMap<String, KeyReadInfo>,
+    /// Which engine backs the store (selects the read projection).
+    kind: StoreReadKind,
 }
 
 /// Compilation context for tile compilation.
@@ -575,10 +617,24 @@ fn convert_impl(
                     // on the upstream `input` — scalar upstream produces scalar
                     // arms, function upstream produces function arms.  `fan_in`
                     // picks the matching combinator.
+                    //
+                    // A **store-read arm** (`__store.k`) is a *leaf* source over
+                    // its own domain (empty input), not an iteration-driven
+                    // morphism — it must not take the fanned input (it would
+                    // reject it). This is the cross-domain co-iteration shape: a
+                    // commit writer's source `zip((reqs, __cnt.acc))` pairs the
+                    // request stream (input-driven) with an induction accumulator
+                    // read (leaf) position-by-position; `fan_in` co-aligns them by
+                    // domain.
                     let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(input))));
                     let mut ops = Vec::new();
                     for elt in elts {
-                        ops.push(convert_impl(elt, Some(fan_out.branch()), ctx)?);
+                        let arm_input = if is_leaf_zip_arm(elt, ctx) {
+                            None
+                        } else {
+                            Some(fan_out.branch())
+                        };
+                        ops.push(convert_impl(elt, arm_input, ctx)?);
                     }
                     Ok(fan_in(ops))
                 }
@@ -669,6 +725,56 @@ fn convert_impl(
                 .map(|e| convert_impl(e, None, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Box::new(UnionOperator::new(ops)))
+        }
+
+        // `as_of((trigger, source))` — the live cross-endpoint read. For each
+        // trigger position (a request loop), latch the shared store as of that
+        // request; the reply is indexed by the trigger (outer-indexed). Emitted by
+        // `transact_phase::rewrite_live_reads`. `AsOf` folds the raw `Tile::Store`
+        // fan directly (via `store_current`), so no `StoreValueStream`
+        // intermediary. Two source shapes:
+        //   - `__store.k` (a bare register read) → a scalar `AsOf` sampling key `k`;
+        //   - `__store` (the whole store) → a snapshot `AsOf` sampling every field
+        //     of the reply's record type at one commit frontier (§I-c), which the
+        //     reply then projects.
+        TypedExprNode::Apply { argument, function }
+            if as_builtin(function) == Some(Builtin::AsOf) =>
+        {
+            expect_no_input(input, "as_of")?;
+            let TypedExprNode::Tuple(elts) = &argument.node else {
+                return Err(ConversionError::Unsupported(format!(
+                    "as_of expects a (trigger, source) Tuple argument, got {:?}",
+                    argument.node
+                )));
+            };
+            let [trigger, source] = elts.as_slice() else {
+                return Err(ConversionError::Unsupported(format!(
+                    "as_of expects exactly (trigger, source), got {} args",
+                    elts.len()
+                )));
+            };
+            let trigger_op = convert_impl(trigger, None, ctx)?;
+            // A whole-store source (`Var(__store)`) → snapshot read: the as_of's
+            // output codomain is the record of sampled fields.
+            if let TypedExprNode::Var(store_name) = &source.node
+                && ctx.lookup_store(store_name).is_some()
+            {
+                let fields = as_of_snapshot_fields(store_name, &expr.ty, ctx)?;
+                let store_fan = ctx.lookup_store(store_name).unwrap().fan.clone();
+                Ok(Box::new(AsOf::new_snapshot(
+                    trigger_op,
+                    store_fan.branch(),
+                    fields,
+                )))
+            } else {
+                let (store_fan, runtime_key, value_extent) = as_of_store_source(source, ctx)?;
+                Ok(Box::new(AsOf::new(
+                    trigger_op,
+                    store_fan,
+                    runtime_key,
+                    value_extent,
+                )))
+            }
         }
 
         // map_domain transforms the codomain of its argument to a copy of the domain.
@@ -1075,7 +1181,11 @@ fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, ConversionError> {
 ///
 /// Op-conversion dispatches on the store's sequencing `domain`: a concrete
 /// iteration extent → the sequential [`Recurse`] (an induction / `mut`-loop
-/// store, [`build_induction_store`]).
+/// store, [`build_induction_store`]); [`Type::Txn`] → the concurrent
+/// [`CommitOperator`] (below). They are *not* interchangeable: the commit
+/// operator is built for an open commit clock (concurrent writers, serialize +
+/// retry), while `Recurse` is the loop recurrence (each position reads the
+/// previous and streams in order).
 fn build_transact_store(
     keys: &[TransactKey],
     writers: &[WriterSite],
@@ -1085,9 +1195,166 @@ fn build_transact_store(
     if !matches!(domain, Type::Txn) {
         return build_induction_store(keys, writers, ctx);
     }
-    Err(ConversionError::Unsupported(
-        "Txn-domain stores are not supported".to_string(),
-    ))
+    build_commit_store(keys, writers, ctx)
+}
+
+/// The reply taps on a writer body's `{commit, writes, to_<defer>*}` decision —
+/// every field other than `commit`/`writes`, with its per-commit value type. A
+/// tap is a reply (`out << e`) that desugar folded onto the writer body; for a
+/// commit store, op-conversion commits each tap as a write-only key so the reply
+/// rides the transaction's commit and is read back as a value-stream. Empty for a
+/// writer with no reply.
+fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
+    let Some(Type::Record(fields)) = body_ty.codomain() else {
+        return Vec::new();
+    };
+    fields
+        .into_iter()
+        .filter(|(f, _)| f != crate::ccl::F_COMMIT && f != F_WRITES)
+        .collect()
+}
+
+/// Build a [`Type::Txn`] transactional store: a multi-key [`CommitOperator`]
+/// wired in a cyclic [`FanOut`], one *fused* [`CommitWriter`] per writer (a
+/// branch of the shared store output). Each fused writer reads the cyclic store,
+/// runs its body — the `let k₀ = p.0 in … let item = p.r in {commit, writes}`
+/// decision, fed via a buffer the writer owns — and either grants (appends a
+/// proposal) or denies. A single writer is the degenerate case (no conflicts →
+/// no retries); ≥2 writers serialize through the operator with conflict + retry.
+/// A *fused* writer (not fanned) is load-bearing: a stateful sequencing producer
+/// cannot be fanned without desyncing its append-only proposal positions.
+fn build_commit_store(
+    keys: &[TransactKey],
+    writers: &[TransactWriter],
+    ctx: &mut OpConversionContext,
+) -> Result<StoreReadInfo, ConversionError> {
+    // Each variable becomes a key under its `field_key`'s runtime value; the
+    // store is one `CommitOperator` over them all (one commit clock, so writes
+    // to different keys commit atomically and disjoint footprints concurrently).
+    let key_extent = Extent::Base(BaseType::String);
+    let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(keys.len());
+    // Per scalar key, an acyclic init operator seeding its tick-0 value (a literal
+    // init is the trivial op; a computed init drains to its scalar).
+    let mut init_ops: Vec<(Value, Box<dyn TileOperator>)> = Vec::new();
+    // The store-wide per-commit value extent describes the map column's
+    // codomain in the store tiling (`full_store_tiling`). Reads project per key
+    // via each `KeyReadInfo.value_extent` and store values are dynamically
+    // tagged, so this is tiling metadata rather than an enforced cell type — but
+    // it must still *describe* the column faithfully, so for a heterogeneous
+    // multi-key store (`Mut[str, Txn]` + `Mut[int, Txn]`) it is the union of the
+    // distinct per-key extents, not whichever key was iterated last. A
+    // homogeneous store collapses the union to its single extent (the common
+    // case, unchanged).
+    let mut value_extents: Vec<Extent> = Vec::new();
+    for k in keys {
+        let field = k.name.field_key();
+        let runtime_key = Value::String(field.clone().into());
+        let key_value_extent = ctx.extent_of(&k.init.ty)?;
+        if !value_extents.contains(&key_value_extent) {
+            value_extents.push(key_value_extent.clone());
+        }
+        // Seed tick 0 from the key's (literal or computed) init op.
+        let init_op = convert_impl(&k.init, None, ctx)?;
+        init_ops.push((runtime_key.clone(), init_op));
+        keys_map.insert(
+            field,
+            KeyReadInfo {
+                runtime_key,
+                value_extent: key_value_extent,
+                index: 0,            // unused for `Commit` reads (keyed by `runtime_key`)
+                carry_forward: true, // register: value persists across commits
+            },
+        );
+    }
+    let value_extent = match value_extents.len() {
+        0 => Extent::Base(BaseType::Unit),
+        1 => value_extents.pop().expect("len == 1"),
+        _ => Extent::Union(value_extents),
+    };
+    let commit = CommitOperator::with_init_ops(
+        init_ops,
+        key_extent.clone(),
+        value_extent.clone(),
+        writers.len(),
+    );
+    let setters: Vec<_> = (0..writers.len())
+        .map(|k| commit.writer_input_setter(k))
+        .collect();
+    let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
+
+    // Resolve a footprint key's runtime value from its `field_key`.
+    let runtime_key = |n: &Name| Value::String(n.field_key().into());
+
+    for (set_writer, w) in setters.into_iter().zip(writers.iter()) {
+        let item_ty = w.source.ty.codomain().ok_or_else(|| {
+            ConversionError::TypeError(format!(
+                "transact writer source must have function type, got {}",
+                w.source.ty
+            ))
+        })?;
+        let item_extent = ctx.extent_of(&item_ty)?;
+        let source_op = convert_impl(&w.source, None, ctx)?;
+        // The body is fed `(snap_{k₀}, …, item)` via a buffer the writer owns; the
+        // snapshot columns carry each read key's per-commit value extent.
+        let read_extents: Vec<Extent> = w
+            .read_keys
+            .iter()
+            .map(|rk| {
+                keys_map
+                    .get(&rk.field_key())
+                    .map(|info| info.value_extent.clone())
+                    .ok_or_else(|| {
+                        ConversionError::Unsupported(format!("read key {rk} is not a store key"))
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let buffer: BodyInputBuffer = Rc::new(RefCell::new(WriterBuffer::default()));
+        let body_input = BodyInputSource::new(buffer.clone(), read_extents, item_extent);
+        let body_op = convert_impl(&w.body, Some(Box::new(body_input)), ctx)?;
+        // A reply (`out << e`) rides this writer body as `to_<defer>` decision
+        // taps. Each commits as a write-only key (appended after the register write
+        // keys), so the reply rides this transaction's commit and is read back as a
+        // `Fun(Txn, V)` value-stream off the shared log. A tap takes no `init_op` —
+        // it has no tick-0 value, so its stream starts at the first reply.
+        let taps = body_tap_fields(&w.body.ty);
+        let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
+        let mut tap_fields: Vec<String> = Vec::with_capacity(taps.len());
+        for (field, tap_ty) in taps {
+            let tap_value_extent = ctx.extent_of(&tap_ty)?;
+            write_keys.push(Value::String(field.clone().into()));
+            keys_map.insert(
+                field.clone(),
+                KeyReadInfo {
+                    runtime_key: Value::String(field.clone().into()),
+                    value_extent: tap_value_extent,
+                    index: 0, // unused for `Commit` reads (keyed by `runtime_key`)
+                    // A reply tap is a per-commit event, not a persistent value:
+                    // emit it only at the tick that wrote it, so two writers'
+                    // taps to one defer don't smear across the shared clock.
+                    carry_forward: false,
+                },
+            );
+            tap_fields.push(field);
+        }
+        let writer = CommitWriter::new(
+            store_fan.branch(),
+            body_op,
+            source_op,
+            buffer,
+            w.read_keys.iter().map(runtime_key).collect(),
+            write_keys,
+            tap_fields,
+            key_extent.clone(),
+            value_extent.clone(),
+        );
+        set_writer(Box::new(writer));
+    }
+
+    Ok(StoreReadInfo {
+        fan: store_fan,
+        keys: keys_map,
+        kind: StoreReadKind::Commit,
+    })
 }
 
 /// Build an induction-domain store (a `mut` loop): one always-commit writer over
@@ -1181,12 +1448,97 @@ fn build_induction_store(
     // Each `__store.kᵢ` read projects `.writes.(i)` off the body stream.
     let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(n_accs);
     for (i, k) in keys.iter().enumerate() {
-        keys_map.insert(k.name.field_key(), KeyReadInfo { index: i });
+        keys_map.insert(
+            k.name.field_key(),
+            KeyReadInfo {
+                runtime_key: Value::Unit,
+                value_extent: ctx.extent_of(&k.init.ty)?,
+                index: i,
+                carry_forward: true, // induction reads don't use StoreValueStream
+            },
+        );
     }
     Ok(StoreReadInfo {
         fan: body_fan,
         keys: keys_map,
+        kind: StoreReadKind::Induction,
     })
+}
+
+/// Resolve an `as_of` live read's `source` — a bare register read `__store.k`
+/// off a registered commit store — to the raw store fan branch, its runtime key,
+/// and the key's value extent. `AsOf` folds the [`Tile::Store`] fan directly (via
+/// `store_current`), so the live-read path takes the fan + key rather than
+/// compiling `source` to a per-key [`StoreValueStream`].
+fn as_of_store_source(
+    source: &Expr,
+    ctx: &mut OpConversionContext,
+) -> Result<(Box<dyn TileOperator>, Value, Extent), ConversionError> {
+    let bad = || {
+        ConversionError::Unsupported(format!(
+            "as_of source must be a bare store register read `__store.k`, got {:?}",
+            source.node
+        ))
+    };
+    let TypedExprNode::Apply { function, argument } = &source.node else {
+        return Err(bad());
+    };
+    let (TypedExprNode::Proj(ProjKey::Field(field)), TypedExprNode::Var(store_name)) =
+        (&function.node, &argument.node)
+    else {
+        return Err(bad());
+    };
+    let info = ctx.lookup_store(store_name).ok_or_else(|| {
+        ConversionError::Unsupported(format!("as_of reads unknown store {store_name}"))
+    })?;
+    let key = info.keys.get(field).ok_or_else(|| {
+        ConversionError::Unsupported(format!("as_of reads unknown store key {field}"))
+    })?;
+    // A live cross-endpoint read samples a register (a persistent `Txn` value),
+    // never a per-commit reply tap — the tap has no `keys` entry.
+    debug_assert!(
+        matches!(info.kind, StoreReadKind::Commit),
+        "as_of live read must sample a commit-store register"
+    );
+    let runtime_key = key.runtime_key.clone();
+    let value_extent = key.value_extent.clone();
+    let fan = info.fan.clone();
+    Ok((fan.branch(), runtime_key, value_extent))
+}
+
+/// The snapshot fields a whole-store `as_of` samples: the record fields of its
+/// output type `Fun(B, Record{field: V})`, each resolved to the store's runtime
+/// key and value extent via the registered store. Field order follows the record
+/// type (which follows the reply's read order), so the latched snapshot record
+/// lines up with the reply's projections.
+fn as_of_snapshot_fields(
+    store_name: &Name,
+    as_of_ty: &Type,
+    ctx: &OpConversionContext,
+) -> Result<Vec<AsOfField>, ConversionError> {
+    let Some(Type::Record(record_fields)) = as_of_ty.codomain() else {
+        return Err(ConversionError::Unsupported(format!(
+            "snapshot as_of output must be Fun(B, Record), got {as_of_ty}"
+        )));
+    };
+    let info = ctx.lookup_store(store_name).ok_or_else(|| {
+        ConversionError::Unsupported(format!("as_of reads unknown store {store_name}"))
+    })?;
+    record_fields
+        .iter()
+        .map(|(field, _)| {
+            let key = info.keys.get(field).ok_or_else(|| {
+                ConversionError::Unsupported(format!(
+                    "as_of snapshot field {field} is not a store key"
+                ))
+            })?;
+            Ok(AsOfField {
+                field: field.clone(),
+                key: key.runtime_key.clone(),
+                value_extent: key.value_extent.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Compile a per-variable read `__store.field` off a registered transactional
@@ -1198,18 +1550,39 @@ fn convert_store_read(
     field: &str,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let (fan, key_index) = {
+    let (fan, kind, key) = {
         let info = ctx.lookup_store(store_name).ok_or_else(|| {
             ConversionError::Unsupported(format!("unknown transactional store {store_name}"))
         })?;
-        (info.fan.clone(), info.keys.get(field).map(|k| k.index))
+        let key = info.keys.get(field).map(|k| {
+            (
+                k.runtime_key.clone(),
+                k.value_extent.clone(),
+                k.index,
+                k.carry_forward,
+            )
+        });
+        (info.fan.clone(), info.kind, key)
     };
-    match key_index {
+    match (kind, key) {
+        // A `Txn` store key: the raw commit history `Fun(Txn, V)` as a
+        // [`StoreValueStream`] over the commit-log map, keyed by `runtime_key`.
+        // A register carries forward; a reply tap emits only at its write tick.
+        // `transact_phase` wraps a read in `last_or_default(stream, init)`, which
+        // the `LastOrDefault` arm compiles to `ExtractLast` — not special-cased here.
+        (StoreReadKind::Commit, Some((runtime_key, value_extent, _, carry_forward))) => {
+            Ok(Box::new(StoreValueStream::new(
+                fan.branch(),
+                runtime_key,
+                value_extent,
+                carry_forward,
+            )))
+        }
         // An induction store key (a `mut` loop accumulator): its history `D ⇀ V`
         // is `.writes.(index)` off the `Recurse` body stream `D ⇀ {commit,
         // writes, …}`. `plan_loops` wraps the read in `last_or_default`, reduced
         // to the final value via `ExtractLast`.
-        Some(index) => {
+        (StoreReadKind::Induction, Some((_, _, index, _))) => {
             let writes = proj_named_field(fan.branch(), F_WRITES)?;
             proj_field(writes, index)
         }
@@ -1217,7 +1590,10 @@ fn convert_store_read(
         // output): not a register, so it has no `keys` entry — project the field
         // directly off the writer body fan (a sibling of `.writes`), yielding the
         // per-position stream `Fun(domain, V)` the consumer/sink reads.
-        None => proj_named_field(fan.branch(), field),
+        (StoreReadKind::Induction, None) => proj_named_field(fan.branch(), field),
+        (StoreReadKind::Commit, None) => Err(ConversionError::Unsupported(format!(
+            "store {store_name} has no key {field}"
+        ))),
     }
 }
 
@@ -1436,6 +1812,28 @@ fn field_extent_of(record_extent: &Extent, field_name: &str) -> Result<Extent, C
 // zip-with-const path's [`MapResultToConst`] caller can't combine via
 // `scalar_tile_to_column_value` later in the pipeline.  Filtering here
 // keeps that caller from ever seeing a function-typed argument.
+/// Whether a `zip` arm is a **leaf source** over its own domain — a store read
+/// `__store.k` or an `as_of((trigger, store))` live read — rather than an
+/// iteration-driven morphism. Such an arm is converted with *no* input (it would
+/// reject the fanned iteration input); `fan_in` co-aligns it with the
+/// input-driven arms by domain position. This is the cross-domain co-iteration
+/// shape: a commit writer's source (`zip((reqs, __cnt.acc))`) or a live reply
+/// combining the request with a store read (`zip((trigger, as_of(store)))`).
+fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
+    match &expr.node {
+        // `__store.k` — a store read.
+        TypedExprNode::Apply { argument, function }
+            if matches!(&function.node, TypedExprNode::Proj(ProjKey::Field(_))) =>
+        {
+            matches!(&argument.node, TypedExprNode::Var(n) if ctx.lookup_store(n).is_some())
+        }
+        // `as_of((trigger, store))` — a live as-of read (a leaf that internally
+        // drives its trigger).
+        TypedExprNode::Apply { function, .. } => as_builtin(function) == Some(Builtin::AsOf),
+        _ => false,
+    }
+}
+
 fn is_const(expr: &Expr) -> Option<&Expr> {
     if let TypedExprNode::Apply { function, argument } = &expr.node
         && as_builtin(function) == Some(Builtin::Const)

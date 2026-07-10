@@ -543,6 +543,27 @@ fn ariadne_render_includes_source_context_and_secondary_labels() {
 }
 
 #[test]
+fn with_begin_transaction_block_parses() {
+    // The transaction surface parses (lowering is a separate, later concern):
+    // a standalone block, a handle-bound block, and one as a loop body.
+    must_parse_module("with begin():\n    x = 1\nx\n");
+    must_parse_module("with t = begin():\n    x = 1\nx\n");
+    must_parse_module("for r in [1]:\n    with begin():\n        x = 1\nx\n");
+}
+
+#[test]
+fn with_begin_binds_handle() {
+    // `with t = begin():` records the optional handle binding.
+    let m = parse_module("with t = begin():\n    x = 1\nx\n")
+        .value
+        .expect("parses");
+    let Stmt::With { binding, .. } = &m.body[0].node else {
+        panic!("expected a With statement, got {:?}", m.body[0].node);
+    };
+    assert_eq!(binding.as_deref(), Some("t"));
+}
+
+#[test]
 fn mut_txn_annotation_parses_as_tuple_subscript() {
     // `Mut[V, Txn]` — the two-argument (value, domain) annotation form —
     // parses as a subscript whose index is a 2-tuple.
