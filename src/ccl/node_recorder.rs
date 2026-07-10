@@ -68,7 +68,7 @@
 //! * The [`ProvenanceTable`] (via
 //!   [`to_provenance_entries`](NodeRecorder::to_provenance_entries) + a resolver):
 //!   produces the composed-view provenance entries for minted nodes.
-//! * `inspector_model::StageAdjacency` (an upstack commit introduces it) (via
+//! * [`StageAdjacency`](crate::inspector_model::StageAdjacency) (via
 //!   [`stage_remap`](NodeRecorder::stage_remap)): the node→node edge projection
 //!   for the multi-pane inspector.
 //!

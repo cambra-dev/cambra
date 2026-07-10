@@ -58,8 +58,8 @@ use crate::{
 /// Use [`eprint_errors`] for source-context rendering: parse, lowering, and
 /// span-carrying inference errors get ariadne reports with underlines; the
 /// remaining variants render as plain `error: …` lines. The same
-/// [`CompileError`]s feed the web `Diagnostic` (`inspector_model`, an upstack commit)
-/// JSON path via `diagnostics_from_compile_errors`
+/// [`CompileError`]s feed the web [`Diagnostic`](crate::inspector_model::Diagnostic)
+/// JSON path via [`diagnostics_from_compile_errors`](crate::inspector_model::diagnostics_from_compile_errors)
 /// — one error model, two renderers. Lambda-elim/conversion spans remain
 /// future work; the enum is shaped so they migrate without changing the
 /// list-of-errors return contract.
@@ -479,7 +479,7 @@ pub struct CompiledProgram {
     /// Resolving any node of that snapshot against this table is the inspector's
     /// (and diagnostics') source-map projection (node → span). The inverse
     /// direction (span → node) is provided by
-    /// `inspector_model::SpanIndex` (an upstack commit), built over the same pair.
+    /// [`crate::inspector_model::SpanIndex`], built over the same pair.
     pub provenance: ProvenanceTable,
     /// The **pre-inference** IR snapshot — the inspector's upstream (source-shaped,
     /// pre-monomorphization) pane, captured right after `uniquify` and before
@@ -536,11 +536,11 @@ pub struct CompiledProgram {
     pub post_desugar_ir: Expr,
     /// Raw node→node remaps, keyed by the [`Pass`] that produced each — retained
     /// for the inspector's stage-adjacency projection
-    /// (`inspector_model::StageAdjacency`, an upstack commit).
+    /// ([`crate::inspector_model::StageAdjacency`]).
     ///
     /// Each entry's pairs are `(downstream id, upstream origin id)` — the
     /// orientation [`crate::ccl::node_recorder::NodeRecorder::stage_remap`]
-    /// emits and `inspector_model::StageAdjacency::from_remap`
+    /// emits and [`crate::inspector_model::StageAdjacency::from_remap`]
     /// expects. These are the **non-identity** edges a pass introduces;
     /// identity edges (a `NodeId` present in both trees) are implicit and not
     /// stored.
@@ -566,7 +566,7 @@ pub struct CompiledProgram {
     /// This is the [`Module`](crate::chl_parser::ast::Module) lowering consumed,
     /// retained verbatim. It is the anchor for *source-language* questions —
     /// name resolution (`goto-definition`, the binder half of `scope-at`) —
-    /// answered by `inspector_model::NameBinderIndex` (an upstack commit).
+    /// answered by [`crate::inspector_model::NameBinderIndex`].
     ///
     /// It is deliberately **distinct from [`post_inference_ir`](Self::post_inference_ir)**
     /// (the typed IR): lowering destroys some source variables before any IR

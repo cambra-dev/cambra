@@ -40,6 +40,34 @@ pub struct InspectNode {
     pub intent_guard: Option<String>,
     /// Children with optional edge labels, e.g. ("left", child_desc)
     pub children: Vec<(String, InspectNode)>,
+
+    // --- Inspector source-linking fields (added for `expand`, I2) ---
+    //
+    // These extend the tree node additively so the inspector's `expand` query
+    // can cross-link a tree row to source + types + provenance, while the CLI
+    // Unicode renderer and the existing `to_json` shape stay unaffected (all
+    // `None`/absent for the non-inspector callers in `pretty_graph` etc.).
+    //
+    // Stored as primitives — `u64` node id, `(start, end)` byte span — to keep
+    // `pretty_tree` free of any `ccl`/domain-type dependency (the module's
+    // standing invariant: it is a pure tree renderer). The inspector query layer
+    // converts its `NodeId`/`Span`/`Type` into these.
+    /// The IR node's stable id (its `NodeId` as a wire number), if this row
+    /// corresponds to an IR node.
+    pub node_id: Option<u64>,
+    /// The node's primary source span `(start, end)` (byte offsets), if known.
+    pub span: Option<(usize, usize)>,
+    /// The node's provenance kind label (e.g. `"Source"`, `"Derived(Mono)"`), if
+    /// known.
+    pub provenance: Option<String>,
+    /// The node's type as a Display string (e.g. `"Int"`, `"(Int ⇒ Int)"`, or a
+    /// hole `"_"`/`"?N"` pre-inference), if this row corresponds to a typed IR
+    /// node. A dedicated field rather than a positional `annotations[0]` entry:
+    /// the type is a first-class wire field (`"type"`), not smuggled into the
+    /// free-form annotation list, so a consumer reads `node.type` directly. The
+    /// string is CCL's canonical type rendering (`Display for Type`), so any
+    /// change there changes this verbatim — see `crate::ccl::Type`.
+    pub ty: Option<String>,
 }
 
 impl InspectNode {
@@ -53,6 +81,10 @@ impl InspectNode {
             obsolete_guard: None,
             intent_guard: None,
             children: Vec::new(),
+            node_id: None,
+            span: None,
+            provenance: None,
+            ty: None,
         }
     }
 
@@ -97,6 +129,30 @@ impl InspectNode {
         self
     }
 
+    /// Set the inspector node id (wire number). Additive — see the field docs.
+    pub fn with_node_id(mut self, id: u64) -> Self {
+        self.node_id = Some(id);
+        self
+    }
+
+    /// Set the inspector source span `(start, end)`. Additive.
+    pub fn with_node_span(mut self, span: (usize, usize)) -> Self {
+        self.span = Some(span);
+        self
+    }
+
+    /// Set the node's type (a CCL `Display` string). Additive — see the field docs.
+    pub fn with_type(mut self, ty: impl Into<String>) -> Self {
+        self.ty = Some(ty.into());
+        self
+    }
+
+    /// Set the inspector provenance-kind label. Additive.
+    pub fn with_provenance(mut self, kind: impl Into<String>) -> Self {
+        self.provenance = Some(kind.into());
+        self
+    }
+
     /// Serialize this node tree to a JSON string without serde.
     ///
     /// Field names mirror the Rust struct fields. `None` guard fields are
@@ -122,6 +178,20 @@ impl InspectNode {
 
         let mut json = format!("{{\"label\":\"{}\"", escape_json(&self.label));
         json.push_str(&format!(",\"annotations\":[{}]", ann_strs.join(",")));
+        // Inspector source-linking fields (I2): emitted only when present, so
+        // non-inspector callers' JSON is unchanged.
+        if let Some(id) = self.node_id {
+            json.push_str(&format!(",\"node_id\":{id}"));
+        }
+        if let Some((start, end)) = self.span {
+            json.push_str(&format!(",\"span\":{{\"start\":{start},\"end\":{end}}}"));
+        }
+        if let Some(ref p) = self.provenance {
+            json.push_str(&format!(",\"provenance\":\"{}\"", escape_json(p)));
+        }
+        if let Some(ref t) = self.ty {
+            json.push_str(&format!(",\"type\":\"{}\"", escape_json(t)));
+        }
         if let Some(ref t) = self.tiling {
             json.push_str(&format!(",\"tiling\":\"{}\"", escape_json(t)));
         }
@@ -136,6 +206,57 @@ impl InspectNode {
         }
         json.push_str(&format!(",\"children\":[{}]}}", children_strs.join(",")));
         json
+    }
+}
+
+// Wire shape (inspector, feature `serde`): the `expand`-node / `ir`-root shape
+// the `/api/snapshot` schema specifies. Field names are camelCase (`nodeId`),
+// `None` optional fields are skipped, and children serialize as
+// `{ "edge": "...", "node": { ... } }` pairs — matching the hand-rolled
+// [`InspectNode::to_json`] above, which the serde-free CLI path still uses.
+// Hand-written (not derived) because the `children: Vec<(String, InspectNode)>`
+// pairs need the `{edge,node}` reshaping and the field key is `nodeId`, not
+// `node_id`.
+#[cfg(feature = "serde")]
+impl serde::Serialize for InspectNode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        /// A `{ "edge", "node" }` child pair, serialized to mirror `to_json`.
+        struct Child<'a>(&'a str, &'a InspectNode);
+        impl serde::Serialize for Child<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut s = serializer.serialize_struct("Child", 2)?;
+                s.serialize_field("edge", self.0)?;
+                s.serialize_field("node", self.1)?;
+                s.end()
+            }
+        }
+
+        /// `{ "start", "end" }`, matching the `Span` wire shape.
+        #[derive(serde::Serialize)]
+        struct WireSpan {
+            start: usize,
+            end: usize,
+        }
+
+        let children: Vec<Child<'_>> = self
+            .children
+            .iter()
+            .map(|(edge, node)| Child(edge, node))
+            .collect();
+        let span = self.span.map(|(start, end)| WireSpan { start, end });
+
+        let mut s = serializer.serialize_struct("InspectNode", 9)?;
+        s.serialize_field("label", &self.label)?;
+        s.serialize_field("annotations", &self.annotations)?;
+        s.serialize_field("nodeId", &self.node_id)?;
+        s.serialize_field("span", &span)?;
+        s.serialize_field("provenance", &self.provenance)?;
+        s.serialize_field("type", &self.ty)?;
+        s.serialize_field("tiling", &self.tiling)?;
+        s.serialize_field("children", &children)?;
+        s.end()
     }
 }
 

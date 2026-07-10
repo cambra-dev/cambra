@@ -35,7 +35,7 @@
 //! model, the side table, and resolution. [`crate::ccl::expr::TypedExpr`]
 //! carries a [`NodeId`], lowering and the later passes populate the table, and
 //! the inverse span→node lookup is provided separately by
-//! `inspector_model::SpanIndex` (an upstack commit introduces it).
+//! [`crate::inspector_model::SpanIndex`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,7 +74,7 @@ impl NodeId {
 
     /// The id's underlying number, for use as an opaque serialization handle
     /// (the inspector wire shape carries a `NodeId` as a JSON number; see
-    /// `crate::inspector_model`, an upstack commit). This is the *only* place the numeric value
+    /// [`crate::inspector_model`]). This is the *only* place the numeric value
     /// is observed — internal logic compares ids by equality, never by value —
     /// so it is exposed solely so a client can round-trip a handle, not to give
     /// the value any in-compiler meaning.
