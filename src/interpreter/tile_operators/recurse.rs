@@ -7,7 +7,7 @@ use std::{
 use bit_set::BitSet;
 
 use super::*;
-use crate::interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value};
+use crate::interpreter::{ColumnValue, Consumer, Extent, Scheduler, Value, WakeupQueue};
 
 // ---------------------------------------------------------------------------
 // Recurse  (mutation-loop driver, single output port)
@@ -177,7 +177,7 @@ impl TileOperator for Recurse {
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
-        mut consumer: Box<dyn Consumer>,
+        consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         // Kick the body chain immediately: the value at position 0 (the
@@ -185,8 +185,15 @@ impl TileOperator for Recurse {
         // serve as soon as it is subscribed.  This is what lets the
         // surrounding drain loop make progress on its first iteration —
         // without this notify, the body's subscription would idle until
-        // something else notified it.
-        consumer.notify();
+        // something else notified it. `consumer` is retained (below, as a
+        // shareable `Rc`) so each subsequent partial pull can re-arm this signal
+        // through the wakeup queue as it converges.
+        let consumer: Rc<RefCell<dyn Consumer>> = {
+            let mut consumer = consumer;
+            Rc::new(RefCell::new(move || consumer.notify()))
+        };
+        consumer.borrow_mut().notify();
+        let wakeups = scheduler.wakeup_queue();
         let init_guard = self.init_op.tiling().universal_guard();
         let init_producer = self
             .init_op
@@ -205,6 +212,8 @@ impl TileOperator for Recurse {
             recursive_input_op.subscribe(recursive_input_guard, Box::new(|| {}), scheduler);
         Box::new(RecurseProducer {
             base: ProducerBase::new(RecurseProducer::alloc_id(), &self.output_tiling),
+            consumer,
+            wakeups,
             init_producer,
             domain_producer,
             recursive_input_producer,
@@ -222,6 +231,20 @@ impl TileOperator for Recurse {
 
 struct RecurseProducer {
     base: ProducerBase,
+    /// The downstream consumer, retained so the cycle can request its own
+    /// re-pull. The recurrence advances one position per `get`, so between the
+    /// first pull and convergence there is more to compute but no *external*
+    /// notification will arrive (the domain source has already fired). After a
+    /// pull that made progress but has not yet converged, `get_impl` asks the
+    /// [`WakeupQueue`] to re-notify this consumer, so a demand-driven driver
+    /// re-pulls until terminal instead of stalling on a wake-up that never comes.
+    /// Held as a shared `Rc` because the wakeup queue delivers it later, and
+    /// because a synchronous `notify()` from inside `get` would re-enter the
+    /// cyclic operator graph mid-borrow (see [`WakeupQueue`]).
+    consumer: Rc<RefCell<dyn Consumer>>,
+    /// The scheduler's deferred-wakeup queue — where a progress-but-not-converged
+    /// pull re-arms `consumer` for the next `check_for_notifications`.
+    wakeups: WakeupQueue,
     init_producer: Box<dyn TileProducer>,
     domain_producer: Box<dyn TileProducer>,
     recursive_input_producer: Box<dyn TileProducer>,
@@ -375,12 +398,21 @@ impl TileProducer for RecurseProducer {
         let Some(init_value) = self.ensure_init_value() else {
             // `Tiling::empty_tile` produces the structurally-valid empty
             // SealedFunction with `Predicate::False` we want as the
-            // "not ready yet" signal.  The outer consumer's loop will
-            // retry on the next pull.
+            // "not ready yet" signal. `init` is a value (a literal or a prior
+            // loop's scalar result), never an external stream, so it *will*
+            // resolve — notify so the driver re-pulls and drives it there,
+            // rather than waiting for a wake-up that only the (already-fired)
+            // domain source could send.
+            self.wakeups.request(self.consumer.clone());
             return self.tiling().empty_tile();
         };
         let domain_terminal = self.refresh_domain_values();
+        // Progress = this pull recorded a new position of the recurrence. When
+        // it did but we have not yet converged, more remains to compute with no
+        // external trigger pending, so we notify below to request a re-pull.
+        let recorded_before = self.recorded_positions.len();
         self.recurse_step();
+        let made_progress = self.recorded_positions.len() > recorded_before;
 
         // Emit the full prev_acc tile (every domain position we've seen
         // with a known prev-acc value).  We don't filter by what
@@ -448,6 +480,11 @@ impl TileProducer for RecurseProducer {
                 .release(self.domain_producer.tiling().universal_guard());
             self.recursive_input_producer
                 .release(self.recursive_input_producer.tiling().universal_guard());
+        }
+        // If we aren't done and there is more data already available, queue up a notification
+        // to be fired outside of the `get` callstack.
+        if !fully_drained && (domain_terminal || made_progress) {
+            self.wakeups.request(self.consumer.clone());
         }
         Tile::SealedFunction {
             domain_predicate,

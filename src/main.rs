@@ -97,7 +97,15 @@ fn run_program(src_name: &str, code: &str, inspect_port: Option<u16>) -> Result<
             debug!("Main releasing with {release_guard:?}");
             let done = release_guard.is_universal();
             producer.release(release_guard);
-            println!("Got value: {tile:#?}");
+            // Producers can return empty tiles, but still have more data.
+            let is_empty = match &tile {
+                Tile::Scalar(cv) => cv.is_empty(),
+                Tile::SealedFunction { domain, .. } => domain.is_empty(),
+                _ => false,
+            };
+            if !is_empty || done {
+                println!("Got value: {tile:#?}");
+            }
             if done {
                 break;
             }
