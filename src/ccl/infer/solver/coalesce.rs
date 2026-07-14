@@ -129,6 +129,8 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
             .filter(|b| crate::ccl::subst::type_free_vars(&c).contains(b));
         shapes.push(Type::Fun {
             name: kept_name,
+            // Compute for now; commit 2 threads kind through `CompactFun`.
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(d),
             codomain: Box::new(c),
         });
@@ -339,6 +341,7 @@ mod tests {
             t,
             Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Bool))
             }

@@ -274,6 +274,7 @@ pub(crate) mod test_helpers {
     pub(crate) fn fun_ty(domain: Type, codomain: Type) -> Type {
         Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }

@@ -160,10 +160,12 @@ pub fn freshen_above(
         }
         Type::Fun {
             name,
+            kind,
             domain: d,
             codomain: c,
         } => Type::Fun {
             name: name.clone(),
+            kind: *kind,
             domain: Box::new(freshen_above(lim, d, target, cache)),
             codomain: Box::new(freshen_above(lim, c, target, cache)),
         },

@@ -913,6 +913,8 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
                 // type is the subscript index lowered recursively.
                 "List" => Ok(Type::Fun {
                     name: None,
+                    // Compute for now; commit 3 sets the `List[…]` collection type to Data.
+                    kind: crate::ccl::ty::FunKind::Compute,
                     domain: Box::new(Type::Hole),
                     codomain: Box::new(lower_type_annotation(index)?),
                 }),

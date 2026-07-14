@@ -53,6 +53,7 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
             name,
             Type::Fun {
                 name: None,
+                kind: cambra::ccl::FunKind::Compute,
                 domain: Box::new(Type::DataSource(name.to_string())),
                 codomain: Box::new(elem_ty.clone()),
             },
@@ -95,6 +96,7 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
             name,
             Type::Fun {
                 name: None,
+                kind: cambra::ccl::FunKind::Compute,
                 domain: Box::new(Type::DataSource(name.to_string())),
                 codomain: Box::new(elem_ty.clone()),
             },
@@ -188,6 +190,7 @@ fn test_list_literal() {
         infer_program("[1, 2, 3]"),
         Type::Fun {
             name: None,
+            kind: cambra::ccl::FunKind::Compute,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(int())
         }
@@ -201,6 +204,7 @@ fn test_list_comp_identity() {
         infer_program("[x for x in [1, 2]]"),
         Type::Fun {
             name: None,
+            kind: cambra::ccl::FunKind::Compute,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(int())
         }
@@ -214,6 +218,7 @@ fn test_list_comp_arithmetic_body() {
         infer_program("[x + 1 for x in [1, 2]]"),
         Type::Fun {
             name: None,
+            kind: cambra::ccl::FunKind::Compute,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(int())
         }
@@ -228,6 +233,7 @@ fn test_list_comp_two_gens() {
         ty,
         Type::Fun {
             name: None,
+            kind: cambra::ccl::FunKind::Compute,
             domain: Box::new(Type::Tuple(vec![Type::UIntRange(2), Type::UIntRange(2)])),
             codomain: Box::new(int())
         },
@@ -622,14 +628,14 @@ fn test_self_application_types() {
 f = lambda x: x > 1
 f
 ",
-    Type::Fun { name: None, domain: Box::new(int()), codomain: Box::new(bool_ty()) }
+    Type::Fun { name: None, kind: cambra::ccl::FunKind::Compute, domain: Box::new(int()), codomain: Box::new(bool_ty()) }
 )]
 #[case::arithmetic(
     r"
 f = lambda x: x + 1
 f
 ",
-    Type::Fun { name: None, domain: Box::new(int()), codomain: Box::new(int()) }
+    Type::Fun { name: None, kind: cambra::ccl::FunKind::Compute, domain: Box::new(int()), codomain: Box::new(int()) }
 )]
 fn test_lambda_unapplied(#[case] code: &str, #[case] expected: Type) {
     assert_eq!(infer_program(code), expected);

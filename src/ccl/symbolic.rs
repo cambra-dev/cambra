@@ -736,7 +736,7 @@ mod tests {
     #[case(
         Expr::lambda(
             "x",
-            Type::Fun { name: None, domain: Box::new(Type::Base(BaseType::Int)), codomain: Box::new(Type::Base(BaseType::Bool)) },
+            Type::Fun { name: None, kind: crate::ccl::ty::FunKind::Compute, domain: Box::new(Type::Base(BaseType::Int)), codomain: Box::new(Type::Base(BaseType::Bool)) },
             Expr::var("x"),
         ),
         "λ x : (Int ⇒ Bool) → x"

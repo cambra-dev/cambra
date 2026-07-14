@@ -1231,6 +1231,7 @@ mod tests {
             ty,
             Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int))
             }
@@ -1267,6 +1268,7 @@ mod tests {
             ty,
             Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::UIntRange(2)),
                 codomain: Box::new(Type::Base(BaseType::Int))
             }
@@ -1460,6 +1462,7 @@ mod tests {
             ty,
             Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int))
             }
@@ -2136,6 +2139,7 @@ mod tests {
             ty,
             Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Unit))
             }
@@ -2155,6 +2159,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let source_ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::DataSource("mystream".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
         };
@@ -2181,11 +2186,13 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let int_ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::DataSource("ints".into())),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
         let str_ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::DataSource("strs".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
         };
@@ -2368,6 +2375,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -2410,6 +2418,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -2462,6 +2471,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -2480,6 +2490,7 @@ mod tests {
         // The node type is Fun(Hole, Int) — the Hole is inside the compound type.
         let expr = Expr::lit(Lit::Int(1)).with_ty(Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Hole),
             codomain: Box::new(Type::Base(BaseType::Int)),
         });
@@ -2696,6 +2707,7 @@ mod tests {
         let str_elem = Expr::lit(Lit::String("hello".into())).with_ty(Type::Base(BaseType::String));
         let list_ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -2729,6 +2741,7 @@ mod tests {
         })
         .with_ty(Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::String)),
             codomain: Box::new(Type::Base(BaseType::String)),
         });

@@ -1117,6 +1117,8 @@ pub(super) fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<
     };
     Ok(Type::Fun {
         name: last_name,
+        // Compute for now; commit 3 makes this kind-aware (first morphism's kind).
+        kind: crate::ccl::ty::FunKind::Compute,
         domain: Box::new(first_dom),
         codomain: Box::new(prev_cod),
     })

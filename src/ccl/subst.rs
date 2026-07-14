@@ -719,6 +719,7 @@ impl Subst {
                 name: None,
                 domain,
                 codomain,
+                ..
             } => {
                 self.rewrite_type_go(domain, memo);
                 self.rewrite_type_go(codomain, memo);
@@ -728,6 +729,7 @@ impl Subst {
                 name: Some(b),
                 domain,
                 codomain,
+                ..
             } => {
                 self.rewrite_type_go(domain, memo);
                 let restricted = self.shadow(b);
@@ -874,16 +876,19 @@ impl Subst {
 
             Type::Fun {
                 name: None,
+                kind,
                 domain,
                 codomain,
             } => Type::Fun {
                 name: None,
+                kind: *kind,
                 domain: Box::new(self.apply_type(domain)),
                 codomain: Box::new(self.apply_type(codomain)),
             },
 
             Type::Fun {
                 name: Some(b),
+                kind,
                 domain,
                 codomain,
             } => {
@@ -891,6 +896,7 @@ impl Subst {
                 let (b2, inner) = self.under_binder_ty(b, codomain);
                 Type::Fun {
                     name: Some(b2),
+                    kind: *kind,
                     domain,
                     codomain: Box::new(inner),
                 }
@@ -1002,6 +1008,7 @@ fn collect_type_fv(
             name,
             domain,
             codomain,
+            ..
         } => {
             collect_type_fv(domain, bound, visited, out);
             // A `Some` name is the Pi binder, bound in the codomain.

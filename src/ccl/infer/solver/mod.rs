@@ -108,6 +108,7 @@ pub fn prim(b: BaseType) -> Type {
 pub fn fun(d: Type, c: Type) -> Type {
     Type::Fun {
         name: None,
+        kind: crate::ccl::ty::FunKind::Compute,
         domain: Box::new(d),
         codomain: Box::new(c),
     }

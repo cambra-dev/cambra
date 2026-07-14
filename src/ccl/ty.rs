@@ -65,6 +65,41 @@ impl fmt::Display for FieldKey {
     }
 }
 
+/// Whether a [`Type::Fun`]'s domain is a **capability** or an **extent** — the
+/// compute-function vs data-function distinction.
+///
+/// - [`FunKind::Compute`] — `α ⇒ β`: the domain is a *capability*, the inputs
+///   the function accepts. No data sits behind it, so shrinking the domain only
+///   under-promises; the contravariant meet at a control-flow join is a sound,
+///   lossy simplification.
+/// - [`FunKind::Data`] — `α ⤇ β`: the domain is an *extent*, a collection's
+///   index set. The domain *is* the data map, so a lossy domain is lost data;
+///   joins of data functions must be lossless — they form a [`Type::Sigma`]
+///   over the extents, never a meet.
+///
+/// Set at introduction (list literals, comprehensions, `++`, registered
+/// sources, and every `History` erasure are `Data`; `lambda`/`def` are
+/// `Compute`). The audit rule for a rebuilt or erased arrow: it is `Data` iff
+/// `extent_of` will drive iteration off its domain. See
+/// `design/type-inference.md` §4.6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum FunKind {
+    /// Capability domain (`⇒`): lossy meet at a join is fine.
+    Compute,
+    /// Extent domain (`⤇`): the domain is data; joins must be lossless.
+    Data,
+}
+
+impl FunKind {
+    /// The display arrow for this kind: `⇒` for compute, `⤇` for data.
+    pub fn arrow(self) -> &'static str {
+        match self {
+            FunKind::Compute => "⇒",
+            FunKind::Data => "⤇",
+        }
+    }
+}
+
 /// A CCL type annotation.
 ///
 /// Appears on [`TypedExpr`] nodes and as the output of type inference.
@@ -109,6 +144,11 @@ pub enum Type {
         /// renaming their Pi binder reconcile there (see the substitution
         /// machinery).
         name: Option<crate::ccl::Name>,
+        /// Whether the domain is a capability (`Compute`) or an extent
+        /// (`Data`). See [`FunKind`]. The derived [`PartialEq`] compares it: a
+        /// data function and a compute function over the same domain/codomain
+        /// are genuinely different types (one carries data, one a capability).
+        kind: FunKind,
         /// The parameter (argument) type. Contravariant position.
         domain: Box<Type>,
         /// The result type. Covariant position; may reference `name`.
@@ -297,14 +337,16 @@ impl fmt::Display for Type {
             Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
             Type::Fun {
                 name: Some(x),
+                kind,
                 domain,
                 codomain,
-            } => write!(f, "(({x}: {domain}) ⇒ {codomain})"),
+            } => write!(f, "(({x}: {domain}) {} {codomain})", kind.arrow()),
             Type::Fun {
                 name: None,
+                kind,
                 domain,
                 codomain,
-            } => write!(f, "({domain} ⇒ {codomain})"),
+            } => write!(f, "({domain} {} {codomain})", kind.arrow()),
             Type::Tuple(ts) => {
                 let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
                 write!(f, "({})", parts.join(", "))
@@ -362,19 +404,23 @@ impl fmt::Display for Type {
 }
 
 impl Type {
-    /// Helper for creating a non-dependent function type (`name: None`).
+    /// Helper for creating a non-dependent **compute** function type
+    /// (`name: None`, `kind: Compute`).
     pub fn fun(domain: Self, codomain: Self) -> Self {
         Type::Fun {
             name: None,
+            kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }
     }
 
-    /// Helper for creating a dependent (Pi) function type `(name: domain) ⇒ codomain`.
+    /// Helper for creating a dependent (Pi) **compute** function type
+    /// `(name: domain) ⇒ codomain`.
     pub fn pi(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
         Type::Fun {
             name: Some(name.into()),
+            kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }
@@ -462,9 +508,13 @@ impl Type {
     pub fn without_pi_names(&self) -> Type {
         match self {
             Type::Fun {
-                domain, codomain, ..
+                domain,
+                codomain,
+                kind,
+                ..
             } => Type::Fun {
                 name: None,
+                kind: *kind,
                 domain: Box::new(domain.without_pi_names()),
                 codomain: Box::new(codomain.without_pi_names()),
             },

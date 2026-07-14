@@ -321,10 +321,12 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         Type::Refinement(base, _) => strip_refinements(base),
         Type::Fun {
             name,
+            kind,
             domain,
             codomain,
         } => Type::Fun {
             name: name.clone(),
+            kind: *kind,
             domain: Box::new(strip_refinements(domain)),
             codomain: Box::new(strip_refinements(codomain)),
         },

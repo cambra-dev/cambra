@@ -113,10 +113,12 @@ impl InferCtx {
             // normalize any nested holes/refinements.
             Type::Fun {
                 name,
+                kind,
                 domain: d,
                 codomain: c,
             } => Type::Fun {
                 name: name.clone(),
+                kind: *kind,
                 domain: Box::new(self.normalize_annotation(d)),
                 codomain: Box::new(self.normalize_annotation(c)),
             },

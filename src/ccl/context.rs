@@ -507,6 +507,8 @@ pub fn compile_program(
             &name,
             Type::Fun {
                 name: None,
+                // Compute for now; commit 3 sets source registration to Data.
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::DataSource(name.clone())),
                 codomain: Box::new(output_type),
             },

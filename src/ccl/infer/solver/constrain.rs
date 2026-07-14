@@ -290,11 +290,13 @@ fn constrain_go(
                 name: n0,
                 domain: d0,
                 codomain: c0,
+                ..
             },
             Type::Fun {
                 name: n1,
                 domain: d1,
                 codomain: c1,
+                ..
             },
         ) => {
             constrain_go(d1, d0, sr, sl, cache)?;
@@ -499,6 +501,8 @@ fn constrain_go(
         ) => {
             let chan = Type::Fun {
                 name: None,
+                // Compute for now; commit 3 sets feed read-views to Data.
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: domain.clone(),
                 codomain: value.clone(),
             };
@@ -520,6 +524,8 @@ fn constrain_go(
         ) => {
             let chan = Type::Fun {
                 name: None,
+                // Compute for now; commit 3 sets feed read-views to Data.
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: domain.clone(),
                 codomain: value.clone(),
             };
@@ -715,10 +721,12 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         | Type::Hole => ty.clone(),
         Type::Fun {
             name,
+            kind,
             domain: d,
             codomain: c,
         } => Type::Fun {
             name: name.clone(),
+            kind: *kind,
             domain: Box::new(extrude(d, !pol, target_level, cache)),
             codomain: Box::new(extrude(c, pol, target_level, cache)),
         },

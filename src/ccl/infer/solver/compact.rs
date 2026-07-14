@@ -432,6 +432,7 @@ fn compact_go(
             name,
             domain: d,
             codomain: c,
+            ..
         } => {
             // Function: domain is contravariant. A fresh `parents` set
             // per child mirrors Scala's `Set.empty` argument — cycles

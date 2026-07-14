@@ -691,6 +691,8 @@ fn erase_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
         let value = std::mem::replace(value.as_mut(), Type::Hole);
         *ty = Type::Fun {
             name: None,
+            // Compute for now; commit 3 sets this History→Fun erasure to Data.
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(value),
         };
@@ -827,12 +829,14 @@ fn refine_source_domain(source: &mut Expr, refinement: Refinement, ctx: &Desugar
     if ctx.input_typed
         && let Type::Fun {
             name,
+            kind,
             domain,
             codomain,
         } = &source.ty
     {
         source.ty = Type::Fun {
             name: name.clone(),
+            kind: *kind,
             domain: Box::new(Type::Refinement(domain.clone(), refinement)),
             codomain: codomain.clone(),
         };
@@ -2842,6 +2846,7 @@ mod tests {
             node: TypedExprNode::Lit(Lit::Unit),
             ty: Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Refinement(Box::new(Type::Hole), refinement)),
                 codomain: Box::new(Type::Hole),
             },
