@@ -349,8 +349,8 @@ fn simplify_reconstruct(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::compact::KindMerge;
+    use super::*;
     use crate::ccl::{BaseType, InferVar};
 
     /// A single-domain compute `fun` slot, for the simplify tests below.

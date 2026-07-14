@@ -186,14 +186,37 @@ fn test_unary_op(#[case] code: &str, #[case] expected: BaseType) {
 
 #[test]
 fn test_list_literal() {
+    // A list literal is a **data** function (extent domain).
     assert_eq!(
         infer_program("[1, 2, 3]"),
-        Type::Fun {
-            name: None,
-            kind: cambra::ccl::FunKind::Compute,
-            domain: Box::new(Type::UIntRange(3)),
-            codomain: Box::new(int())
-        }
+        Type::data_fun(Type::UIntRange(3), int())
+    );
+}
+
+#[test]
+fn test_conditional_collection_forms_sigma() {
+    // A control-flow join of two collections with different extents is
+    // lossless: it forms a Σ over both extents (never a lossy meet-domain
+    // function). `[1, 2]` is `[0, 1] ⤇ Int`, `[1, 2, 3]` is `[0, 2] ⤇ Int`,
+    // so the join is `Σ{[0, 1], [0, 2]} ⤇ Int`. (design/type-inference.md §4.6)
+    assert_eq!(
+        infer_program("[1, 2] if True else [1, 2, 3]"),
+        Type::sigma(
+            None,
+            vec![Type::UIntRange(2), Type::UIntRange(3)],
+            None,
+            int(),
+        )
+    );
+}
+
+#[test]
+fn test_conditional_collection_same_extent_collapses() {
+    // Idempotence: when both arms share an extent, the Σ collapses back to a
+    // plain data function — no spurious 2-choice Σ.
+    assert_eq!(
+        infer_program("[1, 2] if True else [3, 4]"),
+        Type::data_fun(Type::UIntRange(2), int())
     );
 }
 
@@ -586,7 +609,11 @@ fn test_ternary(#[case] code: &str, #[case] expected: BaseType) {
 
 #[test]
 fn test_if_else_arm_type_mismatch() {
-    // Arms return different types — inference must report a type mismatch.
+    // Arms return different scalar types. Under the lattice-join `Case` rule
+    // the arms are constrained into one result variable; two incompatible
+    // atoms at that positive position are an `IncompatibleBounds` error (the
+    // sound union relaxation for heterogeneous scalars is deferred — see
+    // design/type-inference.md §4.6). Still a type error, as it must be.
     let err = infer_program_err(
         r#"
 if True:
@@ -597,9 +624,11 @@ else:
         .trim(),
     );
     assert!(
-        err.iter()
-            .any(|e| matches!(e, InferError::TypeMismatch { .. })),
-        "expected TypeMismatch, got {err:?}"
+        err.iter().any(|e| matches!(
+            e,
+            InferError::IncompatibleBounds { .. } | InferError::TypeMismatch { .. }
+        )),
+        "expected an arm-mismatch error, got {err:?}"
     );
 }
 

@@ -245,6 +245,17 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
                     .zip(ys)
                     .all(|((kx, x), (ky, y))| kx == ky && types_agree_modulo_unread(x, y))
         }
+        // Two Σs agree modulo their (α-varying) witness/element binders: same
+        // choices pairwise (coalesce materializes them in a deterministic
+        // order) and agreeing codomains.
+        (Type::Sigma(a), Type::Sigma(b)) => {
+            a.choices.len() == b.choices.len()
+                && a.choices
+                    .iter()
+                    .zip(&b.choices)
+                    .all(|(x, y)| types_agree_modulo_unread(x, y))
+                && types_agree_modulo_unread(&a.codomain, &b.codomain)
+        }
         // Two histories of *different* kinds never agree — a `Store` and a
         // `Feed` are distinct handles even if their read views coincidentally
         // line up. Reject explicitly rather than letting the or-pattern below

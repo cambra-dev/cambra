@@ -981,7 +981,7 @@ pub(super) fn emit_proj<C: Typing>(
 
 pub(super) fn emit_list<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Type, InferError> {
     if elts.is_empty() {
-        return Ok(fun(Type::UIntRange(0), prim(BaseType::Unit)));
+        return Ok(Type::data_fun(Type::UIntRange(0), prim(BaseType::Unit)));
     }
     // Element type: derive from the first; constrain remaining to it.
     let first_ty = ctx.subexpr(&mut elts[0])?;
@@ -994,8 +994,10 @@ pub(super) fn emit_list<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Typ
     let n = elts.len();
     // Deref a bare store read to its value, as in `emit_tuple`: the list's
     // element (codomain) type takes the dereferenced element type so no `Mut`
-    // appears in the list type.
-    Ok(fun(Type::UIntRange(n), deref_mut(&first_ty)))
+    // appears in the list type. A list literal is a **data** function — its
+    // domain is an extent (the index set), so a join with another collection
+    // is lossless (forms a Σ), never a lossy meet.
+    Ok(Type::data_fun(Type::UIntRange(n), deref_mut(&first_ty)))
 }
 
 /// Emit constraints for a [`TypedExprNode::Case`] — the unified
@@ -1036,11 +1038,10 @@ pub(super) fn emit_case<C: Typing>(
         ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
     }
 
-    let mut result_ty: Option<Type> = None;
+    // Emit every arm's body type first (each under its pattern scope, restored
+    // on both paths), then join.
+    let mut arm_tys = Vec::with_capacity(branches.len());
     for b in branches.iter_mut() {
-        // A pattern binds its payload (the var just written to `binding.ty`)
-        // over the branch's guard and body. `scoped` restores the scope on
-        // both the happy and error paths.
         let scope_info = b
             .pattern
             .as_ref()
@@ -1049,12 +1050,42 @@ pub(super) fn emit_case<C: Typing>(
             Some((name, ty)) => ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, ctx))?,
             None => emit_case_branch(b, ctx)?,
         };
-        match &result_ty {
-            None => result_ty = Some(body_ty),
-            Some(prev) => ctx.require_eq(&body_ty, prev, &|| "Case arm".to_string())?,
-        }
+        arm_tys.push(body_ty);
     }
-    Ok(result_ty.expect("non-empty branches"))
+
+    // A `Mut`/`History` arm is a **second-class reference**: it cannot be
+    // lattice-joined as a value (that would form a first-class conditional
+    // reference). So if any arm is history-typed, require the arms *equal* — the
+    // Case stays history-typed, and the mut-discipline pass rejects it as a
+    // non-bare-variable reference (rule 1). This preserves the deliberate
+    // rejection of a conditional over stores.
+    let any_history = arm_tys.iter().any(|t| {
+        let mut cur = t;
+        while let Type::Refinement(inner, _) = cur {
+            cur = inner;
+        }
+        matches!(cur, Type::History { .. })
+    });
+    if any_history {
+        let first = arm_tys[0].clone();
+        for t in &arm_tys[1..] {
+            ctx.require_eq(t, &first, &|| "Case arm".to_string())?;
+        }
+        return Ok(first);
+    }
+
+    // Value and collection arms join by the **lattice**: each arm's type is a
+    // subtype of one fresh result variable, so the result is their least upper
+    // bound (design/type-inference.md §4.6). Homogeneous arms recover the old
+    // behavior (the var pins to the shared type); data-collection arms with
+    // distinct extents coalesce to a Σ. (Heterogeneous *scalar* arms remain a
+    // hard `IncompatibleBounds` error — the sound union relaxation for them is
+    // deferred; see `coalesce`.)
+    let result = ctx.fresh();
+    for t in &arm_tys {
+        ctx.require_sub(t, &result, &|| "Case arm".to_string())?;
+    }
+    Ok(result)
 }
 
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the

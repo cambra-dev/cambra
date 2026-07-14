@@ -704,7 +704,13 @@ fn collect_type_errors(
             for c in &s.choices {
                 collect_type_errors(c, context_sym, strictness, errors, seen_refinements);
             }
-            collect_type_errors(&s.codomain, context_sym, strictness, errors, seen_refinements);
+            collect_type_errors(
+                &s.codomain,
+                context_sym,
+                strictness,
+                errors,
+                seen_refinements,
+            );
         }
         Type::History {
             value,
@@ -1270,14 +1276,10 @@ mod tests {
         // [10, 20]  =>  Fun(UIntRange(2), Int)
         let mut expr = Expr::list(vec![Expr::lit(Lit::Int(10)), Expr::lit(Lit::Int(20))]);
         let ty = infer(&mut expr, &mut ctx).unwrap();
+        // A list literal is a **data** function (extent domain).
         assert_eq!(
             ty,
-            Type::Fun {
-                name: None,
-                kind: crate::ccl::ty::FunKind::Compute,
-                domain: Box::new(Type::UIntRange(2)),
-                codomain: Box::new(Type::Base(BaseType::Int))
-            }
+            Type::data_fun(Type::UIntRange(2), Type::Base(BaseType::Int))
         );
     }
 
@@ -1288,7 +1290,7 @@ mod tests {
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
             ty,
-            Type::fun(Type::UIntRange(0), Type::Base(BaseType::Unit))
+            Type::data_fun(Type::UIntRange(0), Type::Base(BaseType::Unit))
         );
     }
 

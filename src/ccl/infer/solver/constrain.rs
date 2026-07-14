@@ -288,23 +288,83 @@ fn constrain_go(
         (
             Type::Fun {
                 name: n0,
+                kind: k0,
                 domain: d0,
                 codomain: c0,
-                ..
             },
             Type::Fun {
                 name: n1,
+                kind: k1,
                 domain: d1,
                 codomain: c1,
-                ..
             },
         ) => {
-            constrain_go(d1, d0, sr, sl, cache)?;
+            // Subtyping is **kind-blind** in PR1: the ordinary
+            // contravariant-domain / covariant-codomain rule, regardless of
+            // `FunKind`. The data/compute distinction drives the *join*
+            // (`sigma_join` in the compact merge — the O1/O4 data-loss fix),
+            // not subtyping. A kind-aware rule (`Data <: Compute` upcast,
+            // `Compute <: Data` rejected, `Data`-domain invariance) would
+            // require every collection-consuming builtin scheme (`iterate`,
+            // aggregates, `map`, …) to be data-typed, which is deferred past
+            // PR1. `k0`/`k1` are bound only to document that they are
+            // intentionally ignored here.
+            let _ = (k0, k1);
             let cod_sl = match (n0, n1) {
                 (Some(k), Some(x)) => sl.extended_rename(k, x),
                 _ => sl.clone(),
             };
+            constrain_go(d1, d0, sr, sl, cache)?;
             constrain_go(c0, c1, &cod_sl, sr, cache)
+        }
+
+        // Σ <: Σ — choice width-subtyping (the lhs's extents are a subset of the
+        // rhs's, so `Σ{α} <: Σ{α, β}`) plus a covariant codomain edge carrying
+        // the witness and element-binder correspondences. Choices are extents
+        // (no Pi binders), compared structurally.
+        (Type::Sigma(s0), Type::Sigma(s1)) => {
+            for c0 in &s0.choices {
+                if !s1.choices.iter().any(|c1| c0 == c1) {
+                    return Err(ConstrainError::Mismatch {
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                    });
+                }
+            }
+            let mut cod_sl = sl.clone();
+            if let (Some(a), Some(b)) = (&s0.name, &s1.name) {
+                cod_sl = cod_sl.extended_rename(a, b);
+            }
+            if let (Some(a), Some(b)) = (&s0.pi_name, &s1.pi_name) {
+                cod_sl = cod_sl.extended_rename(a, b);
+            }
+            constrain_go(&s0.codomain, &s1.codomain, &cod_sl, sr, cache)
+        }
+
+        // Σ-intro: a single data function whose extent is one of the Σ's
+        // choices is a subtype of the Σ (`α ⤇ V <: Σ n ∈ {α, β}. n ⤇ V`). The
+        // producer carries no witness, so no correspondence is minted — the
+        // codomain edge rides the element-binder correspondence alone.
+        (
+            Type::Fun {
+                name: pn,
+                kind: crate::ccl::ty::FunKind::Data,
+                domain,
+                codomain: c0,
+            },
+            Type::Sigma(s1),
+        ) => {
+            if !s1.choices.iter().any(|ch| domain.as_ref() == ch) {
+                return Err(ConstrainError::Mismatch {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                });
+            }
+            let cod_sl = match (pn, &s1.pi_name) {
+                (Some(a), Some(b)) => sl.extended_rename(a, b),
+                _ => sl.clone(),
+            };
+            constrain_go(c0, &s1.codomain, &cod_sl, sr, cache)
         }
 
         // Tuple: positional width-subtyping. A longer/equal tuple is a

@@ -732,10 +732,7 @@ impl Subst {
                 // The witness and element binders are bound in the codomain;
                 // shadow both before rewriting it (no rename — Barendregt).
                 let mut restricted = self.clone();
-                for b in [s.name.as_ref(), s.pi_name.as_ref()]
-                    .into_iter()
-                    .flatten()
-                {
+                for b in [s.name.as_ref(), s.pi_name.as_ref()].into_iter().flatten() {
                     restricted = restricted.shadow(b);
                     restricted.assert_no_capture(b);
                 }
@@ -924,10 +921,7 @@ impl Subst {
                 // Shadow the witness + element binders before substituting the
                 // codomain (no rename — Barendregt, uids are unique).
                 let mut restricted = self.clone();
-                for b in [s.name.as_ref(), s.pi_name.as_ref()]
-                    .into_iter()
-                    .flatten()
-                {
+                for b in [s.name.as_ref(), s.pi_name.as_ref()].into_iter().flatten() {
                     restricted = restricted.shadow(b);
                     restricted.assert_no_capture(b);
                 }

@@ -378,18 +378,23 @@ impl fmt::Display for Type {
             // it as `∅` instead of computing `n - 1` and underflowing.
             Type::UIntRange(0) => write!(f, "∅"),
             Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
+            // A plain `Fun` renders with `⇒` regardless of `kind` in PR1: the
+            // data/compute marker stays invisible in `Display` for now, so the
+            // large `⇒`→`⤇` churn across type-string assertions is deferred to a
+            // dedicated follow-up. A `Σ` still renders with `⤇` (it is new, so
+            // no existing assertion churns). See `FunKind::arrow`.
             Type::Fun {
                 name: Some(x),
-                kind,
                 domain,
                 codomain,
-            } => write!(f, "(({x}: {domain}) {} {codomain})", kind.arrow()),
+                ..
+            } => write!(f, "(({x}: {domain}) ⇒ {codomain})"),
             Type::Fun {
                 name: None,
-                kind,
                 domain,
                 codomain,
-            } => write!(f, "({domain} {} {codomain})", kind.arrow()),
+                ..
+            } => write!(f, "({domain} ⇒ {codomain})"),
             Type::Tuple(ts) => {
                 let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
                 write!(f, "({})", parts.join(", "))
@@ -477,6 +482,45 @@ impl Type {
             kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+        }
+    }
+
+    /// Helper for creating a non-dependent **data** function type
+    /// (`name: None`, `kind: Data`) — a collection `domain ⤇ codomain`.
+    pub fn data_fun(domain: Self, codomain: Self) -> Self {
+        Type::Fun {
+            name: None,
+            kind: FunKind::Data,
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
+    }
+
+    /// Helper for creating a dependent (Pi) **data** function type
+    /// `(name: domain) ⤇ codomain`.
+    pub fn data_pi(name: impl Into<crate::ccl::Name>, domain: Self, codomain: Self) -> Self {
+        Type::Fun {
+            name: Some(name.into()),
+            kind: FunKind::Data,
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
+    }
+
+    /// Rebuild a function type copying `name` and `kind` from an `exemplar`
+    /// `Fun`, so a downstream rebuild (lambda elimination, inlining, planning)
+    /// can never silently flip a data arrow to compute or drop its Pi binder. A
+    /// non-`Fun` exemplar yields a plain `Compute` arrow with no binder — the
+    /// safe default at a site with no arrow to copy from.
+    pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
+        match exemplar {
+            Type::Fun { name, kind, .. } => Type::Fun {
+                name: name.clone(),
+                kind: *kind,
+                domain: Box::new(domain),
+                codomain: Box::new(codomain),
+            },
+            _ => Type::fun(domain, codomain),
         }
     }
 

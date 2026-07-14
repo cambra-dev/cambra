@@ -144,7 +144,10 @@ impl CompactFun {
         // The contravariant domain meet, defined only when both sides carry a
         // single extent (a Σ has no single domain to meet).
         let meet = |x: Vec<CompactType>, y: Vec<CompactType>| -> Vec<CompactType> {
-            debug_assert!(x.len() == 1 && y.len() == 1, "meet of a multi-extent domain");
+            debug_assert!(
+                x.len() == 1 && y.len() == 1,
+                "meet of a multi-extent domain"
+            );
             vec![CompactType::merge(
                 !pol,
                 x.into_iter().next().unwrap(),
@@ -574,10 +577,7 @@ fn compact_go(
                 .map(|c| compact_go(c, !pol, subst_acc, &BTreeSet::new(), st))
                 .collect();
             let mut cod_acc = subst_acc.clone();
-            for b in [s.name.as_ref(), s.pi_name.as_ref()]
-                .into_iter()
-                .flatten()
-            {
+            for b in [s.name.as_ref(), s.pi_name.as_ref()].into_iter().flatten() {
                 cod_acc = cod_acc.shadow(b);
             }
             let cod = compact_go(&s.codomain, pol, &cod_acc, &BTreeSet::new(), st);

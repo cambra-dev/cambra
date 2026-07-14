@@ -156,15 +156,13 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                     .collect::<Vec<_>>()
                     .join(" ⊔ ");
                 return Err(CoalesceError::ExtentJoinConflict {
-                    details: format!("data function over {{{doms_s}}} joined with a compute function"),
+                    details: format!(
+                        "data function over {{{doms_s}}} joined with a compute function"
+                    ),
                 });
             }
             KindMerge::Compute => {
-                debug_assert_eq!(
-                    doms.len(),
-                    1,
-                    "compute fun accumulated domain alternatives"
-                );
+                debug_assert_eq!(doms.len(), 1, "compute fun accumulated domain alternatives");
                 shapes.push(Type::Fun {
                     name: kept_name,
                     kind: crate::ccl::ty::FunKind::Compute,
@@ -215,6 +213,15 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         1 => all.remove(0),
         _ => {
             // Multiple incompatible contributions. Reject.
+            //
+            // NB: a positive-polarity union relaxation for heterogeneous scalar
+            // `Case` arms (`1 if c else "x"` → `Int | String`) is *not* done
+            // here: it is indistinguishable at coalesce from a binop-operand
+            // join (`1 + true`), which must stay a hard error. A sound version
+            // needs strict scalar consumers (binops, …) to impose concrete
+            // bounds so the union is rejected at *their* site; that is deferred
+            // past PR1. Collection arms still join losslessly — that happens in
+            // the `fun` slot above (`sigma_join` → Σ), not through atoms.
             let pretty = all
                 .iter()
                 .map(|t| format!("{t}"))

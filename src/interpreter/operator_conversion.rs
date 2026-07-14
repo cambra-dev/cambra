@@ -443,6 +443,19 @@ impl OpConversionContext {
             // source's. `transact_phase` emits `Mut[V, Txn]` stores, so this is a
             // live path — a transactional store's history domain converts here.
             Type::Txn => Ok(Extent::Base(BaseType::UInt)),
+            // A Σ (a conditional collection's extent) is not yet compilable:
+            // it needs the value-`Case` fan-out that eliminates it into a
+            // union of restricts (a following change). Reject loudly rather
+            // than guessing a single extent — a Σ means "one of these
+            // extents", which `Extent::Union` ("all present") would misencode.
+            Type::Sigma(s) => {
+                let choices: Vec<_> = s.choices.iter().map(|c| c.to_string()).collect();
+                Err(ConversionError::TypeError(format!(
+                    "conditional collection extent (Σ over {{{}}}) is not yet compilable; \
+                     value-`Case` compilation lands in a following change",
+                    choices.join(", ")
+                )))
+            }
             other => Err(ConversionError::TypeError(format!(
                 "Cannot convert CCL type {other:?} to an interpreter extent; \
                  this is a compiler bug — type inference should have resolved \
