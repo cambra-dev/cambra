@@ -691,8 +691,8 @@ fn erase_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
         let value = std::mem::replace(value.as_mut(), Type::Hole);
         *ty = Type::Fun {
             name: None,
-            // Compute for now; commit 3 sets this History→Fun erasure to Data.
-            kind: crate::ccl::ty::FunKind::Compute,
+            // A feed channel is a collection stream: erase History → a data function.
+            kind: crate::ccl::ty::FunKind::Data,
             domain: Box::new(domain),
             codomain: Box::new(value),
         };

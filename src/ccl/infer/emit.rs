@@ -689,7 +689,9 @@ pub(super) fn emit_collection_union<C: Typing>(
         tags.insert(FieldKey::Index(i), dom);
     }
     let dom_variant = variant_type(tags);
-    Ok(fun(dom_variant, cod_var))
+    // `++` produces a collection — a **data** function over the tagged union of
+    // its operands' extents.
+    Ok(Type::data_fun(dom_variant, cod_var))
 }
 
 /// Aggregate (`Sum`, `Max`): the scheme is the full operator type
@@ -1152,10 +1154,17 @@ pub(super) fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<
         Type::Fun { name, .. } => name.clone(),
         _ => None,
     };
+    // The chain's kind is the **first** morphism's: a chain over a data source
+    // (`xs ≫ f`, a comprehension) is a data collection; a chain of compute
+    // morphisms is compute. Unresolved in Emit (a bare `Infer` first morphism)
+    // → `Compute`, the safe default.
+    let kind = match peel_refinements_outer(&tys[0]) {
+        Type::Fun { kind, .. } => *kind,
+        _ => crate::ccl::ty::FunKind::Compute,
+    };
     Ok(Type::Fun {
         name: last_name,
-        // Compute for now; commit 3 makes this kind-aware (first morphism's kind).
-        kind: crate::ccl::ty::FunKind::Compute,
+        kind,
         domain: Box::new(first_dom),
         codomain: Box::new(prev_cod),
     })

@@ -299,16 +299,18 @@ fn constrain_go(
                 codomain: c1,
             },
         ) => {
-            // Subtyping is **kind-blind** in PR1: the ordinary
-            // contravariant-domain / covariant-codomain rule, regardless of
-            // `FunKind`. The data/compute distinction drives the *join*
-            // (`sigma_join` in the compact merge — the O1/O4 data-loss fix),
-            // not subtyping. A kind-aware rule (`Data <: Compute` upcast,
-            // `Compute <: Data` rejected, `Data`-domain invariance) would
-            // require every collection-consuming builtin scheme (`iterate`,
-            // aggregates, `map`, …) to be data-typed, which is deferred past
-            // PR1. `k0`/`k1` are bound only to document that they are
-            // intentionally ignored here.
+            // Subtyping is **kind-blind**: the ordinary contravariant-domain /
+            // covariant-codomain rule regardless of `FunKind`. The data/compute
+            // distinction drives the *join* (`sigma_join` at the compact merge —
+            // the O1/O4 data-loss fix), not subtyping.
+            //
+            // A kind-aware `Compute <: Data` rejection is *not* enabled: it
+            // needs every collection-*producing* site to carry the right kind,
+            // and "the kind of a composition" is not positional — `iterate ≫ xs`
+            // produces a collection (Data) though `iterate` is a compute
+            // morphism. Sound kind-aware subtyping therefore needs a
+            // composition-kind propagation design, deferred past PR1. `k0`/`k1`
+            // are bound only to document that they are intentionally ignored.
             let _ = (k0, k1);
             let cod_sl = match (n0, n1) {
                 (Some(k), Some(x)) => sl.extended_rename(k, x),
@@ -561,8 +563,8 @@ fn constrain_go(
         ) => {
             let chan = Type::Fun {
                 name: None,
-                // Compute for now; commit 3 sets feed read-views to Data.
-                kind: crate::ccl::ty::FunKind::Compute,
+                // A feed's read view is a collection stream: a data function.
+                kind: crate::ccl::ty::FunKind::Data,
                 domain: domain.clone(),
                 codomain: value.clone(),
             };
@@ -584,8 +586,8 @@ fn constrain_go(
         ) => {
             let chan = Type::Fun {
                 name: None,
-                // Compute for now; commit 3 sets feed read-views to Data.
-                kind: crate::ccl::ty::FunKind::Compute,
+                // A feed's read view is a collection stream: a data function.
+                kind: crate::ccl::ty::FunKind::Data,
                 domain: domain.clone(),
                 codomain: value.clone(),
             };

@@ -293,8 +293,8 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
             crate::ccl::HistoryKind::Append => {
                 let stream = Type::Fun {
                     name: None,
-                    // Compute for now; commit 3 sets feed read-views to Data.
-                    kind: crate::ccl::ty::FunKind::Compute,
+                    // A feed's read view is a collection stream: a data function.
+                    kind: crate::ccl::ty::FunKind::Data,
                     domain: domain.clone(),
                     codomain: value.clone(),
                 };
@@ -691,7 +691,9 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             if let (Some(first), Some(last)) = (elts.first(), elts.last())
                 && let (
                     Type::Fun {
-                        domain: first_dom, ..
+                        domain: first_dom,
+                        kind: first_kind,
+                        ..
                     },
                     Type::Fun {
                         name: last_name,
@@ -711,8 +713,9 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 // dependence.
                 expr.ty = Type::Fun {
                     name: last_name.clone(),
-                    // Compute for now; commit 3 makes this kind-aware (mirrors emit_compose).
-                    kind: crate::ccl::ty::FunKind::Compute,
+                    // Kind is the first morphism's (mirrors `emit_compose`): a
+                    // chain over a data source is a data collection.
+                    kind: *first_kind,
                     domain: Box::new((**first_dom).clone()),
                     codomain: Box::new((**last_cod).clone()),
                 };

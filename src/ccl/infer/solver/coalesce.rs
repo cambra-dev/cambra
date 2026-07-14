@@ -277,8 +277,8 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
         let chan = CompactType {
             fun: Some(super::compact::CompactFun {
                 name: None,
-                // Compute for now; commit 3 sets feed read-views to Data.
-                kind: super::compact::KindMerge::Compute,
+                // A feed's read view is a collection stream: a data function.
+                kind: super::compact::KindMerge::Data,
                 domains: vec![*domain],
                 codomain: value,
             }),
