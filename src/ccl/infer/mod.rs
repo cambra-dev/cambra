@@ -199,6 +199,11 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             "recursive type at {}: {} (residual μ-types are forbidden)",
             ctx_label, details
         )),
+        CoalesceError::ExtentJoinConflict { details } => InferError::Unsupported(format!(
+            "conditional collection extent conflict at {}: {} \
+             (a data function's extents cannot be dropped by joining with a compute function)",
+            ctx_label, details
+        )),
     }
 }
 

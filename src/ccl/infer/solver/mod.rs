@@ -80,6 +80,13 @@ pub fn type_level(ty: &Type) -> Level {
         // `domain`'s level surfacing here, so a fresh domain var pins the
         // level of the enclosing `Mut`.
         Type::History { value, domain, .. } => type_level(value).max(type_level(domain)),
+        Type::Sigma(s) => s
+            .choices
+            .iter()
+            .map(type_level)
+            .chain(std::iter::once(type_level(&s.codomain)))
+            .max()
+            .unwrap_or(0),
         // A channel domain stores its introduction level, but deliberately
         // reports 0 here: `type_level` drives extrusion and bound-recording
         // level scoping, and a rigid atom must flow through bounds to

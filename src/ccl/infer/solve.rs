@@ -946,6 +946,12 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
             coalesce_type_predicates(value, level, ctx);
             coalesce_type_predicates(domain, level, ctx);
         }
+        Type::Sigma(s) => {
+            s.choices
+                .iter_mut()
+                .for_each(|c| coalesce_type_predicates(c, level, ctx));
+            coalesce_type_predicates(&mut s.codomain, level, ctx);
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
@@ -1417,6 +1423,10 @@ fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>) {
         Type::History { value, domain, .. } => {
             retype_in_type(value, scope);
             retype_in_type(domain, scope);
+        }
+        Type::Sigma(s) => {
+            s.choices.iter_mut().for_each(|c| retype_in_type(c, scope));
+            retype_in_type(&mut s.codomain, scope);
         }
         Type::Base(_)
         | Type::UIntRange(_)

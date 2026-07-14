@@ -265,6 +265,12 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), I
             emit_annotation_predicates(value, ctx)?;
             emit_annotation_predicates(domain, ctx)
         }
+        Type::Sigma(s) => {
+            for c in s.choices.iter_mut() {
+                emit_annotation_predicates(c, ctx)?;
+            }
+            emit_annotation_predicates(&mut s.codomain, ctx)
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)

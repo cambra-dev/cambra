@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ccl::InferVarId;
 
-use super::compact::{AtomKey, CompactGraph, CompactType};
+use super::compact::{AtomKey, CompactFun, CompactGraph, CompactType};
 
 // ---------------------------------------------------------------------------
 // Type simplification: co-occurrence analysis
@@ -246,17 +246,19 @@ fn simplify_analyze(
             );
         }
     }
-    if let Some((_, dom, cod)) = &ct.fun {
+    if let Some(cf) = &ct.fun {
+        for dom in &cf.domains {
+            simplify_analyze(
+                dom,
+                !pol,
+                input_rec_vars,
+                all_vars,
+                rec_processed,
+                co_occurrences,
+            );
+        }
         simplify_analyze(
-            dom,
-            !pol,
-            input_rec_vars,
-            all_vars,
-            rec_processed,
-            co_occurrences,
-        );
-        simplify_analyze(
-            cod,
+            &cf.codomain,
             pol,
             input_rec_vars,
             all_vars,
@@ -315,12 +317,15 @@ fn simplify_reconstruct(
             .collect()
     });
 
-    let new_fun = ct.fun.map(|(name, dom, cod)| {
-        (
-            name,
-            Box::new(simplify_reconstruct(*dom, var_subst)),
-            Box::new(simplify_reconstruct(*cod, var_subst)),
-        )
+    let new_fun = ct.fun.map(|cf| CompactFun {
+        name: cf.name,
+        kind: cf.kind,
+        domains: cf
+            .domains
+            .into_iter()
+            .map(|d| simplify_reconstruct(d, var_subst))
+            .collect(),
+        codomain: Box::new(simplify_reconstruct(*cf.codomain, var_subst)),
     });
 
     let new_history_slot = ct.history_slot.map(|(value, domain, kind)| {
@@ -345,7 +350,18 @@ fn simplify_reconstruct(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::compact::KindMerge;
     use crate::ccl::{BaseType, InferVar};
+
+    /// A single-domain compute `fun` slot, for the simplify tests below.
+    fn compute_fun(dom: CompactType, cod: CompactType) -> Option<CompactFun> {
+        Some(CompactFun {
+            name: None,
+            kind: KindMerge::Compute,
+            domains: vec![dom],
+            codomain: Box::new(cod),
+        })
+    }
 
     /// Build a fresh [`InferVarId`] for use in hand-constructed CompactTypes.
     fn fresh_uid() -> InferVarId {
@@ -370,14 +386,16 @@ mod tests {
         };
         let graph = CompactGraph {
             term: CompactType {
-                fun: Some((None, Box::new(dom), Box::new(cod))),
+                fun: compute_fun(dom, cod),
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
         };
 
         let simplified = simplify_type(graph);
-        let (_, dom_s, cod_s) = simplified.term.fun.unwrap();
+        let cf = simplified.term.fun.unwrap();
+        let dom_s = &cf.domains[0];
+        let cod_s = &cf.codomain;
         assert!(dom_s.vars.contains(&uid_a), "a kept in dom");
         assert!(cod_s.vars.contains(&uid_a), "a kept in cod");
         assert!(!cod_s.vars.contains(&uid_b), "b eliminated from cod");
@@ -397,18 +415,19 @@ mod tests {
         };
         let graph = CompactGraph {
             term: CompactType {
-                fun: Some((
-                    None,
-                    Box::new(make_side([uid_a].into_iter().collect())),
-                    Box::new(make_side([uid_a].into_iter().collect())),
-                )),
+                fun: compute_fun(
+                    make_side([uid_a].into_iter().collect()),
+                    make_side([uid_a].into_iter().collect()),
+                ),
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
         };
 
         let simplified = simplify_type(graph);
-        let (_, dom_s, cod_s) = simplified.term.fun.unwrap();
+        let cf = simplified.term.fun.unwrap();
+        let dom_s = &cf.domains[0];
+        let cod_s = &cf.codomain;
         assert!(dom_s.vars.is_empty(), "a absorbed in dom");
         assert!(cod_s.vars.is_empty(), "a absorbed in cod");
         assert!(dom_s.atoms.contains(&int_key), "Int remains in dom");
@@ -425,24 +444,25 @@ mod tests {
 
         let graph = CompactGraph {
             term: CompactType {
-                fun: Some((
-                    None,
-                    Box::new(CompactType {
+                fun: compute_fun(
+                    CompactType {
                         vars: both.clone(),
                         ..Default::default()
-                    }),
-                    Box::new(CompactType {
+                    },
+                    CompactType {
                         vars: both,
                         ..Default::default()
-                    }),
-                )),
+                    },
+                ),
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
         };
 
         let simplified = simplify_type(graph);
-        let (_, dom_s, cod_s) = simplified.term.fun.unwrap();
+        let cf = simplified.term.fun.unwrap();
+        let dom_s = &cf.domains[0];
+        let cod_s = &cf.codomain;
         assert_eq!(dom_s.vars.len(), 1, "one var after merge in dom");
         assert_eq!(cod_s.vars.len(), 1, "one var after merge in cod");
         assert_eq!(dom_s.vars, cod_s.vars, "same representative in dom and cod");
@@ -456,24 +476,25 @@ mod tests {
 
         let graph = CompactGraph {
             term: CompactType {
-                fun: Some((
-                    None,
-                    Box::new(CompactType {
+                fun: compute_fun(
+                    CompactType {
                         vars: [uid_a].into_iter().collect(),
                         ..Default::default()
-                    }),
-                    Box::new(CompactType {
+                    },
+                    CompactType {
                         vars: [uid_a].into_iter().collect(),
                         ..Default::default()
-                    }),
-                )),
+                    },
+                ),
                 ..Default::default()
             },
             rec_vars: BTreeMap::new(),
         };
 
         let simplified = simplify_type(graph);
-        let (_, dom_s, cod_s) = simplified.term.fun.unwrap();
+        let cf = simplified.term.fun.unwrap();
+        let dom_s = &cf.domains[0];
+        let cod_s = &cf.codomain;
         assert!(dom_s.vars.contains(&uid_a), "a preserved in dom");
         assert!(cod_s.vars.contains(&uid_a), "a preserved in cod");
     }

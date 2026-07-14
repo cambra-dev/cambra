@@ -700,6 +700,12 @@ fn collect_type_errors(
                 collect_type_errors(payload, context_sym, strictness, errors, seen_refinements);
             }
         }
+        Type::Sigma(s) => {
+            for c in &s.choices {
+                collect_type_errors(c, context_sym, strictness, errors, seen_refinements);
+            }
+            collect_type_errors(&s.codomain, context_sym, strictness, errors, seen_refinements);
+        }
         Type::History {
             value,
             domain,

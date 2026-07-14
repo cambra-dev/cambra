@@ -147,6 +147,15 @@ impl InferCtx {
                 domain: Box::new(self.normalize_annotation(domain)),
                 kind: *kind,
             },
+            Type::Sigma(s) => Type::sigma(
+                s.name.clone(),
+                s.choices
+                    .iter()
+                    .map(|t| self.normalize_annotation(t))
+                    .collect(),
+                s.pi_name.clone(),
+                self.normalize_annotation(&s.codomain),
+            ),
             // Leaves and existing inference vars pass through unchanged.
             Type::Base(_)
             | Type::UIntRange(_)

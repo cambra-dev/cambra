@@ -350,6 +350,12 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
             domain: Box::new(strip_refinements(domain)),
             kind: *kind,
         },
+        Type::Sigma(s) => Type::sigma(
+            s.name.clone(),
+            s.choices.iter().map(strip_refinements).collect(),
+            s.pi_name.clone(),
+            strip_refinements(&s.codomain),
+        ),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::Hole

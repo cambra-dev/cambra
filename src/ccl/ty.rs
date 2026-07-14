@@ -270,9 +270,52 @@ pub enum Type {
         /// off-path positions carry forward.
         kind: HistoryKind,
     },
+    /// A dependent sum over a finite set of candidate **extents** — the
+    /// lossless join of data functions at a control-flow merge:
+    /// `Σ name ∈ {choices}. (pi_name: name) ⤇ codomain`.
+    ///
+    /// A `Σ` is always a data function (there is no `kind` field — it is
+    /// `Data` by construction). Its structural shape is fixed: the witness
+    /// occupies the arrow's *domain* position, so no type-level variable leaf
+    /// exists. The witness `name` is referencable only by refinement predicates
+    /// inside `codomain` (the same term-level `Var(name)` mechanism as a
+    /// [`Type::Fun`] Pi binder), denotes the chosen extent opaquely (the
+    /// `DataSource`-domain species), and is **only ever discharged, never
+    /// evaluated** — see `discharge_sigma`. It is kept iff a codomain predicate
+    /// references it (the Pi keep-iff-referenced filter at coalesce); until
+    /// witness-referencing predicates exist it is always `None`, so the
+    /// machinery is live but dormant.
+    ///
+    /// Formed at the compact merge (`sigma_join`) and materialized by coalesce;
+    /// eliminated by the value-`Case` fan-out (PR2). See
+    /// `design/type-inference.md` §4.6.
+    ///
+    /// The payload is boxed to keep `Type` small — a Σ is rare, but `Type` is
+    /// cloned pervasively, and inlining a `Vec` + two `Option<Name>` would
+    /// roughly double every `Type`'s footprint.
+    Sigma(Box<SigmaType>),
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
     // Refinement { base: Box<Type>, predicate: Box<Expr> }
+}
+
+/// The payload of a [`Type::Sigma`] — a dependent sum
+/// `Σ name ∈ {choices}. (pi_name: name) ⤇ codomain`. Boxed inside `Type` to
+/// keep the enum small.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SigmaType {
+    /// The Σ witness (the chosen extent). `Some` iff a `codomain` predicate
+    /// references it; `None` in the common (and, in PR1, every) case.
+    pub name: Option<crate::ccl::Name>,
+    /// The candidate extents. Invariant (asserted at materialization):
+    /// `len >= 2`, deduped, each domain-shaped, none itself a `Sigma`.
+    pub choices: Vec<Type>,
+    /// The underlying arrow's own element binder, bound in `codomain` (the
+    /// `Fun`-`name` slot each choice would carry as a data function).
+    pub pi_name: Option<crate::ccl::Name>,
+    /// The shared element type (`τ₀ ⊔ τ₁`), covariant; may reference `name`
+    /// and `pi_name` through refinement predicates.
+    pub codomain: Box<Type>,
 }
 
 /// Which flavour of [`Type::History`] a handle is — a mutable store (`:=`) or a
@@ -399,6 +442,17 @@ impl fmt::Display for Type {
                     write!(f, "feed({domain} ⇒ {value})")
                 }
             }
+            Type::Sigma(s) => {
+                let cs: Vec<_> = s.choices.iter().map(|t| t.to_string()).collect();
+                let codomain = &s.codomain;
+                match &s.name {
+                    // Named witness (referenced by a codomain predicate):
+                    // `(Σ n ∈ {D0, D1}. n ⤇ V)`.
+                    Some(n) => write!(f, "(Σ {n} ∈ {{{}}}. {n} ⤇ {codomain})", cs.join(", ")),
+                    // Anonymous (the common/dormant case): `Σ{D0, D1} ⤇ V`.
+                    None => write!(f, "Σ{{{}}} ⤇ {codomain}", cs.join(", ")),
+                }
+            }
         }
     }
 }
@@ -424,6 +478,21 @@ impl Type {
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }
+    }
+
+    /// Helper for creating a [`Type::Sigma`] over candidate extents.
+    pub fn sigma(
+        name: Option<crate::ccl::Name>,
+        choices: Vec<Type>,
+        pi_name: Option<crate::ccl::Name>,
+        codomain: Type,
+    ) -> Self {
+        Type::Sigma(Box::new(SigmaType {
+            name,
+            choices,
+            pi_name,
+            codomain: Box::new(codomain),
+        }))
     }
 
     /// If this is a function type, return the domain type, otherwise None.
@@ -468,6 +537,9 @@ impl Type {
         match self {
             Type::Txn => false,
             Type::Fun { domain, .. } => domain.has_enumerable_extent(),
+            // A Σ is enumerable iff every candidate extent is — each choice is
+            // a real alternative the collection might turn out to be.
+            Type::Sigma(s) => s.choices.iter().all(Type::has_enumerable_extent),
             Type::Tuple(ts) => ts.iter().all(Type::has_enumerable_extent),
             Type::Record(fields) => fields.iter().all(|(_, t)| t.has_enumerable_extent()),
             Type::Variant(tags) => tags.iter().all(|(_, t)| t.has_enumerable_extent()),
@@ -541,6 +613,15 @@ impl Type {
                 domain: Box::new(domain.without_pi_names()),
                 kind: *kind,
             },
+            // Normalize the Σ witness and element binder to `None` alongside Pi
+            // binders — the same α-blindness downstream structural comparisons
+            // rely on.
+            Type::Sigma(s) => Type::sigma(
+                None,
+                s.choices.iter().map(|t| t.without_pi_names()).collect(),
+                None,
+                s.codomain.without_pi_names(),
+            ),
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
@@ -608,6 +689,14 @@ impl Type {
                     f(t);
                 }
             }
+            // A Σ's children are its candidate extents and its codomain (the
+            // witness/pi binders are names, not types).
+            Type::Sigma(s) => {
+                for c in &s.choices {
+                    f(c);
+                }
+                f(&s.codomain);
+            }
         }
     }
 
@@ -648,6 +737,14 @@ impl Type {
                 for (_, t) in tags {
                     f(t);
                 }
+            }
+            // A Σ's children are its candidate extents and its codomain (the
+            // witness/pi binders are names, not types).
+            Type::Sigma(s) => {
+                for c in &mut *s.choices {
+                    f(c);
+                }
+                f(&mut s.codomain);
             }
         }
     }

@@ -725,6 +725,23 @@ impl Subst {
                 self.rewrite_type_go(codomain, memo);
             }
 
+            Type::Sigma(s) => {
+                for c in s.choices.iter_mut() {
+                    self.rewrite_type_go(c, memo);
+                }
+                // The witness and element binders are bound in the codomain;
+                // shadow both before rewriting it (no rename — Barendregt).
+                let mut restricted = self.clone();
+                for b in [s.name.as_ref(), s.pi_name.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    restricted = restricted.shadow(b);
+                    restricted.assert_no_capture(b);
+                }
+                restricted.rewrite_type_go(&mut s.codomain, memo);
+            }
+
             Type::Fun {
                 name: Some(b),
                 domain,
@@ -902,6 +919,26 @@ impl Subst {
                 }
             }
 
+            Type::Sigma(s) => {
+                let choices = s.choices.iter().map(|c| self.apply_type(c)).collect();
+                // Shadow the witness + element binders before substituting the
+                // codomain (no rename — Barendregt, uids are unique).
+                let mut restricted = self.clone();
+                for b in [s.name.as_ref(), s.pi_name.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    restricted = restricted.shadow(b);
+                    restricted.assert_no_capture(b);
+                }
+                Type::sigma(
+                    s.name.clone(),
+                    choices,
+                    s.pi_name.clone(),
+                    restricted.apply_type(&s.codomain),
+                )
+            }
+
             Type::Refinement(base, r) => {
                 // The refinement implicitly binds REFINEMENT_BINDER in its bare
                 // predicate; `force_refinement` shadows it before rewriting.
@@ -1014,6 +1051,20 @@ fn collect_type_fv(
             // A `Some` name is the Pi binder, bound in the codomain.
             with_binders(bound, name.clone(), |bnd| {
                 collect_type_fv(codomain, bnd, visited, out)
+            });
+        }
+        Type::Sigma(s) => {
+            // Choices are extents — they do not reference the witness.
+            for c in &s.choices {
+                collect_type_fv(c, bound, visited, out);
+            }
+            // The witness and element binders are bound in the codomain.
+            let binders: Vec<Name> = [s.name.clone(), s.pi_name.clone()]
+                .into_iter()
+                .flatten()
+                .collect();
+            with_binders(bound, binders, |bnd| {
+                collect_type_fv(&s.codomain, bnd, visited, out)
             });
         }
         Type::Refinement(base, r) => {

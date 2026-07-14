@@ -198,6 +198,15 @@ pub fn freshen_above(
             domain: Box::new(freshen_above(lim, domain, target, cache)),
             kind: *kind,
         },
+        Type::Sigma(s) => Type::sigma(
+            s.name.clone(),
+            s.choices
+                .iter()
+                .map(|t| freshen_above(lim, t, target, cache))
+                .collect(),
+            s.pi_name.clone(),
+            freshen_above(lim, &s.codomain, target, cache),
+        ),
         Type::Refinement(inner, r) => Type::Refinement(
             Box::new(freshen_above(lim, inner, target, cache)),
             // Faithfully freshen the predicate's own type slots through the same

@@ -746,6 +746,17 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
                 .map(|(k, t)| (k.clone(), extrude(t, pol, target_level, cache)))
                 .collect(),
         ),
+        Type::Sigma(s) => Type::sigma(
+            s.name.clone(),
+            // The choices are extents (domain position): flip polarity like a
+            // `Fun` domain. The codomain follows the outer polarity.
+            s.choices
+                .iter()
+                .map(|t| extrude(t, !pol, target_level, cache))
+                .collect(),
+            s.pi_name.clone(),
+            extrude(&s.codomain, pol, target_level, cache),
+        ),
         Type::Refinement(inner, r) => Type::Refinement(
             Box::new(extrude(inner, pol, target_level, cache)),
             r.clone(),
