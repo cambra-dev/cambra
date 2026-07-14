@@ -413,6 +413,120 @@ The expected binder is **always globally fresh** (proposal §5.2 verbatim; the �
 
 The pipeline passes downstream of inference treat function types structurally and compare modulo the Pi binder (`Type::without_pi_names`). **Refinement-predicate compilation is deferred out of lambda-elim** (proposal §6.3): predicates ride through inference and lambda-elim in their bare pointful form (a bare boolean over the implicit `REFINEMENT_BINDER`), and **planning** compiles them. Order matters: the group-by / hash-join recognizers run *first*, on the bare form — compiling first would destroy the pointful shapes they match (see the pointful-join-recognizers plan) — and `planning::compile_refinement_predicates` then runs the lambda-elim → simplify sub-pipeline on each remaining predicate (keyed by predicate `Rc` identity) before the generic `iterate`/`restrict` lowering consumes it. This is what lets a refined collection — including a group-by over a *filtered* source (`[sum(x) for x in groupby([y+10 for y in xs if y<6], key)]`) — compile to a runtime `Restrict`/`Filter` rather than reaching op-conversion as an un-compiled predicate. Single-key dependent lookups (`sum(groupby(xs, key)(k))`) and the nested filtered-source group-by both run end-to-end with correct values.
 
+## 4.6 Data vs compute functions and Σ extent joins
+
+> **Status: designed, not yet implemented.** Design of record for the
+> in-flight conditionals stack — see
+> `brainstorm/2026-07-14-conditionals-via-sigma-types.md` for the full plan
+> (compilation, transactions, staging). This section graduates to
+> current-state prose when the type-system PR lands.
+
+The unresolved extent-join corner of §4.5 (O1/O4 — two collections meeting at
+one join point) is resolved by making a missing distinction explicit and
+adding the dependent *sum* dual of §4.5's Pi types.
+
+**The distinction.** A function's domain can mean two things. A **compute
+function** `α ⇒ β` treats it as a *capability* — the inputs accepted; no data
+behind it; shrinking under-promises, so the lossy contravariant meet at a
+join is fine. A **data function** `α ⤇ β` treats it as an *extent* — the
+domain *is* the data map, so a lossy domain is lost data. `Type::Fun` gains a
+`kind: FunKind` (`Compute | Data`) set at introduction: list literals,
+comprehensions, `++`, registered sources, and every `History` erasure are
+data; `lambda`/`def` are compute. The audit rule: *an arrow is data iff
+`extent_of` will drive iteration off its domain*. `data <: compute` is the
+safe, deliberate upcast (forget the extent); `compute <: data` is a new
+`ComputeWhereDataRequired` error; data-data domains are **invariant** —
+contravariance would let the runtime iterate a narrower declared extent and
+silently drop rows. New constructors `data_fun`/`data_pi`, plus
+`fun_like(exemplar, d, c)` for downstream rebuilds so a kind can never flip
+silently.
+
+**Σ types.** A join of two data functions preserves both extents instead of
+meeting them: `α ⤇ τ₀ ⊔ β ⤇ τ₁` = `Σ 𝑛 ∈ {α, β}. 𝑛 ⤇ (τ₀ ⊔ τ₁)`,
+represented as `Type::Sigma { name, choices, pi_name, codomain }`. The
+structural shape is fixed — the witness position *is* the arrow's domain — so
+no type-level variable leaf exists; the witness `name` is referencable only
+by codomain refinement predicates (the §4.5 binder mechanism, hence the
+Π/`Subst` reuse: Σ-Σ constraint edges mint witness and pi correspondences via
+`extended_rename` on the codomain edge), denotes the chosen extent opaquely
+(the `DataSource`-domain species), and is only ever discharged, never
+evaluated. It is kept iff referenced (the Pi keep-iff-referenced filter) —
+dormant until witness-referencing predicates exist. Refinements ride *inside*
+each choice, so differently-refined extents joining at a `Case` carry both
+predicates and never hit `merge_refinements`' positive intersect (which
+becomes capability-domain/codomain/scalar-only by construction).
+
+**Mechanics.** Formation happens at the compact merge: the fun slot becomes a
+`CompactFun` whose `domains` accumulate alternatives under `sigma_join`
+(union + dedup at positive polarity — never a meet); coalesce materializes
+one survivor as a plain data fun, ≥ 2 as a Σ with a fresh witness, and a
+data-⊔-compute collision as a loud `ExtentJoinConflict`. Choice order =
+first-contribution order is a guaranteed contract. Elimination is
+`Type::discharge_sigma(i)`; two **bridge rules** connect the compiled
+union-of-restricts form to the Σ: a gated partition
+`Fun{Data, Variant([Index(i) ↦ {𝐷ᵢ | πᵢ}]), 𝑐}` subtypes the Σ positionally,
+and an exhaustive+disjoint partition union `⧺ⱼ Fun({𝐷 | πⱼ}, 𝑊)` subtypes the
+plain `Fun{Data, 𝐷, 𝑊}` via a wall-validated `Cast` (exhaustiveness asserted
+by the stamping phase). Until the compilation PR lands, `extent_of` and
+planning reject a Σ loudly through one named helper (`reject_sigma_extent`) —
+deliberately not `Extent::Union`, which asserts *all* positions present where
+Σ means *one of*.
+
+**`Case` arms join by the lattice.** `emit_case` constrains every arm into a
+fresh result variable (`require_sub`) instead of requiring equality.
+Compute-typed arms coalesce to the plain join; heterogeneous scalar arms
+materialize the untagged-union normal form `Variant([(Index(i), 𝐴ᵢ)])` at
+positive polarity (negative keeps `IncompatibleBounds`); data-typed arms form
+the Σ above. A consumer that cannot handle the join fails at its own
+constraint site, at emit time.
+
+**What the codomain join gives up — and why that is the right default.** The Σ
+is lossless on the *extent* and lossy on the *codomain*: joining `α ⤇ τ₀` with
+`β ⤇ τ₁` keeps the exact extent set `{α, β}` but coarsens the element type to
+`τ₀ ⊔ τ₁`, forgetting *which* extent pairs with *which* element type. A
+function returning `[1, 2, 3] if flag else ["a", "b"]` types as
+`Σ{[0,2], [0,1]} ⤇ (Int | String)` — the type no longer records "length 3 ⟹
+all Int." Three points make this the right default rather than a leak:
+
+- **The asymmetry is principled.** Loss is forbidden exactly where it is
+  *silent and destroys data* — the domain (dropping an index drops a row, with
+  no trace), which is why extents join into a Σ and never meet. Loss is
+  permitted exactly where it is *visible and only coarsens type* — the
+  codomain: `Int | String` sits in the type, and a consumer that needs `Int`
+  (say `sum`) fails at *its own* constraint site. `Σ-join` is a sound
+  **widening** — it is a supertype of the correlated form (each arm satisfies
+  Σ-intro), so it never admits an unsound program, it only offers less
+  precision.
+- **The correlation is recoverable by construction.** The correlated form
+  `(α ⤇ τ₀) | (β ⤇ τ₁)` is exactly a tagged variant of data functions,
+  `Variant([(Index(0), α ⤇ τ₀), (Index(1), β ⤇ τ₁)])` — a type the system
+  already has. A program that needs a branch-aware consumer introduces the
+  choice *explicitly* (`.Ints(xs) if flag else .Strs(ys)`) and `match`es it;
+  the case-split tax is then paid by the code that benefits from it. The
+  implicit control-flow join carries the ergonomics of the *common* case (a
+  uniform consumer, no case-split), and the explicit variant carries the rare
+  one.
+- **Default-join keeps consumer complexity linear.** If the implicit join
+  preserved correlation, every conditional collection would default to a
+  variant every downstream consumer must destructure, and nested conditionals
+  would multiply the arms through the whole consumer graph — complexity
+  compounding at each control-flow merge. The join collapses codomains so an
+  arbitrary chain of conditionals still presents one collection type; only the
+  extent set (which we must keep) grows.
+
+Two consequences to keep on the record. First, this direction *depends on*
+tagged-variant **surface syntax** (`.Foo(x)` constructors + `match`, the open
+part of [[type-checker-tagged-variants]]): until that ships, the join is a
+*forced* loss with no recovery path, not a chosen one. Second, we are
+deliberately declining **flow-sensitive typing** — an occurrence-typing
+language could keep the arms correlated through the path condition `flag`
+itself, with no tag; Cambra does not narrow on opaque `Bool`s, and the tagged
+variant is the substitute. The witness `name` (above) is orthogonal to this:
+it recovers extent↔*value* correlation in a homogeneous-codomain data function
+(e.g. a conditionally-sized collection of in-bounds indices,
+`Σ 𝑛 ∈ {[0,7], [0,3]}. 𝑛 ⤇ {Int | __elem ∈ 𝑛}`), not per-branch element
+*types* — that axis is the variant's, and the two partition with no gap.
+
 ---
 
 ## 5. CCL-specific inference rules
@@ -444,6 +558,8 @@ The pipeline passes downstream of inference treat function types structurally an
 ### `Case` inference
 
 For each `Branch { guard, body }`: the guard is constrained to `Type::Base(BaseType::Bool)`; body types across all branches are unified. The overall `Case` type is the unified body type. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
+
+The in-flight conditionals stack replaces the arm unification with a genuine lattice join (fresh result variable + per-arm `require_sub`) — see [§4.6](#46-data-vs-compute-functions-and-σ-extent-joins); the strict-equality behavior above is current until that PR lands.
 
 ### Record literals and field access
 
