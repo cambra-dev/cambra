@@ -415,11 +415,12 @@ The pipeline passes downstream of inference treat function types structurally an
 
 ## 4.6 Data vs compute functions and Σ extent joins
 
-> **Status: designed, not yet implemented.** Design of record for the
-> in-flight conditionals stack — see
-> `brainstorm/2026-07-14-conditionals-via-sigma-types.md` for the full plan
-> (compilation, transactions, staging). This section graduates to
-> current-state prose when the type-system PR lands.
+> **Status: implemented (the conditionals-stack type-system PR), with two
+> follow-ups noted inline.** The Σ representation, the `FunKind` marker, and
+> lossless Σ formation at control-flow joins are live. Kind-aware *subtyping*
+> (the `Compute<:Data` rejection) and the value-`Case` elimination bridges are
+> deferred — see the callouts below and
+> `brainstorm/2026-07-14-conditionals-via-sigma-types.md`.
 
 The unresolved extent-join corner of §4.5 (O1/O4 — two collections meeting at
 one join point) is resolved by making a missing distinction explicit and
@@ -429,17 +430,26 @@ adding the dependent *sum* dual of §4.5's Pi types.
 function** `α ⇒ β` treats it as a *capability* — the inputs accepted; no data
 behind it; shrinking under-promises, so the lossy contravariant meet at a
 join is fine. A **data function** `α ⤇ β` treats it as an *extent* — the
-domain *is* the data map, so a lossy domain is lost data. `Type::Fun` gains a
-`kind: FunKind` (`Compute | Data`) set at introduction: list literals,
+domain *is* the data map, so a lossy domain is lost data. `Type::Fun` carries
+a `kind: FunKind` (`Compute | Data`) set at introduction: list literals,
 comprehensions, `++`, registered sources, and every `History` erasure are
 data; `lambda`/`def` are compute. The audit rule: *an arrow is data iff
-`extent_of` will drive iteration off its domain*. `data <: compute` is the
-safe, deliberate upcast (forget the extent); `compute <: data` is a new
-`ComputeWhereDataRequired` error; data-data domains are **invariant** —
-contravariance would let the runtime iterate a narrower declared extent and
-silently drop rows. New constructors `data_fun`/`data_pi`, plus
-`fun_like(exemplar, d, c)` for downstream rebuilds so a kind can never flip
-silently.
+`extent_of` will drive iteration off its domain*. New constructors
+`data_fun`/`data_pi`, plus `fun_like(exemplar, d, c)` for downstream rebuilds
+so a kind can never flip silently.
+
+> **Deferred — kind-aware subtyping (its own follow-up, "PR 1.5").**
+> Subtyping is currently **kind-blind**: the ordinary contravariant rule
+> regardless of kind. The marker's live job is the *join* (`sigma_join`, below)
+> — the O1/O4 data-loss fix — not subtyping. The intended additional guards —
+> `data <: compute` as a deliberate upcast, `compute <: data` rejected
+> (`ComputeWhereDataRequired`), and invariant data-domains — are **not enabled
+> yet**: they only fire soundly once every collection-*producing* site carries
+> the right kind, and "the kind of a composition" is not positional
+> (`iterate ≫ xs` produces a collection though `iterate` is a compute
+> morphism). Sound kind-aware subtyping needs a composition-kind propagation
+> design, tracked as a follow-up. Turning the rejection on before that
+> spuriously rejects valid programs (e.g. `sum([x for x in xs])`).
 
 **Σ types.** A join of two data functions preserves both extents instead of
 meeting them: `α ⤇ τ₀ ⊔ β ⤇ τ₁` = `Σ 𝑛 ∈ {α, β}. 𝑛 ⤇ (τ₀ ⊔ τ₁)`,
@@ -456,29 +466,41 @@ each choice, so differently-refined extents joining at a `Case` carry both
 predicates and never hit `merge_refinements`' positive intersect (which
 becomes capability-domain/codomain/scalar-only by construction).
 
-**Mechanics.** Formation happens at the compact merge: the fun slot becomes a
+**Mechanics.** Formation happens at the compact merge: the fun slot is a
 `CompactFun` whose `domains` accumulate alternatives under `sigma_join`
 (union + dedup at positive polarity — never a meet); coalesce materializes
-one survivor as a plain data fun, ≥ 2 as a Σ with a fresh witness, and a
-data-⊔-compute collision as a loud `ExtentJoinConflict`. Choice order =
-first-contribution order is a guaranteed contract. Elimination is
-`Type::discharge_sigma(i)`; two **bridge rules** connect the compiled
-union-of-restricts form to the Σ: a gated partition
-`Fun{Data, Variant([Index(i) ↦ {𝐷ᵢ | πᵢ}]), 𝑐}` subtypes the Σ positionally,
-and an exhaustive+disjoint partition union `⧺ⱼ Fun({𝐷 | πⱼ}, 𝑊)` subtypes the
-plain `Fun{Data, 𝐷, 𝑊}` via a wall-validated `Cast` (exhaustiveness asserted
-by the stamping phase). Until the compilation PR lands, `extent_of` and
-planning reject a Σ loudly through one named helper (`reject_sigma_extent`) —
-deliberately not `Extent::Union`, which asserts *all* positions present where
-Σ means *one of*.
+one survivor as a plain data fun, ≥ 2 as a Σ with a fresh witness (kept iff a
+codomain predicate references it — always stripped for now, so materialized Σs
+are witness-free), and a data-⊔-compute collision as a loud
+`ExtentJoinConflict`. Choice order = first-contribution order is a guaranteed
+contract. A Σ reaching op-conversion is rejected loudly (`extent_of` — a clear
+"not yet compilable" error, deliberately not `Extent::Union`, which asserts
+*all* positions present where Σ means *one of*).
 
-**`Case` arms join by the lattice.** `emit_case` constrains every arm into a
-fresh result variable (`require_sub`) instead of requiring equality.
-Compute-typed arms coalesce to the plain join; heterogeneous scalar arms
-materialize the untagged-union normal form `Variant([(Index(i), 𝐴ᵢ)])` at
-positive polarity (negative keeps `IncompatibleBounds`); data-typed arms form
-the Σ above. A consumer that cannot handle the join fails at its own
-constraint site, at emit time.
+> **Deferred — value-`Case` elimination bridges (PR2).** The eliminator that
+> compiles a Σ-typed `Case` to a union of restricts — `discharge_sigma(i)` and
+> the two bridge rules (a gated partition `Fun{Data, Variant([Index(i) ↦
+> {𝐷ᵢ | πᵢ}]), 𝑐}` subtyping the Σ positionally; an exhaustive+disjoint
+> partition union subtyping the plain data fun via a wall-validated `Cast`) —
+> lands with the value-`Case` compilation in PR2, where it is exercised
+> end-to-end. Today a Σ-typed `Case` types fine but is rejected at
+> `lambda_elim` (value-`Case`s are not yet compilable).
+
+**`Case` arms join by the lattice.** `emit_case` constrains every value/
+collection arm into a fresh result variable (`require_sub`) instead of
+requiring equality. Homogeneous arms recover the old behavior; data-collection
+arms with distinct extents form the Σ above. `Mut`/`History` arms are the
+exception — a second-class reference cannot be lattice-joined as a value, so
+they keep `require_eq` (the Case stays a reference and mut-discipline rejects a
+conditional over stores, preserving that deliberate rule).
+
+> **Deferred — heterogeneous-scalar union (follow-up).** The design goal is for
+> heterogeneous scalar arms (`1 if c else "x"`) to coalesce to a union.
+> A global positive-atom union at coalesce is **unsound** — it is
+> indistinguishable there from a binop-operand join (`1 + true`), which must
+> stay a hard error. So heterogeneous scalar arms currently remain an
+> `IncompatibleBounds` error; the sound union needs strict scalar consumers
+> (binops, …) to impose concrete bounds, tracked as a follow-up.
 
 **What the codomain join gives up — and why that is the right default.** The Σ
 is lossless on the *extent* and lossy on the *codomain*: joining `α ⤇ τ₀` with
@@ -487,6 +509,15 @@ is lossless on the *extent* and lossy on the *codomain*: joining `α ⤇ τ₀` 
 function returning `[1, 2, 3] if flag else ["a", "b"]` types as
 `Σ{[0,2], [0,1]} ⤇ (Int | String)` — the type no longer records "length 3 ⟹
 all Int." Three points make this the right default rather than a leak:
+
+> **Landed vs. deferred here.** The *extent* losslessness is live: a conditional
+> over collections with the **same** element type (`[1,2] if c else [1,2,3]`)
+> forms `Σ{[0,1],[0,2]} ⤇ Int`. The *codomain* union in the `Int | String`
+> example above is the same deferred piece as the heterogeneous-scalar union
+> (`τ₀ ⊔ τ₁` is a positive atom-join), so that specific example currently
+> errors at the codomain until that follow-up lands. The design rationale below
+> is unchanged — it is why the codomain join is the right *default* once the
+> union is sound.
 
 - **The asymmetry is principled.** Loss is forbidden exactly where it is
   *silent and destroys data* — the domain (dropping an index drops a row, with
