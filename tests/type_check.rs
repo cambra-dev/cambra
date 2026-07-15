@@ -227,7 +227,7 @@ fn test_list_comp_identity() {
         infer_program("[x for x in [1, 2]]"),
         Type::Fun {
             name: None,
-            kind: cambra::ccl::FunKind::Compute,
+            kind: cambra::ccl::FunKind::Data,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(int())
         }
@@ -241,7 +241,7 @@ fn test_list_comp_arithmetic_body() {
         infer_program("[x + 1 for x in [1, 2]]"),
         Type::Fun {
             name: None,
-            kind: cambra::ccl::FunKind::Compute,
+            kind: cambra::ccl::FunKind::Data,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(int())
         }
@@ -256,7 +256,7 @@ fn test_list_comp_two_gens() {
         ty,
         Type::Fun {
             name: None,
-            kind: cambra::ccl::FunKind::Compute,
+            kind: cambra::ccl::FunKind::Data,
             domain: Box::new(Type::Tuple(vec![Type::UIntRange(2), Type::UIntRange(2)])),
             codomain: Box::new(int())
         },

@@ -710,13 +710,24 @@ impl Type {
         }
     }
 
-    /// A structural copy with every Pi binder name erased (`Fun.name → None`).
+    /// A structural copy with every Pi binder name erased (`Fun.name → None`)
+    /// and every function **kind** canonicalized to `Compute`.
     ///
     /// The binder is load-bearing only inside the type solver (it carries
     /// dependent-refinement correspondences); downstream passes treat function
     /// types structurally and a `Some`/`None` binder is the same arrow to them.
     /// Use this when comparing types for structural equality across a pass that
     /// does not preserve the cosmetic binder.
+    ///
+    /// Kind is normalized for the same reason: **lambda elimination preserves a
+    /// function's denotation but not its kind representation** — a data
+    /// collection (`⤇`) becomes a point-free form built from compute combinators
+    /// (`zip`, `apply`, `const`), so the reconstructed arrow reads `Compute`
+    /// though it denotes the same collection. The kind did its work at inference
+    /// (lossless Σ joins at coalesce); post-elimination it is not preserved, so
+    /// the structural-equality asserts (and the feed-operand agreement check)
+    /// compare modulo it. (Kind-aware subtyping, PR1.5 stage 4, therefore acts in
+    /// *Emit*-mode inference, not the post-elimination Check-mode pass.)
     ///
     /// Under the Barendregt convention the blindness needed at the remaining
     /// call sites (lambda elimination's type-preservation asserts) is exactly
@@ -729,13 +740,13 @@ impl Type {
     pub fn without_pi_names(&self) -> Type {
         match self {
             Type::Fun {
-                domain,
-                codomain,
-                kind,
-                ..
+                domain, codomain, ..
             } => Type::Fun {
                 name: None,
-                kind: kind.clone(),
+                // Canonicalize kind — elimination does not preserve it (see the
+                // doc above); comparing modulo it is what these structural asserts
+                // want.
+                kind: FunKind::Compute,
                 domain: Box::new(domain.without_pi_names()),
                 codomain: Box::new(codomain.without_pi_names()),
             },

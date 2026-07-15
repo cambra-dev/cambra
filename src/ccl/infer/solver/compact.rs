@@ -98,30 +98,80 @@ pub enum KindMerge {
 }
 
 impl KindMerge {
-    fn of(kind: &crate::ccl::ty::FunKind) -> Self {
+    /// Resolve a function's kind against its (already-compacted) domain. A
+    /// concrete kind passes through; a [`crate::ccl::ty::FunKind::Var`] resolves
+    /// from its bounds over the two-point lattice `Data ⊑ Compute` (a `Compute`
+    /// lower bound → `Compute`, a `Data` upper bound → `Data`, both → the
+    /// `Compute <: Data` conflict), and an **unconstrained** var resolves from
+    /// the domain: an *extent-shaped* domain (a collection index the runtime
+    /// iterates) → `Data`, else the `Compute` capability default. Passing the
+    /// domain is what lets a map/comprehension — a lambda whose kind var picks
+    /// up no bound — resolve `Data`, so two of them join losslessly (`sigma_join`)
+    /// rather than colliding as compute meets.
+    fn of(kind: &crate::ccl::ty::FunKind, dom: &CompactType) -> Self {
         use crate::ccl::ty::FunKind;
         match kind {
             FunKind::Compute => KindMerge::Compute,
             FunKind::Data => KindMerge::Data,
-            // A kind variable resolves from its accumulated bounds (over the
-            // two-point lattice `Data ⊑ Compute`): a `Compute` lower bound forces
-            // `Compute`, a `Data` upper bound forces `Data`, both is the
-            // `Compute <: Data` conflict. An unconstrained var falls back to
-            // `Compute` here — the safe capability default. (Stage 3 refines the
-            // unconstrained case to a domain-derived default at coalesce, where
-            // the resolved domain is available; today, with subtyping still
-            // kind-blind, no bound is ever set, so every var takes this default —
-            // reproducing the pre-PR1.5 "everything is Compute" behavior.)
             FunKind::Var(v) => {
                 let b = v.bounds.borrow();
                 match (b.forced_compute, b.forced_data) {
                     (true, true) => KindMerge::Conflict,
                     (false, true) => KindMerge::Data,
-                    (true, false) | (false, false) => KindMerge::Compute,
+                    (true, false) => KindMerge::Compute,
+                    (false, false) => {
+                        if is_extent_domain(dom) {
+                            KindMerge::Data
+                        } else {
+                            KindMerge::Compute
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// Whether a compacted domain is **extent-shaped** — a collection index (which
+/// the runtime iterates), as opposed to a scalar/capability parameter. Used to
+/// resolve an unconstrained kind var: an extent domain means the function is a
+/// data collection (`Data`), a capability domain a compute function (`Compute`).
+///
+/// Extent atoms are `UIntRange` (a list's `[0, n)`), `Source` (a data source's
+/// domain), and `Txn` (a store's commit order). A product/sum of extents (a
+/// multi-generator comprehension's record domain, a union's variant domain) is
+/// itself an extent iff every component is. A scalar (`Prim`), a function-typed
+/// domain (a higher-order capability), or a still-unresolved variable is *not*
+/// an extent — the conservative `Compute` side (a polymorphic-in-kind function
+/// whose domain resolves later is the residual the bounds-based path handles).
+fn is_extent_domain(ct: &CompactType) -> bool {
+    if ct.atoms.iter().any(|a| matches!(a, AtomKey::Prim(_))) {
+        return false;
+    }
+    if ct
+        .atoms
+        .iter()
+        .any(|a| matches!(a, AtomKey::UIntRange(_) | AtomKey::Source(_) | AtomKey::Txn))
+    {
+        return true;
+    }
+    // A higher-order (function-typed) domain is a capability.
+    if ct.fun.is_some() {
+        return false;
+    }
+    // A product / sum of extents is an extent.
+    if let Some(rec) = &ct.rec
+        && !rec.is_empty()
+    {
+        return rec.values().all(is_extent_domain);
+    }
+    if let Some(var) = &ct.var
+        && !var.is_empty()
+    {
+        return var.values().all(is_extent_domain);
+    }
+    // Bare variable / empty shape: unresolved → conservative Compute.
+    false
 }
 
 /// A merged function shape. `domains` holds one entry for an ordinary function
@@ -576,7 +626,7 @@ fn compact_go(
             CompactType {
                 fun: Some(CompactFun {
                     name: name.clone(),
-                    kind: KindMerge::of(kind),
+                    kind: KindMerge::of(kind, &dom),
                     domains: vec![dom],
                     codomain: Box::new(cod),
                 }),
