@@ -20,6 +20,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
+use crate::ccl::ty::{FunKind, KindVar};
 use crate::ccl::{Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
 
 use super::type_level;
@@ -75,6 +76,20 @@ pub enum ConstrainError {
         /// The feed type demanded.
         required: Type,
     },
+    /// A compute function (a capability, `⇒`) was supplied where a data
+    /// collection (an extent, `⤇`) is demanded. `Data <: Compute` is the safe
+    /// upcast — a collection is callable at any index in its extent — but the
+    /// reverse would iterate a *declared* extent the value does not actually
+    /// cover, silently dropping rows. Raised only when the cache is
+    /// kind-aware (constraint emission); the post-inference check is kind-blind
+    /// (see [`ConstrainCache`]), since elimination preserves denotation but not
+    /// kind representation.
+    ComputeWhereDataRequired {
+        /// The supplied compute function.
+        lhs: Type,
+        /// The demanded data collection.
+        rhs: Type,
+    },
 }
 
 /// Cache of in-progress subtyping checks. Breaks cycles introduced through
@@ -94,7 +109,58 @@ pub enum ConstrainError {
 /// (var⇄var) edges are renames over the episode's finite binder set, whose
 /// composites saturate; discharges ride acyclic content edges only (their
 /// composites grow along lexical nesting depth, not around cycles).
-pub type ConstrainCache = HashMap<(Type, Type), Vec<(Subst, Subst)>>;
+///
+/// Carries the `kind_aware` mode flag alongside the edge map. The
+/// `Compute <: Data` kind rejection (a capability supplied where an extent is
+/// demanded — see [`ConstrainError::ComputeWhereDataRequired`]) fires only
+/// during constraint **emission** (inference), where kinds are being inferred
+/// and a mismatch is a real extent-loss bug. The post-inference structural
+/// check is **kind-blind**: lambda elimination is denotation-preserving but not
+/// kind-preserving (`Type::without_pi_names` canonicalizes every reconstructed
+/// arrow to `Compute`), so a point-free map flowing into a `Data` argument is
+/// well-denoted and must not be re-rejected on kind. Kind is an inference-time
+/// property, so the flag rides the cache that is already threaded through the
+/// whole recursion.
+pub struct ConstrainCache {
+    edges: HashMap<(Type, Type), Vec<(Subst, Subst)>>,
+    kind_aware: bool,
+}
+
+impl ConstrainCache {
+    /// A kind-aware cache (constraint emission / inference): the
+    /// `Compute <: Data` rejection is live.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self {
+            edges: HashMap::new(),
+            kind_aware: true,
+        }
+    }
+
+    /// A kind-blind cache (the post-inference structural check): kind
+    /// mismatches are ignored (see the type doc).
+    pub fn new_kind_blind() -> Self {
+        Self {
+            edges: HashMap::new(),
+            kind_aware: false,
+        }
+    }
+}
+
+// Transparent access to the edge map: the `kind_aware` field is read by name
+// (field access wins over deref), everything else — `entry`, `get`, … — flows
+// to the inner `HashMap`.
+impl std::ops::Deref for ConstrainCache {
+    type Target = HashMap<(Type, Type), Vec<(Subst, Subst)>>;
+    fn deref(&self) -> &Self::Target {
+        &self.edges
+    }
+}
+impl std::ops::DerefMut for ConstrainCache {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.edges
+    }
+}
 
 /// Cache for [`extrude`], keyed by the polar pair (variable uid, polarity).
 ///
@@ -114,6 +180,71 @@ pub fn constrain_subtype(
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
     constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache)
+}
+
+/// Constrain the kind edge `k0 <: k1` over the two-point lattice
+/// `Data ⊑ Compute` (`Data` bottom / most specific, `Compute` top).
+///
+/// Concrete edges: `Data <: κ` and `κ <: Compute` always hold; `Compute <: Data`
+/// is the sole failure — returned as `true` (the caller raises
+/// [`ConstrainError::ComputeWhereDataRequired`], having the full function types
+/// for the diagnostic) **iff** `kind_aware` (emission mode).
+///
+/// Variable edges set `forced_*` flags, resolved at coalesce
+/// ([`super::compact::KindMerge`]): a compute value flowing *into* a var forces
+/// it `Compute`; a var *demanded* as data forces it `Data`; a var-to-var edge
+/// links the two ([`link_kind_vars`]). A var that ends up with both flags is
+/// the conflict — surfaced loudly at coalesce, never here.
+fn constrain_kind(k0: &FunKind, k1: &FunKind, kind_aware: bool) -> bool {
+    use FunKind::*;
+    match (k0, k1) {
+        // `Data` is bottom, `Compute` is top: these edges always hold.
+        (Data, _) | (_, Compute) => false,
+        // The one rejection — a capability supplied where an extent is demanded.
+        (Compute, Data) => kind_aware,
+        // A compute value flows into this var: it cannot be `Data`.
+        (Compute, Var(v1)) => {
+            v1.bounds.borrow_mut().forced_compute = true;
+            false
+        }
+        // This var is demanded as data: it cannot be `Compute`.
+        (Var(v0), Data) => {
+            v0.bounds.borrow_mut().forced_data = true;
+            false
+        }
+        (Var(v0), Var(v1)) => {
+            link_kind_vars(v0, v1);
+            false
+        }
+    }
+}
+
+/// Link two kind vars under `v0 <: v1` (`Data ⊑ Compute`): a `Compute` force on
+/// the lower propagates *up* (`v0 = Compute ⟹ v1 = Compute`); a `Data` force on
+/// the upper propagates *down* (`v1 = Data ⟹ v0 = Data`).
+///
+/// Propagation is eager over the flags present *now*. All constraints are
+/// emitted before resolution and flags are monotone (false → true), so the
+/// common shape — the forcing edge emitted before the link — is caught. A force
+/// arriving strictly after its link is the residual left to coalesce's
+/// domain-derived default; if a real program needs it, this grows into recorded
+/// links with a resolution-time fixpoint (kept out until the suite demands it).
+fn link_kind_vars(v0: &Rc<KindVar>, v1: &Rc<KindVar>) {
+    if Rc::ptr_eq(v0, v1) {
+        return;
+    }
+    let (lower_is_compute, upper_is_data) = {
+        (
+            v0.bounds.borrow().forced_compute,
+            v1.bounds.borrow().forced_data,
+        )
+    };
+    if lower_is_compute {
+        v1.bounds.borrow_mut().forced_compute = true;
+    }
+    if upper_is_data {
+        v0.bounds.borrow_mut().forced_data = true;
+    }
 }
 
 /// Bridge the holder gap when chaining two edges through one variable.
@@ -299,24 +430,38 @@ fn constrain_go(
                 codomain: c1,
             },
         ) => {
-            // Subtyping is **kind-blind**: the ordinary contravariant-domain /
-            // covariant-codomain rule regardless of `FunKind`. The data/compute
-            // distinction drives the *join* (`sigma_join` at the compact merge —
-            // the O1/O4 data-loss fix), not subtyping.
-            //
-            // A kind-aware `Compute <: Data` rejection is *not* enabled: it
-            // needs every collection-*producing* site to carry the right kind,
-            // and "the kind of a composition" is not positional — `iterate ≫ xs`
-            // produces a collection (Data) though `iterate` is a compute
-            // morphism. Sound kind-aware subtyping therefore needs a
-            // composition-kind propagation design, deferred past PR1. `k0`/`k1`
-            // are bound only to document that they are intentionally ignored.
-            let _ = (k0, k1);
+            // The kind edge over the lattice `Data ⊑ Compute` (see
+            // `constrain_kind`): `Data <: κ` and `κ <: Compute` always hold; a
+            // concrete `Compute <: Data` is the rejection (a capability where an
+            // extent is demanded → silent row loss), live only when the cache is
+            // kind-aware (emission, not the kind-blind post-inference check).
+            // Kind vars accumulate `forced_*` flags here and resolve at coalesce.
+            let kind_aware = cache.kind_aware;
+            if constrain_kind(k0, k1, kind_aware) {
+                return Err(ConstrainError::ComputeWhereDataRequired {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                });
+            }
             let cod_sl = match (n0, n1) {
                 (Some(k), Some(x)) => sl.extended_rename(k, x),
                 _ => sl.clone(),
             };
             constrain_go(d1, d0, sr, sl, cache)?;
+            // NB: Data-domain **invariance** (equating both arrows' domains when
+            // both are `Data`, to stop a wider collection standing where a
+            // narrower declared extent is expected — the silent-row-drop guard
+            // of design §5) is deliberately *not* enabled here. A naive
+            // strict-equality reverse edge breaks the sound, common pattern of a
+            // *filtered* collection (`{[0, n] | p} ⤇ V`) flowing where the
+            // unfiltered extent (`[0, n] ⤇ V`) is expected: the reverse edge
+            // demands `[0, n] <: {[0, n] | p}`, i.e. acquiring a refinement by
+            // subsumption, which the lattice strictly forbids. Invariance must
+            // therefore be *modulo refinements* (and range-aware — whether
+            // `UIntRange` is already invariant decides if the guard is even
+            // needed); that is a separate design question (§5 open question B),
+            // deferred. The contravariant edge above plus the strict refinement
+            // lattice already reject *acquiring* an extent by subsumption.
             constrain_go(c0, c1, &cod_sl, sr, cache)
         }
 
@@ -350,7 +495,7 @@ fn constrain_go(
         (
             Type::Fun {
                 name: pn,
-                kind: crate::ccl::ty::FunKind::Data,
+                kind: FunKind::Data,
                 domain,
                 codomain: c0,
             },
@@ -564,7 +709,7 @@ fn constrain_go(
             let chan = Type::Fun {
                 name: None,
                 // A feed's read view is a collection stream: a data function.
-                kind: crate::ccl::ty::FunKind::Data,
+                kind: FunKind::Data,
                 domain: domain.clone(),
                 codomain: value.clone(),
             };
@@ -587,7 +732,7 @@ fn constrain_go(
             let chan = Type::Fun {
                 name: None,
                 // A feed's read view is a collection stream: a data function.
-                kind: crate::ccl::ty::FunKind::Data,
+                kind: FunKind::Data,
                 domain: domain.clone(),
                 codomain: value.clone(),
             };
@@ -1979,5 +2124,84 @@ mod tests {
         };
         assert!(lam().eq_modulo_ty_slots(&lam()));
         drop(arena);
+    }
+
+    // ----- Kind edge (`FunKind`, the `Compute <: Data` rejection) -----------
+
+    fn data_fun(d: Type, c: Type) -> Type {
+        Type::data_fun(d, c)
+    }
+
+    #[test]
+    fn kind_data_upcasts_to_compute() {
+        // `Data <: Compute` is the safe upcast — a collection is callable at any
+        // index in its extent. `[0, 2] ⤇ Int <: [0, 2] ⇒ Int`.
+        let mut cache = ConstrainCache::new();
+        assert!(
+            constrain_subtype(
+                &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &mut cache,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn kind_compute_where_data_is_rejected() {
+        // `Compute ⋢ Data`: a capability supplied where an extent is demanded is
+        // the rejection (the silent-row-loss guard). `[0, 2] ⇒ Int ⊀ [0, 2] ⤇ Int`.
+        let mut cache = ConstrainCache::new();
+        assert!(matches!(
+            constrain_subtype(
+                &fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &mut cache,
+            ),
+            Err(ConstrainError::ComputeWhereDataRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn kind_rejection_is_off_in_the_kind_blind_check() {
+        // The post-inference check is kind-blind: the very `Compute <: Data`
+        // edge the emission cache rejects is accepted here (elimination
+        // preserves denotation, not kind representation).
+        let mut cache = ConstrainCache::new_kind_blind();
+        assert!(
+            constrain_subtype(
+                &fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &mut cache,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn kind_var_demanded_as_data_is_forced_data() {
+        // A kind var *demanded* as `Data` acquires `forced_data` (no eager
+        // rejection — the var may still legitimately resolve `Data`); it
+        // resolves at coalesce. A compute value flowing into it would set
+        // `forced_compute`, and both flags together is the conflict.
+        let v = KindVar::fresh();
+        let var_fun = Type::Fun {
+            name: None,
+            kind: FunKind::Var(Rc::clone(&v)),
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(prim(BaseType::Int)),
+        };
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(
+            &var_fun,
+            &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
+            &mut cache,
+        )
+        .expect("var <: Data records forced_data, never an eager rejection");
+        assert!(v.bounds.borrow().forced_data, "demanded as data");
+        assert!(
+            !v.bounds.borrow().forced_compute,
+            "no compute value flowed in"
+        );
     }
 }

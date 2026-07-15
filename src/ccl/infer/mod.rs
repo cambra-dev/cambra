@@ -174,6 +174,15 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             type_a: Box::new(coalesce_for_error(&found)),
             type_b: Box::new(coalesce_for_error(&required)),
         },
+        ConstrainError::ComputeWhereDataRequired { lhs, rhs } => InferError::TypeMismatch {
+            ctx: format!(
+                "{ctx_label} (a compute function ⇒ was supplied where a data \
+                 collection ⤇ is required — using a capability as an extent \
+                 would iterate a declared domain the value does not cover)"
+            ),
+            type_a: Box::new(coalesce_for_error(&lhs)),
+            type_b: Box::new(coalesce_for_error(&rhs)),
+        },
     }
 }
 

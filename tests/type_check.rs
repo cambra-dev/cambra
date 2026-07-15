@@ -958,7 +958,12 @@ mod letrec_typing {
     /// `ι = [0,3]`, `ν = Int`.
     #[test]
     fn guarded_single_binding_letrec_typechecks() {
-        let cnt_ty = Type::fun(Type::UIntRange(3), int());
+        // The recurrence carrier is a *data collection* (`⤇`): `cnt` is indexed
+        // by the iteration extent `[0, 2]` and read back through `get_prev_seq`,
+        // whose history argument demands `Data`. Declaring it `Compute`
+        // (`Type::fun`) is the miskind the `Compute <: Data` rejection now
+        // catches at the recurrence's introduction.
+        let cnt_ty = Type::data_fun(Type::UIntRange(3), int());
         let def = Expr::lambda(
             "r",
             Type::UIntRange(3),

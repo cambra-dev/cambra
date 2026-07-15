@@ -415,11 +415,12 @@ The pipeline passes downstream of inference treat function types structurally an
 
 ## 4.6 Data vs compute functions and Σ extent joins
 
-> **Status: implemented (the conditionals-stack type-system PR), with two
-> follow-ups noted inline.** The Σ representation, the `FunKind` marker, and
-> lossless Σ formation at control-flow joins are live. Kind-aware *subtyping*
-> (the `Compute<:Data` rejection) and the value-`Case` elimination bridges are
-> deferred — see the callouts below and
+> **Status: implemented.** The Σ representation, the `FunKind` marker, lossless
+> Σ formation at control-flow joins, *and* kind-aware subtyping (the
+> `Compute<:Data` rejection, PR 1.5) are all live. One guard is deferred with
+> rationale (Data-domain invariance — see the callout below), and the
+> value-`Case` elimination bridges land in the value-`Case` compilation PR. See
+> `brainstorm/2026-07-15-kind-inference.md` and
 > `brainstorm/2026-07-14-conditionals-via-sigma-types.md`.
 
 The unresolved extent-join corner of §4.5 (O1/O4 — two collections meeting at
@@ -431,25 +432,37 @@ function** `α ⇒ β` treats it as a *capability* — the inputs accepted; no d
 behind it; shrinking under-promises, so the lossy contravariant meet at a
 join is fine. A **data function** `α ⤇ β` treats it as an *extent* — the
 domain *is* the data map, so a lossy domain is lost data. `Type::Fun` carries
-a `kind: FunKind` (`Compute | Data`) set at introduction: list literals,
-comprehensions, `++`, registered sources, and every `History` erasure are
-data; `lambda`/`def` are compute. The audit rule: *an arrow is data iff
-`extent_of` will drive iteration off its domain*. New constructors
-`data_fun`/`data_pi`, plus `fun_like(exemplar, d, c)` for downstream rebuilds
-so a kind can never flip silently.
+a `kind: FunKind` (`Compute | Data | Var`). Concrete kinds are stamped at
+introduction: list literals, `++`, registered sources, filtered
+comprehensions/groupby (their cast target, `refined_fn_type`), aggregate
+consumers, and every `History` erasure are `Data`; scalar/combinator builtins
+are `Compute`. A **user lambda mints a kind `Var`** (PR 1.5 — its kind is
+genuinely use-dependent), resolved by the solver against its uses and, failing
+that, its domain (extent-shaped → `Data`). The audit rule for the *concrete*
+stamps: *an arrow is data iff `extent_of` will drive iteration off its domain*.
+Constructors `data_fun`/`data_pi`, plus `fun_like(exemplar, d, c)` for
+downstream rebuilds so a kind can never flip silently.
 
-> **Deferred — kind-aware subtyping (its own follow-up, "PR 1.5").**
-> Subtyping is currently **kind-blind**: the ordinary contravariant rule
-> regardless of kind. The marker's live job is the *join* (`sigma_join`, below)
-> — the O1/O4 data-loss fix — not subtyping. The intended additional guards —
-> `data <: compute` as a deliberate upcast, `compute <: data` rejected
-> (`ComputeWhereDataRequired`), and invariant data-domains — are **not enabled
-> yet**: they only fire soundly once every collection-*producing* site carries
-> the right kind, and "the kind of a composition" is not positional
-> (`iterate ≫ xs` produces a collection though `iterate` is a compute
-> morphism). Sound kind-aware subtyping needs a composition-kind propagation
-> design, tracked as a follow-up. Turning the rejection on before that
-> spuriously rejects valid programs (e.g. `sum([x for x in xs])`).
+> **Kind-aware subtyping (PR 1.5, landed).** Kind is a solver-resolved
+> variable (`FunKind::Var`, `brainstorm/2026-07-15-kind-inference.md`): a lambda
+> mints a fresh kind var, an unconstrained var resolves from its domain at
+> coalesce (extent-shaped → `Data`, else `Compute`), and uses force it either
+> way. The Fun-vs-Fun arm adds a kind edge over `Data ⊑ Compute`: `data <:
+> compute` upcasts, a concrete `compute <: data` is rejected
+> (`ComputeWhereDataRequired`), and a var picks up `forced_compute`/`forced_data`
+> flags (both ⇒ the coalesce conflict). The rejection is **emission-only**: the
+> post-inference check runs a *kind-blind* `ConstrainCache` (`new_kind_blind`),
+> because elimination canonicalizes a map's reconstructed kind to `Compute`
+> (`without_pi_names`) — denotation is preserved, kind representation is not, so
+> a kind-aware re-check would false-reject. `sum([x for x in xs])` and filtered
+> comprehensions/groupby type fine because the cast target and `refined_fn_type`
+> now carry `Data`. **One guard deferred:** Data-domain *invariance* (equating
+> both arrows' domains when both are `Data`) is **not** enabled — a naive
+> strict-equality reverse edge breaks the sound refinement-drop pattern
+> (`{[0, n] | p} ⤇ V` flowing where `[0, n] ⤇ V` is expected demands acquiring a
+> refinement by subsumption, which the lattice forbids); it needs a
+> modulo-refinements, range-aware formulation (kind-inference doc §5, open
+> question B).
 
 **Σ types.** A join of two data functions preserves both extents instead of
 meeting them: `α ⤇ τ₀ ⊔ β ⤇ τ₁` = `Σ 𝑛 ∈ {α, β}. 𝑛 ⤇ (τ₀ ⊔ τ₁)`,

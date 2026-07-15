@@ -426,15 +426,32 @@ pub(super) fn emit_cast<C: Typing>(
         Some(r) => Type::Refinement(Box::new(d), r),
         None => d,
     };
+    // A cast re-views the value *at* `target`, so the result carries `target`'s
+    // kind: a cast to a filtered-collection target (`refined_fn_type`, `Data`)
+    // yields a `Data` collection even though the underlying value is a `Compute`
+    // element projection (`λ u → u.score`, record ⇒ scalar). Preserving only the
+    // domain refinement while dropping `Data` would make every filtered
+    // comprehension / groupby a compute function again, and the aggregate that
+    // consumes it would reject it as compute-where-data.
+    let kind = match &*target {
+        Type::Fun { kind, .. } => kind.clone(),
+        _ => crate::ccl::ty::FunKind::Compute,
+    };
     // Preserve the value's Pi binder so the cast result stays a *named* function.
     // A dependent application of the cast then reconciles binders by the identity
     // correspondence (reusing the binder rather than minting a fresh `__arg`),
     // which is what keeps the O8 contravariant-domain discharge from leaving an
     // undischarged binder in the domain's refinement predicate (design §5.2, O8).
-    match peel_refinements_outer(&value_ty) {
-        Type::Fun { name: Some(k), .. } => Ok(Type::pi(k.clone(), domain, v)),
-        _ => Ok(fun(domain, v)),
-    }
+    let name = match peel_refinements_outer(&value_ty) {
+        Type::Fun { name: Some(k), .. } => Some(k.clone()),
+        _ => None,
+    };
+    Ok(Type::Fun {
+        name,
+        kind,
+        domain: Box::new(domain),
+        codomain: Box::new(v),
+    })
 }
 
 pub(super) fn emit_apply<C: Typing>(
@@ -1163,11 +1180,16 @@ pub(super) fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<
     };
     // The chain's kind is the **first** morphism's: a chain over a data source
     // (`xs ≫ f`, a comprehension) is a data collection; a chain of compute
-    // morphisms is compute. Unresolved in Emit (a bare `Infer` first morphism)
-    // → `Compute`, the safe default.
+    // morphisms is compute. When the first morphism is still a bare `Infer`
+    // (the common case in Emit — a comprehension composed over a source whose
+    // type has not yet resolved to a `Fun`), the chain's kind is genuinely
+    // use-dependent: mint a fresh kind var so a `Data`-demanding consumer (an
+    // aggregate) forces it `Data` via `constrain_kind`, and it otherwise
+    // resolves from its (now-concrete) domain at coalesce. Hardcoding `Compute`
+    // here would reject every composed comprehension flowing into an aggregate.
     let kind = match peel_refinements_outer(&tys[0]) {
         Type::Fun { kind, .. } => kind.clone(),
-        _ => crate::ccl::ty::FunKind::Compute,
+        _ => crate::ccl::ty::FunKind::fresh_var(),
     };
     Ok(Type::Fun {
         name: last_name,

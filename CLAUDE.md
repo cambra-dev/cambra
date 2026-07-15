@@ -80,7 +80,7 @@ Vocabulary, matching `src/ccl/symbolic.rs`:
 
 Types (from `Display for Type` in `src/ccl/mod.rs`):
 
-- **Function**: `(T ⇒ U)` for a compute function (capability domain); `(T ⤇ U)` (plain-text `|=>`) for a data function (extent domain — the domain is the data map, joins must be lossless). The `kind` marker and `⤇` rendering are in-flight (see `src/ccl/brainstorm/2026-07-14-conditionals-via-sigma-types.md`); until that PR lands, `Display` renders every `Fun` as `⇒`.
+- **Function**: `(T ⇒ U)` for a compute function (capability domain); `(T ⤇ U)` (plain-text `|=>`) for a data function (extent domain — the domain is the data map, joins must be lossless). Kind is inferred by the solver (`FunKind::Var`, resolved at coalesce — see `src/ccl/brainstorm/2026-07-15-kind-inference.md`) and `Display` renders it live: a data collection shows `⤇`, a capability (and an unresolved kind var) `⇒`. One benign quirk — an identity comprehension `[x for x in xs]` collapses to `iterate ≫ xs` and displays `⇒` though it denotes a collection.
 - **Sigma** (in-flight, same stack): `Σ{D0, D1} ⤇ V` — a data function whose extent is exactly one of the listed choices; with a live witness binder, `(Σ n ∈ {D0, D1}. n ⤇ V)`.
 - **Refinement**: `{T | predicate}` — predicate is rendered via `symbolic`.
 - **UIntRange**: `[0, N]`, or `∅` when empty.
@@ -104,7 +104,7 @@ Use the symbolic forms below in prose and inline pseudo-code (not in fenced code
 
 - **Function type with named binder** (`Type::Fun` with `name: Some(_)`): `(𝑥: 𝐴) ⇒ 𝐵`. `𝑥` is bound in `𝐵`.
 - **Function type with no named binder** (`Type::Fun` with `name: None`): `𝐴 ⇒ 𝐵`.
-- **Data function type** (in-flight `FunKind::Data`): `𝐴 ⤇ 𝐵`, named-binder form `(𝑥: 𝐴) ⤇ 𝐵` — same associativity as `⇒`; the bar reads "the domain is a fixed extent". **Σ type** (in-flight): `Σ 𝑛 ∈ {𝐷₀, 𝐷₁}. 𝑛 ⤇ 𝑉` — a dependent sum over candidate extents; anonymous-witness shorthand `Σ{𝐷₀, 𝐷₁} ⤇ 𝑉`.
+- **Data function type** (`FunKind::Data`, kind inferred and rendered live): `𝐴 ⤇ 𝐵`, named-binder form `(𝑥: 𝐴) ⤇ 𝐵` — same associativity as `⇒`; the bar reads "the domain is a fixed extent". **Σ type** (formation live; witness binder still dormant): `Σ 𝑛 ∈ {𝐷₀, 𝐷₁}. 𝑛 ⤇ 𝑉` — a dependent sum over candidate extents; anonymous-witness shorthand `Σ{𝐷₀, 𝐷₁} ⤇ 𝑉`.
 - **Refinement type**: `{𝑥: 𝑇 | 𝑝(𝑥)}` — standard subset-type notation.
 - **Lambda** (term): `λ 𝑥 → body`. The `→` after the binder separates the parameter from the body.
 - **Forward apply** (term level): `𝑎 ▷ 𝑓` means `𝑓(𝑎)`.

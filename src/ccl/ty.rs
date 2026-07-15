@@ -466,23 +466,23 @@ impl fmt::Display for Type {
             // it as `∅` instead of computing `n - 1` and underflowing.
             Type::UIntRange(0) => write!(f, "∅"),
             Type::UIntRange(n) => write!(f, "[0, {}]", n - 1),
-            // A plain `Fun` renders with `⇒` regardless of `kind` in PR1: the
-            // data/compute marker stays invisible in `Display` for now, so the
-            // large `⇒`→`⤇` churn across type-string assertions is deferred to a
-            // dedicated follow-up. A `Σ` still renders with `⤇` (it is new, so
-            // no existing assertion churns). See `FunKind::arrow`.
+            // The arrow reflects the resolved `kind`: `⇒` for a compute
+            // capability (and an unresolved kind var), `⤇` for a data extent
+            // (see `FunKind::arrow`). Once kind inference resolves every arrow
+            // (PR1.5), a data collection renders `⤇`, making the extent/capability
+            // distinction legible in every type string.
             Type::Fun {
                 name: Some(x),
+                kind,
                 domain,
                 codomain,
-                ..
-            } => write!(f, "(({x}: {domain}) ⇒ {codomain})"),
+            } => write!(f, "(({x}: {domain}) {} {codomain})", kind.arrow()),
             Type::Fun {
                 name: None,
+                kind,
                 domain,
                 codomain,
-                ..
-            } => write!(f, "({domain} ⇒ {codomain})"),
+            } => write!(f, "({domain} {} {codomain})", kind.arrow()),
             Type::Tuple(ts) => {
                 let parts: Vec<_> = ts.iter().map(|t| t.to_string()).collect();
                 write!(f, "({})", parts.join(", "))
