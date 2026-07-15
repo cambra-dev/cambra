@@ -573,6 +573,23 @@ impl Type {
         }
     }
 
+    /// Helper for creating a dependent (Pi) function type whose **kind is
+    /// inferred** — a fresh [`FunKind::Var`]. Used by `emit_lambda`: a user
+    /// lambda is a capability *or* a collection map depending on its domain and
+    /// use, neither known at emit, so the kind is left to the solver (PR1.5).
+    pub fn pi_inferred_kind(
+        name: impl Into<crate::ccl::Name>,
+        domain: Self,
+        codomain: Self,
+    ) -> Self {
+        Type::Fun {
+            name: Some(name.into()),
+            kind: FunKind::fresh_var(),
+            domain: Box::new(domain),
+            codomain: Box::new(codomain),
+        }
+    }
+
     /// Helper for creating a non-dependent **data** function type
     /// (`name: None`, `kind: Data`) — a collection `domain ⤇ codomain`.
     pub fn data_fun(domain: Self, codomain: Self) -> Self {

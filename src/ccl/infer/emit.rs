@@ -368,7 +368,13 @@ pub(super) fn emit_lambda<C: Typing>(
     // ordinary functions — coalesce strips it when the codomain does not
     // reference it (see `coalesce_compact_go`) — so monomorphic output is
     // unchanged.
-    Ok(Type::pi(&param.name, param_simple, body_ty))
+    //
+    // The lambda's **kind is inferred** (PR1.5): a user `λ` is a capability
+    // (a scalar function) or a collection map depending on its domain and use,
+    // neither settled at emit, so a fresh kind var is minted and the solver
+    // resolves it. (Kind-blind subtyping currently sets no kind bound, so every
+    // such var resolves to the `Compute` default — output unchanged.)
+    Ok(Type::pi_inferred_kind(&param.name, param_simple, body_ty))
 }
 
 /// Type a [`TypedExprNode::Cast`]: `cast(value, target)` re-views `value` at

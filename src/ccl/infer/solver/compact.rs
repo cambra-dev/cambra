@@ -99,16 +99,26 @@ pub enum KindMerge {
 
 impl KindMerge {
     fn of(kind: &crate::ccl::ty::FunKind) -> Self {
+        use crate::ccl::ty::FunKind;
         match kind {
-            crate::ccl::ty::FunKind::Compute => KindMerge::Compute,
-            crate::ccl::ty::FunKind::Data => KindMerge::Data,
-            // Stage 1 (representation only): no site mints kind vars yet, so a
-            // `Var` never reaches compaction. Resolution (carrying the var
-            // through `KindMerge` and resolving it at coalesce) lands with the
-            // emit stage — this loud arm ensures minting without resolution
-            // trips immediately rather than silently mis-merging.
-            crate::ccl::ty::FunKind::Var(_) => {
-                unreachable!("kind var reached KindMerge::of before resolution machinery exists")
+            FunKind::Compute => KindMerge::Compute,
+            FunKind::Data => KindMerge::Data,
+            // A kind variable resolves from its accumulated bounds (over the
+            // two-point lattice `Data ⊑ Compute`): a `Compute` lower bound forces
+            // `Compute`, a `Data` upper bound forces `Data`, both is the
+            // `Compute <: Data` conflict. An unconstrained var falls back to
+            // `Compute` here — the safe capability default. (Stage 3 refines the
+            // unconstrained case to a domain-derived default at coalesce, where
+            // the resolved domain is available; today, with subtyping still
+            // kind-blind, no bound is ever set, so every var takes this default —
+            // reproducing the pre-PR1.5 "everything is Compute" behavior.)
+            FunKind::Var(v) => {
+                let b = v.bounds.borrow();
+                match (b.forced_compute, b.forced_data) {
+                    (true, true) => KindMerge::Conflict,
+                    (false, true) => KindMerge::Data,
+                    (true, false) | (false, false) => KindMerge::Compute,
+                }
             }
         }
     }
