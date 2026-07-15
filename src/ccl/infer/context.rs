@@ -118,7 +118,7 @@ impl InferCtx {
                 codomain: c,
             } => Type::Fun {
                 name: name.clone(),
-                kind: *kind,
+                kind: kind.clone(),
                 domain: Box::new(self.normalize_annotation(d)),
                 codomain: Box::new(self.normalize_annotation(c)),
             },

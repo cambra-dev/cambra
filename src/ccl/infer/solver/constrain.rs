@@ -788,7 +788,7 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             codomain: c,
         } => Type::Fun {
             name: name.clone(),
-            kind: *kind,
+            kind: kind.clone(),
             domain: Box::new(extrude(d, !pol, target_level, cache)),
             codomain: Box::new(extrude(c, pol, target_level, cache)),
         },

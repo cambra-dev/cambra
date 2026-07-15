@@ -228,9 +228,15 @@ pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
     UnboundVariable(String),
     /// A type mismatch was detected between two solved types.
+    ///
+    /// The two `Type`s are boxed to keep `InferError` under the
+    /// `result_large_err` budget: this is the widest variant (two `Type`s plus
+    /// a `ctx` string), and `Type` grew when [`crate::ccl::ty::FunKind`] gained
+    /// an inference variable (PR1.5). Boxing here keeps every
+    /// `Result<_, InferError>` cheap on the common `Ok` path.
     TypeMismatch {
-        type_a: Type,
-        type_b: Type,
+        type_a: Box<Type>,
+        type_b: Box<Type>,
         ctx: String,
     },
     /// A [`Type::Fun`] was required — e.g. in a function-application or
@@ -1657,11 +1663,11 @@ mod tests {
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                InferError::TypeMismatch {
-                    type_a: Type::Base(BaseType::Int),
-                    type_b: Type::Base(BaseType::String),
-                    ..
-                }
+                InferError::TypeMismatch { type_a, type_b, .. }
+                    if matches!(
+                        (type_a.as_ref(), type_b.as_ref()),
+                        (Type::Base(BaseType::Int), Type::Base(BaseType::String))
+                    )
             )),
             "expected TypeMismatch Int/String, got {errs:?}"
         );
@@ -2244,11 +2250,11 @@ mod tests {
         assert!(
             errs.iter().any(|e| matches!(
                 e,
-                InferError::TypeMismatch {
-                    type_a: Type::Base(BaseType::Bool),
-                    type_b: Type::Base(BaseType::Int),
-                    ..
-                }
+                InferError::TypeMismatch { type_a, type_b, .. }
+                    if matches!(
+                        (type_a.as_ref(), type_b.as_ref()),
+                        (Type::Base(BaseType::Bool), Type::Base(BaseType::Int))
+                    )
             )),
             "expected TypeMismatch Bool/Int, got {errs:?}"
         );

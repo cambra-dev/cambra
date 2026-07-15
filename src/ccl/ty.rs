@@ -1,8 +1,10 @@
 //! The CCL [`Type`] lattice, its [`Refinement`] subset-type carrier, and the
 //! type-blind structural equality / hashing on refinement predicate terms.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use smol_str::SmolStr;
 
@@ -82,22 +84,108 @@ impl fmt::Display for FieldKey {
 /// `Compute`). The audit rule for a rebuilt or erased arrow: it is `Data` iff
 /// `extent_of` will drive iteration off its domain. See
 /// `design/type-inference.md` §4.6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Kind is **inferred** (PR1.5, see `brainstorm/2026-07-15-kind-inference.md`):
+/// where the structure fixes it (a list literal is `Data`, a scalar op is
+/// `Compute`) a concrete kind is stamped; where it depends on use or on an
+/// unresolved source (a map/comprehension) a [`FunKind::Var`] is minted and the
+/// solver resolves it, like a type variable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FunKind {
     /// Capability domain (`⇒`): lossy meet at a join is fine.
     Compute,
     /// Extent domain (`⤇`): the domain is data; joins must be lossless.
     Data,
+    /// An unresolved kind, pinned down by the solver at coalesce. Identity is by
+    /// the variable's `uid`, so `FunKind` (and `Type`) keep deriving
+    /// `PartialEq`/`Eq`/`Hash` — the [`KindVar`] impls compare by `uid` only.
+    Var(Rc<KindVar>),
 }
 
 impl FunKind {
-    /// The display arrow for this kind: `⇒` for compute, `⤇` for data.
-    pub fn arrow(self) -> &'static str {
+    /// The display arrow for this kind: `⇒` for compute, `⤇` for data. An
+    /// unresolved variable renders `⇒` (its resolved kind is written back before
+    /// display matters downstream).
+    pub fn arrow(&self) -> &'static str {
         match self {
-            FunKind::Compute => "⇒",
+            FunKind::Compute | FunKind::Var(_) => "⇒",
             FunKind::Data => "⤇",
         }
     }
+
+    /// A fresh inferred kind (a new [`KindVar`] with empty bounds).
+    pub fn fresh_var() -> FunKind {
+        FunKind::Var(KindVar::fresh())
+    }
+}
+
+/// Stable identity of a [`KindVar`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KindVarId(pub(crate) u32);
+
+static KIND_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Bounds on a [`KindVar`], over the two-point kind lattice `Data ⊑ Compute`.
+///
+/// The lattice has only two points, so "bounds" collapse to two flags rather
+/// than the polar bound *lists* an [`crate::ccl::InferVar`] carries — and no
+/// [`Type`] sits inside, so a `KindVar` never forms a cycle. Resolution is a
+/// flag read: `forced_compute ∧ forced_data` is the conflict (`Compute ⊑ κ ⊑
+/// Data`, impossible — the `Compute <: Data` rejection); `forced_compute` alone
+/// → `Compute`; `forced_data` alone → `Data`; neither → the caller's
+/// domain-derived default.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KindBounds {
+    /// A `Compute` value flows *into* this kind (`κ ⊒ Compute ⟹ κ = Compute`).
+    pub forced_compute: bool,
+    /// This kind is *demanded* as `Data` (`κ ⊑ Data ⟹ κ = Data`).
+    pub forced_data: bool,
+}
+
+/// A kind-inference variable — an unknown [`FunKind`] the solver pins down by
+/// accumulating [`KindBounds`]. Identity (`uid`) is immutable and lives outside
+/// the `RefCell`, so equality/hashing is borrow-free and never inspects the
+/// bounds (mirroring [`crate::ccl::InferVar`]).
+pub struct KindVar {
+    /// Stable, globally-unique identity.
+    pub uid: KindVarId,
+    /// Mutable kind bounds.
+    pub bounds: RefCell<KindBounds>,
+}
+
+impl KindVar {
+    /// Allocate a fresh kind variable with empty bounds.
+    pub fn fresh() -> Rc<KindVar> {
+        Rc::new(KindVar {
+            uid: KindVarId(KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            bounds: RefCell::new(KindBounds::default()),
+        })
+    }
+}
+
+// Identity-based (by `uid`), mirroring `InferVar`: borrow-free, never touches
+// `bounds`, so it is safe even while a variable's bounds are borrowed.
+impl PartialEq for KindVar {
+    fn eq(&self, other: &Self) -> bool {
+        self.uid == other.uid
+    }
+}
+impl Eq for KindVar {}
+impl std::hash::Hash for KindVar {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.uid.hash(state);
+    }
+}
+impl fmt::Debug for KindVar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "κ{}", self.uid.0)
+    }
+}
+
+/// Reset the kind-variable counter to zero (test-only, for predictable output).
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reset_kind_var_counter() {
+    KIND_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
 
 /// A CCL type annotation.
@@ -516,7 +604,7 @@ impl Type {
         match exemplar {
             Type::Fun { name, kind, .. } => Type::Fun {
                 name: name.clone(),
-                kind: *kind,
+                kind: kind.clone(),
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
             },
@@ -630,7 +718,7 @@ impl Type {
                 ..
             } => Type::Fun {
                 name: None,
-                kind: *kind,
+                kind: kind.clone(),
                 domain: Box::new(domain.without_pi_names()),
                 codomain: Box::new(codomain.without_pi_names()),
             },

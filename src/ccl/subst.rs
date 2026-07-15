@@ -895,7 +895,7 @@ impl Subst {
                 codomain,
             } => Type::Fun {
                 name: None,
-                kind: *kind,
+                kind: kind.clone(),
                 domain: Box::new(self.apply_type(domain)),
                 codomain: Box::new(self.apply_type(codomain)),
             },
@@ -910,7 +910,7 @@ impl Subst {
                 let (b2, inner) = self.under_binder_ty(b, codomain);
                 Type::Fun {
                     name: Some(b2),
-                    kind: *kind,
+                    kind: kind.clone(),
                     domain,
                     codomain: Box::new(inner),
                 }

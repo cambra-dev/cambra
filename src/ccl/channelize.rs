@@ -836,7 +836,7 @@ fn refine_source_domain(source: &mut Expr, refinement: Refinement, ctx: &Desugar
     {
         source.ty = Type::Fun {
             name: name.clone(),
-            kind: *kind,
+            kind: kind.clone(),
             domain: Box::new(Type::Refinement(domain.clone(), refinement)),
             codomain: codomain.clone(),
         };

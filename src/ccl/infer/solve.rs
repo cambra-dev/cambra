@@ -715,7 +715,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                     name: last_name.clone(),
                     // Kind is the first morphism's (mirrors `emit_compose`): a
                     // chain over a data source is a data collection.
-                    kind: *first_kind,
+                    kind: first_kind.clone(),
                     domain: Box::new((**first_dom).clone()),
                     codomain: Box::new((**last_cod).clone()),
                 };

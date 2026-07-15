@@ -154,25 +154,25 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             } else {
                 InferError::TypeMismatch {
                     ctx: ctx_label.to_string(),
-                    type_a: lhs_ty,
-                    type_b: rhs_ty,
+                    type_a: Box::new(lhs_ty),
+                    type_b: Box::new(rhs_ty),
                 }
             }
         }
         ConstrainError::MissingField { key, in_type } => InferError::TypeMismatch {
             ctx: format!("{ctx_label} (missing field {key:?})"),
-            type_a: coalesce_for_error(&in_type),
-            type_b: Type::Hole,
+            type_a: Box::new(coalesce_for_error(&in_type)),
+            type_b: Box::new(Type::Hole),
         },
         ConstrainError::ExtraTag { tag, in_type } => InferError::TypeMismatch {
             ctx: format!("{ctx_label} (variant tag .{tag} not accepted)"),
-            type_a: coalesce_for_error(&in_type),
-            type_b: Type::Hole,
+            type_a: Box::new(coalesce_for_error(&in_type)),
+            type_b: Box::new(Type::Hole),
         },
         ConstrainError::NotAFeed { found, required } => InferError::TypeMismatch {
             ctx: format!("{ctx_label} (a feed handle is required here, but the value is not one)"),
-            type_a: coalesce_for_error(&found),
-            type_b: coalesce_for_error(&required),
+            type_a: Box::new(coalesce_for_error(&found)),
+            type_b: Box::new(coalesce_for_error(&required)),
         },
     }
 }

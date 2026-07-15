@@ -98,10 +98,18 @@ pub enum KindMerge {
 }
 
 impl KindMerge {
-    fn of(kind: crate::ccl::ty::FunKind) -> Self {
+    fn of(kind: &crate::ccl::ty::FunKind) -> Self {
         match kind {
             crate::ccl::ty::FunKind::Compute => KindMerge::Compute,
             crate::ccl::ty::FunKind::Data => KindMerge::Data,
+            // Stage 1 (representation only): no site mints kind vars yet, so a
+            // `Var` never reaches compaction. Resolution (carrying the var
+            // through `KindMerge` and resolving it at coalesce) lands with the
+            // emit stage — this loud arm ensures minting without resolution
+            // trips immediately rather than silently mis-merging.
+            crate::ccl::ty::FunKind::Var(_) => {
+                unreachable!("kind var reached KindMerge::of before resolution machinery exists")
+            }
         }
     }
 }
@@ -558,7 +566,7 @@ fn compact_go(
             CompactType {
                 fun: Some(CompactFun {
                     name: name.clone(),
-                    kind: KindMerge::of(*kind),
+                    kind: KindMerge::of(kind),
                     domains: vec![dom],
                     codomain: Box::new(cod),
                 }),

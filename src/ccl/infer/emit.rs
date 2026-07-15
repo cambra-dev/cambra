@@ -1160,7 +1160,7 @@ pub(super) fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<
     // morphisms is compute. Unresolved in Emit (a bare `Infer` first morphism)
     // → `Compute`, the safe default.
     let kind = match peel_refinements_outer(&tys[0]) {
-        Type::Fun { kind, .. } => *kind,
+        Type::Fun { kind, .. } => kind.clone(),
         _ => crate::ccl::ty::FunKind::Compute,
     };
     Ok(Type::Fun {
