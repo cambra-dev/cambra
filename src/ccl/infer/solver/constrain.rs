@@ -145,20 +145,13 @@ impl ConstrainCache {
             kind_aware: false,
         }
     }
-}
 
-// Transparent access to the edge map: the `kind_aware` field is read by name
-// (field access wins over deref), everything else — `entry`, `get`, … — flows
-// to the inner `HashMap`.
-impl std::ops::Deref for ConstrainCache {
-    type Target = HashMap<(Type, Type), Vec<(Subst, Subst)>>;
-    fn deref(&self) -> &Self::Target {
-        &self.edges
-    }
-}
-impl std::ops::DerefMut for ConstrainCache {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.edges
+    /// The composite-substitution bridges recorded for a subtyping edge,
+    /// inserting an empty list on first visit. This is the cycle breaker: a
+    /// re-entry on the same `(lhs, rhs)` pair finds its in-progress entry rather
+    /// than recursing forever.
+    fn edge_bridges(&mut self, lhs: Type, rhs: Type) -> &mut Vec<(Subst, Subst)> {
+        self.edges.entry((lhs, rhs)).or_default()
     }
 }
 
@@ -193,8 +186,10 @@ pub fn constrain_subtype(
 /// Variable edges set `forced_*` flags, resolved at coalesce
 /// ([`super::compact::KindMerge`]): a compute value flowing *into* a var forces
 /// it `Compute`; a var *demanded* as data forces it `Data`; a var-to-var edge
-/// links the two ([`link_kind_vars`]). A var that ends up with both flags is
-/// the conflict — surfaced loudly at coalesce, never here.
+/// records a `<:` link ([`KindVar::link`]). Forces propagate transitively along
+/// links as they arrive, so ordering does not matter (a force after its link
+/// still reaches the far end). A var that ends up with both flags is the
+/// conflict — surfaced loudly at coalesce, never here.
 fn constrain_kind(k0: &FunKind, k1: &FunKind, kind_aware: bool) -> bool {
     use FunKind::*;
     match (k0, k1) {
@@ -202,48 +197,23 @@ fn constrain_kind(k0: &FunKind, k1: &FunKind, kind_aware: bool) -> bool {
         (Data, _) | (_, Compute) => false,
         // The one rejection — a capability supplied where an extent is demanded.
         (Compute, Data) => kind_aware,
-        // A compute value flows into this var: it cannot be `Data`.
+        // A compute value flows into this var: it cannot be `Data`. The force
+        // propagates up any `<:` links already drawn to this var.
         (Compute, Var(v1)) => {
-            v1.bounds.borrow_mut().forced_compute = true;
+            v1.force_compute();
             false
         }
-        // This var is demanded as data: it cannot be `Compute`.
+        // This var is demanded as data: it cannot be `Compute`. Propagates down.
         (Var(v0), Data) => {
-            v0.bounds.borrow_mut().forced_data = true;
+            v0.force_data();
             false
         }
+        // A var-to-var edge `v0 <: v1`: record the link so a force arriving on
+        // either end *after* this edge still reaches the other. See [`KindVar`].
         (Var(v0), Var(v1)) => {
-            link_kind_vars(v0, v1);
+            KindVar::link(v0, v1);
             false
         }
-    }
-}
-
-/// Link two kind vars under `v0 <: v1` (`Data ⊑ Compute`): a `Compute` force on
-/// the lower propagates *up* (`v0 = Compute ⟹ v1 = Compute`); a `Data` force on
-/// the upper propagates *down* (`v1 = Data ⟹ v0 = Data`).
-///
-/// Propagation is eager over the flags present *now*. All constraints are
-/// emitted before resolution and flags are monotone (false → true), so the
-/// common shape — the forcing edge emitted before the link — is caught. A force
-/// arriving strictly after its link is the residual left to coalesce's
-/// domain-derived default; if a real program needs it, this grows into recorded
-/// links with a resolution-time fixpoint (kept out until the suite demands it).
-fn link_kind_vars(v0: &Rc<KindVar>, v1: &Rc<KindVar>) {
-    if Rc::ptr_eq(v0, v1) {
-        return;
-    }
-    let (lower_is_compute, upper_is_data) = {
-        (
-            v0.bounds.borrow().forced_compute,
-            v1.bounds.borrow().forced_data,
-        )
-    };
-    if lower_is_compute {
-        v1.bounds.borrow_mut().forced_compute = true;
-    }
-    if upper_is_data {
-        v0.bounds.borrow_mut().forced_data = true;
     }
 }
 
@@ -380,7 +350,7 @@ fn constrain_go(
     // different constraint (see `ConstrainCache`).
     let either_var = matches!(lhs, Type::Infer(_)) || matches!(rhs, Type::Infer(_));
     if either_var {
-        let seen = cache.entry((lhs.clone(), rhs.clone())).or_default();
+        let seen = cache.edge_bridges(lhs.clone(), rhs.clone());
         // Morphisms compare modulo emit-time type slots — the SAME notion of
         // constraint identity the closure bridge uses (`eq_modulo_ty_slots`).
         // Strict `==` here would admit a near-duplicate edge (two captures of
@@ -1248,13 +1218,10 @@ mod tests {
         let mut cache = ConstrainCache::new();
         let sid = (Subst::id(), Subst::id());
         cache
-            .entry((a.clone(), prim(BaseType::Int)))
-            .or_default()
+            .edge_bridges(a.clone(), prim(BaseType::Int))
             .push(sid.clone());
         assert!(
-            cache
-                .get(&(b, prim(BaseType::Int)))
-                .is_some_and(|seen| seen.contains(&sid)),
+            cache.edge_bridges(b, prim(BaseType::Int)).contains(&sid),
             "structurally-equal refined key must hit the same cache entry"
         );
 
@@ -2202,6 +2169,39 @@ mod tests {
         assert!(
             !v.bounds.borrow().forced_compute,
             "no compute value flowed in"
+        );
+    }
+
+    #[test]
+    fn kind_var_link_then_late_force_propagates() {
+        // Regression: a force that arrives *after* a var-var link must still
+        // reach the far end. Draw `v0 <: v1` first, then force `v0` compute via
+        // a later edge (`Compute <: v0`). Transitive propagation must carry
+        // `forced_compute` up to `v1`; the old one-shot copy dropped it, letting
+        // `v1` fall to its (possibly `Data`) domain default — a silent miskind.
+        let v0 = KindVar::fresh();
+        let v1 = KindVar::fresh();
+        let fun_of = |v: &Rc<KindVar>| Type::Fun {
+            name: None,
+            kind: FunKind::Var(Rc::clone(v)),
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(prim(BaseType::Int)),
+        };
+        let mut cache = ConstrainCache::new();
+        // Link first: `v0 <: v1`.
+        constrain_subtype(&fun_of(&v0), &fun_of(&v1), &mut cache).expect("var-var link");
+        assert!(!v1.bounds.borrow().forced_compute, "not forced yet");
+        // Force later: a compute function flows into `v0` (`Compute <: v0`).
+        constrain_subtype(
+            &fun(Type::UIntRange(3), prim(BaseType::Int)),
+            &fun_of(&v0),
+            &mut cache,
+        )
+        .expect("compute <: var records forced_compute");
+        assert!(v0.bounds.borrow().forced_compute, "v0 forced compute");
+        assert!(
+            v1.bounds.borrow().forced_compute,
+            "compute force propagates up the link to v1 after the fact"
         );
     }
 }

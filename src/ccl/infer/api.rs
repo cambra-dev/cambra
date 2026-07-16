@@ -686,8 +686,19 @@ fn collect_type_errors(
             }
         }
         Type::Fun {
-            domain, codomain, ..
+            domain,
+            codomain,
+            kind,
+            ..
         } => {
+            // Coalesce resolves every kind var to a concrete `Data`/`Compute`
+            // (`KindMerge::of`); a surviving `FunKind::Var` is a missed resolution
+            // that would silently display `⇒` and behave as `Compute`. Catch it
+            // loudly rather than letting the wrong default ride downstream.
+            debug_assert!(
+                !matches!(kind, crate::ccl::ty::FunKind::Var(_)),
+                "unresolved FunKind::Var survived coalesce at `{context_sym}`"
+            );
             collect_type_errors(domain, context_sym, strictness, errors, seen_refinements);
             collect_type_errors(codomain, context_sym, strictness, errors, seen_refinements);
         }

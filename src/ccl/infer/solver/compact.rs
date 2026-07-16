@@ -117,7 +117,20 @@ impl KindMerge {
                 let b = v.bounds.borrow();
                 match (b.forced_compute, b.forced_data) {
                     (true, true) => KindMerge::Conflict,
-                    (false, true) => KindMerge::Data,
+                    (false, true) => {
+                        // `forced_data` means this function is demanded where its
+                        // extent is iterated; the contravariant domain edge should
+                        // then have made the domain extent-shaped (or left it an
+                        // unresolved var that will). A *provably* scalar domain
+                        // here is a `Compute <: Data` violation the domain edge is
+                        // meant to catch — assert the coupling the resolution relies
+                        // on rather than silently labelling a scalar as a collection.
+                        debug_assert!(
+                            !is_scalar_domain(dom),
+                            "kind var forced Data over a provably-scalar domain"
+                        );
+                        KindMerge::Data
+                    }
                     (true, false) => KindMerge::Compute,
                     (false, false) => {
                         if is_extent_domain(dom) {
@@ -172,6 +185,14 @@ fn is_extent_domain(ct: &CompactType) -> bool {
     }
     // Bare variable / empty shape: unresolved → conservative Compute.
     false
+}
+
+/// Whether a compacted domain is *provably* scalar/capability-shaped: it carries
+/// a primitive atom or is function-typed. This is stronger than `!is_extent_domain`,
+/// which also holds for a still-unresolved domain (a bare var that may yet resolve
+/// to an extent) — used only to assert the `forced_data`/domain-edge coupling.
+fn is_scalar_domain(ct: &CompactType) -> bool {
+    ct.atoms.iter().any(|a| matches!(a, AtomKey::Prim(_))) || ct.fun.is_some()
 }
 
 /// A merged function shape. `domains` holds one entry for an ordinary function

@@ -433,7 +433,10 @@ pub(super) fn emit_cast<C: Typing>(
     // domain refinement while dropping `Data` would make every filtered
     // comprehension / groupby a compute function again, and the aggregate that
     // consumes it would reject it as compute-where-data.
-    let kind = match &*target {
+    // Peel refinements: a target that is a *refined function* (`{Fun | p}`)
+    // still carries its arrow's kind, which a match on the raw target would drop
+    // to the `Compute` default.
+    let kind = match peel_refinements_outer(target) {
         Type::Fun { kind, .. } => kind.clone(),
         _ => crate::ccl::ty::FunKind::Compute,
     };

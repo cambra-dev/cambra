@@ -151,15 +151,69 @@ pub struct KindVar {
     pub uid: KindVarId,
     /// Mutable kind bounds.
     pub bounds: RefCell<KindBounds>,
+    /// Vars `u` such that `self <: u` (this kind is below them). A `Compute`
+    /// force propagates *up* to them (`self = Compute ⟹ u = Compute`).
+    uppers: RefCell<Vec<Rc<KindVar>>>,
+    /// Vars `l` such that `l <: self` (this kind is above them). A `Data` force
+    /// propagates *down* to them (`self = Data ⟹ l = Data`).
+    lowers: RefCell<Vec<Rc<KindVar>>>,
 }
 
 impl KindVar {
-    /// Allocate a fresh kind variable with empty bounds.
+    /// Allocate a fresh kind variable with empty bounds and no links.
     pub fn fresh() -> Rc<KindVar> {
         Rc::new(KindVar {
             uid: KindVarId(KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
             bounds: RefCell::new(KindBounds::default()),
+            uppers: RefCell::new(Vec::new()),
+            lowers: RefCell::new(Vec::new()),
         })
+    }
+
+    /// Force this kind to `Compute` and propagate transitively up the `<:` links.
+    ///
+    /// Propagation keeps the flags at a fixpoint *incrementally*, so — unlike a
+    /// one-shot copy of the flags present when a link is first drawn — a force
+    /// that arrives strictly after its link still reaches every var it must. The
+    /// monotone flag (false → true) both terminates the walk and makes it
+    /// cycle-safe: a var already `Compute` short-circuits before recursing.
+    pub fn force_compute(self: &Rc<Self>) {
+        if self.bounds.borrow().forced_compute {
+            return;
+        }
+        self.bounds.borrow_mut().forced_compute = true;
+        for u in self.uppers.borrow().iter() {
+            u.force_compute();
+        }
+    }
+
+    /// Force this kind to `Data` and propagate transitively down the `<:` links.
+    /// The dual of [`KindVar::force_compute`]; same fixpoint/termination argument.
+    pub fn force_data(self: &Rc<Self>) {
+        if self.bounds.borrow().forced_data {
+            return;
+        }
+        self.bounds.borrow_mut().forced_data = true;
+        for l in self.lowers.borrow().iter() {
+            l.force_data();
+        }
+    }
+
+    /// Record the edge `lower <: upper` and reconcile the flags already present
+    /// on either end. Later forces on either var propagate through the stored
+    /// link via [`KindVar::force_compute`]/[`KindVar::force_data`].
+    pub fn link(lower: &Rc<KindVar>, upper: &Rc<KindVar>) {
+        if Rc::ptr_eq(lower, upper) {
+            return;
+        }
+        lower.uppers.borrow_mut().push(Rc::clone(upper));
+        upper.lowers.borrow_mut().push(Rc::clone(lower));
+        if lower.bounds.borrow().forced_compute {
+            upper.force_compute();
+        }
+        if upper.bounds.borrow().forced_data {
+            lower.force_data();
+        }
     }
 }
 
