@@ -2,6 +2,10 @@
 name = "cambra"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+description = "A programming language with a dependently-typed functional core and streaming-dataflow execution"
+repository = "https://github.com/cambra-dev/Cambra"
+readme = "README.md"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
