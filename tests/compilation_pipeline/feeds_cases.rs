@@ -392,3 +392,45 @@ x"#;
         );
     }
 }
+
+/// Assert `code` fails to compile with a rendered error containing `needle`.
+fn expect_feed_error(code: &str, needle: &str) {
+    let mut ctx = GlobalContext::default();
+    let errs = match compile_program(&mut ctx, code, Box::new(|| {})) {
+        Ok(_) => panic!("expected a compile error containing {needle:?}; program compiled"),
+        Err(e) => e,
+    };
+    let rendered = render_errors(&errs, "<feed-reject-test>", code);
+    assert!(
+        rendered.contains(needle),
+        "expected error to contain {needle:?}; got:\n{rendered}"
+    );
+}
+
+/// Two `<<=` defines for one defer channel: a channel's stream is set once, so a
+/// second define is rejected (`DeferError::MultipleDefinitions`).
+#[test]
+fn multiple_defines_rejected() {
+    expect_feed_error(
+        "x = defer()\nx <<= [1]\nx <<= [2]\nx",
+        "multiple definitions",
+    );
+}
+
+/// Mixing a `<<` feed and a `<<=` define on one defer is rejected — a channel is
+/// either fed incrementally or set wholesale, not both
+/// (`DeferError::FeedsAndDefinesMixed`).
+#[test]
+fn feeds_and_define_mixed_rejected() {
+    expect_feed_error(
+        "x = defer()\nx << 1\nx <<= [2]\nx",
+        "both feeds and a define",
+    );
+}
+
+/// A bare `defer()` that is never bound to a name (so nothing feeds or defines
+/// it) leaves an unbound handle — rejected (`DeferError::UnboundDeferHandle`).
+#[test]
+fn unbound_defer_handle_rejected() {
+    expect_feed_error("defer()", "unbound defer handle");
+}
