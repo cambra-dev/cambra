@@ -183,6 +183,18 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                     // ≥ 2 extents: a Σ. The witness is kept only if a codomain
                     // predicate references it — nothing mints such a predicate
                     // yet, so it is always `None` here (dormant machinery).
+                    //
+                    // Materialization invariant: the choices are ground extents.
+                    // The Σ<:Σ constrain rule matches choices by exact structural
+                    // `==` while `compact_go`/`extrude` treat them contravariantly
+                    // (at `!pol`); those two treatments only agree while a choice
+                    // carries no inference variable, so an `Infer`-bearing choice
+                    // would record a bound at the wrong polarity relative to how
+                    // constrain compares it. Enforce the invariant the rules rely on.
+                    debug_assert!(
+                        !doms.iter().any(crate::ccl::subst::type_contains_infer),
+                        "Σ materialized with an inference variable in a choice extent"
+                    );
                     shapes.push(Type::sigma(None, doms, kept_name, c));
                 }
             }

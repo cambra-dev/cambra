@@ -1061,13 +1061,14 @@ pub(super) fn emit_case<C: Typing>(
     // Case stays history-typed, and the mut-discipline pass rejects it as a
     // non-bare-variable reference (rule 1). This preserves the deliberate
     // rejection of a conditional over stores.
-    let any_history = arm_tys.iter().any(|t| {
-        let mut cur = t;
-        while let Type::Refinement(inner, _) = cur {
-            cur = inner;
-        }
-        matches!(cur, Type::History { .. })
-    });
+    // A second-class reference is a `History` (store *or* feed — one variant)
+    // possibly wrapped in refinements; `peel_refinements_outer` names that shape.
+    // Both `Mut[V, D]` and a feed channel are `History`, so this one check covers
+    // every second-class arm — the load-bearing assumption is that a store is
+    // never wrapped in anything but `Refinement` before reaching here.
+    let any_history = arm_tys
+        .iter()
+        .any(|t| matches!(peel_refinements_outer(t), Type::History { .. }));
     if any_history {
         let first = arm_tys[0].clone();
         for t in &arm_tys[1..] {

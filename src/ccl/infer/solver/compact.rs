@@ -571,6 +571,16 @@ fn compact_go(
         // themselves a Σ (materialization invariant), so no flattening is
         // needed. Both binders shadow the codomain's accumulated substitution.
         Type::Sigma(s) => {
+            // PR1 invariant: the witness binder is dormant (no predicate
+            // references it yet), so it never survives round-tripping through
+            // the solver. `CompactFun` carries only `pi_name`; `s.name` is used
+            // solely as a codomain shadow binder below. Assert the dormancy so
+            // the day a witness activates surfaces here rather than silently
+            // dropping the binder (unlike `subst`/`apply_type`, which preserve it).
+            debug_assert!(
+                s.name.is_none(),
+                "Σ witness binder is dormant in PR1 but reached compaction"
+            );
             let domains = s
                 .choices
                 .iter()
