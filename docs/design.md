@@ -37,13 +37,13 @@ CHL source
                       call sites. Runs *before* channelize so the letrec phase can route an in-loop
                       feed against inlined pass-by-ref writers; it therefore still sees Defer/Feed/Define)
   → transact_phase   (ccl/transact_phase.rs: each `with begin():` block over Mut[V, Txn] stores folds into
-                      a get_prev_txn-guarded LetRec over the commit domain (per-key histories + per-site
-                      commit records). Runs *before* letrec_phase so the induction phase never sees a
+                      a get_prev_txn-causal LetRec over the commit domain (per-key histories + per-site
+                      commit records). Runs *before* mut_elim so the induction phase never sees a
                       transaction loop; store identity is the Mut[_, Txn] type on the α-unique binding.
                       See src/ccl/design/mutability.md)
-  → letrec_phase     (ccl/letrec_phase.rs: the induction mutability phase — every non-transactional
-                      mutation loop (For/MutWrite markers, feed-free or feeding) becomes a guarded LetRec
-                      group over the induction domain (get_prev_seq recurrence, last_or_default trailing
+  → mut_elim     (ccl/mut_elim.rs: the induction mutability phase — every non-transactional
+                      mutation loop (For/MutWrite markers, feed-free or feeding) becomes a causal LetRec
+                      group over the induction domain (get_prev_seq recurrence, final_or_default trailing
                       read); see src/ccl/design/mutability.md. Runs before channelize so a
                       per-iteration feed inside a loop is hoisted to an ordinary feed of the loop's history)
   → channelize       (ccl/channelize.rs: Defer/Feed/Define → `++`-union channel bindings, each defer
@@ -53,12 +53,12 @@ CHL source
                       Runs after the letrec phase, so an in-loop feed is already hoisted to a feed of the
                       loop's history)
   → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators, then CCC-simplified)
-  → recognize        (ccl/letrec_phase.rs::recognize: AFTER lambda_elim, on the point-free normal form,
-                      lower each guarded LetRec group onto the domain-parameterized Transact carrier —
+  → plan_loops       (ccl/planning/loops.rs::plan_loops: AFTER lambda_elim, on the point-free normal form,
+                      lower each causal LetRec group onto the domain-parameterized Transact carrier —
                       induction domain → Recurse, Txn domain → commit operator. Anchors on the guard
                       builtins (which survive elimination), so one LetRec travels through channelize +
-                      lambda_elim and is recognized point-free — no pointful/point-free double
-                      representation. Transact is recognition's output carrier to op-conversion)
+                      lambda_elim and is planned point-free — no pointful/point-free double
+                      representation. Transact is loop planning's output carrier to op-conversion)
   → planning        (ccl/planning/: hash-join and keyed aggregate optimization; brackets iteration-marking with ccl/simplify.rs)
   → operator_conversion  (interpreter/operator_conversion.rs: λ-free CCL → tile operators)
   → subscribe()

@@ -707,11 +707,11 @@ fn collect_type_errors(
         } => {
             // A history handle at the strict wall is a compiler bug — a `Feed`
             // history should have been erased by `channelize`, a `Store`
-            // history by the unified phase (`transact_phase` / `letrec_phase`).
+            // history by the unified phase (`transact_phase` / `mut_elim`).
             if strictness == Strictness::Strict {
                 let what = match kind {
-                    HistoryKind::Feed => "feed handle type survived channelize",
-                    HistoryKind::Store => "mutable-reference type survived the unified phase",
+                    HistoryKind::Append => "feed handle type survived channelize",
+                    HistoryKind::Overwrite => "mutable-reference type survived the unified phase",
                 };
                 errors.push(InferError::Unsupported(format!(
                     "{what} at `{context_sym}`"
@@ -840,7 +840,7 @@ fn has_pre_desugar_artifacts(expr: &Expr) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Strip outer [`Type::Refinement`] layers and, if a mutable **store**
-/// (a [`HistoryKind::Store`] history) is underneath, return its `(value,
+/// (a [`HistoryKind::Overwrite`] history) is underneath, return its `(value,
 /// domain)` children.
 ///
 /// Only a `Store` history is a `Mut` for the second-class discipline — a
@@ -853,7 +853,7 @@ fn peel_mut(ty: &Type) -> Option<(&Type, &Type)> {
         Type::History {
             value,
             domain,
-            kind: HistoryKind::Store,
+            kind: HistoryKind::Overwrite,
         } => Some((value, domain)),
         Type::Refinement(inner, _) => peel_mut(inner),
         _ => None,
@@ -928,7 +928,7 @@ fn check_no_nested_mut(
         Type::History {
             value,
             domain,
-            kind: HistoryKind::Store,
+            kind: HistoryKind::Overwrite,
         } => {
             if !allow_mut {
                 errors.push(InferError::MutInCompositeType {
@@ -1569,7 +1569,7 @@ mod tests {
                 ty: Type::History {
                     value: Box::new(Type::Base(BaseType::Int)),
                     domain: Box::new(Type::Hole),
-                    kind: HistoryKind::Store,
+                    kind: HistoryKind::Overwrite,
                 },
                 user_annotation: None,
             },

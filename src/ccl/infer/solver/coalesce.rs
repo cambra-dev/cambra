@@ -197,7 +197,7 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
     while let Some((value, domain, kind)) = ct.history_slot.take() {
         // Only a *feed channel* dissolves into a read view; a store is read as
         // its scalar value, never merged into the surrounding type.
-        if kind != HistoryKind::Feed {
+        if kind != HistoryKind::Append {
             ct.history_slot = Some((value, domain, kind));
             break;
         }

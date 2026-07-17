@@ -287,7 +287,7 @@ pub enum Builtin {
     /// Used by `lower_mutation_loop` to expose the scalar final
     /// accumulator of a Record-bodied loop, whose external type is
     /// `Fun(D, Record({step, to_<defer>*}))`: the after-loop scalar acc is
-    /// `(acc_stream ▷ Proj("step"), init) ▷ LastOrDefault`.  The
+    /// `(acc_stream ▷ Proj("step"), init) ▷ FinalOrDefault`.  The
     /// default is the pre-loop accumulator binding, so an
     /// empty-source loop (`for i in []: x += 1; x`) yields `init`
     /// rather than panicking or returning empty.
@@ -298,27 +298,27 @@ pub enum Builtin {
     /// jointly with the `.rev().find(…)` in `ExtractLastProducer` —
     /// both assume the source's last position by emission order, not
     /// by sorted domain value.
-    LastOrDefault,
+    FinalOrDefault,
 
     /// `get_prev_seq : Tuple(Fun(I, V), I, V) → V` — the history value at
     /// the *predecessor* of the given position, or the default at the first
     /// position.
     ///
-    /// Applied as a tupled argument, same convention as [`Self::LastOrDefault`]:
+    /// Applied as a tupled argument, same convention as [`Self::FinalOrDefault`]:
     /// `Apply(Tuple([history, position, default]), Builtin(GetPrevSeq))`.
     /// The polymorphic scheme `∀ι ν. ((ι ⇒ ν), ι, ν) ⇒ ν` lives in
     /// [`crate::ccl::infer::OperatorSchemes`] (shared variables
-    /// across positions, like `LastOrDefault`).
+    /// across positions, like `FinalOrDefault`).
     ///
     /// This is the **guard accessor** for induction-domain recursion in a
     /// [`crate::ccl::TypedExprNode::LetRec`]: a binding whose self-reference
     /// is consumed only as the history argument of `get_prev_seq` depends
     /// only on strictly earlier positions, which is what makes the group
     /// well-founded (see `src/ccl/design/mutability.md`, "The model" /
-    /// "New builtins", and [`crate::ccl::letrec::check_letrec_guarded`]).
+    /// "New builtins", and [`crate::ccl::letrec::check_letrec_causal`]).
     ///
     /// Op-conversion never compiles this builtin directly: letrec pattern
-    /// recognition consumes it (the guarded self-cycle becomes the `Recurse`
+    /// recognition consumes it (the causal self-cycle becomes the `Recurse`
     /// engine), so its op-conversion arm is a deliberate error, like
     /// `LetRec`'s.
     GetPrevSeq,
@@ -338,7 +338,7 @@ pub enum Builtin {
     /// only on strictly earlier commit times, which is what makes the
     /// `store ↔ commits` cycle well-founded (see
     /// `src/ccl/design/mutability.md`, "New builtins", and
-    /// [`crate::ccl::letrec::check_letrec_guarded`]).
+    /// [`crate::ccl::letrec::check_letrec_causal`]).
     ///
     /// Op-conversion never compiles this builtin directly — like
     /// [`Self::GetPrevSeq`], letrec pattern recognition (the commit-operator
@@ -356,7 +356,7 @@ pub enum Builtin {
     /// [`crate::ccl::infer::OperatorSchemes`]; its type `𝐼 ⇒ Txn` is
     /// stamped on the node at emission and the post-phase CHECK-mode `typecheck`
     /// (which trusts a builtin's recorded type) validates it directly. Opaque
-    /// and consumed by [`crate::ccl::letrec_phase::recognize`], which reads the
+    /// and consumed by [`crate::ccl::planning::plan_loops`], which reads the
     /// writer's source and body off the commit-record binding and discards the
     /// `begin`/`store(t)` plumbing. Like [`Self::GetPrevSeq`] /
     /// [`Self::GetPrevTxn`] it never reaches op-conversion, so its op-conversion
@@ -423,7 +423,7 @@ impl Builtin {
             Self::NotFn => "not_fn",
             Self::Sum => "sum",
             Self::Max => "max",
-            Self::LastOrDefault => "last_or_default",
+            Self::FinalOrDefault => "final_or_default",
             Self::GetPrevSeq => "get_prev_seq",
             Self::GetPrevTxn => "get_prev_txn",
             Self::BeginTxn => "begin",
@@ -459,7 +459,7 @@ impl Builtin {
     /// - `is_internalising_builtin_function` — at `Apply { function }`
     ///   positions during the iteration-site walk, decides which
     ///   builtins' arguments to wrap with `iterate(_)`.  `CollectionUnion`
-    ///   and `LastOrDefault` are in this list because they self-iterate
+    ///   and `FinalOrDefault` are in this list because they self-iterate
     ///   from sub-parts of their tuple argument, but the walk's
     ///   per-shape match arms handle them before the catch-all that
     ///   consults this metho — so the per-element wrapping fires first
@@ -467,7 +467,7 @@ impl Builtin {
     /// - `is_iteration_bearing` — at chain heads, decides which builtins
     ///   already provide their own iteration (and so should not be
     ///   wrapped with another `iterate(_)`).  Scalar-result builtins
-    ///   (`Sum`, `Max`, `LastOrDefault`) are in the list too; the
+    ///   (`Sum`, `Max`, `FinalOrDefault`) are in the list too; the
     ///   caller's `expr.ty.domain()` check filters them out at chain
     ///   heads independently.
     ///
@@ -490,12 +490,12 @@ impl Builtin {
                 | Self::PermuteDomain
                 | Self::FlattenDomain
                 | Self::CollectionUnion
-                // `GetPrevSeq`/`GetPrevTxn` share `LastOrDefault`'s
+                // `GetPrevSeq`/`GetPrevTxn` share `FinalOrDefault`'s
                 // classification (a scalar-result builtin over a tuple whose
                 // stream sub-part self-iterates), but op-conversion never sees
                 // them: letrec pattern recognition consumes them first, and the
                 // op-conv arm errors deliberately (see the variant docs).
-                | Self::LastOrDefault
+                | Self::FinalOrDefault
                 | Self::GetPrevSeq
                 | Self::GetPrevTxn
         )

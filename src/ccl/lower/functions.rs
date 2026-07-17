@@ -26,7 +26,7 @@ fn mut_param_store_type(param: &Param) -> Option<Result<Type, LoweringError>> {
         Some(Ok(value)) => Some(Ok(Type::History {
             value: Box::new(value),
             domain: Box::new(Type::Hole),
-            kind: crate::ccl::HistoryKind::Store,
+            kind: crate::ccl::HistoryKind::Overwrite,
         })),
         Some(Err(e)) => Some(Err(e)),
         None => None,

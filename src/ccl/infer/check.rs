@@ -183,7 +183,7 @@ impl Typing for CheckCtx {
                 // collection used as a for-loop source reads as the collection).
                 Type::History {
                     value,
-                    kind: HistoryKind::Store,
+                    kind: HistoryKind::Overwrite,
                     ..
                 } => peel_refinements_outer(value),
                 _ => break,
@@ -200,7 +200,7 @@ impl Typing for CheckCtx {
             Type::History {
                 domain,
                 value,
-                kind: HistoryKind::Feed,
+                kind: HistoryKind::Append,
             } => Ok(((**domain).clone(), (**value).clone())),
             _ => {
                 self.errors.push(InferError::ExpectedFunction {

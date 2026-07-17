@@ -75,7 +75,7 @@ impl fmt::Display for FieldKey {
 /// |---|---|---|---|
 /// | `Hole` | Lowering | "This slot needs a type; not yet known" | End of inference (compiler bug if survives — flagged as `UnresolvedHole`) |
 /// | `Infer(id)` | Type checker only | "Inference variable N from the coalesce pass" | End of inference for any type reachable from the program's root output (flagged as `UnresolvedInfer` by `collect_type_errors`); an induction store's *domain* is necessarily `Infer` until the unified phase resolves it (see `Strictness::PreDesugar`) |
-/// | `History` (`kind: Store`) | Type checker only | "Mutable store: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `letrec_phase`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
+/// | `History` (`kind: Store`) | Type checker only | "Mutable store: a `value` cell tracked over a `domain` (loop index or transaction time)" | the unified phase (`transact_phase` / `mut_elim`, which runs *before* `channelize`; a survivor downstream is a compiler bug) |
 /// | `History` (`kind: Feed`) | Type checker only | "Feed channel `domain ⇒ value`: the defer binding's post-desugar stream type" | `channelize` (which runs after inference; a survivor downstream is a compiler bug) |
 /// | `ChanDom(d, _)` | Type checker only | "Rigid nominal domain of feed channel `d` — its extent resolves at channel assembly" | `channelize` (substituted to the concrete channel domain; a survivor downstream is a compiler bug) |
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -199,12 +199,12 @@ pub enum Type {
     /// invariant, deref-transparent `domain ⇒ value`); they differ only in the
     /// [`HistoryKind`]:
     ///
-    /// - [`HistoryKind::Store`] — a **mutable store** (`:=` / `+=`). A reference
+    /// - [`HistoryKind::Overwrite`] — a **mutable store** (`:=` / `+=`). A reference
     ///   reads through to its `value` (the scalar behind `Mut[Int, D]`; `cnt + 1`
     ///   reads the `Int`), its writes may read the previous position
     ///   (`get_prev_seq` recurrence), and its trailing read is `last_or_default`
     ///   (a scalar). The unified phase materializes it with a carry-forward arm.
-    /// - [`HistoryKind::Feed`] — a **feed channel** (`defer` / `<<` / `<<=`). A
+    /// - [`HistoryKind::Append`] — a **feed channel** (`defer` / `<<` / `<<=`). A
     ///   reference reads the whole stream (`domain ⇒ value`), off-path positions
     ///   are absent (no carry-forward), and `channelize` resolves it to the
     ///   collected channel.
@@ -214,13 +214,13 @@ pub enum Type {
     /// **transient** variant like `Hole` / `Infer`: it exists only between type
     /// inference (which stamps it on `:=` / `defer` introductions and every
     /// reference) and the passes that erase it — the unified phase
-    /// (`transact_phase` / `letrec_phase`) for `Store` histories, `channelize`
+    /// (`transact_phase` / `mut_elim`) for `Store` histories, `channelize`
     /// for `Feed` ones. Both erase it to a bare `Type::Fun`; no pass downstream
     /// may observe a `History` (a survivor at the strict wall is a compiler bug —
     /// see `collect_type_errors`). See src/ccl/design/mutability.md.
     History {
         /// The type of the history's value (a position's cell / element). Read
-        /// through by the deref coercion for a [`HistoryKind::Store`] reference.
+        /// through by the deref coercion for a [`HistoryKind::Overwrite`] reference.
         value: Box<Type>,
         /// The index the history's positions are tracked over (loop index,
         /// transaction time, or a feed channel's collection domain).
@@ -241,12 +241,12 @@ pub enum Type {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HistoryKind {
     /// A mutable store introduced by `:=` — deref-on-read to the scalar `value`,
-    /// a `get_prev_seq` / `get_prev_txn` recurrence, a `last_or_default` trailing
+    /// a `get_prev_seq` / `get_prev_txn` recurrence, a `final_or_default` trailing
     /// read, and a carry-forward arm for off-path positions.
-    Store,
+    Overwrite,
     /// A feed channel introduced by `defer` and written with `<<` / `<<=` — read
     /// as the whole `domain ⇒ value` stream, with off-path positions absent.
-    Feed,
+    Append,
 }
 
 /// If every tag in `tags` is an anonymous positional [`FieldKey::Index`]
@@ -351,7 +351,7 @@ impl fmt::Display for Type {
                 domain,
                 kind,
             } => {
-                if *kind == HistoryKind::Store {
+                if *kind == HistoryKind::Overwrite {
                     write!(f, "Mut[{value}, {domain}]")
                 } else {
                     write!(f, "feed({domain} ⇒ {value})")
@@ -427,7 +427,7 @@ impl Type {
             Type::Variant(tags) => tags.iter().all(|(_, t)| t.has_enumerable_extent()),
             Type::Refinement(inner, _) => inner.has_enumerable_extent(),
             // A store history is erased by the unified phase
-            // (`letrec_phase`/`transact_phase`) and a feed history by `channelize`,
+            // (`mut_elim`/`transact_phase`) and a feed history by `channelize`,
             // both before planning consults this predicate; observing one here is
             // a compiler bug.
             Type::History { .. } => unreachable!("Type::History survived its erasing phase"),

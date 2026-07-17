@@ -112,7 +112,7 @@ pub fn symbolic_typed(expr: &Expr) -> String {
 
 /// Render one transaction writer: `[reads]⇒[writes] over <source> do <body>` —
 /// its read-set / write-set footprint and the per-position decision body.
-fn fmt_transact_writer(w: &crate::ccl::TransactWriter, opts: &SymbolicOpts) -> String {
+fn fmt_transact_writer(w: &crate::ccl::WriterSite, opts: &SymbolicOpts) -> String {
     let names = |ks: &[crate::ccl::Name]| {
         ks.iter()
             .map(|n| n.base().to_string())
@@ -551,7 +551,7 @@ mod tests {
     use crate::ccl::BaseType;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, Refinement,
-        TransactKey, TransactWriter, Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
+        TransactKey, Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind, WriterSite,
     };
     use rstest::rstest;
     use std::rc::Rc;
@@ -812,7 +812,7 @@ in x"
                 name: "i".into(),
                 init: Expr::lit(Lit::Int(0)),
             }],
-            writers: vec![TransactWriter {
+            writers: vec![WriterSite {
                 read_keys: vec!["i".into()],
                 write_keys: vec!["i".into()],
                 source: Expr::var("xs"),
@@ -835,7 +835,7 @@ in x"
                     init: Expr::lit(Lit::Int(1)),
                 },
             ],
-            writers: vec![TransactWriter {
+            writers: vec![WriterSite {
                 read_keys: vec!["x".into(), "y".into()],
                 write_keys: vec!["x".into(), "y".into()],
                 source: Expr::var("xs"),

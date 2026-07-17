@@ -16,9 +16,9 @@ use crate::{
             InferError, TypeInferenceContext, check_mut_discipline, check_mut_write_targets,
             check_pre_desugar, infer, typecheck,
         },
-        inline, lambda_elim, letrec_phase,
+        inline, lambda_elim,
         lower::{LoweringContext, LoweringError, lower_stmts},
-        planning,
+        mut_elim, planning,
         symbolic::{symbolic, symbolic_typed},
         uniquify,
     },
@@ -583,14 +583,14 @@ pub fn compile_program(
     })?;
 
     // The unified letrec phase: direct-mirror mutation loops (`For` /
-    // `MutWrite`) become guarded `LetRec` groups — mutable histories over
+    // `MutWrite`) become causal `LetRec` groups — mutable histories over
     // the induction domain, per src/ccl/design/mutability.md. Runs after
     // inlining (so cross-function writers land at their call sites) and
     // *before* channelize, so a per-iteration feed inside a loop is
     // hoisted to an ordinary feed of the loop's history for desugar to route.
     // The tree still carries Defer/Feed here, so the walls are the relaxed
     // pre-desugar check.
-    let phase_out = letrec_phase::run(expr);
+    let phase_out = mut_elim::run(expr);
     debug!("Letrec phase CCL:\n{}", symbolic(&phase_out));
     check_pre_desugar(&phase_out).expect("letrec phase produced an inconsistent tree");
 
@@ -616,15 +616,15 @@ pub fn compile_program(
     // `check_fully_typed` call is no longer needed here.
     typecheck(&lambda_elim).expect("type error after lambda elimination");
 
-    // Recognition: lower each guarded group — now in its point-free normal
+    // Recognition: lower each causal group — now in its point-free normal
     // form — onto the domain-parameterized `Transact` carrier (a
     // `get_prev_txn` transaction group → `Transact{Txn}`; a `get_prev_seq`
     // induction group → `Transact{iteration extent}`) so planning stages the
     // writer sources and operator conversion picks the engine on the domain.
     // Running post-elim is what keeps ONE letrec representation through
     // channelize and lambda_elim; the point-free guard matcher re-checks
-    // guardedness at this wall. See the `letrec_phase` recognition docs.
-    let recognized = letrec_phase::recognize(lambda_elim);
+    // causality at this wall. See the `mut_elim` recognition docs.
+    let recognized = planning::plan_loops(lambda_elim);
     debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
     typecheck(&recognized).expect("letrec recognition produced an ill-typed tree");
 

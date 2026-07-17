@@ -2,8 +2,8 @@ use log::trace;
 
 use crate::{
     ccl::{
-        AggregateKind, Builtin, Expr, F_WRITES, Lit, Name, ProjKey, TransactKey, TransactWriter,
-        Type, TypedExprNode, ccl_utils::is_trivially_true_predicate, symbolic::symbolic,
+        AggregateKind, Builtin, Expr, F_WRITES, Lit, Name, ProjKey, TransactKey, Type,
+        TypedExprNode, WriterSite, ccl_utils::is_trivially_true_predicate, symbolic::symbolic,
     },
     interpreter::{
         ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
@@ -456,7 +456,7 @@ fn convert_impl(
             convert_store_read(store_name, field, ctx)
         }
 
-        // A bare `Transact` never reaches here: `recognize` always binds it as
+        // A bare `Transact` never reaches here: `plan_loops` always binds it as
         // `let __store = Transact{…}`, which the `Let` arm intercepts (building
         // the shared store and registering it) before compiling `bound_expr`.
         TypedExprNode::Transact { .. } => Err(ConversionError::Unsupported(
@@ -759,24 +759,24 @@ fn convert_impl(
             apply_aggregate(input, kind)
         }
 
-        // `LastOrDefault` is the stream-to-scalar primitive that extracts the
+        // `FinalOrDefault` is the stream-to-scalar primitive that extracts the
         // codomain value at the final position of an iteration stream, falling
         // back to a default scalar when the stream is empty.  Argument is a
         // 2-element `Tuple([stream, default])`; compiles directly to the
         // `ExtractLast` tile operator (which takes both ops).
         TypedExprNode::Apply { argument, function }
-            if as_builtin(function) == Some(Builtin::LastOrDefault) =>
+            if as_builtin(function) == Some(Builtin::FinalOrDefault) =>
         {
             expect_no_input(input, "last_or_default")?;
             let TypedExprNode::Tuple(elts) = &argument.node else {
                 return Err(ConversionError::Unsupported(format!(
-                    "LastOrDefault expects a 2-element Tuple argument, got {:?}",
+                    "FinalOrDefault expects a 2-element Tuple argument, got {:?}",
                     argument.node
                 )));
             };
             if elts.len() != 2 {
                 return Err(ConversionError::Unsupported(format!(
-                    "LastOrDefault expects a 2-element Tuple argument, got {} elements",
+                    "FinalOrDefault expects a 2-element Tuple argument, got {} elements",
                     elts.len()
                 )));
             }
@@ -786,7 +786,7 @@ fn convert_impl(
         }
 
         // `GetPrevSeq` is a letrec guard accessor, never compiled directly:
-        // pattern recognition (a `get_prev_seq`-guarded self-cycle → the
+        // pattern recognition (a `get_prev_seq`-causal self-cycle → the
         // `Recurse` engine) consumes it before op-conversion. Reaching this
         // arm means a `LetRec` group escaped recognition — a compiler bug,
         // reported explicitly rather than falling through to the generic
@@ -956,7 +956,7 @@ fn convert_impl(
         }
 
         // A raw `LetRec` never compiles directly: op-conversion *recognizes
-        // patterns* in the group (a `get_prev_seq`-guarded self-cycle → the
+        // patterns* in the group (a `get_prev_seq`-causal self-cycle → the
         // `Recurse` engine, commit-record shapes → the commit operator) and
         // an unrecognized group is a compile error, never a silent fallback.
         // Recognition lands with the unified phase
@@ -1078,7 +1078,7 @@ fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, ConversionError> {
 /// store, [`build_induction_store`]).
 fn build_transact_store(
     keys: &[TransactKey],
-    writers: &[TransactWriter],
+    writers: &[WriterSite],
     domain: &Type,
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
@@ -1099,7 +1099,7 @@ fn build_transact_store(
 /// `.writes.(i)` off the body stream.
 fn build_induction_store(
     keys: &[TransactKey],
-    writers: &[TransactWriter],
+    writers: &[WriterSite],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     // A `mut` loop is a single writer (its footprint is the loop's accumulators).
@@ -1190,7 +1190,7 @@ fn build_induction_store(
 }
 
 /// Compile a per-variable read `__store.field` off a registered transactional
-/// store. `recognize` wraps a scalar accumulator read in `last_or_default(stream,
+/// store. `plan_loops` wraps a scalar accumulator read in `last_or_default(stream,
 /// init)`, so the current/final value (via [`ExtractLast`]) is selected
 /// downstream, not here.
 fn convert_store_read(
@@ -1207,7 +1207,7 @@ fn convert_store_read(
     match key_index {
         // An induction store key (a `mut` loop accumulator): its history `D ⇀ V`
         // is `.writes.(index)` off the `Recurse` body stream `D ⇀ {commit,
-        // writes, …}`. `recognize` wraps the read in `last_or_default`, reduced
+        // writes, …}`. `plan_loops` wraps the read in `last_or_default`, reduced
         // to the final value via `ExtractLast`.
         Some(index) => {
             let writes = proj_named_field(fan.branch(), F_WRITES)?;

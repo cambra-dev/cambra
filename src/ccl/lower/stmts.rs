@@ -510,7 +510,7 @@ pub(super) fn lower_middle_stmt(
             let mut_ty = Type::History {
                 value: Box::new(value_ty),
                 domain: Box::new(domain),
-                kind: crate::ccl::HistoryKind::Store,
+                kind: crate::ccl::HistoryKind::Overwrite,
             };
             Ok(Expr::let_bind_annotated(name, val, body, mut_ty))
         }

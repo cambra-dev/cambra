@@ -65,7 +65,7 @@
 //! Most `Builtin` nodes are introduced post-inference by
 //! `lambda_elim`/`planning` with their type pre-stamped on the node, and
 //! inference just rubber-stamps them. The exceptions are polymorphic
-//! builtins introduced pre-inference (e.g. `LastOrDefault` from
+//! builtins introduced pre-inference (e.g. `FinalOrDefault` from
 //! `lower_mutation_loop`); those have entries in [`OperatorSchemes`] and
 //! are freshened at each use site like any other scheme.
 

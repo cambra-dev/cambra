@@ -16,7 +16,7 @@ use super::*;
 ///
 /// "Iteration site" means any position where op-conversion would otherwise
 /// compile with `input=None` and the expression is function-typed —
-/// aggregate arguments, the stream side of `LastOrDefault`, mutation-loop
+/// aggregate arguments, the stream side of `FinalOrDefault`, mutation-loop
 /// sources, value-position `Record` fields, `CollectionUnion` operands,
 /// the program's top-level function-valued result, top-level let-bound
 /// function values, and a few other shapes enumerated by
@@ -72,7 +72,7 @@ pub(crate) fn insert_iterate_markers(expr: &mut Expr) {
 ///
 /// Op-conversion's combinator arms split into two groups:
 ///
-/// - **Input-internalising** (`Sum`/`Max`/`LastOrDefault`, `Converse`,
+/// - **Input-internalising** (`Sum`/`Max`/`FinalOrDefault`, `Converse`,
 ///   `MapDomain`, `Uncurry`, `FlattenDomain`, `PermuteDomain`,
 ///   `CollectionUnion`, plus `Iterate` itself): these arms require
 ///   `input=None` and compile their argument (or each operand, in
@@ -125,13 +125,13 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
 
     expr.walk_children_mut(insert_iterate_recurse);
     match &mut expr.node {
-        // `LastOrDefault` takes `Tuple([stream, default])` — only `stream`
+        // `FinalOrDefault` takes `Tuple([stream, default])` — only `stream`
         // is iterated; the `default` is a scalar consumed when the stream
         // is empty.
         TypedExprNode::Apply { argument, function }
             if matches!(
                 &function.node,
-                TypedExprNode::Builtin(Builtin::LastOrDefault)
+                TypedExprNode::Builtin(Builtin::FinalOrDefault)
             ) =>
         {
             if let TypedExprNode::Tuple(elts) = &mut argument.node
@@ -431,7 +431,7 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
 /// 2. Self-iterating builtins ([`Builtin::iterates_arg`]): the
 ///    iteration-internalising group — `MapDomain`, `Uncurry`,
 ///    `Converse`, `CollectionUnion`, plus the nested `PermuteDomain` /
-///    `FlattenDomain` shapes.  (Sum / Max / LastOrDefault are also in
+///    `FlattenDomain` shapes.  (Sum / Max / FinalOrDefault are also in
 ///    `iterates_arg`, but they produce scalars; [`wrap_with_iterate`]'s
 ///    `expr.ty.domain()` check filters them out independently.)  Plus
 ///    the catch-all `Apply` with a non-builtin function (`Proj`, `Var`,
@@ -998,7 +998,7 @@ mod tests {
 
     #[test]
     fn test_insert_iterate_recurse_transact_wraps_writer_source() {
-        use crate::ccl::{TransactKey, TransactWriter};
+        use crate::ccl::{TransactKey, WriterSite};
         // A `Transact` writer's `source` is iterated by the store engine at
         // runtime (op-conversion compiles it with `input=None`), so it must be
         // iterate-wrapped here — the same as a loop source was.
@@ -1017,7 +1017,7 @@ mod tests {
                 name: "acc".into(),
                 init: Expr::lit(Lit::Int(0)).with_ty(int.clone()),
             }],
-            writers: vec![TransactWriter {
+            writers: vec![WriterSite {
                 read_keys: vec!["acc".into()],
                 write_keys: vec!["acc".into()],
                 source: list_123().with_ty(list_ty.clone()),

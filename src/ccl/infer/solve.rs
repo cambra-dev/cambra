@@ -277,7 +277,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
         ) => match kind {
             // Used only in this `#[cfg(debug_assertions)]` helper, so qualify
             // rather than adding a top-level import that is unused in release.
-            crate::ccl::HistoryKind::Feed => {
+            crate::ccl::HistoryKind::Append => {
                 let stream = Type::Fun {
                     name: None,
                     domain: domain.clone(),
@@ -285,7 +285,7 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
                 };
                 types_agree_modulo_unread(&stream, other)
             }
-            crate::ccl::HistoryKind::Store => types_agree_modulo_unread(value, other),
+            crate::ccl::HistoryKind::Overwrite => types_agree_modulo_unread(value, other),
         },
         _ => false,
     }
@@ -772,7 +772,7 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 }
             }
         }
-        // `Transact` is born by `letrec_phase::recognize`, after inference (and
+        // `Transact` is born by `planning::plan_loops`, after inference (and
         // so after coalesce), so a `Transact` never reaches here.
         TypedExprNode::Transact { .. } => {
             unreachable!(

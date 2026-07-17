@@ -396,7 +396,7 @@ fn constrain_go(
         (
             Type::History {
                 value,
-                kind: HistoryKind::Store,
+                kind: HistoryKind::Overwrite,
                 ..
             },
             _,
@@ -493,7 +493,7 @@ fn constrain_go(
             Type::History {
                 value,
                 domain,
-                kind: HistoryKind::Feed,
+                kind: HistoryKind::Append,
             },
             _,
         ) => {
@@ -515,7 +515,7 @@ fn constrain_go(
             Type::History {
                 value,
                 domain,
-                kind: HistoryKind::Feed,
+                kind: HistoryKind::Append,
             },
         ) => {
             let chan = Type::Fun {
@@ -532,7 +532,7 @@ fn constrain_go(
         (
             _,
             Type::History {
-                kind: HistoryKind::Feed,
+                kind: HistoryKind::Append,
                 ..
             },
         ) => Err(ConstrainError::NotAFeed {
@@ -553,7 +553,7 @@ fn constrain_go(
             _,
             Type::History {
                 value,
-                kind: HistoryKind::Store,
+                kind: HistoryKind::Overwrite,
                 ..
             },
         ) => constrain_go(lhs, value, sl, sr, cache),
@@ -1327,7 +1327,7 @@ mod tests {
         Type::History {
             value: Box::new(value),
             domain: Box::new(domain),
-            kind: HistoryKind::Feed,
+            kind: HistoryKind::Append,
         }
     }
 
@@ -1537,7 +1537,7 @@ mod tests {
         Type::History {
             value: Box::new(value),
             domain: Box::new(domain),
-            kind: HistoryKind::Store,
+            kind: HistoryKind::Overwrite,
         }
     }
 

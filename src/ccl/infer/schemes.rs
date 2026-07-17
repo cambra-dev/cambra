@@ -119,7 +119,7 @@ impl OperatorSchemes {
         let gamma = fresh_var(BODY_LEVEL);
         let aggregate_max = PolyScheme::poly(SCHEME_LEVEL, fun(fun(alpha, gamma.clone()), gamma));
 
-        // LastOrDefault: ∀α β. ((α → β), β) → β
+        // FinalOrDefault: ∀α β. ((α → β), β) → β
         // Inline-built (not via `normalize_annotation`) so the codomain of the
         // stream and the default share one variable `β`.
         let alpha = fresh_var(BODY_LEVEL);
@@ -206,7 +206,7 @@ impl OperatorSchemes {
     /// (or polymorphic only in independent vars).
     pub(super) fn builtin(&self, b: Builtin) -> Option<&PolyScheme> {
         match b {
-            Builtin::LastOrDefault => Some(&self.last_or_default),
+            Builtin::FinalOrDefault => Some(&self.last_or_default),
             Builtin::GetPrevSeq => Some(&self.get_prev_seq),
             Builtin::GetPrevTxn => Some(&self.get_prev_txn),
             _ => None,

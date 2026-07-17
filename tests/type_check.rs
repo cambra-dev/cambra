@@ -721,7 +721,7 @@ fn feed_value(ty: &Type) -> &Type {
     match ty {
         Type::History {
             value,
-            kind: HistoryKind::Feed,
+            kind: HistoryKind::Append,
             ..
         } => value,
         _ => panic!("expected a feed handle, got {ty}"),
@@ -899,7 +899,7 @@ mod letrec_typing {
     }
 
     /// `get_prev_seq((history, position, default))` — the tupled-argument
-    /// application convention (same as `LastOrDefault`).
+    /// application convention (same as `FinalOrDefault`).
     fn get_prev_seq(history: Expr, position: Expr, default: Expr) -> Expr {
         Expr::apply(
             Expr::tuple(vec![history, position, default]),
@@ -950,7 +950,7 @@ mod letrec_typing {
             panic!("letrec node preserved");
         };
         assert_eq!(bindings[0].0.ty, cnt_ty, "binder slot resolved in place");
-        cambra::ccl::letrec::check_letrec_guarded(bindings).expect("guarded group");
+        cambra::ccl::letrec::check_letrec_causal(bindings).expect("causal group");
     }
 
     /// A binding body whose type conflicts with its declared binding type is

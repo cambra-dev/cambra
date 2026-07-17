@@ -5,17 +5,17 @@
 //! cluster of defers as one **mutually-scoped `Feed`-kind `LetRec` group** —
 //! the model's "feeds are the letrec's outputs" — so cross-channel references
 //! (`x <<= y`) need no binding order and a reference *cycle* among channels is
-//! rejected by the letrec guardedness rule (channels carry no guard, so a
+//! rejected by the letrec causality rule (channels carry no guard, so a
 //! cycle has no well-founded solution). Recognition later flattens the acyclic
 //! group to dependency-ordered `let`s.
 //!
-//! Runs **immediately after [`crate::ccl::letrec_phase::run`]** in
+//! Runs **immediately after [`crate::ccl::mut_elim::run`]** in
 //! [`crate::ccl::context::compile_program`], on a typed, inlined tree — but
-//! *before* `lambda_elim` and `letrec_phase::recognize` (recognition consumes
+//! *before* `lambda_elim` and `planning::plan_loops` (recognition consumes
 //! the point-free normal form post-elim, so both store and channel letrec
 //! groups travel through this step and elimination intact). The phase has
 //! already hoisted every in-loop feed to an ordinary `Feed(defer, view)` of the
-//! loop's history ([`crate::ccl::letrec_phase::hoist_feeds`]), so channelization
+//! loop's history ([`crate::ccl::mut_elim::hoist_feeds`]), so channelization
 //! is **origin-agnostic**: it never distinguishes an accumulator-loop feed from
 //! a feed-only-loop or scalar feed.
 //!
@@ -26,7 +26,7 @@
 //!
 //! **Type-preserving by construction.** Every channel node this module builds is
 //! stamped with its concrete type from its children (mirroring how
-//! [`crate::ccl::letrec_phase`] emits a well-typed `LetRec`). The one residue
+//! [`crate::ccl::mut_elim`] emits a well-typed `LetRec`). The one residue
 //! that construction cannot know up front — the channel *domains* — is named
 //! rigidly at inference ([`Type::ChanDom`], minted per `let d = Defer`), so a
 //! defer read and every node that consumes one (`d ++ d`, `sum(d)`, the trailing
@@ -34,7 +34,7 @@
 //! Closing the tree is then the pure whole-tree substitution
 //! [`erase_chan_domains`] — map each `ChanDom(d)` to its assembled channel's
 //! concrete domain and erase each `Feed`-kind history to its stream `Fun` — the
-//! exact feed-side analog of `letrec_phase::erase_mut`. There is no re-typing
+//! exact feed-side analog of `mut_elim::erase_mut`. There is no re-typing
 //! pass; the strict post-channelization `typecheck` in `compile_program`
 //! backstops the invariant.
 //!
@@ -113,7 +113,7 @@ use crate::ccl::{
     BaseType, BinOpKind, Branch, Expr, HistoryKind, Lit, LogicKind, Name, Pattern, Refinement,
     Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
     ccl_utils::{count_free, typed_compose},
-    letrec::check_letrec_guarded,
+    letrec::check_letrec_causal,
 };
 
 /// `true` when `ty` carries channelization-erasable residue — a `Hole` stamped
@@ -132,7 +132,7 @@ fn has_type_residue(ty: &Type) -> bool {
         | Type::Infer(_)
         | Type::ChanDom(..)
         | Type::History {
-            kind: HistoryKind::Feed,
+            kind: HistoryKind::Append,
             ..
         } => true,
         _ => {
@@ -161,8 +161,8 @@ pub enum DeferError {
     /// A cluster of defers has channels that reference each other
     /// cyclically (e.g. `x ≪= y; y ≪= x`). Channels are `Feed`-kind letrec
     /// bindings and carry no `get_prev_*` guard, so a cycle has no
-    /// well-founded solution — rejected by the letrec guardedness rule
-    /// ([`crate::ccl::letrec::check_letrec_guarded`]), the same law that
+    /// well-founded solution — rejected by the letrec causality rule
+    /// ([`crate::ccl::letrec::check_letrec_causal`]), the same law that
     /// governs store recursion. The payload names one of the defers on the
     /// cycle.
     MutuallyRecursiveCycle(String),
@@ -549,7 +549,7 @@ pub fn run(expr: Expr, input_typed: bool) -> Result<Expr, DeferError> {
         // tree is therefore a pure whole-tree type substitution: map each
         // `ChanDom(d)` to its assembled channel's concrete domain, and erase
         // each `Feed`-kind history to its bare stream `Fun` — the exact
-        // feed-side analog of `letrec_phase::erase_mut`. The strict
+        // feed-side analog of `mut_elim::erase_mut`. The strict
         // post-desugar `typecheck` in `compile_program` backstops the invariant.
         let mut map = close_chan_domains(std::mem::take(&mut ctx.resolved_domains));
         erase_chan_domains(&mut rewritten, &mut map);
@@ -569,7 +569,7 @@ fn handle_chan_dom(ty: &Type) -> Option<(Name, crate::ccl::ChanLevel)> {
     match peel_refinements(ty) {
         Type::History {
             domain,
-            kind: HistoryKind::Feed,
+            kind: HistoryKind::Append,
             ..
         } => match peel_refinements(domain) {
             Type::ChanDom(n, l) => Some((n.clone(), *l)),
@@ -612,7 +612,7 @@ fn channel_domain_of(ty: &Type) -> Option<Type> {
         Type::Fun { domain, .. } => Some((**domain).clone()),
         Type::History {
             domain,
-            kind: HistoryKind::Feed,
+            kind: HistoryKind::Append,
             ..
         } => Some((**domain).clone()),
         _ => None,
@@ -679,12 +679,12 @@ fn subst_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
 /// erase every `Feed`-kind `Type::History` in `ty` to its
 /// bare stream `Fun(domain, value)` and substitute every `ChanDom` via
 /// [`subst_chan_domains_in_type`] — the feed-side analog of
-/// `letrec_phase::erase_mut_in_type`.
+/// `mut_elim::erase_mut_in_type`.
 fn erase_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
     if let Type::History {
         value,
         domain,
-        kind: HistoryKind::Feed,
+        kind: HistoryKind::Append,
     } = ty
     {
         let domain = std::mem::replace(domain.as_mut(), Type::Hole);
@@ -708,7 +708,7 @@ fn erase_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
 
 /// whole-tree erasure — node types, user annotations, and
 /// the binder slots `walk_children_mut` does not reach (mirroring
-/// `letrec_phase::erase_mut`'s coverage of the strict-wall checker).
+/// `mut_elim::erase_mut`'s coverage of the strict-wall checker).
 ///
 /// The walk is **bottom-up and scope-aware**: a substituted channel domain may
 /// carry a refinement predicate that closes over a `let`-bound variable (a
@@ -720,7 +720,7 @@ fn erase_chan_domains_in_type(ty: &mut Type, map: &HashMap<Name, Type>) {
 /// derives. Still derivation-free — a discharge transport, not re-inference.
 fn erase_chan_domains(expr: &mut Expr, map: &mut HashMap<Name, Type>) {
     // Erase this node's binder-declared type slots (shared coverage with
-    // `letrec_phase::erase_mut` via `walk_binders_mut`). This is order-invariant
+    // `mut_elim::erase_mut` via `walk_binders_mut`). This is order-invariant
     // w.r.t. the `Let`-discharge below: a binder's type resolves against `map` as
     // it stands, and a child's discharge only closes variables bound *inside*
     // that child — never in scope at this binder — so erasing binders before the
@@ -765,7 +765,7 @@ fn fun_codomain(ty: &Type) -> Option<Type> {
         Type::Fun { codomain, .. } => Some((**codomain).clone()),
         Type::History {
             value,
-            kind: HistoryKind::Feed,
+            kind: HistoryKind::Append,
             ..
         } => Some((**value).clone()),
         _ => None,
@@ -779,7 +779,7 @@ fn fun_domain(ty: &Type) -> Option<Type> {
         Type::Fun { domain, .. } => Some((**domain).clone()),
         Type::History {
             domain,
-            kind: HistoryKind::Feed,
+            kind: HistoryKind::Append,
             ..
         } => Some((**domain).clone()),
         _ => None,
@@ -870,7 +870,7 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
     let new_node = match node {
         // Defensive: a `For`/`MutWrite` marker is load-bearing structure, not
         // extracted-feed residue, so keep the `ExprStmt` rather than dropping
-        // its effect. `letrec_phase::run` (before channelize) eliminates every
+        // its effect. `mut_elim::run` (before channelize) eliminates every
         // marker, so this arm is unreachable in the production pipeline;
         // keeping it means a stray marker is passed through to the
         // strict `typecheck` backstop instead of being silently discarded.
@@ -960,7 +960,7 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
                 .collect(),
             body: Box::new(drop_expr_stmts(*body)),
         },
-        // Pre-phase markers: `letrec_phase::run` eliminates these before
+        // Pre-phase markers: `mut_elim::run` eliminates these before
         // channelize, so these arms are defensive (a stray marker recurses
         // structurally and reaches the strict `typecheck` backstop; its interior
         // ExprStmt chain is kept by the marker-bearing arm above).
@@ -1371,7 +1371,7 @@ fn channelize_cluster(
     // The cluster becomes a **mutually-scoped `Feed`-kind letrec group** —
     // the model's "feeds are the letrec's outputs" — so binding order inside
     // the group is immaterial and no topological sort is needed at emission.
-    // What a sort used to reject, the letrec guardedness rule now rejects:
+    // What a sort used to reject, the letrec causality rule now rejects:
     // channels carry no guard, so a reference cycle among them
     // (`x <<= y; y <<= x`) has no well-founded solution — the same law that
     // governs store recursion, applied by the same checker.
@@ -1388,7 +1388,7 @@ fn channelize_cluster(
             ));
         }
     }
-    if let Err(errs) = check_letrec_guarded(&group) {
+    if let Err(errs) = check_letrec_causal(&group) {
         let name = errs[0]
             .cycle
             .first()
@@ -1539,7 +1539,7 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
 
 /// Wrap `inner` in the cluster's **`Feed`-kind letrec group** — every channel
 /// mutually in scope, so cross-channel references (`x <<= y`, in either
-/// direction) need no ordering. Recognition flattens the (guardedness-checked,
+/// direction) need no ordering. Recognition flattens the (causality-checked,
 /// therefore acyclic) group back to plain `let`s in dependency order for
 /// planning. An alias channel (`x <<= y`) leaves its binding typed by the
 /// read's handle, whose rigid `ChanDom` the final [`erase_chan_domains`]
@@ -2539,7 +2539,7 @@ fn extract_for_defer(
             unreachable!("channelize: VariantCtor not yet emitted by lowering")
         }
         // Recognition runs after lambda_elim, so a
-        // guarded `LetRec` reaches feed extraction. Walk its binding bodies
+        // causal `LetRec` reaches feed extraction. Walk its binding bodies
         // and continuation generically — the phase hoists every in-loop /
         // in-block feed to the letrec *body* (`Feed(defer, tap)` ExprStmts),
         // so extraction finds them there; binding bodies carry no feeds but

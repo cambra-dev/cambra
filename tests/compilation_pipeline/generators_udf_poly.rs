@@ -108,7 +108,7 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
 // Brainstorm §4b — generator with loop-carried mutable state.  The body
 // mutates a pre-loop variable (`total += item`) and yields its updated
 // value each iteration, producing a running-total stream.  This routes
-// through the guarded `LetRec` the unified phase emits (recognized onto the
+// through the causal `LetRec` the unified phase emits (recognized onto the
 // `Transact` carrier, then `Recurse`), with the yield-defer hoisted out as a
 // `to_*` feed field on the history record.
 #[rstest]

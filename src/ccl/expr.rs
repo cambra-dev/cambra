@@ -1,21 +1,21 @@
 //! The CCL expression AST: [`TypedExpr`] / [`TypedExprNode`], the
 //! [`TypedBinding`] binding-site struct, the structural traversal helpers, and
-//! the [`Branch`] / [`Pattern`] / [`TransactKey`] / [`TransactWriter`] support
+//! the [`Branch`] / [`Pattern`] / [`TransactKey`] / [`WriterSite`] support
 //! types.
 
 use crate::ccl::{AggregateKind, BinOpKind, Builtin, Lit, Name, ProjKey, Type, UnaryOpKind};
 
-/// The `commit` field of a [`TransactWriter`] decision record — the boolean
+/// The `commit` field of a [`WriterSite`] decision record — the boolean
 /// grant/deny gating the whole (atomic) write set. Always `true` for the
 /// induction (`mut`-loop) case.
 pub const F_COMMIT: &str = "commit";
-/// The `writes` field of a [`TransactWriter`] decision record — the positional
+/// The `writes` field of a [`WriterSite`] decision record — the positional
 /// tuple of proposed per-key new values (`writes.i` for `write_keys[i]`), one
 /// element even for a single-key write set.
 pub const F_WRITES: &str = "writes";
 
 // Field names of a **commit-record** binding — the intermediate representation
-// [`crate::ccl::transact_phase`] emits and [`crate::ccl::letrec_phase::recognize`]
+// [`crate::ccl::transact_phase`] emits and [`crate::ccl::planning::plan_loops`]
 // consumes. A commit-record binding `commits : 𝐼 ⇒ {time, write_targets, decision}`
 // per `with begin():` site carries: the commit time `begin(r)` (`time`), the
 // history bindings of the write-set keys (`write_targets`, so recognition can
@@ -314,7 +314,7 @@ pub enum TypedExprNode {
     /// shared store and propose per-position writes.
     ///
     /// The **domain-parameterized recurrence carrier**, born in
-    /// [`crate::ccl::letrec_phase::recognize`] and consumed at operator
+    /// [`crate::ccl::planning::plan_loops`] and consumed at operator
     /// conversion. It denotes a pure value — the store **record** `{key:
     /// ⟦key⟧}`, each field a key's history `Fun(domain, V)` — so a variable
     /// read is the record projection `__store.key` (an `Apply` of `Proj(field)`
@@ -339,7 +339,7 @@ pub enum TypedExprNode {
         /// keys (its read-set / write-set) and proposes a per-position decision
         /// record. An induction-domain store has exactly one writer (a `mut`
         /// loop, whose footprint is all its accumulators).
-        writers: Vec<TransactWriter>,
+        writers: Vec<WriterSite>,
         /// The store's **sequencing domain** — the index of every key's history
         /// `Fun(domain, V)`. A concrete iteration extent for a `mut`
         /// accumulator (the loop's induction domain); [`Type::Txn`] for a
@@ -357,7 +357,7 @@ pub enum TypedExprNode {
     /// one reference must go through a "previous value" accessor
     /// ([`Builtin::GetPrevSeq`], and later `get_prev_txn`), so values at any
     /// position of the sequencing domain depend only on strictly earlier
-    /// positions.  [`crate::ccl::letrec::check_letrec_guarded`] enforces
+    /// positions.  [`crate::ccl::letrec::check_letrec_causal`] enforces
     /// this; see `src/ccl/design/mutability.md` ("The model" / "`LetRec`").
     ///
     /// This is the general node for loops, transactions, and future
@@ -367,16 +367,16 @@ pub enum TypedExprNode {
     /// *recognizes patterns* in the group (a `get_prev_seq`-guarded
     /// self-cycle is a fold; a commit-record binding read through
     /// `get_prev_txn` is a transactional store) to pick the engine.
-    /// The induction `letrec_phase` emits it for every mutation loop (the
+    /// The induction `mut_elim` emits it for every mutation loop (the
     /// transactional slice — a later PR on this stack — adds `Mut[V, Txn]`
     /// blocks). The group then travels — bodies point-freed — through
-    /// `channelize` and `lambda_elim`; `letrec_phase::recognize` runs *after*
+    /// `channelize` and `lambda_elim`; `planning::plan_loops` runs *after*
     /// `lambda_elim` on the point-free normal form and lowers every recognized
     /// group onto the domain-parameterized [`Transact`](Self::Transact) carrier.
     /// A `LetRec` therefore does not survive to planning — a group reaching
     /// op-conversion unrecognized is treated as unreachable rather than guessed.
     ///
-    /// The node denotes a pure value (the unique solution of the guarded
+    /// The node denotes a pure value (the unique solution of the causal
     /// group, by induction along the domain order), so it satisfies the CCL
     /// purity invariant.
     LetRec {
@@ -397,7 +397,7 @@ pub enum TypedExprNode {
     /// (src/ccl/design/mutability.md, "The unified phase"). Lowering emits
     /// it for mutation loops whose bodies carry no feeds or yields; the
     /// phase rewrites it — with the [`TypedExprNode::MutWrite`]s inside —
-    /// into a guarded [`TypedExprNode::LetRec`]. No pass downstream of the
+    /// into a causal [`TypedExprNode::LetRec`]. No pass downstream of the
     /// phase may observe it; operator conversion rejects it explicitly.
     For {
         /// The iteration binder, bound in `body` to each source element.
@@ -723,8 +723,8 @@ impl TypedExpr {
     ///
     /// Every binding's name is in scope in every binding's body and in
     /// `body` (mutual recursion); the caller is responsible for the
-    /// guardedness well-formedness condition
-    /// ([`crate::ccl::letrec::check_letrec_guarded`]).
+    /// causality well-formedness condition
+    /// ([`crate::ccl::letrec::check_letrec_causal`]).
     pub fn letrec(bindings: Vec<(TypedBinding, Self)>, body: Self) -> Self {
         Self::new(TypedExprNode::LetRec {
             bindings,
@@ -1264,7 +1264,7 @@ pub struct TransactKey {
 /// mutation-loop accumulator arm but reading the *shared* store rather than a
 /// private accumulator.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TransactWriter {
+pub struct WriterSite {
     /// The writer's **read-set**: the store keys whose snapshot value the body
     /// reads, in body-parameter order. The body is fed `(snap_{k₀}, …,
     /// snap_{k_{r-1}}, item)` — each `read_keys[i]` bound as position `i` — so

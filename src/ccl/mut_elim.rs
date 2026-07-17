@@ -1,9 +1,9 @@
 //! The unified letrec phase (v1) and its recognition-to-`Transact` step.
 //!
 //! Rewrites every direct-mirror mutation loop — `ExprStmt(For {…}, cont)`
-//! with [`TypedExprNode::MutWrite`]s in the body — into a **guarded
+//! with [`TypedExprNode::MutWrite`]s in the body — into a **causal
 //! `LetRec`**: the accumulators' history over the loop's induction domain,
-//! recursion guarded by [`Builtin::GetPrevSeq`], trailing reads rewritten to
+//! recursion causal by [`Builtin::GetPrevSeq`], trailing reads rewritten to
 //! `last_or_default` over the completed history. This is the induction slice
 //! of the unified phase in `src/ccl/design/mutability.md` ("The unified
 //! phase"); transactions join it in a later step.
@@ -18,7 +18,7 @@
 //! `lambda_elim` both domains share one normal form and recognition never has
 //! to rebuild a body. See [`transform_loop`] for the emitted shape.
 //!
-//! [`recognize`] runs **after `lambda_elim`**, on the group's point-free
+//! [`crate::ccl::planning::plan_loops`] runs **after `lambda_elim`**, on the group's point-free
 //! normal form, and lowers each group onto the domain-parameterized
 //! [`TypedExprNode::Transact`] carrier (`let __store = Transact{…} in …`),
 //! whose induction domain op-conversion compiles to the `Recurse` recurrence
@@ -32,9 +32,9 @@
 //! the phase through `channelize` and `lambda_elim`, and recognition splits
 //! each binding into its guard scaffold and its already-point-free writer body
 //! (lifted verbatim) — retiring the former pointful/point-free double
-//! representation and the encode⇄decode lockstep it required. Guardedness is
+//! representation and the encode⇄decode lockstep it required. Causality is
 //! re-checked at recognition's wall by the point-free matcher
-//! ([`crate::ccl::letrec::check_letrec_guarded`]).
+//! ([`crate::ccl::letrec::check_letrec_causal`]).
 //!
 //! `Transact` is recognition's **output** carrier, born post-elim and spanning
 //! recognition → planning → op-conversion: it separates the store's *keys*
@@ -46,16 +46,15 @@
 use std::collections::HashMap;
 
 use crate::ccl::{
-    BaseType, Builtin, Expr, F_COMMIT, F_WRITES, HistoryKind, Lit, Name, ProjKey, TransactKey,
-    TransactWriter, Type, TypedBinding, TypedExprNode, ccl_utils::count_free,
-    letrec::check_letrec_guarded, symbolic::symbolic,
+    BaseType, Builtin, Expr, F_COMMIT, F_WRITES, HistoryKind, Lit, Name, Type, TypedBinding,
+    TypedExprNode, letrec::check_letrec_causal, symbolic::symbolic,
 };
 
 // ---------------------------------------------------------------------------
 // Phase: For/MutWrite → LetRec
 // ---------------------------------------------------------------------------
 
-/// Rewrite every direct-mirror loop in `expr` into a guarded `LetRec`.
+/// Rewrite every direct-mirror loop in `expr` into a causal `LetRec`.
 /// Trees without `For` nodes pass through untouched. Panics on malformed
 /// marker shapes — lowering guarantees them, so a violation is a compiler
 /// bug, not a user error.
@@ -113,13 +112,13 @@ fn contains_marker(expr: &Expr) -> bool {
 /// annotation) still carries a mutable-**store** `Type::History` — the
 /// post-condition [`erase_mut`] establishes. A `Feed` history is *not* the
 /// phase's concern (it is erased later by `channelize`), so only
-/// [`HistoryKind::Store`] counts here.
+/// [`HistoryKind::Overwrite`] counts here.
 fn contains_mut_type(expr: &Expr) -> bool {
     fn ty_has_mut(ty: &Type) -> bool {
         matches!(
             ty,
             Type::History {
-                kind: HistoryKind::Store,
+                kind: HistoryKind::Overwrite,
                 ..
             }
         ) || ty.fold_children(false, |acc, t| acc || ty_has_mut(t))
@@ -152,7 +151,7 @@ fn contains_mut_type(expr: &Expr) -> bool {
 fn erase_mut_in_type(ty: &mut Type) {
     if let Type::History {
         value,
-        kind: HistoryKind::Store,
+        kind: HistoryKind::Overwrite,
         ..
     } = ty
     {
@@ -445,7 +444,7 @@ fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
 }
 
 /// A `Var` reference stamped with its concrete type.
-fn tvar(name: &Name, ty: Type) -> Expr {
+pub(crate) fn tvar(name: &Name, ty: Type) -> Expr {
     let mut e = Expr::var(name.clone());
     e.ty = ty;
     e
@@ -457,7 +456,7 @@ fn tvar(name: &Name, ty: Type) -> Expr {
 /// xs`) is read (dereferenced) to its underlying `D ⇒ V` collection — the
 /// store's value type; `erase_mut` clears the residual `Mut` on the source node
 /// at the end of the phase.
-fn fun_parts(ty: &Type) -> (Type, Type) {
+pub(crate) fn fun_parts(ty: &Type) -> (Type, Type) {
     let mut t = ty;
     loop {
         match t {
@@ -467,7 +466,7 @@ fn fun_parts(ty: &Type) -> (Type, Type) {
             // loop-source destructuring.
             Type::History {
                 value,
-                kind: HistoryKind::Store,
+                kind: HistoryKind::Overwrite,
                 ..
             } => t = value,
             _ => break,
@@ -506,7 +505,7 @@ fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
 
 /// `__hist ≫ .writes ≫ .i : domain ⇒ vty` — the accumulator-`i` slice of the
 /// history's proposed-write stream, built as one flat three-element compose so
-/// recognition (and the guarded-slot grammar) match it structurally.
+/// recognition (and the causal-slot grammar) match it structurally.
 fn writes_index_view(
     h: &Name,
     hist_ty: &Type,
@@ -526,7 +525,7 @@ fn writes_index_view(
 }
 
 /// A `Var(name) : ty`.
-fn binding(name: Name, ty: Type) -> TypedBinding {
+pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
     TypedBinding {
         name,
         ty,
@@ -535,7 +534,7 @@ fn binding(name: Name, ty: Type) -> TypedBinding {
 }
 
 /// `let name = def in body`, typed as `body`.
-fn let_in(name: TypedBinding, def: Expr, body: Expr) -> Expr {
+pub(crate) fn let_in(name: TypedBinding, def: Expr, body: Expr) -> Expr {
     let ty = body.ty.clone();
     Expr {
         node: TypedExprNode::Let {
@@ -612,7 +611,7 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<(Name, Expr)>) -> Expr {
 /// from body structurally and never rebuilds either. `writes` is always a
 /// positional tuple (one element even for a single accumulator), matching
 /// the transaction decision convention; the guard reads the *writes
-/// projection* of the history (guarded — see `check_letrec_guarded`); each
+/// projection* of the history (causal — see `check_letrec_causal`); each
 /// feed rides the decision as a `to_<feed>` field, hoisted to
 /// `Feed(defer, __hist ≫ .to_<feed>)` for `channelize` to route.
 fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr) -> Expr {
@@ -684,7 +683,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
 
     // The recurrence guard reads the *writes projection* of the history:
     // `get_prev_seq((__hist ≫ .writes, r, (init₀, …)))` — a projection of the
-    // history is a guarded reference (see `check_letrec_guarded`); the
+    // history is a causal reference (see `check_letrec_causal`); the
     // defaults are the accumulators' pre-loop bindings, tupled.
     let writes_view = hist_field_view(&h, &hist_ty, &domain_ty, F_WRITES, &writes_ty, &decision_ty);
     let mut defaults = Expr::tuple(accs.iter().map(|(n, ty)| tvar(n, ty.clone())).collect());
@@ -729,7 +728,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
         let view_ty = view.ty.clone();
         let mut arg = Expr::tuple(vec![view, tvar(acc, vty.clone())]);
         arg.ty = Type::Tuple(vec![view_ty, vty.clone()]);
-        let mut f = Expr::builtin(Builtin::LastOrDefault);
+        let mut f = Expr::builtin(Builtin::FinalOrDefault);
         f.ty = Type::fun(arg.ty.clone(), vty.clone());
         let mut read = Expr::apply(arg, f);
         read.ty = vty.clone();
@@ -767,8 +766,8 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
 
     let bindings = vec![(binding(h, hist_ty), lambda)];
     debug_assert!(
-        check_letrec_guarded(&bindings).is_ok(),
-        "letrec phase emitted an unguarded group"
+        check_letrec_causal(&bindings).is_ok(),
+        "letrec phase emitted an non-causal group"
     );
     let ty = body_out.ty.clone();
     Expr {
@@ -1028,422 +1027,6 @@ fn subst_env(mut e: Expr, env: &HashMap<Name, Expr>) -> Expr {
     e
 }
 
-// ---------------------------------------------------------------------------
-// Recognition: point-free LetRec → Transact (the carrier planning stages and
-// op-conversion compiles)
-// ---------------------------------------------------------------------------
-
-/// Lower every phase-emitted `LetRec` — **after `lambda_elim`**, on its
-/// point-free normal form — onto the [`TypedExprNode::Transact`] carrier:
-/// `let __store = Transact{…} in <reads off __store.field>`. An unrecognized
-/// group is a compile-time panic (no silent fallback) — the phases and this
-/// recognizer are co-designed against the point-free normal forms, exercised
-/// end-to-end by the induction suite (`tests/compilation_pipeline/mutability.rs`),
-/// so a mismatch is a bug here, not in the program.
-///
-/// Running post-elim is what retires the pointful/point-free double
-/// representation: one `LetRec` travels from the unified phase through
-/// `channelize` and `lambda_elim`; recognition then splits each binding into
-/// its guard scaffold and its **verbatim, already point-free writer body**
-/// (the decision-factored form the phases emit), so nothing is rebuilt.
-/// Planning stages the carrier's writer sources (its `Transact` arm) and
-/// op-conversion picks the engine on the domain, both unchanged.
-///
-/// Two shapes are recognized, dispatched on the guard: a **transaction**
-/// group (`get_prev_txn`-guarded `store ↔ commits` cycles from
-/// `transact_phase`) → `Transact{domain: Txn}`; a
-/// single-binding **induction** group (a `get_prev_seq`-guarded self-cycle
-/// from [`transform_loop`]) → `Transact{domain: iteration extent}`.
-pub fn recognize(expr: Expr) -> Expr {
-    let mut expr = expr;
-    if let TypedExprNode::LetRec { .. } = &expr.node {
-        let TypedExprNode::LetRec { bindings, body } = expr.node else {
-            unreachable!("guarded above")
-        };
-        // The point-free guard matcher backs this in all builds — recognition
-        // is the wall between "phase emitted" and "engine consumed", with
-        // channelize and lambda_elim in between.
-        if let Err(errs) = check_letrec_guarded(&bindings) {
-            panic!(
-                "letrec recognition: unguarded group reached recognition: {}",
-                errs[0]
-            );
-        }
-        // Recurse into the continuation first (later loops / nested groups
-        // nest there — e.g. an induction loop after a transaction).
-        let body = recognize(*body);
-        // A **channel group** — `Feed`-kind bindings channelize emitted as a
-        // mutually-scoped cluster — carries no guard at all. There is no
-        // engine to build: the group is acyclic (the guardedness wall above,
-        // with no guards, is exactly an acyclicity check), so flatten it back
-        // to plain `let`s in dependency order for planning.
-        if !group_has_guard(&bindings) {
-            let bindings = bindings
-                .into_iter()
-                .map(|(b, def)| (b, recognize(def)))
-                .collect();
-            return flatten_channel_group(bindings, body);
-        }
-        assert_eq!(
-            bindings.len(),
-            1,
-            "letrec recognition: a non-transaction group must be a single-binding \
-             induction group in v1"
-        );
-        let (h, def) = bindings.into_iter().next().unwrap();
-        return recognize_group(h, def, body);
-    }
-    expr.map_children(recognize);
-    expr
-}
-
-/// Whether any binding of the group applies a `get_prev_*` guard — i.e. the
-/// group carries recurrent state. A guard-free group is a channel cluster.
-fn group_has_guard(bindings: &[(TypedBinding, Expr)]) -> bool {
-    bindings.iter().any(|(_, def)| {
-        uses_builtin(def, Builtin::GetPrevSeq) || uses_builtin(def, Builtin::GetPrevTxn)
-    })
-}
-
-/// Whether the subtree mentions builtin `b`.
-fn uses_builtin(e: &Expr, b: Builtin) -> bool {
-    if matches!(&e.node, TypedExprNode::Builtin(x) if *x == b) {
-        return true;
-    }
-    let mut found = false;
-    e.walk_children(|c| found = found || uses_builtin(c, b));
-    found
-}
-
-/// Flatten an acyclic channel group to plain `let`s, dependencies bound before
-/// dependents (Kahn's algorithm over the group's reference edges — the group
-/// passed the guardedness wall with no guards, so a source always exists).
-fn flatten_channel_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr {
-    let mut remaining = bindings;
-    let mut ordered: Vec<(TypedBinding, Expr)> = Vec::with_capacity(remaining.len());
-    while !remaining.is_empty() {
-        let i = (0..remaining.len())
-            .find(|&i| {
-                remaining
-                    .iter()
-                    .enumerate()
-                    .all(|(j, (b, _))| j == i || count_free(&b.name, &remaining[i].1) == 0)
-            })
-            .expect("letrec recognition: acyclic channel group has a dependency-free binding");
-        ordered.push(remaining.remove(i));
-    }
-    let mut out = body;
-    for (b, def) in ordered.into_iter().rev() {
-        out = let_in(b, def, out);
-    }
-    out
-}
-
-/// Unwrap the post-elim constant-stream wrapper `x ▷ const`, returning `x`.
-fn unwrap_const(e: Expr) -> Expr {
-    let TypedExprNode::Apply { argument, function } = e.node else {
-        panic!("letrec recognition: expected `x ▷ const`, got a non-application");
-    };
-    assert!(
-        matches!(function.node, TypedExprNode::Builtin(Builtin::Const)),
-        "letrec recognition: expected `x ▷ const`"
-    );
-    *argument
-}
-
-/// Destructure the post-elim guard compose
-/// `(⟨view⟩ ▷ const, ⟨pos⟩, ⟨default⟩ ▷ const) ▷ zip ≫ get_prev_*`,
-/// returning `(default, which-guard)`. The view slot (the guarded history
-/// read) is validated by `check_letrec_guarded` and discarded here — the
-/// engine reconstructs every read from the store itself.
-fn split_guard_compose(guard: Expr) -> (Expr, Builtin) {
-    let TypedExprNode::Compose(mut elts) = guard.node else {
-        panic!("letrec recognition: guard is not a compose");
-    };
-    let last = elts.pop().expect("guard compose has a tail");
-    let TypedExprNode::Builtin(b) = last.node else {
-        panic!("letrec recognition: guard compose does not end in a builtin");
-    };
-    assert!(
-        matches!(b, Builtin::GetPrevSeq | Builtin::GetPrevTxn),
-        "letrec recognition: guard compose does not end in get_prev_*"
-    );
-    assert_eq!(
-        elts.len(),
-        1,
-        "letrec recognition: guard compose has unexpected middle elements"
-    );
-    let head = elts.pop().expect("guard compose head");
-    let TypedExprNode::Apply { argument, function } = head.node else {
-        panic!("letrec recognition: guard head is not a zip application");
-    };
-    assert!(
-        matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)),
-        "letrec recognition: guard head is not zipped"
-    );
-    let TypedExprNode::Tuple(mut slots) = argument.node else {
-        panic!("letrec recognition: guard zip takes a tuple");
-    };
-    assert_eq!(slots.len(), 3, "guard arity (history, position, default)");
-    let default = unwrap_const(slots.pop().expect("default slot"));
-    (default, b)
-}
-
-/// Destructure a post-elim decision compose
-/// `(⟨slot₀⟩, …, ⟨source⟩) ▷ zip ≫ ⟨body…⟩` into its snapshot slots, the
-/// trailing source, and the writer body (the tail elements re-composed,
-/// verbatim). `p_tys` are the body's tuple-parameter element types (snapshot
-/// value types then the item), used only to stamp the rebuilt body compose.
-fn split_decision_compose(decision: Expr, decision_ty: &Type) -> (Vec<Expr>, Expr, Expr) {
-    if !matches!(decision.node, TypedExprNode::Compose(_)) {
-        panic!(
-            "letrec recognition: decision is not a compose: {}",
-            symbolic(&decision)
-        );
-    }
-    let TypedExprNode::Compose(mut elts) = decision.node else {
-        unreachable!("guarded above")
-    };
-    assert!(
-        elts.len() >= 2,
-        "letrec recognition: decision compose needs a snapshot head and a body tail"
-    );
-    let tail: Vec<Expr> = elts.split_off(1);
-    let head = elts.pop().expect("decision head");
-    let TypedExprNode::Apply { argument, function } = head.node else {
-        panic!("letrec recognition: decision head is not a zip application");
-    };
-    assert!(
-        matches!(function.node, TypedExprNode::Builtin(Builtin::Zip)),
-        "letrec recognition: decision head is not zipped"
-    );
-    let TypedExprNode::Tuple(mut slots) = argument.node else {
-        panic!("letrec recognition: decision snapshot is not a tuple");
-    };
-    let source = slots.pop().expect("snapshot carries the source");
-    let slot_val_ty = |e: &Expr| {
-        e.ty.codomain()
-            .expect("letrec recognition: snapshot slot is a stream")
-    };
-    let mut p_tys: Vec<Type> = slots.iter().map(slot_val_ty).collect();
-    p_tys.push(slot_val_ty(&source));
-    let body = if tail.len() == 1 {
-        tail.into_iter().next().expect("single body element")
-    } else {
-        let mut c = Expr::compose(tail);
-        c.ty = Type::fun(Type::Tuple(p_tys), decision_ty.clone());
-        c
-    };
-    (slots, source, body)
-}
-
-/// Destructure the phase\'s decision-factored induction binding (post-elim)
-/// and rebuild it as a `Transact`:
-///
-/// ```text
-/// __hist = let __prev = (⟨view⟩ ▷ const, id, (init…) ▷ const) ▷ zip ≫ get_prev_seq
-///          in (__prev ≫ .0, …, ⟨source⟩) ▷ zip ≫ ⟨body⟩
-/// ```
-///
-/// The writer `body` is lifted verbatim; keys\' inits come off the guard\'s
-/// defaults tuple; the source off the snapshot\'s trailing slot. Reads of
-/// `__hist` in the letrec body (`__hist ≫ .writes ≫ .i` extracts and
-/// `__hist ≫ .to_<feed>` taps) become store-record projections.
-fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
-    let (domain_ty, decision_ty) = fun_parts(&h.ty);
-    let Type::Record(decision_field_tys) = &decision_ty else {
-        panic!("letrec recognition: history codomain is not a record: {decision_ty}");
-    };
-    let feed_fields: Vec<(String, Type)> = decision_field_tys
-        .iter()
-        .filter(|(n, _)| n != F_COMMIT && n != F_WRITES)
-        .cloned()
-        .collect();
-
-    let TypedExprNode::Let {
-        bound_expr: guard,
-        body: applied,
-        ..
-    } = def.node
-    else {
-        panic!(
-            "letrec recognition: induction binding is not the factored `let __prev = ⟨guard⟩ …` \
-             shape"
-        );
-    };
-    let (defaults, which) = split_guard_compose(*guard);
-    assert!(
-        matches!(which, Builtin::GetPrevSeq),
-        "letrec recognition: induction history guarded by get_prev_txn"
-    );
-    let TypedExprNode::Tuple(inits) = defaults.node else {
-        panic!("letrec recognition: guard defaults are not the tupled inits");
-    };
-
-    let (prev_slots, source, writer_body) = split_decision_compose(*applied, &decision_ty);
-    assert_eq!(
-        prev_slots.len(),
-        inits.len(),
-        "letrec recognition: snapshot slots must match the key inits"
-    );
-    let acc_tys: Vec<Type> = prev_slots
-        .iter()
-        .map(|e| {
-            e.ty.codomain()
-                .expect("letrec recognition: previous-value slot is a stream")
-        })
-        .collect();
-
-    // One store key per accumulator. Names are fresh labels: every read is
-    // positional (`__hist ≫ .writes ≫ .i`), so only field order is
-    // load-bearing.
-    let keys: Vec<TransactKey> = inits
-        .into_iter()
-        .map(|init| TransactKey {
-            name: Name::fresh("acc"),
-            init,
-        })
-        .collect();
-    let key_names: Vec<Name> = keys.iter().map(|k| k.name.clone()).collect();
-
-    let mut store_field_tys: Vec<(String, Type)> = keys
-        .iter()
-        .zip(&acc_tys)
-        .map(|(k, vty)| {
-            (
-                k.name.field_key(),
-                Type::fun(domain_ty.clone(), vty.clone()),
-            )
-        })
-        .collect();
-    for (f, vty) in &feed_fields {
-        store_field_tys.push((f.clone(), Type::fun(domain_ty.clone(), vty.clone())));
-    }
-    let store_ty = Type::Record(store_field_tys);
-
-    let writer = TransactWriter {
-        read_keys: key_names.clone(),
-        write_keys: key_names,
-        source,
-        body: writer_body,
-    };
-    let keys_for_reads = keys.clone();
-    let mut transact = Expr::new(TypedExprNode::Transact {
-        keys,
-        writers: vec![writer],
-        domain: domain_ty.clone(),
-    });
-    transact.ty = store_ty.clone();
-
-    let store = Name::fresh("__store");
-    let mut body = letrec_body;
-    rewrite_hist_reads(
-        &mut body,
-        &h.name,
-        &store,
-        &store_ty,
-        &keys_for_reads,
-        &acc_tys,
-        &domain_ty,
-    );
-    assert_eq!(
-        count_free(&h.name, &body),
-        0,
-        "letrec recognition: unhandled history read of `{}`",
-        h.name
-    );
-
-    let ty = body.ty.clone();
-    Expr {
-        node: TypedExprNode::Let {
-            binding: binding(store, store_ty),
-            bound_expr: Box::new(transact),
-            body: Box::new(body),
-        },
-        ty,
-        user_annotation: None,
-    }
-}
-
-/// `__store.field = Apply(Var(__store), Proj(Field(field)))` — a store-record
-/// projection reading key `field`\'s history `Fun(D, V)`.
-fn store_field_read(store: &Name, store_ty: &Type, field: String, field_ty: Type) -> Expr {
-    let mut proj = Expr::proj_field(field);
-    proj.ty = Type::fun(store_ty.clone(), field_ty.clone());
-    let mut app = Expr::apply(tvar(store, store_ty.clone()), proj);
-    app.ty = field_ty;
-    app
-}
-
-/// Rewrite every `__hist` view in the letrec body to a store-record
-/// projection `__store.field`. The phase builds accumulator reads as the flat
-/// compose `__hist ≫ .writes ≫ .i` and feed reads as `__hist ≫ .to_<feed>`;
-/// downstream normalization may extend those composes (`__hist ≫ .to ≫ f`),
-/// so the match is on the *prefix*, keeping any tail elements.
-fn rewrite_hist_reads(
-    e: &mut Expr,
-    h: &Name,
-    store: &Name,
-    store_ty: &Type,
-    keys: &[TransactKey],
-    acc_tys: &[Type],
-    domain_ty: &Type,
-) {
-    if let TypedExprNode::Compose(elts) = &e.node
-        && matches!(elts.first().map(|x| &x.node), Some(TypedExprNode::Var(n)) if n == h)
-    {
-        // The store read replacing the matched prefix, plus how many compose
-        // elements the prefix covered.
-        let replacement: Option<(Expr, usize)> =
-            match (elts.get(1).map(|x| &x.node), elts.get(2).map(|x| &x.node)) {
-                (
-                    Some(TypedExprNode::Proj(ProjKey::Field(f))),
-                    Some(TypedExprNode::Proj(ProjKey::Index(i))),
-                ) if f == F_WRITES => {
-                    let field = keys[*i].name.field_key();
-                    let field_ty = Type::fun(domain_ty.clone(), acc_tys[*i].clone());
-                    Some((store_field_read(store, store_ty, field, field_ty), 3))
-                }
-                (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
-                    // A tap read `__hist ≫ .to_<feed>`: its stream type is the
-                    // store record\'s field type.
-                    let field = f.clone();
-                    let field_ty = store_ty_field(store_ty, &field);
-                    Some((store_field_read(store, store_ty, field, field_ty), 2))
-                }
-                _ => None,
-            };
-        if let Some((read, covered)) = replacement {
-            let rest: Vec<Expr> = elts[covered..].to_vec();
-            if rest.is_empty() {
-                let outer_ty = e.ty.clone();
-                *e = read;
-                e.ty = outer_ty;
-            } else {
-                let mut new_elts = vec![read];
-                new_elts.extend(rest);
-                let outer_ty = e.ty.clone();
-                *e = Expr::compose(new_elts);
-                e.ty = outer_ty;
-            }
-            return;
-        }
-    }
-    e.walk_children_mut(|c| rewrite_hist_reads(c, h, store, store_ty, keys, acc_tys, domain_ty));
-}
-
-/// The declared type of `field` on the store record.
-fn store_ty_field(store_ty: &Type, field: &str) -> Type {
-    let Type::Record(fs) = store_ty else {
-        panic!("letrec recognition: store type is not a record");
-    };
-    fs.iter()
-        .find(|(n, _)| n == field)
-        .unwrap_or_else(|| panic!("letrec recognition: store record lacks field `{field}`"))
-        .1
-        .clone()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1503,18 +1086,18 @@ mod tests {
         (tree, x, i)
     }
 
-    /// The phase turns the loop into a guarded letrec: the history binding
-    /// guarded by `get_prev_seq`, the trailing read via `last_or_default`,
+    /// The phase turns the loop into a causal letrec: the history binding
+    /// causal by `get_prev_seq`, the trailing read via `last_or_default`,
     /// and no marker residue.
     #[test]
-    fn phase_emits_guarded_letrec() {
+    fn phase_emits_causal_letrec() {
         let (tree, _, _) = direct_mirror_sum();
         let out = run(tree);
         let s = symbolic(&out);
         assert!(s.contains("letrec"), "should emit a letrec: {s}");
-        assert!(s.contains("get_prev_seq"), "recursion must be guarded: {s}");
+        assert!(s.contains("get_prev_seq"), "recursion must be causal: {s}");
         assert!(
-            s.contains("last_or_default"),
+            s.contains("final_or_default"),
             "trailing read must extract the final value: {s}"
         );
         assert!(!contains_marker(&out), "no For/MutWrite residue: {s}");
@@ -1532,7 +1115,7 @@ mod tests {
         // (+simplify) pass between the phase and the recognizer, as the
         // pipeline does.
         let elim = crate::ccl::lambda_elim::run(run(tree)).expect("lambda elimination");
-        let out = recognize(elim);
+        let out = crate::ccl::planning::plan_loops(elim);
         let s = symbolic(&out);
         assert!(!s.contains("letrec"), "letrec must be consumed: {s}");
         assert!(!s.contains("get_prev_seq"), "guard must be consumed: {s}");
@@ -1546,7 +1129,7 @@ mod tests {
             "writer body must terminate in a `{{commit, writes}}` decision: {s}"
         );
         assert!(
-            s.contains("__store.") && s.contains("last_or_default"),
+            s.contains("__store.") && s.contains("final_or_default"),
             "trailing read must project the store record and reduce it: {s}"
         );
     }

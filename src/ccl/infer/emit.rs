@@ -13,8 +13,8 @@ use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, Branch, Expr, Name, ProjKey, Refinement, TransactKey, TransactWriter, Type,
-    TypedBinding, TypedExprNode,
+    BaseType, Branch, Expr, Name, ProjKey, Refinement, TransactKey, Type, TypedBinding,
+    TypedExprNode, WriterSite,
 };
 
 use super::context::InferCtx;
@@ -45,7 +45,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
 
         // Builtins with a polymorphic signature (shared type variables
         // across positions) live in the `OperatorSchemes` registry — at
-        // each use site we freshen a copy. Currently only `LastOrDefault`
+        // each use site we freshen a copy. Currently only `FinalOrDefault`
         // qualifies (`∀α β. ((α → β), β) → β`); the registry generalizes
         // as more polymorphic builtins land. All other builtins arrive
         // pre-stamped from lowering and just get converted in place.
@@ -145,7 +145,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
 
         TypedExprNode::CollectionUnion(exprs) => emit_collection_union(exprs, ctx)?,
 
-        // `Transact` is born by `letrec_phase::recognize`, which runs *after*
+        // `Transact` is born by `planning::plan_loops`, which runs *after*
         // inference, so constraint emission never sees one. Gathered
         // `Transact` nodes are typed in the Check pass (`emit_transact`).
         TypedExprNode::Transact { .. } => {
@@ -515,7 +515,7 @@ pub(super) fn emit_expr_stmt<C: Typing>(
 /// the function and instantiates a fresh `ρ` per call site — exactly the
 /// "fresh defer per call" semantics the channelization float gives it.
 pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
-    // A feed channel is an unguarded history `domain ⇒ value`: fresh vars for
+    // A feed channel is a non-causal history `domain ⇒ value`: fresh vars for
     // both. The `value` accumulates the fed element type. The `domain` is a
     // placeholder here — for a `let d = Defer` (the only shape lowering emits)
     // [`emit_let`] immediately replaces it with the rigid nominal `ChanDom(d)`
@@ -525,19 +525,19 @@ pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
     Type::History {
         value: Box::new(ctx.fresh()),
         domain: Box::new(ctx.fresh()),
-        kind: crate::ccl::HistoryKind::Feed,
+        kind: crate::ccl::HistoryKind::Append,
     }
 }
 
 /// Deref a mutable **store** reference to its value type: peel a
-/// (refinement-wrapped) `Mut[V, D]` (a [`HistoryKind::Store`] history) to `V`.
+/// (refinement-wrapped) `Mut[V, D]` (a [`HistoryKind::Overwrite`] history) to `V`.
 /// A no-op on non-store types (including a feed channel, which reads as its
 /// whole stream, not a scalar value).
 fn deref_mut(ty: &Type) -> Type {
     match peel_refinements_outer(ty) {
         Type::History {
             value,
-            kind: crate::ccl::HistoryKind::Store,
+            kind: crate::ccl::HistoryKind::Overwrite,
             ..
         } => value.as_ref().clone(),
         _ => ty.clone(),
@@ -607,7 +607,7 @@ fn constrain_into_feed<C: Typing>(
         Type::History {
             value,
             domain,
-            kind: crate::ccl::HistoryKind::Feed,
+            kind: crate::ccl::HistoryKind::Append,
         } => {
             // The channel is the history's `domain ⇒ value` stream; the
             // contribution flows into it (`Fun(δ, elem)` for a feed, the whole
@@ -626,7 +626,7 @@ fn constrain_into_feed<C: Typing>(
             let required = Type::History {
                 value: Box::new(rho_value.clone()),
                 domain: Box::new(rho_domain.clone()),
-                kind: crate::ccl::HistoryKind::Feed,
+                kind: crate::ccl::HistoryKind::Append,
             };
             ctx.require_sub(target_ty, &required, &|| {
                 format!("feed target of {label} must be a feed handle")
@@ -733,7 +733,7 @@ pub(super) fn emit_let<C: Typing>(
         && let Type::History {
             value,
             domain,
-            kind: crate::ccl::HistoryKind::Feed,
+            kind: crate::ccl::HistoryKind::Append,
         } = &bound_ty
         && let Type::Infer(dv) = domain.as_ref()
     {
@@ -743,7 +743,7 @@ pub(super) fn emit_let<C: Typing>(
                 binding.name.clone(),
                 crate::ccl::ChanLevel(dv.level),
             )),
-            kind: crate::ccl::HistoryKind::Feed,
+            kind: crate::ccl::HistoryKind::Append,
         };
         bound_expr.ty = handle.clone();
         handle
@@ -764,7 +764,7 @@ pub(super) fn emit_let<C: Typing>(
     // own. The binding *slot* is left to coalesce, which fills a monomorphic
     // `let`'s slot from its bound expression (the store's value type `V`) —
     // the store-ness is carried by the *reference* types, not the slot. The
-    // unified phase (`letrec_phase`) rewrites every read/write and erases the
+    // unified phase (`mut_elim`) rewrites every read/write and erases the
     // `Mut` before the strict wall. Every other annotation reconciles the RHS
     // as before (`x: Int = expr`).
     let scheme_ty = match &binding.user_annotation {
@@ -778,7 +778,7 @@ pub(super) fn emit_let<C: Typing>(
             if matches!(
                 peel_refinements_outer(ann),
                 Type::History {
-                    kind: crate::ccl::HistoryKind::Store,
+                    kind: crate::ccl::HistoryKind::Overwrite,
                     ..
                 }
             ) =>
@@ -1151,7 +1151,7 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
 /// value type. `commit` gates the whole (atomic) write set; any extra
 /// `to_<defer>` fields ride along as width-subtyped taps.
 fn emit_transact_writer<C: Typing>(
-    writer: &mut TransactWriter,
+    writer: &mut WriterSite,
     key_types: &std::collections::HashMap<Name, Type>,
     ctx: &mut C,
 ) -> Result<(), InferError> {
@@ -1214,12 +1214,12 @@ fn emit_transact_writer<C: Typing>(
 /// is realized operationally at op-conversion — so no `σ <: α` constraint, just
 /// each writer's per-key store round-trip.
 ///
-/// `Transact` is born by `letrec_phase::recognize` after inference, so this
+/// `Transact` is born by `planning::plan_loops` after inference, so this
 /// rule runs only in the Check pass; it never mints constraints that must
 /// coalesce.
 pub(super) fn emit_transact<C: Typing>(
     keys: &mut [TransactKey],
-    writers: &mut [TransactWriter],
+    writers: &mut [WriterSite],
     domain: &Type,
     ctx: &mut C,
 ) -> Result<Type, InferError> {

@@ -934,7 +934,7 @@ running_totals";
         // The generator lowers to the direct-mirror shape: a `__result` defer
         // bound around a `For` loop whose body writes `total` and feeds the
         // defer with each yield. The unified letrec phase turns this into a
-        // guarded `LetRec` and hoists the yield-feed (src/ccl/design/mutability.md).
+        // causal `LetRec` and hoists the yield-feed (src/ccl/design/mutability.md).
         assert!(
             s.contains("__result_") && s.contains("defer"),
             "should bind a defer for the generator's yields: {s}"
