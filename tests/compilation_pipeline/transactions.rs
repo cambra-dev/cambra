@@ -882,6 +882,104 @@ fn commit_ordered_reply_reading_induction_counter() {
     );
 }
 
+/// In-block reply with an interspersed deny: the reply tap `resp << q` rides the
+/// writer *decision*, so a denied transaction (`r == 0`, guard false) contributes
+/// no tick and no reply, while each committing position emits its
+/// read-your-writes value densely. This is the exact reply-path contract (a
+/// read-your-writes stream, not an arbitrary as-of sample) and must be preserved
+/// exactly under the consumer-driven store: r=0 denies, r=1 commits q:=2 (tick 1),
+/// r=2 commits q:=3 (tick 2) → `resp` = [2, 3] over commit ticks [1, 2].
+#[test]
+fn in_block_reply_with_deny_is_dense() {
+    check_tile(
+        "resp = defer()\nq: Mut[int, Txn] := 0\nfor r in [0, 1, 2]:\n    with begin():\n        if r != 0:\n            q := r + 1\n            resp << q\nresp",
+        commit_stream(&[1, 2], &[2, 3]),
+    );
+}
+
+/// Live-store progress past an interior deny. A finite writer accumulates `total`
+/// with a middle deny (`[10, 0, 20]`: total 0→10, r=0 denies, →30), and a **live**
+/// request stream reads `total + req` as an as-of read latched at each request's
+/// arrival. The consumer-driven store steps past the deny under the writer's own
+/// self-re-arm (no reader-side drive-to-fixpoint), so **every request is served**
+/// (no freeze — one reply per request) and a request delivered after the writer
+/// completes observes the **post-deny** commit (`total = 30`), which the old
+/// producer-side `drive_store_to_fixpoint` stopped short of (a deny stalls the
+/// frontier, so the drive returned the pre-deny `total = 10` and a request latching
+/// then froze there). Observations are asserted **non-decreasing** (a monotone
+/// accumulator sampled at arrival) and members of the committed set — never a
+/// specific "final" value.
+#[test]
+fn live_read_progresses_past_deny() {
+    use cambra::interpreter::sort_sealed_function_by_domain;
+
+    let code = "resps = defer()\n\
+                total: Mut[int, Txn] := 0\n\
+                for r in [10, 0, 20]:\n    with begin():\n        if r != 0:\n            total := total + r\n\
+                for req in source1():\n    with begin():\n        resps << total + req\n\
+                resps";
+    let mut ctx = GlobalContext::default();
+    let src = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(src.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let ug = producer.tiling().universal_guard();
+
+    // Two requests (req = 100 at position 0, req = 200 at position 1); drive the
+    // cyclic store — with its interior deny — to completion.
+    src.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(100)),
+        (Value::UInt(1), Value::Int(200)),
+    ]);
+    src.borrow_mut().set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+    let mut result = producer.get(ug.clone());
+    for _ in 0..64 {
+        result = producer.get(ug.clone());
+    }
+    result.compact();
+
+    let result = sort_sealed_function_by_domain(result);
+    let Tile::SealedFunction {
+        domain, codomain, ..
+    } = &result
+    else {
+        panic!("expected a SealedFunction reply stream, got {result:?}");
+    };
+    let Tile::Scalar(ColumnValue::Ints(vals)) = codomain.as_ref() else {
+        panic!("expected an Ints reply codomain, got {codomain:?}");
+    };
+    // No freeze: both requests are served.
+    assert_eq!(domain.len(), 2, "both requests served (no freeze)");
+    assert_eq!(vals.len(), 2);
+    // The observed `total` per request (reply − its req value). Requests carried
+    // req = 100 at position 0 and req = 200 at position 1.
+    let observed_total: Vec<i64> = vec![vals[0] - 100, vals[1] - 200];
+    // Every observed total is a committed member of {0, 10, 30}.
+    for t in &observed_total {
+        assert!(
+            [0, 10, 30].contains(t),
+            "observed total {t} must be a committed value in {{0, 10, 30}}"
+        );
+    }
+    // A monotone accumulator sampled at arrival is non-decreasing across requests.
+    assert!(
+        observed_total[0] <= observed_total[1],
+        "later request observes a value >= the earlier one, got {observed_total:?}"
+    );
+    // The later request observes the post-deny commit — the store stepped past the
+    // interior deny (which the old drive-to-fixpoint stalled on).
+    assert_eq!(
+        observed_total[1], 30,
+        "the post-writer request observes the drained total 30 (past the r=0 deny)"
+    );
+}
+
 /// Cross-function transactional writer: `def transfer(src, dst, amt)` writes two
 /// `Mut[_, Txn]` registers inside one `with begin():` block. Inlining
 /// beta-reduces the call so the writes name the caller's `a`/`b` bindings, which

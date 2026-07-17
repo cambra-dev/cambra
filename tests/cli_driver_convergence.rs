@@ -14,7 +14,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use cambra::ccl::context::{GlobalContext, compile_program};
-use cambra::interpreter::{Consumer, Tile, TileGuard, Value, tile_operators::FunctionGuard};
+use cambra::interpreter::{
+    ColumnValue, Consumer, Tile, TileGuard, Value, tile_operators::FunctionGuard,
+};
 
 /// Drive a program's `main` output exactly as `src/main.rs` does — pull only
 /// after a notification, stop on a universal release — but with iteration caps
@@ -120,4 +122,52 @@ fn empty_loop_returns_init() {
 #[test]
 fn aggregate_converges_in_one_pull() {
     assert_eq!(drive_scalar_int("sum([1, 2, 3, 4, 5])"), 15);
+}
+
+/// The integer codomain of a one-element `main` output stream (a trailing
+/// standalone read-only transaction's `AsOf` reply).
+fn drive_single_int(code: &str) -> i64 {
+    match drive_main_output(code) {
+        Tile::SealedFunction { codomain, .. } => match *codomain {
+            Tile::Scalar(ColumnValue::Ints(v)) if v.len() == 1 => v[0],
+            other => panic!("expected a one-element Ints stream, got {other:?}"),
+        },
+        other => panic!("expected a SealedFunction stream, got {other:?}"),
+    }
+}
+
+/// A commit store whose writer stream **leads with a deny** must converge through
+/// the notification-gated driver. A denied transaction advances the writer without
+/// growing the commit frontier, so it is invisible in the store tile; the writer's
+/// one-step-per-pull self-re-arm (not a reader-side drive-to-fixpoint) is what
+/// keeps stepping the store past the deny. Before that re-arm, removing the drive
+/// loop would strand the driver in `while !new_data` (a lost wakeup) — this test
+/// turns that hang into a `drive_main_output` cap panic. The trailing `out << q`
+/// is an as-of read; its value is a *member* of the as-of set (the seed `0` or a
+/// committed `q`), never asserted to be a specific "final" — here the batch drains
+/// so it observes a committed value, but membership is the guarantee.
+#[test]
+fn leading_deny_converges_no_stall() {
+    // r=0 denies (guard `r != 0` false); r=1 commits q:=2; r=2 commits q:=3.
+    let v = drive_single_int(
+        "out = defer()\nq: Mut[int, Txn] := 0\nfor r in [0, 1, 2]:\n    with begin():\n        if r != 0:\n            q := r + 1\nwith begin():\n    out << q\nout",
+    );
+    assert!(
+        [0, 2, 3].contains(&v),
+        "trailing as-of read {v} must be a member of the as-of set {{0, 2, 3}}"
+    );
+}
+
+/// As `leading_deny_converges_no_stall`, but the deny sits in the **middle** of
+/// the writer stream (`[1, 0, 2]`): r=1 commits q:=2, r=0 denies (no tick), r=2
+/// commits q:=3. The store must still step past the interior deny to terminal.
+#[test]
+fn middle_deny_converges_no_stall() {
+    let v = drive_single_int(
+        "out = defer()\nq: Mut[int, Txn] := 0\nfor r in [1, 0, 2]:\n    with begin():\n        if r != 0:\n            q := r + 1\nwith begin():\n    out << q\nout",
+    );
+    assert!(
+        [0, 2, 3].contains(&v),
+        "trailing as-of read {v} must be a member of the as-of set {{0, 2, 3}}"
+    );
 }
