@@ -226,7 +226,7 @@ Op-conversion's arms split into two groups by how they handle their parent's
   isolation, with its own iteration extent at the bottom of its chain.  Examples:
   `Iterate` (the canonical chain-head extent producer), `MapDomain`, `Uncurry`,
   `FlattenDomain`, `PermuteDomain`, `CollectionUnion`, `Sum` / `Max`,
-  `LastOrDefault`, and the catch-all `Apply` arm (where the function position
+  `FinalOrDefault`, and the catch-all `Apply` arm (where the function position
   is a `Proj` / `Var` / curried `Apply`).
 
 `Converse` straddles the split: it accepts either `input=None` (produce an
@@ -316,7 +316,7 @@ Three arms share an input across multiple downstream consumers:
 The pipeline always bottoms out at one of three consumer shapes:
 
 1. A scalar produced by `Apply(<chain>, Sum)` / `Max` (compiles to
-   `Aggregate` + `ExtractAggregate`) or `Apply(Tuple([stream, default]), LastOrDefault)`
+   `Aggregate` + `ExtractAggregate`) or `Apply(Tuple([stream, default]), FinalOrDefault)`
    (compiles to `ExtractLast`).
 2. A function-typed program result — `convert_to_operators` is the entry
    point, the resulting tile is subscribed by the user-supplied `main_consumer`

@@ -48,7 +48,7 @@ CHL source
                       per-iteration feed inside a loop is hoisted to an ordinary feed of the loop's history)
   → channelize       (ccl/channelize.rs: Defer/Feed/Define → `++`-union channel bindings, each defer
                       cluster emitted as a mutually-scoped Feed-kind LetRec group; the feed-routing step
-                      of the unified phase, type-preserving by construction. Feed reads type concretely
+                      of mutability elimination (mut_elim + channelize), type-preserving by construction. Feed reads type concretely
                       via rigid ChanDom channel domains, erased here by substitution — no retype pass.
                       Runs after the letrec phase, so an in-loop feed is already hoisted to a feed of the
                       loop's history)

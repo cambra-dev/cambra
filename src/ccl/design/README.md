@@ -15,7 +15,7 @@ CHL source
   → inline            (ccl/inline.rs)                  — inline scalar/UDF lets       →  optimization.md
   → transact_phase    (ccl/transact_phase.rs)          — with begin(): Mut[V,Txn] loops → get_prev_txn-guarded LetRec  →  mutability.md
   → mut_elim      (ccl/mut_elim.rs)            — induction mutation loops → get_prev_seq-causal LetRec, then plan_loops → Transact  →  mutability.md
-  → channelize        (ccl/channelize.rs)              — Defer/Feed/Define → channels; feed-routing step of the unified phase (after infer + the mutability phases; type-preserving)  →  mutability.md §4
+  → channelize        (ccl/channelize.rs)              — Defer/Feed/Define → channels; feed-routing step (channelize) of mutability elimination (after infer + the mutability phases; type-preserving)  →  mutability.md §4
   → lambda_elim       (ccl/lambda_elim.rs)             — λ → point-free combinators (runs simplify internally)  →  optimization.md
   → planning          (ccl/planning/)                  — hash-join / keyed-aggregate; brackets its marker pass with simplify (ccl/simplify.rs)  →  optimization.md
   → operator_conversion (interpreter/)                 — point-free CCL → tile ops     →  optimization.md

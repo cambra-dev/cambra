@@ -54,21 +54,21 @@ name in first-mention order) and emit that `For`/`MutWrite` shape; store-ness of
 each write is checked post-inference, not at lowering, and a plain `=` to an
 outer-scope name is a lowering error that points at `:=`.
 
-The recurrence is **not** built at lowering. The unified `letrec_phase` rewrites
+The recurrence is **not** built at lowering. The unified `mut_elim` rewrites
 every `For`+`MutWrite` loop into a guarded `LetRec` — the accumulators' history
 over the loop's induction domain, guarded by `get_prev_seq`, with trailing reads
-lowered to `last_or_default` — and `letrec_phase::recognize` lowers that onto the
+lowered to `final_or_default` — and `planning::plan_loops` lowers that onto the
 domain-parameterized `Transact` carrier, which operator conversion compiles to a
 `Recurse`. In-loop feeds (`<<`, and `yield` in a generator) are hoisted to
 `Feed(defer, view)` and routed as ordinary channels by `channelize`, the
-feed-routing step of the unified phase. A generator with loop-carried state
+feed-routing step (channelize) of mutability elimination. A generator with loop-carried state
 (`total := 0; for x in xs: total += x; yield total`) is the same shape — `yield e`
 is a `<<` against a synthesized result defer.
 
 The design of record for the recurrence construction and feed routing is
-[mutability.md](mutability.md) ("The model", "The unified phase", and §4); the
-implementation lives in `src/ccl/letrec_phase.rs` (the `For`/`MutWrite` → `LetRec`
-→ `Transact` recognition) and `src/ccl/channelize.rs` (feed routing).
+[mutability.md](mutability.md) ("The model", "mut_elim", and §4); the
+implementation lives in `src/ccl/mut_elim.rs` (the `For`/`MutWrite` → `LetRec`
+→ `Transact` via loop planning) and `src/ccl/channelize.rs` (feed routing).
 
 **Let-bindings in generator bodies** (`y = f(x); yield y`) lower to nested `Let` nodes inside the Lambda body, evaluated once per iteration of the enclosing loop.
 
@@ -82,7 +82,7 @@ Generator expressions `(expr for x in xs)` are lowered via `lower_list_comp` to 
 
 ## Deferred collection operators — `defer` / `<<` / `<<=`
 
-`defer()`, `<<`, and `<<=` are CHL-level operators that let a block accumulate a result value progressively. They are reified as three CCL AST nodes (`Defer`, `Feed`, `Define`) during lowering, then **eliminated** — after type inference and the unified phase — by the feed-channelization step `channelize::run` (§"The `channelize` step" below).
+`defer()`, `<<`, and `<<=` are CHL-level operators that let a block accumulate a result value progressively. They are reified as three CCL AST nodes (`Defer`, `Feed`, `Define`) during lowering, then **eliminated** — after type inference and mut_elim — by the feed-channelization step `channelize::run` (§"The `channelize` step" below).
 
 > TODO: `x = defer()` should be replaced with `deferred x` once we implement a custom parser and aren't stuck with CHL parsing rules.
 
@@ -117,11 +117,11 @@ in ExprStmt(Define(x, 1), x)    # x <<= 1; x
 
 ### The `channelize` step (feed channelization)
 
-Feed channelization runs **after** `infer` and `letrec_phase::run` (and after `inline`), but **before** `lambda_elim` and `letrec_phase::recognize` — recognition consumes the point-free normal form post-elim, so both store and channel letrec groups travel through channelization intact. It is the feed-routing step of the unified phase and is **type-preserving by construction**: inference types the `Defer`/`Feed`/`Define` constructs directly (so type errors report against the user-shaped tree), and every channel node the step builds is stamped from its children's concrete types. The one residue construction cannot know up front — the channel *domains* — is named rigidly at inference (`Type::ChanDom`, minted per `let d = Defer`), so a defer read and every node that consumes it types concretely against the rigid name; closing the tree is then a pure whole-tree substitution (`ChanDom(d)` ↦ the assembled channel domain), *not* a re-typing pass. No pass *downstream* sees `Defer`/`Feed`/`Define`/`ExprStmt` — those can treat the variants as `unreachable!`. (See [type-inference.md](type-inference.md) for why inference runs before channelization.)
+Feed channelization runs **after** `infer` and `mut_elim::run` (and after `inline`), but **before** `lambda_elim` and `planning::plan_loops` — loop planning consumes the point-free normal form post-elim, so both store and channel letrec groups travel through channelization intact. It is the append-mutability half of the eliminator (mut_elim + channelize) and is **type-preserving by construction**: inference types the `Defer`/`Feed`/`Define` constructs directly (so type errors report against the user-shaped tree), and every channel node the step builds is stamped from its children's concrete types. The one residue construction cannot know up front — the channel *domains* — is named rigidly at inference (`Type::ChanDom`, minted per `let d = Defer`), so a defer read and every node that consumes it types concretely against the rigid name; closing the tree is then a pure whole-tree substitution (`ChanDom(d)` ↦ the assembled channel domain), *not* a re-typing pass. No pass *downstream* sees `Defer`/`Feed`/`Define`/`ExprStmt` — those can treat the variants as `unreachable!`. (See [type-inference.md](type-inference.md) for why inference runs before channelization.)
 
-In broad strokes, for each cluster of consecutive `let d_i = Defer in …` bindings the step walks the cluster body to extract every `Feed(d_i, V)` and the (at most one) `Define(d_i, V)`, combines the extracted values via `++` (`TypedExprNode::CollectionUnion`), and emits the cluster as one **mutually-scoped `Feed`-kind `LetRec` group** — so cross-defer references (`x ≪= y; y ≪= …`) need no binding order, and a reference *cycle* among channels is rejected by the letrec guardedness rule (channels carry no guard). Recognition later flattens the acyclic group to dependency-ordered `let`s. Special handling exists for per-iteration feeds (Compose/Apply with iteration lambda), N-arm filter-feed Cases (`if`/`elif` fan-out to refined-source channels), and a handful of structural rewrites (defer-returning let lift, alias inlining for defer handles). Because `letrec_phase` hoists every in-loop feed to a top-level `Feed(defer, view)` before this step runs, channelization is origin-agnostic — it never distinguishes an accumulator-loop feed from a feed-only-loop or scalar feed.
+In broad strokes, for each cluster of consecutive `let d_i = Defer in …` bindings the step walks the cluster body to extract every `Feed(d_i, V)` and the (at most one) `Define(d_i, V)`, combines the extracted values via `++` (`TypedExprNode::CollectionUnion`), and emits the cluster as one **mutually-scoped `Feed`-kind `LetRec` group** — so cross-defer references (`x ≪= y; y ≪= …`) need no binding order, and a reference *cycle* among channels is rejected by the letrec guardedness rule (channels carry no guard). Recognition later flattens the acyclic group to dependency-ordered `let`s. Special handling exists for per-iteration feeds (Compose/Apply with iteration lambda), N-arm filter-feed Cases (`if`/`elif` fan-out to refined-source channels), and a handful of structural rewrites (defer-returning let lift, alias inlining for defer handles). Because `mut_elim` hoists every in-loop feed to a top-level `Feed(defer, view)` before this step runs, channelization is origin-agnostic — it never distinguishes an accumulator-loop feed from a feed-only-loop or scalar feed.
 
-The design of record — where this step sits in the unified phase and why `desugar_defers`/`retype` were retired — is **[mutability.md](mutability.md) §4**; the in-depth implementation notes (extraction paths, shadow-renaming, error modes, navigation map) live in the `ccl/channelize.rs` module rustdoc.
+The design of record — where this step sits in mutability elimination and why `desugar_defers`/`retype` were retired — is **[mutability.md](mutability.md) §4**; the in-depth implementation notes (extraction paths, shadow-renaming, error modes, navigation map) live in the `ccl/channelize.rs` module rustdoc.
 
 ### Inference before desugaring
 
