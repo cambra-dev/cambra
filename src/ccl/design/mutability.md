@@ -743,7 +743,7 @@ loops' domains — the read is that accumulator's **final** value, the same scal
 transaction. The phase distinguishes the two by the site's *enclosing-loop write set*
 (`RawSite::enclosing_writes`, from `loop_induction_writes`): an accumulator in it is co-indexed
 (zipped into the source); one not in it is broadcast — its read is bound to the loop's
-`last_or_default` final (`cross.reads`, in scope in the writer body), which op-conversion compiles to
+`final_or_default` final (`cross.reads`, in scope in the writer body), which op-conversion compiles to
 a `Constant` broadcast (via `MapResultToConst`) over the transaction domain.
 
 The one engine subtlety is **driving** that broadcast to convergence. The final's `ExtractLast` is
