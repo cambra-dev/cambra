@@ -2,7 +2,7 @@ use log::trace;
 
 use crate::{
     ccl::{
-        AggregateKind, Builtin, Expr, F_WRITES, Lit, Name, ProjKey, TransactKey, Type,
+        AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TransactKey, Type,
         TypedExprNode, WriterSite, ccl_utils::is_trivially_true_predicate, symbolic::symbolic,
     },
     interpreter::{
@@ -29,7 +29,7 @@ use crate::{
             FlattenTupleDomain, IterateExtent, MapAggregate, MapDomain, MapExtractAggregate,
             MapResult, MapResultToConst, MapResultToConstMode, MapResultWithSource, Memo,
             PermuteRecordDomain, Recurse, Restrict, TileOperator, Tiling, Uncurry, UnionOperator,
-            fan_in, fan_in_named,
+            VariantWrap, fan_in, fan_in_named,
         },
         tuple_field,
     },
@@ -1054,6 +1054,44 @@ fn convert_impl(
             compile_lit(lit)
         }
 
+        // A scalar tagged-variant value `.Tag(payload)`. Inference width-subtypes
+        // the singleton up to its consumer's full tag set, so `expr.ty` is the
+        // whole `Type::Variant`: the constructed tag names a fixed position, and
+        // the payload op feeds that variant column while the others stay empty.
+        // Compiles to a `Scalar(Union)` tile via `VariantWrap` — the net-new
+        // runtime construct that mirrors `ColumnValue::Union`, reusing the union
+        // column machinery already built for `iterate`/`++`.
+        TypedExprNode::VariantCtor { tag, payload } => {
+            expect_no_input(input, "variant constructor")?;
+            let mut ty = &expr.ty;
+            while let Type::Refinement(inner, _) = ty {
+                ty = inner;
+            }
+            let Type::Variant(variants) = ty else {
+                return Err(ConversionError::TypeError(format!(
+                    "VariantCtor `{tag}` has non-variant type {}; inference should have \
+                     width-subtyped it to a Type::Variant before op-conversion",
+                    expr.ty
+                )));
+            };
+            let tag_key = FieldKey::Name(tag.as_str().into());
+            let idx = variants
+                .iter()
+                .position(|(k, _)| *k == tag_key)
+                .ok_or_else(|| {
+                    ConversionError::TypeError(format!(
+                        "VariantCtor tag `{tag}` not present in its variant type {}",
+                        expr.ty
+                    ))
+                })?;
+            let variant_extents = variants
+                .iter()
+                .map(|(_, t)| ctx.extent_of(t))
+                .collect::<Result<Vec<_>, _>>()?;
+            let payload_op = convert_impl(payload, None, ctx)?;
+            Ok(Box::new(VariantWrap::new(payload_op, idx, variant_extents)))
+        }
+
         // Data source: produces MapResultWithSource(IterateExtent(domain), source).
         TypedExprNode::Source(name) => {
             let input = expect_input(input, &format!("Source({name})"))?;
@@ -1921,4 +1959,132 @@ fn convert_flatten_domain(
         convert_impl(argument, None, ctx)?,
         flatten_indices,
     )))
+}
+
+#[cfg(test)]
+mod variant_ctor_tests {
+    use super::*;
+    use crate::ccl::{BaseType as CclBase, Lit, Type, TypedExpr, TypedExprNode};
+    use crate::interpreter::tile_operators::Tile;
+    use crate::interpreter::{Scheduler, Value};
+
+    /// Build a fully-typed leaf `TypedExpr`.
+    fn typed(node: TypedExprNode, ty: Type) -> TypedExpr {
+        TypedExpr {
+            node,
+            ty,
+            user_annotation: None,
+        }
+    }
+
+    /// A `[Commit(Int), Abort(Unit)]` variant type — the shape the transaction
+    /// decision will carry.
+    fn commit_abort_ty(payload: Type) -> Type {
+        Type::Variant(vec![
+            (FieldKey::Name("Commit".into()), payload),
+            (FieldKey::Name("Abort".into()), Type::Base(CclBase::Unit)),
+        ])
+    }
+
+    /// Drive an operator once and return its tile.
+    fn drive(op: Box<dyn TileOperator>) -> Tile {
+        let mut op = op;
+        let mut sched = Scheduler::new();
+        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
+        producer.get(producer.tiling().universal_guard())
+    }
+
+    /// A scalar `.Commit(7)` op-converts to a `Scalar(Union)` tile whose single
+    /// row reads back as `Value::Union { tag: 0, inner: Int(7) }`. This exercises
+    /// the net-new `VariantCtor` op-conversion arm end-to-end (construct → read).
+    #[test]
+    fn variant_ctor_op_conversion_reads_back_union() {
+        let payload = typed(TypedExprNode::Lit(Lit::Int(7)), Type::Base(CclBase::Int));
+        let vc = typed(
+            TypedExprNode::VariantCtor {
+                tag: "Commit".into(),
+                payload: Box::new(payload),
+            },
+            commit_abort_ty(Type::Base(CclBase::Int)),
+        );
+
+        let mut ctx = OpConversionContext::new();
+        let op = convert_to_operators(&vc, &mut ctx).expect("op-conversion");
+        let tile = drive(op);
+
+        let Tile::Scalar(cv) = &tile else {
+            panic!("expected Scalar(Union) tile, got {tile:?}");
+        };
+        assert_eq!(cv.len(), 1);
+        assert_eq!(
+            cv.index_at(0),
+            Value::Union {
+                tag: 0,
+                inner: Box::new(Value::Int(7)),
+            }
+        );
+    }
+
+    /// The `Abort` arm (a nullary unit payload at tag position 1) reads back as
+    /// `Value::Union { tag: 1, inner: Unit }`.
+    #[test]
+    fn variant_ctor_abort_arm() {
+        let payload = typed(TypedExprNode::Lit(Lit::Unit), Type::Base(CclBase::Unit));
+        let vc = typed(
+            TypedExprNode::VariantCtor {
+                tag: "Abort".into(),
+                payload: Box::new(payload),
+            },
+            commit_abort_ty(Type::Base(CclBase::Int)),
+        );
+
+        let mut ctx = OpConversionContext::new();
+        let op = convert_to_operators(&vc, &mut ctx).expect("op-conversion");
+        let tile = drive(op);
+
+        let Tile::Scalar(cv) = &tile else {
+            panic!("expected Scalar(Union) tile, got {tile:?}");
+        };
+        assert_eq!(
+            cv.index_at(0),
+            Value::Union {
+                tag: 1,
+                inner: Box::new(Value::Unit),
+            }
+        );
+    }
+
+    /// `VariantCtor` survives the `channelize` → `lambda_elim` pass-throughs and
+    /// still op-converts to the same union value — the foundational guarantee
+    /// that lets a later branch emit a variant-shaped decision through the pipeline.
+    #[test]
+    fn variant_ctor_survives_channelize_and_lambda_elim() {
+        let payload = typed(TypedExprNode::Lit(Lit::Int(3)), Type::Base(CclBase::Int));
+        let vc = typed(
+            TypedExprNode::VariantCtor {
+                tag: "Commit".into(),
+                payload: Box::new(payload),
+            },
+            commit_abort_ty(Type::Base(CclBase::Int)),
+        );
+
+        let channelized =
+            crate::ccl::channelize::run(vc, /* input_typed = */ true).expect("channelize");
+        let lowered = crate::ccl::lambda_elim::run(channelized).expect("lambda_elim");
+
+        let mut ctx = OpConversionContext::new();
+        let op = convert_to_operators(&lowered, &mut ctx).expect("op-conversion");
+        let tile = drive(op);
+
+        let Tile::Scalar(cv) = &tile else {
+            panic!("expected Scalar(Union) tile, got {tile:?}");
+        };
+        assert_eq!(
+            cv.index_at(0),
+            Value::Union {
+                tag: 0,
+                inner: Box::new(Value::Int(3)),
+            }
+        );
+    }
 }
