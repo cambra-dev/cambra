@@ -1707,15 +1707,20 @@ fn last_or_default_read(stream: Expr, init: Expr, value_ty: Type) -> Expr {
 }
 
 /// One site's **per-key commit view** — the pointwise projection of its
-/// commit-record stream to `{time, commit, write}` for one written key:
+/// commit-record stream to `{time, write}` for one written key:
 ///
-/// `commits_j ≫ (λ __c → {time: __c.time, commit: __c.decision.commit,
-/// write: __c.decision.writes.idx})`
+/// `commits_j ≫ (λ __c → {time: __c.time, write: __c.decision.writes.idx})`
 ///
-/// This is the record shape `get_prev_txn`'s history argument searches; a
-/// multi-writer key's history unions one view per writing site. The map is a
-/// *pointwise* view of the (guarded) commit stream, so the reference to
-/// `commits_j` stays guarded (`letrec::is_guarded_history_slot`).
+/// This is the record shape `get_prev_txn`'s history argument searches (its
+/// declared `{time, write}` codomain — see [`crate::ccl::Builtin::GetPrevTxn`]);
+/// a multi-writer key's history unions one view per writing site. There is **no
+/// `commit` field**: the commit-record stream `commits_j` carries only committed
+/// transactions (allocate-on-commit — a denied decision proposes nothing, so the
+/// engine allocates no tick and appends no entry), so a grant/deny bit would be
+/// vestigially `true` everywhere. `get_prev_txn` therefore searches the latest
+/// write `≤ t` directly, with no filter. The map is a *pointwise* view of the
+/// (guarded) commit stream, so the reference to `commits_j` stays guarded
+/// (`letrec::is_guarded_history_slot`).
 #[allow(clippy::too_many_arguments)]
 fn per_key_view(
     commits_j: &Name,
@@ -1740,11 +1745,6 @@ fn per_key_view(
         fproj(F_DECISION, rec_ty, decision_ty),
         decision_ty.clone(),
     );
-    let commit = apply_ty(
-        decision.clone(),
-        fproj(F_COMMIT, decision_ty, &Type::Base(BaseType::Bool)),
-        Type::Base(BaseType::Bool),
-    );
     let writes = apply_ty(
         decision,
         fproj(F_WRITES, decision_ty, &writes_ty),
@@ -1756,7 +1756,6 @@ fn per_key_view(
 
     let mut body = Expr::new(TypedExprNode::Record(vec![
         (F_TIME.to_string(), time),
-        (F_COMMIT.to_string(), commit),
         (F_WRITE.to_string(), write),
     ]));
     body.ty = view_rec_ty.clone();
@@ -1989,17 +1988,18 @@ fn build_letrec(
         // `⧺`-merged **per-key commit views** of every site writing this key
         // ("multiple writer sites for one variable merge their commit
         // streams... before the search"). Each view projects the site's
-        // commit stream pointwise to `{time, commit, write}` — the commit
-        // clock, the grant/deny bit `get_prev_txn` filters on, and this key's
-        // proposed value `decision.writes.i`. A key written by no site is
-        // read-only: it self-guards on its own history. The pointwise maps
-        // and the union are guarded shapes (`letrec::is_guarded_history_slot`
-        // — they change what is read at each position, never which positions
-        // the accessor consults), so the `store_k ↔ commits_j` cycles still
-        // cross the guard.
+        // commit stream pointwise to `{time, write}` — the commit clock and
+        // this key's proposed value `decision.writes.i`. There is no grant/deny
+        // bit: the commit stream carries only committed transactions
+        // (allocate-on-commit), so `get_prev_txn` searches the latest write
+        // `≤ t` with no filter (matching its declared `{time, write}` codomain).
+        // A key written by no site is read-only: it self-guards on its own
+        // history. The pointwise maps and the union are guarded shapes
+        // (`letrec::is_guarded_history_slot` — they change what is read at each
+        // position, never which positions the accessor consults), so the
+        // `store_k ↔ commits_j` cycles still cross the guard.
         let view_rec_ty = Type::Record(vec![
             (F_TIME.to_string(), Type::Txn),
-            (F_COMMIT.to_string(), Type::Base(BaseType::Bool)),
             (F_WRITE.to_string(), v.clone()),
         ]);
         let (view, view_ty) = match writers_of.get(k) {

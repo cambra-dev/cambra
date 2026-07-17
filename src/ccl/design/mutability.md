@@ -376,13 +376,15 @@ realizes them by tick allocation, not by computing anything.
 
 Multi-variable atomic blocks produce one shared record `{time, writes: {𝑘₁: 𝑉₁, …}}` per commit,
 and each variable's history reads it through a per-key view — atomicity by construction, since one
-record either exists or does not. A conditional write (`with begin(): if 𝑝: x := 𝑒`) adds a
-`commit: Bool` field that `get_prev_txn` filters on. Multiple writer sites for one variable merge
-their commit streams (ordered by time) before the search — the emitted term is spec-true: each
-key's history searches the `⧺`-union of its writing sites' per-key views
-`commits_j ≫ (λ 𝑐 → {time: 𝑐.time, commit: 𝑐.decision.commit, write: 𝑐.decision.writes.𝑖})`,
-shapes the causality check admits (pointwise maps and unions of causal streams change *what*
-is read per position, never *which* positions the accessor consults).
+record either exists or does not. There is no `commit: Bool` in the per-key view: the commit-record
+stream carries only committed transactions (allocate-on-commit — a denied decision proposes nothing,
+so the engine allocates no tick and appends no entry), so `get_prev_txn` searches the latest write
+`≤ t` with no filter, matching its declared `{time, write}` codomain. Multiple writer sites for one variable merge their commit
+streams (ordered by time) before the search — the emitted term is spec-true: each key's history
+searches the `⧺`-union of its writing sites' per-key views
+`commits_j ≫ (λ 𝑐 → {time: 𝑐.time, write: 𝑐.decision.writes.𝑖})`, shapes the causality check
+admits (pointwise maps and unions of causal streams change *what* is read per position, never
+*which* positions the accessor consults).
 
 ## Compilation pipeline
 
