@@ -51,5 +51,5 @@ Provide a structured response:
 ## Example Triggers
 
 - "Review the head commit against docs/design.md"
-- "Give me a staff review of HEAD~2.. using docs/design.md and docs/plan.md"
+- "Give me a staff review of HEAD~2.. using docs/design.md"
 - "Review branch feature-x"

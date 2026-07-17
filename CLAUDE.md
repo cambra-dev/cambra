@@ -110,7 +110,7 @@ Do not render type information as Rust struct syntax (e.g., `Fun { name: Some("k
 ### Workflow
 After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. **Before creating or pushing a PR, run `./ci.sh` and confirm it is clean** — GitHub CI gates on the same checks, and `./ci.sh` runs the parts no single `cargo` command covers: clippy in *both* debug and release mode plus the doc build. A green debug `cargo clippy` is not enough (see Build Commands above).
 
-When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md`, `docs/plan.md`, and other `*/design-*.md` files close to source files that were changed.
+When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md` and other `*/design-*.md` files close to source files that were changed.
 
 ### Compact instructions
 When you are using compact, focus on test output and code changes.

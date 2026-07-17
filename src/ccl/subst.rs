@@ -1,10 +1,9 @@
 //! Capture-avoiding substitutions over term binders — the context-morphism
 //! machinery for dependent refinements (Pi types).
 //!
-//! This is the load-bearing distinction from the design proposal
-//! (`brainstorm/2026-06-02-dependent-refinements-via-pi-types.md`, §3.5) and its
-//! executable model
-//! (`brainstorm/2026-06-02-dependent-refinements-substitution-prototype.rs`):
+//! This is the load-bearing distinction from the internal design proposal
+//! for dependent refinements via Pi types (§3.5) and its executable
+//! substitution-prototype model:
 //!
 //! * A **context** annotates a type or metavariable — the binders it may
 //!   legitimately mention. It is a *checking* device only (free vars ⊆ context);

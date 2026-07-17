@@ -66,7 +66,7 @@ pub(super) fn lower_generator_for(
     let iter_var = extract_name_target(target, "for-loop target")?;
 
     if for_body_has_yield(body) {
-        // A generator with loop-carried state (brainstorm §4b) — yield
+        // A generator with loop-carried state (mutability design notes, §4b) — yield
         // alongside mutation of an outer-scope variable — routes through
         // the same `Loop` lowering as a plain mutation loop, with the
         // yield-defer's per-iteration feed picked up by `desugar_defers`
@@ -471,7 +471,7 @@ pub(super) fn find_nested_mutation_var(
 /// defer when the body contains a `yield`.
 ///
 /// A mutation loop body may also contain `yield e` statements (the
-/// brainstorm §4b `running_totals` shape: `total += item; yield total`).
+/// mutability design notes' §4b `running_totals` shape: `total += item; yield total`).
 /// In that case the surrounding generator-function context needs a fresh
 /// defer to collect the yielded values, and the mutation loop's body
 /// records `yield e` as a feed into that defer alongside any explicit
@@ -679,10 +679,10 @@ fn lower_mutation_loop(
 ///   defer.  When `yield_defer` is `Some(name)`, the yield is recorded
 ///   as a feed into that name using the same let-chain snapshotting
 ///   rules; when `None`, a `yield` is rejected.  This lets a generator
-///   with loop-carried state (brainstorm §4b's `running_totals`) reuse
-///   the same `Loop` lowering as a plain mutation loop — the yield's
-///   defer is collected by `desugar_defers` as another `to_<defer>`
-///   field on the body Record.
+///   with loop-carried state (the mutability design notes' §4b
+///   `running_totals`) reuse the same `Loop` lowering as a plain
+///   mutation loop — the yield's defer is collected by
+///   `desugar_defers` as another `to_<defer>` field on the body Record.
 ///
 /// The Loop's `loop_body` step expression is the full let-chain ending in
 /// `Var(acc_name)` — the final accumulator value after every mutation in
@@ -986,7 +986,7 @@ bad";
         assert!(matches!(err, LoweringError::Unsupported { .. }));
     }
 
-    /// Brainstorm §4b — a generator with loop-carried state lowers to a
+    /// Mutability design notes, §4b — a generator with loop-carried state lowers to a
     /// `Loop` whose body contains a raw `Feed(__result_*, …)` followed by
     /// a `(step: …)` Record, with the surrounding `let __result = defer`
     /// collecting the yields.  [`crate::ccl::desugar_defers`] absorbs

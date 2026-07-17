@@ -22,9 +22,8 @@ from Python, this document states the divergence explicitly.
 The Python resemblance itself is transitional: CHL is **converging away
 from Python-compatible surface syntax** toward its own syntax, designed
 around two constraints — keep term and type syntax cleanly separated,
-and keep data/control flow statically visible. The direction is recorded
-in [brainstorm/2026-06-29-syntax-convergence.md](brainstorm/2026-06-29-syntax-convergence.md)
-and embodied by the north-star programs in
+and keep data/control flow statically visible. The direction was recorded
+in an internal design note (2026-06-29) and is embodied by the north-star programs in
 [`tests/programs/`](../tests/programs/) (`reachability`, `fanout`,
 `txn_kv`), which are written in the *target* syntax and pinned as
 compile-errors until the language catches up. This spec folds those
@@ -47,7 +46,7 @@ Everything else carries one of these markers:
 
 - **[Planned]** — the parser already recognises the construct (or the
   current design admits it) but lowering rejects it today; near-term
-  roadmap work, tracked in [docs/plan.md](plan.md).
+  roadmap work.
 - **[Decided]** — a design decision that has been made and recorded (the
   marker or its context cites where) but **not implemented**. Decided ≠
   immutable: until code and tests pin it down, a decision can and should
@@ -331,7 +330,7 @@ one-tuple is written `(e,)`.
 
 > **Direction — term-level delimiters [Decided].** The convergence
 > syntax splits the three delimiters by role
-> ([2026-06-29 §1](brainstorm/2026-06-29-syntax-convergence.md)):
+> (2026-06-29 §1):
 >
 > | Delimiter | Role | Examples |
 > | --- | --- | --- |
@@ -379,8 +378,7 @@ expressions.
 > temporal-mutation model reconciles those effects with the
 > unordered, data-dependency-only evaluation story below (time-domain
 > ordering, transactions over write-regions) is worked through in
-> [2026-04-06-mutability.md](brainstorm/2026-04-06-mutability.md) and
-> [2026-06-29 §6](brainstorm/2026-06-29-syntax-convergence.md); this
+> the 2026-04-06 mutability notes and 2026-06-29 §6; this
 > section will need a rewrite when that lands.
 
 ### Collections are unordered
@@ -511,8 +509,7 @@ introspection of the binding environment.
 
 Forward references are not allowed: a name must be in scope at the
 point of use. Mutual recursion between top-level functions is
-**[Planned]** — see
-[docs/brainstorm/2026-03-05-recursion.md](brainstorm/2026-03-05-recursion.md).
+**[Planned]** — see the 2026-03-05 recursion design notes.
 
 ### 3.3 Arithmetic and logical operators
 
@@ -546,7 +543,7 @@ not a runtime error.
 
 > **Direction [Decided].** The convergence syntax adds membership
 > *expressions*: `e in s` tests set membership, `k in m` tests for a key
-> in a map ([2026-06-29 §2](brainstorm/2026-06-29-syntax-convergence.md)).
+> in a map (2026-06-29 §2).
 > `in` as the iteration keyword (`for x in xs`) is unchanged; the
 > expression form is what's new.
 
@@ -632,10 +629,10 @@ Despite the token reuse, this is its only meaning.
 > collection has type `Feed(V)`, and a feed target is forward-declared
 > with an annotation-only binding `h: Feed(_)` (no initialiser) instead
 > of a `defer()` call
-> ([2026-06-29 §5](brainstorm/2026-06-29-syntax-convergence.md); the
+> (2026-06-29 §5; the
 > north-star `fanout` program is the worked example). This vocabulary
-> supersedes the `deferred`-introducer sketch in
-> [2026-04-23-sink-operators.md](brainstorm/2026-04-23-sink-operators.md).
+> supersedes the `deferred`-introducer sketch from the 2026-04-23
+> sink-operators design notes.
 > **[Tentative]**: `<<` additionally becoming the general append
 > operator for lists/sets/collections (2026-06-29 §2). **[Open]**:
 > whether the `<<=` define-statement (§4.4) survives alongside this
@@ -703,7 +700,7 @@ value type — so subscript and attribute access are uniformly
 "evaluate the finite function at a point," just spelt differently.
 
 > **Direction [Tentative].** The collections sketch
-> ([2026-06-29 §2](brainstorm/2026-06-29-syntax-convergence.md), §6.3
+> (2026-06-29 §2, §6.3
 > below) makes partial lookup total by returning an option: `lst[i]`
 > and `map[k]` have type `Option(T)` (matched with `some(v)` / `none`,
 > as in the north-star `txn_kv`), while `Array` lookup stays direct
@@ -735,7 +732,7 @@ annotations are not yet writable in the surface syntax; some built-ins
 > **Direction — `λ x → body` [Decided].** The convergence syntax
 > retires Python's `lambda x: body` in favour of `λ x → body`, with
 > ASCII fallback `\x -> body`
-> ([2026-06-29 §1](brainstorm/2026-06-29-syntax-convergence.md)). This
+> (2026-06-29 §1). This
 > makes the surface lambda match the CCL symbolic form exactly, so
 > surface and core read alike — e.g. `groupby(sales, λ r → r.region)` —
 > and frees `:` in a lambda head for its annotation role
@@ -1012,13 +1009,12 @@ rest of the scope.
 
 Reassignment *inside a `for` body* of a name introduced in an outer
 scope has different semantics: it is a **loop-carried accumulator**
-update, described in §4.6. See
-[docs/brainstorm/2026-04-06-mutability.md](brainstorm/2026-04-06-mutability.md)
+update, described in §4.6. See the 2026-04-06 mutability design notes
 for the temporal-functional-mutation model that motivates this
 treatment.
 
 > **Direction — `=`, `:=`, `rec` [Decided].** In the target binding
-> model ([2026-06-29 §3](brainstorm/2026-06-29-syntax-convergence.md)),
+> model (2026-06-29 §3),
 > `=` is reserved for *timeless equations* — `x = e` asserts `x ≡ e`
 > with no before/after — and a binding departs from it along two
 > independent axes:
@@ -1309,7 +1305,7 @@ treatment.
 
 ### 6.1 Direction: term/type syntax split [Decided]
 
-([2026-06-29 §1](brainstorm/2026-06-29-syntax-convergence.md).)
+(2026-06-29 §1.)
 
 **Capitalization distinguishes term from type.** Lowercase heads are
 terms; capitalized heads are types. Data *constructors* build values,
@@ -1330,7 +1326,7 @@ type `{f: T}`, refinement `{x: T | p(x)}`.
 
 ### 6.2 Direction: non-purity as type wrappers [Decided]
 
-([2026-06-29 §4](brainstorm/2026-06-29-syntax-convergence.md).)
+(2026-06-29 §4.)
 
 Whether a value is mutable / feedable / transactional is a property of
 its **type**, expressed as a wrapper: `Mut(V)`, `Feed(V)`,
@@ -1354,7 +1350,7 @@ no initialiser (§4.3).
 ### 6.3 Direction: collections as functions [Tentative]
 
 The **organizing idea is decided**
-([2026-06-29 §2](brainstorm/2026-06-29-syntax-convergence.md)), and
+(2026-06-29 §2), and
 already shows through in §3.9: a collection *is* a function
 `Domain ⇒ Value`, and the collection types are variations of that one
 shape. The specific encodings below are a working sketch — expect the
@@ -1476,7 +1472,7 @@ share an HTTP listener; the `(port, method, path)` triple must be
 unique across the program.
 
 > **Direction [Open].** The HTTP module design is deliberately parked
-> ([2026-06-29, Open/deferred](brainstorm/2026-06-29-syntax-convergence.md)):
+> (2026-06-29, Open/deferred):
 > how responses carry status codes (`ok(…)`, `not_found(…)`), the
 > structured-request surface (`req.body`, `req.query`, `req.time`,
 > headers), response pairing via feed-at-index (`resps[req.id] = …`, as
@@ -1490,7 +1486,7 @@ unique across the program.
 
 Nothing in this section is implemented — none of its keywords even lex
 today (§1.6). It is specified here because the design is decided
-([2026-06-29 §6](brainstorm/2026-06-29-syntax-convergence.md)) and the
+(2026-06-29 §6) and the
 north-star `txn_kv` program exercises it end to end.
 
 Transactions use a **contextual-parameter** mechanism modeled on
@@ -1618,8 +1614,8 @@ The following are deliberately omitted from CHL today, in some cases
 with parser-level support that lowering rejects:
 
 - **`while` loops** — currently a parse error (the `while` keyword is
-  not yet recognised). Tracked by
-  [plan.md → Mutability → "while loop lowering"](plan.md).
+  not yet recognised). Tracked as future work under mutability
+  ("while loop lowering").
 - **Nested `for` loops with mutable variables** — a single-level
   for-loop accumulator works (§4.6), but mutation inside a nested loop
   is not yet lowered.
@@ -1629,8 +1625,8 @@ with parser-level support that lowering rejects:
   `yield`s, multiple sequential `for` loops, nested `for`s where the
   inner loop yields, and post-loop statements are all rejected
   pending support.
-- **First-class functions in arbitrary positions** — see
-  [docs/brainstorm/2026-03-05-first-class-functions.md](brainstorm/2026-03-05-first-class-functions.md).
+- **First-class functions in arbitrary positions** — see the
+  2026-03-05 first-class-functions design notes.
 - **Recursion** — self-reference in `def` is not yet wired through;
   self-referential *value* bindings get the explicit `rec` form
   (**[Decided]**, §4.3).
@@ -1660,8 +1656,8 @@ with parser-level support that lowering rejects:
 - **The syntax convergence at large** — every **Direction** note in
   this spec (λ-lambdas §3.10, `:=`/`rec` §4.3, membership `in` §3.4,
   type wrappers §6.2, transactions §8, …) is unimplemented; the
-  north-star programs pin the target and
-  [docs/plan.md](plan.md) tracks the sequencing.
+  north-star programs pin the target and the sequencing is tracked
+  separately.
 
 When each lands, this spec will be updated alongside the lowering and
 the demo programs.
@@ -1671,12 +1667,8 @@ the demo programs.
 ## See also
 
 - [docs/design.md](design.md) — overall Cambra architecture.
-- [brainstorm/2026-06-29-syntax-convergence.md](brainstorm/2026-06-29-syntax-convergence.md)
-  — the syntax-convergence decisions folded into the Direction notes
-  above.
 - [src/chl_parser/design-chl-parser.md](../src/chl_parser/design-chl-parser.md) — the parser implementation.
 - [src/ccl/design/](../src/ccl/design/README.md) — the CCL IR and the
   lowering/inference/optimization passes.
 - [docs/operational-semantics/summary.md](operational-semantics/summary.md) — CCL's operational semantics.
 - [docs/demo-programs.md](demo-programs.md) — runnable examples and their status.
-- [docs/plan.md](plan.md) — roadmap for the planned features called out above.

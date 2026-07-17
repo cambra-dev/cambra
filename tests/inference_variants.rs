@@ -388,7 +388,7 @@ fn if_returns_variant() {
 ///
 /// **Ignored**: same bidirectional-Apply collapse as
 /// `variant_param_accepts_subtype`. Will pass once the let-polymorphism
-/// work replaces the hack (brainstorm doc §3.1).
+/// work replaces the hack.
 #[test]
 #[ignore = "blocked by bidirectional Apply equality-collapse; needs let-polymorphism"]
 fn payload_covariance_accept() {

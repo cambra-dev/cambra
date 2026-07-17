@@ -5,9 +5,8 @@
 //! `[sum([s.amount for s in g]) for g in groupby(sales, lambda r: r.region)]`
 //! — i.e. groupby over records with a projecting inner comprehension —
 //! panics during operator conversion because the `curry` combinator isn't
-//! yet supported there.  Tracks
-//! `docs/plan.md` → "Complete `curry` combinator support in
-//! `operator_conversion`".
+//! yet supported there.  Tracks completing `curry` combinator support in
+//! `operator_conversion`.
 //!
 //! Expected output once unblocked (sorted by key):
 //! `Function [ "east" -> 200, "south" -> 75, "west" -> 300 ]`.

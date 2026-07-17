@@ -5,7 +5,6 @@ See also:
 - [example.md](example.md) — end-to-end worked example
 - [deprecation.md](deprecation.md) — transition from yield guards
 - [src/interpreter/design-operators.md](/src/interpreter/design-operators.md) — per-operator specifications
-- [brainstorm/guards-and-separation-algebras.md](../brainstorm/guards-and-separation-algebras.md) — historical brainstorm
 
 ---
 

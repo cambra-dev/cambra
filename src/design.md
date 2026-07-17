@@ -2,7 +2,7 @@
 
 An index of the `src/` tree and where each module's design notes live. For the
 language overview, CHL/CCL split, and the end-to-end execution pipeline, see
-[docs/design.md](/docs/design.md); for the roadmap, [docs/plan.md](/docs/plan.md).
+[docs/design.md](/docs/design.md).
 
 ## Crate structure (`src/`)
 

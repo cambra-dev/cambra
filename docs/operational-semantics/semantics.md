@@ -3,7 +3,6 @@
 See also:
 - [summary.md](summary.md) — high-level overview of the model
 - [src/interpreter/design-operators.md](/src/interpreter/design-operators.md) — per-operator specifications
-- [brainstorm/guards-and-separation-algebras.md](../brainstorm/guards-and-separation-algebras.md) — historical brainstorm
 
 ---
 

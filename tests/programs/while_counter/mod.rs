@@ -3,8 +3,8 @@
 //!
 //! Currently rejected by the new CHL parser before lowering even sees it
 //! (`while` isn't a recognised statement keyword yet).  Blocked on
-//! plan.md → Mutability → "while loop lowering (unbounded time domain;
-//! defer termination checking)".  Flip green by switching to
+//! while-loop lowering (unbounded time domain; defer termination
+//! checking).  Flip green by switching to
 //! `expect_scalar(..., "5")` once the feature ships.
 
 use super::common::expect_compile_error;

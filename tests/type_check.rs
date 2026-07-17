@@ -480,8 +480,7 @@ groups(0)
 // Was blocked on O3 until the apply discharge moved to coalesce: `coalesce_node`
 // re-derives each application's type from its already-resolved function child,
 // discharging on the function's *real* binder rather than the fresh `__arg`
-// binder `emit_apply` peeks when the function is still an inference variable
-// (see `brainstorm/2026-06-10-apply-contravariant-recovery-at-coalesce.md`).
+// binder `emit_apply` peeks when the function is still an inference variable.
 #[test]
 fn test_higher_order_dependent_application_discharges_key() {
     let ty = infer_program(

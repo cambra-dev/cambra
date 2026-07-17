@@ -334,8 +334,7 @@ fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
 /// placeholder is needed because empty arms don't produce a
 /// contribution at all.
 ///
-/// See [docs/plan.md] under "Tech Debt" → "Generalize filter-pattern
-/// recognition" for the broader design context.
+/// Tracked as tech debt: "Generalize filter-pattern recognition".
 ///
 /// # Test behaviour
 ///

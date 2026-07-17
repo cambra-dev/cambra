@@ -16,8 +16,8 @@
 //! for defer-mediating UDFs (see [`LambdaClass`] and the smart walker
 //! entry points), and the N-arm Case-with-feeds gap (see
 //! [`empty_channel`]).  Expect the algorithm to be reworked rather
-//! than incrementally patched.  The umbrella tracking entry lives in
-//! `docs/plan.md` under "Tech Debt — `desugar_defers` prototype".
+//! than incrementally patched, tracked as tech debt under the
+//! `desugar_defers` prototype.
 //!
 //! # Vocabulary
 //!
@@ -148,9 +148,8 @@ impl fmt::Display for DeferError {
 ///
 /// FIXME(desugar_defers-prototype): only the 2-arm shape is recognised;
 /// 3+-arm Cases with feeds in some-but-not-all arms fall through to
-/// [`empty_channel`].  See the umbrella entry in `docs/plan.md` ("Tech
-/// Debt — `desugar_defers` prototype") for the planned N-arm refinement-
-/// based fan-out.
+/// [`empty_channel`].  The planned N-arm refinement-based fan-out is
+/// tracked as tech debt under the `desugar_defers` prototype.
 fn try_extract_filter_feed(body: &Expr, defer_name: &Name) -> Option<(Expr, Expr)> {
     let branches = match &body.node {
         // The filter-feed shape is a guard-only `if` (no scrutinee).
@@ -656,8 +655,7 @@ fn wrap_di_calls_helper(
 /// [`try_smart_walk_di`] are a working sketch.  The open design
 /// question — Record-of-`to_<target>`-fields vs. body substitution at
 /// the call site — has not been settled.  Expect rework rather than
-/// patches.  See the umbrella entry in `docs/plan.md` ("Tech Debt —
-/// `desugar_defers` prototype").
+/// patches, tracked as tech debt under the `desugar_defers` prototype.
 fn rewrite_chains_in_scope(expr: Expr, ctx: &mut DesugarCtx) -> Expr {
     let TypedExpr {
         node,
@@ -2374,8 +2372,8 @@ fn smart_walk_synthesize_call_contributions(
 ///
 /// FIXME(desugar_defers-prototype): part of the unresolved
 /// Record-of-`to_<target>`-fields vs. body-substitution design
-/// question for defer-mediating UDFs.  See the umbrella entry in
-/// `docs/plan.md` ("Tech Debt — `desugar_defers` prototype").
+/// question for defer-mediating UDFs, tracked as tech debt under the
+/// `desugar_defers` prototype.
 fn try_smart_walk_pat(
     function: &Expr,
     argument: &Expr,
@@ -2437,8 +2435,8 @@ fn try_smart_walk_pat(
 ///
 /// FIXME(desugar_defers-prototype): part of the unresolved
 /// Record-of-`to_<target>`-fields vs. body-substitution design
-/// question for defer-mediating UDFs.  See the umbrella entry in
-/// `docs/plan.md` ("Tech Debt — `desugar_defers` prototype").
+/// question for defer-mediating UDFs, tracked as tech debt under the
+/// `desugar_defers` prototype.
 fn try_smart_walk_di(
     function: &Expr,
     argument: &Expr,
@@ -3531,8 +3529,8 @@ fn augment_loop_body_record_named(
 /// which is why this gap doesn't bite realistic programs today.
 ///
 /// FIXME(desugar_defers-prototype): the N-arm Case fan-out is one of
-/// the open items tracked under the umbrella entry in `docs/plan.md`
-/// ("Tech Debt — `desugar_defers` prototype").
+/// the open items tracked as tech debt under the `desugar_defers`
+/// prototype.
 fn empty_channel() -> Expr {
     Expr::lit(Lit::Unit)
 }

@@ -1,11 +1,10 @@
 # Demo Programs
 
-The inverse index of [plan.md](plan.md): "what do users want to write that
-we can't yet support?"
+A status table mapping each demo program in
+[`tests/programs/`](../tests/programs/) to whether it currently works.
 
-Each row maps a program in [`tests/programs/`](../tests/programs/) to its
-current status and, when blocked, to the feature on the roadmap that must
-land for it to become `working`.  Each program is its own subdirectory
+Each row maps a program to its current status and, when blocked, to the
+feature that must land for it to become `working`.  Each program is its own subdirectory
 containing a `program.cambra` source plus a `mod.rs` with one or more
 `#[test]` functions — when a blocked program starts succeeding (or a working
 one starts failing), the test goes red and prompts an update.
@@ -71,7 +70,7 @@ HTTP-sink and subprocess utilities).
 | [http_greeter](../tests/programs/http_greeter/) | Three HTTP endpoints sharing a `prefix` let | `http_serve`, `<<` feed, deferred output, multi-route on one port | ✅ working (sink) | Real HTTP roundtrip — test fires three requests on a background thread while the main thread drives the scheduler. Source uses `{PORT}` placeholder. |
 | [streaming_echo](../tests/programs/streaming_echo/) | Prefix each stdin line with "> " | `stdin()` source, list comprehension | ✅ working | Tested via subprocess so the real OS stdin file descriptor is exercised; substring-matched against captured stdout. |
 | [for_accumulator](../tests/programs/for_accumulator/) | Fold via mutable accumulator | for-loop with loop-carried state | ✅ working | Loop-body reassignment of a pre-loop binding is lowered to a CCL `Loop` accumulator slot. |
-| [while_counter](../tests/programs/while_counter/) | Count up with a while loop | `while`, mutability | 🚧 blocked | [plan.md → Mutability → "while loop lowering"](plan.md). Currently rejected at lowering. |
+| [while_counter](../tests/programs/while_counter/) | Count up with a while loop | `while`, mutability | 🚧 blocked | While-loop lowering is not yet implemented. Currently rejected at lowering. |
 | [reachability](../tests/programs/reachability/) | Transitive closure (recursive query) | self-referential binding, `Set(T)` dedup-by-type, `++`, hash-join in a cycle | 🚧 blocked | North-star recursive query. Parse-blocked on record-term syntax `(src=1, dst=2)`; then `Set(T)` + the self-referential (recursive) binding. |
 | [fanout](../tests/programs/fanout/) | Polymorphic sink constructor (fan-out pipe head) | `Feed(_)` type, `<<` feed, annotation-only forward decl, element polymorphism | 🚧 blocked | `Feed(_)` annotation unsupported; the forward declaration doesn't parse. Not Unix `tee` — returns the writable *head*. |
 | [txn_kv](../tests/programs/txn_kv/) | Transactional KV store over HTTP + a stream-aggregate `/stats` endpoint | `requires Transaction`, `with begin()`, `abort()`, `Mut(..., Txn)`, atomic read-modify-write, `Option` lookup, `match`, `λ`/`restrict`/`count`, structured requests | 🚧 blocked | Lexer rejects `λ` (the `/stats` aggregate), the first of a stack of blockers. Subsumes the former standalone `kv_store` (concurrent handlers share state → must be transactional) and `hit_counter` (the request-stream aggregate). |
@@ -89,8 +88,8 @@ and prompts the author to switch to `expect_scalar` with the correct answer.
 
 `[sum([s.amount for s in g]) for g in groupby(sales, lambda r: r.region)]`
 panics with `"Only higher-order combinators (map, const, zip) can take an
-input operator; found input for non-combinator curry"`.  Tracks
-[plan.md → "Complete `curry` combinator support in `operator_conversion`"](plan.md).
+input operator; found input for non-combinator curry"`.  Blocked on
+completing `curry` combinator support in `operator_conversion`.
 
 Expected output once unblocked:
 `Function [ "east" -> 200, "south" -> 75, "west" -> 300 ]`.

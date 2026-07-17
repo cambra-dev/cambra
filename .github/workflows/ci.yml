@@ -36,7 +36,6 @@ jobs:
             code:
               - '!**/*.md'
               - '!LICENSE'
-              - '!blog/**'
               - '!docs/**'
               # Catch-all: run for everything else
               - '**'

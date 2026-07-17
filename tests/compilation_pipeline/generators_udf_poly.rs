@@ -94,7 +94,7 @@ fn test_generator_function(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
-// Brainstorm §4b — generator with loop-carried mutable state.  The body
+// Mutability design notes, §4b — generator with loop-carried mutable state.  The body
 // mutates a pre-loop variable (`total += item`) and yields its updated
 // value each iteration, producing a running-total stream.  This routes
 // through the cyclic `Loop` lowering with the yield-defer wired in as a

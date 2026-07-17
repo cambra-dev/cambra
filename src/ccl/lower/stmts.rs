@@ -343,8 +343,8 @@ pub(super) fn lower_middle_stmt(
 
             // Detect a mutation loop: at least one top-level assignment to
             // a variable from the outer scope.  Yields are not a barrier
-            // — a generator with loop-carried state (brainstorm §4b's
-            // `running_totals` shape) is just a mutation loop whose body
+            // — a generator with loop-carried state (the mutability design
+            // notes' §4b `running_totals` shape) is just a mutation loop whose body
             // also feeds an auto-generated defer.  The surrounding `body`
             // (the continuation) is threaded into `lower_mutation_loop`
             // so it can lift post-mutation feeds outside the loop and
