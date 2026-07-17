@@ -280,16 +280,6 @@ fn read_initial_scalar(producer: &mut dyn TileProducer) -> Result<Value, InitDra
 /// converging (the doc's "a couple of pulls" claim).
 const MAX_INIT_PULLS: usize = 8;
 
-/// Work-relative backstop on the per-`get` store-convergence loop
-/// ([`drive_store_to_fixpoint`]): the loop may run up to
-/// `STORE_CONVERGENCE_FACTOR × frontier + STORE_CONVERGENCE_SLACK` pulls, where
-/// `frontier` is the number of transactions committed so far. This scales with
-/// real work — a large finite batch never trips it — while a spin (pulls
-/// outrunning commits) does. The factor covers the extra pull a freshly observed
-/// commit can cost to react to; the slack covers the small-frontier startup.
-const STORE_CONVERGENCE_FACTOR: usize = 4;
-const STORE_CONVERGENCE_SLACK: usize = 1 << 10;
-
 /// The frontier of a store tile's change ticks + `frontier` predicate (the
 /// watermark decode behind [`store_frontier`]). `LessThanEq(w)` reads the
 /// watermark directly; the terminal `True` flip reconstructs it from the last
@@ -345,64 +335,6 @@ pub fn store_frontier(tile: &Tile) -> Option<CommitTs> {
         return None;
     };
     frontier_from_domain(changes, frontier)
-}
-
-/// Drive a cyclic commit `source` store to its current fixpoint and return the
-/// converged tile: pull until the decided [`store_frontier`] stops growing (the
-/// store commits one step per pull, so a freshly-arrived transaction takes an
-/// extra pull to observe the newest commit and commit its own). A live store
-/// never goes *terminal* but always *stabilizes* — its frontier stalls the
-/// moment its buffered commits drain or its inputs are pending — so a normal
-/// return is the common path.
-///
-/// **Non-convergence is work-relative, not a fixed pull budget.** The loop
-/// returns the moment the frontier stalls, which happens for *any* finite input
-/// once its buffered commits drain (and between bursts on a live store when
-/// further input is still pending) — so a large-but-finite batch of, say, 10M
-/// commits converges correctly in ~10M pulls, where a fixed cap would falsely
-/// crash. What is *not* legitimate is the frontier advancing without committing
-/// proportional work: each productive pull advances the decided frontier by
-/// (normally) one commit, so the pull count tracks the committed-tick count.
-/// A pull count that outruns the frontier by a wide margin means the store is
-/// spinning without deciding commits — a genuine runaway. An unbounded commit
-/// *cycle* is already forbidden upstream by [`crate::ccl::letrec::check_letrec_causal`]
-/// (every cycle crosses a `get_prev_txn` guard), so this backstop only guards an
-/// engine bug, and it **panics in all builds** rather than fold a partial view —
-/// a loud crash beats the silent live-lock a non-terminal re-emit would spin the
-/// consumer into (the repo's worst outcome).
-///
-/// Shared by [`StoreValueStreamProducer`] and [`AsOfProducer`], the two readers
-/// that fold a live commit store.
-fn drive_store_to_fixpoint(source: &mut dyn TileProducer, guard: &TileGuard) -> Tile {
-    let mut tile = source.get(guard.clone());
-    let mut pulls: usize = 0;
-    loop {
-        let prev = store_frontier(&tile);
-        let next = source.get(guard.clone());
-        let grew = store_frontier(&next) > prev;
-        tile = next;
-        if !grew {
-            return tile;
-        }
-        pulls += 1;
-        // Budget scaled to the work actually decided: `frontier` ticks count
-        // committed transactions (allocate-on-commit, one per tick), and a
-        // freshly observed commit can cost an extra pull to react to, so real
-        // convergence keeps `pulls` within a small multiple of the frontier.
-        // `STORE_CONVERGENCE_SLACK` covers the small-frontier startup window.
-        // Only a spin — `pulls` far outrunning the frontier — trips this.
-        let frontier = store_frontier(&tile).unwrap_or(0);
-        let budget = frontier
-            .saturating_mul(STORE_CONVERGENCE_FACTOR)
-            .saturating_add(STORE_CONVERGENCE_SLACK);
-        assert!(
-            pulls <= budget,
-            "commit store non-convergence: {pulls} pulls advanced the decided \
-             frontier to only {frontier} — the store is spinning without \
-             committing proportional work (an engine bug; an unbounded commit \
-             cycle is forbidden upstream by the guardedness check)"
-        );
-    }
 }
 
 /// `key`'s value as of commit time `t`: the latest change at a tick `≤ t` whose
@@ -1151,10 +1083,13 @@ impl TileProducer for StoreValueStreamProducer {
         &mut self.base
     }
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // Drive the cyclic store to its current fixpoint before projecting
-        // (`drive_store_to_fixpoint`; same convergence the `AsOf` join performs).
+        // Sample the store's current tile once and re-fold the whole changelog
+        // (consumer-driven; no producer-side drive-to-fixpoint). The store's writer
+        // steps one commit per pull and re-arms itself on the wakeup queue, which
+        // fans through the cyclic `FanOut` to re-pull this stream as commits land;
+        // terminality flows through the store's `frontier` predicate below.
         let sg = self.store_producer.tiling().universal_guard();
-        let store = drive_store_to_fixpoint(&mut *self.store_producer, &sg);
+        let store = self.store_producer.get(sg);
         // The store's watermark predicate (`frontier`) is carried through unchanged
         // — terminality flows to this stream. Fold the changelog directly.
         let Tile::Store {
@@ -1510,17 +1445,16 @@ impl TileProducer for AsOfProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // Drive the source to its current fixpoint: a request observes the store
-        // "as of now", which means applying every commit pending at this moment
-        // (`drive_store_to_fixpoint` — one pull per pending commit until the
-        // decided frontier stalls; a runaway cycle panics there rather than
-        // latching a stale snapshot). We key convergence on the frontier (not
-        // domain *length*) precisely because we compact the source below it at
-        // the end of this pull: compaction shrinks the domain but never lowers
-        // the frontier, so a pull that does not advance the frontier decided
-        // nothing new.
+        // Sample the store's **current** tile once (consumer-driven): a request
+        // observes the store as of *this* pull's watermark — an arbitrary as-of
+        // position, which the unordered transactional model permits. We do not
+        // drive the store to a fixpoint here; the store's own writer steps one
+        // commit per pull and re-arms itself on the wakeup queue, and that wakeup
+        // fans through the cyclic `FanOut` to re-pull this reader as commits land.
+        // A trigger position latched this pull freezes to the watermark it sees;
+        // a later position, re-pulled after further commits, latches a later value.
         let sg = self.source.tiling().universal_guard();
-        let source_tile = drive_store_to_fixpoint(&mut *self.source, &sg);
+        let source_tile = self.source.get(sg);
         // Fold the store snapshot **once**, at the current frontier, for every
         // sampled key — so a multi-register read sees all its registers at one
         // commit time (§I-c). `None` if *any* key has no decided value yet, which
@@ -1530,9 +1464,9 @@ impl TileProducer for AsOfProducer {
         // always has a decided value once the store has committed its seeds — no
         // register can be perpetually absent. (A future snapshot read that folds a
         // key with a genuinely-empty log — e.g. an append-only collection with no
-        // writes — would hang on the `awaiting` path below; revisit the coupling
-        // then.) The frontier bound is the same for every key, so it also drives
-        // the release below.
+        // writes — would stay non-terminal forever on the terminality gate below;
+        // revisit the coupling then.) The frontier bound is the same for every key,
+        // so it also drives the release below.
         let frontier = store_frontier(&source_tile);
         let snapshot: Option<Vec<Value>> = self
             .output
@@ -1547,19 +1481,40 @@ impl TileProducer for AsOfProducer {
             } => domain_predicate.clone(),
             _ => Predicate::False,
         };
-        // Latch each newly-seen trigger position to the source's *current*
-        // snapshot. If the source has no decided value yet, latch nothing this
-        // round — the trigger position is left un-seen and gets latched on a later
-        // pull once the source has a value. (For a scalar store the render seeds
-        // the init at tick 0, so this only delays a read that genuinely precedes
-        // any source value.)
+        let store_terminal = matches!(
+            &source_tile,
+            Tile::Store { frontier, .. } if *frontier == Predicate::True
+        );
+        // Latch timing distinguishes a **live** trigger from a **batch** one — the
+        // consumer-driven replacement for the retired in-`get` drive-to-fixpoint:
         //
-        // Positions at or below the release watermark are skipped: the consumer has
-        // already taken them, so they must never re-latch — even if the trigger
-        // re-presents one (the trigger may compact lazily after a forwarded
-        // release; its emitted domain still legally carries the position until it
-        // does). This guard is what makes the `release_impl` compaction safe.
-        if let (Tile::SealedFunction { domain, .. }, Some(snap)) = (&trigger_tile, &snapshot) {
+        //  - A **live** trigger (a non-terminal request stream) cannot wait for a
+        //    store that may never terminate, so each position latches **as of its
+        //    arrival** — the current watermark the moment it is first observed. New
+        //    requests latch newer values as commits land across re-pulls.
+        //  - A **batch** trigger (terminal — a finite loop or the synthesized
+        //    singleton of a standalone read) *can* wait: its store is finite and
+        //    will go terminal, so we **defer** latching until the store is drained.
+        //    The writer's one-step-per-pull self-re-arm drives the store to terminal
+        //    and re-pulls us; latching only then makes the batch observe the
+        //    fully-committed value — the batch scheduler's as-of coincidence, and
+        //    what keeps a standalone read from freezing on the seed. (Deferring is a
+        //    latch-timing gate, not a drive loop: we still sample once per pull.)
+        //
+        // `may_latch` is that gate. Freeze-once is preserved either way — a position
+        // is recorded in `seen` exactly once, so its latched value never changes.
+        let trigger_terminal = trigger_pred.as_bool() == Some(true);
+        let may_latch = store_terminal || !trigger_terminal;
+        // If the store has no decided value yet, `snapshot` is `None` and we latch
+        // nothing this round — the position is left un-seen and latches on a later
+        // pull. Positions at or below the release watermark are skipped: the consumer
+        // has already taken them, so they must never re-latch even if the trigger
+        // re-presents one (a lazily-compacting trigger's domain still legally carries
+        // the position until it compacts). That skip is what makes the `release_impl`
+        // compaction safe.
+        if let (true, Tile::SealedFunction { domain, .. }, Some(snap)) =
+            (may_latch, &trigger_tile, &snapshot)
+        {
             for i in 0..domain.len() {
                 let b = domain.index_at(i);
                 if self.is_released(&b) {
@@ -1576,8 +1531,6 @@ impl TileProducer for AsOfProducer {
         // fan branch is what lets a live store reclaim superseded history:
         // `CommitProducer` GCs the `FanOut`-intersected prefix (keep-latest). We
         // keep the frontier tick itself so the fold still finds each key's value.
-        // (Convergence keys on the frontier, so this compaction can't perturb the
-        // drive loop above.)
         if let Some(f) = frontier
             && f > 0
         {
@@ -1586,24 +1539,25 @@ impl TileProducer for AsOfProducer {
                     Predicate::LessThanEq(Value::UInt(f - 1)),
                 )));
         }
-        // If the source has no decided value yet, a live trigger position that
-        // has not latched is still *awaiting* one — its response is not decided.
-        // Emitting the trigger's terminality here (a terminal-but-empty tile when
-        // the trigger is a finite batch) would tell the consumer "done, no
-        // response", stranding that request forever. Downgrade to a non-terminal
-        // (`False`) predicate so the consumer re-pulls until the source produces a
-        // value and the position latches. (A trigger with no live un-latched
-        // position is genuinely complete, so its terminality rides through.)
-        let awaiting = snapshot.is_none()
-            && matches!(&trigger_tile, Tile::SealedFunction { domain, .. }
-            if (0..domain.len()).any(|i| {
-                let b = domain.index_at(i);
-                !self.is_released(&b) && !self.seen.contains(&b)
-            }));
-        let emit_pred = if awaiting {
-            Predicate::False
-        } else {
+        // Terminality gate. With the producer-side drive-to-fixpoint retired, this
+        // reader samples one watermark per pull and relies on being re-pulled (via
+        // the writer's wakeup fanning through the cyclic `FanOut`) to converge. So
+        // it must stay **non-terminal** until the store itself is terminal *and*
+        // every live trigger position is latched — otherwise it could report "done"
+        // while the store is still committing (freezing a store no other consumer
+        // drives) or while a live trigger position is still awaiting a value (a
+        // finite-batch trigger's terminality would strand that request forever).
+        // Only once the store is fully decided and no unlatched live position
+        // remains does the trigger's own terminality ride through.
+        let has_unlatched_live = matches!(&trigger_tile, Tile::SealedFunction { domain, .. }
+        if (0..domain.len()).any(|i| {
+            let b = domain.index_at(i);
+            !self.is_released(&b) && !self.seen.contains(&b)
+        }));
+        let emit_pred = if store_terminal && !has_unlatched_live {
             trigger_pred
+        } else {
+            Predicate::False
         };
         self.emit_latched(emit_pred)
     }
@@ -1962,11 +1916,12 @@ impl TileOperator for TransactWriter {
         // and body inputs need no notification: the writer pulls them on demand each
         // time the source drives it (and forwarding the cyclic store would loop).
         let consumer: SharedConsumer = Rc::new(RefCell::new(move || consumer.notify()));
-        // The deferred-wakeup queue: when a decision reads a broadcast cross-loop
-        // accumulator final that has not converged yet, the writer re-arms its own
-        // consumer here (rather than looping inside `get`) so a demand-driven
-        // driver re-pulls it — each re-pull advances the sibling loop one step. See
-        // [`WakeupQueue`] and the `None` arm of `get_impl`.
+        // The deferred-wakeup queue: while a source item remains to process, the
+        // writer re-arms its own consumer (rather than looping inside `get`) so a
+        // demand-driven driver re-pulls it — the one-step-per-pull cycle drive that
+        // steps the store forward across pulls (a commit, a deny, or a not-ready
+        // broadcast input each keep the writer non-terminal). See [`WakeupQueue`]
+        // and the re-arm at the end of `get_impl`.
         let wakeups = scheduler.wakeup_queue();
         let sg = self.store_op.tiling().universal_guard();
         let store_producer = self.store_op.subscribe(sg, Box::new(|| {}), scheduler);
@@ -2012,11 +1967,11 @@ struct TransactWriterProducer {
     store_producer: Box<dyn TileProducer>,
     body_producer: Box<dyn TileProducer>,
     source_producer: Box<dyn TileProducer>,
-    /// This writer's consumer, re-armed through [`wakeups`](Self::wakeups) when a
-    /// decision's broadcast input has not converged (see `get_impl`'s `None` arm).
+    /// This writer's consumer, re-armed through [`wakeups`](Self::wakeups) while an
+    /// item remains to process — the one-step-per-pull cycle drive (see `get_impl`).
     consumer: SharedConsumer,
-    /// The scheduler's deferred-wakeup queue — where a not-ready pull requests its
-    /// own re-pull instead of looping in `get`.
+    /// The scheduler's deferred-wakeup queue — where a pull with pending work
+    /// requests its own re-pull instead of looping in `get`.
     wakeups: WakeupQueue,
     buffer: BodyInputBuffer,
     read_keys: Vec<Value>,
@@ -2373,17 +2328,40 @@ impl TileProducer for TransactWriterProducer {
                     // Otherwise the decision is **not ready**: it reads a broadcast
                     // cross-loop accumulator final still converging — its
                     // `ExtractLast` is empty until the sibling loop's `Recurse`
-                    // drains, one position per body pull. Rather than loop inside
-                    // `get` (which would block on a slow source and re-enter the
-                    // cyclic graph), re-arm ourselves on the deferred-wakeup queue:
-                    // a demand-driven driver re-pulls this writer, each re-pull
-                    // advances the sibling loop one step, and the pending row's
-                    // decision fills in monotonically. `current` is left unadvanced,
-                    // so the writer stays non-terminal and the store with it until
-                    // the writer actually commits.
-                    self.wakeups.request(self.consumer.clone());
+                    // drains, one position per body pull. `current` is left
+                    // unadvanced, so the pending item keeps this writer non-terminal
+                    // and the unified re-arm below re-pulls it, each re-pull
+                    // advancing the sibling loop one step until the decision fills in.
                 }
             }
+        }
+        // One-step-per-pull convergence (the `Recurse` / #291 analog): this writer
+        // steps a single source item per `get`, so after processing one it must
+        // re-pull itself to reach the next — the notification-gated driver
+        // (`src/main.rs`, `tests/cli_driver_convergence.rs`) re-pulls only on a
+        // wakeup, never merely because a tile is non-terminal. Re-arm on the
+        // deferred-wakeup queue whenever an item remains to process *now*
+        // (`current < n_items`); this drives the cyclic store forward across pulls,
+        // replacing the readers' retired producer-side drive-to-fixpoint. It covers
+        // every non-terminal continuation uniformly:
+        //  - a **commit** (grant): `current` advances on the commit-ack `release`,
+        //    so the next pull processes the following item;
+        //  - a **deny**: `current` already advanced here, with no commit — invisible
+        //    in the store frontier, so a frontier-growth signal would miss it;
+        //  - a **not-ready** decision (the `None` arm): `current` is unadvanced, so
+        //    the pending item re-arms until the broadcast input converges.
+        // A writer that is *drained but live* (`current >= n_items`, source not yet
+        // complete) does **not** re-arm: a future arrival wakes it through the
+        // source-forwarding consumer, so re-arming would busy-poll an idle server.
+        // The writer's wakeup fans through the cyclic `FanOut` notify closure to
+        // every store branch, so it also re-pulls the `AsOf` / `StoreValueStream`
+        // readers that sample the store per pull.
+        if self
+            .items
+            .as_ref()
+            .is_some_and(|it| self.current < it.len())
+        {
+            self.wakeups.request(self.consumer.clone());
         }
         self.debug_assert_position_invariant();
         self.render()
