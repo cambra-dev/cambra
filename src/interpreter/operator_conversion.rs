@@ -873,7 +873,7 @@ fn convert_impl(
         TypedExprNode::Apply { argument, function }
             if as_builtin(function) == Some(Builtin::FinalOrDefault) =>
         {
-            expect_no_input(input, "last_or_default")?;
+            expect_no_input(input, "final_or_default")?;
             let TypedExprNode::Tuple(elts) = &argument.node else {
                 return Err(ConversionError::Unsupported(format!(
                     "FinalOrDefault expects a 2-element Tuple argument, got {:?}",
@@ -1225,7 +1225,7 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
 /// cannot be fanned without desyncing its append-only proposal positions.
 fn build_commit_store(
     keys: &[TransactKey],
-    writers: &[TransactWriter],
+    writers: &[WriterSite],
     ctx: &mut OpConversionContext,
 ) -> Result<StoreReadInfo, ConversionError> {
     // Each variable becomes a key under its `field_key`'s runtime value; the

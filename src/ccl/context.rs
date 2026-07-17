@@ -585,10 +585,10 @@ pub fn compile_program(
     // Transactional slice of the unified phase: rewrite every `with begin():`
     // writer of a `Mut[_, Txn]` store into a `get_prev_txn`-guarded `LetRec`
     // (histories + commit records over the commit domain), which
-    // `letrec_phase::recognize` destructures into the `Transact{…, Txn}` node
+    // `planning::plan_loops` destructures into the `Transact{…, Txn}` node
     // op-conversion compiles to the commit engine — unifying the transaction and
     // induction paths on one `LetRec` + recognition representation. Runs *before*
-    // `letrec_phase` so the induction phase never sees a transaction loop. See
+    // `mut_elim` so the induction phase never sees a transaction loop. See
     // src/ccl/design/mutability.md.
     //
     // Store identity is the `Mut[_, Txn]` type on the α-unique binding, gathered

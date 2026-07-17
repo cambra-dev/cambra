@@ -248,7 +248,7 @@ fn lower_tx_block_inner(
             // as a `to_<defer>` tap on the writer decision and hoists a
             // `Feed(defer, __store ▷ .to_<defer>)` into the store body, so each
             // emission carries *its own* commit's value. Mirrors the induction
-            // phase's in-loop feeds (see `src/ccl/letrec_phase.rs`).
+            // phase's in-loop feeds (see `src/ccl/mut_elim.rs`).
             ChlStmt::Expr(value) if matches!(&value.node, ChlExpr::Feed { .. }) => {
                 let feed = lower_expr(value, ctx)?;
                 Expr::expr_stmt(feed, chain)

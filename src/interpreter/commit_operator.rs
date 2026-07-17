@@ -365,7 +365,7 @@ pub fn store_frontier(tile: &Tile) -> Option<CommitTs> {
 /// (normally) one commit, so the pull count tracks the committed-tick count.
 /// A pull count that outruns the frontier by a wide margin means the store is
 /// spinning without deciding commits — a genuine runaway. An unbounded commit
-/// *cycle* is already forbidden upstream by [`crate::ccl::letrec::check_letrec_guarded`]
+/// *cycle* is already forbidden upstream by [`crate::ccl::letrec::check_letrec_causal`]
 /// (every cycle crosses a `get_prev_txn` guard), so this backstop only guards an
 /// engine bug, and it **panics in all builds** rather than fold a partial view —
 /// a loud crash beats the silent live-lock a non-terminal re-emit would spin the

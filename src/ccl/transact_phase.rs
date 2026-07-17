@@ -1,20 +1,20 @@
 //! The transactional slice of the unified phase: rewrite every `with begin():`
 //! writer of a `Mut[V, Txn]` store into a **`get_prev_txn`-guarded `LetRec`** —
 //! histories + commit records over the [`Type::Txn`] commit domain — which
-//! [`crate::ccl::letrec_phase::recognize`] then destructures into the
+//! [`crate::ccl::planning::plan_loops`] then destructures into the
 //! `Transact{keys, writers, domain: Txn}` carrier the commit engine consumes.
 //! This unifies the transaction path with the induction path (`For`/`MutWrite`
 //! → a `get_prev_seq` `LetRec` → recognition → `Transact` → engine).
 //!
 //! Runs post-inline (cross-function writers already landed at their call sites)
-//! and *before* [`crate::ccl::letrec_phase`], so the induction phase never sees a
+//! and *before* [`crate::ccl::mut_elim`], so the induction phase never sees a
 //! transaction loop. Lowering emits each `with begin():` block — standalone or
 //! as a `for` body — as a direct-mirror `ExprStmt(For{target, iter, block}, cont)`
 //! whose block writes transactional stores (recognized by their α-unique store
 //! [`Name`] — the `Mut[_, Txn]` bindings [`collect_txn_stores`] gathers from the
 //! typed tree). This phase:
 //!
-//! 1. **strips** every such `For` site, building one [`TransactWriter`] per site
+//! 1. **strips** every such `For` site, building one [`WriterSite`] per site
 //!    (its read/write footprint, its loop source, and a `{commit, writes,
 //!    to_<defer>*}` decision lambda built from the block by read-your-writes
 //!    substitution — each in-block `<<` feed rides the decision as a
@@ -48,7 +48,7 @@
 //! used only for a terminating induction accumulator, not a `Txn` register). Each
 //! `to_<defer>` tap compiles to a per-commit value-stream (`body_tap_fields`).
 //! The in-block feed mirrors the induction phase's in-loop feeds
-//! ([`crate::ccl::letrec_phase`]).
+//! ([`crate::ccl::mut_elim`]).
 //!
 //! **Store identity is the `Mut[_, Txn]` type on the α-unique binding.**
 //! [`collect_txn_stores`] walks the inlined, typed tree for `Let` bindings whose
@@ -64,10 +64,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
     BaseType, Builtin, Expr, F_COMMIT, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES,
-    FieldKey, HistoryKind, Lit, Name, ProjKey, TransactWriter, Type, TypedBinding, TypedExprNode,
+    FieldKey, HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
     ccl_utils::is_free_in_value,
-    letrec::check_letrec_guarded,
-    letrec_phase::{fold_induction_loop, hoist_feeds},
+    letrec::check_letrec_causal,
+    mut_elim::{fold_induction_loop, hoist_feeds},
 };
 
 /// Recognize a **fed-out store read** and rewrite it to an as-of join, *before*
@@ -295,7 +295,10 @@ fn live_store_read(bound_expr: &Expr) -> Option<(&Expr, String)> {
     else {
         return None;
     };
-    if !matches!(&lod_fn.node, TypedExprNode::Builtin(Builtin::LastOrDefault)) {
+    if !matches!(
+        &lod_fn.node,
+        TypedExprNode::Builtin(Builtin::FinalOrDefault)
+    ) {
         return None;
     }
     let TypedExprNode::Tuple(elts) = &lod_arg.node else {
@@ -480,7 +483,7 @@ fn is_live_last_or_default(e: &Expr) -> bool {
     };
     if !matches!(
         &function.node,
-        TypedExprNode::Builtin(Builtin::LastOrDefault)
+        TypedExprNode::Builtin(Builtin::FinalOrDefault)
     ) {
         return false;
     }
@@ -545,7 +548,7 @@ pub fn collect_txn_stores(expr: &Expr) -> HashSet<Name> {
 /// reads it rebinds — are over `V`. Peel a `Mut` wrapper (through transparent
 /// outer refinements) to its value type; leave a non-`Mut` type untouched.
 ///
-/// Mirrors [`crate::ccl::letrec_phase`]'s `erase_mut`, the whole-tree backstop
+/// Mirrors [`crate::ccl::mut_elim`]'s `erase_mut`, the whole-tree backstop
 /// that sweeps any residual `Mut` after this phase — but applied here, at the
 /// value-type reads, so the emitted `LetRec` (and the `Transact` recognition
 /// derives from it) is `Mut`-free by construction, never feeding a `Mut` type
@@ -557,7 +560,7 @@ fn store_value_ty(ty: &Type) -> Type {
             // its whole stream and is never a transactional store target.
             Type::History {
                 value,
-                kind: HistoryKind::Store,
+                kind: HistoryKind::Overwrite,
                 ..
             } => Some(value),
             Type::Refinement(inner, _) => under_mut(inner),
@@ -603,7 +606,7 @@ struct RawSite {
 /// decision computes the tap value alongside the write set (read-your-writes at
 /// the feed's position); the phase hoists `Feed(defer, __store ▷ .to_<defer>)`
 /// into the store body so `channelize` routes it as an ordinary channel
-/// contribution — mirroring `letrec_phase`'s in-loop induction feeds. The tap
+/// contribution — mirroring `mut_elim`'s in-loop induction feeds. The tap
 /// commits with the transaction (a denied commit contributes no reply, since
 /// the engine appends nothing for a `commit: false` decision).
 struct FeedSite {
@@ -683,7 +686,7 @@ pub fn run(expr: Expr, txn_stores: &HashSet<Name>) -> Expr {
     // group logic. Each read accumulator is threaded through the writer source (a
     // `zip` of the loop iter and the accumulator's per-position view), which the
     // commit engine co-iterates. A non-entangled induction loop is left for
-    // `letrec_phase`.
+    // `mut_elim`.
     let cross_reads = cross_domain_reads(&sites, txn_stores);
     let mut cross = CrossDomain::default();
     let stripped = fold_cross_domain_loops(stripped, &cross_reads, &mut cross);
@@ -694,7 +697,7 @@ pub fn run(expr: Expr, txn_stores: &HashSet<Name>) -> Expr {
     // *per site* (parallel to `writers`) so each tap binding reads its own
     // commit-record stream.
     let mut feed_counter = 0usize;
-    let mut writers: Vec<TransactWriter> = Vec::with_capacity(sites.len());
+    let mut writers: Vec<WriterSite> = Vec::with_capacity(sites.len());
     let mut site_feeds: Vec<Vec<FeedSite>> = Vec::with_capacity(sites.len());
     for s in sites {
         let (writer, feeds) = build_writer(s, &key_init, &mut feed_counter, &cross.acc_views);
@@ -710,7 +713,7 @@ pub fn run(expr: Expr, txn_stores: &HashSet<Name>) -> Expr {
 /// Each folded loop's history joins `bindings` as its own single-binding
 /// induction letrec wrapped *around* the transaction letrec; its trailing final
 /// reads and feed hoists go in the shared innermost body (the same shape
-/// [`crate::ccl::letrec_phase::transform_loop`] emits, so recognition handles it
+/// [`crate::ccl::mut_elim::transform_loop`] emits, so recognition handles it
 /// unchanged), and `acc_views` carries each cross-read accumulator's per-position
 /// value stream for the writer-source zip.
 #[derive(Default)]
@@ -892,7 +895,7 @@ fn strip(
             // loop. Partition it by store domain: the transactional remainder is
             // the commit decision; each induction `MutWrite` is lifted onto the
             // loop body as a sibling (after the stripped block, same iteration
-            // position), where `letrec_phase` folds it into the loop recurrence.
+            // position), where `mut_elim` folds it into the loop recurrence.
             // The two domains stay independent — an induction accumulator is
             // never in the atomic commit.
             let (target, source, enclosing_writes) = enclosing.expect(
@@ -913,7 +916,7 @@ fn strip(
             return strip(new_rest, txn_stores, enclosing, sites);
         }
         // A read-only block (feeds a store read, no txn write) → unwrap it onto
-        // the loop spine. The fed store read then flows to `letrec_phase`'s
+        // the loop spine. The fed store read then flows to `mut_elim`'s
         // live/terminal as-of path unchanged (the shape a get-loop had before).
         let spliced = splice_block(*block, *rest);
         return strip(spliced, txn_stores, enclosing, sites);
@@ -1238,7 +1241,7 @@ fn proj_tuple(p: &Name, tuple_ty: &Type, i: usize, elt_ty: Type) -> Expr {
     app
 }
 
-/// Build one [`TransactWriter`] from a stripped site: its `{commit, writes}`
+/// Build one [`WriterSite`] from a stripped site: its `{commit, writes}`
 /// decision lambda over the snapshot-tuple parameter, plus its footprint and
 /// source. The decision reads store snapshots and the loop item off the tuple,
 /// threads read-your-writes by substitution, and gates the whole write set on
@@ -1248,7 +1251,7 @@ fn build_writer(
     key_init: &HashMap<Name, Expr>,
     feed_counter: &mut usize,
     acc_views: &HashMap<Name, CrossAcc>,
-) -> (TransactWriter, Vec<FeedSite>) {
+) -> (WriterSite, Vec<FeedSite>) {
     let value_ty = |k: &Name| {
         key_init
             .get(k)
@@ -1401,7 +1404,7 @@ fn build_writer(
     body.ty = Type::fun(tuple_ty, decision_ty);
 
     (
-        TransactWriter {
+        WriterSite {
             read_keys: site.read_keys,
             write_keys: site.write_keys,
             source,
@@ -1696,7 +1699,7 @@ fn last_or_default_read(stream: Expr, init: Expr, value_ty: Type) -> Expr {
     let arg_ty = Type::Tuple(vec![stream.ty.clone(), init.ty.clone()]);
     let mut arg = Expr::tuple(vec![stream, init]);
     arg.ty = arg_ty.clone();
-    let mut lod = Expr::builtin(Builtin::LastOrDefault);
+    let mut lod = Expr::builtin(Builtin::FinalOrDefault);
     lod.ty = Type::fun(arg_ty, value_ty.clone());
     let mut app = Expr::apply(arg, lod);
     app.ty = value_ty;
@@ -1815,7 +1818,7 @@ struct HoistedFeed {
 /// **Inverse pair:** the per-writer commit-record shape this emits — the
 /// positional `{F_TIME, F_WRITE_TARGETS, F_DECISION}` record and the
 /// `let t = begin(r) in …` body — is destructured by
-/// [`letrec_phase::recover_writer`](crate::ccl::letrec_phase), which must stay
+/// [`plan_loops`](crate::ccl::planning::plan_loops)'s `recover_writer` helper, which must stay
 /// in exact structural lockstep with this function (the shared `F_*` field-name
 /// constants pin the field names; the tuple positions and nesting are pinned
 /// only by these two sites). A mismatch surfaces as a runtime `panic!` in
@@ -1826,7 +1829,7 @@ fn build_letrec(
     expr: Expr,
     key_names: Vec<Name>,
     key_init: HashMap<Name, Expr>,
-    writers: Vec<TransactWriter>,
+    writers: Vec<WriterSite>,
     site_feeds: Vec<Vec<FeedSite>>,
     cross: CrossDomain,
 ) -> Expr {
@@ -1860,7 +1863,7 @@ fn build_letrec(
     let mut site_write_keys: Vec<Vec<Name>> = Vec::with_capacity(writers.len());
 
     for (j, (w, feeds)) in writers.into_iter().zip(site_feeds).enumerate() {
-        let TransactWriter {
+        let WriterSite {
             read_keys,
             write_keys,
             source,
@@ -2061,9 +2064,9 @@ fn build_letrec(
     bindings.extend(commit_bindings);
     bindings.extend(tap_bindings);
     debug_assert!(
-        check_letrec_guarded(&bindings).is_ok(),
+        check_letrec_causal(&bindings).is_ok(),
         "transact_phase emitted an unguarded transaction letrec: {:?}",
-        check_letrec_guarded(&bindings)
+        check_letrec_causal(&bindings)
     );
 
     rebind_letrec(
@@ -2160,7 +2163,7 @@ fn rebind_letrec(
 /// (dependency order: a commit decision reads `acc(r)`, so the accumulator's
 /// history is bound *outside* the transaction group), with its trailing reads and
 /// feed hoists in the shared body — exactly the shape
-/// [`crate::ccl::letrec_phase::transform_loop`] emits, so recognition nests the
+/// [`crate::ccl::mut_elim::transform_loop`] emits, so recognition nests the
 /// carriers with no cross-domain logic.
 fn splice_letrec(
     tail: Expr,
@@ -2322,7 +2325,7 @@ mod tests {
             "each site mints a `begin` commit-time oracle: {s}"
         );
         assert!(
-            s.contains("last_or_default"),
+            s.contains("final_or_default"),
             "the register read reduces its history: {s}"
         );
 
@@ -2332,7 +2335,7 @@ mod tests {
         // The `store ↔ commits` cycle crosses `get_prev_txn` once, so the group
         // is well-founded.
         assert_eq!(
-            check_letrec_guarded(&bindings),
+            check_letrec_causal(&bindings),
             Ok(()),
             "the emitted transaction letrec must be guarded"
         );
