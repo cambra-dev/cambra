@@ -915,4 +915,55 @@ mod tests {
         assert_eq!(variants[0], ColumnValue::Ints(vec![20, 30]));
         assert_eq!(variants[1], ColumnValue::Ints(vec![100]));
     }
+
+    /// Appending two interleaved `Commit(Int) | Abort(Unit)` union columns
+    /// concatenates tags and each per-variant column in order — the fold two
+    /// writers' interleaved decision streams merge through. This is the
+    /// `ColumnValue::Union` machinery a `Commit | Abort` variant decision (G4)
+    /// reuses in the commit-`Store` codomain (design §9 risk 1). Variant 0 =
+    /// `Commit` (carries an Int write), variant 1 = `Abort` (a unit).
+    #[test]
+    fn append_union_interleaved_commit_abort() {
+        // Writer A's stream: Commit(1), Abort, Commit(2).
+        let mut a = ColumnValue::Union {
+            tags: vec![0, 1, 0],
+            variants: vec![ColumnValue::Ints(vec![1, 2]), ColumnValue::Units(1)],
+        };
+        // Writer B's stream: Abort, Commit(3).
+        let b = ColumnValue::Union {
+            tags: vec![1, 0],
+            variants: vec![ColumnValue::Ints(vec![3]), ColumnValue::Units(1)],
+        };
+        a.append(b);
+        let ColumnValue::Union { tags, variants } = &a else {
+            panic!("expected Union");
+        };
+        // Tags concatenate in source order; each variant column concatenates too.
+        assert_eq!(tags, &[0, 1, 0, 1, 0]);
+        assert_eq!(variants[0], ColumnValue::Ints(vec![1, 2, 3]));
+        assert_eq!(variants[1], ColumnValue::Units(2));
+        // Row-wise read-back: the Commit rows carry their Ints; the Abort rows
+        // are units. `index_at` maps a row to its variant-local position.
+        assert_eq!(
+            a.index_at(0),
+            Value::Union {
+                tag: 0,
+                inner: Box::new(Value::Int(1))
+            }
+        );
+        assert_eq!(
+            a.index_at(3),
+            Value::Union {
+                tag: 1,
+                inner: Box::new(Value::Unit)
+            }
+        );
+        assert_eq!(
+            a.index_at(4),
+            Value::Union {
+                tag: 0,
+                inner: Box::new(Value::Int(3))
+            }
+        );
+    }
 }
