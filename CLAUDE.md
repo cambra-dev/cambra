@@ -74,7 +74,8 @@ Vocabulary, matching `src/ccl/symbolic.rs`:
 - **Literals**: `1`, `true`/`false`, `"str"`, `unit`.
 - **Binops**: standard infix with precedence parens (`a + b`, `x == y`, `p and q`, etc.).
 - **Unary**: `-x`, `not x`.
-- **Tuples / lists / records**: `(a, b)`, `[a, b, c]`, `{name: a, age: b}`.
+- **Tuples / lists**: `(a, b)`, `[a, b, c]`.
+- **Records**: a record **value** renders with parens + colons — `(name: a, age: b)` (the renderer emits `(field: val, …)`, `src/ccl/symbolic.rs`); a record **type** renders with braces + colons — `{name: T, age: U}` (`Display for Type`, `src/ccl/mod.rs`). Braces are for types only; do not render a record value with braces.
 - **List mappings** (in lowered list literals): `[0 ↦ e0, 1 ↦ e1]`.
 
 Types (from `Display for Type` in `src/ccl/mod.rs`):

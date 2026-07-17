@@ -319,6 +319,7 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_seq` | `(𝐼 ⇒ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
 | `get_prev_txn` | `(𝐼 ⇒ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
+| `last_or_default` | `(𝐷 ⇒ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractLast`); never applied to a `Txn` register, which has no final-value term |
 
 `begin()` never reaches CCL — lowering records the block structure, and the phase mints one
 `begin_<site>` per site. The oracles are opaque, strictly monotone in arrival order (which is what
@@ -453,10 +454,10 @@ letrec
 
     incr_commits: IncrIdx ⇒ {time: Txn, write: Int} =
         λ r → let t = begin_incr(r) in
-              {time: t, write: store(t) + 1}
+              (time: t, write: store(t) + 1)
 in
-    { incr_resps: λ r → incr_commits(r) ▷ (λ c → "ok " + cnt(r) + "\n"),
-      get_resps:  begin_get ≫ store }
+    ( incr_resps: λ r → incr_commits(r) ▷ (λ c → "ok " + cnt(r) + "\n"),
+      get_resps:  begin_get ≫ store )
 ```
 
 Reading it off:
