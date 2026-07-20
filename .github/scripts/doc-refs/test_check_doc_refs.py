@@ -108,5 +108,26 @@ class TestRustCommentScanner(unittest.TestCase):
         self.assertEqual(self.spans(src), [(4, "// ref.md here")])
 
 
+class TestSourcePathToken(unittest.TestCase):
+    """The `_SRC_PATH` gate for check C — accept real path tokens, reject prose."""
+
+    def match(self, span):
+        m = c._SRC_PATH.match(span)
+        return m.group(1) if m else None
+
+    def test_accepts_paths(self):
+        self.assertEqual(self.match("ast.rs"), "ast.rs")
+        self.assertEqual(self.match("src/ccl/lower/loops.rs"), "src/ccl/lower/loops.rs")
+        self.assertEqual(self.match("Cargo.toml"), "Cargo.toml")
+        # a trailing line/range ref is stripped from the resolved path
+        self.assertEqual(self.match("fan.rs:170"), "fan.rs")
+        self.assertEqual(self.match("fan.rs:170-182"), "fan.rs")
+
+    def test_rejects_non_paths(self):
+        for span in ("the map function", "a.rs with trailing words",
+                     "ir.md#some-anchor", "1.5x faster", "e.g."):
+            self.assertIsNone(self.match(span), span)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate cross-references into the docs so they can't silently rot.
 
-Two checks, run together (see `.github/scripts/doc-refs/README.md`):
+Three checks, run together (see `.github/scripts/doc-refs/README.md`):
 
   A. doc -> doc: every intra-repo Markdown link `[text](path#anchor)` resolves
      to a file that exists, and when it carries a `#fragment` into a Markdown
@@ -10,6 +10,11 @@ Two checks, run together (see `.github/scripts/doc-refs/README.md`):
   B. code -> doc: every `<name>.md` mentioned in a Rust *comment* resolves to a
      doc that exists, and any section title quoted immediately after it (the
      checkable citation convention) exists as a heading in that doc.
+
+  C. doc -> source: every backtick source-path mention in doc prose (e.g.
+     `ast.rs`, `src/ccl/lower/loops.rs`) resolves to a file that exists. A line
+     may opt out with a `doc-refs-ignore` marker (deleted/renamed files,
+     illustrative examples).
 
 Both share one primitive: the set of valid anchors for a Markdown file, computed
 with GitHub's heading-slug algorithm. No external dependencies — stdlib only.
@@ -113,16 +118,15 @@ class Repo:
                 continue
             self.files.append(rel)
         self._file_set = set(self.files)
-        # For suffix resolution of loosely-written code refs: map every
-        # path-suffix of every Markdown file to the file(s) it could mean.
-        self._md_by_suffix: dict[str, list[Path]] = {}
+        # For suffix resolution of loosely-written path references (a bare
+        # filename, a partial path, or a full repo path): map every path-suffix
+        # of every file to the file(s) it could mean.
+        self._by_suffix: dict[str, list[Path]] = {}
         for f in self.files:
-            if f.suffix != ".md":
-                continue
             parts = f.parts
             for i in range(len(parts)):
                 suffix = "/".join(parts[i:])
-                self._md_by_suffix.setdefault(suffix, []).append(f)
+                self._by_suffix.setdefault(suffix, []).append(f)
         self._anchor_cache: dict[Path, set[str]] = {}
 
     def exists(self, rel: Path) -> bool:
@@ -144,11 +148,11 @@ class Repo:
             self._anchor_cache[rel] = heading_anchors(text)
         return self._anchor_cache[rel]
 
-    def resolve_md_suffix(self, written: str) -> tuple[Path | None, list[Path]]:
-        """Resolve a loosely-written doc path (e.g. `design/mutability.md` or a
-        bare `mutability.md`) by unique path-suffix match. Returns
+    def resolve_suffix(self, written: str) -> tuple[Path | None, list[Path]]:
+        """Resolve a loosely-written path (e.g. `design/mutability.md`, a bare
+        `ast.rs`, or a full repo path) by unique path-suffix match. Returns
         (resolved, candidates); resolved is None when zero or >1 candidates."""
-        cands = self._md_by_suffix.get(written.lstrip("./"), [])
+        cands = self._by_suffix.get(written.lstrip("./"), [])
         return (cands[0] if len(cands) == 1 else None, cands)
 
 
@@ -244,6 +248,60 @@ def _fenced_line_numbers(md_text: str):
 
 
 # --------------------------------------------------------------------------- #
+# Check C — source-path mentions in doc prose                                 #
+# --------------------------------------------------------------------------- #
+
+# Backtick (inline-code) mentions of a source file in doc prose — `ast.rs`,
+# `src/ccl/lower/loops.rs`, `Cargo.toml`, optionally with a `:line` suffix.
+# These are the path references the link check never sees (it only parses
+# `[text](target)` link syntax), yet docs cite paths in backticks constantly.
+_SRC_EXT = ("rs", "md", "sh", "toml", "py", "svg")
+_INLINE_SPAN = re.compile(r"`([^`\n]+)`")
+_SRC_PATH = re.compile(
+    r"^([A-Za-z0-9_][\w./-]*\.(?:" + "|".join(_SRC_EXT) + r"))(?::\d+(?:-\d+)?)?$"
+)
+# A line carrying this marker opts out of the source-path check. For the
+# legitimate cases a pure existence check can't tell from rot: illustrative
+# example paths, and deliberate mentions of a deleted/renamed file (migration
+# notes, changelogs — "`foo.rs` was deleted").
+IGNORE_MARKER = "doc-refs-ignore"
+
+
+def check_doc_source_paths(repo: Repo, problems: list[Problem]) -> int:
+    checked = 0
+    for rel in repo.files:
+        if rel.suffix != ".md":
+            continue
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace")
+        fenced = set(_fenced_line_numbers(text))
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if lineno in fenced or IGNORE_MARKER in line:
+                continue
+            for m in _INLINE_SPAN.finditer(line):
+                pm = _SRC_PATH.match(m.group(1).strip())
+                if not pm:
+                    continue
+                tok = pm.group(1)
+                checked += 1
+                _, cands = repo.resolve_suffix(tok)
+                # A unique OR ambiguous match both mean the file exists; only a
+                # zero-candidate mention is rot. Unlike a code citation (check
+                # B), a bare name in prose (`mod.rs`, `main.rs`) is legitimately
+                # ambiguous and must not be flagged.
+                if cands:
+                    continue
+                problems.append(
+                    Problem(
+                        f"{rel}:{lineno}",
+                        f"source-path mention does not resolve: `{tok}` "
+                        f"(if the file was removed or renamed on purpose, "
+                        f"add a `{IGNORE_MARKER}` marker on this line)",
+                    )
+                )
+    return checked
+
+
+# --------------------------------------------------------------------------- #
 # Check B — Rust comment references to docs                                    #
 # --------------------------------------------------------------------------- #
 
@@ -268,7 +326,7 @@ def check_code_refs(repo: Repo, problems: list[Problem]) -> int:
             for m in _MD_REF.finditer(comment):
                 written = m.group(1)
                 checked += 1
-                resolved, cands = repo.resolve_md_suffix(written)
+                resolved, cands = repo.resolve_suffix(written)
                 src = f"{rel}:{lineno}"
                 if resolved is None:
                     if not cands:
@@ -404,6 +462,7 @@ def main() -> int:
     repo = Repo()
     problems: list[Problem] = []
     n_links = check_markdown_links(repo, problems)
+    n_paths = check_doc_source_paths(repo, problems)
     n_refs = check_code_refs(repo, problems)
 
     if problems:
@@ -412,13 +471,16 @@ def main() -> int:
         for p in problems:
             print(f"  {p.source}: {p.detail}", file=sys.stderr)
         print(
-            f"\n{len(problems)} broken reference(s) "
-            f"across {n_links} Markdown link(s) and {n_refs} code ref(s).",
+            f"\n{len(problems)} broken reference(s) across {n_links} Markdown "
+            f"link(s), {n_paths} source-path mention(s), and {n_refs} code ref(s).",
             file=sys.stderr,
         )
         return 1
 
-    print(f"doc-refs OK: {n_links} Markdown link(s), {n_refs} code ref(s) checked.")
+    print(
+        f"doc-refs OK: {n_links} Markdown link(s), {n_paths} source-path "
+        f"mention(s), {n_refs} code ref(s) checked."
+    )
     return 0
 
 

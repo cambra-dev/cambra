@@ -45,7 +45,7 @@ let f = λ params →
 
 ### Mutation-accumulation loops
 
-**Mutation accumulation loops** (`x = 0; for i in src: x += i; x`) are detected in `lower.rs` and lowered to a [`TypedExprNode::Loop`](ir.md#loop-for-mutation-accumulation-iteration) node rather than a `For` node.  `lower_middle_stmt` calls `find_mutation_loop_vars` (which scans the body for *every* outer-scope name that gets mutated, in first-mention order — handles `x = x + i; o << x` shapes and multi-accumulator bodies like `y = y + i; x = x * i`), then `lower_mutation_loop` builds:
+**Mutation accumulation loops** (`x = 0; for i in src: x += i; x`) are detected in `ccl/lower/loops.rs` and lowered to a [`TypedExprNode::Loop`](ir.md#loop-for-mutation-accumulation-iteration) node rather than a `For` node.  `lower_middle_stmt` calls `find_mutation_loop_vars` (which scans the body for *every* outer-scope name that gets mutated, in first-mention order — handles `x = x + i; o << x` shapes and multi-accumulator bodies like `y = y + i; x = x * i`), then `lower_mutation_loop` builds:
 
 ```text
 let x = Loop {

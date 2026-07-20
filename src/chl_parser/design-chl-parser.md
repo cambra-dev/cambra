@@ -331,7 +331,7 @@ through ariadne.
 
 - **Phase 2 — Cutover.** [`src/ccl/lower/`](../ccl/lower/) ported to
   consume the CHL AST directly; `rustpython-parser` and `rustpython-ast`
-  removed from `Cargo.toml`; `pretty_ast.rs` deleted; all integration tests
+  removed from `Cargo.toml`; `pretty_ast.rs` deleted; all integration tests <!-- doc-refs-ignore: pretty_ast.rs was intentionally deleted -->
   switched. *(Landed.)*
 
 - **Phase 3 — Diagnostics.** Future work: more `.labelled(…)` annotations

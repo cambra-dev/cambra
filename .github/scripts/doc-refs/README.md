@@ -28,10 +28,21 @@ code are not checked.
 
 **B. Rust comment → doc (code → doc).** Every `<name>.md` mentioned in a Rust
 *comment* (string literals are excluded) must resolve to a doc that exists,
-matched by unique path-suffix so `mutability.md`, `design/mutability.md`, and the
-full path all resolve to the same file (an ambiguous suffix is an error — write a
-longer path). Any **section title quoted immediately after** the reference must
-exist as a heading in that doc.
+matched by unique path-suffix so `ir.md`, `design/ir.md`, and the full path all
+resolve to the same file (an ambiguous suffix is an error — write a longer
+path). Any **section title quoted immediately after** the reference must exist
+as a heading in that doc.
+
+**C. Doc prose → source (doc → source).** Every backtick (inline-code) mention
+of a source file in doc prose — `ast.rs`, `src/ccl/lower/loops.rs`, `Cargo.toml`
+(optionally with a `:line` suffix) — must resolve to a file that exists, by
+path-suffix match. A bare name that matches several files (`mod.rs`, `main.rs`)
+counts as resolved — only a mention that matches *nothing* is flagged, since the
+point is to catch deleted/renamed files, not to demand precise paths in prose.
+Mentions inside fenced code (or matching nothing path-like) are not checked. A line may opt out with a `doc-refs-ignore` marker
+(e.g. an HTML comment `<!-- doc-refs-ignore -->`) for the cases a pure existence
+check can't distinguish from rot: a deliberate mention of a deleted or renamed
+file (migration notes), or an illustrative example path.
 
 ## The code → doc citation convention
 
@@ -39,7 +50,7 @@ To cite a section from code in a way the checker can verify, put the doc path an
 then the section's **exact heading text** in double quotes, directly adjacent:
 
 ```rust
-// See `src/ccl/design/mutability.md`, "The model" / "`LetRec`".
+// See `src/ccl/design/ir.md`, "Application shape" / "`Cast` — explicit refinement acquisition".
 ```
 
 Multiple titles may be joined by ` / `, `, `, `and`, or wrapped in `(…)`. The run
@@ -48,7 +59,7 @@ word (or a `:`-introduced clause) ends it, so an incidental body-text quote late
 in the sentence is not mistaken for a heading:
 
 ```rust
-// mutability.md, rule 1: "a Mut-typed value must be bare"  <- quote NOT checked
+// ir.md, rule 1: "a Mut-typed value must be bare"  <- quote NOT checked
 ```
 
 Prefer this quoted-title form over a `#anchor` fragment in code: a title survives

@@ -67,8 +67,8 @@ broken one fails CI. Two rules keep references from rotting:
 - *Doc → doc*: a Markdown link — `[text](path.md#anchor)`. The `#anchor` is
   validated against the target's headings.
 - *Code → doc*: the doc path followed by the section's **exact heading text** in
-  double quotes, adjacent — e.g. ``see `src/ccl/design/mutability.md`, "The
-  model"``. The checker confirms the quoted title is a real heading. Prefer this
+  double quotes, adjacent — e.g. ``see `src/ccl/design/ir.md`, "Application
+  shape"``. The checker confirms the quoted title is a real heading. Prefer this
   over an anchor fragment in code: a title survives section reordering and reads
   as prose. (Details and the citation grammar: `.github/scripts/doc-refs/README.md`.)
 
