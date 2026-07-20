@@ -571,7 +571,7 @@ Not currently exercised; flagged for awareness.
 
 ## Implementation map
 
-For navigating the source ([src/ccl/desugar_defers.rs](desugar_defers.rs)):
+For navigating the source ([src/ccl/desugar_defers.rs](../desugar_defers.rs)):
 
 | Concern                                    | Function                                              |
 |--------------------------------------------|-------------------------------------------------------|

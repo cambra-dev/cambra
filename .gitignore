@@ -6,3 +6,7 @@
 !/.claude/hooks/
 docs/Scratch.md
 .credentials.json
+
+# Python bytecode from the tooling scripts under .github/scripts/
+__pycache__/
+*.pyc

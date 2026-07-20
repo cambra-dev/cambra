@@ -19,12 +19,23 @@ ci_doc() {
     cargo doc --no-deps
 }
 ci_shellcheck() { find . -name '*.sh' -not -path './.git/*' -exec shellcheck -a -o all {} +; }
+# Validate intra-repo doc references so they can't silently rot: Markdown
+# links/anchors (doc -> doc) and `<name>.md` citations in Rust comments
+# (code -> doc). Stdlib Python only; no Rust toolchain needed. Unit tests for
+# the checker run first so a checker bug can't mask real breakage.
+ci_doc_refs() {
+  python3 .github/scripts/doc-refs/test_check_doc_refs.py
+  python3 .github/scripts/doc-refs/check_doc_refs.py
+}
 
 ci_all() {
   local failed=0
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_shellcheck || failed=1
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_doc_refs || failed=1
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_fmt || failed=1

@@ -1,6 +1,6 @@
 # CCL Design
 
-The **Cambra Core Language** is the small, typed core that CHL programs lower into. It carries literals, variables, records, variants, lambdas, let-bindings, application, pattern matching, refinements, and type annotations — every node denotes a pure value (see [ir.md](ir.md#purity-invariant)). This directory documents the CCL **intermediate representation** and the **compiler passes** that operate on it.
+The **Cambra Core Language** is the small, typed core that CHL programs lower into. It carries literals, variables, records, variants, lambdas, let-bindings, application, pattern matching, refinements, and type annotations — every node denotes a pure value (see [ir.md](ir.md#purity-invariant-ccl-is-a-pure-value-language)). This directory documents the CCL **intermediate representation** and the **compiler passes** that operate on it.
 
 For the language-level picture (CHL ↔ CCL split, the product/vision framing), see [/docs/design.md](/docs/design.md). For the runtime model that CCL compiles onto, see [/docs/operational-semantics/](/docs/operational-semantics/).
 

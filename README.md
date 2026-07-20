@@ -5,8 +5,6 @@ Cambra is a programming language that abstracts over low-level concerns like mem
 ## Docs
 
 - [Design](docs/design.md) — language overview, CHL, CCL, execution pipeline
-- [Plan](docs/plan.md) — implementation roadmap and status
-- [Developer setup](docs/developer-setup-checklist.md)
 
 ## Building & CI
 

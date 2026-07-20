@@ -18,7 +18,7 @@
 //! those tokens with chumsky combinators and produces the AST defined in
 //! [`ast`].
 //!
-//! See `docs/design-chl-parser.md` for the design rationale and the rationale
+//! See `design-chl-parser.md` (sibling) for the design rationale and the
 //! for picking chumsky 1.0-alpha + logos over alternatives.
 
 pub mod ast;

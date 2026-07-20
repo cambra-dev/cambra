@@ -58,6 +58,34 @@ Comment when the *why* is non-obvious — a hidden constraint, a load-bearing in
 
 Avoid comments that describe the history of the codebase.  Comments should explain how and why the code works.  If there is an alternative approach that seems reasonable but doesn't work, it's ok to describe that, but the comments should always fully make sense just by looking at the current version of the code.
 
+### Referencing docs and sections
+Cross-references into the docs are checked by `./ci.sh doc_refs` (Markdown
+links/anchors between docs, and `<name>.md` citations in Rust comments) and a
+broken one fails CI. Two rules keep references from rotting:
+
+**Use a checkable form.**
+- *Doc → doc*: a Markdown link — `[text](path.md#anchor)`. The `#anchor` is
+  validated against the target's headings.
+- *Code → doc*: the doc path followed by the section's **exact heading text** in
+  double quotes, adjacent — e.g. ``see `src/ccl/design/mutability.md`, "The
+  model"``. The checker confirms the quoted title is a real heading. Prefer this
+  over an anchor fragment in code: a title survives section reordering and reads
+  as prose. (Details and the citation grammar: `.github/scripts/doc-refs/README.md`.)
+
+**Never reference something uncheckable — it rots silently because nothing can
+validate it.** Specifically avoid:
+- *Section numbers across docs* (`§4.6`) — cite the heading (anchor link or
+  quoted title) instead. (Existing `§`-refs are being migrated to links as a
+  follow-up; don't add new ones.)
+- *Transient identifiers*, which are wrong almost immediately: PR-stack positions
+  ("the PR above/below", "PR 3 in the stack"), PR/issue numbers used as if they
+  were stable section markers, review-comment numbers, and dated notes ("the
+  2026-06-29 notes"). If the thing you want to point at is durable, give it a
+  heading and cite that; if it isn't, inline the substance instead of pointing.
+
+When you rename a heading, `./ci.sh doc_refs` flags every inbound link and code
+citation — update them in the same change.
+
 ### Rendering CCL ASTs in conversation
 When showing a CCL AST in chat or when writing code comments — walking through an example, illustrating what a pass sees, comparing before/after a rewrite — **render it in symbolic form** (the output shape of `ccl::symbolic::symbolic` / `symbolic_typed`). The whole reasoning surface here is the algebra; symbolic notation makes that legible at a glance.
 

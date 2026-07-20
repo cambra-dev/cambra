@@ -46,7 +46,7 @@ Two programs need a small substitution before they'll run as-is:
 
 The `🚧 blocked` programs in the table will panic or be rejected at
 lowering when run manually — that's the point.
-See [Known issues](#known-issues) for details on what's blocking each.
+See [Known issues](#known-issues-surfaced-by-these-programs) for details on what's blocking each.
 
 ## Adding to this table
 
@@ -65,7 +65,7 @@ HTTP-sink and subprocess utilities).
 | [prefix_lines](../tests/programs/prefix_lines/) | Transform a list of strings | list comprehension, string concat | ✅ working | The canonical streaming-pipeline shape; precursor to a real stdin/echo program. |
 | [filter_and_aggregate](../tests/programs/filter_and_aggregate/) | "SELECT SUM(score) FROM users WHERE age >= 18" | record literal, field access, comp filter on let-bound source, `sum` | ✅ working | Returns `253`. Exercises a comp filter on a let-bound source — the filter must survive lowering through planning (it rides a `Cast` node on the refined domain). |
 | [generator_pipeline](../tests/programs/generator_pipeline/) | Compose two generators (filter then square), then `max` | `def` + `yield`, generator composition, aggregate | ✅ working | Demonstrates UDF call sites being inlined and fused through to operator conversion. |
-| [groupby_rollup](../tests/programs/groupby_rollup/) | Group sales records by region and total per region | `groupby` over records, `lambda`, inner projection, `sum` | 🚧 blocked | Operator conversion panics on the inner-projecting comprehension (`curry` combinator unsupported). See [known issues](#known-issues). |
+| [groupby_rollup](../tests/programs/groupby_rollup/) | Group sales records by region and total per region | `groupby` over records, `lambda`, inner projection, `sum` | 🚧 blocked | Operator conversion panics on the inner-projecting comprehension (`curry` combinator unsupported). See [known issues](#known-issues-surfaced-by-these-programs). |
 | [inner_join](../tests/programs/inner_join/) | INNER JOIN of users × orders on user-id | hash-join (`if x.id == y.fk`), record fields, multi-source comp | ✅ working | The lowering planner sees the equality filter and lowers to a keyed lookup. |
 | [http_greeter](../tests/programs/http_greeter/) | Three HTTP endpoints sharing a `prefix` let | `http_serve`, `<<` feed, deferred output, multi-route on one port | ✅ working (sink) | Real HTTP roundtrip — test fires three requests on a background thread while the main thread drives the scheduler. Source uses `{PORT}` placeholder. |
 | [streaming_echo](../tests/programs/streaming_echo/) | Prefix each stdin line with "> " | `stdin()` source, list comprehension | ✅ working | Tested via subprocess so the real OS stdin file descriptor is exercised; substring-matched against captured stdout. |

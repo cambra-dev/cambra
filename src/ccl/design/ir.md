@@ -61,7 +61,7 @@ Rationale: keeping application a single-argument node preserves the uniform λ-c
 
 Collection iteration (list comprehensions) is encoded with the existing `Lambda` and `Apply` nodes rather than a dedicated iteration node: `[f(x) for x in xs]` lowers to the map-lambda applied to the collection (`xs ▷ (λ x → f(x))`), with the parameter `x` ranging over the collection's extent. Reusing `Lambda`/`Apply` preserves the uniform λ-calculus basis — whether a lambda maps over a collection or simply receives one argument is a property of what it is applied to, not a mode stored on the node.
 
-Lambdas do not survive to the dataflow graph: [lambda elimination](optimization.md#lambda-elimination) rewrites the applied map-lambda to point-free combinators, which [operator conversion](optimization.md#compilation) then turns into extent-iterating tile operators. See also [/docs/operational-semantics/lowering.md](/docs/operational-semantics/lowering.md).
+Lambdas do not survive to the dataflow graph: [lambda elimination](optimization.md#lambda-elimination-ccllambda_elimrs) rewrites the applied map-lambda to point-free combinators, which [operator conversion](optimization.md#compilation) then turns into extent-iterating tile operators. See also [/docs/operational-semantics/lowering.md](/docs/operational-semantics/lowering.md).
 
 ### `Cast` — explicit refinement acquisition
 
@@ -71,7 +71,7 @@ Lowering ([`ccl_utils::make_cast`]) emits it for list-comprehension filters, for
 
 `Cast` is an **upcast**: its whole typing rule is the single subtype obligation `value_ty <: target`. For the domain refinement lowering emits, that holds by contravariance — `(𝐷 ⇒ 𝑉) <: ({𝐷 | 𝑝} ⇒ 𝑉)` because `{𝐷 | 𝑝} <: 𝐷` — so viewing an unrefined-domain collection function at a refined-domain type is sound. A *covariant* refinement (casting `Int` to `{Int | 𝑝}`) correctly *fails* the check — acquiring a value-level refinement is a runtime/SMT-checked narrowing, not an upcast. How the solver discharges the refinement obligation — flowing the demanded witness onto the target-domain variable and stacking it so chained casts compose — is covered in [type-inference.md](type-inference.md#45-dependent-refinements-via-pi-types).
 
-`lambda_elim`, planning, and operator conversion carry the domain refinement through to a runtime `Restrict`: a `Cast` around a group-by lambda becomes a **Pi-const** form whose refinement planning's pointful group-by recognizer reads off the predicate, while a `Cast` wrapping point-free filter/guard code survives lambda elimination unchanged and is consumed as a domain refinement at planning — see [optimization.md](optimization.md). The current `Cast` only honours domain-refinement targets; the direction for a general `𝑈 ⇒ 𝑇` cast is in [type-inference.md](type-inference.md#future-work).
+`lambda_elim`, planning, and operator conversion carry the domain refinement through to a runtime `Restrict`: a `Cast` around a group-by lambda becomes a **Pi-const** form whose refinement planning's pointful group-by recognizer reads off the predicate, while a `Cast` wrapping point-free filter/guard code survives lambda elimination unchanged and is consumed as a domain refinement at planning — see [optimization.md](optimization.md). The current `Cast` only honours domain-refinement targets; the direction for a general `𝑈 ⇒ 𝑇` cast is in [type-inference.md](type-inference.md#6-future-work).
 
 ### `Case` only — no `IfThenElse`
 

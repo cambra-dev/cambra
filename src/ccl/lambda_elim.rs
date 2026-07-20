@@ -1158,7 +1158,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Integration tests — worked examples from lowering.md
+    // Integration tests — worked examples from docs/operational-semantics/lowering.md
     // -----------------------------------------------------------------------
 
     /// λ i → i ▷ f ▷ g  ⟹  f ≫ g
