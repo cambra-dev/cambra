@@ -20,7 +20,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::ty::{FunKind, Kind, KindVar, Witness};
+use crate::ccl::ty::{FunKind, FunKindVar, Kind, Witness};
 use crate::ccl::{Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
 
 use super::type_level;
@@ -186,7 +186,7 @@ pub fn constrain_subtype(
 /// Variable edges set `forced_*` flags, resolved at coalesce
 /// ([`super::compact::KindMerge`]): a compute value flowing *into* a var forces
 /// it `Compute`; a var *demanded* as data forces it `Data`; a var-to-var edge
-/// records a `<:` link ([`KindVar::link`]). Forces propagate transitively along
+/// records a `<:` link ([`FunKindVar::link`]). Forces propagate transitively along
 /// links as they arrive, so ordering does not matter (a force after its link
 /// still reaches the far end). A var that ends up with both flags is the
 /// conflict — surfaced loudly at coalesce, never here.
@@ -209,9 +209,9 @@ fn constrain_kind(k0: &FunKind, k1: &FunKind, kind_aware: bool) -> bool {
             false
         }
         // A var-to-var edge `v0 <: v1`: record the link so a force arriving on
-        // either end *after* this edge still reaches the other. See [`KindVar`].
+        // either end *after* this edge still reaches the other. See [`FunKindVar`].
         (Var(v0), Var(v1)) => {
-            KindVar::link(v0, v1);
+            FunKindVar::link(v0, v1);
             false
         }
     }
@@ -2285,7 +2285,7 @@ mod tests {
         // rejection — the var may still legitimately resolve `Data`); it
         // resolves at coalesce. A compute value flowing into it would set
         // `forced_compute`, and both flags together is the conflict.
-        let v = KindVar::fresh();
+        let v = FunKindVar::fresh();
         let var_fun = Type::Fun {
             name: None,
             kind: FunKind::Var(Rc::clone(&v)),
@@ -2313,9 +2313,9 @@ mod tests {
         // a later edge (`Compute <: v0`). Transitive propagation must carry
         // `forced_compute` up to `v1`; the old one-shot copy dropped it, letting
         // `v1` fall to its (possibly `Data`) domain default — a silent miskind.
-        let v0 = KindVar::fresh();
-        let v1 = KindVar::fresh();
-        let fun_of = |v: &Rc<KindVar>| Type::Fun {
+        let v0 = FunKindVar::fresh();
+        let v1 = FunKindVar::fresh();
+        let fun_of = |v: &Rc<FunKindVar>| Type::Fun {
             name: None,
             kind: FunKind::Var(Rc::clone(v)),
             domain: Box::new(Type::UIntRange(3)),

@@ -98,8 +98,8 @@ pub enum FunKind {
     Data,
     /// An unresolved kind, pinned down by the solver at coalesce. Identity is by
     /// the variable's `uid`, so `FunKind` (and `Type`) keep deriving
-    /// `PartialEq`/`Eq`/`Hash` — the [`KindVar`] impls compare by `uid` only.
-    Var(Rc<KindVar>),
+    /// `PartialEq`/`Eq`/`Hash` — the [`FunKindVar`] impls compare by `uid` only.
+    Var(Rc<FunKindVar>),
 }
 
 impl FunKind {
@@ -113,29 +113,29 @@ impl FunKind {
         }
     }
 
-    /// A fresh inferred kind (a new [`KindVar`] with empty bounds).
+    /// A fresh inferred kind (a new [`FunKindVar`] with empty bounds).
     pub fn fresh_var() -> FunKind {
-        FunKind::Var(KindVar::fresh())
+        FunKind::Var(FunKindVar::fresh())
     }
 }
 
-/// Stable identity of a [`KindVar`].
+/// Stable identity of a [`FunKindVar`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct KindVarId(pub(crate) u32);
+pub struct FunKindVarId(pub(crate) u32);
 
-static KIND_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
+static FUN_KIND_VAR_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// Bounds on a [`KindVar`], over the two-point kind lattice `Data ⊑ Compute`.
+/// Bounds on a [`FunKindVar`], over the two-point kind lattice `Data ⊑ Compute`.
 ///
 /// The lattice has only two points, so "bounds" collapse to two flags rather
 /// than the polar bound *lists* an [`crate::ccl::InferVar`] carries — and no
-/// [`Type`] sits inside, so a `KindVar` never forms a cycle. Resolution is a
+/// [`Type`] sits inside, so a `FunKindVar` never forms a cycle. Resolution is a
 /// flag read: `forced_compute ∧ forced_data` is the conflict (`Compute ⊑ κ ⊑
 /// Data`, impossible — the `Compute <: Data` rejection); `forced_compute` alone
 /// → `Compute`; `forced_data` alone → `Data`; neither → the caller's
 /// domain-derived default.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct KindBounds {
+pub struct FunKindBounds {
     /// A `Compute` value flows *into* this kind (`κ ⊒ Compute ⟹ κ = Compute`).
     pub forced_compute: bool,
     /// This kind is *demanded* as `Data` (`κ ⊑ Data ⟹ κ = Data`).
@@ -143,28 +143,28 @@ pub struct KindBounds {
 }
 
 /// A kind-inference variable — an unknown [`FunKind`] the solver pins down by
-/// accumulating [`KindBounds`]. Identity (`uid`) is immutable and lives outside
+/// accumulating [`FunKindBounds`]. Identity (`uid`) is immutable and lives outside
 /// the `RefCell`, so equality/hashing is borrow-free and never inspects the
 /// bounds (mirroring [`crate::ccl::InferVar`]).
-pub struct KindVar {
+pub struct FunKindVar {
     /// Stable, globally-unique identity.
-    pub uid: KindVarId,
+    pub uid: FunKindVarId,
     /// Mutable kind bounds.
-    pub bounds: RefCell<KindBounds>,
+    pub bounds: RefCell<FunKindBounds>,
     /// Vars `u` such that `self <: u` (this kind is below them). A `Compute`
     /// force propagates *up* to them (`self = Compute ⟹ u = Compute`).
-    uppers: RefCell<Vec<Rc<KindVar>>>,
+    uppers: RefCell<Vec<Rc<FunKindVar>>>,
     /// Vars `l` such that `l <: self` (this kind is above them). A `Data` force
     /// propagates *down* to them (`self = Data ⟹ l = Data`).
-    lowers: RefCell<Vec<Rc<KindVar>>>,
+    lowers: RefCell<Vec<Rc<FunKindVar>>>,
 }
 
-impl KindVar {
+impl FunKindVar {
     /// Allocate a fresh kind variable with empty bounds and no links.
-    pub fn fresh() -> Rc<KindVar> {
-        Rc::new(KindVar {
-            uid: KindVarId(KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
-            bounds: RefCell::new(KindBounds::default()),
+    pub fn fresh() -> Rc<FunKindVar> {
+        Rc::new(FunKindVar {
+            uid: FunKindVarId(FUN_KIND_VAR_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            bounds: RefCell::new(FunKindBounds::default()),
             uppers: RefCell::new(Vec::new()),
             lowers: RefCell::new(Vec::new()),
         })
@@ -188,7 +188,7 @@ impl KindVar {
     }
 
     /// Force this kind to `Data` and propagate transitively down the `<:` links.
-    /// The dual of [`KindVar::force_compute`]; same fixpoint/termination argument.
+    /// The dual of [`FunKindVar::force_compute`]; same fixpoint/termination argument.
     pub fn force_data(self: &Rc<Self>) {
         if self.bounds.borrow().forced_data {
             return;
@@ -203,14 +203,14 @@ impl KindVar {
     /// it to mirror def-site links onto the per-instantiation copies — the flags
     /// alone are not enough, since a force arriving *after* instantiation must
     /// still traverse the link to the sibling instantiation.
-    pub fn links(&self) -> (Vec<Rc<KindVar>>, Vec<Rc<KindVar>>) {
+    pub fn links(&self) -> (Vec<Rc<FunKindVar>>, Vec<Rc<FunKindVar>>) {
         (self.uppers.borrow().clone(), self.lowers.borrow().clone())
     }
 
     /// Record the edge `lower <: upper` and reconcile the flags already present
     /// on either end. Later forces on either var propagate through the stored
-    /// link via [`KindVar::force_compute`]/[`KindVar::force_data`].
-    pub fn link(lower: &Rc<KindVar>, upper: &Rc<KindVar>) {
+    /// link via [`FunKindVar::force_compute`]/[`FunKindVar::force_data`].
+    pub fn link(lower: &Rc<FunKindVar>, upper: &Rc<FunKindVar>) {
         if Rc::ptr_eq(lower, upper) {
             return;
         }
@@ -227,18 +227,18 @@ impl KindVar {
 
 // Identity-based (by `uid`), mirroring `InferVar`: borrow-free, never touches
 // `bounds`, so it is safe even while a variable's bounds are borrowed.
-impl PartialEq for KindVar {
+impl PartialEq for FunKindVar {
     fn eq(&self, other: &Self) -> bool {
         self.uid == other.uid
     }
 }
-impl Eq for KindVar {}
-impl std::hash::Hash for KindVar {
+impl Eq for FunKindVar {}
+impl std::hash::Hash for FunKindVar {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.uid.hash(state);
     }
 }
-impl fmt::Debug for KindVar {
+impl fmt::Debug for FunKindVar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "κ{}", self.uid.0)
     }
@@ -247,7 +247,7 @@ impl fmt::Debug for KindVar {
 /// Reset the kind-variable counter to zero (test-only, for predictable output).
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn reset_kind_var_counter() {
-    KIND_VAR_COUNTER.store(0, Ordering::Relaxed);
+    FUN_KIND_VAR_COUNTER.store(0, Ordering::Relaxed);
 }
 
 /// A CCL type annotation.

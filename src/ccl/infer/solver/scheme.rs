@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::ty::{FunKind, KindVar, KindVarId};
+use crate::ccl::ty::{FunKind, FunKindVar, FunKindVarId};
 use crate::ccl::{Bound, InferVar, InferVarId, Level, Refinement, Type, TypedExpr, TypedExprNode};
 
 use super::type_level;
@@ -88,10 +88,10 @@ pub struct FreshenCache {
     /// function's arrow kind ([`FunKind::Var`]) must be decided *per use*, just
     /// like the type it quantifies: two instantiations that flow into differently
     /// -kinded contexts (one demanding `Data`, one `Compute`) must not share a
-    /// `KindVar` cell, or forcing one contaminates the other into a spurious
+    /// `FunKindVar` cell, or forcing one contaminates the other into a spurious
     /// `ExtentJoinConflict`. Freshening mints one `κ'` per original `κ` (bounds
     /// copied so def-intrinsic forcing survives), consistently within a copy.
-    pub kind_vars: HashMap<KindVarId, Rc<KindVar>>,
+    pub kind_vars: HashMap<FunKindVarId, Rc<FunKindVar>>,
 }
 
 impl FreshenCache {
@@ -124,7 +124,7 @@ pub enum FreshenLevel {
 /// original.
 /// Freshen a function's arrow kind at instantiation. A concrete kind
 /// (`Data`/`Compute`) is intrinsic and copies through. An unresolved
-/// [`FunKind::Var`] is *quantified*: mint one fresh `KindVar` per original
+/// [`FunKind::Var`] is *quantified*: mint one fresh `FunKindVar` per original
 /// (cached by `uid` so repeated occurrences of the same `κ` in one copy stay
 /// identified), seeding it with a copy of the original's bounds so any
 /// def-intrinsic forcing is preserved while use-site forcing lands on the fresh
@@ -145,17 +145,17 @@ fn freshen_kind(kind: &FunKind, cache: &mut FreshenCache) -> FunKind {
 /// — from `x`'s `uppers` — while `lowers` are recursed only to guarantee every
 /// linked var is minted; inserting into the cache before recursing terminates a
 /// link cycle on the cache hit.
-fn freshen_kind_var(kv: &Rc<KindVar>, cache: &mut FreshenCache) -> Rc<KindVar> {
+fn freshen_kind_var(kv: &Rc<FunKindVar>, cache: &mut FreshenCache) -> Rc<FunKindVar> {
     if let Some(f) = cache.kind_vars.get(&kv.uid) {
         return f.clone();
     }
-    let f = KindVar::fresh();
+    let f = FunKindVar::fresh();
     *f.bounds.borrow_mut() = *kv.bounds.borrow();
     cache.kind_vars.insert(kv.uid, Rc::clone(&f));
     let (uppers, lowers) = kv.links();
     for u in &uppers {
         let fu = freshen_kind_var(u, cache);
-        KindVar::link(&f, &fu);
+        FunKindVar::link(&f, &fu);
     }
     for l in &lowers {
         // The edge `l <: kv` is drawn from `l`'s side (its `uppers` include
@@ -570,16 +570,16 @@ fn freshen_subst_payloads(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::ty::{FunKind, KindVar};
+    use crate::ccl::ty::{FunKind, FunKindVar};
     use crate::ccl::{BaseType, InferVar};
 
     #[test]
     fn freshening_mints_a_distinct_kind_var_per_instantiation() {
         // A generalized function's arrow kind must be decided per use. Freshening
-        // a Fun whose kind is an unresolved var must mint a *new* KindVar (bounds
+        // a Fun whose kind is an unresolved var must mint a *new* FunKindVar (bounds
         // copied), not share the original — otherwise forcing one instantiation's
         // kind contaminates the other into a spurious `ExtentJoinConflict`.
-        let kv = KindVar::fresh();
+        let kv = FunKindVar::fresh();
         kv.bounds.borrow_mut().forced_data = true; // a def-intrinsic bound to carry
         // A quantified domain (level > lim) so the Fun is instantiated, not
         // early-returned as a captured/monomorphic shape.
@@ -620,9 +620,9 @@ mod tests {
         // freshening, so a use-site force on one instantiation still reaches its
         // sibling. Copying the bounds alone (the flags present at def time) would
         // drop the link and let a later force miss the far end.
-        let lower = KindVar::fresh(); // κ₁
-        let upper = KindVar::fresh(); // κ₂, with κ₁ <: κ₂
-        KindVar::link(&lower, &upper);
+        let lower = FunKindVar::fresh(); // κ₁
+        let upper = FunKindVar::fresh(); // κ₂, with κ₁ <: κ₂
+        FunKindVar::link(&lower, &upper);
         // A higher-order type with κ₁ on the (quantified) domain arrow and κ₂ on
         // the outer arrow; the Infer domain lifts both above `lim` so both are
         // instantiated rather than early-returned.
