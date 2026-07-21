@@ -1,0 +1,347 @@
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --bg-panel: #fafafa;
+  --bg-header: #f0f0f0;
+  --fg: #1a1a1a;
+  --fg-muted: #6a6a6a;
+  --border: #d8d8d8;
+  --type: #0a6b3c;
+  --node-id: #9a6a00;
+  --edge: #2a5fa5;
+  --err: #c0392b;
+  --warn: #b8860b;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1e1e1e;
+    --bg-panel: #242424;
+    --bg-header: #2c2c2c;
+    --fg: #e4e4e4;
+    --fg-muted: #9a9a9a;
+    --border: #3a3a3a;
+    --type: #6fcf97;
+    --node-id: #d8b25a;
+    --edge: #79a9e8;
+    --err: #ff6b5b;
+    --warn: #e0b34a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* Header / status bar */
+.header {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 0.5rem 0.9rem;
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.header .title {
+  font-weight: 600;
+}
+.header .name {
+  color: var(--fg);
+}
+.header .badge {
+  font-size: 11px;
+  padding: 0.1rem 0.45rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+}
+.header .badge.failed {
+  color: var(--err);
+  border-color: var(--err);
+}
+.header .spacer {
+  flex: 1 1 auto;
+}
+
+/* N-pane layout: each pane gets an equal share (flex: 1 1 0). */
+.panels {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+}
+.panel:last-child {
+  border-right: none;
+}
+.panel.tree {
+  background: var(--bg-panel);
+}
+.panel-title {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.35rem 0.9rem;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-muted);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+/* A per-pane badge in the title bar (e.g. "pre-inference (holes)"). */
+.pane-badge {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 10px;
+  padding: 0.05rem 0.4rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--fg-muted);
+}
+.panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* CodeMirror editor fills its panel body */
+.panel.source .cm-editor {
+  height: 100%;
+}
+
+/* IR tree */
+.tree-root {
+  padding: 0.5rem 0.4rem;
+}
+.tree-node {
+  white-space: nowrap;
+}
+.tree-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  padding: 0.05rem 0.2rem;
+  border-radius: 3px;
+  cursor: default;
+}
+.tree-row.expandable {
+  cursor: pointer;
+}
+.tree-row.expandable:hover {
+  background: rgba(127, 127, 127, 0.12);
+}
+.twisty {
+  display: inline-block;
+  width: 0.9em;
+  text-align: center;
+  color: var(--fg-muted);
+  user-select: none;
+}
+.twisty.leaf {
+  opacity: 0.3;
+}
+.edge-label {
+  color: var(--edge);
+  font-size: 11px;
+}
+.node-label {
+  font-weight: 500;
+}
+.node-type {
+  color: var(--type);
+}
+/* B5: the downstream-resolved type of a pre-inference hole, shown on hover (not
+   inline — the `→` glyph confused with `⇒`/`⇀`). A custom tooltip styled to
+   match the source pane's `.cm-hover`; positioned at the pointer via JS. */
+.node-resolved-tooltip {
+  position: fixed;
+  z-index: 10;
+  pointer-events: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0.3rem 0.5rem;
+  max-width: 32rem;
+  color: var(--type);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.22);
+}
+.node-id {
+  color: var(--node-id);
+  font-size: 11px;
+  opacity: 0.85;
+}
+.tree-children {
+  margin-left: 1.1em;
+  border-left: 1px dotted var(--border);
+  padding-left: 0.3em;
+}
+.tree-children.collapsed {
+  display: none;
+}
+
+/* Diagnostics list (degraded path) */
+.diagnostics {
+  padding: 0.7rem 0.9rem;
+}
+.diagnostics .empty {
+  color: var(--fg-muted);
+}
+.diag {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--fg-muted);
+  border-radius: 4px;
+  padding: 0.5rem 0.7rem;
+  margin-bottom: 0.6rem;
+  white-space: pre-wrap;
+}
+.diag.error {
+  border-left-color: var(--err);
+}
+.diag.warning {
+  border-left-color: var(--warn);
+}
+.diag .diag-head {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 0.25rem;
+}
+.diag.error .diag-head {
+  color: var(--err);
+}
+.diag.warning .diag-head {
+  color: var(--warn);
+}
+.diag .diag-span {
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+
+.fatal {
+  padding: 1rem;
+  color: var(--err);
+}
+
+/* F2: make CodeMirror tooltips readable + theme-aware. CM6's default theme
+   gives every tooltip (our hover panel AND the lint diagnostic popup) a
+   light-grey background with muted text — low contrast, unreadable in a light
+   Firefox. Route them through our --bg/--fg vars, which already flip on
+   prefers-color-scheme. `!important` overrides CM's injected theme rules. */
+.cm-tooltip {
+  background: var(--bg) !important;
+  color: var(--fg) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: 4px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.22);
+}
+/* The lint diagnostic popup: ensure its text uses the readable foreground and
+   gets a severity-coloured rule, not CM's muted default. */
+.cm-tooltip.cm-tooltip-lint,
+.cm-tooltip-lint .cm-diagnostic {
+  color: var(--fg);
+}
+.cm-tooltip-lint .cm-diagnostic {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0.3rem 0.5rem;
+}
+.cm-tooltip-lint .cm-diagnostic-error {
+  border-left: 3px solid var(--err);
+}
+.cm-tooltip-lint .cm-diagnostic-warning {
+  border-left: 3px solid var(--warn);
+}
+
+/* F2: hover tooltip (tightest node label / type set / provenance) */
+.cm-hover {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0.3rem 0.5rem;
+  max-width: 32rem;
+}
+.cm-hover-label {
+  font-weight: 600;
+}
+.cm-hover-type {
+  color: var(--type);
+}
+.cm-hover-prov {
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.cm-hover-gotodef {
+  display: block;
+  margin-top: 0.35rem;
+  padding: 0.15rem 0;
+  border: none;
+  background: none;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--edge);
+  cursor: pointer;
+  text-align: left;
+}
+.cm-hover-gotodef:hover {
+  text-decoration: underline;
+}
+
+/* Source-editor span highlights: the primary anchor span (strong) and the
+   transitively-linked spans reached across stages (lighter). */
+.cm-sel-node {
+  background: rgba(121, 169, 232, 0.28);
+  border-radius: 2px;
+}
+.cm-link-node {
+  background: rgba(121, 169, 232, 0.13);
+  border-radius: 2px;
+}
+
+/* F2: tree row selection + clickable twisty */
+.tree-row.selectable {
+  cursor: pointer;
+}
+.tree-row.selectable:hover {
+  background: rgba(127, 127, 127, 0.12);
+}
+/* Primary selection (the directly-clicked / anchor node) — strong; linked
+   nodes reached across stages — lighter. */
+.tree-row.selected {
+  background: rgba(121, 169, 232, 0.28);
+}
+.tree-row.linked {
+  background: rgba(121, 169, 232, 0.13);
+}
+.twisty.clickable {
+  cursor: pointer;
+}

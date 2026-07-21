@@ -176,6 +176,12 @@ impl InspectNode {
 
     /// Serialize this node tree to a JSON string without serde.
     ///
+    /// DEPRECATED: emits the legacy `web_inspector` dashboard's wire shape (its
+    /// only caller). The cambra-inspector `/api/snapshot` path uses the
+    /// `Serialize` impl below instead; this method and `web_inspector` will be
+    /// removed once cambra-inspector gains the operator-graph and live panes the
+    /// old dashboard still provides.
+    ///
     /// Field names mirror the Rust struct fields. `None` guard fields are
     /// omitted. Children serialize as `{"edge":"...","node":{...}}` pairs,
     /// preserving edge labels.
