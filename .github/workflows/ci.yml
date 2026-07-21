@@ -203,6 +203,21 @@ jobs:
         # the step above already built.
         run: CAMBRA_REFINEMENT_ORDER=reverse ./ci.sh test
 
+      - name: Inspector
+        # The cambra-inspector crate (lints + tests). Separate from the core
+        # `cargo` checks, which only build the root package. Runs even if earlier
+        # steps failed so all errors surface in one run.
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        run: ./ci.sh inspector
+
+      - name: Fixtures
+        # The golden wire fixtures: regenerate into a temp dir and diff against
+        # the committed corpus, plus the orphan-fixture check. Needs its own step
+        # because CI invokes each gate individually and never calls `ci_all`, so
+        # a gate that exists only in `ci.sh` runs locally and nowhere else.
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        run: ./ci.sh fixtures
+
         # 4. Success Signal for noops
       - name: No-op for docs
         if: steps.filter.outputs.code == 'false'

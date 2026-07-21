@@ -1,0 +1,24 @@
+[package]
+name = "cambra-inspector"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# The user-facing program-inspector: HTTP server (tiny_http) + embedded
+# CodeMirror frontend, serving the read-only post-inference snapshot from
+# `cambra::inspector_model`. This crate owns serde + the JS toolchain so the
+# `cambra` core stays serde-free.
+#
+# W0 scaffold only: depends on `cambra` with the `serde` feature on (this is
+# what pulls serde into the build). Wire types (I3), the server (I5), and the
+# frontend (F1–F3) land in later steps.
+
+[dependencies]
+cambra = { path = "..", features = ["serde"] }
+# The transport-edge serializer. serde_json lives HERE, never on `cambra` — the
+# core builds the (serde-gated) wire types; this crate turns them into JSON.
+# The test also parses the produced JSON back to a `Value` to assert the shape.
+serde_json = { version = "1", features = ["preserve_order"] }
+# The user-facing inspector HTTP server (I5). Same version as the `cambra` core's
+# web_inspector dev dashboard, but a separate, sibling server living here.
+tiny_http = "0.12"

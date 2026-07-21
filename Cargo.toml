@@ -1,3 +1,18 @@
+[workspace]
+# The root `cambra` package is implicitly a workspace member; `cambra-inspector`
+# is the second member. Splitting serde + the inspector HTTP/frontend into a
+# separate crate is what keeps `cargo build -p cambra` serde-free: serde is an
+# optional, default-off feature here, pulled in only when `cambra-inspector`
+# (or `--features serde`) builds it. See projects/program-inspector/m1-static-plan.md §2.
+members = ["cambra-inspector"]
+# The root package is edition 2024, whose default resolver is 3, but a workspace
+# table overrides the member's edition default — so leaving this unset or at 2
+# silently downgrades the whole build. 3 is MSRV-aware version selection (it
+# respects `rust-version` when picking a dependency version); the feature
+# unification `ci_clippy_serde` and `ci_clippy_lib` rely on arrived in 2 and is
+# unchanged in 3, so those gates are not what this setting decides.
+resolver = "3"
+
 [package]
 name = "cambra"
 version = "0.1.0"

@@ -1,0 +1,24 @@
+{
+  "source": {
+    "name": "cambra-inspector/examples/type_error.chl",
+    "text": "# Deliberate type error: `and` expects Bool operands but gets Ints.\n# Demonstrates the degraded (snapshotKind: \"failed\") inspector path.\n1 and 2\n"
+  },
+  "definitions": [],
+  "diagnostics": [
+    {
+      "severity": "error",
+      "stage": "infer",
+      "message": "Type mismatch for BinOp: expected Bool, found Int",
+      "span": {
+        "start": 137,
+        "end": 144
+      }
+    }
+  ],
+  "meta": {
+    "payloadKind": "failed",
+    "schema": 1
+  },
+  "panes": [],
+  "paneLinks": []
+}

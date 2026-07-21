@@ -1,0 +1,3401 @@
+{
+  "source": {
+    "name": "cambra-inspector/examples/txn_multi_read.chl",
+    "text": "# Transactional store read at multiple sites (RT-4a shape). Each `with begin():`\n# block reads `pool` twice — once in the guard, once in the write value — so the\n# transact phase substitutes the read-your-writes snapshot at two sites; the\n# substituted copies must carry freshened (unique) NodeIds.\nout = defer()\npool: Mut(Int, Txn) := 100\nfor r in [10, 20, 30]:\n    with begin():\n        if pool > r:\n            pool := pool - r\nwith begin():\n    out << pool\nout\n"
+  },
+  "definitions": [
+    {
+      "useSpan": {
+        "start": 396,
+        "end": 400
+      },
+      "defSpan": {
+        "start": 317,
+        "end": 343
+      },
+      "name": "pool"
+    },
+    {
+      "useSpan": {
+        "start": 403,
+        "end": 404
+      },
+      "defSpan": {
+        "start": 344,
+        "end": 435
+      },
+      "name": "r"
+    },
+    {
+      "useSpan": {
+        "start": 426,
+        "end": 430
+      },
+      "defSpan": {
+        "start": 317,
+        "end": 343
+      },
+      "name": "pool"
+    },
+    {
+      "useSpan": {
+        "start": 433,
+        "end": 434
+      },
+      "defSpan": {
+        "start": 344,
+        "end": 435
+      },
+      "name": "r"
+    },
+    {
+      "useSpan": {
+        "start": 460,
+        "end": 464
+      },
+      "defSpan": {
+        "start": 317,
+        "end": 343
+      },
+      "name": "pool"
+    },
+    {
+      "useSpan": {
+        "start": 465,
+        "end": 468
+      },
+      "defSpan": {
+        "start": 303,
+        "end": 316
+      },
+      "name": "out"
+    }
+  ],
+  "diagnostics": [],
+  "meta": {
+    "payloadKind": "program",
+    "schema": 1
+  },
+  "panes": [
+    {
+      "id": "post-inference",
+      "label": "IR (POST-INFERENCE)",
+      "kind": "typed",
+      "root": 41,
+      "nodes": [
+        {
+          "label": "Let(out)",
+          "nodeId": 41,
+          "spans": [
+            {
+              "start": 303,
+              "end": 316
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "feed(chan(out) ⇒ Int)",
+          "children": [
+            {
+              "id": 40,
+              "predicate": false
+            },
+            {
+              "id": 39,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Defer",
+          "nodeId": 40,
+          "spans": [
+            {
+              "start": 309,
+              "end": 316
+            }
+          ],
+          "rewritten": null,
+          "type": "feed(chan(out) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "MutDecl(pool)",
+          "nodeId": 39,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "feed(chan(out) ⇒ Int)",
+          "children": [
+            {
+              "id": 38,
+              "predicate": false
+            },
+            {
+              "id": 37,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(100))",
+          "nodeId": 38,
+          "spans": [
+            {
+              "start": 340,
+              "end": 343
+            }
+          ],
+          "rewritten": null,
+          "type": "Int@100",
+          "children": [
+            {
+              "id": 61,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 61,
+          "spans": [
+            {
+              "start": 340,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 62,
+              "predicate": false
+            },
+            {
+              "id": 63,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 62,
+          "spans": [
+            {
+              "start": 340,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(100))",
+          "nodeId": 63,
+          "spans": [
+            {
+              "start": 340,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "ExprStmt",
+          "nodeId": 37,
+          "spans": [
+            {
+              "start": 344,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.stmt_seq"
+          },
+          "type": "feed(chan(out) ⇒ Int)",
+          "children": [
+            {
+              "id": 36,
+              "predicate": false
+            },
+            {
+              "id": 12,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "For",
+          "nodeId": 36,
+          "spans": [
+            {
+              "start": 344,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "Unit",
+          "children": [
+            {
+              "id": 16,
+              "predicate": false
+            },
+            {
+              "id": 35,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "List",
+          "nodeId": 16,
+          "spans": [
+            {
+              "start": 354,
+              "end": 365
+            }
+          ],
+          "rewritten": null,
+          "type": "([0, 2] ⤇ Int)",
+          "children": [
+            {
+              "id": 13,
+              "predicate": false
+            },
+            {
+              "id": 14,
+              "predicate": false
+            },
+            {
+              "id": 15,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(10))",
+          "nodeId": 13,
+          "spans": [
+            {
+              "start": 354,
+              "end": 356
+            }
+          ],
+          "rewritten": null,
+          "type": "Int@10",
+          "children": [
+            {
+              "id": 64,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 64,
+          "spans": [
+            {
+              "start": 354,
+              "end": 356
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 65,
+              "predicate": false
+            },
+            {
+              "id": 66,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 65,
+          "spans": [
+            {
+              "start": 354,
+              "end": 356
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(10))",
+          "nodeId": 66,
+          "spans": [
+            {
+              "start": 354,
+              "end": 356
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(20))",
+          "nodeId": 14,
+          "spans": [
+            {
+              "start": 358,
+              "end": 360
+            }
+          ],
+          "rewritten": null,
+          "type": "Int@20",
+          "children": [
+            {
+              "id": 67,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 67,
+          "spans": [
+            {
+              "start": 358,
+              "end": 360
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 68,
+              "predicate": false
+            },
+            {
+              "id": 69,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 68,
+          "spans": [
+            {
+              "start": 358,
+              "end": 360
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(20))",
+          "nodeId": 69,
+          "spans": [
+            {
+              "start": 358,
+              "end": 360
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(30))",
+          "nodeId": 15,
+          "spans": [
+            {
+              "start": 362,
+              "end": 364
+            }
+          ],
+          "rewritten": null,
+          "type": "Int@30",
+          "children": [
+            {
+              "id": 70,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 70,
+          "spans": [
+            {
+              "start": 362,
+              "end": 364
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 71,
+              "predicate": false
+            },
+            {
+              "id": 72,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 71,
+          "spans": [
+            {
+              "start": 362,
+              "end": 364
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(30))",
+          "nodeId": 72,
+          "spans": [
+            {
+              "start": 362,
+              "end": 364
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "ExprStmt",
+          "nodeId": 35,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.stmt_seq"
+          },
+          "type": "Unit",
+          "children": [
+            {
+              "id": 34,
+              "predicate": false
+            },
+            {
+              "id": 17,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Begin",
+          "nodeId": 34,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "Unit",
+          "children": [
+            {
+              "id": 33,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "ExprStmt",
+          "nodeId": 33,
+          "spans": [
+            {
+              "start": 393,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.stmt_seq"
+          },
+          "type": "Unit",
+          "children": [
+            {
+              "id": 32,
+              "predicate": false
+            },
+            {
+              "id": 18,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Case",
+          "nodeId": 32,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "Unit",
+          "children": [
+            {
+              "id": 23,
+              "predicate": false
+            },
+            {
+              "id": 29,
+              "predicate": false
+            },
+            {
+              "id": 31,
+              "predicate": false
+            },
+            {
+              "id": 30,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Greater))",
+          "nodeId": 23,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": null,
+          "type": "Bool",
+          "children": [
+            {
+              "id": 21,
+              "predicate": false
+            },
+            {
+              "id": 22,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(pool)",
+          "nodeId": 21,
+          "spans": [
+            {
+              "start": 396,
+              "end": 400
+            }
+          ],
+          "rewritten": null,
+          "type": "Mut(Int, Txn)",
+          "children": []
+        },
+        {
+          "label": "Var(r)",
+          "nodeId": 22,
+          "spans": [
+            {
+              "start": 403,
+              "end": 404
+            }
+          ],
+          "rewritten": null,
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "ExprStmt",
+          "nodeId": 29,
+          "spans": [
+            {
+              "start": 418,
+              "end": 434
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "Unit",
+          "children": [
+            {
+              "id": 28,
+              "predicate": false
+            },
+            {
+              "id": 24,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "MutWrite(pool)",
+          "nodeId": 28,
+          "spans": [
+            {
+              "start": 418,
+              "end": 434
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "Unit",
+          "children": [
+            {
+              "id": 27,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Arithmetic(Sub))",
+          "nodeId": 27,
+          "spans": [
+            {
+              "start": 426,
+              "end": 434
+            }
+          ],
+          "rewritten": null,
+          "type": "Int",
+          "children": [
+            {
+              "id": 25,
+              "predicate": false
+            },
+            {
+              "id": 26,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(pool)",
+          "nodeId": 25,
+          "spans": [
+            {
+              "start": 426,
+              "end": 430
+            }
+          ],
+          "rewritten": null,
+          "type": "Mut(Int, Txn)",
+          "children": []
+        },
+        {
+          "label": "Var(r)",
+          "nodeId": 26,
+          "spans": [
+            {
+              "start": 433,
+              "end": 434
+            }
+          ],
+          "rewritten": null,
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Unit)",
+          "nodeId": 24,
+          "spans": [
+            {
+              "start": 418,
+              "end": 434
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.txn_unit"
+          },
+          "type": "Unit",
+          "children": []
+        },
+        {
+          "label": "Lit(Bool(true))",
+          "nodeId": 31,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.txn_deny"
+          },
+          "type": "Bool@true",
+          "children": [
+            {
+              "id": 73,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 73,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 74,
+              "predicate": false
+            },
+            {
+              "id": 75,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 74,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": []
+        },
+        {
+          "label": "Lit(Bool(true))",
+          "nodeId": 75,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": []
+        },
+        {
+          "label": "Lit(Unit)",
+          "nodeId": 30,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.txn_deny"
+          },
+          "type": "Unit",
+          "children": []
+        },
+        {
+          "label": "Lit(Unit)",
+          "nodeId": 18,
+          "spans": [
+            {
+              "start": 393,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.txn_unit"
+          },
+          "type": "Unit",
+          "children": []
+        },
+        {
+          "label": "Lit(Unit)",
+          "nodeId": 17,
+          "spans": [
+            {
+              "start": 344,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.loop_unit"
+          },
+          "type": "Unit",
+          "children": []
+        },
+        {
+          "label": "ExprStmt",
+          "nodeId": 12,
+          "spans": [
+            {
+              "start": 435,
+              "end": 465
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.txn_singleton"
+          },
+          "type": "feed(chan(out) ⇒ Int)",
+          "children": [
+            {
+              "id": 11,
+              "predicate": false
+            },
+            {
+              "id": 1,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "For",
+          "nodeId": 11,
+          "spans": [
+            {
+              "start": 435,
+              "end": 465
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.txn_singleton"
+          },
+          "type": "Unit",
+          "children": [
+            {
+              "id": 7,
+              "predicate": false
+            },
+            {
+              "id": 10,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "List",
+          "nodeId": 7,
+          "spans": [
+            {
+              "start": 435,
+              "end": 465
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.txn_singleton"
+          },
+          "type": "([0, 0] ⤇ Unit)",
+          "children": [
+            {
+              "id": 6,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Unit)",
+          "nodeId": 6,
+          "spans": [
+            {
+              "start": 435,
+              "end": 465
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.txn_singleton"
+          },
+          "type": "Unit",
+          "children": []
+        },
+        {
+          "label": "ExprStmt",
+          "nodeId": 10,
+          "spans": [
+            {
+              "start": 435,
+              "end": 465
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.txn_singleton"
+          },
+          "type": "Unit",
+          "children": [
+            {
+              "id": 8,
+              "predicate": false
+            },
+            {
+              "id": 9,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Begin",
+          "nodeId": 8,
+          "spans": [
+            {
+              "start": 435,
+              "end": 465
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.image"
+          },
+          "type": "Unit",
+          "children": [
+            {
+              "id": 5,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "ExprStmt",
+          "nodeId": 5,
+          "spans": [
+            {
+              "start": 453,
+              "end": 464
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.stmt_seq"
+          },
+          "type": "Unit",
+          "children": [
+            {
+              "id": 4,
+              "predicate": false
+            },
+            {
+              "id": 2,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Feed(out)",
+          "nodeId": 4,
+          "spans": [
+            {
+              "start": 453,
+              "end": 464
+            }
+          ],
+          "rewritten": null,
+          "type": "Unit",
+          "children": [
+            {
+              "id": 3,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(pool)",
+          "nodeId": 3,
+          "spans": [
+            {
+              "start": 460,
+              "end": 464
+            }
+          ],
+          "rewritten": null,
+          "type": "Mut(Int, Txn)",
+          "children": []
+        },
+        {
+          "label": "Lit(Unit)",
+          "nodeId": 2,
+          "spans": [
+            {
+              "start": 453,
+              "end": 464
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.txn_unit"
+          },
+          "type": "Unit",
+          "children": []
+        },
+        {
+          "label": "Lit(Unit)",
+          "nodeId": 9,
+          "spans": [
+            {
+              "start": 435,
+              "end": 465
+            }
+          ],
+          "rewritten": {
+            "via": "Lower",
+            "nature": "machinery",
+            "label": "lower.txn_singleton"
+          },
+          "type": "Unit",
+          "children": []
+        },
+        {
+          "label": "Var(out)",
+          "nodeId": 1,
+          "spans": [
+            {
+              "start": 465,
+              "end": 468
+            }
+          ],
+          "rewritten": null,
+          "type": "feed(chan(out) ⇒ Int)",
+          "children": []
+        }
+      ]
+    },
+    {
+      "id": "post-channelize",
+      "label": "IR (POST-CHANNELIZE)",
+      "kind": "typed",
+      "root": 300,
+      "nodes": [
+        {
+          "label": "LetRec",
+          "nodeId": 300,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.carrier"
+          },
+          "type": "([0, 0] ⤇ Int)",
+          "children": [
+            {
+              "id": 295,
+              "predicate": false
+            },
+            {
+              "id": 277,
+              "predicate": false
+            },
+            {
+              "id": 299,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lambda(__t)",
+          "nodeId": 295,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "(Txn ⇒ Int)",
+          "children": [
+            {
+              "id": 294,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 294,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 293,
+              "predicate": false
+            },
+            {
+              "id": 292,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(get_prev_txn)",
+          "nodeId": 293,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "((([0, 2] ⇒ {time: Txn, write: Int}), Txn, Int) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 292,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "(([0, 2] ⇒ {time: Txn, write: Int}), Txn, Int)",
+          "children": [
+            {
+              "id": 290,
+              "predicate": false
+            },
+            {
+              "id": 291,
+              "predicate": false
+            },
+            {
+              "id": 278,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 290,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "([0, 2] ⇒ {time: Txn, write: Int})",
+          "children": [
+            {
+              "id": 289,
+              "predicate": false
+            },
+            {
+              "id": 288,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(zip)",
+          "nodeId": 289,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "({time: ([0, 2] ⇒ Txn), write: ([0, 2] ⇒ Int)} ⇒ ([0, 2] ⇒ {time: Txn, write: Int}))",
+          "children": []
+        },
+        {
+          "label": "Record",
+          "nodeId": 288,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "{time: ([0, 2] ⇒ Txn), write: ([0, 2] ⇒ Int)}",
+          "children": [
+            {
+              "id": 281,
+              "predicate": false
+            },
+            {
+              "id": 287,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Compose",
+          "nodeId": 281,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "([0, 2] ⇒ Txn)",
+          "children": [
+            {
+              "id": 279,
+              "predicate": false
+            },
+            {
+              "id": 280,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__commits)",
+          "nodeId": 279,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "([0, 2] ⇒ {time: Txn, write_targets: ((Txn ⇒ Int)), decision: {`commit{writes: (Int)} | `abort}})",
+          "children": []
+        },
+        {
+          "label": "Proj(Field(\"time\"))",
+          "nodeId": 280,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "({time: Txn, write_targets: ((Txn ⇒ Int)), decision: {`commit{writes: (Int)} | `abort}} ⇒ Txn)",
+          "children": []
+        },
+        {
+          "label": "Compose",
+          "nodeId": 287,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "([0, 2] ⇒ Int)",
+          "children": [
+            {
+              "id": 283,
+              "predicate": false
+            },
+            {
+              "id": 284,
+              "predicate": false
+            },
+            {
+              "id": 285,
+              "predicate": false
+            },
+            {
+              "id": 286,
+              "predicate": false
+            },
+            {
+              "id": 282,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__commits)",
+          "nodeId": 283,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "([0, 2] ⇒ {time: Txn, write_targets: ((Txn ⇒ Int)), decision: {`commit{writes: (Int)} | `abort}})",
+          "children": []
+        },
+        {
+          "label": "Proj(Field(\"decision\"))",
+          "nodeId": 284,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "({time: Txn, write_targets: ((Txn ⇒ Int)), decision: {`commit{writes: (Int)} | `abort}} ⇒ {`commit{writes: (Int)} | `abort})",
+          "children": []
+        },
+        {
+          "label": "Builtin(variant_project)",
+          "nodeId": 285,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "({`commit{writes: (Int)} | `abort} ⇒ {writes: (Int)})",
+          "children": []
+        },
+        {
+          "label": "Proj(Field(\"writes\"))",
+          "nodeId": 286,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "({writes: (Int)} ⇒ (Int))",
+          "children": []
+        },
+        {
+          "label": "Proj(Index(0))",
+          "nodeId": 282,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "((Int) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Var(__t)",
+          "nodeId": 291,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "Txn",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(100))",
+          "nodeId": 278,
+          "spans": [
+            {
+              "start": 340,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.history"
+          },
+          "type": "Int@100",
+          "children": [
+            {
+              "id": 61,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 61,
+          "spans": [
+            {
+              "start": 340,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 62,
+              "predicate": false
+            },
+            {
+              "id": 63,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 62,
+          "spans": [
+            {
+              "start": 340,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(100))",
+          "nodeId": 63,
+          "spans": [
+            {
+              "start": 340,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lambda(__r)",
+          "nodeId": 277,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.commit_record"
+          },
+          "type": "([0, 2] ⇒ {time: Txn, write_targets: ((Txn ⇒ Int)), decision: {`commit{writes: (Int)} | `abort}})",
+          "children": [
+            {
+              "id": 276,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Let(__t)",
+          "nodeId": 276,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.commit_record"
+          },
+          "type": "{time: Txn, write_targets: ((Txn ⇒ Int)), decision: {`commit{writes: (Int)} | `abort}}",
+          "children": [
+            {
+              "id": 264,
+              "predicate": false
+            },
+            {
+              "id": 275,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 264,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.commit_record"
+          },
+          "type": "Txn",
+          "children": [
+            {
+              "id": 263,
+              "predicate": false
+            },
+            {
+              "id": 262,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(begin)",
+          "nodeId": 263,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.commit_record"
+          },
+          "type": "([0, 2] ⇒ Txn)",
+          "children": []
+        },
+        {
+          "label": "Var(__r)",
+          "nodeId": 262,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.commit_record"
+          },
+          "type": "[0, 2]",
+          "children": []
+        },
+        {
+          "label": "Record",
+          "nodeId": 275,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.commit_record"
+          },
+          "type": "{time: Txn, write_targets: ((Txn ⇒ Int)), decision: {`commit{writes: (Int)} | `abort}}",
+          "children": [
+            {
+              "id": 274,
+              "predicate": false
+            },
+            {
+              "id": 273,
+              "predicate": false
+            },
+            {
+              "id": 271,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__t)",
+          "nodeId": 274,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.commit_record"
+          },
+          "type": "Txn",
+          "children": []
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 273,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.commit_record"
+          },
+          "type": "((Txn ⇒ Int))",
+          "children": [
+            {
+              "id": 272,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(pool)",
+          "nodeId": 272,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.commit_record"
+          },
+          "type": "(Txn ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 271,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.commit_record"
+          },
+          "type": "{`commit{writes: (Int)} | `abort}",
+          "children": [
+            {
+              "id": 261,
+              "predicate": false
+            },
+            {
+              "id": 307,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lambda(__txp)",
+          "nodeId": 261,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "((Int, Int) ⇒ {`commit{writes: (Int)} | `abort})",
+          "children": [
+            {
+              "id": 260,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Case",
+          "nodeId": 260,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "{`commit{writes: (Int)} | `abort}",
+          "children": [
+            {
+              "id": 247,
+              "predicate": false
+            },
+            {
+              "id": 256,
+              "predicate": false
+            },
+            {
+              "id": 259,
+              "predicate": false
+            },
+            {
+              "id": 258,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Greater))",
+          "nodeId": 247,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 248,
+              "predicate": false
+            },
+            {
+              "id": 251,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 248,
+          "spans": [
+            {
+              "start": 396,
+              "end": 400
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 249,
+              "predicate": false
+            },
+            {
+              "id": 250,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Proj(Index(0))",
+          "nodeId": 249,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "((Int, Int) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Var(__txp)",
+          "nodeId": 250,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "(Int, Int)",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 251,
+          "spans": [
+            {
+              "start": 403,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 252,
+              "predicate": false
+            },
+            {
+              "id": 253,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Proj(Index(1))",
+          "nodeId": 252,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "((Int, Int) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Var(__txp)",
+          "nodeId": 253,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "(Int, Int)",
+          "children": []
+        },
+        {
+          "label": "VariantCtor(.commit)",
+          "nodeId": 256,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "{`commit{writes: (Int)} | `abort}",
+          "children": [
+            {
+              "id": 255,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Record",
+          "nodeId": 255,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "{writes: (Int)}",
+          "children": [
+            {
+              "id": 239,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 239,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "(Int)",
+          "children": [
+            {
+              "id": 220,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Case",
+          "nodeId": 220,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 221,
+              "predicate": false
+            },
+            {
+              "id": 228,
+              "predicate": false
+            },
+            {
+              "id": 235,
+              "predicate": false
+            },
+            {
+              "id": 236,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Greater))",
+          "nodeId": 221,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 222,
+              "predicate": false
+            },
+            {
+              "id": 225,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 222,
+          "spans": [
+            {
+              "start": 396,
+              "end": 400
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 223,
+              "predicate": false
+            },
+            {
+              "id": 224,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Proj(Index(0))",
+          "nodeId": 223,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "((Int, Int) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Var(__txp)",
+          "nodeId": 224,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "(Int, Int)",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 225,
+          "spans": [
+            {
+              "start": 403,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 226,
+              "predicate": false
+            },
+            {
+              "id": 227,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Proj(Index(1))",
+          "nodeId": 226,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "((Int, Int) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Var(__txp)",
+          "nodeId": 227,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "(Int, Int)",
+          "children": []
+        },
+        {
+          "label": "BinOp(Arithmetic(Sub))",
+          "nodeId": 228,
+          "spans": [
+            {
+              "start": 426,
+              "end": 434
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 229,
+              "predicate": false
+            },
+            {
+              "id": 232,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 229,
+          "spans": [
+            {
+              "start": 426,
+              "end": 430
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 230,
+              "predicate": false
+            },
+            {
+              "id": 231,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Proj(Index(0))",
+          "nodeId": 230,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "((Int, Int) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Var(__txp)",
+          "nodeId": 231,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "(Int, Int)",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 232,
+          "spans": [
+            {
+              "start": 433,
+              "end": 434
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 233,
+              "predicate": false
+            },
+            {
+              "id": 234,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Proj(Index(1))",
+          "nodeId": 233,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "((Int, Int) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Var(__txp)",
+          "nodeId": 234,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "(Int, Int)",
+          "children": []
+        },
+        {
+          "label": "Lit(Bool(true))",
+          "nodeId": 235,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Bool@true",
+          "children": [
+            {
+              "id": 73,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 73,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 74,
+              "predicate": false
+            },
+            {
+              "id": 75,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 74,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": []
+        },
+        {
+          "label": "Lit(Bool(true))",
+          "nodeId": 75,
+          "spans": [
+            {
+              "start": 396,
+              "end": 404
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 236,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 237,
+              "predicate": false
+            },
+            {
+              "id": 238,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Proj(Index(0))",
+          "nodeId": 237,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "((Int, Int) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Var(__txp)",
+          "nodeId": 238,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "(Int, Int)",
+          "children": []
+        },
+        {
+          "label": "Lit(Bool(true))",
+          "nodeId": 259,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Bool",
+          "children": []
+        },
+        {
+          "label": "VariantCtor(.abort)",
+          "nodeId": 258,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "{`commit{writes: (Int)} | `abort}",
+          "children": [
+            {
+              "id": 257,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Unit)",
+          "nodeId": 257,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.writer"
+          },
+          "type": "Unit",
+          "children": []
+        },
+        {
+          "label": "Tuple",
+          "nodeId": 307,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "(Int, Int)",
+          "children": [
+            {
+              "id": 308,
+              "predicate": false
+            },
+            {
+              "id": 311,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 308,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 309,
+              "predicate": false
+            },
+            {
+              "id": 310,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(pool)",
+          "nodeId": 309,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "(Txn ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Var(__t)",
+          "nodeId": 310,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "Txn",
+          "children": []
+        },
+        {
+          "label": "Apply",
+          "nodeId": 311,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 312,
+              "predicate": false
+            },
+            {
+              "id": 316,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "List",
+          "nodeId": 312,
+          "spans": [
+            {
+              "start": 354,
+              "end": 365
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "([0, 2] ⤇ Int)",
+          "children": [
+            {
+              "id": 313,
+              "predicate": false
+            },
+            {
+              "id": 314,
+              "predicate": false
+            },
+            {
+              "id": 315,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Int(10))",
+          "nodeId": 313,
+          "spans": [
+            {
+              "start": 354,
+              "end": 356
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "Int@10",
+          "children": [
+            {
+              "id": 64,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 64,
+          "spans": [
+            {
+              "start": 354,
+              "end": 356
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 65,
+              "predicate": false
+            },
+            {
+              "id": 66,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 65,
+          "spans": [
+            {
+              "start": 354,
+              "end": 356
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(10))",
+          "nodeId": 66,
+          "spans": [
+            {
+              "start": 354,
+              "end": 356
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(20))",
+          "nodeId": 314,
+          "spans": [
+            {
+              "start": 358,
+              "end": 360
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "Int@20",
+          "children": [
+            {
+              "id": 67,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 67,
+          "spans": [
+            {
+              "start": 358,
+              "end": 360
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 68,
+              "predicate": false
+            },
+            {
+              "id": 69,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 68,
+          "spans": [
+            {
+              "start": 358,
+              "end": 360
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(20))",
+          "nodeId": 69,
+          "spans": [
+            {
+              "start": 358,
+              "end": 360
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(30))",
+          "nodeId": 315,
+          "spans": [
+            {
+              "start": 362,
+              "end": 364
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "Int@30",
+          "children": [
+            {
+              "id": 70,
+              "predicate": true
+            }
+          ]
+        },
+        {
+          "label": "BinOp(Compare(Equals))",
+          "nodeId": 70,
+          "spans": [
+            {
+              "start": 362,
+              "end": 364
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Bool",
+          "children": [
+            {
+              "id": 71,
+              "predicate": false
+            },
+            {
+              "id": 72,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(__elem)",
+          "nodeId": 71,
+          "spans": [
+            {
+              "start": 362,
+              "end": 364
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Lit(Int(30))",
+          "nodeId": 72,
+          "spans": [
+            {
+              "start": 362,
+              "end": 364
+            }
+          ],
+          "rewritten": {
+            "via": "Infer",
+            "nature": "machinery",
+            "label": "predicate.rebuild"
+          },
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Var(__r)",
+          "nodeId": 316,
+          "spans": [
+            {
+              "start": 371,
+              "end": 435
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "[0, 2]",
+          "children": []
+        },
+        {
+          "label": "Let(pool)",
+          "nodeId": 299,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.carrier"
+          },
+          "type": "([0, 0] ⤇ Int)",
+          "children": [
+            {
+              "id": 298,
+              "predicate": false
+            },
+            {
+              "id": 321,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 298,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.key_rebind"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 297,
+              "predicate": false
+            },
+            {
+              "id": 296,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(as_of_read)",
+          "nodeId": 297,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.key_rebind"
+          },
+          "type": "((Txn ⇒ Int) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Var(pool)",
+          "nodeId": 296,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Transact",
+            "nature": "expansion",
+            "label": "transact.key_rebind"
+          },
+          "type": "(Txn ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "LetRec",
+          "nodeId": 321,
+          "spans": [
+            {
+              "start": 303,
+              "end": 316
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "([0, 0] ⤇ Int)",
+          "children": [
+            {
+              "id": 320,
+              "predicate": false
+            },
+            {
+              "id": 1,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Let(pool)",
+          "nodeId": 320,
+          "spans": [
+            {
+              "start": 303,
+              "end": 316
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "([0, 0] ⇒ Int)",
+          "children": [
+            {
+              "id": 317,
+              "predicate": false
+            },
+            {
+              "id": 304,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Apply",
+          "nodeId": 317,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "Int",
+          "children": [
+            {
+              "id": 318,
+              "predicate": false
+            },
+            {
+              "id": 319,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Builtin(as_of_read)",
+          "nodeId": 318,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "((Txn ⇒ Int) ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Var(pool)",
+          "nodeId": 319,
+          "spans": [
+            {
+              "start": 317,
+              "end": 343
+            }
+          ],
+          "rewritten": {
+            "via": "Channelize",
+            "nature": "expansion",
+            "label": "channelize.cluster"
+          },
+          "type": "(Txn ⇒ Int)",
+          "children": []
+        },
+        {
+          "label": "Compose",
+          "nodeId": 304,
+          "spans": [
+            {
+              "start": 435,
+              "end": 465
+            }
+          ],
+          "rewritten": {
+            "via": "Letrec",
+            "nature": "expansion",
+            "label": "letrec.loop"
+          },
+          "type": "([0, 0] ⇒ Int)",
+          "children": [
+            {
+              "id": 302,
+              "predicate": false
+            },
+            {
+              "id": 301,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "List",
+          "nodeId": 302,
+          "spans": [
+            {
+              "start": 435,
+              "end": 465
+            }
+          ],
+          "rewritten": {
+            "via": "Letrec",
+            "nature": "expansion",
+            "label": "letrec.loop"
+          },
+          "type": "([0, 0] ⤇ Unit)",
+          "children": [
+            {
+              "id": 303,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Lit(Unit)",
+          "nodeId": 303,
+          "spans": [
+            {
+              "start": 435,
+              "end": 465
+            }
+          ],
+          "rewritten": {
+            "via": "Letrec",
+            "nature": "expansion",
+            "label": "letrec.loop"
+          },
+          "type": "Unit",
+          "children": []
+        },
+        {
+          "label": "Lambda(__txn_item_0)",
+          "nodeId": 301,
+          "spans": [
+            {
+              "start": 435,
+              "end": 465
+            }
+          ],
+          "rewritten": {
+            "via": "Letrec",
+            "nature": "expansion",
+            "label": "letrec.loop"
+          },
+          "type": "(Unit ⇒ Int)",
+          "children": [
+            {
+              "id": 3,
+              "predicate": false
+            }
+          ]
+        },
+        {
+          "label": "Var(pool)",
+          "nodeId": 3,
+          "spans": [
+            {
+              "start": 460,
+              "end": 464
+            }
+          ],
+          "rewritten": null,
+          "type": "Int",
+          "children": []
+        },
+        {
+          "label": "Var(out)",
+          "nodeId": 1,
+          "spans": [
+            {
+              "start": 465,
+              "end": 468
+            }
+          ],
+          "rewritten": null,
+          "type": "([0, 0] ⤇ Int)",
+          "children": []
+        }
+      ]
+    }
+  ]
+}
