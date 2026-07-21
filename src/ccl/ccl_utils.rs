@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, Builtin, Expr, Lit, Name, PredicateId, Refinement, Type, TypedExprNode,
+    BaseType, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, Name, PredicateId, Refinement,
+    Type, TypedExprNode, UnaryOpKind,
 };
 
 /// Returns `true` if `expr` directly references the given built-in primitive.
@@ -27,6 +28,63 @@ pub fn apply_function(expr: Expr, function: Expr, output_ty: Type) -> Expr {
         function.with_ty(Type::fun(expr_ty, output_ty.clone())),
     )
     .with_ty(output_ty)
+}
+
+/// Build arm `i`'s effective **first-match** predicate `gᵢ ∧ ¬g₀ ∧ … ∧ ¬gᵢ₋₁`,
+/// encoding a `Case`'s "first matching guard wins" semantics: arm `i` fires only
+/// where its own guard holds and no earlier arm's did. `prior` holds `g₀ … gᵢ₋₁`
+/// in order; `guard` is `gᵢ`. Every guard is a `Bool`-typed expression over the
+/// same element, so the synthesized conjunction is `Bool` too — typed here
+/// because the callers (post-inference desugar, lambda elimination, the
+/// transaction path walk) must be type-preserving.
+///
+/// Shared by [`crate::ccl::channelize`] (feed fan-out), [`crate::ccl::lambda_elim`]
+/// (value-`Case` compilation), and the transaction path walk — every conditional
+/// fan-out in the pipeline partitions its domain with the same encoding.
+pub fn synthesize_arm_predicate(guard: &Expr, prior: &[Expr]) -> Expr {
+    let bool_ty = Type::Base(BaseType::Bool);
+    let mut pred = guard.clone();
+    for g in prior {
+        let mut neg = Expr::unary(UnaryOpKind::Not, g.clone());
+        neg.ty = bool_ty.clone();
+        let mut conj = Expr::binop(pred, BinOpKind::BoolLogic(LogicKind::And), neg);
+        conj.ty = bool_ty.clone();
+        pred = conj;
+    }
+    pred
+}
+
+/// Returns `true` if `b` is a trailing `true → Case{…}` arm whose body is itself
+/// a guard-only value `Case` — the shape an `elif` chain lowers to
+/// (`a if p else b if q else c`; the `else` binds the nested conditional).
+fn is_trailing_nested_case(b: &Branch) -> bool {
+    b.pattern.is_none()
+        && matches!(&b.guard.node, TypedExprNode::Lit(Lit::Bool(true)))
+        && matches!(
+            &b.body.node,
+            TypedExprNode::Case { scrutinee: None, branches }
+                if branches.iter().all(|ib| ib.pattern.is_none())
+        )
+}
+
+/// Flatten `elif` chains: a trailing `true → Case{…}` arm splices its inner
+/// branches into the outer list, so a value-`Case` fan-out sees one flat
+/// partition `[g₀ → e₀; g₁ → e₁; …; true → eₙ]` rather than a nest of `Case`s.
+/// The first-match encoding ([`synthesize_arm_predicate`]) composes the guards
+/// correctly across the flattened arms. Shared by the value-`Case` compilation
+/// ([`crate::ccl::lambda_elim`]) and the comprehension element fan-out
+/// ([`crate::ccl::lower`]).
+pub fn flatten_trailing_value_case(mut branches: Vec<Branch>) -> Vec<Branch> {
+    while branches.last().is_some_and(is_trailing_nested_case) {
+        let last = branches.pop().expect("checked non-empty via last()");
+        if let TypedExprNode::Case {
+            branches: inner, ..
+        } = last.body.node
+        {
+            branches.extend(inner);
+        }
+    }
+    branches
 }
 
 /// Builds a composition of expressions, setting the types based on the input
@@ -397,7 +455,7 @@ pub fn sync_cast_targets(expr: &mut Expr) {
 /// element by the point-free function `predicate : base ⇒ Bool` (stored as
 /// `__elem ▷ predicate`, see [`bare_predicate_of_fn`]). Returns `base` unchanged
 /// when the predicate is trivially true.
-fn refine_with(base: Type, predicate: &Expr) -> Type {
+pub(crate) fn refine_with(base: Type, predicate: &Expr) -> Type {
     if is_trivially_true_predicate(predicate) {
         return base;
     }

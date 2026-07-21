@@ -25,6 +25,7 @@ use crate::ccl::{Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Ty
 
 use super::type_level;
 use crate::ccl::FieldKey;
+use crate::ccl::ccl_utils::strip_refinements;
 
 // ---------------------------------------------------------------------------
 // Constraint solver
@@ -328,6 +329,28 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
 /// the only inversions anywhere are of renames (lossless).
 /// This is what lets a non-invertible discharge survive crossing a consumer
 /// edge that was recorded before the producer's content arrived.
+/// Whether `union_dom` is a gated **partition** of the single extent `target`:
+/// a `Variant` with contiguous `Index(0..n)` tags (n ≥ 1) whose every payload,
+/// with its gate refinement stripped, is structurally `target` (also stripped).
+/// This is the shape lambda_elim's value-`Case` fan-out gives *same-extent* arms
+/// — the signature bridge rule 2 realizes as the plain data function
+/// `target ⤇ W`. Requiring the stripped payloads to equal `target` keeps a
+/// genuine heterogeneous `++` flowing into a fresh-var domain out of this rule
+/// (its legs differ, or the target is an unresolved var, so the ordinary
+/// contravariant arm applies).
+fn is_index_partition_of(union_dom: &Type, target: &Type) -> bool {
+    let Type::Variant(tags) = union_dom else {
+        return false;
+    };
+    if tags.is_empty() {
+        return false;
+    }
+    let base = strip_refinements(target);
+    tags.iter()
+        .enumerate()
+        .all(|(i, (k, payload))| *k == FieldKey::Index(i) && strip_refinements(payload) == base)
+}
+
 fn constrain_go(
     lhs: &Type,
     rhs: &Type,
@@ -377,6 +400,39 @@ fn constrain_go(
         // `Txn` is a nullary leaf: reflexively equal to itself, incomparable
         // to every other type (the catch-all `Mismatch` below).
         (Type::Txn, Type::Txn) => Ok(()),
+
+        // Bridge rule 2 (gated-partition `⧺` <: plain data function): the
+        // `Variant`-domain union `⧺ᵢ ({D | π̂ᵢ} ⤇ W)` that lambda_elim's
+        // value-`Case` fan-out produces for **same-extent** arms *is* the plain
+        // data function `D ⤇ W` — an exhaustive + disjoint partition of `D`
+        // (exhaustiveness guaranteed by the stamping phase, not proven here; see
+        // lambda_elim's `build_value_case_fanout` and `design/type-inference.md`
+        // §4.6). Each leg `{D | π̂ᵢ} <: D` by refinement width (covariant, not the
+        // function-domain contravariance below), codomain covariant. Fires only
+        // when every leg refines the *same concrete* target extent `D`, so a
+        // genuine heterogeneous `++` flowing into a fresh-var domain still takes
+        // the ordinary contravariant arm below (its domain var resolves to the
+        // `Variant`, iterating every leg).
+        (
+            Type::Fun {
+                kind: FunKind::Data,
+                domain: union_dom,
+                codomain: c0,
+                ..
+            },
+            Type::Fun {
+                domain: d1,
+                codomain: c1,
+                ..
+            },
+        ) if is_index_partition_of(union_dom, d1) => {
+            if let Type::Variant(tags) = union_dom.as_ref() {
+                for (_, payload) in tags {
+                    constrain_go(payload, d1, sl, sr, cache)?;
+                }
+            }
+            constrain_go(c0, c1, sl, sr, cache)
+        }
 
         // Function: contravariant on domain, covariant on codomain. The
         // codomain edge *derives* the binder correspondence — aligning the two
@@ -439,15 +495,15 @@ fn constrain_go(
         // are general rules on the sum, *realized per witness* (dispatch is on the
         // `Witness`, and for a type-witness further on its `Kind`): the solver
         // knows dependent sums, not any surface concept. Two are genuine subtyping
-        // — the injection `Fun(Data) <: Σ` (a branch is-a sum) and the width
-        // `Σ <: Σ` (a smaller sum is-a bigger sum). The third, `Σ <: Fun`, is
-        // **not** subsumption but Σ-*elimination* discharged through this solver:
-        // a Σ value is one branch, not a function total on the union, so it cannot
-        // be subsumed to one — consuming it distributes the consumer over the
-        // witness. Only the `Kind::Enumerated` witness (what a conditional
-        // collection materializes) is wired today; the `Kind::Any` (`Collection`)
-        // and value-witness (`List`/`Map`) realizations are `todo!()` skeletons.
-        // See type-inference.md §4.6.)
+        // — the injection `Fun(Data) <: Σ` (a branch, or the compiled fan-out,
+        // is-a sum) and the width `Σ <: Σ` (a smaller sum is-a bigger sum). The
+        // third, `Σ <: Fun`, is **not** subsumption but Σ-*elimination* discharged
+        // through this solver: a Σ value is one branch, not a function total on the
+        // union, so it cannot be subsumed to one — consuming it distributes the
+        // consumer over the witness. Only the `Kind::Enumerated` witness (what a
+        // conditional collection materializes) is wired today; the `Kind::Any`
+        // (`Collection`) and value-witness (`List`/`Map`) realizations are
+        // `todo!()` skeletons. See type-inference.md §4.6.)
 
         // Tuple: positional width-subtyping. A longer/equal tuple is a
         // subtype, so every position rhs requires must exist in lhs.
@@ -483,13 +539,26 @@ fn constrain_go(
         }
 
         // **Σ-injection** `Fun(Data) <: Σ`: a data function is a subtype of the
-        // sum iff its domain is a body-instantiation for some witness the sum
-        // ranges over, and its codomain then flows into the sum's shared codomain.
-        // This is how the `emit_case` join lands — each arm is constrained `<:
-        // result`, and `result` coalesces to the Σ, so at the consistency wall
-        // each arm re-injects into it. The membership test is realized per
-        // witness; the codomain then flows covariantly the same way for every
-        // witness.
+        // sum iff it realizes the sum's fibers. Two shapes:
+        //
+        //   * **Single-arm injection** — a data function over *one* candidate
+        //     domain is that fiber (the `emit_case` arm-into-result edge: each arm
+        //     is constrained `<: result`, and `result` coalesces to the Σ, so at
+        //     the wall each arm re-injects). Extent matched by *value*.
+        //   * **Gated-partition introduction** — the compiled value-`Case`
+        //     fan-out, a data function whose domain is a gated partition
+        //     `Variant([{Dᵢ|π̂ᵢ}])`, realizes the *whole* Σ. This is the finite-Σ =
+        //     gated-coproduct isomorphism (`../design/type-inference.md` §4.6): the
+        //     gates zero out all-but-one leg, collapsing the disjoint-union domain
+        //     (a product of fibers) to the coproduct. Sound iff the legs' base
+        //     extents, as a *set*, equal the candidates (every fiber realized,
+        //     nothing extra) — the gates' exclusivity+exhaustiveness is a
+        //     `lambda_elim` construction invariant (asserted there), not re-proven.
+        //     Each leg edge `{Dᵢ|π̂ᵢ} <: Dᵢ` is *covariant* (an introduction —
+        //     refinement width, not the function-domain contravariance).
+        //
+        // Realized per witness; the codomain flows covariantly the same way for
+        // every witness.
         (
             Type::Fun {
                 name: pn,
@@ -499,10 +568,15 @@ fn constrain_go(
             },
             Type::Sigma(s),
         ) => match &s.witness {
-            // A conditional collection: inject iff `domain` is one of its
-            // candidate extents, then flow the codomain. Its body is the data
-            // function `Witness ⤇ V` (built by `conditional_collection`), so its
-            // parts are read here, where that shape is guaranteed.
+            // A conditional collection. Its body is the data function `Witness ⤇
+            // V` (built by `conditional_collection`), so its parts are read here,
+            // where that shape is guaranteed. Two injecting shapes:
+            //   * the compiled value-`Case` fan-out — a gated partition
+            //     `Variant([{Dᵢ|π̂ᵢ}])` — is **Σ-introduction**, sound iff the
+            //     legs' base extents, as a *set*, equal the candidates (finite-Σ =
+            //     gated-coproduct iso; each leg edge `{Dᵢ|π̂ᵢ} <: Dᵢ` covariant);
+            //   * a single arm whose extent matches one candidate (the
+            //     `emit_case` arm-into-result edge).
             Witness::Type(Kind::Enumerated(candidates)) => {
                 let Type::Fun {
                     name: binder,
@@ -512,17 +586,46 @@ fn constrain_go(
                 else {
                     unreachable!("a conditional collection's body is a data function")
                 };
-                if candidates.iter().any(|d| d == domain.as_ref()) {
-                    let cod_sl = match (pn, binder.as_ref()) {
-                        (Some(k), Some(x)) => sl.extended_rename(k, x),
-                        _ => sl.clone(),
-                    };
-                    constrain_go(c0, cod, &cod_sl, sr, cache)
-                } else {
-                    Err(ConstrainError::Mismatch {
-                        lhs: lhs.clone(),
-                        rhs: rhs.clone(),
-                    })
+                let cod_sl = match (pn, binder.as_ref()) {
+                    (Some(k), Some(x)) => sl.extended_rename(k, x),
+                    _ => sl.clone(),
+                };
+                match domain.as_ref() {
+                    Type::Variant(legs) => {
+                        let cand_bases: Vec<Type> =
+                            candidates.iter().map(strip_refinements).collect();
+                        let leg_bases: Vec<Type> =
+                            legs.iter().map(|(_, leg)| strip_refinements(leg)).collect();
+                        let every_fiber_realized =
+                            cand_bases.iter().all(|c| leg_bases.contains(c));
+                        let no_extraneous_leg = leg_bases.iter().all(|l| cand_bases.contains(l));
+                        if every_fiber_realized && no_extraneous_leg {
+                            for (_, leg) in legs {
+                                let leg_base = strip_refinements(leg);
+                                let cand = candidates
+                                    .iter()
+                                    .find(|&c| strip_refinements(c) == leg_base)
+                                    .expect("no_extraneous_leg guarantees a matching candidate");
+                                constrain_go(leg, cand, sl, sr, cache)?;
+                            }
+                            constrain_go(c0, cod, &cod_sl, sr, cache)
+                        } else {
+                            Err(ConstrainError::Mismatch {
+                                lhs: lhs.clone(),
+                                rhs: rhs.clone(),
+                            })
+                        }
+                    }
+                    _ => {
+                        if candidates.iter().any(|d| d == domain.as_ref()) {
+                            constrain_go(c0, cod, &cod_sl, sr, cache)
+                        } else {
+                            Err(ConstrainError::Mismatch {
+                                lhs: lhs.clone(),
+                                rhs: rhs.clone(),
+                            })
+                        }
+                    }
                 }
             }
             // The universe ranges over every domain (any data function injects).

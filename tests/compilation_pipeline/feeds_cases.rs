@@ -346,6 +346,39 @@ d"#;
     );
 }
 
+/// An `if/else` where **both arms feed** a pure-feed loop (no accumulator). The
+/// `else` is an ordinary trailing arm (guard `true`, first-match predicate
+/// `¬(i < 2)`), so it fans out as its own refined-source channel — `channelize`
+/// refines the *source* domain per arm (a shared `Int` codomain), rather than
+/// leaving the guard on a `Unit` gated lift. As a function: 0 ↦ 0, 1 ↦ 1,
+/// 2 ↦ 100, 3 ↦ 100.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn if_else_both_feed_fan_out() {
+    let code = r#"o = defer()
+for i in [0, 1, 2, 3]:
+    if i < 2:
+        o << i
+    else:
+        o << 100
+o"#;
+    check_tile(
+        code,
+        Tile::SealedFunction {
+            domain: ColumnValue::Union {
+                tags: vec![0, 0, 1, 1],
+                variants: vec![
+                    ColumnValue::UInts(vec![0, 1]),
+                    ColumnValue::UInts(vec![2, 3]),
+                ],
+            },
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 100, 100]))),
+            domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+            deleted: BitSet::new(),
+        },
+    );
+}
+
 /// `<<=` sets a channel's whole stream, so its RHS must be a collection
 /// (a `Fun`). A scalar RHS is rejected by typing — the discipline that keeps
 /// every feed history a genuine `domain ⇒ value` stream (scalar values belong

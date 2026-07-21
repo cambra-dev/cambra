@@ -268,6 +268,17 @@ non-`Iterate` arm reaching op-conversion with `input=None` fails an assertion �
 a planner bug, not a user error.  Similarly, `Restrict` reaching op-conversion
 with `input=None` is a planner bug.
 
+**Constant-in-element predicates.** The scalar value-`Case` C-form
+(`(unit | π̂ ≫ const 𝑒) ⧺ …`) and the data-collection gate fan-out
+(`zs = xs if c else ys`) restrict a domain by a predicate that is *constant in
+the element* — the gate is the arm's first-match path condition, not a function
+of the position.  These compile through the ordinary `Restrict` path with no new
+operator: a `const(c)` gate with a non-literal `c` is *not* matched by
+`is_trivially_true_predicate` (which recognises only a literal `true`), so it
+yields a real `Restrict` that gates the whole extent — empty when the gate is
+false, identity when true — over both `Units(1)` one-shot drivers and full
+extents.
+
 ### Let-bindings and `BindingKind`
 
 `Let { binding, bound_expr, body }` fans the parent's input out to both children
@@ -337,6 +348,32 @@ In all three cases planning has ensured every iteration site has an explicit
 what to emit based only on its own AST shape and the input flowing in.
 
 ---
+
+## Designed, not yet implemented
+
+Operator work specified by the in-flight conditionals stack; listed here so the
+specs live next to their peers. Each graduates into the sections above when its PR
+lands.
+
+### `DispatchRecurse` — multi-leg induction (conditional store writes)
+
+A conditional induction write compiles to one writer-site *leg per path* — each leg a
+decision body over a predicate-restricted slice of one shared base extent, including a
+carry-forward leg over the complement (see `../ccl/design/mutability.md` §"Value-selecting
+`Case` and conditional induction writes"). `build_induction_store` today hard-wires exactly one
+writer (`let [w] = writers`); `DispatchRecurse` extends `Recurse` to N legs:
+
+- One `IterateExtent(D)` over the shared base extent, in base order — the legs' ⧺-union
+  is realized by **ordered dispatch**, never by materializing a tagged union (which would
+  re-tag positions and desync the body-input buffers).
+- Per position: evaluate the leg predicates (disjoint and exhaustive by construction —
+  the phase synthesized first-match predicates plus the complement; a runtime
+  debug-assert checks exactly one matches) and feed the position to only the matching
+  leg's body buffer, `(snapshot…, item)` tuple convention unchanged.
+- The interleaved decision stream is the store's body stream; the recurrence cycle on
+  `.writes` and the release semantics are `Recurse`'s, per leg. Leg predicates compile
+  against the same body-input shape, so a guard reading the accumulator
+  (`if total < 10: total += x`) works.
 
 ## Open Challenges
 

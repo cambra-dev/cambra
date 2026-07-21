@@ -210,34 +210,7 @@ fn test_tuples(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
-// ---------------------------------------------------------------------------
-// Conditional-collection Sigma: the safety chokepoint
-// ---------------------------------------------------------------------------
-
-/// A control-flow join of two differently-sized collections types as the
-/// dependent-sum **conditional collection** over both extents
-/// (`Type::conditional_collection`; see type-inference.md §4.6). This lays only
-/// the *type-level* Sigma (formation + the `Σ <: Fun` elimination rule, so it
-/// can be consumed at the type level); *compiling* it — the value-`Case`
-/// fan-out that eliminates it into a union of restricts — lands with
-/// value-`Case` compilation. Until then a Sigma-consuming program must be
-/// rejected **cleanly** (a returned compile error, never a panic and never a
-/// silent miscompile). The value-`Case` is caught at lambda elimination — the
-/// natural not-yet-implemented boundary value-`Case` compilation graduates.
-/// This pins the contract end-to-end: it type-checks, then fails to compile
-/// without crashing.
-#[test]
-fn conditional_collection_rejected_cleanly() {
-    use cambra::ccl::context::{GlobalContext, compile_program};
-    use cambra::interpreter::Consumer;
-    let mut ctx = GlobalContext::default();
-    let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let errs = compile_program(&mut ctx, "sum([1, 2] if True else [1, 2, 3])", consumer)
-        .err()
-        .expect("a Sigma-consuming program must fail to compile, not miscompile or panic");
-    let rendered = format!("{errs:?}");
-    assert!(
-        rendered.contains("lambda elimination") && rendered.contains("Case"),
-        "expected a clean value-Case not-yet-compilable rejection, got:\n{rendered}"
-    );
-}
+// A conditional collection consumed by `sum` (`sum([1,2] if c else [1,2,3])`)
+// type-checks as a Σ (via the `Σ <: Fun` elimination rule) and *compiles* via
+// value-`Case` elimination — see `conditionals.rs` for the end-to-end
+// compile-and-run coverage.

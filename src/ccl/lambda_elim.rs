@@ -42,10 +42,13 @@
 
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::{cast_target_refinement, is_free, is_free_in_value, typed_compose};
+use crate::ccl::ccl_utils::{
+    apply_primitive, cast_target_refinement, flatten_trailing_value_case, is_free,
+    is_free_in_value, refine_with, strip_refinements, synthesize_arm_predicate, typed_compose,
+};
 use crate::ccl::infer::{dbg_typecheck_mv, debug_typecheck};
 use crate::ccl::simplify::simplify;
-use crate::ccl::{Builtin, Lit, Name, Refinement};
+use crate::ccl::{BaseType, Branch, Builtin, FieldKey, Lit, Name, Refinement};
 use crate::ccl::{Expr, Type, TypedExpr, TypedExprNode, symbolic::symbolic};
 
 // ---------------------------------------------------------------------------
@@ -296,6 +299,234 @@ fn extract_filter_case(body: Expr) -> (Expr, Expr) {
     } else {
         panic!("extract_filter_case: expected a filter-pattern Case body")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Value-selecting Case compilation (the scalar C-form)
+// ---------------------------------------------------------------------------
+
+/// Whether `arms` is a **conditional-collection coproduct** — a non-empty,
+/// `Index`-tagged `Variant` whose every payload is a data function
+/// (`Type::extent_coproduct`). Distinguishes it from a user tagged-union.
+fn is_extent_coproduct(arms: &[(FieldKey, Type)]) -> bool {
+    !arms.is_empty()
+        && arms.iter().all(|(_, t)| {
+            matches!(
+                t,
+                Type::Fun {
+                    kind: crate::ccl::ty::FunKind::Data,
+                    ..
+                }
+            )
+        })
+}
+
+/// Returns `true` if `ty` (peeling outer refinements) is a *collection* — a
+/// data/compute function or a conditional-collection coproduct. A
+/// value-selecting `Case` whose arms are collections takes the data-typed gate
+/// fan-out; a `Case` returning a scalar / compute value takes the C-form below.
+fn is_collection_result(ty: &Type) -> bool {
+    match strip_refinements(ty) {
+        Type::Fun { .. } => true,
+        Type::Variant(arms) => is_extent_coproduct(&arms),
+        _ => false,
+    }
+}
+
+/// Compile a guard-based **value-selecting** `Case` (a ternary or `if`/`elif`/
+/// `else` that returns a scalar / compute value) to the **C-form**: a union of
+/// gated one-shot lifts over the `UIntRange(1)` driver, extracted by
+/// `final_or_default`.
+///
+/// ```text
+/// Case{scrutinee: None, [g₀ → e₀; …; gₙ → eₙ]}   (gₙ is the exhaustive trailing `true`)
+///   ⟹  (⧺ᵢ const(eᵢ) : {UIntRange(1) | π̂ᵢ} ⤇ V,  eₙ) ▷ final_or_default
+/// ```
+///
+/// where `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ` ([`synthesize_arm_predicate`]). Each arm is a
+/// constant lift of its value over a one-position driver whose domain is
+/// *refined by the arm's first-match gate*. The gate is **constant in the
+/// driver element** (see `../../interpreter/design-operators.md`): it does not
+/// vary with the driver position, so the whole one-element extent survives (gate
+/// holds) or is emptied (gate fails). The partition is exhaustive (the trailing
+/// `true` guard), so exactly one arm survives and the union has one element;
+/// `final_or_default`'s default `eₙ` is a type anchor for the empty case that
+/// cannot occur. The outer type is the `Case`'s own value type `V`, unchanged,
+/// so lambda_elim's type-preservation assertion holds.
+fn build_value_case_cform(
+    ctx: &mut ElimContext,
+    branches: Vec<Branch>,
+    result_ty: Type,
+) -> Result<Expr, LambdaElimError> {
+    // Exhaustiveness invariant: a value-selecting `Case` must be total (a
+    // trailing `true` guard). `default_body` below becomes `final_or_default`'s
+    // default, and the whole first-match/`final_or_default` argument is sound only
+    // if the last arm is that unconditional fallback — a non-exhaustive `Case`
+    // reaching here would silently return the last arm's value with its gate
+    // false (an empty union → the wrong default). Lowering always appends the
+    // `true` complement (a ternary's `else`); assert it at this boundary.
+    debug_assert!(
+        branches
+            .last()
+            .is_some_and(|b| matches!(&b.guard.node, TypedExprNode::Lit(Lit::Bool(true)))),
+        "value-selecting Case must be exhaustive (trailing `true` guard)"
+    );
+    let bool_ty = Type::Base(BaseType::Bool);
+    let driver_dom = Type::UIntRange(1);
+
+    let mut prior_guards: Vec<Expr> = Vec::new();
+    let mut arms: Vec<Expr> = Vec::new();
+    let mut arm_domains: Vec<Type> = Vec::new();
+    let mut default_body: Option<Expr> = None;
+
+    for b in branches {
+        let guard = elim_lambdas(ctx, b.guard)?;
+        let body = elim_lambdas(ctx, b.body)?;
+        // First-match gate π̂ᵢ, lifted to a constant-in-element predicate
+        // `const(π̂ᵢ) : UIntRange(1) ⇒ Bool` over the driver. `synthesize_arm_predicate`
+        // combines the (already point-free) guards with raw `and`/`not` nodes, so
+        // eliminate once more to desugar those into applied-combinator form.
+        let gate_value = elim_lambdas(ctx, synthesize_arm_predicate(&guard, &prior_guards))?;
+        prior_guards.push(guard);
+        let gate_fn = apply_primitive(
+            gate_value,
+            Builtin::Const,
+            Type::fun(driver_dom.clone(), bool_ty.clone()),
+        );
+        // {UIntRange(1) | π̂ᵢ} — the gated one-shot driver domain. A trivially-true
+        // gate (a leading `if True`) leaves the driver unrefined (always fires).
+        let refined_dom = refine_with(driver_dom.clone(), &gate_fn);
+        arm_domains.push(refined_dom.clone());
+        // const(eᵢ) : {UIntRange(1) | π̂ᵢ} ⤇ V — lift the value over the gated driver.
+        let arm = apply_primitive(
+            body.clone(),
+            Builtin::Const,
+            Type::data_fun(refined_dom, result_ty.clone()),
+        );
+        arms.push(arm);
+        default_body = Some(body);
+    }
+
+    // A one-branch value `Case` denotes just that branch's value.
+    let default_body = default_body.expect("value-selecting Case has at least one branch");
+    if arms.len() == 1 {
+        return Ok(default_body);
+    }
+
+    // Union domain = Variant({Index(i): {UIntRange(1)|π̂ᵢ}}) — the same tagged
+    // union `emit_collection_union` produces, so op-conversion's `UnionOperator`
+    // dispatches to the surviving arm.
+    let union_dom = Type::Variant(
+        arm_domains
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| (FieldKey::Index(i), d))
+            .collect(),
+    );
+    let union_ty = Type::data_fun(union_dom, result_ty.clone());
+    let union = Expr::collection_union(arms).with_ty(union_ty.clone());
+
+    // (union, eₙ) ▷ final_or_default : V
+    let tuple_ty = Type::Tuple(vec![union_ty, result_ty.clone()]);
+    let arg = Expr::tuple(vec![union, default_body]).with_ty(tuple_ty);
+    Ok(apply_primitive(arg, Builtin::FinalOrDefault, result_ty))
+}
+
+/// The element (codomain) type a collection-valued `Case` produces: the
+/// codomain of a plain data function, or the coproduct's shared codomain when
+/// the arms had distinct extents (the type system gave the `Case` a
+/// conditional-collection coproduct — the arms share the joined codomain, so
+/// the first arm's codomain is it). Peels outer refinements first.
+fn collection_value_ty(ty: &Type) -> Type {
+    match strip_refinements(ty) {
+        Type::Fun { codomain, .. } => *codomain,
+        Type::Variant(arms) if is_extent_coproduct(&arms) => match arms.into_iter().next() {
+            Some((_, Type::Fun { codomain, .. })) => *codomain,
+            _ => unreachable!("is_extent_coproduct guarantees a data-function arm"),
+        },
+        other => other,
+    }
+}
+
+/// Compile a guard-based **value-selecting** `Case` whose arms are *collections*
+/// (data-typed) to the **gate fan-out**: each arm's whole collection,
+/// restricted by its constant first-match gate, unioned.
+///
+/// ```text
+/// Case{scrutinee: None, [g₀ → xs₀; …; gₙ → xsₙ]}   ⟹   ⧺ᵢ (xsᵢ | π̂ᵢ)
+/// ```
+///
+/// where `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ` ([`synthesize_arm_predicate`]). Each gate is
+/// **constant in the element** (see the C-form above), so an arm's collection
+/// survives whole (gate holds) or is emptied (gate fails); the partition is
+/// exhaustive, so exactly one arm is non-empty and the union is that arm's
+/// collection. The union's type is the tagged `Variant`-domain data function —
+/// the same shape `emit_collection_union` gives a `++`, which the strict wall
+/// accepts where the `Case`'s Σ type is demanded via the gated-partition bridge
+/// rule (`../design/type-inference.md` §4.6). The fan-out is type-preserving by
+/// construction: the union's positional tags line up with the Σ's choices.
+fn build_value_case_fanout(
+    ctx: &mut ElimContext,
+    branches: Vec<Branch>,
+    result_ty: Type,
+) -> Result<Expr, LambdaElimError> {
+    // Exhaustiveness invariant (as in [`build_value_case_cform`]): a total value
+    // selection has a trailing `true` guard, so exactly one arm survives the
+    // first-match partition and the union is that arm's whole collection. A
+    // non-exhaustive `Case` here would leave the union empty on the uncovered
+    // path (e.g. `sum` = 0) — a silent miscompile, not a rejection.
+    debug_assert!(
+        branches
+            .last()
+            .is_some_and(|b| matches!(&b.guard.node, TypedExprNode::Lit(Lit::Bool(true)))),
+        "value-selecting Case (fan-out) must be exhaustive (trailing `true` guard)"
+    );
+    let bool_ty = Type::Base(BaseType::Bool);
+    let value_ty = collection_value_ty(&result_ty);
+
+    let mut prior_guards: Vec<Expr> = Vec::new();
+    let mut arms: Vec<Expr> = Vec::new();
+
+    for b in branches {
+        let guard = elim_lambdas(ctx, b.guard)?;
+        let coll = elim_lambdas(ctx, b.body)?;
+        let arm_dom = coll.ty.domain().ok_or_else(|| {
+            LambdaElimError::Unsupported(format!(
+                "value-selecting Case arm is not a plain collection (nested conditional \
+                 collections are not yet supported): {}",
+                coll.ty
+            ))
+        })?;
+        // First-match gate, lifted to a constant-in-element predicate over the
+        // arm's own domain, then attached as a domain refinement (planning
+        // materializes it as the arm's `restrict`).
+        let gate_value = elim_lambdas(ctx, synthesize_arm_predicate(&guard, &prior_guards))?;
+        prior_guards.push(guard);
+        let gate_fn = apply_primitive(
+            gate_value,
+            Builtin::Const,
+            Type::fun(arm_dom.clone(), bool_ty.clone()),
+        );
+        let refined_dom = refine_with(arm_dom, &gate_fn);
+        arms.push(coll.with_ty(Type::data_fun(refined_dom, value_ty.clone())));
+    }
+
+    // A one-branch collection `Case` denotes just that arm's collection, and its
+    // Σ collapses to that arm's plain data function — no union or bridge needed.
+    if arms.len() == 1 {
+        return Ok(arms.pop().unwrap());
+    }
+
+    // The tagged union of gated arms *is* the Σ the type system gave the `Case`
+    // (`../design/type-inference.md` §4.6), so the node carries the Σ directly —
+    // lambda_elim stays type-preserving (Σ in, Σ out). The union's positional
+    // `Index(i)` tags line up with the Σ's choices (bridge rule 1's ordering
+    // contract). The strict `typecheck` reconciles the union's structural
+    // `Variant`-domain type against this stamped Σ via the gated-partition bridge
+    // rule (`union <: Σ`); op-conversion compiles the union straight to a
+    // `UnionOperator` from its operands (whose domains are concrete extents),
+    // never consulting the Σ, so the Σ chokepoint is never reached.
+    Ok(Expr::collection_union(arms).with_ty(result_ty))
 }
 
 // ---------------------------------------------------------------------------
@@ -696,6 +927,28 @@ fn elim_lambda_impl(
             unreachable!("lambda_elim: Transact is born by recognition, after this pass")
         }
 
+        // A value-selecting `Case` inside a bare lambda body (`λ x → Case{[gᵢ → eᵢ]}`),
+        // where the gate `gᵢ(x)` varies with the element. A *comprehension*
+        // element conditional (`[a if g(x) else b for x in xs]`) is fanned out at
+        // comprehension lowering (`lower::comprehension::fan_out_element_case`) into
+        // `⧺ᵢ src|π̂ᵢ ≫ eᵢ`, so it never reaches here. This arm catches the residual
+        // shapes — a per-element conditional in a lambda whose *iteration source is
+        // not visible at lowering* (a UDF body, a comprehension with an extra
+        // `if`-filter alongside the element `Case`) — which need the same source
+        // fan-out but at a site without a source in hand. Deferred (a documented
+        // follow-up; see `design/mutability.md` §"Value-selecting `Case`…").
+        TypedExprNode::Case {
+            scrutinee: None,
+            branches,
+        } if branches.iter().all(|b| b.pattern.is_none()) => {
+            Err(LambdaElimError::Unsupported(format!(
+                "per-element conditional (a value-selecting `Case` inside `λ {param} → …`) is \
+                 not compilable at a site with no visible iteration source. A comprehension \
+                 element conditional (`[a if g({param}) else b for {param} in xs]`), a top-level \
+                 ternary, a conditional collection, and a conditional feed all compile today."
+            )))
+        }
+
         // Unsupported constructs.
         body => Err(LambdaElimError::Unsupported(format!(
             "unsupported body kind in lambda elimination for param '{param}' in body {body:?}"
@@ -862,6 +1115,27 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         }
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
+
+        // Value-selecting guard `Case`: the literal union-of-restricts. A
+        // scalar / compute result takes the C-form (gated one-shot lifts +
+        // `final_or_default`); a data-collection result takes the gate fan-out
+        // (each whole arm restricted then unioned). A pattern-matching
+        // `Case` (`scrutinee: Some`) is not handled here yet.
+        TypedExprNode::Case {
+            scrutinee: None,
+            branches,
+        } if branches.iter().all(|b| b.pattern.is_none()) => {
+            // Flatten `elif` chains to one partition first, so a nested
+            // conditional collection collapses into a single N-choice fan-out.
+            let branches = flatten_trailing_value_case(branches);
+            let result = if is_collection_result(&ty) {
+                build_value_case_fanout(ctx, branches, ty)?
+            } else {
+                build_value_case_cform(ctx, branches, ty)?
+            };
+            debug_typecheck(&result);
+            Ok(result)
+        }
 
         // Control-flow constructs not yet supported.
         node @ TypedExprNode::Case { .. } => Err(LambdaElimError::Unsupported(format!(

@@ -381,19 +381,13 @@ fn lower_for_body_terminal(
             branches,
             else_body,
         } => {
-            if else_body.is_some() {
-                return Err(LoweringError::unsupported(
-                    stmt.span,
-                    "if/else inside generator for-loop body is not supported; \
-                     use a plain if-guard (no else branch)",
-                ));
-            }
-            // `if` / `elif` (no `else`): one `Case` branch per guard, in source
-            // order, then a trailing `true → Unit` fallthrough. A feeding
-            // multi-arm `Case` is fanned out by `channelize` into one
-            // refined-source channel per feeding arm (predicate
-            // `gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`, encoding "first matching guard wins"), so `elif`
-            // is no longer gated here.
+            // `if` / `elif` [/ `else`]: one `Case` branch per guard, in source
+            // order. A feeding multi-arm `Case` is fanned out by `channelize` into
+            // one refined-source channel per feeding arm (predicate
+            // `gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`, first-matching-guard-wins), so `elif` and `else` are
+            // both ordinary arms. The trailing arm is the `else` body when present
+            // (guard `true`, so its first-match predicate is `¬⋁ⱼ gⱼ`), else a
+            // `true → Unit` fallthrough (positions no guard admits do nothing).
             let mut out_branches = Vec::with_capacity(branches.len() + 1);
             for branch in branches {
                 let cond = lower_expr(&branch.cond, ctx)?;
@@ -412,10 +406,20 @@ fn lower_for_body_terminal(
                     body: arm,
                 });
             }
+            let fallthrough = match else_body {
+                Some(else_body) => lower_for_body_stmts(
+                    else_body,
+                    defer_name,
+                    mutation_scope,
+                    frame_introduced.clone(),
+                    ctx,
+                )?,
+                None => Expr::lit(Lit::Unit),
+            };
             out_branches.push(Branch {
                 pattern: None,
                 guard: Expr::lit(Lit::Bool(true)),
-                body: Expr::lit(Lit::Unit),
+                body: fallthrough,
             });
             Ok(Expr::new(TypedExprNode::Case {
                 scrutinee: None,
@@ -1147,9 +1151,11 @@ x";
         );
     }
 
-    /// `if/else` inside a generator for-loop body is rejected.
+    /// `if/else` inside a generator for-loop body lowers: the `else` becomes the
+    /// trailing `true`-guarded `Case` arm (its first-match predicate `¬(x > 0)`),
+    /// which `channelize` fans out as its own feeding channel.
     #[test]
-    fn test_generator_if_else_in_body_rejected() {
+    fn test_generator_if_else_in_body_lowers() {
         let code = "\
 def bad(xs):
     for x in xs:
@@ -1159,15 +1165,9 @@ def bad(xs):
             yield 0
 bad";
         let stmts = parse_module(code);
-        let err = expect_one_lowering_error(&stmts);
-        match &err {
-            LoweringError::Unsupported { message: msg, .. } => {
-                assert!(
-                    msg.contains("if/else inside generator"),
-                    "error should mention if/else in generator: {msg}"
-                );
-            }
-        }
+        lower_stmts(&stmts, &mut LoweringContext::default())
+            .into_result()
+            .expect("if/else in a generator for-loop body should lower");
     }
 
     /// A for/yield loop preceded by assignments is supported: the preceding

@@ -686,6 +686,59 @@ fn compact_go(
                 ..Default::default()
             }
         }
+        // A **conditional-collection coproduct** (`Type::extent_coproduct`)
+        // re-entering the solver (e.g. a let-bound conditional collection used
+        // again, or a nested conditional whose inner coproduct is an arm of the
+        // outer): its `Index`-tagged arms are data functions over the candidate
+        // extents, so it compacts to a `Data` `CompactFun` whose domains are
+        // those extents — the same shape a fresh join accumulates via
+        // `union_extents` — rather than to variant tags. This is what lets a
+        // nested conditional collection flatten its inner extents into the outer
+        // join's alternatives. The discriminator (arms are data *functions*)
+        // excludes a `++`/gated-partition domain-`Variant`, whose payloads are
+        // bare extents, and a user tagged-union (`Name` tags).
+        Type::Variant(tags)
+            if !tags.is_empty()
+                && tags.iter().enumerate().all(|(i, (k, t))| {
+                    *k == FieldKey::Index(i)
+                        && matches!(
+                            t,
+                            Type::Fun {
+                                kind: crate::ccl::ty::FunKind::Data,
+                                ..
+                            }
+                        )
+                }) =>
+        {
+            let domains = tags
+                .iter()
+                .map(|(_, t)| {
+                    let Type::Fun { domain, .. } = t else {
+                        unreachable!("guard checked all arms are Fun")
+                    };
+                    compact_go(domain, !pol, subst_acc, &BTreeSet::new(), st)
+                })
+                .collect();
+            // Arms share the joined codomain (and element binder); take arm 0's.
+            let Type::Fun {
+                name: pi_name,
+                codomain: cod_ty,
+                ..
+            } = &tags[0].1
+            else {
+                unreachable!("guard checked all arms are Fun")
+            };
+            let cod = compact_go(cod_ty, pol, subst_acc, &BTreeSet::new(), st);
+            CompactType {
+                fun: Some(CompactFun {
+                    name: pi_name.clone(),
+                    kind: KindMerge::Data,
+                    domains,
+                    codomain: Box::new(cod),
+                }),
+                ..Default::default()
+            }
+        }
         Type::Variant(tags) => {
             // Variant payloads are covariant — recurse at the same
             // polarity (no flip, unlike Fun's domain). The merge rule

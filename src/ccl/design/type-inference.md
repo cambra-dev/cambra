@@ -416,11 +416,11 @@ The pipeline passes downstream of inference treat function types structurally an
 ## 4.6 Data vs compute functions and conditional-collection extent joins
 
 > **Status: implemented.** The `FunKind` marker, lossless conditional-collection
-> formation at control-flow joins, *and* kind-aware subtyping (the
-> `Compute<:Data` rejection) are all live. One guard is deferred with rationale
-> (Data-domain invariance — see the callout below), and the value-`Case`
-> elimination *compilation* lands in the value-`Case` compilation PR (the
-> type-level elimination rule is live here).
+> formation at control-flow joins, kind-aware subtyping (the `Compute<:Data`
+> rejection), *and* the value-`Case` elimination (Σ-introduction via a gated
+> partition, Σ-elimination when consumed) are all live. Deferred with rationale:
+> Data-domain invariance (see the kind-aware callout below) and the
+> heterogeneous-scalar union.
 >
 > **A real dependent sum.** A conditional collection is the dependent sum
 > `Σ (𝑤 ∈ {𝐷ᵢ}). 𝑤 ⤇ V` ([`Type::Sigma`], built by
@@ -573,13 +573,39 @@ collection materializes). The other two witnesses each rule dispatches on — th
 skeletons, present so the general shape is visible and unreachable until those
 witnesses are constructed.
 
-> **Deferred — value-`Case` elimination compilation.** The type-level
-> elimination rule (`Σ <: Fun`) is live here, so a conditional-collection `Case`
-> type-checks and propagates. *Compiling* that elimination — the value-`Case`
-> fan-out that lowers it to a union of restricts — lands with the value-`Case`
-> compilation in a follow-up, where it is exercised end-to-end. Today a
-> conditional-collection `Case` types fine but is rejected at `lambda_elim`
-> (value-`Case`s are not yet compilable).
+> **Landed — value-`Case` elimination.** `lambda_elim` compiles a value-selecting
+> `Case` to a union of gated restricts, and the subtyping solver reconciles that
+> union against the Σ (or its same-extent collapse) — no separate "bridge"
+> concept, just the Σ rules above applied to the compiled form:
+>
+>   * **Σ-introduction** — the compiled gated partition `Fun{Data,
+>     Variant([{𝐷ᵢ | π̂ᵢ}]), 𝑐}` realizes the *whole* Σ. This is the finite-Σ =
+>     gated-coproduct isomorphism: the exclusive+exhaustive gates zero out
+>     all-but-one leg, collapsing the disjoint-union domain (a *product* of
+>     fibers) to the coproduct. Sound iff the legs' base extents, as a *set*,
+>     equal the Σ candidates (every fiber realized, nothing extra — not the
+>     positional bijection an earlier draft used, which rejected a valid `Case`
+>     whose branches share an extent); each leg edge `{𝐷ᵢ | π̂ᵢ} <: 𝐷ᵢ` is
+>     covariant (an introduction). Carried by the `Fun(Data) <: Σ` injection arm.
+>   * **same-extent collapse** — when every arm shares one extent 𝐷 the Σ
+>     collapses to the plain data function `𝐷 ⤇ 𝑐`, and the gated partition
+>     subtypes *that* directly (`is_index_partition_of`), guarded so a genuine
+>     heterogeneous `++` into a fresh-var domain still takes the ordinary
+>     contravariant arm.
+>   * **Σ-elimination** — a conditional collection consumed as a plain collection
+>     (an aggregate, a program result) is the `Σ <: Fun` rule above.
+>
+> The gates' exclusivity+exhaustiveness — the precondition the isomorphism rests
+> on — is a `lambda_elim` construction invariant (asserted at the fan-out
+> boundary: a non-exhaustive value-`Case` would realize an empty collection on
+> the uncovered path, a silent miscompile), *not* re-proven in the solver.
+>
+> Consuming a conditional collection through a *comprehension* (`[f(x) for x in
+> (xs if c else ys)]`) compiles: `lower::comprehension` floats the source `Case`
+> out of the map so it never becomes a Σ *applied to an index* (which would
+> collide); each arm is built as a data-kinded `Compose`, and the arms then join
+> into one Σ (`union_extents`). A conditional *between* two standalone
+> comprehensions is still kind-limited (see the kind-inference follow-up below).
 
 **`Case` arms join by the lattice.** `emit_case` constrains every value/
 collection arm into a fresh result variable (`require_sub`) instead of

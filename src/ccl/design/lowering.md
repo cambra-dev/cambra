@@ -70,6 +70,17 @@ The design of record for the recurrence construction and feed routing is
 implementation lives in `src/ccl/mut_elim.rs` (the `For`/`MutWrite` → `LetRec`
 → `Transact` via loop planning) and `src/ccl/channelize.rs` (feed routing).
 
+**Conditionals in loop bodies (designed, not yet implemented).** Today a mutation
+nested inside an `if` is rejected at lowering (`lower_middle_stmt`). The in-flight
+conditionals stack adds a `ChlStmt::If` arm to the direct-mirror loop-body
+lowering: each branch body
+lowers through the same recursive statement-chain helper and is emitted as a
+statement-position `Case` — a faithful mirror, no path computation at lowering
+(mutability is a type-level fact lowering does not have). `find_mutation_loop_vars`
+recurses into the branches so `for x in src: if p: total += x` classifies as a
+mutation loop; the path fan-out happens in `mut_elim`. A `for` or a
+`with begin():` nested inside an `if` inside a loop body stays rejected.
+
 **Let-bindings in generator bodies** (`y = f(x); yield y`) lower to nested `Let` nodes inside the Lambda body, evaluated once per iteration of the enclosing loop.
 
 **Pre-loop lets** (assignments before the outer `for` in a function body) are handled by `lower_stmts` — they wrap the generator expression in `Let` nodes. The `for` lowering itself (`lower_generator_for`) only handles the loop and its body.

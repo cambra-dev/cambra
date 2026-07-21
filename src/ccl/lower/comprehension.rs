@@ -4,8 +4,10 @@
 use super::*;
 use crate::{
     ccl::{
-        BinOpKind, Expr, LogicKind, Name, Type,
-        ccl_utils::{make_cast, refined_fn_type},
+        BinOpKind, Branch, Expr, LogicKind, Name, Type, TypedExprNode,
+        ccl_utils::{
+            flatten_trailing_value_case, make_cast, refined_fn_type, synthesize_arm_predicate,
+        },
         uniquify,
     },
     chl_parser::ast::{AssignTarget, CompClause, Comprehension, Expr as ChlExpr, Spanned},
@@ -138,6 +140,60 @@ pub(super) fn lower_list_comp(
         }
     };
 
+    // ---- Phase 4.5: Float a value-`Case` source out of the comprehension --------
+    // `[e for x in (xs if c else ys)]` — a comprehension over a *conditional
+    // collection* — lowers with a value-`Case` source. Iterating it directly
+    // would bind the index variable to *both* choice extents (as the read index
+    // and the result domain), which inference rejects as an untagged-sum
+    // collision. Because the guards do not reference the comprehension variable,
+    // the `Case` floats out soundly: `[e for x in Case{gᵢ→srcᵢ}]` ⟹
+    // `Case{gᵢ → [e for x in srcᵢ]}` — each arm an ordinary map over a concrete
+    // collection, the enclosing `Case` a value-`Case` over collections (typed as
+    // the Σ, compiled by the gate fan-out). Single generator, no comprehension
+    // filter; a nested conditional source floats per arm by recursion. (A
+    // multi-generator or filtered comprehension over a conditional source is a
+    // follow-up — it falls through to the direct path.)
+    if single_gen
+        && pred_op.is_none()
+        && matches!(
+            &gen_sources[0].node,
+            TypedExprNode::Case { scrutinee: None, branches }
+                if branches.iter().all(|b| b.pattern.is_none())
+        )
+    {
+        let source = gen_sources.pop().expect("single generator has one source");
+        return Ok(float_comp_source_case(source, &gen_iter_vars[0], &body));
+    }
+
+    // ---- Phase 4.6: Fan out a value-`Case` *element* into filtered maps ----------
+    // `[a if g(x) else b for x in xs]` — a comprehension whose *element* is a
+    // per-element conditional — lowers with a value-`Case` body. The `Case`
+    // cannot float out (its guards reference the comprehension variable `x`), so
+    // instead fan out the source by each arm's first-match gate:
+    // `[eᵢ if gᵢ … for x in xs]` ⟹ `⧺ᵢ [eᵢ for x in xs if π̂ᵢ]`,
+    // `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`. Each arm restricts the source by its
+    // (element-dependent) gate — the ordinary filter refinement — and maps by
+    // that arm's value; the gates partition the source, so the union recombines
+    // the arms by position into the fully-mapped collection. A `CollectionUnion`
+    // (not a `Case`), so the compute-kinded per-arm maps do not need to join.
+    // Single generator, no comprehension filter; the value arms may reference `x`.
+    if single_gen
+        && pred_op.is_none()
+        && matches!(
+            &body.node,
+            TypedExprNode::Case { scrutinee: None, branches }
+                if branches.iter().all(|b| b.pattern.is_none())
+        )
+    {
+        let source = gen_sources.pop().expect("single generator has one source");
+        return Ok(fan_out_element_case(
+            source,
+            &gen_iter_vars[0],
+            outer_var,
+            body,
+        ));
+    }
+
     // ---- Phase 5: Build the body as a nested Apply/Lambda chain ------------------
     // Working innermost-first (reverse order) we wrap the accumulated expression:
     //   body = Apply(Lambda(iter_var_i, body), Apply(source_i, idx_arg_i))
@@ -183,6 +239,96 @@ pub(super) fn lower_list_comp(
         Ok(make_cast(unrefined_lambda, target_ty))
     } else {
         Ok(Expr::lambda(outer_var, Type::Hole, body_expr))
+    }
+}
+
+/// Float a value-`Case` *source* out of a single-generator comprehension:
+/// `[e for x in Case{gᵢ→srcᵢ}]` ⟹ `Case{gᵢ → [e for x in srcᵢ]}`. Sound because
+/// the guards do not reference the comprehension variable `x`. Recurses so a
+/// nested conditional source flattens per arm; a concrete (non-`Case`) source
+/// builds the ordinary map chain `λ __idx → __idx ▷ src ▷ (λ x → body)`.
+fn float_comp_source_case(source: Expr, iter_var: &str, body: &Expr) -> Expr {
+    let is_value_case = matches!(
+        &source.node,
+        TypedExprNode::Case { scrutinee: None, branches }
+            if branches.iter().all(|b| b.pattern.is_none())
+    );
+    if is_value_case {
+        let TypedExprNode::Case { branches, .. } = source.node else {
+            unreachable!("guarded by is_value_case")
+        };
+        let floated = branches
+            .into_iter()
+            .map(|b| Branch {
+                pattern: b.pattern,
+                guard: b.guard,
+                // The arm body *is* this arm's source collection; float into it.
+                body: float_comp_source_case(b.body, iter_var, body),
+            })
+            .collect();
+        return Expr::new(TypedExprNode::Case {
+            scrutinee: None,
+            branches: floated,
+        });
+    }
+    // Concrete source: `source ≫ (λ x → body)` — a `Compose`, *not* the apply
+    // chain Phase 5 builds. The compose form is equivalent (a map applies the
+    // body to each element) but `emit_compose` stamps it with the *source's*
+    // data kind (a map over a collection is itself a collection). That data kind
+    // is what lets two such arms of a conditional source `sigma_join` into the Σ
+    // (compiled by the gate fan-out) rather than colliding as compute-kinded
+    // lambdas whose distinct index extents would meet.
+    Expr::compose(vec![
+        source,
+        Expr::lambda(iter_var, Type::Hole, body.clone()),
+    ])
+}
+
+/// Fan out a single-generator comprehension whose *element* is a value-`Case`
+/// into a union of filtered maps: `[eᵢ if gᵢ … for x in src]` ⟹
+/// `⧺ᵢ [eᵢ for x in src if π̂ᵢ]`, first-match `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`. Each arm is a
+/// filtered map — the source restricted on its domain by the arm's
+/// (element-dependent) gate (a `cast` carrying the refinement, exactly the shape
+/// Phase 6 builds for a comprehension `if`-filter), composed with the arm's value
+/// map. The gates partition the source, so the `++`-union recombines the arms by
+/// position into the fully-mapped collection.
+fn fan_out_element_case(source: Expr, iter_var: &str, outer_var: &str, body: Expr) -> Expr {
+    let TypedExprNode::Case { branches, .. } = body.node else {
+        unreachable!("fan_out_element_case requires a Case body")
+    };
+    // Flatten a nested `elif` element (`a if p else b if q else c`, a trailing
+    // `true → Case{…}`) into one flat partition, so each arm is a plain value.
+    let branches = flatten_trailing_value_case(branches);
+    let mut prior_guards: Vec<Expr> = Vec::new();
+    let arms: Vec<Expr> = branches
+        .into_iter()
+        .map(|b| {
+            let gate = synthesize_arm_predicate(&b.guard, &prior_guards);
+            prior_guards.push(b.guard);
+            // Element map: `λ __idx → __idx ▷ src ▷ (λ x → eᵢ)`.
+            let elem_map = Expr::lambda(
+                outer_var,
+                Type::Hole,
+                Expr::apply(
+                    Expr::apply(Expr::var(Name::raw(outer_var)), source.clone()),
+                    Expr::lambda(iter_var, Type::Hole, b.body),
+                ),
+            );
+            // Gate over the source domain: `__elem ▷ src ▷ (λ x → π̂ᵢ)` — the bare
+            // refinement predicate, matching Phase 6's loop-join filter shape.
+            let gate_on_source = Expr::apply(
+                Expr::apply(Expr::var(Name::elem()), source.clone()),
+                Expr::lambda(iter_var, Type::Hole, gate),
+            );
+            let target = refined_fn_type(Type::Hole, gate_on_source, Type::Hole);
+            make_cast(elem_map, target)
+        })
+        .collect();
+    // A one-arm value `Case` (degenerate) is just the single filtered map.
+    if arms.len() == 1 {
+        arms.into_iter().next().expect("checked len == 1")
+    } else {
+        Expr::collection_union(arms)
     }
 }
 

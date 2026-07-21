@@ -110,9 +110,9 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, BinOpKind, Branch, Expr, HistoryKind, Lit, LogicKind, Name, Pattern, Refinement,
-    Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
-    ccl_utils::{count_free, typed_compose},
+    BaseType, Branch, Expr, HistoryKind, Lit, Name, Pattern, Refinement, Type, TypedBinding,
+    TypedExpr, TypedExprNode,
+    ccl_utils::{count_free, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
 };
 
@@ -213,19 +213,21 @@ impl fmt::Display for DeferError {
 /// Recognize a guard-only `Case` that feeds `defer_name` in one or more arms —
 /// the desugar-stage counterpart of `lambda_elim`'s `is_filter_case_body`.
 ///
-/// Shape (as lowered from `if g₀: d << v₀ elif g₁: d << v₁ …` in a for-loop
-/// body): `Case { None, [g₀ → body₀; …; gₙ₋₁ → bodyₙ₋₁; true → unit] }`, where
-/// each non-trailing `bodyᵢ` is either `Feed(defer_name, vᵢ)` (a feeding arm)
-/// or `Unit` (a non-feeding arm), and the trailing arm is the implicit
-/// `true → unit` fallthrough.
+/// Shape (as lowered from `if g₀: d << v₀ elif g₁: d << v₁ … [else: d << vₑ]` in
+/// a for-loop body): `Case { None, [g₀ → body₀; …; true → bodyₜ] }`, where each
+/// `bodyᵢ` is either `Feed(defer_name, vᵢ)` (a feeding arm) or `Unit` (a
+/// non-feeding arm). The trailing `true`-guarded arm is the `else` body when
+/// present (a feed) or the implicit fallthrough (`Unit`) when absent — both are
+/// ordinary arms here, so an `else` that feeds fans out just like a guard arm
+/// (its first-match predicate is `¬⋁ⱼ gⱼ`).
 ///
-/// Returns each non-trailing arm's `(guard, feed_value?)` in source order —
-/// `feed_value` is `None` for a non-feeding arm, whose guard still participates
-/// in later arms' predicate synthesis ([`synthesize_arm_predicate`]). Returns
-/// `None` (not fannable) if there is a scrutinee, no `true → unit` fallthrough,
-/// an arm binds a pattern, or an arm body is neither this defer's feed nor
-/// `Unit` — so a `Case` mixing this defer's feeds with other effects falls
-/// through to the generic handling rather than being silently collapsed.
+/// Returns each arm's `(guard, feed_value?)` in source order — `feed_value` is
+/// `None` for a non-feeding arm, whose guard still participates in later arms'
+/// predicate synthesis ([`synthesize_arm_predicate`]). Returns `None` (not
+/// fannable) if there is a scrutinee, the trailing guard is not `true`, an arm
+/// binds a pattern, or an arm body is neither this defer's feed nor `Unit` — so a
+/// `Case` mixing this defer's feeds with other effects falls through to the
+/// generic handling rather than being silently collapsed.
 fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, Option<Expr>)>> {
     let TypedExprNode::Case {
         scrutinee: None,
@@ -237,16 +239,16 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
     if branches.len() < 2 {
         return None;
     }
-    let (last, rest) = branches.split_last().expect("len >= 2");
-    // The trailing arm must be the implicit `true → unit` fallthrough.
-    if !matches!(&last.guard.node, TypedExprNode::Lit(Lit::Bool(true)))
-        || !matches!(&last.body.node, TypedExprNode::Lit(Lit::Unit))
-    {
+    // The trailing arm is the fallthrough / `else` — its guard must be `true`.
+    if !matches!(
+        &branches.last().expect("len >= 2").guard.node,
+        TypedExprNode::Lit(Lit::Bool(true))
+    ) {
         return None;
     }
-    let mut arms = Vec::with_capacity(rest.len());
+    let mut arms = Vec::with_capacity(branches.len());
     let mut any_feed = false;
-    for b in rest {
+    for b in branches {
         // A guard-only arm never binds a pattern.
         if b.pattern.is_some() {
             return None;
@@ -261,25 +263,6 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
         }
     }
     any_feed.then_some(arms)
-}
-
-/// Build arm `i`'s effective predicate `gᵢ ∧ ¬g₀ ∧ … ∧ ¬gᵢ₋₁`, encoding a
-/// `Case`'s "first matching guard wins" semantics: arm `i` fires only where its
-/// own guard holds and no earlier arm's did. `prior` holds `g₀ … gᵢ₋₁` in
-/// order; `guard` is `gᵢ`. Every guard is a `Bool`-typed expression over the
-/// same loop element, so the synthesized conjunction is `Bool` too — typed here
-/// (desugar runs post-inference and must be type-preserving).
-fn synthesize_arm_predicate(guard: &Expr, prior: &[Expr]) -> Expr {
-    let bool_ty = Type::Base(BaseType::Bool);
-    let mut pred = guard.clone();
-    for g in prior {
-        let mut neg = Expr::unary(UnaryOpKind::Not, g.clone());
-        neg.ty = bool_ty.clone();
-        let mut conj = Expr::binop(pred, BinOpKind::BoolLogic(LogicKind::And), neg);
-        conj.ty = bool_ty.clone();
-        pred = conj;
-    }
-    pred
 }
 
 /// Attempt to apply the defer-returning lift to a `Let` binding.
@@ -2514,16 +2497,54 @@ fn extract_for_defer(
                 // that the fan-out sites above intercept, so there is no
                 // iteration source to restrict per arm. The loop-sourced
                 // multi-arm fan-out (`if g: d << v` and `if/elif` in a for-loop
-                // body) is handled at those sites via `try_extract_fanout_feed`,
-                // one refined-source channel per arm `i` predicated on
-                // `gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`. A *source-less* conditional feed has no
-                // refinement to hang the guard on, so reject it rather than
-                // mishandle. (The former Record-based fan-out is retired — it
-                // published an ill-typed `Unit` empty-channel for no-feed arms,
-                // a silent miscompile.)
-                return Err(DeferError::PartialFeedCaseUnsupported(
-                    defer_name.to_string(),
-                ));
+                // body) is handled at those sites via `try_extract_fanout_feed`.
+                //
+                // A *source-less* conditional feed (`if c: d << 1 else: d << 2`,
+                // outside any loop) has no iteration source, so each feeding arm
+                // becomes a **gated one-shot lift** over the `Unit` driver:
+                // `λ __unused : {Unit | π̂ᵢ} → vᵢ`, first-match `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`
+                // (a source-less feed; see `design/mutability.md`). Lambda elimination const-lifts
+                // each to the value-`Case` C-form arm, planning materializes the
+                // gate, and the channel union publishes exactly the selected arm's
+                // value — empty (a naturally-partial feed) when no arm fires. A
+                // *scrutinee / pattern* feed cannot be gated by a boolean
+                // predicate, so it stays rejected.
+                let guard_only =
+                    scrutinee.is_none() && per_branch.iter().all(|(p, ..)| p.is_none());
+                if !guard_only {
+                    return Err(DeferError::PartialFeedCaseUnsupported(
+                        defer_name.to_string(),
+                    ));
+                }
+                let unit_ty = Type::Base(BaseType::Unit);
+                let mut prior_guards: Vec<Expr> = Vec::new();
+                for (_, guard, branch_feeds, _) in &per_branch {
+                    let pred = synthesize_arm_predicate(guard, &prior_guards);
+                    prior_guards.push(guard.clone());
+                    // `{Unit | π̂ᵢ}` — the gate is constant in the driver element.
+                    // Store `π̂ᵢ` *directly* as the refinement's bare predicate (it
+                    // does not mention `__elem`): planning's `fn_of_bare_predicate`
+                    // slow-paths that through lambda elimination, desugaring the
+                    // `and`/`not` into point-free form — the same path the
+                    // loop-sourced fan-out relies on. A degenerate literal-`true`
+                    // gate leaves the driver unrefined (an unconditional feed).
+                    let refined = if matches!(&pred.node, TypedExprNode::Lit(Lit::Bool(true))) {
+                        unit_ty.clone()
+                    } else {
+                        Type::Refinement(
+                            Box::new(unit_ty.clone()),
+                            Refinement {
+                                predicate: Rc::new(pred),
+                            },
+                        )
+                    };
+                    for v in branch_feeds {
+                        feeds.push(Expr::lambda("__unused", refined.clone(), v.clone()));
+                    }
+                }
+                // Fall through: the residual value in every arm is now feed-free
+                // (`Unit` for a bare `d << v` arm), so the `Case` below denotes the
+                // statement's (discarded) value.
             }
             TypedExprNode::Case {
                 scrutinee,
@@ -2785,6 +2806,33 @@ mod tests {
         assert!(
             run(with_d, false).is_ok(),
             "a multi-arm Case feeding the defer must fan out, not be rejected"
+        );
+    }
+
+    /// A *source-less scrutinee* feed stays rejected. The guard-only source-less
+    /// feed (`if c: d << v`) channelizes to gated `Unit` lifts, but a
+    /// scrutinee/pattern `Case` cannot be gated by a boolean first-match
+    /// predicate, so `guard_only` is false and the narrowed
+    /// `PartialFeedCaseUnsupported` fires. (No surface syntax lowers to a
+    /// scrutinee feed yet, so this defensive path is only reachable at the IR
+    /// level — pinned here.)
+    #[test]
+    fn run_source_less_scrutinee_feed_rejected() {
+        let feeding_arm = Branch {
+            pattern: None,
+            guard: Expr::lit(Lit::Bool(true)),
+            body: Expr::feed("d", lit(1)),
+        };
+        let case_expr = Expr::new(TypedExprNode::Case {
+            scrutinee: Some(Box::new(lit(0))),
+            branches: vec![feeding_arm],
+        });
+        let with_d = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), case_expr);
+        let err = run(with_d, false)
+            .expect_err("a source-less scrutinee feed must stay rejected, not channelize");
+        assert!(
+            matches!(err, DeferError::PartialFeedCaseUnsupported(_)),
+            "expected PartialFeedCaseUnsupported, got {err:?}"
         );
     }
 
