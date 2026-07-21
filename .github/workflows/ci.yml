@@ -99,6 +99,14 @@ jobs:
           /tmp/elan-init -y --default-toolchain "$(cat formal/lean-toolchain)" >/dev/null
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
+      # Node toolchain for the cambra-inspector web frontend (vitest + bundle).
+      # TODO: pin to a SHA to match this repo's action-pinning convention.
+      - name: Setup Node
+        if: steps.filter.outputs.code == 'true'
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v4
+        with:
+          node-version: 20
+
       # 3. Run Checks (Only if code changed)
       - name: Shellcheck
         if: steps.filter.outputs.code == 'true'
@@ -203,6 +211,11 @@ jobs:
         # a gate that exists only in `ci.sh` runs locally and nowhere else.
         if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh fixtures
+
+      - name: Web
+        # The frontend: typecheck + vitest + committed-bundle freshness.
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        run: ./ci.sh web
 
         # 4. Success Signal for noops
       - name: No-op for docs

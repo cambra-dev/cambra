@@ -73,6 +73,44 @@ ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
     cargo doc -p cambra --no-deps
 }
+# The web frontend: typecheck + vitest, plus a freshness check on the committed
+# single-file bundle (R7 — `dist/index.html` is `include_str!`'d so `cargo build`
+# needs no Node). Requires npm; skipped (not failed) when npm is absent so the
+# Rust-only local path still works.
+ci_web() {
+  if ! command -v npm > /dev/null 2>&1; then
+    echo "ci_web: npm not found; skipping web frontend checks" >&2
+    return 0
+  fi
+  (
+    # Every step is `|| exit 1` rather than relying on `set -e`: `ci_all` calls
+    # this function on the left of a `||`, which disables errexit for the whole
+    # dynamic extent — including this subshell. Without the explicit exits a
+    # failing `npm run test` would fall through to the build below and the
+    # subshell would report the *build's* status, so red tests passed the gate.
+    cd cambra-inspector/web || exit 1
+    npm ci || exit 1
+    npm run typecheck || exit 1
+    npm run test || exit 1
+    # Rebuild the bundle and fail if it drifted from the committed copy.
+    # Deliberately a file comparison against the pre-build copy, not
+    # `git diff`: in a colocated jj repo git HEAD can sit below the working
+    # copy, which turns a git-based check into a false failure — and the raw
+    # diff of the single-line minified bundle is unreadable anyway.
+    vendored="$(mktemp)"
+    trap 'rm -f "${vendored}"' EXIT
+    cp dist/index.html "${vendored}" || exit 1
+    npm run build || exit 1
+    if ! cmp -s "${vendored}" dist/index.html; then
+      vendored_size="$(wc -c < "${vendored}")"
+      built_size="$(wc -c < dist/index.html)"
+      echo "ci_web FAILED: vendored dist/index.html differs from a fresh build" >&2
+      echo "  sizes: vendored ${vendored_size} bytes vs built ${built_size} bytes" >&2
+      echo "  re-vendor via: (cd cambra-inspector/web && npm run build), then commit dist/index.html" >&2
+      exit 1
+    fi
+  )
+}
 # Golden-fixture drift gate: regenerate the frontend's snapshot fixtures into a
 # temp dir through the same script the fix path uses (regen-fixtures.sh, driven
 # by scripts/fixtures.manifest) and fail on any byte difference from the
@@ -209,6 +247,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_fixtures || failed="${failed} fixtures"
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_web || failed="${failed} web"
   if [[ -n "${failed}" ]]; then
     echo "ci.sh FAILED:${failed}" >&2
     exit 1
