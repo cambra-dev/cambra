@@ -4,34 +4,68 @@
 //! # The model
 //!
 //! Every IR node has a stable [`NodeId`]. As a pass rewrites the tree it appends
-//! [`RewriteStep`]s to a [`LineageLog`]: a [`Op::Transform`] records "these input
-//! ids vanished, these output ids appeared"; a [`Op::Copy`] records "these output
-//! ids are freshened duplicates of that origin." Each step *separately* carries a
-//! `blame` set (the upstream ids the outputs attribute to — **not** the same as
-//! what they consumed), a `nature` bit (faithful expansion vs. pure machinery),
-//! and a stable `label`. An untouched id is one no step mentions.
+//! [`RewriteStep`]s to a [`LineageLog`], each recording one hop of identity: an
+//! [`Op::Transform`] says "these ids vanished, these appeared"; an [`Op::Copy`]
+//! says "these ids are freshened duplicates of that origin". An id no step
+//! mentions is untouched and survives by default. Alongside its `op`, a step
+//! carries a `blame` set, a `nature` bit (faithful expansion vs. pure
+//! machinery), and a stable `label`.
 //!
 //! At an inspector pane boundary the intervening logs are folded once, in pass
-//! order, by [`collapse`] into a [`LineageMap`] — a bidirectional node↔node
-//! relation with an explicit self-edge for every id that survived — and, in
-//! parallel, into a [`SourceProjection`] that resolves each surviving node's
-//! blame back to source spans. The fold composes away ids born and consumed
-//! within the phase, and its two-sided leak check ([`Leak`]) guarantees no node
-//! silently loses its history.
+//! order, by [`collapse`], which yields two things: a [`LineageMap`] — the
+//! bidirectional node↔node relation, with an explicit self-edge for every id
+//! that survived — and a [`SourceProjection`] resolving each surviving node back
+//! to source spans. Ids born and consumed within the same phase compose away. A
+//! two-sided leak audit ([`Leak`]) rejects any node that loses its history: an
+//! output id with no ancestry and an input id that vanished unaccounted for are
+//! both errors.
 //!
-//! # Two independent channels (load-bearing)
+//! # Consumption and blame are separate channels
 //!
-//! `consumed` and `blame` are distinct and never mixed:
+//! A step's `consumed` and `blame` sets answer different questions and never mix:
 //!
-//! * **`consumed`** drives *fate* accounting — an id is consumed, carried, or
-//!   dropped — and the leak audit. Lineage edges resolve through the `roots`
-//!   state, which only `consumed`/`produced` move.
-//! * **`blame`** drives *span* resolution and may name ids that survive the step.
-//!   It resolves through the `attr` projection, never through `roots`.
+//! * **`consumed`** is *fate* — which ids this step destroys. It drives the leak
+//!   audit and the lineage edges, both of which resolve through the fold's
+//!   `roots` state; only `consumed`/`produced` move that state.
+//! * **`blame`** is *attribution* — which upstream ids the step's outputs take
+//!   their spans from. It may name ids that survive the step, and resolves
+//!   through the `attr` projection, never through `roots`.
 //!
-//! Welding the two would (for example) resolve a channelized feed union — whose
+//! Welding them would (for example) resolve a channelized feed union — whose
 //! step consumes the enclosing `Defer`/`Let` but blames the surviving fed-value
 //! operands — to the `defer` keyword's span rather than the operands'.
+//!
+//! # Recording is a byproduct of construction
+//!
+//! A [`RecorderSession`] installs one log for a boundary. Within it, [`step`]
+//! opens a frame and returns an RAII [`StepGuard`]; frames nest, and the
+//! innermost open frame captures. Only `consumed` is declared up front — the
+//! other two sides are captured by hooks in node construction itself:
+//! `Expr::new` reports a mint, and every freshen path reports an
+//! `(origin, fresh)` pair. A pass therefore cannot perform a rewrite without
+//! recording it, nor record one it did not perform.
+//!
+//! `StepGuard`'s `Drop` pops the frame (LIFO; an unwind still pops and flushes
+//! whatever was captured before it) and appends its records to the log.
+//!
+//! ## Flush order within a frame
+//!
+//! A frame emits its captured `Copy`s around its own `Transform`, partitioned by
+//! origin:
+//!
+//! 1. copies whose origin this frame **consumes**, which must fold while that
+//!    origin is still live;
+//! 2. the `Transform { consumed, produced: births }`;
+//! 3. copies whose origin this frame **produced**, which must fold once it is.
+//!
+//! Both orders are required, so neither can be the global one. The partition is
+//! per `(origin, fresh)` pair, so one deep freshen of a subtree mixing consumed
+//! and newly born nodes lands on both sides.
+//!
+//! The `Transform` stays whole because it carries root inheritance: the produced
+//! ids take the union of the consumed ids' roots. Splitting it into a birth half
+//! and a consume half would hand every born node an empty root set, severing it
+//! from its ancestry without tripping the audit.
 //!
 //! # Domains, not passes
 //!
@@ -58,7 +92,6 @@ pub type RewriteLabel = &'static str;
 /// the `op`'s consumed/produced/origin ids and the separate `blame` ids — are
 /// resolved independently at [`collapse`] time (see the module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
-// Consumed when the passes adopt the recorder (next commit in the stack).
 pub(crate) struct RewriteStep {
     /// The identity relation this step performs.
     pub op: Op,
@@ -387,9 +420,6 @@ pub enum Leak {
 /// `roots`. A blamed id absent from `attr` contributes no spans (it has no
 /// known source), which is legal — empty blame or all-unknown blame yields
 /// `spans: []`, the "known node, no source anchor" case.
-///
-/// A private helper of [`collapse`], so it is dead exactly while `collapse` is.
-#[allow(dead_code)]
 fn attribute(
     blame: &[NodeId],
     nature: Nature,
@@ -453,12 +483,6 @@ fn attribute(
 /// edges — the bipartite product for N:M steps and self-edges for untouched ids
 /// both fall out. Ids born and consumed within the phase never reach an output
 /// and compose away.
-///
-/// Exercised only by this module's tests until a pane boundary calls it, which
-/// needs the per-pass logs the passes do not yet record. `collapse_lowering` is
-/// the always-on sibling and shares the [`RootTracker`] core, so the fold logic
-/// here is not untested — only this entry point is uncalled.
-#[allow(dead_code)]
 pub(crate) fn collapse(
     logs: &[(Pass, LineageLog)],
     input_ids: &HashSet<NodeId>,
@@ -846,6 +870,16 @@ impl OpenStep {
     /// [`TypedExpr::freshen_node_id`](crate::ccl::expr::TypedExpr::freshen_node_id),
     /// so capture is total and a declared-origin frame kind would be redundant.
     ///
+    /// The copies straddle the `Transform`, split by whether this frame consumes
+    /// the origin (see the module docs, "Flush order within a frame"): a copy of
+    /// a node the frame is about to consume has to fold *before* the `Transform`
+    /// removes it, and a copy of a node the frame gave birth to has to fold
+    /// *after* the `Transform` makes it live. Both are real requirements, so the
+    /// split is per `(origin, fresh)` pair rather than per frame — one deep
+    /// freshen of a subtree mixing consumed and newly born nodes lands on both
+    /// sides. `group_copies` preserves first-appearance order within each side,
+    /// so a copy *of a copy* still follows the copy that produced its origin.
+    ///
     /// A `Transform` frame whose `consumed` *and* captured `births` are both
     /// empty emits no `Transform` record: it was opened purely to capture the
     /// freshen pairs of a deep clone (its only output is those per-origin `Copy`
@@ -860,6 +894,21 @@ impl OpenStep {
             births,
             copies,
         } = self;
+        let dying: HashSet<NodeId> = consumed.iter().copied().collect();
+        let (pre, post): (Vec<_>, Vec<_>) = copies
+            .into_iter()
+            .partition(|(origin, _)| dying.contains(origin));
+        let push_copies = |log: &mut LineageLog, pairs: &[(NodeId, NodeId)]| {
+            for (origin, produced) in group_copies(pairs) {
+                log.push(RewriteStep {
+                    op: Op::Copy { origin, produced },
+                    blame: Vec::new(),
+                    nature,
+                    label,
+                });
+            }
+        };
+        push_copies(log, &pre);
         if !(consumed.is_empty() && births.is_empty()) {
             log.push(RewriteStep {
                 op: Op::Transform {
@@ -871,14 +920,7 @@ impl OpenStep {
                 label,
             });
         }
-        for (origin, produced) in group_copies(&copies) {
-            log.push(RewriteStep {
-                op: Op::Copy { origin, produced },
-                blame: Vec::new(),
-                nature,
-                label,
-            });
-        }
+        push_copies(log, &post);
     }
 
     /// Finalize this frame into a [`LoweringLog`]. Lowering frames are opened
@@ -887,9 +929,16 @@ impl OpenStep {
     /// [`lowering_leaf`], so a lowering frame carries no consumed ids and no
     /// births — only the captured per-origin copies flush here, as `Copy`
     /// [`LoweringStep`]s mirroring their origins' folded entries (empty anchor).
+    ///
+    /// Consequently there is no `Transform` for copies to be ordered against,
+    /// and [`flush_into`](Self::flush_into)'s consumed/born partition has nothing
+    /// to do here. Both halves of that emptiness are asserted rather than
+    /// assumed: a lowering frame that grew a consumed set or a birth would need
+    /// the partition, and would silently lose the ordering without it.
     fn flush_into_lowering(self, log: &mut LoweringLog) {
         let OpenStep {
             label,
+            consumed,
             nature,
             births,
             copies,
@@ -899,6 +948,11 @@ impl OpenStep {
             births.is_empty(),
             "a lowering copy-frame captured a mint ({births:?}) — leaf mints must \
              append via lowering_leaf, frames capture only copies",
+        );
+        debug_assert!(
+            consumed.is_empty(),
+            "a lowering copy-frame declared a consumed set ({consumed:?}) — it emits \
+             no Transform, so its copies would have nothing to be ordered against",
         );
         for (origin, produced) in group_copies(&copies) {
             log.push(LoweringStep {
@@ -1083,11 +1137,6 @@ impl RecorderSession {
     /// Install a fresh, empty **pass** log as the active recording target for
     /// this thread. Non-reentrant: at most one session per thread
     /// (debug-asserted).
-    ///
-    /// The pass-log counterpart to [`lowering`](Self::lowering), which is
-    /// always-on. Uncalled outside this module's tests until a pass boundary
-    /// installs a session of its own.
-    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::install(ActiveLog::Pass(Vec::new()))
     }
@@ -1113,9 +1162,6 @@ impl RecorderSession {
 
     /// Drain and return the recorded **pass** log, ending the session. The
     /// subsequent `Drop` is then a no-op (the slot is already empty).
-    ///
-    /// Paired with [`new`](Self::new), so it is dead exactly while that is.
-    #[allow(dead_code)]
     pub(crate) fn into_log(self) -> LineageLog {
         ACTIVE_LOG.with(|slot| match slot.borrow_mut().take() {
             Some(ActiveLog::Pass(log)) => log,
@@ -1961,10 +2007,11 @@ mod tests {
         // The `fold_induction_loop`/`build_writer` template shape (transact/letrec
         // instrumentation hazard): a single frame births a template `T`, copies
         // it per read site (`subst_env` freshens a clone at each), and discards
-        // `T` (it never reaches the output tree). Per `OpenStep::flush_into`'s
-        // refinement the frame's `Transform` (which produces `T`) flushes BEFORE
-        // the captured `Copy` steps, so `T` is live when the copies are processed —
-        // the whole shape composes in ONE frame, no split needed. `T` remains live
+        // `T` (it never reaches the output tree). `T` is a *birth*, so its copies
+        // land in `flush_into`'s post-`Transform` partition and fold once `T` is
+        // live — the whole shape composes in ONE frame, no split needed. (The
+        // mirror case, a copy of a node the frame *consumes*, is
+        // `copies_straddle_the_frame_transform_by_origin`.) `T` remains live
         // at collapse (never consumed) but is neither an input-pane nor an
         // output-pane id, so it triggers no leak (`Dropped` checks inputs only,
         // `Unexplained` checks outputs only).
@@ -2024,5 +2071,71 @@ mod tests {
             sorted(map.downstream(&origin).to_vec()),
             sorted(vec![c1, c2])
         );
+    }
+
+    /// One frame, both copy directions: a copy of a node the frame **consumes**
+    /// folds before its `Transform`, a copy of a node the frame **births** folds
+    /// after. The partition is per `(origin, fresh)` pair, so a single frame
+    /// mixing the two lands copies on both sides.
+    ///
+    /// The consumed direction is the one a single global order cannot serve: the
+    /// `Transform` removes the origin's roots, so a `Copy` folding after it would
+    /// be [`Leak::CopyOfUnknown`]. The birth direction needs the opposite order
+    /// (`born_copied_discarded_template_composes_without_leaks`), which is why
+    /// `flush_into` splits rather than picking one.
+    #[test]
+    fn copies_straddle_the_frame_transform_by_origin() {
+        // An input-pane node this frame will consume *and* copy (the
+        // `transform_chain` remainder-splice shape: one subtree fanned across
+        // several branches, the original destructured).
+        let input = Expr::lit(Lit::Int(7));
+        let src = input.node_id();
+        let (t, from_input, from_birth);
+        let session = RecorderSession::new();
+        {
+            let _g = step("test.straddle", vec![src], vec![src], Nature::Machinery);
+            let mut ci = input.clone();
+            ci.freshen_node_id();
+            from_input = ci.node_id();
+            // A template born in this same frame, then copied.
+            let template = Expr::lit(Lit::Int(0));
+            t = template.node_id();
+            let mut cb = template.clone();
+            cb.freshen_node_id();
+            from_birth = cb.node_id();
+        }
+        let log = session.into_log();
+        assert!(
+            matches!(&log[0].op, Op::Copy { origin, .. } if *origin == src),
+            "the copy of the consumed origin flushes first: {log:?}",
+        );
+        assert_eq!(
+            log[1].op,
+            Op::Transform {
+                consumed: vec![src],
+                produced: vec![t],
+            },
+            "the frame's Transform flushes between the two copy runs: {log:?}",
+        );
+        assert!(
+            matches!(&log[2].op, Op::Copy { origin, .. } if *origin == t),
+            "the copy of the birth flushes last: {log:?}",
+        );
+
+        let logs = vec![(Pass::Letrec, log)];
+        let (map, _proj, leaks) = collapse(
+            &logs,
+            &set([src]),
+            &set([from_input, from_birth]),
+            &SourceProjection::new(),
+        );
+        assert!(
+            leaks.is_empty(),
+            "both copies fold against a live origin: {leaks:?}",
+        );
+        // Both copies trace to the frame's one input root, by different paths:
+        // one mirrors `src` directly, the other through the template `t`.
+        assert_eq!(map.upstream(&from_input), &[src]);
+        assert_eq!(map.upstream(&from_birth), &[src]);
     }
 }
