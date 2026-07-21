@@ -435,6 +435,7 @@ feed-only position still appends a change carrying the tap. Because the drive is
 position-sorted, the tap stream is position-ordered even over an async source (the dense
 `Recurse` path scrambled it by arrival order — the bug this replaces).
 
+<a id="remaining-the-never-terminating-bound"></a>
 **Bounding a never-terminating loop (keep-latest changelog GC).** The changelog is bounded
 the same way the commit store's is: a reader's release drives GC, and `StoreDenseRead`
 forwards a store release derived **purely from the consumer's release** — never from who the
