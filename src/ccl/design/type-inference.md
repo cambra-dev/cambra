@@ -544,8 +544,8 @@ conditional over stores, preserving that deliberate rule).
 coproduct is lossless on the *extent* and lossy on the *codomain*: joining
 `α ⤇ τ₀` with `β ⤇ τ₁` keeps the exact extent set `{α, β}` but coarsens the
 element type of every arm to the shared `τ₀ ⊔ τ₁`, forgetting *which* extent
-pairs with *which* element type. A function returning `[1, 2, 3] if flag else
-["a", "b"]` types as `([0,2] ⤇ (Int|String)) | ([0,1] ⤇ (Int|String))` — the
+pairs with *which* element type. A function returning `[1, 2, 3] if flag else ["a", "b"]`
+types as `([0,2] ⤇ (Int|String)) | ([0,1] ⤇ (Int|String))` — the
 type no longer records "length 3 ⟹ all Int." Three points make this the right
 default rather than a leak:
 
