@@ -175,6 +175,19 @@ inside it has no coherent meaning.
   post-loop **induction** accumulator's final and for a cross-loop broadcast source — those *are*
   fold-to-completion reads of a terminating history — but a `Txn` register read is never one.)
 
+> **Design commitment — transactional mutability is deliberately *unordered*.** There is no
+> ordering guarantee between transactions on the same `Txn` variable beyond the existence of *a*
+> commit order the runtime picks; a program may not assume one transaction serializes before
+> another, and nothing in the compiler or engine should impose such an order. The arbitrary-position
+> fed-out read above is the direct consequence, **not a defect**: a trailing `with begin(): out <<
+> balance` after a loop whose first iteration *denies* may observe the register before the first commit
+> lands (its singleton read samples an early position). The only ways a `Txn` value interacts with
+> the world are: read/written **inside** a `with begin():` (rejected outside one — as a feed RHS or
+> anywhere else), or observed as a *definite* committed value through the **future `await_last`** —
+> the single sanctioned terminal read. Do **not** add inter-transaction ordering to "fix" the
+> early-read case; the unordering is the intended model, and `await_last` is where determinism comes
+> from when a program needs it.
+
 ## CCL representation
 
 ### Surface-marker nodes: `For`, `MutWrite`, `Begin`, `Feed`
@@ -831,54 +844,63 @@ today rather than silently mishandled.
 
 ### Value-selecting `Case` and conditional induction writes (partially implemented)
 
-> **Status: value-selecting `Case`s compile; conditional induction writes are designed but not
-> yet implemented.**
+> **Status: value-selecting `Case`s and conditional induction writes both compile.**
 >
-> **Implemented** (value selection compiles via the literal union-of-restricts): scalar / compute
-> ternaries (the C-form), data-collection selection (the gate fan-out, reconciled to the Σ by
-> Σ-introduction), source-less conditional feeds, a **conditional element** in a
-> comprehension (`[a if g(x) else b for x in xs]`, fanned out over the source by the
-> element-dependent gate), and a comprehension **over a conditional collection** (`[f(x) for x in
-> (xs if c else ys)]`, the source `Case` floats out of the map). **Not yet implemented**:
-> conditional *induction writes* (`if 𝑝: total += x`, the per-leg writer sites + `DispatchRecurse`
-> below — still rejected at lowering); a conditional *between* standalone comprehensions
-> (`([…]) if c else ([…])` — a comprehension used as a value is compute-kinded, so its arms meet
-> rather than join; the deferred kind-inference work); and a per-element conditional at a site with
-> no visible iteration source (a UDF body, or a comprehension `if`-filter beside the element `Case`).
+> **Implemented**: scalar / compute ternaries (the C-form), data-collection selection (the gate
+> fan-out, reconciled to the Σ by Σ-introduction), source-less conditional
+> feeds, a **conditional element** in a comprehension (`[a if g(x) else b for x in xs]`, fanned out
+> over the source by the element-dependent gate), a comprehension **over a conditional collection**
+> (`[f(x) for x in (xs if c else ys)]`, the source `Case` floats out of the map), a conditional
+> **between** standalone comprehensions (`([…]) if c else ([…])` — the maps carry `Data` after kind
+> inference, so their arms join into a Σ), a **conditional induction write** (`if 𝑝: total += x`
+> — one commit-gated writer over the changelog, below), and an **`if`/`else` that writes both arms**
+> of one accumulator (`if 𝑝: acc += a else: acc += b`) — the per-accumulator value-`Case` write set
+> compiles via the value-preserving `filter_values` union-of-restricts inside the writer lambda (see
+> below and `../../interpreter/design-operators.md`). That desugar also resolves the former residual —
+> a value-selecting `Case` inside a lambda with no visible iteration source (a UDF body, or a
+> comprehension `if`-filter beside the element `Case`). **Not yet implemented**: a conditional *feed*
+> on an induction path (naturally partial — a follow-up).
 
-The *filter* `Case` (`[𝑔 → action; true → unit]` → `Restrict`) and now the value-selecting `Case`
-compile; a conditional induction write (`if 𝑝: total += x`) is still rejected at lowering. The
-compilation is a **literal union of restricts** — the CCL algebra stays restricts + unions — and an
-**off-path arm is never evaluated**, so a guard-protected partial expression (`x // y if y != 0 else
-0`) never faults on the path its guard excludes. A **data-collection** fan-out is lazy structurally:
-an arm whose gate is false restricts to an empty extent, and an empty extent is never iterated. The
-**scalar** value-`Case` C-form gates a `Units(1)` driver and swaps in each arm's constant via
-`MapResultToConst`; when a false gate empties the driver (all rows deleted), `MapResultToConst` returns
-a terminal-empty tile *without* pulling the arm's constant — so the off-path value (a `//`, `%`, or
-index that the gate guards) is never computed. Every fan-out shares one first-match encoding,
-`πᵢ = 𝑔ᵢ ∧ ¬⋁ⱼ˂ᵢ 𝑔ⱼ` (`synthesize_arm_predicate` in `ccl_utils`, shared between channelize, the
-value fan-outs, and the transaction path walk):
+The *filter* `Case` (`[𝑔 → action; true → unit]` → `Restrict`), the value-selecting `Case`, and the
+conditional induction write all compile. The value-`Case` compilation is a **literal union of
+restricts** — the CCL algebra stays restricts + unions — and an **off-path arm is never evaluated**,
+so a guard-protected partial expression (`x // y if y != 0 else 0`) never faults on the path its guard
+excludes. A **data-collection** fan-out is lazy structurally: an arm whose gate is false restricts to
+an empty extent, and an empty extent is never iterated. The **scalar** value-`Case` C-form gates a
+`Units(1)` driver and swaps in each arm's constant via `MapResultToConst`; when a false gate empties
+the driver (all rows deleted), `MapResultToConst` returns a terminal-empty tile *without* pulling the
+arm's constant — so the off-path value (a `//`, `%`, or index that the gate guards) is never computed.
+Every fan-out shares one first-match encoding, `πᵢ = 𝑔ᵢ ∧ ¬⋁ⱼ˂ᵢ 𝑔ⱼ` (`synthesize_arm_predicate` in
+`ccl_utils`, shared between channelize, the value fan-outs, and the transaction path walk).
 
-```
-target = ⧺ᵢ (source | 𝑝ᵢ ≫ (λ 𝑟 → 𝑣ᵢ))                                  -- channel: partial off-path
-total  = ⧺ᵢ (source | 𝑝ᵢ ≫ (λ 𝑟 → 𝑣ᵢ)) ⧺ (source | ¬⋁ᵢ𝑝ᵢ ≫ (λ 𝑟 → get_prev_seq(total, 𝑟, init)))
-```
+A **conditional induction write** takes a different, simpler route than the value fan-out: it rides
+the induction accumulator's own `{commit, writes}` **decision** rather than a union of restricted
+sources. `lower_loop_body_chain` lowers `if 𝑝: acc += e` to a statement-position `Case`
+(`[𝑝 → acc += e; true → unit]`), and `mut_elim::transform_chain`'s `Case` arm merges its
+branches into **one uniform, carry-complete writer decision over the full loop source**:
+`commit = ⋁ⱼ π̂ⱼ` (the disjunction of the writing branches' first-match guards), and each accumulator's
+`writesᵢ = Case[π̂ⱼ → wⱼᵢ; …; true → snapshotᵢ]` — a per-accumulator value-`Case` whose trailing `true`
+arm is the **carry** (the entering accumulator). `commit: false` positions are dropped from the
+changelog store (`InductionStore`, see `../../interpreter/design-operators.md`) — sparse — and the
+carry arm makes the write value **total at every position** (so the dense `Recurse` path, which
+cycles on `.writes` for an async source, honors the guard by carrying rather than dropping it). So
+the `Overwrite`/`Feed` distinction and the carry-forward live *inside one decision on one writer* — no
+per-leg restricted source, no complement leg, and none of the cyclic-convergence hazard a
+restricted-source multi-leg realization carried. Recognition packages it as an ordinary single-writer
+`Transact`; op-conversion routes it to the changelog store, and reads fold the changelog densely
+(`StoreDenseRead`). The per-accumulator value-`Case` is value-selecting inside the writer lambda,
+compiled to the **value-preserving `filter_values` union-of-restricts** (`⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`;
+`Builtin::FilterValues` → the `Filter` tile op, flat-merged with `UnionOperator::new_flat`) — an
+off-path arm is never evaluated, so a **partial op** (`//`) in a written value never faults at a
+guard-rejected position. See `../../interpreter/design-operators.md`.
 
-The presence or absence of the complement arm *is* the `Overwrite`/`Feed` distinction, and the union
-is **between letrec bindings, not inside one decision body**: a conditional mutable write emits one
-writer-site *leg per path* — the write leg over `{𝑟 : 𝐷 | π̂}` and the **carry-forward leg** over
-the complement `{𝑟 : 𝐷 | ¬̂π}` whose body passes the snapshot through — each guarded by
-`get_prev_seq` over the ⧺-union of all legs' per-key views (a shape the guardedness check already
-admits). Per-leg bindings let decision records differ per path, and a conditional feed on a path
-is **naturally partial**: `Feed(d, __legⱼ ≫ .to_k)` over the leg's restricted domain — no flag
-field. The phase walks the loop body as a *path enumeration* (a statement-position `Case` forks
-per branch plus the implicit complement; the rest of the chain clones into each path; guards
-resolve in the fork point's read-your-writes env), recognition generalizes the single-writer
-induction group to one `Transact` with one writer per leg, and op-conversion realizes the union by
-**ordered dispatch** (`DispatchRecurse`, see `../../interpreter/design-operators.md`): one
-iteration of the base extent, each position fed to exactly the leg whose predicate holds —
-faithful to the ⧺ because the leg predicates partition the domain, and position-aligned by
-construction.
+Both a **finite** loop and an **async** (streaming) source drive an induction accumulator — the
+model treats a finite domain as a stream that terminates (§Liveness). At the realization level this
+is *one* concept but currently *two* operators: the changelog `InductionStore` for the finite
+single-writer case, a dense `Recurse` fallback for async/tap loops. Collapsing them onto the single
+changelog realization (so the finite/async distinction disappears from the code as it has from the
+model) is a mapped interpreter cleanup — see *Planned: one changelog realization for every loop* in
+`../../interpreter/design-operators.md`.
 
 The value-`Case` positions ride the same union-of-restricts:
 

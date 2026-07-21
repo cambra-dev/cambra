@@ -70,17 +70,15 @@ The design of record for the recurrence construction and feed routing is
 implementation lives in `src/ccl/mut_elim.rs` (the `For`/`MutWrite` → `LetRec`
 → `Transact` via loop planning) and `src/ccl/channelize.rs` (feed routing).
 
-**Conditionals in loop bodies (designed, not yet implemented).** Today a mutation
-nested inside an `if` in a loop body is detected (`find_nested_mutation_var`) and
-**rejected** at lowering. The in-flight conditionals stack *will* add a
-`ChlStmt::If` arm to the direct-mirror loop-body lowering: each branch body will
-lower through the same recursive statement-chain helper and be emitted as a
+**Conditionals in loop bodies.** A mutation nested inside an `if` in a loop body
+lowers via a `ChlStmt::If` arm in the direct-mirror loop-body lowering: each branch
+body lowers through the same recursive statement-chain helper and is emitted as a
 statement-position `Case` — a faithful mirror, no path computation at lowering
 (mutability is a type-level fact lowering does not have). `find_mutation_loop_vars`
-will then recurse into the branches so `for x in src: if p: total += x` classifies
-as a mutation loop rather than being rejected; the branch merge is compiled
-downstream in `mut_elim`. A `for` or a `with begin():` nested inside an `if` inside
-a loop body stays rejected.
+recurses into the branches so `for x in src: if p: total += x` classifies as a
+mutation loop; the branch merge (the write leg and its carry) is compiled downstream
+in `mut_elim` (`transform_chain`). A `for` or a `with begin():` nested inside an `if`
+inside a loop body stays rejected.
 
 **Let-bindings in generator bodies** (`y = f(x); yield y`) lower to nested `Let` nodes inside the Lambda body, evaluated once per iteration of the enclosing loop.
 

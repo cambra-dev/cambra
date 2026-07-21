@@ -263,10 +263,11 @@ pub(super) fn lower_final_stmt(
                     return Err(LoweringError::unsupported(
                         last.span,
                         format!(
-                            "mutation of `{nested}` is nested inside an `if` or \
-                             inner `for` in this for-loop body; only top-level \
-                             mutations of outer-scope variables are supported \
-                             today.  Move the mutation to the top of the loop \
+                            "mutation of `{nested}` is nested inside an inner \
+                             `for` in this for-loop body; nested-loop mutation \
+                             is not yet supported (a conditional `if p: \
+                             {nested} += …` write is supported — only an inner \
+                             `for` is not).  Move the mutation to the outer loop \
                              body, or rewrite using a generator expression."
                         ),
                     ));
@@ -614,11 +615,12 @@ pub(super) fn lower_middle_stmt(
                 return Err(LoweringError::unsupported(
                     stmt.span,
                     format!(
-                        "mutation of `{nested}` is nested inside an `if` or \
-                     inner `for` in this for-loop body; only top-level \
-                     mutations of outer-scope variables are supported \
-                     today.  Move the mutation to the top of the loop \
-                     body, or rewrite using a generator expression."
+                        "mutation of `{nested}` is nested inside an inner `for` \
+                     in this for-loop body; nested-loop mutation is not yet \
+                     supported (a conditional `if p: {nested} += …` write is \
+                     supported — only an inner `for` is not).  Move the mutation \
+                     to the outer loop body, or rewrite using a generator \
+                     expression."
                     ),
                 ));
             }

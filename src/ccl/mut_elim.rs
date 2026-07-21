@@ -46,8 +46,9 @@
 use std::collections::HashMap;
 
 use crate::ccl::{
-    BaseType, Builtin, Expr, F_COMMIT, F_WRITES, HistoryKind, Lit, Name, Type, TypedBinding,
-    TypedExprNode, letrec::check_letrec_causal, symbolic::symbolic,
+    BaseType, Branch, Builtin, Expr, F_COMMIT, F_WRITES, HistoryKind, Lit, Name, Type,
+    TypedBinding, TypedExprNode, ccl_utils::synthesize_arm_predicate, letrec::check_letrec_causal,
+    symbolic::symbolic,
 };
 
 // ---------------------------------------------------------------------------
@@ -632,6 +633,14 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
         return rewrite(cont);
     }
 
+    // A conditional induction write (`if p: total += x`) lowers to a
+    // statement-position guard-`Case`; `transform_chain` merges its branches into
+    // one always-commit decision with a per-accumulator value-`Case` write set
+    // (see its `Case` arm). So the conditional case folds through the SAME
+    // single-writer path as a plain loop — one writer over the full source, no
+    // per-leg restricted sources — which recognition packages as a single-writer
+    // `Transact` and op-conversion routes to the changelog `InductionStore`.
+
     // Fold the accumulators into a decision-factored history binding, then wrap it
     // in a nested `LetRec`: re-point the continuation's trailing reads at the
     // extracted finals, recurse into it, prepend the reads, and hoist the feeds.
@@ -754,9 +763,23 @@ pub(crate) fn fold_induction_loop(
     );
 
     // Walk the body: build the RYW chain, collect feeds, and produce the
-    // terminal `{commit: true, writes, to_<feed>*}` decision record.
+    // terminal `{commit: true, writes, to_<feed>*}` decision record. `entering`
+    // is each accumulator's *raw* value on loop-body entry (`__p ▷ .i`, before any
+    // write this iteration) — the baseline a statement-`Case` compares against to
+    // decide `commit`, so an *unconditional* write before/around the `Case` still
+    // forces a change (see `conditional_decision`).
+    let entering: Vec<Expr> = accs
+        .iter()
+        .map(|(n, _)| {
+            env.get(n)
+                .expect("accumulator seeded in the RYW environment")
+                .clone()
+        })
+        .collect();
     let mut feeds: Vec<FeedSite> = Vec::new();
-    let chain = transform_chain(loop_body, &mut env, &accs, &writes_ty, &mut feeds);
+    let chain = transform_chain(
+        loop_body, &mut env, &accs, &writes_ty, &entering, &mut feeds,
+    );
 
     // The decision codomain: `{commit, writes}` plus one field per feed site.
     let mut decision_fields: Vec<(String, Type)> = vec![
@@ -963,6 +986,35 @@ fn body_has_feed(expr: &Expr) -> bool {
     matches!(expr.node, TypedExprNode::Feed { .. }) || expr.any_child(body_has_feed)
 }
 
+/// Replace the terminal `Unit` of a statement chain with `tail` — splicing the
+/// post-`Case` remainder onto the end of a branch's chain (both end in `Unit`).
+fn splice_after_unit(chain: Expr, tail: Expr) -> Expr {
+    match chain.node {
+        TypedExprNode::Lit(Lit::Unit) => tail,
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => let_in(binding, *bound_expr, splice_after_unit(*body, tail)),
+        TypedExprNode::ExprStmt { expr, body } => {
+            Expr::expr_stmt(*expr, splice_after_unit(*body, tail))
+        }
+        // A non-chain terminal: recursion has reached a leaf that is not the
+        // `Unit` sentinel a lowered chain ends in, so there is nowhere to splice
+        // `tail`. This is reachable only if `tail` is itself empty — otherwise we
+        // would silently drop continuation code (the worst failure for a
+        // statement chain). Lowering guarantees every spliceable branch ends in
+        // `Unit`, so assert the tail is trivial here rather than discarding it.
+        other => {
+            debug_assert!(
+                matches!(tail.node, TypedExprNode::Lit(Lit::Unit)),
+                "splice_after_unit would drop a non-trivial tail onto a non-`Unit` terminal"
+            );
+            Expr::new(other)
+        }
+    }
+}
+
 /// Walk the direct-mirror statement chain, threading the read-your-writes
 /// environment: `Let`s pass through (values substituted), each `MutWrite`
 /// becomes a fresh shadowing `Let` that advances the environment, each
@@ -974,6 +1026,7 @@ fn transform_chain(
     env: &mut HashMap<Name, Expr>,
     accs: &[(Name, Type)],
     writes_ty: &Type,
+    entering: &[Expr],
     feeds: &mut Vec<FeedSite>,
 ) -> Expr {
     match expr.node {
@@ -983,19 +1036,99 @@ fn transform_chain(
             body,
         } => {
             let bound = subst_env(*bound_expr, env);
-            let rest = transform_chain(*body, env, accs, writes_ty, feeds);
+            let rest = transform_chain(*body, env, accs, writes_ty, entering, feeds);
             let_in(b, bound, rest)
+        }
+        // A statement-position guard-`Case` (`if p: acc += e`, lowered by
+        // `lower_loop_body_chain` to `{gᵢ → branch; true → carry}`): merge its
+        // branches into a single always-commit decision whose write set is a
+        // per-accumulator first-match value-`Case`. A non-writing (carry) branch
+        // contributes the accumulator's snapshot, so `commit: true` writing the
+        // unchanged value is a no-op — the conditional change rides the *values*
+        // (each value-`Case` compiles via the C-form at `lambda_elim`), not a
+        // per-position commit gate. One writer over the full source, so no
+        // restricted per-leg sources and no cyclic desync — the changelog
+        // (`InductionStore`) realization the dense multi-leg `Recurse` replaced.
+        TypedExprNode::ExprStmt { expr: effect, body }
+            if matches!(
+                &effect.node,
+                TypedExprNode::Case {
+                    scrutinee: None,
+                    ..
+                }
+            ) =>
+        {
+            let TypedExprNode::Case { branches, .. } = effect.node else {
+                unreachable!("guarded by the match arm")
+            };
+            let rest = *body;
+            // Each branch: splice the post-`Case` remainder onto its chain, walk it
+            // with a cloned RYW env, and take (first-match predicate, write set).
+            // The write sets come from `decision_writes` — fully inlined (point-free
+            // over `__p`), so they are safe to use as `Case` arms and to compare
+            // structurally.
+            let mut priors: Vec<Expr> = Vec::new();
+            let mut all: Vec<(Expr, Vec<Expr>)> = Vec::new();
+            for br in branches {
+                // The first-match predicate, resolved through the RYW env so the
+                // loop item / accumulators read their writer-body snapshot slots
+                // (`__p.k` / `__p.i`) rather than the raw loop binder — the
+                // `commit` field must be point-free like `writes`.
+                let pi = subst_env(synthesize_arm_predicate(&br.guard, &priors), env);
+                priors.push(br.guard.clone());
+                let spliced = splice_after_unit(br.body, rest.clone());
+                let mut branch_env = env.clone();
+                let mut branch_feeds: Vec<FeedSite> = Vec::new();
+                let dec = transform_chain(
+                    spliced,
+                    &mut branch_env,
+                    accs,
+                    writes_ty,
+                    entering,
+                    &mut branch_feeds,
+                );
+                // NOTE (known limitation, lifted upstack): a feed inside a
+                // conditional induction branch (`for …: if p: out << …`) is NOT
+                // rejected at lowering — lowering only rejects `with begin()` in a
+                // loop branch, not a `<<`/`yield`. So such a feed reaches here and
+                // trips this assert (a compiler panic) rather than a graceful
+                // error. This is deliberately left as-is on this branch: the
+                // induction-unification work carries reply taps on the changelog
+                // store and removes this whole `branch_feeds` path, so a conditional
+                // feed riding an accumulator compiles there. Until then it panics.
+                assert!(
+                    branch_feeds.is_empty(),
+                    "a feed on a conditional induction path is not yet supported (unblocked by the changelog-tap induction realization)"
+                );
+                all.push((pi, decision_writes(&dec)));
+            }
+            // The lowered `Case` always ends in the `true → carry` complement — the
+            // write set on the path where no guard fired. That carry already has any
+            // **unconditional** write (before the `Case`, or after it in `rest`,
+            // spliced into every branch) applied, so it is the correct value-`Case`
+            // fallthrough — and it must be *inlined* (which it is, via
+            // `decision_writes`), never the raw `env` slot (a `let`-bound name would
+            // escape the writer lambda). The other branches that differ from it are
+            // the conditional writes.
+            let (_, carry) = all.pop().expect("a lowered guard-Case has a `true` arm");
+            let writing: Vec<(Expr, Vec<Expr>)> =
+                all.into_iter().filter(|(_, w)| *w != carry).collect();
+            conditional_decision(writing, carry, entering, writes_ty)
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
             match effect.node {
-                // A write advances the read-your-writes environment.
+                // A write advances the read-your-writes environment by *inlining*
+                // the written value (point-free over `__p`), not binding a `let` —
+                // the same substitution model `transact_phase::walk_block` uses.
+                // Inlining keeps every captured value self-contained: an
+                // unconditional write followed by a statement-`Case` leaves no dead
+                // `let` wrapping the decision (which would break the value-`Case`
+                // C-form compilation of the write set), and a feed reached after a
+                // write can be hoisted without stranding a branch-local binder.
                 TypedExprNode::MutWrite { name, value } => {
                     let val = subst_env(*value, env);
-                    let vty = val.ty.clone();
-                    let fresh = Name::fresh(name.base());
-                    env.insert(name.clone(), tvar(&fresh, vty.clone()));
-                    let rest = transform_chain(*body, env, accs, writes_ty, feeds);
-                    let_in(binding(fresh, vty), val, rest)
+                    env.insert(name.clone(), val);
+                    transform_chain(*body, env, accs, writes_ty, entering, feeds)
                 }
                 // A feed is captured (value resolved in the current env) and
                 // dropped from the chain; it becomes a `to_<feed>` field on
@@ -1008,7 +1141,7 @@ fn transform_chain(
                         field,
                         value: val,
                     });
-                    transform_chain(*body, env, accs, writes_ty, feeds)
+                    transform_chain(*body, env, accs, writes_ty, entering, feeds)
                 }
                 // A bare `unit` statement is a no-op: drop it and continue. This
                 // is the discarded terminal of a spliced pass-by-reference writer
@@ -1018,7 +1151,7 @@ fn transform_chain(
                 // the loop-body continuation), which `flatten_spine` right-
                 // associates onto the spine but does not elide.
                 TypedExprNode::Lit(Lit::Unit) => {
-                    transform_chain(*body, env, accs, writes_ty, feeds)
+                    transform_chain(*body, env, accs, writes_ty, entering, feeds)
                 }
                 // A nested statement sequence spliced as one effect — an inlined
                 // writer body whose head is *not* a `MutWrite` (e.g. a `Feed`, so
@@ -1030,7 +1163,7 @@ fn transform_chain(
                     body: inner_b,
                 } => {
                     let spliced = expr_stmt_typed(*inner_e, expr_stmt_typed(*inner_b, *body));
-                    transform_chain(spliced, env, accs, writes_ty, feeds)
+                    transform_chain(spliced, env, accs, writes_ty, entering, feeds)
                 }
                 other => panic!(
                     "letrec phase: unexpected statement in loop body: {}",
@@ -1081,6 +1214,160 @@ fn transform_chain(
             })
         ),
     }
+}
+
+/// The `writes` tuple elements of a `{commit, writes(, to_*)}` decision record
+/// (as [`transform_chain`] builds it) — one *self-contained* expression per
+/// accumulator, in accumulator order. A branch's write introduces RYW `let`s
+/// (`let total = __p.0 + __p.1 in {…, writes: (total)}`) that the merged
+/// value-`Case` arms live outside of, so peel and inline those bindings.
+fn decision_writes(dec: &Expr) -> Vec<Expr> {
+    let mut env: HashMap<Name, Expr> = HashMap::new();
+    let mut cur = dec;
+    loop {
+        match &cur.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                let bound = subst_env((**bound_expr).clone(), &env);
+                env.insert(binding.name.clone(), bound);
+                cur = body;
+            }
+            TypedExprNode::Record(fields) => {
+                let writes = &fields
+                    .iter()
+                    .find(|(f, _)| f == F_WRITES)
+                    .expect("letrec phase: a writer decision has a `writes` field")
+                    .1;
+                let TypedExprNode::Tuple(elts) = &writes.node else {
+                    panic!("letrec phase: a decision `writes` is a positional tuple");
+                };
+                return elts.iter().map(|e| subst_env(e.clone(), &env)).collect();
+            }
+            _ => panic!(
+                "letrec phase: a branch decision is `let* in {{commit, writes}}`, got {}",
+                symbolic(dec)
+            ),
+        }
+    }
+}
+
+/// Build the writer decision `{commit, writes}` for a statement-`Case`, from its
+/// *writing* branches (first-match predicate + write set each) and the entering
+/// accumulator `snapshot`.
+///
+/// One uniform, **carry-complete** shape covers every arity — one conditional
+/// write, `if/else`-both-write, `elif`-with-writes, and the pure-guard carry:
+///
+/// - `commit = ⋁ⱼ ĝⱼ` — the disjunction of the writing branches' first-match
+///   guards (`false` when nothing writes). This gates the *sparse* changelog: a
+///   position no writing guard admits records no change (the `InductionStore`
+///   inherits the value), so a run of carries costs nothing.
+/// - `writesᵢ = Case[ĝ₀ → w₀ᵢ; …; ĝₙ → wₙᵢ; true → snapshotᵢ]` — a per-accumulator
+///   first-match value-`Case` whose trailing `true` arm is the **carry** (the
+///   entering accumulator). The carry arm makes the write value *total at every
+///   position*: `lambda_elim` compiles this `Case` as a union of domain-restricts
+///   (`⧺ⱼ wⱼᵢ ↾ π̂ⱼ`), so a **partial op** (`//`, `%`) in a write value is only
+///   evaluated at the positions its guard admits — never at a carried position.
+///
+/// Carry-completeness is also what makes the dense `Recurse` path correct for an
+/// **async source**: that path cycles on `.writes` (not `.commit`), and `writes`
+/// now carries `snapshotᵢ` (the previous accumulator) wherever no guard fires, so
+/// the guard is honored by the value rather than silently dropped.
+fn conditional_decision(
+    writing: Vec<(Expr, Vec<Expr>)>,
+    carry: Vec<Expr>,
+    entering: &[Expr],
+    writes_ty: &Type,
+) -> Expr {
+    let bool_ty = Type::Base(BaseType::Bool);
+    let mut commit_guards: Vec<Expr> = writing.iter().map(|(g, _)| g.clone()).collect();
+    // An **unconditional** write (before the `Case`, or after it in `rest`, spliced
+    // into every branch) is baked into the `carry` — so `carry ≠ entering` means the
+    // accumulator changed at *every* position, and the change must commit
+    // everywhere. Add the `true` path: without it a conditional-only `commit =
+    // ⋁ writing` would leave the unconditional write uncommitted (a carry) at
+    // non-firing positions, silently reverting it to the previous value.
+    if carry.as_slice() != entering {
+        let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
+        t.ty = bool_ty.clone();
+        commit_guards.push(t);
+    }
+    let commit = disjoin_guards(commit_guards.into_iter(), &bool_ty);
+    let write_elts: Vec<Expr> = (0..carry.len())
+        .map(|i| {
+            // No conditional write for accumulator `i` → just the carry value (the
+            // unconditional-write-applied value, or the raw entering value if none).
+            if writing.is_empty() {
+                return carry[i].clone();
+            }
+            let mut case_branches: Vec<Branch> = writing
+                .iter()
+                .map(|(g, w)| Branch {
+                    pattern: None,
+                    guard: g.clone(),
+                    body: w[i].clone(),
+                })
+                .collect();
+            let mut carry_guard = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
+            carry_guard.ty = bool_ty.clone();
+            case_branches.push(Branch {
+                pattern: None,
+                guard: carry_guard,
+                body: carry[i].clone(),
+            });
+            let vty = carry[i].ty.clone();
+            let mut c = Expr::new(TypedExprNode::Case {
+                scrutinee: None,
+                branches: case_branches,
+            });
+            c.ty = vty;
+            c
+        })
+        .collect();
+    decision_record(commit, write_elts, writes_ty)
+}
+
+/// Disjoin guard expressions into one boolean (`false` when empty) — the writer
+/// decision's `commit` gate, true exactly when some writing branch fires.
+fn disjoin_guards(guards: impl Iterator<Item = Expr>, bool_ty: &Type) -> Expr {
+    let mut acc: Option<Expr> = None;
+    for g in guards {
+        acc = Some(match acc {
+            None => g,
+            Some(prev) => {
+                let mut o = Expr::binop(
+                    prev,
+                    crate::ccl::BinOpKind::BoolLogic(crate::ccl::LogicKind::Or),
+                    g,
+                );
+                o.ty = bool_ty.clone();
+                o
+            }
+        });
+    }
+    acc.unwrap_or_else(|| {
+        let mut f = Expr::new(TypedExprNode::Lit(Lit::Bool(false)));
+        f.ty = bool_ty.clone();
+        f
+    })
+}
+
+/// Assemble a writer decision record `{commit, writes: (write_elts…)}`.
+fn decision_record(commit: Expr, write_elts: Vec<Expr>, writes_ty: &Type) -> Expr {
+    let mut writes = Expr::tuple(write_elts);
+    writes.ty = writes_ty.clone();
+    let mut rec = Expr::new(TypedExprNode::Record(vec![
+        (F_COMMIT.to_string(), commit),
+        (F_WRITES.to_string(), writes),
+    ]));
+    rec.ty = Type::Record(vec![
+        (F_COMMIT.to_string(), Type::Base(BaseType::Bool)),
+        (F_WRITES.to_string(), writes_ty.clone()),
+    ]);
+    rec
 }
 
 /// Rename every use of `from` (bare `Var`s and `MutWrite` targets) to `to`,

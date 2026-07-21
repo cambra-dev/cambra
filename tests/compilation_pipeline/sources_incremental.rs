@@ -505,6 +505,58 @@ fn test_incremental_global_aggregate() {
 
 /// Mutation loop summing values from an incremental source, semantically
 /// equivalent to `sum(source1())` but exercising `Recurse` instead of
+/// A *conditional* induction write over an async source: `if i > 15: x := x + i`.
+/// An async (`DataSourceDomain`) extent routes to the dense `Recurse` path, which
+/// cycles on `.writes` (not `.commit`). The writer decision is *carry-complete*
+/// (`writes.x = Case[i > 15 → x + i; true → x]`), so a rejected position carries the
+/// previous accumulator rather than accumulating unconditionally — the guard is
+/// honored by the value, not silently dropped. Source `[10, 20, 30]`, guard `> 15`:
+/// only 20 and 30 accumulate, so the final `x = 50` (a dropped guard would give 60).
+#[test_log::test]
+fn test_incremental_conditional_mutation_loop() {
+    let code = "\
+x := 0
+for i in source1():
+    if i > 15:
+        x := x + i
+x";
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+
+    let consumer: Box<dyn Consumer> = Box::new(move || {});
+    let mut compiled = compile_program(&mut ctx, code, consumer).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(10)),
+        (Value::UInt(1), Value::Int(20)),
+        (Value::UInt(2), Value::Int(30)),
+    ]);
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+
+    let empty = Tile::Scalar(ColumnValue::Ints(vec![]));
+    let mut result = empty.clone();
+    for _ in 0..4 {
+        result = producer.get(producer.tiling().universal_guard());
+        if result != empty {
+            break;
+        }
+    }
+    assert_eq!(
+        result,
+        Tile::Scalar(ColumnValue::Ints(vec![50])),
+        "conditional induction over an async source must honor the guard (20 + 30), not sum all (60)"
+    );
+}
+
 /// `MapAggregate`.  Verifies that `Recurse` correctly:
 /// - Re-reads its `domain` input as the source grows in batches.
 /// - Holds back the final emission until the source signals it's done.
