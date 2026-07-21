@@ -667,6 +667,7 @@ mod tests {
         // has no finite, enumerable extent.
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -681,6 +682,7 @@ mod tests {
     fn should_inline_scalar_to_scalar() {
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -694,9 +696,11 @@ mod tests {
         // eliminates the nested lambda before any `curry` combinator is produced.
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
             }),
@@ -714,11 +718,13 @@ mod tests {
         let refinement = Refinement { predicate: pred };
         let inner_fun = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Refinement(Box::new(inner_fun), refinement)),
         };
@@ -730,6 +736,7 @@ mod tests {
         // UIntRange(3) → Int: iterable domain, don't inline.
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -741,6 +748,7 @@ mod tests {
         // (Int, Int) → Int: both components non-iterable, should inline.
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Tuple(vec![
                 Type::Base(BaseType::Int),
                 Type::Base(BaseType::Int),
@@ -756,6 +764,7 @@ mod tests {
         // non-iterable, so this is inlined.
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Tuple(vec![
                 Type::UIntRange(3),
                 Type::Base(BaseType::Int),
@@ -980,6 +989,7 @@ mod tests {
     fn fn_ty(domain: Type, codomain: Type) -> Type {
         Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
         }

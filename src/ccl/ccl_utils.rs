@@ -298,8 +298,14 @@ pub fn cast_target_refinement(target: &Type) -> Option<Refinement> {
 ///
 /// `base_domain` and `codomain` are typically `Type::Hole` at lowering time;
 /// inference fills them in by unifying against the value being cast.
+///
+/// The result is a **data** function (`⤇`): the refined domain is a filtered
+/// *extent* the runtime iterates, so the cast target must carry `Data` kind —
+/// a filtered collection flows into aggregates and joins, which demand `Data`.
+/// Building it as `Compute` would trip the `Compute <: Data` rejection at every
+/// filtered comprehension / groupby.
 pub fn refined_fn_type(base_domain: Type, predicate: Expr, codomain: Type) -> Type {
-    Type::fun(
+    Type::data_fun(
         Type::Refinement(
             Box::new(base_domain),
             Refinement {
@@ -320,14 +326,8 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
     match ty {
         Type::Refinement(base, _) => strip_refinements(base),
         Type::Fun {
-            name,
-            domain,
-            codomain,
-        } => Type::Fun {
-            name: name.clone(),
-            domain: Box::new(strip_refinements(domain)),
-            codomain: Box::new(strip_refinements(codomain)),
-        },
+            domain, codomain, ..
+        } => Type::fun_like(ty, strip_refinements(domain), strip_refinements(codomain)),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(strip_refinements).collect()),
         Type::Record(fs) => Type::Record(
             fs.iter()

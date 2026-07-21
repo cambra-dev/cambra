@@ -209,3 +209,35 @@ fn test_let_nonscalar(#[case] code: &str, #[case] expected: Tile) {
 fn test_tuples(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
+
+// ---------------------------------------------------------------------------
+// Conditional-collection coproduct: the safety chokepoint
+// ---------------------------------------------------------------------------
+
+/// A control-flow join of two differently-sized collections types as a
+/// **coproduct** over both extents (an `Index`-tagged `Variant` of data
+/// functions — `Type::extent_coproduct`; see collections.md). This lays only
+/// the *type-level* coproduct (formation + the `Variant <: Fun` consume rule,
+/// so it can be consumed at the type level); *compiling* it — the value-`Case`
+/// fan-out that eliminates it into a union of restricts — lands with
+/// value-`Case` compilation. Until then a coproduct-consuming program must be
+/// rejected **cleanly** (a returned compile error, never a panic and never a
+/// silent miscompile). The value-`Case` is caught at lambda elimination — the
+/// natural not-yet-implemented boundary value-`Case` compilation graduates.
+/// This pins the contract end-to-end: it type-checks, then fails to compile
+/// without crashing.
+#[test]
+fn conditional_collection_rejected_cleanly() {
+    use cambra::ccl::context::{GlobalContext, compile_program};
+    use cambra::interpreter::Consumer;
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let errs = compile_program(&mut ctx, "sum([1, 2] if True else [1, 2, 3])", consumer)
+        .err()
+        .expect("a coproduct-consuming program must fail to compile, not miscompile or panic");
+    let rendered = format!("{errs:?}");
+    assert!(
+        rendered.contains("lambda elimination") && rendered.contains("Case"),
+        "expected a clean value-Case not-yet-compilable rejection, got:\n{rendered}"
+    );
+}

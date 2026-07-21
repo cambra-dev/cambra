@@ -82,7 +82,219 @@ impl AtomKey {
 /// neither directly, so [`coalesce_compact`](super::coalesce::coalesce_compact)
 /// picks a single concrete type from these bag-of-types contributions and
 /// errors on conflict.
-#[derive(Debug, Clone, Default)]
+/// The kind of a merged function slot. Three-state so [`CompactType::merge`]
+/// stays infallible: a `Data ⊔ Compute` collision that would collapse a
+/// conditional collection's extents becomes `Conflict` and is reported loudly at coalesce
+/// ([`super::coalesce::CoalesceError::ExtentJoinConflict`]), never a mid-merge
+/// panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindMerge {
+    /// Capability domain — the ordinary contravariant meet.
+    Compute,
+    /// Extent domain — joins are lossless (`union_extents`).
+    Data,
+    /// A data/compute or multi-extent collision; deferred to coalesce.
+    Conflict,
+}
+
+impl KindMerge {
+    /// Resolve a function's kind against its (already-compacted) domain. A
+    /// concrete kind passes through; a [`crate::ccl::ty::FunKind::Var`] resolves
+    /// from its bounds over the two-point lattice `Data ⊑ Compute` (a `Compute`
+    /// lower bound → `Compute`, a `Data` upper bound → `Data`, both → the
+    /// `Compute <: Data` conflict), and an **unconstrained** var resolves from
+    /// the domain: an *extent-shaped* domain (a collection index the runtime
+    /// iterates) → `Data`, else the `Compute` capability default. Passing the
+    /// domain is what lets a map/comprehension — a lambda whose kind var picks
+    /// up no bound — resolve `Data`, so two of them join losslessly (`union_extents`)
+    /// rather than colliding as compute meets.
+    fn of(kind: &crate::ccl::ty::FunKind, dom: &CompactType) -> Self {
+        use crate::ccl::ty::FunKind;
+        match kind {
+            FunKind::Compute => KindMerge::Compute,
+            FunKind::Data => KindMerge::Data,
+            FunKind::Var(v) => {
+                let b = v.bounds.borrow();
+                match (b.forced_compute, b.forced_data) {
+                    (true, true) => KindMerge::Conflict,
+                    (false, true) => {
+                        // `forced_data` means this function is demanded where its
+                        // extent is iterated. If the domain is *provably* scalar (a
+                        // primitive or a higher-order capability parameter), the
+                        // demand contradicts the shape: a capability was supplied
+                        // where a data extent is required (`Compute <: Data`). That
+                        // is a real conflict, surfaced loudly at coalesce like the
+                        // two-flag case below — never a silent relabelling of a
+                        // scalar as a collection (which the runtime would then try
+                        // to iterate over a domain the value does not cover).
+                        if is_scalar_domain(dom) {
+                            KindMerge::Conflict
+                        } else {
+                            KindMerge::Data
+                        }
+                    }
+                    (true, false) => KindMerge::Compute,
+                    (false, false) => {
+                        if is_extent_domain(dom) {
+                            KindMerge::Data
+                        } else {
+                            KindMerge::Compute
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether a compacted domain is **extent-shaped** — a collection index (which
+/// the runtime iterates), as opposed to a scalar/capability parameter. Used to
+/// resolve an unconstrained kind var: an extent domain means the function is a
+/// data collection (`Data`), a capability domain a compute function (`Compute`).
+///
+/// Extent atoms are `UIntRange` (a list's `[0, n)`), `Source` (a data source's
+/// domain), and `Txn` (a register's commit order). A product/sum of extents (a
+/// multi-generator comprehension's record domain, a union's variant domain) is
+/// itself an extent iff every component is. A scalar (`Prim`), a function-typed
+/// domain (a higher-order capability), or a still-unresolved variable is *not*
+/// an extent — the conservative `Compute` side (a polymorphic-in-kind function
+/// whose domain resolves later is the residual the bounds-based path handles).
+fn is_extent_domain(ct: &CompactType) -> bool {
+    if ct.atoms.iter().any(|a| matches!(a, AtomKey::Prim(_))) {
+        return false;
+    }
+    if ct
+        .atoms
+        .iter()
+        .any(|a| matches!(a, AtomKey::UIntRange(_) | AtomKey::Source(_) | AtomKey::Txn))
+    {
+        return true;
+    }
+    // A higher-order (function-typed) domain is a capability.
+    if ct.fun.is_some() {
+        return false;
+    }
+    // A product / sum of extents is an extent.
+    if let Some(rec) = &ct.rec
+        && !rec.is_empty()
+    {
+        return rec.values().all(is_extent_domain);
+    }
+    if let Some(var) = &ct.var
+        && !var.is_empty()
+    {
+        return var.values().all(is_extent_domain);
+    }
+    // Bare variable / empty shape: unresolved → conservative Compute.
+    false
+}
+
+/// Whether a compacted domain is *provably* scalar/capability-shaped: it carries
+/// a primitive atom or is function-typed. This is stronger than `!is_extent_domain`,
+/// which also holds for a still-unresolved domain (a bare var that may yet resolve
+/// to an extent) — used only to assert the `forced_data`/domain-edge coupling.
+fn is_scalar_domain(ct: &CompactType) -> bool {
+    ct.atoms.iter().any(|a| matches!(a, AtomKey::Prim(_))) || ct.fun.is_some()
+}
+
+/// A merged function shape. `domains` holds one entry for an ordinary function
+/// (the meet of the merged domains); a positive `Data ⊔ Data` join accumulates
+/// ≥ 2 deduplicated alternatives — the candidate extents of a conditional collection, materialized
+/// by coalesce.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactFun {
+    /// The Pi (element) binder, `na.or(nb)` on merge.
+    pub name: Option<Name>,
+    /// The merged kind.
+    pub kind: KindMerge,
+    /// Domain alternatives — `len == 1` unless a conditional collection formed.
+    pub domains: Vec<CompactType>,
+    /// The codomain (covariant).
+    pub codomain: Box<CompactType>,
+}
+
+/// The lossless join of two data-function domain-alternative lists: the union
+/// of the alternatives, deduplicated by structural [`CompactType`] equality.
+/// Never a meet — this preserves every extent, which coalesce materializes as
+/// a conditional-collection coproduct ([`crate::ccl::Type::extent_coproduct`]);
+/// a single surviving extent is a plain data function.
+fn union_extents(mut a: Vec<CompactType>, b: Vec<CompactType>) -> Vec<CompactType> {
+    for d in b {
+        if !a.contains(&d) {
+            a.push(d);
+        }
+    }
+    a
+}
+
+impl CompactFun {
+    /// Merge two function slots. `pol` is the *outer* polarity; domains merge
+    /// contravariantly (at `!pol`), the codomain covariantly (at `pol`).
+    fn merge(pol: bool, a: CompactFun, b: CompactFun) -> CompactFun {
+        use KindMerge::*;
+        let name = a.name.clone().or_else(|| b.name.clone());
+        let codomain = Box::new(CompactType::merge(pol, *a.codomain, *b.codomain));
+        // The contravariant domain meet, defined only when both sides carry a
+        // single extent (a multi-extent collection has no single domain to meet).
+        let meet = |x: Vec<CompactType>, y: Vec<CompactType>| -> Vec<CompactType> {
+            debug_assert!(
+                x.len() == 1 && y.len() == 1,
+                "meet of a multi-extent domain"
+            );
+            vec![CompactType::merge(
+                !pol,
+                x.into_iter().next().unwrap(),
+                y.into_iter().next().unwrap(),
+            )]
+        };
+        // On any prior conflict, stay conflicted (keep the wider domain list
+        // so coalesce can render diagnostics).
+        let widest = |x: Vec<CompactType>, y: Vec<CompactType>| {
+            if x.len() >= y.len() { x } else { y }
+        };
+        let (kind, domains) = if a.kind == Conflict || b.kind == Conflict {
+            (Conflict, widest(a.domains, b.domains))
+        } else if pol {
+            // Positive (join).
+            match (a.kind, b.kind) {
+                (Data, Data) => (Data, union_extents(a.domains, b.domains)),
+                (Compute, Compute) => (Compute, meet(a.domains, b.domains)),
+                // Data ⊔ Compute: an honest upcast to a callable (Compute) iff
+                // the data side is a single extent; collapsing a conditional collection to a meet
+                // would be multi-extent loss → Conflict.
+                _ => {
+                    if a.domains.len() == 1 && b.domains.len() == 1 {
+                        (Compute, meet(a.domains, b.domains))
+                    } else {
+                        (Conflict, widest(a.domains, b.domains))
+                    }
+                }
+            }
+        } else {
+            // Negative (meet): the stronger contract wins (Data if either is).
+            let k = if a.kind == Data || b.kind == Data {
+                Data
+            } else {
+                Compute
+            };
+            if a.domains.len() == 1 && b.domains.len() == 1 {
+                (k, meet(a.domains, b.domains))
+            } else {
+                // Two multi-extent requirements meeting at a negative position — no current
+                // program produces this; flag it loudly at coalesce.
+                (Conflict, widest(a.domains, b.domains))
+            }
+        };
+        CompactFun {
+            name,
+            kind,
+            domains,
+            codomain,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompactType {
     /// Variable contributions from this position. Multiple variables
     /// can co-occur (e.g. when two projection morphisms both flow into
@@ -116,13 +328,11 @@ pub struct CompactType {
     /// the absorbing element (here from intersecting disjoint tag sets at
     /// negative polarity).
     pub var: Option<BTreeMap<FieldKey, CompactType>>,
-    /// Function shape, if any: an optional Pi binder name plus the domain
-    /// and codomain. Recursively merged with polarity flip on the domain.
-    /// The name is preserved so a dependent codomain's refinement predicate
-    /// keeps its binder bound through coalesce; it is stripped at
-    /// materialization when the codomain does not actually reference it
-    /// (keeping ordinary functions `name: None`).
-    pub fun: Option<(Option<Name>, Box<CompactType>, Box<CompactType>)>,
+    /// Function shape, if any: see [`CompactFun`]. Carries the Pi binder, the
+    /// merged [`KindMerge`], the domain alternatives (one, unless a positive
+    /// `Data ⊔ Data` join accumulated alternatives via [`union_extents`]), and the
+    /// codomain. Recursively merged with polarity flip on the domain.
+    pub fun: Option<CompactFun>,
     /// Witness contributions at this position. A set with `==`
     /// membership (deduplicated by [`Refinement`]'s structural `PartialEq`),
     /// stored as a `Vec` in first-insertion order. A refinement-set is
@@ -176,15 +386,7 @@ impl CompactType {
         };
         let fun = match (lhs.fun, rhs.fun) {
             (None, f) | (f, None) => f,
-            (Some((na, la, ra)), Some((nb, lb, rb))) => Some((
-                // Prefer a present binder name; two distinct names at one
-                // position only arise for unrelated functions merging, where
-                // either is as good (the name is stripped at coalesce unless
-                // the codomain references it).
-                na.or(nb),
-                Box::new(Self::merge(!pol, *la, *lb)),
-                Box::new(Self::merge(pol, *ra, *rb)),
-            )),
+            (Some(a), Some(b)) => Some(CompactFun::merge(pol, a, b)),
         };
         let refinements = Self::merge_refinements(pol, lhs.refinements, rhs.refinements);
         // History children merge componentwise at the outer polarity
@@ -430,6 +632,7 @@ fn compact_go(
         Type::Hole => CompactType::empty(),
         Type::Fun {
             name,
+            kind,
             domain: d,
             codomain: c,
         } => {
@@ -446,7 +649,12 @@ fn compact_go(
             };
             let cod = compact_go(c, pol, &cod_acc, &BTreeSet::new(), st);
             CompactType {
-                fun: Some((name.clone(), Box::new(dom), Box::new(cod))),
+                fun: Some(CompactFun {
+                    name: name.clone(),
+                    kind: KindMerge::of(kind, &dom),
+                    domains: vec![dom],
+                    codomain: Box::new(cod),
+                }),
                 ..Default::default()
             }
         }

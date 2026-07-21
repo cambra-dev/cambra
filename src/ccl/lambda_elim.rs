@@ -341,9 +341,13 @@ fn elim_lambda_impl(
     let body_ty = body.ty.clone();
     let result_ty = match fun_ty_or_hole(param_ty, &body_ty) {
         Type::Fun {
-            domain, codomain, ..
+            domain,
+            codomain,
+            kind,
+            ..
         } if crate::ccl::subst::type_free_vars(&body_ty).contains(param) => Type::Fun {
             name: Some(param.clone()),
+            kind,
             domain,
             codomain,
         },
@@ -927,6 +931,7 @@ mod tests {
     fn fun_ty(a: Type, b: Type) -> Type {
         Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(a),
             codomain: Box::new(b),
         }

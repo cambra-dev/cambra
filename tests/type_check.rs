@@ -53,6 +53,7 @@ fn infer_program_with_sources(code: &str, sources: &[(&str, Type)]) -> Type {
             name,
             Type::Fun {
                 name: None,
+                kind: cambra::ccl::FunKind::Compute,
                 domain: Box::new(Type::DataSource(name.to_string())),
                 codomain: Box::new(elem_ty.clone()),
             },
@@ -95,6 +96,7 @@ fn infer_program_with_sources_err(code: &str, sources: &[(&str, Type)]) -> Vec<I
             name,
             Type::Fun {
                 name: None,
+                kind: cambra::ccl::FunKind::Compute,
                 domain: Box::new(Type::DataSource(name.to_string())),
                 codomain: Box::new(elem_ty.clone()),
             },
@@ -184,13 +186,68 @@ fn test_unary_op(#[case] code: &str, #[case] expected: BaseType) {
 
 #[test]
 fn test_list_literal() {
+    // A list literal is a **data** function (extent domain).
     assert_eq!(
         infer_program("[1, 2, 3]"),
-        Type::Fun {
-            name: None,
-            domain: Box::new(Type::UIntRange(3)),
-            codomain: Box::new(int())
-        }
+        Type::data_fun(Type::UIntRange(3), int())
+    );
+}
+
+#[test]
+fn test_conditional_collection_forms_coproduct() {
+    // A control-flow join of two collections with different extents is
+    // lossless: it forms a **coproduct** over both extents (never a lossy
+    // meet-domain function). `[1, 2]` is `[0, 1] ⤇ Int`, `[1, 2, 3]` is
+    // `[0, 2] ⤇ Int`, so the join is the `Index`-tagged sum
+    // `([0, 1] ⤇ Int) | ([0, 2] ⤇ Int)` — a plain sum, not a dependent sum
+    // (a finite branch set needs no witness; see collections.md).
+    assert_eq!(
+        infer_program("[1, 2] if True else [1, 2, 3]"),
+        Type::extent_coproduct(vec![Type::UIntRange(2), Type::UIntRange(3)], None, int())
+    );
+}
+
+#[test]
+fn test_conditional_collection_same_extent_collapses() {
+    // Idempotence: when both arms share an extent, the coproduct collapses back
+    // to a plain data function — no spurious 2-arm coproduct (`union_extents`
+    // dedups the shared extent).
+    assert_eq!(
+        infer_program("[1, 2] if True else [3, 4]"),
+        Type::data_fun(Type::UIntRange(2), int())
+    );
+}
+
+#[test]
+fn test_conditional_record_arms_join_by_field_intersection() {
+    // `emit_case` types arms with `require_sub` (a lattice join), not the old
+    // strict `require_eq` — so two record arms with differing fields no longer
+    // fail; they join to the common-field intersection at positive polarity.
+    // `{a, b} if c else {a, c}` → `{a: Int}`. Pins the widening so a future
+    // change to record-arm polarity can't silently alter which conditionals
+    // type-check. (design/type-inference.md, Case-arm lattice joins)
+    assert_eq!(
+        infer_program("{a: 1, b: 2} if True else {a: 1, c: 3}").to_string(),
+        "{a: Int}"
+    );
+}
+
+#[test]
+fn test_aggregate_over_scalar_lambda_is_rejected() {
+    // Summing a plain `Int ⇒ Int` lambda demands its kind var be `Data` (an
+    // iterable extent) while its domain is provably scalar — the `Compute <:
+    // Data` violation. The rejection must surface at coalesce for a *var*-kinded
+    // user lambda (not only the concrete-`Compute` case), and it must be a clean
+    // error rather than a debug panic / silent miskind. Regression for the
+    // kind-inference rejection being inert on `FunKind::Var`.
+    let errs = infer_program_err("f = lambda i: i + 1\nsum(f)");
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            InferError::Unsupported(m)
+                if m.contains("compute function") && m.contains("data collection")
+        )),
+        "expected a compute-where-data-required rejection, got {errs:?}"
     );
 }
 
@@ -201,6 +258,7 @@ fn test_list_comp_identity() {
         infer_program("[x for x in [1, 2]]"),
         Type::Fun {
             name: None,
+            kind: cambra::ccl::FunKind::Data,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(int())
         }
@@ -214,6 +272,7 @@ fn test_list_comp_arithmetic_body() {
         infer_program("[x + 1 for x in [1, 2]]"),
         Type::Fun {
             name: None,
+            kind: cambra::ccl::FunKind::Data,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(int())
         }
@@ -228,6 +287,7 @@ fn test_list_comp_two_gens() {
         ty,
         Type::Fun {
             name: None,
+            kind: cambra::ccl::FunKind::Data,
             domain: Box::new(Type::Tuple(vec![Type::UIntRange(2), Type::UIntRange(2)])),
             codomain: Box::new(int())
         },
@@ -579,7 +639,11 @@ fn test_ternary(#[case] code: &str, #[case] expected: BaseType) {
 
 #[test]
 fn test_if_else_arm_type_mismatch() {
-    // Arms return different types — inference must report a type mismatch.
+    // Arms return different scalar types. Under the lattice-join `Case` rule
+    // the arms are constrained into one result variable; two incompatible
+    // atoms at that positive position are an `IncompatibleBounds` error (the
+    // sound union relaxation for heterogeneous scalars is deferred — see
+    // design/type-inference.md §4.6). Still a type error, as it must be.
     let err = infer_program_err(
         r#"
 if True:
@@ -590,9 +654,11 @@ else:
         .trim(),
     );
     assert!(
-        err.iter()
-            .any(|e| matches!(e, InferError::TypeMismatch { .. })),
-        "expected TypeMismatch, got {err:?}"
+        err.iter().any(|e| matches!(
+            e,
+            InferError::IncompatibleBounds { .. } | InferError::TypeMismatch { .. }
+        )),
+        "expected an arm-mismatch error, got {err:?}"
     );
 }
 
@@ -621,14 +687,14 @@ fn test_self_application_types() {
 f = lambda x: x > 1
 f
 ",
-    Type::Fun { name: None, domain: Box::new(int()), codomain: Box::new(bool_ty()) }
+    Type::Fun { name: None, kind: cambra::ccl::FunKind::Compute, domain: Box::new(int()), codomain: Box::new(bool_ty()) }
 )]
 #[case::arithmetic(
     r"
 f = lambda x: x + 1
 f
 ",
-    Type::Fun { name: None, domain: Box::new(int()), codomain: Box::new(int()) }
+    Type::Fun { name: None, kind: cambra::ccl::FunKind::Compute, domain: Box::new(int()), codomain: Box::new(int()) }
 )]
 fn test_lambda_unapplied(#[case] code: &str, #[case] expected: Type) {
     assert_eq!(infer_program(code), expected);
@@ -922,7 +988,12 @@ mod letrec_typing {
     /// `ι = [0,3]`, `ν = Int`.
     #[test]
     fn guarded_single_binding_letrec_typechecks() {
-        let cnt_ty = Type::fun(Type::UIntRange(3), int());
+        // The recurrence carrier is a *data collection* (`⤇`): `cnt` is indexed
+        // by the iteration extent `[0, 2]` and read back through `get_prev_seq`,
+        // whose history argument demands `Data`. Declaring it `Compute`
+        // (`Type::fun`) is the miskind the `Compute <: Data` rejection now
+        // catches at the recurrence's introduction.
+        let cnt_ty = Type::data_fun(Type::UIntRange(3), int());
         let def = Expr::lambda(
             "r",
             Type::UIntRange(3),

@@ -412,6 +412,27 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
     // re-mints (each rebuilt as a fresh `Rc`) compare equal structurally,
     // and nothing downstream depends on which term instance the codomain
     // holds.
+    //
+    // Stamp the site's kind `Data`: a `wrap_with_iterate` result is, by
+    // construction, an *iterated collection* — the runtime sweeps its domain
+    // extent — whatever (possibly `Compute`/var) kind the value-producer body
+    // inferred. This is what gives an identity comprehension `[x for x in xs]`
+    // display parity (`⤇`) with the bare list `xs` it denotes: both are the
+    // same collection, so both render the data arrow.
+    let site_ty = match site_ty {
+        Type::Fun {
+            name,
+            domain,
+            codomain,
+            ..
+        } => Type::Fun {
+            name,
+            kind: crate::ccl::ty::FunKind::Data,
+            domain,
+            codomain,
+        },
+        other => other,
+    };
     *expr = typed_compose(elts).with_ty(site_ty);
 }
 

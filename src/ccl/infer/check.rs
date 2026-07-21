@@ -102,7 +102,7 @@ impl Typing for CheckCtx {
         // truth for width/variance and (since refinements ride the lattice as
         // restriction witnesses) witness subsetting. A failure is recorded (not
         // propagated) so the walk continues and reports every error.
-        if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::new()) {
+        if let Err(e) = constrain_subtype(sub, sup, &mut ConstrainCache::new_kind_blind()) {
             self.errors.push(map_constrain_err(e, &at()));
         }
         Ok(())

@@ -103,37 +103,47 @@ impl OperatorSchemes {
         // Not: Bool → Bool
         let not_op = PolyScheme::mono(fun(prim(BaseType::Bool), prim(BaseType::Bool)));
 
-        // Sum: ∀α. (α → Int) → Int. The full operator type: consumes a
-        // collection (a function whose domain α is unconstrained) and folds
-        // its Int codomain to an Int. Inline-built so α gets its own fresh
-        // var even though it's unconstrained.
+        // Sum: ∀α. (α ⤇ Int) → Int. The full operator type: consumes a
+        // **collection** (a data function whose extent α is unconstrained) and
+        // folds its Int codomain to an Int. Inline-built so α gets its own
+        // fresh var even though it's unconstrained.
         let alpha = fresh_var(BODY_LEVEL);
         let aggregate_sum = PolyScheme::poly(
             SCHEME_LEVEL,
-            fun(fun(alpha.clone(), prim(BaseType::Int)), prim(BaseType::Int)),
+            fun(
+                Type::data_fun(alpha.clone(), prim(BaseType::Int)),
+                prim(BaseType::Int),
+            ),
         );
 
-        // Max: ∀α γ. (α → γ) → γ. Consumes a collection and folds its
+        // Max: ∀α γ. (α ⤇ γ) → γ. Consumes a collection and folds its
         // codomain γ to a result of the same type.
         let alpha = fresh_var(BODY_LEVEL);
         let gamma = fresh_var(BODY_LEVEL);
-        let aggregate_max = PolyScheme::poly(SCHEME_LEVEL, fun(fun(alpha, gamma.clone()), gamma));
+        let aggregate_max = PolyScheme::poly(
+            SCHEME_LEVEL,
+            fun(Type::data_fun(alpha, gamma.clone()), gamma),
+        );
 
-        // FinalOrDefault: ∀α β. ((α → β), β) → β
-        // Inline-built (not via `normalize_annotation`) so the codomain of the
-        // stream and the default share one variable `β`.
+        // FinalOrDefault: ∀α β. ((α ⤇ β), β) → β. The first field is a
+        // collection stream. Inline-built (not via `normalize_annotation`) so
+        // the codomain of the stream and the default share one variable `β`.
         let alpha = fresh_var(BODY_LEVEL);
         let beta = fresh_var(BODY_LEVEL);
         let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
-        tup.insert(FieldKey::Index(0), fun(alpha.clone(), beta.clone()));
+        tup.insert(
+            FieldKey::Index(0),
+            Type::data_fun(alpha.clone(), beta.clone()),
+        );
         tup.insert(FieldKey::Index(1), beta.clone());
         let final_or_default = PolyScheme::poly(SCHEME_LEVEL, fun(product(tup), beta));
 
-        // GetPrevSeq: ∀ι ν. ((ι → ν), ι, ν) → ν — history, position, default.
+        // GetPrevSeq: ∀ι ν. ((ι ⤇ ν), ι, ν) → ν — history (a collection),
+        // position, default.
         let iota = fresh_var(BODY_LEVEL);
         let nu = fresh_var(BODY_LEVEL);
         let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
-        tup.insert(FieldKey::Index(0), fun(iota.clone(), nu.clone()));
+        tup.insert(FieldKey::Index(0), Type::data_fun(iota.clone(), nu.clone()));
         tup.insert(FieldKey::Index(1), iota);
         tup.insert(FieldKey::Index(2), nu.clone());
         let get_prev_seq = PolyScheme::poly(SCHEME_LEVEL, fun(product(tup), nu));
@@ -156,7 +166,8 @@ impl OperatorSchemes {
             ("write".to_string(), nu.clone()),
         ]);
         let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
-        tup.insert(FieldKey::Index(0), fun(iota, commit_record));
+        // The commit stream (field 0) is a collection — a data function.
+        tup.insert(FieldKey::Index(0), Type::data_fun(iota, commit_record));
         tup.insert(FieldKey::Index(1), Type::Txn);
         tup.insert(FieldKey::Index(2), nu.clone());
         let get_prev_txn = PolyScheme::poly(SCHEME_LEVEL, fun(product(tup), nu));

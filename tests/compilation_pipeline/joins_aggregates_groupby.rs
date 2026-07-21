@@ -164,32 +164,32 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[1,2,3]",
-    "iterate ≫ [1, 2, 3]:([0, 2] ⇒ Int)",
+    "iterate ≫ [1, 2, 3]:([0, 2] ⤇ Int)",
     make_int_list(&[1,2,3])
 )]
 #[case(
     "x = [1,2,3]; x",
-    "let x : ([0, 2] ⇒ Int) = iterate ≫ [1, 2, 3]\nin x:([0, 2] ⇒ Int)",
+    "let x : ([0, 2] ⤇ Int) = iterate ≫ [1, 2, 3]\nin x:([0, 2] ⤇ Int)",
     make_int_list(&[1,2,3])
 )]
 #[case(
     "x = [1,2,3]; [y + 10 for y in x]",
-    "let x : ([0, 2] ⇒ Int) = iterate ≫ [1, 2, 3]\nin x ≫ (id, 10 ▷ const) ▷ zip ≫ add:([0, 2] ⇒ Int)",
+    "let x : ([0, 2] ⤇ Int) = iterate ≫ [1, 2, 3]\nin x ≫ (id, 10 ▷ const) ▷ zip ≫ add:([0, 2] ⇒ Int)",
     make_int_list(&[11,12,13])
 )]
 #[case(
     "[x + 10 + x for x in [1,2,3]]",
-    "iterate ≫ [1, 2, 3] ≫ ((id, 10 ▷ const) ▷ zip ≫ add, id) ▷ zip ≫ add:([0, 2] ⇒ Int)",
+    "iterate ≫ [1, 2, 3] ≫ ((id, 10 ▷ const) ▷ zip ≫ add, id) ▷ zip ≫ add:([0, 2] ⤇ Int)",
     make_int_list(&[12,14,16])
 )]
 #[case(
     "y = 10; [x + y for x in [1,2,3]]",
-    "let y : Int = 10\nin iterate ≫ [1, 2, 3] ≫ (id, y ▷ const) ▷ zip ≫ add:([0, 2] ⇒ Int)",
+    "let y : Int = 10\nin iterate ≫ [1, 2, 3] ≫ (id, y ▷ const) ▷ zip ≫ add:([0, 2] ⤇ Int)",
     make_int_list(&[11,12,13])
 )]
 #[case(
     "[x for x in [False,True] if x]",
-    "iterate ▷ ([false, true] ▷ restrict) ≫ cast([false, true]):({[0, 1] | __elem ▷ [false, true]} ⇒ Bool)",
+    "iterate ▷ ([false, true] ▷ restrict) ≫ cast([false, true]):({[0, 1] | __elem ▷ [false, true]} ⤇ Bool)",
     Tile::SealedFunction {
         domain: ColumnValue::UInts(vec![1]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Bools(BitVec::from_elem(1, true)))),
@@ -199,7 +199,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + 10 for x in [1,2,3] if x == 2]",
-    "iterate ▷ (([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq) ▷ restrict) ≫ cast([1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add):({[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq)} ⇒ Int)",
+    "iterate ▷ (([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq) ▷ restrict) ≫ cast([1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add):({[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 2 ▷ const) ▷ zip ≫ eq)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::UInts(vec![1]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![12]))),
@@ -209,7 +209,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y for x in [1,2,3] for y in [10,20]]",
-    "iterate ≫ (.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:(([0, 2], [0, 1]) ⇒ Int)",
+    "iterate ≫ (.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add:(([0, 2], [0, 1]) ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
@@ -225,7 +225,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[(x, y) for x in [1,2,3] for y in [10,20]]",
-    "iterate ≫ (.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip:(([0, 2], [0, 1]) ⇒ (Int, Int))",
+    "iterate ≫ (.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip:(([0, 2], [0, 1]) ⤇ (Int, Int))",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
@@ -244,7 +244,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x for x in [1,2,3] for y in [10,20]]",
-    "iterate ≫ .0 ≫ [1, 2, 3]:(([0, 2], [0, 1]) ⇒ Int)",
+    "iterate ≫ .0 ≫ [1, 2, 3]:(([0, 2], [0, 1]) ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0, 0, 1, 1, 2, 2])),
@@ -260,7 +260,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y for x in [1,2,3] if x == 2 for y in [10,20] if y == 10]",
-    "iterate ▷ ((((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add):({([0, 2], [0, 1]) | __elem ▷ (((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and)} ⇒ Int)",
+    "iterate ▷ ((((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast((.0 ≫ [1, 2, 3], .1 ≫ [10, 20]) ▷ zip ≫ add):({([0, 2], [0, 1]) | __elem ▷ (((.0 ≫ [1, 2, 3], 2 ▷ const) ▷ zip ≫ eq, (.1 ≫ [10, 20], 10 ▷ const) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![1])),
@@ -275,18 +275,25 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     }
 )]
 #[case(
+    // An identity comprehension collapses to `iterate ≫ [1, 2, 3]`; because
+    // `wrap_with_iterate` stamps its result `Data` (an iterated collection is,
+    // by construction, an extent the runtime sweeps), it displays `⤇` in parity
+    // with the bare list literal `[1, 2, 3]` (case above) it denotes. (The one
+    // residual `⇒` is a comprehension whose *source is a let-bound var* —
+    // `x = [1,2,3]; [y+10 for y in x]` — whose compose domain is reconstructed
+    // post-coalesce, so the kind var resolves before its extent is known.)
     "[x for x in [x for x in [x for x in [1,2,3]]]]",
-    "iterate ≫ [1, 2, 3]:([0, 2] ⇒ Int)",
+    "iterate ≫ [1, 2, 3]:([0, 2] ⤇ Int)",
     make_int_list(&[1,2,3])
 )]
 #[case(
     "[x for x in [y for y in [1,2,3] if y < 3] if x < 2]",
-    "iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(cast([1, 2, 3])):({{[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} | __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⇒ Int)",
+    "iterate ▷ (([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt) ▷ restrict) ▷ ((cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(cast([1, 2, 3])):({{[0, 2] | __elem ▷ ([1, 2, 3] ≫ (id, 3 ▷ const) ▷ zip ≫ lt)} | __elem ▷ (cast([1, 2, 3]) ≫ (id, 2 ▷ const) ▷ zip ≫ lt)} ⤇ Int)",
     make_int_list(&[1])
 )]
 #[case(
     "[(x, x) for x in [(x, x) for x in [1,2,3]]]",
-    "iterate ≫ [1, 2, 3] ≫ (id, id) ▷ zip ≫ (id, id) ▷ zip:([0, 2] ⇒ ((Int, Int), (Int, Int)))",
+    "iterate ≫ [1, 2, 3] ≫ (id, id) ▷ zip ≫ (id, id) ▷ zip:([0, 2] ⤇ ((Int, Int), (Int, Int)))",
     Tile::SealedFunction {
         domain: ColumnValue::UInts(vec![0, 1, 2]),
         codomain: Box::new(Tile::Record(HashMap::from([
@@ -305,7 +312,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y for x in ['a', 'b'] for y in ['c', 'd', 'e']]",
-    "iterate ≫ (.0 ≫ [\"a\", \"b\"], .1 ≫ [\"c\", \"d\", \"e\"]) ▷ zip ≫ concat:(([0, 1], [0, 2]) ⇒ String)",
+    "iterate ≫ (.0 ≫ [\"a\", \"b\"], .1 ≫ [\"c\", \"d\", \"e\"]) ▷ zip ≫ concat:(([0, 1], [0, 2]) ⤇ String)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0, 0, 0, 1, 1, 1])),
@@ -321,7 +328,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + 10 for x in testsource1() if x < 15]",
-    "iterate ▷ ((source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add):({source(testsource1) | __elem ▷ (source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt)} ⇒ Int)",
+    "iterate ▷ ((source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt) ▷ restrict) ≫ cast(source(testsource1) ≫ (id, 10 ▷ const) ▷ zip ≫ add):({source(testsource1) | __elem ▷ (source(testsource1) ≫ (id, 15 ▷ const) ▷ zip ≫ lt)} ⤇ Int)",
     make_int_list(&[10, 20])
 )]
 #[case("sum([1,2,3])", "(iterate ≫ [1, 2, 3]) ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]
@@ -477,7 +484,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case(
     "[x + y + z for x in [1] for y in [1, 2] for z in [1, 2, 3] if x == z and y == z and x + y == z + 1]",
-    "iterate ▷ (((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ ((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and)} ⇒ Int)",
+    "iterate ▷ (((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and) ▷ restrict) ≫ cast(((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, .2 ≫ [1, 2, 3]) ▷ zip ≫ add):({([0, 0], [0, 1], [0, 2]) | __elem ▷ ((((.0 ≫ [1], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq, (.1 ≫ [1, 2], .2 ≫ [1, 2, 3]) ▷ zip ≫ eq) ▷ zip ≫ and, ((.0 ≫ [1], .1 ≫ [1, 2]) ▷ zip ≫ add, (.2 ≫ [1, 2, 3], 1 ▷ const) ▷ zip ≫ add) ▷ zip ≫ eq) ▷ zip ≫ and)} ⤇ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Records(HashMap::from([
             ("_0".into(), ColumnValue::UInts(vec![0])),

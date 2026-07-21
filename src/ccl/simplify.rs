@@ -1002,6 +1002,7 @@ mod tests {
     fn fun_ty(a: Type, b: Type) -> Type {
         Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(a),
             codomain: Box::new(b),
         }
@@ -1023,6 +1024,7 @@ mod tests {
         }
         let ty = Type::Fun {
             name: None,
+            kind: crate::ccl::ty::FunKind::Compute,
             domain: fun_tys.first().unwrap().0.clone(),
             codomain: fun_tys.last().unwrap().1.clone(),
         };

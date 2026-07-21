@@ -20,6 +20,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
+use crate::ccl::ty::{FunKind, KindVar};
 use crate::ccl::{Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
 
 use super::type_level;
@@ -75,6 +76,20 @@ pub enum ConstrainError {
         /// The feed type demanded.
         required: Type,
     },
+    /// A compute function (a capability, `⇒`) was supplied where a data
+    /// collection (an extent, `⤇`) is demanded. `Data <: Compute` is the safe
+    /// upcast — a collection is callable at any index in its extent — but the
+    /// reverse would iterate a *declared* extent the value does not actually
+    /// cover, silently dropping rows. Raised only when the cache is
+    /// kind-aware (constraint emission); the post-inference check is kind-blind
+    /// (see [`ConstrainCache`]), since elimination preserves denotation but not
+    /// kind representation.
+    ComputeWhereDataRequired {
+        /// The supplied compute function.
+        lhs: Type,
+        /// The demanded data collection.
+        rhs: Type,
+    },
 }
 
 /// Cache of in-progress subtyping checks. Breaks cycles introduced through
@@ -94,7 +109,51 @@ pub enum ConstrainError {
 /// (var⇄var) edges are renames over the episode's finite binder set, whose
 /// composites saturate; discharges ride acyclic content edges only (their
 /// composites grow along lexical nesting depth, not around cycles).
-pub type ConstrainCache = HashMap<(Type, Type), Vec<(Subst, Subst)>>;
+///
+/// Carries the `kind_aware` mode flag alongside the edge map. The
+/// `Compute <: Data` kind rejection (a capability supplied where an extent is
+/// demanded — see [`ConstrainError::ComputeWhereDataRequired`]) fires only
+/// during constraint **emission** (inference), where kinds are being inferred
+/// and a mismatch is a real extent-loss bug. The post-inference structural
+/// check is **kind-blind**: lambda elimination is denotation-preserving but not
+/// kind-preserving (`Type::without_pi_names` canonicalizes every reconstructed
+/// arrow to `Compute`), so a point-free map flowing into a `Data` argument is
+/// well-denoted and must not be re-rejected on kind. Kind is an inference-time
+/// property, so the flag rides the cache that is already threaded through the
+/// whole recursion.
+pub struct ConstrainCache {
+    edges: HashMap<(Type, Type), Vec<(Subst, Subst)>>,
+    kind_aware: bool,
+}
+
+impl ConstrainCache {
+    /// A kind-aware cache (constraint emission / inference): the
+    /// `Compute <: Data` rejection is live.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self {
+            edges: HashMap::new(),
+            kind_aware: true,
+        }
+    }
+
+    /// A kind-blind cache (the post-inference structural check): kind
+    /// mismatches are ignored (see the type doc).
+    pub fn new_kind_blind() -> Self {
+        Self {
+            edges: HashMap::new(),
+            kind_aware: false,
+        }
+    }
+
+    /// The composite-substitution bridges recorded for a subtyping edge,
+    /// inserting an empty list on first visit. This is the cycle breaker: a
+    /// re-entry on the same `(lhs, rhs)` pair finds its in-progress entry rather
+    /// than recursing forever.
+    fn edge_bridges(&mut self, lhs: Type, rhs: Type) -> &mut Vec<(Subst, Subst)> {
+        self.edges.entry((lhs, rhs)).or_default()
+    }
+}
 
 /// Cache for [`extrude`], keyed by the polar pair (variable uid, polarity).
 ///
@@ -114,6 +173,48 @@ pub fn constrain_subtype(
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
     constrain_go(lhs, rhs, &Subst::id(), &Subst::id(), cache)
+}
+
+/// Constrain the kind edge `k0 <: k1` over the two-point lattice
+/// `Data ⊑ Compute` (`Data` bottom / most specific, `Compute` top).
+///
+/// Concrete edges: `Data <: κ` and `κ <: Compute` always hold; `Compute <: Data`
+/// is the sole failure — returned as `true` (the caller raises
+/// [`ConstrainError::ComputeWhereDataRequired`], having the full function types
+/// for the diagnostic) **iff** `kind_aware` (emission mode).
+///
+/// Variable edges set `forced_*` flags, resolved at coalesce
+/// ([`super::compact::KindMerge`]): a compute value flowing *into* a var forces
+/// it `Compute`; a var *demanded* as data forces it `Data`; a var-to-var edge
+/// records a `<:` link ([`KindVar::link`]). Forces propagate transitively along
+/// links as they arrive, so ordering does not matter (a force after its link
+/// still reaches the far end). A var that ends up with both flags is the
+/// conflict — surfaced loudly at coalesce, never here.
+fn constrain_kind(k0: &FunKind, k1: &FunKind, kind_aware: bool) -> bool {
+    use FunKind::*;
+    match (k0, k1) {
+        // `Data` is bottom, `Compute` is top: these edges always hold.
+        (Data, _) | (_, Compute) => false,
+        // The one rejection — a capability supplied where an extent is demanded.
+        (Compute, Data) => kind_aware,
+        // A compute value flows into this var: it cannot be `Data`. The force
+        // propagates up any `<:` links already drawn to this var.
+        (Compute, Var(v1)) => {
+            v1.force_compute();
+            false
+        }
+        // This var is demanded as data: it cannot be `Compute`. Propagates down.
+        (Var(v0), Data) => {
+            v0.force_data();
+            false
+        }
+        // A var-to-var edge `v0 <: v1`: record the link so a force arriving on
+        // either end *after* this edge still reaches the other. See [`KindVar`].
+        (Var(v0), Var(v1)) => {
+            KindVar::link(v0, v1);
+            false
+        }
+    }
 }
 
 /// Bridge the holder gap when chaining two edges through one variable.
@@ -197,8 +298,8 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
     // constraining different fibers (of one family — g(0) vs g(1) — or of two
     // unrelated families), between which no sound transport exists. This is
     // the extent-join corner (O1/O4); the eventual resolution is the
-    // lossless-Σ extent regime (vault: type-checker-data-vs-compute-functions),
-    // under which both fibers become components of the one Σ-type and the
+    // lossless coproduct extent regime (data-vs-compute functions), under which
+    // both fibers become arms of the one coproduct and the
     // question dissolves. Until then: no reachable program produces this
     // shape, so reaching it means a solver bug — refuse loudly rather than
     // corrupt the edge.
@@ -249,7 +350,7 @@ fn constrain_go(
     // different constraint (see `ConstrainCache`).
     let either_var = matches!(lhs, Type::Infer(_)) || matches!(rhs, Type::Infer(_));
     if either_var {
-        let seen = cache.entry((lhs.clone(), rhs.clone())).or_default();
+        let seen = cache.edge_bridges(lhs.clone(), rhs.clone());
         // Morphisms compare modulo emit-time type slots — the SAME notion of
         // constraint identity the closure bridge uses (`eq_modulo_ty_slots`).
         // Strict `==` here would admit a near-duplicate edge (two captures of
@@ -288,22 +389,57 @@ fn constrain_go(
         (
             Type::Fun {
                 name: n0,
+                kind: k0,
                 domain: d0,
                 codomain: c0,
             },
             Type::Fun {
                 name: n1,
+                kind: k1,
                 domain: d1,
                 codomain: c1,
             },
         ) => {
-            constrain_go(d1, d0, sr, sl, cache)?;
+            // The kind edge over the lattice `Data ⊑ Compute` (see
+            // `constrain_kind`): `Data <: κ` and `κ <: Compute` always hold; a
+            // concrete `Compute <: Data` is the rejection (a capability where an
+            // extent is demanded → silent row loss), live only when the cache is
+            // kind-aware (emission, not the kind-blind post-inference check).
+            // Kind vars accumulate `forced_*` flags here and resolve at coalesce.
+            let kind_aware = cache.kind_aware;
+            if constrain_kind(k0, k1, kind_aware) {
+                return Err(ConstrainError::ComputeWhereDataRequired {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                });
+            }
             let cod_sl = match (n0, n1) {
                 (Some(k), Some(x)) => sl.extended_rename(k, x),
                 _ => sl.clone(),
             };
+            constrain_go(d1, d0, sr, sl, cache)?;
+            // NB: Data-domain **invariance** (equating both arrows' domains when
+            // both are `Data`, to stop a wider collection standing where a
+            // narrower declared extent is expected — the silent-row-drop guard
+            // of design §5) is deliberately *not* enabled here. A naive
+            // strict-equality reverse edge breaks the sound, common pattern of a
+            // *filtered* collection (`{[0, n] | p} ⤇ V`) flowing where the
+            // unfiltered extent (`[0, n] ⤇ V`) is expected: the reverse edge
+            // demands `[0, n] <: {[0, n] | p}`, i.e. acquiring a refinement by
+            // subsumption, which the lattice strictly forbids. Invariance must
+            // therefore be *modulo refinements* (and range-aware — whether
+            // `UIntRange` is already invariant decides if the guard is even
+            // needed); that is a separate design question (§5 open question B),
+            // deferred. The contravariant edge above plus the strict refinement
+            // lattice already reject *acquiring* an extent by subsumption.
             constrain_go(c0, c1, &cod_sl, sr, cache)
         }
+
+        // (Conditional-collection coproduct subtyping — the injection
+        // `Fun(Data) <: Variant`, the consume `Variant <: Fun`, and the
+        // width `Variant <: Variant` — lives with the other `Variant` arms
+        // below; a finite conditional collection is a plain coproduct, not a
+        // dependent sum. See `Type::extent_coproduct` and collections.md.)
 
         // Tuple: positional width-subtyping. A longer/equal tuple is a
         // subtype, so every position rhs requires must exist in lhs.
@@ -334,6 +470,114 @@ fn constrain_go(
                         });
                     }
                 }
+            }
+            Ok(())
+        }
+
+        // A single data function **injected** into a conditional-collection
+        // coproduct (`Type::extent_coproduct`): one branch of the union, matched
+        // to the arm with the same extent. This is how the `emit_case` join
+        // lands — each arm is constrained `<: result`, and `result` coalesces to
+        // the coproduct, so at the consistency wall each arm re-subsumes into it.
+        // The extent match is by *value* (like the old Σ-intro), and only fires
+        // when every arm is a data function.
+        (
+            Type::Fun {
+                name: pn,
+                kind: FunKind::Data,
+                domain,
+                codomain: c0,
+            },
+            Type::Variant(arms),
+        ) if !arms.is_empty()
+            && arms.iter().all(|(_, t)| {
+                matches!(
+                    t,
+                    Type::Fun {
+                        kind: FunKind::Data,
+                        ..
+                    }
+                )
+            }) =>
+        {
+            let matched = arms.iter().find_map(|(_, t)| match t {
+                Type::Fun {
+                    name: an,
+                    domain: d,
+                    codomain: ac,
+                    ..
+                } if d.as_ref() == domain.as_ref() => Some((an, ac)),
+                _ => None,
+            });
+            match matched {
+                Some((an, ac)) => {
+                    let cod_sl = match (pn, an) {
+                        (Some(k), Some(x)) => sl.extended_rename(k, x),
+                        _ => sl.clone(),
+                    };
+                    constrain_go(c0, ac, &cod_sl, sr, cache)
+                }
+                None => Err(ConstrainError::Mismatch {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                }),
+            }
+        }
+
+        // A **conditional collection** (a coproduct of data functions formed at
+        // a control-flow join — `Type::extent_coproduct`) *consumed* as a plain
+        // collection: whatever arm it turns out to be, iterating it walks the
+        // discriminated union of the arms' extents, so it presents as
+        // `Fun(Variant({Index(i): domainᵢ}), V)` — the same tagged domain the
+        // runtime union tile carries. The consumer's domain edge is
+        // contravariant: a *fresh* domain var resolves to the union (the common
+        // case — `sum`, `[… for x in …]`), a consumer demanding a *concrete
+        // narrower* extent fails the `d1 <: Variant` edge. Each arm's codomain
+        // flows into the consumer codomain (the arms share the joined codomain,
+        // so this is one covariant edge per arm). Fires only when every arm is a
+        // data function; a user tagged-union is not a collection.
+        (
+            Type::Variant(arms),
+            Type::Fun {
+                name: n1,
+                domain: d1,
+                codomain: c1,
+                ..
+            },
+        ) if !arms.is_empty()
+            && arms.iter().all(|(_, t)| {
+                matches!(
+                    t,
+                    Type::Fun {
+                        kind: FunKind::Data,
+                        ..
+                    }
+                )
+            }) =>
+        {
+            let extent_variant = Type::Variant(
+                arms.iter()
+                    .map(|(k, t)| {
+                        let Type::Fun { domain, .. } = t else {
+                            unreachable!("guard checked all arms are Fun")
+                        };
+                        (k.clone(), domain.as_ref().clone())
+                    })
+                    .collect(),
+            );
+            constrain_go(d1, &extent_variant, sr, sl, cache)?;
+            for (_, t) in arms {
+                let Type::Fun {
+                    name: pn, codomain, ..
+                } = t
+                else {
+                    unreachable!("guard checked all arms are Fun")
+                };
+                let cod_sl = match (pn, n1) {
+                    (Some(k), Some(x)) => sl.extended_rename(k, x),
+                    _ => sl.clone(),
+                };
+                constrain_go(codomain, c1, &cod_sl, sr, cache)?;
             }
             Ok(())
         }
@@ -499,6 +743,8 @@ fn constrain_go(
         ) => {
             let chan = Type::Fun {
                 name: None,
+                // A feed's read view is a collection stream: a data function.
+                kind: FunKind::Data,
                 domain: domain.clone(),
                 codomain: value.clone(),
             };
@@ -520,6 +766,8 @@ fn constrain_go(
         ) => {
             let chan = Type::Fun {
                 name: None,
+                // A feed's read view is a collection stream: a data function.
+                kind: FunKind::Data,
                 domain: domain.clone(),
                 codomain: value.clone(),
             };
@@ -715,10 +963,12 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         | Type::Hole => ty.clone(),
         Type::Fun {
             name,
+            kind,
             domain: d,
             codomain: c,
         } => Type::Fun {
             name: name.clone(),
+            kind: kind.clone(),
             domain: Box::new(extrude(d, !pol, target_level, cache)),
             codomain: Box::new(extrude(c, pol, target_level, cache)),
         },
@@ -1022,13 +1272,10 @@ mod tests {
         let mut cache = ConstrainCache::new();
         let sid = (Subst::id(), Subst::id());
         cache
-            .entry((a.clone(), prim(BaseType::Int)))
-            .or_default()
+            .edge_bridges(a.clone(), prim(BaseType::Int))
             .push(sid.clone());
         assert!(
-            cache
-                .get(&(b, prim(BaseType::Int)))
-                .is_some_and(|seen| seen.contains(&sid)),
+            cache.edge_bridges(b, prim(BaseType::Int)).contains(&sid),
             "structurally-equal refined key must hit the same cache entry"
         );
 
@@ -1898,5 +2145,165 @@ mod tests {
         };
         assert!(lam().eq_modulo_ty_slots(&lam()));
         drop(arena);
+    }
+
+    // --- Conditional-collection coproduct subtyping (collections.md) ---
+
+    fn coproduct(extents: Vec<Type>) -> Type {
+        Type::extent_coproduct(extents, None, prim(BaseType::Int))
+    }
+
+    #[test]
+    fn coproduct_width_is_subtype() {
+        // A conditional collection is a coproduct (`Index`-tagged Variant of
+        // data functions); width-subtyping is positional — the lhs's tags
+        // (a prefix) appear in the rhs. The reverse (rhs has an extra tag) is
+        // not a subtype.
+        let sub = coproduct(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        let sup = coproduct(vec![
+            Type::UIntRange(2),
+            Type::UIntRange(3),
+            Type::UIntRange(4),
+        ]);
+        assert!(constrain_subtype(&sub, &sup, &mut ConstrainCache::new()).is_ok());
+        assert!(constrain_subtype(&sup, &sub, &mut ConstrainCache::new()).is_err());
+    }
+
+    #[test]
+    fn data_fun_injects_into_coproduct() {
+        // Injection: a single data function whose extent matches one arm is a
+        // subtype of the coproduct (the `emit_case` arm-into-result edge); a
+        // data function over a non-member extent is not.
+        let sup = coproduct(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        let member = Type::data_fun(Type::UIntRange(2), prim(BaseType::Int));
+        assert!(constrain_subtype(&member, &sup, &mut ConstrainCache::new()).is_ok());
+        let nonmember = Type::data_fun(Type::UIntRange(9), prim(BaseType::Int));
+        assert!(constrain_subtype(&nonmember, &sup, &mut ConstrainCache::new()).is_err());
+    }
+
+    #[test]
+    fn coproduct_consumed_as_fun() {
+        // Consume: a conditional collection used as a plain function. A *fresh*
+        // domain var absorbs the discriminated union of the arm extents (the
+        // `sum` / comprehension case).
+        let cop = coproduct(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        let consumer = fun(fresh_var(0), prim(BaseType::Int));
+        assert!(constrain_subtype(&cop, &consumer, &mut ConstrainCache::new()).is_ok());
+        // A consumer demanding a *concrete narrower* extent fails: the
+        // coproduct never silently narrows to a single declared extent.
+        let narrow = fun(Type::UIntRange(2), prim(BaseType::Int));
+        assert!(constrain_subtype(&cop, &narrow, &mut ConstrainCache::new()).is_err());
+    }
+
+    // ----- Kind edge (`FunKind`, the `Compute <: Data` rejection) -----------
+
+    fn data_fun(d: Type, c: Type) -> Type {
+        Type::data_fun(d, c)
+    }
+
+    #[test]
+    fn kind_data_upcasts_to_compute() {
+        // `Data <: Compute` is the safe upcast — a collection is callable at any
+        // index in its extent. `[0, 2] ⤇ Int <: [0, 2] ⇒ Int`.
+        let mut cache = ConstrainCache::new();
+        assert!(
+            constrain_subtype(
+                &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &mut cache,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn kind_compute_where_data_is_rejected() {
+        // `Compute ⋢ Data`: a capability supplied where an extent is demanded is
+        // the rejection (the silent-row-loss guard). `[0, 2] ⇒ Int ⊀ [0, 2] ⤇ Int`.
+        let mut cache = ConstrainCache::new();
+        assert!(matches!(
+            constrain_subtype(
+                &fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &mut cache,
+            ),
+            Err(ConstrainError::ComputeWhereDataRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn kind_rejection_is_off_in_the_kind_blind_check() {
+        // The post-inference check is kind-blind: the very `Compute <: Data`
+        // edge the emission cache rejects is accepted here (elimination
+        // preserves denotation, not kind representation).
+        let mut cache = ConstrainCache::new_kind_blind();
+        assert!(
+            constrain_subtype(
+                &fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
+                &mut cache,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn kind_var_demanded_as_data_is_forced_data() {
+        // A kind var *demanded* as `Data` acquires `forced_data` (no eager
+        // rejection — the var may still legitimately resolve `Data`); it
+        // resolves at coalesce. A compute value flowing into it would set
+        // `forced_compute`, and both flags together is the conflict.
+        let v = KindVar::fresh();
+        let var_fun = Type::Fun {
+            name: None,
+            kind: FunKind::Var(Rc::clone(&v)),
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(prim(BaseType::Int)),
+        };
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(
+            &var_fun,
+            &data_fun(Type::UIntRange(3), prim(BaseType::Int)),
+            &mut cache,
+        )
+        .expect("var <: Data records forced_data, never an eager rejection");
+        assert!(v.bounds.borrow().forced_data, "demanded as data");
+        assert!(
+            !v.bounds.borrow().forced_compute,
+            "no compute value flowed in"
+        );
+    }
+
+    #[test]
+    fn kind_var_link_then_late_force_propagates() {
+        // Regression: a force that arrives *after* a var-var link must still
+        // reach the far end. Draw `v0 <: v1` first, then force `v0` compute via
+        // a later edge (`Compute <: v0`). Transitive propagation must carry
+        // `forced_compute` up to `v1`; the old one-shot copy dropped it, letting
+        // `v1` fall to its (possibly `Data`) domain default — a silent miskind.
+        let v0 = KindVar::fresh();
+        let v1 = KindVar::fresh();
+        let fun_of = |v: &Rc<KindVar>| Type::Fun {
+            name: None,
+            kind: FunKind::Var(Rc::clone(v)),
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(prim(BaseType::Int)),
+        };
+        let mut cache = ConstrainCache::new();
+        // Link first: `v0 <: v1`.
+        constrain_subtype(&fun_of(&v0), &fun_of(&v1), &mut cache).expect("var-var link");
+        assert!(!v1.bounds.borrow().forced_compute, "not forced yet");
+        // Force later: a compute function flows into `v0` (`Compute <: v0`).
+        constrain_subtype(
+            &fun(Type::UIntRange(3), prim(BaseType::Int)),
+            &fun_of(&v0),
+            &mut cache,
+        )
+        .expect("compute <: var records forced_compute");
+        assert!(v0.bounds.borrow().forced_compute, "v0 forced compute");
+        assert!(
+            v1.bounds.borrow().forced_compute,
+            "compute force propagates up the link to v1 after the fact"
+        );
     }
 }

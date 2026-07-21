@@ -507,6 +507,8 @@ pub fn compile_program(
             &name,
             Type::Fun {
                 name: None,
+                // A registered data source is a collection: a data function.
+                kind: crate::ccl::ty::FunKind::Data,
                 domain: Box::new(Type::DataSource(name.clone())),
                 codomain: Box::new(output_type),
             },

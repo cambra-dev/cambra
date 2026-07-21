@@ -362,7 +362,13 @@ pub(super) fn emit_lambda<C: Typing>(
     // ordinary functions — coalesce strips it when the codomain does not
     // reference it (see `coalesce_compact_go`) — so monomorphic output is
     // unchanged.
-    Ok(Type::pi(&param.name, param_simple, body_ty))
+    //
+    // The lambda's **kind is inferred**: a user `λ` is a capability
+    // (a scalar function) or a collection map depending on its domain and use,
+    // neither settled at emit, so a fresh kind var is minted and the solver
+    // resolves it. (Kind-blind subtyping currently sets no kind bound, so every
+    // such var resolves to the `Compute` default — output unchanged.)
+    Ok(Type::pi_inferred_kind(&param.name, param_simple, body_ty))
 }
 
 /// Type a [`TypedExprNode::Cast`]: `cast(value, target)` re-views `value` at
@@ -414,15 +420,35 @@ pub(super) fn emit_cast<C: Typing>(
         Some(r) => Type::Refinement(Box::new(d), r),
         None => d,
     };
+    // A cast re-views the value *at* `target`, so the result carries `target`'s
+    // kind: a cast to a filtered-collection target (`refined_fn_type`, `Data`)
+    // yields a `Data` collection even though the underlying value is a `Compute`
+    // element projection (`λ u → u.score`, record ⇒ scalar). Preserving only the
+    // domain refinement while dropping `Data` would make every filtered
+    // comprehension / groupby a compute function again, and the aggregate that
+    // consumes it would reject it as compute-where-data.
+    // Peel refinements: a target that is a *refined function* (`{Fun | p}`)
+    // still carries its arrow's kind, which a match on the raw target would drop
+    // to the `Compute` default.
+    let kind = match peel_refinements_outer(target) {
+        Type::Fun { kind, .. } => kind.clone(),
+        _ => crate::ccl::ty::FunKind::Compute,
+    };
     // Preserve the value's Pi binder so the cast result stays a *named* function.
     // A dependent application of the cast then reconciles binders by the identity
     // correspondence (reusing the binder rather than minting a fresh `__arg`),
     // which is what keeps the O8 contravariant-domain discharge from leaving an
     // undischarged binder in the domain's refinement predicate (design §5.2, O8).
-    match peel_refinements_outer(&value_ty) {
-        Type::Fun { name: Some(k), .. } => Ok(Type::pi(k.clone(), domain, v)),
-        _ => Ok(fun(domain, v)),
-    }
+    let name = match peel_refinements_outer(&value_ty) {
+        Type::Fun { name: Some(k), .. } => Some(k.clone()),
+        _ => None,
+    };
+    Ok(Type::Fun {
+        name,
+        kind,
+        domain: Box::new(domain),
+        codomain: Box::new(v),
+    })
 }
 
 pub(super) fn emit_apply<C: Typing>(
@@ -683,7 +709,9 @@ pub(super) fn emit_collection_union<C: Typing>(
         tags.insert(FieldKey::Index(i), dom);
     }
     let dom_variant = variant_type(tags);
-    Ok(fun(dom_variant, cod_var))
+    // `++` produces a collection — a **data** function over the tagged union of
+    // its operands' extents.
+    Ok(Type::data_fun(dom_variant, cod_var))
 }
 
 /// Aggregate (`Sum`, `Max`): the scheme is the full operator type
@@ -975,7 +1003,7 @@ pub(super) fn emit_proj<C: Typing>(
 
 pub(super) fn emit_list<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Type, InferError> {
     if elts.is_empty() {
-        return Ok(fun(Type::UIntRange(0), prim(BaseType::Unit)));
+        return Ok(Type::data_fun(Type::UIntRange(0), prim(BaseType::Unit)));
     }
     // Element type: derive from the first; constrain remaining to it.
     let first_ty = ctx.subexpr(&mut elts[0])?;
@@ -988,8 +1016,10 @@ pub(super) fn emit_list<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Typ
     let n = elts.len();
     // Deref a bare mutable read to its value, as in `emit_tuple`: the list's
     // element (codomain) type takes the dereferenced element type so no `Mut`
-    // appears in the list type.
-    Ok(fun(Type::UIntRange(n), deref_mut(&first_ty)))
+    // appears in the list type. A list literal is a **data** function — its
+    // domain is an extent (the index set), so a join with another collection
+    // is lossless (forms a coproduct), never a lossy meet.
+    Ok(Type::data_fun(Type::UIntRange(n), deref_mut(&first_ty)))
 }
 
 /// Emit constraints for a [`TypedExprNode::Case`] — the unified
@@ -1030,11 +1060,10 @@ pub(super) fn emit_case<C: Typing>(
         ctx.require_sub(&scrut_ty, &expected, &|| "Case scrutinee".to_string())?;
     }
 
-    let mut result_ty: Option<Type> = None;
+    // Emit every arm's body type first (each under its pattern scope, restored
+    // on both paths), then join.
+    let mut arm_tys = Vec::with_capacity(branches.len());
     for b in branches.iter_mut() {
-        // A pattern binds its payload (the var just written to `binding.ty`)
-        // over the branch's guard and body. `scoped` restores the scope on
-        // both the happy and error paths.
         let scope_info = b
             .pattern
             .as_ref()
@@ -1043,12 +1072,47 @@ pub(super) fn emit_case<C: Typing>(
             Some((name, ty)) => ctx.scoped(&name, &ty, |ctx| emit_case_branch(b, ctx))?,
             None => emit_case_branch(b, ctx)?,
         };
-        match &result_ty {
-            None => result_ty = Some(body_ty),
-            Some(prev) => ctx.require_eq(&body_ty, prev, &|| "Case arm".to_string())?,
-        }
+        arm_tys.push(body_ty);
     }
-    Ok(result_ty.expect("non-empty branches"))
+    debug_assert!(
+        !arm_tys.is_empty(),
+        "emit_case: a Case must carry at least one branch"
+    );
+
+    // A `Mut`/`History` arm is a **second-class reference**: it cannot be
+    // lattice-joined as a value (that would form a first-class conditional
+    // reference). So if any arm is history-typed, require the arms *equal* — the
+    // Case stays history-typed, and the mut-discipline pass rejects it as a
+    // non-bare-variable reference (rule 1). This preserves the deliberate
+    // rejection of a conditional over stores.
+    // A second-class reference is a `History` (overwrite *or* feed — one variant)
+    // possibly wrapped in refinements; `peel_refinements_outer` names that shape.
+    // Both `Mut[V, D]` and a feed channel are `History`, so this one check covers
+    // every second-class arm — the load-bearing assumption is that a mutable variable is
+    // never wrapped in anything but `Refinement` before reaching here.
+    let any_history = arm_tys
+        .iter()
+        .any(|t| matches!(peel_refinements_outer(t), Type::History { .. }));
+    if any_history {
+        let first = arm_tys[0].clone();
+        for t in &arm_tys[1..] {
+            ctx.require_eq(t, &first, &|| "Case arm".to_string())?;
+        }
+        return Ok(first);
+    }
+
+    // Value and collection arms join by the **lattice**: each arm's type is a
+    // subtype of one fresh result variable, so the result is their least upper
+    // bound (design/type-inference.md §4.6). Homogeneous arms recover the old
+    // behavior (the var pins to the shared type); data-collection arms with
+    // distinct extents coalesce to a coproduct. (Heterogeneous *scalar* arms remain a
+    // hard `IncompatibleBounds` error — the sound union relaxation for them is
+    // deferred; see `coalesce`.)
+    let result = ctx.fresh();
+    for t in &arm_tys {
+        ctx.require_sub(t, &result, &|| "Case arm".to_string())?;
+    }
+    Ok(result)
 }
 
 /// Emit a single Case branch: its guard must be `Bool`; the node takes the
@@ -1115,8 +1179,22 @@ pub(super) fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<
         Type::Fun { name, .. } => name.clone(),
         _ => None,
     };
+    // The chain's kind is the **first** morphism's: a chain over a data source
+    // (`xs ≫ f`, a comprehension) is a data collection; a chain of compute
+    // morphisms is compute. When the first morphism is still a bare `Infer`
+    // (the common case in Emit — a comprehension composed over a source whose
+    // type has not yet resolved to a `Fun`), the chain's kind is genuinely
+    // use-dependent: mint a fresh kind var so a `Data`-demanding consumer (an
+    // aggregate) forces it `Data` via `constrain_kind`, and it otherwise
+    // resolves from its (now-concrete) domain at coalesce. Hardcoding `Compute`
+    // here would reject every composed comprehension flowing into an aggregate.
+    let kind = match peel_refinements_outer(&tys[0]) {
+        Type::Fun { kind, .. } => kind.clone(),
+        _ => crate::ccl::ty::FunKind::fresh_var(),
+    };
     Ok(Type::Fun {
         name: last_name,
+        kind,
         domain: Box::new(first_dom),
         codomain: Box::new(prev_cod),
     })

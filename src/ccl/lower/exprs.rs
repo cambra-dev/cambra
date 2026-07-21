@@ -475,22 +475,22 @@ mod tests {
     // Variable collection and inline key lambda
     #[case(
         "groupby(xs, lambda x: x)",
-        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)"
+        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], lambda x: x // 2)",
-        "λ __gb_k → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
+        "λ __gb_k → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
     )]
     // Key is a variable reference (pre-defined function)
     #[case(
         "groupby(xs, key_fn)",
-        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)"
+        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
     )]
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "λ __iter_record → __iter_record ▷ (λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⇒ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
+        "λ __iter_record → __iter_record ▷ (λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

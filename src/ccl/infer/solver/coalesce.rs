@@ -56,6 +56,27 @@ pub enum CoalesceError {
         /// Pretty representation of the cycle entry point.
         details: String,
     },
+    /// A data function carrying >= 2 candidate extents (a conditional collection) met a compute
+    /// function at a positive join, so collapsing to the ordinary meet would
+    /// drop extents. Reported loudly rather than silently losing data (no
+    /// current program produces this shape). See `design/type-inference.md`
+    /// §4.6.
+    ExtentJoinConflict {
+        /// Pretty representation of the conflicting function shapes.
+        details: String,
+    },
+    /// A single function slot whose kind resolved contradictorily: it was
+    /// demanded as a data extent (`forced_data`) while being — or being fed as
+    /// — a compute capability (a provably-scalar domain, or `forced_compute`).
+    /// This is the coalesce-time face of `Compute <: Data`, the counterpart of
+    /// [`super::constrain::ConstrainError::ComputeWhereDataRequired`] for the
+    /// case where the violation only becomes provable once the kind variable's
+    /// bounds and domain are resolved (e.g. summing a plain `Int ⇒ Int`
+    /// lambda). See `design/type-inference.md` §4.6.
+    ComputeWhereDataRequired {
+        /// Pretty representation of the offending capability.
+        details: String,
+    },
 }
 
 /// Distinguishes a partial tuple (Index keys) from a partial record
@@ -117,21 +138,93 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
     if let Some(var) = &ct.var {
         shapes.push(materialize_variant(var, polarity)?);
     }
-    if let Some((name, dom, cod)) = &ct.fun {
-        let d = coalesce_compact_go(dom, !polarity)?;
-        let c = coalesce_compact_go(cod, polarity)?;
+    if let Some(cf) = &ct.fun {
+        use super::compact::KindMerge;
+        // Materialize the codomain once (covariant), and each domain
+        // alternative (contravariant), deduplicating at the `Type` level —
+        // this catches var-level equalities that the compact-time
+        // `CompactType ==` dedup in `union_extents` missed (simplify may have
+        // merged uids after compaction).
+        let c = coalesce_compact_go(&cf.codomain, polarity)?;
+        let mut doms: Vec<Type> = Vec::new();
+        for d in &cf.domains {
+            let dt = coalesce_compact_go(d, !polarity)?;
+            if !doms.contains(&dt) {
+                doms.push(dt);
+            }
+        }
         // Strip the Pi binder unless the codomain's refinement predicates
         // actually reference it (design §3.2 / O10): keeps ordinary functions
-        // `name: None` while a genuinely dependent codomain keeps its binder
-        // bound.
-        let kept_name = name
+        // `name: None` while a genuinely dependent codomain keeps its binder.
+        let kept_name = cf
+            .name
             .clone()
             .filter(|b| crate::ccl::subst::type_free_vars(&c).contains(b));
-        shapes.push(Type::Fun {
-            name: kept_name,
-            domain: Box::new(d),
-            codomain: Box::new(c),
-        });
+        match cf.kind {
+            KindMerge::Conflict => {
+                let doms_s = doms
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ⊔ ");
+                // A single surviving domain means one function slot whose kind
+                // resolved contradictorily: it was demanded as a data extent
+                // (`forced_data`) while being (or being fed as) a compute
+                // capability — the coalesce-time face of `Compute <: Data`.
+                // Two or more surviving domains mean a conditional collection's candidate extents
+                // would be dropped by collapsing to a compute meet (a genuine
+                // extent-join collision). See `design/type-inference.md` §4.6.
+                if doms.len() <= 1 {
+                    return Err(CoalesceError::ComputeWhereDataRequired {
+                        details: format!("a compute function (capability) over {{{doms_s}}}"),
+                    });
+                }
+                return Err(CoalesceError::ExtentJoinConflict {
+                    details: format!(
+                        "data function over {{{doms_s}}} joined with a compute function"
+                    ),
+                });
+            }
+            KindMerge::Compute => {
+                debug_assert_eq!(doms.len(), 1, "compute fun accumulated domain alternatives");
+                shapes.push(Type::Fun {
+                    name: kept_name,
+                    kind: crate::ccl::ty::FunKind::Compute,
+                    domain: Box::new(doms.into_iter().next().expect("compute fun has one domain")),
+                    codomain: Box::new(c),
+                });
+            }
+            KindMerge::Data => {
+                if doms.len() == 1 {
+                    // Idempotence: a single surviving extent is a plain data fun.
+                    shapes.push(Type::Fun {
+                        name: kept_name,
+                        kind: crate::ccl::ty::FunKind::Data,
+                        domain: Box::new(doms.into_iter().next().expect("len == 1")),
+                        codomain: Box::new(c),
+                    });
+                } else {
+                    // ≥ 2 extents: a **conditional collection** — a coproduct
+                    // (`Index`-tagged `Variant`) of data functions, one per
+                    // candidate extent, sharing the joined codomain. A finite,
+                    // static set of branches is a plain sum, not a dependent sum
+                    // (see collections.md); the value is one arm, tagged by
+                    // contribution order, matching the runtime value-`Case` gates.
+                    //
+                    // Materialization invariant: the choices are ground extents.
+                    // Variant width-subtyping matches arms positionally (by tag),
+                    // and `compact_go`/`extrude` treat the arm domains
+                    // contravariantly (at `!pol`); those agree only while a choice
+                    // carries no inference variable, so an `Infer`-bearing choice
+                    // would record a bound at the wrong polarity. Enforce it.
+                    debug_assert!(
+                        !doms.iter().any(crate::ccl::subst::type_contains_infer),
+                        "conditional collection materialized with an inference variable in an extent"
+                    );
+                    shapes.push(Type::extent_coproduct(doms, kept_name, c));
+                }
+            }
+        }
     }
     if let Some((value, domain, kind)) = &ct.history_slot {
         // Both children materialize at the same polarity (invariant — both
@@ -158,6 +251,15 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
         1 => all.remove(0),
         _ => {
             // Multiple incompatible contributions. Reject.
+            //
+            // NB: a positive-polarity union relaxation for heterogeneous scalar
+            // `Case` arms (`1 if c else "x"` → `Int | String`) is *not* done
+            // here: it is indistinguishable at coalesce from a binop-operand
+            // join (`1 + true`), which must stay a hard error. A sound version
+            // needs strict scalar consumers (binops, …) to impose concrete
+            // bounds so the union is rejected at *their* site; that is deferred
+            // past the coproduct foundation. Collection arms still join losslessly — that happens in
+            // the `fun` slot above (`union_extents`), not through atoms.
             let pretty = all
                 .iter()
                 .map(|t| format!("{t}"))
@@ -211,7 +313,13 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
         // `fun`-slot CompactType (exactly what the old single-payload slot held)
         // and merge it into the read view.
         let chan = CompactType {
-            fun: Some((None, domain, value)),
+            fun: Some(super::compact::CompactFun {
+                name: None,
+                // A feed's read view is a collection stream: a data function.
+                kind: super::compact::KindMerge::Data,
+                domains: vec![*domain],
+                codomain: value,
+            }),
             ..Default::default()
         };
         ct = CompactType::merge(polarity, ct, chan);
@@ -339,10 +447,153 @@ mod tests {
             t,
             Type::Fun {
                 name: None,
+                kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Bool))
             }
         );
+    }
+
+    #[test]
+    fn coalesce_two_data_extents_form_coproduct() {
+        use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
+        // A `Data` fun slot carrying two distinct extents with a shared `Int`
+        // codomain coalesces to the conditional-collection coproduct
+        // `([0,1]⤇Int) | ([0,2]⤇Int)` — a plain (`Index`-tagged) sum of data
+        // functions, one per extent (see collections.md; not a dependent sum).
+        let graph = CompactGraph {
+            term: CompactType {
+                fun: Some(CompactFun {
+                    name: None,
+                    kind: KindMerge::Data,
+                    domains: vec![
+                        compact_type(&Type::UIntRange(2)).term,
+                        compact_type(&Type::UIntRange(3)).term,
+                    ],
+                    codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
+                }),
+                ..Default::default()
+            },
+            rec_vars: BTreeMap::new(),
+        };
+        assert_eq!(
+            coalesce_compact(&graph).unwrap(),
+            Type::extent_coproduct(
+                vec![Type::UIntRange(2), Type::UIntRange(3)],
+                None,
+                Type::Base(BaseType::Int),
+            )
+        );
+    }
+
+    #[test]
+    fn coalesce_single_data_extent_is_plain_data_fun() {
+        use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
+        // One surviving extent collapses to a plain `Data` fun (idempotence:
+        // `xs if c else xs` types as `xs`).
+        let graph = CompactGraph {
+            term: CompactType {
+                fun: Some(CompactFun {
+                    name: None,
+                    kind: KindMerge::Data,
+                    domains: vec![compact_type(&Type::UIntRange(2)).term],
+                    codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
+                }),
+                ..Default::default()
+            },
+            rec_vars: BTreeMap::new(),
+        };
+        assert_eq!(
+            coalesce_compact(&graph).unwrap(),
+            Type::Fun {
+                name: None,
+                kind: crate::ccl::ty::FunKind::Data,
+                domain: Box::new(Type::UIntRange(2)),
+                codomain: Box::new(Type::Base(BaseType::Int)),
+            }
+        );
+    }
+
+    #[test]
+    fn coalesce_duplicate_data_extents_dedup_to_plain_fun() {
+        use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
+        // Two structurally-equal extents dedup to one → a plain `Data` fun, not
+        // a spurious 2-arm coproduct.
+        let graph = CompactGraph {
+            term: CompactType {
+                fun: Some(CompactFun {
+                    name: None,
+                    kind: KindMerge::Data,
+                    domains: vec![
+                        compact_type(&Type::UIntRange(2)).term,
+                        compact_type(&Type::UIntRange(2)).term,
+                    ],
+                    codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
+                }),
+                ..Default::default()
+            },
+            rec_vars: BTreeMap::new(),
+        };
+        assert_eq!(
+            coalesce_compact(&graph).unwrap(),
+            Type::Fun {
+                name: None,
+                kind: crate::ccl::ty::FunKind::Data,
+                domain: Box::new(Type::UIntRange(2)),
+                codomain: Box::new(Type::Base(BaseType::Int)),
+            }
+        );
+    }
+
+    #[test]
+    fn coalesce_extent_join_conflict_errs() {
+        use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
+        // A `Conflict` kind (a conditional collection met a compute function) is a loud coalesce
+        // error, never a silent extent drop.
+        let graph = CompactGraph {
+            term: CompactType {
+                fun: Some(CompactFun {
+                    name: None,
+                    kind: KindMerge::Conflict,
+                    domains: vec![
+                        compact_type(&Type::UIntRange(2)).term,
+                        compact_type(&Type::UIntRange(3)).term,
+                    ],
+                    codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
+                }),
+                ..Default::default()
+            },
+            rec_vars: BTreeMap::new(),
+        };
+        assert!(matches!(
+            coalesce_compact(&graph),
+            Err(CoalesceError::ExtentJoinConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn coalesce_single_domain_conflict_is_compute_where_data_required() {
+        use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
+        // A `Conflict` over a *single* domain is one function slot demanded as a
+        // data extent while being a compute capability — the coalesce-time face
+        // of `Compute <: Data`, reported as `ComputeWhereDataRequired` rather
+        // than the multi-extent `ExtentJoinConflict`.
+        let graph = CompactGraph {
+            term: CompactType {
+                fun: Some(CompactFun {
+                    name: None,
+                    kind: KindMerge::Conflict,
+                    domains: vec![compact_type(&prim(BaseType::Int)).term],
+                    codomain: Box::new(compact_type(&prim(BaseType::Int)).term),
+                }),
+                ..Default::default()
+            },
+            rec_vars: BTreeMap::new(),
+        };
+        assert!(matches!(
+            coalesce_compact(&graph),
+            Err(CoalesceError::ComputeWhereDataRequired { .. })
+        ));
     }
 
     #[test]

@@ -718,6 +718,7 @@ impl Subst {
                 name: None,
                 domain,
                 codomain,
+                ..
             } => {
                 self.rewrite_type_go(domain, memo);
                 self.rewrite_type_go(codomain, memo);
@@ -727,6 +728,7 @@ impl Subst {
                 name: Some(b),
                 domain,
                 codomain,
+                ..
             } => {
                 self.rewrite_type_go(domain, memo);
                 let restricted = self.shadow(b);
@@ -875,14 +877,12 @@ impl Subst {
                 name: None,
                 domain,
                 codomain,
-            } => Type::Fun {
-                name: None,
-                domain: Box::new(self.apply_type(domain)),
-                codomain: Box::new(self.apply_type(codomain)),
-            },
+                ..
+            } => Type::fun_like(ty, self.apply_type(domain), self.apply_type(codomain)),
 
             Type::Fun {
                 name: Some(b),
+                kind,
                 domain,
                 codomain,
             } => {
@@ -890,6 +890,7 @@ impl Subst {
                 let (b2, inner) = self.under_binder_ty(b, codomain);
                 Type::Fun {
                     name: Some(b2),
+                    kind: kind.clone(),
                     domain,
                     codomain: Box::new(inner),
                 }
@@ -963,6 +964,34 @@ pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
     out
 }
 
+/// Whether `ty`'s structural skeleton contains an unresolved [`Type::Infer`]
+/// leaf. This is the per-type dual of `check_fully_typed`'s whole-program scan:
+/// a cheap "is this type ground" predicate for invariant assertions at pass
+/// boundaries. It walks the type skeleton only — a `Refinement`'s predicate is
+/// a term, not a type, and is not descended into (an `Infer` embedded in a
+/// predicate cast is out of scope and would need a term walk).
+pub fn type_contains_infer(ty: &Type) -> bool {
+    match ty {
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::ChanDom(..)
+        | Type::Txn
+        | Type::Hole => false,
+        Type::Infer(_) => true,
+        Type::Fun {
+            domain, codomain, ..
+        } => type_contains_infer(domain) || type_contains_infer(codomain),
+        Type::History { value, domain, .. } => {
+            type_contains_infer(value) || type_contains_infer(domain)
+        }
+        Type::Tuple(ts) => ts.iter().any(type_contains_infer),
+        Type::Record(fs) => fs.iter().any(|(_, t)| type_contains_infer(t)),
+        Type::Variant(tags) => tags.iter().any(|(_, t)| type_contains_infer(t)),
+        Type::Refinement(base, _) => type_contains_infer(base),
+    }
+}
+
 /// Insert each of `names` into `bound` for the duration of `f`, restoring the
 /// set afterward. Only names that were *newly* inserted are removed, so a
 /// binder that shadows an already-in-scope name of the same spelling does not
@@ -1001,6 +1030,7 @@ fn collect_type_fv(
             name,
             domain,
             codomain,
+            ..
         } => {
             collect_type_fv(domain, bound, visited, out);
             // A `Some` name is the Pi binder, bound in the codomain.
