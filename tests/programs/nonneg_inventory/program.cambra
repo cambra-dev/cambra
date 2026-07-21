@@ -1,0 +1,30 @@
+# A refined transactional store: the value type {q: Int | q >= 0} states the
+# invariant "stock never goes negative" once, and the compiler enforces it on
+# every write path.  The `stock >= qty` guard in `reserve` is load-bearing —
+# it is what proves the decrement stays non-negative on that branch.  Deleting
+# the guard must make this program ill-typed, not make the store go negative
+# at runtime.
+
+inventory: Mut(Map(String, {q: Int | q >= 0}), Txn) := ["tee" -> 5]
+
+def reserve(sku: String, qty: Int) => Bool requires Transaction:
+    assert qty > 0
+    match inventory[sku]:
+        case some(stock):
+            if stock >= qty:
+                inventory[sku] := stock - qty
+                true
+            else:
+                false
+        case none: false
+
+# Three sequential reservations against a stock of 5: the first two succeed,
+# the third finds 1 < 2 and leaves the store untouched.
+requests = [(sku="tee", qty=2), (sku="tee", qty=2), (sku="tee", qty=2)]
+for r in requests:
+    with begin():
+        reserve(r.sku, r.qty)
+
+with begin():
+    remaining = inventory["tee"]
+remaining

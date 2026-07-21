@@ -1,0 +1,17 @@
+# Function contracts as boundary asserts.  Asserts at the top of a function
+# are preconditions; an assert on the result variable before it is returned
+# is a postcondition.  Both lift to refinement types in CCL — preconditions
+# refine the parameters, the postcondition refines the codomain — so call
+# sites must prove the preconditions, and an implementation that can't
+# discharge the postcondition is rejected at compile time.  There is no
+# refinement syntax at the term level; the asserts ARE the surface form.
+
+def discounted(price: Int, discount: Int):
+    assert price >= 0
+    assert discount >= 0
+    assert discount <= price
+    p = price - discount
+    assert p >= 0
+    p
+
+discounted(100, 25)

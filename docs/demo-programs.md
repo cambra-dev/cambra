@@ -11,8 +11,9 @@ one starts failing), the test goes red and prompts an update.
 
 ## Running a program manually
 
-Every program in the table below is a runnable `.cambra` file.  To run one
-by hand:
+Every program in the table below is a runnable `.cambra` file (named
+`program.cambra`, except `storefront`, which has `v0.cambra` and `v1.cambra`
+— the two sides of its version upgrade).  To run one by hand:
 
 ```bash
 cargo run -- tests/programs/<name>/program.cambra
@@ -57,6 +58,23 @@ for the helpers each `mod.rs` uses (`expect_scalar`,
 `expect_compile_error`, `expect_scalar_currently_buggy`, plus the
 HTTP-sink and subprocess utilities).
 
+## North-star programs and corpus policy
+
+The gallery's north-star is [`storefront`](../tests/programs/storefront/) —
+one operational application spanning transactions, streaming, analytics,
+and serving, in two versions (`v0.cambra`, `v1.cambra`) whose diff is a
+version upgrade.  Corpus policy: the storefront is **not** staged into
+progressive versions-as-tests.  Each capability it needs is isolated by a
+small feature-focused satellite program that pins that gap alone
+(`discount_contract`, `nonneg_inventory`, `ledger_balance`, alongside the
+earlier north-stars `txn_kv`, `reachability`, and `fanout`).  The
+satellites keep failures legible — one gap, one red test — while the
+storefront keeps the composition honest: features that pass in isolation
+must also pass composed, and its single test goes red at each layer of
+unblocking to prompt the next pin.  Its
+[`mod.rs`](../tests/programs/storefront/mod.rs) documents the orchestration
+plan and the full dependency map.
+
 ## Programs
 
 | Program | Use case | Exercises | Status | Notes / Blocker |
@@ -73,7 +91,11 @@ HTTP-sink and subprocess utilities).
 | [while_counter](../tests/programs/while_counter/) | Count up with a while loop | `while`, mutability | 🚧 blocked | While-loop lowering is not yet implemented. Currently rejected at lowering. |
 | [reachability](../tests/programs/reachability/) | Transitive closure (recursive query) | self-referential binding, `Set(T)` dedup-by-type, `++`, hash-join in a cycle | 🚧 blocked | North-star recursive query. Parse-blocked on record-term syntax `(src=1, dst=2)`; then `Set(T)` + the self-referential (recursive) binding. |
 | [fanout](../tests/programs/fanout/) | Polymorphic sink constructor (fan-out pipe head) | `Feed(_)` type, `<<` feed, annotation-only forward decl, element polymorphism | 🚧 blocked | `Feed(_)` annotation unsupported; the forward declaration doesn't parse. Not Unix `tee` — returns the writable *head*. |
-| [txn_kv](../tests/programs/txn_kv/) | Transactional KV store over HTTP + a stream-aggregate `/stats` endpoint | `requires Transaction`, `with begin()`, `abort()`, `Mut(..., Txn)`, atomic read-modify-write, `Option` lookup, `match`, `λ`/`restrict`/`count`, structured requests | 🚧 blocked | Lexer rejects `λ` (the `/stats` aggregate), the first of a stack of blockers. Subsumes the former standalone `kv_store` (concurrent handlers share state → must be transactional) and `hit_counter` (the request-stream aggregate). |
+| [txn_kv](../tests/programs/txn_kv/) | Transactional KV store over HTTP + a stream-aggregate `/stats` endpoint | `requires Transaction`, `with begin()`, `abort()`, `Mut(..., Txn)`, atomic read-modify-write, `Option` lookup, `match`, `\` lambdas/`restrict`/`count`, structured requests | 🚧 blocked | Lexer rejects the `\` lambda (the `/stats` aggregate), the first of a stack of blockers. Subsumes the former standalone `kv_store` (concurrent handlers share state → must be transactional) and `hit_counter` (the request-stream aggregate). |
+| [discount_contract](../tests/programs/discount_contract/) | Function contract via boundary asserts | `assert` preconditions + postcondition, lift to CCL refinements, call-site discharge | 🚧 blocked | The CHL contract surface (see [the function-contracts Direction note](chl-spec.md#6-types-informal-sketch)). Parse-blocked on `assert`; behind it, the lift itself. Expected `75` once working. |
+| [nonneg_inventory](../tests/programs/nonneg_inventory/) | Stock reservation against a refined store | `Mut(Map(String, {q: Int \| q >= 0}), Txn)` value refinement, map literal `[k -> v]`, guarded decrement discharging it, `match`/`Option` | 🚧 blocked | The storefront's oversell invariant in isolation — deleting the guard must be a type error. Parse-blocked at the `->` map entry in the store literal. |
+| [ledger_balance](../tests/programs/ledger_balance/) | Deposit ledger + time-pinned `/balance` view | feed written inside transactions, transaction time on feed elements, `restrict(\e -> e.time < txn.current_time())`, `sum` | 🚧 blocked | Lifts `txn_kv`'s `/stats` idiom from request streams to feeds — `e.time` comes from the feed's transaction-time domain, not the feeder. Lex-blocked on the `\` lambda. |
+| [storefront](../tests/programs/storefront/) | **North-star app**: transactional orders + inventory + contract-checked pricing + time-indexed revenue views, in V0 and V1 | everything the four rows above pin, plus `groupby` rollup iterated as `key -> g` entry pairs, map comprehension `[k -> v for …]`, status-code response constructors (`http.ok`/`http.bad_request`/`http.not_found`/`http.conflict`, via `import http`), map-valued `/stats` response, version upgrade | 🚧 blocked | Two sources (`v0.cambra`, `v1.cambra` — the diff is the budgeted-flash-sale upgrade) under one orchestrating test; its `mod.rs` documents the full dependency list. See [the corpus policy above](#north-star-programs-and-corpus-policy). Lex-blocked on the `\` lambda. |
 
 ## Known issues surfaced by these programs
 
@@ -111,10 +133,9 @@ when you go to add more.
   large literal lists (replacement for the deleted `examples/slow.cambra`).
   Measures how cross-product compilation scales; ideally paired with a
   benchmark harness.
-- **Version upgrade (a v2 of `txn_kv`)** — the same program with `put`'s
-  computation changed, exercising version dispatch over persistent
-  transactional state at the `t_new` branch point.  Long-term we want a v2 of
-  *every* program (a diffing dimension across the corpus).  Deferred pending a
-  decision on how a diff is represented in the gallery (two files? a
-  directive?) and the `Versioned` node shape; branch/merge is out of scope for
-  now.
+- **Version upgrade** — the first instance now exists: `storefront` carries
+  `v0.cambra`/`v1.cambra` as two files whose diff is the upgrade, exercising
+  version dispatch over persistent transactional state at the `t_new` branch
+  point.  Still open: the `Versioned` node shape and dispatch semantics (no
+  isolating feature program yet), and long-term a v2 of *every* program (a
+  diffing dimension across the corpus); branch/merge is out of scope for now.

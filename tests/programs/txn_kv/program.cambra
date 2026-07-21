@@ -13,9 +13,11 @@
 # (typeclass-solver-resolved, not an effect), summoned implicitly at the call
 # site.  A transaction commits on normal block exit; `abort()` rolls it back.
 
-get_reqs,   get_resps   = http_serve("8080", "GET",  "/get")
-set_reqs,   set_resps   = http_serve("8080", "POST", "/set")
-stats_reqs, stats_resps = http_serve("8080", "GET",  "/stats")
+import http
+
+get_reqs,   get_resps   = http.serve("8080", "GET",  "/get")
+set_reqs,   set_resps   = http.serve("8080", "POST", "/set")
+stats_reqs, stats_resps = http.serve("8080", "GET",  "/stats")
 
 store: Mut(Map(String, String), Txn) := []
 
@@ -37,12 +39,12 @@ for req in get_reqs:
         result = store[req.query.key]
     get_resps[req.id] = match result:
         case some(v): v
-        case none:    not_found("no such key\n")
+        case none:    http.not_found("no such key\n")
 
 # Write count as a declarative aggregate over the /set request stream — a view,
 # not mutable state.  `set_reqs` fans out to both the writer loop above and
 # this counter.
 for req in stats_reqs:
     with begin() as txn:
-        num_writes = count(set_reqs.restrict(λ r → r.time < txn.current_time()))
+        num_writes = count(set_reqs.restrict(\r -> r.time < txn.current_time()))
         stats_resps[req.id] = str(num_writes) + "\n"

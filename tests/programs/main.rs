@@ -14,6 +14,7 @@
 mod common;
 
 mod arithmetic;
+mod discount_contract;
 mod fanout;
 mod filter_and_aggregate;
 mod for_accumulator;
@@ -23,8 +24,11 @@ mod http_accumulator;
 mod http_counter;
 mod http_greeter;
 mod inner_join;
+mod ledger_balance;
+mod nonneg_inventory;
 mod prefix_lines;
 mod reachability;
+mod storefront;
 mod streaming_echo;
 mod txn_kv;
 mod while_counter;

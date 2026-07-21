@@ -138,10 +138,12 @@ pass
 `nonlocal`, `del`, `assert`, `raise`, `is` are **not** keywords in CHL
 today. Some are reserved for future use.
 
-> **Direction.** The convergence syntax adds binder/keyword vocabulary
-> that is not lexed today: `rec` (recursive binding — §4.3, **[Decided]**),
+> **Direction.** Planned binder/keyword vocabulary, not lexed today:
+> `rec` (recursive binding — §4.3, **[Decided]**),
 > `with`, `given`, `requires`, `summon` (transactions / contextual
-> parameters — §8, **[Decided]**), and `match` / `case` (pattern
+> parameters — §8, **[Decided]**), `import` (built-in
+> modules — the `http` module surface, **[Decided]**; general modules
+> remain future work, §9), and `match` / `case` (pattern
 > matching, **[Tentative]** — it appears in the north-star `txn_kv`
 > program but has no design writeup). Avoid taking these names for other
 > purposes.
@@ -177,11 +179,16 @@ parsing-then-erroring.
 `++` is not a Python token at all: it is CHL's collection-union operator
 (§3.3). There is no increment operator — `++` is always binary.
 
-> **Direction.** The convergence syntax adds tokens that are not lexed
-> today **[Decided]**: `λ` and `→` for lambdas, with ASCII fallbacks `\`
-> and `->` (§3.10), and `:=` for mutation (§4.3). Note that the future
-> `:=` is *not* Python's walrus operator — it is the Algol-tradition
-> assignment statement, and there is still no assignment-as-expression.
+> **Direction.** Tokens not lexed today **[Decided]**: `\` and `->` for
+> lambdas (§3.10), `->` doubling as the pair / map-entry arrow (§2.4),
+> and `:=` for mutation (§4.3). CHL surface syntax is **ASCII-only**:
+> earlier sketches used `λ`/`→`/`↦`, and those are dropped — non-ASCII
+> source is a usability hazard, and dual spellings fork a corpus into
+> two dialects. (The CCL *symbolic rendering* in design docs keeps its
+> mathematical notation; that is documentation, not source.) Note that
+> the future `:=` is *not* Python's walrus operator — it is the
+> Algol-tradition assignment statement, and there is still no
+> assignment-as-expression.
 
 ### 1.9 Semicolons
 
@@ -259,8 +266,7 @@ valid). Every binding LHS is therefore a static pattern: which names a
 statement introduces is decidable from the syntax alone, without any
 runtime evaluation.
 
-> **Direction.** The convergence syntax adds statement forms that are
-> not in today's grammar: `x := e` mutation statements (**[Decided]**,
+> **Direction.** Planned statement forms, not in today's grammar: `x := e` mutation statements (**[Decided]**,
 > §4.3), `rec x = e` recursive bindings (**[Decided]**, §4.3),
 > annotation-only forward declarations such as `h: Feed(_)` with no
 > initialiser (**[Decided]**, §3.7 — today an annotation *requires* a
@@ -328,26 +334,38 @@ record. Dicts currently parse but are rejected at lowering.
 `(e)` (no trailing comma) is parenthesised `e`, **not** a one-tuple. A
 one-tuple is written `(e,)`.
 
-> **Direction — term-level delimiters [Decided].** The convergence
-> syntax splits the three delimiters by role
+> **Direction — term-level delimiters [Decided].** The three
+> delimiters split by role
 > (2026-06-29 §1):
 >
 > | Delimiter | Role | Examples |
 > | --- | --- | --- |
 > | `( … )` | product **terms** | tuple `(1, 2, 3)`, record `(f1=1, f2=2)` |
-> | `[ … ]` | **collections** — definition *and* lookup | list `[1, 2, 3]`, map `[k=v, …]`, indexing `counts[word]`, `xs[0]` |
+> | `[ … ]` | **collections** — definition *and* lookup | list `[1, 2, 3]`, map `[k -> v, …]`, indexing `counts[word]`, `xs[0]` |
 > | `{ … }` | structural **types** | tuple type `{T, U}`, record type `{f: T}`, refinement `{x: T \| p(x)}` |
 >
 > Under that scheme `{…}` never appears at the term level: today's
 > `{name: e}` records become `(name=e, …)`, and dicts become map
-> literals `[k=v, …]`. (An earlier sketch had dicts moving to
-> `[k: v, …]`; that is superseded — `:` is settling on annotation/type
-> duty, `=` on definition.) Still **[Open]**: the spelling of an
-> *empty* map under the new scheme. The record-syntax /
-> call-argument interaction is resolved by the
-> functions-take-one-product-argument direction (§3.8): `f(x=1)` *is*
-> `f` applied to a record — keyword arguments and record arguments are
-> the same thing.
+> literals `[k -> v, …]`.
+>
+> Map entries use `->`, not `=` (**[Decided]**). `a -> b` is **pair
+> syntax** — sugar for the two-tuple `(a, b)`, valid in construction
+> (`let x = 1 -> 2`) and in patterns (`for k -> g in m`, §7.2) — so a
+> map literal is a collection of entry pairs, matching the
+> collections-are-functions model (§6.3). It also keeps the two
+> operators' binding disciplines distinct: the left of `=` is always a
+> *definition target* (a name, a record field label, a collection
+> point `c[i]`), while the left of `->` is an *evaluated key
+> expression*. And it removes a one-character trap: `[x = 5]` (map)
+> vs `[x == 5]` (one-element list of `Bool`). Three earlier sketches
+> are superseded: dicts as `[k: v, …]` (`:` is settling on
+> annotation/type duty), map entries as `[k=v, …]` (which read as
+> keyword arguments), and Unicode `[k ↦ v, …]` (CHL is ASCII-only —
+> §1.8). Still **[Open]**: the spelling of an *empty* map under the
+> new scheme. The record-syntax / call-argument interaction is
+> resolved by the functions-take-one-product-argument direction
+> (§3.8): `f(x=1)` *is* `f` applied to a record — keyword arguments
+> and record arguments are the same thing.
 
 ---
 
@@ -541,8 +559,7 @@ with a guard or as an aggregate.
 Comparing values of incompatible types is a compile-time type error,
 not a runtime error.
 
-> **Direction [Decided].** The convergence syntax adds membership
-> *expressions*: `e in s` tests set membership, `k in m` tests for a key
+> **Direction [Decided].** Planned membership *expressions*: `e in s` tests set membership, `k in m` tests for a key
 > in a map (2026-06-29 §2).
 > `in` as the iteration keyword (`for x in xs`) is unchanged; the
 > expression form is what's new.
@@ -729,14 +746,15 @@ Annotated lambda parameters mirror `def` parameters (§4.1). Refinement
 annotations are not yet writable in the surface syntax; some built-ins
 (e.g. `groupby`, §7.2) produce refined lambdas internally.
 
-> **Direction — `λ x → body` [Decided].** The convergence syntax
-> retires Python's `lambda x: body` in favour of `λ x → body`, with
-> ASCII fallback `\x -> body`
-> (2026-06-29 §1). This
-> makes the surface lambda match the CCL symbolic form exactly, so
-> surface and core read alike — e.g. `groupby(sales, λ r → r.region)` —
-> and frees `:` in a lambda head for its annotation role
-> (`λ x : T → body`).
+> **Direction — `\x -> body` [Decided].** Python's `lambda x: body`
+> is retired in favour of `\x -> body`
+> (2026-06-29 §1, ASCII
+> revision 2026-07): `\` binds the parameter, `->` separates the body
+> — e.g. `groupby(sales, \r -> r.region)` — and `:` in a lambda head
+> is freed for its annotation role (`\x: T -> body`). An earlier
+> sketch made Unicode `λ x → body` primary; CHL is ASCII-only (§1.8).
+> `\x -> x -> 1` (a lambda returning a pair, §2.4) is unusual but
+> unambiguous — the first `->` closes the binder, the rest is body.
 
 ### 3.11 List, tuple, record, dict literals
 
@@ -768,7 +786,7 @@ There is no empty-dict literal today.
 > | --- | --- |
 > | `(1, 2)` — tuple | unchanged: `( … )` is the product constructor |
 > | `{name: e, …}` — record | `(name=e, …)` — a record is a product with named fields (and a call's keyword arguments are exactly such a record — §3.8) |
-> | `{"k": v, …}` — dict | `[k=v, …]` — a map literal; `[ … ]` is the collection delimiter |
+> | `{"k": v, …}` — dict | `[k -> v, …]` — a map literal of entry pairs (§2.4); `[ … ]` is the collection delimiter |
 > | `[1, 2, 3]` — list | same spelling, but shared across collection types: the literal can denote an `Array`, `List`, or `Set`, disambiguated by annotation or usage, with `list([…])` / `set([…])` constructors for explicitness (**[Tentative]** — §6.3) |
 > | `{}` — empty record | the empty product `()`: records and tuples are both products (§3.8), so the empty record, the empty tuple, and the unit value coincide (§3.1) |
 > | `[]` — empty list | same spelling; the empty-**map** spelling is **[Open]** (§2.4) |
@@ -929,6 +947,12 @@ function must be definable without referring to its own name.
 > `store: Mut(Map(…), Txn)`. What stays true is that the capability is
 > visible in the types at the binder, not smuggled in.
 
+> **Direction [Tentative].** Return-type annotations:
+> `def f(t: T) => U:` — `=>` is the function-type arrow, so the same
+> signature can be written as a binding, `f: (T => U) = \t -> …`.
+> Recommended style annotates both parameters and the return type on
+> top-level `def`s; the north-star programs follow it.
+
 ### 4.2 `def` — generator function
 
 A function whose body contains a `yield` expression anywhere — at any
@@ -995,6 +1019,13 @@ a, b = pair
 ```
 
 is supported at any nesting depth.
+
+> **Direction [Tentative].** Destructuring targets generalize: any
+> tuple-yielding expression can be destructured wherever a target
+> appears — assignment and `for` binders alike — and `k -> v` pair
+> patterns (§2.4) join tuple patterns. Today's grammar special-cases
+> the `reqs, resps = http_serve(…)` statement form (§7.4); that is an
+> implementation restriction, not a design one.
 
 **No assignment-as-expression** (no walrus `:=`). **No multi-target
 chained assignment** (`a = b = c` is not in the grammar).
@@ -1298,6 +1329,43 @@ a value of the base type for which a predicate holds. Refinements are
 inferred internally by built-ins like `groupby` (§7.2); the decided
 surface form is `{x: T | p(x)}` (§6.1), not writable yet.
 
+> **Direction [Decided] — function contracts are asserts.** There is
+> no refinement syntax at a function definition site: a function's
+> contract is written as `assert` statements in its body, lifted to
+> refinement types in CCL. The two canonical shapes: precondition
+> asserts at the top of the body, referencing parameters, lift to
+> refinements on those parameters (`assert qty > 0` makes the domain
+> `{qty: Int | qty > 0}`); an assert on the result variable
+> immediately before it is returned lifts to a refinement on the
+> codomain, dependent on the parameters through `Type::Fun`'s named
+> binders (a trailing `assert p >= item.cost * qty` gives the codomain
+> `{p: Int | p >= item.cost * qty}`). Asserts are not restricted to
+> those positions: an assert anywhere in a block refines the binders
+> in scope from that point on, and one under a conditional contributes
+> a path-sensitive refinement. Call sites must discharge parameter
+> refinements, so preconditions propagate outward to trust boundaries
+> — in the north-star `storefront`, `reserve`'s `assert qty > 0` is
+> what forces the HTTP handler to validate `req.body.qty` before the
+> call typechecks. Type-position refinement syntax (§6.1) remains for
+> **data** — store value types, feed element types; both surfaces meet
+> in CCL as ordinary refinement types.
+>
+> Discharge is a spectrum, not a promise of static proof: an assert
+> the compiler can prove is discharged at compile time and erased; one
+> it cannot prove remains a runtime check. A planned `static assert`
+> form (**[Open]**) demands compile-time discharge — failing the build
+> when the proof doesn't go through — and may generalize to a
+> constexpr-like marker forcing any statement to resolve at compile
+> time. Also **[Open]**: the precise placement and reference rules
+> (what a pre- or postcondition may mention, where the lift draws its
+> cut points) need elaboration; and *nominal* domain types carrying
+> their own invariants (a `Price` whose `assert amount >= 0` rides the
+> type instead of being repeated per function) are the agreed
+> direction for factoring recurring contracts, with no syntax settled
+> yet (§6.1). Pinned by `discount_contract` (the mechanism in
+> isolation), `nonneg_inventory` (data refinement plus guarded
+> discharge), and `storefront` (both combined).
+
 The underlying type system additionally tracks unions, source types,
 and inference variables; see
 [docs/operational-semantics/](operational-semantics/) for the formal
@@ -1323,6 +1391,17 @@ is **not** generic-argument syntax (it belongs to collections, §2.4).
 
 **`{…}` is structural-type syntax** (§2.4): tuple type `{T, U}`, record
 type `{f: T}`, refinement `{x: T | p(x)}`.
+
+> **Direction [Tentative].** Named types come in two strengths. A
+> plain `=` binding to a capitalized name is a structural **alias** —
+> `Item = {price: Int, cost: Int}` — interchangeable with the type it
+> names. A `type` declaration is **nominal** —
+> `type Price = {amount: Int}` — distinct from every other type of the
+> same shape. Nominal types are the agreed home for domain invariants
+> (a `Price` carrying `assert amount >= 0` in its declaration, per the
+> contracts direction in §6), so a contract states its ontology once
+> instead of repeating asserts at every function; the declaration
+> syntax for that invariant is not yet settled.
 
 ### 6.2 Direction: non-purity as type wrappers [Decided]
 
@@ -1426,6 +1505,19 @@ sharing that key.
 The standard pattern (above) — group, then aggregate per group — is
 what `groupby` is primarily designed to support.
 
+> **Direction [Tentative].** Iterating a keyed collection yields its
+> **entries** — `groupby` returns a map-like `K ⇒ Collection` value, a
+> bare `for` binder binds the whole entry pair, and a `k -> g` pattern
+> (pair sugar, §2.4) destructures it, so the rollup can rebuild a map
+> with a map comprehension:
+>
+> ```python
+> [key -> sum([o.price for o in g]) for key -> g in groupby(paid, \o -> o.sku)]
+> ```
+>
+> (the north-star `storefront` `/stats` rollup). Today's implemented
+> iteration, shown above, yields the bare groups with no key.
+
 ### 7.3 `defer`
 
 `defer()` (zero arguments) creates a deferred collection placeholder.
@@ -1473,12 +1565,41 @@ unique across the program.
 
 > **Direction [Open].** The HTTP module design is deliberately parked
 > (2026-06-29, Open/deferred):
-> how responses carry status codes (`ok(…)`, `not_found(…)`), the
-> structured-request surface (`req.body`, `req.query`, `req.time`,
-> headers), response pairing via feed-at-index (`resps[req.id] = …`, as
-> the north-star `txn_kv` writes it), and multi-endpoint multiplexing
-> are all sketches, not decisions. The `(requests, responses)`
-> tuple-destructuring form above is what's implemented today.
+> how responses carry status codes, the structured-request surface
+> (`req.body`, `req.query`, `req.time`, headers), response pairing via
+> feed-at-index (`resps[req.id] = …`, as the north-star `txn_kv`
+> writes it), and multi-endpoint multiplexing are all sketches, not
+> decisions — closing any of them out means designing the HTTP
+> library. The sketch the north-star `storefront` handlers are
+> written against: a response is a record,
+> `{code: {c: Int | 100 <= c <= 599}, body: String}`, and the status
+> constructors are ordinary library functions over it
+> (`def not_found(body): (code=404, body=body)`, likewise `ok` /
+> `bad_request` / `conflict`), with the record literal as the escape
+> hatch for other codes — no new language surface. They live in an
+> **`http` module** (**[Decided]**): programs write `import http`,
+> then `http.ok(…)` / `http.not_found(…)`, and the north-star
+> programs address the source the same way, `http.serve(…)`. Modules
+> are records, so a module can be passed as one; the general module
+> system (user modules, multi-file) remains future work (§9). A response feed's
+> element type would be per-endpoint: a bare serializable value,
+> answered as a 200 carrying it (`txn_kv` writes `String` bodies; the
+> north-star `storefront` `/stats` answers with its revenue map
+> directly), or the response record — one type, **not** the union of
+> the two, since unions are structural, for records and variants, not
+> a pattern-matchable set algebra over arbitrary types; a handler with
+> any non-200 arm therefore wraps every arm. How the sink accepts
+> either element type (an instance riding §8's typeclass solver?),
+> the wire serialization of bare structured values, and whether an
+> endpoint's response type can carry a contract refinement
+> (`{r: Response | r.code < 500}`, "never answers 500") ride on the
+> same library design. So does the typing of the response sink
+> itself: a *deferred keyed collection* — supporting both
+> `resps[req.id] = …` and a feed form `resps << …` — that needs CCL
+> and CHL definitions. The `(requests, responses)`
+> tuple-destructuring form above is what's implemented today,
+> special-cased to `http_serve` only as an implementation matter
+> (§4.3 Direction).
 
 ---
 
@@ -1507,6 +1628,12 @@ Shared mutable state accessed by concurrent handlers **must** be
 transactional — `store: Mut(Map(K, V), Txn)` — and every access runs
 inside a `with begin():` block; this is what makes a read-modify-write
 atomic in the presence of concurrent `http_serve` handlers.
+
+Scope transactions minimally: only the operations that must be atomic
+go inside `with begin():` — input validation before it, response
+assignment after it. The north-star handlers observe this throughout
+(e.g. `storefront`'s `/order` validates and matches the catalog before
+opening the transaction around `reserve` + `quote` + the feed).
 
 Supporting decisions (same source):
 
@@ -1600,8 +1727,8 @@ them — the gallery is the single source of truth.
 The gallery holds two kinds of program. Most compile today and
 illustrate implemented features. The **north-star** programs —
 `reachability`, `fanout`, `txn_kv` — are instead written in the
-*target* syntax of the convergence decisions (`rec`, `:=`, `(f=…)`
-records, `λ`-lambdas, `Feed`/`Mut` wrappers, transactions) and are
+*target* syntax of the Direction notes (`rec`, `:=`, `(f=…)` records,
+`\`-lambdas, `Feed`/`Mut` wrappers, transactions) and are
 pinned as expected compile-errors that go red one by one as the
 direction lands; read them as the direction's worked examples, with
 the same status caveats as the Direction notes they exercise.
@@ -1630,10 +1757,12 @@ with parser-level support that lowering rejects:
 - **Recursion** — self-reference in `def` is not yet wired through;
   self-referential *value* bindings get the explicit `rec` form
   (**[Decided]**, §4.3).
-- **Imports / multiple files** — CHL is single-file today. If
-  multi-file support lands, a real *module* concept (imports,
-  namespaces) arrives with it — that is when the word "module" earns
-  a place in this spec (§2.1 deliberately avoids it now).
+- **Imports / multiple files** — CHL is single-file today. Importing
+  *built-in* modules is decided ahead of the rest (`import http`, the
+  HTTP Direction note in §7.4); user modules, multi-file programs, and
+  the general namespace story arrive together later — that is when the
+  full *module* concept earns a place in this spec (§2.1 deliberately
+  avoids it now).
 - **Classes / `try`** — not in the language. `with` is not a keyword
   today but is claimed by the transaction design (**[Decided]**, §8) —
   it will not carry Python's general context-manager meaning.
@@ -1642,19 +1771,24 @@ with parser-level support that lowering rejects:
 - **Surface refinement type syntax** — refinement types (§6) are
   inferred today only via built-ins like `groupby`; the decided
   surface form is `{x: T | p(x)}` (**[Decided]**, §6.1), not yet in
-  the grammar.
+  the grammar. Function contracts arrive as `assert`s lifted to
+  refinements (**[Decided]**, §6) — `assert` is likewise not yet a
+  statement.
 - **Pattern matching** beyond tuple destructuring on assignment
   targets — a `match`/`case` form appears in the north-star `txn_kv`
   (**[Tentative]**, §1.6) but has no design writeup.
 - **The term-level delimiter migration** — records `(f=1, …)`, maps
-  `[k=v, …]`, `{…}` reserved for types (**[Decided]**, §2.4). Today
+  `[k -> v, …]`, `{…}` reserved for types (**[Decided]**, §2.4). Today
   the parser still classifies `{…}` by its keys (record vs. dict) and
-  dict lowering is `Unsupported`; an earlier plan to move dicts to
-  `[k: v, …]` is superseded by the map-literal decision.
-- **Map/dict comprehensions** — not in the grammar; their surface form
-  follows the map-literal decision above (**[Open]**).
-- **The syntax convergence at large** — every **Direction** note in
-  this spec (λ-lambdas §3.10, `:=`/`rec` §4.3, membership `in` §3.4,
+  dict lowering is `Unsupported`; earlier plans to move dicts to
+  `[k: v, …]`, `[k=v, …]`, or Unicode `[k ↦ v, …]` are superseded by
+  the map-literal decision.
+- **Map/dict comprehensions** — not in the grammar; the surface form
+  follows the map-literal decision above: `[k -> v for …]`
+  (**[Decided]** as surface, unimplemented; the north-star
+  `storefront` `/stats` rollup uses it).
+- **The target syntax at large** — every **Direction** note in
+  this spec (`\`-lambdas §3.10, `:=`/`rec` §4.3, membership `in` §3.4,
   type wrappers §6.2, transactions §8, …) is unimplemented; the
   north-star programs pin the target and the sequencing is tracked
   separately.

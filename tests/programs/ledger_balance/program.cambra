@@ -1,0 +1,26 @@
+# A time-pinned view over a transactionally-fed collection.  `ledger` is fed
+# only inside transactions, so each element carries the commit time of the
+# transaction that fed it; /balance answers with the sum of deposits committed
+# strictly before its own transaction began.  This is `txn_kv`'s /stats idiom
+# lifted from a request stream to a *feed*: `e.time` is contributed by the
+# feed's transaction-time domain, not written by the feeder.  Without the
+# restrict, the sum is only defined when the feed closes — for a server,
+# never.
+
+ledger: Feed({amount: Int})
+
+import http
+
+deposit_reqs, deposit_resps = http.serve("8080", "POST", "/deposit")
+balance_reqs, balance_resps = http.serve("8080", "GET", "/balance")
+
+for req in deposit_reqs:
+    with begin():
+        ledger << (amount=req.body.amount)
+    deposit_resps[req.id] = "ok"
+
+for req in balance_reqs:
+    with begin() as txn:
+        deposits = ledger.restrict(\e -> e.time < txn.current_time())
+        balance = sum([e.amount for e in deposits])
+    balance_resps[req.id] = balance
