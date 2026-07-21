@@ -61,9 +61,12 @@ use crate::{
 ///
 /// Use [`eprint_errors`] for source-context rendering: parse, lowering, and
 /// span-carrying inference errors get ariadne reports with underlines; the
-/// remaining variants render as plain `error: …` lines. Lambda-elim/conversion
-/// spans remain future work; the enum is shaped so they migrate without
-/// changing the list-of-errors return contract.
+/// remaining variants render as plain `error: …` lines. The same
+/// [`CompileError`]s feed the web [`Diagnostic`](crate::inspector_model::Diagnostic)
+/// JSON path via [`diagnostics_from_compile_errors`](crate::inspector_model::diagnostics_from_compile_errors)
+/// — one error model, two renderers. Lambda-elim/conversion spans remain
+/// future work; the enum is shaped so they migrate without changing the
+/// list-of-errors return contract.
 #[derive(Debug)]
 pub enum CompileError {
     /// The parser rejected one token / token sequence.
@@ -591,8 +594,6 @@ pub struct CompiledProgram {
     /// folds it at each pane boundary into the per-pane
     /// [`SourceProjection`](crate::ccl::lineage::SourceProjection)s and pane-pair
     /// [`LineageMap`](crate::ccl::lineage::LineageMap)s the inspector consumes.
-    // Consumed by the inspector model; unused within the compiler itself.
-    #[allow(dead_code)]
     pub(crate) pass_lineage: Vec<(Pass, LineageLog)>,
     /// The parsed CHL surface AST — the source-of-truth for source-level
     /// (lexical) inspector queries.
@@ -600,7 +601,7 @@ pub struct CompiledProgram {
     /// This is the [`Module`](crate::chl_parser::ast::Module) lowering consumed,
     /// retained verbatim. It is the anchor for *source-language* questions —
     /// name resolution (`goto-definition`, the binder half of `scope-at`) —
-    /// answered by the inspector's name-binder index.
+    /// answered by [`crate::inspector_model::NameBinderIndex`].
     ///
     /// It is deliberately **distinct from [`post_inference_ir`](Self::post_inference_ir)**
     /// (the typed IR): lowering destroys some source variables before any IR
@@ -647,8 +648,6 @@ impl CompiledProgram {
     ///   post-inference ids);
     /// * post-desugar pane = fold the concatenated Inline + Desugar logs
     ///   (post-inference → post-desugar ids). Both boundaries are fully recorded.
-    // Consumed by the inspector model (a later commit in this stack).
-    #[allow(dead_code)]
     pub(crate) fn materialize_panes(&self) -> MaterializedPanes {
         debug_assert_eq!(
             self.pass_lineage.first().map(|(p, _)| *p),
@@ -699,8 +698,6 @@ impl CompiledProgram {
 /// [`CompiledProgram::materialize_panes`]. Inspector-facing; the pane
 /// projections drive `hover`/`resolve`/`spanIndex`/`build_inspect_tree`, and the
 /// maps drive the cross-pane `paneLinks` (shipped dense, self-edges included).
-// Consumed by the inspector model; unused within the compiler itself.
-#[allow(dead_code)]
 pub(crate) struct MaterializedPanes {
     /// pre-inference pane projection (= the lowering projection).
     pub(crate) pre_inference: SourceProjection,
