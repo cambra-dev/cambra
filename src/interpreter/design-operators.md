@@ -370,6 +370,22 @@ folds a conditional write to one carry-complete writer (`writes = Case[ĝ → w;
 snapshot]`), so there is no multi-writer group and no dense-`Recurse` fallback — the former
 second realization is fully retired.
 
+**Compound (tuple/record) accumulators.** A register holds one `Value`, so a tuple/record
+accumulator is stored *boxed* — a `Scalar(Record)` codomain (one column of record values) —
+while a tuple/record *literal* compiles to a struct-of-arrays `Record` tiling (a column per
+field). The two representations meet at the register boundaries and are reconciled there with
+the existing `scalar_tile_to_column_value` (box: `Tile::Record` → `ColumnValue::Records`) and
+its inverse `column_value_to_tile` (unbox to a declared tiling shape): the `InductionStore`
+init seed (`read_initial_scalar`), the conditional-write decision merge (`flat_merge`), and
+the scalar-final read (`ExtractLast`, which matches on *extent* not tiling shape). So a
+compound accumulator folds, reads-its-own-writes, carries, and conditionally writes like a
+scalar one. The **commit store** shares this: a `Mut[(int, int), Txn]` / `Mut[{x: int}, Txn]`
+transactional register threads through the same `read_initial_scalar` seed and value-Case
+decision merge, so unconditional, conditional (deny), `if`/`else`, record, and mixed
+scalar+compound multi-key stores all commit correctly. (Enabling the transactional form needed
+only the tuple/record *type annotation* syntax in `lower_type_annotation` — the store
+machinery was already compound-ready.)
+
 The finite/async split — the one place in the substrate that distinguished a finite source
 from a streaming one — is **gone**. Everywhere else the tiling protocol treats a finite
 source as a stream that happens to terminate (comprehensions, joins, aggregates all run over

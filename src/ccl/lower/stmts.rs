@@ -898,6 +898,22 @@ pub(super) fn lower_type_annotation(annotation: &Spanned<ChlExpr>) -> Result<Typ
             )),
         },
         ChlExpr::Lit(ChlLit::None) => Ok(Type::Base(BaseType::Unit)),
+        // A tuple type annotation `(A, B, …)` — e.g. a compound register value
+        // type `Mut[(int, int), Txn]`. Each element lowered recursively.
+        ChlExpr::Tuple(parts) => Ok(Type::Tuple(
+            parts
+                .iter()
+                .map(lower_type_annotation)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        // A record type annotation `{x: A, y: B}` — e.g. `Mut[{x: int}, Txn]`.
+        // Bare-identifier keys (a `Record`, not an expression-keyed `Dict`).
+        ChlExpr::Record(fields) => Ok(Type::Record(
+            fields
+                .iter()
+                .map(|f| Ok((f.name.to_string(), lower_type_annotation(&f.value)?)))
+                .collect::<Result<Vec<_>, LoweringError>>()?,
+        )),
         // Subscripted type constructors, e.g. `List[T]`. The wildcard is
         // accepted anywhere, so `List[_]` recurses to an element `Hole`.
         ChlExpr::Subscript { target, index } => {

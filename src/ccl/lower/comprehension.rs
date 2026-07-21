@@ -275,9 +275,9 @@ fn float_comp_source_case(source: Expr, iter_var: &str, body: &Expr) -> Expr {
     // chain Phase 5 builds. The compose form is equivalent (a map applies the
     // body to each element) but `emit_compose` stamps it with the *source's*
     // data kind (a map over a collection is itself a collection). That data kind
-    // is what lets two such arms of a conditional source `sigma_join` into the Σ
-    // (compiled by the gate fan-out) rather than colliding as compute-kinded
-    // lambdas whose distinct index extents would meet.
+    // is what lets two such arms of a conditional source join into the
+    // coproduct (`union_extents`, compiled by the gate fan-out) rather than
+    // colliding as compute-kinded lambdas whose distinct index extents would meet.
     Expr::compose(vec![
         source,
         Expr::lambda(iter_var, Type::Hole, body.clone()),

@@ -43,10 +43,16 @@ impl ExtractLast {
             Tiling::SealedFunction { codomain, .. } => *codomain.clone(),
             other => panic!("ExtractLast source must have SealedFunction tiling, got {other}"),
         };
+        // The default and the source codomain need only describe the same
+        // value-space (extent); their *structural* tilings may differ. A
+        // record/tuple value is `Scalar(Record)` from a register history but
+        // `Record({_0: Scalar, …})` (struct-of-arrays) from a literal. `get_impl`
+        // normalizes both through `scalar_tile_to_column_value`, so the real
+        // invariant is that the extents agree, not the tiling shapes.
         debug_assert_eq!(
-            default.tiling(),
-            &tiling,
-            "ExtractLast default tiling must match source codomain tiling",
+            default.tiling().extent(),
+            tiling.extent(),
+            "ExtractLast default extent must match source codomain extent",
         );
         Self {
             source,
