@@ -211,16 +211,16 @@ fn test_tuples(#[case] code: &str, #[case] expected: Value) {
 }
 
 // ---------------------------------------------------------------------------
-// Conditional-collection coproduct: the safety chokepoint
+// Conditional-collection Sigma: the safety chokepoint
 // ---------------------------------------------------------------------------
 
-/// A control-flow join of two differently-sized collections types as a
-/// **coproduct** over both extents (an `Index`-tagged `Variant` of data
-/// functions — `Type::extent_coproduct`; see type-inference.md Â§4.6). This lays only
-/// the *type-level* coproduct (formation + the `Variant <: Fun` consume rule,
-/// so it can be consumed at the type level); *compiling* it — the value-`Case`
+/// A control-flow join of two differently-sized collections types as the
+/// dependent-sum **conditional collection** over both extents
+/// (`Type::conditional_collection`; see type-inference.md §4.6). This lays only
+/// the *type-level* Sigma (formation + the `Σ <: Fun` elimination rule, so it
+/// can be consumed at the type level); *compiling* it — the value-`Case`
 /// fan-out that eliminates it into a union of restricts — lands with
-/// value-`Case` compilation. Until then a coproduct-consuming program must be
+/// value-`Case` compilation. Until then a Sigma-consuming program must be
 /// rejected **cleanly** (a returned compile error, never a panic and never a
 /// silent miscompile). The value-`Case` is caught at lambda elimination — the
 /// natural not-yet-implemented boundary value-`Case` compilation graduates.
@@ -234,7 +234,7 @@ fn conditional_collection_rejected_cleanly() {
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let errs = compile_program(&mut ctx, "sum([1, 2] if True else [1, 2, 3])", consumer)
         .err()
-        .expect("a coproduct-consuming program must fail to compile, not miscompile or panic");
+        .expect("a Sigma-consuming program must fail to compile, not miscompile or panic");
     let rendered = format!("{errs:?}");
     assert!(
         rendered.contains("lambda elimination") && rendered.contains("Case"),

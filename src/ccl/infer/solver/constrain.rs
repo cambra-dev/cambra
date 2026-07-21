@@ -20,7 +20,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::ty::{FunKind, KindVar};
+use crate::ccl::ty::{FunKind, Kind, KindVar, Witness};
 use crate::ccl::{Bound, HistoryKind, InferVar, InferVarId, Level, Refinement, Type};
 
 use super::type_level;
@@ -298,8 +298,8 @@ fn bridge_holder_gap(lo: &Subst, hi: &Subst) -> (Subst, Subst) {
     // constraining different fibers (of one family — g(0) vs g(1) — or of two
     // unrelated families), between which no sound transport exists. This is
     // the extent-join corner (O1/O4); the eventual resolution is the
-    // lossless coproduct extent regime (data-vs-compute functions), under which
-    // both fibers become arms of the one coproduct and the
+    // lossless conditional-collection extent regime (data-vs-compute functions),
+    // under which both fibers become candidate domains of the one Sigma and the
     // question dissolves. Until then: no reachable program produces this
     // shape, so reaching it means a solver bug — refuse loudly rather than
     // corrupt the edge.
@@ -435,11 +435,18 @@ fn constrain_go(
             constrain_go(c0, c1, &cod_sl, sr, cache)
         }
 
-        // (Conditional-collection coproduct subtyping — the injection
-        // `Fun(Data) <: Variant`, the consume `Variant <: Fun`, and the
-        // width `Variant <: Variant` — lives with the other `Variant` arms
-        // below; a finite conditional collection is a plain coproduct, not a
-        // dependent sum. See `Type::extent_coproduct` and type-inference.md Â§4.6.)
+        // (Dependent-sum (Σ) rules live just below, after the `Record` arm. They
+        // are general rules on the sum, *realized per witness `Kind`*: the solver
+        // knows dependent sums, not any surface concept. Two are genuine subtyping
+        // — the injection `Fun(Data) <: Σ` (a branch is-a sum) and the width
+        // `Σ <: Σ` (a smaller sum is-a bigger sum). The third, `Σ <: Fun`, is
+        // **not** subsumption but Σ-*elimination* discharged through this solver:
+        // a Σ value is one branch, not a function total on the union, so it cannot
+        // be subsumed to one — consuming it distributes the consumer over the
+        // witness. Only the `Kind::Enumerated` witness (what a conditional
+        // collection materializes) is wired today; the `Kind::Any` (`Collection`)
+        // and value-witness (`List`/`Map`) realizations are `todo!()` skeletons.
+        // See type-inference.md §4.6.)
 
         // Tuple: positional width-subtyping. A longer/equal tuple is a
         // subtype, so every position rhs requires must exist in lhs.
@@ -474,13 +481,13 @@ fn constrain_go(
             Ok(())
         }
 
-        // A single data function **injected** into a conditional-collection
-        // coproduct (`Type::extent_coproduct`): one branch of the union, matched
-        // to the arm with the same extent. This is how the `emit_case` join
-        // lands — each arm is constrained `<: result`, and `result` coalesces to
-        // the coproduct, so at the consistency wall each arm re-subsumes into it.
-        // The extent match is by *value* (like the old Σ-intro), and only fires
-        // when every arm is a data function.
+        // **Σ-injection** `Fun(Data) <: Σ`: a data function is a subtype of the
+        // sum iff its domain is a body-instantiation for some witness the sum
+        // ranges over, and its codomain then flows into the sum's shared codomain.
+        // This is how the `emit_case` join lands — each arm is constrained `<:
+        // result`, and `result` coalesces to the Σ, so at the consistency wall
+        // each arm re-injects into it. The membership test is realized per
+        // witness `Kind`; the covariant codomain edge is Kind-agnostic.
         (
             Type::Fun {
                 name: pn,
@@ -488,98 +495,111 @@ fn constrain_go(
                 domain,
                 codomain: c0,
             },
-            Type::Variant(arms),
-        ) if !arms.is_empty()
-            && arms.iter().all(|(_, t)| {
-                matches!(
-                    t,
-                    Type::Fun {
-                        kind: FunKind::Data,
-                        ..
-                    }
-                )
-            }) =>
-        {
-            let matched = arms.iter().find_map(|(_, t)| match t {
-                Type::Fun {
-                    name: an,
-                    domain: d,
-                    codomain: ac,
-                    ..
-                } if d.as_ref() == domain.as_ref() => Some((an, ac)),
-                _ => None,
-            });
-            match matched {
-                Some((an, ac)) => {
-                    let cod_sl = match (pn, an) {
-                        (Some(k), Some(x)) => sl.extended_rename(k, x),
-                        _ => sl.clone(),
-                    };
-                    constrain_go(c0, ac, &cod_sl, sr, cache)
+            Type::Sigma(s),
+        ) => {
+            let injects = match &s.witness {
+                // The witness is one of these domains: inject iff `domain` is one.
+                Witness::Type(Kind::Enumerated(candidates)) => {
+                    candidates.iter().any(|d| d == domain.as_ref())
                 }
-                None => Err(ConstrainError::Mismatch {
+                // The universe ranges over every domain, so any data function
+                // injects.
+                Witness::Type(Kind::Any) => {
+                    todo!("Σ-injection into a Collection (Kind::Any): any domain injects")
+                }
+                // Inject iff `domain` is the body refinement instantiated at some
+                // value of the witness type.
+                Witness::Value { .. } => {
+                    todo!("Σ-injection into a value-witness sum (List/Map)")
+                }
+            };
+            if injects {
+                let cod_sl = match (pn, s.binder()) {
+                    (Some(k), Some(x)) => sl.extended_rename(k, x),
+                    _ => sl.clone(),
+                };
+                constrain_go(c0, s.codomain(), &cod_sl, sr, cache)
+            } else {
+                Err(ConstrainError::Mismatch {
                     lhs: lhs.clone(),
                     rhs: rhs.clone(),
-                }),
+                })
             }
         }
 
-        // A **conditional collection** (a coproduct of data functions formed at
-        // a control-flow join — `Type::extent_coproduct`) *consumed* as a plain
-        // collection: whatever arm it turns out to be, iterating it walks the
-        // discriminated union of the arms' extents, so it presents as
-        // `Fun(Variant({Index(i): domainᵢ}), V)` — the same tagged domain the
-        // runtime union tile carries. The consumer's domain edge is
-        // contravariant: a *fresh* domain var resolves to the union (the common
-        // case — `sum`, `[… for x in …]`), a consumer demanding a *concrete
-        // narrower* extent fails the `d1 <: Variant` edge. Each arm's codomain
-        // flows into the consumer codomain (the arms share the joined codomain,
-        // so this is one covariant edge per arm). Fires only when every arm is a
-        // data function; a user tagged-union is not a collection.
+        // **Σ-elimination** `Σ <: Fun`: a sum *consumed* as a plain collection.
+        // Not subsumption — consuming distributes the consumer over the witness;
+        // the domain it sees is the discriminated union of the body-instantiation
+        // domains, and the shared codomain flows into the consumer codomain (one
+        // covariant edge). The consumer's domain edge is contravariant: a *fresh*
+        // domain var resolves to the union (the common case — `sum`, `[… for x in
+        // …]`), a consumer demanding a *concrete narrower* extent fails the edge,
+        // so the collection never silently narrows. The presented domain is
+        // realized per witness `Kind`.
         (
-            Type::Variant(arms),
+            Type::Sigma(s),
             Type::Fun {
                 name: n1,
                 domain: d1,
                 codomain: c1,
                 ..
             },
-        ) if !arms.is_empty()
-            && arms.iter().all(|(_, t)| {
-                matches!(
-                    t,
-                    Type::Fun {
-                        kind: FunKind::Data,
-                        ..
-                    }
-                )
-            }) =>
-        {
-            let extent_variant = Type::Variant(
-                arms.iter()
-                    .map(|(k, t)| {
-                        let Type::Fun { domain, .. } = t else {
-                            unreachable!("guard checked all arms are Fun")
-                        };
-                        (k.clone(), domain.as_ref().clone())
-                    })
-                    .collect(),
-            );
-            constrain_go(d1, &extent_variant, sr, sl, cache)?;
-            for (_, t) in arms {
-                let Type::Fun {
-                    name: pn, codomain, ..
-                } = t
-                else {
-                    unreachable!("guard checked all arms are Fun")
-                };
-                let cod_sl = match (pn, n1) {
+        ) => {
+            let consumed_domain = match &s.witness {
+                // A finite, discriminated union of the candidate extents — the
+                // same tagged domain the runtime union tile carries.
+                Witness::Type(Kind::Enumerated(candidates)) => Type::Variant(
+                    candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, d)| (FieldKey::Index(i), d.clone()))
+                        .collect(),
+                ),
+                // The universe is not enumerable, so there is no finite union to
+                // present — elimination is opaque/existential.
+                Witness::Type(Kind::Any) => {
+                    todo!("Σ-elimination of a Collection (Kind::Any): opaque domain")
+                }
+                // The refined key-domain derived from the witness value.
+                Witness::Value { .. } => {
+                    todo!("Σ-elimination of a value-witness sum (List/Map)")
+                }
+            };
+            constrain_go(d1, &consumed_domain, sr, sl, cache)?;
+            let cod_sl = match (s.binder(), n1) {
+                (Some(k), Some(x)) => sl.extended_rename(k, x),
+                _ => sl.clone(),
+            };
+            constrain_go(s.codomain(), c1, &cod_sl, sr, cache)
+        }
+
+        // **Σ-width** `Σ <: Σ`: the lhs sum's witness domain must be a subset of
+        // the rhs's, and the shared codomain flows covariantly. The subset test
+        // is realized per witness `Kind` pair.
+        (Type::Sigma(a), Type::Sigma(b)) => {
+            let witness_subset = match (&a.witness, &b.witness) {
+                // Every lhs candidate extent must appear among the rhs candidates
+                // (matched by *value*, not position — a nested/re-subsumed
+                // conditional's extents land in an arbitrary order).
+                (Witness::Type(Kind::Enumerated(xs)), Witness::Type(Kind::Enumerated(ys))) => {
+                    xs.iter().all(|x| ys.iter().any(|y| y == x))
+                }
+                // Any other witness-Kind pairing (Collection / value-witness, and
+                // cross-Kind relations) is decided with the collections work.
+                _ => todo!("Σ-width for non-enumerated witness Kinds"),
+            };
+            if witness_subset {
+                let cod_sl = match (a.binder(), b.binder()) {
                     (Some(k), Some(x)) => sl.extended_rename(k, x),
                     _ => sl.clone(),
                 };
-                constrain_go(codomain, c1, &cod_sl, sr, cache)?;
+                constrain_go(a.codomain(), b.codomain(), &cod_sl, sr, cache)
+            } else {
+                Err(ConstrainError::Mismatch {
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                })
             }
-            Ok(())
         }
 
         // Variant: width-subtyping is the dual. lhs's tags must all appear
@@ -992,6 +1012,17 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             Box::new(extrude(inner, pol, target_level, cache)),
             r.clone(),
         ),
+        // The witness's type children are the real (contravariant) domain, so
+        // they extrude at `!pol` — matching the single-`Fun` domain above; the
+        // body (a data function over the witness) extrudes covariantly. The
+        // anonymous witness reference is at level 0, so it short-circuits.
+        Type::Sigma(s) => Type::Sigma(Box::new(crate::ccl::ty::SigmaType {
+            witness: s
+                .witness
+                .map_types(|t| extrude(t, !pol, target_level, cache)),
+            body: Box::new(extrude(&s.body, pol, target_level, cache)),
+        })),
+        Type::Witness => ty.clone(),
         // Invariant payload: polarity is meaningless under invariance, so
         // both children are extruded with two-way proxies (a history is read
         // *and* written) instead of the polar one-way approximation below.
@@ -2147,20 +2178,21 @@ mod tests {
         drop(arena);
     }
 
-    // --- Conditional-collection coproduct subtyping (type-inference.md Â§4.6) ---
+    // --- Conditional-collection Sigma rules (subtyping: injection + width;
+    //     elimination: consume) — type-inference.md §4.6 ---
 
-    fn coproduct(extents: Vec<Type>) -> Type {
-        Type::extent_coproduct(extents, None, prim(BaseType::Int))
+    fn conditional(extents: Vec<Type>) -> Type {
+        Type::conditional_collection(extents, None, prim(BaseType::Int))
     }
 
     #[test]
-    fn coproduct_width_is_subtype() {
-        // A conditional collection is a coproduct (`Index`-tagged Variant of
-        // data functions); width-subtyping is positional — the lhs's tags
-        // (a prefix) appear in the rhs. The reverse (rhs has an extra tag) is
-        // not a subtype.
-        let sub = coproduct(vec![Type::UIntRange(2), Type::UIntRange(3)]);
-        let sup = coproduct(vec![
+    fn conditional_width_is_subtype() {
+        // A conditional collection is a Sigma over candidate domains;
+        // width-subtyping is by-value subset — every lhs candidate extent
+        // appears among the rhs candidates. The reverse (rhs has an extra
+        // extent the lhs lacks) is not a subtype.
+        let sub = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+        let sup = conditional(vec![
             Type::UIntRange(2),
             Type::UIntRange(3),
             Type::UIntRange(4),
@@ -2170,11 +2202,11 @@ mod tests {
     }
 
     #[test]
-    fn data_fun_injects_into_coproduct() {
-        // Injection: a single data function whose extent matches one arm is a
-        // subtype of the coproduct (the `emit_case` arm-into-result edge); a
-        // data function over a non-member extent is not.
-        let sup = coproduct(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+    fn data_fun_injects_into_conditional() {
+        // Injection: a single data function whose extent matches a candidate
+        // domain is a subtype of the Sigma (the `emit_case` arm-into-result
+        // edge); a data function over a non-member extent is not.
+        let sup = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
         let member = Type::data_fun(Type::UIntRange(2), prim(BaseType::Int));
         assert!(constrain_subtype(&member, &sup, &mut ConstrainCache::new()).is_ok());
         let nonmember = Type::data_fun(Type::UIntRange(9), prim(BaseType::Int));
@@ -2182,17 +2214,17 @@ mod tests {
     }
 
     #[test]
-    fn coproduct_consumed_as_fun() {
-        // Consume: a conditional collection used as a plain function. A *fresh*
-        // domain var absorbs the discriminated union of the arm extents (the
-        // `sum` / comprehension case).
-        let cop = coproduct(vec![Type::UIntRange(2), Type::UIntRange(3)]);
+    fn conditional_consumed_as_fun() {
+        // Elimination: a conditional collection used as a plain function. A
+        // *fresh* domain var absorbs the discriminated union of the candidate
+        // extents (the `sum` / comprehension case).
+        let cond = conditional(vec![Type::UIntRange(2), Type::UIntRange(3)]);
         let consumer = fun(fresh_var(0), prim(BaseType::Int));
-        assert!(constrain_subtype(&cop, &consumer, &mut ConstrainCache::new()).is_ok());
+        assert!(constrain_subtype(&cond, &consumer, &mut ConstrainCache::new()).is_ok());
         // A consumer demanding a *concrete narrower* extent fails: the
-        // coproduct never silently narrows to a single declared extent.
+        // conditional collection never silently narrows to a single extent.
         let narrow = fun(Type::UIntRange(2), prim(BaseType::Int));
-        assert!(constrain_subtype(&cop, &narrow, &mut ConstrainCache::new()).is_err());
+        assert!(constrain_subtype(&cond, &narrow, &mut ConstrainCache::new()).is_err());
     }
 
     // ----- Kind edge (`FunKind`, the `Compute <: Data` rejection) -----------

@@ -76,8 +76,8 @@ impl fmt::Display for FieldKey {
 ///   lossy simplification.
 /// - [`FunKind::Data`] — `α ⤇ β`: the domain is an *extent*, a collection's
 ///   index set. The domain *is* the data map, so a lossy domain is lost data;
-///   joins of data functions must be lossless — they form a coproduct
-///   ([`Type::extent_coproduct`]) over the extents, never a meet.
+///   joins of data functions must be lossless — they form a conditional-collection
+///   Sigma ([`Type::conditional_collection`]) over the extents, never a meet.
 ///
 /// Set at introduction (list literals, comprehensions, `++`, registered
 /// sources, and every `History` erasure are `Data`; `lambda`/`def` are
@@ -420,18 +420,139 @@ pub enum Type {
         /// off-path positions carry forward.
         kind: HistoryKind,
     },
+    /// A **dependent sum** `Σ (witness). body`: a value pairing a witness with a
+    /// body whose type may depend on it. A **conditional collection** (the
+    /// lossless join of data functions at a control-flow merge) is the finite
+    /// instance — the witness is a type ranging over the branches' candidate
+    /// domains ([`Witness::Type`] with [`Kind::Enumerated`]) and the body is
+    /// `Witness ⤇ V`. `List`/`Map` will be the value-witness instances
+    /// ([`Witness::Value`]) and `Collection[T]` the universe-ranging type-witness
+    /// ([`Kind::Any`]), added with the collections work.
+    ///
+    /// Consuming a Sigma is **elimination** (the consumer distributed over the
+    /// witness, `Σ 𝑤. 𝑔(body)`, collapsing when the result is
+    /// witness-independent) — never a `Σ <: Fun` coercion. Transient in the
+    /// same sense as [`Type::Witness`]: value-`Case` compilation eliminates it.
+    /// See `src/ccl/design/type-inference.md` §4.6.
+    Sigma(Box<SigmaType>),
+    /// A **type-level reference to the enclosing Sigma's type-witness** — the
+    /// witness in *domain* position, e.g. the body `Witness ⤇ V` of a
+    /// conditional collection. Anonymous and nullary (like [`Type::Txn`]): a
+    /// type-witness is always the nearest-enclosing Sigma's and is referenced
+    /// only in that Sigma's immediate body domain, so it needs no identity.
+    /// Transient — discharged to a concrete domain when its Sigma is eliminated,
+    /// so none survives to op-conversion. (A *value*-witness is referenced in a
+    /// refinement predicate as a term `Var` bound by [`Witness::Value`], via the
+    /// §4.5 binder mechanism — not through this leaf.)
+    Witness,
     // Planned:
     // Pi { param: String, param_ty: Box<Type>, body_ty: Box<Type> }
-    // Refinement { base: Box<Type>, predicate: Box<Expr> }
-    //
-    // NOTE: a **conditional collection** (the lossless join of data functions
-    // with distinct extents at a control-flow merge) is not a variant here — it
-    // is a plain coproduct, an `Index`-tagged [`Type::Variant`] of data
-    // functions built by [`Type::extent_coproduct`]. A finite, static set of
-    // branches needs no dependent sum (a finite Σ degenerates to a coproduct);
-    // see `src/ccl/design/type-inference.md`. A genuine dependent `Σ` (over a
-    // runtime/opaque witness — `List` length, `Map` key extent) will be added
-    // with the collections work, where the witness is real.
+}
+
+/// The payload of a [`Type::Sigma`] — a dependent sum `Σ (witness). body`.
+/// Boxed inside `Type` to keep the enum small.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SigmaType {
+    /// What the Sigma is summed over — a type-witness (classified by a [`Kind`])
+    /// or a value-witness (classified by its type). Also selects the eliminator.
+    pub witness: Witness,
+    /// `B(witness)`: a data function whose *domain* is determined by the witness.
+    /// For a [`Witness::Type`] it is `Witness ⤇ V` (the witness in domain
+    /// position); for a [`Witness::Value`] it is `{x | pred(x, binder)} ⤇ V`.
+    pub body: Box<Type>,
+}
+
+impl SigmaType {
+    /// The sum's shared codomain — the element type `V` of the body data function
+    /// `<witness-domain> ⤇ V`. Kind-agnostic: every Sigma body is a data
+    /// function, so this is always well-defined.
+    pub fn codomain(&self) -> &Type {
+        match &*self.body {
+            Type::Fun { codomain, .. } => codomain,
+            _ => unreachable!("Sigma body is always a data function `<domain> ⤇ V`"),
+        }
+    }
+
+    /// The body data function's element (Pi) binder, if any. Kind-agnostic.
+    pub fn binder(&self) -> Option<&crate::ccl::Name> {
+        match &*self.body {
+            Type::Fun { name, .. } => name.as_ref(),
+            _ => unreachable!("Sigma body is always a data function `<domain> ⤇ V`"),
+        }
+    }
+}
+
+/// A [`SigmaType`]'s witness, following the classification hierarchy
+/// **values : types : kinds** — a value-witness is classified by its type, a
+/// type-witness by its [`Kind`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Witness {
+    /// The witness **is a type** (a domain) of the given [`Kind`], referenced
+    /// anonymously in the body's domain position via the nullary
+    /// [`Type::Witness`].
+    Type(Kind),
+    /// The witness **is a value** of `ty` (`Nat` for a `List` length, `Set[K]`
+    /// for a `Map` key-set); `binder` is its fresh Σ-binder, referenced as a
+    /// term `Var(binder)` in the body's domain refinement (via the §4.5 binder
+    /// mechanism). Reserved for the collections work.
+    Value {
+        ty: Box<Type>,
+        binder: crate::ccl::Name,
+    },
+}
+
+/// The **kind** of a type-witness — which domains it ranges over (a kind
+/// classifies types, so it classifies which type the witness may be).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Kind {
+    /// A finite, explicitly **enumerated** set of candidate domains, in
+    /// branch/contribution order (a tested contract). Statically enumerable →
+    /// the value-`Case` fan-out. The conditional-collection case, the only one
+    /// wired today.
+    Enumerated(Vec<Type>),
+    /// **Any** domain — the universe `*` (`Collection[T]`; not enumerable →
+    /// large elimination, opaque). Type reserved; machinery lands with the
+    /// collections work.
+    Any,
+}
+
+impl Witness {
+    /// The type children this witness carries: the candidate domains of a
+    /// [`Kind::Enumerated`] type-witness, or the value type of a
+    /// [`Witness::Value`]. Empty for [`Kind::Any`] (the universe carries no
+    /// enumerated types). A value-witness's *binder* is a name, not a type, so
+    /// it is not included.
+    pub fn types(&self) -> &[Type] {
+        match self {
+            Witness::Type(Kind::Enumerated(choices)) => choices,
+            Witness::Type(Kind::Any) => &[],
+            Witness::Value { ty, .. } => std::slice::from_ref(ty),
+        }
+    }
+
+    /// Mutable analog of [`types`](Self::types).
+    pub fn types_mut(&mut self) -> &mut [Type] {
+        match self {
+            Witness::Type(Kind::Enumerated(choices)) => choices,
+            Witness::Type(Kind::Any) => &mut [],
+            Witness::Value { ty, .. } => std::slice::from_mut(ty),
+        }
+    }
+
+    /// Rebuild this witness with `f` applied to each type child (see
+    /// [`types`](Self::types)), preserving the kind and any value-witness binder.
+    pub fn map_types(&self, mut f: impl FnMut(&Type) -> Type) -> Witness {
+        match self {
+            Witness::Type(Kind::Enumerated(choices)) => {
+                Witness::Type(Kind::Enumerated(choices.iter().map(&mut f).collect()))
+            }
+            Witness::Type(Kind::Any) => Witness::Type(Kind::Any),
+            Witness::Value { ty, binder } => Witness::Value {
+                ty: Box::new(f(ty)),
+                binder: binder.clone(),
+            },
+        }
+    }
 }
 
 /// Which flavour of [`Type::History`] a handle is — a mutable variable (`:=`) or a
@@ -563,6 +684,26 @@ impl fmt::Display for Type {
                     write!(f, "feed({domain} ⇒ {value})")
                 }
             }
+            Type::Sigma(s) => {
+                // The body is `<witness-domain> ⤇ V`; render the anonymous-witness
+                // shorthand `Σ{…} ⤇ V` for a type-witness (no live binder), and the
+                // live-binder form `(Σ b : ty. body)` for a value-witness.
+                let codomain = match &*s.body {
+                    Type::Fun { codomain, .. } => codomain.to_string(),
+                    other => other.to_string(),
+                };
+                match &s.witness {
+                    Witness::Type(Kind::Enumerated(choices)) => {
+                        let cs: Vec<_> = choices.iter().map(|t| t.to_string()).collect();
+                        write!(f, "Σ{{{}}} ⤇ {codomain}", cs.join(", "))
+                    }
+                    Witness::Type(Kind::Any) => write!(f, "Σ* ⤇ {codomain}"),
+                    Witness::Value { ty, binder } => {
+                        write!(f, "(Σ {binder} : {ty}. {})", s.body)
+                    }
+                }
+            }
+            Type::Witness => write!(f, "σ"),
         }
     }
 }
@@ -635,43 +776,35 @@ impl Type {
         }
     }
 
-    /// The type of a **conditional collection**: a coproduct (untagged,
-    /// `Index`-tagged [`Type::Variant`]) of data functions, one per candidate
-    /// extent, all sharing the joined codomain. Formed at a control-flow join
-    /// of data collections with distinct extents (`xs if c else ys`): the value
-    /// is *one* of the arms, tagged by contribution order, and the branch tags
-    /// are exactly the value-`Case` gates the runtime carries.
+    /// The type of a **conditional collection**: a dependent sum
+    /// `Σ{choices} ⤇ codomain` — a type-witness of [`Kind::Enumerated`] over the
+    /// candidate domains (branch/contribution order — a tested contract), whose
+    /// body is `Witness ⤇ codomain` (the anonymous witness in domain position).
+    /// Formed at a control-flow join of data collections with distinct domains
+    /// (`xs if c else ys`); consumed by elimination (the value-`Case` fan-out).
     ///
-    /// This is a plain sum type, **not** a dependent sum — a finite, static set
-    /// of branches needs no witness (a finite `Σ` degenerates to a coproduct);
-    /// see [type-inference.md](../ccl/design/type-inference.md). Callers guarantee
-    /// `choices.len() >= 2` (a single extent is a plain data function); the
-    /// arms share `pi_name` (the element binder) and `codomain`.
-    pub fn extent_coproduct(
+    /// Callers guarantee `choices.len() >= 2` (a single domain is a plain data
+    /// function, not a Sigma). `pi_name` is the body arrow's element binder;
+    /// `codomain` the shared element type.
+    pub fn conditional_collection(
         choices: Vec<Type>,
         pi_name: Option<crate::ccl::Name>,
         codomain: Type,
     ) -> Self {
         debug_assert!(
             choices.len() >= 2,
-            "extent_coproduct: a single extent is a plain data function, not a coproduct"
+            "conditional_collection: a single domain is a plain data function, not a Sigma"
         );
-        let arms = choices
-            .into_iter()
-            .enumerate()
-            .map(|(i, dom)| {
-                (
-                    FieldKey::Index(i),
-                    Type::Fun {
-                        name: pi_name.clone(),
-                        kind: FunKind::Data,
-                        domain: Box::new(dom),
-                        codomain: Box::new(codomain.clone()),
-                    },
-                )
-            })
-            .collect();
-        Type::Variant(arms)
+        let body = Type::Fun {
+            name: pi_name,
+            kind: FunKind::Data,
+            domain: Box::new(Type::Witness),
+            codomain: Box::new(codomain),
+        };
+        Type::Sigma(Box::new(SigmaType {
+            witness: Witness::Type(Kind::Enumerated(choices)),
+            body: Box::new(body),
+        }))
     }
 
     /// If this is a function type, return the domain type, otherwise None.
@@ -728,6 +861,18 @@ impl Type {
             // Erased by `channelize` (before planning); a survivor here
             // is a compiler bug, same as `History`.
             Type::ChanDom(..) => unreachable!("Type::ChanDom survived channelize"),
+            // A dependent sum and its witness placeholder are transient (a
+            // conditional collection is eliminated by value-`Case` compilation
+            // before planning); enumerability is per its candidate domains.
+            Type::Sigma(s) => match &s.witness {
+                Witness::Type(Kind::Enumerated(choices)) => {
+                    choices.iter().all(Type::has_enumerable_extent)
+                }
+                // The universe (`Collection`) and value-witnesses are not
+                // statically enumerable.
+                Witness::Type(Kind::Any) | Witness::Value { .. } => false,
+            },
+            Type::Witness => false,
             // Concrete or type-resolvable domains: enumerable from the type alone.
             Type::Base(_)
             | Type::UIntRange(_)
@@ -751,7 +896,7 @@ impl Type {
     /// collection (`⤇`) becomes a point-free form built from compute combinators
     /// (`zip`, `apply`, `const`), so the reconstructed arrow reads `Compute`
     /// though it denotes the same collection. The kind did its work at inference
-    /// (lossless coproduct joins at coalesce); post-elimination it is not preserved, so
+    /// (lossless conditional-collection joins at coalesce); post-elimination it is not preserved, so
     /// the structural-equality asserts (and the feed-operand agreement check)
     /// compare modulo it. (Kind-aware subtyping therefore acts in
     /// *Emit*-mode inference, not the post-elimination Check-mode pass.)
@@ -800,12 +945,17 @@ impl Type {
                 domain: Box::new(domain.without_pi_names()),
                 kind: *kind,
             },
+            Type::Sigma(s) => Type::Sigma(Box::new(SigmaType {
+                witness: s.witness.map_types(|t| t.without_pi_names()),
+                body: Box::new(s.body.without_pi_names()),
+            })),
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
+            | Type::Witness
             | Type::Txn => self.clone(),
         }
     }
@@ -840,6 +990,7 @@ impl Type {
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
+            | Type::Witness
             | Type::Txn => {}
             Type::Fun {
                 domain, codomain, ..
@@ -866,6 +1017,13 @@ impl Type {
                 for (_, t) in tags {
                     f(t);
                 }
+            }
+            // The witness's type children and the body are the Sigma's children.
+            Type::Sigma(s) => {
+                for t in s.witness.types() {
+                    f(t);
+                }
+                f(&s.body);
             }
         }
     }
@@ -881,6 +1039,7 @@ impl Type {
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
+            | Type::Witness
             | Type::Txn => {}
             Type::Fun {
                 domain, codomain, ..
@@ -907,6 +1066,12 @@ impl Type {
                 for (_, t) in tags {
                     f(t);
                 }
+            }
+            Type::Sigma(s) => {
+                for t in s.witness.types_mut() {
+                    f(t);
+                }
+                f(&mut s.body);
             }
         }
     }

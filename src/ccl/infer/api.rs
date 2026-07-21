@@ -754,6 +754,16 @@ fn collect_type_errors(
             }
             collect_type_errors(inner, context_sym, strictness, errors, seen_refinements);
         }
+        Type::Sigma(s) => {
+            // Recurse for holes/infers in the witness's type children and the
+            // body; the anonymous type-witness reference (`Type::Witness`) is
+            // bound by this Sigma, so it carries no error.
+            for t in s.witness.types() {
+                collect_type_errors(t, context_sym, strictness, errors, seen_refinements);
+            }
+            collect_type_errors(&s.body, context_sym, strictness, errors, seen_refinements);
+        }
+        Type::Witness => {}
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn => {}
     }
 }

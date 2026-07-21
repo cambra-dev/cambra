@@ -265,10 +265,17 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), I
             emit_annotation_predicates(value, ctx)?;
             emit_annotation_predicates(domain, ctx)
         }
+        Type::Sigma(s) => {
+            for t in s.witness.types_mut() {
+                emit_annotation_predicates(t, ctx)?;
+            }
+            emit_annotation_predicates(&mut s.body, ctx)
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::Witness
         | Type::Txn
         | Type::Hole
         | Type::Infer(_) => Ok(()),
@@ -1018,7 +1025,7 @@ pub(super) fn emit_list<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Typ
     // element (codomain) type takes the dereferenced element type so no `Mut`
     // appears in the list type. A list literal is a **data** function — its
     // domain is an extent (the index set), so a join with another collection
-    // is lossless (forms a coproduct), never a lossy meet.
+    // is lossless (forms a conditional-collection Sigma), never a lossy meet.
     Ok(Type::data_fun(Type::UIntRange(n), deref_mut(&first_ty)))
 }
 
@@ -1105,9 +1112,9 @@ pub(super) fn emit_case<C: Typing>(
     // subtype of one fresh result variable, so the result is their least upper
     // bound (design/type-inference.md §4.6). Homogeneous arms recover the old
     // behavior (the var pins to the shared type); data-collection arms with
-    // distinct extents coalesce to a coproduct. (Heterogeneous *scalar* arms remain a
-    // hard `IncompatibleBounds` error — the sound union relaxation for them is
-    // deferred; see `coalesce`.)
+    // distinct extents coalesce to a conditional-collection Sigma. (Heterogeneous
+    // *scalar* arms remain a hard `IncompatibleBounds` error — the sound union
+    // relaxation for them is deferred; see `coalesce`.)
     let result = ctx.fresh();
     for t in &arm_tys {
         ctx.require_sub(t, &result, &|| "Case arm".to_string())?;

@@ -194,23 +194,23 @@ fn test_list_literal() {
 }
 
 #[test]
-fn test_conditional_collection_forms_coproduct() {
+fn test_conditional_collection_forms_sigma() {
     // A control-flow join of two collections with different extents is
-    // lossless: it forms a **coproduct** over both extents (never a lossy
-    // meet-domain function). `[1, 2]` is `[0, 1] ⤇ Int`, `[1, 2, 3]` is
-    // `[0, 2] ⤇ Int`, so the join is the `Index`-tagged sum
-    // `([0, 1] ⤇ Int) | ([0, 2] ⤇ Int)` — a plain sum, not a dependent sum
-    // (a finite branch set needs no witness; see type-inference.md Â§4.6).
+    // lossless: it forms the dependent-sum **conditional collection** over both
+    // extents (never a lossy meet-domain function). `[1, 2]` is `[0, 1] ⤇ Int`,
+    // `[1, 2, 3]` is `[0, 2] ⤇ Int`, so the join is `Σ (w ∈ {[0, 1], [0, 2]}).
+    // w ⤇ Int` — the witness is the runtime branch discriminant (see
+    // type-inference.md §4.6).
     assert_eq!(
         infer_program("[1, 2] if True else [1, 2, 3]"),
-        Type::extent_coproduct(vec![Type::UIntRange(2), Type::UIntRange(3)], None, int())
+        Type::conditional_collection(vec![Type::UIntRange(2), Type::UIntRange(3)], None, int())
     );
 }
 
 #[test]
 fn test_conditional_collection_same_extent_collapses() {
-    // Idempotence: when both arms share an extent, the coproduct collapses back
-    // to a plain data function — no spurious 2-arm coproduct (`union_extents`
+    // Idempotence: when both arms share an extent, the Sigma collapses back
+    // to a plain data function — no spurious 2-choice Sigma (`union_extents`
     // dedups the shared extent).
     assert_eq!(
         infer_program("[1, 2] if True else [3, 4]"),

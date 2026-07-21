@@ -413,26 +413,33 @@ The expected binder is **always globally fresh** (proposal §5.2 verbatim; the �
 
 The pipeline passes downstream of inference treat function types structurally and compare modulo the Pi binder (`Type::without_pi_names`). **Refinement-predicate compilation is deferred out of lambda-elim** (proposal §6.3): predicates ride through inference and lambda-elim in their bare pointful form (a bare boolean over the implicit `REFINEMENT_BINDER`), and **planning** compiles them. Order matters: the group-by / hash-join recognizers run *first*, on the bare form — compiling first would destroy the pointful shapes they match (see the pointful-join-recognizers plan) — and `planning::compile_refinement_predicates` then runs the lambda-elim → simplify sub-pipeline on each remaining predicate (keyed by predicate `Rc` identity) before the generic `iterate`/`restrict` lowering consumes it. This is what lets a refined collection — including a group-by over a *filtered* source (`[sum(x) for x in groupby([y+10 for y in xs if y<6], key)]`) — compile to a runtime `Restrict`/`Filter` rather than reaching op-conversion as an un-compiled predicate. Single-key dependent lookups (`sum(groupby(xs, key)(k))`) and the nested filtered-source group-by both run end-to-end with correct values.
 
-## 4.6 Data vs compute functions and coproduct extent joins
+## 4.6 Data vs compute functions and conditional-collection extent joins
 
-> **Status: implemented.** The `FunKind` marker, lossless coproduct formation at
-> control-flow joins, *and* kind-aware subtyping (the `Compute<:Data` rejection)
-> are all live. One guard is deferred with rationale (Data-domain invariance —
-> see the callout below), and the value-`Case` elimination bridges land in the
-> value-`Case` compilation PR.
+> **Status: implemented.** The `FunKind` marker, lossless conditional-collection
+> formation at control-flow joins, *and* kind-aware subtyping (the
+> `Compute<:Data` rejection) are all live. One guard is deferred with rationale
+> (Data-domain invariance — see the callout below), and the value-`Case`
+> elimination *compilation* lands in the value-`Case` compilation PR (the
+> type-level elimination rule is live here).
 >
-> **Not a dependent sum.** A conditional collection is a **coproduct** — a
-> finite, `Index`-tagged [`Type::Variant`] of data functions built by
-> `Type::extent_coproduct`. A finite, static set of branches needs no witness (a
-> finite Σ degenerates to a coproduct), so there is no `Type::Sigma` here; a
-> genuine dependent Σ (over a runtime/opaque witness — a `List` length, a `Map`
-> key extent) is a separate construct introduced with the collections work,
-> where the witness is real.
+> **A real dependent sum.** A conditional collection is the dependent sum
+> `Σ (𝑤 ∈ {𝐷ᵢ}). 𝑤 ⤇ V` ([`Type::Sigma`], built by
+> `Type::conditional_collection`). The witness `𝑤` is genuinely load-bearing: it
+> *is* the runtime branch discriminant (which arm was taken), and it is
+> **projected at elimination** — a consumer of the collection distributes over
+> the witness (the value-`Case` fan-out). It is not a coproduct wearing Σ
+> notation: consumption is *elimination* (typed, propagating), not a `Σ <: Fun`
+> coercion, and the witness is referenced in the body's domain position
+> ([`Type::Witness`]). The witness here is a **type**-witness of
+> `Kind::Enumerated` (a static branch set) — the finite instance; the
+> *value*-witness instances (`List` length, `Map` key-set) and the `Kind::Any`
+> universe instance (`Collection`) arrive with the collections work, sharing the
+> same `Type::Sigma` machinery.
 
 The unresolved extent-join corner of §4.5 (O1/O4 — two collections meeting at
 one join point) is resolved by making a missing distinction explicit and
-representing the join as a coproduct of data functions (the finite, non-dependent
-sum — a plain `Variant`).
+representing the join as the dependent sum of data functions over the branch
+extents.
 
 **The distinction.** A function's domain can mean two things. A **compute
 function** `α ⇒ β` treats it as a *capability* — the inputs accepted; no data
@@ -481,53 +488,78 @@ sets `kind` explicitly.
 > modulo-refinements, range-aware formulation (kind-inference doc §5, open
 > question B).
 
-**Coproduct types.** A join of two data functions preserves both extents
-instead of meeting them: `α ⤇ τ₀ ⊔ β ⤇ τ₁` = `(α ⤇ (τ₀⊔τ₁)) | (β ⤇ (τ₀⊔τ₁))`,
-represented as the `Index`-tagged `Type::Variant([Index(0): α⤇τ, Index(1):
-β⤇τ])` that `Type::extent_coproduct` builds. This is a plain sum type — the
-value is *one* of the arms, tagged by contribution order — not a dependent sum:
-a finite, static branch set carries no witness. (The witness only becomes
-load-bearing for a genuine dependent Σ over a runtime/opaque extent, which the
-collections work adds separately.) Refinements ride *inside* each arm, so
-differently-refined extents joining at a `Case` carry both predicates and never
-hit `merge_refinements`' positive intersect (which becomes
-capability-domain/codomain/scalar-only by construction).
+**Conditional-collection Sigma.** A join of two data functions preserves both
+extents instead of meeting them: `α ⤇ τ₀ ⊔ β ⤇ τ₁` = `Σ (𝑤 ∈ {α, β}).
+𝑤 ⤇ (τ₀⊔τ₁)`, the [`Type::Sigma`] that `Type::conditional_collection` builds —
+one shared body `Witness(𝑤) ⤇ (τ₀⊔τ₁)` over the witness, whose candidate domains
+are the branch extents in contribution order (a tested contract). The value is
+*one* branch, discriminated by the witness at elimination. Refinements ride
+*inside* each candidate domain, so differently-refined extents joining at a
+`Case` carry both predicates and never hit `merge_refinements`' positive
+intersect (which becomes capability-domain/codomain/scalar-only by
+construction).
 
 **Mechanics.** Formation happens at the compact merge: the fun slot is a
 `CompactFun` whose `domains` accumulate alternatives under `union_extents`
 (union + dedup at positive polarity — never a meet); coalesce materializes
-one survivor as a plain data fun, ≥ 2 as a coproduct
-(`Type::extent_coproduct` — one `Index` arm per extent, sharing the joined
-codomain), and a data-⊔-compute collision as a loud coalesce error:
+one survivor as a plain data fun, ≥ 2 as a conditional-collection Sigma
+(`Type::conditional_collection` — the candidate domains are the extents, sharing
+the joined codomain), and a data-⊔-compute collision as a loud coalesce error:
 `ExtentJoinConflict` when ≥ 2 candidate extents would be dropped (a genuine
-coproduct join), `ComputeWhereDataRequired` when a single slot is a capability
-demanded as an extent. Arm order = first-contribution order is a guaranteed
-contract. A conditional collection reaching op-conversion is rejected loudly
-before then (at `lambda_elim`, since value-`Case`s are not yet compilable).
+extent join), `ComputeWhereDataRequired` when a single slot is a capability
+demanded as an extent. Candidate order = first-contribution order is a
+guaranteed contract. A conditional collection reaching op-conversion is rejected
+loudly before then (at `lambda_elim`, since value-`Case`s are not yet
+compilable). The Sigma witness is the canonical, shared binder `__witness`
+(`ReservedName::Witness`, like the refinement `__elem`), so two
+structurally-equal conditional collections compare equal without α-renaming.
 
-The three subtyping arms (`constrain.rs`) are: **injection** `Fun(Data) <:
-Variant` (a single data function subsumes into the coproduct at the arm with the
-matching extent — the `emit_case` arm-into-result edge); **consume** `Variant <:
-Fun` (a coproduct used as one collection presents as `Fun(Variant({Index(i):
-𝐷ᵢ}), V)`, iterating the discriminated union — a fresh domain var absorbs it,
-a concrete narrower extent is rejected); and **width** `Variant <: Variant`
-(positional). Both new arms fire only when every arm payload is a data function
-(a user tagged-union is not a collection). The extent match on injection is by
-*value* (the arm with the same extent).
+These are **general dependent-sum rules** (`constrain.rs`), not
+conditional-collection–specific logic: the solver knows Σ, and each rule is
+*realized per witness `Kind`* — the part that genuinely differs (domain
+membership, the presented domain, the subset test) dispatches on `Kind`, while
+the covariant codomain edge is Kind-agnostic (`SigmaType::codomain`/`binder`).
+Two rules are genuine subtyping; one is elimination — a distinction worth keeping
+precise, because the last is *not* subsumption even though it is discharged
+through the same `<:` solver.
 
-> **Deferred — value-`Case` elimination bridges.** The eliminator that
-> compiles a conditional-collection `Case` to a union of restricts — the two
-> bridge rules (a gated partition `Fun{Data, Variant([Index(i) ↦ {𝐷ᵢ | πᵢ}]),
-> 𝑐}` subtyping the coproduct positionally; an exhaustive+disjoint partition
-> union subtyping the plain data fun via a wall-validated `Cast`) — lands with
-> the value-`Case` compilation in a follow-up, where it is exercised end-to-end.
-> Today a conditional-collection `Case` types fine but is rejected at
-> `lambda_elim` (value-`Case`s are not yet compilable).
+The subtyping rules: **injection** `Fun(Data) <: Σ` (a data function is a subtype
+of the sum when its domain is a body-instantiation for some witness the sum
+ranges over — a branch *is-a* sum, `A <: A+B`; the `emit_case` arm-into-result
+edge); and **width** `Σ <: Σ` (the lhs sum's witness domain is a subset of the
+rhs's — a smaller sum *is-a* bigger sum). For a `Kind::Enumerated` witness both
+tests are by *value* over the candidate domains (which land in an arbitrary
+order, so position cannot be relied on).
+
+The elimination rule: **consume** `Σ <: Fun`. This is *not* subsumption — a Σ
+value is *one* branch, total on only one `𝐷ᵢ`, so it is **not** substitutable
+for a function total on `⋃𝐷ᵢ`. Consuming it **eliminates** the sum: the consumer
+distributes over the witness, and for a `Kind::Enumerated` witness the collection
+presents as `Fun(Variant({Index(i): 𝐷ᵢ}), V)`, iterating the discriminated union
+of the candidate extents — a fresh domain var absorbs it, a concrete narrower
+extent is rejected, and the shared codomain flows in one covariant edge. It rides
+the `<:` solver only because that is the plumbing for "this collection is consumed
+by that consumer"; the constraints it emits coincide with subtyping the sum's
+*eliminated shape* `(⋃𝐷ᵢ) ⤇ V`, so it composes soundly with the two real
+subtyping rules without ever treating a Σ as substitutable for a function.
+
+Only the `Kind::Enumerated` realization is wired today (what a conditional
+collection materializes). The `Kind::Any` (`Collection`) and value-witness
+(`List`/`Map`) realizations of each rule are `todo!()` skeletons — present so the
+general shape is visible, unreachable until those Kinds are constructed.
+
+> **Deferred — value-`Case` elimination compilation.** The type-level
+> elimination rule (`Σ <: Fun`) is live here, so a conditional-collection `Case`
+> type-checks and propagates. *Compiling* that elimination — the value-`Case`
+> fan-out that lowers it to a union of restricts — lands with the value-`Case`
+> compilation in a follow-up, where it is exercised end-to-end. Today a
+> conditional-collection `Case` types fine but is rejected at `lambda_elim`
+> (value-`Case`s are not yet compilable).
 
 **`Case` arms join by the lattice.** `emit_case` constrains every value/
 collection arm into a fresh result variable (`require_sub`) instead of
 requiring equality. Homogeneous arms recover the old behavior; data-collection
-arms with distinct extents form the coproduct above. `Mut`/`History` arms are the
+arms with distinct extents form the conditional-collection Sigma above. `Mut`/`History` arms are the
 exception — a second-class reference cannot be lattice-joined as a value, so
 they keep `require_eq` (the Case stays a reference and mut-discipline rejects a
 conditional over stores, preserving that deliberate rule).
@@ -541,17 +573,17 @@ conditional over stores, preserving that deliberate rule).
 > (binops, …) to impose concrete bounds, tracked as a follow-up.
 
 **What the codomain join gives up — and why that is the right default.** The
-coproduct is lossless on the *extent* and lossy on the *codomain*: joining
-`α ⤇ τ₀` with `β ⤇ τ₁` keeps the exact extent set `{α, β}` but coarsens the
-element type of every arm to the shared `τ₀ ⊔ τ₁`, forgetting *which* extent
-pairs with *which* element type. A function returning `[1, 2, 3] if flag else ["a", "b"]`
-types as `([0,2] ⤇ (Int|String)) | ([0,1] ⤇ (Int|String))` — the
-type no longer records "length 3 ⟹ all Int." Three points make this the right
-default rather than a leak:
+Sigma is lossless on the *extent* and lossy on the *codomain*: joining
+`α ⤇ τ₀` with `β ⤇ τ₁` keeps the exact candidate set `{α, β}` but coarsens the
+shared body's element type to `τ₀ ⊔ τ₁`, forgetting *which* extent pairs with
+*which* element type. A function returning `[1, 2, 3] if flag else ["a", "b"]`
+types as `Σ (𝑤 ∈ {[0,2], [0,1]}). 𝑤 ⤇ (Int|String)` — the type no longer
+records "length 3 ⟹ all Int." Three points make this the right default rather
+than a leak:
 
 > **Landed vs. deferred here.** The *extent* losslessness is live: a conditional
 > over collections with the **same** element type (`[1,2] if c else [1,2,3]`)
-> forms `([0,1] ⤇ Int) | ([0,2] ⤇ Int)`. The *codomain* union in the
+> forms `Σ (𝑤 ∈ {[0,1], [0,2]}). 𝑤 ⤇ Int`. The *codomain* union in the
 > `Int | String` example above is the same deferred piece as the
 > heterogeneous-scalar union (`τ₀ ⊔ τ₁` is a positive atom-join), so that
 > specific example currently errors at the codomain until that follow-up lands.
@@ -560,18 +592,17 @@ default rather than a leak:
 
 - **The asymmetry is principled.** Loss is forbidden exactly where it is
   *silent and destroys data* — the domain (dropping an index drops a row, with
-  no trace), which is why extents join into a coproduct and never meet. Loss is
-  permitted exactly where it is *visible and only coarsens type* — the
-  codomain: `Int | String` sits in the type, and a consumer that needs `Int`
-  (say `sum`) fails at *its own* constraint site. The shared-codomain coproduct
+  no trace), which is why extents join into the Sigma's candidate set and never
+  meet. Loss is permitted exactly where it is *visible and only coarsens type* —
+  the codomain: `Int | String` sits in the type, and a consumer that needs `Int`
+  (say `sum`) fails at *its own* constraint site. The shared-codomain Sigma
   is a sound **widening** — a supertype of the correlated form (each arm injects
   into it), so it never admits an unsound program, it only offers less
   precision.
-- **The correlation is recoverable by construction.** The correlated form keeps
-  each arm's own codomain — `Variant([(Index(0), α ⤇ τ₀), (Index(1), β ⤇ τ₁)])`,
-  the same `Variant` node with per-arm rather than shared codomains. A program
-  that needs a branch-aware consumer introduces the
-  choice *explicitly* (`.Ints(xs) if flag else .Strs(ys)`) and `match`es it;
+- **The correlation is recoverable by construction.** The correlated form is a
+  tagged variant with each arm's own codomain — `Variant([(Index(0), α ⤇ τ₀),
+  (Index(1), β ⤇ τ₁)])`. A program that needs a branch-aware consumer introduces
+  the choice *explicitly* (`.Ints(xs) if flag else .Strs(ys)`) and `match`es it;
   the case-split tax is then paid by the code that benefits from it. The
   implicit control-flow join carries the ergonomics of the *common* case (a
   uniform consumer, no case-split), and the explicit variant carries the rare
@@ -582,7 +613,7 @@ default rather than a leak:
   would multiply the arms through the whole consumer graph — complexity
   compounding at each control-flow merge. The join collapses codomains so an
   arbitrary chain of conditionals still presents one collection type; only the
-  extent set (which we must keep) grows.
+  candidate extent set (which we must keep) grows.
 
 Two consequences to keep on the record. First, this direction *depends on*
 tagged-variant **surface syntax** (`.Foo(x)` constructors + `match`, the open
@@ -591,14 +622,15 @@ part of [[type-checker-tagged-variants]]): until that ships, the join is a
 deliberately declining **flow-sensitive typing** — an occurrence-typing
 language could keep the arms correlated through the path condition `flag`
 itself, with no tag; Cambra does not narrow on opaque `Bool`s, and the tagged
-variant is the substitute. A genuine dependent Σ *witness* is orthogonal to
-this: it would recover extent↔*value* correlation in a homogeneous-codomain
-data function (e.g. a conditionally-sized collection of in-bounds indices,
-`Σ 𝑛 ∈ {[0,7], [0,3]}. 𝑛 ⤇ {Int | __elem ∈ 𝑛}`), not per-branch element
-*types* — that axis is the coproduct's, and the two partition with no gap. That
-dependent Σ (over a runtime/opaque witness) is not present here — a finite
-conditional collection is a plain coproduct; the witness arrives with the
-collections work.
+variant is the substitute. Note the codomain loss is orthogonal to the axis the
+conditional-collection Sigma's witness *does* recover: our witness is a
+*type*-witness (`Kind::Enumerated` — which branch extent was taken), so the Sigma
+keeps the exact extent set. A *value*-witness Σ would recover extent↔*value*
+correlation in a homogeneous-codomain data function (e.g. a conditionally-sized
+collection of in-bounds indices, `Σ 𝑛 ∈ Nat. {Int | __elem ∈ [0, 𝑛]} ⤇ …`),
+not per-branch element *types* — a third axis, neither this codomain join's nor
+the type-witness's. That value-witness Σ shares the same `Type::Sigma` machinery
+(the `Witness::Value` case) and arrives with the collections work.
 
 ---
 
@@ -632,7 +664,7 @@ collections work.
 
 For each `Branch { guard, body }`: the guard is constrained to `Type::Base(BaseType::Bool)`; body types across all branches are unified. The overall `Case` type is the unified body type. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
 
-The in-flight conditionals stack replaces the arm unification with a genuine lattice join (fresh result variable + per-arm `require_sub`) — see [§4.6](#46-data-vs-compute-functions-and-coproduct-extent-joins); the strict-equality behavior above is current until that PR lands.
+The in-flight conditionals stack replaces the arm unification with a genuine lattice join (fresh result variable + per-arm `require_sub`) — see [§4.6](#46-data-vs-compute-functions-and-conditional-collection-extent-joins); the strict-equality behavior above is current until that PR lands.
 
 ### Record literals and field access
 

@@ -89,6 +89,17 @@ pub fn type_level(ty: &Type) -> Level {
         // instantiation), which reads it directly and is exempted from the
         // `type_level` short-circuit.
         Type::ChanDom(..) => 0,
+        // The witness's type children and the body carry the sum's inference
+        // vars; the anonymous witness reference is a leaf (level 0).
+        Type::Sigma(s) => s
+            .witness
+            .types()
+            .iter()
+            .map(type_level)
+            .max()
+            .unwrap_or(0)
+            .max(type_level(&s.body)),
+        Type::Witness => 0,
         Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => 0,
     }
 }

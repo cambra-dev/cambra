@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::is_free;
-use crate::ccl::{Branch, Name, PredicateId, Type, TypedExpr, TypedExprNode};
+use crate::ccl::{Branch, Name, PredicateId, SigmaType, Type, TypedExpr, TypedExprNode, Witness};
 
 /// A term binder name.
 pub type Binder = Name;
@@ -698,6 +698,9 @@ impl Subst {
             | Type::DataSource(_)
             | Type::Txn
             | Type::Hole
+            // A witness reference is a type-level binder occurrence, never a term
+            // binder the substitution acts on.
+            | Type::Witness
             | Type::Infer(_) => {}
 
             // a nominal channel domain names its defer
@@ -759,6 +762,18 @@ impl Subst {
             Type::Variant(tags) => tags
                 .iter_mut()
                 .for_each(|(_, t)| self.rewrite_type_go(t, memo)),
+
+            // A value-witness binder is a term binder; but a term substitution
+            // never maps it (it is a fresh Σ-binder, out of the substitution's
+            // domain), so it passes through untouched. Rewrite predicates in the
+            // witness's type children and the body.
+            Type::Sigma(s) => {
+                s.witness
+                    .types_mut()
+                    .iter_mut()
+                    .for_each(|t| self.rewrite_type_go(t, memo));
+                self.rewrite_type_go(&mut s.body, memo);
+            }
         }
     }
 
@@ -867,6 +882,7 @@ impl Subst {
             | Type::DataSource(_)
             | Type::Txn
             | Type::Hole
+            | Type::Witness
             | Type::Infer(_) => ty.clone(),
 
             // rename the named defer binder, mirroring the
@@ -924,6 +940,14 @@ impl Subst {
                 domain: Box::new(self.apply_type(domain)),
                 kind: *kind,
             },
+
+            // A value-witness binder is a fresh Σ-binder, out of a term
+            // substitution's domain, so it passes through. Rewrite predicates in
+            // the witness's type children and the body.
+            Type::Sigma(s) => Type::Sigma(Box::new(SigmaType {
+                witness: s.witness.map_types(|t| self.apply_type(t)),
+                body: Box::new(self.apply_type(&s.body)),
+            })),
         }
     }
 
@@ -977,6 +1001,7 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Txn
+        | Type::Witness
         | Type::Hole => false,
         Type::Infer(_) => true,
         Type::Fun {
@@ -989,6 +1014,9 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         Type::Record(fs) => fs.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Variant(tags) => tags.iter().any(|(_, t)| type_contains_infer(t)),
         Type::Refinement(base, _) => type_contains_infer(base),
+        Type::Sigma(s) => {
+            s.witness.types().iter().any(type_contains_infer) || type_contains_infer(&s.body)
+        }
     }
 }
 
@@ -1025,6 +1053,8 @@ fn collect_type_fv(
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
+        // A witness reference is type-level, never a free term variable.
+        | Type::Witness
         | Type::Infer(_) => {}
         Type::Fun {
             name,
@@ -1062,6 +1092,23 @@ fn collect_type_fv(
         Type::History { value, domain, .. } => {
             collect_type_fv(value, bound, visited, out);
             collect_type_fv(domain, bound, visited, out);
+        }
+        // The witness's type children carry free term vars with the binder
+        // *not* in scope (a value-witness's type annotation cannot mention its
+        // own binder). A value-witness's binder, however, is a term binder bound
+        // over the body, so it is subtracted there; a type-witness is anonymous.
+        Type::Sigma(s) => {
+            for t in s.witness.types() {
+                collect_type_fv(t, bound, visited, out);
+            }
+            match &s.witness {
+                Witness::Value { binder, .. } => {
+                    with_binders(bound, [binder.clone()], |bnd| {
+                        collect_type_fv(&s.body, bnd, visited, out)
+                    });
+                }
+                Witness::Type(_) => collect_type_fv(&s.body, bound, visited, out),
+            }
         }
     }
 }

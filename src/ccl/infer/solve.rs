@@ -291,6 +291,28 @@ fn types_agree_modulo_unread(read: &Type, now: &Type) -> bool {
             }
             crate::ccl::HistoryKind::Overwrite => types_agree_modulo_unread(value, other),
         },
+        // The anonymous type-witness reference agrees with itself.
+        (Type::Witness, Type::Witness) => true,
+        // Two Sigmas agree iff their witnesses (same flavour, type children
+        // agreeing pairwise, value-binder equal) and bodies agree.
+        (Type::Sigma(a), Type::Sigma(b)) => {
+            use crate::ccl::ty::{Kind, Witness};
+            let witness_agree = match (&a.witness, &b.witness) {
+                (Witness::Type(Kind::Enumerated(xs)), Witness::Type(Kind::Enumerated(ys))) => {
+                    xs.len() == ys.len()
+                        && xs
+                            .iter()
+                            .zip(ys)
+                            .all(|(x, y)| types_agree_modulo_unread(x, y))
+                }
+                (Witness::Type(Kind::Any), Witness::Type(Kind::Any)) => true,
+                (Witness::Value { ty: x, binder: bx }, Witness::Value { ty: y, binder: by }) => {
+                    bx == by && types_agree_modulo_unread(x, y)
+                }
+                _ => false,
+            };
+            witness_agree && types_agree_modulo_unread(&a.body, &b.body)
+        }
         _ => false,
     }
 }
@@ -949,10 +971,18 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
             coalesce_type_predicates(value, level, ctx);
             coalesce_type_predicates(domain, level, ctx);
         }
+        Type::Sigma(s) => {
+            s.witness
+                .types_mut()
+                .iter_mut()
+                .for_each(|t| coalesce_type_predicates(t, level, ctx));
+            coalesce_type_predicates(&mut s.body, level, ctx);
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::Witness
         | Type::Txn
         | Type::Hole
         | Type::Infer(_) => {}
@@ -1421,10 +1451,18 @@ fn retype_in_type(ty: &mut Type, scope: &HashMap<Name, Type>) {
             retype_in_type(value, scope);
             retype_in_type(domain, scope);
         }
+        Type::Sigma(s) => {
+            s.witness
+                .types_mut()
+                .iter_mut()
+                .for_each(|t| retype_in_type(t, scope));
+            retype_in_type(&mut s.body, scope);
+        }
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::Witness
         | Type::Txn
         | Type::Hole
         | Type::Infer(_) => {}

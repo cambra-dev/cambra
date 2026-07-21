@@ -250,6 +250,16 @@ pub fn freshen_above(
             domain: Box::new(freshen_above(lim, domain, target, cache)),
             kind: *kind,
         },
+        // The witness's type children and the body freshen like any other
+        // position; the witness flavour/binder is preserved by `map_types`.
+        Type::Sigma(s) => Type::Sigma(Box::new(crate::ccl::ty::SigmaType {
+            witness: s
+                .witness
+                .map_types(|t| freshen_above(lim, t, target, cache)),
+            body: Box::new(freshen_above(lim, &s.body, target, cache)),
+        })),
+        // The anonymous witness reference carries no solver content.
+        Type::Witness => ty.clone(),
         Type::Refinement(inner, r) => Type::Refinement(
             Box::new(freshen_above(lim, inner, target, cache)),
             // Faithfully freshen the predicate's own type slots through the same

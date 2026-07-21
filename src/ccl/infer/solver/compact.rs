@@ -216,7 +216,7 @@ pub struct CompactFun {
 /// The lossless join of two data-function domain-alternative lists: the union
 /// of the alternatives, deduplicated by structural [`CompactType`] equality.
 /// Never a meet — this preserves every extent, which coalesce materializes as
-/// a conditional-collection coproduct ([`crate::ccl::Type::extent_coproduct`]);
+/// a conditional-collection Sigma ([`crate::ccl::Type::conditional_collection`]);
 /// a single surviving extent is a plain data function.
 fn union_extents(mut a: Vec<CompactType>, b: Vec<CompactType>) -> Vec<CompactType> {
     for d in b {
@@ -719,6 +719,60 @@ fn compact_go(
                 history_slot: Some((Box::new(value), Box::new(domain), *kind)),
                 ..Default::default()
             }
+        }
+        // A conditional-collection Sigma re-entering compaction (e.g. a
+        // generalized binding whose scheme carries one, freshened at a use site)
+        // decomposes back into the multi-domain `fun` slot it was materialized
+        // from: one domain alternative per candidate extent, sharing the body's
+        // codomain. Coalesce then re-forms the identical Sigma (`union_extents` →
+        // `conditional_collection`), so this is a faithful round-trip. The
+        // anonymous witness reference (`Type::Witness`) carries no solver content
+        // — the extents live in the `Kind::Enumerated` candidates.
+        Type::Sigma(s) => match &s.witness {
+            crate::ccl::ty::Witness::Type(crate::ccl::ty::Kind::Enumerated(choices)) => {
+                let Type::Fun {
+                    name,
+                    codomain: cod,
+                    ..
+                } = &*s.body
+                else {
+                    unreachable!("conditional-collection Sigma body is a data function")
+                };
+                // Domains are contravariant (matches the single-`Fun` arm above).
+                let domains: Vec<CompactType> = choices
+                    .iter()
+                    .map(|d| compact_go(d, !pol, subst_acc, &BTreeSet::new(), st))
+                    .collect();
+                let cod_acc = match name {
+                    Some(b) => subst_acc.shadow(b),
+                    None => subst_acc.clone(),
+                };
+                let codomain = compact_go(cod, pol, &cod_acc, &BTreeSet::new(), st);
+                CompactType {
+                    fun: Some(CompactFun {
+                        name: name.clone(),
+                        // `conditional_collection` always builds a data function.
+                        kind: KindMerge::Data,
+                        domains,
+                        codomain: Box::new(codomain),
+                    }),
+                    ..Default::default()
+                }
+            }
+            // `Collection` (Kind::Any) and value-witness Sigmas (List/Map) are
+            // introduced with the collections work, not the conditionals path.
+            crate::ccl::ty::Witness::Type(crate::ccl::ty::Kind::Any)
+            | crate::ccl::ty::Witness::Value { .. } => {
+                unimplemented!(
+                    "compaction of Collection / value-witness Sigmas is deferred to the collections work"
+                )
+            }
+        },
+        // A bare witness reference only exists in a Sigma body's domain slot,
+        // which the `Sigma` arm consumes without recursing into — so a `Witness`
+        // reaching the compaction walk on its own is a bug.
+        Type::Witness => {
+            unreachable!("bare Type::Witness reached compaction outside its Sigma binder")
         }
         Type::Infer(state) => {
             let uid = state.uid;

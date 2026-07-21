@@ -204,24 +204,24 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                         codomain: Box::new(c),
                     });
                 } else {
-                    // ≥ 2 extents: a **conditional collection** — a coproduct
-                    // (`Index`-tagged `Variant`) of data functions, one per
-                    // candidate extent, sharing the joined codomain. A finite,
-                    // static set of branches is a plain sum, not a dependent sum
-                    // (see type-inference.md Â§4.6); the value is one arm, tagged by
-                    // contribution order, matching the runtime value-`Case` gates.
+                    // ≥ 2 extents: a **conditional collection** — the dependent
+                    // sum `Σ (w ∈ {domsᵢ}). w ⤇ c`, one candidate domain per
+                    // branch extent, sharing the joined codomain `c`. The witness
+                    // is the runtime discriminant (which branch was taken),
+                    // projected at elimination (the value-`Case` fan-out). See
+                    // type-inference.md §4.6.
                     //
                     // Materialization invariant: the choices are ground extents.
-                    // Variant width-subtyping matches arms positionally (by tag),
-                    // and `compact_go`/`extrude` treat the arm domains
-                    // contravariantly (at `!pol`); those agree only while a choice
-                    // carries no inference variable, so an `Infer`-bearing choice
-                    // would record a bound at the wrong polarity. Enforce it.
+                    // The Σ subtyping rules match candidate domains by value, and
+                    // `compact_go`/`extrude` treat them contravariantly (at
+                    // `!pol`); those agree only while a choice carries no
+                    // inference variable, so an `Infer`-bearing choice would
+                    // record a bound at the wrong polarity. Enforce it.
                     debug_assert!(
                         !doms.iter().any(crate::ccl::subst::type_contains_infer),
                         "conditional collection materialized with an inference variable in an extent"
                     );
-                    shapes.push(Type::extent_coproduct(doms, kept_name, c));
+                    shapes.push(Type::conditional_collection(doms, kept_name, c));
                 }
             }
         }
@@ -258,7 +258,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
             // join (`1 + true`), which must stay a hard error. A sound version
             // needs strict scalar consumers (binops, …) to impose concrete
             // bounds so the union is rejected at *their* site; that is deferred
-            // past the coproduct foundation. Collection arms still join losslessly — that happens in
+            // past the conditional-collection foundation. Collection arms still join losslessly — that happens in
             // the `fun` slot above (`union_extents`), not through atoms.
             let pretty = all
                 .iter()
@@ -455,12 +455,12 @@ mod tests {
     }
 
     #[test]
-    fn coalesce_two_data_extents_form_coproduct() {
+    fn coalesce_two_data_extents_form_conditional() {
         use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
         // A `Data` fun slot carrying two distinct extents with a shared `Int`
-        // codomain coalesces to the conditional-collection coproduct
-        // `([0,1]⤇Int) | ([0,2]⤇Int)` — a plain (`Index`-tagged) sum of data
-        // functions, one per extent (see type-inference.md Â§4.6; not a dependent sum).
+        // codomain coalesces to the conditional-collection Sigma
+        // `Σ (w ∈ {[0,2], [0,3]}). w ⤇ Int` — one candidate domain per extent
+        // (see type-inference.md §4.6).
         let graph = CompactGraph {
             term: CompactType {
                 fun: Some(CompactFun {
@@ -478,7 +478,7 @@ mod tests {
         };
         assert_eq!(
             coalesce_compact(&graph).unwrap(),
-            Type::extent_coproduct(
+            Type::conditional_collection(
                 vec![Type::UIntRange(2), Type::UIntRange(3)],
                 None,
                 Type::Base(BaseType::Int),
@@ -518,7 +518,7 @@ mod tests {
     fn coalesce_duplicate_data_extents_dedup_to_plain_fun() {
         use crate::ccl::infer::solver::compact::{CompactFun, KindMerge};
         // Two structurally-equal extents dedup to one → a plain `Data` fun, not
-        // a spurious 2-arm coproduct.
+        // a spurious 2-choice conditional collection.
         let graph = CompactGraph {
             term: CompactType {
                 fun: Some(CompactFun {

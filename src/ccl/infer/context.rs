@@ -147,11 +147,18 @@ impl InferCtx {
                 domain: Box::new(self.normalize_annotation(domain)),
                 kind: *kind,
             },
+            // Structural recursion: normalize the witness's type children and
+            // the body.
+            Type::Sigma(s) => Type::Sigma(Box::new(crate::ccl::ty::SigmaType {
+                witness: s.witness.map_types(|t| self.normalize_annotation(t)),
+                body: Box::new(self.normalize_annotation(&s.body)),
+            })),
             // Leaves and existing inference vars pass through unchanged.
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
+            | Type::Witness
             | Type::Txn
             | Type::Infer(_) => ty.clone(),
         }

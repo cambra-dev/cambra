@@ -348,12 +348,17 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
             domain: Box::new(strip_refinements(domain)),
             kind: *kind,
         },
+        Type::Sigma(s) => Type::Sigma(Box::new(crate::ccl::ty::SigmaType {
+            witness: s.witness.map_types(strip_refinements),
+            body: Box::new(strip_refinements(&s.body)),
+        })),
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::Hole
         | Type::Infer(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::Witness
         | Type::Txn => ty.clone(),
     }
 }
