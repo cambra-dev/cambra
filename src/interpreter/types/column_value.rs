@@ -135,6 +135,24 @@ impl ColumnValue {
             ColumnValue::Records(r) => {
                 ColumnValue::Records(r.iter().map(|(k, v)| (k.clone(), v.repeat(n))).collect())
             }
+            // A single-element `Union` carries its one value in `variants[tag]`
+            // (the other variant columns are empty). Broadcasting it (e.g.
+            // `MapResultToConst` lifting a constant `.Abort(unit)` over a stream)
+            // repeats that arm's payload `n` times and its `tag` in `tags`; the
+            // empty arms stay empty, preserving the `ColumnValue::Union` invariant
+            // (`variants[j].len()` equals the count of `j`s in `tags`).
+            ColumnValue::Union { tags, variants } => {
+                let tag = tags[0];
+                let variants = variants
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| if i == tag { v.repeat(n) } else { v.clone() })
+                    .collect();
+                ColumnValue::Union {
+                    tags: vec![tag; n],
+                    variants,
+                }
+            }
             _ => panic!("Cannot repeat composite ColumnValue"),
         }
     }
@@ -428,6 +446,14 @@ impl ColumnValue {
     /// Create a `ColumnValue` from a single `Value`, wrapping it in a 1-element column.
     pub fn single(value: Value) -> Self {
         match value {
+            // `Unit` has a dedicated dense column (`Units(n)`), which is the
+            // canonical representation `from_values`/`empty_tile` produce for a
+            // `Unit` extent. Falling through to the `Variants` catch-all would
+            // make a singleton `Unit` column collide (`append`/`merge`
+            // "mismatched variants") with an extent-canonical `Units` column —
+            // e.g. a `.Abort()` (`Unit` payload) variant value fanned through a
+            // `Memo`. Keep the representation canonical here.
+            Value::Unit => ColumnValue::Units(1),
             Value::Bool(b) => ColumnValue::Bools(BitVec::from_elem(1, b)),
             Value::Int(i) => ColumnValue::Ints(vec![i]),
             Value::UInt(i) => ColumnValue::UInts(vec![i]),
@@ -764,6 +790,16 @@ impl ColumnValue {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn single_unit_is_canonical_units_column() {
+        // A singleton `Unit` value must build the dense `Units(1)` column that
+        // `from_values`/`empty_tile` produce for a `Unit` extent — not a
+        // `Variants([Unit])` singleton, which would collide ("mismatched
+        // variants") in `append`/`merge` against an extent-canonical `Units`
+        // column (e.g. a `.Abort()` Unit-payload variant fanned through a `Memo`).
+        assert_eq!(ColumnValue::single(Value::Unit), ColumnValue::Units(1));
+    }
 
     #[test]
     fn test_cartesian_product_no_filter() {

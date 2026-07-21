@@ -410,6 +410,54 @@ pub enum Builtin {
     /// planning treats it as an iteration-bearing source (it stages the trigger
     /// inside its tuple rather than prepending an `iterate`).
     AsOf,
+
+    /// `variant_project(i) : Union([P₀,…,Pₙ]) ⇒ Pᵢ` — the elimination-side dual
+    /// of [`crate::ccl::TypedExprNode::VariantCtor`]/`VariantWrap`. Projects arm
+    /// `i` out of a tagged-union stream, **restricting to the sub-domain of
+    /// positions that carry tag `i`** and yielding that arm's inner payload
+    /// column.
+    ///
+    /// Minted by [`crate::ccl::lambda_elim`] when it compiles a scrutinee-`Case`
+    /// over a [`crate::ccl::Type::Variant`] to the union-of-tag-restricts
+    /// `⧺ᵢ (𝑑 ▷ variant_project(i) ▷ (λ 𝑤ᵢ → 𝑒ᵢ))`. It is applied as a
+    /// compose element consuming the fed scrutinee stream (`input=Some`, like
+    /// [`Self::Restrict`]/[`Self::FilterValues`]), so op-conversion reads the
+    /// union extents off the fed input's tiling and builds the
+    /// [`crate::interpreter::tile_operators::VariantProject`] tile op. The
+    /// per-arm sub-streams are re-totaled by a **flat** `UnionOperator` (the
+    /// tags partition the domain exhaustively).
+    ///
+    /// **Restrict and project are one op** because [`crate::interpreter::ColumnValue::Union`]
+    /// already stores each arm's payloads densely (see the tile-op docs); there
+    /// is no separate boolean `Restrict` step nor a `Predicate::Union`.
+    ///
+    /// Minted after inference, so it carries no [`crate::ccl::infer::OperatorSchemes`]
+    /// scheme: its type `Union ⇒ Pᵢ` is stamped on the node and the post-phase
+    /// CHECK-mode `typecheck` trusts it (like [`Self::BeginTxn`]).
+    VariantProject(usize),
+
+    /// `variant_wrap(i) : Pᵢ ⇒ Union([P₀,…,Pₙ])` — the introduction-side dual of
+    /// [`Self::VariantProject`]: injects a payload at variant position `i`,
+    /// producing a tagged union value. The **point-free** form of
+    /// [`crate::ccl::TypedExprNode::VariantCtor`].
+    ///
+    /// Minted by [`crate::ccl::lambda_elim`] when a `VariantCtor` appears inside
+    /// a lambda body (`λ p → .Cᵢ(eᵢ(p))`): the constructor elaborates to
+    /// `eᵢ ≫ variant_wrap(i)`, a composable morphism `param_ty ⇒ Union` that can
+    /// sit as the RHS of a `≫` — e.g. a writer-decision arm
+    /// `filter_values(π̂ᵢ) ≫ eᵢ ≫ variant_wrap(Commit)`. (A genuinely scalar
+    /// `VariantCtor` outside any lambda keeps its own node + op-conversion arm.)
+    ///
+    /// Applied as a compose element consuming the fed payload stream
+    /// (`input=Some`, like [`Self::VariantProject`]); op-conversion reads the
+    /// union extents off the node's codomain and builds the **existing**
+    /// [`crate::interpreter::tile_operators::VariantWrap`] tile, which wraps the
+    /// payload stream element-wise (preserving the domain).
+    ///
+    /// Minted after inference, so it carries no [`crate::ccl::infer::OperatorSchemes`]
+    /// scheme: its type `Pᵢ ⇒ Union` is stamped on the node and the post-phase
+    /// CHECK-mode `typecheck` trusts it (like [`Self::BeginTxn`]).
+    VariantWrap(usize),
 }
 
 impl Builtin {
@@ -444,6 +492,10 @@ impl Builtin {
             Self::BeginTxn => "begin",
             Self::CollectionUnion => "collection_union",
             Self::AsOf => "as_of",
+            // The arm index is rendered by `symbolic` (a `&'static str` cannot
+            // carry it); this bare name is the fallback for other callers.
+            Self::VariantProject(_) => "variant_project",
+            Self::VariantWrap(_) => "variant_wrap",
         }
     }
 

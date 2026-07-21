@@ -480,6 +480,21 @@ fn is_filter_values_led(expr: &Expr) -> bool {
     )
 }
 
+/// A compose head that is a `variant_project(i)` (the scrutinee-`Case`
+/// tag-restrict). Like [`is_filter_values_led`], it restricts the domain at
+/// *runtime* (to arm `i`'s tag partition) and carries no domain refinement for
+/// planning to re-materialise, so const-reduce must not collapse past it — doing
+/// so would drop the tag restriction and apply the arm's constant at *every*
+/// position, overlapping the other arms. It is composed as a **bare** builtin
+/// (it consumes the fed scrutinee stream), so the pattern matches the builtin
+/// directly rather than an `Apply`.
+fn is_variant_project_led(expr: &Expr) -> bool {
+    matches!(
+        &expr.node,
+        TypedExprNode::Builtin(Builtin::VariantProject(_))
+    )
+}
+
 fn try_const_reduce(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
@@ -488,7 +503,11 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
         // restricts the domain at *runtime* and carries no refinement for planning
         // to re-materialise (unlike `restrict`), so collapsing it would drop the
         // filter and apply the constant at every position — never reduce past one.
-        |left, right| as_const(right).is_some() && !is_filter_values_led(left),
+        |left, right| {
+            as_const(right).is_some()
+                && !is_filter_values_led(left)
+                && !is_variant_project_led(left)
+        },
         |left, right| {
             let Some(g) = as_const(&right) else {
                 unreachable!()
@@ -1441,6 +1460,23 @@ mod tests {
             simplify(guarded.clone()),
             guarded,
             "const-reduce must not drop the restrict (its upstream iterate guards it)"
+        );
+    }
+
+    #[test]
+    fn simplify_preserves_variant_project_under_const_reduce() {
+        // `variant_project(i) ≫ const(g)` must NOT collapse to `const(g)`: the
+        // projection restricts the domain to arm `i`'s tag partition at runtime
+        // and carries no refinement to re-materialise, so dropping it would apply
+        // the constant at *every* position, overlapping the other arms. Guards
+        // `is_variant_project_led`.
+        let vp = Expr::builtin(Builtin::VariantProject(0)).with_ty(fun_ty(int_ty(), int_ty()));
+        let const_k = typed_const(Expr::lit(Lit::Int(7)).with_ty(int_ty()), int_ty());
+        let compose = typed_compose2(vp, const_k);
+        assert_eq!(
+            simplify(compose.clone()),
+            compose,
+            "const-reduce must not collapse past variant_project (drops the tag restriction)"
         );
     }
 
