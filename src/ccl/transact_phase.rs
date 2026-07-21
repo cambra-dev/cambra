@@ -65,9 +65,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
-    BaseType, Builtin, Expr, F_COMMIT, F_DECISION, F_FIRE_SUFFIX, F_TIME, F_WRITE, F_WRITE_TARGETS,
-    F_WRITES, FieldKey, HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode,
-    WriterSite,
+    BaseType, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES, FieldKey,
+    HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
     ccl_utils::{is_free_in_value, synthesize_arm_predicate},
     letrec::check_letrec_causal,
     mut_elim::{fold_induction_loop, hoist_feeds},
@@ -1485,7 +1484,7 @@ fn build_writer(
         feed_counter,
         &allowed_writes,
     );
-    let commit = or_commit(commit_paths);
+    let commit = crate::ccl::ccl_utils::disjoin(commit_paths, true, &Type::Base(BaseType::Bool));
 
     // The decision `writes` is a positional tuple over `write_keys`, matching
     // `emit_transact_writer` (a single write is a one-element tuple). A write key
@@ -1503,46 +1502,26 @@ fn build_writer(
     let mut writes = Expr::tuple(write_vals);
     writes.ty = Type::Tuple(write_tys.clone());
 
-    // Decision record `{commit, writes, to_<defer>*}`: `commit`/`writes` first,
-    // then one `to_<defer>` tap field per in-block feed (its read-your-writes
-    // value). This is exactly the shape `emit_transact`/`writer_tap_fields`
-    // recognize and op-conversion's `body_tap_fields` reads — the induction
-    // recognizer builds the same `{commit, writes, to_<feed>*}` decision.
-    let mut decision_field_tys: Vec<(String, Type)> = vec![
-        (F_COMMIT.to_string(), Type::Base(BaseType::Bool)),
-        (F_WRITES.to_string(), Type::Tuple(write_tys)),
-    ];
-    let mut decision_fields: Vec<(String, Expr)> = vec![
-        (F_COMMIT.to_string(), commit.clone()),
-        (F_WRITES.to_string(), writes),
-    ];
-    let bool_ty = Type::Base(BaseType::Bool);
-    let mut feed_sites: Vec<FeedSite> = Vec::with_capacity(collected_feeds.len());
-    for (defer, field, val, fpath) in collected_feeds {
-        decision_field_tys.push((field.clone(), val.ty.clone()));
-        feed_sites.push(FeedSite {
-            defer,
+    // Decision record `{commit, writes, to_<defer>*}` — built by the shared
+    // `writer_decision_record` (the one place the tap/`__fire` encoding lives, so
+    // the induction writer and this transaction writer stay in lockstep). The
+    // in-block feeds ride as `to_<defer>` taps (read-your-writes value + a
+    // `__fire` gate when their path is narrower than the commit); `feed_sites`
+    // records the defer/field/type the phase hoists.
+    let feed_sites: Vec<FeedSite> = collected_feeds
+        .iter()
+        .map(|(defer, field, val, _)| FeedSite {
+            defer: defer.clone(),
             field: field.clone(),
             value_ty: val.ty.clone(),
-        });
-        // A tap whose control-flow path is *narrower* than the transaction's
-        // overall commit carries a `__fire` field (its own path) so the engine
-        // appends the reply only on that route — not on a sibling route's commit.
-        // The test is purely *structural* (`fpath != commit`, no Boolean
-        // simplification): when the path is structurally the commit (a single-guard
-        // or spine feed) the field is omitted; a path that is *semantically* the
-        // commit but not structurally equal (e.g. duplicate feed paths making
-        // `commit = p ∨ p`) still carries a redundant — but always sound — gate.
-        if fpath != commit {
-            let fire_field = format!("{field}{F_FIRE_SUFFIX}");
-            decision_field_tys.push((fire_field.clone(), bool_ty.clone()));
-            decision_fields.push((fire_field, fpath));
-        }
-        decision_fields.push((field, val));
-    }
-    let decision_ty = Type::Record(decision_field_tys);
-    let mut decision = Expr::new(TypedExprNode::Record(decision_fields));
-    decision.ty = decision_ty.clone();
+        })
+        .collect();
+    let feeds: Vec<(String, Expr, Expr)> = collected_feeds
+        .into_iter()
+        .map(|(_, field, val, fpath)| (field, val, fpath))
+        .collect();
+    let decision = crate::ccl::ccl_utils::writer_decision_record(commit.clone(), writes, &feeds);
+    let decision_ty = decision.ty.clone();
 
     let mut body = Expr::lambda(p, tuple_ty.clone(), decision);
     body.ty = Type::fun(tuple_ty, decision_ty);
@@ -1846,43 +1825,6 @@ fn and_path(path: &Expr, guard: &Expr) -> Expr {
     );
     e.ty = Type::Base(BaseType::Bool);
     e
-}
-
-/// The transaction commit condition: the disjunction of the paths its writes and
-/// feeds fire on. A literal-`true` path (a spine write) short-circuits to `true`
-/// (the unconditional commit — bit-identical to the pre-conditionals emission);
-/// `false` paths drop out; no Boolean simplification otherwise (`p ∨ ¬p` stays
-/// symbolic, the engine evaluates one `Bool`). Empty (no write or feed) → `true`,
-/// a degenerate case lowering already rejects (an empty block).
-fn or_commit(paths: Vec<Expr>) -> Expr {
-    let bool_ty = Type::Base(BaseType::Bool);
-    let true_lit = || {
-        let mut t = Expr::new(TypedExprNode::Lit(Lit::Bool(true)));
-        t.ty = bool_ty.clone();
-        t
-    };
-    let mut acc: Option<Expr> = None;
-    for p in paths {
-        if is_true_lit(&p) {
-            return true_lit();
-        }
-        if matches!(p.node, TypedExprNode::Lit(Lit::Bool(false))) {
-            continue;
-        }
-        acc = Some(match acc {
-            None => p,
-            Some(a) => {
-                let mut e = Expr::binop(
-                    a,
-                    crate::ccl::BinOpKind::BoolLogic(crate::ccl::LogicKind::Or),
-                    p,
-                );
-                e.ty = bool_ty.clone();
-                e
-            }
-        });
-    }
-    acc.unwrap_or_else(true_lit)
 }
 
 /// Replace every free `Var(n)` with `n`'s current environment value. Names are

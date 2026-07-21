@@ -409,6 +409,103 @@ pub fn store_value_at(tile: &Tile, t: CommitTs, key: &Value) -> Option<Value> {
     None
 }
 
+/// `key`'s value written **at exactly** tick `t` — the delta at tick `t` if it
+/// names `key`, else `None`. Unlike [`store_value_at`] (which carries the latest
+/// write ≤ `t` forward), this reads only the change *at* `t`: the per-position
+/// event a reply tap is, so a position that did not fire the tap yields `None`
+/// (and the dense read omits it).
+pub fn store_delta_at(tile: &Tile, t: CommitTs, key: &Value) -> Option<Value> {
+    let Tile::Store {
+        changes, deltas, ..
+    } = tile
+    else {
+        return None;
+    };
+    for i in 0..changes.len() {
+        if changes.index_at(i) == Value::UInt(t) {
+            return value_to_map(&deltas.index_at(i)).get(key).cloned();
+        }
+    }
+    None
+}
+
+/// Fold `key`'s value at changelog tick `t` under the store's **carry policy** —
+/// the one place the register-vs-tap distinction lives, shared by both changelog
+/// readers ([`StoreValueStream`] over commit ticks and [`StoreDenseRead`] over
+/// loop positions):
+///
+/// - a **register / accumulator** (`carry_forward: true`) carries its last write
+///   forward — the value as-of `t` is the latest write ≤ `t` ([`store_value_at`]);
+/// - a **reply tap** (`carry_forward: false`) is a per-tick event — a value only
+///   at the tick that actually wrote it ([`store_delta_at`]), `None` elsewhere.
+///
+/// Both readers differ in *which* ticks they fold and how they label the domain
+/// (commit clock vs loop position, `+1` offset), but the per-tick fold is this.
+pub fn fold_changelog_key(
+    tile: &Tile,
+    t: CommitTs,
+    key: &Value,
+    carry_forward: bool,
+) -> Option<Value> {
+    if carry_forward {
+        store_value_at(tile, t, key)
+    } else {
+        store_delta_at(tile, t, key)
+    }
+}
+
+/// Fold `key` over an **ascending** sequence of `query_ticks` in a single
+/// O(changes + queries) pass — the incremental form of [`fold_changelog_key`],
+/// so a full-stream reader folding every tick is linear, not O(changes ×
+/// queries) (a per-tick [`fold_changelog_key`] each re-scans the whole log). Both
+/// changelog readers ([`StoreValueStream`], [`StoreDenseRead`]) share it.
+///
+/// Result element `i` is the fold at `query_ticks[i]` under the carry policy: the
+/// latest write ≤ the tick (`carry_forward: true`, an accumulator carried across
+/// ticks that did not write `key`), or the exact-tick delta (`carry_forward:
+/// false`, a reply tap — `None` where the tick did not write `key`). Requires
+/// `changes` ascending (the render invariant) and `query_ticks` ascending; the
+/// cursor advances monotonically and never rewinds.
+pub fn fold_changelog_key_ascending(
+    tile: &Tile,
+    query_ticks: impl IntoIterator<Item = CommitTs>,
+    key: &Value,
+    carry_forward: bool,
+) -> Vec<Option<Value>> {
+    let queries: Vec<CommitTs> = query_ticks.into_iter().collect();
+    let Tile::Store {
+        changes, deltas, ..
+    } = tile
+    else {
+        return vec![None; queries.len()];
+    };
+    let n = changes.len();
+    let mut idx = 0usize; // next unprocessed change index (monotonic)
+    let mut carry: Option<Value> = None; // running latest write ≤ the current query
+    let mut out = Vec::with_capacity(queries.len());
+    for t in queries {
+        let mut exact: Option<Value> = None;
+        while idx < n {
+            let Value::UInt(tick) = changes.index_at(idx) else {
+                idx += 1;
+                continue;
+            };
+            if tick > t {
+                break;
+            }
+            if let Some(v) = value_to_map(&deltas.index_at(idx)).get(key) {
+                carry = Some(v.clone());
+                if tick == t {
+                    exact = Some(v.clone());
+                }
+            }
+            idx += 1;
+        }
+        out.push(if carry_forward { carry.clone() } else { exact });
+    }
+    out
+}
+
 /// The full snapshot record as of commit time `t`: every key's latest change at
 /// a tick `≤ t`, folded oldest-to-newest so later writes win. Empty if `tile` is
 /// not a store or has no change `≤ t`. This is the multi-key,
@@ -977,7 +1074,20 @@ impl TileProducer for CommitProducer {
     }
 }
 
-/// Extract a source stream's codomain elements (the items to transact over).
+/// Extract a source stream's codomain elements (the items to transact over) in
+/// the codomain's **column order**.
+///
+/// This is correct for the **commit writer** precisely because transactions are
+/// *unordered* — each item becomes a commit proposal the [`CommitOperator`]
+/// serializes by frontier/conflict, and any serialization is a valid commit order
+/// (see the unordered-mutability design commitment). So an async source whose
+/// domain arrives out of position order (a `HashMap` enumeration) may be processed
+/// in arrival order without affecting the result.
+///
+/// The **induction** drive must NOT use this: its recurrence `xₙ = f(xₙ₋₁, itemₙ)`
+/// is position-ordered, so it reads by absolute domain position via
+/// [`decode_source_positioned`], which sorts. The two look alike but carry opposite
+/// ordering requirements — do not swap one for the other.
 fn decode_source_items(tile: &Tile) -> Vec<Value> {
     let Tile::SealedFunction {
         domain, codomain, ..
@@ -997,6 +1107,37 @@ fn decode_source_items(tile: &Tile) -> Vec<Value> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Decode an iteration source tile into `(absolute domain position, item)` pairs,
+/// **sorted by position** — the ordered counterpart of [`decode_source_items`].
+///
+/// The induction drive's recurrence is position-ordered, so it cannot use column
+/// order: an **async** source's domain arrives *unordered* (it enumerates a set of
+/// arrived keys) and *compacts* as its consumed prefix is released, so column order
+/// is not position order. Pairing each item with its actual `UInt` domain position
+/// and sorting makes the drive read `x₀, x₁, …` in order regardless of arrival. A
+/// finite list is the special case (its domain is already `[0, 1, …]`). Contrast
+/// [`decode_source_items`], which the *transaction* writer uses because commit
+/// order is unordered.
+fn decode_source_positioned(tile: &Tile) -> Vec<(usize, Value)> {
+    let Tile::SealedFunction {
+        domain, codomain, ..
+    } = tile
+    else {
+        return Vec::new();
+    };
+    if !matches!(codomain.as_ref(), Tile::Scalar(_) | Tile::Record(_)) {
+        return Vec::new();
+    }
+    let mut pairs: Vec<(usize, Value)> = (0..domain.len())
+        .filter_map(|i| match domain.index_at(i) {
+            Value::UInt(pos) => Some((pos, source_value_at(codomain, i))),
+            _ => None,
+        })
+        .collect();
+    pairs.sort_by_key(|(pos, _)| *pos);
+    pairs
 }
 
 /// The `Value` at position `i` of a source codomain tile — a scalar column or a
@@ -1157,6 +1298,8 @@ impl TileOperator for InductionStore {
             output_tiling: self.output_tiling.clone(),
             processed: 0,
             source_complete: false,
+            released_through: None,
+            source_fully_released: false,
         })
     }
 }
@@ -1179,6 +1322,18 @@ struct InductionStoreProducer {
     /// Whether the iteration source is complete (its last pull was terminal). A
     /// batch source (a list — the usual loop extent) is complete on the first pull.
     source_complete: bool,
+    /// Highest source position released back upstream (the reclaimed prefix). The
+    /// drive drives positions strictly forward and never re-reads a position
+    /// `< processed`, so that prefix is obsolete and released incrementally
+    /// (bounding source retention on a long async loop, the same reclamation the
+    /// dense `Recurse` path performed). A co-iterated reader still holding earlier
+    /// positions keeps them live via the source's cross-producer release
+    /// intersection. `None` until the first release.
+    released_through: Option<usize>,
+    /// Whether the whole source has been released (`True`) after the loop reached
+    /// its terminal end-state — the finite loop's `get_released_predicate() == True`
+    /// invariant; issued once.
+    source_fully_released: bool,
 }
 
 impl TileProducer for InductionStoreProducer {
@@ -1189,16 +1344,42 @@ impl TileProducer for InductionStoreProducer {
             .source_producer
             .get(self.source_producer.tiling().universal_guard());
         self.source_complete = src.is_terminal();
-        let items = decode_source_items(&src);
-        // Drive each not-yet-processed position in order. Tick 0 is the seeded
-        // init, so iteration `pos` occupies tick `pos + 1`: it reads the previous
-        // accumulator as of tick `pos` (the init at `pos == 0`, else the latest
-        // change ≤ that tick — a leading carry inherits the seed), feeds the body,
-        // and steps tick `pos + 1`. The engine must be stepped through `pos` before
-        // we fold, hence the sequential push-body-step loop. The body's decision
-        // gates commit (append the change) vs carry (`step(_, None)` — the value
-        // inherits from tick 0 / the latest earlier change).
-        while self.processed < items.len() {
+        // Pair each item with its absolute domain position and sort. An async
+        // source's domain arrives unordered, so we drive by position, not by the
+        // codomain's column order (see [`decode_source_positioned`]).
+        let by_pos: HashMap<usize, Value> = decode_source_positioned(&src).into_iter().collect();
+        // Invariant: an induction source domain has **no interior hole** — a
+        // finite list `[0, N)` or an async `DataSource`'s UInt domain only ever
+        // gaps at the *trailing* end (positions not yet arrived). The drive relies
+        // on this (it stops at the first missing `processed` and resumes when it
+        // arrives); a permanent interior hole would stall forever. The arrived set
+        // is *not* a prefix from 0: `get_impl` releases the consumed prefix below,
+        // so a later pull sees a shifted window (e.g. `{5, 6, 7}`). Assert the
+        // sorted positions form a contiguous run from their retained base instead.
+        debug_assert!(
+            !self.source_complete || {
+                let mut ks: Vec<usize> = by_pos.keys().copied().collect();
+                ks.sort_unstable();
+                ks.windows(2).all(|w| w[1] == w[0] + 1)
+            },
+            "induction source domain has an interior gap: {:?}",
+            {
+                let mut ks: Vec<usize> = by_pos.keys().copied().collect();
+                ks.sort_unstable();
+                ks
+            }
+        );
+        // Drive each not-yet-processed position **in contiguous order**. Tick 0 is
+        // the seeded init, so iteration `pos` occupies tick `pos + 1`: it reads the
+        // previous accumulator as of tick `pos` (the init at `pos == 0`, else the
+        // latest change ≤ that tick — a leading carry inherits the seed), feeds the
+        // body, and steps tick `pos + 1`. The engine must be stepped through `pos`
+        // before we fold, hence the sequential push-body-step loop. The body's
+        // decision gates commit (append the change) vs carry (`step(_, None)` — the
+        // value inherits from tick 0 / the latest earlier change). Stop at the first
+        // gap (position `processed` not yet arrived): the recurrence is sequential,
+        // so a later position cannot be decided before its predecessor.
+        while let Some(item) = by_pos.get(&self.processed) {
             let pos = self.processed;
             let snap_in: Vec<Value> = self
                 .read_keys
@@ -1209,16 +1390,11 @@ impl TileProducer for InductionStoreProducer {
                         .expect("tick 0 seeds every accumulator, so a prev read always resolves")
                 })
                 .collect();
-            self.buffer
-                .borrow_mut()
-                .rows
-                .push((snap_in, items[pos].clone()));
+            self.buffer.borrow_mut().rows.push((snap_in, item.clone()));
             let body_tile = self
                 .body_producer
                 .get(self.body_producer.tiling().universal_guard());
-            // Induction taps are ungated (conditional feeds on an induction path
-            // are rejected at lowering), so `tap_fired` is all-`true` and unused.
-            let Some((commit, writes, _tap_fired)) =
+            let Some((commit, writes, tap_fired)) =
                 body_decision_at(&body_tile, pos, &self.tap_fields)
             else {
                 // The decision for a freshly-pushed row of a self-contained
@@ -1235,25 +1411,87 @@ impl TileProducer for InductionStoreProducer {
                     self.write_keys.len(),
                     "the decision's write set aligns with the store's write keys"
                 );
-                Some(self.write_keys.iter().cloned().zip(writes).collect())
+                // Register writes lead, taps follow (the layout `build_induction_
+                // store_single` sets). A committing position applies every register
+                // write but only the taps that *fired* on its route — a non-fired
+                // conditional feed is omitted from the delta, so its per-position
+                // read (`store_delta_at`) skips this position. `commit` is true
+                // whenever a tap fires (the letrec phase folds feed-fire paths into
+                // the commit gate), so a fired tap always rides an appended change.
+                // Layout invariant (as on the transaction side): `write_keys` =
+                // register keys ++ tap keys, so the subtraction never underflows —
+                // a break would wrap `n_reg` to a huge value in release and
+                // mis-index `tap_fired`.
+                debug_assert!(
+                    self.write_keys.len() >= self.tap_fields.len(),
+                    "induction store: tap fields ({}) exceed write keys ({})",
+                    self.tap_fields.len(),
+                    self.write_keys.len()
+                );
+                let n_reg = self.write_keys.len() - self.tap_fields.len();
+                Some(
+                    self.write_keys
+                        .iter()
+                        .cloned()
+                        .zip(writes)
+                        .enumerate()
+                        .filter(|(i, _)| *i < n_reg || tap_fired[*i - n_reg])
+                        .map(|(_, kv)| kv)
+                        .collect(),
+                )
             } else {
-                None // carry: the accumulator holds from tick 0 / the latest change
+                // Carry: no change is appended, so a tap (fired or not) contributes
+                // nothing at this position — an *ungated* tap (one whose fire path
+                // is the commit itself, so it carries no `__fire` gate) reads
+                // `tap_fired = true` by default, but a carry position records it
+                // nowhere, which is correct: the letrec phase folds every feed-fire
+                // path into `commit`, so a position that genuinely fires a tap
+                // commits (and takes the branch above) rather than carrying here.
+                None // the accumulator holds from tick 0 / the latest change
             };
             self.engine.step(pos + 1, write_set);
             self.processed = pos + 1;
         }
         let mut store = self.engine.render_full_store_tile();
-        // Signal terminality once the source is complete and every position has
-        // been decided: the accumulator is final, so the frontier *closes*
+        // Incrementally reclaim the processed prefix of the source. The drive only
+        // ever pulls position `processed` forward and never re-reads a position
+        // `< processed`, so `[0, processed)` is obsolete to *this* producer;
+        // releasing it bounds source retention on a long async loop (matching the
+        // dense `Recurse` path). The source drops a row only once every producer
+        // releases it (cross-producer intersection), so a co-iterated reader still
+        // folding earlier positions keeps them live.
+        let unused = self.processed == 0
+            || self
+                .released_through
+                .is_some_and(|r| r + 1 >= self.processed);
+        if !unused {
+            self.source_producer
+                .release(TileGuard::Function(FunctionGuard::Domain(
+                    Predicate::LessThanEq(Value::UInt(self.processed - 1)),
+                )));
+            self.released_through = Some(self.processed - 1);
+        }
+        // Signal terminality once the source is complete and every arrived position
+        // has been decided: the accumulator is final, so the frontier *closes*
         // (`terminal`) and a downstream `ExtractLast`/`final_or_default` resolves.
         // The frontier keeps its `LessThanEq(w)` watermark, which spans the whole
         // extent including a trailing run of carries — so `len`/`store_frontier`
         // no longer undercount to the last change tick when the tail is all carry.
-        if self.source_complete
-            && self.processed >= items.len()
-            && let Tile::Store { terminal, .. } = &mut store
-        {
+        // A terminal source has a gapless domain, so having driven every contiguous
+        // position (`by_pos` no longer holds `processed`) means the whole extent is
+        // decided — robust to the incremental prefix release above shrinking
+        // `by_pos`.
+        let done = self.source_complete && !by_pos.contains_key(&self.processed);
+        if done && let Tile::Store { terminal, .. } = &mut store {
             *terminal = true;
+        }
+        // Final reclamation: once terminal, release the *whole* source (`True`) so a
+        // finite loop reaches the `get_released_predicate() == True` end-state (the
+        // incremental prefix release above stops one short of a `True` predicate).
+        if done && !self.source_fully_released {
+            self.source_producer
+                .release(TileGuard::Function(FunctionGuard::Domain(Predicate::True)));
+            self.source_fully_released = true;
         }
         debug_assert!(
             store.check_from(&self.output_tiling),
@@ -1262,11 +1500,23 @@ impl TileProducer for InductionStoreProducer {
         store
     }
 
-    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
-        // The induction store is a finite batch driven to completion in one pull
-        // sweep; its whole changelog is retained for the accumulator-final read.
-        // Read-side commit-log GC (the long-lived-store bound) is a follow-up —
-        // tracked with the trailing-carry frontier gap in the pivot design notes.
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // Keep-latest changelog GC (mirrors [`CommitProducer::release_impl`]). The
+        // store sits behind a `FanOut`, so this guard is the **intersection** of
+        // what every reader (dense accumulator reads, reply-tap reads) has released
+        // — the tick prefix safe to reclaim. `gc_released_prefix` drops the
+        // superseded entries in that prefix but **keeps each key's latest write**,
+        // which is exactly what the drive's own recurrence needs (`read_as_of(
+        // processed)` folds to the latest ≤ processed), so the GC never strands the
+        // recurrence — bounding a never-terminating streaming loop's changelog to
+        // O(keys) + the slowest reader's lag. (A scalar-final `ExtractLast` reader
+        // holds the whole stream until terminal, so it releases nothing early — but
+        // that read is inherently non-terminating over an endless source anyway.)
+        if let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard
+            && let Some(through) = max_released_tick(pred)
+        {
+            self.engine.gc_released_prefix(through);
+        }
     }
 }
 
@@ -1397,9 +1647,9 @@ impl TileProducer for StoreValueStreamProducer {
         // watermark through.
         let Tile::Store {
             changes,
-            deltas,
             frontier,
             terminal,
+            ..
         } = &store
         else {
             return self.tiling().empty_tile();
@@ -1409,38 +1659,35 @@ impl TileProducer for StoreValueStreamProducer {
         } else {
             frontier.clone()
         };
-        // Project each change tick's delta map to `key`'s value. A register carries
-        // the last written value forward across ticks that don't touch `key` (so a
-        // read sees the latest write ≤ that tick — the step interpolation); a reply
-        // tap emits only at the tick that wrote it (a per-commit event — carrying it
-        // forward would smear one writer's reply across another writer's commit
-        // ticks on the shared clock). Scan every change to keep `carried` accurate
-        // for the register case, but only *emit* ticks past the release cursor — the
-        // log grows monotonically and an accumulating consumer has already merged
-        // the released prefix.
-        let mut ticks: Vec<usize> = Vec::with_capacity(changes.len());
-        let mut values: Vec<Value> = Vec::with_capacity(changes.len());
-        let mut carried: Option<Value> = None;
-        for i in 0..changes.len() {
-            let Value::UInt(tick) = changes.index_at(i) else {
+        // Fold the changelog to `key`'s value under the carry policy
+        // ([`fold_changelog_key_ascending`], shared with the induction
+        // `StoreDenseRead`): a register carries the latest write ≤ the tick; a
+        // reply tap emits only the tick that wrote it (carrying it forward would
+        // smear one writer's reply across another's commit ticks on the shared
+        // clock). One O(changes) ascending pass folds every tick — the released
+        // prefix is still walked so the carry is built correctly, then dropped at
+        // emit time (the accumulating consumer has already merged it).
+        let all_ticks: Vec<usize> = (0..changes.len())
+            .filter_map(|i| match changes.index_at(i) {
+                Value::UInt(tick) => Some(tick),
+                _ => None,
+            })
+            .collect();
+        let folded = fold_changelog_key_ascending(
+            &store,
+            all_ticks.iter().copied(),
+            &self.key,
+            self.carry_forward,
+        );
+        let mut ticks: Vec<usize> = Vec::with_capacity(all_ticks.len());
+        let mut values: Vec<Value> = Vec::with_capacity(all_ticks.len());
+        for (tick, v) in all_ticks.iter().zip(folded) {
+            if self.release_cursor.is_released(*tick) {
                 continue;
-            };
-            let delta = value_to_map(&deltas.index_at(i));
-            let here = delta.get(&self.key);
-            if let Some(v) = here {
-                carried = Some(v.clone());
             }
-            if self.release_cursor.is_released(tick) {
-                continue;
-            }
-            let emit = if self.carry_forward {
-                carried.as_ref()
-            } else {
-                here
-            };
-            if let Some(v) = emit {
-                ticks.push(tick);
-                values.push(v.clone());
+            if let Some(v) = v {
+                ticks.push(*tick);
+                values.push(v);
             }
         }
         Tile::SealedFunction {
@@ -1499,6 +1746,12 @@ impl TileProducer for StoreValueStreamProducer {
 ///
 /// A scalar-final read (`total` after the loop) is `ExtractLast` over this dense
 /// stream; a co-iterated read is the stream itself — one reader serves both.
+///
+/// The per-tick fold — register carries, tap is a delta event — is the shared
+/// [`fold_changelog_key`]; this reader and [`StoreValueStream`] are the same
+/// changelog projection differing only on *which* ticks they fold (loop positions
+/// at `p + 1` here, commit ticks there) and how they emit (full re-emit here for
+/// `fan_in`/`ExtractLast`; delta-once there for `Memo`-accumulating consumers).
 pub struct StoreDenseRead {
     /// Output tiling `SealedFunction { domain: D, codomain: Scalar(V) }`.
     tiling: Tiling,
@@ -1507,9 +1760,16 @@ pub struct StoreDenseRead {
     trigger: Box<dyn TileOperator>,
     /// The induction store (a [`Tile::Store`] fan branch).
     store_op: Box<dyn TileOperator>,
-    /// The accumulator key to project.
+    /// The key to project.
     key: Value,
     value_extent: Extent,
+    /// Whether the key carries its value forward across positions that do not
+    /// write it. An **accumulator** (`true`) folds the latest write ≤ each
+    /// position (`store_value_at`), so every trigger position has a value. A
+    /// **reply tap** (`false`) is a per-position event: it appears only at the
+    /// position whose changelog delta actually wrote it (`store_delta_at`), so the
+    /// dense read emits the fired subset of positions.
+    carry_forward: bool,
 }
 
 impl StoreDenseRead {
@@ -1518,6 +1778,7 @@ impl StoreDenseRead {
         store_op: Box<dyn TileOperator>,
         key: Value,
         value_extent: Extent,
+        carry_forward: bool,
     ) -> Self {
         let Tiling::SealedFunction { domain, .. } = trigger.tiling() else {
             panic!(
@@ -1540,6 +1801,7 @@ impl StoreDenseRead {
             store_op,
             key,
             value_extent,
+            carry_forward,
         }
     }
 }
@@ -1574,6 +1836,8 @@ impl TileOperator for StoreDenseRead {
             store_producer,
             key: self.key.clone(),
             value_extent: self.value_extent.clone(),
+            carry_forward: self.carry_forward,
+            key_write_ticks: Vec::new(),
         })
     }
 }
@@ -1582,8 +1846,13 @@ struct StoreDenseReadProducer {
     base: ProducerBase,
     trigger_producer: Box<dyn TileProducer>,
     store_producer: Box<dyn TileProducer>,
+    carry_forward: bool,
     key: Value,
     value_extent: Extent,
+    /// Ascending ticks at which `key` was written, cached from the last fold. A
+    /// carry read's [`Self::release_impl`] uses it to find the carry source of the
+    /// earliest still-needed position — the store prefix it can safely release.
+    key_write_ticks: Vec<usize>,
 }
 
 impl TileProducer for StoreDenseReadProducer {
@@ -1617,15 +1886,62 @@ impl TileProducer for StoreDenseReadProducer {
         // non-terminal until the store is fully decided, so the consumer re-pulls.
         let sg = self.store_producer.tiling().universal_guard();
         let store = self.store_producer.get(sg);
-        let mut values: Vec<Value> = Vec::with_capacity(positions.len());
-        for i in 0..positions.len() {
-            let Value::UInt(p) = positions.index_at(i) else {
-                unreachable!("induction loop-extent positions are UInt");
-            };
-            values.push(
-                store_value_at(&store, p + 1, &self.key)
-                    .expect("tick 0 seeds every accumulator, so the fold always resolves"),
-            );
+        // Sort the trigger's positions ascending before folding. An async source's
+        // iteration domain arrives in arbitrary (set) order, but the dense read's
+        // output domain must be position-ordered: a scalar-final read is
+        // `ExtractLast` over this stream — the *last column* — which is the final
+        // accumulator only if the highest loop position is last. (A co-iterated
+        // read aligns by domain *value* via `fan_in`, so ordering is immaterial
+        // there; sorting is correct for both.)
+        let mut sorted: Vec<usize> = (0..positions.len())
+            .map(|i| match positions.index_at(i) {
+                Value::UInt(p) => p,
+                _ => unreachable!("induction loop-extent positions are UInt"),
+            })
+            .collect();
+        sorted.sort_unstable();
+        // Fold `key` at every position's tick `p + 1` in one ascending pass (the
+        // shared [`fold_changelog_key_ascending`]): an accumulator carries the
+        // latest write ≤ that tick (every position resolves — tick 0 seeds it); a
+        // reply tap yields a value only where that tick actually wrote it, so a
+        // non-firing position is omitted (the feed's per-position stream over
+        // exactly the fired positions). One O(changes + positions) pass, not an
+        // O(changes)-per-position re-scan.
+        let folded = fold_changelog_key_ascending(
+            &store,
+            sorted.iter().map(|p| p + 1),
+            &self.key,
+            self.carry_forward,
+        );
+        debug_assert!(
+            !self.carry_forward || folded.iter().all(Option::is_some),
+            "tick 0 seeds every accumulator, so the carry fold always resolves"
+        );
+        let mut kept: Vec<usize> = Vec::with_capacity(sorted.len());
+        let mut values: Vec<Value> = Vec::with_capacity(sorted.len());
+        for (p, v) in sorted.iter().zip(folded) {
+            if let Some(v) = v {
+                kept.push(*p);
+                values.push(v);
+            }
+        }
+        let positions = ColumnValue::from_uints(kept);
+        // Cache the (ascending) ticks that wrote `key`, so a carry read's release
+        // can find the carry source of the first still-needed position. Only a
+        // carry read back-references earlier ticks; a tap needs no such cache.
+        if self.carry_forward
+            && let Tile::Store {
+                changes, deltas, ..
+            } = &store
+        {
+            self.key_write_ticks = (0..changes.len())
+                .filter_map(|i| match changes.index_at(i) {
+                    Value::UInt(t) if value_to_map(&deltas.index_at(i)).contains_key(&self.key) => {
+                        Some(t)
+                    }
+                    _ => None,
+                })
+                .collect();
         }
         // The dense read is decided over `D` once the store is terminal (every
         // position folded to its final value); until then it tracks the trigger's
@@ -1646,9 +1962,51 @@ impl TileProducer for StoreDenseReadProducer {
         }
     }
 
-    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
-        // A finite induction accumulator read is retained whole for its
-        // co-iterating consumer; prefix GC is the long-lived-store follow-up.
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // A downstream release of loop positions `≤ max_pos` is a promise never to
+        // request them again, so we forward whatever the store no longer needs — a
+        // decision derived purely from the release, not from who the consumer is.
+        //
+        // The **trigger** (the iteration source) is always released `≤ max_pos`: a
+        // consumed async `DataSource` / finite list is reclaimed.
+        //
+        // The **store** release depends on the read mode, because it decides which
+        // ticks a *future* fold can still reach:
+        // - A **tap** read (`carry_forward: false`) reads only tick `p + 1`'s delta
+        //   at position `p` — no back-reference — so positions `≤ max_pos` make ticks
+        //   `≤ max_pos + 1` dead.
+        // - A **carry** read (`carry_forward: true`) reads the latest write `≤` each
+        //   position's tick. The earliest still-needed position is `max_pos + 1`
+        //   (reading tick `max_pos + 2`); its **carry source** is the latest write to
+        //   `key` at a tick `≤ max_pos + 2`, and the carry source only moves forward
+        //   for later positions. So every tick *strictly below* that carry source is
+        //   dead for all future positions — and nothing above it is released, so the
+        //   engine's keep-latest GC never drops a live carry source. This bounds the
+        //   changelog for *any* carry consumer (scalar-final or co-iterated) without
+        //   the producer knowing which it is.
+        if let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard {
+            if let Some(max_pos) = max_released_tick(pred) {
+                let store_release_upto = if self.carry_forward {
+                    let need_tick = max_pos + 2;
+                    // Carry source = latest write to `key` at tick ≤ need_tick;
+                    // release strictly below it (the seed at tick 0 bounds this).
+                    self.key_write_ticks
+                        .iter()
+                        .rev()
+                        .find(|&&t| t <= need_tick)
+                        .and_then(|&carry_source| carry_source.checked_sub(1))
+                } else {
+                    Some(max_pos + 1)
+                };
+                if let Some(upto) = store_release_upto {
+                    self.store_producer
+                        .release(TileGuard::Function(FunctionGuard::Domain(
+                            Predicate::LessThanEq(Value::UInt(upto)),
+                        )));
+                }
+            }
+            self.trigger_producer.release(obsolete_guard);
+        }
     }
 }
 
@@ -3215,6 +3573,69 @@ mod tests {
         );
     }
 
+    /// Releasing a reader's consumed prefix bounds the changelog: the store GCs
+    /// the FanOut-intersected prefix, **keeping each key's latest write**, so a
+    /// long-lived loop's retained changelog is O(keys) rather than O(positions).
+    /// `acc := 10; for i in [1,2,3]: acc += i` renders a 4-tick dense changelog;
+    /// after a reader releases through tick 2, only the latest write survives —
+    /// and the accumulator still reads its correct final value.
+    #[test]
+    fn induction_store_release_bounds_changelog_keeping_latest() {
+        let buffer: BodyInputBuffer = Rc::new(RefCell::new(WriterBuffer::default()));
+        let body_input = BodyInputSource::new(buffer.clone(), vec![value_extent()], value_extent());
+        let body = AddIfBody::new(Box::new(body_input), i64::MIN); // unconditional
+        let source = ItemSource::new(&[1, 2, 3]);
+        let acc = acct("acc");
+        let mut op = InductionStore::new(
+            vec![(
+                acc.clone(),
+                Box::new(Constant::new(int(10), value_extent())),
+            )],
+            Box::new(body),
+            Box::new(source),
+            buffer,
+            vec![acc.clone()],
+            vec![acc.clone()],
+            Vec::new(),
+            key_extent(),
+            value_extent(),
+        );
+        let guard = op.tiling().universal_guard();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+
+        let full = producer.get(producer.tiling().universal_guard());
+        let Tile::Store { changes, .. } = &full else {
+            panic!("induction store output is a Store");
+        };
+        assert_eq!(
+            changes.len(),
+            4,
+            "full dense changelog: seed + three writes"
+        );
+
+        // A reader consumed loop positions ≤ 1 → store ticks ≤ 2.
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::LessThanEq(Value::UInt(2)),
+        )));
+
+        let bounded = producer.get(producer.tiling().universal_guard());
+        assert!(validate_tile(&bounded));
+        assert_eq!(
+            store_current(&bounded, &acc).map(|(_, v)| v),
+            Some(int(16)),
+            "the accumulator still reads its correct final value after GC"
+        );
+        let Tile::Store { changes, .. } = &bounded else {
+            panic!("induction store output is a Store");
+        };
+        assert_eq!(
+            changes.len(),
+            1,
+            "keep-latest GC drops the superseded prefix (ticks 0,1,2), keeping only \
+             the latest write (tick 3) — the changelog no longer grows with positions"
+        );
+    }
+
     /// Build an `InductionStore` behind a fan and read `acc` densely over the loop
     /// extent via `StoreDenseRead`; return the dense `Fun(D, V)` values in order.
     fn dense_read(items: &[i64], threshold: i64, init: i64) -> Vec<i64> {
@@ -3239,7 +3660,8 @@ mod tests {
         );
         let fan = Rc::new(FanOut::new(Box::new(store)));
         let trigger = IterateExtent::new(Extent::uint_range(items.len()));
-        let mut reader = StoreDenseRead::new(Box::new(trigger), fan.branch(), acc, value_extent());
+        let mut reader =
+            StoreDenseRead::new(Box::new(trigger), fan.branch(), acc, value_extent(), true);
         let guard = reader.tiling().universal_guard();
         let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
         let tile = producer.get(producer.tiling().universal_guard());
@@ -3279,6 +3701,229 @@ mod tests {
     #[test]
     fn dense_read_unconditional_accumulator() {
         assert_eq!(dense_read(&[1, 2, 3], i64::MIN, 10), vec![11, 13, 16]);
+    }
+
+    /// The shared single-pass fold ([`fold_changelog_key_ascending`]) agrees with
+    /// the per-tick [`fold_changelog_key`] at every query tick, for both the carry
+    /// and tap policies — the invariant the O(N) rewrite of both changelog readers
+    /// rests on. Uses a *sparse* changelog (a key not written at every tick) so the
+    /// carry-forward vs exact-delta distinction is exercised.
+    #[test]
+    fn fold_changelog_ascending_matches_per_tick() {
+        let mut e = CommitEngine::new(balances(&[("acc", 0)]));
+        e.attempt(Proposal {
+            snapshot: 0,
+            reads: balances(&[("acc", 0)]),
+            writes: balances(&[("acc", 5)]),
+        }); // tick 1: acc = 5
+        e.attempt(Proposal {
+            snapshot: 1,
+            reads: HashMap::new(),
+            writes: balances(&[("other", 9)]),
+        }); // tick 2: a different key (acc carries)
+        e.attempt(Proposal {
+            snapshot: 2,
+            reads: balances(&[("acc", 5)]),
+            writes: balances(&[("acc", 8)]),
+        }); // tick 3: acc = 8
+        let store = e.render_full_store_tile();
+        let acc = acct("acc");
+        let queries: Vec<usize> = (0..=4).collect();
+        for carry in [true, false] {
+            let batched =
+                fold_changelog_key_ascending(&store, queries.iter().copied(), &acc, carry);
+            let per_tick: Vec<Option<Value>> = queries
+                .iter()
+                .map(|t| fold_changelog_key(&store, *t, &acc, carry))
+                .collect();
+            assert_eq!(batched, per_tick, "ascending fold diverges (carry={carry})");
+        }
+    }
+
+    /// A **carry** dense reader must not over-release the changelog. A sparse
+    /// accumulator writes at position 0 (tick 1) and position 3 (tick 4), carrying
+    /// positions 1, 2 from the *tick-1* write. Releasing the leading positions must
+    /// not strand tick 1 (positions 1, 2's carry source): the reader forwards a
+    /// store release that stops *below* the earliest still-needed carry source, so
+    /// tick 1 survives and a re-read after releasing position 0 still folds
+    /// positions 1, 2 to the tick-1 write (5), not the seed (0).
+    #[test]
+    fn carry_dense_reader_does_not_over_release_store() {
+        let buffer: BodyInputBuffer = Rc::new(RefCell::new(WriterBuffer::default()));
+        let body_input = BodyInputSource::new(buffer.clone(), vec![value_extent()], value_extent());
+        // Writes iff `item > 3`: over [5, 1, 1, 9] that fires at positions 0 and 3.
+        let body = AddIfBody::new(Box::new(body_input), 3);
+        let source = ItemSource::new(&[5, 1, 1, 9]);
+        let acc = acct("acc");
+        let store = InductionStore::new(
+            vec![(acc.clone(), Box::new(Constant::new(int(0), value_extent())))],
+            Box::new(body),
+            Box::new(source),
+            buffer,
+            vec![acc.clone()],
+            vec![acc.clone()],
+            Vec::new(),
+            key_extent(),
+            value_extent(),
+        );
+        let fan = Rc::new(FanOut::new(Box::new(store)));
+        let trigger = IterateExtent::new(Extent::uint_range(4));
+        let mut reader =
+            StoreDenseRead::new(Box::new(trigger), fan.branch(), acc, value_extent(), true);
+        let guard = reader.tiling().universal_guard();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+
+        let read_values = |p: &mut Box<dyn TileProducer>| -> Vec<(usize, i64)> {
+            let tile = p.get(p.tiling().universal_guard());
+            let Tile::SealedFunction {
+                domain, codomain, ..
+            } = tile
+            else {
+                panic!("dense read is a SealedFunction");
+            };
+            let Tile::Scalar(col) = *codomain else {
+                panic!("dense read codomain is a scalar column");
+            };
+            (0..domain.len())
+                .map(|i| match (domain.index_at(i), col.index_at(i)) {
+                    (Value::UInt(p), Value::Int(v)) => (p, v),
+                    other => panic!("unexpected dense read entry {other:?}"),
+                })
+                .collect()
+        };
+
+        // Full read: acc = 5 (pos 0), 5, 5 (carries), 14 (pos 3).
+        assert_eq!(
+            read_values(&mut producer),
+            vec![(0, 5), (1, 5), (2, 5), (3, 14)]
+        );
+        // Release the leading position, then re-read. The carry source (tick 1)
+        // must survive so positions 1, 2 still fold to 5 — not the seed 0.
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::LessThanEq(Value::UInt(0)),
+        )));
+        let after = read_values(&mut producer);
+        for (p, v) in [(1usize, 5i64), (2, 5), (3, 14)] {
+            assert!(
+                after.contains(&(p, v)),
+                "position {p} must still read {v} after releasing position 0; got {after:?}"
+            );
+        }
+    }
+
+    /// Records the domain-release watermarks a producer receives — lets a test
+    /// observe what `StoreDenseRead` forwards to the store *without* a second
+    /// FanOut branch (which would perturb GC via the release intersection).
+    struct ReleaseRecorder {
+        inner: Box<dyn TileOperator>,
+        releases: Rc<RefCell<Vec<usize>>>,
+    }
+
+    struct ReleaseRecorderProducer {
+        base: ProducerBase,
+        inner: Box<dyn TileProducer>,
+        releases: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl TileOperator for ReleaseRecorder {
+        fn tiling(&self) -> &Tiling {
+            self.inner.tiling()
+        }
+        fn subscribe(
+            &mut self,
+            intent_guard: TileGuard,
+            consumer: Box<dyn Consumer>,
+            scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            let inner = self.inner.subscribe(intent_guard, consumer, scheduler);
+            Box::new(ReleaseRecorderProducer {
+                base: ProducerBase::new(ReleaseRecorderProducer::alloc_id(), self.inner.tiling()),
+                inner,
+                releases: self.releases.clone(),
+            })
+        }
+    }
+
+    impl TileProducer for ReleaseRecorderProducer {
+        impl_producer_base!();
+        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+            self.inner.get(projection_guard)
+        }
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            if let TileGuard::Function(FunctionGuard::Domain(pred)) = &obsolete_guard
+                && let Some(w) = max_released_tick(pred)
+            {
+                self.releases.borrow_mut().push(w);
+            }
+            self.inner.release(obsolete_guard);
+        }
+    }
+
+    /// A carry reader's release forwards a store watermark that stops **below the
+    /// carry source** of the first still-needed position — bounding the changelog
+    /// without stranding a live carry. Over `[5, 1, 1, 9]` gated by `item > 3`,
+    /// `acc` writes at ticks 1 (pos 0) and 4 (pos 3); ticks 0, 1, 4 write `acc`.
+    /// Releasing dense position 0 leaves position 1 (reading tick 2) earliest; its
+    /// carry source is tick 1, so the forwarded store release is `≤ 0` (not `≤ 1`,
+    /// which the naive `pos + 1` rule would have stranded). Releasing through
+    /// position 2 (position 3 reading tick 4 now earliest, carry source tick 4)
+    /// forwards `≤ 3`, so keep-latest GC can reclaim the whole superseded prefix.
+    #[test]
+    fn carry_dense_reader_release_stops_below_carry_source() {
+        let buffer: BodyInputBuffer = Rc::new(RefCell::new(WriterBuffer::default()));
+        let body_input = BodyInputSource::new(buffer.clone(), vec![value_extent()], value_extent());
+        let body = AddIfBody::new(Box::new(body_input), 3);
+        let source = ItemSource::new(&[5, 1, 1, 9]);
+        let acc = acct("acc");
+        let store = InductionStore::new(
+            vec![(acc.clone(), Box::new(Constant::new(int(0), value_extent())))],
+            Box::new(body),
+            Box::new(source),
+            buffer,
+            vec![acc.clone()],
+            vec![acc.clone()],
+            Vec::new(),
+            key_extent(),
+            value_extent(),
+        );
+        let fan = Rc::new(FanOut::new(Box::new(store)));
+        let releases = Rc::new(RefCell::new(Vec::<usize>::new()));
+        let recorder = ReleaseRecorder {
+            inner: fan.branch(),
+            releases: releases.clone(),
+        };
+        let trigger = IterateExtent::new(Extent::uint_range(4));
+        let mut reader = StoreDenseRead::new(
+            Box::new(trigger),
+            Box::new(recorder),
+            acc,
+            value_extent(),
+            true,
+        );
+        let guard = reader.tiling().universal_guard();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+
+        // Drive the fold once so the reader caches which ticks wrote `acc`.
+        let _ = producer.get(producer.tiling().universal_guard());
+
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::LessThanEq(Value::UInt(0)),
+        )));
+        assert_eq!(
+            releases.borrow().last().copied(),
+            Some(0),
+            "releasing dense pos 0 must forward store release ≤ 0 (carry source tick 1 survives)"
+        );
+
+        let _ = producer.get(producer.tiling().universal_guard());
+        producer.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::LessThanEq(Value::UInt(2)),
+        )));
+        assert_eq!(
+            releases.borrow().last().copied(),
+            Some(3),
+            "releasing through dense pos 2 must forward store release ≤ 3 (only tick 4 kept)"
+        );
     }
 
     /// Two writers touch the *same* key from the same snapshot: the first
@@ -4717,6 +5362,27 @@ mod tests {
         // An undecided store (nothing committed yet) has no current value.
         let undecided = store_tile(&[(0, &[("alice", 100)])], Predicate::False);
         assert_eq!(store_current(&undecided, &acct("alice")), None);
+    }
+
+    #[test]
+    fn decode_source_positioned_pairs_by_domain_and_sorts() {
+        // An async source's domain arrives unordered (it enumerates a set of
+        // arrived keys), and the codomain aligns to the domain *column*, not to
+        // position. Decoding must pair each item with its actual domain position
+        // and sort — otherwise the position-driven drive reads the wrong item at
+        // each tick, and a scalar-final `ExtractLast` over the dense read (which
+        // relies on the highest position being last) picks a mid-loop value.
+        let tile = Tile::SealedFunction {
+            domain: ColumnValue::from_uints(vec![2, 0, 1]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::from_ints(vec![30, 10, 20]))),
+            domain_predicate: Predicate::True,
+            deleted: bit_set::BitSet::new(),
+        };
+        assert_eq!(
+            decode_source_positioned(&tile),
+            vec![(0, int(10)), (1, int(20)), (2, int(30))],
+            "items must be paired with their domain position and sorted ascending"
+        );
     }
 
     #[test]

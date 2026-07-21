@@ -59,7 +59,7 @@ every `For`+`MutWrite` loop into a guarded `LetRec` — the accumulators' histor
 over the loop's induction domain, guarded by `get_prev_seq`, with trailing reads
 lowered to `final_or_default` — and `planning::plan_loops` lowers that onto the
 domain-parameterized `Transact` carrier, which operator conversion compiles to a
-`Recurse`. In-loop feeds (`<<`, and `yield` in a generator) are hoisted to
+position-driven `InductionStore` changelog. In-loop feeds (`<<`, and `yield` in a generator) are hoisted to
 `Feed(defer, view)` and routed as ordinary channels by `channelize`, the
 feed-routing step (channelize) of mutability elimination. A generator with loop-carried state
 (`total := 0; for x in xs: total += x; yield total`) is the same shape — `yield e`

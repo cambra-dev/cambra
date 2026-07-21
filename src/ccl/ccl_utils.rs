@@ -4,9 +4,77 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::ccl::{
-    BaseType, BinOpKind, Branch, Builtin, Expr, Lit, LogicKind, Name, PredicateId, Refinement,
-    Type, TypedExprNode, UnaryOpKind,
+    BaseType, BinOpKind, Branch, Builtin, Expr, F_COMMIT, F_FIRE_SUFFIX, F_WRITES, Lit, LogicKind,
+    Name, PredicateId, Refinement, Type, TypedExprNode, UnaryOpKind,
 };
+
+/// Disjoin control-flow `paths` into one boolean commit gate — the writer
+/// decision's `commit` field, true exactly where some path commits. Short-circuits
+/// a literal `true` path (an unconditional commit) and skips a literal `false`,
+/// so a spine writer folds to `true` (not `true or true or …`) and the two phases
+/// build the same gate for the same shape. `empty` is the value of an empty
+/// disjunction: `true` for a transaction block (a bare `with begin():` always
+/// commits), `false` for an induction `Case` (no writing/feeding branch commits
+/// nothing — a pure carry).
+pub fn disjoin(paths: impl IntoIterator<Item = Expr>, empty: bool, bool_ty: &Type) -> Expr {
+    let lit = |b: bool| Expr::new(TypedExprNode::Lit(Lit::Bool(b))).with_ty(bool_ty.clone());
+    let mut acc: Option<Expr> = None;
+    for p in paths {
+        match &p.node {
+            TypedExprNode::Lit(Lit::Bool(true)) => return lit(true),
+            TypedExprNode::Lit(Lit::Bool(false)) => continue,
+            _ => {}
+        }
+        acc = Some(match acc {
+            None => p,
+            Some(prev) => {
+                Expr::binop(prev, BinOpKind::BoolLogic(LogicKind::Or), p).with_ty(bool_ty.clone())
+            }
+        });
+    }
+    acc.unwrap_or_else(|| lit(empty))
+}
+
+/// Assemble a writer **decision record** `{commit, writes, (to_<feed>__fire,)?
+/// to_<feed>, …}` — the single encoding of the tap/`__fire` protocol shared by the
+/// transaction writer ([`crate::ccl::transact_phase`]) and the induction writer
+/// ([`crate::ccl::mut_elim`]). Both feed it to the interpreter through the same
+/// `body_decision_at` decoder, so the shape must be built in exactly one place.
+///
+/// `feeds` are `(field, value, fire)` in tap order. A tap whose `fire` path is
+/// structurally the writer's `commit` — a spine or sole-committer feed that fires
+/// with *every* committing position — carries **no** gate (the engine treats an
+/// ungated tap as firing with the commit). A **narrower** `fire` carries a
+/// `to_<feed>__fire` gate the engine reads to fire the reply only on its own route,
+/// so a sibling route's commit does not over-fire it.
+///
+/// `commit` must already be the writer's *final* commit gate — including every
+/// feed's fire path, so a feed-only committing position appends a change carrying
+/// the tap (the caller folds fires into `commit` before calling; see
+/// `transact_phase`'s `commit_paths` and `letrec_phase`'s widen).
+pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(String, Expr, Expr)]) -> Expr {
+    let mut fields: Vec<(String, Expr)> = Vec::with_capacity(2 + feeds.len() * 2);
+    fields.push((F_COMMIT.to_string(), commit.clone()));
+    fields.push((F_WRITES.to_string(), writes));
+    for (field, value, fire) in feeds {
+        // Gate iff the fire path is *narrower* than the commit — a structural test
+        // (no Boolean simplification); the engine handles both an ungated tap
+        // (fires with commit) and a gated one (fires on its route) correctly, so
+        // the two shapes are observationally equal, this only decides which is
+        // emitted.
+        if *fire != commit {
+            fields.push((format!("{field}{F_FIRE_SUFFIX}"), fire.clone()));
+        }
+        fields.push((field.clone(), value.clone()));
+    }
+    let ty = Type::Record(
+        fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.ty.clone()))
+            .collect(),
+    );
+    Expr::new(TypedExprNode::Record(fields)).with_ty(ty)
+}
 
 /// Returns `true` if `expr` directly references the given built-in primitive.
 pub(crate) fn is_builtin(expr: &Expr, b: Builtin) -> bool {

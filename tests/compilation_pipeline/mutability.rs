@@ -342,6 +342,76 @@ for i in [1, 2]:
 x"#,
     Tile::Scalar(ColumnValue::Ints(vec![33]))
 )]
+// A **conditional feed** riding an accumulator loop: the `o << i` fires only on
+// the guard's route, so the tap stream carries just the fired positions (loop
+// positions 1, 2 where i = 20, 30). `transform_chain` gives the feed a
+// `to_o__fire` gate; the `InductionStore` omits the tap from a non-firing
+// position's delta, and `StoreDenseRead` (non-carry) reads only fired positions.
+#[case(
+    r#"
+o = defer()
+cnt := 0
+for i in [10, 20, 30]:
+    cnt := cnt + 1
+    if i > 15:
+        o << i
+o"#,
+    Tile::SealedFunction {
+        domain: ColumnValue::from_uints(vec![1, 2]),
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![20, 30]))),
+        domain_predicate: Predicate::True,
+        deleted: BitSet::new(),
+    }
+)]
+// A **conditional write** with an unconditional feed after it: `cnt` increments
+// only when `i > 15`, and `o << cnt` fires every position. The post-`if` feed
+// duplicates onto both paths (mutually exclusive guards), so the tap rides two
+// disjoint fire routes: positions 1, 2 (guard held → cnt 1, 2) and position 0
+// (carry → cnt 0). As a function that is 0 ↦ 0, 1 ↦ 1, 2 ↦ 2.
+#[case(
+    r#"
+o = defer()
+cnt := 0
+for i in [10, 20, 30]:
+    if i > 15:
+        cnt := cnt + 1
+    o << cnt
+o"#,
+    Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 0, 1],
+            variants: vec![ColumnValue::from_uints(vec![1, 2]), ColumnValue::from_uints(vec![0])],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 0]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    }
+)]
+// A full `if/else` write with a trailing feed: each position takes exactly one
+// arm (`i < 2` → `x += i`, else `x += 100`) and feeds the post-arm `x`. The two
+// arms partition the loop extent, so the tap rides two disjoint routes. As a
+// function: 0 ↦ 0, 1 ↦ 1, 2 ↦ 101, 3 ↦ 201.
+#[case(
+    r#"
+o = defer()
+x := 0
+for i in [0, 1, 2, 3]:
+    if i < 2:
+        x := x + i
+    else:
+        x := x + 100
+    o << x
+o"#,
+    Tile::SealedFunction {
+        domain: ColumnValue::Union {
+            tags: vec![0, 0, 1, 1],
+            variants: vec![ColumnValue::from_uints(vec![0, 1]), ColumnValue::from_uints(vec![2, 3])],
+        },
+        codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 101, 201]))),
+        domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+        deleted: BitSet::new(),
+    }
+)]
 #[ignore] // TODO support nested loops with mutations.
 #[case(
     r#"
