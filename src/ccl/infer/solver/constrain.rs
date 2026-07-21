@@ -496,36 +496,43 @@ fn constrain_go(
                 codomain: c0,
             },
             Type::Sigma(s),
-        ) => {
-            let injects = match &s.witness {
-                // The witness is one of these domains: inject iff `domain` is one.
-                Witness::Type(Kind::Enumerated(candidates)) => {
-                    candidates.iter().any(|d| d == domain.as_ref())
-                }
-                // The universe ranges over every domain, so any data function
-                // injects.
-                Witness::Type(Kind::Any) => {
-                    todo!("Σ-injection into a Collection (Kind::Any): any domain injects")
-                }
-                // Inject iff `domain` is the body refinement instantiated at some
-                // value of the witness type.
-                Witness::Value { .. } => {
-                    todo!("Σ-injection into a value-witness sum (List/Map)")
-                }
-            };
-            if injects {
-                let cod_sl = match (pn, s.binder()) {
-                    (Some(k), Some(x)) => sl.extended_rename(k, x),
-                    _ => sl.clone(),
+        ) => match &s.witness {
+            // A conditional collection: inject iff `domain` is one of its
+            // candidate extents, then flow the codomain. Its body is the data
+            // function `Witness ⤇ V` (built by `conditional_collection`), so its
+            // parts are read here, where that shape is guaranteed.
+            Witness::Type(Kind::Enumerated(candidates)) => {
+                let Type::Fun {
+                    name: binder,
+                    codomain: cod,
+                    ..
+                } = &*s.body
+                else {
+                    unreachable!("a conditional collection's body is a data function")
                 };
-                constrain_go(c0, s.codomain(), &cod_sl, sr, cache)
-            } else {
-                Err(ConstrainError::Mismatch {
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                })
+                if candidates.iter().any(|d| d == domain.as_ref()) {
+                    let cod_sl = match (pn, binder.as_ref()) {
+                        (Some(k), Some(x)) => sl.extended_rename(k, x),
+                        _ => sl.clone(),
+                    };
+                    constrain_go(c0, cod, &cod_sl, sr, cache)
+                } else {
+                    Err(ConstrainError::Mismatch {
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                    })
+                }
             }
-        }
+            // The universe ranges over every domain (any data function injects).
+            Witness::Type(Kind::Any) => {
+                todo!("Σ-injection into a Collection (Kind::Any): any domain injects")
+            }
+            // Inject iff `domain` is the body refinement instantiated at some
+            // value of the witness type.
+            Witness::Value { .. } => {
+                todo!("Σ-injection into a value-witness sum (List/Map)")
+            }
+        },
 
         // **Σ-elimination** `Σ <: Fun`: a sum *consumed* as a plain collection.
         // Not subsumption — consuming distributes the consumer over the witness;
@@ -544,63 +551,86 @@ fn constrain_go(
                 codomain: c1,
                 ..
             },
-        ) => {
-            let consumed_domain = match &s.witness {
-                // A finite, discriminated union of the candidate extents — the
-                // same tagged domain the runtime union tile carries.
-                Witness::Type(Kind::Enumerated(candidates)) => Type::Variant(
+        ) => match &s.witness {
+            // A finite, discriminated union of the candidate extents — the same
+            // tagged domain the runtime union tile carries. The body is the data
+            // function `Witness ⤇ V`, read here where that shape is guaranteed.
+            Witness::Type(Kind::Enumerated(candidates)) => {
+                let Type::Fun {
+                    name: binder,
+                    codomain: cod,
+                    ..
+                } = &*s.body
+                else {
+                    unreachable!("a conditional collection's body is a data function")
+                };
+                let consumed_domain = Type::Variant(
                     candidates
                         .iter()
                         .enumerate()
                         .map(|(i, d)| (FieldKey::Index(i), d.clone()))
                         .collect(),
-                ),
-                // The universe is not enumerable, so there is no finite union to
-                // present — elimination is opaque/existential.
-                Witness::Type(Kind::Any) => {
-                    todo!("Σ-elimination of a Collection (Kind::Any): opaque domain")
-                }
-                // The refined key-domain derived from the witness value.
-                Witness::Value { .. } => {
-                    todo!("Σ-elimination of a value-witness sum (List/Map)")
-                }
-            };
-            constrain_go(d1, &consumed_domain, sr, sl, cache)?;
-            let cod_sl = match (s.binder(), n1) {
-                (Some(k), Some(x)) => sl.extended_rename(k, x),
-                _ => sl.clone(),
-            };
-            constrain_go(s.codomain(), c1, &cod_sl, sr, cache)
-        }
+                );
+                constrain_go(d1, &consumed_domain, sr, sl, cache)?;
+                let cod_sl = match (binder.as_ref(), n1) {
+                    (Some(k), Some(x)) => sl.extended_rename(k, x),
+                    _ => sl.clone(),
+                };
+                constrain_go(cod, c1, &cod_sl, sr, cache)
+            }
+            // The universe is not enumerable, so there is no finite union to
+            // present — elimination is opaque/existential.
+            Witness::Type(Kind::Any) => {
+                todo!("Σ-elimination of a Collection (Kind::Any): opaque domain")
+            }
+            // The refined key-domain derived from the witness value.
+            Witness::Value { .. } => {
+                todo!("Σ-elimination of a value-witness sum (List/Map)")
+            }
+        },
 
         // **Σ-width** `Σ <: Σ`: the lhs sum's witness domain must be a subset of
         // the rhs's, and the shared codomain flows covariantly. The subset test
         // is realized per witness `Kind` pair.
-        (Type::Sigma(a), Type::Sigma(b)) => {
-            let witness_subset = match (&a.witness, &b.witness) {
-                // Every lhs candidate extent must appear among the rhs candidates
-                // (matched by *value*, not position — a nested/re-subsumed
-                // conditional's extents land in an arbitrary order).
-                (Witness::Type(Kind::Enumerated(xs)), Witness::Type(Kind::Enumerated(ys))) => {
-                    xs.iter().all(|x| ys.iter().any(|y| y == x))
-                }
-                // Any other witness-Kind pairing (Collection / value-witness, and
-                // cross-Kind relations) is decided with the collections work.
-                _ => todo!("Σ-width for non-enumerated witness Kinds"),
-            };
-            if witness_subset {
-                let cod_sl = match (a.binder(), b.binder()) {
-                    (Some(k), Some(x)) => sl.extended_rename(k, x),
-                    _ => sl.clone(),
+        (Type::Sigma(a), Type::Sigma(b)) => match (&a.witness, &b.witness) {
+            // Two conditional collections: every lhs candidate extent must appear
+            // among the rhs candidates (matched by *value*, not position — a
+            // nested/re-subsumed conditional's extents land in an arbitrary
+            // order), then the shared codomain flows. Both bodies are data
+            // functions, read here where that shape is guaranteed.
+            (Witness::Type(Kind::Enumerated(xs)), Witness::Type(Kind::Enumerated(ys))) => {
+                let (
+                    Type::Fun {
+                        name: a_binder,
+                        codomain: a_cod,
+                        ..
+                    },
+                    Type::Fun {
+                        name: b_binder,
+                        codomain: b_cod,
+                        ..
+                    },
+                ) = (&*a.body, &*b.body)
+                else {
+                    unreachable!("a conditional collection's body is a data function")
                 };
-                constrain_go(a.codomain(), b.codomain(), &cod_sl, sr, cache)
-            } else {
-                Err(ConstrainError::Mismatch {
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
-                })
+                if xs.iter().all(|x| ys.iter().any(|y| y == x)) {
+                    let cod_sl = match (a_binder.as_ref(), b_binder.as_ref()) {
+                        (Some(k), Some(x)) => sl.extended_rename(k, x),
+                        _ => sl.clone(),
+                    };
+                    constrain_go(a_cod, b_cod, &cod_sl, sr, cache)
+                } else {
+                    Err(ConstrainError::Mismatch {
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                    })
+                }
             }
-        }
+            // Any other witness-Kind pairing (Collection / value-witness, and
+            // cross-Kind relations) is decided with the collections work.
+            _ => todo!("Σ-width for non-enumerated witness Kinds"),
+        },
 
         // Variant: width-subtyping is the dual. lhs's tags must all appear
         // in rhs (with a payload subtype check). Payload depth is covariant.

@@ -456,30 +456,13 @@ pub struct SigmaType {
     /// What the Sigma is summed over — a type-witness (classified by a [`Kind`])
     /// or a value-witness (classified by its type). Also selects the eliminator.
     pub witness: Witness,
-    /// `B(witness)`: a data function whose *domain* is determined by the witness.
-    /// For a [`Witness::Type`] it is `Witness ⤇ V` (the witness in domain
-    /// position); for a [`Witness::Value`] it is `{x | pred(x, binder)} ⤇ V`.
+    /// The body `B(witness)` — an arbitrary type that may depend on the witness.
+    /// The **conditional-collection** instance's body is the data function
+    /// `Witness ⤇ V` (built by [`Type::conditional_collection`]); other Σ
+    /// instances may have non-function bodies, so this stays a general `Type`.
+    /// Code that reads a function body's parts (codomain, element binder) does so
+    /// only where it already knows the instance is a conditional collection.
     pub body: Box<Type>,
-}
-
-impl SigmaType {
-    /// The sum's shared codomain — the element type `V` of the body data function
-    /// `<witness-domain> ⤇ V`. Kind-agnostic: every Sigma body is a data
-    /// function, so this is always well-defined.
-    pub fn codomain(&self) -> &Type {
-        match &*self.body {
-            Type::Fun { codomain, .. } => codomain,
-            _ => unreachable!("Sigma body is always a data function `<domain> ⤇ V`"),
-        }
-    }
-
-    /// The body data function's element (Pi) binder, if any. Kind-agnostic.
-    pub fn binder(&self) -> Option<&crate::ccl::Name> {
-        match &*self.body {
-            Type::Fun { name, .. } => name.as_ref(),
-            _ => unreachable!("Sigma body is always a data function `<domain> ⤇ V`"),
-        }
-    }
 }
 
 /// A [`SigmaType`]'s witness, following the classification hierarchy
