@@ -20,11 +20,13 @@
 //! - `GET /api/diagnostics` — [`diagnostics_body`]
 //!   (`{"diagnostics":[]}` on success, structured diagnostics on failure).
 //!   `application/json`.
+//! - `GET /` and `GET /index.html` — the CodeMirror frontend: the built,
+//!   self-contained `cambra-inspector/web/dist/index.html` bundle, which
+//!   fetches `/api/snapshot` and renders the source + IR tree. `text/html`.
+//! - anything else — `404 Not Found`.
 //!
-//! Both bodies come from [`build_bodies`]' single compile, so the diagnostics
-//! the two routes report can never disagree.
-//! - anything else — `404 Not Found`. The frontend's own route lands with the
-//!   frontend.
+//! Both `/api` bodies come from [`build_bodies`]' single compile, so the
+//! diagnostics the two routes report can never disagree.
 //!
 //! # Transport decision: snapshot degrades on failure
 //!
@@ -45,6 +47,16 @@ use crate::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_comp
 use crate::interpreter::Consumer;
 
 use super::{snapshot_json, snapshot_json_pretty};
+
+/// The CodeMirror frontend, embedded at compile time. This is the built,
+/// self-contained single-file bundle (`cambra-inspector/web/dist/index.html`,
+/// produced by `npm run build`), committed to the repo so `cargo build` needs
+/// no Node toolchain (R7).
+///
+/// The path reaches out of `src/` because the frontend is a sibling directory
+/// rather than a workspace member: `cambra-inspector/` holds the TypeScript
+/// project, and this is the one place the Rust build reads from it.
+const INDEX_HTML: &str = include_str!("../../cambra-inspector/web/dist/index.html");
 
 /// The pre-rendered response bodies for the one static program.
 ///
@@ -127,6 +139,12 @@ fn json_header() -> tiny_http::Header {
         .expect("static header parses")
 }
 
+fn html_header() -> tiny_http::Header {
+    "Content-Type: text/html; charset=utf-8"
+        .parse()
+        .expect("static header parses")
+}
+
 fn text_header() -> tiny_http::Header {
     "Content-Type: text/plain; charset=utf-8"
         .parse()
@@ -150,11 +168,13 @@ pub fn serve(code: &str, name: &str, port: u16) -> io::Result<()> {
     eprintln!("cambra: inspecting {name} at http://localhost:{port} — Ctrl+C to stop");
 
     for request in server.incoming_requests() {
-        // `bodies` outlives the loop, so a response borrows it: the snapshot is
-        // megabytes on a large program and every request would otherwise copy it.
+        // `bodies` and `INDEX_HTML` both outlive the loop, so a response
+        // borrows: the snapshot is megabytes on a large program and the bundle
+        // is a quarter of one, and every request would otherwise copy it.
         let (body, status, header) = match request.url() {
             "/api/snapshot" => (bodies.snapshot.as_bytes(), 200, json_header()),
             "/api/diagnostics" => (bodies.diagnostics.as_bytes(), 200, json_header()),
+            "/" | "/index.html" => (INDEX_HTML.as_bytes(), 200, html_header()),
             _ => (NOT_FOUND, 404, text_header()),
         };
         let response = tiny_http::Response::new(

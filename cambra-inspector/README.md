@@ -3,16 +3,12 @@
 A read-only web view of a compiled Cambra program: the source alongside one IR
 tree pane per retained compiler pane, cross-linked by true node→node
 provenance. It is served by the `cambra` binary itself — `cambra --inspect-only
-<program>` — and this directory holds the CodeMirror frontend that renders what
-that server sends.
+<program>` — and this directory holds the CodeMirror frontend it embeds and
+serves.
 
 > **Milestone 1 — static, no values.** The inspector shows the *program*, not an
 > execution: types and structure, no runtime values or ticks. It is strictly
 > read-only (no mutation endpoints).
-
-> **No `GET /` yet.** The server offers `/api/*` only; the route that delivers
-> the bundle, and the `include_str!` that embeds it in the binary, land
-> separately. Run the frontend from `web/` in the meantime.
 
 ## What it shows
 
@@ -49,15 +45,14 @@ inspected is the compiler:
 - The **read-only model** — the payload shape and the span/name indices it is
   built from — is `src/inspector_model/`. It answers no positional query: every
   lookup is the frontend's, over the shipped tables.
-- The **transport** is `src/inspector_server/`: it turns the model into JSON
-  (`snapshot_json`) and serves it over HTTP (`serve.rs`), and `wire_check.rs`
-  is the structural validator both those tests and `tests/inspector_goldens.rs`
-  assert the wire against. The route that delivers the frontend lands
-  separately.
+- The **transport and delivery vehicle** is `src/inspector_server/`: it turns
+  the model into JSON (`snapshot_json`), serves it over HTTP (`serve.rs`), and
+  embeds the built frontend bundle. `wire_check.rs` is the structural validator
+  both those tests and `tests/inspector_goldens.rs` assert the wire against.
 
 ```
-client ──HTTP──> cambra --inspect-only ──> inspector_server ──> inspector_model ──> compile_program
-     GET /api/snapshot                  tiny_http + serde_json    read-only model
+browser ──HTTP──> cambra --inspect-only ──> inspector_server ──> inspector_model ──> compile_program
+        GET / + /api/snapshot            tiny_http + serde_json    read-only model
 ```
 
 ## Directory contents
@@ -65,6 +60,7 @@ client ──HTTP──> cambra --inspect-only ──> inspector_server ──> 
 | Path | What it is |
 |---|---|
 | `web/` | The CodeMirror 6 / TypeScript frontend. **Has its own [README](web/README.md)** — build, tests, module layout, and the byte↔char bridge. |
+| `web/dist/index.html` | The built, self-contained single-file bundle, committed and `include_str!`-embedded by the server (so `cargo build` needs no Node). |
 | `web/src/__fixtures__/` | The golden snapshot corpus the frontend's tests read, blessed by `scripts/regen-fixtures.sh`. |
 | `scripts/fixtures.manifest` | Which gallery program each committed fixture is dumped from. |
 | `scripts/regen-fixtures.sh` | The re-bless path, and the `ci.sh` drift gate's regenerator. |
@@ -84,8 +80,8 @@ cargo run -- program.cambra --inspect-only=9000                              # c
 
 Then open <http://localhost:8080> — the server binds loopback only.
 
-Routes: `GET /api/snapshot` (the full model — degrades gracefully to source +
-diagnostics on a compile failure) and `GET /api/diagnostics`.
+Routes: `GET /` (the frontend), `GET /api/snapshot` (the full model — degrades
+gracefully to source + diagnostics on a compile failure), `GET /api/diagnostics`.
 
 `--inspect-only` compiles the program and does not run it. Its sibling
 `--inspect` runs the program and serves the live runtime dashboard
@@ -124,8 +120,8 @@ payload is too large to commit is asserted structurally in
 
 ## Editing the frontend
 
-`web/dist/index.html` is committed on purpose: it is the built, self-contained
-single-file bundle. **After changing anything under `web/src/`, rerun
+`web/dist/index.html` is committed on purpose and embedded at compile time, so
+the binary works without Node. **After changing anything under `web/src/`, rerun
 `npm run build` and commit the regenerated bundle** — `ci.sh web` compares it
 against a fresh build (see the "Committed bundle (R7)" section of
 [`web/README.md`](web/README.md)).
