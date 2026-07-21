@@ -12,9 +12,9 @@
 use std::collections::HashMap;
 
 use crate::ccl::{
-    Builtin, Expr, F_COMMIT, F_DECISION, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey,
-    Type, TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::count_free,
+    Builtin, Expr, F_DECISION, F_WRITE_TARGETS, F_WRITES, Name, ProjKey, TransactKey, Type,
+    TypedBinding, TypedExprNode, WriterSite,
+    ccl_utils::{commit_payload_ty, count_free},
     letrec::check_letrec_causal,
     mut_elim::{binding, fun_parts, let_in, tvar},
     symbolic::symbolic,
@@ -163,7 +163,7 @@ fn unwrap_const(e: Expr) -> Expr {
 /// `(⟨view⟩ ▷ const, ⟨pos⟩, ⟨default⟩ ▷ const) ▷ zip ≫ get_prev_*`,
 /// returning `(default, which-guard)`. The view slot (the causal history
 /// read) is validated by `check_letrec_causal` and discarded here — the
-/// engine reconstructs every read from the register itself.
+/// engine reconstructs every read from the reg itself.
 fn split_causal_compose(guard: Expr) -> (Expr, Builtin) {
     let TypedExprNode::Compose(mut elts) = guard.node else {
         panic!("letrec recognition: guard is not a compose");
@@ -561,12 +561,15 @@ fn collapse_snapshot_sources(e: &mut Expr, reg: &Name, reg_ty: &Type) {
 /// `__hist ≫ .to_<feed>` taps) become register-record projections.
 fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let (domain_ty, decision_ty) = fun_parts(&h.ty);
-    let Type::Record(decision_field_tys) = &decision_ty else {
-        panic!("letrec recognition: history codomain is not a record: {decision_ty}");
+    // The decision codomain is the variant `[.Commit(𝑃) | .Abort]`; the feed taps
+    // ride the (dense) `Commit` payload record `𝑃` alongside `writes`.
+    let payload_ty = commit_payload_ty(&decision_ty);
+    let Type::Record(payload_field_tys) = &payload_ty else {
+        panic!("letrec recognition: Commit payload is not a record: {payload_ty}");
     };
-    let feed_fields: Vec<(String, Type)> = decision_field_tys
+    let feed_fields: Vec<(String, Type)> = payload_field_tys
         .iter()
-        .filter(|(n, _)| n != F_COMMIT && n != F_WRITES)
+        .filter(|(n, _)| n != F_WRITES)
         .cloned()
         .collect();
 
@@ -701,25 +704,33 @@ fn rewrite_hist_reads(
 ) {
     if let TypedExprNode::Compose(elts) = &e.node
         && matches!(elts.first().map(|x| &x.node), Some(TypedExprNode::Var(n)) if n == h)
+        // The phase now interposes a `variant_project(Commit)` step between the
+        // history var and the `.writes`/`.to_<feed>` reads, eliminating the
+        // `[.Commit(𝑃) | .Abort]` decision to its dense payload. Skip it, then
+        // match the payload-field prefix as before (`elts[2]`/`elts[3]`).
+        && matches!(
+            elts.get(1).map(|x| &x.node),
+            Some(TypedExprNode::Builtin(Builtin::VariantProject(_)))
+        )
     {
         // The reg read replacing the matched prefix, plus how many compose
-        // elements the prefix covered.
+        // elements the prefix covered (the `variant_project` step included).
         let replacement: Option<(Expr, usize)> =
-            match (elts.get(1).map(|x| &x.node), elts.get(2).map(|x| &x.node)) {
+            match (elts.get(2).map(|x| &x.node), elts.get(3).map(|x| &x.node)) {
                 (
                     Some(TypedExprNode::Proj(ProjKey::Field(f))),
                     Some(TypedExprNode::Proj(ProjKey::Index(i))),
                 ) if f == F_WRITES => {
                     let field = keys[*i].name.field_key();
                     let field_ty = Type::fun(domain_ty.clone(), acc_tys[*i].clone());
-                    Some((reg_field_read(reg, reg_ty, field, field_ty), 3))
+                    Some((reg_field_read(reg, reg_ty, field, field_ty), 4))
                 }
                 (Some(TypedExprNode::Proj(ProjKey::Field(f))), _) if f != F_WRITES => {
-                    // A tap read `__hist ≫ .to_<feed>`: its stream type is the
-                    // register record\'s field type.
+                    // A tap read `__hist ≫ variant_project(Commit) ≫ .to_<feed>`:
+                    // its stream type is the register record\'s field type.
                     let field = f.clone();
                     let field_ty = reg_ty_field(reg_ty, &field);
-                    Some((reg_field_read(reg, reg_ty, field, field_ty), 2))
+                    Some((reg_field_read(reg, reg_ty, field, field_ty), 3))
                 }
                 _ => None,
             };
@@ -745,7 +756,7 @@ fn rewrite_hist_reads(
 /// The declared type of `field` on the register record.
 fn reg_ty_field(reg_ty: &Type, field: &str) -> Type {
     let Type::Record(fs) = reg_ty else {
-        panic!("letrec recognition: register type is not a record");
+        panic!("letrec recognition: reg type is not a record");
     };
     fs.iter()
         .find(|(n, _)| n == field)

@@ -1872,3 +1872,76 @@ fn heterogeneous_multi_key_store_reads_string_key() {
         },
     );
 }
+
+// ---------------------------------------------------------------------------
+// Commit|Abort decision variant: off-path partial op + interleaving
+// ---------------------------------------------------------------------------
+
+/// **Cost #1 — off-path partial op does not fault.** A guarded `//` in a
+/// conditional transaction write: `if d != 0: acc := acc // d`. The divisor `d`
+/// starts at 3 and is zeroed on the first commit, so the second request's guard
+/// (`d != 0`, read on the snapshot) is false — an `.Abort`. The write value `acc
+/// // d` rides the lazy `⧺ filter_values(d != 0) ≫ (acc // d)` arm the value-`Case`
+/// compiles to, so the division is evaluated only where its guard holds — never at
+/// the `d == 0` position. Were the partial op evaluated off-path it would panic on
+/// divide-by-zero. First commit: `acc := 100 // 3 = 33` (and `d := 0`); the second
+/// aborts, so `acc` stays 33.
+///
+/// Off-path safety depends on the guard reading the value it protects. Because
+/// the lazy `filter_values` union never evaluates the off-path arm, a guard that
+/// reads the protected register (`d != 0`) suppresses the fault. An item-only
+/// guard (`if r != 0`) that does *not* read the divisor offers no protection and
+/// correctly still faults — that is sound semantics (a guard that doesn't guard
+/// the dangerous term), not a limitation; item-only guards otherwise commit and
+/// deny normally.
+#[test]
+fn txn_off_path_guarded_division_does_not_fault() {
+    check_tile(
+        indoc! {r#"
+            out = defer()
+            d: Mut[int, Txn] := 3
+            acc: Mut[int, Txn] := 100
+            for r in [1, 2]:
+                with begin():
+                    if d != 0:
+                        acc := acc // d
+                        d := d - 3
+            with begin():
+                out << acc
+            out
+        "#},
+        commit_stream(&[0], &[33]),
+    );
+}
+
+/// **Interleaved two-writer Commit/Abort through the store.** Two writer
+/// sites on the *same* register `pool` interleave committing and aborting
+/// decisions: `10`/`20` always fit (`.Commit`), `200`/`300` never do (`.Abort`).
+/// The variant decision flows through the commit-`Store` codomain — each writer's
+/// `[.Commit(⟨writes⟩) | .Abort]` stream folds into the shared changelog — and the
+/// trailing `get_prev_txn` read reads back the conserved value `100 - 10 - 20 =
+/// 70`. The *result* is order-independent by construction — the two commits always
+/// fit and the two aborts never do — but note this test exercises only the single
+/// interleaving the store's round-robin `drain_start` rotation produces at runtime,
+/// not an enumeration of schedules.
+#[test]
+fn interleaved_two_writer_commit_abort_through_store() {
+    check_tile(
+        indoc! {r#"
+            out = defer()
+            pool: Mut[int, Txn] := 100
+            for r in [10, 200]:
+                with begin():
+                    if pool >= r:
+                        pool := pool - r
+            for r in [20, 300]:
+                with begin():
+                    if pool >= r:
+                        pool := pool - r
+            with begin():
+                out << pool
+            out
+        "#},
+        commit_stream(&[0], &[70]),
+    );
+}

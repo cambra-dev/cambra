@@ -14,7 +14,7 @@ use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     BaseType, Branch, Expr, Name, ProjKey, Refinement, TransactKey, Type, TypedBinding,
-    TypedExprNode, WriterSite,
+    TypedExprNode, V_ABORT, V_COMMIT, WriterSite,
 };
 
 use super::context::InferCtx;
@@ -1221,20 +1221,31 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
     product(dom)
 }
 
-/// The per-position `to_<defer>` output fields a writer's decision record
-/// carries beyond `{commit, writes}`, read off the writer body's codomain —
-/// `(field, value_ty)`. Each becomes a virtual register-record key `to_<defer>:
-/// Fun(domain, value_ty)` (the per-position feed output stream).
+/// The per-position `to_<defer>` output fields a writer's decision carries beyond
+/// `writes`, read off the writer body's codomain — `(field, value_ty)`. Each
+/// becomes a virtual register-record key `to_<defer>: Fun(domain, value_ty)` (the
+/// per-position feed output stream). The decision codomain is the variant
+/// `[.Commit(𝑃) | .Abort]`; the taps live inside the (dense) `Commit` payload
+/// record `𝑃`, so peel `Commit` and drop the `writes` field.
 pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
     let Some(codom) = body_ty.codomain() else {
         return Vec::new();
     };
-    let Type::Record(fields) = peel_refinements_outer(&codom) else {
+    let Type::Variant(tags) = peel_refinements_outer(&codom) else {
+        return Vec::new();
+    };
+    let Some((_, commit_payload)) = tags
+        .iter()
+        .find(|(k, _)| matches!(k, FieldKey::Name(n) if n == V_COMMIT))
+    else {
+        return Vec::new();
+    };
+    let Type::Record(fields) = peel_refinements_outer(commit_payload) else {
         return Vec::new();
     };
     fields
         .iter()
-        .filter(|(f, _)| f != crate::ccl::F_COMMIT && f != crate::ccl::F_WRITES)
+        .filter(|(f, _)| f != crate::ccl::F_WRITES)
         .map(|(f, t)| (f.clone(), t.clone()))
         .collect()
 }
@@ -1242,11 +1253,11 @@ pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
 /// Type one transaction writer against the register's per-key value types.
 ///
 /// `key_types` maps each register key to the type of one committed value. The body
-/// is `Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), {commit: Bool, writes:
-/// Tuple(new_{w₀}, …), to_<defer>*})`, where snapshot position `i` is
+/// is `Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), [.Commit(⟨writes:
+/// Tuple(new_{w₀}, …), to_<defer>*⟩) | .Abort])`, where snapshot position `i` is
 /// `read_keys[i]`'s value type and each `writes` entry `new_j <: write_keys[j]`'s
-/// value type. `commit` gates the whole (atomic) write set; any extra
-/// `to_<defer>` fields ride along as width-subtyped taps.
+/// value type. The `.Commit`/`.Abort` tag is the whole-transaction grant/deny;
+/// any extra `to_<defer>` fields ride the `.Commit` payload as width-subtyped taps.
 fn emit_transact_writer<C: Typing>(
     writer: &mut WriterSite,
     key_types: &std::collections::HashMap<Name, Type>,
@@ -1278,18 +1289,25 @@ fn emit_transact_writer<C: Typing>(
         new_tys.push(new.clone());
         news.push((new, bound));
     }
-    let mut codom: BTreeMap<FieldKey, Type> = BTreeMap::new();
-    codom.insert(
-        FieldKey::Name(SmolStr::from(crate::ccl::F_COMMIT)),
-        prim(BaseType::Bool),
-    );
-    codom.insert(
+    // Decision codomain: the variant `[.Commit(𝑃) | .Abort]`. `𝑃` is the (dense)
+    // payload record carrying at least `writes: Tuple(new_j…)` — the body's real
+    // `Commit` payload width-subtypes to it (its `to_<defer>` taps are extra
+    // fields). Tag order is `Commit`=0, `Abort`=1, matching
+    // `ccl_utils::decision_variant_ty` and the runtime `body_decision_at` decode;
+    // variant subtyping matches tags by name, so the order is not load-bearing
+    // for the constraint, only for the stamped index resolution downstream.
+    let mut payload: BTreeMap<FieldKey, Type> = BTreeMap::new();
+    payload.insert(
         FieldKey::Name(SmolStr::from(crate::ccl::F_WRITES)),
         Type::Tuple(new_tys),
     );
+    let decision_codom = Type::Variant(vec![
+        (FieldKey::Name(SmolStr::from(V_COMMIT)), product(payload)),
+        (FieldKey::Name(SmolStr::from(V_ABORT)), prim(BaseType::Unit)),
+    ]);
 
     let body_ty = ctx.subexpr(&mut writer.body)?;
-    ctx.require_sub(&body_ty, &fun(body_dom, product(codom)), &|| {
+    ctx.require_sub(&body_ty, &fun(body_dom, decision_codom), &|| {
         "transaction body".to_string()
     })?;
     for (new, contrib) in news {
