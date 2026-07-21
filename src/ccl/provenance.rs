@@ -65,8 +65,8 @@ impl NodeId {
     }
 
     /// The id's underlying number, for use as an opaque serialization handle
-    /// (the inspector wire shape carries a `NodeId` as a JSON number). This is
-    /// the *only* place the numeric value
+    /// (the inspector wire shape carries a `NodeId` as a JSON number; see
+    /// [`crate::inspector_model`]). This is the *only* place the numeric value
     /// is observed — internal logic compares ids by equality, never by value —
     /// so it is exposed solely so a client can round-trip a handle, not to give
     /// the value any in-compiler meaning.
