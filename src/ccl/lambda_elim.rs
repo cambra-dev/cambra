@@ -936,7 +936,8 @@ fn elim_lambda_impl(
         // not visible at lowering* (a UDF body, a comprehension with an extra
         // `if`-filter alongside the element `Case`) — which need the same source
         // fan-out but at a site without a source in hand. Deferred (a documented
-        // follow-up; see `design/mutability.md` §"Value-selecting `Case`…").
+        // follow-up; see `design/mutability.md`
+        // "Value-selecting `Case` and conditional induction writes (partially implemented)").
         TypedExprNode::Case {
             scrutinee: None,
             branches,
