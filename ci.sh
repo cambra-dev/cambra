@@ -44,6 +44,52 @@ ci_doc() {
   RUSTDOCFLAGS="-A warnings -D rustdoc::broken_intra_doc_links" \
     cargo doc --no-deps
 }
+# The `cambra-inspector` workspace member: its crate lints + tests. Kept separate
+# from the core `cambra` checks above (which stay serde-free and fast) and run
+# explicitly with `-p` because the root `cargo` invocations only build the root
+# package. Building the inspector pulls `cambra` with the `serde` feature, so
+# this also exercises the serde-gated wire types in the core.
+# `|| return 1` per command, not bare `set -e`: `ci_all` calls each gate on the
+# left of a `||` to collect the failing gate's name, and that disables errexit
+# for the whole dynamic extent — including this function. Without it a clippy
+# failure would fall through to the tests below and the function would report
+# the *tests'* status, so a lint break passed the gate whenever tests were green.
+# (`return`, not `exit`: this body is not a subshell, so `exit` would tear down
+# the whole run instead of recording one failed gate.)
+ci_inspector() {
+  cargo clippy -p cambra-inspector --all-targets -- -D warnings || return 1
+  cargo test -p cambra-inspector -q || return 1
+}
+# Golden-fixture drift gate: regenerate the frontend's snapshot fixtures into a
+# temp dir through the same script the fix path uses (regen-fixtures.sh, driven
+# by scripts/fixtures.manifest) and fail on any byte difference from the
+# committed copies. The fix on an intended wire change is the script itself:
+#   cambra-inspector/scripts/regen-fixtures.sh   # then commit the diff
+# (Cross-process dump determinism — the property this gate relies on — is
+# pinned corpus-wide by cambra-inspector/tests/goldens.rs under ci_inspector.)
+ci_fixtures() {
+  (
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "${tmp}"' EXIT
+    cambra-inspector/scripts/regen-fixtures.sh "${tmp}"
+    fix="cambra-inspector/web/src/__fixtures__"
+    drifted=0
+    for f in "${tmp}"/*.snapshot.json; do
+      name="$(basename "${f}")"
+      # cmp + a short excerpt, not a full `git diff`: a drifted snapshot diff
+      # is thousands of lines and buries which fixture failed.
+      if ! cmp -s "${fix}/${name}" "${f}"; then
+        committed_size="$(wc -c < "${fix}/${name}")"
+        regen_size="$(wc -c < "${f}")"
+        echo "ci_fixtures FAILED: fixture drift: ${name} (committed ${committed_size} bytes vs regenerated ${regen_size} bytes)" >&2
+        diff -u "${fix}/${name}" "${f}" | head -n 12 >&2 || true
+        echo "  re-bless via: cambra-inspector/scripts/regen-fixtures.sh, then commit the diff" >&2
+        drifted=1
+      fi
+    done
+    exit "${drifted}"
+  )
+}
 ci_shellcheck() { find . -name '*.sh' -not -path './.git/*' -exec shellcheck -a -o all {} +; }
 # Validate intra-repo doc references so they can't silently rot: Markdown
 # links/anchors (doc -> doc) and `<name>.md` citations in Rust comments
@@ -77,35 +123,46 @@ ci_fast() {
 }
 
 ci_all() {
-  local failed=0
+  # Names of failed gates, so the last lines of a long run say WHAT failed.
+  local failed=""
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_shellcheck || failed=1
+  ci_shellcheck || failed="${failed} shellcheck"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_doc_refs || failed=1
+  ci_doc_refs || failed="${failed} doc_refs"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_fmt || failed=1
+  ci_fmt || failed="${failed} fmt"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_clippy || failed=1
+  ci_clippy || failed="${failed} clippy"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_clippy_release || failed=1
+  ci_clippy_release || failed="${failed} clippy_release"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_clippy_serde || failed=1
+  ci_clippy_serde || failed="${failed} clippy_serde"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_clippy_lib || failed=1
+  ci_clippy_lib || failed="${failed} clippy_lib"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_doc || failed=1
+  ci_doc || failed="${failed} doc"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
-  ci_test || failed=1
-  exit "${failed}"
+  ci_test || failed="${failed} test"
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_inspector || failed="${failed} inspector"
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_fixtures || failed="${failed} fixtures"
+  if [[ -n "${failed}" ]]; then
+    echo "ci.sh FAILED:${failed}" >&2
+    exit 1
+  fi
+  echo "ci.sh: all gates passed"
 }
 
 fix=0

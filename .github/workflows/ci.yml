@@ -75,7 +75,6 @@ jobs:
         if: steps.filter.outputs.code == 'true'
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-
       # 3. Run Checks (Only if code changed)
       - name: Shellcheck
         if: steps.filter.outputs.code == 'true'
@@ -152,6 +151,13 @@ jobs:
         # produces an ill-typed tree — it is off by default locally because it is
         # superlinear on nested comprehensions (see `ci_test` / `debug_typecheck`).
         run: DEEP_TYPECHECK=1 ./ci.sh test
+
+      - name: Inspector
+        # The cambra-inspector crate (lints + tests). Separate from the core
+        # `cargo` checks, which only build the root package. Runs even if earlier
+        # steps failed so all errors surface in one run.
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        run: ./ci.sh inspector
 
         # 4. Success Signal for noops
       - name: No-op for docs

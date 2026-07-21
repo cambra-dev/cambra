@@ -1,0 +1,12 @@
+# Minimal defer/feed pipeline (isolated from generators).
+#
+# A `defer()` channel fed from TWO sites — a scalar seed and a per-iteration
+# `<<` inside a `for` loop — then collapsed with `max`. The two feed sites
+# fan in to one channel during desugaring; that channel union is the
+# synthesized structure to look at in the inspector.
+readings = [1, 2, 3, 4]
+totals = defer()
+totals << sum(readings)
+for x in readings:
+    totals << x
+max(totals)
