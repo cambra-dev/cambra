@@ -835,8 +835,8 @@ today rather than silently mishandled.
 > yet implemented.**
 >
 > **Implemented** (value selection compiles via the literal union-of-restricts): scalar / compute
-> ternaries (the C-form), data-collection selection (the gate fan-out, reconciled to the Σ via the
-> gated-partition bridge rules), source-less conditional feeds, a **conditional element** in a
+> ternaries (the C-form), data-collection selection (the gate fan-out, reconciled to the Σ by
+> Σ-introduction), source-less conditional feeds, a **conditional element** in a
 > comprehension (`[a if g(x) else b for x in xs]`, fanned out over the source by the
 > element-dependent gate), and a comprehension **over a conditional collection** (`[f(x) for x in
 > (xs if c else ys)]`, the source `Case` floats out of the map). **Not yet implemented**:
@@ -893,8 +893,9 @@ The value-`Case` positions ride the same union-of-restricts:
   (`lambda_elim::build_value_case_fanout`): each arm's whole collection restricted by a
   constant-in-element gate, unioned; the union carries the Σ the type system gave the `Case` (see
   `design/type-inference.md` §4.6), and the strict wall reconciles its structural `Variant`-domain
-  type via the gated-partition bridge rules (bridge 1 `<: Σ` for distinct extents; bridge 2
-  `<: plain data fun` for the same-extent collapse). `elif` chains flatten to one N-choice
+  type against the Σ by **Σ-introduction** (the compiled gated partition realizes the whole sum —
+  the finite-Σ = gated-coproduct iso, legs' base extents set-equal to the candidates), or against
+  the same-extent collapse's plain data fun. `elif` chains flatten to one N-choice
   partition first. A conditional collection is *consumed* (aggregate, program result) via the
   `Σ <: Fun` subtyping rule, and *through a comprehension* by floating the source `Case` out of the
   map (see the comprehension bullet below).

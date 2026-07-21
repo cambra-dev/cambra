@@ -596,8 +596,7 @@ fn constrain_go(
                             candidates.iter().map(strip_refinements).collect();
                         let leg_bases: Vec<Type> =
                             legs.iter().map(|(_, leg)| strip_refinements(leg)).collect();
-                        let every_fiber_realized =
-                            cand_bases.iter().all(|c| leg_bases.contains(c));
+                        let every_fiber_realized = cand_bases.iter().all(|c| leg_bases.contains(c));
                         let no_extraneous_leg = leg_bases.iter().all(|l| cand_bases.contains(l));
                         if every_fiber_realized && no_extraneous_leg {
                             for (_, leg) in legs {

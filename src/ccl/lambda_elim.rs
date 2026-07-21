@@ -305,32 +305,12 @@ fn extract_filter_case(body: Expr) -> (Expr, Expr) {
 // Value-selecting Case compilation (the scalar C-form)
 // ---------------------------------------------------------------------------
 
-/// Whether `arms` is a **conditional-collection coproduct** — a non-empty,
-/// `Index`-tagged `Variant` whose every payload is a data function
-/// (`Type::extent_coproduct`). Distinguishes it from a user tagged-union.
-fn is_extent_coproduct(arms: &[(FieldKey, Type)]) -> bool {
-    !arms.is_empty()
-        && arms.iter().all(|(_, t)| {
-            matches!(
-                t,
-                Type::Fun {
-                    kind: crate::ccl::ty::FunKind::Data,
-                    ..
-                }
-            )
-        })
-}
-
 /// Returns `true` if `ty` (peeling outer refinements) is a *collection* — a
-/// data/compute function or a conditional-collection coproduct. A
-/// value-selecting `Case` whose arms are collections takes the data-typed gate
-/// fan-out; a `Case` returning a scalar / compute value takes the C-form below.
+/// data/compute function or a conditional-collection Σ. A value-selecting `Case`
+/// whose arms are collections takes the data-typed gate fan-out; a `Case`
+/// returning a scalar / compute value takes the C-form below.
 fn is_collection_result(ty: &Type) -> bool {
-    match strip_refinements(ty) {
-        Type::Fun { .. } => true,
-        Type::Variant(arms) => is_extent_coproduct(&arms),
-        _ => false,
-    }
+    matches!(strip_refinements(ty), Type::Fun { .. } | Type::Sigma(_))
 }
 
 /// Compile a guard-based **value-selecting** `Case` (a ternary or `if`/`elif`/
@@ -433,16 +413,18 @@ fn build_value_case_cform(
 }
 
 /// The element (codomain) type a collection-valued `Case` produces: the
-/// codomain of a plain data function, or the coproduct's shared codomain when
-/// the arms had distinct extents (the type system gave the `Case` a
-/// conditional-collection coproduct — the arms share the joined codomain, so
-/// the first arm's codomain is it). Peels outer refinements first.
+/// codomain of a plain data function, or the shared codomain of a
+/// conditional-collection Σ when the arms had distinct extents (all fibers
+/// share the joined codomain). Peels outer refinements first.
 fn collection_value_ty(ty: &Type) -> Type {
     match strip_refinements(ty) {
         Type::Fun { codomain, .. } => *codomain,
-        Type::Variant(arms) if is_extent_coproduct(&arms) => match arms.into_iter().next() {
-            Some((_, Type::Fun { codomain, .. })) => *codomain,
-            _ => unreachable!("is_extent_coproduct guarantees a data-function arm"),
+        // A conditional-collection Σ shares one codomain across its fibers; its
+        // body is the data function `Witness ⤇ V`, read here (this is only
+        // reached for a collection-typed `Case`, so the shape is guaranteed).
+        Type::Sigma(s) => match &*s.body {
+            Type::Fun { codomain, .. } => codomain.as_ref().clone(),
+            _ => unreachable!("a conditional collection's body is a data function"),
         },
         other => other,
     }

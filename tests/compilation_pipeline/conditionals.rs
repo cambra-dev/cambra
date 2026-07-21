@@ -111,9 +111,9 @@ fn test_value_ternary_skips_partial_off_path_arm(#[case] code: &str, #[case] exp
 // type system gave the `Case`; exactly one gated arm is non-empty, so consuming
 // the union (here via `sum`) sees just that arm's elements.
 //
-// The union's tagged-`Variant` domain reconciles against the Σ via the
-// gated-partition bridge rules (distinct extents → bridge 1 / `<: Σ`;
-// same-extent collapse → bridge 2 / `<: plain data fun`).
+// The union's tagged-`Variant` domain reconciles against the Σ by
+// Σ-introduction (distinct extents → the compiled partition realizes the whole
+// Σ; same-extent collapse → it subtypes the collapsed plain data fun).
 // ---------------------------------------------------------------------------
 
 #[rstest]
@@ -121,7 +121,7 @@ fn test_value_ternary_skips_partial_off_path_arm(#[case] code: &str, #[case] exp
 // Distinct-extent arms — the `Case` types as a Σ; `sum` consumes it via `Σ <: Fun`.
 #[case("c: bool = True\nsum([1, 2] if c else [1, 2, 3])", Value::Int(3))]
 #[case("c: bool = False\nsum([1, 2] if c else [1, 2, 3])", Value::Int(6))]
-// Same-extent arms — the Σ collapses to a plain data function (bridge rule 2).
+// Same-extent arms — the Σ collapses to a plain data function.
 #[case("c: bool = True\nsum([1, 2] if c else [3, 4])", Value::Int(3))]
 #[case("c: bool = False\nsum([1, 2] if c else [3, 4])", Value::Int(7))]
 // Guard is a computed comparison.
@@ -137,6 +137,23 @@ fn test_value_ternary_skips_partial_off_path_arm(#[case] code: &str, #[case] exp
 #[case(
     "n: int = 3\nsum([1] if n == 1 else [2, 2] if n == 2 else [3, 3, 3])",
     Value::Int(9)
+)]
+// **Repeated extent across branches.** `[1]` and `[2]` share extent `[0,1)`, so
+// the Σ has *two* candidates (`{[0,1), [0,2)}`) but the fan-out has *three*
+// legs. This is the case a positional leg↔candidate bijection would reject; the
+// set-equality (coverage) Σ-introduction rule accepts it (two legs realize the
+// shared `[0,1)` fiber, their gates partitioning "branch a or b was taken").
+#[case(
+    "n: int = 1\nsum([1] if n == 1 else [2] if n == 2 else [3, 3])",
+    Value::Int(1)
+)]
+#[case(
+    "n: int = 2\nsum([1] if n == 1 else [2] if n == 2 else [3, 3])",
+    Value::Int(2)
+)]
+#[case(
+    "n: int = 9\nsum([1] if n == 1 else [2] if n == 2 else [3, 3])",
+    Value::Int(6)
 )]
 fn test_value_case_collection_sum(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
@@ -156,9 +173,9 @@ fn test_value_case_collection_result() {
 }
 
 // Same-extent arms as a program result: the Σ collapses to a plain data
-// function (bridge rule 2), not a Σ, but the runtime still selects the right
-// arm. This pins the tile shape of the collapse, which the `sum` cases above
-// only exercise through an aggregate.
+// function, not a Σ, but the runtime still selects the right arm. This pins the
+// tile shape of the collapse, which the `sum` cases above only exercise through
+// an aggregate.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_value_case_same_extent_collection_result() {
