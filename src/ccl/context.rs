@@ -610,11 +610,11 @@ pub fn compile_program(
     // no-atomicity transaction — rejected here (type-aware), not at lowering.
     transact_phase::check_no_induction_only_transactions(&expr, &txn_registers)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
-    // A *guarded* in-block induction write (`if q: cnt += 1`) has no commit-gated
-    // lifting yet — reject it cleanly here rather than let it reach the phase's
-    // internal invariant assert (only a bare top-level in-block induction write is
-    // supported, and it is exactly the out-of-block form).
-    transact_phase::check_no_guarded_induction_writes(&expr, &txn_registers)
+    // A *guarded* induction write inside a committing block (`balance := …; if p:
+    // cnt += 1`) is not liftable and would be silently dropped from the decision
+    // record — reject it before the phase runs (a debug-only assert would miss it
+    // in release).
+    transact_phase::check_no_guarded_induction_write_in_block(&expr, &txn_registers)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     expr = transact_phase::run(expr, &txn_registers);
     debug!("Transact phase CCL:\n{}", symbolic(&expr));

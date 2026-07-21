@@ -261,6 +261,26 @@ fn check_compile_error(code: &str, needle: &str) {
     "#},
     40
 )]
+// Semantic change: the deny guard is no longer transaction-scoped. A spine
+// (unconditional) write beside an `if` commits unconditionally (`commit = p ∨
+// true → true`), so the spine write lands even when the guard is false. Here the
+// spine `x := x + 1` commits (x → 101) though `if x > 1000` never fires — under
+// the old transaction-scoped deny, a false guard would have denied the whole
+// transaction and left x = 100.
+#[case::spine_write_commits_beside_false_guard(
+    indoc! {r#"
+        out = defer()
+        x: Mut[int, Txn] := 100
+        with begin():
+            x := x + 1
+            if x > 1000:
+                x := x + 10
+        with begin():
+            out << x
+        out
+    "#},
+    101
+)]
 fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
     check_tile(code, commit_stream(&[0], &[expected]));
 }
@@ -569,6 +589,160 @@ fn two_reply_feeds_one_transaction() {
                 Tile::Scalar(ColumnValue::Ints(vec![1, 5, 14])),
             ])),
             domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+/// A reply feed under **one arm of cross-key routing**: the feed `out << x` sits
+/// inside `if x >= 2` (which writes `a`), while the `else` writes `b`. Both arms
+/// write, so *every* iteration commits — but the feed must fire only on its own
+/// route (`x >= 2`), not on the sibling `else` route's commit. The tap carries a
+/// `__fire` gate the engine honors, so over `[1, 2, 3]` (commit ticks 1, 2, 3)
+/// `out` receives 2 and 3 (ticks 2, 3) — not a value at tick 1. (Without the
+/// gate the tap would over-fire on every commit.)
+#[test]
+fn reply_feed_under_one_route_does_not_overfire() {
+    check_tile(
+        indoc! {r#"
+            a: Mut[int, Txn] := 0
+            b: Mut[int, Txn] := 0
+            out = defer()
+            for x in [1, 2, 3]:
+                with begin():
+                    if x >= 2:
+                        a := a + x
+                        out << x
+                    else:
+                        b := b + x
+            out
+        "#},
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![2, 3]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+/// **Both arms feed** in a *committing* block: each arm writes the register `a`
+/// and replies on `out`. Both taps ride the same commit but must fire only on
+/// their own route — each carries its own `__fire` gate. x=1 → else (a += 100,
+/// out << 0); x=2 → if (a += 2, out << 2); x=3 → if (a += 3, out << 3). Every
+/// position commits (both arms write), so `out` is [0, 2, 3] over domain [0,1,2].
+#[test]
+fn both_arms_feed_in_committing_block() {
+    check_tile(
+        indoc! {r#"
+            a: Mut[int, Txn] := 0
+            out = defer()
+            for x in [1, 2, 3]:
+                with begin():
+                    if x >= 2:
+                        a := a + x
+                        out << x
+                    else:
+                        a := a + 100
+                        out << 0
+            out
+        "#},
+        // Both taps fan out into a tagged-union channel (each fires on its own
+        // route): variant 0 is the `if` arm (x=2,3 → 2,3), variant 1 the `else`
+        // (x=1 → 0). Same union shape as the read-only both-arms reply, over the
+        // committing-block feed indexing (cf. `reply_feed_under_one_route`).
+        Tile::SealedFunction {
+            domain: ColumnValue::Union {
+                tags: vec![0, 0, 1],
+                variants: vec![ColumnValue::UInts(vec![2, 3]), ColumnValue::UInts(vec![1])],
+            },
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
+            domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+/// **Read-your-writes of a conditionally-written key, after the `Case`.** The
+/// spine feed `out << a` reads `a`'s post-`Case` value: the written value on the
+/// guard path, the carry (prior committed value) on the deny path. `a := a + 10`
+/// under `if x >= 2`, then `out << a`. x=1 → deny → a carries 0 → out 0; x=2 →
+/// a = 10 → out 10; x=3 → a = 20 → out 20. The spine feed commits every position.
+#[test]
+fn ryw_of_conditionally_written_key_after_case() {
+    check_tile(
+        indoc! {r#"
+            a: Mut[int, Txn] := 0
+            out = defer()
+            for x in [1, 2, 3]:
+                with begin():
+                    if x >= 2:
+                        a := a + 10
+                    out << a
+            out
+        "#},
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![1, 2, 3]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 10, 20]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+/// A **conditional feed in a read-only `with begin():` block** — a conditional
+/// reply that reads a register (`if r > 1: resp << pool`). The block commits no
+/// register, so the reply is a filtered live read: `channelize` fans the guard-
+/// `Case` out into a refined-source channel (the same path a non-transactional
+/// `if r > 1: resp << r` takes), rather than the feed-only hoist which handles
+/// only straight-line replies. `pool` is never written, so its as-of value is its
+/// init (100), replied at the guard-passing positions (r = 2, 3 → domain 1, 2).
+#[test]
+fn conditional_reply_in_readonly_block() {
+    check_tile(
+        indoc! {r#"
+            resp = defer()
+            pool: Mut[int, Txn] := 100
+            for r in [1, 2, 3]:
+                with begin():
+                    if r > 1:
+                        resp << pool
+            resp
+        "#},
+        Tile::SealedFunction {
+            domain: ColumnValue::UInts(vec![1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 100]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+    );
+}
+
+/// An `if/else` conditional reply in a read-only `with begin():` block: both arms
+/// feed, so the fan-out refines the source on each arm (the `else` with predicate
+/// `¬(r > 1)`) — the read-only-block counterpart of the pure-feed `if/else`
+/// fan-out. As a function: r=1 → 0 (else), r=2 → 2, r=3 → 3 (both variants).
+#[test]
+fn conditional_if_else_reply_in_readonly_block() {
+    check_tile(
+        indoc! {r#"
+            resp = defer()
+            pool := 100
+            for r in [1, 2, 3]:
+                with begin():
+                    if r > 1:
+                        resp << r
+                    else:
+                        resp << 0
+            resp
+        "#},
+        Tile::SealedFunction {
+            domain: ColumnValue::Union {
+                tags: vec![0, 0, 1],
+                variants: vec![ColumnValue::UInts(vec![1, 2]), ColumnValue::UInts(vec![0])],
+            },
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
+            domain_predicate: Predicate::Union(vec![Predicate::True, Predicate::True]),
             deleted: BitSet::new(),
         },
     );
@@ -889,52 +1063,95 @@ fn nested_transactions_rejected() {
     );
 }
 
-/// An `else` branch inside a `with begin():` block is rejected with a clear
-/// diagnostic (not a compiler panic): the guard model supports only a bare `if
-/// cond:` deny guard. `else`-with-writes would need conditional per-key write
-/// values with unconditional commit — a distinct, unsettled semantics.
+/// An `if`/`else` inside a `with begin():` block **routes** across keys: each
+/// arm's writes are scoped to its path, and the transaction commits
+/// unconditionally (both arms write). Over `[1, 2, 3]`: x=1 → else → b += 1;
+/// x=2 → a += 2; x=3 → a += 3. Final a = 5, b = 1 — read via the register carry
+/// (`get_prev_txn`), each iteration one commit.
 #[test]
-fn tx_if_else_with_writes_rejected() {
-    check_compile_error(
+fn tx_if_else_routes_across_keys() {
+    check_tile(
         indoc! {r#"
             a: Mut[int, Txn] := 0
             b: Mut[int, Txn] := 0
+            out = defer()
             for x in [1, 2, 3]:
                 with begin():
                     if x >= 2:
                         a := a + x
                     else:
                         b := b + x
+            with begin():
+                out << a + b
+            out
         "#},
-        "`else` branch inside a `with begin():` block is not supported",
+        commit_stream(&[0], &[6]),
     );
 }
 
-/// Likewise an `elif` chain inside a transaction is rejected gracefully.
+/// **Absolute** (non-RMW) conditional writes routing across keys: each arm sets
+/// its key outright (`a := 5`, not `a := a + x`), so neither key is read in the
+/// block. The key an arm does *not* write must still **carry** its prior
+/// committed value — which is only expressible as that key's read snapshot, so
+/// `collect_footprint` finalizes each conditionally-written key into the read set
+/// (a plain write-only key would have no snapshot to carry). Over `[1, 2, 3]`:
+/// x=1 → else → b := 6 (a carries 0); x=2, x=3 → a := 5 (b carries 6). Final
+/// a = 5, b = 6, so `out << a + b` = 11.
 #[test]
-fn tx_if_elif_rejected() {
-    check_compile_error(
+fn tx_if_else_absolute_writes_route_across_keys() {
+    check_tile(
         indoc! {r#"
             a: Mut[int, Txn] := 0
+            b: Mut[int, Txn] := 0
+            out = defer()
             for x in [1, 2, 3]:
+                with begin():
+                    if x >= 2:
+                        a := 5
+                    else:
+                        b := 6
+            with begin():
+                out << a + b
+            out
+        "#},
+        commit_stream(&[0], &[11]),
+    );
+}
+
+/// An `elif` chain (no `else`) inside a transaction: first-match per position,
+/// the trailing implicit arm the deny (a position matching no guard does not
+/// commit). `a := 0`, over `[3, 2, 1]`: x=3 → `if` → a += 3; x=2 → `elif` →
+/// a += 1; x=1 → neither → deny. Final a = 4. (The loop leads with a committing
+/// position so the trailing as-of read observes the drained store — a leading
+/// *deny* delays the first commit past that read's position-0 sample.)
+#[test]
+fn tx_if_elif_first_match() {
+    check_tile(
+        indoc! {r#"
+            a: Mut[int, Txn] := 0
+            out = defer()
+            for x in [3, 2, 1]:
                 with begin():
                     if x >= 3:
                         a := a + x
                     elif x >= 2:
                         a := a + 1
+            with begin():
+                out << a
+            out
         "#},
-        "`elif` inside a `with begin():` block is not supported",
+        commit_stream(&[0], &[4]),
     );
 }
 
-/// Multiple sibling `if cond:` guards in one block are rejected. Each guard
-/// feeds the *one* shared commit bit (`apply_guard` conjoins them), so a write
-/// under a passing guard would be silently dropped when an unrelated later guard
-/// fails — a wrong result with no diagnostic. Rejected until per-write path
-/// conditions land, mirroring the `elif`/`else` rejection.
+/// Multiple sibling `if cond:` guards in one block: each scopes only its own
+/// write, and the transaction commits on the disjunction of the write paths (a
+/// write under a passing guard is no longer dropped when an unrelated guard
+/// fails — the path-scoped deny semantics). Over `[5]`: `a >= 0` holds → a += 5;
+/// `r > 100` fails → b carries. Final a = 5.
 #[test]
-fn multiple_if_guards_in_block_rejected() {
-    check_compile_error(
+fn multiple_if_guards_route_independently() {
+    check_tile(
         indoc! {r#"
             a: Mut[int, Txn] := 0
             b: Mut[int, Txn] := 0
@@ -949,7 +1166,7 @@ fn multiple_if_guards_in_block_rejected() {
                 out << a
             out
         "#},
-        "multiple `if cond:` guards",
+        commit_stream(&[0], &[5]),
     );
 }
 
@@ -987,25 +1204,25 @@ fn induction_write_inside_begin_block_rejected() {
     );
 }
 
-/// A *bare* top-level in-block induction write is lifted onto the enclosing loop
-/// (exactly the out-of-block form). A *guarded* one (`if q: cnt += 1`) alongside a
-/// register write has no commit-gated lifting yet, so it is rejected cleanly rather
-/// than reaching `walk_block`'s invariant assert (where a `debug_assert!` used to
-/// let the write silently drop in release).
+/// A *guarded* induction write in a **mixed** block — one that *does* commit a
+/// transactional register — is rejected. `check_no_induction_only_transactions`
+/// passes (the block commits `reg`), but the guarded `cnt += 1` is not liftable
+/// by `partition_spine` and would be silently dropped from the decision record.
+/// A dedicated pre-check (`check_no_guarded_induction_write_in_block`) catches it.
 #[test]
-fn guarded_induction_write_inside_begin_block_rejected() {
+fn guarded_induction_write_in_mixed_block_rejected() {
     check_compile_error(
         indoc! {r#"
-            pool: Mut[int, Txn] := 100
+            reg: Mut[int, Txn] := 0
             cnt: Mut[int] := 0
-            for r in [10, 20]:
+            for x in [1, 2, 3]:
                 with begin():
-                    pool := pool - r
-                    if r > 15:
+                    reg := reg + x
+                    if x >= 2:
                         cnt := cnt + 1
             cnt
         "#},
-        "induction variable `cnt` is written inside an `if` guard in a `with begin():` block",
+        "guarded induction write in a transaction block is not supported",
     );
 }
 

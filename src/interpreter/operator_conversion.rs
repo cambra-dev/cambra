@@ -1270,7 +1270,11 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
     };
     fields
         .into_iter()
-        .filter(|(f, _)| f != crate::ccl::F_COMMIT && f != F_WRITES)
+        // `commit`/`writes` are the decision core; a `*__fire` field is a tap's
+        // *fire gate* (read by `body_decision_at`), not a tap value itself.
+        .filter(|(f, _)| {
+            f != crate::ccl::F_COMMIT && f != F_WRITES && !f.ends_with(crate::ccl::F_FIRE_SUFFIX)
+        })
         .collect()
 }
 
