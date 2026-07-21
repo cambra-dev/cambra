@@ -21,7 +21,9 @@ CI lints in **both** debug and release (`ci_clippy` and `ci_clippy_release` in `
 ## General Instructions
 
 ### When in Doubt, Ask
+
 Stop and ask before proceeding when:
+
 - A task is ambiguous and you could reasonably interpret it multiple ways
 - Something in the code contradicts what you'd expect from the design docs or CLAUDE.md
 - You're about to make a non-trivial architectural choice that isn't covered by existing patterns
@@ -50,10 +52,8 @@ Specific decision points where this matters:
 
 - **Defensive checks at internal boundaries.** Add `debug_assert!`, `unreachable!`, and explicit invariant checks at pass boundaries and between modules where load-bearing assumptions live. Don't go overboard — assertions that just restate what the type system already enforces are noise. Add them where the invariant is real but not type-enforced: pass output shapes, module-boundary preconditions, post-conditions on internal helpers. Name what the invariant *is* in the assertion message.
 
-### Skills
-- `/pyast` — Quick reference for `rustpython_parser` AST types (ExprKind, StmtKind, Operator, Constant, etc.)
-
 ### Code Comments
+
 Comment when the *why* is non-obvious — a hidden constraint, a load-bearing invariant, an unusual choice, behavior that would surprise a reader. Skip comments when a good name and a clear signature already convey the intent. Follow rustdoc best practices for public items; don't manufacture docstrings to hit a coverage target.
 
 Avoid comments that describe the history of the codebase.  Comments should explain how and why the code works.  If there is an alternative approach that seems reasonable but doesn't work, it's ok to describe that, but the comments should always fully make sense just by looking at the current version of the code.
@@ -87,6 +87,7 @@ When you rename a heading, `./ci.sh doc_refs` flags every inbound link and code
 citation — update them in the same change.
 
 ### Rendering CCL ASTs in conversation
+
 When showing a CCL AST in chat or when writing code comments — walking through an example, illustrating what a pass sees, comparing before/after a rewrite — **render it in symbolic form** (the output shape of `ccl::symbolic::symbolic` / `symbolic_typed`). The whole reasoning surface here is the algebra; symbolic notation makes that legible at a glance.
 
 Vocabulary, matching `src/ccl/symbolic.rs`:
@@ -124,9 +125,11 @@ Do **not** write `Apply { function: ..., argument: ... }`, `Apply(f, x)`, `Compo
 When the type matters to the point being made (e.g. showing a domain refinement that triggers operator dispatch), include type annotations via `symbolic_typed`-style suffixes: `expr:type`.
 
 ### Metavariable notation in design docs
+
 When design-doc prose and inline pseudo-code mix CCL syntax with meta-theoretic placeholders (stand-ins for any specific term, type, or predicate), italicize the placeholders using Unicode mathematical italic characters. Single-letter Latin: `𝑎`–`𝑧` (U+1D44E–U+1D467, lowercase, for term/value metas) and `𝐴`–`𝑍` (U+1D434–U+1D44D, uppercase, for type metas). One gotcha — italic lowercase `ℎ` lives at the legacy codepoint U+210E, not in the contiguous range. Digit subscripts: `₀`–`₉` (U+2080–U+2089) for indexed variants (`𝐷₁`, `𝐶₂`). Multi-character placeholders (`body`, `arg`, `param`, `predicate`, ...) and concrete identifiers (`xs`, `__gb_k`, `key_fn`, ...) stay upright. The convention applies to inline pseudo-code in backticks and to prose mentions, **not** to fenced code blocks — those represent literal source and stay in regular characters throughout. String literals (`"x"`, `"k"`) are also literal, not metavariables, and stay upright. Stars/underscores for italics don't work inside backticks; the Unicode math characters are pre-rendered italic glyphs that render correctly in any modern Markdown viewer.
 
 ### Symbolic notation for types and terms
+
 Use the symbolic forms below in prose and inline pseudo-code (not in fenced code blocks, which represent literal source):
 
 - **Function type with named binder** (`Type::Fun` with `name: Some(_)`): `(𝑥: 𝐴) ⇒ 𝐵`. `𝑥` is bound in `𝐵`.
@@ -141,20 +144,24 @@ Both `⇒` and `→` are right-associative. They are distinct: `⇒` is for *typ
 Do not render type information as Rust struct syntax (e.g., `Fun { name: Some("k"), domain: K, codomain: ... }`) when prose calls for symbolic notation — the struct form is appropriate inside fenced ` ```rust ` blocks that show actual Rust source, but in symbolic positions use the arrow / refinement-bracket notation above.
 
 ### Workflow
+
 After making code changes, run the formatter before running the code; prefer running the linter after ensuring the project builds. **Before creating or pushing a PR, run `./ci.sh` and confirm it is clean** — GitHub CI gates on the same checks, and `./ci.sh` runs the parts no single `cargo` command covers: clippy in *both* debug and release mode plus the doc build. A green debug `cargo clippy` is not enough (see Build Commands above).
 
 When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes `docs/design.md` and other `*/design-*.md` files close to source files that were changed.
 
 ### Compact instructions
+
 When you are using compact, focus on test output and code changes.
 
 ### Git Conventions
+
 - Do not attribute authorship to AI tools or models anywhere git records it — neither commit messages nor PR descriptions. This covers any form the attribution takes: `Co-Authored-By:` trailers, "Generated with"/"Created with" footers (e.g. `🤖 Generated with [Claude Code]`), tool/model names in the body, and any future variant. The rule is the intent (no AI authorship credit), not a fixed list of strings. PR descriptions matter because this repo squash-merges, so the PR body becomes the commit message on the main branch.
 - When making changes, verify the freshness of the local repo by fetching and comparing the diff. The following commands do this, if there are differences, warn the user and ask the user whether they would like to pull or rebase.
    1. `git fetch origin`
    2. `git log master..origin/master --pretty=format:"%h%x09%an%x09%ad%x09%s"| head -n 20`
 
 ### Updating PR descriptions
+
 `gh pr edit --body` fails with exit code 1 due to a Projects (classic) deprecation warning, even when the body update would otherwise succeed. Use the REST API instead:
 
 ```bash
@@ -162,11 +169,13 @@ gh api repos/OWNER/REPO/pulls/PR_NUMBER --method PATCH --field body="..." --jq .
 ```
 
 ### Stacked PRs with git-spice
+
 This repo uses [git-spice](https://abhinav.github.io/git-spice/) (`gs`) for stacked PRs. Workflow for creating a new PR in a stack:
 
 > **Before submitting:** run `./ci.sh` and confirm it passes. `gs branch submit` runs no checks of its own, so this is the only gate before GitHub CI sees the branch — and it lints in both debug *and* release (an un-run release clippy pass is the most common way CI fails after a green local `cargo clippy`).
 
 **Option A — git-spice branch creation** (stage changes first, then):
+
 ```bash
 gs branch create -m "commit message"   # creates branch + commit in one step
 gs branch submit --fill --no-draft     # submit to GitHub
@@ -174,6 +183,7 @@ gs stack submit --update-only          # add nav comments to all PRs in stack
 ```
 
 **Option B — plain git then track** (more control over commit flow):
+
 ```bash
 git checkout -b <branch-name>
 git add <files> && git commit -m "..."
@@ -183,6 +193,7 @@ gs stack submit --update-only
 ```
 
 Notes:
+
 - Prefer `gs branch create` over `git checkout -b` for branch creation — if `spice.branchCreate.prefix` is configured, git-spice will apply it automatically, avoiding manual prefix guessing.
 - For a PR stacked on `main`, `--base main` is implicit; for stacked PRs use `--base <parent-branch>`.
 - `gs stack submit` discovers existing PRs by branch name and adds navigation comments. Use `--update-only` to skip prompts for branches without PRs yet.
