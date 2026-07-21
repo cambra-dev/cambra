@@ -115,7 +115,29 @@ use crate::ccl::{
     TypedExpr, TypedExprNode,
     ccl_utils::{count_free, synthesize_arm_predicate, typed_compose},
     letrec::check_letrec_causal,
+    lineage::{self, LineageLog, Nature, RecorderSession},
+    provenance::NodeId,
 };
+
+/// A cluster defer's rewrite identity: its binder name, the enclosing
+/// `let d = Defer` node id, and the `Defer` node id. Threaded from `desugar`'s
+/// cluster collection through [`channelize_cluster`] so the cluster's lineage
+/// step can consume the scaffolding it removes — the cluster/defer origin ids
+/// threaded into `try_lift_defer`.
+struct ClusterDefer {
+    name: Name,
+    /// The `let dᵢ = Defer` wrapper node.
+    let_id: NodeId,
+    /// The `Defer` node bound by the wrapper.
+    defer_id: NodeId,
+}
+
+/// Collect every main-tree [`NodeId`] in `e` (itself and descendants), skipping
+/// type-refinement predicates — the node set the lineage steps reason about.
+fn collect_subtree_ids(e: &Expr, acc: &mut Vec<NodeId>) {
+    acc.push(e.node_id());
+    e.walk_children(|c| collect_subtree_ids(c, acc));
+}
 
 /// `true` when `ty` carries channelization-erasable residue — a `Hole` stamped
 /// on a node this pass constructed or invalidated, an unresolved `Infer` channel
@@ -266,6 +288,22 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
     any_feed.then_some(arms)
 }
 
+/// Clone a **main-tree** subtree and freshen every NodeId in the copy, so a
+/// fan-out arm that duplicates a surviving source subtree never shares its
+/// ids (the duplicate-id source `post_desugar_ir` uniqueness would otherwise
+/// trip on). Each freshened node fires the `on_copy` lineage hook into the
+/// enclosing fan-out step, turning the clone into per-origin `Copy` records.
+///
+/// Deliberately **not** used for predicate-position clones (the guard copies
+/// that end up inside a `Type::Refinement` predicate): the predicate domain is
+/// out of scope for the tree walks, and freshening there would churn ids no
+/// walk ever observes.
+fn freshened_clone(e: &Expr) -> Expr {
+    let mut c = e.clone();
+    c.freshen_node_ids_deep();
+    c
+}
+
 /// Attempt to apply the defer-returning lift to a `Let` binding.
 ///
 /// Pattern: `let y = (let x = Defer in body_x) in body_y` where
@@ -281,8 +319,16 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
 /// Also handles an optional `ExprStmt` prefix on `bound_expr`: the
 /// heads of any leading ExprStmts become a prefix that's prepended to
 /// the lifted body, with stale Feed/Define target names renamed to `y`.
-fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option<(Expr, Name)> {
+fn try_lift_defer(
+    binding_name: &Name,
+    bound_expr: &Expr,
+    body: &Expr,
+    outer_let_id: NodeId,
+) -> Option<(Expr, Name)> {
     let mut prefix: Vec<Expr> = Vec::new();
+    // The stripped `ExprStmt` envelope ids are consumed by the lift (their heads
+    // are re-wrapped into fresh envelopes below); capture them for the step.
+    let mut stripped_envelope_ids: Vec<NodeId> = Vec::new();
     let mut current = bound_expr.clone();
     loop {
         let cur_id = current.node_id;
@@ -291,6 +337,7 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
                 expr: head,
                 body: tail,
             } => {
+                stripped_envelope_ids.push(cur_id);
                 prefix.push(*head);
                 current = *tail;
             }
@@ -306,7 +353,8 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
             }
         }
     }
-    let (inner_name, inner_handle_ty, inner_body_x) = match current.node {
+    let inner_let_id = current.node_id;
+    let (inner_name, inner_handle_ty, inner_body_x, inner_defer_id) = match current.node {
         TypedExprNode::Let {
             binding: inner_binding,
             bound_expr: inner_be,
@@ -314,14 +362,28 @@ fn try_lift_defer(binding_name: &Name, bound_expr: &Expr, body: &Expr) -> Option
         } if matches!(inner_be.node, TypedExprNode::Defer)
             && is_defer_returning(&inner_body, &inner_binding.name) =>
         {
+            // Read the `Defer`'s id before moving `inner_be.ty` out of the box.
+            let inner_defer_id = inner_be.node_id();
             // Keep the inner defer's recorded handle type (`feed(ChanDom(F) ⇒
             // V)`) — the lifted binding must carry it so cluster discovery
             // keys the channel by the domain name consumer types reference,
             // not by the term name. (`Hole` on an untyped tree, harmlessly.)
-            (inner_binding.name, inner_be.ty, *inner_body)
+            (inner_binding.name, inner_be.ty, *inner_body, inner_defer_id)
         }
         _ => return None,
     };
+
+    // The lift is committed: open its step. It consumes the outer `Let`, the
+    // inner `let x = Defer` wrapper and its `Defer`, and the stripped `ExprStmt`
+    // envelopes; the fresh `Defer`/`Let` and re-wrapped envelopes built below are
+    // its births. A faithful `Expansion` of the defer-returning UDF inline, so
+    // blame is the same scaffolding ids. (Substitution's `Var`-overwrite drops
+    // and the replacement-`Var` duplication it leaves are not separately
+    // recorded here.)
+    let mut consumed = vec![outer_let_id, inner_let_id, inner_defer_id];
+    consumed.extend(stripped_envelope_ids);
+    let blame = consumed.clone();
+    let _lift = lineage::step("channelize.lift_defer", consumed, blame, Nature::Expansion);
 
     // `body_x[x → y]` — also renames Feed/Define targets named `x` to `y`.
     let inner_subst = desugar_rename(inner_body_x, &inner_name, binding_name);
@@ -568,6 +630,18 @@ pub fn run(expr: Expr, input_typed: bool) -> Result<Expr, DeferError> {
         assert_no_type_residue(&rewritten);
     }
     Ok(rewritten)
+}
+
+/// Channelize as [`run`], but also drain the [`LineageLog`] of the
+/// [`RewriteStep`](crate::ccl::lineage::RewriteStep)s this pass records. The log
+/// is drained even on error (the partial log is harmless).
+pub(crate) fn run_with_lineage(
+    expr: Expr,
+    input_typed: bool,
+) -> (Result<Expr, DeferError>, LineageLog) {
+    let session = RecorderSession::new();
+    let result = run(expr, input_typed);
+    (result, session.into_log())
 }
 
 /// The channel-domain name (and its inference level) carried by a feed
@@ -894,7 +968,23 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
                 body: Box::new(drop_expr_stmts(*body)),
             }
         }
-        TypedExprNode::ExprStmt { body, .. } => return drop_expr_stmts(*body),
+        TypedExprNode::ExprStmt { expr: effect, body } => {
+            // The `ExprStmt` envelope and its effect (a `Unit` residue once feeds
+            // are extracted) are discarded with no surviving counterpart —
+            // `Nature::Machinery`, empty blame. Recorded as a `Transform` discard
+            // (produced empty) before recursing.
+            let mut consumed = vec![node_id];
+            collect_subtree_ids(&effect, &mut consumed);
+            {
+                let _g = lineage::step(
+                    "channelize.drop_expr_stmt",
+                    consumed,
+                    Vec::new(),
+                    Nature::Machinery,
+                );
+            }
+            return drop_expr_stmts(*body);
+        }
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -1148,7 +1238,14 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             {
                 chan_names.insert(binding.name.clone(), n);
             }
-            let mut defer_names = vec![binding.name];
+            // Capture each defer's `let`-wrapper and `Defer` node ids alongside
+            // its binder name, so the cluster's lineage step consumes the exact
+            // scaffolding channelization removes.
+            let mut defers = vec![ClusterDefer {
+                name: binding.name,
+                let_id: node_id,
+                defer_id: bound_expr.node_id(),
+            }];
             let mut current_body = *body;
             loop {
                 let cur_let_id = current_body.node_id;
@@ -1163,7 +1260,12 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
                         {
                             chan_names.insert(b.name.clone(), n);
                         }
-                        defer_names.push(b.name);
+                        let defer_id = be.node_id();
+                        defers.push(ClusterDefer {
+                            name: b.name,
+                            let_id: cur_let_id,
+                            defer_id,
+                        });
                         current_body = *inner;
                     }
                     other => {
@@ -1182,7 +1284,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // non-clustered defers (inner `let d = Defer in ...`
             // separated from this cluster by other lets).
             let body_rewritten = desugar(current_body, ctx)?;
-            channelize_cluster(&defer_names, &chan_names, body_rewritten, ctx)
+            channelize_cluster(&defers, &chan_names, body_rewritten, ctx)
         }
         TypedExprNode::Let {
             binding,
@@ -1200,7 +1302,9 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
             // functions: `let y = f(arg)` where f's body is `let x =
             // Defer in x` inlines to `let y = (let x = Defer in x) in
             // body_y`, and the lift collapses the two scopes.
-            if let Some((lifted, inner_name)) = try_lift_defer(&binding.name, &bound_expr, &body) {
+            if let Some((lifted, inner_name)) =
+                try_lift_defer(&binding.name, &bound_expr, &body, node_id)
+            {
                 // The lift renames the inner defer binder to the outer name,
                 // but *consumer types outside the lifted subtree* may carry
                 // the inner handle's rigid `ChanDom`. Record the alias so the
@@ -1335,7 +1439,7 @@ fn desugar(expr: Expr, ctx: &mut DesugarCtx) -> Result<Expr, DeferError> {
 /// used directly, and top-level scalar feeds are lifted to `Fun(Unit,
 /// T)` via the `λ __unused → V` wrap inside `extract_for_defer`.
 fn channelize_cluster(
-    defer_names: &[Name],
+    defers: &[ClusterDefer],
     chan_names: &HashMap<Name, Name>,
     body: Expr,
     ctx: &mut DesugarCtx,
@@ -1344,7 +1448,7 @@ fn channelize_cluster(
     // body's Feed/Define replacements as we process each defer in turn.
     let mut channels: HashMap<Name, Expr> = HashMap::new();
     let mut rewritten = body;
-    for name in defer_names.iter().rev() {
+    for name in defers.iter().rev().map(|d| &d.name) {
         // Process innermost defer first so its feeds are picked up before
         // the outer defer's walk; the outer walk wouldn't see them anyway
         // since extract_for_defer matches by name.  Processing order is
@@ -1373,7 +1477,7 @@ fn channelize_cluster(
     // the read's handle type, whose domain is the referenced channel's own
     // `ChanDom` (closed later).
     if ctx.input_typed {
-        for name in defer_names {
+        for name in defers.iter().map(|d| &d.name) {
             if let Some(ch) = channels.get(name) {
                 let key = chan_names
                     .get(name)
@@ -1401,8 +1505,8 @@ fn channelize_cluster(
     // channels carry no guard, so a reference cycle among them
     // (`x <<= y; y <<= x`) has no well-founded solution — the same law that
     // governs overwrite recursion, applied by the same checker.
-    let mut group: Vec<(TypedBinding, Expr)> = Vec::with_capacity(defer_names.len());
-    for name in defer_names {
+    let mut group: Vec<(TypedBinding, Expr)> = Vec::with_capacity(defers.len());
+    for name in defers.iter().map(|d| &d.name) {
         if let Some(channel) = channels.remove(name) {
             group.push((
                 TypedBinding {
@@ -1422,6 +1526,14 @@ fn channelize_cluster(
             .clone();
         return Err(DeferError::MutuallyRecursiveCycle(name.base().to_string()));
     }
+    // Open the cluster's lineage step over the bind/emit: the `let dᵢ = Defer`
+    // scaffolding (each wrapper `Let` and its `Defer`) is consumed, and the
+    // carrier `LetRec` minted by `emit_cluster_letrec` inside is its birth. This
+    // is a faithful `Expansion` of the defer cluster, so blame is the same defer
+    // scaffolding ids (the carrier traces to the `defer`s it channelizes).
+    let consumed: Vec<NodeId> = defers.iter().flat_map(|d| [d.let_id, d.defer_id]).collect();
+    let blame = consumed.clone();
+    let _g = lineage::step("channelize.cluster", consumed, blame, Nature::Expansion);
     Ok(bind_cluster_at_scope(rewritten, group))
 }
 
@@ -1582,8 +1694,11 @@ fn emit_cluster_letrec(inner: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
         return inner;
     }
     let ty = inner.ty.clone();
-    // A freshly-minted cluster carrier — not a rebuild of an input node, so it
-    // draws a fresh `NodeId` through the canonical `Expr::new` constructor.
+    // A freshly-minted cluster carrier — not a rebuild of an input node. Built
+    // through `Expr::new` (rather than a struct literal with a bare
+    // `NodeId::fresh()`) so the `on_mint` hook fires and the enclosing cluster
+    // step captures the carrier as its birth. Same single fresh-id draw either
+    // way, so minting order (and the golden fixtures) is unchanged.
     let mut carrier = Expr::new(TypedExprNode::LetRec {
         bindings: group,
         body: Box::new(inner),
@@ -1816,6 +1931,21 @@ fn combine_feed_values(mut feeds: Vec<Expr>) -> Expr {
     if feeds.len() == 1 {
         return feeds.pop().unwrap();
     }
+    // The fan-in union is a **pure insertion** over the surviving feed
+    // operands — the `CollectionUnion` node is minted with no lineage ancestor
+    // (its operands survive as its children), so it is attributed via blame to
+    // the fed-value operand roots, with empty `consumed`. This is the legal
+    // empty-consumed-with-blame shape. It is a SIBLING step, opened before the
+    // `channelize.cluster` step (the cluster carrier isn't minted yet), so each
+    // frame captures its own births; its blame is the surviving fed-value
+    // operand roots. The minted union is this step's captured birth.
+    let blame: Vec<NodeId> = feeds.iter().map(|f| f.node_id()).collect();
+    let _g = lineage::step(
+        "channelize.feed_union",
+        Vec::new(),
+        blame,
+        Nature::Expansion,
+    );
     let ty = collection_union_type(&feeds);
     Expr::collection_union(feeds).with_ty(ty)
 }
@@ -1992,12 +2122,18 @@ fn extract_for_defer(
             let lifted = if in_inner_scope || is_collection {
                 value
             } else {
+                // The `λ __unused → V` Unit-lift is a pure insertion over the
+                // surviving fed value: minted with no lineage ancestor, blamed to
+                // the value's root (which survives as its body). Empty consumed.
+                let blame = vec![value.node_id()];
+                let _g =
+                    lineage::step("channelize.feed_lift", Vec::new(), blame, Nature::Expansion);
                 Expr::lambda("__unused", Type::Base(BaseType::Unit), value)
             };
             feeds.push(lifted);
             // The `Feed` wrapper's id is reused onto this `Lit(Unit)` replacement
             // (the enclosing rebuild carries `node_id`) — a preserve, not a
-            // discard.
+            // discard, so no step is opened for it here.
             TypedExprNode::Lit(Lit::Unit)
         }
         TypedExprNode::Define { name, value } if &name == defer_name => {
@@ -2076,8 +2212,25 @@ fn extract_for_defer(
                         let let_ty =
                             crate::ccl::subst::Subst::discharge(&binding.name, bound_expr.clone())
                                 .apply_type(&original.ty);
-                        *feed = Expr::let_bind(binding.name.clone(), bound_expr.clone(), original)
-                            .with_ty(let_ty);
+                        // The wrap-`Let` is a pure insertion over the surviving
+                        // feed and a freshened copy of the bound expression:
+                        // open its step so the minted `Let` (blamed to the
+                        // wrapped material) and the freshened `bound_expr` copy
+                        // are recorded. Freshening keeps the copy's ids distinct
+                        // from `bound_expr`'s surviving occurrence in the body.
+                        let blame = vec![original.node_id(), bound_expr.node_id()];
+                        let _wrap = lineage::step(
+                            "channelize.wrap_let",
+                            Vec::new(),
+                            blame,
+                            Nature::Expansion,
+                        );
+                        *feed = Expr::let_bind(
+                            binding.name.clone(),
+                            freshened_clone(&bound_expr),
+                            original,
+                        )
+                        .with_ty(let_ty);
                     }
                 }
                 new_body
@@ -2174,6 +2327,20 @@ fn extract_for_defer(
                     // element-var typing; the guard itself lives on the domain.
                     let src_domain = new_argument.ty.domain().unwrap_or(Type::Hole);
                     let src_item = new_argument.ty.codomain().unwrap_or(Type::Hole);
+                    // Fan-out companion channels: the per-arm refined-source
+                    // scaffolding (predicate lambdas/applies, value lambdas) is
+                    // minted fresh over cloned, surviving source nodes, and the
+                    // collapsed source lambda's body is replaced by `Unit`.
+                    // Recorded as a blamed pure insertion attributed to the
+                    // iteration source. (The source lambda's dropped body and the
+                    // clones' shared ids are residual; this arm is not on the
+                    // leak-tested path.)
+                    let _fanout = lineage::step(
+                        "channelize.case_fanout",
+                        Vec::new(),
+                        vec![new_argument.node_id()],
+                        Nature::Expansion,
+                    );
                     let mut prior: Vec<Expr> = Vec::new();
                     for (guard, feed_value) in fanout_arms {
                         if let Some(value) = feed_value {
@@ -2185,7 +2352,10 @@ fn extract_for_defer(
                             let pred_on_source = Expr::apply(source_at_elem, pred_lambda)
                                 .with_ty(Type::Base(BaseType::Bool));
                             let refinement_struct = Refinement::born(Rc::new(pred_on_source));
-                            let mut refined_argument = new_argument.clone();
+                            // Main-tree channel source: freshen the clone (the
+                            // `source_at_elem` copy above rides the predicate and
+                            // is left shared — predicate domain out of scope).
+                            let mut refined_argument = freshened_clone(&new_argument);
                             refine_source_domain(&mut refined_argument, refinement_struct, ctx);
                             // stamp the channel at
                             // construction (the value lambda's codomain,
@@ -2233,15 +2403,31 @@ fn extract_for_defer(
                     in_inner_scope,
                     ctx,
                 )?;
-                for v in lambda_feeds {
-                    // `Apply { argument: source-element, function: λ p → v }`
-                    // applies the value lambda to the per-element source, so the
-                    // companion channel's type is the lambda's codomain `v.ty`
-                    // (the argument matches `param.ty`). Typed at construction.
-                    let v_ty = v.ty.clone();
-                    let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
-                    let channel = Expr::apply(new_argument.clone(), channel_lambda).with_ty(v_ty);
-                    feeds.push(channel);
+                {
+                    // Companion value-lambda channels: minted over the cloned
+                    // (surviving) iteration source, a blamed pure insertion
+                    // attributed to the fed values.
+                    let blame: Vec<NodeId> = lambda_feeds.iter().map(|f| f.node_id()).collect();
+                    let _companion = lineage::step(
+                        "channelize.apply_fanout",
+                        Vec::new(),
+                        blame,
+                        Nature::Expansion,
+                    );
+                    for v in lambda_feeds {
+                        // `Apply { argument: source-element, function: λ p → v }`
+                        // applies the value lambda to the per-element source, so
+                        // the companion channel's type is the lambda's codomain
+                        // `v.ty` (the argument matches `param.ty`). Typed at
+                        // construction.
+                        let v_ty = v.ty.clone();
+                        let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
+                        // Main-tree source clone: freshen so each companion
+                        // channel owns distinct ids.
+                        let channel = Expr::apply(freshened_clone(&new_argument), channel_lambda)
+                            .with_ty(v_ty);
+                        feeds.push(channel);
+                    }
                 }
                 let new_function = TypedExpr {
                     node: TypedExprNode::Lambda {
@@ -2390,6 +2576,15 @@ fn extract_for_defer(
                             };
                             let src_domain = source_prefix.ty.domain().unwrap_or(Type::Hole);
                             let src_item = source_prefix.ty.codomain().unwrap_or(Type::Hole);
+                            // See the Apply-fanout arm: blamed pure insertion of
+                            // the per-arm refined-source companion channels,
+                            // attributed to the iteration source prefix.
+                            let _fanout = lineage::step(
+                                "channelize.case_fanout",
+                                Vec::new(),
+                                vec![source_prefix.node_id()],
+                                Nature::Expansion,
+                            );
                             let mut prior: Vec<Expr> = Vec::new();
                             for (guard, feed_value) in fanout_arms {
                                 if let Some(value) = feed_value {
@@ -2403,7 +2598,10 @@ fn extract_for_defer(
                                         .with_ty(Type::Base(BaseType::Bool));
                                     let refinement_struct =
                                         Refinement::born(Rc::new(pred_on_source));
-                                    let mut refined_prefix = source_prefix.clone();
+                                    // Main-tree channel source: freshen the
+                                    // clone (the `source_at_elem` copy rides the
+                                    // predicate and is left shared).
+                                    let mut refined_prefix = freshened_clone(&source_prefix);
                                     refine_source_domain(
                                         &mut refined_prefix,
                                         refinement_struct,
@@ -2457,25 +2655,41 @@ fn extract_for_defer(
                         // up to (but not including) this element, which is
                         // exactly the surrounding context the feed value
                         // needs.
-                        for v in lambda_feeds {
-                            // `Expr::lambda` stamps `Fun(param.ty, v.ty)`; the
-                            // param carries the matched lambda's own (concrete)
-                            // type, so the companion value lambda is fully typed.
-                            // The compose type is `Fun(prefix-domain, v.ty)`;
-                            // a prefix that is itself a defer read carries its
-                            // handle's rigid `ChanDom` domain, closed by the
-                            // final `erase_chan_domains` substitution.
-                            let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
-                            let mut channel_elts = new_elts.clone();
-                            channel_elts.push(channel_lambda);
-                            // A single-element "compose" is just that
-                            // element; otherwise build a Compose.
-                            let channel_expr = if channel_elts.len() == 1 {
-                                channel_elts.into_iter().next().unwrap()
-                            } else {
-                                compose_typed_or_hole(channel_elts)
-                            };
-                            feeds.push(channel_expr);
+                        {
+                            // Companion compose channels: minted over cloned
+                            // (surviving) prefix elements, a blamed pure insertion
+                            // attributed to the fed values.
+                            let blame: Vec<NodeId> =
+                                lambda_feeds.iter().map(|f| f.node_id()).collect();
+                            let _companion = lineage::step(
+                                "channelize.compose_fanout",
+                                Vec::new(),
+                                blame,
+                                Nature::Expansion,
+                            );
+                            for v in lambda_feeds {
+                                // `Expr::lambda` stamps `Fun(param.ty, v.ty)`; the
+                                // param carries the matched lambda's own (concrete)
+                                // type, so the companion value lambda is fully
+                                // typed. The compose type is `Fun(prefix-domain,
+                                // v.ty)`; a prefix that is itself a defer read
+                                // carries its handle's rigid `ChanDom` domain,
+                                // closed by the final `erase_chan_domains` subst.
+                                let channel_lambda = Expr::lambda(&param.name, param.ty.clone(), v);
+                                // Main-tree prefix elements duplicated into the
+                                // companion compose: freshen each clone.
+                                let mut channel_elts: Vec<Expr> =
+                                    new_elts.iter().map(freshened_clone).collect();
+                                channel_elts.push(channel_lambda);
+                                // A single-element "compose" is just that
+                                // element; otherwise build a Compose.
+                                let channel_expr = if channel_elts.len() == 1 {
+                                    channel_elts.into_iter().next().unwrap()
+                                } else {
+                                    compose_typed_or_hole(channel_elts)
+                                };
+                                feeds.push(channel_expr);
+                            }
                         }
                         new_elts.push(TypedExpr {
                             node: TypedExprNode::Lambda {
@@ -2554,8 +2768,19 @@ fn extract_for_defer(
             if local_define.is_some() {
                 return Err(DeferError::NestedDefinition);
             }
-            for v in local_feeds {
-                feeds.push(Expr::lambda(&param.name, param.ty.clone(), v));
+            {
+                // Companion lambda-wrapped channels: a blamed pure insertion of
+                // the re-wrapping lambdas, attributed to the fed values.
+                let blame: Vec<NodeId> = local_feeds.iter().map(|f| f.node_id()).collect();
+                let _companion = lineage::step(
+                    "channelize.lambda_fanout",
+                    Vec::new(),
+                    blame,
+                    Nature::Expansion,
+                );
+                for v in local_feeds {
+                    feeds.push(Expr::lambda(&param.name, param.ty.clone(), v));
+                }
             }
             TypedExprNode::Lambda {
                 param,
@@ -2776,9 +3001,14 @@ mod tests {
             Expr::let_bind("x", Expr::new(TypedExprNode::Defer), inner_body).with_ty(int.clone());
         let bound_expr = Expr::expr_stmt(Expr::feed("x", lit(1)), inner);
         let body = var("y").with_ty(int.clone());
+        // The outer `let y = bound_expr in body` the caller holds: the lift
+        // consumes its id, so build the node rather than inventing an id that
+        // belongs to nothing.
+        let outer = Expr::let_bind("y", bound_expr.clone(), body.clone());
 
         let (lifted, inner_name) =
-            try_lift_defer(&Name::raw("y"), &bound_expr, &body).expect("the lift shape matches");
+            try_lift_defer(&Name::raw("y"), &bound_expr, &body, outer.node_id())
+                .expect("the lift shape matches");
         assert_eq!(inner_name, Name::raw("x"));
 
         // Every `ExprStmt` on the spine carries a type. Checking for the absence

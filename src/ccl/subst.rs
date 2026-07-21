@@ -609,7 +609,12 @@ impl Subst {
     /// observed uniformly across the tree. `Compose` node types are recomputed from the
     /// rewritten elements (substituting a `Var` whose type was an unresolved
     /// placeholder can concretize the element types; the `Compose.ty ==
-    /// Fun(first_domain, last_codomain)` invariant must follow).
+    /// `Fun(first_domain, last_codomain)` invariant must follow).
+    ///
+    /// There is no freshen observer: a compound replacement's interior is
+    /// freshened by [`TypedExpr::freshen_interior_node_ids`], whose re-mints fire
+    /// the ambient `lineage::on_copy` hook directly into any open lineage step, so
+    /// the caller needs no callback.
     pub fn rewrite_expr(&self, e: &mut TypedExpr) {
         if self.is_id() {
             return;
@@ -627,7 +632,7 @@ impl Subst {
         if !is_free(binder, e) {
             return;
         }
-        Subst::discharge(binder.clone(), term.clone()).rewrite_expr(e);
+        Subst::discharge(binder.clone(), term.clone()).rewrite_expr_go(e, &PredMemo::new());
     }
 
     fn rewrite_expr_go(&self, e: &mut TypedExpr, memo: &PredMemo<Subst>) {

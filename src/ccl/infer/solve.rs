@@ -24,6 +24,7 @@ use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, coalesce_compact, compact_type,
     constrain_subtype, freshen_expr_type_slots, seed_chan_dom_pairings, simplify_type,
 };
+use crate::ccl::lineage::{Nature, step};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{Expr, Level, Name, Type, TypedBinding, TypedExprNode};
@@ -1227,9 +1228,21 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
 /// "The id domain"), and freshening them would split the predicate `Rc` sharing
 /// planning's compile memo depends on.
 fn freshen_clone_node_ids(expr: &mut Expr) {
-    // The deep walk lives on `TypedExpr::freshen_node_ids_deep`; each re-mint
-    // fires the ambient `on_copy` hook, captured by the open Mono Copy step.
+    // The deep walk lives on `TypedExpr::freshen_node_ids_deep`, shared with the
+    // transact/letrec `subst_env` copy-freshening. Every re-mint funnels through
+    // `freshen_node_id`, which fires the lineage `on_copy` hook — so a lineage
+    // `step` open around this call captures every cloned node as a per-origin
+    // `Copy` (the `via: Mono` `Copy` lineage).
     expr.freshen_node_ids_deep();
+}
+
+/// Collect every **main-tree** node id of `expr` (the `walk_children` node set —
+/// refinement-predicate interiors excluded), matching the pane node-set the
+/// lineage fold reasons over. Used to build the `consumed` set of the mono
+/// wrapper `Transform` (the original generalized-def subtree that vanishes).
+fn collect_node_ids(expr: &Expr, out: &mut Vec<NodeId>) {
+    out.push(expr.node_id());
+    expr.walk_children(|c| collect_node_ids(c, out));
 }
 
 #[allow(clippy::mutable_key_type)]
@@ -1304,8 +1317,27 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
     // (not folded into the shared `freshen_expr_type_slots`, which also runs on
     // refinement-predicate copies outside any mono context). It covers the
     // `walk_children` domain only — predicate-embedded ids, reachable through
-    // type slots, are outside the id domain and stay aliased.
-    freshen_clone_node_ids(&mut clone);
+    // type slots, are outside the id domain and stay aliased. The coalesce below
+    // runs re-entrantly on the clone, so any nested generalized `let`'s own
+    // specializations record their own steps.
+    //
+    // Lineage: the clone consumes nothing (`frame.def` stays live) and
+    // mints nothing new — it only freshens ids. Opening a `Transform`
+    // consume-nothing frame narrowly around the freshen makes the recorder emit
+    // exactly the per-origin `Copy` steps captured from `on_copy` (an empty
+    // `consumed`+`births` `Transform` flushes to no `Transform`, only the
+    // `Copy`s), one per cloned node. The frame is scoped tightly so the
+    // re-entrant `coalesce_node` below (which opens its own steps) is not
+    // captured here.
+    {
+        let _g = step(
+            "infer.mono_specialize",
+            Vec::new(),
+            Vec::new(),
+            Nature::Expansion,
+        );
+        freshen_clone_node_ids(&mut clone);
+    }
 
     // Pin the clone to the use's live instantiation type, two-way. Inward,
     // this drives the use site's accumulated bounds into the clone's
@@ -1373,6 +1405,16 @@ pub(super) fn specialize_use(use_expr: &mut Expr, frame_idx: usize, ctx: &mut Co
 /// definition is dead code.
 pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     let saved_annotation = expr.user_annotation.take();
+    // The original generalized-`let`'s id, captured before the rebuild below
+    // overwrites `expr`. Only `expr.node` is consumed here; `expr.node_id()`
+    // survives as the id the wrapper `Transform` below consumes and blames, so
+    // the freshly-minted specialization-wrapper `Let`s trace back to the
+    // generalized `let`. The rewrite is encoded as two steps: a produced-empty
+    // discard of the generalized-def subtree plus a narrow `Transform`
+    // (original `let` → wrapper `Let`s); splitting them keeps the per-node
+    // `Copy` edges (def node → its clones) out of the wrapper step's bipartite
+    // consumed × produced product.
+    let original_let_id = expr.node_id();
     let node = std::mem::replace(&mut expr.node, TypedExprNode::Error);
     let TypedExprNode::Let {
         binding,
@@ -1398,26 +1440,69 @@ pub(super) fn coalesce_generalized_let(expr: &mut Expr, level: Level, ctx: &mut 
     // Wrap the body in one specialized `let` per distinct type. Built in
     // reverse so first-demanded types end up outermost; ordering is
     // immaterial since the specializations never reference one another.
+    //
+    // Lineage: this rewrite consumes the whole original generalized `let` — its
+    // node id *and* its bound-definition subtree (`frame.def`) — and mints the
+    // per-spec wrapper `Let`s. Each specialization is a freshened *clone* of
+    // `frame.def` (recorded as per-node `Copy` steps by `specialize_use`, which
+    // ran during the body walk above, so they land earlier in the log); the
+    // original def subtree itself vanishes here. Two SEPARATE steps, not one:
+    //
+    // * A produced-empty discard consumes the def-subtree ids. Keeping it apart
+    //   from the wrapper step matters because the fold emits the bipartite
+    //   product of a step's consumed × produced — folding the whole subtree
+    //   into the wrapper step would link every def node to every wrapper Let,
+    //   drowning the precise per-node `Copy` edges (each def node → its
+    //   specialization clones) in product noise. A discard produces nothing,
+    //   so the def nodes keep exactly their Copy lineage.
+    // * The wrapper step consumes only `original_let_id` and births the
+    //   wrapper `Let`s — the one construct the wrappers genuinely replace.
+    //
+    // Copy-then-consume composes correctly — the clones snapshotted the def's
+    // roots before these consumes remove them. Blaming `original_let_id`
+    // traces the wrappers to the generalized `let`'s source span (→
+    // `Derived(Mono)`). `Nature::Expansion` — the wrappers faithfully expand
+    // the user-written generalized definition.
+    let mut def_consumed = Vec::new();
+    collect_node_ids(&frame.def, &mut def_consumed);
+    def_consumed.retain(|id| *id != original_let_id);
+    {
+        let _discard = step(
+            "infer.mono_def_consumed",
+            def_consumed,
+            vec![],
+            Nature::Machinery,
+        );
+    }
     let mut result = body;
-    for spec in frame.specs.into_iter().rev() {
-        // The discharge only does work when the specialization binder is free
-        // in the body type's refinement predicates; skip cloning `spec.def`
-        // otherwise (it is still moved into the rebuilt `let` below).
-        let body_ty = if crate::ccl::subst::type_free_vars(&result.ty).contains(&spec.name) {
-            crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone()).apply_type(&result.ty)
-        } else {
-            result.ty.clone()
-        };
-        result = Expr::new(TypedExprNode::Let {
-            binding: TypedBinding {
-                name: spec.name,
-                ty: spec.def.ty.clone(),
-                user_annotation: None,
-            },
-            bound_expr: Box::new(spec.def),
-            body: Box::new(result),
-        })
-        .with_ty(body_ty);
+    {
+        let _g = step(
+            "infer.mono_wrappers",
+            vec![original_let_id],
+            vec![original_let_id],
+            Nature::Expansion,
+        );
+        for spec in frame.specs.into_iter().rev() {
+            // The discharge only does work when the specialization binder is free
+            // in the body type's refinement predicates; skip cloning `spec.def`
+            // otherwise (it is still moved into the rebuilt `let` below).
+            let body_ty = if crate::ccl::subst::type_free_vars(&result.ty).contains(&spec.name) {
+                crate::ccl::subst::Subst::discharge(&spec.name, spec.def.clone())
+                    .apply_type(&result.ty)
+            } else {
+                result.ty.clone()
+            };
+            result = Expr::new(TypedExprNode::Let {
+                binding: TypedBinding {
+                    name: spec.name,
+                    ty: spec.def.ty.clone(),
+                    user_annotation: None,
+                },
+                bound_expr: Box::new(spec.def),
+                body: Box::new(result),
+            })
+            .with_ty(body_ty);
+        }
     }
     *expr = result;
     expr.user_annotation = saved_annotation;
@@ -1563,6 +1648,7 @@ fn refresh_lambda_param_slot(expr: &mut Expr) {
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
+    use super::collect_node_ids;
     use crate::ccl::infer::{int_lit_ty, str_lit_ty};
     use crate::ccl::{BaseType, Type, TypedExpr, TypedExprNode};
 
@@ -1715,6 +1801,78 @@ mod tests {
             used_names.len(),
             3,
             "a literal argument mints its own specialization, so none collapse"
+        );
+    }
+
+    /// Collect every node's `NodeId` reachable from `expr` (main tree +
+    /// type-borne refinement-predicate nodes), mirroring
+    /// `uniquify::collect_node_ids` so the multiset matches what the inspector
+    /// would index.
+    /// Monomorphization freshens every cloned node's `NodeId` and records its
+    /// lineage. Checks this directly at the inference seam: after `id` is
+    /// specialized at two distinct types, (a) every node in the inferred tree
+    /// has a *unique* id — clones never collide on the original definition's
+    /// ids — and (b) the mono lineage log carries `Copy` steps (the freshened
+    /// clones) whose produced ids are all distinct (one per cloned node).
+    #[test]
+    fn monomorphization_freshens_node_ids_and_records_lineage() {
+        use crate::ccl::infer::TypeInferenceContext;
+        use crate::ccl::lineage::{Op, RecorderSession};
+        use crate::ccl::provenance::NodeId;
+        use std::collections::HashSet;
+
+        // let id = λx. x in (id 1, id "a")  →  two specializations of `id`.
+        let id = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("x"));
+        let body = TypedExpr::new(TypedExprNode::Tuple(vec![
+            TypedExpr::apply(lit_int(1), TypedExpr::var("id")),
+            TypedExpr::apply(lit_string("a"), TypedExpr::var("id")),
+        ]));
+        let mut e = TypedExpr::let_bind("id", id, body);
+
+        // Install a session so the mono steps flush into a drainable log (this
+        // is what `compile_program` does around the whole infer boundary).
+        let session = RecorderSession::new();
+        let mut ctx = TypeInferenceContext::new();
+        crate::ccl::infer::infer(&mut e, &mut ctx).expect("type-checks");
+        let log = session.into_log();
+
+        // (b) The mono lineage recorded `Copy` steps for the freshened clones,
+        // and every produced clone id is minted exactly once (no collisions).
+        let produced: Vec<NodeId> = log
+            .iter()
+            .filter_map(|s| match &s.op {
+                Op::Copy { produced, .. } => Some(produced.iter().copied()),
+                Op::Transform { .. } => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !produced.is_empty(),
+            "monomorphization must record clone Copy steps"
+        );
+        let produced_set: HashSet<_> = produced.iter().copied().collect();
+        assert_eq!(
+            produced.len(),
+            produced_set.len(),
+            "every fresh clone id is minted exactly once (no collisions)"
+        );
+
+        // (a) No id collides anywhere in the inferred tree: without freshening,
+        // the two `id` specializations would share the definition's ids and the
+        // multiset would have duplicates.
+        //
+        // Enumerated over the `walk_children` domain, which *is* the id domain.
+        // Predicate-embedded ids are deliberately excluded: they are outside the
+        // domain and specializations legitimately alias them, because freshening
+        // them would split the predicate `Rc` sharing planning's compile memo
+        // depends on (see `freshen_clone_node_ids`).
+        let mut ids = Vec::new();
+        collect_node_ids(&e, &mut ids);
+        let unique: HashSet<_> = ids.iter().copied().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "every node in the specialized tree has a unique NodeId"
         );
     }
 
