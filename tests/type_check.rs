@@ -200,7 +200,7 @@ fn test_conditional_collection_forms_coproduct() {
     // meet-domain function). `[1, 2]` is `[0, 1] ⤇ Int`, `[1, 2, 3]` is
     // `[0, 2] ⤇ Int`, so the join is the `Index`-tagged sum
     // `([0, 1] ⤇ Int) | ([0, 2] ⤇ Int)` — a plain sum, not a dependent sum
-    // (a finite branch set needs no witness; see collections.md).
+    // (a finite branch set needs no witness; see type-inference.md Â§4.6).
     assert_eq!(
         infer_program("[1, 2] if True else [1, 2, 3]"),
         Type::extent_coproduct(vec![Type::UIntRange(2), Type::UIntRange(3)], None, int())

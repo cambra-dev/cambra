@@ -208,7 +208,7 @@ fn coalesce_compact_go(ct: &CompactType, polarity: bool) -> Result<Type, Coalesc
                     // (`Index`-tagged `Variant`) of data functions, one per
                     // candidate extent, sharing the joined codomain. A finite,
                     // static set of branches is a plain sum, not a dependent sum
-                    // (see collections.md); the value is one arm, tagged by
+                    // (see type-inference.md Â§4.6); the value is one arm, tagged by
                     // contribution order, matching the runtime value-`Case` gates.
                     //
                     // Materialization invariant: the choices are ground extents.
@@ -460,7 +460,7 @@ mod tests {
         // A `Data` fun slot carrying two distinct extents with a shared `Int`
         // codomain coalesces to the conditional-collection coproduct
         // `([0,1]⤇Int) | ([0,2]⤇Int)` — a plain (`Index`-tagged) sum of data
-        // functions, one per extent (see collections.md; not a dependent sum).
+        // functions, one per extent (see type-inference.md Â§4.6; not a dependent sum).
         let graph = CompactGraph {
             term: CompactType {
                 fun: Some(CompactFun {

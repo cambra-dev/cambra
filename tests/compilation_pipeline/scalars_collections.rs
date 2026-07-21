@@ -216,7 +216,7 @@ fn test_tuples(#[case] code: &str, #[case] expected: Value) {
 
 /// A control-flow join of two differently-sized collections types as a
 /// **coproduct** over both extents (an `Index`-tagged `Variant` of data
-/// functions — `Type::extent_coproduct`; see collections.md). This lays only
+/// functions — `Type::extent_coproduct`; see type-inference.md Â§4.6). This lays only
 /// the *type-level* coproduct (formation + the `Variant <: Fun` consume rule,
 /// so it can be consumed at the type level); *compiling* it — the value-`Case`
 /// fan-out that eliminates it into a union of restricts — lands with

@@ -439,7 +439,7 @@ fn constrain_go(
         // `Fun(Data) <: Variant`, the consume `Variant <: Fun`, and the
         // width `Variant <: Variant` — lives with the other `Variant` arms
         // below; a finite conditional collection is a plain coproduct, not a
-        // dependent sum. See `Type::extent_coproduct` and collections.md.)
+        // dependent sum. See `Type::extent_coproduct` and type-inference.md Â§4.6.)
 
         // Tuple: positional width-subtyping. A longer/equal tuple is a
         // subtype, so every position rhs requires must exist in lhs.
@@ -2147,7 +2147,7 @@ mod tests {
         drop(arena);
     }
 
-    // --- Conditional-collection coproduct subtyping (collections.md) ---
+    // --- Conditional-collection coproduct subtyping (type-inference.md Â§4.6) ---
 
     fn coproduct(extents: Vec<Type>) -> Type {
         Type::extent_coproduct(extents, None, prim(BaseType::Int))

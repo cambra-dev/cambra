@@ -429,7 +429,7 @@ pub enum Type {
     // is a plain coproduct, an `Index`-tagged [`Type::Variant`] of data
     // functions built by [`Type::extent_coproduct`]. A finite, static set of
     // branches needs no dependent sum (a finite Σ degenerates to a coproduct);
-    // see `src/ccl/design/collections.md`. A genuine dependent `Σ` (over a
+    // see `src/ccl/design/type-inference.md`. A genuine dependent `Σ` (over a
     // runtime/opaque witness — `List` length, `Map` key extent) will be added
     // with the collections work, where the witness is real.
 }
@@ -644,7 +644,7 @@ impl Type {
     ///
     /// This is a plain sum type, **not** a dependent sum — a finite, static set
     /// of branches needs no witness (a finite `Σ` degenerates to a coproduct);
-    /// see [collections.md](../ccl/design/collections.md). Callers guarantee
+    /// see [type-inference.md](../ccl/design/type-inference.md). Callers guarantee
     /// `choices.len() >= 2` (a single extent is a plain data function); the
     /// arms share `pi_name` (the element binder) and `codomain`.
     pub fn extent_coproduct(

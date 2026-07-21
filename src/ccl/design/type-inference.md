@@ -632,7 +632,7 @@ collections work.
 
 For each `Branch { guard, body }`: the guard is constrained to `Type::Base(BaseType::Bool)`; body types across all branches are unified. The overall `Case` type is the unified body type. A 0-branch `Case` is a malformed AST (lowering never produces one) and returns `InferError::EmptyCase`.
 
-The in-flight conditionals stack replaces the arm unification with a genuine lattice join (fresh result variable + per-arm `require_sub`) — see [§4.6](#46-data-vs-compute-functions-and-σ-extent-joins); the strict-equality behavior above is current until that PR lands.
+The in-flight conditionals stack replaces the arm unification with a genuine lattice join (fresh result variable + per-arm `require_sub`) — see [§4.6](#46-data-vs-compute-functions-and-coproduct-extent-joins); the strict-equality behavior above is current until that PR lands.
 
 ### Record literals and field access
 
