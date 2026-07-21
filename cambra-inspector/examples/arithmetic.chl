@@ -1,0 +1,6 @@
+# Let-bindings + arithmetic. A simple post-inference tree:
+# Lit nodes carry ": Int", BinOp nodes show operator dispatch.
+g = 10
+def f(p, q):
+  p + q + g
+f(1, 2)
