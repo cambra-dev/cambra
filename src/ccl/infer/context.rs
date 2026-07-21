@@ -96,6 +96,13 @@ pub(super) struct InferCtx {
     /// sharing it carries none of the context-dependence that makes sharing
     /// delicate elsewhere.
     lit_singletons: HashMap<Lit, Rc<TypedExpr>>,
+    /// The `NodeId` of the node currently being emitted, maintained by the
+    /// [`emit_node`](super::emit::emit_node) wrapper: set on entry, *restored
+    /// only on success* so that on the fail-fast error path it is left pointing
+    /// at the innermost node that failed. This is provenance metadata for
+    /// diagnostics, surfaced to the `compile_program` boundary via the public
+    /// `infer`'s side-channel — it never influences inference itself.
+    pub(super) current_node_id: Option<crate::ccl::provenance::NodeId>,
 }
 
 impl InferCtx {
@@ -108,6 +115,7 @@ impl InferCtx {
             level: 0,
             pred_memo: Default::default(),
             lit_singletons: HashMap::new(),
+            current_node_id: None,
         }
     }
 

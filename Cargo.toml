@@ -25,6 +25,11 @@ test-helpers = []
 # Enable when bisecting a miscompile: `cargo test --features deep-typecheck`.
 deep-typecheck = []
 
+# Optional, default-OFF. Enables `Serialize`/`Deserialize` derives on the
+# inspector wire types (added in I3 via `#[cfg_attr(feature = "serde", ...)]`).
+# `cambra-inspector` turns this on; plain `cambra` builds compile zero serde.
+serde = ["dep:serde"]
+
 [dev-dependencies]
 microbench = "0.5.0"
 rstest = { version = "0.26.1", features = ["async-timeout"] }
@@ -45,6 +50,10 @@ bit-vec = "0.8.0"
 intervalsets = "0.1.0-alpha.2"
 smol_str = "0.3.6"
 stacker = "0.1"
+# Optional: gated behind the `serde` feature (default off). The inspector wire
+# types derive `Serialize` only when `cambra-inspector` enables it. serde_json
+# (the transport-edge (de)serializer) lives in `cambra-inspector`, not here.
+serde = { version = "1", features = ["derive"], optional = true }
 
 [profile.release]
 debug = "line-tables-only"

@@ -64,6 +64,7 @@ pub(super) fn lower_list_comp(
     // that body and predicate expressions can reference it.
     let mut gen_sources: Vec<Expr> = Vec::new();
     let mut gen_iter_vars: Vec<String> = Vec::new();
+    let mut gen_spans: Vec<Span> = Vec::new();
 
     for (target, iter, _) in generators.iter() {
         // Mint binder uids inside the source *now*, before Phase 5/6 clone it
@@ -76,6 +77,7 @@ pub(super) fn lower_list_comp(
         let var_name = extract_name_target(target, "comprehension target")?;
         gen_iter_vars.push(var_name);
         gen_sources.push(source);
+        gen_spans.push(iter.span);
     }
 
     // ---- Phase 2: Lower body and all predicates to CCL -------------------------
@@ -126,7 +128,9 @@ pub(super) fn lower_list_comp(
     let single_gen = generators.len() == 1;
     let outer_var = "__iter_record";
 
-    // Helper: build the index argument for generator `i`.
+    // Helper: build the index argument for generator `i` — untagged, for the
+    // Phase-6 loop-join predicate chain only (predicate-position nodes live in
+    // a type slot outside the `walk_children` domain and stay unseeded).
     // Single-gen: a bare VarRef to the outer variable.
     // Multi-gen: a RecordField projection of the i-th field from the outer record.
     let make_idx_arg = |var: Name, i: usize| -> Expr {
@@ -141,6 +145,9 @@ pub(super) fn lower_list_comp(
     // ---- Phase 5: Build the body as a nested Apply/Lambda chain ------------------
     // Working innermost-first (reverse order) we wrap the accumulated expression:
     //   body = Apply(Lambda(iter_var_i, body), Apply(source_i, idx_arg_i))
+    // All chain plumbing is manufactured encoding of the comprehension rule,
+    // spanned to its generator's iterable.
+    let lc = "lower.comprehension";
     let mut body_expr: Expr = body;
     for (i, (iter_var, source)) in gen_iter_vars
         .iter()
@@ -148,10 +155,17 @@ pub(super) fn lower_list_comp(
         .enumerate()
         .rev()
     {
-        body_expr = Expr::apply(
-            Expr::apply(make_idx_arg(Name::raw(outer_var), i), source),
-            Expr::lambda(iter_var, Type::Hole, body_expr),
-        );
+        let gspan = gen_spans[i];
+        let idx_arg = if single_gen {
+            ctx.tag_machinery(Expr::var(Name::raw(outer_var)), gspan, lc)
+        } else {
+            let vref = ctx.tag_machinery(Expr::var(Name::raw(outer_var)), gspan, lc);
+            let proj = ctx.tag_machinery(Expr::proj_index(i), gspan, lc);
+            ctx.tag_machinery(Expr::apply(vref, proj), gspan, lc)
+        };
+        let indexed_source = ctx.tag_machinery(Expr::apply(idx_arg, source), gspan, lc);
+        let per_elem = ctx.tag_machinery(Expr::lambda(iter_var, Type::Hole, body_expr), gspan, lc);
+        body_expr = ctx.tag_machinery(Expr::apply(indexed_source, per_elem), gspan, lc);
     }
 
     // ---- Phase 6: Attach restriction ----------
@@ -178,11 +192,23 @@ pub(super) fn lower_list_comp(
         // Cast Apply arm in `infer::emit` constructs the refined result
         // from it, and the generic annotation handler infers the predicate's
         // sub-expressions.
-        let unrefined_lambda = Expr::lambda(outer_var, Type::Hole, body_expr);
+        // The outer lambda and its cast wrapper are chain plumbing too;
+        // whichever of them is the comprehension's root is re-tagged as the
+        // expression's direct image by `lower_expr`.
+        let element_span = comp.element.span;
+        let unrefined_lambda = ctx.tag_machinery(
+            Expr::lambda(outer_var, Type::Hole, body_expr),
+            element_span,
+            lc,
+        );
         let target_ty = refined_fn_type(Type::Hole, pred_expr, Type::Hole);
-        Ok(make_cast(unrefined_lambda, target_ty))
+        Ok(ctx.tag_machinery(make_cast(unrefined_lambda, target_ty), element_span, lc))
     } else {
-        Ok(Expr::lambda(outer_var, Type::Hole, body_expr))
+        Ok(ctx.tag_machinery(
+            Expr::lambda(outer_var, Type::Hole, body_expr),
+            comp.element.span,
+            lc,
+        ))
     }
 }
 

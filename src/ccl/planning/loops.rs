@@ -17,6 +17,7 @@ use crate::ccl::{
     ccl_utils::{count_free, strip_refinements},
     letrec::check_letrec_causal,
     mut_elim::{binding, fun_parts, let_in, tvar},
+    provenance::NodeId,
     symbolic::symbolic,
 };
 
@@ -487,6 +488,7 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
         },
         ty,
         user_annotation: None,
+        node_id: NodeId::fresh(),
     }
 }
 
@@ -668,6 +670,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         },
         ty,
         user_annotation: None,
+        node_id: NodeId::fresh(),
     }
 }
 

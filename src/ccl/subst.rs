@@ -55,6 +55,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, is_free};
+use crate::ccl::provenance::NodeId;
 use crate::ccl::{Branch, Name, PredicateId, Type, TypedExpr, TypedExprNode};
 
 /// A term binder name.
@@ -498,6 +499,7 @@ impl Subst {
             }
         };
         TypedExpr {
+            node_id: NodeId::fresh(),
             node,
             ty: self.apply_type(&e.ty),
             user_annotation: e.user_annotation.as_ref().map(|t| self.apply_type(t)),
@@ -567,7 +569,24 @@ impl Subst {
         if let TypedExprNode::Var(n) = &e.node
             && let Some(repl) = self.0.get(n)
         {
+            // The occurrence's own id is distinct per occurrence; capture it
+            // before the overwrite so it can be carried onto the replacement.
+            let occurrence_id = e.node_id;
             *e = repl.as_expr();
+            // Root-carry: carry the occurrence's own id onto the replacement
+            // ROOT — a *preserve*, so the root inherits the occurrence's
+            // span/attribution (the use-site), unique per occurrence by
+            // construction.
+            e.node_id = occurrence_id;
+            if !matches!(e.node, TypedExprNode::Var(_)) {
+                // Compound replacement: `as_expr` bare-`clone()`s the whole
+                // subtree, sharing the source's NodeIds. Freshen only the
+                // INTERIOR (children + type slots) — the root keeps the carried
+                // id. Freshening the root too would leave a `Copy` naming a dead
+                // id (the fold would flag it as a leak). Each interior re-mint
+                // fires the ambient `on_copy` lineage hook into any open step.
+                e.freshen_interior_node_ids();
+            }
             return;
         }
         // *Every* type slot the node carries, not just `ty` and the annotation: a

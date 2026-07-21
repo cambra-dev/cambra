@@ -117,6 +117,7 @@ pub(super) fn lower_generator_for(
     iter: &Spanned<ChlExpr>,
     body: &[Spanned<ChlStmt>],
     outer_bindings: &HashSet<String>,
+    for_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let iter_var = extract_name_target(target, "for-loop target")?;
@@ -135,20 +136,22 @@ pub(super) fn lower_generator_for(
             // The generator's defer is bound around the loop and used as the
             // continuation — same shape as the plain yield-only path below.
             let defer_name = ctx.fresh_result_name();
+            let continuation = ctx.tag_machinery(
+                Expr::var(defer_name.clone()),
+                for_span,
+                "lower.generator_defer",
+            );
             let inner = lower_direct_mirror_loop(
                 target,
                 iter,
                 body,
                 &acc_names,
-                Expr::var(defer_name.clone()),
+                continuation,
                 Some(&defer_name),
+                for_span,
                 ctx,
             )?;
-            return Ok(Expr::let_bind(
-                defer_name,
-                Expr::new(TypedExprNode::Defer),
-                inner,
-            ));
+            return Ok(generator_defer_binding(defer_name, inner, for_span, ctx));
         }
 
         let source = lower_expr(iter, ctx)?;
@@ -165,13 +168,18 @@ pub(super) fn lower_generator_for(
                 ctx,
             )
         })?;
-        let for_node = Expr::for_loop(iter_var, source, for_body);
-        let seq = Expr::expr_stmt(for_node, Expr::var(defer_name.clone()));
-        Ok(Expr::let_bind(
-            defer_name,
-            Expr::new(TypedExprNode::Defer),
-            seq,
-        ))
+        let for_node = tagged_for_loop(iter_var, source, for_body, for_span, ctx);
+        let handle = ctx.tag_machinery(
+            Expr::var(defer_name.clone()),
+            for_span,
+            "lower.generator_defer",
+        );
+        let seq = ctx.tag_machinery(
+            Expr::expr_stmt(for_node, handle),
+            for_span,
+            "lower.generator_defer",
+        );
+        Ok(generator_defer_binding(defer_name, seq, for_span, ctx))
     } else {
         let source = lower_expr(iter, ctx)?;
         let frame_introduced = HashSet::from([iter_var.clone()]);
@@ -179,8 +187,43 @@ pub(super) fn lower_generator_for(
         let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
             lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)
         })?;
-        Ok(Expr::for_loop(iter_var, source, for_body))
+        Ok(tagged_for_loop(iter_var, source, for_body, for_span, ctx))
     }
+}
+
+/// Build the `Compose([source, Lambda(iter_var, body)])` loop encoding (the
+/// shape of [`Expr::for_loop`]), tagging **both** minted nodes — the `Compose`
+/// and the interior `Lambda` — as the for statement's direct image.
+fn tagged_for_loop(
+    iter_var: String,
+    source: Expr,
+    body: Expr,
+    for_span: Span,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    let lambda = ctx.tag_source(Expr::lambda(iter_var, Type::Hole, body), for_span);
+    ctx.tag_source(Expr::compose(vec![source, lambda]), for_span)
+}
+
+/// Wrap a generator's lowered loop in its synthesized defer binding,
+/// `let <defer_name> = Defer in <inner>` — manufactured wiring of the
+/// yield-desugaring rule.
+fn generator_defer_binding(
+    defer_name: String,
+    inner: Expr,
+    for_span: Span,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    let defer = ctx.tag_machinery(
+        Expr::new(TypedExprNode::Defer),
+        for_span,
+        "lower.generator_defer",
+    );
+    ctx.tag_machinery(
+        Expr::let_bind(defer_name, defer, inner),
+        for_span,
+        "lower.generator_defer",
+    )
 }
 
 /// Lower the body statements of a `for`-loop to a single CCL expression.
@@ -231,7 +274,9 @@ fn lower_for_body_stmts(
     );
     let (last, rest) = stmts.split_last().unwrap();
 
-    let mut bindings: Vec<(String, Expr, Option<Type>)> = Vec::new();
+    // Each binding carries its statement's span so the `Let` folded around the
+    // terminal below can be tagged as that statement's direct image.
+    let mut bindings: Vec<(String, Expr, Option<Type>, Span)> = Vec::new();
 
     for stmt in rest {
         match &stmt.node {
@@ -242,7 +287,7 @@ fn lower_for_body_stmts(
                 }
                 let val = lower_expr(value, ctx)?;
                 frame_introduced.insert(name.clone());
-                bindings.push((name, val, None));
+                bindings.push((name, val, None, stmt.span));
             }
             ChlStmt::AnnAssign {
                 target,
@@ -263,7 +308,7 @@ fn lower_for_body_stmts(
                 let ann = lower_type_annotation(annotation)?;
                 let val = lower_expr(value, ctx)?;
                 frame_introduced.insert(name.clone());
-                bindings.push((name, val, Some(ann)));
+                bindings.push((name, val, Some(ann), stmt.span));
             }
             ChlStmt::AugAssign { target, op, value } => {
                 let name = extract_name_target(target, "augmented assignment")?;
@@ -281,8 +326,8 @@ fn lower_for_body_stmts(
                         ),
                     ));
                 }
-                let val = lower_aug_binop(&name, *op, value, ctx)?;
-                bindings.push((name, val, None));
+                let val = lower_aug_binop(&name, *op, value, stmt.span, ctx)?;
+                bindings.push((name, val, None, stmt.span));
             }
             ChlStmt::Define { .. } => {
                 return Err(LoweringError::unsupported(
@@ -302,7 +347,7 @@ fn lower_for_body_stmts(
                 }
                 let func_expr = lower_function_body(stmt.span, params, fn_body, ctx)?;
                 frame_introduced.insert(name_str.clone());
-                bindings.push((name_str, func_expr, None));
+                bindings.push((name_str, func_expr, None, stmt.span));
             }
             // A `with begin():` transaction inside a *generator* loop body is a
             // later increment; top-level and simple `for … with begin():` loops
@@ -327,13 +372,17 @@ fn lower_for_body_stmts(
     let terminal =
         lower_for_body_terminal(last, defer_name, mutation_scope, &frame_introduced, ctx)?;
 
-    // Fold let-bindings around the terminal from outermost to innermost.
+    // Fold let-bindings around the terminal from outermost to innermost; each
+    // `Let` images its binding statement.
     Ok(bindings
         .into_iter()
         .rev()
-        .fold(terminal, |body, (name, val, ann)| match ann {
-            Some(a) => Expr::let_bind_annotated(name, val, body, a),
-            None => Expr::let_bind(name, val, body),
+        .fold(terminal, |body, (name, val, ann, span)| {
+            let let_expr = match ann {
+                Some(a) => Expr::let_bind_annotated(name, val, body, a),
+                None => Expr::let_bind(name, val, body),
+            };
+            ctx.tag_source(let_expr, span)
         }))
 }
 
@@ -363,14 +412,18 @@ fn lower_for_body_terminal(
                         "yield outside a generator for-loop context",
                     )
                 })?;
-                Ok(Expr::feed(name.to_string(), lower_expr(y, ctx)?))
+                let feed = Expr::feed(name.to_string(), lower_expr(y, ctx)?);
+                Ok(ctx.tag_source(feed, stmt.span))
             }
             // `r << e` — direct feed into a named defer handle.
             // Note: when inside a yield-bearing generator (defer_name is Some),
             // `r` is not validated to equal defer_name; a mismatch would
             // type-check via inference but could produce confusing behaviour.
             // A future improvement could add a lowering-time error here.
-            ChlExpr::Feed { target, value } => lower_feed(target, value, ctx),
+            ChlExpr::Feed { target, value: v } => {
+                let feed = lower_feed(target, v, ctx)?;
+                Ok(ctx.tag_source(feed, value.span))
+            }
             _ => Err(LoweringError::unsupported(
                 value.span,
                 "for-loop body must end in a yield, `<<` feed, nested for, \
@@ -412,15 +465,24 @@ fn lower_for_body_terminal(
                     body: arm,
                 });
             }
+            // The guard-less fallthrough arm (`true → Unit`) is manufactured
+            // encoding; the `Case` itself images the `if` statement.
             out_branches.push(Branch {
                 pattern: None,
-                guard: Expr::lit(Lit::Bool(true)),
-                body: Expr::lit(Lit::Unit),
+                guard: ctx.tag_machinery(
+                    Expr::lit(Lit::Bool(true)),
+                    stmt.span,
+                    "lower.guard_fallthrough",
+                ),
+                body: ctx.tag_machinery(Expr::lit(Lit::Unit), stmt.span, "lower.guard_fallthrough"),
             });
-            Ok(Expr::new(TypedExprNode::Case {
-                scrutinee: None,
-                branches: out_branches,
-            }))
+            Ok(ctx.tag_source(
+                Expr::new(TypedExprNode::Case {
+                    scrutinee: None,
+                    branches: out_branches,
+                }),
+                stmt.span,
+            ))
         }
         ChlStmt::For { target, iter, body } => {
             let inner_var = extract_name_target(target, "for-loop target")?;
@@ -434,7 +496,13 @@ fn lower_for_body_terminal(
             let inner_body = ctx.with_shadowed([inner_var.clone()], |ctx| {
                 lower_for_body_stmts(body, defer_name, &inner_mutation_scope, inner_frame, ctx)
             })?;
-            Ok(Expr::for_loop(inner_var, inner_source, inner_body))
+            Ok(tagged_for_loop(
+                inner_var,
+                inner_source,
+                inner_body,
+                stmt.span,
+                ctx,
+            ))
         }
         // A `with begin():` transaction as a *generator* loop-body terminal is a
         // later increment; top-level and simple `for … with begin():` loops are
@@ -592,6 +660,7 @@ pub(super) fn find_nested_mutation_var(
 ///
 /// `yield_defer` names the synthesised generator defer a `yield` feeds; a
 /// `yield` with no `yield_defer` in scope is an error.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_direct_mirror_loop(
     target: &Spanned<AssignTarget>,
     iter: &Spanned<ChlExpr>,
@@ -599,6 +668,7 @@ pub(super) fn lower_direct_mirror_loop(
     acc_names: &[String],
     continuation: Expr,
     yield_defer: Option<&str>,
+    for_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let iter_var = extract_name_target(target, "for-loop target")?;
@@ -609,7 +679,7 @@ pub(super) fn lower_direct_mirror_loop(
     // body — shadow it so a body read of a like-named transactional register is
     // read as the loop local, not gated as an out-of-block register read.
     let chain = ctx.with_shadowed([iter_var.clone()], |ctx| {
-        let mut chain = Expr::lit(Lit::Unit);
+        let mut chain = ctx.tag_machinery(Expr::lit(Lit::Unit), for_span, "lower.loop_unit");
         for stmt in body_stmts.iter().rev() {
             chain = match &stmt.node {
                 // `x = value` — a plain immutable binding. Inside a loop body it
@@ -620,16 +690,17 @@ pub(super) fn lower_direct_mirror_loop(
                     let name = extract_name_target(target, "assignment")?;
                     check_mut_write_context(&name, stmt.span, ctx)?;
                     let val = lower_expr(value, ctx)?;
-                    Expr::let_bind(name, val, chain)
+                    ctx.tag_source(Expr::let_bind(name, val, chain), stmt.span)
                 }
                 ChlStmt::AugAssign { target, op, value } => {
                     let name = extract_name_target(target, "augmented assignment")?;
                     check_mut_write_context(&name, stmt.span, ctx)?;
-                    let val = lower_aug_binop(&name, *op, value, ctx)?;
+                    let val = lower_aug_binop(&name, *op, value, stmt.span, ctx)?;
                     if acc_names.contains(&name) {
-                        Expr::expr_stmt(Expr::mut_write(name, val), chain)
+                        let write = ctx.tag_source(Expr::mut_write(name, val), stmt.span);
+                        ctx.tag_source(Expr::expr_stmt(write, chain), stmt.span)
                     } else {
-                        Expr::let_bind(name, val, chain)
+                        ctx.tag_source(Expr::let_bind(name, val, chain), stmt.span)
                     }
                 }
                 // `x := value` — a mutable write inside the loop body. A write to
@@ -654,9 +725,10 @@ pub(super) fn lower_direct_mirror_loop(
                     check_mut_write_context(&name, stmt.span, ctx)?;
                     let val = lower_expr(value, ctx)?;
                     if acc_names.contains(&name) {
-                        Expr::expr_stmt(Expr::mut_write(name, val), chain)
+                        let write = ctx.tag_source(Expr::mut_write(name, val), stmt.span);
+                        ctx.tag_source(Expr::expr_stmt(write, chain), stmt.span)
                     } else {
-                        Expr::let_bind(name, val, chain)
+                        ctx.tag_source(Expr::let_bind(name, val, chain), stmt.span)
                     }
                 }
                 // `y: T = value` — an ordinary annotated per-iteration local, the
@@ -679,7 +751,7 @@ pub(super) fn lower_direct_mirror_loop(
                     }
                     let ann = lower_type_annotation(annotation)?;
                     let val = lower_expr(value, ctx)?;
-                    Expr::let_bind_annotated(name, val, chain, ann)
+                    ctx.tag_source(Expr::let_bind_annotated(name, val, chain, ann), stmt.span)
                 }
                 // `o << value` — an in-loop feed. Emitted as a raw `Feed` marker
                 // (reads stay bare); the phase resolves its value in the
@@ -700,7 +772,8 @@ pub(super) fn lower_direct_mirror_loop(
                         }
                     };
                     let lowered = lower_expr(feed_value, ctx)?;
-                    Expr::expr_stmt(Expr::feed(defer_name, lowered), chain)
+                    let feed = ctx.tag_source(Expr::feed(defer_name, lowered), value.span);
+                    ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")
                 }
                 // `yield value` — a feed into the surrounding generator's defer.
                 ChlStmt::Expr(value) if let ChlExpr::Yield(y) = &value.node => {
@@ -711,7 +784,9 @@ pub(super) fn lower_direct_mirror_loop(
                         )
                     })?;
                     let lowered = lower_expr(y, ctx)?;
-                    Expr::expr_stmt(Expr::feed(defer_name.to_string(), lowered), chain)
+                    let feed =
+                        ctx.tag_source(Expr::feed(defer_name.to_string(), lowered), value.span);
+                    ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")
                 }
                 // A bare expression statement — the `Feed`/`Yield` guards above
                 // did not match, so this is an ordinary side-effect (e.g. a call
@@ -721,7 +796,7 @@ pub(super) fn lower_direct_mirror_loop(
                 // out pure (the phase drops the loop as a no-op).
                 ChlStmt::Expr(value) => {
                     let lowered = lower_expr(value, ctx)?;
-                    Expr::expr_stmt(lowered, chain)
+                    ctx.tag_machinery(Expr::expr_stmt(lowered, chain), stmt.span, "lower.stmt_seq")
                 }
                 // `with begin(): <block>` — a per-iteration transaction, emitted
                 // as a `Begin` marker (one statement in the loop body). Its
@@ -732,7 +807,8 @@ pub(super) fn lower_direct_mirror_loop(
                 // recurrence — which is what lets one loop mix both.
                 ChlStmt::With { .. } => {
                     let block = lower_with_block(stmt, ctx)?;
-                    Expr::expr_stmt(Expr::begin(block), chain)
+                    let begin = ctx.tag_source(Expr::begin(block), stmt.span);
+                    ctx.tag_machinery(Expr::expr_stmt(begin, chain), stmt.span, "lower.stmt_seq")
                 }
                 _ => {
                     return Err(LoweringError::unsupported(
@@ -747,16 +823,25 @@ pub(super) fn lower_direct_mirror_loop(
         Ok::<Expr, LoweringError>(chain)
     })?;
 
-    let for_node = Expr::new(TypedExprNode::For {
-        target: TypedBinding {
-            name: iter_var.into(),
-            ty: Type::Hole,
-            user_annotation: None,
-        },
-        iter: Box::new(source),
-        body: Box::new(chain),
-    });
-    Ok(Expr::expr_stmt(for_node, continuation))
+    // The direct-mirror `For` images the for statement; the sequencing
+    // `ExprStmt` splicing it before the continuation is manufactured.
+    let for_node = ctx.tag_source(
+        Expr::new(TypedExprNode::For {
+            target: TypedBinding {
+                name: iter_var.into(),
+                ty: Type::Hole,
+                user_annotation: None,
+            },
+            iter: Box::new(source),
+            body: Box::new(chain),
+        }),
+        for_span,
+    );
+    Ok(ctx.tag_machinery(
+        Expr::expr_stmt(for_node, continuation),
+        for_span,
+        "lower.stmt_seq",
+    ))
 }
 
 /// Lower a mutation loop that feeds or yields, via the direct-mirror
@@ -771,6 +856,7 @@ pub(super) fn lower_generator_or_mutation_loop(
     body_stmts: &[Spanned<ChlStmt>],
     acc_names: &[String],
     continuation: Expr,
+    for_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if for_body_has_yield(body_stmts) {
@@ -782,15 +868,21 @@ pub(super) fn lower_generator_or_mutation_loop(
             acc_names,
             continuation,
             Some(&yield_defer),
+            for_span,
             ctx,
         )?;
-        Ok(Expr::let_bind(
-            yield_defer,
-            Expr::new(TypedExprNode::Defer),
-            inner,
-        ))
+        Ok(generator_defer_binding(yield_defer, inner, for_span, ctx))
     } else {
-        lower_direct_mirror_loop(target, iter, body_stmts, acc_names, continuation, None, ctx)
+        lower_direct_mirror_loop(
+            target,
+            iter,
+            body_stmts,
+            acc_names,
+            continuation,
+            None,
+            for_span,
+            ctx,
+        )
     }
 }
 

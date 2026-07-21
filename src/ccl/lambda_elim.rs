@@ -459,6 +459,7 @@ fn elim_lambda_impl(
             );
             let inner_pf = elim_lambdas(ctx, *value)?;
             let cast_val = TypedExpr {
+                node_id: crate::ccl::provenance::NodeId::fresh(),
                 node: TypedExprNode::Cast {
                     value: Box::new(inner_pf),
                     target,
@@ -723,6 +724,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         node,
         ty,
         user_annotation,
+        ..
     } = expr;
     // Only the debug-build invariant asserts below read `original_ty`.
     #[cfg(debug_assertions)]
@@ -866,6 +868,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         // List, ExprStmt, Feed, Define, and the atoms (no children to walk).
         node => {
             let mut expr = TypedExpr {
+                node_id: crate::ccl::provenance::NodeId::fresh(),
                 node,
                 ty,
                 user_annotation,

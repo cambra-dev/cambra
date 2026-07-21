@@ -23,7 +23,27 @@ use super::{product, variant_type};
 /// Walk one expression node, emit constraints for it, write its inferred
 /// `Type` onto `expr.ty`, and return that `Type`. Sub-expressions recurse;
 /// their `Type`s are stored on their own nodes the same way.
+///
+/// Thin wrapper over [`emit_node_inner`] that maintains
+/// [`InferCtx::current_node_id`](super::context::InferCtx): it
+/// records this node's id on entry and restores the previous id *only on
+/// success*. Inference is fail-fast, so on the error path the id is
+/// intentionally left pointing at the innermost node that failed — that is the
+/// node the diagnostic blames. All recursion (including the generic
+/// `Typing::subexpr` impl) routes through here, so every emitted node passes
+/// through this bookkeeping.
 pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, InferError> {
+    let prev = ctx.current_node_id.replace(expr.node_id());
+    let result = emit_node_inner(expr, ctx);
+    if result.is_ok() {
+        ctx.current_node_id = prev;
+    }
+    result
+}
+
+/// The body of [`emit_node`]: the actual per-node constraint emission. See the
+/// wrapper for the `current_node_id` bookkeeping.
+fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, InferError> {
     // Compute the label before the mutable borrow so Case can pass it to emit_case.
     let label = symbolic(expr);
     let ty = match &mut expr.node {

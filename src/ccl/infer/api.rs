@@ -146,6 +146,17 @@ pub struct TypeInferenceContext {
 
     /// Types of known externally-registered data sources.
     pub(crate) source_types: HashMap<String, Type>,
+
+    /// Node ids for the inference errors returned by the last [`infer`] run,
+    /// aligned **positionally** with the returned `Vec<InferError>` (entry `i`
+    /// is the blame node for error `i`, `None` when unknown). Inference stays
+    /// ignorant of the source projection; it only surfaces these ids, and
+    /// `compile_program` drains them via
+    /// [`take_infer_error_nodes`](Self::take_infer_error_nodes) to resolve each
+    /// to a source span (against the `lowering_projection`) while it is in scope. This
+    /// is the side-channel that lets the public [`infer`] keep its
+    /// location-free `Result<Type, Vec<InferError>>` signature unchanged.
+    infer_error_nodes: Vec<Option<crate::ccl::provenance::NodeId>>,
 }
 
 /// RAII guard returned by [`TypeInferenceContext::enter_scope`].
@@ -197,6 +208,15 @@ impl TypeInferenceContext {
     /// is registered; the type is a `Fun(DataSource(name), output_type)`.
     pub fn register_source_type(&mut self, name: &str, ty: Type) {
         self.source_types.insert(name.to_string(), ty);
+    }
+
+    /// Drain the per-error blame node ids accumulated by the most recent
+    /// failing [`infer`] run. See
+    /// [`infer_error_nodes`](TypeInferenceContext::infer_error_nodes); the
+    /// returned `Vec` is aligned positionally with the `Vec<InferError>` that
+    /// `infer` returned, and `compile_program` zips the two to resolve spans.
+    pub fn take_infer_error_nodes(&mut self) -> Vec<Option<crate::ccl::provenance::NodeId>> {
+        std::mem::take(&mut self.infer_error_nodes)
     }
 
     /// Look up the CCL type for a registered source by name.
@@ -362,6 +382,25 @@ pub enum InferError {
     },
 }
 
+/// An [`InferError`] paired with the [`NodeId`](crate::ccl::provenance::NodeId)
+/// of the expression it was emitted at, when known.
+///
+/// The location is *provenance metadata*, not part of the error's identity:
+/// `InferError` itself stays location-free (and `PartialEq`, as the inference
+/// tests require). The inner [`infer::run`](crate::ccl::infer::run)
+/// produces these so the `compile_program` boundary can resolve each id to a
+/// source [`Span`](crate::chl_parser::ast::Span) via the `lowering_projection`
+/// while it is still in scope. Only the fail-fast pass-1 emit site carries a
+/// real id; coalesce/scope-check errors use `node_id: None`, which renders as
+/// graceful plain text.
+pub struct LocatedInferError {
+    /// The underlying inference error.
+    pub error: InferError,
+    /// The node the error was emitted at, or `None` when no precise node is
+    /// known (coalesce / scope-validity errors).
+    pub node_id: Option<crate::ccl::provenance::NodeId>,
+}
+
 impl std::fmt::Debug for InferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -499,7 +538,20 @@ pub fn infer(expr: &mut Expr, ctx: &mut TypeInferenceContext) -> Result<Type, Ve
     // variable's bounds, breaking the `Rc` cycles that would otherwise leak
     // the whole variable graph. See [`InferArena`].
     let _arena = InferArena::new();
-    super::run(expr, &ctx.source_types)
+    // Match on the inner result so we can split a `LocatedInferError`'s span
+    // metadata off into the side-channel, keeping this signature
+    // location-free. `_arena` drops on both arms (and any earlier `?` — there
+    // are none here), so the variable-graph teardown still happens.
+    match super::run(expr, &ctx.source_types) {
+        Ok(ty) => Ok(ty),
+        Err(located) => {
+            // Stash the blame node ids (positionally aligned with the errors)
+            // for `compile_program` to resolve to spans, then hand back the
+            // bare `Vec<InferError>` the public contract promises.
+            ctx.infer_error_nodes = located.iter().map(|le| le.node_id).collect();
+            Err(located.into_iter().map(|le| le.error).collect())
+        }
+    }
 }
 
 /// How the annotation checks treat inference-transient type variants.

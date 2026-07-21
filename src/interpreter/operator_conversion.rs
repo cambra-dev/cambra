@@ -1970,11 +1970,7 @@ mod variant_ctor_tests {
 
     /// Build a fully-typed leaf `TypedExpr`.
     fn typed(node: TypedExprNode, ty: Type) -> TypedExpr {
-        TypedExpr {
-            node,
-            ty,
-            user_annotation: None,
-        }
+        TypedExpr::new(node).with_ty(ty)
     }
 
     /// A `[Commit(Int), Abort(Unit)]` variant type — the shape the transaction

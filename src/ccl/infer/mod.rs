@@ -294,7 +294,7 @@ pub(crate) fn bool_lit_ty(b: bool) -> Type {
 pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
-) -> Result<Type, Vec<InferError>> {
+) -> Result<Type, Vec<LocatedInferError>> {
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
         let pre = InferCtx::new(HashMap::new());
@@ -305,8 +305,16 @@ pub(crate) fn run(
         InferCtx::new(translated)
     };
 
-    // Pass 1: emit constraints.
-    emit_node(expr, &mut sub_ctx).map_err(|e| vec![e])?;
+    // Pass 1: emit constraints. On the fail-fast error, `current_node_id` is
+    // left pointing at the innermost node that failed — the diagnostic blame
+    // node. The high-value variants (`UnboundVariable`/`TypeMismatch`/
+    // `ExpectedFunction`) all originate here.
+    emit_node(expr, &mut sub_ctx).map_err(|e| {
+        vec![LocatedInferError {
+            error: e,
+            node_id: sub_ctx.current_node_id,
+        }]
+    })?;
 
     // Pass 2: resolve each node's inference variables in place into expr.ty,
     // fill the binder slots that aren't any node's expr.ty (the `Let` binding
@@ -320,7 +328,15 @@ pub(crate) fn run(
     // state, so nothing needs to be kept in sync across them.
     let errors = coalesce_pass(expr);
     if !errors.is_empty() {
-        return Err(errors);
+        // Coalesce errors are not attributed to a single emit node; render
+        // gracefully as plain text (`node_id: None`).
+        return Err(errors
+            .into_iter()
+            .map(|error| LocatedInferError {
+                error,
+                node_id: None,
+            })
+            .collect());
     }
     // Stamp the resolved binder types onto free `Var` references a discharge
     // substituted into refinement predicates (see `retype_predicate_slots`).
@@ -359,7 +375,15 @@ pub(crate) fn run(
         let mut scope_errors = Vec::new();
         check_scope_valid(expr, &root_scope, &mut scope_errors);
         if !scope_errors.is_empty() {
-            return Err(scope_errors);
+            // Debug-only scope-validity errors are compiler-bug diagnostics, not
+            // user-facing; no precise emit node (`node_id: None`).
+            return Err(scope_errors
+                .into_iter()
+                .map(|error| LocatedInferError {
+                    error,
+                    node_id: None,
+                })
+                .collect());
         }
     }
     Ok(expr.ty.clone())
