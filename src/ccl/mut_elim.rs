@@ -47,7 +47,7 @@ use std::collections::HashMap;
 
 use crate::ccl::{
     BaseType, Builtin, Expr, F_COMMIT, F_WRITES, HistoryKind, Lit, Name, Type, TypedBinding,
-    TypedExprNode, letrec::check_letrec_causal, symbolic::symbolic,
+    TypedExprNode, letrec::check_letrec_causal, provenance::NodeId, symbolic::symbolic,
 };
 
 // ---------------------------------------------------------------------------
@@ -161,6 +161,20 @@ fn erase_mut_in_type(ty: &mut Type) {
 fn erase_mut(expr: &mut Expr) {
     expr.walk_type_slots_mut(erase_mut_in_type);
     expr.walk_children_mut(erase_mut);
+}
+
+/// An id-freshened copy of `e` — every node re-minted (the shared deep walk).
+///
+/// The phase splices some template expressions (the history `step` view, the
+/// loop source) into the output at several positions; a bare `clone` would stamp
+/// the *same* NodeIds at each, breaking the tree's id-uniqueness invariant. Each
+/// spliced copy is freshened so the positions carry distinct ids. When called
+/// inside an open lineage frame the deep walk's `on_copy` hook captures each
+/// re-mint as a `Copy` step (the copy mirrors the original's lineage), so these
+/// copies are attributed, not swept.
+fn fresh_copy(mut e: Expr) -> Expr {
+    e.freshen_node_ids_deep();
+    e
 }
 
 /// A `Unit` literal stamped with `Base(Unit)` — the value of a mutable write.
@@ -382,21 +396,114 @@ fn flatten_spine(mut e: Expr) -> Expr {
     e
 }
 
+/// Every node id in a subtree (main-tree node set) — for consuming a wholly
+/// vanishing source subtree.
+fn collect_all_ids(e: &Expr, out: &mut Vec<NodeId>) {
+    out.push(e.node_id());
+    e.walk_children(|c| collect_all_ids(c, out));
+}
+
+/// Collect the node ids of a loop body's statement **spine** — the nodes
+/// [`transform_chain`] destructures and drops as it rebuilds the decision chain.
+/// A spine node's *value* expression (a `Let` bound value, a `MutWrite`/`Feed`
+/// value) is **preserved** by [`subst_env`] (containers in place, substituted
+/// leaves via the read-site id-carry), so it is a self-edge and is **not**
+/// collected. This is the loop frame's `consumed` set (blame ⊥ consumption). It
+/// must mirror `transform_chain`'s spine arms: a drift surfaces at the leak gate
+/// as a `Dropped` (a vanishing node left unconsumed) or `Unexplained` (a
+/// preserved node wrongly consumed).
+fn collect_block_spine_ids(block: &Expr, out: &mut Vec<NodeId>) {
+    match &block.node {
+        TypedExprNode::Let { body, .. } => {
+            out.push(block.node_id());
+            collect_block_spine_ids(body, out);
+        }
+        TypedExprNode::ExprStmt { expr: effect, body } => {
+            out.push(block.node_id());
+            match &effect.node {
+                // A nested spliced sequence: `transform_chain` re-associates it
+                // onto the spine, so its own spine nodes vanish too.
+                TypedExprNode::ExprStmt { .. } => collect_block_spine_ids(effect, out),
+                // MutWrite/Feed/Unit effect nodes drop (their value is preserved).
+                _ => out.push(effect.node_id()),
+            }
+            collect_block_spine_ids(body, out);
+        }
+        TypedExprNode::Lit(Lit::Unit) => out.push(block.node_id()),
+        _ => {}
+    }
+}
+
 fn rewrite(mut expr: Expr) -> Expr {
+    let stmt_id = expr.node_id();
     if let TypedExprNode::ExprStmt { expr: effect, body } = expr.node {
-        if let TypedExprNode::For {
-            target,
-            iter,
-            body: loop_body,
-        } = effect.node
-        {
+        let effect_id = effect.node_id();
+        if matches!(&effect.node, TypedExprNode::For { .. }) {
+            // The loop → causal `LetRec` rewrite. It consumes the loop
+            // statement's structural spine (the `ExprStmt` wrapper, the `For`, and
+            // the loop body's spine nodes) and mints the carrier `LetRec` plus its
+            // history/guard/decision scaffolding (captured as births in this
+            // frame). The iteration source and each value expression are
+            // preserved (self-edges), so neither is consumed. Blame is the `For`
+            // (its source span); `Nature::Expansion` — a `LetRec` faithfully
+            // expands the loop. One frame suffices: the env templates the body
+            // copies are born here, and the `Transform` flushes before its
+            // captured `Copy`s.
+            let mut consumed = vec![stmt_id, effect_id];
+            if let TypedExprNode::For {
+                body: lb, iter: it, ..
+            } = &effect.node
+            {
+                collect_block_spine_ids(lb, &mut consumed);
+                // The iteration source is preserved (bare clone) on the
+                // accumulator and feed paths — `transform_loop` /
+                // `transform_feed_only_loop` keep its ids — so it is a self-edge
+                // there and is NOT consumed. On the *drop* path (no accumulator,
+                // no feed — e.g. a transaction-emptied `For`) the whole loop
+                // vanishes, so the source is consumed. (A transaction-emptied
+                // loop's source was already `Copy`-freshened into the commit
+                // record by `transact_phase`, earlier in the log, so consuming the
+                // original here is well-ordered.)
+                let mut accs = Vec::new();
+                collect_writes(lb, &mut accs);
+                if accs.is_empty() && !body_has_feed(lb) {
+                    collect_all_ids(it, &mut consumed);
+                }
+            }
+            let TypedExprNode::For {
+                target,
+                iter,
+                body: loop_body,
+            } = effect.node
+            else {
+                unreachable!("guarded above")
+            };
+            let _g = crate::ccl::lineage::step(
+                "letrec.loop",
+                consumed,
+                vec![effect_id],
+                crate::ccl::lineage::Nature::Expansion,
+            );
             return transform_loop(target, *iter, *loop_body, *body);
         }
         // A `MutWrite` outside any `For` is a *sequential* mutation — a
         // top-level `cnt += 1`, or an inlined pass-by-reference writer
         // (`bump(cnt)`) spliced between statements. There is no recurrence to
         // build; normalize it to a shadowing `let` (see `normalize_bare_write`).
-        if let TypedExprNode::MutWrite { name, value } = effect.node {
+        if matches!(&effect.node, TypedExprNode::MutWrite { .. }) {
+            let TypedExprNode::MutWrite { name, value } = effect.node else {
+                unreachable!("guarded above")
+            };
+            // Consumes the `ExprStmt` wrapper and the `MutWrite` marker; the
+            // shadowing `let` it mints is captured here. The write value is
+            // preserved (recursed in place). `Nature::Machinery` — a shadowing
+            // rebind is pure plumbing, not a source construct.
+            let _g = crate::ccl::lineage::step(
+                "letrec.bare_write",
+                vec![stmt_id, effect_id],
+                vec![effect_id],
+                crate::ccl::lineage::Nature::Machinery,
+            );
             return normalize_bare_write(name, *value, *body);
         }
         // Not a loop/write statement: rebuild and recurse.
@@ -629,6 +736,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
         "letrec phase emitted a non-causal group"
     );
     let ty = body_out.ty.clone();
+    // `Expr::new` so the carrier `LetRec` mint is captured by the open loop frame.
     Expr::new(TypedExprNode::LetRec {
         bindings,
         body: Box::new(body_out),
@@ -864,11 +972,22 @@ fn transform_feed_only_loop(target: TypedBinding, iter: Expr, loop_body: Expr, c
     // Emit in reverse so the first source feed ends up outermost — desugar
     // collects feeds outermost-first into the channel union, preserving source
     // order (mirrors the accumulator path's hoist ordering).
+    let mut source_kept = false;
     for (defer, value) in feeds.into_iter().rev() {
         let value_ty = value.ty.clone();
         let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), value);
         lambda.ty = Type::fun(target.ty.clone(), value_ty.clone());
-        let mut map = Expr::compose(vec![iter.clone(), lambda]);
+        // Each feed maps its own copy of the loop source. Keep the first copy's
+        // ids (a bare clone — a self-edge preserving the source, so the loop frame
+        // need not consume it); freshen the rest so the copies do not share ids
+        // (captured as `Copy` steps of the still-live source).
+        let src = if source_kept {
+            fresh_copy(iter.clone())
+        } else {
+            source_kept = true;
+            iter.clone()
+        };
+        let mut map = Expr::compose(vec![src, lambda]);
         map.ty = Type::fun(domain_ty.clone(), value_ty);
         let mut feed = Expr::feed(defer, map);
         feed.ty = Type::Base(BaseType::Unit);
@@ -1061,7 +1180,27 @@ fn subst_env(mut e: Expr, env: &HashMap<Name, Expr>) -> Expr {
     if let TypedExprNode::Var(n) = &e.node
         && let Some(rep) = env.get(n)
     {
-        return rep.clone();
+        // A stored env value is substituted at every read site; a bare
+        // `rep.clone()` would stamp the *same* NodeIds into each copy, breaking
+        // the tree's id-uniqueness invariant. Freshen each copy's ids (the
+        // shared deep walk — main tree + predicate `Rc`s + `Cast` targets), then
+        // carry the read site's own id onto the copy's ROOT. That makes the read
+        // position a **preserve** (self-edge): the source span of the `Var(x)`
+        // read survives onto the snapshot projection replacing it, and the loop
+        // frame does not consume it. The copy's freshened interior is captured as
+        // per-origin `Copy` steps of the env template (born in the same open loop
+        // frame — the template flushes first, so the copies land on a live
+        // origin; the born-copied-discarded template hazard, pinned by
+        // `lineage::born_copied_discarded_template_composes_without_leaks`).
+        let read_id = e.node_id();
+        let mut copy = rep.clone();
+        // Freshen the INTERIOR only, then carry the read site's id onto the root.
+        // A deep freshen re-mints the root too, and overwriting it afterwards
+        // leaves an `Op::Copy` whose produced id no node carries — the same
+        // dead-id hazard `subst.rs`'s root-carry avoids the same way.
+        copy.freshen_interior_node_ids();
+        copy.node_id = read_id;
+        return copy;
     }
     e.map_children(|c| subst_env(c, env));
     e
@@ -1226,13 +1365,90 @@ mod tests {
         );
     }
 
-    /// RT-4b: the `flatten_spine` bare-writer arm — `Let(x, MutWrite(..), k)` (a
+    /// The typed direct-mirror tree for `x := 0; for i in [1,2,3]: x := x + x; x`
+    /// — the loop body reads the accumulator at **two** sites (`x + x`), so
+    /// [`transform_chain`]'s `subst_env` substitutes the read-your-writes value at
+    /// both. Before the freshen fix the two copies shared NodeIds.
+    fn loop_two_reads() -> Expr {
+        let int = Type::Base(BaseType::Int);
+        let list_ty = Type::fun(Type::UIntRange(3), int.clone());
+        let x = Name::fresh("x");
+        let i = Name::fresh("i");
+
+        let mut list = Expr::new(TypedExprNode::List(
+            [1, 2, 3]
+                .iter()
+                .map(|n| {
+                    let mut l = Expr::new(TypedExprNode::Lit(Lit::Int(*n)));
+                    l.ty = int.clone();
+                    l
+                })
+                .collect(),
+        ));
+        list.ty = list_ty;
+
+        // x + x — two reads of the accumulator in one write value.
+        let mut sum = Expr::new(TypedExprNode::BinOp {
+            left: Box::new(tvar(&x, int.clone())),
+            op: crate::ccl::BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
+            right: Box::new(tvar(&x, int.clone())),
+        });
+        sum.ty = int.clone();
+        let mut write = Expr::mut_write(x.clone(), sum);
+        write.ty = Type::Base(BaseType::Unit);
+        let mut unit = Expr::new(TypedExprNode::Lit(Lit::Unit));
+        unit.ty = Type::Base(BaseType::Unit);
+        let mut body = Expr::expr_stmt(write, unit);
+        body.ty = Type::Base(BaseType::Unit);
+
+        let mut for_node = Expr::new(TypedExprNode::For {
+            target: TypedBinding {
+                name: i,
+                ty: int.clone(),
+                user_annotation: None,
+            },
+            iter: Box::new(list),
+            body: Box::new(body),
+        });
+        for_node.ty = Type::Base(BaseType::Unit);
+
+        let mut stmt = Expr::expr_stmt(for_node, tvar(&x, int.clone()));
+        stmt.ty = int.clone();
+        let mut init = Expr::new(TypedExprNode::Lit(Lit::Int(0)));
+        init.ty = int.clone();
+        let mut tree = Expr::let_bind(x, init, stmt);
+        tree.ty = int;
+        tree
+    }
+
+    /// Letrec-flavored sibling: the induction phase preserves
+    /// id-uniqueness when a loop body reads the accumulator at multiple sites.
+    /// `transform_chain`'s `subst_env` substitutes the read-your-writes value at
+    /// each read; before the freshen fix the copies shared NodeIds, and the
+    /// `step_view` template cloned into the guard + trailing reads shared ids too.
+    /// (Asserted at the phase boundary for the same reason as the transact
+    /// sibling: a runnable loop program's `post_desugar_ir` is defer-bearing.)
+    #[test]
+    fn subst_env_and_scaffolding_keep_ids_unique() {
+        let out = run(loop_two_reads());
+        // Through the shared checker: id uniqueness within a tree is one invariant
+        // with one implementation. A subst_env copy or a writes-view clone that was
+        // not freshened shows up here as two nodes sharing an id.
+        crate::ccl::context::assert_unique_node_ids(&out, "letrec phase");
+        // Recognition's own id-uniqueness is checked by the integration suite:
+        // it now runs *after* `lambda_elim` (which point-frees the induction
+        // binding's `λ r → let __prev = ⟨guard⟩ …` into the factored `let __prev
+        // = ⟨guard⟩ …` shape `recognize` destructures), so it can no longer
+        // consume this pass's raw `λ r → …` output directly.
+    }
+
+    /// The `flatten_spine` bare-writer arm — `Let(x, MutWrite(..), k)` (a
     /// value-position writer whose body is a bare write, e.g. an inlined
     /// `y = bump(c)`) — carries the input write's NodeId onto the repositioned
     /// write rather than minting a fresh one. This is the preserve-id fix: a mint
     /// would sever the write's source span and could duplicate the id.
     ///
-    /// Unit-test form at the letrec boundary (the plan's RT-4b fallback): the
+    /// Unit-test form at the letrec boundary: the
     /// bare-writer `MutWrite` is consumed by the loop rewrite and does not survive
     /// into `post_desugar_ir` as a span-indexable `MutWrite`, so id preservation
     /// through the phase is asserted directly here.

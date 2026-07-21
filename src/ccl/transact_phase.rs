@@ -70,6 +70,7 @@ use crate::ccl::{
     ccl_utils::is_free_in_value,
     letrec::check_letrec_causal,
     mut_elim::{fold_induction_loop, hoist_feeds},
+    provenance::NodeId,
 };
 
 /// Recognize a **fed-out register read** and rewrite it to an as-of join, *before*
@@ -445,6 +446,108 @@ pub fn collect_txn_registers(expr: &Expr) -> HashSet<Name> {
     out
 }
 
+/// Collect the input node ids the transaction rewrite consumes (the frame's
+/// `consumed` set — blame ⊥ consumption). These are the `with begin():` markers
+/// and their block spines that vanish, plus the transactional register `let`
+/// declarations (their inits are captured into the histories and preserved; the
+/// declaration nodes themselves are dropped by `rebind_letrec`). Everything
+/// preserved — register value expressions (`subst_env` containers + id-carried read
+/// leaves), the iteration source, the register inits, the read-only feed spine, and
+/// the enclosing `For` (retired by `mut_elim`, not here) — is a self-edge and
+/// is NOT collected.
+///
+/// Mirrors what [`strip`]/[`build_writer`]/[`build_letrec`] actually drop; a
+/// drift surfaces at the leak gate as `Dropped` (a vanishing node left
+/// unconsumed) or `Unexplained` (a preserved node wrongly consumed).
+fn collect_txn_consumed(expr: &Expr, txn_registers: &HashSet<Name>, out: &mut Vec<NodeId>) {
+    match &expr.node {
+        // A `with begin():` block on a statement spine: the `ExprStmt` wrapper and
+        // the `Begin` marker vanish. A *writing* block's inner spine is consumed
+        // by `walk_block` (the decision is freshly built); a *read-only* block's
+        // spine is spliced onto the loop (ids preserved), only its terminal `Unit`
+        // dropping.
+        TypedExprNode::ExprStmt { expr: effect, body }
+            if matches!(&effect.node, TypedExprNode::Begin { .. }) =>
+        {
+            out.push(expr.node_id());
+            out.push(effect.node_id());
+            if let TypedExprNode::Begin { body: block } = &effect.node {
+                if block_writes_txn(block, txn_registers) {
+                    collect_writing_block_spine(block, out);
+                } else {
+                    collect_readonly_block_drops(block, out);
+                }
+            }
+            collect_txn_consumed(body, txn_registers, out);
+        }
+        // A transactional register `let` declaration: the binding node drops (its init
+        // is preserved). The body is recursed.
+        TypedExprNode::Let { binding, body, .. } if txn_registers.contains(&binding.name) => {
+            out.push(expr.node_id());
+            collect_txn_consumed(body, txn_registers, out);
+        }
+        _ => expr.walk_children(|c| collect_txn_consumed(c, txn_registers, out)),
+    }
+}
+
+/// A writing `with begin():` block's spine (consumed by `walk_block`): the
+/// `Let`/`ExprStmt` structural nodes, the `MutWrite`/`Feed` markers, `if` guards
+/// (`Case` + branch bodies), and terminal `Unit`s. Value expressions are
+/// preserved (self-edges) and not collected.
+fn collect_writing_block_spine(block: &Expr, out: &mut Vec<NodeId>) {
+    match &block.node {
+        TypedExprNode::Let { body, .. } => {
+            out.push(block.node_id());
+            collect_writing_block_spine(body, out);
+        }
+        TypedExprNode::ExprStmt { expr: effect, body } => {
+            out.push(block.node_id());
+            match &effect.node {
+                TypedExprNode::Case {
+                    scrutinee: None,
+                    branches,
+                } => {
+                    out.push(effect.node_id());
+                    // `apply_guard` uses branch[0]: its guard is `subst_env`'d into
+                    // `commit` (preserved — a self-edge), its body spine consumed.
+                    // The deny branch(es) (`true → unit`) are dropped entirely.
+                    if let Some(first) = branches.first() {
+                        collect_writing_block_spine(&first.body, out);
+                    }
+                    for b in &branches[1..] {
+                        collect_all_ids_tx(&b.guard, out);
+                        collect_all_ids_tx(&b.body, out);
+                    }
+                }
+                _ => out.push(effect.node_id()),
+            }
+            collect_writing_block_spine(body, out);
+        }
+        TypedExprNode::Lit(Lit::Unit) => out.push(block.node_id()),
+        _ => {}
+    }
+}
+
+/// Every node id in a subtree (main-tree node set) — for consuming a wholly
+/// dropped fragment (e.g. a `with begin():` guard's deny branch).
+fn collect_all_ids_tx(e: &Expr, out: &mut Vec<NodeId>) {
+    out.push(e.node_id());
+    e.walk_children(|c| collect_all_ids_tx(c, out));
+}
+
+/// A read-only `with begin():` block: `splice_block` unwraps it onto the loop
+/// spine, **preserving** the `Let`/`ExprStmt`(feed) spine ids and dropping only
+/// the terminal `Unit`.
+fn collect_readonly_block_drops(block: &Expr, out: &mut Vec<NodeId>) {
+    match &block.node {
+        TypedExprNode::Lit(Lit::Unit) => out.push(block.node_id()),
+        TypedExprNode::ExprStmt { body, .. } | TypedExprNode::Let { body, .. } => {
+            collect_readonly_block_drops(body, out)
+        }
+        _ => {}
+    }
+}
+
 /// The value type `V` of a register reference. A transactional register's binding and
 /// its in-block references are `Mut(V, Txn)`-typed after inference, but the
 /// histories and commit records this phase emits — and the `final_or_default`
@@ -536,6 +639,23 @@ pub fn run(expr: Expr, txn_registers: &HashSet<Name>) -> Expr {
     if txn_registers.is_empty() && !contains_begin(&expr) {
         return expr;
     }
+    // Lineage: the whole transaction rewrite is one frame. It consumes the `with
+    // begin():` markers, store declarations, and block spine nodes that vanish
+    // (pre-walked into `consumed`), and mints the commit `LetRec` scaffolding
+    // (captured as births). Store values, sources, and inits are preserved
+    // (self-edges), so the frame's only copies are of born templates — the
+    // Transform flushes before them. Blame the program
+    // root (the rewrite's source anchor); `Nature::Expansion` — the commit
+    // `LetRec` faithfully expands the `with begin():` transaction.
+    let mut consumed: Vec<NodeId> = Vec::new();
+    collect_txn_consumed(&expr, txn_registers, &mut consumed);
+    let root_id = expr.node_id();
+    let _frame = crate::ccl::lineage::step(
+        "transact.commit",
+        consumed,
+        vec![root_id],
+        crate::ccl::lineage::Nature::Expansion,
+    );
     let mut sites: Vec<RawSite> = Vec::new();
     let stripped = strip(expr, txn_registers, None, &mut sites);
     // Post-strip invariants (release asserts, like the letrec-phase
@@ -909,7 +1029,8 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
         // any other terminal is unexpected — sequence it defensively before rest.
         other => {
             let ty = rest.ty.clone();
-            // A freshly-synthesized defensive sequencing wrapper.
+            // A freshly-synthesized defensive sequencing wrapper — `Expr::new` so
+            // the mint is captured by the open transaction frame.
             Expr::new(TypedExprNode::ExprStmt {
                 expr: Box::new(Expr {
                     node: other,
@@ -998,6 +1119,7 @@ fn partition_spine(expr: Expr, txn_registers: &HashSet<Name>, lifted: &mut Vec<E
 fn prepend_effects(effects: Vec<Expr>, rest: Expr) -> Expr {
     effects.into_iter().rev().fold(rest, |rest, effect| {
         let ty = rest.ty.clone();
+        // `Expr::new` so the mint is captured by the open transaction frame.
         Expr::new(TypedExprNode::ExprStmt {
             expr: Box::new(effect),
             body: Box::new(rest),
@@ -1208,6 +1330,20 @@ fn tvar(name: &Name, ty: Type) -> Expr {
     e
 }
 
+/// An id-freshened copy of `e` — every node re-minted (the shared deep walk).
+///
+/// A store key's `init` is spliced at one position and preserved (kept ids) at
+/// the other; the writer `source` and `subst_env` env values land at read sites
+/// where a bare `clone` would stamp the *same* NodeIds, breaking id-uniqueness.
+/// Each such copy is freshened so the positions carry distinct ids. When called
+/// inside the open `transact.commit` frame the deep walk's `on_copy` hook
+/// captures each re-mint as a `Copy` step (mirroring the original's lineage), so
+/// these copies are attributed, not swept.
+fn fresh_copy(mut e: Expr) -> Expr {
+    e.freshen_node_ids_deep();
+    e
+}
+
 /// `p ▷ .i : elt_ty` — projection of the writer body's tuple parameter.
 fn proj_tuple(p: &Name, tuple_ty: &Type, i: usize, elt_ty: Type) -> Expr {
     let mut proj = Expr::proj_index(i);
@@ -1271,7 +1407,11 @@ fn build_writer(
     broadcasts.sort_by(|a, b| a.0.cmp(&b.0));
 
     let (source, item_ty) = if site_accs.is_empty() {
-        (site.source.clone(), orig_item_ty.clone())
+        // Freshen: the original iteration source survives (as the emptied `For`'s
+        // iter) until the letrec phase drops it, so this copy must not duplicate
+        // its ids. Captured as a `Copy` step of the still-live source by the open
+        // `transact.commit` frame.
+        (fresh_copy(site.source.clone()), orig_item_ty.clone())
     } else {
         build_zip_source(&site.source, &orig_item_ty, &site_accs)
     };
@@ -1424,13 +1564,21 @@ fn build_zip_source(source: &Expr, item_ty: &Type, accs: &[(Name, Expr, Type)]) 
     let new_item_ty = Type::Tuple(elt_tys);
 
     let x = Name::fresh("__zx");
+    // The zip re-embeds the writer's `source` and each accumulator `view`, which
+    // already live at their own tree positions; freshen each copy so the zip's
+    // clone does not duplicate their NodeIds. Captured as `Copy` steps by the open
+    // `transact.commit` frame (mirroring each origin's lineage).
     let mut elts = vec![apply_ty(
         tvar(&x, dom.clone()),
-        source.clone(),
+        fresh_copy(source.clone()),
         item_ty.clone(),
     )];
     for (_, view, vty) in accs {
-        elts.push(apply_ty(tvar(&x, dom.clone()), view.clone(), vty.clone()));
+        elts.push(apply_ty(
+            tvar(&x, dom.clone()),
+            fresh_copy(view.clone()),
+            vty.clone(),
+        ));
     }
     let mut tup = Expr::tuple(elts);
     tup.ty = new_item_ty.clone();
@@ -1583,7 +1731,26 @@ fn subst_env(e: &Expr, env: &HashMap<Name, Expr>) -> Expr {
     if let TypedExprNode::Var(n) = &e.node
         && let Some(rep) = env.get(n)
     {
-        return rep.clone();
+        // A stored env value is substituted at every read site; a bare
+        // `rep.clone()` would stamp the *same* NodeIds into each copy, breaking
+        // the tree's id-uniqueness invariant. Freshen each copy's ids (the
+        // shared deep walk — main tree + predicate `Rc`s + `Cast` targets), then
+        // carry the read site's own id onto the copy's ROOT. That makes the read
+        // position a **preserve** (self-edge): the source span of the `Var`
+        // read survives onto the snapshot projection replacing it, and the
+        // transaction frame does not consume it. The copy's freshened interior is
+        // captured as per-origin `Copy` steps of the env template (born in the
+        // open transaction frame; the `Transform` flushes before its captured
+        // `Copy`s).
+        let read_id = e.node_id();
+        let mut copy = rep.clone();
+        // Freshen the INTERIOR only, then carry the read site's id onto the root.
+        // A deep freshen re-mints the root too, and overwriting it afterwards
+        // leaves an `Op::Copy` whose produced id no node carries — the same
+        // dead-id hazard `subst.rs`'s root-carry avoids the same way.
+        copy.freshen_interior_node_ids();
+        copy.node_id = read_id;
+        return copy;
     }
     let mut out = e.clone();
     out.map_children(|c| subst_env(&c, env));
@@ -1626,6 +1793,8 @@ fn binding(name: Name, ty: Type) -> TypedBinding {
 /// `let name : name_ty = def in body`, typed as `body`.
 fn let_typed(name: Name, name_ty: Type, def: Expr, body: Expr) -> Expr {
     let ty = body.ty.clone();
+    // `Expr::new` so the mint fires `on_mint` and lands as a birth in the open
+    // transaction frame.
     Expr::new(TypedExprNode::Let {
         binding: binding(name, name_ty),
         bound_expr: Box::new(def),
@@ -1717,7 +1886,15 @@ fn per_key_view(
     let writes_ty = record_field_ty(decision_ty, F_WRITES);
     let c = Name::fresh("__c");
     let cvar = tvar(&c, rec_ty.clone());
-    let time = apply_ty(cvar.clone(), fproj(F_TIME, rec_ty, &Type::Txn), Type::Txn);
+    // `__c` and the `__c.decision` projection are each referenced at several
+    // record fields; freshen the extra copies so the shared references do not
+    // duplicate NodeIds (same name binds them, ids are metadata). Captured as
+    // `Copy` steps by the open `transact.commit` frame.
+    let time = apply_ty(
+        fresh_copy(cvar.clone()),
+        fproj(F_TIME, rec_ty, &Type::Txn),
+        Type::Txn,
+    );
     let decision = apply_ty(
         cvar,
         fproj(F_DECISION, rec_ty, decision_ty),
@@ -1961,6 +2138,11 @@ fn build_letrec(
         let v = value_ty(k);
         let reg_k = hist[k].clone();
         let t = Name::fresh("__t");
+        // The key's `init` is spliced at two positions (here, and the
+        // continuation rebind in `splice_letrec`). Keep the original ids HERE (a
+        // bare clone — a self-edge preserving the store declaration's init, since
+        // the declaration node is dropped but its init survives), and freshen the
+        // rebind copy so the two never share ids.
         let init = key_init.get(k).cloned().expect("key init present");
         // The `get_prev_txn` history slot — the design's denotation: the
         // `⧺`-merged **per-key commit views** of every site writing this key
@@ -2167,7 +2349,9 @@ fn splice_letrec(
         // it defensively. `erase_mut` sweeps any surviving `Var(x)` reference type.
         let v = register_value_ty(&key_init[k].ty);
         let stream = tvar(&hist[k], history_ty(&v));
-        let init = key_init.get(k).cloned().expect("key init present");
+        // Freshen: the same `init` is also spliced at the history binding's
+        // `get_prev_txn` default (`build_letrec`), so the copies must not share ids.
+        let init = fresh_copy(key_init.get(k).cloned().expect("key init present"));
         let bound = final_or_default_read(stream, init, v.clone());
         inner = let_typed(k.clone(), v, bound, inner);
     }
@@ -2177,6 +2361,7 @@ fn splice_letrec(
         .collect();
     let body = hoist_feeds(inner, feed_views);
     let ty = body.ty.clone();
+    // `Expr::new` so the transaction carrier `LetRec` mint is captured.
     let txn_letrec = Expr::new(TypedExprNode::LetRec {
         bindings,
         body: Box::new(body),
@@ -2200,6 +2385,7 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
     inner = hoist_feeds(inner, cross.feeds);
     for (b, def) in cross.bindings.into_iter().rev() {
         let ty = inner.ty.clone();
+        // `Expr::new` so the cross-domain induction `LetRec` mint is captured.
         inner = Expr::new(TypedExprNode::LetRec {
             bindings: vec![(b, def)],
             body: Box::new(inner),
@@ -2313,6 +2499,102 @@ mod tests {
             check_letrec_causal(&bindings),
             Ok(()),
             "the emitted transaction letrec must be guarded"
+        );
+    }
+
+    /// The typed direct-mirror tree for a `with begin():` writer that reads the
+    /// store at **two** sites: `pool: Mut(Int, Txn) := 100; with begin(): pool :=
+    /// pool + pool`. Both `pool` reads are substituted from the read-your-writes
+    /// environment by [`subst_env`]; before the freshen fix the two copies shared
+    /// NodeIds, duplicating ids into the phase output.
+    fn txn_two_reads() -> (Expr, Name) {
+        let int = Type::Base(BaseType::Int);
+        let list_ty = Type::fun(Type::UIntRange(1), int.clone());
+        let pool = Name::fresh("pool");
+        let r = Name::fresh("r");
+
+        let mut ten = Expr::new(TypedExprNode::Lit(Lit::Int(10)));
+        ten.ty = int.clone();
+        let mut list = Expr::new(TypedExprNode::List(vec![ten]));
+        list.ty = list_ty;
+
+        // pool + pool — two reads of the store in one write value.
+        let mut add = Expr::new(TypedExprNode::BinOp {
+            left: Box::new(tvar(&pool, int.clone())),
+            op: BinOpKind::Arithmetic(ArithmeticKind::Add),
+            right: Box::new(tvar(&pool, int.clone())),
+        });
+        add.ty = int.clone();
+        let mut write = Expr::mut_write(pool.clone(), add);
+        write.ty = Type::Base(BaseType::Unit);
+        let mut unit = Expr::new(TypedExprNode::Lit(Lit::Unit));
+        unit.ty = Type::Base(BaseType::Unit);
+        let mut block = Expr::expr_stmt(write, unit);
+        block.ty = Type::Base(BaseType::Unit);
+        // A transactional store write must sit inside a `with begin():`
+        // (`Begin`) block on the loop body: `ExprStmt(Begin{block}, unit)`.
+        let mut begin = Expr::begin(block);
+        begin.ty = Type::Base(BaseType::Unit);
+        let mut body_unit = Expr::new(TypedExprNode::Lit(Lit::Unit));
+        body_unit.ty = Type::Base(BaseType::Unit);
+        let mut for_body = Expr::expr_stmt(begin, body_unit);
+        for_body.ty = Type::Base(BaseType::Unit);
+
+        let mut for_node = Expr::new(TypedExprNode::For {
+            target: binding(r, int.clone()),
+            iter: Box::new(list),
+            body: Box::new(for_body),
+        });
+        for_node.ty = Type::Base(BaseType::Unit);
+
+        let mut cont = Expr::new(TypedExprNode::Lit(Lit::Unit));
+        cont.ty = Type::Base(BaseType::Unit);
+        let mut stmt = Expr::expr_stmt(for_node, cont);
+        stmt.ty = Type::Base(BaseType::Unit);
+        let mut init = Expr::new(TypedExprNode::Lit(Lit::Int(100)));
+        init.ty = int;
+        let mut tree = Expr::let_bind(pool.clone(), init, stmt);
+        tree.ty = Type::Base(BaseType::Unit);
+        (tree, pool)
+    }
+
+    /// Every duplicated NodeId over the main tree (`walk_children` node-set), for
+    /// the id-uniqueness regression assertions.
+    fn duplicate_ids(expr: &Expr) -> Vec<NodeId> {
+        fn walk(e: &Expr, seen: &mut HashSet<NodeId>, dups: &mut Vec<NodeId>) {
+            if !seen.insert(e.node_id()) {
+                dups.push(e.node_id());
+            }
+            e.walk_children(|c| walk(c, seen, dups));
+        }
+        let mut seen = HashSet::new();
+        let mut dups = Vec::new();
+        walk(expr, &mut seen, &mut dups);
+        dups
+    }
+
+    /// The transaction phase preserves the tree's id-uniqueness invariant
+    /// even when a `with begin():` block reads the store at multiple sites.
+    ///
+    /// `subst_env` substitutes the read-your-writes snapshot at every store read;
+    /// a bare `clone` at each site stamped the *same* NodeIds into the output, so
+    /// before the freshen fix `run`'s output carried duplicate ids. The assertion
+    /// is made at the transact-phase boundary rather than `post_desugar_ir`: a
+    /// runnable txn program requires an `out << ` feed to surface output, which
+    /// makes `desugar_defers` channelize, and `desugar_substitute` legitimately
+    /// leaves duplicate ids on defer-bearing programs (the post-desugar tripwire
+    /// is gated off there). This isolates the subst_env fix at the boundary that
+    /// establishes uniqueness.
+    #[test]
+    fn subst_env_copies_keep_ids_unique() {
+        let (tree, pool) = txn_two_reads();
+        let names = HashSet::from([pool]);
+        let out = run(tree, &names);
+        let dups = duplicate_ids(&out);
+        assert!(
+            dups.is_empty(),
+            "transact phase left duplicate NodeIds after substituting a store read at \
+             multiple sites (subst_env must freshen each copy): {dups:?}"
         );
     }
 }

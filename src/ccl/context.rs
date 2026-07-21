@@ -17,10 +17,13 @@ use crate::{
             check_mut_write_targets, check_pre_desugar, infer, typecheck,
         },
         inline, lambda_elim,
-        lineage::{Leak, RecorderSession, SourceProjection, collapse_lowering},
+        lineage::{
+            Leak, LineageLog, LineageMap, RecorderSession, SourceProjection, collapse,
+            collapse_lowering,
+        },
         lower::{LoweringContext, LoweringError, lower_stmts},
         mut_elim, planning,
-        provenance::NodeId,
+        provenance::{NodeId, Pass},
         symbolic::{symbolic, symbolic_typed},
         transact_phase, uniquify,
     },
@@ -506,8 +509,13 @@ pub struct CompiledProgram {
     /// present, since an unrecorded mint surfaces as `Leak::Unexplained` at the
     /// fold. Produced by
     /// [`collapse_lowering`](crate::ccl::lineage::collapse_lowering) at the
-    /// lowering boundary, never mutated incrementally. It is always-on and the
-    /// release `InferError` diagnostics read it one-hop (spans of the blame node).
+    /// lowering boundary, never mutated incrementally. It is the base every later
+    /// pane fold bottoms out in, and the release `InferError` diagnostics read it
+    /// one-hop (spans of the blame node). The downstream pane projections
+    /// (post-inference, post-desugar) are **not** stored here — they are folded
+    /// from this projection + [`pass_lineage`](Self::pass_lineage) at
+    /// snapshot-serve time by [`materialize_panes`](Self::materialize_panes),
+    /// keyed on the ids of each retained snapshot tree.
     pub lowering_projection: SourceProjection,
     /// The **pre-inference** IR snapshot — the inspector's upstream (source-shaped,
     /// pre-monomorphization) pane, captured right after `uniquify` and before
@@ -520,8 +528,11 @@ pub struct CompiledProgram {
     /// shared/remapped `NodeId`s.
     ///
     /// Monomorphization runs *inside* `infer`, freshening cloned ids, so this
-    /// snapshot holds the pre-mono **originals**; every ordinary node keeps its
-    /// id identical across the pair. Its ids resolve against the
+    /// snapshot holds the pre-mono **originals**. Its fan-out to the post-mono
+    /// [`post_inference_ir`](Self::post_inference_ir) is exactly the
+    /// [`Pass::Mono`] lineage log in [`pass_lineage`](Self::pass_lineage) (one
+    /// upstream def → N downstream clones); every ordinary node keeps its id
+    /// identical across the pair. Its ids resolve against the
     /// [`lowering_projection`](Self::lowering_projection) (they are the pre-mono originals, keyed by lowering's
     /// directly-lowered attributions).
     pub pre_inference_ir: Expr,
@@ -530,11 +541,14 @@ pub struct CompiledProgram {
     /// This is `expr` captured **right after `infer`/`typecheck` and before
     /// `inline::inline_non_iterable_lambdas` consumes it**: fully typed, but
     /// still *source-shaped* (lambdas intact, not yet point-free — `inline`,
-    /// `lambda_elim`, and `planning` have not run).
+    /// `lambda_elim`, and `planning` have not run). Its node ids are the input
+    /// pane of the post-inference → post-desugar fold and resolve against the
+    /// materialized post-inference projection (see
+    /// [`materialize_panes`](Self::materialize_panes)).
     ///
     /// Distinct from [`ast`](Self::ast), which holds `join_planned` (the
     /// *post-planning* tree): `lambda_elim`/`planning` re-mint every `NodeId`,
-    /// so `ast`'s ids don't resolve against the lowering projection, and it is
+    /// so `ast`'s ids resolve to `None` in the table, and it is
     /// execution-shaped (point-free, fused) — the wrong tree for a source-level
     /// view. The inspector anchors here instead.
     pub post_inference_ir: Expr,
@@ -548,9 +562,38 @@ pub struct CompiledProgram {
     /// fan-ins) are present. Because monomorphization ran earlier (inside
     /// `infer`), this tree is post-mono like [`post_inference_ir`](Self::post_inference_ir).
     ///
-    /// Every id preserved through inline/transact/letrec/desugar is shared with
-    /// [`post_inference_ir`](Self::post_inference_ir).
+    /// The post-inference ⇄ post-desugar adjacency is folded from the
+    /// [`Pass::Inline`] + [`Pass::Desugar`] entries of
+    /// [`pass_lineage`](Self::pass_lineage) at snapshot-serve time (see
+    /// [`materialize_panes`](Self::materialize_panes)); every id preserved
+    /// through inline/transact/letrec/desugar is shared with
+    /// [`post_inference_ir`](Self::post_inference_ir) (a self-edge).
     pub post_desugar_ir: Expr,
+    /// Per-pass [`LineageLog`]s recorded by the lineage recorder
+    /// ([`crate::ccl::lineage`]), in pipeline order:
+    ///
+    /// * [`Pass::Mono`] — monomorphization's per-clone `Copy` steps and the
+    ///   `coalesce_generalized_let` wrapper `Transform` (bridges the
+    ///   pre-inference ⇄ post-inference panes),
+    /// * [`Pass::Inline`] — inline's beta/alias discard `Transform`s and fan-out
+    ///   `Copy` steps,
+    /// * [`Pass::Transact`] — the transaction rewrite's `transact.commit`
+    ///   Transform (consuming the `with begin():` markers) plus its commit-`LetRec`
+    ///   scaffolding births and `subst_env` snapshot copies,
+    /// * [`Pass::Letrec`] — the induction phase's `letrec.loop` Transform
+    ///   (consuming the loop spine) plus its history/decision births and copies,
+    ///   and
+    /// * [`Pass::Desugar`] — channelize's cluster/feed-union/lift/drop rewrites
+    ///   (Inline + Transact + Letrec + Desugar together bridge post-inference ⇄
+    ///   post-desugar, fully recorded — no catch-all).
+    ///
+    /// This is the **authoritative** lineage surface. [`materialize_panes`](Self::materialize_panes)
+    /// folds it at each pane boundary into the per-pane
+    /// [`SourceProjection`](crate::ccl::lineage::SourceProjection)s and pane-pair
+    /// [`LineageMap`](crate::ccl::lineage::LineageMap)s the inspector consumes.
+    // Consumed by the inspector model; unused within the compiler itself.
+    #[allow(dead_code)]
+    pub(crate) pass_lineage: Vec<(Pass, LineageLog)>,
     /// The parsed CHL surface AST — the source-of-truth for source-level
     /// (lexical) inspector queries.
     ///
@@ -593,6 +636,83 @@ impl CompiledProgram {
     pub fn sinks(&self) -> impl Iterator<Item = &CompiledOutput> {
         self.outputs.iter().filter(|o| !o.is_main())
     }
+
+    /// Fold [`pass_lineage`](Self::pass_lineage) at the two pane boundaries into
+    /// the per-pane [`SourceProjection`]s and pane-pair [`LineageMap`]s the
+    /// inspector consumes. Cold path (snapshot-serve only), never called by
+    /// `compile_program`:
+    ///
+    /// * pre-inference pane = the lowering projection (uniquify preserves ids);
+    /// * post-inference pane = fold the Mono log (lowering projection →
+    ///   post-inference ids);
+    /// * post-desugar pane = fold the concatenated Inline + Desugar logs
+    ///   (post-inference → post-desugar ids). Both boundaries are fully recorded.
+    // Consumed by the inspector model (a later commit in this stack).
+    #[allow(dead_code)]
+    pub(crate) fn materialize_panes(&self) -> MaterializedPanes {
+        debug_assert_eq!(
+            self.pass_lineage.first().map(|(p, _)| *p),
+            Some(Pass::Mono),
+            "pass_lineage must retain the Mono log first (the pre→post-inference boundary)"
+        );
+        let pre_ids = collect_tree_ids(&self.pre_inference_ir);
+        let post_inf_ids = collect_tree_ids(&self.post_inference_ir);
+        let post_des_ids = collect_tree_ids(&self.post_desugar_ir);
+
+        // Boundary 1: the Mono log (first entry) bridges pre → post-inference.
+        let (mono_map, post_inference, mono_leaks) = collapse(
+            &self.pass_lineage[..1],
+            &pre_ids,
+            &post_inf_ids,
+            &self.lowering_projection,
+        );
+        // The Mono boundary is fully recorded (mono Copy steps + the coalesce
+        // wrapper Transform consuming the whole original def subtree).
+        assert_leaks_clean(&mono_leaks, "pre-inference → post-inference (Mono)");
+
+        // Boundary 2: the Inline + Transact + Letrec + Desugar logs bridge
+        // post-inference → post-desugar. All four passes record their rewrites, so
+        // this boundary is fully recorded too — zero-leak, no catch-all bridge.
+        let (desugar_map, post_desugar, desugar_leaks) = collapse(
+            &self.pass_lineage[1..],
+            &post_inf_ids,
+            &post_des_ids,
+            &post_inference,
+        );
+        assert_leaks_clean(
+            &desugar_leaks,
+            "post-inference → post-desugar (Inline+Transact+Letrec+Desugar)",
+        );
+
+        MaterializedPanes {
+            pre_inference: self.lowering_projection.clone(),
+            post_inference,
+            post_desugar,
+            mono_map,
+            desugar_map,
+        }
+    }
+}
+
+/// The per-pane projections and pane-pair lineage maps materialized from
+/// [`CompiledProgram::pass_lineage`] — see
+/// [`CompiledProgram::materialize_panes`]. Inspector-facing; the pane
+/// projections drive `hover`/`resolve`/`spanIndex`/`build_inspect_tree`, and the
+/// maps drive the cross-pane `paneLinks` (shipped dense, self-edges included).
+// Consumed by the inspector model; unused within the compiler itself.
+#[allow(dead_code)]
+pub(crate) struct MaterializedPanes {
+    /// pre-inference pane projection (= the lowering projection).
+    pub(crate) pre_inference: SourceProjection,
+    /// post-inference pane projection.
+    pub(crate) post_inference: SourceProjection,
+    /// post-desugar pane projection.
+    pub(crate) post_desugar: SourceProjection,
+    /// pre-inference → post-inference lineage map (Mono fan-out). Dense: shipped
+    /// verbatim on the `paneLinks` wire, self-edges included.
+    pub(crate) mono_map: LineageMap<NodeId, NodeId>,
+    /// post-inference → post-desugar lineage map (Inline + Desugar).
+    pub(crate) desugar_map: LineageMap<NodeId, NodeId>,
 }
 
 /// Every main-tree node id reachable in `expr` (the `walk_children` node set,
@@ -608,11 +728,16 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> std::collections::HashSet<NodeId>
     acc
 }
 
-/// The lowering-boundary leak gate: the lowering log records every mint and
-/// copy at its site, so [`collapse_lowering`]'s fold must explain every
-/// output-tree node with **no** leak of any class — an `Unexplained` (an
-/// unrecorded lowering mint) is a recording bug, not tolerated residue.
-/// Debug/test only, single code path (`cfg!`, not `#[cfg]`).
+/// The boundary leak gate.
+///
+/// Both inspector pane boundaries are now **fully recorded** — every pass between
+/// two retained panes (Mono at boundary 1; Inline + Transact + Letrec + Desugar
+/// at boundary 2) emits its mints/consumes/copies as [`RewriteStep`]s — so the
+/// fold must explain every node with **no** leak of any class. There is no
+/// catch-all bridge — every node is explained by a recorded step: an
+/// `Unexplained` (an uncaptured mint) or a `Dropped`
+/// (an unconsumed vanishing node) is a recording bug, not tolerated residue.
+/// Debug/test only (the fold is the cold snapshot-serve path).
 fn assert_leaks_clean(leaks: &[Leak], boundary: &str) {
     if !cfg!(any(debug_assertions, test)) {
         return;
@@ -805,8 +930,10 @@ pub fn compile_program(
 
     // Retain the pre-inference IR for the inspector's upstream pane before
     // `infer` mutates `expr` in place. This is the source-shaped, pre-mono,
-    // still-hole-typed tree. Its ids resolve against the `lowering_projection`
-    // (the pre-mono originals). See `CompiledProgram::pre_inference_ir`.
+    // still-hole-typed tree; its fan-out to the post-inference snapshot (mono
+    // freshens clone ids inside `infer`) is recorded in the `Pass::Mono` lineage
+    // log captured below. Its ids resolve against the `lowering_projection` (the
+    // pre-mono originals). See `CompiledProgram::pre_inference_ir`.
     let pre_inference_ir = expr.clone();
 
     // Register every source (pre-registered + discovered during lowering) with
@@ -829,13 +956,20 @@ pub fn compile_program(
 
     // Inference runs on the user-shaped tree — before channelize — so type
     // errors are reported against the program the user wrote, not the
-    // channelized rewrite.
+    // channelized rewrite. Monomorphization runs *inside* `infer`; a
+    // `RecorderSession` installed across the boundary captures its per-clone
+    // `Copy` steps and the `coalesce_generalized_let` wrapper `Transform` into
+    // the `Pass::Mono` lineage log (the pre → post-inference pane bridge).
+    let mono_session = RecorderSession::new();
     let infer_outcome = infer(&mut expr, ctx.inference_ctx());
+    let mono_lineage = mono_session.into_log();
     // On failure, resolve each error's own blame node to a source span *here* —
     // the lowering projection is in scope and holds the lowered attribution (this
-    // is the always-on release read: one hop, no fold). Every error names a node;
-    // an id the projection doesn't cover (a node minted after lowering, e.g. by
-    // monomorphization) degrades to a span-less diagnostic.
+    // is the always-on release read: one hop, no fold, before any pane exists).
+    // Infer errors occur before the panes are materialized, so the lowering
+    // projection is the only lineage layer they can consult. Every error names a
+    // node; an id the projection doesn't cover (a node minted after lowering,
+    // e.g. by monomorphization) degrades to a span-less diagnostic.
     if let Err(errors) = infer_outcome {
         return Err(resolve_infer_errors(errors, &lowering_projection));
     }
@@ -892,12 +1026,20 @@ pub fn compile_program(
     // Retain the post-inference IR for the inspector before `inline` consumes
     // `expr`. This is the source-shaped, fully-typed anchor (lambdas intact, not
     // yet point-free; inline/transact/letrec/desugar/lambda_elim/planning have
-    // not run). `ast` (`join_planned`) is the *wrong* tree for a source
+    // not run). Its node ids are the input pane of the post-inference →
+    // post-desugar fold. `ast` (`join_planned`) is the *wrong* tree for a source
     // view — `lambda_elim`/`planning` re-mint ids and produce execution shape.
     // See `CompiledProgram::post_inference_ir`.
     let post_inference_ir = expr.clone();
 
-    expr = inline::inline_non_iterable_lambdas(expr);
+    // Runs inline under a `RecorderSession` so its construction steps (beta/alias
+    // discard `Transform`s + fan-out `Copy`s) are captured into a `LineageLog`
+    // retained on `CompiledProgram::pass_lineage` (`Pass::Inline`).
+    let (inlined, inline_lineage) = inline::inline_with_lineage(expr);
+    expr = inlined;
+    // Id-uniqueness tripwire at the inline boundary. Order-agnostic tree
+    // invariant; see `assert_unique_node_ids`.
+    assert_unique_node_ids(&expr, "post-inline");
     debug!("UDFs inlined CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).map_err(|errs| {
         if errs
@@ -942,7 +1084,14 @@ pub fn compile_program(
     // supported, and it is exactly the out-of-block form).
     transact_phase::check_no_guarded_induction_writes(&expr, &txn_registers)
         .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    // Runs the transact phase under a `RecorderSession` so its rewrite steps
+    // (site strips → commit `LetRec`, decision/history/tap mints, `subst_env`
+    // copies) are captured into a `LineageLog` retained on
+    // `CompiledProgram::pass_lineage` (`Pass::Transact`).
+    let transact_session = RecorderSession::new();
     expr = transact_phase::run(expr, &txn_registers);
+    let transact_lineage = transact_session.into_log();
+    assert_unique_node_ids(&expr, "post-transact");
     debug!("Transact phase CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).expect("transact phase produced an inconsistent tree");
 
@@ -954,7 +1103,14 @@ pub fn compile_program(
     // hoisted to an ordinary feed of the loop's history for desugar to route.
     // The tree still carries Defer/Feed here, so the walls are the relaxed
     // pre-desugar check.
+    // Runs the mut-elim (induction) phase under a `RecorderSession` so its rewrite
+    // steps (loop → causal `LetRec`, decision/history mints, `subst_env` copies)
+    // are captured into a `LineageLog` retained on `CompiledProgram::pass_lineage`
+    // (`Pass::Letrec`).
+    let letrec_session = RecorderSession::new();
     let phase_out = mut_elim::run(expr);
+    let letrec_lineage = letrec_session.into_log();
+    assert_unique_node_ids(&phase_out, "post-letrec-run");
     debug!("Letrec phase CCL:\n{}", symbolic(&phase_out));
     check_pre_desugar(&phase_out).expect("letrec phase produced an inconsistent tree");
 
@@ -968,9 +1124,25 @@ pub fn compile_program(
     // remain: channelization is type-preserving by construction and closes
     // channel domains by substitution; the strict `typecheck` below is the
     // release-visible enforcement.
-    let mut desugared = channelize::run(phase_out, /* input_typed= */ true).errs()?;
+    // Runs channelize under a `RecorderSession` so its construction steps
+    // (cluster/feed-union/lift/drop `RewriteStep`s) are captured into a
+    // `LineageLog` retained on `CompiledProgram::pass_lineage` (`Pass::Desugar`).
+    let (channelize_result, desugar_lineage) =
+        channelize::run_with_lineage(phase_out, /* input_typed= */ true);
+    let mut desugared = channelize_result.errs()?;
     debug!("Channelized:\n{}", symbolic(&desugared));
     typecheck(&desugared).expect("channelize produced an ill-typed tree");
+    // Id-uniqueness tripwire on the post-channelize tree. Freshen-at-duplication
+    // (inline's `Subst` clones + channelize's fan-out source clones) makes this
+    // hold unconditionally now — before that migration channelize's bare
+    // `.clone()`s left genuine duplicate ids here, so no such assert could
+    // exist. Order-agnostic tree invariant; see `assert_unique_node_ids`.
+    assert_unique_node_ids(&desugared, "post-desugar");
+
+    // Desugar-stage provenance is folded from the `Pass::Inline` + `Pass::Transact`
+    // + `Pass::Letrec` + `Pass::Desugar` lineage logs at snapshot-serve time
+    // (`CompiledProgram::materialize_panes`) — every pass fully recorded. Nothing
+    // is applied here.
 
     // Retain the post-channelize tree for the inspector's downstream pane. On the
     // post-inference desugar order this snapshot is *downstream* of
@@ -1109,6 +1281,17 @@ pub fn compile_program(
         pre_inference_ir,
         post_inference_ir,
         post_desugar_ir,
+        // Pipeline order — Mono FIRST (bridges pre→post-inference), then Inline +
+        // Transact + Letrec + Desugar (bridge post-inference→post-desugar), in the
+        // order the passes run. `materialize_panes` relies on Mono being index 0
+        // (it folds `[..1]` for boundary 1 and `[1..]` for boundary 2).
+        pass_lineage: vec![
+            (Pass::Mono, mono_lineage),
+            (Pass::Inline, inline_lineage),
+            (Pass::Transact, transact_lineage),
+            (Pass::Letrec, letrec_lineage),
+            (Pass::Desugar, desugar_lineage),
+        ],
         source_ast: module,
         source: code.to_string(),
     })
@@ -1117,6 +1300,70 @@ pub fn compile_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::lineage::{Nature, SourceAttribution};
+
+    /// Compile a program for provenance inspection, returning the whole
+    /// [`CompiledProgram`].
+    fn compile_ok(code: &str) -> CompiledProgram {
+        let mut ctx = GlobalContext::default();
+        let consumer: Box<dyn Consumer> = Box::new(|| {});
+        compile_program(&mut ctx, code, consumer).expect("program compiles")
+    }
+
+    /// Provenance census of a stage tree against its materialized pane
+    /// [`SourceProjection`]: a count of every **main-tree** node (the
+    /// `walk_children` node-set) by attribution category — `Source`,
+    /// `Derived(<pass>)`, `Synthetic(<pass>)` (via [`attr_category`]),
+    /// or `unresolved` (no projection entry). A `BTreeMap` so the pinned rows are
+    /// order-stable and diff cleanly.
+    ///
+    /// This is the guardrail that converts a future pass churning ids without
+    /// recording into a *forced visible diff*: it shows up as `Synthetic`
+    /// inflation and fails the pinned row. With every pane boundary fully
+    /// recorded AND the lowering fold covering every node (each a `Source`
+    /// direct image or a `Synthetic(Lower)` plumbing leaf — an unrecorded mint
+    /// would be a `Leak::Unexplained` at `collapse_lowering`), `unresolved` is a
+    /// hard zero at every pane — asserted structurally in `census_ratchet`, not
+    /// ratcheted per row.
+    /// The flat provenance category string for a node's attribution — the
+    /// census row key and the label the mono/inline/desugar tests match on.
+    ///
+    /// Test-only: schema 3 ships the native `{via, nature, label}` tag on the
+    /// wire, so this categorization no longer lives on `SourceAttribution`. It
+    /// folds the two-axis tag back into the flat `Source` / `Derived(<via>)` /
+    /// `Synthetic(<via>)` vocabulary these ratchets pin.
+    fn attr_category(attr: &SourceAttribution) -> String {
+        match attr.rewritten.nature {
+            // A direct image (`Nature::Source`) is the census `Source` row — the
+            // wire null-compresses it, and the ratchet pins it unmoved.
+            Nature::Source => "Source".to_string(),
+            Nature::Expansion => format!("Derived({:?})", attr.rewritten.via),
+            Nature::Machinery => format!("Synthetic({:?})", attr.rewritten.via),
+        }
+    }
+
+    fn provenance_census(
+        stage_ir: &Expr,
+        projection: &SourceProjection,
+    ) -> std::collections::BTreeMap<String, usize> {
+        fn label(projection: &SourceProjection, id: NodeId) -> String {
+            match projection.get(&id) {
+                None => "unresolved".to_string(),
+                Some(attr) => attr_category(attr),
+            }
+        }
+        fn walk(
+            e: &Expr,
+            projection: &SourceProjection,
+            out: &mut std::collections::BTreeMap<String, usize>,
+        ) {
+            *out.entry(label(projection, e.node_id())).or_default() += 1;
+            e.walk_children(|c| walk(c, projection, out));
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(stage_ir, projection, &mut out);
+        out
+    }
 
     /// Driver that runs `compile_program` for an error-only test, returning
     /// the collected error list. Discards the program — these tests only
@@ -1127,6 +1374,236 @@ mod tests {
         match compile_program(&mut ctx, code, consumer) {
             Ok(_) => panic!("expected compile error, got success"),
             Err(errs) => errs,
+        }
+    }
+
+    /// Compile-time canary for the always-on lowering session cost (a
+    /// *measurement hook*, not a gate — nothing is asserted here). The lowering
+    /// session installs in every
+    /// build now, recording at leaf grain (ordinary mints open no frame, so
+    /// `on_mint` stays a no-op) plus a copy frame per uncurry/compare-chain site,
+    /// followed by one O(nodes) fold. This times a representative compile so a
+    /// regression in that overhead is observable.
+    ///
+    /// Run manually (release, the meaningful configuration):
+    /// `cargo test --release -- --ignored lowering_session_cost_canary --nocapture`.
+    #[test]
+    #[ignore = "benchmark hook (not a gate); run manually with --release --nocapture"]
+    fn lowering_session_cost_canary() {
+        use std::time::Instant;
+        // A program exercising leaf recording (arithmetic/loop plumbing) plus a
+        // copy frame (the chained comparison's shared operand).
+        let code = "x := 0\nfor i in [1, 2, 3]:\n    x += i\n1 < x < 3\nx\n";
+        let iters = 2_000u32;
+        let start = Instant::now();
+        for _ in 0..iters {
+            let _ = compile_ok(code);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "lowering-session canary: {iters} compiles in {elapsed:?} \
+             ({:?}/compile)",
+            elapsed / iters,
+        );
+    }
+
+    /// RT-4c: the provenance-census ratchet. Pins the exact per-category node
+    /// counts for a corpus of representative programs at each retained stage. A
+    /// future pass that churns ids without recording shows up as `Synthetic` /
+    /// `unresolved` inflation and fails the matching row; a deliberate provenance
+    /// improvement (e.g. a desugar lift-preserve that turns a swept node into a
+    /// tracked one) *moves* a row, and that diff is itself the commit's
+    /// provenance-impact statement.
+    ///
+    /// The txn/loop rows show the **fully-recorded** state: their post-desugar
+    /// trees are `Derived(Transact)`/`Derived(Letrec)`/`Derived(Desugar)` — the
+    /// commit `LetRec` scaffolding and the loop→`LetRec` rewrite are recorded as
+    /// real lineage steps (every node resolves through a recorded lineage
+    /// step). The lowering fold covers
+    /// every node, so `unresolved` is a hard zero at
+    /// every pane — asserted structurally in the loop below, on top of the
+    /// per-row pins. These counts are **structural** (nodes counted by tree
+    /// position); this test's job is the forward ratchet and pinning the
+    /// attribution shape.
+    ///
+    /// The `Source` / `Synthetic(Lower)` split follows the structural rule on
+    /// `LoweringContext::tag_source`: `Source` marks a lowered *expression root*,
+    /// so an image that is not a root — a callee `Var`, an interior comparison of
+    /// a chain, a statement-level `Let` — counts as `Synthetic(Lower)` while still
+    /// carrying the `"lower.image"` label. A row that moves count between those
+    /// two categories with its **total unchanged** is a reclassification, not a
+    /// coverage change; a total that moves, or an `unresolved` appearing, is not.
+    ///
+    /// # Re-bless procedure
+    /// Run `cargo test -q --lib census_ratchet -- --nocapture` (or read the assert
+    /// diff on failure), confirm the delta is an *intended* provenance change for
+    /// the commit in flight, then update the affected row's expected map here.
+    #[test]
+    fn census_ratchet() {
+        use std::collections::BTreeMap;
+        /// A per-stage census (category → count).
+        type Census = BTreeMap<String, usize>;
+        /// One corpus row: program name, source, and expected census for the
+        /// three retained stages (pre-inference, post-inference, post-desugar).
+        type Row = (&'static str, &'static str, [Census; 3]);
+        fn bt(pairs: &[(&str, usize)]) -> Census {
+            pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        }
+
+        let cases: &[Row] = &[
+            (
+                "arithmetic",
+                "x = 1 + 2\nx\n",
+                [
+                    // `let x = (1 + 2) in x`: the four expression roots (`1`, `2`,
+                    // the `+`, the trailing `x`) are `Source`; the `Let` images the
+                    // *assignment statement*, and a statement is not a
+                    // `Spanned<ChlExpr>`, so under the structural rule it is
+                    // `Synthetic(Lower)` carrying the `"lower.image"` label.
+                    bt(&[("Source", 4), ("Synthetic(Lower)", 1)]),
+                    bt(&[("Source", 4), ("Synthetic(Lower)", 1)]),
+                    bt(&[("Source", 4), ("Synthetic(Lower)", 1)]),
+                ],
+            ),
+            (
+                "polymorphic",
+                "dup = \\x -> (x, x)\n(dup(1), dup(2 == 2))\n",
+                [
+                    // Full lowering-projection coverage. The three
+                    // `Synthetic(Lower)` nodes are images that are not expression
+                    // *roots*: the two call-site callee `Var`s (images of the
+                    // written function names) and the `def`'s statement-level
+                    // `Let`. They keep the `"lower.image"` label.
+                    bt(&[("Source", 11), ("Synthetic(Lower)", 3)]),
+                    bt(&[
+                        ("Derived(Mono)", 10),
+                        ("Source", 7),
+                        ("Synthetic(Lower)", 2),
+                    ]),
+                    // Freshen-at-duplication: inline copies every
+                    // occurrence of a fanned-out UDF body, so the formerly
+                    // keep-first-preserved occurrence (Mono/Source) is now a
+                    // freshened `Derived(Inline)` copy too. Structural count is
+                    // unchanged (11); the attribution shifts Mono+Source → Inline.
+                    bt(&[("Derived(Inline)", 10), ("Source", 1)]),
+                ],
+            ),
+            (
+                "udf_fanout",
+                "def inc(n):\n    n + 1\na = inc(1)\nb = inc(2)\na + b\n",
+                [
+                    // Six non-root images: the `def` and two `a`/`b` assignment
+                    // `Let`s, and the three callee `Var`s.
+                    bt(&[("Source", 10), ("Synthetic(Lower)", 6)]),
+                    bt(&[("Derived(Mono)", 5), ("Source", 7), ("Synthetic(Lower)", 4)]),
+                    // See `polymorphic`: freshen-at-duplication reattributes the
+                    // formerly-preserved inlined occurrences to `Derived(Inline)`.
+                    bt(&[
+                        ("Derived(Inline)", 6),
+                        ("Source", 3),
+                        ("Synthetic(Lower)", 2),
+                    ]),
+                ],
+            ),
+            (
+                "compare_chain",
+                // Chained comparison — the keep-first duplicate-NodeId
+                // regression program. The outermost AND glue is re-tagged as the
+                // whole expression's image (`Source`); each *pair* BinOp images
+                // its own `<` but is interior, so it is `Synthetic(Lower)` under
+                // the structural rule, as are the `x = 2` assignment `Let` and the
+                // statement-sequencing `ExprStmt`. The freshened second use of the
+                // shared middle operand still mirrors its origin's attribution.
+                "x = 2\n1 < x < 3\nx\n",
+                [
+                    bt(&[("Source", 7), ("Synthetic(Lower)", 4)]),
+                    bt(&[("Source", 7), ("Synthetic(Lower)", 4)]),
+                    // Inline substitutes the single-use `x` binding and drops
+                    // the effect-free comparison statement, leaving the small
+                    // surviving spine.
+                    bt(&[("Source", 2), ("Synthetic(Lower)", 1)]),
+                ],
+            ),
+            (
+                "mutation_loop",
+                "x := 0\nfor i in [1, 2, 3]:\n    x += i\nx\n",
+                [
+                    // Lowering-manufactured plumbing (the `+=` expansion's
+                    // read/arithmetic, the loop-body chain terminal, the loop's
+                    // sequencing `ExprStmt`) is attributed `Synthetic(Lower)` by
+                    // lowering at its mint site; everything the user wrote images
+                    // as `Source`.
+                    bt(&[("Source", 7), ("Synthetic(Lower)", 8)]),
+                    bt(&[("Source", 7), ("Synthetic(Lower)", 8)]),
+                    // post-desugar: the letrec phase records its
+                    // loop→`LetRec` rewrite as honest `Derived(Letrec)`
+                    // (Expansion); the lowering-manufactured survivors keep
+                    // their `Synthetic(Lower)` attributions.
+                    bt(&[
+                        ("Derived(Letrec)", 38),
+                        ("Source", 7),
+                        ("Synthetic(Lower)", 3),
+                    ]),
+                ],
+            ),
+            (
+                "txn_begin",
+                "out = defer()\npool: Mut(Int, Txn) := 100\nfor r in [10, 20, 30]:\n    with begin():\n        pool := pool - r\nwith begin():\n    out << pool\nout",
+                [
+                    bt(&[("Source", 12), ("Synthetic(Lower)", 19)]),
+                    bt(&[("Source", 12), ("Synthetic(Lower)", 19)]),
+                    // post-desugar: the transaction rewrite is recorded, so
+                    // the formerly bridge-swept commit `LetRec` scaffolding is
+                    // honest `Derived(Transact)` (54 — was 59 before the per-key
+                    // commit view was retired for allocate-on-commit, dropping
+                    // the decision copy + `commit` projection per writer); the
+                    // transaction-emptied `For` retired by the mut-elim phase is
+                    // `Derived(Letrec)` (2); channelize's feed-union/cluster
+                    // steps attribute 7 nodes `Derived(Desugar)`. The 2
+                    // `Synthetic(Lower)` survivors are the standalone
+                    // transaction's singleton `[unit]` source — manufactured by
+                    // lowering and attributed at the mint site.
+                    bt(&[
+                        ("Derived(Desugar)", 7),
+                        ("Derived(Letrec)", 2),
+                        ("Derived(Transact)", 54),
+                        ("Source", 6),
+                        ("Synthetic(Lower)", 2),
+                    ]),
+                ],
+            ),
+        ];
+
+        for (name, code, expected) in cases {
+            let p = compile_ok(code);
+            let panes = p.materialize_panes();
+            let actual = [
+                provenance_census(&p.pre_inference_ir, &panes.pre_inference),
+                provenance_census(&p.post_inference_ir, &panes.post_inference),
+                provenance_census(&p.post_desugar_ir, &panes.post_desugar),
+            ];
+            let stages = ["pre_inference_ir", "post_inference_ir", "post_desugar_ir"];
+            for i in 0..3 {
+                // Structural invariant, not a per-row ratchet: with the lowering
+                // fold covering every node (an unrecorded mint would be a
+                // `Leak::Unexplained` at `collapse_lowering`) and every pane
+                // boundary fully recorded, NO census at ANY pane may contain an
+                // `unresolved` row — a node the pane projection knows nothing
+                // about no longer exists.
+                assert!(
+                    !actual[i].contains_key("unresolved"),
+                    "`{name}` at {}: census contains `unresolved` rows ({:?}) — a node \
+                     escaped the lowering projection or a pass rewrote without recording",
+                    stages[i],
+                    actual[i]
+                );
+                assert_eq!(
+                    actual[i], expected[i],
+                    "census drift for `{name}` at {}: re-bless if intended (see the \
+                     re-bless procedure on this test)",
+                    stages[i]
+                );
+            }
         }
     }
 
@@ -1367,5 +1844,489 @@ x = (1 +)
             parse_count >= 1,
             "expected at least 1 parse error: {errs:?}"
         );
+    }
+
+    /// Monomorphization end-to-end: a generalized definition used at two
+    /// distinct types is monomorphized into two specializations. Each
+    /// specialization's cloned nodes get fresh `NodeId`s (so they no longer
+    /// collide on the original definition's ids), and the folded post-inference
+    /// projection attributes them `Derived(Mono)` with spans tracing — through
+    /// the per-clone `Copy` steps and the wrapper `Transform` — back to the
+    /// original lowered node's source span (within the def's first line).
+    #[test]
+    fn monomorphization_tags_specializations_with_mono_provenance() {
+        // `dup` is bound to a polymorphic lambda and applied at Int and String,
+        // forcing two specializations. A non-trivial body (`(x, x)`) keeps the
+        // definition from being beta-reduced away before inference (a plain
+        // `\x -> x` is inlined during lowering, leaving nothing to
+        // monomorphize). The trailing tuple is the program's value.
+        let code = "\
+dup = \\x -> (x, x)
+(dup(1), dup(\"a\"))
+";
+        let compiled = compile_ok(code);
+        let panes = compiled.materialize_panes();
+
+        // The `dup = \x -> (x, x)` statement is the first line; its nodes
+        // were attributed `Source` within that span by lowering, and the mono Copy /
+        // wrapper Transform steps carry those spans onto the specialization
+        // nodes as `Derived(Mono)`.
+        let def_line_end = code.find('\n').expect("two-line program");
+
+        // Walk the post-inference pane; collect every node whose attribution is
+        // `Derived(Mono)`.
+        fn collect_mono<'a>(
+            e: &Expr,
+            proj: &'a SourceProjection,
+            out: &mut Vec<&'a SourceAttribution>,
+        ) {
+            if let Some(attr) = proj.get(&e.node_id())
+                && attr_category(attr) == "Derived(Mono)"
+            {
+                out.push(attr);
+            }
+            e.walk_children(|c| collect_mono(c, proj, out));
+        }
+        let mut mono = Vec::new();
+        collect_mono(
+            &compiled.post_inference_ir,
+            &panes.post_inference,
+            &mut mono,
+        );
+        assert!(
+            !mono.is_empty(),
+            "monomorphization must attribute specialization nodes Derived(Mono)"
+        );
+        for attr in &mono {
+            assert!(
+                !attr.spans.is_empty(),
+                "a mono specialization resolves to its original def's source span(s)"
+            );
+            for span in &attr.spans {
+                assert!(
+                    span.end <= def_line_end,
+                    "mono origin span {span:?} traces back to the `dup` definition \
+                     (within the first line, bytes 0..{def_line_end})"
+                );
+            }
+        }
+    }
+
+    /// The inline fan-out copies resolve `Derived(Inline)` with real spans.
+    ///
+    /// A scalar UDF called at two sites *at the same type* fans its body out
+    /// during inlining (one specialization from mono, N freshened copies from
+    /// inline, each recorded as a `Copy` step). Each freshened body copy mirrors
+    /// the original body node's spans — so it resolves to that body's source
+    /// span in the post-desugar projection, attributed `Derived(Inline)`.
+    #[test]
+    fn inline_fanout_copies_resolve_via_inline_copy() {
+        // `add1` is a scalar UDF (Int → Int, non-iterable domain → inlined),
+        // called at two sites both at `Int`, so mono produces ONE specialization
+        // and the two-site fan-out is inline's. The body `x + 1` is duplicated
+        // into freshened copies (recorded as `Copy` steps).
+        let code = "\
+add1 = \\x -> x + 1
+a = add1(10)
+b = add1(20)
+a + b
+";
+        let compiled = compile_ok(code);
+        let panes = compiled.materialize_panes();
+
+        fn collect(expr: &Expr, acc: &mut std::collections::HashSet<NodeId>) {
+            acc.insert(expr.node_id());
+            expr.walk_children(|c| collect(c, acc));
+        }
+        let mut pre = std::collections::HashSet::new();
+        collect(&compiled.post_inference_ir, &mut pre);
+        let mut post = std::collections::HashSet::new();
+        collect(&compiled.post_desugar_ir, &mut post);
+
+        // Candidate inline copies: ids that appear post-desugar but not
+        // post-inference (the freshened fan-out copies; on this defer-free
+        // program transact/letrec/desugar mint nothing else of note).
+        let new_ids: Vec<NodeId> = post.difference(&pre).copied().collect();
+        assert!(
+            !new_ids.is_empty(),
+            "the two-site UDF must fan out into fresh post-desugar ids"
+        );
+
+        let proj = &panes.post_desugar;
+        let derived_inline: Vec<NodeId> = new_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                proj.get(id)
+                    .is_some_and(|a| attr_category(a) == "Derived(Inline)" && !a.spans.is_empty())
+            })
+            .collect();
+        assert!(
+            !derived_inline.is_empty(),
+            "at least one inline fan-out copy must resolve Derived(Inline) \
+             with non-empty spans; new ids resolved as: {:?}",
+            new_ids
+                .iter()
+                .map(|id| (*id, proj.get(id).map(attr_category)))
+                .collect::<Vec<_>>()
+        );
+
+        // Mislabel regression guard: no inline fan-out copy is attributed
+        // `Synthetic(Desugar)` — the `Copy` steps recorded them.
+        for id in &new_ids {
+            if let Some(a) = proj.get(id) {
+                assert_ne!(
+                    attr_category(a),
+                    "Synthetic(Desugar)",
+                    "inline fan-out copy {id:?} was left to the bridge (Synthetic(Desugar))"
+                );
+            }
+        }
+    }
+
+    /// Channelize's rewrites surface as `Desugar`-attributed nodes in the
+    /// post-desugar projection: a defer program compiles end-to-end and the
+    /// folded projection carries `Pass::Desugar` attributions — the recorded
+    /// feed-union/cluster steps (`Derived(Desugar)`, blaming the fed values) and
+    /// channelize's `Machinery` steps.
+    #[test]
+    fn desugar_tags_channelized_plumbing_with_desugar_provenance() {
+        // A for-loop feed: channelize routes the feed into a channel union +
+        // companion-source fan-out, recording those rewrites as Desugar steps.
+        let code = "\
+x = defer()
+for i in [1, 2, 3]:
+  x << i
+x
+";
+        let compiled = compile_ok(code);
+        let panes = compiled.materialize_panes();
+        let proj = &panes.post_desugar;
+
+        fn count_desugar(e: &Expr, proj: &SourceProjection, n: &mut usize) {
+            if proj.get(&e.node_id()).is_some_and(|a| {
+                let l = attr_category(a);
+                l == "Synthetic(Desugar)" || l == "Derived(Desugar)"
+            }) {
+                *n += 1;
+            }
+            e.walk_children(|c| count_desugar(c, proj, n));
+        }
+        let mut desugar = 0;
+        count_desugar(&compiled.post_desugar_ir, proj, &mut desugar);
+        assert!(
+            desugar >= 1,
+            "channelize's rewrites must be attributed via Pass::Desugar"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The construction-step logs retained on
+    // `CompiledProgram::pass_lineage`. These assert on log *structure* (labels,
+    // op shapes, channel emptiness) — never on absolute NodeId values.
+    // -----------------------------------------------------------------------
+    mod lineage_adoption {
+        use super::*;
+        use crate::ccl::lineage::{Leak, LineageLog, Op, SourceProjection, collapse};
+        use std::collections::HashSet;
+
+        fn log_for(prog: &CompiledProgram, pass: Pass) -> &LineageLog {
+            prog.pass_lineage
+                .iter()
+                .find(|(p, _)| *p == pass)
+                .map(|(_, l)| l)
+                .expect("pass has a retained lineage log")
+        }
+
+        /// Every main-tree node id of `e` (skips type-predicate interiors, the
+        /// node set the steps reason about).
+        fn tree_ids(e: &Expr) -> HashSet<NodeId> {
+            fn go(e: &Expr, s: &mut HashSet<NodeId>) {
+                s.insert(e.node_id());
+                e.walk_children(|c| go(c, s));
+            }
+            let mut s = HashSet::new();
+            go(e, &mut s);
+            s
+        }
+
+        /// A top-level two-feed defer cluster: no loop (so no companion-channel
+        /// duplication) and no mutation (so transact/letrec are inert). Exercises
+        /// the cluster step and the feed-union fan-in.
+        const DEFER_CLUSTER: &str = "x = defer()\nx << [1, 2]\nx << [3, 4]\nx\n";
+
+        #[test]
+        fn defer_cluster_logs_cluster_and_feed_union_steps() {
+            let prog = compile_ok(DEFER_CLUSTER);
+            let log = log_for(&prog, Pass::Desugar);
+
+            let cluster = log
+                .iter()
+                .find(|s| s.label == "channelize.cluster")
+                .expect("a channelize.cluster step");
+            match &cluster.op {
+                Op::Transform { consumed, produced } => {
+                    assert!(
+                        !consumed.is_empty(),
+                        "cluster consumes the defer scaffolding: {:?}",
+                        cluster.op
+                    );
+                    assert!(
+                        !produced.is_empty(),
+                        "cluster produces the carrier letrec: {:?}",
+                        cluster.op
+                    );
+                }
+                other => panic!("cluster step must be a Transform, got {other:?}"),
+            }
+
+            let feed_union = log
+                .iter()
+                .find(|s| s.label == "channelize.feed_union")
+                .expect("a channelize.feed_union step");
+            match &feed_union.op {
+                Op::Transform { consumed, .. } => assert!(
+                    consumed.is_empty(),
+                    "feed_union is a pure insertion (empty consumed): {:?}",
+                    feed_union.op
+                ),
+                other => panic!("feed_union step must be a Transform, got {other:?}"),
+            }
+            assert!(
+                !feed_union.blame.is_empty(),
+                "feed_union blames the surviving fed-value roots",
+            );
+        }
+
+        #[test]
+        fn inline_fanout_logs_copy_steps() {
+            // `inc` is called twice: its body fans out to both sites; each
+            // freshened copy (now minted at the duplication site, not by a
+            // post-hoc dedup sweep) is captured as a Copy step.
+            let prog = compile_ok("def inc(n):\n    n + 1\na = inc(1)\nb = inc(2)\na + b\n");
+            let log = log_for(&prog, Pass::Inline);
+            let copies = log
+                .iter()
+                .filter(|s| matches!(s.op, Op::Copy { .. }))
+                .count();
+            assert!(
+                copies >= 1,
+                "inline fan-out must record at least one Copy step; log: {log:?}"
+            );
+        }
+
+        #[test]
+        fn defer_free_program_has_near_empty_channelize_log() {
+            // No defers ⇒ channelize rewrites nothing; its log carries no cluster,
+            // feed-union, lift, or drop steps.
+            let prog = compile_ok("a = 1\nb = 2\na + b\n");
+            let log = log_for(&prog, Pass::Desugar);
+            assert!(
+                log.iter().all(|s| !s.label.starts_with("channelize.")),
+                "defer-free program should log no channelize rewrites; got {log:?}"
+            );
+        }
+
+        /// An unconditional loop feeding a defer: `channelize` fans the feed out
+        /// over a *cloned iteration source* (the compose-fanout companion). Its
+        /// source clones were bare `.clone()`s sharing NodeIds before
+        /// freshen-at-duplication — a genuine duplicate-id class in
+        /// `post_desugar_ir`. The transact/letrec phases are inert on a pure
+        /// defer loop (no mutation), so the pane pair is fully explained.
+        const LOOP_FED_DEFER: &str = "x = defer()\nfor i in [1, 2, 3]:\n  x << i\nx\n";
+
+        /// A guarded loop feed lowers to a `Case` with a `true → unit`
+        /// fallthrough, taking the case-fanout arm.
+        const CASE_FED_DEFER: &str =
+            "x = defer()\nfor i in [1, 2, 3]:\n  if i > 1:\n    x << i\nx\n";
+
+        #[test]
+        fn case_and_loop_fed_defer_post_desugar_ids_are_unique() {
+            // The tree-invariant tripwire (`assert_unique_node_ids`) runs inside
+            // `compile_program`; assert the same here, focused on the fan-out
+            // classes that produced genuine duplicate ids before this migration
+            // (channelize's source clones fed a loop / `Case`).
+            for code in [LOOP_FED_DEFER, CASE_FED_DEFER] {
+                let prog = compile_ok(code);
+                let dups = duplicate_node_ids(&prog.post_desugar_ir);
+                assert!(
+                    dups.is_empty(),
+                    "post_desugar_ir must carry unique ids for `{code}`; dups: {dups:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn loop_fed_defer_records_source_copies_and_has_no_leaks() {
+            let prog = compile_ok(LOOP_FED_DEFER);
+            let log = log_for(&prog, Pass::Desugar);
+
+            // The freshened iteration-source clones are recorded as Copy steps
+            // (they were invisible shared-id clones before freshen-at-source).
+            let copies = log
+                .iter()
+                .filter(|s| matches!(s.op, Op::Copy { .. }))
+                .count();
+            assert!(
+                copies >= 1,
+                "loop-fed fan-out must record source Copy steps; log: {log:?}"
+            );
+
+            let input_ids = tree_ids(&prog.post_inference_ir);
+            let output_ids = tree_ids(&prog.post_desugar_ir);
+            // The post-inference → post-desugar boundary is the Inline + Desugar
+            // logs (`pass_lineage[1..]`); the leading Mono log bridges the
+            // pre → post-inference boundary and would reference pre-inference ids
+            // absent from this input pane.
+            let (_map, _proj, leaks) = collapse(
+                &prog.pass_lineage[1..],
+                &input_ids,
+                &output_ids,
+                &SourceProjection::new(),
+            );
+            // A pure defer loop keeps transact/letrec inert (the documented
+            // tolerance would apply on a *mutation* loop), so the channelize
+            // steps — now including the source Copy steps — fully explain the
+            // pane pair with no residual leak of any kind.
+            assert!(
+                leaks.is_empty(),
+                "loop-fed defer pane pair must be fully explained; leaks: {leaks:?}"
+            );
+        }
+
+        #[test]
+        fn collapse_over_real_panes_has_no_channelize_attributable_leaks() {
+            let prog = compile_ok(DEFER_CLUSTER);
+            let input_ids = tree_ids(&prog.post_inference_ir);
+            let output_ids = tree_ids(&prog.post_desugar_ir);
+
+            // Inline + Desugar logs bridge this pane pair; the Mono log
+            // (`pass_lineage[0]`) belongs to the pre → post-inference boundary.
+            let (_map, _proj, leaks) = collapse(
+                &prog.pass_lineage[1..],
+                &input_ids,
+                &output_ids,
+                &SourceProjection::new(),
+            );
+
+            // A recording *bug* would surface as one of these structural leaks
+            // (an ordering/attribution error inside a step). Their absence is the
+            // real invariant: the channelize steps consume/produce live ids only.
+            let bug_leaks: Vec<&Leak> = leaks
+                .iter()
+                .filter(|l| {
+                    matches!(
+                        l,
+                        Leak::ConsumedUnknown { .. }
+                            | Leak::CopyOfUnknown { .. }
+                            | Leak::ProducedLive { .. }
+                            | Leak::EmptyConsumed { .. }
+                    )
+                })
+                .collect();
+            assert!(
+                bug_leaks.is_empty(),
+                "no channelize-attributable recording bug leaks; got {bug_leaks:?}"
+            );
+
+            // Unexplained/Dropped leaks that remain are NOT channelize's: the
+            // transact/letrec phases run between the two panes and mint/consume
+            // nodes without recording steps until the next increment. This
+            // program keeps them inert (no mutation, no loop), so in practice the
+            // list is empty — assert that to catch a channelize regression, while
+            // documenting why a residual would be tolerable.
+            let residual: Vec<&Leak> = leaks
+                .iter()
+                .filter(|l| matches!(l, Leak::Unexplained { .. } | Leak::Dropped { .. }))
+                .collect();
+            assert!(
+                residual.is_empty(),
+                "this program keeps transact/letrec inert, so channelize's steps \
+                 should fully explain the pane pair; residual leaks: {residual:?}"
+            );
+        }
+
+        /// A mutation loop (`x := 0; for i: x += i; x`).
+        const MUTATION_LOOP: &str = "x := 0\nfor i in [1, 2, 3]:\n    x += i\nx\n";
+        /// A transaction program: a `with begin():` writer loop + a fed-out read.
+        const TXN: &str = "out = defer()\npool: Mut(Int, Txn) := 100\n\
+             for r in [10, 20, 30]:\n    with begin():\n        pool := pool - r\n\
+             with begin():\n    out << pool\nout";
+
+        #[test]
+        fn letrec_loop_records_a_consuming_transform_step() {
+            // The induction phase records its loop → guarded `LetRec` rewrite as a
+            // `letrec.loop` Transform consuming the loop statement's spine.
+            let prog = compile_ok(MUTATION_LOOP);
+            let log = log_for(&prog, Pass::Letrec);
+            let loop_step = log
+                .iter()
+                .find(|s| s.label == "letrec.loop")
+                .expect("a letrec.loop step");
+            match &loop_step.op {
+                Op::Transform { consumed, produced } => {
+                    assert!(
+                        !consumed.is_empty(),
+                        "the loop rewrite consumes the loop spine: {:?}",
+                        loop_step.op
+                    );
+                    assert!(
+                        !produced.is_empty(),
+                        "the loop rewrite mints the carrier LetRec scaffolding: {:?}",
+                        loop_step.op
+                    );
+                }
+                other => panic!("letrec.loop must be a Transform, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn transact_records_a_commit_transform_step() {
+            // The transaction phase records its whole rewrite as a
+            // `transact.commit` Transform consuming the `with begin():` markers.
+            let prog = compile_ok(TXN);
+            let log = log_for(&prog, Pass::Transact);
+            let commit = log
+                .iter()
+                .find(|s| s.label == "transact.commit")
+                .expect("a transact.commit step");
+            match &commit.op {
+                Op::Transform { consumed, produced } => {
+                    assert!(
+                        !consumed.is_empty(),
+                        "the transaction rewrite consumes the `with begin():` markers: {:?}",
+                        commit.op
+                    );
+                    assert!(
+                        !produced.is_empty(),
+                        "the transaction rewrite mints the commit LetRec scaffolding: {:?}",
+                        commit.op
+                    );
+                }
+                other => panic!("transact.commit must be a Transform, got {other:?}"),
+            }
+        }
+
+        /// The mutation-loop and transaction pane pairs fold with **no** leak of
+        /// any class — the whole post-inference → post-desugar boundary (Inline +
+        /// Transact + Letrec + Desugar) is fully recorded.
+        #[test]
+        fn recorded_phases_leave_the_pane_pair_leak_free() {
+            for code in [MUTATION_LOOP, TXN] {
+                let prog = compile_ok(code);
+                let input_ids = tree_ids(&prog.post_inference_ir);
+                let output_ids = tree_ids(&prog.post_desugar_ir);
+                let (_map, _proj, leaks) = collapse(
+                    &prog.pass_lineage[1..],
+                    &input_ids,
+                    &output_ids,
+                    &SourceProjection::new(),
+                );
+                assert!(
+                    leaks.is_empty(),
+                    "fully-recorded pane pair must be leak-free for `{code}`; leaks: {leaks:?}"
+                );
+            }
+        }
     }
 }

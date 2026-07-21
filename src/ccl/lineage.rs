@@ -58,7 +58,6 @@ pub type RewriteLabel = &'static str;
 /// the `op`'s consumed/produced/origin ids and the separate `blame` ids — are
 /// resolved independently at [`collapse`] time (see the module docs).
 #[derive(Clone, Debug, PartialEq, Eq)]
-// Consumed when the passes adopt the recorder (next commit in the stack).
 pub(crate) struct RewriteStep {
     /// The identity relation this step performs.
     pub op: Op,
@@ -387,9 +386,6 @@ pub enum Leak {
 /// `roots`. A blamed id absent from `attr` contributes no spans (it has no
 /// known source), which is legal — empty blame or all-unknown blame yields
 /// `spans: []`, the "known node, no source anchor" case.
-///
-/// A private helper of [`collapse`], so it is dead exactly while `collapse` is.
-#[allow(dead_code)]
 fn attribute(
     blame: &[NodeId],
     nature: Nature,
@@ -453,12 +449,6 @@ fn attribute(
 /// edges — the bipartite product for N:M steps and self-edges for untouched ids
 /// both fall out. Ids born and consumed within the phase never reach an output
 /// and compose away.
-///
-/// Exercised only by this module's tests until a pane boundary calls it, which
-/// needs the per-pass logs the passes do not yet record. `collapse_lowering` is
-/// the always-on sibling and shares the [`RootTracker`] core, so the fold logic
-/// here is not untested — only this entry point is uncalled.
-#[allow(dead_code)]
 pub(crate) fn collapse(
     logs: &[(Pass, LineageLog)],
     input_ids: &HashSet<NodeId>,
@@ -1083,11 +1073,6 @@ impl RecorderSession {
     /// Install a fresh, empty **pass** log as the active recording target for
     /// this thread. Non-reentrant: at most one session per thread
     /// (debug-asserted).
-    ///
-    /// The pass-log counterpart to [`lowering`](Self::lowering), which is
-    /// always-on. Uncalled outside this module's tests until a pass boundary
-    /// installs a session of its own.
-    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self::install(ActiveLog::Pass(Vec::new()))
     }
@@ -1113,9 +1098,6 @@ impl RecorderSession {
 
     /// Drain and return the recorded **pass** log, ending the session. The
     /// subsequent `Drop` is then a no-op (the slot is already empty).
-    ///
-    /// Paired with [`new`](Self::new), so it is dead exactly while that is.
-    #[allow(dead_code)]
     pub(crate) fn into_log(self) -> LineageLog {
         ACTIVE_LOG.with(|slot| match slot.borrow_mut().take() {
             Some(ActiveLog::Pass(log)) => log,
