@@ -79,15 +79,13 @@ pub(super) fn lower_list_comp(
     }
 
     // ---- Phase 2: Lower body and all predicates to CCL -------------------------
-    let body = lower_expr(&comp.element, ctx)?;
-
-    // Lower every `if` guard from each generator to CCL.  We hold on to the
-    // original CHL nodes only to build human-readable description strings;
-    // all detection logic operates on the lowered CCL expressions.
     let chl_preds: Vec<&Spanned<ChlExpr>> = generators
         .iter()
         .flat_map(|(_, _, ifs)| ifs.iter().copied())
         .collect();
+    let body = lower_expr(&comp.element, ctx)?;
+    // We hold on to the original CHL guard nodes only to build human-readable
+    // description strings; all detection logic operates on the lowered CCL.
     let lowered_preds: Vec<Expr> = chl_preds
         .iter()
         .map(|e| lower_expr(e, ctx))

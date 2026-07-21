@@ -675,38 +675,22 @@ fn elim_lambda_impl(
         }
 
         // `Defer`, `Feed`, `Define`, and `ExprStmt` are eliminated by
-        // `desugar_defers` before inference; by the time `lambda_elim`
-        // runs they cannot appear.
+        // `channelize`, which runs before lambda-elim; by the time
+        // `lambda_elim` runs they cannot appear.
         TypedExprNode::Feed { .. }
         | TypedExprNode::Define { .. }
         | TypedExprNode::Defer
         | TypedExprNode::ExprStmt { .. } => {
-            unreachable!("Defer/Feed/Define/ExprStmt eliminated by desugar_defers before inference")
+            unreachable!(
+                "Defer/Feed/Define/ExprStmt eliminated by channelize, which runs before lambda-elim"
+            )
         }
 
-        // Loop: eliminate `param` from sub-expressions, respecting shadowing
-        // by the Loop's own params.  The mutation-loop-shaped Loop produced
-        // by [`crate::ccl::lower::lower_mutation_loop`] uses `Compose` and
-        // `Lambda` inside its `loop_body`; standard recursion handles those.
-        // `init_args` and `source` sit outside the loop's param scope and
-        // are always recursed into via `walk_loop_children`.
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => Ok(TypedExpr {
-            ty: result_ty,
-            node: crate::ccl::try_walk_loop_children(
-                params,
-                init_args,
-                source,
-                loop_body,
-                Some(param),
-                |e| elim_lambda(ctx, param, param_ty, e),
-            )?,
-            user_annotation: None,
-        }),
+        // `Transact` is born by recognition, which runs *after* this pass —
+        // none can reach lambda elimination.
+        TypedExprNode::Transact { .. } => {
+            unreachable!("lambda_elim: Transact is born by recognition, after this pass")
+        }
 
         // Unsupported constructs.
         body => Err(LambdaElimError::Unsupported(format!(

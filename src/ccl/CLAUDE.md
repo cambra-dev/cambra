@@ -16,4 +16,4 @@ If you find yourself adding a new `TypedExprNode` variant that "does something" 
 ## General Instructions
 
 ### Workflow
-When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes the CCL design docs in `design/` (`ir.md`, `type-inference.md`, `lowering.md`, `optimization.md`, `desugar-defers.md`) and other `*/design-*.md` files close to source files that were changed.
+When planning, include updates to the appropriate docs to reflect the changes; validate the docs are up to date before creating a PR. This includes the CCL design docs in `design/` (`ir.md`, `type-inference.md`, `lowering.md`, `optimization.md`, `mutability.md`) and other `*/design-*.md` files close to source files that were changed.

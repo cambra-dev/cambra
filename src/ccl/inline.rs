@@ -50,9 +50,15 @@
 //! `const(x)` wrappers, which would otherwise require special
 //! recognition downstream.
 //!
-//! [`Defer`]/[`Feed`]/[`Define`] are already gone by the time this pass
-//! runs (they're eliminated by [`crate::ccl::desugar_defers`] before
-//! inference), so this pass never sees them.
+//! This pass runs **before** [`crate::ccl::channelize`] (so the unified
+//! letrec phase can route an in-loop feed against inlined writers, and a
+//! defer-mediating UDF reaches its call site before desugar routes it), so it
+//! *does* see [`Defer`]/[`Feed`]/[`Define`] nodes and `Type::History` (feed) domains.
+//! Beta-reduction goes through the defer-aware [`crate::ccl::subst::Subst`]
+//! engine, whose `Feed`/`Define` arms rename a fed-to handle correctly when a
+//! defer-mediating UDF is inlined (`g(mydefer)` for `def g(out): out << e`
+//! renames `out` → `mydefer`). Generators are defer-returning (their body ends
+//! in the yield-defer), so inlining preserves their output.
 //!
 //! [`Defer`]: crate::ccl::TypedExprNode::Defer
 //! [`Feed`]: crate::ccl::TypedExprNode::Feed
@@ -123,6 +129,15 @@ fn is_iterable_domain(ty: &Type) -> bool {
         // There are infinitely many possible functions for any given function
         // type, so function-typed domains cannot be enumerated.
         Type::Fun { .. } => false,
+        // A history-typed domain has no enumerable extent — treat it
+        // non-iterable like a function so a history-param UDF is inlined; the
+        // `_ => true` fallthrough would otherwise strand it. Two cases reach
+        // here, both pre-erasure (inlining runs before `channelize` and the
+        // unified phase): a `Feed` defer-handle domain (a defer-mediating UDF
+        // `λ out → out << e` has domain `feed(ρ)`; its call sites beta-reduce,
+        // renaming the fed-to handle — see `Subst::handle_target`), and a
+        // `Overwrite` pass-by-ref param domain.
+        Type::History { .. } => false,
         _ => true,
     }
 }
@@ -168,8 +183,13 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
         // A Lambda param shadows `name` inside the body — treat it as a binding
         // site so we don't substitute through it.
         TypedExprNode::Lambda { param, .. } if &param.name == name => true,
-        // A Loop with any param matching `name` is a definitive bind site.
-        TypedExprNode::Loop { params, .. } if params.iter().any(|p| &p.name == name) => true,
+        // A LetRec with any group binder matching `name` is a definitive
+        // bind site (the group scopes every binding body and the letrec body).
+        TypedExprNode::LetRec { bindings, .. } if bindings.iter().any(|(b, _)| &b.name == name) => {
+            true
+        }
+        // A For whose target matches `name` shadows it inside the body.
+        TypedExprNode::For { target, .. } if &target.name == name => true,
         TypedExprNode::Error => crate::unexpected_error_node!(),
         // A `Case` branch's structural pattern binds its payload name,
         // shadowing `name` inside that branch's guard/body; `any_child`
@@ -192,6 +212,19 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
     }
 }
 
+/// Returns `true` if `name` is written by a mutable-variable mutation (`MutWrite`) anywhere
+/// inside `expr`. A mutable write advances the variable's history, so an alias
+/// `let y = x` may not be substituted past one (the read would move to the wrong
+/// position) — the mutation-era complement to [`is_let_bound`]'s lexical-rebind
+/// check. Conservative: any write to `x` in the body blocks the substitution,
+/// even if every use of the alias precedes it.
+fn is_mut_written(name: &Name, expr: &Expr) -> bool {
+    match &expr.node {
+        TypedExprNode::MutWrite { name: target, .. } if target == name => true,
+        _ => expr.any_child(|e| is_mut_written(name, e)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tree walk
 // ---------------------------------------------------------------------------
@@ -204,10 +237,11 @@ fn is_let_bound(name: &Name, expr: &Expr) -> bool {
 /// [`crate::ccl::lambda_elim`] prevents the let-in-lambda rewrite from
 /// wrapping aliases in `const(…)`.
 ///
-/// `Defer`/`Feed`/`Define` are eliminated by
-/// [`crate::ccl::desugar_defers`] before this pass runs, so this
-/// pass never sees them.  The defer-returning lift lives in
-/// `desugar_defers::try_lift_defer`.
+/// This pass runs **before** [`crate::ccl::channelize`] (see the module
+/// docs), so it *does* encounter `Defer`/`Feed`/`Define` nodes; beta-reduction
+/// routes them through the defer-aware [`crate::ccl::subst::Subst`] engine,
+/// which renames a fed-to handle when a defer-mediating UDF is inlined. The
+/// defer-returning lift itself lives in `channelize::try_lift_defer`.
 fn inline_impl(expr: Expr) -> Expr {
     let Expr {
         node,
@@ -228,12 +262,19 @@ fn inline_impl(expr: Expr) -> Expr {
             // and drop the Let.  This must run before lambda_elim so that the
             // let-in-lambda rule never wraps such aliases in `const(x)`.
             //
-            // Guard: only safe when x is not re-bound inside body.  If body
-            // contains `let x = …` the substitution would capture those x
-            // references under the wrong binding (e.g. `x = 1; y = x; x += 4;
-            // y` must return 1, not 5).
+            // Guard: only safe when `x` is not *re-defined* inside body. Two
+            // ways it can be: a lexical rebind (`let x = …` / `λ x → …`), which
+            // would capture the substituted references under the shadow; or a
+            // mutable write (`x += …`, a `MutWrite`), which advances `x`'s history
+            // so a read at the binding site and a read after the write are
+            // different values. Substituting past a write moves the read to the
+            // wrong position — e.g. `x := 1; y: int = x; x += 4; y` must be `1`
+            // (the value when `y` is bound), not `5` (the post-write value). A
+            // mutable write is a `MutWrite`, not a `let`, so `is_let_bound` alone
+            // misses it (writes stopped being `let` shadows in mutability v2).
             if let TypedExprNode::Var(repl_name) = &bound_expr.node
                 && !is_let_bound(repl_name, &body)
+                && !is_mut_written(repl_name, &body)
             {
                 return substitute(body, &binding.name, &bound_expr);
             }
@@ -265,7 +306,7 @@ fn inline_impl(expr: Expr) -> Expr {
         // expression, wrap it in a fresh `let __for_src_N = source` binding so
         // that `try_lift_defer` can physically rename its inner defer handle,
         // preventing two same-named `__result` defers from coexisting in
-        // `desugar_defers`. Re-running `inline_impl` on the wrapping `Let`
+        // `channelize`. Re-running `inline_impl` on the wrapping `Let`
         // triggers `try_lift_defer` on the new binding.
         TypedExprNode::Compose(terms) => {
             TypedExprNode::Compose(terms.into_iter().map(inline_impl).collect())
@@ -427,26 +468,22 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
             }
         }
 
-        // Loop param shadowing matters here — we're substituting `name`
-        // throughout, but if the loop's params bind `name`, the body sees
-        // the param's value, not the substituted one.  walk_children_mut
-        // would visit `loop_body` unconditionally, so handle Loop explicitly.
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => crate::ccl::walk_loop_children(
-            params,
-            init_args,
-            source,
-            loop_body,
-            // Param shadowing matters here — we're substituting `name`
-            // throughout, but if the loop's param binds `name`, the body
-            // sees the param's value, not the substituted one.
-            Some(name),
-            |e| inline_and_beta_reduce(e, name, lambda),
-        ),
+        // LetRec group binders shadow `name` across every binding body AND
+        // the letrec body (mutual recursion), so a matching binder stops the
+        // substitution for the whole group.
+        TypedExprNode::LetRec { bindings, body } => {
+            if bindings.iter().any(|(b, _)| &b.name == name) {
+                TypedExprNode::LetRec { bindings, body }
+            } else {
+                TypedExprNode::LetRec {
+                    bindings: bindings
+                        .into_iter()
+                        .map(|(b, def)| (b, inline_and_beta_reduce(def, name, lambda)))
+                        .collect(),
+                    body: Box::new(inline_and_beta_reduce(*body, name, lambda)),
+                }
+            }
+        }
 
         // The cast target is where its refinement predicate is written —
         // `lambda_elim` and operator conversion read the predicate off the
@@ -462,8 +499,22 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr) -> Expr {
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
 
+        // The loop target shadows `name` inside the body only; the source
+        // still substitutes.
+        TypedExprNode::For { target, iter, body } => {
+            let iter = Box::new(inline_and_beta_reduce(*iter, name, lambda));
+            let body = if &target.name == name {
+                body
+            } else {
+                Box::new(inline_and_beta_reduce(*body, name, lambda))
+            };
+            TypedExprNode::For { target, iter, body }
+        }
+
         // All remaining variants: pure structural recursion.  Atoms have
-        // no children, so this is a no-op for them.
+        // no children, so this is a no-op for them.  (`MutWrite` lands here:
+        // its `name` references a value binding, never an inlinable lambda
+        // `let`, so only its `value` child needs the walk.)
         node => {
             let mut expr = Expr {
                 node,

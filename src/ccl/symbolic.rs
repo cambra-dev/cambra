@@ -110,6 +110,24 @@ pub fn symbolic_typed(expr: &Expr) -> String {
 // Core recursive renderer
 // ---------------------------------------------------------------------------
 
+/// Render one transaction writer: `[reads]⇒[writes] over <source> do <body>` —
+/// its read-set / write-set footprint and the per-position decision body.
+fn fmt_transact_writer(w: &crate::ccl::WriterSite, opts: &SymbolicOpts) -> String {
+    let names = |ks: &[crate::ccl::Name]| {
+        ks.iter()
+            .map(|n| n.base().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "[{}]⇒[{}] over {} do {}",
+        names(&w.read_keys),
+        names(&w.write_keys),
+        fmt(&w.source, Precedence::Lowest, opts),
+        fmt(&w.body, Precedence::Lowest, opts)
+    )
+}
+
 /// Render `expr`, wrapping in `( )` if its precedence is below `min_prec`.
 fn fmt(expr: &Expr, min_prec: Precedence, opts: &SymbolicOpts) -> String {
     let (self_prec, text) = fmt_inner(expr, opts);
@@ -311,44 +329,73 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             format!(".{tag}({})", fmt(payload, Precedence::Lowest, opts)),
         ),
 
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-            ..
-        } => {
-            // Render each loop-carried slot as `name = init`, with the
-            // accumulator's type shown after the name when known.  Single
-            // accumulator: bare `x = 0`.  Multiple: parenthesised
-            // `(x = 0, y = 1)` so the slot list reads as a single chunk.
-            // The loop's debug `name` is intentionally omitted — symbolic
-            // is the readable surface form; pretty-printed AST dumps
-            // still show the label.  Taps don't get a separate header —
-            // they appear in the body's Record literal directly.
-            let slot_strs: Vec<_> = params
+        // `transact (k = init, …) { [reads]⇒[writes] over <source> do <body>;
+        // … }` — the shared keys with their seeds, then one writer clause per
+        // concurrent writer. Reads of a key are the record projection
+        // `__reg.k` elsewhere in the tree, not shown here.
+        TypedExprNode::Transact { keys, writers, .. } => {
+            let key_strs: Vec<_> = keys
                 .iter()
-                .zip(init_args.iter())
-                .map(|(p, init)| {
-                    let init_str = fmt(init, Precedence::Lowest, opts);
-                    match &p.ty {
-                        Type::Hole | Type::Infer(_) => format!("{} = {init_str}", p.name),
-                        t => format!("{}: {t} = {init_str}", p.name),
-                    }
-                })
+                .map(|k| format!("{} = {}", k.name, fmt(&k.init, Precedence::Lowest, opts)))
                 .collect();
-            let slots = if slot_strs.len() == 1 {
-                slot_strs.into_iter().next().unwrap()
-            } else {
-                format!("({})", slot_strs.join(", "))
-            };
-            let source_str = fmt(source, Precedence::Lowest, opts);
-            let body_str = fmt(loop_body, Precedence::Lowest, opts);
+            let writer_strs: Vec<_> = writers
+                .iter()
+                .map(|w| fmt_transact_writer(w, opts))
+                .collect();
             (
                 Precedence::Lowest,
-                format!("loop {slots} over {source_str} do {body_str}"),
+                format!(
+                    "transact ({}) {{ {} }}",
+                    key_strs.join(", "),
+                    writer_strs.join("; ")
+                ),
             )
         }
+
+        // Mutually recursive group: `letrec b₁ = e₁; …; bₙ = eₙ in body`,
+        // bindings separated by `; `, with the `in` continuation on its own
+        // line matching the `Let` rendering. Binding names carry ` : ty`
+        // when the declared type is known, like other typed binders.
+        TypedExprNode::LetRec { bindings, body } => {
+            let binding_strs: Vec<_> = bindings
+                .iter()
+                .map(|(b, def)| {
+                    let ty_str = if !matches!(b.ty, Type::Hole | Type::Infer(_)) {
+                        format!(" : {}", b.ty)
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "{}{ty_str} = {}",
+                        b.name,
+                        fmt(def, Precedence::Lowest, opts)
+                    )
+                })
+                .collect();
+            let body_str = fmt(body, Precedence::Lowest, opts);
+            (
+                Precedence::Lowest,
+                format!("letrec {}\nin {body_str}", binding_strs.join("; ")),
+            )
+        }
+
+        // Direct-mirror statement loop: `for i in xs do body`.
+        TypedExprNode::For { target, iter, body } => (
+            Precedence::Lowest,
+            format!(
+                "for {} in {} do {}",
+                target.name,
+                fmt(iter, Precedence::Apply, opts),
+                fmt(body, Precedence::Lowest, opts)
+            ),
+        ),
+
+        // Mutable-variable write: `x := e` — distinct from let-binding `=`
+        // (the name references its introduction; it is not a fresh binder).
+        TypedExprNode::MutWrite { name, value } => (
+            Precedence::Lowest,
+            format!("{} := {}", name, fmt(value, Precedence::Lowest, opts)),
+        ),
 
         TypedExprNode::Source(name) => (Precedence::Atom, format!("source({name})")),
 
@@ -503,8 +550,8 @@ mod tests {
     use super::symbolic;
     use crate::ccl::BaseType;
     use crate::ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, Refinement, Type,
-        TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BinOpKind, Branch, Expr, Lit, LogicKind, Refinement,
+        TransactKey, Type, TypedBinding, TypedExpr, TypedExprNode, UnaryOpKind, WriterSite,
     };
     use rstest::rstest;
     use std::rc::Rc;
@@ -758,28 +805,75 @@ in x"
     )]
     // Aggregate
     #[case(Expr::aggregate(Expr::var("xs"), AggregateKind::Max), "Max(xs)")]
-    // Loop, single accumulator
+    // Transact, single key: `transact (k = init) { [reads]⇒[writes] over src do body }`
     #[case(
-        TypedExpr::new(TypedExprNode::Loop {
-            params: vec![TypedBinding::new_unannotated("i")],
-            init_args: vec![Expr::lit(Lit::Int(0))],
-            source: Box::new(Expr::var("xs")),
-            loop_body: Box::new(Expr::var("i")),
+        TypedExpr::new(TypedExprNode::Transact {
+            keys: vec![TransactKey {
+                name: "i".into(),
+                init: Expr::lit(Lit::Int(0)),
+            }],
+            writers: vec![WriterSite {
+                read_keys: vec!["i".into()],
+                write_keys: vec!["i".into()],
+                source: Expr::var("xs"),
+                body: Expr::var("i"),
+            }],
+            domain: Type::Base(BaseType::Int),
         }),
-        "loop i = 0 over xs do i"
+        "transact (i = 0) { [i]⇒[i] over xs do i }"
     )]
-    // Loop, multi-accumulator: slots are parenthesised
+    // Transact, multiple keys and a multi-key writer footprint
     #[case(
-        TypedExpr::new(TypedExprNode::Loop {
-            params: vec![
-                TypedBinding::new_unannotated("x"),
-                TypedBinding::new_unannotated("y"),
+        TypedExpr::new(TypedExprNode::Transact {
+            keys: vec![
+                TransactKey {
+                    name: "x".into(),
+                    init: Expr::lit(Lit::Int(0)),
+                },
+                TransactKey {
+                    name: "y".into(),
+                    init: Expr::lit(Lit::Int(1)),
+                },
             ],
-            init_args: vec![Expr::lit(Lit::Int(0)), Expr::lit(Lit::Int(1))],
-            source: Box::new(Expr::var("xs")),
-            loop_body: Box::new(Expr::tuple(vec![Expr::var("x"), Expr::var("y")])),
+            writers: vec![WriterSite {
+                read_keys: vec!["x".into(), "y".into()],
+                write_keys: vec!["x".into(), "y".into()],
+                source: Expr::var("xs"),
+                body: Expr::tuple(vec![Expr::var("x"), Expr::var("y")]),
+            }],
+            domain: Type::Base(BaseType::Int),
         }),
-        "loop (x = 0, y = 1) over xs do (x, y)"
+        "transact (x = 0, y = 1) { [x, y]⇒[x, y] over xs do (x, y) }"
+    )]
+    // LetRec: bindings separated by `; `, `in` continuation as in Let
+    #[case(
+        Expr::letrec(
+            vec![
+                (TypedBinding::new_unannotated("x"), Expr::lit(Lit::Int(0))),
+                (TypedBinding::new_unannotated("y"), Expr::var("x")),
+            ],
+            Expr::var("y"),
+        ),
+        "\
+letrec x = 0; y = x
+in y"
+    )]
+    // LetRec with a resolved binding type: the binder carries ` : ty`
+    #[case(
+        Expr::letrec(
+            vec![(
+                TypedBinding {
+                    name: "x".into(),
+                    ty: Type::Base(BaseType::Int),
+                    user_annotation: None,
+                },
+                Expr::lit(Lit::Int(0)),
+            )],
+            Expr::var("x"),
+        ),
+        "\
+letrec x : Int = 0
+in x"
     )]
     fn test_symbolic_expr(#[case] expr: Expr, #[case] expected: &str) {
         assert_eq!(symbolic(&expr), expected);

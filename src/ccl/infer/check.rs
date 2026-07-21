@@ -3,14 +3,14 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::infer::InferError;
-use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fresh_var};
+use crate::ccl::infer::solver::{ConstrainCache, PolyScheme, constrain_subtype, fresh_var, prim};
 use crate::ccl::symbolic::symbolic;
-use crate::ccl::{Expr, Level, Name, Type, TypedExprNode};
+use crate::ccl::{BaseType, Expr, HistoryKind, Level, Name, Type, TypedExprNode};
 
 use super::emit::{
     emit_aggregate, emit_apply, emit_binop, emit_case, emit_cast, emit_collection_union,
-    emit_compose, emit_expr_stmt, emit_lambda, emit_let, emit_list, emit_loop, emit_proj,
-    emit_record, emit_tuple, emit_unary, emit_variant_ctor,
+    emit_compose, emit_expr_stmt, emit_for, emit_lambda, emit_let, emit_letrec, emit_list,
+    emit_proj, emit_record, emit_transact, emit_tuple, emit_unary, emit_variant_ctor,
 };
 use super::schemes::OperatorSchemes;
 use super::typing::{Typing, peel_refinements_outer};
@@ -168,13 +168,40 @@ impl Typing for CheckCtx {
         at: &dyn Fn() -> String,
     ) -> Result<(Type, Type), InferError> {
         // Destructure the resolved type directly (no inference vars). Peel any
-        // outer refinement witnesses the function picked up during solving.
-        match peel_refinements_outer(t) {
+        // outer refinement witnesses the function picked up during solving,
+        // and — pre-desugar only — read through a transparent handle to the
+        // value it wraps: a defer's `Feed` to its channel, and a `Mut` history to
+        // its value (a `Mut`-typed collection used as a for-loop source derefs
+        // to the collection). Both mirror the solver's transparent-read rule
+        // that Emit applies when it destructures the same position, so Check and
+        // Emit agree at the consistency wall; post-desugar/-erasure trees carry
+        // neither type.
+        let mut peeled = peel_refinements_outer(t);
+        loop {
+            peeled = match peeled {
+                // A `Overwrite` history derefs to its scalar value (a `Mut`-typed
+                // collection used as a for-loop source reads as the collection).
+                Type::History {
+                    value,
+                    kind: HistoryKind::Overwrite,
+                    ..
+                } => peel_refinements_outer(value),
+                _ => break,
+            };
+        }
+        match peeled {
             Type::Fun {
                 domain: d,
                 codomain: c,
                 ..
             } => Ok(((**d).clone(), (**c).clone())),
+            // A `Feed` history reads as its whole stream `domain ⇒ value` — a
+            // defer's channel — so it destructures directly to (domain, value).
+            Type::History {
+                domain,
+                value,
+                kind: HistoryKind::Append,
+            } => Ok(((**domain).clone(), (**value).clone())),
             _ => {
                 self.errors.push(InferError::ExpectedFunction {
                     found: t.clone(),
@@ -302,18 +329,29 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, InferError> {
 
         TypedExprNode::CollectionUnion(exprs) => emit_collection_union(exprs, ctx)?,
 
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => emit_loop(params, init_args, source, loop_body, ctx)?,
+        TypedExprNode::Transact {
+            keys,
+            writers,
+            domain,
+        } => emit_transact(keys, writers, domain, ctx)?,
 
-        TypedExprNode::Feed { .. } | TypedExprNode::Define { .. } | TypedExprNode::Defer => {
-            unreachable!(
-                "Defer/Feed/Define survived desugar_defers and reached typecheck: {:?}",
-                expr.node
-            )
+        TypedExprNode::LetRec { bindings, body } => emit_letrec(bindings, body, ctx)?,
+
+        TypedExprNode::For { target, iter, body } => emit_for(target, iter, body, ctx)?,
+
+        // A `Defer` leaf's type was minted during inference (`Feed(ρ)`);
+        // like `Var`, the recorded type carries the full load — trust it.
+        TypedExprNode::Defer => expr.ty.clone(),
+
+        // The feed/define/mut-write target lives in the scope Check doesn't
+        // maintain (it trusts recorded types), and the contribution/write
+        // edge was already recorded during inference. Check the value
+        // subtree; the node itself is `Unit`.
+        TypedExprNode::Feed { value, .. }
+        | TypedExprNode::Define { value, .. }
+        | TypedExprNode::MutWrite { value, .. } => {
+            ctx.subexpr(value)?;
+            prim(BaseType::Unit)
         }
 
         TypedExprNode::Error => crate::unexpected_error_node!(),

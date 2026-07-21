@@ -176,6 +176,19 @@ pub enum Stmt {
         value: Spanned<Expr>,
     },
 
+    /// Mutable assignment: `target := value`, or `target: ty := value` with an
+    /// optional type annotation. `:=` is the *mutability* signal — it marks the
+    /// assignment as a store introduction (first `:=` to a name) or a store write
+    /// (subsequent), so lowering never has to guess `MutWrite`-vs-`Let` from a
+    /// name registry. The annotation is optional: bare `x := 0` is an induction
+    /// accumulator (domain inferred), `x: Mut[V, Txn] := 0` a transactional
+    /// register (the annotation carries the `Txn` domain, exactly as before).
+    MutAssign {
+        target: Spanned<AssignTarget>,
+        annotation: Option<Spanned<Expr>>,
+        value: Spanned<Expr>,
+    },
+
     /// Defer-define statement: `target <<= value`.
     ///
     /// Distinct from [`Stmt::AugAssign`] because it has no corresponding plain

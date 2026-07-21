@@ -16,7 +16,7 @@ use super::*;
 ///
 /// "Iteration site" means any position where op-conversion would otherwise
 /// compile with `input=None` and the expression is function-typed —
-/// aggregate arguments, the stream side of `LastOrDefault`, mutation-loop
+/// aggregate arguments, the stream side of `FinalOrDefault`, mutation-loop
 /// sources, value-position `Record` fields, `CollectionUnion` operands,
 /// the program's top-level function-valued result, top-level let-bound
 /// function values, and a few other shapes enumerated by
@@ -72,7 +72,7 @@ pub(crate) fn insert_iterate_markers(expr: &mut Expr) {
 ///
 /// Op-conversion's combinator arms split into two groups:
 ///
-/// - **Input-internalising** (`Sum`/`Max`/`LastOrDefault`, `Converse`,
+/// - **Input-internalising** (`Sum`/`Max`/`FinalOrDefault`, `Converse`,
 ///   `MapDomain`, `Uncurry`, `FlattenDomain`, `PermuteDomain`,
 ///   `CollectionUnion`, plus `Iterate` itself): these arms require
 ///   `input=None` and compile their argument (or each operand, in
@@ -125,19 +125,35 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
 
     expr.walk_children_mut(insert_iterate_recurse);
     match &mut expr.node {
-        // `LastOrDefault` takes `Tuple([stream, default])` — only `stream`
+        // `FinalOrDefault` takes `Tuple([stream, default])` — only `stream`
         // is iterated; the `default` is a scalar consumed when the stream
         // is empty.
         TypedExprNode::Apply { argument, function }
             if matches!(
                 &function.node,
-                TypedExprNode::Builtin(Builtin::LastOrDefault)
+                TypedExprNode::Builtin(Builtin::FinalOrDefault)
             ) =>
         {
             if let TypedExprNode::Tuple(elts) = &mut argument.node
                 && let Some(stream) = elts.first_mut()
             {
                 wrap_with_iterate(stream);
+            }
+        }
+        // `as_of` takes `Tuple([trigger, source])` — the `trigger` is the
+        // iteration site (op-conversion compiles it with `input=None`), so wrap
+        // it; the `source` is a register read (`__reg.k`), not an iteration source,
+        // and is left alone. A `Var` trigger is already iterate-wrapped at its
+        // let-site, so `wrap_with_iterate`'s `is_iteration_bearing` check makes
+        // this a no-op there; a raw `[unit]` singleton (the standalone terminal
+        // read) is the case that genuinely needs the wrap.
+        TypedExprNode::Apply { argument, function }
+            if matches!(&function.node, TypedExprNode::Builtin(Builtin::AsOf)) =>
+        {
+            if let TypedExprNode::Tuple(elts) = &mut argument.node
+                && let Some(trigger) = elts.first_mut()
+            {
+                wrap_with_iterate(trigger);
             }
         }
         // `CollectionUnion`'s function form: argument is `Tuple(ops...)`
@@ -169,10 +185,13 @@ pub(super) fn insert_iterate_recurse(expr: &mut Expr) {
         {
             wrap_with_iterate(argument);
         }
-        // Mutation-loop sources are iterated internally by [`Recurse`];
-        // op-conversion's `Loop` arm compiles `source` with `input=None`.
-        TypedExprNode::Loop { source, .. } => {
-            wrap_with_iterate(source);
+        // Each transaction writer's source is iterated internally by the
+        // register engine (`Recurse` for an induction accumulator); op-conversion
+        // compiles it with `input=None`, so wrap it like a loop source.
+        TypedExprNode::Transact { writers, .. } => {
+            for w in writers.iter_mut() {
+                wrap_with_iterate(&mut w.source);
+            }
         }
         // Value-position `Record` literals (not the special-cased
         // `Apply(Record, Zip)` form, which `Zip`'s arm handles via fan-out):
@@ -412,7 +431,7 @@ pub(super) fn wrap_with_iterate(expr: &mut Expr) {
 /// 2. Self-iterating builtins ([`Builtin::iterates_arg`]): the
 ///    iteration-internalising group — `MapDomain`, `Uncurry`,
 ///    `Converse`, `CollectionUnion`, plus the nested `PermuteDomain` /
-///    `FlattenDomain` shapes.  (Sum / Max / LastOrDefault are also in
+///    `FlattenDomain` shapes.  (Sum / Max / FinalOrDefault are also in
 ///    `iterates_arg`, but they produce scalars; [`wrap_with_iterate`]'s
 ///    `expr.ty.domain()` check filters them out independently.)  Plus
 ///    the catch-all `Apply` with a non-builtin function (`Proj`, `Var`,
@@ -438,7 +457,14 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
             // (`make_restrict` only wraps an iteration source), so a
             // restrict-led chain must be recognised too — otherwise
             // re-running the marker pass would double-wrap refined sites.
-            Some(b) => matches!(b, Builtin::Iterate | Builtin::Restrict) || b.iterates_arg(),
+            // `AsOf` is a self-contained source — it produces its own `Fun(B, V)`
+            // over the trigger and op-conversion rejects a non-empty input — so an
+            // as-of-led chain is already iteration-bearing; prepending an
+            // `iterate` would strand the as_of mid-chain.
+            Some(b) => {
+                matches!(b, Builtin::Iterate | Builtin::Restrict | Builtin::AsOf)
+                    || b.iterates_arg()
+            }
             // Non-builtin function position (`Proj`, `Var`, curried
             // `Apply`, …): op-conversion's catch-all `Apply` arm
             // rejects `input=Some`, so wrapping would break compilation.
@@ -971,44 +997,45 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_iterate_recurse_loop_wraps_source() {
-        // `Loop`'s `source` is iterated by `Recurse` at runtime, and
-        // op-conversion compiles it with `input=None` — wrap it here.
+    fn test_insert_iterate_recurse_transact_wraps_writer_source() {
+        use crate::ccl::{TransactKey, WriterSite};
+        // A `Transact` writer's `source` is iterated by the register engine at
+        // runtime (op-conversion compiles it with `input=None`), so it must be
+        // iterate-wrapped here — the same as a loop source was.
         let int = int_ty();
         let list_ty = fun_ty(Type::UIntRange(3), int.clone());
-        // Build a minimal Loop with one accumulator and a body that just
-        // re-emits the previous accumulator value.  The exact body shape
-        // doesn't matter for this test — we're only checking the
-        // `source` field gets iterate-wrapped.
-        let body = Expr::new(TypedExprNode::Record(vec![(
-            "step".to_string(),
-            Expr::proj_index(0).with_ty(fun_ty(
-                Type::Tuple(vec![int.clone(), int.clone()]),
-                int.clone(),
-            )),
-        )]))
-        .with_ty(Type::Record(vec![(
-            "step".to_string(),
-            fun_ty(Type::Tuple(vec![int.clone(), int.clone()]), int.clone()),
-        )]));
-
-        let mut expr = Expr::loop_node(
-            vec!["acc".into()],
-            vec![Expr::lit(Lit::Int(0)).with_ty(int.clone())],
-            list_123().with_ty(list_ty.clone()),
-            body,
-        )
-        .with_ty(list_ty);
+        // A minimal induction accumulator: one key, one writer whose body is a bare
+        // previous-accumulator read.  The exact body shape doesn't matter for
+        // this test — we only check the writer `source` gets iterate-wrapped.
+        let body = Expr::var("acc").with_ty(int.clone());
+        let reg_ty = Type::Record(vec![(
+            "acc".to_string(),
+            fun_ty(Type::UIntRange(3), int.clone()),
+        )]);
+        let mut expr = Expr::new(TypedExprNode::Transact {
+            keys: vec![TransactKey {
+                name: "acc".into(),
+                init: Expr::lit(Lit::Int(0)).with_ty(int.clone()),
+            }],
+            writers: vec![WriterSite {
+                read_keys: vec!["acc".into()],
+                write_keys: vec!["acc".into()],
+                source: list_123().with_ty(list_ty.clone()),
+                body,
+            }],
+            domain: Type::UIntRange(3),
+        })
+        .with_ty(reg_ty);
 
         insert_iterate_recurse(&mut expr);
 
-        let TypedExprNode::Loop { source, .. } = &expr.node else {
-            panic!("expected Loop, got: {}", symbolic(&expr));
+        let TypedExprNode::Transact { writers, .. } = &expr.node else {
+            panic!("expected Transact, got: {}", symbolic(&expr));
         };
         assert!(
-            is_iterate_apply(chain_head(source)),
-            "Loop's source should be iterate-led, got: {}",
-            symbolic(source)
+            is_iterate_apply(chain_head(&writers[0].source)),
+            "Transact writer source should be iterate-led, got: {}",
+            symbolic(&writers[0].source)
         );
     }
 

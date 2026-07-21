@@ -98,8 +98,6 @@ pub enum SyntheticKind {
     /// `Name` may itself be a `Synthetic` carrying a `SyntheticKind`, so the
     /// reference must be indirected to keep the type finite-sized.)
     Mono(Box<Name>),
-    /// A defer handle renamed to dodge a shadow during channelization.
-    ShadowRename,
     /// A lambda/binding floated out during defer desugaring.
     FloatedDefer,
     /// The fresh binder the solver mints for a dependent application's
@@ -115,7 +113,6 @@ impl SyntheticKind {
         match self {
             SyntheticKind::Pair => "__pair",
             SyntheticKind::Mono(_) => "__mono",
-            SyntheticKind::ShadowRename => "__shadowed",
             SyntheticKind::FloatedDefer => "__floated",
             SyntheticKind::SolverArg => "__arg",
         }
@@ -194,11 +191,6 @@ impl Name {
         Self::synthetic(SyntheticKind::Mono(Box::new(source)))
     }
 
-    /// A defer handle renamed to dodge a shadow (channelization).
-    pub fn shadow_rename() -> Self {
-        Self::synthetic(SyntheticKind::ShadowRename)
-    }
-
     /// A lambda/binding floated out during defer desugaring.
     pub fn floated() -> Self {
         Self::synthetic(SyntheticKind::FloatedDefer)
@@ -218,6 +210,21 @@ impl Name {
             Name::Unique { base, .. } => base,
             Name::Synthetic { kind, .. } => kind.stem(),
             Name::Reserved(r) => r.spelling(),
+        }
+    }
+
+    /// A globally-distinct string key for this name, suitable as a **register
+    /// record field label** for a [`crate::ccl::TypedExprNode::Transact`] key.
+    /// Unlike [`base`](Self::base) it folds the `uid` in, so two distinct
+    /// binders sharing a spelling (e.g. accumulators in sibling loops) get
+    /// distinct keys. A variable read of a register key projects this field of
+    /// the register record (`__reg.field_key`).
+    pub fn field_key(&self) -> String {
+        match self {
+            Name::Raw(s) => s.clone(),
+            Name::Unique { base, uid } => format!("{base}#{}", uid.0),
+            Name::Synthetic { kind, uid } => format!("{}#{}", kind.stem(), uid.0),
+            Name::Reserved(r) => r.spelling().to_string(),
         }
     }
 
@@ -324,7 +331,6 @@ mod tests {
                 ..
             } if *src == Name::raw("f")
         ));
-        assert_eq!(Name::shadow_rename().base(), "__shadowed");
         assert_eq!(Name::floated().base(), "__floated");
         assert_eq!(Name::solver_arg().base(), "__arg");
         // Different kinds never collide even if uids ever coincided.

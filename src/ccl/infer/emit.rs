@@ -13,7 +13,8 @@ use crate::ccl::infer::InferError;
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    BaseType, Branch, Expr, Name, ProjKey, Refinement, Type, TypedBinding, TypedExprNode,
+    BaseType, Branch, Expr, Name, ProjKey, Refinement, TransactKey, Type, TypedBinding,
+    TypedExprNode, WriterSite,
 };
 
 use super::context::InferCtx;
@@ -44,7 +45,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
 
         // Builtins with a polymorphic signature (shared type variables
         // across positions) live in the `OperatorSchemes` registry — at
-        // each use site we freshen a copy. Currently only `LastOrDefault`
+        // each use site we freshen a copy. Currently only `FinalOrDefault`
         // qualifies (`∀α β. ((α → β), β) → β`); the registry generalizes
         // as more polymorphic builtins land. All other builtins arrive
         // pre-stamped from lowering and just get converted in place.
@@ -119,23 +120,69 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
 
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 
-        // Defer/Feed/Define are eliminated by `desugar_defers` before
-        // inference runs, so the type checker never sees them.
-        TypedExprNode::Feed { .. } | TypedExprNode::Define { .. } | TypedExprNode::Defer => {
-            unreachable!(
-                "Defer/Feed/Define survived desugar_defers and reached inference: {:?}",
-                expr.node
-            )
+        TypedExprNode::Defer => emit_defer(ctx),
+
+        // The feed/define target lookup is Emit-specific (Check maintains no
+        // scope): resolve the feed handle's type from the environment exactly
+        // as a `Var` use would. Instantiation is a no-op for the common
+        // monomorphic defer binding; for a feed-typed lambda param it
+        // returns the param type verbatim.
+        TypedExprNode::Feed { name, value } => {
+            let target_ty = match ctx.scopes.lookup(name) {
+                None => return Err(InferError::UnboundVariable(name.to_string())),
+                Some(binding) => binding.scheme.instantiate(ctx.level),
+            };
+            emit_feed(&target_ty, value, &label, ctx)?
+        }
+
+        TypedExprNode::Define { name, value } => {
+            let target_ty = match ctx.scopes.lookup(name) {
+                None => return Err(InferError::UnboundVariable(name.to_string())),
+                Some(binding) => binding.scheme.instantiate(ctx.level),
+            };
+            emit_define(&target_ty, value, &label, ctx)?
         }
 
         TypedExprNode::CollectionUnion(exprs) => emit_collection_union(exprs, ctx)?,
 
-        TypedExprNode::Loop {
-            params,
-            init_args,
-            source,
-            loop_body,
-        } => emit_loop(params, init_args, source, loop_body, ctx)?,
+        // `Transact` is born by `planning::plan_loops`, which runs *after*
+        // inference, so constraint emission never sees one. Gathered
+        // `Transact` nodes are typed in the Check pass (`emit_transact`).
+        TypedExprNode::Transact { .. } => {
+            unreachable!(
+                "Transact is born post-inference by letrec recognition; Emit never sees it"
+            )
+        }
+
+        TypedExprNode::LetRec { bindings, body } => emit_letrec(bindings, body, ctx)?,
+
+        TypedExprNode::For { target, iter, body } => emit_for(target, iter, body, ctx)?,
+
+        // The write target's lookup is Emit-specific, like `Feed`'s: the
+        // written value must flow into the mutable variable's binding type.
+        // Instantiation is a no-op for the monomorphic accumulator bindings
+        // lowering produces (a polymorphic init would under-constrain the
+        // write and surface as `UnresolvedInfer`).
+        TypedExprNode::MutWrite { name, value } => {
+            let var_ty = match ctx.scopes.lookup(name) {
+                None => return Err(InferError::UnboundVariable(name.to_string())),
+                Some(binding) => binding.scheme.instantiate(ctx.level),
+            };
+            // The written value flows into the mutable variable's *value* type, not the
+            // `Mut` handle itself: peel `Mut[V, D]` to `V` before constraining.
+            // (The `(_, Mut)` lenient coercion arm would deref anyway, but the
+            // explicit peel names the write semantics — a write updates `V`.)
+            let mut_val = match peel_refinements_outer(&var_ty) {
+                Type::History { value, .. } => value.as_ref().clone(),
+                _ => var_ty.clone(),
+            };
+            let value_ty = ctx.subexpr(value)?;
+            let write_label = name.clone();
+            ctx.require_sub(&value_ty, &mut_val, &|| {
+                format!("write to mutable variable `{write_label}`")
+            })?;
+            Type::Base(BaseType::Unit)
+        }
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
     };
@@ -146,7 +193,7 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Inf
     if expr.user_annotation.is_some() {
         // The annotation may carry refinement predicates (e.g. a
         // filter-feed source annotation `Fun(Refinement(Hole, r), Hole)`
-        // from `desugar_defers`). Now that refinements ride the lattice,
+        // from `channelize`). Now that refinements ride the lattice,
         // those predicates surface on the node's coalesced type and reach
         // the post-inference checks, so their expression trees must be
         // inferred in the current scope and rebuilt on the annotation itself.
@@ -212,9 +259,17 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), I
             }
             Ok(())
         }
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole | Type::Infer(_) => {
-            Ok(())
+        Type::History { value, domain, .. } => {
+            emit_annotation_predicates(value, ctx)?;
+            emit_annotation_predicates(domain, ctx)
         }
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::ChanDom(..)
+        | Type::Txn
+        | Type::Hole
+        | Type::Infer(_) => Ok(()),
     }
 }
 
@@ -410,7 +465,13 @@ pub(super) fn emit_unary<C: Typing>(
 pub(super) fn emit_tuple<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Type, InferError> {
     let mut fields = BTreeMap::new();
     for (i, e) in elts.iter_mut().enumerate() {
-        fields.insert(FieldKey::Index(i), ctx.subexpr(e)?);
+        // A bare mutable read in a tuple denotes its *value* (reads deref, design
+        // doc "a bare reference denotes the value"), so the product field takes
+        // the dereferenced element type. The element node stays a bare `Var`
+        // carrying `Mut` (rule 1 accepts it; the phase erases the type later) —
+        // only the *composite type* is dereferenced, so a `Mut` never appears
+        // nested in it. A non-`Mut` element is unchanged.
+        fields.insert(FieldKey::Index(i), deref_mut(&ctx.subexpr(e)?));
     }
     Ok(product(fields))
 }
@@ -422,7 +483,12 @@ pub(super) fn emit_record<C: Typing>(
 ) -> Result<Type, InferError> {
     let mut fields = BTreeMap::new();
     for (n, e) in fs.iter_mut() {
-        fields.insert(FieldKey::Name(SmolStr::from(n.as_str())), ctx.subexpr(e)?);
+        // Deref a bare mutable read to its value, as in `emit_tuple`: the field
+        // takes the dereferenced type so no `Mut` appears in the record type.
+        fields.insert(
+            FieldKey::Name(SmolStr::from(n.as_str())),
+            deref_mut(&ctx.subexpr(e)?),
+        );
     }
     Ok(product(fields))
 }
@@ -436,6 +502,140 @@ pub(super) fn emit_expr_stmt<C: Typing>(
 ) -> Result<Type, InferError> {
     ctx.subexpr(e)?;
     ctx.subexpr(body)
+}
+
+/// Type a `Defer` node: a fresh feed handle. `let d = Defer in body` binds
+/// `d : Feed(ρ)`, with `ρ` accumulating the channel's eventual type from
+/// the feeds/defines targeting `d` and discharging into the reads of `d`.
+///
+/// A bare `Defer` RHS is never generalized (`should_generalize` requires a
+/// lambda RHS), so every use of the binding shares one handle — feeds and
+/// reads of the same defer meet in one `ρ`. A defer minted *inside* a
+/// generalized function body (`λn → let x = Defer in …`) generalizes with
+/// the function and instantiates a fresh `ρ` per call site — exactly the
+/// "fresh defer per call" semantics the channelization float gives it.
+pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
+    // A feed channel is a non-causal history `domain ⇒ value`: fresh vars for
+    // both. The `value` accumulates the fed element type. The `domain` is a
+    // placeholder here — for a `let d = Defer` (the only shape lowering emits)
+    // [`emit_let`] immediately replaces it with the rigid nominal `ChanDom(d)`
+    // naming the defer binder, so every consumer types concretely against that
+    // name (no `Infer` channel-domain residue) and `channelize` erases it to
+    // the concrete channel domain by substitution.
+    Type::History {
+        value: Box::new(ctx.fresh()),
+        domain: Box::new(ctx.fresh()),
+        kind: crate::ccl::HistoryKind::Append,
+    }
+}
+
+/// Deref a mutable variable reference to its value type: peel a
+/// (refinement-wrapped) `Mut[V, D]` (a [`HistoryKind::Overwrite`] history) to `V`.
+/// A no-op on non-mutable types (including a feed channel, which reads as its
+/// whole stream, not a scalar value).
+fn deref_mut(ty: &Type) -> Type {
+    match peel_refinements_outer(ty) {
+        Type::History {
+            value,
+            kind: crate::ccl::HistoryKind::Overwrite,
+            ..
+        } => value.as_ref().clone(),
+        _ => ty.clone(),
+    }
+}
+
+/// Type a `Feed { name, value }`: the fed value contributes one element to
+/// the target handle's channel; the feed expression itself is `Unit` (it is
+/// statement-positioned — channelize extracts the value into a channel and
+/// leaves `Unit` residue).
+///
+/// The contribution is `Fun(fresh δ, value_ty)`, constrained into the target
+/// handle whose domain is the rigid `ChanDom(d)` — so `δ` pins to that name
+/// rather than a free `Infer`, and `channelize` erases `ChanDom(d)` to the
+/// concrete channel domain (a source domain, or a `Variant` union of feed
+/// sites) by substitution.
+pub(super) fn emit_feed<C: Typing>(
+    target_ty: &Type,
+    value: &mut Expr,
+    label: &str,
+    ctx: &mut C,
+) -> Result<Type, InferError> {
+    // A feed payload is a *value* (`Mut` never appears in a feed payload — the
+    // discipline forbids it), so deref a bare mutable reference to its value
+    // type here. This wrapping into a `Fun` codomain buries the type where the
+    // solver's `(Mut, _)` deref arm cannot reach it: two contributions to one
+    // channel become `Fun` lower bounds that are *joined* (codomains lub'd),
+    // not constrained against a demand, so an undereferenced `Mut[V, D]` would
+    // collide with a plain-`V` feed to the same channel instead of dereffing.
+    let value_ty = deref_mut(&ctx.subexpr(value)?);
+    let contribution = fun(ctx.fresh(), value_ty);
+    constrain_into_feed(target_ty, &contribution, label, ctx)
+}
+
+/// Type a `Define { name, value }`: the defined value *is* the handle's
+/// eventual payload (`x <<= v` sets the whole channel); the define
+/// expression itself is `Unit`, like `Feed`.
+pub(super) fn emit_define<C: Typing>(
+    target_ty: &Type,
+    value: &mut Expr,
+    label: &str,
+    ctx: &mut C,
+) -> Result<Type, InferError> {
+    let value_ty = ctx.subexpr(value)?;
+    constrain_into_feed(target_ty, &value_ty, label, ctx)
+}
+
+/// Land `payload_sub` inside the feed handle `target_ty`, returning `Unit`
+/// (the type of the feed/define expression itself).
+///
+/// When the target is structurally a feed handle — a lexically visible
+/// `let d = Defer` binding, possibly closure-captured — constrain straight
+/// into its payload. Otherwise the target is opaque (a lambda parameter
+/// receiving the handle: the ParamAsTarget pattern), so *demand* it be a
+/// feed via the upper bound `target <: Feed(ρf)` and constrain into that
+/// requirement's payload. The call-site argument edge `Feed(ρ_arg) <:
+/// param` then meets the upper bound, and the invariant Feed/Feed rule
+/// carries the contribution back into the caller's channel; a non-feed
+/// argument fails the same meeting with `NotAFeed`.
+fn constrain_into_feed<C: Typing>(
+    target_ty: &Type,
+    payload_sub: &Type,
+    label: &str,
+    ctx: &mut C,
+) -> Result<Type, InferError> {
+    match peel_refinements_outer(target_ty) {
+        Type::History {
+            value,
+            domain,
+            kind: crate::ccl::HistoryKind::Append,
+        } => {
+            // The channel is the history's `domain ⇒ value` stream; the
+            // contribution flows into it (`Fun(δ, elem)` for a feed, the whole
+            // collection for a define).
+            let rho = fun((**domain).clone(), (**value).clone());
+            ctx.require_sub(payload_sub, &rho, &|| format!("contribution to {label}"))?;
+        }
+        _ => {
+            // Opaque target (a lambda parameter receiving the handle —
+            // ParamAsTarget): *demand* it be a feed channel, then constrain the
+            // contribution into that requirement's channel. The call-site
+            // argument edge meets the demand, and the invariant history/history
+            // rule carries the contribution back to the caller's channel.
+            let rho_value = ctx.fresh();
+            let rho_domain = ctx.fresh();
+            let required = Type::History {
+                value: Box::new(rho_value.clone()),
+                domain: Box::new(rho_domain.clone()),
+                kind: crate::ccl::HistoryKind::Append,
+            };
+            ctx.require_sub(target_ty, &required, &|| {
+                format!("feed target of {label} must be a feed handle")
+            })?;
+            let rho = fun(rho_domain, rho_value);
+            ctx.require_sub(payload_sub, &rho, &|| format!("contribution to {label}"))?;
+        }
+    }
+    Ok(prim(BaseType::Unit))
 }
 
 pub(super) fn emit_collection_union<C: Typing>(
@@ -515,18 +715,211 @@ pub(super) fn emit_let<C: Typing>(
     // Emit the RHS at a deeper level so its locally-minted variables can be
     // generalized at the binding site (`scoped_let`).
     let bound_ty = ctx.in_let_rhs(|ctx| ctx.subexpr(bound_expr))?;
-    // User annotation on binding site (e.g. `x: Int = expr`):
-    if let Some(ann) = &binding.user_annotation {
-        ctx.bind_annotation(&bound_ty, ann)?;
-    }
+    // A `let d = Defer` binding names its channel's domain rigidly — replace
+    // the handle's (fresh, otherwise-unconstrained) domain var with the
+    // literal nominal `ChanDom(d)`, so every consumer of a read of `d` types
+    // concretely against the rigid name (no `Infer` channel-domain residue).
+    // The slot must hold the *literal* rigid type, not a var pinned to it: a
+    // var would carry `ChanDom(d)` as a *bound*, and a cross-channel edge
+    // (`x <<= y`) would then mix two channels' rigid names in one bound set
+    // (`Incompatible lower bounds`). The discarded fresh var is referenced
+    // nowhere else; the rigid name inherits its *level*, which is what lets
+    // instantiation treat the channel identity as quantified (a defer inside
+    // a generalized definition is a distinct channel per specialization —
+    // `freshen_above`'s `ChanDom` arm). Gated on the domain still being an
+    // `Infer`: in Check mode (and any re-run) the recorded domain is already
+    // `ChanDom` and is left untouched.
+    let bound_ty = if matches!(bound_expr.node, TypedExprNode::Defer)
+        && let Type::History {
+            value,
+            domain,
+            kind: crate::ccl::HistoryKind::Append,
+        } = &bound_ty
+        && let Type::Infer(dv) = domain.as_ref()
+    {
+        let handle = Type::History {
+            value: value.clone(),
+            domain: Box::new(Type::ChanDom(
+                binding.name.clone(),
+                crate::ccl::ChanLevel(dv.level),
+            )),
+            kind: crate::ccl::HistoryKind::Append,
+        };
+        bound_expr.ty = handle.clone();
+        handle
+    } else {
+        bound_ty
+    };
+    // The type the variable is bound at over the body.
+    //
+    // A `Mut` annotation (an induction accumulator introduction, e.g. `x: Mut[V] =
+    // init`) binds the *variable* at the mutable type `Mut[V, D]`, so its
+    // references carry `Mut` and reads deref to `V` (the coercion arms in
+    // `constrain.rs`). `normalize` mints the annotation's `Hole` value/domain
+    // as fresh vars in Emit — so `?V` receives the initializer and every write
+    // — and is the identity in Check. The initializer is the mutable variable's tick-0
+    // read, so it is constrained `init <: V`; the constraint is skipped when
+    // `V` is an inferred `Hole` (a `Mut[_]` value under Check's
+    // identity-normalize), which the already-resolved tree validates on its
+    // own. The binding *slot* is left to coalesce, which fills a monomorphic
+    // `let`'s slot from its bound expression (the mutable variable's value type `V`) —
+    // the mutability is carried by the *reference* types, not the slot. The
+    // unified phase (`mut_elim`) rewrites every read/write and erases the
+    // `Mut` before the strict wall. Every other annotation reconciles the RHS
+    // as before (`x: Int = expr`).
+    let scheme_ty = match &binding.user_annotation {
+        // Only a *mutable* annotation (`x: Mut[V] = init`) binds the variable at
+        // the history type and constrains `init <: V`. A `Feed`-kind history
+        // annotation is deliberately excluded: it is not a mutable-variable introduction,
+        // so it falls through to the generic `Some(ann)` arm below (there is no
+        // `Feed[…]` initializer surface today, but gating on `Overwrite` keeps this
+        // arm honest rather than silently mis-typing a channel as a value).
+        Some(ann)
+            if matches!(
+                peel_refinements_outer(ann),
+                Type::History {
+                    kind: crate::ccl::HistoryKind::Overwrite,
+                    ..
+                }
+            ) =>
+        {
+            let hist_ty = ctx.normalize(ann);
+            if let Type::History { value, .. } = peel_refinements_outer(&hist_ty)
+                && !matches!(value.as_ref(), Type::Hole)
+            {
+                let value_ty = value.as_ref().clone();
+                let label = binding.name.clone();
+                ctx.require_sub(&bound_ty, &value_ty, &|| {
+                    format!("initializer of mutable `{label}`")
+                })?;
+            }
+            hist_ty
+        }
+        Some(ann) => {
+            ctx.bind_annotation(&bound_ty, ann)?;
+            // A non-mutable annotation on a *mutable* bound expression is a
+            // **deref-copy** (`y: int = x`): bind `y` at the annotation's value
+            // type, not the mutable type. Binding it at the mutable type makes `y` an
+            // alias of `x` in the type system, so the second-class `Mut`
+            // discipline (which keys on the type) then misfires on a variable the
+            // user declared immutable — `z = y` is rejected as an unannotated
+            // `Mut` alias (rule 3), and `y += 1` is *accepted* as a mutable write.
+            // `bind_annotation` has already reconciled the two through the deref
+            // coercion, so returning the normalized annotation is sound; for a
+            // non-mutable bound expression annotation and inferred type agree, so
+            // this stays `bound_ty`.
+            if matches!(peel_refinements_outer(&bound_ty), Type::History { .. })
+                && !matches!(peel_refinements_outer(ann), Type::History { .. })
+            {
+                ctx.normalize(ann)
+            } else {
+                bound_ty
+            }
+        }
+        None => bound_ty,
+    };
     let generalize = ctx.is_generalizable(bound_expr);
-    let body_ty = ctx.scoped_let(&binding.name, &bound_ty, generalize, |ctx| {
+    let body_ty = ctx.scoped_let(&binding.name, &scheme_ty, generalize, |ctx| {
         ctx.subexpr(body)
     })?;
     // Lifting the body type out of the binder's scope must close it over the
     // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
     // story.
     Ok(ctx.close_let_type(&binding.name, bound_expr, body_ty))
+}
+
+/// Run `f` with every `(name, ty)` pair bound monomorphically, innermost-last
+/// — the scope-extension step of the `LetRec` rule. Nesting [`Typing::scoped`]
+/// keeps the push/pop discipline (and its error-path restoration) in the one
+/// place that owns it.
+fn scoped_group<C: Typing, R>(
+    ctx: &mut C,
+    binders: &[(Name, Type)],
+    f: &mut dyn FnMut(&mut C) -> Result<R, InferError>,
+) -> Result<R, InferError> {
+    match binders.split_first() {
+        None => f(ctx),
+        Some(((name, ty), rest)) => ctx.scoped(name, ty, |ctx| scoped_group(ctx, rest, f)),
+    }
+}
+
+/// Emit/check a `letrec` group (design doc `src/ccl/design/mutability.md`,
+/// "`LetRec`"), returning the body type.
+///
+/// Typing rule: with `Γ, b₁ : T₁, …, bₙ : Tₙ` — every binding's *declared*
+/// type in scope for the whole group — check each binding body against its
+/// declared `Tᵢ`, then synthesize the letrec body in the same extended scope.
+/// Declared types are bound *before* any body is visited (mutual recursion:
+/// a body may reference any group binder, including its own).
+///
+/// The unified phase generates each binding's `ty` concretely, so the common
+/// case is pure checking; a `Hole` slot still allocates an inference variable
+/// through [`Typing::normalize`] (the same binding-slot mechanism every
+/// binder uses), which coalesce then resolves in place.
+pub(super) fn emit_letrec<C: Typing>(
+    bindings: &mut [(TypedBinding, Expr)],
+    body: &mut Expr,
+    ctx: &mut C,
+) -> Result<Type, InferError> {
+    // Normalize every declared type first and write it back onto the binder
+    // slot, so references and coalesce share the same (possibly fresh)
+    // variables — mirroring `emit_lambda`'s param handling.
+    let declared: Vec<(Name, Type)> = bindings
+        .iter_mut()
+        .map(|(b, _)| {
+            let ty = ctx.normalize(&b.ty);
+            b.ty = ty.clone();
+            (b.name.clone(), ty)
+        })
+        .collect();
+    for ((b, _), (_, ty)) in bindings.iter().zip(&declared) {
+        if let Some(ann) = &b.user_annotation {
+            ctx.bind_annotation(ty, ann)?;
+        }
+    }
+    scoped_group(ctx, &declared, &mut |ctx| {
+        for (i, (b, def)) in bindings.iter_mut().enumerate() {
+            let def_ty = ctx.subexpr(def)?;
+            let label = b.name.clone();
+            ctx.require_sub(&def_ty, &declared[i].1, &|| {
+                format!("LetRec binding `{label}`")
+            })?;
+        }
+        ctx.subexpr(body)
+    })
+}
+
+/// Emit/check a direct-mirror statement `for` loop ([`TypedExprNode::For`]):
+/// the source must be a function `Fun(D, T)`, the target binds at `T` in the
+/// body's scope, and the node is `Unit` (a statement, not a value). The
+/// `MutWrite`s inside the body are typed by their own (context-specific)
+/// rule; the unified phase (src/ccl/design/mutability.md) eliminates the
+/// node before anything downstream runs.
+pub(super) fn emit_for<C: Typing>(
+    target: &mut TypedBinding,
+    iter: &mut Expr,
+    body: &mut Expr,
+    ctx: &mut C,
+) -> Result<Type, InferError> {
+    let iter_ty = ctx.subexpr(iter)?;
+    let iter_label = symbolic(iter);
+    let (_domain, item_ty) =
+        ctx.as_function(&iter_ty, &|| format!("for-loop source `{iter_label}`"))?;
+
+    // The target binds at the source's element type — same binder discipline
+    // as `emit_lambda`'s param (normalize the slot so references share vars).
+    let target_simple = ctx.normalize(&target.ty);
+    target.ty = target_simple.clone();
+    let target_label = target.name.clone();
+    ctx.require_sub(&item_ty, &target_simple, &|| {
+        format!("for-loop target `{target_label}`")
+    })?;
+    if let Some(ann) = target.user_annotation.clone() {
+        ctx.bind_annotation(&target_simple, &ann)?;
+    }
+
+    ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))?;
+    Ok(Type::Base(BaseType::Unit))
 }
 
 /// Build the open-product shape a projection of `key` requires its input to
@@ -581,7 +974,10 @@ pub(super) fn emit_list<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<Typ
         ctx.require_eq(&r_ty, &first_ty, &|| "List element".to_string())?;
     }
     let n = elts.len();
-    Ok(fun(Type::UIntRange(n), first_ty))
+    // Deref a bare mutable read to its value, as in `emit_tuple`: the list's
+    // element (codomain) type takes the dereferenced element type so no `Mut`
+    // appears in the list type.
+    Ok(fun(Type::UIntRange(n), deref_mut(&first_ty)))
 }
 
 /// Emit constraints for a [`TypedExprNode::Case`] — the unified
@@ -714,99 +1110,145 @@ pub(super) fn emit_compose<C: Typing>(elts: &mut [Expr], ctx: &mut C) -> Result<
     })
 }
 
-/// Emit inference constraints for a `Loop` node and return its outer type
-/// `Fun(D, Record({step: σ, tap_k: τ_k}))`.
+/// The body domain for a mutation loop accumulator step and a transaction
+/// writer: `Tuple(slot_0, …, slot_{n-1}, item)` — the read-set snapshot slots
+/// followed by the iteration item, matching the body lambda's `let s_i = p.i …
+/// let item = p.n` destructuring.
+fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) -> Type {
+    let mut dom: BTreeMap<FieldKey, Type> = BTreeMap::new();
+    for (i, slot) in slots.into_iter().enumerate() {
+        dom.insert(FieldKey::Index(i), slot);
+    }
+    let item_index = dom.len();
+    dom.insert(FieldKey::Index(item_index), item);
+    product(dom)
+}
+
+/// The per-position `to_<defer>` output fields a writer's decision record
+/// carries beyond `{commit, writes}`, read off the writer body's codomain —
+/// `(field, value_ty)`. Each becomes a virtual register-record key `to_<defer>:
+/// Fun(domain, value_ty)` (the per-position feed output stream).
+pub(super) fn writer_tap_fields(body_ty: &Type) -> Vec<(String, Type)> {
+    let Some(codom) = body_ty.codomain() else {
+        return Vec::new();
+    };
+    let Type::Record(fields) = peel_refinements_outer(&codom) else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .filter(|(f, _)| f != crate::ccl::F_COMMIT && f != crate::ccl::F_WRITES)
+        .map(|(f, t)| (f.clone(), t.clone()))
+        .collect()
+}
+
+/// Type one transaction writer against the register's per-key value types.
 ///
-/// The Loop's typing rule (mirroring the paper's `App` shape — fresh
-/// variables for each "guess" position, one-way `constrain_subtype` calls
-/// throughout — see Parreaux 2020 Fig 9, p. 124:9):
-///
-/// - `source` is a stream `Fun(D, item)`; we mint fresh `D` and `item`
-///   and constrain_subtype the inferred source type to fit.
-/// - Each accumulator slot `params[i]` gets a fresh var `α_i`. The
-///   `init_args[i]` value flows in as a lower bound: `init <: α_i`.
-/// - `loop_body` is a Lambda whose input is `Tuple(α_0, …, α_{n-1}, item)`
-///   and whose output is `Record({step: σ, tap_k: τ_k})`. We mint `σ`
-///   and one `τ_k` per `body_taps` entry and constrain_subtype the inferred body
-///   type against the expected shape.
-/// - The recurrence wires the step output back to the accumulator slots:
-///   single-acc → `σ <: α_0`; multi-acc → `σ <: Tuple(α_0, …, α_{n-1})`
-///   (which depth-decomposes into `σ.i <: α_i`).
-///
-/// The accumulator vars are structurally shared across iterations by
-/// construction — there's exactly one `α_i` per slot, and `init`, the
-/// body's reads of `p.i`, and `σ` all flow into the same variable. No
-/// separate "iterations agree" constraint is needed.
-///
-/// `params[i].name` is bound inside `loop_body` only via the body's own
-/// let-chain (`let acc_i = p.i in …`), so we do not push the params
-/// into `ctx.scopes` here.
-pub(super) fn emit_loop<C: Typing>(
-    params: &mut [TypedBinding],
-    init_args: &mut [Expr],
-    source: &mut Expr,
-    loop_body: &mut Expr,
+/// `key_types` maps each register key to the type of one committed value. The body
+/// is `Fun(Tuple(snap_{k₀}, …, snap_{k_{r-1}}, item), {commit: Bool, writes:
+/// Tuple(new_{w₀}, …), to_<defer>*})`, where snapshot position `i` is
+/// `read_keys[i]`'s value type and each `writes` entry `new_j <: write_keys[j]`'s
+/// value type. `commit` gates the whole (atomic) write set; any extra
+/// `to_<defer>` fields ride along as width-subtyped taps.
+fn emit_transact_writer<C: Typing>(
+    writer: &mut WriterSite,
+    key_types: &std::collections::HashMap<Name, Type>,
     ctx: &mut C,
-) -> Result<Type, InferError> {
-    debug_assert_eq!(
-        params.len(),
-        init_args.len(),
-        "Loop: params and init_args must have equal length"
+) -> Result<(), InferError> {
+    let s_ty = ctx.subexpr(&mut writer.source)?;
+    let (_d, item) = ctx.as_function(&s_ty, &|| "transaction source".to_string())?;
+
+    let mut snaps: Vec<Type> = Vec::with_capacity(writer.read_keys.len());
+    for rk in &writer.read_keys {
+        let snap = key_types.get(rk).cloned().ok_or_else(|| {
+            InferError::Unsupported(format!("read key {rk} is not a register key"))
+        })?;
+        snaps.push(snap);
+    }
+    let body_dom = accumulator_body_domain(snaps, item);
+
+    // Body codomain: `{commit: Bool, writes: Tuple(new_j…)}`, with `new_j` a
+    // fresh var bounded above by `write_keys[j]`'s value type. `writes` is a
+    // positional tuple built directly (not via `product`, whose empty case
+    // collapses to `Record([])`): even a single-key write set is `Tuple([_])`.
+    let mut new_tys: Vec<Type> = Vec::with_capacity(writer.write_keys.len());
+    let mut news: Vec<(Type, Type)> = Vec::with_capacity(writer.write_keys.len());
+    for wk in &writer.write_keys {
+        let new = ctx.fresh();
+        let bound = key_types.get(wk).cloned().ok_or_else(|| {
+            InferError::Unsupported(format!("write key {wk} is not a register key"))
+        })?;
+        new_tys.push(new.clone());
+        news.push((new, bound));
+    }
+    let mut codom: BTreeMap<FieldKey, Type> = BTreeMap::new();
+    codom.insert(
+        FieldKey::Name(SmolStr::from(crate::ccl::F_COMMIT)),
+        prim(BaseType::Bool),
+    );
+    codom.insert(
+        FieldKey::Name(SmolStr::from(crate::ccl::F_WRITES)),
+        Type::Tuple(new_tys),
     );
 
-    // Source: Fun(D, item).
-    let s_ty = ctx.subexpr(source)?;
-    let (d, item) = ctx.as_function(&s_ty, &|| "Loop source".to_string())?;
-
-    // Accumulator slots: one var α per `params[i]` (Emit mints it and writes
-    // it into the binder; Check reads the resolved accumulator type back);
-    // `init_args[i] <: α_i`.
-    let alphas: Vec<Type> = params
-        .iter_mut()
-        .map(|p| ctx.binding_slot(&mut p.ty))
-        .collect();
-    for (i, init) in init_args.iter_mut().enumerate() {
-        let init_ty = ctx.subexpr(init)?;
-        ctx.require_sub(&init_ty, &alphas[i], &|| "Loop init".to_string())?;
-    }
-
-    // Body codomain: Record carrying at least `{step: σ}`.  Tap fields
-    // (`to_<defer>`) are no longer named at this level — `desugar_defers`
-    // runs before inference and folds them into the body's literal Record;
-    // we let the actual body record flow into `actual_cod` as a lower
-    // bound and use that as the Loop's outer codomain, so downstream
-    // projections on `to_<defer>` still see the right fields.
-    let sigma = ctx.fresh();
-    let actual_cod = ctx.fresh();
-    let mut cod_fields: BTreeMap<FieldKey, Type> = BTreeMap::new();
-    cod_fields.insert(FieldKey::Name(SmolStr::from("step")), sigma.clone());
-    let step_record = product(cod_fields);
-
-    // Body domain: Tuple(α_0, …, α_{n-1}, item).
-    let mut dom_fields: BTreeMap<FieldKey, Type> = BTreeMap::new();
-    for (i, alpha) in alphas.iter().enumerate() {
-        dom_fields.insert(FieldKey::Index(i), alpha.clone());
-    }
-    dom_fields.insert(FieldKey::Index(alphas.len()), item.clone());
-    let body_dom = product(dom_fields);
-
-    let body_ty = ctx.subexpr(loop_body)?;
-    ctx.require_sub(&body_ty, &fun(body_dom, actual_cod.clone()), &|| {
-        "Loop body".to_string()
+    let body_ty = ctx.subexpr(&mut writer.body)?;
+    ctx.require_sub(&body_ty, &fun(body_dom, product(codom)), &|| {
+        "transaction body".to_string()
     })?;
-    // The body's codomain must at least carry `step: σ`.
-    ctx.require_sub(&actual_cod, &step_record, &|| "Loop body step".to_string())?;
-
-    // Recurrence: σ <: α_0 (single) or σ <: Tuple(α_0, …, α_{n-1}) (multi).
-    if alphas.len() == 1 {
-        ctx.require_sub(&sigma, &alphas[0], &|| "Loop recurrence".to_string())?;
-    } else {
-        let mut tup: BTreeMap<FieldKey, Type> = BTreeMap::new();
-        for (i, alpha) in alphas.iter().enumerate() {
-            tup.insert(FieldKey::Index(i), alpha.clone());
-        }
-        ctx.require_sub(&sigma, &product(tup), &|| "Loop recurrence".to_string())?;
+    for (new, contrib) in news {
+        ctx.require_sub(&new, &contrib, &|| "transaction write".to_string())?;
     }
+    Ok(())
+}
 
-    Ok(fun(d, actual_cod))
+/// Type a [`TypedExprNode::Transact`] (Check-pass rule).
+///
+/// The node denotes the register **record** `{key: ⟦key⟧}` — each key's read type
+/// `Fun(domain, α)` (the value's history over the register's sequencing domain),
+/// what a variable projection `__reg.key` yields; a read reduces it to the
+/// latest `α` via `final_or_default(history, init)`. The init is the position-0
+/// value, so it bounds the codomain `α` (`init <: α`), not the whole stream.
+/// There is no recurrence *fixpoint* over a step type — the register↔writer cycle
+/// is realized operationally at op-conversion — so no `σ <: α` constraint, just
+/// each writer's per-key register round-trip.
+///
+/// `Transact` is born by `planning::plan_loops` after inference, so this
+/// rule runs only in the Check pass; it never mints constraints that must
+/// coalesce.
+pub(super) fn emit_transact<C: Typing>(
+    keys: &mut [TransactKey],
+    writers: &mut [WriterSite],
+    domain: &Type,
+    ctx: &mut C,
+) -> Result<Type, InferError> {
+    use std::collections::HashMap;
+    let mut fields: Vec<(String, Type)> = Vec::with_capacity(keys.len());
+    // key Name → the type of one committed value (a writer's snapshot / write
+    // bound) — the codomain of the key's history.
+    let mut key_types: HashMap<Name, Type> = HashMap::with_capacity(keys.len());
+    for k in keys.iter_mut() {
+        // The register-record field is the value's history `Fun(domain, α)` over
+        // the register's sequencing domain; `final_or_default` reads it back to the
+        // latest `α`.
+        let value_ty = ctx.fresh();
+        let read_ty = fun(domain.clone(), value_ty.clone());
+        let init_ty = ctx.subexpr(&mut k.init)?;
+        ctx.require_sub(&init_ty, &value_ty, &|| "transact init".to_string())?;
+        fields.push((k.name.field_key(), read_ty));
+        key_types.insert(k.name.clone(), value_ty);
+    }
+    for w in writers.iter_mut() {
+        emit_transact_writer(w, &key_types, ctx)?;
+        // A `to_<defer>` field on the writer's decision record becomes a
+        // virtual register key the consumer reads as `__reg.to_…`. Its stream
+        // is **site-domained** — one tap value per iteration of *this
+        // writer's* source (the channel unions channelize assembled reference
+        // it at that type) — unlike the key histories, which live over the
+        // register's sequencing domain.
+        let site_dom = w.source.ty.domain().unwrap_or_else(|| domain.clone());
+        for (field, value_ty) in writer_tap_fields(&w.body.ty) {
+            fields.push((field, fun(site_dom.clone(), value_ty)));
+        }
+    }
+    Ok(Type::Record(fields))
 }

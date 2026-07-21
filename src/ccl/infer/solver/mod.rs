@@ -52,7 +52,10 @@ pub mod simplify_type;
 pub use coalesce::{CoalesceError, coalesce_compact};
 pub use compact::{CompactGraph, CompactType, compact_type};
 pub use constrain::{ConstrainCache, ConstrainError, ExtrudeCache, constrain_subtype, extrude};
-pub use scheme::{FreshenCache, FreshenLevel, PolyScheme, freshen_above, freshen_expr_type_slots};
+pub use scheme::{
+    FreshenCache, FreshenLevel, PolyScheme, freshen_above, freshen_expr_type_slots,
+    seed_chan_dom_pairings,
+};
 pub use simplify_type::simplify_type;
 
 /// The level of `ty` — the maximum scope level of any inference variable
@@ -72,7 +75,21 @@ pub fn type_level(ty: &Type) -> Level {
         Type::Record(fs) => fs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Variant(tags) => tags.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Refinement(inner, _) => type_level(inner),
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => 0,
+        // Combine both children like `Fun` (domain + codomain): a later
+        // increment's per-call-site domain generalization depends on the
+        // `domain`'s level surfacing here, so a fresh domain var pins the
+        // level of the enclosing `Mut`.
+        Type::History { value, domain, .. } => type_level(value).max(type_level(domain)),
+        // A channel domain stores its introduction level, but deliberately
+        // reports 0 here: `type_level` drives extrusion and bound-recording
+        // level scoping, and a rigid atom must flow through bounds to
+        // lower-level consumers *unchanged* — that flow is exactly how a
+        // channel's readers come to reference it. The stored level's one
+        // consumer is `freshen_above`'s `ChanDom` arm (quantification at
+        // instantiation), which reads it directly and is exempted from the
+        // `type_level` short-circuit.
+        Type::ChanDom(..) => 0,
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => 0,
     }
 }
 

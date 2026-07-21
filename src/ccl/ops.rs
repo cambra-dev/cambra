@@ -276,7 +276,7 @@ pub enum Builtin {
     Sum,
     /// `max`.
     Max,
-    /// `last_or_default : Tuple(Fun(D, T), T) → T` — extract the
+    /// `final_or_default : Tuple(Fun(D, T), T) → T` — extract the
     /// codomain value at the final position of an iteration stream, or
     /// fall back to the default scalar when the stream's domain is
     /// empty.  Compiles directly to the `ExtractLast` tile operator
@@ -287,7 +287,7 @@ pub enum Builtin {
     /// Used by `lower_mutation_loop` to expose the scalar final
     /// accumulator of a Record-bodied loop, whose external type is
     /// `Fun(D, Record({step, to_<defer>*}))`: the after-loop scalar acc is
-    /// `(acc_stream ▷ Proj("step"), init) ▷ LastOrDefault`.  The
+    /// `(acc_stream ▷ Proj("step"), init) ▷ FinalOrDefault`.  The
     /// default is the pre-loop accumulator binding, so an
     /// empty-source loop (`for i in []: x += 1; x`) yields `init`
     /// rather than panicking or returning empty.
@@ -298,7 +298,72 @@ pub enum Builtin {
     /// jointly with the `.rev().find(…)` in `ExtractLastProducer` —
     /// both assume the source's last position by emission order, not
     /// by sorted domain value.
-    LastOrDefault,
+    FinalOrDefault,
+
+    /// `get_prev_seq : Tuple(Fun(I, V), I, V) → V` — the history value at
+    /// the *predecessor* of the given position, or the default at the first
+    /// position.
+    ///
+    /// Applied as a tupled argument, same convention as [`Self::FinalOrDefault`]:
+    /// `Apply(Tuple([history, position, default]), Builtin(GetPrevSeq))`.
+    /// The polymorphic scheme `∀ι ν. ((ι ⇒ ν), ι, ν) ⇒ ν` lives in
+    /// [`crate::ccl::infer::OperatorSchemes`] (shared variables
+    /// across positions, like `FinalOrDefault`).
+    ///
+    /// This is the **guard accessor** for induction-domain recursion in a
+    /// [`crate::ccl::TypedExprNode::LetRec`]: a binding whose self-reference
+    /// is consumed only as the history argument of `get_prev_seq` depends
+    /// only on strictly earlier positions, which is what makes the group
+    /// well-founded (see `src/ccl/design/mutability.md`, "The model: histories and causal recursion" /
+    /// "Builtins", and [`crate::ccl::letrec::check_letrec_causal`]).
+    ///
+    /// Op-conversion never compiles this builtin directly: letrec pattern
+    /// recognition consumes it (the causal self-cycle becomes the `Recurse`
+    /// engine), so its op-conversion arm is a deliberate error, like
+    /// `LetRec`'s.
+    GetPrevSeq,
+
+    /// `get_prev_txn : Tuple(Fun(Txn, {time: Txn, write: V}), Txn, V) → V` —
+    /// the write carried by the latest commit in the history stream *strictly
+    /// before* the given time, or the default if none.
+    ///
+    /// Applied as a tupled argument, same convention as [`Self::GetPrevSeq`]:
+    /// `Apply(Tuple([history, time, default]), Builtin(GetPrevTxn))`. Its
+    /// polymorphic scheme `∀ν. ((Txn ⇒ {time: Txn, write: ν}), Txn, ν) ⇒ ν`
+    /// lives in [`crate::ccl::infer::OperatorSchemes`].
+    ///
+    /// This is the **transaction-domain guard accessor** for a
+    /// [`crate::ccl::TypedExprNode::LetRec`]: a binding whose reference to a
+    /// commit-record binding is consumed only as the history argument depends
+    /// only on strictly earlier commit times, which is what makes the
+    /// `register ↔ commits` cycle well-founded (see
+    /// `src/ccl/design/mutability.md`, "Builtins", and
+    /// [`crate::ccl::letrec::check_letrec_causal`]).
+    ///
+    /// Op-conversion never compiles this builtin directly — like
+    /// [`Self::GetPrevSeq`], letrec pattern recognition (the commit-operator
+    /// complex) consumes it, so its op-conversion arm is a deliberate error.
+    GetPrevTxn,
+
+    /// `begin_<site> : 𝐼 ⇒ Txn` — the commit-time **oracle** for one `with
+    /// begin():` site: where the site's iteration `𝑟` lands in the global
+    /// commit order. Applied as `begin(r)` (`Apply(Var(r), Builtin(BeginTxn))`)
+    /// inside a commit-record binding, it produces the transaction's commit time
+    /// `t`, at which that writer's register snapshots are read (`balance(t)`).
+    ///
+    /// Minted by `transact_phase` — one application per site,
+    /// *after* inference, so it carries no scheme in
+    /// [`crate::ccl::infer::OperatorSchemes`]; its type `𝐼 ⇒ Txn` is
+    /// stamped on the node at emission and the post-phase CHECK-mode `typecheck`
+    /// (which trusts a builtin's recorded type) validates it directly. Opaque
+    /// and consumed by [`crate::ccl::planning::plan_loops`], which reads the
+    /// writer's source and body off the commit-record binding and discards the
+    /// `begin`/`balance(t)` plumbing. Like [`Self::GetPrevSeq`] /
+    /// [`Self::GetPrevTxn`] it never reaches op-conversion, so its op-conversion
+    /// arm is a deliberate error. A single shared builtin serves every site: the
+    /// site identity recognition needs (the source stream + iteration domain)
+    /// lives in the commit-record binding, not in the oracle.
+    BeginTxn,
 
     /// `collection_union : (Fun(A, B), Fun(C, D)) → Fun(Union(A, C), dedup(B, D))`
     ///
@@ -306,6 +371,31 @@ pub enum Builtin {
     /// domain is the discriminated union of both input domains and whose codomain is
     /// the deduplicated union of both input codomains.  Lowered from Python `a @ b`.
     CollectionUnion,
+
+    /// `as_of : Tuple(Fun(B, _), Fun(Txn, V)) → Fun(B, V)` — the **as-of
+    /// (temporal) join**, the live cross-endpoint read. Applied as a tupled
+    /// argument `Apply(Tuple([trigger, source]), Builtin(AsOf))`: for each
+    /// `trigger` (request-loop) position, latch `source`'s (a transactional
+    /// register's running render, `Fun(Txn, V)`) latest-decided value as of that
+    /// position. The reply is indexed by the *trigger* (the enclosing request
+    /// loop), not the commit clock — an outer-indexed read.
+    ///
+    /// Born in `transact_phase`'s `rewrite_live_reads`, run
+    /// **pre-lambda-elim** (after `channelize`): it recognizes a read-only
+    /// reply — a chain of live-register reads `let k₁ = final_or_default((balance.f₁, _))
+    /// in … in trigger ≫ (λ r → e)` — and rewrites it, dropping the never-resolving
+    /// `final_or_default`s. Reading **one** register → `as_of((trigger, balance.f)) ≫
+    /// (λ k → e)`; reading **several** → `as_of((trigger, balance)) ≫ (λ snap → e[kᵢ
+    /// ↦ snap.fᵢ])`, a single snapshot record folded at one commit frontier so the
+    /// registers are read atomically (§I-c). Running before lambda elimination
+    /// keeps a computed reply (`e = k + 1`) a lambda the elim pass point-frees,
+    /// rather than a point-free `const` that could only be broadcast. Compiles to
+    /// the `commit_operator` `AsOf` tile operator (scalar- or
+    /// record-valued). It carries its **own recorded type** (no inference scheme):
+    /// op-conversion and every post-phase `typecheck` read `.ty` directly, and
+    /// planning treats it as an iteration-bearing source (it stages the trigger
+    /// inside its tuple rather than prepending an `iterate`).
+    AsOf,
 }
 
 impl Builtin {
@@ -333,8 +423,12 @@ impl Builtin {
             Self::NotFn => "not_fn",
             Self::Sum => "sum",
             Self::Max => "max",
-            Self::LastOrDefault => "last_or_default",
+            Self::FinalOrDefault => "final_or_default",
+            Self::GetPrevSeq => "get_prev_seq",
+            Self::GetPrevTxn => "get_prev_txn",
+            Self::BeginTxn => "begin",
             Self::CollectionUnion => "collection_union",
+            Self::AsOf => "as_of",
         }
     }
 
@@ -365,7 +459,7 @@ impl Builtin {
     /// - `is_internalising_builtin_function` — at `Apply { function }`
     ///   positions during the iteration-site walk, decides which
     ///   builtins' arguments to wrap with `iterate(_)`.  `CollectionUnion`
-    ///   and `LastOrDefault` are in this list because they self-iterate
+    ///   and `FinalOrDefault` are in this list because they self-iterate
     ///   from sub-parts of their tuple argument, but the walk's
     ///   per-shape match arms handle them before the catch-all that
     ///   consults this metho — so the per-element wrapping fires first
@@ -373,7 +467,7 @@ impl Builtin {
     /// - `is_iteration_bearing` — at chain heads, decides which builtins
     ///   already provide their own iteration (and so should not be
     ///   wrapped with another `iterate(_)`).  Scalar-result builtins
-    ///   (`Sum`, `Max`, `LastOrDefault`) are in the list too; the
+    ///   (`Sum`, `Max`, `FinalOrDefault`) are in the list too; the
     ///   caller's `expr.ty.domain()` check filters them out at chain
     ///   heads independently.
     ///
@@ -396,7 +490,14 @@ impl Builtin {
                 | Self::PermuteDomain
                 | Self::FlattenDomain
                 | Self::CollectionUnion
-                | Self::LastOrDefault
+                // `GetPrevSeq`/`GetPrevTxn` share `FinalOrDefault`'s
+                // classification (a scalar-result builtin over a tuple whose
+                // stream sub-part self-iterates), but op-conversion never sees
+                // them: letrec pattern recognition consumes them first, and the
+                // op-conv arm errors deliberately (see the variant docs).
+                | Self::FinalOrDefault
+                | Self::GetPrevSeq
+                | Self::GetPrevTxn
         )
     }
 }

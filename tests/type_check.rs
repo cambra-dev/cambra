@@ -14,7 +14,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
-    FieldKey, Type,
+    FieldKey, HistoryKind, Type,
     infer::{InferError, TypeInferenceContext, infer},
     lower::{LoweringContext, lower_stmts},
 };
@@ -306,6 +306,20 @@ x: int = 1 + 2
 x
 ",
     BaseType::Int
+)]
+#[case::wildcard(
+    r"
+x: _ = 2
+x
+",
+    BaseType::Int
+)]
+#[case::wildcard_str(
+    r#"
+x: _ = "hi"
+x
+"#,
+    BaseType::String
 )]
 fn test_ann_assign_ok(#[case] code: &str, #[case] expected: BaseType) {
     assert_eq!(infer_program(code), Type::Base(expected));
@@ -682,5 +696,296 @@ fn test_filtered_comprehension_has_refinement_on_domain() {
         assert_eq!(**cod, int(), "expected codomain Int, got {ty}");
     } else {
         panic!("expected Fun type, got {ty}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Defer / Feed / Define typing rules (pre-channelize trees)
+// ---------------------------------------------------------------------------
+//
+// These tests run inference on lowered-but-NOT-channelized trees, exercising
+// the `Defer`/`Feed`/`Define` typing rules directly: a defer binding types
+// as a feed history `feed(δ ⇒ value)`, feeds contribute `Fun(δ, elem)` channel
+// shapes into it, defines set the whole stream outright, and reads discharge
+// transparently through the handle as that stream. A channel's *domain* is a
+// rigid nominal `Type::ChanDom(d)` minted at the `let d = defer()` site, so
+// reads type concretely against that name at inference (no `Infer` residue);
+// `channelize` later substitutes the assembled channel domain for `ChanDom`.
+
+/// Destructure `ty` as a feed history `feed(domain ⇒ value)` and return the
+/// channel's element type `value`; panics otherwise. A feed reads as its whole
+/// stream, so its element type is the history's `value` slot directly (there is
+/// no separate scalar payload to peel — scalar `<<=` is rejected by typing).
+fn feed_value(ty: &Type) -> &Type {
+    match ty {
+        Type::History {
+            value,
+            kind: HistoryKind::Append,
+            ..
+        } => value,
+        _ => panic!("expected a feed handle, got {ty}"),
+    }
+}
+
+#[test]
+fn test_defined_defer_is_feed_of_collection() {
+    // `<<=` sets the whole channel; its RHS must be a collection (a `Fun`),
+    // so the feed's element type is the collection's element.
+    let ty = infer_program("x = defer()\nx <<= [1,2,3]\nx");
+    assert_eq!(*feed_value(&ty), int());
+}
+
+#[test]
+fn test_scalar_define_is_rejected() {
+    // A scalar `<<=` RHS is disallowed — `<<=` only accepts collections
+    // (`Fun`s), so an `Int` fails to align with the channel stream.
+    let errs = infer_program_err("x = defer()\nx <<= 1\nx");
+    assert!(
+        !errs.is_empty(),
+        "a scalar defined into a feed channel must be a type error"
+    );
+}
+
+#[test]
+fn test_fed_defer_is_feed_of_channel() {
+    let ty = infer_program("x = defer()\n[x << i for i in [1,2,3]]\nx");
+    assert_eq!(*feed_value(&ty), int());
+}
+
+#[test]
+fn test_scalar_feeds_join_in_channel() {
+    let ty = infer_program("x = defer()\nx << 1\nx << 2\nx");
+    assert_eq!(*feed_value(&ty), int());
+}
+
+#[test]
+fn test_defined_defer_reads_through_aggregate() {
+    // A collection define sets the whole stream; `sum` reads the handle as
+    // that stream and aggregates it to a scalar.
+    assert_eq!(infer_program("x = defer()\nx <<= [1,2,3]\nsum(x)"), int());
+}
+
+#[test]
+fn test_fed_defer_reads_through_aggregate() {
+    // `sum` consumes the feed handle as its channel stream `(α → γ)`.
+    assert_eq!(infer_program("x = defer()\nx << 1\nx << 2\nsum(x)"), int());
+}
+
+#[test]
+fn test_defer_chain_flattens_feeds() {
+    // `x <<= y` sets x's channel to y's whole stream. A feed reads through as
+    // its stream, so x gets y's stream directly (a single feed layer, not
+    // nested); desugar later binds x to y's channel.
+    let ty = infer_program("x = defer()\ny = defer()\nx <<= y\ny <<= [0, 1]\nx");
+    assert_eq!(*feed_value(&ty), int());
+}
+
+#[test]
+fn test_heterogeneous_feeds_error() {
+    let errs = infer_program_err("x = defer()\nx << 1\nx << \"s\"\nx");
+    assert!(
+        !errs.is_empty(),
+        "Int and String feeds into one defer must collide"
+    );
+}
+
+#[test]
+fn test_feed_through_param_flows_back_to_caller() {
+    // ParamAsTarget: g feeds its parameter. The call edge
+    // `Feed(ρ_x) <: c` meets the feed's `c <: Feed(ρ_f)` upper bound,
+    // and invariance carries g's contribution back into ρ_x — so the
+    // String contribution collides with the direct Int feed.
+    let errs = infer_program_err(
+        r#"
+def g(c):
+  c << "s"
+  c
+x = defer()
+g(x)
+x << 1
+x"#,
+    );
+    assert!(
+        !errs.is_empty(),
+        "a String fed through g's parameter must collide with the Int fed directly"
+    );
+}
+
+#[test]
+fn test_feed_through_param_compatible_types_ok() {
+    // Same shape with compatible contributions: both land in ρ_x as Int.
+    let ty = infer_program(
+        r#"
+def g(c):
+  c << 100
+  c
+x = defer()
+g(x)
+x << 1
+x"#,
+    );
+    assert_eq!(*feed_value(&ty), int());
+}
+
+#[test]
+fn test_plain_value_to_feeding_param_errors() {
+    // `g(5)` where g feeds its parameter: the write capability cannot be
+    // conjured from a plain value (`NotAFeed` at the call edge).
+    let errs = infer_program_err(
+        r#"
+def g(c):
+  c << 1
+  c
+g(5)"#,
+    );
+    assert!(
+        !errs.is_empty(),
+        "feeding through a non-feed argument must error"
+    );
+}
+
+#[test]
+fn test_unbound_feed_target_errors() {
+    let errs = infer_program_err("x << 1");
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, InferError::UnboundVariable(n) if n == "x")),
+        "feeding an unbound name must report UnboundVariable, got {errs:?}"
+    );
+}
+
+#[test]
+fn test_generalized_defer_function_specializes_per_element_type() {
+    // A defer minted inside a generalized function instantiates a fresh
+    // feed handle (and element type) per call site — monomorphize then
+    // specializes per resolved Feed type.
+    let ty = infer_program(
+        r#"
+def make(v):
+  x = defer()
+  x << v
+  x
+a = make(1)
+b = make("s")
+(a, b)"#,
+    );
+    let Type::Tuple(elems) = &ty else {
+        panic!("expected a pair of feed handles, got {ty}");
+    };
+    assert_eq!(*feed_value(&elems[0]), int());
+    assert_eq!(*feed_value(&elems[1]), string());
+}
+
+// ---------------------------------------------------------------------------
+// LetRec typing (direct construction — no surface syntax emits LetRec yet)
+// ---------------------------------------------------------------------------
+
+/// Direct-construction tests for the [`TypedExprNode::LetRec`] typing rule:
+/// every binding's declared type is bound over the whole group (mutual
+/// recursion), each binding body checks against its declaration, and the
+/// node synthesizes the letrec body's type. Constructed as raw `Expr`s
+/// because nothing in the pipeline emits `LetRec` yet (the unified phase of
+/// `src/ccl/design/mutability.md` lands it later).
+mod letrec_typing {
+    use cambra::ccl::infer::{TypeInferenceContext, infer, typecheck};
+    use cambra::ccl::{
+        ArithmeticKind, BinOpKind, Builtin, Expr, Lit, Type, TypedBinding, TypedExprNode,
+    };
+    use cambra::interpreter::BaseType;
+
+    fn int() -> Type {
+        Type::Base(BaseType::Int)
+    }
+
+    /// `get_prev_seq((history, position, default))` — the tupled-argument
+    /// application convention (same as `FinalOrDefault`).
+    fn get_prev_seq(history: Expr, position: Expr, default: Expr) -> Expr {
+        Expr::apply(
+            Expr::tuple(vec![history, position, default]),
+            Expr::builtin(Builtin::GetPrevSeq),
+        )
+    }
+
+    fn typed_binding(name: &str, ty: Type) -> TypedBinding {
+        TypedBinding {
+            name: name.into(),
+            ty,
+            user_annotation: None,
+        }
+    }
+
+    /// The design's induction-recurrence shape typechecks end-to-end through
+    /// `infer` + the strict `typecheck` wall:
+    /// `letrec cnt : [0,3] ⇒ Int = λ r → get_prev_seq((cnt, r, 0)) + 1 in cnt`.
+    /// The body's self-reference resolves against the group scope at the
+    /// declared type, and the guard builtin's polymorphic scheme pins
+    /// `ι = [0,3]`, `ν = Int`.
+    #[test]
+    fn guarded_single_binding_letrec_typechecks() {
+        let cnt_ty = Type::fun(Type::UIntRange(3), int());
+        let def = Expr::lambda(
+            "r",
+            Type::UIntRange(3),
+            Expr::binop(
+                get_prev_seq(Expr::var("cnt"), Expr::var("r"), Expr::lit(Lit::Int(0))),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                Expr::lit(Lit::Int(1)),
+            ),
+        );
+        let mut expr = Expr::letrec(
+            vec![(typed_binding("cnt", cnt_ty.clone()), def)],
+            Expr::var("cnt"),
+        );
+
+        let ty = infer(&mut expr, &mut TypeInferenceContext::new()).expect("inference succeeds");
+        assert_eq!(
+            ty, cnt_ty,
+            "the letrec's type is its body's (a read of cnt)"
+        );
+        typecheck(&expr).expect("strict typecheck passes");
+
+        // The shape is also well-formed by the guardedness check.
+        let TypedExprNode::LetRec { bindings, .. } = &expr.node else {
+            panic!("letrec node preserved");
+        };
+        assert_eq!(bindings[0].0.ty, cnt_ty, "binder slot resolved in place");
+        cambra::ccl::letrec::check_letrec_causal(bindings).expect("causal group");
+    }
+
+    /// A binding body whose type conflicts with its declared binding type is
+    /// rejected: `letrec x : Int = "s" in x`.
+    #[test]
+    fn conflicting_declared_binding_type_is_rejected() {
+        let mut expr = Expr::letrec(
+            vec![(
+                typed_binding("x", int()),
+                Expr::lit(Lit::String("s".into())),
+            )],
+            Expr::var("x"),
+        );
+        infer(&mut expr, &mut TypeInferenceContext::new())
+            .expect_err("String body against an Int declaration must fail");
+    }
+
+    /// Mutual scope: binding A's body references B and vice versa — both
+    /// resolve against the group scope (the whole group is bound before any
+    /// body is emitted), and the letrec body sees both.
+    #[test]
+    fn mutual_two_binding_scope_resolves() {
+        let mut expr = Expr::letrec(
+            vec![
+                (typed_binding("a", int()), Expr::var("b")),
+                (typed_binding("b", int()), Expr::var("a")),
+            ],
+            Expr::binop(
+                Expr::var("a"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                Expr::var("b"),
+            ),
+        );
+        let ty = infer(&mut expr, &mut TypeInferenceContext::new())
+            .expect("mutually referencing bindings resolve");
+        assert_eq!(ty, int());
+        typecheck(&expr).expect("strict typecheck passes");
     }
 }

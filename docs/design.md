@@ -31,10 +31,34 @@ CHL source
   → parse            (chl_parser, see src/chl_parser/design-chl-parser.md)
   → lower            (ccl/lower/: CHL AST → CCL Expr)
   → uniquify         (ccl/uniquify.rs: α-uniquify binders — Barendregt convention, base+uid Names)
-  → desugar_defers   (ccl/desugar_defers.rs: Defer/Feed/Define → let-chain + Record channels)
-  → infer            (ccl/infer/: type inference; delegates to ccl/infer/solver/, the constraint solver)
-  → inline           (ccl/inline.rs: inline UDF Let bindings with non-iterable domains; beta-reduce at call sites)
+  → infer            (ccl/infer/: type inference; delegates to ccl/infer/solver/, the constraint solver;
+                      runs on the user-shaped tree so type errors report against the program as written)
+  → inline           (ccl/inline.rs: inline UDF Let bindings with non-iterable domains; beta-reduce at
+                      call sites. Runs *before* channelize so the letrec phase can route an in-loop
+                      feed against inlined pass-by-ref writers; it therefore still sees Defer/Feed/Define)
+  → transact_phase   (ccl/transact_phase.rs: each `with begin():` block over Mut[V, Txn] registers folds into
+                      a get_prev_txn-causal LetRec over the commit domain (per-key histories + per-site
+                      commit records). Runs *before* mut_elim so the induction phase never sees a
+                      transaction loop; register identity is the Mut[_, Txn] type on the α-unique binding.
+                      See src/ccl/design/mutability.md)
+  → mut_elim     (ccl/mut_elim.rs: the induction mutability phase — every non-transactional
+                      mutation loop (For/MutWrite markers, feed-free or feeding) becomes a causal LetRec
+                      group over the induction domain (get_prev_seq recurrence, final_or_default trailing
+                      read); see src/ccl/design/mutability.md. Runs before channelize so a
+                      per-iteration feed inside a loop is hoisted to an ordinary feed of the loop's history)
+  → channelize       (ccl/channelize.rs: Defer/Feed/Define → `++`-union channel bindings, each defer
+                      cluster emitted as a mutually-scoped Feed-kind LetRec group; the feed-routing step
+                      of mutability elimination (mut_elim + channelize), type-preserving by construction. Feed reads type concretely
+                      via rigid ChanDom channel domains, erased here by substitution — no retype pass.
+                      Runs after the letrec phase, so an in-loop feed is already hoisted to a feed of the
+                      loop's history)
   → lambda_elim      (ccl/lambda_elim.rs: lambda → point-free combinators, then CCC-simplified)
+  → plan_loops       (ccl/planning/loops.rs::plan_loops: AFTER lambda_elim, on the point-free normal form,
+                      lower each causal LetRec group onto the domain-parameterized Transact carrier —
+                      induction domain → Recurse, Txn domain → commit operator. Anchors on the guard
+                      builtins (which survive elimination), so one LetRec travels through channelize +
+                      lambda_elim and is planned point-free — no pointful/point-free double
+                      representation. Transact is loop planning's output carrier to op-conversion)
   → planning        (ccl/planning/: hash-join and keyed aggregate optimization; brackets iteration-marking with ccl/simplify.rs)
   → operator_conversion  (interpreter/operator_conversion.rs: λ-free CCL → tile operators)
   → subscribe()

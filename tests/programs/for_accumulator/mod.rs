@@ -1,9 +1,8 @@
 //! Sum 1..5 by accumulating into a loop-carried mutable variable — the
-//! natural imperative shape for "fold".
-//!
-//! The reassignment of the pre-loop `acc` inside the for body is
-//! recognised as a loop-carried accumulator and lowered to a CCL `Loop`
-//! node (see `src/ccl/design/ir.md` → `Loop`).
+//! natural imperative shape for "fold".  The accumulator is introduced by
+//! the `:=` mutation operator (`acc := 0`) and advanced with `acc := acc + i`;
+//! a plain `=` inside a loop is an immutable per-iteration binding, not a
+//! mutable write.
 
 use super::common::expect_scalar;
 

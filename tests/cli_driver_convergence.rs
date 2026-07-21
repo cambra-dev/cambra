@@ -91,7 +91,7 @@ fn drive_scalar_int(code: &str) -> i64 {
 #[test]
 fn accumulator_converges_via_notification_gated_driver() {
     assert_eq!(
-        drive_scalar_int("x = 0\nfor i in [1, 2, 3, 4, 5]:\n    x += 1\nx"),
+        drive_scalar_int("x := 0\nfor i in [1, 2, 3, 4, 5]:\n    x += 1\nx"),
         5
     );
 }
@@ -101,7 +101,7 @@ fn accumulator_converges_via_notification_gated_driver() {
 #[test]
 fn loop_carried_sum_converges() {
     assert_eq!(
-        drive_scalar_int("x = 0\nfor i in [1, 2, 3, 4, 5]:\n    x += i\nx"),
+        drive_scalar_int("x := 0\nfor i in [1, 2, 3, 4, 5]:\n    x += i\nx"),
         15
     );
 }
@@ -111,7 +111,7 @@ fn loop_carried_sum_converges() {
 /// without stalling.
 #[test]
 fn empty_loop_returns_init() {
-    assert_eq!(drive_scalar_int("x = 7\nfor i in []:\n    x += 1\nx"), 7);
+    assert_eq!(drive_scalar_int("x := 7\nfor i in []:\n    x += 1\nx"), 7);
 }
 
 /// Control: an aggregate converges in a single pull (no cycle), so it must keep

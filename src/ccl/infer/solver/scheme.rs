@@ -67,15 +67,29 @@ impl PolyScheme {
             self.level,
             &self.body,
             FreshenLevel::At(current_level),
-            &mut HashMap::new(),
+            &mut FreshenCache::new(),
         )
     }
 }
 
-/// Cache for [`freshen_above`], mapping each original quantified
-/// variable to its single fresh replacement so multiple occurrences
-/// share the same fresh var.
-pub type FreshenCache = HashMap<InferVarId, Rc<InferVar>>;
+/// Cache for [`freshen_above`]: each original quantified variable maps to its
+/// single fresh replacement so multiple occurrences share the same fresh var,
+/// and each quantified channel-domain name ([`Type::ChanDom`]) maps to its
+/// single fresh (or pre-seeded — see [`seed_chan_dom_pairings`]) rename.
+#[derive(Default)]
+pub struct FreshenCache {
+    /// Original quantified var → its fresh replacement.
+    pub vars: HashMap<InferVarId, Rc<InferVar>>,
+    /// Original quantified channel-domain name → its rename. Seeded by
+    /// `specialize_use` with use-site pairings; unpaired names mint fresh.
+    pub chan_doms: HashMap<crate::ccl::Name, crate::ccl::Name>,
+}
+
+impl FreshenCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 /// The level [`freshen_above`] assigns to each fresh variable it mints.
 #[derive(Clone, Copy)]
@@ -109,12 +123,41 @@ pub fn freshen_above(
     // term carries its own type slots (which may hold quantified variables a
     // low base hides). So never short-circuit a refinement on `type_level`;
     // descend and freshen the predicate slots too (each leaf slot still
-    // short-circuits on its own level).
-    if !matches!(ty, Type::Refinement(..)) && type_level(ty) <= lim {
+    // short-circuits on its own level). A `ChanDom` is likewise exempt: it
+    // deliberately reports `type_level` 0 (its level must not trigger
+    // extrusion — see `type_level`), so its quantification is decided by the
+    // arm below from its *stored* introduction level.
+    if !matches!(ty, Type::Refinement(..) | Type::ChanDom(..)) && type_level(ty) <= lim {
         return ty.clone();
     }
     match ty {
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Hole => ty.clone(),
+        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => {
+            ty.clone()
+        }
+        // A channel domain minted inside the generalized definition
+        // (level > lim) is *quantified* exactly like a variable — each
+        // instantiation is its own channel. But a rigid name cannot be
+        // identified through bounds the way a fresh var can, so instantiation
+        // renames it here, cache-consistently ([`FreshenCache::chan_doms`] —
+        // pre-seeded by `specialize_use` so the clone agrees with the use
+        // site's pass-1 instantiation names). A free channel (level ≤ lim, a
+        // captured outer defer) keeps its name: every instantiation's
+        // contributions union into the one shared channel.
+        Type::ChanDom(name, lvl) => {
+            if lvl.0 <= lim {
+                return ty.clone();
+            }
+            let fresh = cache
+                .chan_doms
+                .entry(name.clone())
+                .or_insert_with(|| crate::ccl::Name::fresh(name.base()))
+                .clone();
+            let new_level = match target {
+                FreshenLevel::At(level) => level,
+                FreshenLevel::Preserve => lvl.0,
+            };
+            Type::ChanDom(fresh, crate::ccl::ChanLevel(new_level))
+        }
         Type::Fun {
             name,
             domain: d,
@@ -139,6 +182,20 @@ pub fn freshen_above(
                 .map(|(k, t)| (k.clone(), freshen_above(lim, t, target, cache)))
                 .collect(),
         ),
+        // Freshening is polarity-free (it copies structure, not constraints),
+        // so the invariant payload recurses like any other position.
+        // Both children recurse (mirror `Fun`): freshening the `domain` is
+        // what lets a `Mut` param's fresh domain var generalize, so each call
+        // site instantiates its own domain (induction index vs. `Txn`).
+        Type::History {
+            value,
+            domain,
+            kind,
+        } => Type::History {
+            value: Box::new(freshen_above(lim, value, target, cache)),
+            domain: Box::new(freshen_above(lim, domain, target, cache)),
+            kind: *kind,
+        },
         Type::Refinement(inner, r) => Type::Refinement(
             Box::new(freshen_above(lim, inner, target, cache)),
             // Faithfully freshen the predicate's own type slots through the same
@@ -150,7 +207,7 @@ pub fn freshen_above(
             freshen_refinement_predicate(lim, r, target, cache),
         ),
         Type::Infer(tv) => {
-            if let Some(existing) = cache.get(&tv.uid) {
+            if let Some(existing) = cache.vars.get(&tv.uid) {
                 return Type::Infer(Rc::clone(existing));
             }
             // Mint the fresh variable at the level `target` dictates: the use
@@ -160,7 +217,7 @@ pub fn freshen_above(
                 FreshenLevel::Preserve => tv.level,
             };
             let v = InferVar::fresh(new_level);
-            cache.insert(tv.uid, Rc::clone(&v));
+            cache.vars.insert(tv.uid, Rc::clone(&v));
 
             // Snapshot bounds before recursing — the recursion may touch
             // other variables but must not see partially-mutated state.
@@ -256,14 +313,180 @@ pub fn freshen_expr_type_slots(
                 }
             }
         }
-        TypedExprNode::Loop { params, .. } => {
-            for p in params.iter_mut() {
-                p.ty = freshen_above(lim, &p.ty, target, cache);
+        TypedExprNode::LetRec { bindings, .. } => {
+            for (b, _) in bindings.iter_mut() {
+                b.ty = freshen_above(lim, &b.ty, target, cache);
             }
+        }
+        TypedExprNode::For { target: t, .. } => {
+            t.ty = freshen_above(lim, &t.ty, target, cache);
         }
         _ => {}
     }
     expr.walk_children_mut(|c| freshen_expr_type_slots(c, lim, target, cache));
+}
+
+/// Structurally pair a use site's resolved instantiation type against the
+/// definition's type, seeding `out` with def-name → use-name entries for each
+/// *quantified* (level > `lim`) channel-domain name. Pass-1 instantiation
+/// minted the use side's names ([`freshen_above`]'s `ChanDom` arm); the
+/// specialization clone must reuse *those* names — a rigid name, unlike a
+/// variable, cannot be identified with its instantiation through the pin's
+/// bounds — so `specialize_use` seeds the clone's [`FreshenCache`] with these
+/// pairings before freshening.
+///
+/// Positions are matched constructor-wise through refinements; a position
+/// where the sides disagree structurally (an unexercised placeholder, a
+/// collapsed union) is skipped — the clone then mints a fresh name there and
+/// any stale consumer name surfaces at the post-channelize strict typecheck
+/// rather than silently.
+pub fn seed_chan_dom_pairings(
+    use_ty: &Type,
+    def_ty: &Type,
+    lim: Level,
+    out: &mut HashMap<crate::ccl::Name, crate::ccl::Name>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    seed_pairings_go(use_ty, def_ty, lim, out, &mut seen);
+}
+
+fn seed_pairings_go(
+    use_ty: &Type,
+    def_ty: &Type,
+    lim: Level,
+    out: &mut HashMap<crate::ccl::Name, crate::ccl::Name>,
+    seen: &mut std::collections::HashSet<InferVarId>,
+) {
+    fn peel(ty: &Type) -> &Type {
+        match ty {
+            Type::Refinement(inner, _) => peel(inner),
+            _ => ty,
+        }
+    }
+    // The definition side is unresolved — a slot is often a *variable* whose
+    // bounds carry the structure (a lambda definition's type is a var bounded
+    // by its `Fun`). Descend through the bounds, once per var (`seen` guards
+    // the cyclic bound graph). The use side is resolved; a placeholder var
+    // there has no bounds and pairs nothing.
+    if let Type::Infer(dv) = peel(def_ty) {
+        if seen.insert(dv.uid) {
+            let (lows, ups) = {
+                let s = dv.bounds.borrow();
+                (s.lower.clone(), s.upper.clone())
+            };
+            for b in lows.iter().chain(ups.iter()) {
+                seed_pairings_go(use_ty, &b.ty, lim, out, seen);
+            }
+        }
+        return;
+    }
+    if let Type::Infer(uv) = peel(use_ty) {
+        if seen.insert(uv.uid) {
+            let (lows, ups) = {
+                let s = uv.bounds.borrow();
+                (s.lower.clone(), s.upper.clone())
+            };
+            for b in lows.iter().chain(ups.iter()) {
+                seed_pairings_go(&b.ty, def_ty, lim, out, seen);
+            }
+        }
+        return;
+    }
+    match (peel(use_ty), peel(def_ty)) {
+        (Type::ChanDom(u, _), Type::ChanDom(d, dlvl)) if dlvl.0 > lim && u != d => {
+            let prev = out.insert(d.clone(), u.clone());
+            debug_assert!(
+                prev.is_none_or(|p| p == *u),
+                "seed_chan_dom_pairings: definition channel `{d}` paired against two \
+                 distinct use-site names"
+            );
+        }
+        (Type::ChanDom(..), Type::ChanDom(..)) => {}
+        (
+            Type::Fun {
+                domain: ud,
+                codomain: uc,
+                ..
+            },
+            Type::Fun {
+                domain: dd,
+                codomain: dc,
+                ..
+            },
+        ) => {
+            seed_pairings_go(ud, dd, lim, out, seen);
+            seed_pairings_go(uc, dc, lim, out, seen);
+        }
+        (Type::Tuple(us), Type::Tuple(ds)) => {
+            for (u, d) in us.iter().zip(ds) {
+                seed_pairings_go(u, d, lim, out, seen);
+            }
+        }
+        (Type::Record(us), Type::Record(ds)) => {
+            for ((un, u), (dn, d)) in us.iter().zip(ds) {
+                if un == dn {
+                    seed_pairings_go(u, d, lim, out, seen);
+                }
+            }
+        }
+        (Type::Variant(us), Type::Variant(ds)) => {
+            for ((uk, u), (dk, d)) in us.iter().zip(ds) {
+                if uk == dk {
+                    seed_pairings_go(u, d, lim, out, seen);
+                }
+            }
+        }
+        (
+            Type::History {
+                value: uv,
+                domain: ud,
+                ..
+            },
+            Type::History {
+                value: dv,
+                domain: dd,
+                ..
+            },
+        ) => {
+            seed_pairings_go(uv, dv, lim, out, seen);
+            seed_pairings_go(ud, dd, lim, out, seen);
+        }
+        // A feed handle reads through to its stream `Fun(domain, value)`
+        // during coalescing (`dissolve_read_feeds`), so the use side may be
+        // the dissolved `Fun` where the definition still carries the
+        // `History` — or vice versa. Pair the corresponding slots.
+        (
+            Type::Fun {
+                domain: ud,
+                codomain: uc,
+                ..
+            },
+            Type::History {
+                value: dv,
+                domain: dd,
+                ..
+            },
+        ) => {
+            seed_pairings_go(ud, dd, lim, out, seen);
+            seed_pairings_go(uc, dv, lim, out, seen);
+        }
+        (
+            Type::History {
+                value: uv,
+                domain: ud,
+                ..
+            },
+            Type::Fun {
+                domain: dd,
+                codomain: dc,
+                ..
+            },
+        ) => {
+            seed_pairings_go(ud, dd, lim, out, seen);
+            seed_pairings_go(uv, dc, lim, out, seen);
+        }
+        _ => {}
+    }
 }
 
 /// Freshen the discharge payloads of a bound edge's substitution: each captured

@@ -489,6 +489,22 @@ impl TileProducer for MapResultToConstProducer {
         let input_tile = self.input.get(input_guard);
         let constant_tile = self.constant.get(c_tiling.universal_guard());
 
+        // The broadcast value must be fully known before we can replicate it
+        // across the input's domain: `repeat` fabricates nothing, it copies a
+        // single present value. A constant that is still absent (e.g. a scalar
+        // read from a sibling induction loop that has not yet converged) yields
+        // an empty (non-terminal) output — the consumer re-pulls once it lands,
+        // rather than us inventing a value for the unknown positions.
+        //
+        // This is one half of a single invariant — "never fabricate a position
+        // from a not-yet-converged sibling read." The other half is the
+        // co-presence truncate in `binop::zip_arithmetic`/`zip_concat`: a binop
+        // over a lagging operand combines only the common prefix instead of
+        // returning the longer side's tail. Keep the two in step.
+        if !constant_tile.is_terminal() {
+            return self.tiling().empty_tile();
+        }
+
         let mode = self.mode;
         process_tile_result(self.tiling(), input_tile, move |codomain| {
             let const_tile = repeat_tile(constant_tile, codomain.len());

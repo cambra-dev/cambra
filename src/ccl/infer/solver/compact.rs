@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use smol_str::SmolStr;
 
 use crate::ccl::subst::Subst;
-use crate::ccl::{BaseType, InferVarId, Name, Refinement, Type, fresh_infer_var_id};
+use crate::ccl::{BaseType, HistoryKind, InferVarId, Name, Refinement, Type, fresh_infer_var_id};
 
 use crate::ccl::FieldKey;
 
@@ -44,6 +44,11 @@ pub enum AtomKey {
     UIntRange(usize),
     /// Externally-registered data source.
     Source(SmolStr),
+    /// The transaction-commit domain (nullary, like a base type).
+    Txn,
+    /// a nominal feed-channel domain (rigid until
+    /// channelize substitutes it).
+    ChanDom(Name, crate::ccl::ChanLevel),
 }
 
 impl AtomKey {
@@ -52,6 +57,8 @@ impl AtomKey {
             Type::Base(b) => Some(AtomKey::Prim(b.clone())),
             Type::UIntRange(n) => Some(AtomKey::UIntRange(*n)),
             Type::DataSource(n) => Some(AtomKey::Source(SmolStr::from(n.as_str()))),
+            Type::Txn => Some(AtomKey::Txn),
+            Type::ChanDom(n, l) => Some(AtomKey::ChanDom(n.clone(), *l)),
             _ => None,
         }
     }
@@ -61,6 +68,8 @@ impl AtomKey {
             AtomKey::Prim(b) => Type::Base(b.clone()),
             AtomKey::UIntRange(n) => Type::UIntRange(*n),
             AtomKey::Source(n) => Type::DataSource(n.to_string()),
+            AtomKey::Txn => Type::Txn,
+            AtomKey::ChanDom(n, l) => Type::ChanDom(n.clone(), *l),
         }
     }
 }
@@ -123,6 +132,17 @@ pub struct CompactType {
     /// [`CompactType::merge`]). The stored [`Refinement`] is the payload
     /// carried to coalesce.
     pub refinements: Vec<Refinement>,
+    /// History-handle `(value, domain, kind)`, if a [`Type::History`]
+    /// contributed here — a mutable variable (`kind: Overwrite`) or a feed channel
+    /// (`kind: Feed`).
+    ///
+    /// Both children recurse at the **same polarity** as the handle itself: a
+    /// history is invariant in both at the constraint level (`constrain_go`
+    /// checks both directions when two same-kind handles meet), so by the time
+    /// compaction runs both directions' information has already been propagated
+    /// onto each child's variables, and compaction only needs a deterministic
+    /// materialization, not a second polarity analysis.
+    pub history_slot: Option<(Box<CompactType>, Box<CompactType>, HistoryKind)>,
 }
 
 impl CompactType {
@@ -138,7 +158,7 @@ impl CompactType {
     ///   *union* keys.
     /// - `fun`: recursively merge each side, flipping polarity on the
     ///   domain.
-    fn merge(pol: bool, lhs: CompactType, rhs: CompactType) -> CompactType {
+    pub(super) fn merge(pol: bool, lhs: CompactType, rhs: CompactType) -> CompactType {
         let mut vars = lhs.vars;
         vars.extend(rhs.vars);
         let mut atoms = lhs.atoms;
@@ -167,6 +187,22 @@ impl CompactType {
             )),
         };
         let refinements = Self::merge_refinements(pol, lhs.refinements, rhs.refinements);
+        // History children merge componentwise at the outer polarity
+        // (invariance was already enforced when the constraint edges were
+        // recorded). Two histories at one position share a kind — a mutable variable and a
+        // feed never meet here (the constraint solver's kind-guarded
+        // history/history rule rejects that), so keep either side's kind.
+        let history_slot = match (lhs.history_slot, rhs.history_slot) {
+            (None, m) | (m, None) => m,
+            (Some((va, da, ka)), Some((vb, db, kb))) => {
+                debug_assert_eq!(ka, kb, "compaction merged histories of different kinds");
+                Some((
+                    Box::new(Self::merge(pol, *va, *vb)),
+                    Box::new(Self::merge(pol, *da, *db)),
+                    ka,
+                ))
+            }
+        };
         CompactType {
             vars,
             atoms,
@@ -174,6 +210,7 @@ impl CompactType {
             var,
             fun,
             refinements,
+            history_slot,
         }
     }
 
@@ -366,9 +403,11 @@ fn compact_go(
     match ty {
         // Atomic types contribute a single atom. A term substitution never
         // touches an atom, so `subst_acc` is irrelevant here.
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) => {
-            CompactType::from_atom(AtomKey::from_type(ty).unwrap())
-        }
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::ChanDom(..)
+        | Type::Txn => CompactType::from_atom(AtomKey::from_type(ty).unwrap()),
         // Refinements ride the lattice as a witness set: compact the underlying
         // type, then attach this layer's witness. Walking a variable's bound
         // that is `Refinement(D, r)` therefore unions `r` into that variable's
@@ -453,6 +492,23 @@ fn compact_go(
             }
             CompactType {
                 var: Some(compacted),
+                ..Default::default()
+            }
+        }
+        // A history's children compact at the same polarity as the reference —
+        // invariant in both (enforced at constraint time, so this is
+        // materialization only; see the `CompactType::history_slot` docs).
+        // Fresh `parents` per child. The `kind` (overwrite vs
+        // feed) rides along so coalesce rebuilds the same flavour.
+        Type::History {
+            value,
+            domain,
+            kind,
+        } => {
+            let value = compact_go(value, pol, subst_acc, &BTreeSet::new(), st);
+            let domain = compact_go(domain, pol, subst_acc, &BTreeSet::new(), st);
+            CompactType {
+                history_slot: Some((Box::new(value), Box::new(domain), *kind)),
                 ..Default::default()
             }
         }
@@ -566,9 +622,9 @@ fn compact_go(
             // coalesce-time read of monomorphization; it is sound because every
             // var reaching coalesce is monomorphically determined (one type or
             // an `IncompatibleBounds` error). See the rationale above.
-            let no_concrete = bound
-                .as_ref()
-                .is_none_or(|b| b.atoms.is_empty() && b.rec.is_none() && b.fun.is_none());
+            let no_concrete = bound.as_ref().is_none_or(|b| {
+                b.atoms.is_empty() && b.rec.is_none() && b.fun.is_none() && b.history_slot.is_none()
+            });
             if no_concrete {
                 for b in &opposite_bounds {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);

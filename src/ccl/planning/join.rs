@@ -1033,7 +1033,7 @@ fn convert_loop_join(base_ty: &Type, refinement: &Expr) -> Option<Expr> {
 ///
 /// Loop joins can occur anywhere an iteration site appears: at the program
 /// root, at sink-bound `Record` fields, at aggregate arguments, at
-/// `LastOrDefault` streams, at `Loop` sources, at `CollectionUnion`
+/// `FinalOrDefault` streams, at `Loop` sources, at `CollectionUnion`
 /// operands, or as a let-bound function value.
 ///
 /// Supports n-way joins (n ≥ 2) when all arms are connected via equality

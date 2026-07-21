@@ -75,6 +75,38 @@ pub enum Tile {
         /// Boolean representing whether the aggregate is complete
         terminal: ColumnValue,
     },
+    /// A **transactional store**: a right-continuous step function
+    /// `Txn ⇒ {key: value}` over the commit-time domain, materialized as its
+    /// **changelog** — the ticks that committed a write, each carrying that
+    /// tick's write-set *delta*.
+    ///
+    /// This is *not* a [`Tile::SealedFunction`] and must not be treated as one:
+    /// in a `SealedFunction` a domain position absent from `changes` is
+    /// **unknown**, whereas here it is **decided-absent — the value holds from
+    /// the latest earlier change** (step interpolation). The value at an
+    /// arbitrary commit time is obtained by *folding* the changelog
+    /// (`store_value_at` /
+    /// `store_snapshot_at`),
+    /// never by indexing a position directly, and the current value of a *live*
+    /// store is
+    /// `store_current` —
+    /// which, unlike `ExtractLast`, is defined without the stream ever
+    /// terminating. Encoding the step semantics in a distinct variant keeps
+    /// ordinary-function operations (direct indexing, `ExtractLast`) from
+    /// silently misreading a store. See `src/ccl/design/mutability.md`.
+    Store {
+        /// Commit ticks that carry a write (the change events), sorted ascending.
+        changes: ColumnValue,
+        /// Per-tick write-set deltas, parallel to `changes`: `deltas[i]` is the
+        /// map of keys written at `changes[i]`, encoded as a `Variants` cell (via
+        /// `map_to_value`). A key absent
+        /// from a tick's delta was not written at that tick (its value holds).
+        deltas: ColumnValue,
+        /// The decided frontier: every tick at or below its bound is decided.
+        /// `Predicate::True` once the store is fully committed (no more writes),
+        /// which is the only condition under which a *terminal* read resolves.
+        frontier: Predicate,
+    },
 }
 
 impl Tile {
@@ -100,6 +132,8 @@ impl Tile {
                 domain2, deleted, ..
             } => domain2.len() - deleted.len(),
             Tile::Aggregation { accumulator, .. } => accumulator.len(),
+            // The number of change events in the changelog.
+            Tile::Store { changes, .. } => changes.len(),
         }
     }
 
@@ -133,6 +167,11 @@ impl Tile {
             }
             (Tile::CurriedFunction { .. }, Tiling::CurriedFunction { .. }) => true,
             (Tile::Aggregation { .. }, Tiling::Aggregation { .. }) => true,
+            // The change ticks must lie in the commit domain; the per-tick delta
+            // encoding is trusted (like `CurriedFunction`).
+            (Tile::Store { changes, .. }, Tiling::Store { domain, .. }) => {
+                changes.is_compatible_with_extent(domain)
+            }
             _ => false,
         }
     }
@@ -150,6 +189,10 @@ impl Tile {
             Tile::Aggregation { terminal, .. } => {
                 terminal.as_single().map(|t| t.as_bool()).unwrap_or(false)
             }
+            // A store is terminal once its commit frontier is decided-forever
+            // (no more writes will commit) — the only state in which a *terminal*
+            // read of it resolves.
+            Tile::Store { frontier, .. } => frontier.as_bool().unwrap_or(false),
         }
     }
 
@@ -242,6 +285,30 @@ impl Tile {
                             .unwrap_or_else(|| panic!("Record missing field {f}")),
                     )
                 })
+            }
+            // Change-append: `other`'s new commit ticks are strictly greater than
+            // any already present (the changelog only grows forward in commit
+            // time), so appending preserves the ascending order the fold relies
+            // on. The frontier advances to the union — for the watermark
+            // `LessThanEq(w)` this is `LessThanEq(max(w_self, w_other))`, and
+            // `True` (fully committed) absorbs. Mirrors the `SealedFunction` arm
+            // sans `deleted`: a store releases by physically dropping a decided
+            // prefix (see `remove_guarded`), never by logical tombstoning.
+            (
+                Tile::Store {
+                    changes: s_changes,
+                    deltas: s_deltas,
+                    frontier: s_frontier,
+                },
+                Tile::Store {
+                    changes: o_changes,
+                    deltas: o_deltas,
+                    frontier: o_frontier,
+                },
+            ) => {
+                s_changes.append(o_changes);
+                s_deltas.append(o_deltas);
+                *s_frontier = s_frontier.union(&o_frontier);
             }
             (s, o) => panic!("Incompatible tiles {s:?} and {o:?}"),
         };
@@ -487,6 +554,18 @@ impl Tile {
                     }
                 }
             }
+            // A store release names a prefix of decided commit ticks the consumer
+            // no longer needs to *read at*. Dropping those change cells here would
+            // be unsound: under step interpolation a released tick's value may
+            // still hold forward past the release watermark, so a fold
+            // (`store_current` at the frontier) needs each key's latest write even
+            // when it lies in the released prefix. The load-bearing GC is therefore
+            // the engine's `gc_released_prefix` (keep-latest), which bounds the
+            // *source*; the per-consumer `FanOut` view reaching here is a throwaway
+            // per-pull clone the consumer folds whole, so removal is a no-op. This
+            // is the release-path face of the `SealedFunction` overload the `Store`
+            // variant exists to avoid — "release tick t" is not "delete position t".
+            (Tile::Store { .. }, TileGuard::Function(FunctionGuard::Domain(_))) => {}
             (s, g) => panic!("Incompatible tile and guard in remove_guarded: {s:?} and {g:?}"),
         }
     }
@@ -534,6 +613,19 @@ impl Tile {
                 )))),
                 TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
             ]),
+            // The store's guard is over its commit-time domain (the change
+            // ticks), like a `SealedFunction` — consumers release a prefix of it.
+            Tile::Store {
+                changes, frontier, ..
+            } => {
+                if frontier.is_true() {
+                    TileGuard::Function(FunctionGuard::Domain(Predicate::True))
+                } else {
+                    TileGuard::Function(FunctionGuard::Domain(
+                        Predicate::from_column_value(changes).union(frontier),
+                    ))
+                }
+            }
         }
     }
 
@@ -593,6 +685,22 @@ pub fn validate_tile(tile: &Tile) -> bool {
         } => {
             HashSet::<Value>::from_iter(domain.clone().drain_to_value_iter()).len() == domain.len()
                 && domain.len() == codomain.len()
+        }
+        // A store's changelog is one delta per change tick, and the ticks are
+        // strictly ascending — the fold ([`store_value_at`] et al.) and the
+        // change-append `merge` both depend on it, and neither is type-enforced.
+        Tile::Store {
+            changes, deltas, ..
+        } => {
+            changes.len() == deltas.len()
+                && matches!(deltas, ColumnValue::Variants(_))
+                && (0..changes.len()).all(|i| {
+                    i == 0
+                        || matches!(
+                            (changes.index_at(i - 1), changes.index_at(i)),
+                            (Value::UInt(a), Value::UInt(b)) if a < b
+                        )
+                })
         }
         _ => true,
     }

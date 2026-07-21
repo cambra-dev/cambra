@@ -541,3 +541,23 @@ fn ariadne_render_includes_source_context_and_secondary_labels() {
         "rendered: {rendered}"
     );
 }
+
+#[test]
+fn mut_txn_annotation_parses_as_tuple_subscript() {
+    // `Mut[V, Txn]` — the two-argument (value, domain) annotation form —
+    // parses as a subscript whose index is a 2-tuple.
+    let m = parse_module("store: Mut[int, Txn] = 0\nstore\n")
+        .value
+        .expect("parses");
+    let Stmt::AnnAssign { annotation, .. } = &m.body[0].node else {
+        panic!("expected an AnnAssign, got {:?}", m.body[0].node);
+    };
+    let Expr::Subscript { index, .. } = &annotation.node else {
+        panic!("expected a Subscript annotation, got {:?}", annotation.node);
+    };
+    assert!(
+        matches!(&index.node, Expr::Tuple(elts) if elts.len() == 2),
+        "Mut[int, Txn] index should be a 2-tuple, got {:?}",
+        index.node
+    );
+}

@@ -133,8 +133,25 @@ impl InferCtx {
                     .map(|(k, t)| (k.clone(), self.normalize_annotation(t)))
                     .collect(),
             ),
+            // Structural recursion like `Fun` — normalizing each child turns a
+            // nested `Hole` into a fresh var. (No `Mut`-specific `Hole` logic
+            // here; that belongs to a later increment.)
+            Type::History {
+                value,
+                domain,
+                kind,
+            } => Type::History {
+                value: Box::new(self.normalize_annotation(value)),
+                domain: Box::new(self.normalize_annotation(domain)),
+                kind: *kind,
+            },
             // Leaves and existing inference vars pass through unchanged.
-            Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Infer(_) => ty.clone(),
+            Type::Base(_)
+            | Type::UIntRange(_)
+            | Type::DataSource(_)
+            | Type::ChanDom(..)
+            | Type::Txn
+            | Type::Infer(_) => ty.clone(),
         }
     }
 }
@@ -267,7 +284,7 @@ impl Typing for InferCtx {
         // (`lower.rs`) only lowers `int`/`str`/`bool`/`None` annotations from
         // source, all of which are `Type::Base` leaves where two-way ≡ one-way
         // (distinct bases are incomparable; equal bases compare reflexively).
-        // The other annotation producer — `desugar_defers`' filter-feed
+        // The other annotation producer — `channelize`' filter-feed
         // `Fun(Refinement(Hole, r), Hole)` shapes — is Hole-based: normalized
         // Holes become fresh vars, where the two directions record symmetric
         // bounds (the intended "annotation wins" propagation) rather than

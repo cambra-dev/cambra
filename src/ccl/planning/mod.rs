@@ -37,6 +37,7 @@ use crate::ccl::{
 mod groupby;
 mod iterate;
 mod join;
+mod loops;
 mod predicates;
 
 // Preserve the `crate::ccl::planning::…` paths that other modules' doc-comments
@@ -47,6 +48,7 @@ mod predicates;
 // imports today, so its re-export exists purely to keep the documented path
 // resolvable — hence the `allow`.
 pub(crate) use iterate::insert_iterate_markers;
+pub(crate) use loops::plan_loops;
 pub(crate) use predicates::compile_refinement_predicates;
 #[allow(unused_imports)]
 pub(crate) use predicates::fn_of_bare_predicate;
@@ -55,7 +57,7 @@ pub(crate) use predicates::fn_of_bare_predicate;
 /// an efficient implementation strategy at each one.
 ///
 /// At each iteration site (aggregate arguments, mutation-loop sources,
-/// `LastOrDefault` streams, value-position `Record` fields, `CollectionUnion`
+/// `FinalOrDefault` streams, value-position `Record` fields, `CollectionUnion`
 /// operands, the program's top-level function-valued result, top-level
 /// let-bound function values, and a few other shapes enumerated by
 /// [`iterate::insert_iterate_recurse`]), [`iterate::insert_iterate_markers`]
@@ -118,6 +120,9 @@ pub fn run(mut expr: Expr) -> Expr {
     // re-sync every `Cast`'s `target` slot so the post-planning typecheck's
     // reconstruction (which reads `target`) matches the compiled recorded type.
     ccl_utils::sync_cast_targets(&mut expr);
+    // Live cross-endpoint reads are recognized earlier, in
+    // `transact_phase::rewrite_live_reads` (pre-lambda-elim), so by here every
+    // such read is already an `as_of` join — nothing to do at planning time.
     expr
 }
 

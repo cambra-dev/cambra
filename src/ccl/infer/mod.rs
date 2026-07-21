@@ -65,7 +65,7 @@
 //! Most `Builtin` nodes are introduced post-inference by
 //! `lambda_elim`/`planning` with their type pre-stamped on the node, and
 //! inference just rubber-stamps them. The exceptions are polymorphic
-//! builtins introduced pre-inference (e.g. `LastOrDefault` from
+//! builtins introduced pre-inference (e.g. `FinalOrDefault` from
 //! `lower_mutation_loop`); those have entries in [`OperatorSchemes`] and
 //! are freshened at each use site like any other scheme.
 
@@ -78,8 +78,11 @@ mod solve;
 pub mod solver;
 mod typing;
 
-// Public surface (consumed by `crate::ccl::infer`): the two entry points and
-// the operator-scheme registry.
+// Public surface (consumed by `crate::ccl::infer`): the entry points, the check
+// pass, and the operator-scheme registry. (Inference is the only type-synthesis
+// pass: feed reads type concretely via their rigid `ChanDom` channel domains,
+// which `crate::ccl::channelize` erases by substitution — no post-channelize
+// re-typing.)
 pub use api::*;
 pub use check::check;
 pub use schemes::OperatorSchemes;
@@ -165,6 +168,11 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             ctx: format!("{ctx_label} (variant tag .{tag} not accepted)"),
             type_a: coalesce_for_error(&in_type),
             type_b: Type::Hole,
+        },
+        ConstrainError::NotAFeed { found, required } => InferError::TypeMismatch {
+            ctx: format!("{ctx_label} (a feed handle is required here, but the value is not one)"),
+            type_a: coalesce_for_error(&found),
+            type_b: coalesce_for_error(&required),
         },
     }
 }

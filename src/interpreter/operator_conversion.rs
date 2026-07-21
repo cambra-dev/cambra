@@ -2,8 +2,8 @@ use log::trace;
 
 use crate::{
     ccl::{
-        AggregateKind, Builtin, Expr, Lit, Name, ProjKey, Type, TypedExprNode,
-        ccl_utils::is_trivially_true_predicate, symbolic::symbolic,
+        AggregateKind, Builtin, Expr, F_WRITES, Lit, Name, ProjKey, TransactKey, Type,
+        TypedExprNode, WriterSite, ccl_utils::is_trivially_true_predicate, symbolic::symbolic,
     },
     interpreter::{
         ArithmeticKind, BaseType, BinOpKind as InterpreterBinOp, CompareKind,
@@ -90,6 +90,20 @@ pub fn convert_record_fields_to_operators(
             bound_expr,
             body,
         } => {
+            // `let __reg = Transact{…}`: build the shared store and register it
+            // (the reads `__reg.k` in the fields project off it), the same as
+            // the `convert_impl` `Let` arm. Multi-sink programs (a trailing
+            // `Record`) reach the store binding through here.
+            if let TypedExprNode::Transact {
+                keys,
+                writers,
+                domain,
+            } = &bound_expr.node
+            {
+                let info = build_transact_store(keys, writers, domain, ctx)?;
+                ctx.register_store(binding.name.clone(), info);
+                return convert_record_fields_to_operators(body, ctx);
+            }
             let bound_op = convert_impl(bound_expr, None, ctx)?;
             let fan_out = Rc::new(FanOut::new(Box::new(Memo::new(bound_op))));
             let mut scope = ctx.enter_scope();
@@ -191,6 +205,27 @@ pub(crate) enum BindingKind {
     Free,
 }
 
+/// How to read one key (variable) of a transactional store. The scalar-read
+/// reduction to the current/final value (`final_or_default` → `ExtractLast`) is
+/// expressed in the CCL, not here.
+struct KeyReadInfo {
+    /// The key's position in the writer's `writes` tuple: `__reg.k` projects
+    /// `.writes.(index)` off the store body stream.
+    index: usize,
+}
+
+/// A built transactional store, registered under its `__reg` binder so each
+/// per-variable read (`__reg.k`) can branch the shared fan and project key
+/// `k`. The scalar-read reduction (`final_or_default` → `ExtractLast`) is
+/// expressed in the CCL, not here.
+struct StoreReadInfo {
+    /// The cyclic store fan — a [`FanOut`] over the store body stream; every
+    /// read is a branch of this one fan.
+    fan: Rc<FanOut>,
+    /// Per-variable read info, keyed by the variable's [`Name::field_key`].
+    keys: HashMap<String, KeyReadInfo>,
+}
+
 /// Compilation context for tile compilation.
 ///
 /// Bundles the variable scope stack with the data-source registry needed to
@@ -204,6 +239,12 @@ pub struct OpConversionContext {
     scopes: ScopeStack<Name, (Rc<FanOut>, BindingKind)>,
     /// Maps source names to their runtime [`DataSourceDomainExtentImpl`].
     sources: HashMap<String, Rc<RefCell<dyn DataSourceDomainExtentImpl>>>,
+    /// Transactional stores in scope, keyed by their `__reg` binder. A
+    /// `let __reg = Transact{…}` builds the shared store once and registers
+    /// it here; each variable read `__reg.k` projects key `k` off the shared
+    /// store fan (see [`StoreReadInfo`]). Names are α-unique, so a flat
+    /// (unscoped) map suffices.
+    transactional_stores: HashMap<Name, StoreReadInfo>,
 }
 
 /// RAII scope guard for [`TileCompileContext`].
@@ -288,6 +329,16 @@ impl OpConversionContext {
         self.scopes.lookup(name)
     }
 
+    /// Register a built transactional store under its `__reg` binder.
+    fn register_store(&mut self, name: Name, info: StoreReadInfo) {
+        self.transactional_stores.insert(name, info);
+    }
+
+    /// Look up a transactional store by its `__reg` binder.
+    fn lookup_store(&self, name: &Name) -> Option<&StoreReadInfo> {
+        self.transactional_stores.get(name)
+    }
+
     /// Convert a CCL [`Type`] to an interpreter [`Extent`].
     ///
     /// Refinements are enforced at runtime by [`crate::interpreter::tile_operators::Filter`] operators and are
@@ -345,6 +396,11 @@ impl OpConversionContext {
             // Leaf types — no refinements possible, handle inline.
             Type::Base(b) => Ok(Extent::Base(b.clone())),
             Type::UIntRange(n) => Ok(Extent::uint_range(*n)),
+            // A `Txn` domain enumerates as UInt commit ticks (the prototype's
+            // `CommitTime`); its positions are minted at runtime, like a data
+            // source's. `transact_phase` emits `Mut[V, Txn]` stores, so this is a
+            // live path — a transactional store's history domain converts here.
+            Type::Txn => Ok(Extent::Base(BaseType::UInt)),
             other => Err(ConversionError::TypeError(format!(
                 "Cannot convert CCL type {other:?} to an interpreter extent; \
                  this is a compiler bug — type inference should have resolved \
@@ -382,6 +438,33 @@ fn convert_impl(
             panic!("Expected no lambdas, got {}", symbolic(expr));
         }
 
+        // `__reg.k` — a read of variable `k` off a transactional store. The
+        // shared store fan was built at `let __reg = Transact{…}`; this
+        // branches it and projects key `k`'s carry-forward stream. A store read
+        // is a leaf source (no upstream input).
+        TypedExprNode::Apply { argument, function }
+            if matches!(&function.node, TypedExprNode::Proj(ProjKey::Field(_)))
+                && matches!(&argument.node, TypedExprNode::Var(n) if ctx.lookup_store(n).is_some()) =>
+        {
+            let TypedExprNode::Var(store_name) = &argument.node else {
+                unreachable!("guarded above")
+            };
+            let TypedExprNode::Proj(ProjKey::Field(field)) = &function.node else {
+                unreachable!("guarded above")
+            };
+            expect_no_input(input, "transactional store read")?;
+            convert_store_read(store_name, field, ctx)
+        }
+
+        // A bare `Transact` never reaches here: `plan_loops` always binds it as
+        // `let __reg = Transact{…}`, which the `Let` arm intercepts (building
+        // the shared store and registering it) before compiling `bound_expr`.
+        TypedExprNode::Transact { .. } => Err(ConversionError::Unsupported(
+            "Transact must be bound by a `let __reg = …` (recognition invariant), \
+             never compiled as a bare value"
+                .into(),
+        )),
+
         // let name = value in body: compile value, push a scope, compile body.
         //
         // After lambda-elim's `λx → let v = def in body  ⟹
@@ -400,6 +483,20 @@ fn convert_impl(
             bound_expr,
             body,
         } => {
+            // `let __reg = Transact{…} in body`: build the shared store once
+            // and register it under `__reg`; the variable reads (`__reg.k`)
+            // in `body` project keys off it. `__reg` is never a plain `Var`
+            // use, so it needs no scope binding.
+            if let TypedExprNode::Transact {
+                keys,
+                writers,
+                domain,
+            } = &bound_expr.node
+            {
+                let info = build_transact_store(keys, writers, domain, ctx)?;
+                ctx.register_store(binding.name.clone(), info);
+                return convert_impl(body, input, ctx);
+            }
             let (bound_input, body_input) = match input {
                 Some(input) => {
                     let fan_out = Rc::new(FanOut::new(input));
@@ -662,30 +759,78 @@ fn convert_impl(
             apply_aggregate(input, kind)
         }
 
-        // `LastOrDefault` is the stream-to-scalar primitive that extracts the
+        // `FinalOrDefault` is the stream-to-scalar primitive that extracts the
         // codomain value at the final position of an iteration stream, falling
         // back to a default scalar when the stream is empty.  Argument is a
         // 2-element `Tuple([stream, default])`; compiles directly to the
         // `ExtractLast` tile operator (which takes both ops).
         TypedExprNode::Apply { argument, function }
-            if as_builtin(function) == Some(Builtin::LastOrDefault) =>
+            if as_builtin(function) == Some(Builtin::FinalOrDefault) =>
         {
-            expect_no_input(input, "last_or_default")?;
+            expect_no_input(input, "final_or_default")?;
             let TypedExprNode::Tuple(elts) = &argument.node else {
                 return Err(ConversionError::Unsupported(format!(
-                    "LastOrDefault expects a 2-element Tuple argument, got {:?}",
+                    "FinalOrDefault expects a 2-element Tuple argument, got {:?}",
                     argument.node
                 )));
             };
             if elts.len() != 2 {
                 return Err(ConversionError::Unsupported(format!(
-                    "LastOrDefault expects a 2-element Tuple argument, got {} elements",
+                    "FinalOrDefault expects a 2-element Tuple argument, got {} elements",
                     elts.len()
                 )));
             }
             let stream_op = convert_impl(&elts[0], None, ctx)?;
             let default_op = convert_impl(&elts[1], None, ctx)?;
             Ok(Box::new(ExtractLast::new(stream_op, default_op)))
+        }
+
+        // `GetPrevSeq` is a letrec guard accessor, never compiled directly:
+        // pattern recognition (a `get_prev_seq`-causal self-cycle → the
+        // `Recurse` engine) consumes it before op-conversion. Reaching this
+        // arm means a `LetRec` group escaped recognition — a compiler bug,
+        // reported explicitly rather than falling through to the generic
+        // Apply arm. Recognition lands with the unified phase
+        // (`src/ccl/design/mutability.md`).
+        TypedExprNode::Apply { function, .. }
+            if as_builtin(function) == Some(Builtin::GetPrevSeq) =>
+        {
+            Err(ConversionError::Unsupported(
+                "get_prev_seq reached operator conversion — letrec pattern \
+                 recognition (the unified phase, src/ccl/design/mutability.md) \
+                 must consume it before this pass"
+                    .into(),
+            ))
+        }
+
+        // `GetPrevTxn` is the transaction-domain guard accessor — like
+        // `GetPrevSeq`, letrec pattern recognition (the commit-operator
+        // complex) consumes it before op-conversion. Reaching this arm means a
+        // transactional `LetRec` group escaped recognition — a compiler bug.
+        TypedExprNode::Apply { function, .. }
+            if as_builtin(function) == Some(Builtin::GetPrevTxn) =>
+        {
+            Err(ConversionError::Unsupported(
+                "get_prev_txn reached operator conversion — letrec pattern \
+                 recognition (the unified phase, src/ccl/design/mutability.md) \
+                 must consume it before this pass"
+                    .into(),
+            ))
+        }
+
+        // `begin` is the transaction commit-time oracle — opaque and consumed by
+        // letrec pattern recognition (which reads the writer off the commit-record
+        // binding and discards the `begin`/`store(t)` plumbing). Reaching this arm
+        // means a transactional `LetRec` group escaped recognition — a compiler bug.
+        TypedExprNode::Apply { function, .. }
+            if as_builtin(function) == Some(Builtin::BeginTxn) =>
+        {
+            Err(ConversionError::Unsupported(
+                "begin (the transaction commit-time oracle) reached operator \
+                 conversion — letrec pattern recognition (the unified phase, \
+                 src/ccl/design/mutability.md) must consume it before this pass"
+                    .into(),
+            ))
         }
 
         TypedExprNode::Apply { function, argument } if is_applied_flatten_domain(function) => {
@@ -810,98 +955,18 @@ fn convert_impl(
             Ok(Box::new(MapResultWithSource::new(source, input)))
         }
 
-        // Mutation-loop-shaped Loop: compile the cyclic op-graph.
-        //
-        // Every Loop has body codomain `Record({step: <step_shape>,
-        // to_<defer>*: T_*})` (see [`infer_mutation_loop`]):
-        // - `step_shape` is the scalar accumulator type for a single
-        //   accumulator, or `Tuple(T_0, …, T_{n-1})` for multi-var.
-        //   The cycle is closed on `.step` — op-conversion projects it
-        //   before feeding back to `recursive_input`.
-        // - `to_<defer>` is one field per `<<` feed inside the body
-        //   (possibly empty), emitted by [`desugar_defers`].  These
-        //   ride along on the same body fan-out; surrounding lowering
-        //   picks each off via `Proj("to_<defer>")`.
-        //
-        // The Loop's external output is always the running body stream
-        // (the `Fun(D, Record(...))`); surrounding lowering finishes
-        // with `Proj("step") [▷ Proj(i)] ▷ Last` to land on each
-        // accumulator's final scalar value.  See [`Recurse`] for the
-        // runtime mechanics.
-        TypedExprNode::Loop { .. } => {
-            let shape = expr.as_mutation_loop().ok_or_else(|| {
-                ConversionError::Unsupported(
-                    "Loop is not in the supported mutation-loop shape \
-                     (≥1 accumulator params with one matching init_arg per param)"
-                        .into(),
-                )
-            })?;
-            let n_accs = shape.acc_vars.len();
-            // The iteration domain comes from `source`'s `Fun(D, item_ty)` type.
-            let domain_ty = shape.source.ty.domain().ok_or_else(|| {
-                ConversionError::TypeError(format!(
-                    "mutation-loop source must have function type, got {}",
-                    shape.source.ty
-                ))
-            })?;
-            let source_domain_extent = ctx.extent_of(&domain_ty)?;
-            // Build the packed init.  For a single accumulator we just
-            // compile its init expression; for multiple, every init is
-            // compiled to a scalar op and then combined via `ScalarFanIn`
-            // into a single Record (`_0`, `_1`, …) so that `Recurse`'s
-            // codomain is one packed tile rather than N parallel cycles.
-            let init_op: Box<dyn TileOperator> = if n_accs == 1 {
-                convert_impl(&shape.init_args[0], None, ctx)?
-            } else {
-                let arms: Vec<Box<dyn TileOperator>> = shape
-                    .init_args
-                    .iter()
-                    .map(|init| convert_impl(init, None, ctx))
-                    .collect::<Result<_, _>>()?;
-                fan_in(arms)
-            };
-            let domain_op: Box<dyn TileOperator> =
-                Box::new(IterateExtent::new(source_domain_extent));
-            let recurse = Recurse::new(init_op, domain_op);
-            let set_recursive_input = recurse.recursive_input_setter();
-            let prev_acc_fan = Rc::new(FanOut::new_cyclic(Box::new(recurse)));
-            let source_op = convert_impl(shape.source, None, ctx)?;
-            // Wire the body's input.  For a single accumulator the input
-            // is `fan_in(prev_acc, source)` — a 2-arm record `(_0, _1)`
-            // matching the body's `let acc = p.0 in let item = p.1`
-            // shape.  For multiple accumulators we *unpack* the packed
-            // prev-acc record into its `_0..=_{n-1}` fields first, then
-            // fan-in all N+1 streams together, so the body's `let acc_i
-            // = p.i` projections line up positionally.
-            let body_input = if n_accs == 1 {
-                fan_in(vec![prev_acc_fan.branch(), source_op])
-            } else {
-                let mut arms: Vec<Box<dyn TileOperator>> = Vec::with_capacity(n_accs + 1);
-                for i in 0..n_accs {
-                    arms.push(proj_field(prev_acc_fan.branch(), i)?);
-                }
-                arms.push(source_op);
-                fan_in(arms)
-            };
-            let body_op = convert_impl(shape.loop_body, Some(body_input), ctx)?;
-            let body_fan = Rc::new(FanOut::new_cyclic(Box::new(Memo::new(body_op))));
-            // Always cycle on `.step`; the external output is the
-            // running body Record stream.  Surrounding lowering
-            // projects `step` (and per-accumulator indices, for
-            // multi-var) and applies `Last` to land on the final
-            // scalar accumulator value(s).
-            let cycle_branch = proj_named_field(body_fan.branch(), "step")?;
-            let loop_op: Box<dyn TileOperator> = body_fan.branch();
-            set_recursive_input(cycle_branch);
-            // A Loop's output is always a SealedFunction whose domain is
-            // the iteration extent; any surrounding `input` is the same
-            // iteration stream, so the Loop is already aligned and we
-            // pass it through unchanged.  (Wrapping in `MapResult` would
-            // re-apply it as a per-position lookup function and panic on
-            // missing positions, the same way let-bound aligned scalars
-            // would.)
-            Ok(loop_op)
-        }
+        // A raw `LetRec` never compiles directly: op-conversion *recognizes
+        // patterns* in the group (a `get_prev_seq`-causal self-cycle → the
+        // `Recurse` engine, commit-record shapes → the commit operator) and
+        // an unrecognized group is a compile error, never a silent fallback.
+        // Recognition lands with the unified phase
+        // (`src/ccl/design/mutability.md`).
+        TypedExprNode::LetRec { .. } => Err(ConversionError::Unsupported(
+            "LetRec reached operator conversion without pattern recognition — \
+             the unified phase and its recognizers \
+             (src/ccl/design/mutability.md) land in a later step"
+                .into(),
+        )),
 
         other => Err(ConversionError::Unsupported(format!(
             "CCL node {other:?} is not yet supported in operator_conversion"
@@ -1002,6 +1067,158 @@ fn compile_lit(lit: &Lit) -> Result<Box<dyn TileOperator>, ConversionError> {
         Lit::Unit => (Value::Unit, Extent::Base(BaseType::Unit)),
     };
     Ok(Box::new(Constant::new(value, extent)))
+}
+
+/// Build the operator graph for a `let __reg = Transact{…}` and return the
+/// [`StoreReadInfo`] registered under the `__reg` binder so each per-variable
+/// read `__reg.k` ([`convert_store_read`]) branches the fan and projects it.
+///
+/// Op-conversion dispatches on the store's sequencing `domain`: a concrete
+/// iteration extent → the sequential [`Recurse`] (an induction / `mut`-loop
+/// store, [`build_induction_store`]).
+fn build_transact_store(
+    keys: &[TransactKey],
+    writers: &[WriterSite],
+    domain: &Type,
+    ctx: &mut OpConversionContext,
+) -> Result<StoreReadInfo, ConversionError> {
+    if !matches!(domain, Type::Txn) {
+        return build_induction_store(keys, writers, ctx);
+    }
+    Err(ConversionError::Unsupported(
+        "Txn-domain stores are not supported".to_string(),
+    ))
+}
+
+/// Build an induction-domain store (a `mut` loop): one always-commit writer over
+/// the loop source, compiled to a [`Recurse`] (the loop recurrence) exactly as a
+/// `Loop` was. The writer body is `λ p → … → {commit: true, writes: (new₀, …)}`;
+/// we cycle on `.writes` (a single accumulator's value is the lone element,
+/// unwrapped; several accumulators ride the packed tuple). The returned
+/// [`StoreReadInfo`] is `Induction`-kind: each `__reg.kᵢ` read projects
+/// `.writes.(i)` off the body stream.
+fn build_induction_store(
+    keys: &[TransactKey],
+    writers: &[WriterSite],
+    ctx: &mut OpConversionContext,
+) -> Result<StoreReadInfo, ConversionError> {
+    // A `mut` loop is a single writer (its footprint is the loop's accumulators).
+    let [w] = writers else {
+        return Err(ConversionError::Unsupported(format!(
+            "an induction-domain store has exactly one writer (a `mut` loop), got {}",
+            writers.len()
+        )));
+    };
+    let n_accs = keys.len();
+    debug_assert_eq!(
+        n_accs,
+        w.write_keys.len(),
+        "a mut loop writes every accumulator key"
+    );
+    // At least one accumulator: an accumulator-free loop routes through
+    // `transform_feed_only_loop` in the phase and never reaches here. Make the
+    // precondition explicit — the `n_accs > 1` branches below `fan_in` the
+    // keys, and `fan_in(vec![])` (n_accs == 0) is an ill-formed record.
+    debug_assert!(
+        n_accs >= 1,
+        "an induction store has at least one accumulator"
+    );
+
+    // Position-0 seed: one accumulator → its init op; several → a packed
+    // `_0.._{n-1}` record via `fan_in` (the `Recurse` codomain is one packed
+    // tile rather than N parallel cycles).
+    let init_op: Box<dyn TileOperator> = if n_accs == 1 {
+        convert_impl(&keys[0].init, None, ctx)?
+    } else {
+        let arms: Vec<Box<dyn TileOperator>> = keys
+            .iter()
+            .map(|k| convert_impl(&k.init, None, ctx))
+            .collect::<Result<_, _>>()?;
+        fan_in(arms)
+    };
+
+    // Iteration domain from the writer source `Fun(D, item)`, iterated internally
+    // by `IterateExtent` (matching the retired `Loop` arm); the item stream rides
+    // the compiled `source`.
+    let domain_ty = w.source.ty.domain().ok_or_else(|| {
+        ConversionError::TypeError(format!(
+            "induction-store writer source must have function type, got {}",
+            w.source.ty
+        ))
+    })?;
+    let domain_op: Box<dyn TileOperator> = Box::new(IterateExtent::new(ctx.extent_of(&domain_ty)?));
+    let recurse = Recurse::new(init_op, domain_op);
+    let set_recursive_input = recurse.recursive_input_setter();
+    let prev_acc_fan = Rc::new(FanOut::new_cyclic(Box::new(recurse)));
+    let source_op = convert_impl(&w.source, None, ctx)?;
+    // Body input `(acc₀, …, acc_{n-1}, item)`: the previous accumulator snapshot
+    // then the item — the shape the writer body's `let acc_i = p.i … let item =
+    // p.n` destructuring expects. Single accumulator → prev is the scalar;
+    // several → unpack the packed prev-acc record into its `_0.._{n-1}` fields.
+    let body_input = if n_accs == 1 {
+        fan_in(vec![prev_acc_fan.branch(), source_op])
+    } else {
+        let mut arms: Vec<Box<dyn TileOperator>> = Vec::with_capacity(n_accs + 1);
+        for i in 0..n_accs {
+            arms.push(proj_field(prev_acc_fan.branch(), i)?);
+        }
+        arms.push(source_op);
+        fan_in(arms)
+    };
+    let body_op = convert_impl(&w.body, Some(body_input), ctx)?;
+    let body_fan = Rc::new(FanOut::new_cyclic(Box::new(Memo::new(body_op))));
+    // Cycle on `.writes` — the proposed new accumulator(s). Single accumulator →
+    // unwrap the 1-tuple; several → the packed tuple itself (its `_0.._{n-1}`
+    // fields feed the body input).
+    let writes_branch = proj_named_field(body_fan.branch(), F_WRITES)?;
+    let cycle_branch: Box<dyn TileOperator> = if n_accs == 1 {
+        proj_field(writes_branch, 0)?
+    } else {
+        writes_branch
+    };
+    set_recursive_input(cycle_branch);
+
+    // Each `__reg.kᵢ` read projects `.writes.(i)` off the body stream.
+    let mut keys_map: HashMap<String, KeyReadInfo> = HashMap::with_capacity(n_accs);
+    for (i, k) in keys.iter().enumerate() {
+        keys_map.insert(k.name.field_key(), KeyReadInfo { index: i });
+    }
+    Ok(StoreReadInfo {
+        fan: body_fan,
+        keys: keys_map,
+    })
+}
+
+/// Compile a per-variable read `__reg.field` off a registered transactional
+/// store. `plan_loops` wraps a scalar accumulator read in `final_or_default(stream,
+/// init)`, so the current/final value (via [`ExtractLast`]) is selected
+/// downstream, not here.
+fn convert_store_read(
+    store_name: &Name,
+    field: &str,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    let (fan, key_index) = {
+        let info = ctx.lookup_store(store_name).ok_or_else(|| {
+            ConversionError::Unsupported(format!("unknown transactional store {store_name}"))
+        })?;
+        (info.fan.clone(), info.keys.get(field).map(|k| k.index))
+    };
+    match key_index {
+        // An induction store key (a `mut` loop accumulator): its history `D ⇀ V`
+        // is `.writes.(index)` off the `Recurse` body stream `D ⇀ {commit,
+        // writes, …}`. `plan_loops` wraps the read in `final_or_default`, reduced
+        // to the final value via `ExtractLast`.
+        Some(index) => {
+            let writes = proj_named_field(fan.branch(), F_WRITES)?;
+            proj_field(writes, index)
+        }
+        // A `to_<defer>` virtual key (a feed riding the writer's per-position
+        // output): not a register, so it has no `keys` entry — project the field
+        // directly off the writer body fan (a sibling of `.writes`), yielding the
+        // per-position stream `Fun(domain, V)` the consumer/sink reads.
+        None => proj_named_field(fan.branch(), field),
+    }
 }
 
 /// Build an operator that extracts field `_n` from the record codomain of `input`.

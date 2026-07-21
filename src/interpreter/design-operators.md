@@ -159,7 +159,7 @@ during compilation; producers are created on demand at runtime.
 | `FanIn` | `N` inputs of `SealedFunction(shared_extent → *)` tilings |  `SealedFunction(shared_domain → Record(_0, … _N))` | Merges N sealed-function operators that share a domain into one sealed function whose codomain is a Record Tiling of all their codomains. Prefer the free `fan_in` factory at op-conversion call sites: it dispatches to `FanIn` (function-tiled arms) or `ScalarFanIn` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
 | `ScalarFanIn` | `N` inputs with `Scalar` tilings | `Record(_0, … _N)` | Packs N scalar inputs into a single `Record` tiling where each field is a `Scalar` tiling. The scalar counterpart of `FanIn`; reachable from op-conversion via the `fan_in` factory. |
 | `MapResult` | Function: any tiling of type `A → B`<br>Data: `SealedFunction(extent → Scalar(A))` | `SealedFunction(extent → Scalar(B))` | Applies a function element-wise over a sealed-function input, transforming each codomain value. The function input can have many different tilings; currently supports `Scalar(ComputableFunction)`, `Scalar(Function)`, `CurriedFunction`, and `SealedFunction` tilings. When the **data** input is itself a `CurriedFunction`, it maps the function over each codomain list, producing a `CurriedFunction` with the same domain and transformed values. |
-| `MapResultToConst` | `SealedFunction(extent → *)` | `SealedFunction(extent → Scalar)` | Replaces every codomain value of a sealed-function input with the same constant, preserving the domain. |
+| `MapResultToConst` | `SealedFunction(extent → *)` | `SealedFunction(extent → Scalar)` | Replaces every codomain value of a sealed-function input with the same constant (or zips it in, per its mode), preserving the domain. The constant must be present (terminal) before it can be broadcast — a still-absent constant (e.g. a scalar read from a sibling induction loop that has not yet converged) yields an empty, non-terminal output rather than fabricating a value for the unknown positions. |
 | `ToScalar` | `SealedFunction(Unit → Scalar)` | `Scalar` | Unwraps a `SealedFunction` with `domain = Units(1)`, extracting and returning its single codomain element as a scalar tile. |
 | `Converse` | `SealedFunction(domain → Scalar(codomain))` | `CurriedFunction(codomain → domain)` | Inverts a sealed-function operator: each codomain value maps to the list of domain values that produced it. |
 | `Uncurry` | `CurriedFunction(A → B → C)` | `SealedFunction(Record(A, B) → Scalar(C))` | Flattens a curried function into a sealed function with a pair domain: transforms the nested lookup structure `A → B → C` into a flat pair-keyed structure `(A, B) → C`. |
@@ -179,6 +179,21 @@ during compilation; producers are created on demand at runtime.
 TODOs for implementing hash joins:
 
 - Add support for MapResult to take a `CurriedFunction(A → UInt → B)` as the function argument, which will then convert `SealedFunction(C → A)` to `CurriedFunction(C → UInt → B)`
+
+---
+
+## The commit operator (`interpreter/commit_operator.rs`) <!-- doc-refs-ignore -->
+
+The transaction engine that backs a `Type::Txn` [`Transact`](../ccl/design/ir.md#transact--the-domain-parameterized-recurrence-carrier) store: concurrent writers propose transactions against a shared multi-key register, and the operator serializes them onto one monotonic `CommitTs` clock with optimistic-concurrency validation (allocate-on-commit + backward validation + serialize-and-retry). Op-conversion's `build_commit_store` assembles it. The design splits into a **pure engine** and its **tile adapters**:
+
+- **`CommitEngine`** (tile-free, unit-tested) — the serialization logic. The store is `CommitTs ⇀ (Key ⇀ Value)`, held as per-tick write-set deltas with a per-key latest-write index. `attempt(proposal)` allocates the next tick and commits iff no read key was overwritten after the proposal's snapshot (else `Stale`, and the writer retries at the advanced watermark). `read_as_of(t, key)` folds the delta history; `gc_released_prefix(through)` reclaims released committed versions below the frontier, keeping each key's latest write.
+- **`CommitOperator` / `CommitProducer`** — the store tile adapter. Output tiling `Store(CommitTs → Scalar(Key ⇀ Value))` (`full_store_tiling`) — a [`Tile::Store`] *changelog*, not a `SealedFunction`: each change tick carries that tick's write-set delta, and a tick absent from the changelog is *decided-absent* (its value holds from the latest earlier change), so consumers must **fold** it (`store_current` / `store_value_at`), never index it. This is what makes `store_current` well-defined on a live, non-terminal store — the fix for the `ExtractLast`-over-a-live-store hang. The watermark rides the `frontier` predicate (`LessThanEq(w)` while committing, flips to `True` once every writer is terminal). Each writer input is wired *after* construction via `writer_input_setter(k)`, so the operator is built inside a cyclic `FanOut` and each writer reads the store back before proposing (the `Recurse` feedback idiom, generalized to N writers). On each `get`, the producer drains every writer's new proposals in writer-index order (the serialization order) and `release`s each committed step back to its writer (the commit-ack that advances it). A store release names a prefix of decided ticks a consumer no longer reads at; the load-bearing GC is the engine's `gc_released_prefix` (keep-latest), while the per-consumer `FanOut` view folds the changelog whole, so `Tile::Store`'s `remove_guarded` is a no-op (a released tick is not a deletable position).
+- **`TransactWriter` / `TransactWriterProducer`** — one *fused* writer per `with begin():` site (fused, not fanned: a stateful append-only proposal stream cannot be split across fanned branches without desyncing). Each pull reads the cyclic store, folds `(frontier, snapshot)` for its read keys, feeds `(snap…, item)` into its body via a `WriterBuffer`/`BodyInputSource`, and — per `(item, frontier)` (idempotent retry-suppression) — appends a `{snap, reads, writes}` proposal when the body grants (`commit: true`) or advances locally when it denies. Reply taps (`out << e` inside a block) ride the decision record as write-only keys committed atomically with the transaction. The proposal stream is an offset window: released (committed) prefixes are compacted away, keeping writer state bounded on a long-lived store.
+- **`BodyInputSource` / `BodyInputSourceProducer`** — serves the writer body its `(snapshot…, item)` input off the shared `WriterBuffer`. It is **release-aware**: the body op fans this source through `FanOut`/`Memo` (which pull it repeatedly per round), so it emits only positions past its released cursor — re-emitting a released position would make the `Memo`'s append-merge duplicate a domain position (an invalid tile). This makes it delta-producing, like the induction body's `fan_in` input.
+- **`StoreValueStream` / `StoreValueStreamProducer`** — folds the shared store's [`Tile::Store`] changelog to project one key's commit-value stream `CommitTs ⇀ V` (carrying values forward across ticks that wrote other keys — the step interpolation). Its own *output* is a `SealedFunction(CommitTs → Scalar(V))` — a genuine per-key value-over-time, each tick a decided value. Each **batch** `__reg.k` register read compiles to this and reduces it via `ExtractLast` (the terminal latest committed value, for a program that ends its writers). A **live** cross-endpoint read folds the store directly via `AsOf` (below), not through this stream.
+- **`AsOf` / `AsOfProducer`** — the **as-of (temporal) join**, the live cross-endpoint read. Two inputs: a `trigger` (`SealedFunction(B → *)` — the positions to sample at, e.g. an HTTP request stream) and a `source` — the shared commit store itself (a [`Tile::Store`] fan branch) — plus what to sample (`AsOfOutput`). For each trigger position, latch the store's **current value(s)** (`store_current`, folding the store at its decided frontier) at the moment that position is first observed, indexed by the *trigger* (the outer request loop), not the commit clock. Two output shapes: a **scalar** read of one register → `SealedFunction(B → Scalar(V))` (a single- or computed-register live read); a **snapshot** read of several registers → `SealedFunction(B → Record{field: Scalar(V)})`, every field folded from *one* source render at one commit frontier so the registers are read atomically (§I-c snapshot consistency), which the reply projects. It folds the store directly rather than through a per-key `StoreValueStream`: the drive-to-frontier and latest-value logic live in the step tiling (`store_frontier` / `store_current`), so `AsOf` is the thin residual sampler. On each pull it drives `source` to its current fixpoint — pulling until the decided **frontier** (`store_frontier`) stops growing (the cyclic store commits one step per pull), bounded by `MAX_STORE_CONVERGENCE_PULLS` — then latches that value to every newly-seen trigger position. **Tile-legal by construction**: the output grows monotonically over the trigger domain and an already-latched position is never re-emitted with a different value (the "snapshot per request" invariant). It is the dual of the commit `Recurse`: `Recurse` latches a private accumulator per *source* step; `AsOf` latches the store's current value per *trigger* step. `release_impl` compacts released trigger positions (a prefix watermark, since the request domain is a monotone `UInt` prefix); `get_impl` releases the store fan *below* its latest decided tick (a future trigger only ever needs the latest-as-of-its-time, `≥` the current), letting `CommitProducer` reclaim a live store's superseded history. Born in `transact_phase::rewrite_live_reads` (pre-lambda-elim); carries its own recorded type (no inference scheme).
+
+A single-writer induction store is the degenerate no-conflict case of this same contract, which is why one `Transact` carrier serves both engines.
 
 ---
 
@@ -211,7 +226,7 @@ Op-conversion's arms split into two groups by how they handle their parent's
   isolation, with its own iteration extent at the bottom of its chain.  Examples:
   `Iterate` (the canonical chain-head extent producer), `MapDomain`, `Uncurry`,
   `FlattenDomain`, `PermuteDomain`, `CollectionUnion`, `Sum` / `Max`,
-  `LastOrDefault`, and the catch-all `Apply` arm (where the function position
+  `FinalOrDefault`, and the catch-all `Apply` arm (where the function position
   is a `Proj` / `Var` / curried `Apply`).
 
 `Converse` straddles the split: it accepts either `input=None` (produce an
@@ -291,16 +306,17 @@ Three arms share an input across multiple downstream consumers:
 - **`Let { bound_expr, body }`** fans the parent input into both the bound
   expression and the body (described above).
 
-- **`Loop` bodies** fan-out the cyclic prev-accumulator stream and the body
-  output (via `FanOut::new_cyclic`); see the `Recurse` description above for
-  the full structure.
+- **`Recurse` bodies** (the induction realization of a recognized `Transact`)
+  fan-out the cyclic prev-accumulator stream and the body output (via
+  `FanOut::new_cyclic`); see the `Recurse` description above for the full
+  structure.
 
 ### Aggregates, sinks, and the program root
 
 The pipeline always bottoms out at one of three consumer shapes:
 
 1. A scalar produced by `Apply(<chain>, Sum)` / `Max` (compiles to
-   `Aggregate` + `ExtractAggregate`) or `Apply(Tuple([stream, default]), LastOrDefault)`
+   `Aggregate` + `ExtractAggregate`) or `Apply(Tuple([stream, default]), FinalOrDefault)`
    (compiles to `ExtractLast`).
 2. A function-typed program result — `convert_to_operators` is the entry
    point, the resulting tile is subscribed by the user-supplied `main_consumer`
