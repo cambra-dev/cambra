@@ -75,6 +75,14 @@ jobs:
         if: steps.filter.outputs.code == 'true'
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
+      # Node toolchain for the cambra-inspector web frontend (vitest + bundle).
+      # TODO: pin to a SHA to match this repo's action-pinning convention.
+      - name: Setup Node
+        if: steps.filter.outputs.code == 'true'
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v4
+        with:
+          node-version: 20
+
       # 3. Run Checks (Only if code changed)
       - name: Shellcheck
         if: steps.filter.outputs.code == 'true'
@@ -158,6 +166,11 @@ jobs:
         # steps failed so all errors surface in one run.
         if: steps.filter.outputs.code == 'true' && (success() || failure())
         run: ./ci.sh inspector
+
+      - name: Web
+        # The frontend: typecheck + vitest + committed-bundle freshness.
+        if: steps.filter.outputs.code == 'true' && (success() || failure())
+        run: ./ci.sh web
 
         # 4. Success Signal for noops
       - name: No-op for docs

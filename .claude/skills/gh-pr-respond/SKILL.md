@@ -21,13 +21,14 @@ A single consolidated script lives alongside this skill:
 - **`--mode pending`** — pending (draft) review comments for `--author` (default: `groundlar`), via REST
 - **`--mode all`** — both active and pending
 
-Defaults: `org=cambra-dev`, `repo=Cambra`, `author=groundlar`.
+Defaults: `org=cambra-dev`, `repo=cambra`, `author=groundlar`.
 
 ## Workflow
 
 ### 1. Parse Scope
 
 From the user's invocation:
+
 - **PR number**: required — ask if not provided.
 - **Mode**: `active` (default), `pending`, or `all`.
 - **Author**: default `groundlar`, overridable via `--author <name>`.
@@ -49,6 +50,7 @@ For each comment that references a file and line, read that file at and around t
 ### 4. Produce Response Plan
 
 For each comment thread, choose exactly one action:
+
 - **Fix**: describe the specific code change needed (or make the fix directly if small and unambiguous).
 - **Reply**: draft a response explaining current code rationale, design intent, or correcting a misunderstanding.
 - **Question**: ask the reviewer for more information when the comment is ambiguous.

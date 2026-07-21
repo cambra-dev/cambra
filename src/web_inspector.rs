@@ -1,4 +1,11 @@
 //! Web inspector: serves a live dashboard of the interpreter's runtime state.
+//!
+//! DEPRECATED. The `cambra-inspector` crate is the intended replacement, but
+//! cannot fully supplant this yet: it models only the static IR passes
+//! (pre-inference / post-inference / post-desugar) and has no operator/dataflow
+//! graph pane and no live per-tick view. Once the operator graph is instrumented
+//! (the `NodeId → OperatorId` lineage edge) and a live/tick layer lands, this
+//! module — and the `InspectNode::to_json` wire it depends on — can be removed.
 
 use std::sync::{Arc, Mutex};
 use std::thread;
