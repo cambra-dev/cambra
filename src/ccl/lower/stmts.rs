@@ -42,7 +42,7 @@ pub(super) fn lower_stmts_recovering(
     // register-writing loop is lowered before the `:=` / `def` that precedes it
     // textually. (No transactional-registry snapshot here — the top level is the
     // outermost scope, so nothing to restore to.)
-    pre_register_mut_param_defs(stmts, ctx);
+    pre_register_txn_decls(stmts, ctx);
     let (last, rest) = stmts.split_last().unwrap();
 
     // Final statement: recover by substituting Expr::error() on failure.
@@ -171,8 +171,9 @@ pub(super) fn lower_stmts_inner(
     // `def`s still shadow outer same-named ones *within* the block (pre-register
     // overwrites them here; the restore reinstates the outer ones on exit).
     // Restored on both the success and error paths below.
+    let snapshot = ctx.snapshot_transactional();
     let saved_mut_param_fns = ctx.mut_param_fns.clone();
-    pre_register_mut_param_defs(stmts, ctx);
+    pre_register_txn_decls(stmts, ctx);
     let (last, rest) = stmts.split_last().unwrap();
 
     // The final statement must be a bare expression, an if/else block, or
@@ -188,6 +189,7 @@ pub(super) fn lower_stmts_inner(
                 lower_middle_stmt(stmt, &rest[..i], acc, outer_bindings, ctx, is_top_level)
             })
     });
+    ctx.restore_transactional(snapshot);
     ctx.mut_param_fns = saved_mut_param_fns;
     result
 }
@@ -237,7 +239,7 @@ pub(super) fn lower_final_stmt(
                 // is rejected there, not here). A plain `=` to an outer name is
                 // caught separately by the generator path below.
                 let acc_names = find_mutation_loop_vars(for_body, &scope);
-                if !acc_names.is_empty() {
+                if !acc_names.is_empty() || for_body_has_with(for_body) {
                     return lower_generator_or_mutation_loop(
                         target,
                         iter,
@@ -308,6 +310,7 @@ pub(super) fn lower_final_stmt(
         // "must end in a value" error below, never this arm.)
         ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
+            check_mut_write_context(&name, last.span, ctx)?;
             let val = lower_aug_binop(&name, *op, value, ctx)?;
             Ok(Expr::mut_write(name, val))
         }
@@ -328,9 +331,15 @@ pub(super) fn lower_final_stmt(
         }) =>
         {
             let name = extract_name_target(target, "mutable assignment")?;
+            check_mut_write_context(&name, last.span, ctx)?;
             let val = lower_expr(value, ctx)?;
             Ok(Expr::mut_write(name, val))
         }
+        // A standalone `with begin():` as the program's final statement: one
+        // transaction whose value is `Unit` (a trailing transaction produces no
+        // value — its replies ride the feed, and a program that wants a committed
+        // value reads it inside a `with begin():` block that feeds it out).
+        ChlStmt::With { .. } => lower_standalone_transaction(last, Expr::lit(Lit::Unit), ctx),
         // Parse-recovery placeholder: silently substitute. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(Expr::error()),
         _ => Err(LoweringError::unsupported(
@@ -477,11 +486,23 @@ pub(super) fn lower_middle_stmt(
             value,
         } => {
             let name = extract_name_target(target, "mutable assignment")?;
+            // A *bare* `x := e` (no annotation) to an already-live mutable variable is a
+            // write / sequential re-bind, not a declaration: gate it like any
+            // mutable write. A transactional register written here (outside a
+            // `with begin():` block) is rejected; an induction accumulator re-bind
+            // passes (`check_mut_write_context` is a no-op for it). An
+            // *annotated* `:=` is the introduction and needs no gate.
+            if annotation.is_none() {
+                check_mut_write_context(&name, stmt.span, ctx)?;
+            }
             let val = lower_expr(value, ctx)?;
             // A bare `x := e` where `x` is already in scope is a *write*, not a
             // declaration: emit a `MutWrite` marker (mutability checked
             // post-inference; the unified phase turns it into a recurrence in a
-            // loop or a shadowing advance at the top level).
+            // loop or a shadowing advance at the top level). A transactional
+            // register write here was already rejected by
+            // `check_mut_write_context` above (a register write must sit inside
+            // a `with begin():` block).
             if annotation.is_none() {
                 let mut scope = outer_bindings.clone();
                 collect_stmt_names(preceding, &mut scope);
@@ -490,23 +511,32 @@ pub(super) fn lower_middle_stmt(
                 }
             }
             // Otherwise this is an *introduction*. Resolve the optional
-            // annotation to the declared value type:
-            //   (none)           → induction accumulator, value type inferred
-            //   `x: Mut[V] := e` → induction accumulator at value type `V`
-            //   `x: T := e`      → induction accumulator at value type `T`
-            let value_ty = match annotation {
-                None => Type::Hole,
+            // annotation to `(value type, transactional?)`:
+            //   (none)             → induction accumulator, value type inferred
+            //   `x: Mut[V] := e`   → induction accumulator at value type `V`
+            //   `x: Mut[V, Txn]`   → transactional register at value type `V`
+            //   `x: T := e`        → induction accumulator at value type `T`
+            let (value_ty, is_txn) = match annotation {
+                None => (Type::Hole, false),
                 Some(ann) => match mut_annotation_parts(ann) {
                     Some(parts) => parts?,
-                    None => lower_type_annotation(ann)?,
+                    None => (lower_type_annotation(ann)?, false),
                 },
             };
             // Stamp the binding `Mut[V, D]` (so inference binds `x` at `Mut` and
-            // its references deref to `V`). The mutable variable carries *no* lowering
+            // its references deref to `V`). `D = Txn` for a transactional register
+            // (fixed here, never inferred), which also registers `x` so its
+            // `with begin():` writes lower to `MutWrite` and its bare reads are
+            // gated. An induction accumulator gets `D = Hole` and carries *no* lowering
             // registry — its mutability is this `Mut` type, checked
             // post-inference; its domain is the loop it accumulates over, which
             // the unified phase resolves. See src/ccl/design/mutability.md.
-            let domain = Type::Hole;
+            let domain = if is_txn {
+                ctx.register_transactional(name.clone());
+                Type::Txn
+            } else {
+                Type::Hole
+            };
             let mut_ty = Type::History {
                 value: Box::new(value_ty),
                 domain: Box::new(domain),
@@ -521,8 +551,11 @@ pub(super) fn lower_middle_stmt(
         // targets are supported; tuple-destructuring `(a, b) += …` is Unsupported.
         ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
-            // A bare mutable write whose target-is-a-mutable check runs
-            // post-inference.
+            // A `+=` to a transactional register outside a `with begin():` block
+            // is rejected here (a register write must commit inside a block);
+            // otherwise it is a bare mutable write whose target-is-a-mutable check
+            // runs post-inference.
+            check_mut_write_context(&name, stmt.span, ctx)?;
             let val = lower_aug_binop(&name, *op, value, ctx)?;
             Ok(Expr::expr_stmt(Expr::mut_write(name, val), body))
         }
@@ -560,12 +593,12 @@ pub(super) fn lower_middle_stmt(
             // the loop and wrap the continuation. Mutability of each write is
             // checked post-inference; a `:=` / `+=` to a non-mutable surfaces there.
             let acc_names = find_mutation_loop_vars(for_body, &scope);
-            if !acc_names.is_empty() {
-                // All mutation loops — feedless, feeding, and yielding — take
-                // the direct-mirror `For`/`MutWrite`/`Feed` path; the unified
-                // letrec phase (src/ccl/design/mutability.md) builds the
-                // recurrence and hoists any in-loop feed to an ordinary feed
-                // of the loop's history.
+            if !acc_names.is_empty() || for_body_has_with(for_body) {
+                // All such loops — mutation accumulators, per-iteration
+                // `with begin():` transactions, and mixes of both (plus their
+                // feeds/yields) — take the direct-mirror `For` path; the unified
+                // phases (src/ccl/design/mutability.md) build the recurrence,
+                // strip each `Begin` into a commit site, and hoist feeds.
                 return lower_generator_or_mutation_loop(
                     target, iter, for_body, &acc_names, body, ctx,
                 );
@@ -626,6 +659,10 @@ pub(super) fn lower_middle_stmt(
             lower_final_stmt(stmt, preceding, outer_bindings, ctx)?,
             body,
         )),
+        // A standalone `with begin():` transaction — one commit over a
+        // synthesized singleton source, `transact_phase` folds it into the
+        // shared commit store (see src/ccl/design/mutability.md).
+        ChlStmt::With { .. } => lower_standalone_transaction(stmt, body, ctx),
         // Parse-recovery placeholder: silently drop the broken statement and
         // pass the continuation through. See `ChlExpr::Error`.
         ChlStmt::Error => Ok(body),
@@ -690,19 +727,53 @@ pub(super) fn name_target_as_name(target: &Spanned<AssignTarget>) -> Option<&str
     }
 }
 
-/// If `annotation` is a `Mut[…]` form, extract its declared *value* type.
+/// Reject a `Mut[V, Txn]` **register** write that lands *outside* a `with
+/// begin():` block — the write-side mirror of the out-of-block read gate in
+/// [`super::lower_expr`]. A register's history is the commit order, so a bare
+/// write outside a block would become a plain sequential `let` shadow that
+/// silently hides every committed value from subsequent reads; require the
+/// write to sit inside a block.
 ///
-/// - `Mut[V]` / `Mut[_]` → `V` — an induction-domain accumulator whose
-///   sequencing domain is inferred from its writing loop by the unified phase
-///   (`Mut[_]` → `Hole`, value type inferred).
-/// - A multi-argument `Mut[…]` (the `Mut[V, Txn]` transactional-register form)
-///   parses as a tuple index and is rejected here — the transactional register is
-///   not part of this layer.
+/// A name shadowed by an inner local binder is a genuine local (its α-unique
+/// binder wins), not the register, so it is never gated — mirroring the read
+/// gate's `is_shadowed` guard against the base-name registry.
 ///
-/// Returns `None` for a non-`Mut` annotation.
+/// The dual case — an induction `Mut[V]` mutable variable written *inside* a block, which
+/// `transact_phase` would silently swallow — is rejected at the block-body write
+/// site in [`super::transactions::write_or_let`]; that check needs no induction
+/// registry, because inside a block the only legal `:=` / `+=` target is a
+/// transactional register.
+pub(super) fn check_mut_write_context(
+    name: &str,
+    span: Span,
+    ctx: &LoweringContext,
+) -> Result<(), LoweringError> {
+    if ctx.is_shadowed(name) {
+        return Ok(());
+    }
+    if ctx.is_transactional_register(name) && !ctx.in_tx_body {
+        return Err(LoweringError::unsupported(
+            span,
+            format!("write transactional variable `{name}` inside a `with begin():` block"),
+        ));
+    }
+    Ok(())
+}
+
+/// If `annotation` is a `Mut[…]` form, extract its declared *value* type and
+/// whether it is **transactional** (`Mut[V, Txn]`).
+///
+/// - `Mut[V]` / `Mut[_]` → `(V, false)` — an induction-domain accumulator whose
+///   sequencing domain is inferred from its writing loop (`Mut[_]` → `(Hole,
+///   false)`, value type inferred).
+/// - `Mut[V, Txn]` → `(V, true)` — a transactional register over the commit
+///   order (the two-slot form parses as a tuple index `(V, Txn)`).
+///
+/// `Txn` is the only explicit sequencing domain supported; any other second
+/// slot is a lowering error. Returns `None` for a non-`Mut` annotation.
 pub(super) fn mut_annotation_parts(
     annotation: &Spanned<ChlExpr>,
-) -> Option<Result<Type, LoweringError>> {
+) -> Option<Result<(Type, bool), LoweringError>> {
     let ChlExpr::Subscript { target, index } = &annotation.node else {
         return None;
     };
@@ -712,18 +783,31 @@ pub(super) fn mut_annotation_parts(
     if head.as_str() != "Mut" {
         return None;
     }
-    // A multi-argument `Mut[…]` subscript parses as a tuple index.
-    if let ChlExpr::Tuple(_) = &index.node {
-        return Some(Err(LoweringError::unsupported(
-            annotation.span,
-            "Mut[…] takes one argument: `Mut[V]` (the sequencing domain is the \
-             loop the mutable variable accumulates over, inferred by the unified phase)",
-        )));
+    // `Mut[V, Txn]` parses as a tuple index `(V, Txn)`.
+    if let ChlExpr::Tuple(parts) = &index.node {
+        if parts.len() != 2 {
+            return Some(Err(LoweringError::unsupported(
+                annotation.span,
+                "Mut[…] takes one or two arguments: `Mut[V]` or `Mut[V, Txn]`",
+            )));
+        }
+        let value_ty = match lower_type_annotation(&parts[0]) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+        return Some(match &parts[1].node {
+            ChlExpr::Name(d) if d.as_str() == "Txn" => Ok((value_ty, true)),
+            _ => Err(LoweringError::unsupported(
+                parts[1].span,
+                "the only explicit `Mut` sequencing domain is `Txn` (`Mut[V, Txn]`); \
+                 omit it (`Mut[V]`) to infer a loop's induction domain",
+            )),
+        });
     }
-    Some(lower_type_annotation(index))
+    Some(lower_type_annotation(index).map(|t| (t, false)))
 }
 
-/// Pre-register every `Mut`-parameter `def` in a block
+/// Pre-register every `x: Mut[V, Txn] := e` transactional-register introduction
 /// (and every pass-by-reference-`Mut` `def`) in `stmts` with the lowering
 /// context.
 ///
@@ -741,24 +825,48 @@ pub(super) fn mut_annotation_parts(
 /// (matching CHL's redefinition-shadows semantics). The caller
 /// ([`lower_stmts_inner`]) scopes the whole set to the block, so this only
 /// resolves same-name definitions *within* one block, never across scopes.
-pub(super) fn pre_register_mut_param_defs(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) {
+pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut LoweringContext) {
     for stmt in stmts {
-        // A `def` with a pass-by-reference `Mut` parameter is lowered and
-        // applied curried. Blocks lower right-to-left, so a call site is
-        // lowered *before* the `def` preceding it textually — pre-register
-        // the name here so [`lower_call`] picks the curried shape. Register
-        // or unregister per the definition's mut-ness so the last `def` of a
-        // name in the block wins (a non-`Mut` redefinition clears an earlier
-        // `Mut` one, so its calls lower tupled).
-        if let ChlStmt::FunctionDef { name, params, .. } = &stmt.node {
-            let has_mut_param = params
-                .iter()
-                .any(|p| p.annotation.as_ref().is_some_and(is_mut_annotation));
-            if has_mut_param {
-                ctx.register_mut_param_fn(name.as_str());
-            } else {
-                ctx.unregister_mut_param_fn(name.as_str());
+        match &stmt.node {
+            // `x: Mut[V, Txn] := e` — a transactional-register introduction.
+            // Register `x` so a following loop's `with begin(): x := …` write is
+            // recognised as a commit and a bare read of `x` is gated. A bare
+            // `:=`, `x: T := e`, or `x: Mut[V] := e` is an induction accumulator and is
+            // intentionally *not* registered (its mutability is checked
+            // post-inference).
+            ChlStmt::MutAssign {
+                target,
+                annotation: Some(annotation),
+                ..
+            } => {
+                let AssignTarget::Name(id) = &target.node else {
+                    continue;
+                };
+                // A malformed `Mut[…]` annotation (`Err`) surfaces its real error
+                // when the `MutAssign` itself is lowered; not registering it here
+                // is harmless.
+                if matches!(mut_annotation_parts(annotation), Some(Ok((_, true)))) {
+                    ctx.register_transactional(id.as_str());
+                }
             }
+            // A `def` with a pass-by-reference `Mut` parameter is lowered and
+            // applied curried. Blocks lower right-to-left, so a call site is
+            // lowered *before* the `def` preceding it textually — pre-register
+            // the name here so [`lower_call`] picks the curried shape. Register
+            // or unregister per the definition's mut-ness so the last `def` of a
+            // name in the block wins (a non-`Mut` redefinition clears an earlier
+            // `Mut` one, so its calls lower tupled).
+            ChlStmt::FunctionDef { name, params, .. } => {
+                let has_mut_param = params
+                    .iter()
+                    .any(|p| p.annotation.as_ref().is_some_and(is_mut_annotation));
+                if has_mut_param {
+                    ctx.register_mut_param_fn(name.as_str());
+                } else {
+                    ctx.unregister_mut_param_fn(name.as_str());
+                }
+            }
+            _ => {}
         }
     }
 }

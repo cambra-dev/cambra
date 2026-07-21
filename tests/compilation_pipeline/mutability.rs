@@ -408,6 +408,38 @@ fn augmented_assignment_to_non_mutable_rejected() {
     expect_mut_discipline_error("x = 0\nx += 1\nx", "not a mutable variable");
 }
 
+/// `Mut[…]` takes one or two type arguments (`Mut[V]` or `Mut[V, Txn]`); three
+/// is rejected at lowering.
+#[test]
+fn mut_annotation_with_too_many_arguments_rejected() {
+    expect_compile_error(
+        "x: Mut[int, Txn, int] := 0\nx",
+        "takes one or two arguments",
+    );
+}
+
+/// The only explicit `Mut` sequencing domain is `Txn`; any other second argument
+/// (`Mut[V, Foo]`) is rejected — omit it (`Mut[V]`) to infer a loop's induction
+/// domain.
+#[test]
+fn mut_annotation_with_non_txn_domain_rejected() {
+    expect_compile_error(
+        "x: Mut[int, Foo] := 0\nx",
+        "only explicit `Mut` sequencing domain is `Txn`",
+    );
+}
+
+/// A `:=` accumulator *declared inside* a for-loop body (rather than before it)
+/// is rejected: the accumulator's recurrence spans the whole loop, so its
+/// declaration must precede the loop.
+#[test]
+fn accumulator_declared_inside_loop_rejected() {
+    expect_compile_error(
+        "for i in [1, 2, 3]:\n    y: Mut[int] := 0\n    y += i\ny",
+        "accumulator declaration inside a for-loop body is not",
+    );
+}
+
 /// A `Mut[…]` annotation with the immutable `=` operator is contradictory —
 /// `Mut` introduces a mutable variable, which is `:=`'s job. Rejected at lowering, pointing
 /// at `:=`.

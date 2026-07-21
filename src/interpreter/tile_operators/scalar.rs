@@ -144,6 +144,124 @@ impl TileOperator for ToScalar {
     }
 }
 
+/// Wraps each element of a payload input into a tagged [`Value::Union`] at a
+/// fixed variant position, producing a `Scalar(Union)` tile — the runtime
+/// realization of a scalar [`crate::ccl::TypedExprNode::VariantCtor`].
+///
+/// A lone `VariantCtor(tag, payload)` denotes a *singleton* variant value that
+/// inference width-subtypes into its consumer's full tag set. By op-conversion
+/// the node's type is that full [`Extent::Union`], so the constructor names a
+/// fixed position `tag` within `variant_extents`: `variant_extents[tag]` is fed
+/// by `input`, and every other variant contributes an empty column (no element
+/// of this scalar carries their tag). The tag *names* are erased at this
+/// boundary — a union value dispatches by position — so the wrapper only needs
+/// the resolved index.
+pub struct VariantWrap {
+    /// The payload operator feeding `variants[tag]`.
+    input: Box<dyn TileOperator>,
+    /// The resolved 0-based position of the constructed tag in the full union.
+    tag: usize,
+    /// Per-variant extents of the full union; `input` feeds position `tag`.
+    variant_extents: Vec<Extent>,
+    /// Output tiling — always `Scalar(Union(variant_extents))`.
+    tiling: Tiling,
+}
+
+impl VariantWrap {
+    /// Construct a `VariantWrap` placing `input`'s scalar payload at variant
+    /// position `tag` within a union of `variant_extents`.
+    pub fn new(input: Box<dyn TileOperator>, tag: usize, variant_extents: Vec<Extent>) -> Self {
+        assert!(
+            tag < variant_extents.len(),
+            "VariantWrap: tag index {tag} out of range for {} variants",
+            variant_extents.len()
+        );
+        let tiling = Tiling::Scalar(Extent::Union(variant_extents.clone()));
+        Self {
+            input,
+            tag,
+            variant_extents,
+            tiling,
+        }
+    }
+}
+
+impl TileOperator for VariantWrap {
+    fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("payload", self.input.inspect(opts))
+            .annotate(format!("tag {}", self.tag))
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        let input =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        Box::new(VariantWrapProducer {
+            base: ProducerBase::new(VariantWrapProducer::alloc_id(), &self.tiling),
+            input,
+            tag: self.tag,
+            variant_extents: self.variant_extents.clone(),
+        })
+    }
+}
+
+struct VariantWrapProducer {
+    base: ProducerBase,
+    /// The subscribed payload producer.
+    input: Box<dyn TileProducer>,
+    tag: usize,
+    variant_extents: Vec<Extent>,
+}
+
+impl TileProducer for VariantWrapProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        node.child("payload", self.input.inspect(opts))
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let payload =
+            scalar_tile_to_column_value(self.input.get(self.input.tiling().universal_guard()));
+        let n = payload.len();
+        // Every element of this scalar carries `tag`, so `variants[tag]` is the
+        // whole payload column and the other variant columns are empty. Matches
+        // the `ColumnValue::Union` invariant: `variants[j].len()` equals the
+        // count of `j`s in `tags`.
+        let variants: Vec<ColumnValue> = self
+            .variant_extents
+            .iter()
+            .enumerate()
+            .map(|(i, ext)| {
+                if i == self.tag {
+                    payload.clone()
+                } else {
+                    ColumnValue::from_values(Vec::new(), ext)
+                }
+            })
+            .collect();
+        Tile::Scalar(ColumnValue::Union {
+            tags: vec![self.tag; n],
+            variants,
+        })
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        if obsolete_guard.is_universal() {
+            self.input.release(self.input.tiling().universal_guard());
+        }
+    }
+}
+
 struct ToScalarProducer {
     base: ProducerBase,
     /// The subscribed input producer.

@@ -85,11 +85,11 @@ pub enum Tile {
     /// **unknown**, whereas here it is **decided-absent — the value holds from
     /// the latest earlier change** (step interpolation). The value at an
     /// arbitrary commit time is obtained by *folding* the changelog
-    /// (`store_value_at` /
-    /// `store_snapshot_at`),
+    /// ([`store_value_at`](crate::interpreter::commit_operator::store_value_at) /
+    /// [`store_snapshot_at`](crate::interpreter::commit_operator::store_snapshot_at)),
     /// never by indexing a position directly, and the current value of a *live*
     /// store is
-    /// `store_current` —
+    /// [`store_current`](crate::interpreter::commit_operator::store_current) —
     /// which, unlike `ExtractLast`, is defined without the stream ever
     /// terminating. Encoding the step semantics in a distinct variant keeps
     /// ordinary-function operations (direct indexing, `ExtractLast`) from
@@ -99,7 +99,7 @@ pub enum Tile {
         changes: ColumnValue,
         /// Per-tick write-set deltas, parallel to `changes`: `deltas[i]` is the
         /// map of keys written at `changes[i]`, encoded as a `Variants` cell (via
-        /// `map_to_value`). A key absent
+        /// [`crate::interpreter::commit_operator::map_to_value`]). A key absent
         /// from a tick's delta was not written at that tick (its value holds).
         deltas: ColumnValue,
         /// The decided frontier: every tick at or below its bound is decided.

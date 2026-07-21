@@ -973,6 +973,9 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
             name,
             value: Box::new(drop_expr_stmts(*value)),
         },
+        TypedExprNode::Begin { body } => TypedExprNode::Begin {
+            body: Box::new(drop_expr_stmts(*body)),
+        },
         // Feed/Define get caught by assert_no_defer_residue downstream.
         node @ (TypedExprNode::Feed { .. }
         | TypedExprNode::Define { .. }
@@ -983,9 +986,12 @@ fn drop_expr_stmts(expr: Expr) -> Expr {
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_)) => node,
         TypedExprNode::Error => crate::unexpected_error_node!(),
-        TypedExprNode::VariantCtor { .. } => {
-            unreachable!("channelize: VariantCtor not yet emitted by lowering")
-        }
+        // A tagged-variant value carries no ExprStmt of its own; recurse into
+        // the payload so a nested one is dropped.
+        TypedExprNode::VariantCtor { tag, payload } => TypedExprNode::VariantCtor {
+            tag,
+            payload: Box::new(drop_expr_stmts(*payload)),
+        },
     };
     TypedExpr {
         node: new_node,
@@ -1027,6 +1033,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
             assert_no_defer_residue(argument)
         }
         TypedExprNode::Cast { value, .. } => assert_no_defer_residue(value),
+        TypedExprNode::Begin { body } => assert_no_defer_residue(body),
         TypedExprNode::BinOp { left, right, .. } => {
             assert_no_defer_residue(left)?;
             assert_no_defer_residue(right)
@@ -1081,9 +1088,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), DeferError> {
         | TypedExprNode::Proj(_)
         | TypedExprNode::Source(_) => Ok(()),
         TypedExprNode::Error => crate::unexpected_error_node!(),
-        TypedExprNode::VariantCtor { .. } => {
-            unreachable!("channelize: VariantCtor not yet emitted by lowering")
-        }
+        TypedExprNode::VariantCtor { payload, .. } => assert_no_defer_residue(payload),
     }
 }
 
@@ -1676,6 +1681,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(argument, bound, out);
             }
             TypedExprNode::Cast { value, .. } => rec(value, bound, out),
+            TypedExprNode::Begin { body } => rec(body, bound, out),
             TypedExprNode::BinOp { left, right, .. } => {
                 rec(left, bound, out);
                 rec(right, bound, out);
@@ -1756,9 +1762,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             | TypedExprNode::Source(_)
             | TypedExprNode::Defer => {}
             TypedExprNode::Error => crate::unexpected_error_node!(),
-            TypedExprNode::VariantCtor { .. } => {
-                unreachable!("channelize: VariantCtor not yet emitted by lowering")
-            }
+            TypedExprNode::VariantCtor { payload, .. } => rec(payload, bound, out),
         }
     }
     let mut targets: HashSet<Name> = HashSet::new();
@@ -1925,6 +1929,19 @@ fn extract_for_defer(
         // Pass through Feed/Define for *other* defers — they'll be processed
         // by a different `channelize_defer` call.
         node @ (TypedExprNode::Feed { .. } | TypedExprNode::Define { .. }) => node,
+        // Defensive: `transact_phase` strips every `Begin` before channelize, so
+        // this is unreachable in the pipeline; recurse structurally if a stray
+        // one survives (reaching the strict typecheck backstop).
+        TypedExprNode::Begin { body } => TypedExprNode::Begin {
+            body: Box::new(extract_for_defer(
+                *body,
+                defer_name,
+                feeds,
+                define,
+                in_inner_scope,
+                ctx,
+            )?),
+        },
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -2535,9 +2552,17 @@ fn extract_for_defer(
         | TypedExprNode::Source(_)
         | TypedExprNode::Defer) => node,
         TypedExprNode::Error => crate::unexpected_error_node!(),
-        TypedExprNode::VariantCtor { .. } => {
-            unreachable!("channelize: VariantCtor not yet emitted by lowering")
-        }
+        TypedExprNode::VariantCtor { tag, payload } => TypedExprNode::VariantCtor {
+            tag,
+            payload: Box::new(extract_for_defer(
+                *payload,
+                defer_name,
+                feeds,
+                define,
+                in_inner_scope,
+                ctx,
+            )?),
+        },
         // Recognition runs after lambda_elim, so a
         // causal `LetRec` reaches feed extraction. Walk its binding bodies
         // and continuation generically — the phase hoists every in-loop /

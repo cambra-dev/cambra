@@ -22,7 +22,7 @@
 //! normal form, and lowers each group onto the domain-parameterized
 //! [`TypedExprNode::Transact`] carrier (`let __reg = Transact{…} in …`),
 //! whose induction domain op-conversion compiles to the `Recurse` recurrence
-//! (the `Txn` domain, to the commit operator — the transactional slice).
+//! (the `Txn` domain, to the commit operator).
 //!
 //! **Why one `LetRec` travels post-elim, and why `Transact` still exists.**
 //! Recognition anchors on the guard builtins (`get_prev_seq` / `get_prev_txn`
@@ -632,6 +632,98 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
         return rewrite(cont);
     }
 
+    // Fold the accumulators into a decision-factored history binding, then wrap it
+    // in a nested `LetRec`: re-point the continuation's trailing reads at the
+    // extracted finals, recurse into it, prepend the reads, and hoist the feeds.
+    let fold = fold_induction_loop(&target, &iter, loop_body);
+    let mut cont = cont;
+    for (acc, x_final) in &fold.renames {
+        rename_uses(&mut cont, acc, x_final);
+    }
+    let mut body_out = rewrite(cont);
+    for (b, def) in fold.reads.into_iter().rev() {
+        body_out = let_in(b, def, body_out);
+    }
+    body_out = hoist_feeds(body_out, fold.feed_views);
+    let bindings = vec![fold.binding];
+    debug_assert!(
+        check_letrec_causal(&bindings).is_ok(),
+        "letrec phase emitted a non-causal group"
+    );
+    let ty = body_out.ty.clone();
+    Expr {
+        node: TypedExprNode::LetRec {
+            bindings,
+            body: Box::new(body_out),
+        },
+        ty,
+        user_annotation: None,
+    }
+}
+
+/// An induction loop folded into a single decision-factored history binding,
+/// *without* touching the continuation — the reusable core shared by the
+/// induction path ([`transform_loop`], which wraps it in a nested `LetRec`) and
+/// the transaction path ([`crate::ccl::transact_phase`], which merges the
+/// `binding` into a shared `Mut[_, Txn]` letrec so a commit decision can read an
+/// induction accumulator at its request position — the `cnt(r)` cross-domain
+/// read). The caller applies `renames` to its continuation, recurses, prepends
+/// `reads`, and hoists `feed_views`. The `hist`/type/`accs` fields let the
+/// transaction phase synthesize a per-position accumulator read
+/// (`__hist ≫ .writes ≫ .i` applied at a position).
+pub(crate) struct InductionFold {
+    /// `(__hist, λ r → …)` — the guarded induction history binding.
+    pub binding: (TypedBinding, Expr),
+    /// Trailing final-value lets (`let x_final = final_or_default(…)`) to prepend
+    /// to the continuation, in accumulator order.
+    pub reads: Vec<(TypedBinding, Expr)>,
+    /// `(acc, x_final)` renames to apply to the continuation before recursing.
+    pub renames: Vec<(Name, Name)>,
+    /// `(defer, view)` feeds to hoist over the continuation, in source order.
+    pub feed_views: Vec<(Name, Expr)>,
+    /// The history binder and its shape, for per-position accumulator reads.
+    pub hist: Name,
+    pub hist_ty: Type,
+    pub domain_ty: Type,
+    pub writes_ty: Type,
+    pub decision_ty: Type,
+    /// Accumulators in first-write order (index `i` ↦ `writes.i`), value-typed.
+    pub accs: Vec<(Name, Type)>,
+}
+
+impl InductionFold {
+    /// `__hist ≫ .writes ≫ .i : domain ⇒ vty` — accumulator `i`'s value stream.
+    /// A per-position cross-domain read of that accumulator (`acc(pos)`) is this
+    /// applied at `pos`; the transaction phase uses it to resolve a `commits(r)`
+    /// decision that reads an induction accumulator at its request position.
+    pub(crate) fn acc_view(&self, i: usize) -> Expr {
+        let (_, vty) = &self.accs[i];
+        writes_index_view(
+            &self.hist,
+            &self.hist_ty,
+            &self.domain_ty,
+            &self.writes_ty,
+            &self.decision_ty,
+            i,
+            vty,
+        )
+    }
+}
+
+/// See [`InductionFold`]. Caller must guard on a non-empty accumulator set
+/// (an accumulator-free loop is a feed-only/no-op loop, handled separately).
+pub(crate) fn fold_induction_loop(
+    target: &TypedBinding,
+    iter: &Expr,
+    loop_body: Expr,
+) -> InductionFold {
+    let mut accs: Vec<(Name, Type)> = Vec::new();
+    collect_writes(&loop_body, &mut accs);
+    assert!(
+        !accs.is_empty(),
+        "fold_induction_loop: caller must guard on a non-empty accumulator set"
+    );
+
     let (domain_ty, item_ty) = fun_parts(&iter.ty);
     let acc_tys: Vec<Type> = accs.iter().map(|(_, t)| t.clone()).collect();
     // The proposed write set — always a positional tuple, one element even
@@ -706,7 +798,7 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     let mut snap_elts: Vec<Expr> = (0..accs.len())
         .map(|i| proj_of(&prev, &writes_ty, i, &acc_tys[i]))
         .collect();
-    let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), iter);
+    let mut item_read = Expr::apply(tvar(&r, domain_ty.clone()), iter.clone());
     item_read.ty = item_ty.clone();
     snap_elts.push(item_read);
     let mut snap = Expr::tuple(snap_elts);
@@ -718,11 +810,12 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
     lambda.ty = hist_ty.clone();
 
     // Trailing reads: one extracted final value per accumulator —
-    // `(__hist ≫ .writes ≫ .i, x0) ▷ final_or_default` — and the continuation
-    // re-pointed at it (`rename_uses` also renames MutWrite targets, so a
+    // `(__hist ≫ .writes ≫ .i, x0) ▷ final_or_default` — paired with the
+    // `(acc → fresh-final)` rename the caller applies to its continuation (so a
     // later loop over the same variable accumulates from the extracted value).
-    let mut cont = cont;
-    let mut final_lets: Vec<(TypedBinding, Expr)> = Vec::new();
+    // The read's default is the accumulator's pre-loop binding.
+    let mut reads: Vec<(TypedBinding, Expr)> = Vec::new();
+    let mut renames: Vec<(Name, Name)> = Vec::new();
     for (i, (acc, vty)) in accs.iter().enumerate() {
         let view = writes_index_view(&h, &hist_ty, &domain_ty, &writes_ty, &decision_ty, i, vty);
         let view_ty = view.ty.clone();
@@ -734,20 +827,12 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
         read.ty = vty.clone();
 
         let x_final = Name::fresh(acc.base());
-        rename_uses(&mut cont, acc, &x_final);
-        final_lets.push((binding(x_final, vty.clone()), read));
+        renames.push((acc.clone(), x_final.clone()));
+        reads.push((binding(x_final, vty.clone()), read));
     }
 
-    // Only now recurse into the continuation (a later loop over the same
-    // variable has been re-pointed at the extracted value).
-    let mut body_out = rewrite(cont);
-    for (b, def) in final_lets.into_iter().rev() {
-        body_out = let_in(b, def, body_out);
-    }
-
-    // Hoist each in-loop feed to an ordinary feed of the history's tap field
-    // (`Feed(defer, __hist ▷ .to_<feed>)`) for desugar to route as a channel
-    // contribution. `feeds` is in source order; `hoist_feeds` preserves it.
+    // Each in-loop feed as a hoistable `(defer, __hist ▷ .to_<feed>)` view, in
+    // source order (`hoist_feeds` preserves it).
     let feed_views = feeds
         .iter()
         .map(|f| {
@@ -762,21 +847,18 @@ fn transform_loop(target: TypedBinding, iter: Expr, loop_body: Expr, cont: Expr)
             (f.defer.clone(), view)
         })
         .collect();
-    body_out = hoist_feeds(body_out, feed_views);
 
-    let bindings = vec![(binding(h, hist_ty), lambda)];
-    debug_assert!(
-        check_letrec_causal(&bindings).is_ok(),
-        "letrec phase emitted an non-causal group"
-    );
-    let ty = body_out.ty.clone();
-    Expr {
-        node: TypedExprNode::LetRec {
-            bindings,
-            body: Box::new(body_out),
-        },
-        ty,
-        user_annotation: None,
+    InductionFold {
+        binding: (binding(h.clone(), hist_ty.clone()), lambda),
+        reads,
+        renames,
+        feed_views,
+        hist: h,
+        hist_ty,
+        domain_ty,
+        writes_ty,
+        decision_ty,
+        accs,
     }
 }
 

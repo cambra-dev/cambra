@@ -157,16 +157,27 @@ inside it has no coherent meaning.
   error (hint: "read transactional variable `x` inside a `with begin():` block"). Reading inside a
   block pins a snapshot-consistent view — several `Txn` reads in one block see one commit snapshot,
   which is the point of requiring the block. A read fed out of a block that does *not* write that
-  register is a **temporal (as-of) read**: `for r in reqs: with begin(): out << balance` reads the register's
-  latest committed value as of each request and replies indexed by the *request loop* (the outer
-  context), not the commit clock — the cross-endpoint temporal read. The **terminal** read is the
-  degenerate case: a trailing standalone `with begin(): out << balance` latches the register's final
-  value once its writers complete (`out` is the one-element stream `[final]`). Both are the same
-  as-of read.
+  register is always an **as-of read at an arbitrary position** — the register's value as of wherever the
+  reading transaction lands in the commit order, replied indexed by the *reading loop* (the outer
+  context), not the commit clock. Compiled to `AsOf`, a *sample at each reader's observation time*.
+  This is uniform across the reading loop's domain — a live request stream (`for r in reqs: with
+  begin(): out << balance`, the live cross-endpoint read), a finite literal loop, or the synthesized
+  singleton of a trailing standalone read (`with begin(): out << balance`) — because the sequencing
+  domain that governs the read is the register's `Txn` commit clock, not the reader's own extent, and
+  a transaction observes the register as of *its* place in that clock. There is deliberately **no
+  terminal/"final" *register* read**: a program cannot request the register's last committed value (a
+  future `await_final` builtin would; it does not exist yet). This is specific to registers — the
+  *induction* final already exists (`ExtractLast`, the trailing read of a completed accumulator, below);
+  it is only the register final that has no term. A standalone read's `out` is therefore the
+  one-element stream `[as-of value]` at the singleton position — an arbitrary as-of sample that,
+  under the current batch scheduler, happens to observe the register once its writers have drained, but
+  is not *promised* to be the final by the semantics. (`ExtractLast` is still the operator for a
+  post-loop **induction** accumulator's final and for a cross-loop broadcast source — those *are*
+  fold-to-completion reads of a terminating history — but a `Txn` register read is never one.)
 
 ## CCL representation
 
-### Surface-marker nodes: `For`, `MutWrite`, `Feed`
+### Surface-marker nodes: `For`, `MutWrite`, `Begin`, `Feed`
 
 Lowering emits **surface-CCL** markers — nodes in 1:1 structural correspondence with the CHL
 statements, doing no semantic work; they change representation only, leaving structure for the type
@@ -185,11 +196,17 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   target is *not* `Mut` is a **type error**, never a shadowing rebind (`x += e` on a plain `x` is
   rejected, not silently turned into `x = x + e`). `x += e` lowers to `MutWrite(x, x + e)`, the
   embedded read being the in-context read.
+- `Begin { body }` — one `with begin():` transaction block, made a *single* `Unit`-valued statement
+  (`ExprStmt(Begin{block}, rest)`) so a loop body may freely mix a per-iteration transaction, sibling
+  induction writes, and feeds. `body` is the per-transaction statement chain. The transaction phase
+  strips it: a block writing a `Mut[_, Txn]` register becomes a commit site (partitioned by register
+  domain — induction writes lifted onto the enclosing loop); a read-only block is unwrapped onto the
+  loop spine. A standalone block lowers to a singleton `For` wrapping a `Begin`.
 - `Feed { name, value }` / `Defer` — a `<<` feed and its channel. These survive into inference (so
   a defer binding is typed, at `Feed[𝑉]`) and are eliminated by mut_elim (feeds via channelize).
 
-`For`/`MutWrite`/`Feed`/`Defer` are **pre-phase surface-structure nodes**: pure placeholders no
-pass executes, eliminated wholesale by mut_elim + channelize. The purity invariant
+`For`/`MutWrite`/`Begin`/`Feed`/`Defer` are **pre-phase surface-structure nodes**: pure placeholders
+no pass executes, eliminated wholesale by mut_elim + channelize. The purity invariant
 ([src/ccl/CLAUDE.md](../CLAUDE.md)) holds the same way it does for `Defer` — the phase asserts no
 residue, and planning/op-conversion never see them.
 
@@ -361,20 +378,22 @@ realizes them by tick allocation, not by computing anything.
 
 Multi-variable atomic blocks produce one shared record `{time, writes: {𝑘₁: 𝑉₁, …}}` per commit,
 and each variable's history reads it through a per-key view — atomicity by construction, since one
-record either exists or does not. A conditional write (`with begin(): if 𝑝: x := 𝑒`) adds a
-`commit: Bool` field that `get_prev_txn` filters on. Multiple writer sites for one variable merge
-their commit streams (ordered by time) before the search — the emitted term is spec-true: each
-key's history searches the `⧺`-union of its writing sites' per-key views
-`commits_j ≫ (λ 𝑐 → {time: 𝑐.time, commit: 𝑐.decision.commit, write: 𝑐.decision.writes.𝑖})`,
-shapes the causality check admits (pointwise maps and unions of causal streams change *what*
-is read per position, never *which* positions the accessor consults).
+record either exists or does not. There is no `commit: Bool` in the per-key view: the commit-record
+stream carries only committed transactions (allocate-on-commit — a denied decision proposes nothing,
+so the engine allocates no tick and appends no entry), so `get_prev_txn` searches the latest write
+`≤ t` with no filter, matching its declared `{time, write}` codomain. Multiple writer sites for one variable merge their commit
+streams (ordered by time) before the search — the emitted term is spec-true: each key's history
+searches the `⧺`-union of its writing sites' per-key views
+`commits_j ≫ (λ 𝑐 → {time: 𝑐.time, write: 𝑐.decision.writes.𝑖})`, shapes the causality check
+admits (pointwise maps and unions of causal streams change *what* is read per position, never
+*which* positions the accessor consults).
 
 ## Compilation pipeline
 
 ```
 CHL source
   → parse              (annotations incl. _, Mut[…]/Feed[…]/Txn forms, with begin())
-  → lower              (surface CCL: For / MutWrite / Feed / Defer; Mut/Feed types from annotations;
+  → lower              (surface CCL: For / MutWrite / Begin / Feed / Defer; Mut/Feed types from annotations;
                         NO mutability classification — every loop is a `For`, intro-vs-write is scope-only)
   → uniquify
   → infer + check      (on the surface-CCL tree; Feed[V] with a rigid ChanDom domain types the defers)
@@ -416,7 +435,7 @@ substituted wholesale.
 ### mut_elim: eliminating overwrite mutability
 
 Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` algebra) with every
-`For`/`MutWrite`/`Feed`/`Defer` eliminated (feeds routed here, then discharged by `channelize`). It:
+`For`/`MutWrite`/`Begin`/`Feed`/`Defer` eliminated (feeds routed here, then discharged by `channelize`). It:
 
 0. **Normalizes to the flat-spine invariant** (`flatten_spine`). Inlining a pass-by-reference
    writer splices its body — a bare `MutWrite`, possibly a multi-statement `ExprStmt` chain, or a
@@ -445,7 +464,7 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
    an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
    `Compose([iter, λ target → body])`, with feeds/yields already routed in step 4 — so a generator
    or bare side-effect loop needs no letrec at all. Trailing induction reads → `final_or_default(history,
-   init)`; a `Txn` read fed out of a read-only block → a broadcast of the register history over the
+   init)`; a `Txn` read fed out of a read-only block → a broadcast of the history over the
    enclosing loop, which planning latches through the as-of read.
 
 Stateless programs never build a letrec — the phase degenerates to plain feed routing.
@@ -476,9 +495,19 @@ Note the mix: `balance` is transactional; `cnt` is a plain induction accumulator
 *inside* the transaction block. **In the model** this is legal — `cnt`'s writes sequence on the incr
 loop's induction domain, independent of the commit order, so `cnt` does not join `balance` in the
 atomic commit (it is absent from `incr_commits` below). Writing an induction accumulator inside a
-`with begin():` block is **not yet implemented** (see [Not yet implemented](#not-yet-implemented)) —
-write `cnt += 1` in the loop body *outside* the block for the same result today. (A write to `balance`
-*outside* a `with begin():` block is rejected in both the model and the implementation.)
+`with begin():` block **is implemented for a bare, top-level write**: the transaction phase partitions
+the block by register domain, lifting each top-level-spine induction `MutWrite` onto the enclosing loop
+as its own recurrence while the register writes form the commit decision. Because the write is lifted
+out entirely, block placement is *inert* for it — a bare in-block induction write is **exactly the
+out-of-block form** (it fires once per iteration unconditionally, independent of whether the co-located
+transaction commits). A **guarded** in-block induction write (`if q: cnt += 1`) is a different matter:
+committing it only when the transaction commits needs commit-gated carry-forward (the value-`Case`
+machinery upstack), so today it is **rejected** (`check_no_guarded_induction_writes`) rather than
+silently lifted with the wrong (unconditional) semantics. A commit *decision* that reads an induction accumulator
+(`balance += cnt`) **is also implemented** — the accumulator is threaded through the writer source and
+the commit engine co-iterates it (see [Reading an induction accumulator in a commit
+decision](#reading-an-induction-accumulator-in-a-commit-decision)). (A write to `balance` *outside* a
+`with begin():` block is rejected in both the model and the implementation.)
 
 After mut_elim (with `IncrIdx`/`GetIdx` the two request-source domains):
 
@@ -495,7 +524,7 @@ letrec
               (time: t, write: balance(t) + 1)
 in
     ( incr_resps: λ r → incr_commits(r) ▷ (λ c → "ok " + cnt(r) + "\n"),
-      get_resps:  begin_get ≫ balance )
+      get_resps:  read_at_get ≫ balance )
 ```
 
 Reading it off:
@@ -510,10 +539,20 @@ Reading it off:
 - **`cnt`** — the induction recurrence, self-referential through `get_prev_seq` (causal); its domain is `IncrIdx`, not
   `Txn`, because its annotation said so.
 - **`incr_resps`** — the reply for `𝑟` depends on `incr_commits(𝑟)` (then discards it): the reply is
-  sequenced after the commit, so a client that receives `ok 2` then GETs observes `≥ 2` (external
-  consistency, given the oracles' arrival-order monotonicity).
-- **`get_resps`** — the temporal read: assign the GET a commit time, read the register's history there,
-  reply indexed by the GET request loop. No commit record, no write set — composition.
+  sequenced after the commit.
+- **`get_resps`** — the fed-out register read: `read_at_get` picks the GET's *observation time* (a `Txn`
+  position — wherever the read lands in the commit order) and `balance` is sampled there, replied
+  indexed by the GET request loop. This is the **same store-level-timestamp mechanism** the `AsOf`
+  sections describe as "a sample at an arbitrary observation-time position": the read takes a timestamp
+  at its observation point and returns the committed prefix as of that time — described uniformly here
+  and there, not as rival semantics. `read_at_get` is deliberately *not* a `begin_<site>` oracle: a
+  read-only block mints none — it commits nothing, produces no `{time, write}` record, and takes no
+  commit slot (`begin_<site>`/`BeginTxn` is the *writer* oracle only). It is pure composition, no
+  commit record, no write set. **External consistency** is a real property of this same mechanism (not
+  a competing guarantee): a GET issued *after* a POST's `ok`-reply lands at an observation time ≥ that
+  POST's commit (arrival-order monotonicity), so a client that sees `ok 2` then GETs observes `≥ 2`;
+  a read with no such causal ordering samples an *arbitrary* position among concurrent commits — which
+  is all the "arbitrary as-of" of the `AsOf` sections means.
 
 ## Semantics
 
@@ -532,8 +571,9 @@ Reading it off:
   program that needs the counter transactionally consistent with the register declares it
   `Mut[Int, Txn]`.
 - **Liveness.** Induction domains are finite or stream-complete; `Txn` histories complete when all
-  writer sources do. A terminal read resolves only on a complete history; a temporal read reads as-of
-  its own position and does not wait for completeness.
+  writer sources do. A fed-out `Txn` register read reads as-of its own position in the commit clock
+  and does not wait for completeness — there is no term that denotes a complete-history read of a
+  register (a future `await_final` would be that term).
 
 ## Ordering and concurrency
 
@@ -587,6 +627,16 @@ contrast is the point:
 order of a feed `++`-union across multiple feeders (or several feeds in one body), and the multi-writer
 commit-stream merge order for one register. These are stated where they arise and left open here.
 
+A larger open point: a transaction's denotation depends on its commit order, but only a loop over a
+**live external stream** (a `DataSource`) actually *pins* that order — real arrival order is the
+denotational anchor. A **standalone** `with begin():` (the synthesized `[unit]` singleton) and a
+**literal-list loop** leave the order to the engine's serialization (`drain_start`), so any
+order-sensitive body has arbitrary denotation there. Today the batch test programs pass only because
+their bodies are commutative (see `tests/compilation_pipeline/transactions.rs`); they are effectively
+engine tests. The principled fix — rejecting transactions whose commit order isn't context-defined, and
+an explicit construct to anchor a block's timing to program events (a register *final* read is one
+instance of the missing construct) — is a follow-up design pass, not settled here.
+
 ## Loop planning (`plan_loops`): letrec patterns → the Transact carrier
 
 `plan_loops` (in `planning/loops.rs`) runs **after `lambda_elim`**, on the letrec's point-free normal
@@ -606,7 +656,7 @@ causal matcher (`letrec::check_letrec_causal`).
 |---|---|
 | a binding referenced only via `get_prev_seq(𝑏, …)`, over a finite/stream induction domain | `Recurse` — the sequential loop engine |
 | commit-record bindings + `begin_<site>` oracles + `Txn` histories read via `get_prev_txn` | the commit operator (`CommitOperator`, `TransactWriter`, cyclic `FanOut`, `StoreValueStream`) |
-| a `Txn` history read out of a read-only block (`begin_<site> ≫ balance`) | the as-of read (`AsOf`), latching the store's latest-decided commit, indexed by the outer trigger loop |
+| a `Txn` history read out of a read-only block (any reading loop — a live request stream, a finite loop, or a standalone singleton) | the as-of read (`AsOf`), latching the store's value as of the reading transaction's position, indexed by the outer reading loop |
 | a non-causal cycle, or a causal shape loop planning does not know | compile error (no silent fallback) |
 
 ### The runtime engines
@@ -622,15 +672,25 @@ causal matcher (`letrec::check_letrec_causal`).
   snapshot. Disjoint footprints commit concurrently; overlapping ones serialize. `release` is the
   commit acknowledgment (the retry signal rides the existing producer/consumer channel). The store
   compacts by the MVCC law and GCs the released prefix.
-- **`AsOf`** — the as-of (temporal) join, for a cross-endpoint temporal read. Given a *trigger* (the
-  request stream — the positions to sample at) and a *source* (a store's `StoreValueStream`), it
-  latches, for each trigger position, the source's latest-decided value at the moment that position
-  is first observed. The output is indexed by the **trigger** (the outer request loop), not the
-  commit clock — which is why a temporal reply matches its request by position and needs no explicit
-  correlation id. It is the dual of the commit `Recurse`: `Recurse` latches a private accumulator
-  per source step; `AsOf` latches a foreign stream's head per trigger step. The terminal read is
-  the degenerate case — a standalone read-only transaction's singleton trigger latches the final
-  committed value.
+- **`AsOf`** — the as-of (temporal) join: **every** fed-out `Txn` register read, regardless of the
+  reading loop's domain. Given a *trigger* (the reading loop — the positions to sample at) and a
+  *source* (the store), it latches, for each trigger position, the store's value as of the moment
+  that position is first observed. The output is indexed by the **trigger** (the outer reading loop),
+  not the commit clock — which is why a reply matches its reader by position and needs no explicit
+  correlation id. It is the dual of the commit `Recurse`: `Recurse` latches a private accumulator per
+  source step; `AsOf` latches the store's current value per trigger step. It is a *sample at
+  observation time* — an arbitrary as-of position, which is exactly the read a transaction gets: the
+  store as of where it lands in the commit order. There is no separate terminal/final read operator
+  for a register, because no term requests the final value (a future `await_final` would). A
+  standalone read is just the singleton-trigger case of the same `AsOf`; under the batch scheduler it
+  observes the drained store, but that coincidence is not part of the semantics.
+- **`StoreValueStream`** — projects one key's `CommitTs ⇀ V` commit-value stream by folding the
+  store changelog. It backs the **in-block reply tap** (`out << e` inside a block — a per-commit,
+  commit-tick-indexed event stream) and is the fold `AsOf` samples. It is *not* reduced by
+  `ExtractLast` for a register read — that path (a fold-to-completion "final register value") does
+  not exist. `ExtractLast` itself remains, but for the two genuinely-terminating histories that do
+  have a final: a post-loop **induction** accumulator, and the **broadcast source** (a sibling
+  induction loop's final, broadcast into a commit decision).
 
 The two loop engines are **not interchangeable**: the commit operator is built for an open commit
 clock and mis-drives an incremental/live source, while `Recurse` is the ordered loop recurrence.
@@ -671,6 +731,99 @@ affordable by that complete compile-time knowledge.
 - **Recursively-defined values** generally — the `LetRec` node and causality check are the general
   mechanism; only loop-planning patterns need to grow.
 
+## Reading an induction accumulator in a commit decision
+
+A commit decision may read an induction accumulator at its request position
+(`with begin(): balance += cnt` — the register write folds in `cnt(r)`). The intended letrec is the
+[worked example](#worked-example)'s: `𝑐𝑛𝑡` (induction, `IncrIdx`) and `balance`/`incr_commits`
+(transaction, `Txn`) mutually in scope, so `incr_commits(𝑟)` reads `𝑐𝑛𝑡(𝑟)`.
+
+**CCL — outer induction letrec, accumulator threaded through the writer source.** The transaction
+phase folds the entangled induction loop (via `fold_induction_loop`, shared with `transform_loop`)
+into its own **outer** single-binding induction letrec wrapping the transaction letrec — dependency
+order, since `incr_commits` reads `𝑐𝑛𝑡` and `𝑐𝑛𝑡` is self-guarded — so `recognize` nests the two
+carriers (`Recurse` outer, commit engine inner) with **no** cross-domain group logic. The read itself
+rides the **writer source**: an accumulator the decision reads is zipped into the source,
+`source ↦ λ 𝑟 → (reqs(𝑟), 𝑐𝑛𝑡-view(𝑟)) : 𝐼 ⇒ (item, 𝑉)`, and the decision body reads it off the item
+tuple's slot. This keeps recognition's writer round-trip intact — `recover_writer` lifts the source
+verbatim (a `zip` is opaque to its shape parser), so no recognition change is needed.
+
+**Engine — co-iterating the accumulator with the loop source.** Two small changes carry it:
+
+- *`zip` conversion.* A register-read arm of a `zip` (`__cnt.acc`) is a **leaf** source over its own
+  domain, not an iteration-driven morphism. The generic `zip` path converts such an arm with *no*
+  input (rather than fanning the shared iteration input into it, which it would reject); `fan_in`
+  then co-aligns the leaf accumulator stream with the input-driven request stream by domain position.
+- *Source decoding.* The co-iterated source's codomain is a `Record` (the `(item, acc(𝑟))` tuple);
+  `decode_source_items` decodes each position into a `Value::Record`, which the writer body reads off
+  its `._0` / `._𝑖` slots.
+
+The accumulator stream is on the writer's own request domain, so it is position-aligned and needs no
+as-of latch. The `balance ↔ incr_commits` cycle is unchanged (`get_prev_txn`-guarded); `𝑐𝑛𝑡` sits
+outside it, read-only to the transaction, so guardedness is unaffected. No new operator — the
+existing `zip`/`fan_in` co-iteration plus a wider source decode.
+
+### Co-indexed vs. cross-loop (broadcast)
+
+The above is the **co-indexed** case: `𝑐𝑛𝑡` is written by the transaction's *own* loop, so its value
+is request-indexed and threads through the writer source. When the decision instead reads an
+accumulator written by a **different, already-completed loop** (`for i in xs: cnt += 1` *then*
+`for r in reqs: with begin(): balance -= cnt`), there is no per-request correspondence between the two
+loops' domains — the read is that accumulator's **final** value, the same scalar broadcast into every
+transaction. The phase distinguishes the two by the site's *enclosing-loop write set*
+(`RawSite::enclosing_writes`, from `loop_induction_writes`): an accumulator in it is co-indexed
+(zipped into the source); one not in it is broadcast — its read is bound to the loop's
+`final_or_default` final (`cross.reads`, in scope in the writer body), which op-conversion compiles to
+a `Constant` broadcast (via `MapResultToConst`) over the transaction domain.
+
+The one engine subtlety is **driving** that broadcast to convergence. The final's `ExtractLast` is
+empty until the sibling loop's `Recurse` drains (one position per body pull), and nothing external
+re-pulls the writer: the store's own convergence loop stops once the commit frontier stalls, and the
+frontier cannot advance until this writer commits, which needs the value still converging. The writer
+resolves this the same way `Recurse` resolves its own one-step-per-pull convergence (see #291): when
+its decision body is not ready, it re-arms itself on the scheduler's **deferred-wakeup queue**
+(`WakeupQueue::request`) and returns non-terminal, keeping its pending body-input row so a re-pull
+reuses it (a re-push would duplicate a buffer position against the body's `Memo`). Each demand-driven
+re-pull advances the sibling loop one step until the decision is ready — no blocking loop inside
+`get`, and it composes with an async sibling source (the source's own notification drives the
+re-pulls). A fed-out read *of* the result register is an `AsOf` (an in-block reply tap, or a trailing
+standalone read), which demand-drives this convergence: each committed reply pulls the writer, which
+advances the sibling loop, exactly as an in-block reply drives the writer in the co-indexed case. The
+co-indexed and non-cross paths are untouched.
+
+(Note the asymmetry: the broadcast **source** — the sibling induction loop's accumulator — *does*
+have a final, read via `ExtractLast`, because an induction loop terminates and its last value is
+denotable. The result **register** does not: a `Txn` register has no final-value term, so reads of it
+are `AsOf`, never `ExtractLast`.)
+
+## Replies: live cross-endpoint reads and commit-ordered taps
+
+A `<<` reply takes one of two forms, by where it sits relative to the `with begin():` block.
+
+**As-of read (reply *of* a register, outside the writing block).** A read-only block
+`with begin(): resp << 𝑒` reading a `Txn` register replies the register as of the reading transaction's
+position. The pre-lambda-elim `rewrite_live_reads` turns it into an as-of join indexed by the reading
+loop, not the commit clock — uniformly, whether that loop is a live request stream, a finite loop, or
+a standalone singleton (the live cross-endpoint read is one instance, not a distinct compilation).
+Three shapes:
+
+- **one register** — `as_of((trigger, balance.f)) ≫ (λ 𝑘 → 𝑒)` (`resp << balance`, `resp << balance + 1`);
+- **several at one snapshot** — `as_of((trigger, {fᵢ: histᵢ})) ≫ (λ snap → 𝑒[𝑘ᵢ ↦ snap.fᵢ])`
+  (`resp << a + b`), one whole-register snapshot per request (§I-c);
+- **request element combined with a register read** — `zip((trigger, as_of((trigger, source)))) ≫ (λ p
+  → 𝑒[req ↦ p.0, 𝑘ᵢ ↦ p.1(.fᵢ)])` (`resp << balance + req`): the request rides alongside its register
+  snapshot. The `as_of` arm is a leaf that op-conversion's `zip` co-iterates with the request stream
+  (the same `is_leaf_zip_arm` path as the commit-decision read above) — no new operator.
+
+**Commit-ordered / commit-gated reply (reply *inside* the writing block).** A `<<` inside the block
+rides the writer decision as a `to_<defer>` tap, committed atomically with the register write and
+read back as a per-commit value-stream (commit-tick-indexed). So it is **sequenced after the commit**
+and **gated**: a denied transaction (`if 𝑝:` false) proposes no write and emits no tap, replying
+nothing. The tap may read an induction accumulator (`resp << cnt`), which composes with the
+commit-decision co-iteration above. Contrast a sibling reply *outside* the block (`resp << cnt`),
+which rides the induction domain and fires every iteration regardless of commit — value-correct,
+request-indexed, but not commit-ordered. To gate or commit-order a reply, put it in the block.
+
 ## Not yet implemented
 
 These features belong to the model above but are not yet built. Each is rejected at compile time
@@ -706,20 +859,6 @@ both need a *value-selecting* `Case` (`x = if 𝑝: 𝑒₁ else: 𝑒₂`) as a
 `lambda_elim`. The planned fix (refinement-based fan-out, lowering a value `Case` to a union of
 restricts `⧺ᵢ (source | pathᵢ ≫ 𝑒ᵢ)`) unblocks both the transaction conditionals and the same-shaped
 N-arm Case-with-feeds gap.
-
-### Induction accumulator written inside a `with begin():` block
-
-The model allows a plain induction accumulator to be written inside a transaction block — its writes
-sequence on the loop's induction domain, independent of the commit order (see the [worked
-example](#worked-example)). Lowering rejects it today; write the induction `+=` in the loop body
-*outside* the block for the same result.
-
-### Live reply combining the request element with a register read
-
-A cross-endpoint temporal read may read one or several registers (`resp << balance`, `resp << a + b`); the
-reply is indexed by the request loop and served by an as-of join. A reply that combines the request
-element *with* a register read (`resp << balance + req`) is a function of both the trigger and the register
-(wanting a `zip(trigger, as_of)` shape) and is **rejected** rather than compiled to a silent hang.
 
 ### `with t = begin():` transaction handle
 

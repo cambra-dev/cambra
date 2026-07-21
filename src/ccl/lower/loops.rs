@@ -64,6 +64,18 @@ fn stmt_has_feed(stmt: &Spanned<ChlStmt>) -> bool {
     }
 }
 
+/// Whether the loop body contains a top-level `with begin():` transaction block.
+///
+/// A routing predicate, like [`for_body_has_yield`]/[`for_body_has_feed`]: a
+/// for-loop whose body has a `with` block (with or without sibling induction
+/// writes/feeds) takes the direct-mirror `For` path, where the block lowers to a
+/// [`TypedExprNode::Begin`] marker `transact_phase` later strips. (A `with`
+/// nested under an `if`/inner `for` is not this shape; the body walker rejects
+/// it.)
+pub(super) fn for_body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
+    stmts.iter().any(|s| matches!(s.node, ChlStmt::With { .. }))
+}
+
 /// Return `true` if the loop body's **terminal** statement is a bare *effect*
 /// expression — a call (or other expression) that is neither a `yield` nor a
 /// `<<` feed, e.g. `for x in xs: bump(cnt)`. Such a terminal is a hidden-writer
@@ -143,13 +155,16 @@ pub(super) fn lower_generator_for(
         let frame_introduced = HashSet::from([iter_var.clone()]);
         // Plain yield without loop-carried mutation: desugar yield → defer + feed.
         let defer_name = ctx.fresh_result_name();
-        let for_body = lower_for_body_stmts(
-            body,
-            Some(&defer_name),
-            outer_bindings,
-            frame_introduced,
-            ctx,
-        )?;
+        // The loop target shadows a like-named transactional register in the body.
+        let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
+            lower_for_body_stmts(
+                body,
+                Some(&defer_name),
+                outer_bindings,
+                frame_introduced,
+                ctx,
+            )
+        })?;
         let for_node = Expr::for_loop(iter_var, source, for_body);
         let seq = Expr::expr_stmt(for_node, Expr::var(defer_name.clone()));
         Ok(Expr::let_bind(
@@ -160,7 +175,10 @@ pub(super) fn lower_generator_for(
     } else {
         let source = lower_expr(iter, ctx)?;
         let frame_introduced = HashSet::from([iter_var.clone()]);
-        let for_body = lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)?;
+        // The loop target shadows a like-named transactional register in the body.
+        let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
+            lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)
+        })?;
         Ok(Expr::for_loop(iter_var, source, for_body))
     }
 }
@@ -286,6 +304,16 @@ fn lower_for_body_stmts(
                 frame_introduced.insert(name_str.clone());
                 bindings.push((name_str, func_expr, None));
             }
+            // A `with begin():` transaction inside a *generator* loop body is a
+            // later increment; top-level and simple `for … with begin():` loops
+            // are lowered in `stmts.rs`/`transactions.rs`.
+            ChlStmt::With { .. } => {
+                return Err(LoweringError::unsupported(
+                    stmt.span,
+                    "a `with begin():` transaction inside a generator/nested for-loop body \
+                     is not yet supported",
+                ));
+            }
             _ => {
                 return Err(LoweringError::unsupported(
                     stmt.span,
@@ -402,10 +430,20 @@ fn lower_for_body_terminal(
             let mut inner_mutation_scope = mutation_scope.clone();
             inner_mutation_scope.extend(frame_introduced.iter().cloned());
             let inner_frame = HashSet::from([inner_var.clone()]);
-            let inner_body =
-                lower_for_body_stmts(body, defer_name, &inner_mutation_scope, inner_frame, ctx)?;
+            // The inner loop target shadows a like-named transactional register.
+            let inner_body = ctx.with_shadowed([inner_var.clone()], |ctx| {
+                lower_for_body_stmts(body, defer_name, &inner_mutation_scope, inner_frame, ctx)
+            })?;
             Ok(Expr::for_loop(inner_var, inner_source, inner_body))
         }
+        // A `with begin():` transaction as a *generator* loop-body terminal is a
+        // later increment; top-level and simple `for … with begin():` loops are
+        // lowered in `stmts.rs`/`transactions.rs`.
+        ChlStmt::With { .. } => Err(LoweringError::unsupported(
+            stmt.span,
+            "a `with begin():` transaction inside a generator/nested for-loop body \
+             is not yet supported",
+        )),
         _ => Err(LoweringError::unsupported(
             stmt.span,
             "for-loop body must end in a yield, `<<` feed, nested for, or if-guard",
@@ -567,128 +605,147 @@ pub(super) fn lower_direct_mirror_loop(
     let source = lower_expr(iter, ctx)?;
 
     // Build the statement chain right-to-left, ending in Unit (the For's
-    // body is a statement, not a value).
-    let mut chain = Expr::lit(Lit::Unit);
-    for stmt in body_stmts.iter().rev() {
-        chain = match &stmt.node {
-            // `x = value` — a plain immutable binding. Inside a loop body it
-            // is a per-iteration shadowing `let`, *never* a mutable write: `=`
-            // is not a mutation operator (accumulators are written with `:=`
-            // / `+=`). A loop-carried accumulator therefore never appears here.
-            ChlStmt::Assign { target, value } => {
-                let name = extract_name_target(target, "assignment")?;
-                let val = lower_expr(value, ctx)?;
-                Expr::let_bind(name, val, chain)
-            }
-            ChlStmt::AugAssign { target, op, value } => {
-                let name = extract_name_target(target, "augmented assignment")?;
-                let val = lower_aug_binop(&name, *op, value, ctx)?;
-                if acc_names.contains(&name) {
-                    Expr::expr_stmt(Expr::mut_write(name, val), chain)
-                } else {
+    // body is a statement, not a value). The loop target is in scope over the
+    // body — shadow it so a body read of a like-named transactional register is
+    // read as the loop local, not gated as an out-of-block register read.
+    let chain = ctx.with_shadowed([iter_var.clone()], |ctx| {
+        let mut chain = Expr::lit(Lit::Unit);
+        for stmt in body_stmts.iter().rev() {
+            chain = match &stmt.node {
+                // `x = value` — a plain immutable binding. Inside a loop body it
+                // is a per-iteration shadowing `let`, *never* a mutable write: `=`
+                // is not a mutation operator (accumulators are written with `:=`
+                // / `+=`). A loop-carried accumulator therefore never appears here.
+                ChlStmt::Assign { target, value } => {
+                    let name = extract_name_target(target, "assignment")?;
+                    check_mut_write_context(&name, stmt.span, ctx)?;
+                    let val = lower_expr(value, ctx)?;
                     Expr::let_bind(name, val, chain)
                 }
-            }
-            // `x := value` — a mutable write inside the loop body. A write to
-            // an accumulator is a `MutWrite` (the recurrence the phase
-            // threads); a `:=` to any other name is a per-iteration local
-            // `let`. An annotated `:=` intro inside the loop is rejected, like
-            // the `Mut[…]` declaration below — accumulators are declared
-            // before the loop.
-            ChlStmt::MutAssign {
-                target,
-                annotation,
-                value,
-            } => {
-                let name = extract_name_target(target, "mutable assignment")?;
-                if annotation.is_some() && !acc_names.contains(&name) {
-                    return Err(LoweringError::unsupported(
-                        stmt.span,
-                        "a `:=` accumulator declaration inside a for-loop body is not \
-                             supported; declare the accumulator before the loop",
-                    ));
+                ChlStmt::AugAssign { target, op, value } => {
+                    let name = extract_name_target(target, "augmented assignment")?;
+                    check_mut_write_context(&name, stmt.span, ctx)?;
+                    let val = lower_aug_binop(&name, *op, value, ctx)?;
+                    if acc_names.contains(&name) {
+                        Expr::expr_stmt(Expr::mut_write(name, val), chain)
+                    } else {
+                        Expr::let_bind(name, val, chain)
+                    }
                 }
-                let val = lower_expr(value, ctx)?;
-                if acc_names.contains(&name) {
-                    Expr::expr_stmt(Expr::mut_write(name, val), chain)
-                } else {
-                    Expr::let_bind(name, val, chain)
-                }
-            }
-            // `y: T = value` — an ordinary annotated per-iteration local, the
-            // annotated counterpart of the plain `y = value` binding above.
-            // Lowers to an annotated shadowing `let` (never a `MutWrite`: a
-            // `Mut[…]` accumulator must be declared *before* the loop, matching
-            // `lower_for_body_stmts`).
-            ChlStmt::AnnAssign {
-                target,
-                annotation,
-                value,
-            } => {
-                let name = extract_name_target(target, "annotated assignment")?;
-                if mut_annotation_parts(annotation).is_some() {
-                    return Err(LoweringError::unsupported(
-                        stmt.span,
-                        "a `Mut[…]` declaration inside a for-loop body is not \
-                             supported; declare the accumulator before the loop",
-                    ));
-                }
-                let ann = lower_type_annotation(annotation)?;
-                let val = lower_expr(value, ctx)?;
-                Expr::let_bind_annotated(name, val, chain, ann)
-            }
-            // `o << value` — an in-loop feed. Emitted as a raw `Feed` marker
-            // (reads stay bare); the phase resolves its value in the
-            // read-your-writes environment and hoists it out of the loop.
-            ChlStmt::Expr(value)
-                if let ChlExpr::Feed {
-                    target: feed_target,
-                    value: feed_value,
-                } = &value.node =>
-            {
-                let defer_name = match &feed_target.node {
-                    ChlExpr::Name(id) => id.as_str().to_string(),
-                    _ => {
+                // `x := value` — a mutable write inside the loop body. A write to
+                // an accumulator is a `MutWrite` (the recurrence the phase
+                // threads); a `:=` to any other name is a per-iteration local
+                // `let`. An annotated `:=` intro inside the loop is rejected, like
+                // the `Mut[…]` declaration below — accumulators are declared
+                // before the loop.
+                ChlStmt::MutAssign {
+                    target,
+                    annotation,
+                    value,
+                } => {
+                    let name = extract_name_target(target, "mutable assignment")?;
+                    if annotation.is_some() && !acc_names.contains(&name) {
                         return Err(LoweringError::unsupported(
-                            feed_target.span,
-                            "feed target: only simple name targets are supported",
+                            stmt.span,
+                            "a `:=` accumulator declaration inside a for-loop body is not \
+                             supported; declare the accumulator before the loop",
                         ));
                     }
-                };
-                let lowered = lower_expr(feed_value, ctx)?;
-                Expr::expr_stmt(Expr::feed(defer_name, lowered), chain)
-            }
-            // `yield value` — a feed into the surrounding generator's defer.
-            ChlStmt::Expr(value) if let ChlExpr::Yield(y) = &value.node => {
-                let defer_name = yield_defer.ok_or_else(|| {
-                    LoweringError::unsupported(
-                        value.span,
-                        "yield outside a generator for-loop context",
-                    )
-                })?;
-                let lowered = lower_expr(y, ctx)?;
-                Expr::expr_stmt(Expr::feed(defer_name.to_string(), lowered), chain)
-            }
-            // A bare expression statement — the `Feed`/`Yield` guards above
-            // did not match, so this is an ordinary side-effect (e.g. a call
-            // to a pass-by-reference writer, `bump(cnt)`). Sequence it before
-            // the rest; its value is discarded (the loop body is a statement).
-            // Post-inline it may reveal a `MutWrite` (accumulator loop) or turn
-            // out pure (the phase drops the loop as a no-op).
-            ChlStmt::Expr(value) => {
-                let lowered = lower_expr(value, ctx)?;
-                Expr::expr_stmt(lowered, chain)
-            }
-            _ => {
-                return Err(LoweringError::unsupported(
-                    stmt.span,
-                    "only assignments (`x = …`, `x op= …`), `<<` feeds, \
-                         `yield`, and bare side-effect calls are supported inside \
-                         a mutation loop body",
-                ));
-            }
-        };
-    }
+                    check_mut_write_context(&name, stmt.span, ctx)?;
+                    let val = lower_expr(value, ctx)?;
+                    if acc_names.contains(&name) {
+                        Expr::expr_stmt(Expr::mut_write(name, val), chain)
+                    } else {
+                        Expr::let_bind(name, val, chain)
+                    }
+                }
+                // `y: T = value` — an ordinary annotated per-iteration local, the
+                // annotated counterpart of the plain `y = value` binding above.
+                // Lowers to an annotated shadowing `let` (never a `MutWrite`: a
+                // `Mut[…]` accumulator must be declared *before* the loop, matching
+                // `lower_for_body_stmts`).
+                ChlStmt::AnnAssign {
+                    target,
+                    annotation,
+                    value,
+                } => {
+                    let name = extract_name_target(target, "annotated assignment")?;
+                    if mut_annotation_parts(annotation).is_some() {
+                        return Err(LoweringError::unsupported(
+                            stmt.span,
+                            "a `Mut[…]` declaration inside a for-loop body is not \
+                             supported; declare the accumulator before the loop",
+                        ));
+                    }
+                    let ann = lower_type_annotation(annotation)?;
+                    let val = lower_expr(value, ctx)?;
+                    Expr::let_bind_annotated(name, val, chain, ann)
+                }
+                // `o << value` — an in-loop feed. Emitted as a raw `Feed` marker
+                // (reads stay bare); the phase resolves its value in the
+                // read-your-writes environment and hoists it out of the loop.
+                ChlStmt::Expr(value)
+                    if let ChlExpr::Feed {
+                        target: feed_target,
+                        value: feed_value,
+                    } = &value.node =>
+                {
+                    let defer_name = match &feed_target.node {
+                        ChlExpr::Name(id) => id.as_str().to_string(),
+                        _ => {
+                            return Err(LoweringError::unsupported(
+                                feed_target.span,
+                                "feed target: only simple name targets are supported",
+                            ));
+                        }
+                    };
+                    let lowered = lower_expr(feed_value, ctx)?;
+                    Expr::expr_stmt(Expr::feed(defer_name, lowered), chain)
+                }
+                // `yield value` — a feed into the surrounding generator's defer.
+                ChlStmt::Expr(value) if let ChlExpr::Yield(y) = &value.node => {
+                    let defer_name = yield_defer.ok_or_else(|| {
+                        LoweringError::unsupported(
+                            value.span,
+                            "yield outside a generator for-loop context",
+                        )
+                    })?;
+                    let lowered = lower_expr(y, ctx)?;
+                    Expr::expr_stmt(Expr::feed(defer_name.to_string(), lowered), chain)
+                }
+                // A bare expression statement — the `Feed`/`Yield` guards above
+                // did not match, so this is an ordinary side-effect (e.g. a call
+                // to a pass-by-reference writer, `bump(cnt)`). Sequence it before
+                // the rest; its value is discarded (the loop body is a statement).
+                // Post-inline it may reveal a `MutWrite` (accumulator loop) or turn
+                // out pure (the phase drops the loop as a no-op).
+                ChlStmt::Expr(value) => {
+                    let lowered = lower_expr(value, ctx)?;
+                    Expr::expr_stmt(lowered, chain)
+                }
+                // `with begin(): <block>` — a per-iteration transaction, emitted
+                // as a `Begin` marker (one statement in the loop body). Its
+                // atomic writes/reads live in the block; sibling induction `+=`
+                // writes and `<<` feeds around it stay on this loop body.
+                // `transact_phase` strips the `Begin` into a commit-record site
+                // keyed on this loop and leaves the induction remainder for the
+                // recurrence — which is what lets one loop mix both.
+                ChlStmt::With { .. } => {
+                    let block = lower_with_block(stmt, ctx)?;
+                    Expr::expr_stmt(Expr::begin(block), chain)
+                }
+                _ => {
+                    return Err(LoweringError::unsupported(
+                        stmt.span,
+                        "only assignments (`x = …`, `x op= …`), `<<` feeds, \
+                         `yield`, `with begin():` transactions, and bare \
+                         side-effect calls are supported inside a for-loop body",
+                    ));
+                }
+            };
+        }
+        Ok::<Expr, LoweringError>(chain)
+    })?;
 
     let for_node = Expr::new(TypedExprNode::For {
         target: TypedBinding {
@@ -895,6 +952,41 @@ in guarded_let"
     // -----------------------------------------------------------------------
     // Generator function negative / mutation-loop tests
     // -----------------------------------------------------------------------
+
+    /// A `with begin():` block that neither writes a transactional register nor
+    /// feeds a read does nothing observable and is rejected. Covers standalone,
+    /// middle, and loop-body positions — here `x`/`y` are plain locals, not
+    /// `Mut[_, Txn]` stores, and there is no feed.
+    #[test]
+    fn test_with_begin_requires_effect() {
+        for code in [
+            "with begin():\n    x = 1\nx",
+            "with begin():\n    x = 1\ny = 2\ny",
+            "for r in [1]:\n    with begin():\n        x = 1\nx",
+        ] {
+            let stmts = parse_module(code);
+            let err = expect_one_lowering_error(&stmts);
+            let LoweringError::Unsupported { message: msg, .. } = &err;
+            assert!(
+                msg.contains("must do something"),
+                "expected a `with begin()` no-effect error, got: {msg}"
+            );
+        }
+    }
+
+    /// `store: Mut[int, Txn] := 0` lowers as a plain `let store = 0`, registering
+    /// `store` transactional. A *bare* trailing read is then rejected — a
+    /// transactional register may be read only inside a `with begin():` block.
+    #[test]
+    fn test_mut_txn_bare_read_rejected() {
+        let stmts = parse_module("store: Mut[int, Txn] := 0\nstore");
+        let err = expect_one_lowering_error(&stmts);
+        let LoweringError::Unsupported { message: msg, .. } = &err;
+        assert!(
+            msg.contains("inside a `with begin():` block"),
+            "expected a `with begin():` hint for a bare transactional read, got: {msg}"
+        );
+    }
 
     /// Augmented assignment to iter var (shadowing) in a generator for-loop.
     /// This is NOT a yield — the for-loop body ends in `bad` (the bare var),

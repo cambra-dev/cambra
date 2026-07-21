@@ -463,6 +463,11 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
 
         TypedExprNode::Defer => (Precedence::Atom, "defer".to_string()),
 
+        TypedExprNode::Begin { body } => {
+            let body_str = fmt(body, Precedence::Lowest, opts);
+            (Precedence::Atom, format!("begin {{ {body_str} }}"))
+        }
+
         TypedExprNode::Error => (Precedence::Atom, "<error>".to_string()),
     };
     if opts.show_types {

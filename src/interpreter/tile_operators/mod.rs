@@ -281,6 +281,38 @@ pub trait TileProducer {
     }
 }
 
+/// A producer that participates in a cyclic operator graph as an **append-only,
+/// position-stable sequencing source** — the `Recurse` feedback idiom and the
+/// commit operator both rely on this contract:
+///
+/// 1. Its output tile is append-only along the sequencing domain: a value once
+///    emitted at a position is never changed (only `release` shrinks the view).
+/// 2. Positions are absolute and never shift; a released prefix may be compacted
+///    away, but the live suffix keeps its position values.
+/// 3. Because a released prefix desyncs a fanned branch, a stateful sequencing
+///    producer is wired with exactly one consumer (the cycle uses
+///    [`FanOut::new_cyclic`] around the *operator*; the producer itself is never
+///    fanned). Fanning one is a wiring bug, not a user error.
+/// 4. `release` is the acknowledgment: a released prefix signals the region is
+///    committed/consumed, and the producer advances its append/compaction cursor
+///    in response.
+///
+/// Implementing this trait is a deliberate statement that the producer obeys the
+/// contract above. Invariant (2)'s position-stability is maintained *by
+/// construction* (the engine/window appends immutable positions and only
+/// compacts released prefixes); [`Self::debug_assert_position_invariant`] does
+/// not re-derive it. It cheaply checks the producer's own append/compaction
+/// **bookkeeping** — the per-cursor/per-writer state whose desync is how a
+/// compaction or wiring bug would actually manifest — in debug builds.
+pub(crate) trait CyclicSequencingProducer: TileProducer {
+    /// Debug-only check of the append/compaction bookkeeping backing the
+    /// append-only / position-stable invariant (contract item 2), called from
+    /// the producer's `get` path — e.g. that per-writer cursors stay aligned
+    /// with the writer set. A failure is a compaction or wiring bug, not a user
+    /// error; a no-op in release builds.
+    fn debug_assert_position_invariant(&self);
+}
+
 /// Represents a step on a path through a Tile structure
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TilePathStep {

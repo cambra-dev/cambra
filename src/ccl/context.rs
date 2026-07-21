@@ -20,7 +20,7 @@ use crate::{
         lower::{LoweringContext, LoweringError, lower_stmts},
         mut_elim, planning,
         symbolic::{symbolic, symbolic_typed},
-        uniquify,
+        transact_phase, uniquify,
     },
     interpreter::{
         Consumer, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
@@ -582,6 +582,42 @@ pub fn compile_program(
         }
     })?;
 
+    // Transactional slice of the unified phase: rewrite every `with begin():`
+    // writer of a `Mut[_, Txn]` register into a `get_prev_txn`-guarded `LetRec`
+    // (histories + commit records over the commit domain), which
+    // `planning::plan_loops` destructures into the `Transact{…, Txn}` node
+    // op-conversion compiles to the commit engine — unifying the transaction and
+    // induction paths on one `LetRec` + recognition representation. Runs *before*
+    // `mut_elim` so the induction phase never sees a transaction loop. See
+    // src/ccl/design/mutability.md.
+    //
+    // Register-ness is the `Mut[_, Txn]` type; register identity is the α-unique
+    // binder `Name`. Both are read off the *inlined, typed* tree — so a
+    // cross-function writer's registers (its `transfer(a, b)` writes already
+    // beta-reduced to name `a`/`b`) are seen, and an unrelated local merely spelled
+    // like a register is not (its binder is a distinct `Name`). This replaces the
+    // lowering-time base-name registry.
+    let txn_registers = transact_phase::collect_txn_registers(&expr);
+    // A transactional writer reaching a `with begin():` block via a function call
+    // is a nested transaction — the callee's inlined `For` would otherwise be
+    // silently absorbed into the outer block's read-your-writes env, dropping its
+    // commit. Reject it before the phase strips the sites.
+    transact_phase::check_no_nested_transactions(&expr, &txn_registers)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    // An induction accumulator written inside a block with no register write is a
+    // no-atomicity transaction — rejected here (type-aware), not at lowering.
+    transact_phase::check_no_induction_only_transactions(&expr, &txn_registers)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    // A *guarded* in-block induction write (`if q: cnt += 1`) has no commit-gated
+    // lifting yet — reject it cleanly here rather than let it reach the phase's
+    // internal invariant assert (only a bare top-level in-block induction write is
+    // supported, and it is exactly the out-of-block form).
+    transact_phase::check_no_guarded_induction_writes(&expr, &txn_registers)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    expr = transact_phase::run(expr, &txn_registers);
+    debug!("Transact phase CCL:\n{}", symbolic(&expr));
+    check_pre_desugar(&expr).expect("transact phase produced an inconsistent tree");
+
     // The unified letrec phase: direct-mirror mutation loops (`For` /
     // `MutWrite`) become causal `LetRec` groups — mutable histories over
     // the induction domain, per src/ccl/design/mutability.md. Runs after
@@ -604,9 +640,25 @@ pub fn compile_program(
     // remain: channelization is type-preserving by construction and closes
     // channel domains by substitution; the strict `typecheck` below is the
     // release-visible enforcement.
-    let desugared = channelize::run(phase_out, /* input_typed= */ true).errs()?;
+    let mut desugared = channelize::run(phase_out, /* input_typed= */ true).errs()?;
     debug!("Channelized:\n{}", symbolic(&desugared));
     typecheck(&desugared).expect("channelize produced an ill-typed tree");
+
+    // Fed-out register reads: rewrite a read-only reply that reads a register out of
+    // its block into an outer-indexed as-of join (an as-of read at the reading
+    // transaction's arbitrary commit position), *before* lambda elimination — so a
+    // computed reply (`resp << balance + 1`) stays a lambda the elim pass point-frees,
+    // rather than a point-free `const` a planning-time recognizer would have to
+    // reject. Uniform across the reading loop's domain. See
+    // `transact_phase::rewrite_live_reads`.
+    transact_phase::rewrite_live_reads(&mut desugared);
+    // A fed-out read whose *shape* the rewrite doesn't recognize would fall through
+    // to an `ExtractLast`; beside a never-terminating request stream that never goes
+    // terminal and hangs. Reject that case with a clear error rather than hang the
+    // endpoint — a hang-guard, not a semantic gate. See `check_live_reads_resolved`.
+    transact_phase::check_live_reads_resolved(&desugared)
+        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
+    typecheck(&desugared).expect("live-read rewrite produced an ill-typed tree");
 
     let lambda_elim = lambda_elim::run(desugared).errs()?;
     debug!("λ-eliminated CCL:\n{}", symbolic(&lambda_elim));
