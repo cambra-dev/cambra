@@ -64,9 +64,12 @@ use crate::{
 ///
 /// Use [`eprint_errors`] for source-context rendering: parse, lowering, and
 /// span-carrying inference errors get ariadne reports with underlines; the
-/// remaining variants render as plain `error: …` lines. Lambda-elim/conversion
-/// spans remain future work; the enum is shaped so they migrate without
-/// changing the list-of-errors return contract.
+/// remaining variants render as plain `error: …` lines. The same
+/// [`CompileError`]s feed the web [`Diagnostic`](crate::inspector_model::Diagnostic)
+/// JSON path via [`diagnostics_from_compile_errors`](crate::inspector_model::diagnostics_from_compile_errors)
+/// — one error model, two renderers. Lambda-elim/conversion spans remain
+/// future work; the enum is shaped so they migrate without changing the
+/// list-of-errors return contract.
 #[derive(Debug)]
 pub enum CompileError {
     /// The parser rejected one token / token sequence.
@@ -579,10 +582,7 @@ pub struct CompiledProgram {
     /// every flush is a no-op — see [`provenance_capture_enabled`]. This is the
     /// authoritative provenance surface:
     /// [`materialize_panes`](Self::materialize_panes) folds it for each pane
-    /// pane pair.
-    // Consumed by `materialize_panes` and the inspector model; the compiler
-    // itself never reads it.
-    #[allow(dead_code)]
+    /// pair.
     pub(crate) provenance_table: ProvenanceTable,
     /// The parsed CHL surface AST — the source-of-truth for source-level
     /// (lexical) inspector queries.
@@ -590,7 +590,7 @@ pub struct CompiledProgram {
     /// This is the [`Module`](crate::chl_parser::ast::Module) lowering consumed,
     /// retained verbatim. It is the anchor for *source-language* questions —
     /// name resolution (`goto-definition`, the binder half of `scope-at`) —
-    /// answered by the inspector's name-binder index.
+    /// answered by [`crate::inspector_model::NameBinderIndex`].
     ///
     /// It is deliberately **distinct from [`post_inference_ir`](Self::post_inference_ir)**
     /// (the typed IR): lowering destroys some source variables before any IR

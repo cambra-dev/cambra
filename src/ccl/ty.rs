@@ -1623,7 +1623,7 @@ impl Type {
     /// [`TypedExpr`], not a `Type`).  Callers that need to walk a
     /// refinement's predicate must handle [`Type::Refinement`] explicitly
     /// — e.g. by matching on it before calling this helper.
-    pub fn walk_children(&self, mut f: impl FnMut(&Type)) {
+    pub fn walk_children<'a>(&'a self, mut f: impl FnMut(&'a Type)) {
         match self {
             Type::Base(_)
             | Type::UIntRange(_)

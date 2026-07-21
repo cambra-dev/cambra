@@ -74,7 +74,10 @@ impl CompiledProgram {
     /// The retained pane trees, in pipeline order, element for element with
     /// [`PANES`]. The length is [`PANES`]' own, so the two cannot disagree about
     /// how many panes there are.
-    fn pane_trees(&self) -> [&Expr; PANES.len()] {
+    ///
+    /// The inspector model reads this alongside [`PANES`] to build one snapshot
+    /// pane per entry.
+    pub(crate) fn pane_trees(&self) -> [&Expr; PANES.len()] {
         [
             &self.pre_inference_ir,
             &self.post_inference_ir,

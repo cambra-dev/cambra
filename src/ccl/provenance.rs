@@ -135,6 +135,16 @@ impl NodeId {
     pub fn fresh() -> Self {
         NodeId(FRESH_NODE_ID.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// The id's underlying number, for use as an opaque serialization handle
+    /// (the inspector wire shape carries a `NodeId` as a JSON number; see
+    /// [`crate::inspector_model`]). This is the *only* place the numeric value
+    /// is observed — internal logic compares ids by equality, never by value —
+    /// so it is exposed solely so a client can round-trip a handle, not to give
+    /// the value any in-compiler meaning.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 impl std::fmt::Debug for NodeId {
@@ -146,10 +156,10 @@ impl std::fmt::Debug for NodeId {
 // Wire shape (inspector, feature `serde`): a bare JSON number. A `NodeId` is an
 // opaque handle the client round-trips, so it serializes as its underlying
 // `u64`, read off the field directly, not as a struct. Hand-written rather than
-// `#[serde(transparent)]` because the inner field is private. There is no
-// accessor for the number: nothing in the compiler reads it — ids are compared
-// by equality — so the wire impl is its only reader, and an accessor can come
-// back when a caller needs one.
+// `#[serde(transparent)]` because the inner field is private. Nothing in the
+// compiler reads the number — ids are compared by equality — so the only
+// readers are this impl and [`NodeId::as_u64`], which the inspector model uses
+// to project an id onto the wire outside a `Serialize` context.
 //
 // TODO(wire-stability): the mint-order value is not stable across compiler
 // changes — anything that shifts upstream mint *counts* renumbers every later id,
@@ -222,10 +232,6 @@ impl Nature {
     /// `"source"` never reaches the wire: the sole emission path branches on
     /// [`is_source`](Self::is_source) first and writes `null` instead. The arm
     /// exists for completeness.
-    ///
-    /// Compiled only under the `serde` feature (the `Serialize` impl below is its
-    /// sole caller), so a default build sees it as dead.
-    #[allow(dead_code)]
     pub(crate) fn wire_str(self) -> &'static str {
         match self {
             Nature::Source => "source",
