@@ -363,7 +363,8 @@ tap-free** induction store over a **static** (finite, non-async) extent here; a 
 tap** (a feed riding the loop) or an **async data-source** extent falls back to a dense
 `Recurse` whose body stream is `D ⇀ {commit, writes}`, read by `.writes.(index)`.
 (Multi-writer is *not* a fallback case — recognition folds every conditional write to one
-writer, so `build_induction_store`'s ≥2-writer branch is dead.)
+writer, so `build_induction_store` rejects any writer count ≠ 1 outright rather than
+carrying a multi-leg branch.)
 
 This finite/async split is an **incompleteness, not a semantic distinction** — and the only
 place in the substrate that makes it. Everywhere else the tiling protocol treats a finite
