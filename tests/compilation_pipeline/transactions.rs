@@ -57,10 +57,25 @@ fn check_compile_error(code: &str, needle: &str) {
 // because their bodies are commutative (subtraction/addition conserve the total
 // regardless of interleaving), and the engine has its own direct `CommitEngine`
 // unit tests. `multi_writer_grant_deny` looks order-independent only because it
-// asserts the final pool, not *which* writer succeeded. Rejecting transactions
-// whose commit order isn't context-defined (and an explicit construct to anchor a
-// block's timing to program events) is follow-up design work; see
-// `src/ccl/design/mutability.md` "Ordering and concurrency". The committed value
+// asserts the final pool, not *which* writer succeeded. These blocks depend only
+// on program start (no source arrival, no cross-transaction data dependence), and
+// program start is a single event that imposes no order *among* the blocks it
+// triggers — so the event model *defines* their commit order as mutually unordered,
+// and the engine may serialize them any way, correct under all of them. That is the
+// contract, not a defect; see `src/ccl/design/mutability.md` "Ordering and
+// concurrency".
+//
+// TODO(await_final): these batch cases assert a *final* register value, but the
+// language has no term for one yet, so they read it with a trailing standalone
+// read-only transaction (`with begin(): out << pool`) — an arbitrary as-of sample
+// that observes the drained store only as a batch-scheduler coincidence, not a
+// promise. The designed `await_final(pool)` primitive is the real terminal read
+// (`src/ccl/design/mutability.md` "await_final"): once it exists, rewrite each
+// `out << <register>` trailing read here as `await_final(<register>)` so the
+// assertion pins the committed final by the semantics rather than by
+// commutativity.
+//
+// The committed value
 // is read by a trailing standalone read-only transaction (`with begin(): out <<
 // pool`) and fed to `out` — an as-of read latched to the singleton trigger at the
 // read transaction's commit position, so `out` is the one-element stream at

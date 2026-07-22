@@ -88,92 +88,27 @@ lets a feed be a plain output rather than a cyclic binding.)
 
 ## Surface language
 
-### Mutability is explicit, by the `:=` operator
+The surface syntax and the behaviour a programmer observes — `:=` mutation, `with begin():`
+transactions, the read rules (read-your-writes, the trailing induction read, the `Txn`-register
+block-read rule and as-of reads), feeds as the append-law sibling of mutation, `await_final`, and the
+ordering-and-concurrency contract — are specified in the
+[CHL spec, "Mutability, transactions, and feeds"](../../../docs/chl-spec.md#8-mutability-transactions-and-feeds).
+This document specifies the **realization**: how lowering, `mut_elim`, `channelize`, planning, and the
+runtime engines eliminate all of it into pure dataflow. The spec is the observable contract;
+everything below is how that contract is met.
 
-A variable is mutable **by the operator that introduces it**: `:=` introduces (and writes) a
-mutable variable; plain `=` is an ordinary immutable binding and *never* mutates. The `Mut[…]`
-annotation is **optional** — it carries the value type and, for the transactional case, the
-sequencing domain — but it is `:=`, not the annotation, that makes a variable mutable.
+Two surface facts are load-bearing for the realization and worth restating here:
 
-```python
-cnt := 0                     # loop accumulator; value type and sequencing domain both inferred
-cnt: Mut[Int] := 0           # same, with the value type spelled explicitly
-balance: Mut[Int, Txn] := 0    # transactional register over the commit order
-out = defer()                # a feed (deferred output); the `out: Feed[_]` form is not yet implemented
-```
-
-- `:=` — the mutation operator, for both the initial introduction (`cnt := 0`) and every
-  subsequent write (`cnt := cnt + 1`), inside a loop or transaction or at the top level. `+=` is
-  its compound shorthand. A plain `=` binds immutably: `x = 0; x = x + 1` is ordinary `let`
-  shadowing, and a plain `=` to a name bound outside a loop is a lowering error that points at
-  `:=`.
-- `Mut[𝑉]` / `Mut[𝑉, 𝐷]` — the optional mutability annotation. `𝑉` is the value type (inferred if
-  omitted, i.e. a bare `cnt := 0`); the second parameter `𝐷` is the sequencing domain, omitted
-  (or `_`) it is inferred as the domain of the loop that writes the variable. `Txn` — the
-  transactional case — is **never inferred**: sharing a variable across concurrent writers or
-  endpoints is a semantic commitment the program must spell, so a transactional register is
-  introduced with `balance: Mut[𝑉, Txn] := …`. `Mut[…]` is also legal as a function *parameter*
-  annotation — pass-by-reference, under the downward-only discipline in
-  [`Mut` is a CCL type](#mut-is-a-ccl-type). A `Mut[…]` annotation with a plain `=`
-  (`x: Mut[Int] = 0`) is contradictory and rejected — use `:=`.
-- `Feed[𝑉]` — a deferred output channel, fed with `<<`. **Today a channel is introduced by
-  `out = defer()`** (or arrives from a builtin — `http_serve` returns its response channel at a
-  `Feed` type). The bare-annotation form `out: Feed[_]` (no value) is **designed but not yet
-  implemented** — `Feed[…]` is not accepted as a type annotation at lowering, so a channel comes
-  from `defer()`/`http_serve`, never a standalone `Feed[_]` declaration.
-- `_` is a **wildcard** accepted anywhere in a user type annotation, meaning "infer this slot."
-  `Mut[_]`, `Mut[_, Txn]`, `List[_]` are all legal. (`Feed[_]` is not, per the note above.)
-
-A name needs `:=` exactly when its history spans iterations or transactions; a value that is
-computed once and never rewritten stays a plain `=` binding.
-
-### Transactions
-
-A transaction is a `with begin():` block, usable anywhere a statement can appear — as a loop body
-(one transaction per iteration) or standalone (a single transaction):
-
-```python
-for req in incr_reqs:
-    with begin():
-        balance += 1
-```
-
-`begin()` is the transaction marker. The handle form `with t = begin():` is **designed but not yet
-implemented** — it is rejected at lowering today (`with t = begin():` transaction handle is not
-supported yet; use a bare `with begin():`). In the intended design it binds `t` to the transaction's
-commit time (a `Txn` value): `t` *is* the position `begin_<site>(𝑟)` the letrec manipulates. Writes
-to `Txn`-domain variables are legal only inside a `with begin():` block; all writes in one block
-commit atomically. Nested transactions are rejected — a block commits as one unit, so a `with`
-inside it has no coherent meaning.
-
-### Reads
-
-- **Inside the mutating context** — a bare reference denotes the value at the current position:
-  the previous iteration's value, or, after a write in the same iteration/block, the written value
-  (read-your-writes).
-- **After a loop** — a bare trailing read of an induction variable is its final value
-  (`final_or_default` over the completed history; the loop has ended, so "latest" is unambiguous).
-- **A `Txn` register is read only inside a `with begin():` block.** A bare read outside one is an
-  error (hint: "read transactional variable `x` inside a `with begin():` block"). Reading inside a
-  block pins a snapshot-consistent view — several `Txn` reads in one block see one commit snapshot,
-  which is the point of requiring the block. A read fed out of a block that does *not* write that
-  register is always an **as-of read at an arbitrary position** — the register's value as of wherever the
-  reading transaction lands in the commit order, replied indexed by the *reading loop* (the outer
-  context), not the commit clock. Compiled to `AsOf`, a *sample at each reader's observation time*.
-  This is uniform across the reading loop's domain — a live request stream (`for r in reqs: with
-  begin(): out << balance`, the live cross-endpoint read), a finite literal loop, or the synthesized
-  singleton of a trailing standalone read (`with begin(): out << balance`) — because the sequencing
-  domain that governs the read is the register's `Txn` commit clock, not the reader's own extent, and
-  a transaction observes the register as of *its* place in that clock. There is deliberately **no
-  terminal/"final" *register* read**: a program cannot request the register's last committed value (a
-  future `await_final` builtin would; it does not exist yet). This is specific to registers — the
-  *induction* final already exists (`ExtractLast`, the trailing read of a completed accumulator, below);
-  it is only the register final that has no term. A standalone read's `out` is therefore the
-  one-element stream `[as-of value]` at the singleton position — an arbitrary as-of sample that,
-  under the current batch scheduler, happens to observe the register once its writers have drained, but
-  is not *promised* to be the final by the semantics. (`ExtractLast` is still the operator for a
-  post-loop **induction** accumulator's final and for a cross-loop broadcast source — those *are*
-  fold-to-completion reads of a terminating history — but a `Txn` register read is never one.)
+- **`:=` introduces and writes; `Txn` is never inferred.** A mutable variable is made by the `:=`
+  operator, not the annotation; a transactional register must be spelled `x: Mut[𝑉, Txn] := …`
+  (`Txn` never arises by inference). This document renders types in CCL symbolic form, so `Mut[𝑉, 𝐷]`
+  appears in **brackets** throughout — the CCL `Display` form — even though the surface language
+  converges to parenthesized type application (`Mut(𝑉, Txn)`); see the spec's spelling note.
+- **A `Txn` register is read only inside a `with begin():` block, and a fed-out read is an as-of
+  sample** (compiled to `AsOf`); the sole terminal register read is `await_final`, designed but not
+  built. These two facts drive the
+  [live-read rewrite](#replies-live-cross-endpoint-reads-and-commit-ordered-taps) and the
+  [`AsOf` engine](#the-runtime-engines) below.
 
 ## CCL representation
 
@@ -369,7 +304,7 @@ Symbolic rendering: `letrec 𝑏₁ = 𝑒₁; …; 𝑏ₙ = 𝑒ₙ in body`.
 | `get_prev_seq` | `(𝐼 ⇒ 𝑉, 𝐼, 𝑉) ⇒ 𝑉` | history value at the predecessor of the given position; default at the first |
 | `get_prev_txn` | `(𝐼 ⇒ {time: Txn, write: 𝑉}, Txn, 𝑉) ⇒ 𝑉` | write of the latest commit strictly before the given time; default if none |
 | `begin_<site>` | `𝐼 ⇒ Txn` | the commit-time oracle for one `with begin():` site — where site `𝑠`'s iteration `𝑟` lands in the global commit order |
-| `final_or_default` | `(𝐷 ⇒ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractLast`); never applied to a `Txn` register, which has no final-value term |
+| `final_or_default` | `(𝐷 ⇒ 𝑉, 𝑉) ⇒ 𝑉` | final value of a completed history; the default if the domain is empty. The trailing induction read (`ExtractLast`). Applied to a `Txn` register only through the surface [`await_final`](#await_final) primitive (designed, not yet built); a bare fed-out register read never becomes one |
 
 `begin()` never reaches CCL — lowering records the block structure, and the phase mints one
 `begin_<site>` per site. The oracles are opaque, strictly monotone in arrival order (which is what
@@ -556,6 +491,10 @@ Reading it off:
 
 ## Semantics
 
+The observable guarantees are the spec's (see the CHL spec,
+["Mutability, transactions, and feeds"](../../../docs/chl-spec.md#8-mutability-transactions-and-feeds));
+this section states how the letrec model *delivers* them.
+
 - **Serial denotation, concurrent engine.** The letrec denotes a *serial* execution: `Txn` is a
   total order, and each transaction reads exactly the prefix strictly before its own time.
   Optimistic concurrency — snapshots, backward validation, retry — is engine implementation,
@@ -572,70 +511,40 @@ Reading it off:
   `Mut[Int, Txn]`.
 - **Liveness.** Induction domains are finite or stream-complete; `Txn` histories complete when all
   writer sources do. A fed-out `Txn` register read reads as-of its own position in the commit clock
-  and does not wait for completeness — there is no term that denotes a complete-history read of a
-  register (a future `await_final` would be that term).
+  and does not wait for completeness. The one term that *does* wait for a register's completeness is
+  [`await_final`](#await_final) (designed, not yet built); it is well-defined precisely because it
+  closes the writer set (the register is unreferenceable afterward, so no later writer can extend the
+  history it just declared complete).
 
 ## Ordering and concurrency
 
-A mutable program's meaning is an *ordering story* — which effect happens before which. Three
-orderings are in play, and this section states, once, how they relate, what is ordered vs concurrent,
-and what a program may rely on. (The individual mechanisms are justified where they are introduced;
-this consolidates the account a reader needs to reason about a whole program.)
+The observable ordering contract — maximum parallelism subject to dependency edges rooted at **events**
+(program start, source arrivals, forced data dependencies, `await_final`), and the guarantees a program
+may rely on — is specified in the
+[CHL spec, "Ordering and concurrency"](../../../docs/chl-spec.md#85-ordering-and-concurrency). This
+section records the **realization** side: how the engines deliver that contract, and which points
+remain open in the model.
 
-**1. Each sequencing domain is a total order, and that order is the *only* intra-variable ordering.**
-A history is a function over its domain; causality (every cycle crosses a causal accessor) means a
-value at a position depends only on strictly-earlier positions of *that* domain. There is no other
-ordering hidden inside a single variable.
+**Engine freedom, stated symmetrically.** The two loop engines sit at opposite ends, and the contrast
+is why dispatch on the sequencing domain is load-bearing (not an optimization):
 
-**2. How surface order maps to each domain.**
-- **Degenerate (top-level statements):** statement order = `let`-nesting order.
-- **Induction (`for`):** statement order within the body is read-your-writes; across iterations the
-  order *is* the iteration source's domain order.
-- **`Txn` — the sharp case: commit order = *arrival* order, not program order.** Two `with begin():`
-  blocks do **not** commit in the order they appear in source; the oracle assigns each a commit time
-  *when the runtime observes its trigger*. A programmer's default assumption (lexical order) is wrong.
-  The one intra-block guarantee is read-your-writes (statement order within a block, over its single
-  snapshot).
-
-**3. Happens-before across variables/domains.** Independent domains are **unordered** — two loops
-with no data dependence have no relative order; the engine may interleave them freely. A *dependence*
-(one history reading another) induces both a happens-before **and a liveness obligation**, and the
-kind of read fixes which:
-- a **terminal read** of another history (a trailing `final_or_default`) sequences the reader after
-  the writer *completes* — it waits for completeness (only sound where the domain genuinely
-  completes: an induction accumulator, never a `Txn` register);
-- a **temporal (as-of) read** waits only for the **frontier** (a watermark on the source domain), not
-  for completeness — it samples the source as of the reader's own position.
-
-**4. Engine freedom, stated symmetrically.** The two loop engines sit at opposite ends and the
-contrast is the point:
 - **Induction (`Recurse`)** reads position `𝑖-1`, so it is a *strict total-order data-dependence
-  chain*: necessarily sequential, and independent iterations are **not** reordered.
-- **`Txn` (commit operator)** has a *serial denotation* (a total commit order, each transaction
-  reading the prefix strictly before its time) but a *concurrent engine* (optimistic concurrency),
-  correct iff observationally equivalent to that denotation. Disjoint footprints commit concurrently.
+  chain*: necessarily sequential, independent iterations **not** reordered.
+- **`Txn` (commit operator)** has a *serial denotation* (a total commit order, each transaction reading
+  the prefix strictly before its time) but a *concurrent engine* (optimistic concurrency), correct iff
+  observationally equivalent to that denotation. Disjoint footprints commit concurrently.
 
-**5. Guarantees a program may rely on.**
-- **Read-your-writes** within a block/iteration.
-- **Reply-after-commit / cross-endpoint monotonicity.** A reply fed from *inside* a block (or data-
-  dependent on its commit record) is sequenced after that commit; combined with the oracles'
-  arrival-order monotonicity this gives external consistency — a client that sees `ok 2` then reads
-  another endpoint observes `≥ 2`.
-- **Terminal vs temporal reads** as in (3): completeness vs frontier.
+**How the program-start-anchored case is realized.** A standalone `with begin():` or a literal-list
+loop depends only on program start, which — being a single event — imposes no order among the blocks it
+triggers (the spec's ordering model), so their commit order is unconstrained. The engine realizes that
+freedom through its serialization choice (`drain_start`); any serialization the model admits is a
+correct outcome. This is why the batch programs in `tests/compilation_pipeline/transactions.rs` pass
+only because their bodies are commutative — they add no edge that distinguishes their commit order, so
+they are effectively engine tests.
 
-**Open / under-specified.** A few points are genuine model questions, not just exposition: the merge
-order of a feed `++`-union across multiple feeders (or several feeds in one body), and the multi-writer
-commit-stream merge order for one register. These are stated where they arise and left open here.
-
-A larger open point: a transaction's denotation depends on its commit order, but only a loop over a
-**live external stream** (a `DataSource`) actually *pins* that order — real arrival order is the
-denotational anchor. A **standalone** `with begin():` (the synthesized `[unit]` singleton) and a
-**literal-list loop** leave the order to the engine's serialization (`drain_start`), so any
-order-sensitive body has arbitrary denotation there. Today the batch test programs pass only because
-their bodies are commutative (see `tests/compilation_pipeline/transactions.rs`); they are effectively
-engine tests. The principled fix — rejecting transactions whose commit order isn't context-defined, and
-an explicit construct to anchor a block's timing to program events (a register *final* read is one
-instance of the missing construct) — is a follow-up design pass, not settled here.
+**Open / under-specified.** Two genuine model questions remain: the merge order of a feed `++`-union
+across multiple feeders (or several feeds in one body), and the multi-writer commit-stream merge order
+for one register.
 
 ## Loop planning (`plan_loops`): letrec patterns → the Transact carrier
 
@@ -680,9 +589,12 @@ causal matcher (`letrec::check_letrec_causal`).
   correlation id. It is the dual of the commit `Recurse`: `Recurse` latches a private accumulator per
   source step; `AsOf` latches the store's current value per trigger step. It is a *sample at
   observation time* — an arbitrary as-of position, which is exactly the read a transaction gets: the
-  store as of where it lands in the commit order. There is no separate terminal/final read operator
-  for a register, because no term requests the final value (a future `await_final` would). A
-  standalone read is just the singleton-trigger case of the same `AsOf`; under the batch scheduler it
+  store as of where it lands in the commit order. The only terminal/final register read is
+  [`await_final`](#await_final) (designed, not yet built): when implemented it is `ExtractLast` over the
+  key's `StoreValueStream` (the register-carry stream `StoreValueStream` already projects), folding the
+  completed commit-value stream to its last value — no new engine, the same `final_or_default →
+  ExtractLast` path the induction final uses, applied for the first time to a `Txn` history. Absent it,
+  a standalone read is just the singleton-trigger case of the same `AsOf`; under the batch scheduler it
   observes the drained store, but that coincidence is not part of the semantics.
 - **`StoreValueStream`** — projects one key's `CommitTs ⇀ V` commit-value stream by folding the
   store changelog. It backs the **in-block reply tap** (`out << e` inside a block — a per-commit,
@@ -862,6 +774,35 @@ N-arm Case-with-feeds gap.
 
 ### `with t = begin():` transaction handle
 
-Designed — it binds `t` to the transaction's commit time (see [Transactions](#transactions)) —
-but rejected at lowering today.
+Designed — it binds `t` to the transaction's commit time (see the CHL spec,
+[transactions](../../../docs/chl-spec.md#82-transactions-with-begin)) — but rejected at lowering today.
+
+### `await_final`
+
+The **terminal read of a transactional register** — surface, semantics, and the unreferenceable-after
+rule are specified in the
+[CHL spec, "`await_final`"](../../../docs/chl-spec.md#86-await_final-decided): `await_final(𝑥)` reads a
+`Mut[𝑉, Txn]` register's last committed value once its whole commit history completes, and `𝑥` is
+unreferenceable afterward so the completion event is well-defined. In the [ordering
+model](../../../docs/chl-spec.md#85-ordering-and-concurrency) it is the register-domain analog of loop
+completion — a **completeness** edge on the `Txn` domain. Designed, not built. This section is the
+intended realization.
+
+**Intended realization (no new engine).** `await_final(𝑥)` lowers to `final_or_default(𝑥.history, init)`
+— the *single* permitted application of `final_or_default` to a `Txn` history (a bare fed-out register
+read never becomes one; see the CHL spec, [reads](../../../docs/chl-spec.md#83-reads)). It compiles through the existing `final_or_default →
+ExtractLast` path, with `ExtractLast` folding the key's `StoreValueStream` — the register-carry
+(`carry_forward`) commit-value stream `StoreValueStream` already projects — to its last value. Contrast
+the fed-out as-of read, which hands `AsOf` the raw store fan and samples an *arbitrary* position: same
+`StoreValueStream` source, different reducer (fold-to-last vs. sample-at-trigger). No new operator, no
+new runtime node — `await_final` is the first term to reduce a register stream to completion.
+
+**Build sketch** (for whoever implements it): a `"await_final"` arm in `lower_call`
+(`src/ccl/lower/exprs.rs`) emitting the register-final read; the unreferenceable-after rule enforced by
+the scope machinery that already backs the read/write gates (`LoweringContext`'s transactional-register
+set in `src/ccl/lower/mod.rs`) — drop `𝑥` from scope at the await point so a later reference hits the
+existing gate; and the completeness read allowed to survive the live-read rewrite
+(`rewrite_live_reads` in `src/ccl/transact_phase.rs`) rather than being dropped as an unresolved
+`final_or_default` over a live history. **Not built today**: a program that names `await_final` does not
+compile.
 

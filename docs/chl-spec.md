@@ -131,22 +131,26 @@ and    or     not
 if     elif   else
 for    in
 def    lambda return yield
+with
 pass
 ```
 
-`while`, `class`, `import`, `try`, `except`, `with`, `as`, `global`,
-`nonlocal`, `del`, `assert`, `raise`, `is` are **not** keywords in CHL
-today. Some are reserved for future use.
+`with` is a keyword: it introduces a transaction block, `with begin():`
+(§8.2). It does **not** carry Python's general context-manager meaning.
+
+`while`, `class`, `import`, `try`, `except`, `as`, `global`, `nonlocal`,
+`del`, `assert`, `raise`, `is` are **not** keywords in CHL today. Some are
+reserved for future use.
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
-> `rec` (recursive binding — §4.3, **[Decided]**),
-> `with`, `given`, `requires`, `summon` (transactions / contextual
-> parameters — §8, **[Decided]**), `import` (built-in
-> modules — the `http` module surface, **[Decided]**; general modules
-> remain future work, §9), and `match` / `case` (pattern
-> matching, **[Tentative]** — it appears in the north-star `txn_kv`
-> program but has no design writeup). Avoid taking these names for other
-> purposes.
+> `rec` (recursive binding — §4.3, **[Decided]**), `given`, `requires`,
+> `summon` (the transactions-as-contextual-parameters layer — §8.7,
+> **[Decided]**), `import` (built-in modules — the `http` module surface,
+> **[Decided]**; general modules remain future work, §9), and `match` /
+> `case` (pattern matching, **[Tentative]** — it appears in the north-star
+> `txn_kv` program but has no design writeup). Avoid taking these names for
+> other purposes. (`with` and `:=` are **already** lexed — they carry
+> today's transactions and mutation, §8 — so they are not in this list.)
 
 ### 1.7 Literals
 
@@ -167,28 +171,31 @@ surface level.
 &  |  ^
 == != <  <= >  >=
 =  += -= *= //=
+:=
 <<  <<=
 (  )  [  ]  {  }  ,  :  .  ;
 ```
 
+`:=` is the **mutation** operator (§4.3, §8.1) — it introduces and writes
+a mutable variable. It is *not* Python's walrus operator: it is an
+Algol-tradition assignment **statement**, and there is still no
+assignment-as-expression.
+
 **Notably absent vs. Python** at the lexical level: `/`, `%`, `**`, `>>`,
-`~`, `@` (no matmul, no decorators), `:=`, walrus expressions, `...`.
-The parser refuses these at the syntactic level rather than
+`~`, `@` (no matmul, no decorators), walrus assignment-*expressions*, and
+`...`. The parser refuses these at the syntactic level rather than
 parsing-then-erroring.
 
 `++` is not a Python token at all: it is CHL's collection-union operator
 (§3.3). There is no increment operator — `++` is always binary.
 
 > **Direction.** Tokens not lexed today **[Decided]**: `\` and `->` for
-> lambdas (§3.10), `->` doubling as the pair / map-entry arrow (§2.4),
-> and `:=` for mutation (§4.3). CHL surface syntax is **ASCII-only**:
-> earlier sketches used `λ`/`→`/`↦`, and those are dropped — non-ASCII
-> source is a usability hazard, and dual spellings fork a corpus into
-> two dialects. (The CCL *symbolic rendering* in design docs keeps its
-> mathematical notation; that is documentation, not source.) Note that
-> the future `:=` is *not* Python's walrus operator — it is the
-> Algol-tradition assignment statement, and there is still no
-> assignment-as-expression.
+> lambdas (§3.10), and `->` doubling as the pair / map-entry arrow (§2.4).
+> CHL surface syntax is **ASCII-only**: earlier sketches used `λ`/`→`/`↦`,
+> and those are dropped — non-ASCII source is a usability hazard, and dual
+> spellings fork a corpus into two dialects. (The CCL *symbolic rendering*
+> in design docs keeps its mathematical notation; that is documentation,
+> not source.)
 
 ### 1.9 Semicolons
 
@@ -227,6 +234,7 @@ simple_stmt     ::= return_stmt
                  |  pass_stmt
                  |  assign_stmt
                  |  ann_assign_stmt
+                 |  mut_assign_stmt
                  |  aug_assign_stmt
                  |  define_stmt
                  |  expr_stmt
@@ -236,6 +244,7 @@ pass_stmt       ::= "pass"
 
 assign_stmt     ::= assign_target "=" expression
 ann_assign_stmt ::= assign_target ":" expression "=" expression
+mut_assign_stmt ::= assign_target [ ":" expression ] ":=" expression
 aug_assign_stmt ::= assign_target aug_op expression
 define_stmt     ::= assign_target "<<=" expression
 expr_stmt       ::= expression
@@ -246,13 +255,15 @@ assign_target   ::= ident
                  |  "(" assign_target ( "," assign_target )* [ "," ] ")"
                  |  assign_target ( "," assign_target )+ [ "," ]
 
-compound_stmt   ::= if_stmt | for_stmt | def_stmt
+compound_stmt   ::= if_stmt | for_stmt | with_stmt | def_stmt
 
 if_stmt         ::= "if" expression ":" block
                     ( "elif" expression ":" block )*
                     [ "else" ":" block ]
 
 for_stmt        ::= "for" assign_target "in" expression ":" block
+
+with_stmt       ::= "with" [ ident "=" ] expression ":" block
 
 def_stmt        ::= "def" ident "(" [ param ( "," param )* [ "," ] ] ")" ":" block
 param           ::= ident [ ":" expression ]
@@ -266,13 +277,29 @@ valid). Every binding LHS is therefore a static pattern: which names a
 statement introduces is decidable from the syntax alone, without any
 runtime evaluation.
 
-> **Direction.** Planned statement forms, not in today's grammar: `x := e` mutation statements (**[Decided]**,
-> §4.3), `rec x = e` recursive bindings (**[Decided]**, §4.3),
-> annotation-only forward declarations such as `h: Feed(_)` with no
-> initialiser (**[Decided]**, §3.7 — today an annotation *requires* a
-> value), and out-of-line collection definition through a subscript
-> target, `c[i] = v` (**[Tentative]**, §6.3 — this would relax the
-> no-subscript-target rule above).
+`mut_assign_stmt` is the `:=` **mutation** statement (§4.3, §8.1),
+introducing or writing a mutable variable, in bare (`x := e`) or annotated
+(`x: T := e`) form; the annotation is the same position as
+`ann_assign_stmt`, with `:=` in place of `=` selecting mutation. `+=` and
+friends (`aug_assign_stmt`) are compound mutations and require a mutable
+target — the mutability check is semantic (§8.1), not grammatical, so the
+production is shared with pre-`:=` code shapes.
+
+`with_stmt` is a transaction block (§8.2). Its context expression is any
+`expression` in the grammar, but lowering accepts only `begin()` (with the
+optional `ident "="` prefix binding the transaction handle — `with t =
+begin():`, §8.2, `[Decided]`); any other context is rejected. `with` does
+**not** provide Python's general context-manager statement.
+
+> **Direction.** Planned statement forms, not in today's grammar:
+> `rec x = e` recursive bindings (**[Decided]**, §4.3), annotation-only
+> forward declarations such as `h: Feed(_)` with no initialiser
+> (**[Decided]**, §3.7 — today an annotation *requires* a value), and
+> out-of-line collection definition through a subscript target,
+> `c[i] = v` (**[Tentative]**, §6.3 — this would relax the
+> no-subscript-target rule above). (`mut_assign_stmt` and `with_stmt`
+> above are already implemented — §4.3, §8; they are in the grammar, not
+> this list.)
 
 ### 2.3 Expression precedence
 
@@ -371,33 +398,43 @@ one-tuple is written `(e,)`.
 
 ## 3. Expression semantics
 
-Each CHL expression denotes a value, and in two cases also performs an
-**effect** when evaluated:
+Each CHL expression denotes a value; some expression forms additionally
+perform an **effect** when evaluated. The effecting forms:
 
-- **Feed `<<`** (§3.7) writes its right-hand-side into a deferred
+- **Feed `<<`** (§3.7) appends its right-hand side to a deferred
   collection.
-- **`yield`** (§3.13) writes its operand into the deferred collection
-  that the enclosing generator function will return.
+- **`yield`** (§3.13) appends its operand to the deferred collection the
+  enclosing generator function returns.
+- **A call to an effecting function** — one that writes a `Mut(…)`
+  parameter (pass-by-reference, §6.2) or writes a transactional register
+  inside a `with begin():` block (§8) — performs that function's writes.
+  A function's effects are always visible in its signature (a `Mut(…)`
+  parameter, or a `Txn`-register write in its body); there are **no
+  implicit-effect functions**, so an inert expression statement (§4.9)
+  stays detectable and rejected.
 
-Every other expression form is *pure*: it depends only on its inputs,
-has no observable side effects, and is safe to evaluate zero, one, or
-many times. Mutation at the source level is a property of *statements*
-(loop-carried reassignment in a `for` body — §4.6) rather than of
-expressions.
+Mutation of a *variable* is a property of statements, not expressions:
+`x := e` (§4.3, §8.1) writes a mutable variable, and loop accumulation
+(§4.6) and transactions (§8.2) are the statement contexts that give those
+writes their sequencing. A bare *reference* to a mutable variable is a
+pure read — a dereference of its current value; the effect is carried by
+the `:=` write and the effecting call, never by the read.
 
-> **Direction.** This two-effect inventory is a property of *today's*
-> language, not a permanent invariant. Under the mutability direction
-> (**[Decided]** — §4.3, §6.2, §8) a function can take `Mut(…)`
-> parameters or mutate transactional state
-> (`def put(…) requires Transaction: store[key] := value` in the
-> north-star `txn_kv`), so a *call* to such a function is itself an
-> effecting expression — and "safe to evaluate zero, one, or many
-> times" no longer follows from the expression's form alone. How the
-> temporal-mutation model reconciles those effects with the
-> unordered, data-dependency-only evaluation story below (time-domain
-> ordering, transactions over write-regions) is worked through in
-> the 2026-04-06 mutability notes and 2026-06-29 §6; this
-> section will need a rewrite when that lands.
+Every other expression form is *pure*: it depends only on its inputs and
+has no observable effect. A pure expression is safe to evaluate zero,
+one, or many times, and it is only over pure sub-expressions that the
+freedoms below (unordered collections, unspecified evaluation order)
+apply. Ordering *between* effects is not free-for-all: it is governed by
+the dependency-edge model of §8.5 — effects are ordered exactly by the
+data dependencies among them, and unordered (freely interleaved)
+otherwise.
+
+> **Direction [Decided].** The `requires Transaction` / `given` / `summon`
+> contextual-parameter layer (§8.7) adds a *second* way for a call to be
+> effecting — a function that manifests a transaction from context rather
+> than through a `Mut(…)` parameter. That layer is not yet implemented;
+> the `Mut(…)`-parameter and `with begin():` effecting-call forms above
+> are.
 
 ### Collections are unordered
 
@@ -418,7 +455,7 @@ ordering or to match up data between coupled source/sink pairs like
 `http_serve`.
 
 The single way to introduce inter-iteration ordering is a
-**loop-carried accumulator** (§4.6): rebinding an outer-scope name
+**loop-carried accumulator** (§4.6): a `:=` write to an outer-scope name
 inside a `for` body creates a data dependency from one iteration to
 the next, forcing those iterations to run sequentially in the order
 the dependency requires. No other construct sequences iterations.
@@ -443,15 +480,17 @@ on its output.
 
 ### Evaluation order is unspecified
 
-CHL expressions are *pure* (today's language — see the Direction note
-above): the only side-effecting expression forms are `<<` and `yield`,
-and both of those contribute to bag-valued deferred collections — bag
-contributions commute. Consequently, the order in which
-sub-expressions of a compound expression evaluate is **not specified**
-by this document. Argument evaluation order in a
-call, operand order in a binary operator, the relative order of two
-independent feeds in the same loop body — none of these are
-sequenced.
+Most CHL expressions are *pure* (see the effect inventory above): a pure
+expression has no observable effect, so the order in which the
+sub-expressions of a compound expression evaluate is **not specified** by
+this document. Argument evaluation order in a call, operand order in a
+binary operator, the relative order of two independent feeds in the same
+loop body — none of these are sequenced. The append effects (`<<`,
+`yield`) contribute to bag-valued deferred collections and commute, so
+they too impose no order among themselves beyond data dependencies. The
+one place order *is* observable — effecting calls and transactional
+writes — is governed by the dependency-edge model of §8.5, not by source
+position.
 
 The only constraints on execution order are **data dependencies**:
 if expression `A` produces a value that expression `B` consumes,
@@ -940,12 +979,14 @@ read-only: a function cannot mutate a name from an outer scope.
 Recursion through self-reference is **[Planned]**; for now each
 function must be definable without referring to its own name.
 
-> **Direction.** The read-only-capture rule is scoped to today's
-> language: under the mutability direction (**[Decided]** — §6.2, §8)
-> a function can mutate captured state whose type carries the wrapper,
-> as the north-star `txn_kv`'s `put` does to the top-level
-> `store: Mut(Map(…), Txn)`. What stays true is that the capability is
-> visible in the types at the binder, not smuggled in.
+> **Direction.** The read-only-*capture* rule is today's language:
+> mutation already crosses a function boundary, but through a `Mut(…)`
+> **parameter** (pass-by-reference — implemented, §8.1, §6.2), not by
+> capturing and writing an outer name. The **[Decided]** extension lets a
+> function mutate *captured* state whose type carries the wrapper — as the
+> north-star `txn_kv`'s `put` does to the top-level
+> `store: Mut(Map(…), Txn)`. Either way the capability is visible in the
+> types at the binder, not smuggled in.
 
 > **Direction [Tentative].** Return-type annotations:
 > `def f(t: T) => U:` — `=>` is the function-type arrow, so the same
@@ -1005,9 +1046,10 @@ executes, so it can be the source of an unbounded stream (e.g. when
 
 | Form | Semantics |
 |---|---|
-| `target = value` | Evaluate `value`, bind it to `target` for the rest of the enclosing scope. |
-| `target: T = value` | Same as above, additionally checking that `value` has type `T`. |
-| `target op= value` | Equivalent to `target = target op value`: the binding is **replaced**, the old value is shadowed. Not in-place mutation. |
+| `target = value` | Evaluate `value`, bind it to `target` as an **immutable** binding for the rest of the enclosing scope. Never mutates. |
+| `target: T = value` | Same, additionally checking that `value` has type `T`. |
+| `target := value` | **Mutation** (§8.1): introduce (the first `:=`) or write a mutable variable. It is `:=`, not any annotation, that makes a variable mutable; transactional registers are always introduced this way (`x: Mut(V, Txn) := …`). |
+| `target op= value` | Compound mutation — `target := target op value`, for `op` ∈ `+ - * //`. The target **must** be a mutable variable (one introduced with `:=`); a `+=` to an immutable binding is a type error, not a silent rebind. |
 | `target <<= value` | Resolves a previously-deferred name to `value` (§4.4). |
 
 `target` is an `AssignTarget`: a bare name or a (nested) tuple of bare
@@ -1027,49 +1069,38 @@ is supported at any nesting depth.
 > the `reqs, resps = http_serve(…)` statement form (§7.4); that is an
 > implementation restriction, not a design one.
 
-**No assignment-as-expression** (no walrus `:=`). **No multi-target
-chained assignment** (`a = b = c` is not in the grammar).
+**No assignment-as-expression** — neither `=` nor `:=` is an expression
+(the mutation `:=` is a statement, §1.8). **No multi-target chained
+assignment** (`a = b = c` is not in the grammar).
 
 Annotated assignment **requires** a value (`x: T` alone is a parse error,
 unlike Python's bare type-only declarations).
 
-Augmented assignment `x += 1` is a **rebinding**, not a mutation: the
-name `x` now refers to a new value, but no other reference to the
-previous value is affected. The previous binding is shadowed for the
-rest of the scope.
+A `:=` write to a name introduced *outside* a `for` loop is a
+**loop-carried accumulator** update (§4.6); inside a `with begin():` block
+it is a transactional write (§8.2). A plain `=` never mutates — reusing a
+name with `=` in the same scope is immutable shadowing (§5), and a plain
+`=` to an outer-scope name *inside* a loop body is rejected, pointing at
+`:=` (§4.6).
 
-Reassignment *inside a `for` body* of a name introduced in an outer
-scope has different semantics: it is a **loop-carried accumulator**
-update, described in §4.6. See the 2026-04-06 mutability design notes
-for the temporal-functional-mutation model that motivates this
-treatment.
-
-> **Direction — `=`, `:=`, `rec` [Decided].** In the target binding
-> model (2026-06-29 §3),
-> `=` is reserved for *timeless equations* — `x = e` asserts `x ≡ e`
-> with no before/after — and a binding departs from it along two
-> independent axes:
+> **Direction — `=`, `rec` [Decided].** `:=` and its compound forms are
+> **implemented** (§8.1); the rest of the target binding model is still
+> [Decided]. That model (2026-06-29 §3) splits bindings along two axes:
+> plain `=` is reserved for *timeless equations* — `x = e` asserts
+> `x ≡ e` with no before/after — with `:=` (already in place) as the
+> **time** axis and a new marker `rec` as the **self-reference** axis:
 >
-> - **Time → `:=`.** A mutable's value at the current moment is written
->   `x := e`, covering both initialisation and update (`+=` and friends
->   become sugar over `:=`). An initialising `:=` is itself enough to
->   mark the variable mutable; a `Mut(_)` annotation (§6.2) is
->   mandatory only where there is no initialiser, e.g. parameters.
->   Today's loop-carried accumulator (§4.6) is this model's motivating
->   case: under the target syntax its updates are written with `:=`,
->   and the current "rebinding inside a `for` body" encoding goes away.
 > - **Self-reference → `rec`.** A self-referential *value* binding must
->   be marked: `rec reach: Set({src: Int, dst: Int}) = … reach …`
->   solves the equation as a least fixpoint (see the north-star
->   `reachability`). `rec` stays in the timeless `=` world — a fixpoint
->   is a value, not a mutation. Unmarked value self-reference is a
->   compile error; `def` self-reference and recursive types need no
->   marker.
+>   be marked: `rec reach: Set({src: Int, dst: Int}) = … reach …` solves
+>   the equation as a least fixpoint (see the north-star `reachability`).
+>   `rec` stays in the timeless `=` world — a fixpoint is a value, not a
+>   mutation. Unmarked value self-reference is a compile error; `def`
+>   self-reference and recursive types need no marker.
 >
-> **[Open]**: whether same-scope *shadowing* (`x = 1` then `x = 2`,
-> legal today per §5) survives once `=` reads as a timeless equation —
-> two equations for one name in one scope contradict the reading, but
-> the brainstorm doesn't address it.
+> **[Open]**: whether same-scope *shadowing* (`x = 1` then `x = 2`, legal
+> today per §5) survives once `=` reads as a timeless equation — two
+> equations for one name in one scope contradict the reading, but the
+> brainstorm doesn't address it.
 
 ### 4.4 Define statement `<<=`
 
@@ -1165,48 +1196,49 @@ Inside a generator function (§4.2) the body uses `yield` instead of
 `<<` — `yield` plays the same role as `<<` but feeds into the
 generator's implicit result collection.
 
-**Loop-carried accumulators.** A for-loop body may also rebind names
-introduced in an outer scope (function arguments, pre-loop lets, or
-any binding from an enclosing frame). Such a rebinding is *not* a
-new per-iteration shadow; it is an **accumulator update**, and it
-introduces an inter-iteration data dependency that **forces the loop
-to run sequentially** in the order dictated by that dependency:
+**Loop-carried accumulators.** A `:=` write (§4.3, §8.1) to a name
+introduced *before* the loop — a pre-loop `:=`, a function argument, or
+any binding from an enclosing frame — is an **accumulator update**, not a
+per-iteration shadow. It introduces an inter-iteration data dependency
+that **forces the loop to run sequentially** in the order the dependency
+requires:
 
 - Before the loop, the name has its outer value.
-- At each iteration, the body computes a new value for the name from
-  the previous-iteration's value and the current element.
-- After the loop, the name holds the value at the last iteration
-  (or, if the source was empty, the outer pre-loop value).
+- At each iteration, the body computes a new value from the
+  previous-iteration's value and the current element.
+- After the loop, the name holds the value at the last iteration (or, if
+  the source was empty, the outer pre-loop value).
 
-In other words: loops are parallel by default, and the presence of an
-accumulator is what serialises them. A loop with multiple
-accumulators is still a single sequential loop — the dependencies are
-shared across all of the accumulators in lockstep with the iteration.
+Loops are parallel by default (above); an accumulator is what serialises
+them. A loop with multiple accumulators is still a single sequential loop —
+the dependencies advance in lockstep with the iteration.
 
 ```python
-acc = 0
+acc := 0
 for i in [1, 2, 3, 4, 5]:
-    acc = acc + i
+    acc := acc + i
 acc                              # 15
 ```
 
-Multiple accumulators are supported (one per rebound outer name);
-their updates within an iteration are ordered by their data
-dependencies, so a later accumulator's update may freely refer to an
-earlier accumulator's just-computed value. The same rule covers
-generator functions with loop-carried state
-(`total = 0; for x in xs: total += x; yield total`).
+Multiple accumulators are supported (one per outer name written with
+`:=`); their updates within an iteration are ordered by their data
+dependencies, so a later update may refer to an earlier accumulator's
+just-computed value. The same covers generator functions with loop-carried
+state (`total := 0; for x in xs: total += x; yield total`).
 
-Assignments inside a for-loop body whose target is a **fresh** name
-(not introduced in an outer frame) are ordinary per-iteration
-bindings: in scope for the rest of the iteration, gone at the next
-one.
+Accumulation **requires `:=`**. Because a plain `=` never mutates, a plain
+`=` to an outer-scope name inside a loop body is a lowering error — left to
+mean anything it could only be a silently-discarded per-iteration shadow,
+never an accumulator:
 
-> **Direction.** Under the `:=` mutation model (§4.3, **[Decided]**)
-> accumulator updates are written `acc := acc + i`, making the
-> loop-carried dependency explicit at the update site instead of being
-> inferred from "rebinding of an outer name". The sequencing semantics
-> described here are unchanged by the notation.
+> `assignment to X is mutation: X is bound outside the for-loop body
+> (function argument or pre-loop binding). `=` binds immutably; to mutate
+> a mutable variable, introduce it with `:=` before the loop and write it
+> with `X := …` or `X += …``
+
+A plain `=` whose target is a **fresh** name (not introduced in an outer
+frame) is unaffected: an ordinary per-iteration binding, in scope for the
+rest of that iteration and gone at the next.
 
 *Currently unsupported* (see §12): nested for-loops with mutable
 variables, and `while` loops.
@@ -1240,25 +1272,25 @@ explicitly as `if cond: return e\nelse: <rest>`.
 
 ### 4.9 Expression statement
 
-A bare expression `e` is a statement. The expression is evaluated; if
-it appears as the **last statement** of a block, its value is the
-block's value, and if it appears elsewhere, it must be a feed
-expression (`target << value`) — otherwise the statement is inert and
-is rejected.
+A bare expression `e` is a statement. The expression is evaluated; if it
+appears as the **last statement** of a block, its value is the block's
+value. If it appears elsewhere, it must **have an effect** — a feed
+(`target << value`), or a call to an effecting function (one that writes a
+`Mut(…)` parameter or a transactional register, §8) — otherwise the
+statement is inert and is rejected.
 
-This rules out Python's "expression for its side-effect" idiom for
-anything except `<<`. CHL has no implicit-effect functions.
+This rules out Python's "expression for its side-effect" idiom for any
+effect *not* visible in a function's signature: CHL has **no
+implicit-effect functions**, so whether a bare call is a legitimate effect
+statement or an inert mistake is decidable from the callee's type.
 
-> **Direction.** Under the mutability direction (**[Decided]** — the
-> *purity* note in §3, §6.2, §8) effecting functions exist: a function
-> can take `Mut(…)` parameters or declare `requires Transaction`, and
-> a bare call to one — `put(req.body.key, req.body.value)` in the
-> north-star `txn_kv` — is a legitimate expression statement evaluated
-> for its effect. The rule above then generalises from "must be a
-> feed" to "must have an effect". What survives unchanged is the
-> second sentence: there are still no ***implicit***-effect functions —
-> a function's effects are always visible in its signature, so an
-> inert statement remains detectable, and remains rejected.
+> **Direction [Decided].** The `requires Transaction` / `given` / `summon`
+> contextual-parameter layer (§8.7) adds a further kind of effecting call —
+> a function that manifests a transaction from context rather than through
+> a `Mut(…)` parameter (`put(req.body.key, req.body.value)` in the
+> north-star `txn_kv`). It is not yet implemented; the effect rule above
+> already covers the implemented `Mut(…)`-parameter and `with begin():`
+> effecting calls.
 
 ---
 
@@ -1282,11 +1314,13 @@ CHL is **lexically scoped**. The scopes are:
    produce for downstream code must be carried out via a loop-carried
    accumulator (§4.6) or yielded into a deferred collection.
 
-A binding form (`=`, annotated `x: T = e`, `<<=`, `for`, `def`,
-`lambda`, comprehension `for`) introduces a name for the rest of its
-enclosing scope. Re-binding the same name in the same scope
-**shadows**; previous values are not recoverable. (Whether shadowing
-survives the timeless reading of `=` is **[Open]** — see §4.3.)
+A binding form (`=`, annotated `x: T = e`, `:=` (mutable introduction —
+§8.1), `<<=`, `for`, `def`, `lambda`, comprehension `for`) introduces a
+name for the rest of its enclosing scope. Re-binding the same name in the
+same scope with `=` **shadows** (previous values are not recoverable);
+re-writing a mutable with `:=` advances its history rather than shadowing
+(§8.1). (Whether `=` shadowing survives the timeless reading of `=` is
+**[Open]** — see §4.3.)
 
 There is no `global` / `nonlocal` mechanism — closure capture is the
 only way for a function to refer to outer names, and capture is
@@ -1403,28 +1437,36 @@ type `{f: T}`, refinement `{x: T | p(x)}`.
 > instead of repeating asserts at every function; the declaration
 > syntax for that invariant is not yet settled.
 
-### 6.2 Direction: non-purity as type wrappers [Decided]
+### 6.2 Non-purity as type wrappers
 
 (2026-06-29 §4.)
 
-Whether a value is mutable / feedable / transactional is a property of
-its **type**, expressed as a wrapper: `Mut(V)`, `Feed(V)`,
-`Mut(V, Txn)`. Wrappers have to appear in function signatures and
-inside data structures regardless (a function taking a mutable map, a
-map *of* feeds), so they are types rather than introducer keywords.
+Whether a value is mutable / feedable / transactional is a property of its
+**type**, expressed as a wrapper: `Mut(V)`, `Feed(V)`, `Mut(V, Txn)`.
+Wrappers have to appear in function signatures and inside data structures
+regardless (a function taking a mutable variable, a map *of* feeds), so
+they are types rather than introducer keywords.
 
-Two supporting rules:
+`Mut(V)` and `Mut(V, Txn)` are **implemented** — mutation and transactions
+are specified in §8, and the two supporting rules below hold today. (The
+compiler currently spells type application with brackets — `Mut[V, Txn]` —
+and accepts lowercase primitives; see §8's spelling note.) `Feed(V)` exists
+as an internal type — what `defer()` and `http_serve` produce (§3.7) — but
+its *forward-declaration surface* `h: Feed(_)` is **[Decided]**, not yet
+accepted at lowering (§3.7, §7.3).
 
-- **Impure types are annotated at binders.** The wrapper must be
-  written at the binding that introduces it — a bare
-  `def add_one(x): x += 1` is rejected without `x: Mut(_)`.
+Two supporting rules (implemented):
+
+- **Impure types are annotated at binders.** The wrapper must be written
+  at the binding that introduces it — a bare `def add_one(x): x += 1` is
+  rejected without `x: Mut(_)`.
 - **`_` means "infer the rest."** A partial-inference type hole:
-  `def add_one(x: Mut(_)): …` infers `Mut(Int)`; likewise
-  `Map(String, _)`, `List(_)`.
+  `def add_one(x: Mut(_)): …` infers `Mut(Int)`; likewise `Mut(_, Txn)`,
+  `List(_)`.
 
 For ergonomics, an initialising `:=` alone marks a variable mutable
-(`total := 0`); `Mut(_)` annotations are mandatory only where there is
-no initialiser (§4.3).
+(`total := 0`); a `Mut(_)` annotation is mandatory only where there is no
+initialiser — e.g. a `Mut` parameter (§4.3, §8.1).
 
 ### 6.3 Direction: collections as functions [Tentative]
 
@@ -1603,62 +1645,279 @@ unique across the program.
 
 ---
 
-## 8. Transactions and contextual parameters [Decided]
+## 8. Mutability, transactions, and feeds
 
-Nothing in this section is implemented — none of its keywords even lex
-today (§1.6). It is specified here because the design is decided
-(2026-06-29 §6) and the
-north-star `txn_kv` program exercises it end to end.
+CHL programs reassign variables, accumulate in loops, run transactions,
+and stream replies to sinks — yet the runtime is pure dataflow with no
+mutable cell anywhere. This section specifies the **surface a programmer
+writes** for mutation and transactions, and the **behaviour they may rely
+on**. How the compiler eliminates all of it into pure dataflow (the
+causal-recursion model, the commit engine, the loop engines) is the
+realization, specified in
+[src/ccl/design/mutability.md](../src/ccl/design/mutability.md); this
+section is the observable contract that realization must honour.
 
-Transactions use a **contextual-parameter** mechanism modeled on
-Scala 3's `given`/`using`/`summon`:
+**The one-line model.** A mutable variable *is* a function from a
+**sequencing domain** (a time axis) to a value. "Mutation" is the
+incremental revelation of that function as the domain advances; "reading"
+is a lookup at the current position. Sequential rebinding, loop
+accumulation (§4.6), and concurrent transactions are then *one* model over
+three domains — a degenerate statement sequence, a `for` loop's iteration
+order, and the transaction commit order `Txn` — not three mechanisms. A
+**feed** (`<<`, §3.7) is the *same* kind of object under a different
+merge law (§8.4): a mutable variable is *last-write-wins*, a feed is
+*append-only*.
 
-- `def put(…) requires Transaction:` — the function declares that it
-  needs a transaction from context.
-- `with begin():` — opens a transaction and puts it in the given
-  context for the block. **Commit is implicit on normal block exit**;
-  `abort()` rolls back.
-- `with begin() as txn:` — same, and additionally binds the transaction
-  so its methods are callable (e.g. `txn.current_time()`).
-- `given txn` — injects an existing transaction into the context.
-- `summon(Transaction)` — manifests the contextual transaction as a
-  value.
+> **Spelling note.** Examples below use the canonical target spellings
+> — type application in **parentheses** (`Mut(Int, Txn)`, §6.1)
+> and **capitalized** type names (`Int`, `Bool`, `String`, §6.1). The
+> compiler *currently* accepts only the transitional forms instead:
+> square-bracket type application (`Mut[Int, Txn]`) and lowercase
+> primitives (`int`, `bool`, `str`). Those are known warts converging to
+> the forms shown here; the semantics are identical, and this note is the
+> one place the divergence is called out rather than repeated per example.
 
-Shared mutable state accessed by concurrent handlers **must** be
-transactional — `store: Mut(Map(K, V), Txn)` — and every access runs
-inside a `with begin():` block; this is what makes a read-modify-write
-atomic in the presence of concurrent `http_serve` handlers.
+### 8.1 Mutation is explicit: the `:=` operator
 
-Scope transactions minimally: only the operations that must be atomic
+A variable is mutable **by the operator that introduces it**. `:=` both
+introduces and writes a mutable variable; plain `=` is an immutable
+binding and *never* mutates (§4.3). The `Mut(…)` annotation is optional —
+it is `:=`, not the annotation, that makes a variable mutable.
+
+```python
+cnt := 0                       # loop accumulator; value type and domain inferred
+cnt: Mut(Int) := 0             # same, value type spelled explicitly
+balance: Mut(Int, Txn) := 0    # transactional register over the commit order
+```
+
+- `:=` — the write operator, for the first introduction (`cnt := 0`) and
+  every later write (`cnt := cnt + 1`), at top level, in a loop, or in a
+  transaction. `+=` / `-=` / `*=` / `//=` are compound shorthands. A `:=`
+  or `+=` applied to a name that is *not* mutable is a **type error**, not
+  a silent rebind — this is the rule that makes "declare it with `:=`" a
+  real discipline.
+- `Mut(V)` / `Mut(V, D)` — the optional mutability annotation (§6.2). `V`
+  is the value type; `D` is the sequencing domain, inferred as the writing
+  loop's domain when omitted or written `_`. **`Txn` is never inferred** —
+  sharing a variable across concurrent writers or endpoints is a semantic
+  commitment the program must spell, so a transactional register is always
+  introduced `balance: Mut(V, Txn) := …`.
+- `Mut(…)` is also legal as a function **parameter** annotation —
+  pass-by-reference, so a callee can write the caller's variable
+  (§6.2). It carries a **downward-only, no-aliasing** discipline: a `Mut`
+  argument is always a bare variable (never a computed expression), `Mut`
+  never appears inside a composite type (no tuple/record/list/`Feed` of
+  `Mut`, so it is never returned), and an unannotated `b = a` copy of a
+  mutable is rejected — to copy the current value demand the deref
+  (`b: Int = a`), to seed a *new* mutable use `:=` (`b: Mut(Int) := a`).
+
+A name needs `:=` exactly when its history spans iterations or
+transactions; a value computed once and never rewritten stays a plain `=`.
+
+### 8.2 Transactions: `with begin():`
+
+A transaction is a `with begin():` block, usable anywhere a statement can
+appear — as a loop body (one transaction per iteration) or standalone (a
+single transaction):
+
+```python
+for req in incr_reqs:
+    with begin():
+        balance += 1
+```
+
+- `begin()` is the transaction marker. **All writes in one block commit
+  atomically** — the whole block's writes become visible together or not
+  at all. There is no partially-visible commit.
+- Writes to a `Txn`-domain register are legal **only** inside a `with
+  begin():` block; a write outside one is rejected (§8.3), as is a write
+  reached through a transactional-writer function *called* inside a block
+  (a disguised nested transaction).
+- **Nested transactions are rejected** — a block commits as one unit, so a
+  `with` inside it has no coherent meaning.
+- **Deny guard.** A block may carry a single bare `if p:` guard; the
+  transaction commits iff `p` holds over its snapshot, and a denied
+  transaction contributes no write and no reply. An `elif`, an `else` that
+  writes, or more than one `if` guard in one block is **[Planned]**
+  (rejected today with a diagnostic) — the general path-based conditional
+  model is worked through in the design doc.
+- **Transaction handle — `with t = begin():` [Decided].** Binds `t` to the
+  transaction's commit time (a `Txn` value); designed but rejected at
+  lowering today.
+
+**Scope transactions minimally.** Only the operations that must be atomic
 go inside `with begin():` — input validation before it, response
-assignment after it. The north-star handlers observe this throughout
-(e.g. `storefront`'s `/order` validates and matches the catalog before
-opening the transaction around `reserve` + `quote` + the feed).
+assignment after it. The north-star handlers observe this throughout (e.g.
+`storefront`'s `/order` validates and matches the catalog before opening
+the transaction around `reserve` + `quote` + the feed).
+
+### 8.3 Reads
+
+- **In-context** (inside the mutating loop or block) — a bare reference is
+  the value at the current position: the previous iteration's value, or,
+  after a write earlier in the same iteration/block, the just-written
+  value (**read-your-writes**).
+- **Trailing induction read** — after a `for` loop, a bare reference to an
+  induction accumulator is its final value (or the pre-loop value if the
+  source was empty). The loop has ended, so "latest" is unambiguous.
+- **A `Txn` register is read only inside a `with begin():` block.** A bare
+  read outside one is an error. Reading inside a block pins a
+  **snapshot-consistent** view: several register reads in one block see
+  one commit snapshot — the reason the block is required.
+- **As-of read.** A register read fed *out* of a block that does not
+  itself write that register is an **as-of read at an arbitrary commit
+  position** — the register's value as of wherever the reading transaction
+  lands in the commit order, replied indexed by the *reading* loop. This
+  is uniform whether the reader is a live request stream, a finite loop,
+  or the synthesized singleton of a standalone read.
+- **Terminal read — `await_final(x)` [Decided].** The one term that reads a
+  register's *final* committed value, waiting for its whole commit history
+  to complete, is `await_final` (§8.6). There is deliberately no other
+  terminal register read; absent it, every fed-out register read is an
+  arbitrary as-of sample, not a promised final.
+
+### 8.4 Feeds are the second form of mutability
+
+A feed (`<<`, §3.7) is the **same history object** as a mutable variable,
+under the **append-only** merge law: contributions union (`++`), there is
+no carry-forward, and a read yields the whole stream — which is exactly
+why a feed is an unordered bag (§3.7) while a mutable variable derefs to a
+single latest value. `o << e` is surface-impure in the same way `x := e`
+is; the two differ only in that merge law.
+
+Two feed shapes interact with transactions, and the difference is
+observable:
+
+- **Reply *inside* a block** (`out << e` within `with begin():`) rides the
+  commit: it is **sequenced after the commit** and **gated** — a denied
+  transaction replies nothing — and is indexed by commit tick.
+- **Reply *outside* the block** rides its own loop's domain and fires every
+  iteration regardless of commit — request-indexed, value-correct, but not
+  commit-ordered. **To gate or commit-order a reply, put it inside the
+  block.**
+
+### 8.5 Ordering and concurrency
+
+A mutable program's meaning is an *ordering story* — which effect happens
+before which. CHL states that story as a single principle:
+
+**Execution is maximally concurrent; nothing is ordered by its position in
+the source text. The only ordering is the transitive closure of dependency
+edges, and every edge originates at an _event_.** Two pieces of logic are
+ordered exactly when a chain of dependency edges connects them, and freely
+interleaved (or parallel) otherwise. The events:
+
+- **Program start.** Initializers, literals, constant loop sources
+  (`[10, 20, 30]`), and top-level `=` bindings are available here; logic
+  reading only them runs immediately.
+- **Incoming data on a source.** Each element arriving on a source
+  (`stdin()`, `http_serve`, …) is an event; logic consuming it depends on
+  its arrival. This is the event that **pins commit order**: a writer
+  driven by a live stream commits in the stream's real arrival order.
+- **A data dependency forced by logic.** When logic reads a value another
+  piece produces, the read depends on the write — read-your-writes in a
+  block, a commit decision reading a snapshot, a reply consuming its own
+  commit record.
+- **`await_final`.** The **completion event** of a transactional register
+  (§8.6): it is available only once every writer of the register has
+  drained, and everything downstream depends on that completion.
+
+Consequences a program may rely on:
+
+- **Commit order is not lexical order.** Two `with begin():` blocks do
+  **not** commit in the order they appear in source; each block's position
+  is fixed by its trigger event (a source arrival, or the loop index for a
+  batch writer). A programmer's default lexical-order assumption is wrong.
+- **Read-your-writes** within a block or iteration.
+- **Reply-after-commit / cross-endpoint monotonicity.** A reply fed from
+  inside a block is sequenced after that commit; combined with arrival-order
+  monotonicity this gives external consistency — a client that sees `ok 2`
+  then reads another endpoint observes `≥ 2`.
+- **Terminal vs. temporal reads.** `await_final` (and the trailing
+  induction read) wait for a history's *completeness*; an as-of read waits
+  only for the *frontier* (that no earlier-or-equal commit is still
+  outstanding) and samples the register as of the reader's own position.
+- **A shared program-start anchor gives no *relative* order — by design,
+  not by omission.** A standalone `with begin():` or a literal-list loop
+  depends on **program start** like everything else, but on nothing more.
+  Program start is a *single* event: it sequences each block after itself,
+  yet imposes no order *among* the blocks it triggers, so they are mutually
+  unordered — the engine may serialize them any way and the program is
+  correct under all of them. (A live-stream writer differs because its
+  successive arrivals are *distinct* events carrying a real order, which
+  the commits inherit.) This is the contract, not a gap: to fix a relative
+  order, **supply a distinguishing edge** — drive the writers from the
+  source whose arrival order you mean, introduce a data dependence, or
+  bound the result with `await_final`. An order-sensitive body with no such
+  edge has nondeterministic denotation, by design.
+
+### 8.6 `await_final` [Decided]
+
+**Designed, not yet built** — a program that names `await_final` does not
+compile today.
+
+`await_final(x)` is a builtin call on a transactional register
+`x: Mut(V, Txn)`, an expression of type `V`: the register's **last
+committed value**, once its entire commit history is complete (every
+writer source drained), or the initializer if it was never committed. It
+is the register-domain counterpart of the trailing induction read (§8.3)
+and the completion event of the ordering model (§8.5) — the *only* read
+that waits for a `Txn` register's completeness rather than the frontier.
+
+```python
+pool: Mut(Int, Txn) := 100
+for r in reqs:
+    with begin():
+        pool -= r
+final = await_final(pool)      # waits for every writer of `pool`, then the last commit
+```
+
+**`x` is unreferenceable afterward.** After `await_final(x)`, `x` may not be
+read or written — any later reference is a compile error. This is what makes
+the completion event well-defined: `await_final` declares `x`'s history
+complete, and a later write would extend a history already declared
+finished. Forbidding later references closes the writer set at the await
+point, so "final" names a fixed value. (A `for` loop's accumulator gets the
+same terminal read for free because the loop has a lexical end; a register
+has none, so the barrier is drawn explicitly by consuming it.)
+
+### 8.7 Direction [Decided]: transactions as contextual parameters
+
+(2026-06-29 §6; the north-star `txn_kv` program is the worked example.)
+
+The implemented model above passes a transaction *implicitly by block
+scope* (`with begin():` establishes it; `Mut(…, Txn)` registers are the
+shared state). A **[Decided]** further direction adds an explicit
+contextual-parameter mechanism modeled on Scala 3's `given`/`using`/`summon`,
+so a transaction can be threaded into a called function without a `Mut`
+parameter:
+
+- `def put(…) requires Transaction:` — the function declares it needs a
+  transaction from context.
+- `given txn` — injects an existing transaction into the context.
+- `summon(Transaction)` — manifests the contextual transaction as a value.
 
 Supporting decisions (same source):
 
-- **Discharged by the typeclass/given solver, *not* algebraic
-  effects.** Cambra compiles to static dataflow; handler-based effects
-  make control flow non-local and data flow handler-dependent — exactly
-  what the dataflow compiler cannot see through. `requires Transaction`
-  is ordinary dictionary passing, resolved by the same solver that will
-  serve general typeclasses.
-- **Locally-scoped givens, not global coherence.** A fresh transaction
-  is minted per `with begin()` block; many exist over a program's life.
+- **Discharged by the typeclass/given solver, *not* algebraic effects.**
+  Cambra compiles to static dataflow; handler-based effects make control
+  flow non-local and data flow handler-dependent — exactly what the
+  dataflow compiler cannot see through. `requires Transaction` is ordinary
+  dictionary passing, resolved by the same solver that will serve general
+  typeclasses.
+- **Locally-scoped givens, not global coherence.** A fresh transaction is
+  minted per `with begin():` block; many exist over a program's life.
 - **Domains as a type index.** `Transaction(dom)`, created with
-  `with dom.begin()`, restores per-domain coherence while allowing
-  fresh transactions across scopes. Start with one global domain and
-  make `dom` itself a given, so the common case omits it.
+  `with dom.begin()`, restores per-domain coherence while allowing fresh
+  transactions across scopes. Start with one global domain and make `dom`
+  itself a given, so the common case omits it.
 - **Commit/abort are data operations on a time-region**, not control
-  effects: block exit merges the region forward (commit), `abort()`
-  drops it (rollback) — a structured early-exit, not exception
-  unwinding.
-- **Terminology:** type `Transaction`; variable abbreviation `txn`
-  (never `tx`, which collides with "transmit"); operations `begin()` /
-  `abort()`; commit is implicit.
+  effects: block exit merges the region forward (commit), `abort()` drops
+  it (rollback) — a structured early-exit, not exception unwinding.
+- **Terminology:** type `Transaction`; variable abbreviation `txn` (never
+  `tx`, which collides with "transmit"); operations `begin()` / `abort()`.
 - **Implicit *parameters* only — never implicit conversions**; given
-  visibility stays explicit and resolution inspectable (hence
-  `summon`).
+  visibility stays explicit and resolution inspectable (hence `summon`).
 
 ## 9. Sinks
 
@@ -1763,9 +2022,9 @@ with parser-level support that lowering rejects:
   the general namespace story arrive together later — that is when the
   full *module* concept earns a place in this spec (§2.1 deliberately
   avoids it now).
-- **Classes / `try`** — not in the language. `with` is not a keyword
-  today but is claimed by the transaction design (**[Decided]**, §8) —
-  it will not carry Python's general context-manager meaning.
+- **Classes / `try`** — not in the language. `with` **is** a keyword
+  (§1.6), but only for transaction blocks `with begin():` (§8.2); it does
+  not carry Python's general context-manager meaning.
 - **Float arithmetic** — no `f64` type at the surface.
 - **String operations** beyond `+` concatenation.
 - **Surface refinement type syntax** — refinement types (§6) are
@@ -1787,11 +2046,16 @@ with parser-level support that lowering rejects:
   follows the map-literal decision above: `[k -> v for …]`
   (**[Decided]** as surface, unimplemented; the north-star
   `storefront` `/stats` rollup uses it).
-- **The target syntax at large** — every **Direction** note in
-  this spec (`\`-lambdas §3.10, `:=`/`rec` §4.3, membership `in` §3.4,
-  type wrappers §6.2, transactions §8, …) is unimplemented; the
-  north-star programs pin the target and the sequencing is tracked
-  separately.
+- **The target syntax at large** — the mutation and transaction
+  **core is implemented** (`:=`, `with begin():`, `Mut(…, Txn)` registers,
+  feeds — §8), currently spelled with transitional bracket type
+  application and lowercase primitives (§8's spelling note). The remaining
+  **Direction** notes are unimplemented: `\`-lambdas (§3.10), `rec`
+  bindings (§4.3), membership `in` (§3.4), parenthesized type application
+  and capitalized type names (§6.1), the `->` pair/map-entry syntax (§2.4),
+  the `Feed(_)` forward-declaration surface (§3.7, §6.2), and
+  transactions-as-contextual-parameters (§8.7). The north-star programs
+  pin the target; the sequencing is tracked
 
 When each lands, this spec will be updated alongside the lowering and
 the demo programs.
