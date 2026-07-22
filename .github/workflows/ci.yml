@@ -26,6 +26,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Full-history fetch of all refs so the pre-rewrite tripwire below
+          # sees every commit reachable from the repo, not just the PR head.
+          fetch-depth: 0
+
+      # This repo was recreated from filter-rewritten history; cbf7ce76 is the
+      # tip of the retired pre-rewrite history (kept in cambra-dev/cambra-old).
+      # If that commit is present, someone pushed a ref based on the old
+      # history, which would republish the content the rewrite removed. Fail
+      # before anything else runs.
+      - name: Refuse pre-rewrite history
+        run: |
+          if git cat-file -e cbf7ce7624005647b6c019e1651dca9806b9738e 2>/dev/null; then
+            echo "::error::Pre-rewrite history detected: commit cbf7ce76 is reachable from a ref in this repo (possibly this PR). Rebase the offending branch onto the rewritten main and delete any ref that carries the old history."
+            exit 1
+          fi
 
       # Validate intra-repo doc references (Markdown links/anchors + code->doc
       # citations). Deliberately runs on EVERY PR — including docs-only ones,
