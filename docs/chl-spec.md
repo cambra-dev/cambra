@@ -1081,7 +1081,10 @@ A `:=` write to a name introduced *outside* a `for` loop is a
 it is a transactional write (§8.2). A plain `=` never mutates — reusing a
 name with `=` in the same scope is immutable shadowing (§5), and a plain
 `=` to an outer-scope name *inside* a loop body is rejected, pointing at
-`:=` (§4.6).
+`:=` (§4.6). The model behind every `:=` is **temporal functional
+mutation** — a mutable variable is a pure function from a time domain to
+values, and a write reveals one more position of it (§8.1, and
+[src/ccl/design/mutability.md](../src/ccl/design/mutability.md)).
 
 > **Direction — `=`, `rec` [Decided].** `:=` and its compound forms are
 > **implemented** (§8.1); the rest of the target binding model is still
