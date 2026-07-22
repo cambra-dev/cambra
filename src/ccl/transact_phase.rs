@@ -1731,8 +1731,9 @@ fn walk_block(
 /// carry-forward value-`Case` over the branches (an arm that didn't write a key
 /// contributes its snapshot). Guards resolve against the incoming env (RYW). The
 /// rejoined `Case`s are value-selecting inside the writer lambda, so `lambda_elim`
-/// compiles them to pointwise `Select`s; sequencing after the join reads the
-/// merged value (RYW across the join). Commit paths accumulate across the arms.
+/// compiles them to a value-preserving `filter_values` union-of-restricts;
+/// sequencing after the join reads the merged value (RYW across the join). Commit
+/// paths accumulate across the arms.
 #[allow(clippy::too_many_arguments)]
 fn walk_case(
     branches: &[crate::ccl::Branch],

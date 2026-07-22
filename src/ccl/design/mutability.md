@@ -957,7 +957,8 @@ path condition (a branch guard `𝑔` extends it to `path ∧ 𝑔`, first-match
   (`if 𝑝: a := … else: b := …`) routes each key per path.
 
 The per-key merges are value-selecting `Case`s over the snapshot inside the writer lambda, compiled
-to pointwise `Select`s (`FunctionDef::Select`; see `../../interpreter/design-operators.md`). The
+to the same **value-preserving `filter_values` union-of-restricts** (`⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`) as
+every other writer-body value-`Case` (see `../../interpreter/design-operators.md`). The
 block stays **one decision record per transaction** — per-path writer sites are unsound (a path
 predicate reads the snapshot, which exists only at the commit tick; one `begin()` is one
 serialization point; multi-key read-your-writes needs one snapshot and one write-set).
@@ -982,10 +983,10 @@ chain whose first request falls through to a non-committing branch hits this. It
 generally; tests that exercise elif routing deliberately lead with a committing position. Treat a
 leading-deny elif chain as unsupported until the position-0 as-of latch is generalized.
 
-**Not yet implemented**: `with t = begin():` (the handle) is still rejected. A *partial* op (`//`,
-`%`) in a conditional write/merge value is evaluated eagerly (the pointwise `Select`) and faults at a
-guard-rejected position — lazy per-position selection over a fed value stream needs a value-preserving
-filter primitive.
+**Not yet implemented**: `with t = begin():` (the handle) is still rejected. (A *partial* op in a
+conditional write/merge value does **not** fault at a guard-rejected position — the writer-body
+value-`Case` compiles to the value-preserving `filter_values` union-of-restricts above, so an
+off-path arm's value is never evaluated.)
 
 ### `with t = begin():` transaction handle
 
