@@ -508,17 +508,31 @@ the joined codomain), and a data-⊔-compute collision as a loud coalesce error:
 `ExtentJoinConflict` when ≥ 2 candidate extents would be dropped (a genuine
 extent join), `ComputeWhereDataRequired` when a single slot is a capability
 demanded as an extent. Candidate order = first-contribution order is a
-guaranteed contract. A conditional collection reaching op-conversion is rejected
-loudly before then (at `lambda_elim`, since value-`Case`s are not yet
-compilable). The Sigma witness is the canonical, shared binder `__witness`
-(`ReservedName::Witness`, like the refinement `__elem`), so two
-structurally-equal conditional collections compare equal without α-renaming.
+guaranteed contract: it fixes a deterministic materialization (stable, testable)
+and the discriminant order the deferred value-`Case` fan-out will index by — but
+the subtyping rules below match candidates *by value*, never by position. Nested
+conditionals **flatten**: a Σ re-entering compaction (a sub-conditional's result
+joining a sibling extent) decomposes back into its multi-domain fun slot
+(`compact_go`'s `Sigma` arm), so `union_extents` folds its candidates in —
+`(xs if p else ys) if q else zs` forms one flat `Σ (𝑤 ∈ {xs, ys, zs}). 𝑤 ⤇ V`,
+never a nested Σ. This is why a candidate extent is always a ground
+data-function domain, never itself a Σ. A conditional collection reaching
+op-conversion is rejected loudly before then (at `lambda_elim`, since
+value-`Case`s are not yet compilable). The type-witness is **nullary**
+([`Type::Witness`] — a leaf, no binder), so two structurally-equal conditional
+collections compare equal by the derived structural equality with nothing to
+α-rename.
 
 These are **general dependent-sum rules** (`constrain.rs`), not
 conditional-collection–specific logic: the solver knows Σ, and each rule is
-*realized per witness `Kind`* — the part that genuinely differs (domain
-membership, the presented domain, the subset test) dispatches on `Kind`, while
-the covariant codomain edge is Kind-agnostic (`SigmaType::codomain`/`binder`).
+*realized per witness* — the part that genuinely differs (domain membership, the
+presented domain, the subset test) dispatches on the `Witness`, and for a
+*type*-witness further on its `Kind`. The covariant codomain edge is
+conceptually uniform across witnesses, but because [`SigmaType`]'s `body` is a
+*general* type (only the conditional-collection instance's body is the data
+function `Witness ⤇ V`), each `Kind::Enumerated` realization reads the codomain
+by a local destructure of `body` — guarded by an `unreachable!` that names the
+construction invariant — rather than through a general `SigmaType` accessor.
 Two rules are genuine subtyping; one is elimination — a distinction worth keeping
 precise, because the last is *not* subsumption even though it is discharged
 through the same `<:` solver.
@@ -543,10 +557,21 @@ by that consumer"; the constraints it emits coincide with subtyping the sum's
 *eliminated shape* `(⋃𝐷ᵢ) ⤇ V`, so it composes soundly with the two real
 subtyping rules without ever treating a Σ as substitutable for a function.
 
+Note this type-level rule is **branch-agnostic**: it makes the consumer total
+over the tagged union of *all* candidate extents; it does not pick a branch.
+Runtime branch selection is the deferred value-`Case` fan-out (below), which
+gates each extent `𝐷ᵢ` by its branch predicate `π̂ᵢ` (compiled from the original
+`if`/`elif` conditions) — the gates are exclusive and exhaustive, so exactly one
+restricted leg is non-empty. The witness is what ties the two layers: type-level
+it names *which* extent was taken; at runtime that identity is realized as *which*
+gate passes.
+
 Only the `Kind::Enumerated` realization is wired today (what a conditional
-collection materializes). The `Kind::Any` (`Collection`) and value-witness
-(`List`/`Map`) realizations of each rule are `todo!()` skeletons — present so the
-general shape is visible, unreachable until those Kinds are constructed.
+collection materializes). The other two witnesses each rule dispatches on — the
+`Kind::Any` type-witness (`Collection`) and the value-witness (`List`/`Map`,
+[`Witness::Value`], classified by a *type* rather than a `Kind`) — are `todo!()`
+skeletons, present so the general shape is visible and unreachable until those
+witnesses are constructed.
 
 > **Deferred — value-`Case` elimination compilation.** The type-level
 > elimination rule (`Σ <: Fun`) is live here, so a conditional-collection `Case`
@@ -573,22 +598,30 @@ conditional over stores, preserving that deliberate rule).
 > (binops, …) to impose concrete bounds, tracked as a follow-up.
 
 **What the codomain join gives up — and why that is the right default.** The
-Sigma is lossless on the *extent* and lossy on the *codomain*: joining
-`α ⤇ τ₀` with `β ⤇ τ₁` keeps the exact candidate set `{α, β}` but coarsens the
-shared body's element type to `τ₀ ⊔ τ₁`, forgetting *which* extent pairs with
-*which* element type. A function returning `[1, 2, 3] if flag else ["a", "b"]`
-types as `Σ (𝑤 ∈ {[0,2], [0,1]}). 𝑤 ⤇ (Int|String)` — the type no longer
-records "length 3 ⟹ all Int." Three points make this the right default rather
-than a leak:
+Sigma is lossless on the *extent* and lossy on the *codomain*: the shared body's
+element type is the ordinary covariant lattice join `τ₀ ⊔ τ₁` of the arms'
+codomains (`CompactFun::merge` merges the codomain at `pol`, the domains at
+`!pol`), forgetting *which* extent pairs with *which* element type. This is the
+same lattice join used everywhere else, with the same representability limit:
+where the LUB exists it is a **structured coarsening** that does not error —
+record codomains intersect to their common fields, refinements drop to the shared
+base (the join `merge_records`/`merge_refinements` apply at any positive
+position). Where the LUB is a **scalar union** it is unrepresentable, so it is
+the deferred piece below: a function returning `[1, 2, 3] if flag else ["a", "b"]`
+*would* type as `Σ (𝑤 ∈ {[0,2], [0,1]}). 𝑤 ⤇ (Int|String)` — no longer recording
+"length 3 ⟹ all Int" — but that `Int|String` codomain currently **errors** at
+coalesce, the same `IncompatibleBounds` rejection as `1 + true`. Three points
+make the codomain join the right default rather than a leak:
 
 > **Landed vs. deferred here.** The *extent* losslessness is live: a conditional
 > over collections with the **same** element type (`[1,2] if c else [1,2,3]`)
-> forms `Σ (𝑤 ∈ {[0,1], [0,2]}). 𝑤 ⤇ Int`. The *codomain* union in the
-> `Int | String` example above is the same deferred piece as the
-> heterogeneous-scalar union (`τ₀ ⊔ τ₁` is a positive atom-join), so that
-> specific example currently errors at the codomain until that follow-up lands.
-> The design rationale below is unchanged — it is why the codomain join is the
-> right *default* once the union is sound.
+> forms `Σ (𝑤 ∈ {[0,1], [0,2]}). 𝑤 ⤇ Int`, and a structured-codomain coarsening
+> (record field intersection, refinement drop) lands too. Only the **scalar**
+> codomain union (`Int | String`) is deferred: it is a positive atom-join,
+> indistinguishable at coalesce from `1 + true`, so it errors until strict scalar
+> consumers can bound it (the heterogeneous-scalar follow-up below). The design
+> rationale below is unchanged — it is why the codomain join is the right
+> *default* once the union is sound.
 
 - **The asymmetry is principled.** Loss is forbidden exactly where it is
   *silent and destroys data* — the domain (dropping an index drops a row, with

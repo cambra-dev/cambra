@@ -436,7 +436,8 @@ fn constrain_go(
         }
 
         // (Dependent-sum (Σ) rules live just below, after the `Record` arm. They
-        // are general rules on the sum, *realized per witness `Kind`*: the solver
+        // are general rules on the sum, *realized per witness* (dispatch is on the
+        // `Witness`, and for a type-witness further on its `Kind`): the solver
         // knows dependent sums, not any surface concept. Two are genuine subtyping
         // — the injection `Fun(Data) <: Σ` (a branch is-a sum) and the width
         // `Σ <: Σ` (a smaller sum is-a bigger sum). The third, `Σ <: Fun`, is
@@ -487,7 +488,8 @@ fn constrain_go(
         // This is how the `emit_case` join lands — each arm is constrained `<:
         // result`, and `result` coalesces to the Σ, so at the consistency wall
         // each arm re-injects into it. The membership test is realized per
-        // witness `Kind`; the covariant codomain edge is Kind-agnostic.
+        // witness; the codomain then flows covariantly the same way for every
+        // witness.
         (
             Type::Fun {
                 name: pn,
@@ -542,7 +544,7 @@ fn constrain_go(
         // domain var resolves to the union (the common case — `sum`, `[… for x in
         // …]`), a consumer demanding a *concrete narrower* extent fails the edge,
         // so the collection never silently narrows. The presented domain is
-        // realized per witness `Kind`.
+        // realized per witness.
         (
             Type::Sigma(s),
             Type::Fun {
@@ -591,7 +593,7 @@ fn constrain_go(
 
         // **Σ-width** `Σ <: Σ`: the lhs sum's witness domain must be a subset of
         // the rhs's, and the shared codomain flows covariantly. The subset test
-        // is realized per witness `Kind` pair.
+        // is realized per witness pair.
         (Type::Sigma(a), Type::Sigma(b)) => match (&a.witness, &b.witness) {
             // Two conditional collections: every lhs candidate extent must appear
             // among the rhs candidates (matched by *value*, not position — a
