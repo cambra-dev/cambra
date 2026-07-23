@@ -250,11 +250,33 @@ where
             )
             .boxed();
 
-        // Parenthesised expression / tuple / generator expression.
+        // Record value `(name=value, …)`: the parentheses are the product
+        // constructor and `=` binds a named field (§2.4). Tried before the
+        // plain-expression tail below; `name` not followed by `=` (e.g. `(x)`,
+        // `(x, y)`, `(x == y)`) falls through to a group/tuple.
+        let record_field = ident_only
+            .then_ignore(just(Token::Eq))
+            .then(expr.clone())
+            .map(|((name, name_span), value)| RecordField {
+                name,
+                name_span,
+                value,
+            });
+        let paren_record = record_field
+            .separated_by(just(Token::Comma))
+            .at_least(1)
+            .allow_trailing()
+            .collect::<Vec<_>>()
+            .then_ignore(just(Token::RParen))
+            .map_with(|fields, e| Spanned::new(e.span(), Expr::Record(fields)));
+
+        // Parenthesised expression / tuple / record / generator expression.
         let paren_group = just(Token::LParen)
             .ignore_then(choice((
                 // Empty tuple `()`.
                 just(Token::RParen).map_with(|_, e| Spanned::new(e.span(), Expr::Tuple(vec![]))),
+                // Record value `(name=value, …)`.
+                paren_record,
                 expr.clone()
                     .then(choice((
                         // Generator expression `(expr for ...)`.
@@ -285,23 +307,24 @@ where
             )))
             .boxed();
 
-        // Brace literal `{ … }`. One production covers every brace form,
-        // classified after the fact by whether its items carry a `: value`:
+        // Brace literal `{ … }` — always **type** syntax (record values are
+        // `(x=1)`, §2.4; maps are `[k -> v]`). One production covers every
+        // brace form, classified after the fact by whether its items carry a
+        // `: value`:
         //
-        //   - every item `key: value`  → record (all bare-ident keys) or dict
-        //   - no item has a value       → colon-free brace group `{T, U}`
-        //                                 (tuple-type syntax, `Expr::BraceGroup`)
-        //   - empty `{}`                → dict (preserves existing behaviour)
-        //   - mixed                     → a parse error
+        //   - every item `field: T`, all bare-ident fields → record type
+        //     (`Expr::BraceRecord`)
+        //   - no item has a value → colon-free brace group `{T, U}`
+        //     (tuple type, `Expr::BraceGroup`)
+        //   - anything else (empty `{}`, expression keys, mixed) → error:
+        //     it is neither a record type nor a tuple type
         //
-        // Parsing items as `expr (":" expr)?` (rather than two competing
-        // `{`-starting alternatives) keeps a single committed brace parser, so
-        // classification is a total function of what was matched instead of
-        // relying on `choice` backtracking across a consumed `{`.
+        // Parsing items as `expr (":" expr)?` keeps a single committed brace
+        // parser, so classification is a total function of what was matched.
         let brace_item = expr
             .clone()
             .then(just(Token::Colon).ignore_then(expr.clone()).or_not());
-        let dict_or_record = just(Token::LBrace)
+        let brace_type = just(Token::LBrace)
             .ignore_then(
                 brace_item
                     .separated_by(just(Token::Comma))
@@ -312,45 +335,31 @@ where
             .validate(|items, e, emitter| {
                 let span = e.span();
                 let with_value = items.iter().filter(|(_, v)| v.is_some()).count();
-                if items.is_empty() {
-                    // Empty `{}` stays a (rejected-at-lowering) dict, matching
-                    // the pre-existing behaviour; the empty-record/unit meaning
-                    // is a separate, unsettled question.
-                    return Spanned::new(span, Expr::Dict(Vec::new()));
-                }
-                if with_value == items.len() {
-                    // Every item has a value: record iff all keys are bare
-                    // identifiers, else dict.
-                    let all_idents = items.iter().all(|(k, _)| matches!(k.node, Expr::Name(_)));
-                    if all_idents {
-                        let fields = items
-                            .into_iter()
-                            .map(|(k, v)| match k.node {
-                                Expr::Name(name) => RecordField {
-                                    name,
-                                    name_span: k.span,
-                                    value: v.expect("all items have a value"),
-                                },
-                                _ => unreachable!("guarded by all_idents"),
-                            })
-                            .collect();
-                        Spanned::new(span, Expr::Record(fields))
-                    } else {
-                        let entries = items
-                            .into_iter()
-                            .map(|(k, v)| (k, v.expect("all items have a value")))
-                            .collect();
-                        Spanned::new(span, Expr::Dict(entries))
-                    }
-                } else if with_value == 0 {
-                    // No `: value` anywhere: a colon-free brace group.
+                let all_idents =
+                    !items.is_empty() && items.iter().all(|(k, _)| matches!(k.node, Expr::Name(_)));
+                if !items.is_empty() && with_value == items.len() && all_idents {
+                    // Record type `{field: T, …}`.
+                    let fields = items
+                        .into_iter()
+                        .map(|(k, v)| match k.node {
+                            Expr::Name(name) => RecordField {
+                                name,
+                                name_span: k.span,
+                                value: v.expect("all items have a value"),
+                            },
+                            _ => unreachable!("guarded by all_idents"),
+                        })
+                        .collect();
+                    Spanned::new(span, Expr::BraceRecord(fields))
+                } else if !items.is_empty() && with_value == 0 {
+                    // Tuple type `{T, U}` (colon-free brace group).
                     let elts = items.into_iter().map(|(k, _)| k).collect();
                     Spanned::new(span, Expr::BraceGroup(elts))
                 } else {
                     emitter.emit(Rich::custom(
                         span,
-                        "brace items must be either all `key: value` (record or dict) \
-                         or all bare expressions (tuple type `{T, U}`), not a mix",
+                        "`{…}` is type syntax: a record type `{field: T}` or a \
+                         tuple type `{T, U}`; a map is written `[k -> v]`",
                     ));
                     Spanned::new(span, Expr::Error)
                 }
@@ -360,9 +369,9 @@ where
         // The atom is the lowest level of expression precedence — failure
         // here is the most common "expected an expression here" diagnostic.
         // We label it so error messages collapse the 5+ atom alternatives
-        // (literal, name, `(…)`, list, dict) into a single "expression"
+        // (literal, name, `(…)`, list, brace type) into a single "expression"
         // label when the failure is at the atom's start position.
-        let atom = choice((lit, list_or_listcomp, paren_group, dict_or_record, name))
+        let atom = choice((lit, list_or_listcomp, paren_group, brace_type, name))
             .labelled("expression")
             .recover_with(via_parser(nested_delimiters(
                 Token::LParen,
@@ -1207,14 +1216,21 @@ mod tests {
     }
 
     #[test]
-    fn record_vs_dict() {
-        // Bare-ident keys → Record.
-        assert!(matches!(parse_e("{x: 1, y: 2}").node, Expr::Record(_)));
-        // String keys → Dict.
+    fn record_value_and_brace_forms() {
+        // A record *value* is `(name=value, …)` (parens).
         assert!(matches!(
-            parse_e(r#"{"name": "alice"}"#).node,
-            Expr::Dict(_)
+            parse_e("(x=1, y=2)").node,
+            Expr::Record(fields) if fields.len() == 2
         ));
+        // `(name)` without `=` is a parenthesised group, not a record.
+        assert!(matches!(parse_e("(x)").node, Expr::Name(_)));
+        // Brace with bare-ident keys is a record *type* (`BraceRecord`).
+        assert!(matches!(parse_e("{x: 1, y: 2}").node, Expr::BraceRecord(_)));
+        // Expression-key braces are not a valid type — a map is `[k -> v]`.
+        assert!(
+            !parse_expression(r#"{"name": "alice"}"#).errors.is_empty(),
+            "expression-key braces should be a parse error"
+        );
     }
 
     #[test]

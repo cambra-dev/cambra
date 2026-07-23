@@ -25,17 +25,17 @@ use crate::helpers::*;
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    "{x: 1, y: 2}",
+    "(x=1, y=2)",
     make_record(&[("x", Value::Int(1)), ("y", Value::Int(2))])
 )]
 #[case(
-    r#"{name: "alice", age: 30}"#,
+    r#"(name="alice", age=30)"#,
     make_record(&[("name", Value::String("alice".into())), ("age", Value::Int(30))])
 )]
-#[case("{x: 1, y: 2}.x", Value::Int(1))]
-#[case("{x: 1, y: 2}.y", Value::Int(2))]
-#[case(r#"r = {name: "bob", score: 99}; r.score"#, Value::Int(99))]
-#[case(r#"r = {name: "bob", score: 99}; r.name"#, Value::String("bob".into()))]
+#[case("(x=1, y=2).x", Value::Int(1))]
+#[case("(x=1, y=2).y", Value::Int(2))]
+#[case(r#"r = (name="bob", score=99); r.score"#, Value::Int(99))]
+#[case(r#"r = (name="bob", score=99); r.name"#, Value::String("bob".into()))]
 fn test_records(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -46,9 +46,9 @@ fn test_records(#[case] code: &str, #[case] expected: Value) {
 
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("{x: 1 + 2, y: 3 * 4}", make_record(&[("x", Value::Int(3)), ("y", Value::Int(12))]))]
-#[case(r#"r = {x: 10, y: 3}; r.x - r.y"#, Value::Int(7))]
-#[case(r#"r = {x: 10, y: 3}; r.x * r.y"#, Value::Int(30))]
+#[case("(x=1 + 2, y=3 * 4)", make_record(&[("x", Value::Int(3)), ("y", Value::Int(12))]))]
+#[case(r#"r = (x=10, y=3); r.x - r.y"#, Value::Int(7))]
+#[case(r#"r = (x=10, y=3); r.x * r.y"#, Value::Int(30))]
 fn test_records_computed(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -60,8 +60,8 @@ fn test_records_computed(#[case] code: &str, #[case] expected: Value) {
 /// Project a field from an inline record literal in a list comprehension body.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case("[{n: x, doubled: x * 2}.n for x in [1, 2, 3]]", make_int_list(&[1, 2, 3]))]
-#[case("[{n: x, doubled: x * 2}.doubled for x in [1, 2, 3]]", make_int_list(&[2, 4, 6]))]
+#[case("[(n=x, doubled=x * 2).n for x in [1, 2, 3]]", make_int_list(&[1, 2, 3]))]
+#[case("[(n=x, doubled=x * 2).doubled for x in [1, 2, 3]]", make_int_list(&[2, 4, 6]))]
 fn test_record_field_in_comp_body(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
@@ -71,7 +71,7 @@ fn test_record_field_in_comp_body(#[case] code: &str, #[case] expected: Tile) {
 #[timeout(Duration::from_secs(10))]
 fn test_comp_with_record_body() {
     let tile =
-        sort_sealed_function_by_domain(run_pipeline("[{n: x, doubled: x * 2} for x in [1, 2, 3]]"));
+        sort_sealed_function_by_domain(run_pipeline("[(n=x, doubled=x * 2) for x in [1, 2, 3]]"));
     assert_eq!(
         extract_record_field(tile.clone(), "n"),
         ColumnValue::Ints(vec![1, 2, 3]),
@@ -86,11 +86,11 @@ fn test_comp_with_record_body() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    r#"[r.x for r in [{x: 1, y: "a"}, {x: 2, y: "b"}, {x: 3, y: "c"}]]"#,
+    r#"[r.x for r in [(x=1, y="a"), (x=2, y="b"), (x=3, y="c")]]"#,
     make_int_list(&[1, 2, 3])
 )]
 #[case(
-    r#"[r.y for r in [{x: 1, y: "a"}, {x: 2, y: "b"}, {x: 3, y: "c"}]]"#,
+    r#"[r.y for r in [(x=1, y="a"), (x=2, y="b"), (x=3, y="c")]]"#,
     Tile::SealedFunction {
         domain: ColumnValue::UInts(vec![0, 1, 2]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Strings(vec![
@@ -111,7 +111,7 @@ fn test_comp_over_record_list(#[case] code: &str, #[case] expected: Tile) {
 #[timeout(Duration::from_secs(10))]
 fn test_comp_filter_on_record_field() {
     let tile = sort_sealed_function_by_domain(run_pipeline(
-        r#"[r.name for r in [{name: "alice", age: 30}, {name: "bob", age: 17}, {name: "carol", age: 25}] if r.age >= 18]"#,
+        r#"[r.name for r in [(name="alice", age=30), (name="bob", age=17), (name="carol", age=25)] if r.age >= 18]"#,
     ));
     let Tile::SealedFunction { codomain, .. } = tile else {
         panic!("expected SealedFunction");
@@ -127,7 +127,7 @@ fn test_comp_filter_on_record_field() {
 #[timeout(Duration::from_secs(10))]
 fn test_aggregate_over_record_field() {
     check_scalar(
-        r#"sum([r.score for r in [{score: 10}, {score: 20}, {score: 30}]])"#,
+        r#"sum([r.score for r in [(score=10), (score=20), (score=30)]])"#,
         Value::Int(60),
     );
 }
@@ -140,7 +140,7 @@ fn test_aggregate_over_record_field() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_join_with_record_body() {
-    let tile = run_pipeline("[{a: x, b: y} for x in [1, 2] for y in [3, 4] if x + y == 5]");
+    let tile = run_pipeline("[(a=x, b=y) for x in [1, 2] for y in [3, 4] if x + y == 5]");
     // (1,4) and (2,3) are the only pairs summing to 5.
     // Output order is determined by join domain — sort both fields together by "a" to compare.
     let ColumnValue::Ints(a_vals) = extract_record_field(tile.clone(), "a") else {
@@ -161,7 +161,7 @@ fn test_join_with_record_body() {
 #[timeout(Duration::from_secs(10))]
 fn test_hash_join_record_body() {
     let tile = sort_sealed_function_by_domain(run_pipeline(
-        "[{left: x, right: y} for x in [1, 2, 3] for y in [2, 3, 4] if x == y]",
+        "[(left=x, right=y) for x in [1, 2, 3] for y in [2, 3, 4] if x == y]",
     ));
     // matched pairs: (2,2) and (3,3)
     assert_eq!(

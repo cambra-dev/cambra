@@ -29,8 +29,8 @@ fn test_literals(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 // Capitalized primitive.
 #[case("x: Int = 5\nx", Value::Int(5))]
-// Record type `{name: T, …}`.
-#[case("p: {a: Int, b: Int} = {a: 1, b: 2}\np.a", Value::Int(1))]
+// Record type `(name=T, …)`.
+#[case("p: {a: Int, b: Int} = (a=1, b=2)\np.a", Value::Int(1))]
 // Tuple type `{T, U}` (colon-free brace group).
 #[case("t: {Int, Bool} = (1, True)\nt[0]", Value::Int(1))]
 fn test_type_annotation_forms(#[case] code: &str, #[case] expected: Value) {

@@ -99,7 +99,7 @@ plus the requisite `DEDENT`s are emitted, so every `INDENT` is paired.
 ### 1.4 Implicit line continuation
 
 Inside `(...)`, `[...]`, or `{...}` (any depth, any combination), newlines
-and indentation are **ignored**. Multi-line list, tuple, dict, record,
+and indentation are **ignored**. Multi-line list, tuple, record,
 and call expressions are written naturally:
 
 ```python
@@ -341,25 +341,29 @@ atom ::= literal
        | "(" ")"                              -- empty tuple (target: the unit value, §3.1; [Open] whether it equals None today)
        | "(" expression "," ")"              -- one-tuple
        | "(" expression ( "," expression )+ [ "," ] ")"   -- tuple
+       | "(" record_field ( "," record_field )* [ "," ] ")"   -- record value
        | "[" [ expression ( "," expression )* [ "," ] ] "]"   -- list
        | "[" expression comp_for ( comp_for | comp_if )* "]"  -- collection comprehension
        | "(" expression comp_for ( comp_for | comp_if )* ")"  -- collection comprehension (paren form)
-       | "{" [ record_field ( "," record_field )* [ "," ] ] "}"   -- record (bare-identifier keys)
-       | "{" dict_entry ( "," dict_entry )* [ "," ] "}"           -- dict (expression keys)
+       | "{" typed_ident ( "," typed_ident )* [ "," ] "}"   -- record type (§6.1)
+       | "{" expression ( "," expression )+ [ "," ] "}"   -- tuple type (§6.1)
 
-record_field ::= ident ":" expression
-dict_entry   ::= expression ":" expression
+record_field ::= ident "=" expression
+typed_ident  ::= ident ":" expression
 comp_for     ::= "for" assign_target "in" expression
 comp_if      ::= "if" expression
 ```
 
-A `{...}` literal is classified by its keys: if **every** key is a bare
-identifier it is a **record** (`{x: 1, y: 2}`); otherwise (string keys,
-computed keys) it is a **dict** (`{"name": "alice"}`). `{}` is the empty
-record. Dicts currently parse but are rejected at lowering.
+A record **value** is a parenthesised list of `name=value` fields:
+`(x=1, y=2)`. The parentheses are the product constructor (§2.4 Direction),
+shared with tuples — `(1, 2)` is a tuple, `(x=1, y=2)` a record, `(e)` a
+parenthesised `e`, `(e,)` a one-tuple.
 
-`(e)` (no trailing comma) is parenthesised `e`, **not** a one-tuple. A
-one-tuple is written `(e,)`.
+A `{...}` literal is **type** syntax (§6.1), never a term-level value: bare
+identifier keys with `:` make a record type (`{x: T, y: U}`) and a colon-free
+list makes a tuple type (`{T, U}`). A `{...}` in value position is a lowering
+error pointing at the `(…)` form. (Finite maps are a collection, written
+`[k -> v, …]` — §6.3 — not a brace form.)
 
 > **Direction — term-level delimiters [Decided].** The three
 > delimiters split by role
@@ -371,9 +375,9 @@ one-tuple is written `(e,)`.
 > | `[ … ]` | **collections** — definition *and* lookup | list `[1, 2, 3]`, map `[k -> v, …]`, indexing `counts[word]`, `xs[0]` |
 > | `{ … }` | structural **types** | tuple type `{T, U}`, record type `{f: T}`, refinement `{x: T \| p(x)}` |
 >
-> Under that scheme `{…}` never appears at the term level: today's
-> `{name: e}` records become `(name=e, …)`, and dicts become map
-> literals `[k -> v, …]`.
+> Under that scheme `{…}` never appears at the term level: record values are
+> written `(name=e, …)`, and finite maps are collection literals
+> `[k -> v, …]` (**[Decided]**).
 >
 > Map entries use `->`, not `=` (**[Decided]**). `a -> b` is **pair
 > syntax** — sugar for the two-tuple `(a, b)`, valid in construction
@@ -385,9 +389,9 @@ one-tuple is written `(e,)`.
 > point `c[i]`), while the left of `->` is an *evaluated key
 > expression*. And it removes a one-character trap: `[x = 5]` (map)
 > vs `[x == 5]` (one-element list of `Bool`). Three earlier sketches
-> are superseded: dicts as `[k: v, …]` (`:` is settling on
-> annotation/type duty), map entries as `[k=v, …]` (which read as
-> keyword arguments), and Unicode `[k ↦ v, …]` (CHL is ASCII-only —
+> are superseded: map entries as `[k: v, …]` (`:` is settling on
+> annotation/type duty), as `[k=v, …]` (which read as keyword
+> arguments), and Unicode `[k ↦ v, …]` (CHL is ASCII-only —
 > §1.8). Still **[Open]**: the spelling of an *empty* map under the
 > new scheme. The record-syntax / call-argument interaction is
 > resolved by the functions-take-one-product-argument direction
@@ -514,7 +518,7 @@ they appear on consecutive source lines.
 ### Partiality is not yet defined [Open]
 
 Some expressions are *partial*: an out-of-range list index, a missing
-dict key, division by zero, integer overflow. Where this document says
+map key, division by zero, integer overflow. Where this document says
 such an expression "is not defined", it stops there deliberately: CHL
 has **no defined divergence semantics yet**. Whether a partial
 expression traps at runtime, diverges, is statically excluded by
@@ -736,7 +740,7 @@ error.
 ### 3.9 Subscript and attribute access
 
 ```
-target[index]    -- subscript: list element or dict lookup
+target[index]    -- subscript: list element or map lookup
 target.attr      -- attribute: record field access
 ```
 
@@ -744,13 +748,13 @@ target.attr      -- attribute: record field access
   element (0-based). An out-of-range subscript is a compile-time type
   error when statically known; otherwise the expression is not
   defined (see *Partiality*, §3).
-- **Subscript** on a dict with key `k` denotes the value associated
+- **Subscript** on a map with key `k` denotes the value associated
   with `k`. Looking up a missing key is not defined (see *Partiality*,
   §3).
 - **Attribute** on a record denotes the value of the named field. The
   field must exist; missing fields are a compile-time type error.
 
-Lists, dicts, and records all denote *finite functions* from their
+Lists, maps, and records all denote *finite functions* from their
 respective index domains (`UInt`, `K`, field-name) to their element /
 value type — so subscript and attribute access are uniformly
 "evaluate the finite function at a point," just spelt differently.
@@ -795,27 +799,28 @@ annotations are not yet writable in the surface syntax; some built-ins
 > `\x -> x -> 1` (a lambda returning a pair, §2.4) is unusual but
 > unambiguous — the first `->` closes the binder, the rest is body.
 
-### 3.11 List, tuple, record, dict literals
+### 3.11 List, tuple, record literals
 
 | Form | Denotes |
 |---|---|
 | `[]`, `[e₀, e₁, …]` | A finite list — an indexed bag of elements. The element at integer index `i` is `eᵢ`, but iteration order is unspecified (§3). Element types must unify. |
 | `(e,)`, `(e₀, e₁, …)`, `e₀, e₁, …` | An anonymous heterogeneous product (tuple). Element types may differ. Tuples are positional, not unordered: `(1, 2)` and `(2, 1)` are distinct values. |
-| `{}`, `{name: e, …}` | A record (named-field product). Field names are bare identifiers; field types may differ. |
-| `{k₀: v₀, …}` (any non-identifier key) | A dict (finite map). Key types must unify; value types must unify. Parses today, but rejected at lowering. |
+| `(name=e, …)` | A record (named-field product). Field names are bare identifiers; field types may differ. The parentheses are the product constructor, shared with tuples (§2.4). |
 
 A trailing comma is allowed in every form (and required to disambiguate
 `(e,)` from `(e)`).
 
-**Record vs. dict.** The parser classifies a `{...}` literal by its
-keys (§2.4): all-bare-identifier keys make a record, anything else
-makes a dict. The two are different constructs despite sharing a
-delimiter — a record is a product with statically-known fields, a dict
-is a finite map over dynamic keys. Both the shared delimiter and the
-look-at-the-keys rule are transitional (see the Direction note below).
+**Tuple vs. record.** Both use `( … )`: a comma-list of bare expressions is
+a tuple (`(1, 2)`), a comma-list of `name=value` fields is a record
+(`(x=1, y=2)`). `(e)` (no field, no trailing comma) is a parenthesised `e`.
 
-**Empty forms.** `{}` is the empty record. `[]` is the empty list.
-There is no empty-dict literal today.
+**Records are not braces.** `{...}` is type syntax (§6.1) — a record *type*
+`{name: T}` or a tuple type `{T, U}`. A `{...}` in value position is a
+lowering error. Finite maps are a collection literal `[k -> v, …]` (§6.3,
+**[Decided]**), not a brace form.
+
+**Empty forms.** `()` is the empty product — the unit value, and equally the
+empty record (§3.1). `[]` is the empty list.
 
 > **Direction [Decided].** The literal forms migrate with the
 > delimiter split (§2.4) and the collections model (§6.3), form by
@@ -824,10 +829,10 @@ There is no empty-dict literal today.
 > | Today | Target |
 > | --- | --- |
 > | `(1, 2)` — tuple | unchanged: `( … )` is the product constructor |
-> | `{name: e, …}` — record | `(name=e, …)` — a record is a product with named fields (and a call's keyword arguments are exactly such a record — §3.8) |
-> | `{"k": v, …}` — dict | `[k -> v, …]` — a map literal of entry pairs (§2.4); `[ … ]` is the collection delimiter |
+> | `(name=e, …)` — record | a record is a product with named fields (and a call's keyword arguments are exactly such a record — §3.8) |
+> | finite map | `[k -> v, …]` — a collection of entry pairs (§2.4); `[ … ]` is the collection delimiter |
 > | `[1, 2, 3]` — list | same spelling, but shared across collection types: the literal can denote an `Array`, `List`, or `Set`, disambiguated by annotation or usage, with `list([…])` / `set([…])` constructors for explicitness (**[Tentative]** — §6.3) |
-> | `{}` — empty record | the empty product `()`: records and tuples are both products (§3.8), so the empty record, the empty tuple, and the unit value coincide (§3.1) |
+> | empty record / unit | the empty product `()`: records and tuples are both products (§3.8), so the empty record, the empty tuple, and the unit value coincide (§3.1) |
 > | `[]` — empty list | same spelling; the empty-**map** spelling is **[Open]** (§2.4) |
 >
 > `{ … }` itself moves wholesale to the type level (§2.4, §6.1); no
@@ -1358,9 +1363,9 @@ marked one carries its status per "How to read this document".)
   have the same field names with the same field types.
 - `Mut(V)` / `Mut(V, Txn)` — mutable-variable / transactional-register
   type (§6.2, §8).
-- `Dict(K, V)` — finite-map type. **[Planned]** — dict literals parse
-  but are rejected at lowering (§3.11), and `Dict(…)` is not accepted
-  as an annotation.
+- `Map(K, V)` — finite-map type. **[Planned]** — the map literal
+  `[k -> v, …]` (§3.11) and `Map(…)` as an annotation are both
+  unimplemented.
 - `{T₀, T₁, …} ⇒ U` — function type. A function takes exactly one
   argument (§3.8): an n-parameter function's domain is the
   corresponding tuple type, and a keyword-argument function's domain
@@ -2035,13 +2040,12 @@ with parser-level support that lowering rejects:
 - **Pattern matching** beyond tuple destructuring on assignment
   targets — a `match`/`case` form appears in the north-star `txn_kv`
   (**[Tentative]**, §1.6) but has no design writeup.
-- **The term-level delimiter migration** — records `(f=1, …)`, maps
-  `[k -> v, …]`, `{…}` reserved for types (**[Decided]**, §2.4). Today
-  the parser still classifies `{…}` by its keys (record vs. dict) and
-  dict lowering is `Unsupported`; earlier plans to move dicts to
-  `[k: v, …]`, `[k=v, …]`, or Unicode `[k ↦ v, …]` are superseded by
-  the map-literal decision.
-- **Map/dict comprehensions** — not in the grammar; the surface form
+- **The term-level delimiter migration** — record values are `(f=1, …)`, and
+  `{…}` no longer denotes a term-level value (it is record-type / tuple-type
+  syntax, §2.4). Finite maps as `[k -> v, …]` remain **[Decided]**; earlier
+  plans to spell them `[k: v, …]`, `[k=v, …]`, or Unicode `[k ↦ v, …]` are
+  superseded by the map-literal decision.
+- **Map comprehensions** — not in the grammar; the surface form
   follows the map-literal decision above: `[k -> v for …]`
   (**[Decided]** as surface, unimplemented; the north-star
   `storefront` `/stats` rollup uses it).

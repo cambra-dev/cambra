@@ -794,7 +794,7 @@ mod tests {
     fn rendered_errors_have_exact_format() {
         let code = "\
 x = 1 +
-y = {\"a\": 1}
+y = {a: 1}
 y
 ";
         let errs = compile_err(code);
@@ -814,9 +814,9 @@ Error: parse error
 Error: lowering error
    ╭─[<test>:2:5]
    │
- 2 │ y = {\"a\": 1}
-   │     ────┬───
-   │         ╰───── dict literals (with non-identifier keys) are not yet supported
+ 2 │ y = {a: 1}
+   │     ───┬──
+   │        ╰──── `{…}` is type syntax (a record type `{name: T}`); a record value is written `(name=value)`
 ───╯
 ";
         let normalize = |s: &str| -> String {
@@ -839,12 +839,12 @@ Error: lowering error
     #[test]
     fn parse_error_does_not_suppress_later_lowering_errors() {
         // Statement 1 has a syntax error (parser recovers at the next
-        // newline); statement 2 contains a dict literal with non-identifier
-        // keys, which lowering rejects. We must see both stages' errors in
-        // the result.
+        // newline); statement 2 is a brace record in value position, which
+        // parses but lowering rejects (braces are type syntax). We must see
+        // both stages' errors in the result.
         let code = "\
 x = (1 +)
-y = {\"a\": 1}
+y = {a: 1}
 y
 ";
         let errs = compile_err(code);
@@ -882,8 +882,8 @@ y = 2 *
     #[test]
     fn multiple_lowering_errors_all_surface() {
         let code = "\
-x = {\"a\": 1}
-y = {\"b\": 2}
+x = {a: 1}
+y = {b: 2}
 y
 ";
         let errs = compile_err(code);

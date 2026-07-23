@@ -1,29 +1,12 @@
 # CHL Parser Design
 
 This document describes the design of the Cambra High-Level Language (CHL)
-parser introduced in `src/chl_parser/`, which replaced the
-[`rustpython_parser`](https://crates.io/crates/rustpython-parser) front end.
+parser in `src/chl_parser/`.
 
-## Motivation
-
-The historical front end used `rustpython_parser` to parse CHL source as
-Python. This was expedient but constraining:
-
-1. **Strict Python compatibility is no longer a goal.** CHL has already
-   diverged from Python at the operator level (`<<` is the feed operator,
-   `<<=` defines a deferred output, `++` is collection union) and we want
-   to add more CHL-specific syntax in future without coercing it into
-   Python's grammar.
-
-2. **Error recovery is weak.** `rustpython_parser` aborts on the first
-   syntax error, surfacing one diagnostic per parse. For an interactive UX
-   we want to recover from local errors and report *all* problems in a file.
-
-3. **Lowering is awkward.** Several `rustpython_ast` shapes don't map
-   cleanly onto CCL — e.g. `if`/`elif` chains nest in `orelse` fields, and
-   record-style `{ident: value}` and dict-style `{"key": value}` share a
-   `Dict` variant that lowering has to re-classify. A bespoke CHL AST can be
-   shaped to match what lowering actually consumes.
+Two properties shape it: **error recovery** — parsing continues past a local
+syntax error and reports *all* problems in a file, for an interactive UX — and
+an **AST shaped to match what lowering consumes**, so lowering does no
+re-classification.
 
 ## Stack: logos + chumsky
 
@@ -122,7 +105,7 @@ refuses them at the syntactic level rather than parsing-then-erroring.
 
 ### Stage 3 — AST (`ast.rs`)
 
-Designed fresh — no dependency on `rustpython_ast`. Key shape choices:
+Key shape choices:
 
 - **Every node carries a span** via `Spanned<T>`, so diagnostics for any
   sub-expression have precise location info.
@@ -132,9 +115,11 @@ Designed fresh — no dependency on `rustpython_ast`. Key shape choices:
 - **`if`/`elif` chains flatten.** `Stmt::If` carries a `Vec<IfBranch>` (one
   per `if`/`elif`) plus an optional `else_body`, rather than nesting an
   `If` inside an `Else`. This matches the `Case` shape in CCL.
-- **Records and dicts are syntactically distinct.** `{x: 1}` (bare
-  identifier keys) parses as `Expr::Record`; `{"name": "alice"}` (expression
-  keys) parses as `Expr::Dict`. Lowering no longer has to re-classify.
+- **Records are parens; braces are types.** A record *value* `(x=1)` parses
+  as `Expr::Record`; brace literals are type syntax — `{x: T}` is
+  `Expr::BraceRecord`, `{T, U}` is `Expr::BraceGroup`, `{"name": v}` is
+  `Expr::Dict`. Lowering reads the brace forms as types and rejects them as
+  values.
 - **Feed / Define have their own variants.** `Expr::Feed` and `Stmt::Define`
   capture `<<` and `<<=` directly, rather than appearing as `BinOp(LShift)`
   and `AugAssign(LShift)` that lowering must special-case.
@@ -323,21 +308,6 @@ The structured `ParseErrorInfo` preserves everything ariadne needs
 so callers building their own diagnostic UI can render without going
 through ariadne.
 
-## Phased migration plan
-
-- **Phase 1 — Foundation.** Lexer, parser, AST, tests. Produces a CHL AST
-  that nothing consumes yet; `rustpython_parser` remains the authoritative
-  input to lowering. *(Landed.)*
-
-- **Phase 2 — Cutover.** [`src/ccl/lower/`](../ccl/lower/) ported to
-  consume the CHL AST directly; `rustpython-parser` and `rustpython-ast`
-  removed from `Cargo.toml`; `pretty_ast.rs` deleted; all integration tests <!-- doc-refs-ignore: pretty_ast.rs was intentionally deleted -->
-  switched. *(Landed.)*
-
-- **Phase 3 — Diagnostics.** Future work: more `.labelled(…)` annotations
-  for richer expected-set categories, and a real diagnostic surface in the
-  compile-error path so end users see ariadne output by default.
-
 ## Gotchas
 
 Two non-obvious chumsky 1.0-alpha lifetime pitfalls — both surface as the
@@ -362,10 +332,9 @@ unhelpful `'src must outlive 'static` error — were hit during development:
 - **Unit tests** in `lexer.rs` and `parser.rs` cover individual grammar
   productions and the layout pass.
 - **Integration tests** in `tests/chl_parser_roundtrip.rs` parse
-  representative CHL programs lifted from the existing test suite (joined
-  comprehensions, defer/feed patterns, function definitions with `yield`,
-  multi-line bracketed expressions, …) and assert the AST shape only at
-  the level required to catch regressions.
+  representative CHL programs (joined comprehensions, defer/feed patterns,
+  function definitions with `yield`, multi-line bracketed expressions, …) and
+  assert the AST shape only at the level required to catch regressions.
 
 Run with `cargo test chl_parser` for the unit tests and
 `cargo test --test chl_parser_roundtrip` for the integration tests.

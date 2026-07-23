@@ -32,7 +32,7 @@ x"#,
     Tile::Scalar(ColumnValue::Ints(vec![6]))
 )]
 // The accumulator's value type can be spelled concretely: `Mut(Int)`
-// annotates the binding at `int` (checked against init and updates).
+// annotates the binding at `Int` (checked against init and updates).
 #[case(
     r#"
 x: Mut(Int) := 0
@@ -580,30 +580,30 @@ fn mut_arg_must_be_a_mutable_not_a_plain_value() {
 #[test]
 fn nonmut_param_reads_mut_arg_current_value() {
     check_scalar(
-        "cnt: Mut[int] := 5\ndef g(a: int):\n    a + 1\ng(cnt)",
+        "cnt: Mut(Int) := 5\ndef g(a: Int):\n    a + 1\ng(cnt)",
         cambra::interpreter::Value::Int(6),
     );
 }
 // The enforced annotation has force even when the argument is a mutable
-// variable: a `str` parameter rejects an `int` register's value. Before
+// variable: a `String` parameter rejects an `Int` register's value. Before
 // parameter annotations were carried through lowering this compiled — the
-// annotation was silently dropped and `a` inferred `int` from the argument.
+// annotation was silently dropped and `a` inferred `Int` from the argument.
 #[test]
 fn nonmut_param_annotation_enforced_against_mut_arg() {
     expect_compile_error(
-        "cnt: Mut[int] := 0\ndef g(a: str):\n    a\ng(cnt)",
+        "cnt: Mut(Int) := 0\ndef g(a: String):\n    a\ng(cnt)",
         "mismatch",
     );
 }
-// Pass-by-reference sibling of the above: a `Mut[int]` register cannot bind a
-// `Mut[str]` parameter — the value types must agree across the `(Mut, Mut)`
+// Pass-by-reference sibling of the above: a `Mut(Int)` register cannot bind a
+// `Mut(String)` parameter — the value types must agree across the `(Mut, Mut)`
 // edge. (This path is unchanged by parameter-annotation enforcement; the `Mut`
 // annotation always seeded the binder type. Pinned here because nothing else
 // covers a `Mut` value-type clash at a call site.)
 #[test]
 fn mut_param_value_type_must_match_mut_arg() {
     expect_compile_error(
-        "cnt: Mut[int] := 0\ndef g(c: Mut[str]):\n    c := \"x\"\ng(cnt)\ncnt",
+        "cnt: Mut(Int) := 0\ndef g(c: Mut(String)):\n    c := \"x\"\ng(cnt)\ncnt",
         "mismatch",
     );
 }
@@ -691,7 +691,7 @@ fn mutable_reads_are_positional() {
 /// `y: Int = x` must compile (not trip the rule-3 "unannotated `Mut` alias"
 /// error). Regression for the deref-copy being bound at the mutable type, which
 /// made `y` a `Mut` alias in the type system and misfired the discipline on a
-/// binding the user declared `int`.
+/// binding the user declared `Int`.
 #[test]
 fn deref_copy_is_a_value_not_a_mutable_alias() {
     check_scalar(
@@ -702,7 +702,7 @@ fn deref_copy_is_a_value_not_a_mutable_alias() {
 
 /// Writing a deref-copy is rejected — `y: Int = x` is immutable, so `y += 1` is
 /// the "not a mutable variable" error, never a silent mutable write. Regression for a
-/// write-site demand coalescing the `int`-declared `y`'s `.ty` to `Mut` and the
+/// write-site demand coalescing the `Int`-declared `y`'s `.ty` to `Mut` and the
 /// write-target check trusting `.ty` over the annotation.
 #[test]
 fn write_to_deref_copy_rejected() {
