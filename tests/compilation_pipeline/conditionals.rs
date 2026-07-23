@@ -590,6 +590,14 @@ for x in [3, 1]:
 total",
     3
 )]
+// **Trailing carries**: writes then a carrying tail (`x < 3` fires at 1,2; the
+// last three positions carry). The scalar-final read must fold to the last
+// *written* value (1+2 = 3), not undercount because the changelog's last change
+// tick sits below the position watermark — the terminality-vs-watermark fix.
+#[case(
+    "total := 0\nfor x in [1, 2, 3, 4, 5]:\n    if x < 3:\n        total += x\ntotal",
+    3
+)]
 // A **partial op** (`//`) in the written value, guarded away from its bad input.
 // The write value is compiled lazily (`filter_values(x != 0) ≫ (total // x)`), so
 // `total // x` is evaluated only where `x != 0` — never at the `x == 0` position
