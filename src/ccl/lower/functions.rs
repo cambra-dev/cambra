@@ -113,10 +113,22 @@ pub(super) fn uncurry_params(
             _ => Type::Hole,
         };
         let mut lam = Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr);
-        if matches!(param_ty, Type::History { .. })
-            && let TypedExprNode::Lambda { param, .. } = &mut lam.node
-        {
-            param.user_annotation = Some(param_ty);
+        if let TypedExprNode::Lambda { param, .. } = &mut lam.node {
+            if matches!(param_ty, Type::History { .. }) {
+                // `Mut[…]` pass-by-reference: the annotation rides `user_annotation`
+                // for the mutability discipline check (rule 3).
+                param.user_annotation = Some(param_ty);
+            } else if let Some(ann) = &params[0].annotation
+                && mut_param_history_type(&params[0]).is_none()
+            {
+                // Any *other* annotation (`int`, `List[T]`, …) is a
+                // **checking-mode** declaration: attach it so `emit_lambda` binds
+                // the param at its declared type and an ill-typed argument is
+                // rejected at the call site. Without this the annotation was
+                // silently dropped and the param inferred purely from its body (so
+                // `def g(a: int)` with an identity body accepted any argument).
+                param.user_annotation = Some(lower_type_annotation(ann)?);
+            }
         }
         return Ok(lam);
     }
@@ -156,7 +168,24 @@ pub(super) fn uncurry_params(
         let proj = Expr::apply(Expr::var(&tuple_name), Expr::proj_index(i));
         substitute_param_in_body(acc, &Name::raw(arg.name.as_str()), &proj)
     });
-    Ok(Expr::lambda(&tuple_name, Type::Hole, body_with_subs))
+    // Attach the *tuple* of per-parameter annotations (checking mode), mirroring the
+    // single-parameter case: each annotated position is enforced at the call site,
+    // unannotated positions ride `Hole` (inferred). Skip if no parameter is
+    // annotated. (This arm has no `Mut` params — those are curried above.)
+    let elem_anns: Vec<Type> = params
+        .iter()
+        .map(|p| match &p.annotation {
+            Some(ann) => lower_type_annotation(ann),
+            None => Ok(Type::Hole),
+        })
+        .collect::<Result<_, _>>()?;
+    let mut lam = Expr::lambda(&tuple_name, Type::Hole, body_with_subs);
+    if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
+        && let TypedExprNode::Lambda { param, .. } = &mut lam.node
+    {
+        param.user_annotation = Some(Type::Tuple(elem_anns));
+    }
+    Ok(lam)
 }
 
 /// Lower a CHL lambda expression to an [`Expr::Lambda`] via
