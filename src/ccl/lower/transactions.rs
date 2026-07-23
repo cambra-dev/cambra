@@ -184,31 +184,12 @@ fn lower_tx_block_inner(
     fallback_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    // A bare `if cond:` is a *deny guard for the whole transaction*: its
-    // condition becomes the single commit bit (`commit = cond`), so every write
-    // in the block — inside the `if` or not — is gated on it. Two sibling guards
-    // would each feed that one shared bit, and `transact_phase::apply_guard`
-    // conjoins them: a write under a passing guard is then silently dropped when
-    // an *unrelated* later guard fails (the guards are not scoped to their own
-    // writes). Until per-write path conditions land (the `Case`-merged decision,
-    // whose `commit` is the *disjunction* of the write path-conditions — see
-    // src/ccl/design/mutability.md "General in-transaction conditionals (and conditional writes)"), reject a second
-    // guard rather than miscompile, exactly as `elif`/`else` are rejected.
-    let mut guards = stmts
-        .iter()
-        .filter(|s| matches!(s.node, ChlStmt::If { .. }));
-    if guards.next().is_some()
-        && let Some(second) = guards.next()
-    {
-        return Err(LoweringError::unsupported(
-            second.span,
-            "multiple `if cond:` guards in one `with begin():` block are not \
-             supported: each gates the *whole* transaction's commit, so a write \
-             under one guard would be dropped whenever another fails. Combine the \
-             conditions into one guard (`if a and b:`) or split into separate \
-             transactions",
-        ));
-    }
+    // Multiple `if` guards, `elif` chains, and `else` branches are all supported:
+    // `transact_phase`'s path walk scopes each write to its own control-flow path,
+    // rejoins each key with a carry-forward `Case`, and commits on the disjunction
+    // of the write paths (see `src/ccl/design/mutability.md`). A guard is no longer
+    // transaction-scoped — a spine write beside an `if` commits unconditionally.
+    //
     // The chain terminal is manufactured sequencing (spanned to the block's
     // statements — the `with` construct when the block is empty).
     let block_span = match (stmts.first(), stmts.last()) {
@@ -318,27 +299,11 @@ fn lower_tx_if(
     else_body: Option<&[Spanned<ChlStmt>]>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    // The transaction guard model supports only a single bare `if cond:` — a
-    // *deny* guard whose implicit empty else means "do not commit". An `elif`
-    // chain or an `else` branch that writes would instead need each written key
-    // to become a conditional value (`k = if cond: v_then else: v_else`) with
-    // the transaction committing unconditionally — a distinct semantics from
-    // the deny guard, and a choice (deny vs. value-select) not yet settled.
-    // Reject both here rather than panicking downstream in `transact_phase`.
-    if branches.len() > 1 {
-        return Err(LoweringError::unsupported(
-            branches[1].cond.span,
-            "`elif` inside a `with begin():` block is not supported; only a bare \
-             `if cond:` deny guard is",
-        ));
-    }
-    if else_body.is_some() {
-        return Err(LoweringError::unsupported(
-            branches[0].cond.span,
-            "an `else` branch inside a `with begin():` block is not supported; a bare \
-             `if cond:` is a deny guard (the transaction commits only when `cond` holds)",
-        ));
-    }
+    // `if`/`elif`/`else` inside a block lowers to the general first-match `Case`
+    // (branches in order, a trailing `true → else|unit` complement). A bare
+    // `if cond:` (no `else`) keeps the deny idiom — its implicit empty-`else`
+    // carry means the transaction does not commit that write when `cond` fails;
+    // an `elif`/`else` that writes routes each key per path (`transact_phase`).
     let mut out_branches = Vec::with_capacity(branches.len() + 1);
     for branch in branches {
         let guard = lower_expr(&branch.cond, ctx)?;
