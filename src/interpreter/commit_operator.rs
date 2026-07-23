@@ -315,15 +315,22 @@ enum InitDrainFailure {
 /// produced but stayed empty) from a [`InitDrainFailure::Diverged`] one (no
 /// scalar tile settled within the bound).
 fn read_initial_scalar(producer: &mut dyn TileProducer) -> Result<Value, InitDrainFailure> {
+    use crate::interpreter::tile_operators::scalar_tile_to_column_value;
     let guard = producer.tiling().universal_guard();
     let mut saw_empty_scalar = false;
     for _ in 0..MAX_INIT_PULLS {
-        if let Tile::Scalar(cv) = producer.get(guard.clone()) {
-            if !cv.is_empty() {
-                return Ok(cv.index_at(0));
-            }
-            saw_empty_scalar = true;
+        // A compound (tuple/record) accumulator's init is struct-of-arrays
+        // (`Tile::Record`); box it into a single scalar record value so it seeds
+        // like any scalar. A plain scalar init passes straight through.
+        let cv = match producer.get(guard.clone()) {
+            Tile::Scalar(cv) => cv,
+            tile @ Tile::Record(_) => scalar_tile_to_column_value(tile),
+            _ => continue,
+        };
+        if !cv.is_empty() {
+            return Ok(cv.index_at(0));
         }
+        saw_empty_scalar = true;
     }
     // A scalar that stayed empty across the bound is a genuinely empty init; a
     // producer that never even yielded a scalar never settled.

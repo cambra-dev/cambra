@@ -44,12 +44,19 @@ impl ExtractLast {
             Tiling::SealedFunction { codomain, .. } => *codomain.clone(),
             other => panic!("ExtractLast source must have SealedFunction tiling, got {other}"),
         };
-        // The default has to be *representable* in the output value space, not
-        // identical to it. A tag `match`/conditional whose arms carry different
-        // tags collapses to the arms' join, and the trailing arm supplying the
-        // default is one of those arms — so its own extent is width-narrower (it
-        // carries its tag and not its siblings'). Emission below builds the column
-        // at the declared extent, which is what makes the narrower value fit.
+        // The default has to be *representable* in the output value space — neither
+        // identically tiled nor even the same extent. Two independent reasons, both
+        // live:
+        //
+        // - **Tiling shape.** A record/tuple value is `Scalar(Record)` coming from a
+        //   register history but `Record({_0: Scalar, …})` (struct-of-arrays) from a
+        //   literal. `get_impl` normalizes both through `scalar_tile_to_column_value`,
+        //   so the structural tilings need not agree — only the value-spaces.
+        // - **Width.** A tag `match`/conditional whose arms carry different tags
+        //   collapses to the arms' join, and the trailing arm supplying the default is
+        //   one of those arms, so its extent carries its own tag and not its siblings'.
+        //   Emission builds the column at the declared extent, which is what makes the
+        //   narrower value fit.
         debug_assert!(
             tiling.extent().includes(&default.tiling().extent()),
             "ExtractLast default must be representable in the source codomain: \
