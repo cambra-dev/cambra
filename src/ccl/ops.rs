@@ -381,6 +381,14 @@ pub enum Builtin {
     /// `max : ∀α γ. (α ⤇ γ) ⇒ γ` — fold a collection's codomain to one of the
     /// same type.
     Max,
+    /// `drain` — the terminal aggregate: consume a collection of any element
+    /// type and yield `unit` (see [`AggregateKind::Drain`]). Produced only by
+    /// the `set` constructor's group collapse.
+    Drain,
+    /// `sole : ∀α γ. (α ⤇ γ) ⇒ γ` — a group's one element, faulting on a group
+    /// holding more (see [`AggregateKind::Sole`]). Produced only by the `map`
+    /// constructor's group collapse.
+    Sole,
     /// `final_or_default : Tuple(Fun(D, T), T) → T` — extract the
     /// codomain value at the final position of an iteration stream, or
     /// fall back to the default scalar when the stream's domain is
@@ -658,6 +666,8 @@ impl Builtin {
             Self::MapFilter => "map_filter",
             Self::Sum => "sum",
             Self::Max => "max",
+            Self::Drain => "drain",
+            Self::Sole => "sole",
             Self::FinalOrDefault => "final_or_default",
             Self::GetPrevSeq => "get_prev_seq",
             Self::GetPrevTxn => "get_prev_txn",
@@ -688,6 +698,8 @@ impl Builtin {
         match kind {
             AggregateKind::Sum => Self::Sum,
             AggregateKind::Max => Self::Max,
+            AggregateKind::Drain => Self::Drain,
+            AggregateKind::Sole => Self::Sole,
         }
     }
 
@@ -727,6 +739,7 @@ impl Builtin {
             self,
             Self::Sum
                 | Self::Max
+                | Self::Drain
                 | Self::Converse
                 | Self::MapDomain
                 | Self::Uncurry
