@@ -306,6 +306,186 @@ fn test_conditional_record_arms_join_by_field_intersection() {
     );
 }
 
+// A `Collection(T) = Σ D. D ⤇ T` has an opaque (Σ-witness) domain, so it may
+// only be consumed *uniformly* (a var-domain consumer that works at any domain).
+// A consumer demanding a **concrete** domain (`Array(N)`) must be rejected — the
+// collection is not known to have that domain. This is the `TypeKind::Any` Σ-elim
+// presenting the sum itself as the consumed domain: a concrete domain is not `<:` a
+// sum. (Regression for the soundness hole where a `Collection` was silently accepted
+// as a fixed-domain `Array`.)
+#[test]
+fn test_collection_consumed_at_concrete_domain_is_rejected() {
+    // `f`'s `c` is genuinely `Collection(int)`; `g` demands `Array(3)`.
+    let base = "def g(a: Array(3, Int)):\n    sum(a)\ndef f(c: Collection(Int)):\n    g(c)\n";
+    assert!(!infer_program_err(&format!("{base}f([1,2])")).is_empty());
+    assert!(!infer_program_err(&format!("{base}f([1,2,3,4])")).is_empty());
+}
+
+/// A conditional collection reaching a UDF parameter, bare and under each annotation
+/// that should accept it.
+///
+/// The arms' domains arrive as atoms on the parameter's one domain position rather than
+/// as two arrow shapes, and reading that position is `denoted_domains` — the single
+/// reading shared by coalesce's materialization and the domain lattice. Both consumers
+/// have to agree, because an annotation adds a second contribution at the same position
+/// (`Described(Any)` for `Collection`, `Described(UIntRanges)` for `List`) and so routes
+/// the merge through `order_by_kind`/`domain_kind` instead of through materialization.
+/// While that path could read only a candidate holding *one* atom, the two joined
+/// domains had "no shape", the kinds came out unrelated, and the merge conflicted.
+#[test]
+fn conditional_collection_into_a_udf_param() {
+    let c = "box([1, 2]) if True else box([1, 2, 3])";
+    for param in ["c", "c: Collection(Int)", "c: List(Int)"] {
+        assert_eq!(
+            infer_program(&format!("def f({param}):\n    sum(c)\nf({c})")),
+            int(),
+            "a conditional collection must reach `{param}`"
+        );
+    }
+    // A **filtered** arm reaches this route too, and the parameter agrees with a `let`:
+    // the candidates travel as a sum, and a candidate whose domain is inferred resolves
+    // because candidates cross a level boundary invariantly.
+    let filtered = "box([x for x in [1, 2, 3] if x > 1]) if True else box([1, 2])";
+    for program in [
+        format!("def f(c):\n    sum(c)\nf({filtered})"),
+        format!("x = {filtered}\nsum(x)"),
+    ] {
+        assert_eq!(
+            infer_program(&program),
+            int(),
+            "the filtered arms survive: {program}"
+        );
+    }
+    // `List` still excludes a refined arm, and now only for the intended reason — a refined
+    // range is not a `UIntRange`, so it cannot supply the length witness a `List` ranges over.
+    assert!(
+        !infer_program_err(&format!("def f(c: List(Int)):\n    sum(c)\nf({filtered})")).is_empty(),
+        "a filtered collection is not a `List`"
+    );
+}
+
+#[test]
+fn test_collection_uniform_consumers_accepted() {
+    // Uniform (var-domain) consumers accept a `Collection` at any domain.
+    assert_eq!(
+        infer_program("def f(c: Collection(Int)):\n    sum(c)\nf(box([1,2,3]))"),
+        int()
+    );
+    // Identity round-trips the sum unchanged — the close re-pairs the domain the
+    // annotation's own bound opened. Asserted on `f` itself, since a
+    // *concrete* call site legitimately refines the domain (an annotation bounds the
+    // param, it does not replace it).
+    assert_eq!(
+        infer_program("def f(c: Collection(Int)):\n    c\nf").to_string(),
+        "(Σ σ ∈ *. (σ ⤇ Int) ⇒ Σ σ ∈ *. (σ ⤇ Int))"
+    );
+    // A comprehension over a `Collection` maps it (domain-preserving), so the witness
+    // survives into the result. At a concrete call site the argument is the `box`ed
+    // literal, whose kind names one candidate — so what comes back is that one-candidate
+    // sum, not the opaque `Any` the annotation ranges over.
+    assert_eq!(
+        infer_program("def f(c: Collection(Int)):\n    [x + 1 for x in c]\nf(box([1,2,3]))")
+            .to_string(),
+        "Σ σ ∈ {[0, 2]}. (σ ⤇ Int)"
+    );
+}
+
+// `List` goes through the *same* open-and-close as `Collection` above — the kind is the
+// only difference. Nothing leaks: elimination names the consumed sum's witness and the
+// close re-binds it, so no free witness escapes into a consumer's result.
+#[test]
+fn test_list_map_reseals_to_list() {
+    // Identity round-trips the sum (compaction re-pairs the opened domain).
+    assert_eq!(
+        infer_program("def f(c: List(Int)):\n    c\nf").to_string(),
+        "(Σ σ ∈ [..]. (σ ⤇ Int) ⇒ Σ σ ∈ [..]. (σ ⤇ Int))"
+    );
+    // `map` (domain-preserving) at a concrete call site preserves the *argument's*
+    // witness — the annotation bounds the param rather than replacing it, so the caller's
+    // one-candidate kind, not the `List` kind, is what reaches the result.
+    assert_eq!(
+        infer_program("def f(c: List(Int)):\n    [x + 1 for x in c]\nf(box([1,2,3]))").to_string(),
+        "Σ σ ∈ {[0, 2]}. (σ ⤇ Int)"
+    );
+    // `sum` (collapsing) → the scalar element type; the domain collapses away.
+    assert_eq!(
+        infer_program("def f(c: List(Int)):\n    sum(c)\nf(box([1,2,3]))"),
+        int()
+    );
+}
+
+/// Width-to-top (`Σ <: Collection`) holds for **every** kind, keyed included — `Any`
+/// is ⊤ structurally rather than by a row per kind
+/// (`src/ccl/design/type-inference.md`, "Witness kinds form a lattice"). A
+/// `Map(𝐾, 𝑉)` *is* a data function with codomain `𝑉`, so there is nothing for the
+/// kind lattice to withhold, and a map handed to a `Collection(𝑉)` slot is read as
+/// its values.
+///
+/// What should reject `sum(m)` is not this edge but the **iteration element**:
+/// iterating a `Map` yields `(𝐾, 𝑉)` entries, and entries cannot be summed. Until
+/// `sum` lowers as `sum([x for x in m])` the rejection has nowhere to come from
+/// (`src/ccl/design/collections.md`, "Implementation roadmap"). That leaves the two
+/// routes into a map's values *agreeing* — see
+/// [`test_map_consumption_is_kind_blind_interim`] for the direct one — rather than
+/// one of them closed by a kind row that cannot tell a user's `sum(m)` from lowering
+/// consuming a `groupby` per key.
+#[test]
+fn test_keyed_collection_widens_to_collection_like_any_other() {
+    assert_eq!(
+        infer_program(
+            "def f(c: Collection(Int)):\n    sum(c)\ndef g(m: Map(Int, Int)):\n    f(m)\ng"
+        )
+        .to_string(),
+        "(Σ σ ∈ {Int?}. (σ ⤇ Int) ⇒ Int)"
+    );
+    // A positional collection widens by the same arm, so the edge is kind-blind rather
+    // than keyed-specific.
+    assert_eq!(
+        infer_program("def f(c: Collection(Int)):\n    sum(c)\ndef g(l: List(Int)):\n    f(l)\ng")
+            .to_string(),
+        "(Σ σ ∈ [..]. (σ ⤇ Int) ⇒ Int)"
+    );
+}
+
+/// The **other** route by which a map can be read as its values — direct
+/// consumption — is still open, and deliberately so: `Σ`-elimination (`Σ <: Fun`)
+/// is kind-blind, because that is the same arm that makes `sum(xs)` work for a
+/// `List` and `[f(g) for g in groupby(…)]` work for a keyed collection. So
+/// `sum(m)` type-checks today and sums the values.
+///
+/// That is the [Interim] "`for`-in binds the codomain for every kind" state, not a
+/// second subtyping hole: closing it means giving `Map` a per-kind `Iterable`
+/// instance, which needs the kind to be *represented*
+/// (`src/ccl/design/collections.md`, "Two axes: representation vs kind
+/// [Decided direction; representation tentative]"). When the operation layer lands this
+/// assertion flips to a rejection pointing at `values(m)`.
+#[test]
+fn test_map_consumption_is_kind_blind_interim() {
+    assert_eq!(
+        infer_program("def g(m: Map(Int, Int)):\n    sum(m)\ng").to_string(),
+        "(Σ σ ∈ {Int?}. (σ ⤇ Int) ⇒ Int)"
+    );
+}
+
+// A conditional (`Enumerated` Σ) collection may likewise not be consumed at a
+// concrete domain: its arms flow individually into the consumer and a too-small
+// arm fails the contravariant edge (`consumer_domain <: arm_domain`). Pins the
+// per-arm rejection that was previously untested.
+#[test]
+fn test_conditional_collection_consumed_at_concrete_domain_is_rejected() {
+    // Arms `{[0,1], [0,2]}` (2- and 3-element); a concrete `Array(N)` consumer is
+    // rejected because some arm cannot supply domain N.
+    let base = "def g(a: Array(3, Int)):\n    sum(a)\n";
+    assert!(
+        !infer_program_err(&format!("{base}g(box([1,2]) if True else box([3,4,5]))")).is_empty()
+    );
+    // Even a `sum`-only, var-domain consumer accepts the same conditional.
+    assert_eq!(
+        infer_program("sum(box([1,2]) if True else box([3,4,5]))"),
+        int()
+    );
+}
+
 #[test]
 fn test_aggregate_over_scalar_lambda_is_rejected() {
     // Summing a plain lambda: a bare `λ` is a capability, built concrete
@@ -472,6 +652,28 @@ def f(a: List(Int), b: Int):
 f(box([1,2]),3)"
         ),
         int_lit(3)
+    );
+}
+
+#[test]
+fn test_def_param_annotation_enforces_domain() {
+    // `Array(3, int)` = `[0, 2] ⤇ Int`: the argument's domain must match.
+    assert_eq!(
+        infer_program("def g(a: Array(3, Int)):\n    sum(a)\ng([1, 2, 3])"),
+        int()
+    );
+    // A shorter or longer literal is rejected — the domain is part of the type.
+    assert!(!infer_program_err("def g(a: Array(3, Int)):\n    sum(a)\ng([1, 2])").is_empty());
+    assert!(!infer_program_err("def g(a: Array(3, Int)):\n    sum(a)\ng([1, 2, 3, 4])").is_empty());
+    // `List(int)` accepts any length (the length is a runtime witness).
+    assert_eq!(
+        infer_program("def g(a: List(Int)):\n    sum(a)\ng(box([1, 2, 3, 4, 5]))"),
+        int()
+    );
+    // The element type is enforced through the annotation too.
+    assert!(
+        !infer_program_err("def g(a: Array(3, Int)):\n    sum(a)\ng([\"a\", \"b\", \"c\"])")
+            .is_empty()
     );
 }
 
@@ -664,14 +866,13 @@ fn test_source_list_comp_element_type() {
     );
 }
 
-/// A `List(_)` annotation is a value-witness Σ (`Σ n:UInt. {i | i < n} ⤇ V`).
-/// Injecting a concrete collection into it tests **membership in the witness kind** —
-/// does the injecting domain realize the length witness (is it a range)? — which is a
-/// predicate on a shape, not a subtype constraint. When the injecting collection is
-/// *computed* (a comprehension), its domain is an inference variable at emit time and
-/// has no shape to read, so the requirement is recorded as a **kinding constraint** on
-/// that variable and discharged when its position resolves. See
-/// `src/ccl/design/collections.md`, "Injecting a domain that has no shape yet".
+/// A `List(_)` annotation is the `UIntRanges`-kinded Σ (`Σ (𝐷: UIntRanges). 𝐷 ⤇ V`).
+/// Injecting a concrete collection into it is a **kind-membership check** — is the
+/// injecting domain a range? — a predicate on a shape, not a subtype constraint. When
+/// the injecting collection is *computed* (a comprehension), its domain is an inference
+/// variable at emit time and has no shape to read, so the requirement is recorded as a
+/// **kinding constraint** on that variable and discharged when its position resolves.
+/// See `src/ccl/design/collections.md`, "Injecting a domain that has no shape yet".
 #[test]
 fn test_comprehension_enters_a_list_annotation() {
     // The comprehension's domain resolves to `[0, 3)` — a range — which realizes

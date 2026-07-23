@@ -722,11 +722,11 @@ The pipeline passes downstream of inference treat function types structurally an
 > notation: consumption goes through its own rule (typed, propagating), not a `Σ <: Fun`
 > coercion, and the witness is referenced in the body's domain position
 > ([`Type::WitnessRef`]). The witness here is a **type**-witness of
-> `TypeKind::Enumerated` (a static branch set) — the finite instance. The
-> *value*-witness instances share the same `Type::Sigma` machinery: the `List`
-> length witness is **implemented** (the collections work), while the `Map`
-> key-set witness and the `TypeKind::Any` universe instance (`Collection`) remain
-> pending.
+> `TypeKind::Enumerated` (a static branch set) — the finite instance. The other
+> instances share the same `Type::Sigma` machinery, differing only in their
+> witness *kind*: `TypeKind::UIntRanges` (`List`) and the `TypeKind::Any` universe
+> instance (`Collection`) are **implemented** (the collections work);
+> `TypeKind::Keyed` (`Map`/`Set`) remains pending.
 
 The unresolved domain-join corner of §4.5 (O1/O4 — two collections meeting at
 one join point) is resolved by making a missing distinction explicit and
@@ -922,6 +922,15 @@ on an unfixed correspondence. Body subtyping therefore recurses through the ordi
 arms, which is also what relates the two bodies' Pi binders: the `Fun`/`Fun` arm derives
 that correspondence itself.
 
+**A kind *parameter* is related, not inspected.** A kind may carry a type
+(`Keyed(𝐾)`), and a parameter is not something a membership predicate can settle: relating
+two types is subtyping's job. So containment hands the pair back as an *obligation* and the
+Σ-width arm discharges it through the ordinary solver, invariantly in both directions (a
+`Map(Int, 𝑉)` is not a `Map(String, 𝑉)` either way). Shape is checked; parameters are
+related. Emitting rather than testing is also what lets an **open** parameter be pinned by
+the kind it is compared against instead of merely failing to match it, which is what makes
+an annotation `Map(_, 𝑉)` inferable.
+
 Witness-kind subtyping `K₀ <: K₁` is not a premise of this rule — it is a *sufficient*
 condition for it, and the one the implementation uses. See [Witness kinds form a
 lattice](#witness-kinds-form-a-lattice) for the kind level and [Where the pairing search
@@ -1014,10 +1023,26 @@ same containment, run once there is a shape to read.
 
 `TypeKind::Any` (`Collection`) is two containment rows: everything is contained in
 the universe, and the universe is contained in nothing narrower — which is what
-rejects consuming a `Collection` where a concrete domain is demanded. The **keyed**
-witness is the one still to be wired; it lands as its own kind over a
-`Refinement(𝐾, ⟨opaque key token⟩)` domain (see `src/ccl/design/collections.md`
-"Implementation roadmap"), and needs no new witness *flavour* — only a new kind.
+rejects consuming a `Collection` where a concrete domain is demanded.
+**`TypeKind::Keyed(𝐾)`** is the kind of every key domain over 𝐾, which is what a
+`Map`/`Set` is: `Map(𝐾, 𝑉) = Σ (𝐷: Keyed(𝐾)). 𝐷 ⤇ 𝑉` — the last collection shape to
+join the kind system, needing no new witness *flavour*, only a new kind.
+
+`Keyed` is the first **parameterized** kind, and that distinction is load-bearing.
+An `Enumerated` kind *lists* its candidates, so containment asks a decidable question
+about one kind — is this domain in that set — and equality answers it. A parameter is
+a **type to be related**, and relating two types is subtyping's job, not a
+predicate's. So containment does not decide a parameter: it emits the pair as an
+*obligation* and the Σ-width arm discharges it through the ordinary constraint solver,
+invariantly in both directions (a `Map(Int, 𝑉)` is not a `Map(String, 𝑉)` either way).
+Emitting rather than testing is also what lets an **open** key type be pinned by the
+kind it is compared against, instead of merely failing to match it — the same
+distinction that makes an annotation `Map(_, 𝑉)` inferable.
+
+The one kind still awaiting this treatment on the *concrete* side is the keyed domain
+a producer mints, `Refinement(𝐾, ⟨opaque key token⟩)`; until it lands, nothing
+satisfies `Enumerated <: Keyed` (see `src/ccl/design/collections.md` "Implementation
+roadmap").
 
 > **Where the gated partition is related to the sum.** Nowhere in `<:` — that is the
 > content of [only a term builds a sum](#only-a-term-builds-a-sum). The gated tagged union
@@ -1135,11 +1160,13 @@ itself, with no tag; Cambra does not narrow on opaque `Bool`s, and the tagged
 variant is the substitute. Note the codomain loss is orthogonal to the axis the
 conditional-collection Sigma's witness *does* recover: our witness is a
 *type*-witness (`TypeKind::Enumerated` — which branch domain was taken), so the Sigma
-keeps the exact domain set. A Σ whose witness kind *describes* its domains rather
-than listing them recovers a different correlation — a conditionally-sized
-collection is `Σ (𝐷: UIntRanges). 𝐷 ⤇ 𝑇`, one shape for every length — which is a
-third axis, neither this codomain join's nor the enumerated witness's. It is the
-same `Type::Sigma` machinery either way: only the witness *kind* differs.
+keeps the exact domain set. A *value*-witness Σ would recover domain↔*value*
+correlation in a homogeneous-codomain data function (e.g. a conditionally-sized
+collection of in-bounds indices, `Σ 𝑛 ∈ Nat. {Int | __elem ∈ [0, 𝑛]} ⤇ …`),
+not per-branch element *types* — a third axis, neither this codomain join's nor
+the enumerated witness's. It is the same `Type::Sigma` machinery either way — only
+the witness *kind* differs — and is **implemented for `List`** (the collections
+work), pending for the keyed `Map`/`Set` case.
 
 > **Direction — collections.** The general collection design
 > ([collections.md](collections.md)) is built on this section. Its first
@@ -1148,8 +1175,9 @@ same `Type::Sigma` machinery either way: only the witness *kind* differs.
 > - **The witness goes live** — *done for `List`.* A materialized
 >   *conditional-collection* Σ is witness-free (`name` always `None`, stripped
 >   because no codomain predicate references it); a `List` instead rides its
->   **kind**, `Σ (𝐷: UIntRanges). 𝐷 ⤇ 𝑇`, with its own term and a
->   `Described` compact/coalesce domain. The keyed collection (`Map`/`Set`) is the same
+>   **kind** — the every-index-range instance `Σ 𝐷 ∈ UIntRanges. 𝐷 ⤇ 𝑇`, with its own
+>   term and a `Described` compact/coalesce domain. The keyed collection (`Map`/`Set`) is
+>   the same
 >   apparatus over a *membership*-refined element type (`{𝑘: 𝐾 | 𝑘 ∈ 𝐸}`, exactly
 >   the `{Int | __elem ∈ 𝑛}` shape above), and is the remaining live use —
 >   landing with the keyed collection types themselves (collections.md
@@ -1450,7 +1478,7 @@ kinding check does it for a resolved type.
 about current usage, not a restriction on the notion, and a second kind-carrying position
 would need no change to the kind level.
 
-Alongside subtyping, each **described** kind carries one further thing: a **membership
+Alongside subtyping, a **described** kind may carry one further thing: a **membership
 predicate** on a type — is this type a dense prefix range (`UIntRanges`), anything at all
 (`Any`), and whatever a later kind adds. Membership and kind subtyping are different
 questions and want different signatures. Membership takes a *type* and answers about one
@@ -1458,9 +1486,15 @@ kind; subtyping takes two *kinds*. A listed kind is contained in a described one
 when every one of its candidates satisfies that kind's membership predicate — which is how
 the two compose, and the only place they meet.
 
-Keeping them apart is what makes a new kind cheap: a variant, a membership predicate, and
-a row in the kind order. Nothing in `constrain.rs` changes, which is the property
-`every_witness_kind_uses_the_same_sigma_rules` pins.
+A **parameterized** kind has no such predicate, and that is the interesting case rather
+than an exception. A member of `Keyed(𝐾)` is `{𝐾 | __elem ▷ keydom#id}`, so deciding
+membership means *relating* a candidate's key to 𝐾 — an obligation, not a `bool`. Those
+rows therefore live in subtyping, which has somewhere to put an obligation, and
+[`TypeKind::admits`] never sees them.
+
+Keeping them apart is what makes a new kind cheap: a variant, a membership predicate or a
+parameter relation, and a row in the kind order. Nothing in `constrain.rs` changes, which
+is the property `every_witness_kind_uses_the_same_sigma_rules` pins.
 
 **Away from listed-vs-listed, the order is what the lattice reads rather than a computed
 kind.** `order_witness_kinds` runs `contains` in both directions and reports which side is narrower;
@@ -2502,8 +2536,9 @@ correct.
   so the two do not meet today; they would the moment the fan-out is reconciled against a
   sum with two or more candidates. A Σ formed at the join fixes the order by construction.
 
-- **Witness-dependent kinds are unbuilt.** No kind carries a reference to an *enclosing*
-  witness — the `Σ (𝑤₁: 𝐾₁). Σ (𝑤₂: 𝐾₂[𝑤₁]). 𝐵` shape. Nothing forecloses it: it is kind
+- **Witness-dependent kinds are unbuilt.** A kind may carry a type parameter
+  (`Keyed(𝐾)`), but nothing carries a reference to an *enclosing* witness — the
+  `Σ (𝑤₁: 𝐾₁). Σ (𝑤₂: 𝐾₂[𝑤₁]). 𝐵` shape. Nothing forecloses it: it is kind
   subtyping under a substitution, an extension of the kind level rather than of the Σ
   rules. Listed because it is the honest edge of "general dependent sums", not because
   anything needs it.

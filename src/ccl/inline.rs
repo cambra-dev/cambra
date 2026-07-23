@@ -105,6 +105,18 @@ pub fn inline_non_iterable_lambdas(expr: Expr) -> Expr {
 /// operator graph can natively schedule a function over this domain as
 /// `IterateExtent` without inlining.
 ///
+/// **This predicate is a type-shape hack and should be removed.** Dispatching
+/// the inline decision on the *shape* of a function's domain is the same
+/// anti-pattern as the retired `has_enumerable_extent`: it conflates "materialized
+/// collection to iterate" with "capability/consumer to beta-reduce" and gets edge
+/// cases wrong (a `Collection`/`List` parameter needs the `Sigma` arm below just
+/// to be classified correctly). The principled decision is the function's *kind*
+/// (`FunKind::Compute` → inline the capability; `FunKind::Data` → materialize the
+/// collection) — a provenance property, not a domain guess. That replacement is
+/// made on the branch that fixes `groupby` to its honest keyed type, because the
+/// looser `groupby` here still relies on inlining a `Data` partition function
+/// (`key ⤇ group`), which a clean kind-based rule would (correctly) stop doing.
+///
 /// | Type | Iterable? | Reason |
 /// |------|-----------|--------|
 /// | `Base(_)` | no | No finite enumeration of all integers / strings / bools |
@@ -130,7 +142,7 @@ fn is_iterable_domain(ty: &Type) -> bool {
         // There are infinitely many possible functions for any given function
         // type, so function-typed domains cannot be enumerated.
         Type::Fun { .. } => false,
-        // A dependent-sum (`Collection`/`List`) parameter domain is a collection
+        // A dependent-sum (`Collection`/`List`/`Map`) parameter domain is a collection
         // *value* consumed as a whole (`λ c → sum(c)`), not an enumerable index set —
         // so its UDF is a capability to inline, like a `Fun`-domain one. Without this
         // arm it falls through to `_ => true`, the UDF is wrongly left un-inlined, and

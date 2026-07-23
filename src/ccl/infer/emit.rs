@@ -345,8 +345,8 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), L
             for t in s.witness.types_mut() {
                 emit_annotation_predicates(t, ctx)?;
             }
-            // A witness is a type, referenced anonymously in the body's domain
-            // position, so it introduces no term binder to scope the body under.
+            // A witness introduces no *term* binder — it is a type, referenced by the
+            // nullary `Type::Witness` leaf — so the body is processed directly.
             emit_annotation_predicates(&mut s.body, ctx)
         }
         Type::Base(_)

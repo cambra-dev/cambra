@@ -719,13 +719,7 @@ fn constrain_sigma_width(
                 rhs: rhs.clone(),
             });
         };
-        for (v, k) in obligations.kinds {
-            v.bounds.borrow_mut().kinds.push(k);
-        }
-        if let Some((subs, sups)) = obligations.pairing {
-            let (subs, sups) = (subs, sups);
-            discharge_pairing(&subs, &sups, sl, sr, cache, lhs, rhs)?;
-        }
+        discharge_obligations(obligations, sl, sr, cache, lhs, rhs)?;
         for (_, elem) in fibers {
             constrain_go(&elem, cod_b, sl, sr, cache)?;
         }
@@ -739,22 +733,13 @@ fn constrain_sigma_width(
             rhs: rhs.clone(),
         });
     };
-    // A candidate with no shape yet gets a **kinding constraint** on its variable
-    // rather than an optimistic acceptance: recorded during emission without knowing
-    // what the variable will become, read when it resolves, which is what the solver
-    // already does for every other constraint on a variable.
-    for (v, k) in obligations.kinds {
-        v.bounds.borrow_mut().kinds.push(k);
-    }
+    discharge_obligations(obligations, sl, sr, cache, lhs, rhs)?;
     // The body of every sum is `𝑤 ⤇ 𝑉` ([`SigmaType::over`]), so instantiating a pairing
     // `(𝑑, 𝑒)` gives `𝑑 ⤇ 𝑉₀ <: 𝑒 ⤇ 𝑉₁`, and the `Fun`/`Fun` decomposition of *that* is
     // exactly the two halves below. They are emitted separately rather than by handing
     // instantiated bodies to `constrain_go`, because their dependencies differ: one is
     // per-pairing and one is not, and re-deriving the codomain edge inside a search
     // would emit it once per attempt — including failed attempts.
-    if let Some((subs, sups)) = obligations.pairing {
-        discharge_pairing(&subs, &sups, sl, sr, cache, lhs, rhs)?;
-    }
     // The codomain edge, **once**: `𝑉` does not mention the witness (one codomain is
     // shared across a sum's candidates), so it is the same edge for every pairing. It
     // also *has* to be emitted here rather than deferred — post-coalesce records no
@@ -774,6 +759,44 @@ fn constrain_sigma_width(
         _ => sl.clone(),
     };
     constrain_go(cod_a, cod_b, &cod_sl, sr, cache)
+}
+
+/// Discharge everything a [`KindObligations`] carries.
+///
+/// **One reader.** Both Σ-width paths go through here — the same-form one, and the
+/// cross-form one that reads an unfactored sum through its fibers — because an
+/// obligation is a *set* of things containment could not answer, and a path that
+/// discharges some of them silently accepts the rest. Two copies drift by omission: the
+/// field a later kind adds gets wired into whichever copy the author was looking at, and
+/// the other one keeps accepting.
+fn discharge_obligations(
+    obligations: crate::ccl::ty::KindObligations,
+    sl: &Subst,
+    sr: &Subst,
+    cache: &mut ConstrainCache,
+    lhs: &Type,
+    rhs: &Type,
+) -> Result<(), ConstrainError> {
+    // A candidate with no shape yet gets a **kinding constraint** on its variable rather
+    // than an optimistic acceptance: recorded during emission without knowing what the
+    // variable will become, read when it resolves, which is what the solver already does
+    // for every other constraint on a variable.
+    for (v, k) in obligations.kinds {
+        v.bounds.borrow_mut().kinds.push(k);
+    }
+    // Kind **parameters** are invariant, so each pair goes through `constrain_go` in both
+    // directions — the sub side under `sl` and the sup side under `sr`, swapped for the
+    // reverse edge. Emitted alongside a pending kinding constraint, not instead of it: the
+    // relation requires the pair either way, and withholding it would drop the only edge
+    // that pins an open parameter.
+    for (sub, sup) in &obligations.params {
+        constrain_go(sub, sup, sl, sr, cache)?;
+        constrain_go(sup, sub, sr, sl, cache)?;
+    }
+    if let Some((subs, sups)) = &obligations.pairing {
+        discharge_pairing(subs, sups, sl, sr, cache, lhs, rhs)?;
+    }
+    Ok(())
 }
 
 /// Discharge a [`KindObligations::pairing`] — the `∀ 𝑑 ∈ 𝐾₀. ∃ 𝑒 ∈ 𝐾₁` of Σ-width — by
@@ -3147,6 +3170,42 @@ mod tests {
         }
     }
 
+    /// **Every kind goes through the same rules.** A witness kind decides only
+    /// containment ([`TypeKind::contains`]); consumption and width are written once, so
+    /// a kind that names no domains at all is still consumed and still widens with no
+    /// rule of its own. `Any` is the case that proves it: nothing constructs it from source yet,
+    /// and it needs no solver code.
+    ///
+    /// It also pins where ⊤ *stops*. A sum widens to it, because that is Σ-width with
+    /// `𝐾 ⊆ Any`. A bare `𝐷 ⤇ 𝑉` does **not**: that edge would build a sum by
+    /// subsumption, and a structural top is an upper bound of every pair of data
+    /// functions — precisely the implicit join `box` exists to surface.
+    #[test]
+    fn every_witness_kind_uses_the_same_sigma_rules() {
+        let int = prim(BaseType::Int);
+        let collection = TypeKind::Any.into_data_fun(None, int.clone());
+        let list = Type::list_of(int.clone());
+        let concrete = Type::data_fun(Type::UIntRange(3), int.clone());
+
+        // Width to ⊤: a *sum* reaches it, a bare data function does not.
+        assert!(constrain_subtype(&list, &collection, &mut ConstrainCache::new()).is_ok());
+        assert!(
+            constrain_subtype(&concrete, &collection, &mut ConstrainCache::new()).is_err(),
+            "a bare data function must not enter the top sum by subsumption"
+        );
+        // Width, and the codomain still flows.
+        assert!(constrain_subtype(&collection, &collection, &mut ConstrainCache::new()).is_ok());
+        let collection_bool = TypeKind::Any.into_data_fun(None, prim(BaseType::Bool));
+        assert!(
+            constrain_subtype(&collection, &collection_bool, &mut ConstrainCache::new()).is_err()
+        );
+        // The universe is not a *sub*-kind of a narrower description.
+        assert!(constrain_subtype(&collection, &list, &mut ConstrainCache::new()).is_err());
+        // Consumed: a consumer's fresh domain variable absorbs the named witness.
+        let consumer = fun(fresh_var(0), int);
+        assert!(constrain_subtype(&collection, &consumer, &mut ConstrainCache::new()).is_ok());
+    }
+
     /// `into_data_fun` is the single materialization, so what it builds is decided by
     /// one test: a **merged domain kind** listing exactly one domain determines that
     /// domain and needs no witness; every other kind carries one. Says nothing about a
@@ -3187,6 +3246,44 @@ mod tests {
         assert!(
             constrain_subtype(&boxed, &list, &mut ConstrainCache::new()).is_ok(),
             "box(xs) must reach List(V) by width"
+        );
+    }
+
+    /// A keyed kind's key type is a **parameter**, not a candidate: comparing two
+    /// keyed kinds *relates* the two key types invariantly rather than testing them
+    /// for equality. So a wrong key type is rejected in both directions, and an
+    /// **open** one is pinned by the kind it is compared against — the thing a
+    /// predicate-only containment cannot do.
+    #[test]
+    fn keyed_kind_relates_its_key_type_invariantly() {
+        let str_ = prim(BaseType::String);
+        let int_map = Type::map_of(prim(BaseType::Int), str_.clone());
+        let string_map = Type::map_of(prim(BaseType::String), str_.clone());
+
+        for (sub, sup) in [(&int_map, &string_map), (&string_map, &int_map)] {
+            assert!(
+                constrain_subtype(sub, sup, &mut ConstrainCache::new()).is_err(),
+                "Map(Int, _) and Map(String, _) must not relate in either direction"
+            );
+        }
+
+        // An open key type is *pinned*, not merely matched: the edge succeeds and
+        // leaves the variable bounded by the demanded key type.
+        let open = Type::infer();
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&Type::map_of(open.clone(), str_), &int_map, &mut cache)
+            .expect("an open key type is pinned by the kind it is compared against");
+        let Type::Infer(v) = &open else {
+            unreachable!("Type::infer() is a variable")
+        };
+        let bounds = v.bounds.borrow();
+        let is_int = |b: &Bound| b.ty == prim(BaseType::Int);
+        assert!(
+            bounds.upper.iter().any(is_int) && bounds.lower.iter().any(is_int),
+            "invariance should bound the key variable above *and* below by Int, got \
+             lower={:?} upper={:?}",
+            bounds.lower,
+            bounds.upper
         );
     }
 

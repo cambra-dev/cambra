@@ -1204,9 +1204,10 @@ fn collect_type_fv(
             collect_type_fv(value, bound, visited, out);
             collect_type_fv(domain, bound, visited, out);
         }
-        // A witness binder binds no *term* variable, so the body's free
-        // term vars are collected under the *enclosing* binders, with nothing
-        // subtracted for the Σ itself.
+        // A witness binder binds no *term* variable, so the body's free term vars are
+        // collected under the *enclosing* binders, with nothing subtracted for the Σ
+        // itself. (Its type children — a keyed kind's key type, say — are collected too:
+        // they can carry refinements.)
         Type::Sigma(s) => {
             for t in s.witness.types() {
                 collect_type_fv(t, bound, visited, out);

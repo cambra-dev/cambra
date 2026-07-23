@@ -1985,9 +1985,119 @@ mod tests {
         );
     }
 
+    /// `λ (m: Map(Int, Str)) → m` and the `Set` analog: the keyed Σ
+    /// (`Σ (𝐷: Keyed(𝐾)). 𝐷 ⤇ 𝑉`) is accepted as a parameter annotation and
+    /// round-trips through the compact/coalesce carrier with its witness **kind**
+    /// (including the key type) and codomain preserved.
+    #[test]
+    fn test_infer_keyed_collection_param_round_trips() {
+        for ann in [
+            Type::map_of(Type::Base(BaseType::Int), Type::Base(BaseType::String)),
+            Type::set_of(Type::Base(BaseType::Int)),
+        ] {
+            let mut ctx = TypeInferenceContext::new();
+            let mut expr = TypedExpr::new(TypedExprNode::Lambda {
+                param: TypedBinding {
+                    name: "m".into(),
+                    ty: Type::infer(),
+                    user_annotation: Some(ann),
+                },
+                body: Box::new(Expr::var("m")),
+            });
+            let ty = infer(&mut expr, &mut ctx).expect("keyed collection param round-trips");
+            let Type::Fun {
+                domain, codomain, ..
+            } = &ty
+            else {
+                panic!("expected a function type, got {ty}");
+            };
+            // Both the param and the returned body re-form the keyed Σ with the
+            // `Keyed` witness kind — carrying its key type — not a plain data
+            // function and not some other kind.
+            for slot in [domain.as_ref(), codomain.as_ref()] {
+                assert!(
+                    matches!(slot, Type::Sigma(s)
+                        if matches!(s.witness.kind(),
+                            crate::ccl::ty::TypeKind::Keyed(k)
+                            if **k == Type::Base(BaseType::Int))),
+                    "keyed collection should stay a Keyed(Int) Σ, got {slot}"
+                );
+            }
+        }
+    }
+
+    /// `([1, 2, 3] : Collection(Int))` is rejected for the same reason its `List` twin
+    /// is: `Any` is the ⊤ of the kind order, and ⊤ is still *entered by a term*. A
+    /// structural top that a bare `𝐷 ⤇ 𝑉` fell into would be an upper bound of every
+    /// pair of data functions — exactly the implicit join `box` exists to surface.
+    #[test]
+    fn test_infer_collection_node_annotation_needs_box() {
+        let mut ctx = TypeInferenceContext::new();
+        let ints = vec![
+            Expr::lit(Lit::Int(1)),
+            Expr::lit(Lit::Int(2)),
+            Expr::lit(Lit::Int(3)),
+        ];
+        let mut expr = Expr::new(TypedExprNode::List(ints))
+            .with_user_annotation(Type::collection_of(Type::Base(BaseType::Int)));
+        infer(&mut expr, &mut ctx)
+            .expect_err("a bare list literal does not enter Collection(Int); that needs `box`");
+    }
+
+    /// A `Collection(int)` **parameter** round-trips through the compact/coalesce
+    /// carrier (like the `List` param), and **consuming** it (`sum`) drives the
+    /// `TypeKind::Any` elimination — the opaque domain is opened, the codomain flows,
+    /// so `sum` over a `Collection(int)` is `Int`.
+    #[test]
+    fn test_infer_collection_param_and_consume() {
+        let mut ctx = TypeInferenceContext::new();
+        let mut ident = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::collection_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::var("xs")),
+        });
+        let ty = infer(&mut ident, &mut ctx).expect("Collection param round-trips");
+        let Type::Fun {
+            domain, codomain, ..
+        } = &ty
+        else {
+            panic!("expected a function type, got {ty}");
+        };
+        assert!(
+            matches!(domain.as_ref(), Type::Sigma(_)),
+            "param is the Σ: {domain}"
+        );
+        assert!(
+            matches!(codomain.as_ref(), Type::Sigma(_)),
+            "body returns the Σ: {codomain}"
+        );
+
+        let mut ctx = TypeInferenceContext::new();
+        let mut consume = TypedExpr::new(TypedExprNode::Lambda {
+            param: TypedBinding {
+                name: "xs".into(),
+                ty: Type::infer(),
+                user_annotation: Some(Type::collection_of(Type::Base(BaseType::Int))),
+            },
+            body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
+        });
+        let ty = infer(&mut consume, &mut ctx).expect("consuming a Collection type-checks");
+        let Type::Fun { codomain, .. } = &ty else {
+            panic!("expected a function type, got {ty}");
+        };
+        assert_eq!(
+            codomain.as_ref(),
+            &Type::Base(BaseType::Int),
+            "sum(Collection(int)) : Int"
+        );
+    }
+
     /// `([1, 2, 3] : List(Int))` on a *node* annotation is **rejected**: entering a
     /// collection type is `box`, not a subtyping edge, so the concrete `[0, 3) ⤇ Int`
-    /// does not inject into `Σ (D: UIntRanges). D ⤇ Int`
+    /// does not inject into `Σ 𝐷 ∈ UIntRanges. 𝐷 ⤇ Int`
     /// (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). This pins the
     /// annotation path specifically, which is one-way (`inferred <: ann`) and reaches the
     /// witness kind through `emit_annotation_predicates`. A conflicting element type is

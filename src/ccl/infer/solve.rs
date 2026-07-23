@@ -435,23 +435,25 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
         },
         // The anonymous type-witness reference agrees with itself.
         (Type::WitnessRef(_), Type::WitnessRef(_)) => true,
-        // Two Sigmas agree iff their witness kinds (type children agreeing
-        // pairwise) and bodies agree.
+        // Two Sigmas agree iff their witness ranges (type children agreeing
+        // pairwise) and bodies agree. A sum also stands in for the domain a
+        // consumer named, so this arm covers a consumed sum meeting its identical
+        // re-resolution.
         (Type::Sigma(a), Type::Sigma(b)) => {
-            // Listed domains agree pairwise (in order — a sum's listing order is a
-            // materialization contract); a described kind agrees only with the same
-            // description, having no children to recurse into.
-            let kinds_agree = match (a.kind().listed(), b.kind().listed()) {
-                (Some(xs), Some(ys)) => {
-                    xs.len() == ys.len()
-                        && xs
-                            .iter()
-                            .zip(ys)
-                            .all(|(x, y)| types_agree_modulo_unread(x, y, refinements))
-                }
-                (None, None) => a.kind() == b.kind(),
-                _ => false,
-            };
+            // Same kind constructor, with children agreeing pairwise. No per-kind arm:
+            // the discriminant settles the constructor and `children` yields whatever
+            // types that constructor carries — listed domains for an enumerated kind, a
+            // key type for a keyed one, nothing for a bare description. The children go
+            // through `types_agree_modulo_unread` rather than `==` so an unread refinement
+            // sitting inside a kind still agrees.
+            let (ka, kb) = (a.kind(), b.kind());
+            let kinds_agree = std::mem::discriminant(ka) == std::mem::discriminant(kb)
+                && ka.children().len() == kb.children().len()
+                && ka
+                    .children()
+                    .iter()
+                    .zip(kb.children())
+                    .all(|(x, y)| types_agree_modulo_unread(x, y, refinements));
             kinds_agree && types_agree_modulo_unread(&a.body, &b.body, refinements)
         }
         _ => false,
@@ -948,6 +950,32 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::Compose(elts) => {
             for e in elts.iter_mut() {
                 coalesce_node(e, level, ctx);
+            }
+            // Invariant (design/collections.md, "Consuming a keyed collection:
+            // discharge, not point-free compose"): lowering never emits a
+            // point-free `Compose` over a *dependent* producer — a morphism whose
+            // codomain references that morphism's own Pi binder. Such a binder
+            // would escape into the next morphism (bound outside its scope), the
+            // leak the well-scopedness check rejects. Dependent-collection
+            // consumption (a `groupby`/keyed group) is always emitted η-expanded,
+            // so the binder is discharged by a dependent application instead.
+            // Assert it here, where the morphism types are resolved.
+            #[cfg(debug_assertions)]
+            for m in elts.iter() {
+                if let Type::Fun {
+                    name: Some(binder),
+                    codomain,
+                    ..
+                } = peel_refinements_outer(&m.ty)
+                {
+                    debug_assert!(
+                        !crate::ccl::subst::type_free_vars(codomain).contains(binder),
+                        "a Compose morphism's codomain references its own Pi binder \
+                         `{binder}` — a point-free compose over a dependent producer \
+                         (the escaping-binder leak). Dependent-collection consumption \
+                         must be η-expanded; see design/collections.md.",
+                    );
+                }
             }
             // Compose morphism-domain reconstruction. inference coalesces
             // each morphism's domain independently — the `Var <: Var`

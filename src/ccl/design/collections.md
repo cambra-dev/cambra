@@ -174,9 +174,9 @@ column names the branch that *will* land it.
 | Consuming a sum at a **domain-preserving** consumer, in any constraint order — a variable's collection-shaped lower bounds denote the sum, so the join is read when its outgoing edge is drawn; a restriction distributes over the candidates | Implemented | `collections-design` |
 | a sum's **candidates** as an invariant position (two-way extrusion proxies), so an arm whose domain is *inferred* — any comprehension arm — joins like a written one | Implemented | `collections-design` |
 | a use of a **lambda parameter** falling back to the parameter slot where the bare read has no answer, so a **UDF-call** arm joins through the bound graph | Implemented | `collections-design` |
-| `Collection(𝑇)` (`TypeKind::Any`): its own term, consumption, width-to-top from every *sum* kind (⊤ absorbs structurally; a bare `𝐷 ⤇ 𝑉` is not below it) | Planned | `collection-constructors` |
-| `Map` / `Set` / `Dict` annotations as the `Keyed(𝐾)` witness **kind** | Planned | `collection-constructors` |
-| kind **parameters** (a `Keyed` kind's key type) related invariantly through the solver, not tested by containment | Planned | `collection-constructors` |
+| `Collection(𝑇)` (`TypeKind::Any`): its own term, consumption, width-to-top from every *sum* kind (⊤ absorbs structurally; a bare `𝐷 ⤇ 𝑉` is not below it) | Implemented | `collection-constructors` |
+| `Map` / `Set` / `Dict` annotations as the `Keyed(𝐾)` witness **kind** | Implemented | `collection-constructors` |
+| kind **parameters** (a `Keyed` kind's key type) related invariantly through the solver, not tested by containment | Implemented | `collection-constructors` |
 | a **shared hole** ([`Type::SharedHole`]) — one annotation type var written at two lowering sites | Planned | `groupby-keyed-collection` |
 | the keyed **discharge** — keyed term / consumption / width, as kind containment | Planned | `groupby-keyed-collection` |
 | [`Builtin::Reify`]; `groupby` infers the keyed `Map` type; kind-based inlining | Planned | `groupby-keyed-collection` |
@@ -1364,9 +1364,10 @@ rest in, and why that order. Each step is independently landable and pins a test
    here](type-inference.md#deliberately-incomplete-here) is the gap list they close):
 
    1. **A kind lattice** — `<:`, `⊔`, `⊓` over [`TypeKind`], with `Any` as ⊤ by
-      structure; membership split out as a per-kind predicate on a type. Fills
-      `join_witness_kinds`' missing `Described ⊔ Described`, and retires the `(Keyed, Any)`
-      row to the iteration-element layer (step 3).
+      structure; membership split out as a per-kind predicate on a type, and a
+      parameterized kind's rows kept in subtyping where an obligation has somewhere to
+      go. Fills `join_witness_kinds`' missing `Described ⊔ Described`. Landed, and it
+      retired the `(Keyed, Any)` exclusion to the iteration-element layer (step 3).
    2. **The pairing search** — `∀ 𝑑 ∈ 𝐾₀. ∃ 𝑒 ∈ 𝐾₁`, with the codomain edge emitted once
       and the domain edge per pairing. **Landed.** The precondition is ground candidates,
       not a particular time: a ground comparison records no bounds, so a failed attempt

@@ -456,6 +456,22 @@ pub enum Builtin {
     /// planning treats it as an iteration-bearing source (it stages the trigger
     /// inside its tuple rather than prepending an `iterate`).
     AsOf,
+
+    /// `∈ : (𝐾, Collection(𝐾)) → Bool` — set **membership**, the predicate atom
+    /// of a keyed collection's domain: `Map(𝐾, 𝑉) = Σ (𝐸: Collection(𝐾)). {𝑘: 𝐾 |
+    /// 𝑘 ∈ 𝐸} ⤇ 𝑉`. Applied to a 2-tuple `Apply(Tuple([𝑘, 𝐸]), Builtin(Member))`,
+    /// the List `<`-analog: where `List`'s domain refinement is `𝑖 < 𝑛` over a
+    /// scalar length witness, a keyed collection's is `𝑘 ∈ 𝐸` over a
+    /// `Collection(𝐾)` key-set witness. Its type is **pre-stamped** at
+    /// construction (no [`crate::ccl::infer::OperatorSchemes`] scheme), so emit
+    /// reads `.ty` directly.
+    ///
+    /// **Eval / op-conversion are deferred.** Membership is evaluated only at a
+    /// keyed *lookup* (`m[k]` totality) or a membership *filter* (`x in s`),
+    /// neither of which exists yet; until then the atom is a *carried* refinement
+    /// term that rides the type and is never executed. Both arms `unimplemented!`
+    /// with that explanation (see `src/ccl/design/collections.md`).
+    Member,
 }
 
 impl Builtin {
@@ -491,6 +507,7 @@ impl Builtin {
             Self::BeginTxn => "begin",
             Self::CollectionUnion => "collection_union",
             Self::AsOf => "as_of",
+            Self::Member => "member",
         }
     }
 

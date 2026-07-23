@@ -1069,23 +1069,30 @@ fn lower_type_application(
             };
             Ok(Type::list_of(lower_type_annotation(elem)?))
         }
-        // The **keyed** collections (`Map`/`Set`/`Dict`) are data functions over a
-        // keyed extent `𝐸` with keys `{𝑘: 𝐾 | 𝑘 ∈ 𝐸}` (design/collections.md).
-        // Deferred: Cambra has no map/set/dict *values* yet, so a keyed Σ would be
-        // an uninhabited type. Wired once a keyed-collection value form exists
-        // (higher in the stack).
-        "Map" | "Dict" | "Set" => Err(LoweringError::unsupported(
-            span,
-            format!(
-                "`{head}(…)` is deferred — Cambra has no {head}/keyed-collection \
-                 values yet, so the type would be uninhabited (see \
-                 `src/ccl/design/collections.md` \"Status\"); \
-                 `Array(n, T)` and `List(T)` are available"
-            ),
-        )),
-        // `Collection(T)` = `Σ (𝐷: Any). 𝐷 ⤇ T` — the whole-domain-witness sum (a
-        // `TypeKind::Any` type-witness): an unordered, opaque-extent collection, the ⊤
-        // of the kind order (`Type::collection_of`, design/collections.md).
+        // `Map(K, V)` / `Dict(K, V)` = `Σ 𝐷 ∈ Keyed(K). 𝐷 ⤇ V`
+        // — a keyed collection over the key-set witness `𝐸` (`Type::map_of`,
+        // design/collections.md). `Dict` is the surface spelling of `Map`.
+        "Map" | "Dict" => {
+            let [k, v] = args else {
+                return Err(arity_err("a key and a value type"));
+            };
+            Ok(Type::map_of(
+                lower_type_annotation(k)?,
+                lower_type_annotation(v)?,
+            ))
+        }
+        // `Set(K)` = `Map(K, unit)` — a keyed collection whose codomain is
+        // `unit`, so the key domain is the payload (`Type::set_of`).
+        "Set" => {
+            let [k] = args else {
+                return Err(arity_err("one key type"));
+            };
+            Ok(Type::set_of(lower_type_annotation(k)?))
+        }
+        // `Collection(T)` = `Σ 𝐷. 𝐷 ⤇ T` — the whole-domain-witness sum (a
+        // `TypeKind::Any` type-witness): an unordered, opaque-extent collection
+        // into which any data function injects (`Type::collection_of`,
+        // design/collections.md).
         "Collection" => {
             let [elem] = args else {
                 return Err(arity_err("one element type"));
