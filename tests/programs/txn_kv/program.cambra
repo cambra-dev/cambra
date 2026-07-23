@@ -45,6 +45,6 @@ for req in get_reqs:
 # not mutable state.  `set_reqs` fans out to both the writer loop above and
 # this counter.
 for req in stats_reqs:
-    with begin() as txn:
+    with txn = begin():
         num_writes = count(set_reqs.restrict(\r -> r.time < txn.current_time()))
         stats_resps[req.id] = str(num_writes) + "\n"
