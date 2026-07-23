@@ -69,7 +69,7 @@ use crate::ccl::{
     FieldKey, HistoryKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
     ccl_utils::is_free_in_value,
     letrec::check_letrec_causal,
-    mut_elim::{fold_induction_loop, hoist_feeds},
+    mut_elim::{fold_induction_loop, hoist_feeds, register_value_tys},
 };
 
 /// Recognize a **fed-out register read** and rewrite it to an as-of join, *before*
@@ -680,7 +680,11 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         let TypedExprNode::For { target, iter, body } = effect.node else {
             unreachable!("guarded above")
         };
-        let fold = fold_induction_loop(&target, &iter, *body);
+        // The loop body and the continuation between them carry every reference to
+        // this loop's accumulators, so their `Mut(V, D)`s give each one the value
+        // type inference joined for it.
+        let reg_vtys = register_value_tys([&*body, &*cont]);
+        let fold = fold_induction_loop(&target, &iter, *body, &reg_vtys);
         for (i, (acc, vty)) in fold.accs.iter().enumerate() {
             if cross_reads.contains(acc) {
                 let final_var = fold

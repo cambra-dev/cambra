@@ -523,3 +523,122 @@ fn test_conditional_element_result() {
     let result = run_pipeline("[(x * 10 if x > 2 else 0) for x in [1, 2, 3, 4]]");
     assert_eq!(codomain_ints(&result), vec![0, 0, 30, 40]);
 }
+
+// ---------------------------------------------------------------------------
+// Conditional induction writes — `if p: acc += e` in a mutation loop.
+//
+// `lower_loop_body_chain` lowers the `if` to a statement-`Case`; `transform_chain`
+// merges its branches into one writer decision — a single conditional write is
+// `{commit: ĝ, writes: prev+e}` (a `!commit` position carries in the changelog).
+// One writer over the full source → a single-writer `Transact` → the changelog
+// `InductionStore`, read densely and reduced to the final accumulator.
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Guard fires for 3, 4 → total = 3 + 4 = 7; positions 0, 1 carry.
+#[case(
+    "total := 0\nfor x in [1, 2, 3, 4]:\n    if x > 2:\n        total += x\ntotal",
+    7
+)]
+// Guard fires for none → total stays at its init.
+#[case(
+    "total := 0\nfor x in [1, 2, 3]:\n    if x > 10:\n        total += x\ntotal",
+    0
+)]
+// Guard fires for all → same as an unconditional accumulate (1+2+3 = 6).
+#[case(
+    "total := 0\nfor x in [1, 2, 3]:\n    if x > 0:\n        total += x\ntotal",
+    6
+)]
+// A non-zero init the leading carries fold to (only 3 fires → 100 + 3 = 103).
+#[case(
+    "total := 100\nfor x in [1, 2, 3]:\n    if x == 3:\n        total += x\ntotal",
+    103
+)]
+// Fire early, then an **all-carry tail**: x=3 (position 0) writes +3; x=1
+// (position 1) carries. The last *change* is at position 0, but the final
+// accumulator is at position 1 — so the scalar-final `ExtractLast` must read the
+// carried tail, not stop at the last change tick. Pins the terminality/watermark
+// decoupling (a sparse writer whose tail carries reads its true final value).
+#[case(
+    "total := 0\nfor x in [3, 1]:\n    if x > 2:\n        total += x\ntotal",
+    3
+)]
+// A **partial op** (`//`) in the written value, guarded away from its bad input.
+// The write value is compiled lazily (`filter_values(x != 0) ≫ (total // x)`), so
+// `total // x` is evaluated only where `x != 0` — never at the `x == 0` position
+// it would fault on. x=2 → 100 // 2 = 50; x=0 → guard false, carry → 50.
+#[case(
+    "total := 100\nfor x in [2, 0]:\n    if x != 0:\n        total := total // x\ntotal",
+    50
+)]
+// An **absolute** conditional write (`total := 5`, a constant not reading the
+// accumulator): the arm is `filter_values(x > 2) ≫ const(5)`. The filter routes
+// the constant to the guard's positions only — `try_const_reduce` must not
+// collapse `filter_values ≫ const` to a bare `const` (which would set 5 at every
+// position). x=1,2 carry init 9; x=3,4 set 5 → final 5.
+#[case(
+    "total := 9\nfor x in [1, 2, 3, 4]:\n    if x > 2:\n        total := 5\ntotal",
+    5
+)]
+// An **unconditional** write *before* a conditional write on the same accumulator.
+// The unconditional `+= 1` applies at every position and must commit even where
+// the guard fails — the guard change rides *on top* of it. x=1 → +1 (=1); x=2 →
+// +1 then +10 (=12); x=3 → +1 then +10 (=23). A commit gate that only fired on the
+// guard would drop the `+= 1` at x=1 (regressing to the prior value).
+#[case(
+    "x := 0\nfor i in [1, 2, 3]:\n    x := x + 1\n    if i > 1:\n        x := x + 10\nx",
+    23
+)]
+// Same, with the unconditional write *after* the conditional (spliced into every
+// path). x=1 → +1 (=1); x=2 → +10 then +1 (=12); x=3 → +10 then +1 (=23).
+#[case(
+    "x := 0\nfor i in [1, 2, 3]:\n    if i > 1:\n        x := x + 10\n    x := x + 1\nx",
+    23
+)]
+// **Sibling** `if`s (not `elif`) writing the *same* accumulator: the write set is
+// a nested value-`Case`, and `commit` is forced true wherever the carry differs
+// from the entering value. i=1: +100 (=100); i=2: +2 then +100 (=202); i=3: +3
+// (=205). Final 205.
+#[case(
+    "a := 0\nfor i in [1, 2, 3]:\n    if i > 1:\n        a := a + i\n    if i < 3:\n        a := a + 100\na",
+    205
+)]
+fn test_conditional_induction_write(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+// Two **separate** accumulators in one loop — one unconditional, one conditional.
+// `cnt` commits on every position (its carry always differs from the entering
+// value); `total` rides its own conditional value-`Case`. cnt = 3 (all), total =
+// 2+3 = 5. Encoded as `cnt * 10 + total` = 35 to pin both independently.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn test_conditional_induction_two_accumulators() {
+    check_scalar(
+        "cnt := 0\ntotal := 0\nfor i in [1, 2, 3]:\n    cnt := cnt + 1\n    if i > 1:\n        total := total + i\ncnt * 10 + total",
+        Value::Int(35),
+    );
+}
+
+// An `if`/`else` that writes the *same* accumulator on both arms: the write set
+// is a per-position value-`Case` (`writes.total = Case[x>2 → prev+x; true →
+// prev+1]`), compiled by the lazy value-preserving `filter_values`
+// union-of-restricts inside the writer lambda (`⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`; each
+// arm's value is evaluated only where its guard holds — no eager both-arm eval).
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// x=1,2 → +1 (else); x=3,4 → +x. total = 1+1+3+4 = 9.
+#[case(
+    "total := 0\nfor x in [1, 2, 3, 4]:\n    if x > 2:\n        total += x\n    else:\n        total += 1\ntotal",
+    9
+)]
+// elif chain, all arms write. x=1→+10, x=2→+20, x=3→+30. total = 60.
+#[case(
+    "total := 0\nfor x in [1, 2, 3]:\n    if x == 1:\n        total += 10\n    elif x == 2:\n        total += 20\n    else:\n        total += 30\ntotal",
+    60
+)]
+fn test_conditional_induction_if_else_both_write(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}

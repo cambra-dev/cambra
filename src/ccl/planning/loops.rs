@@ -79,11 +79,15 @@ pub(crate) fn plan_loops(expr: Expr) -> Expr {
         if is_txn_group(&bindings) {
             return recognize_txn_group(bindings, body);
         }
-        assert_eq!(
+        // An induction group is a single writer: a plain `mut` loop, and — since
+        // the conditional case folds to one always-commit-with-a-value-`Case` /
+        // `commit`-gated writer over the full source (`transform_chain`'s `Case`
+        // arm) rather than per-leg restricted bindings — a conditional write too.
+        debug_assert_eq!(
             bindings.len(),
             1,
-            "letrec recognition: a non-transaction group must be a single-binding \
-             induction group in v1"
+            "an induction letrec group is a single writer (a conditional write folds \
+             to one commit-gated writer, not a per-leg group)"
         );
         let (h, def) = bindings.into_iter().next().unwrap();
         return recognize_group(h, def, body);

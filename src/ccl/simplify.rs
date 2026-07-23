@@ -483,10 +483,26 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
 /// to `domain(f) → codomain(g)`.
 ///
 /// Operates pairwise in an n-ary compose; trailing elements are preserved.
+/// Whether `expr` is a value-preserving filter application `filter_values(p)` —
+/// `Apply(p, Builtin::FilterValues)`. Such an upstream restricts the domain at
+/// runtime, so it must survive [`try_const_reduce`] (dropping it would apply the
+/// constant everywhere).
+fn is_filter_values_led(expr: &Expr) -> bool {
+    matches!(
+        &expr.node,
+        TypedExprNode::Apply { function, .. } if is_builtin(function, Builtin::FilterValues)
+    )
+}
+
 fn try_const_reduce(expr: &mut Expr) -> bool {
     try_pairwise_in_compose(
         expr,
-        |_left, right| as_const(right).is_some(),
+        // A `left ≫ const(g)` collapses to `const(g)` carrying `left`'s *type*
+        // domain — sound only when `left` is a pure reshaping. `filter_values`
+        // restricts the domain at *runtime* and carries no refinement for planning
+        // to re-materialise (unlike `restrict`), so collapsing it would drop the
+        // filter and apply the constant at every position — never reduce past one.
+        |left, right| as_const(right).is_some() && !is_filter_values_led(left),
         |left, right| {
             let Some(g) = as_const(&right) else {
                 unreachable!()
