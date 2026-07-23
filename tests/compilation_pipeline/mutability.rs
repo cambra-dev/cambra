@@ -22,7 +22,7 @@ x"#,
     Tile::Scalar(ColumnValue::Ints(vec![6]))
 )]
 // The `:=` operator marks mutability syntactically — a bare `x := 0` induction
-// accumulator (no `Mut[…]` annotation) written with `x := x + i`.
+// accumulator (no `Mut(…)` annotation) written with `x := x + i`.
 #[case(
     r#"
 x := 0
@@ -31,11 +31,11 @@ for i in [1, 2, 3]:
 x"#,
     Tile::Scalar(ColumnValue::Ints(vec![6]))
 )]
-// The accumulator's value type can be spelled concretely: `Mut[int]`
+// The accumulator's value type can be spelled concretely: `Mut(Int)`
 // annotates the binding at `int` (checked against init and updates).
 #[case(
     r#"
-x: Mut[int] := 0
+x: Mut(Int) := 0
 for i in [1, 2, 3]:
     x += i
 x"#,
@@ -236,9 +236,9 @@ o"#,
 // as an accumulator recurrence: 0 → 1 → 2 → 3 over [1, 2, 3].
 #[case(
     r#"
-def bump(c: Mut[int]):
+def bump(c: Mut(Int)):
     c += 1
-cnt: Mut[int] := 0
+cnt: Mut(Int) := 0
 for x in [1, 2, 3]:
     bump(cnt)
 cnt"#,
@@ -248,9 +248,9 @@ cnt"#,
 // `MutWrite(cnt, cnt + 1)` normalizes to a shadowing `let`, so `cnt` reads 1.
 #[case(
     r#"
-def bump(c: Mut[int]):
+def bump(c: Mut(Int)):
     c += 1
-cnt: Mut[int] := 0
+cnt: Mut(Int) := 0
 bump(cnt)
 cnt"#,
     Tile::Scalar(ColumnValue::Ints(vec![1]))
@@ -291,10 +291,10 @@ a * 1000 + b"#,
 // flat-spine normalization un-nests it so both writes land on the spine.
 #[case(
     r#"
-def bump2(c: Mut[int]):
+def bump2(c: Mut(Int)):
     c += 1
     c += 2
-cnt: Mut[int] := 0
+cnt: Mut(Int) := 0
 bump2(cnt)
 cnt"#,
     Tile::Scalar(ColumnValue::Ints(vec![3]))
@@ -304,9 +304,9 @@ cnt"#,
 // the spine (its value is `unit`), so the mutable-variable advance reaches the trailing read.
 #[case(
     r#"
-def bump(c: Mut[int]):
+def bump(c: Mut(Int)):
     c += 1
-cnt: Mut[int] := 0
+cnt: Mut(Int) := 0
 y = bump(cnt)
 cnt"#,
     Tile::Scalar(ColumnValue::Ints(vec![1]))
@@ -320,14 +320,14 @@ cnt += 1
 cnt"#,
     Tile::Scalar(ColumnValue::Ints(vec![1]))
 )]
-// I1(b): a non-`Mut` annotated local (`y: int = …`) inside a mutation-loop
+// I1(b): a non-`Mut` annotated local (`y: Int = …`) inside a mutation-loop
 // body lowers as an ordinary per-iteration annotated `let`, not rejected.
 // Per iter: y = 2·i; acc += y over [1,2,3] → 2+4+6 = 12.
 #[case(
     r#"
 acc := 0
 for i in [1, 2, 3]:
-    y: int = i * 2
+    y: Int = i * 2
     acc += y
 acc"#,
     Tile::Scalar(ColumnValue::Ints(vec![12]))
@@ -408,23 +408,23 @@ fn augmented_assignment_to_non_mutable_rejected() {
     expect_mut_discipline_error("x = 0\nx += 1\nx", "not a mutable variable");
 }
 
-/// `Mut[…]` takes one or two type arguments (`Mut[V]` or `Mut[V, Txn]`); three
+/// `Mut(…)` takes one or two type arguments (`Mut(V)` or `Mut(V, Txn)`); three
 /// is rejected at lowering.
 #[test]
 fn mut_annotation_with_too_many_arguments_rejected() {
     expect_compile_error(
-        "x: Mut[int, Txn, int] := 0\nx",
+        "x: Mut(Int, Txn, Int) := 0\nx",
         "takes one or two arguments",
     );
 }
 
 /// The only explicit `Mut` sequencing domain is `Txn`; any other second argument
-/// (`Mut[V, Foo]`) is rejected — omit it (`Mut[V]`) to infer a loop's induction
+/// (`Mut(V, Foo)`) is rejected — omit it (`Mut(V)`) to infer a loop's induction
 /// domain.
 #[test]
 fn mut_annotation_with_non_txn_domain_rejected() {
     expect_compile_error(
-        "x: Mut[int, Foo] := 0\nx",
+        "x: Mut(Int, Foo) := 0\nx",
         "only explicit `Mut` sequencing domain is `Txn`",
     );
 }
@@ -435,17 +435,17 @@ fn mut_annotation_with_non_txn_domain_rejected() {
 #[test]
 fn accumulator_declared_inside_loop_rejected() {
     expect_compile_error(
-        "for i in [1, 2, 3]:\n    y: Mut[int] := 0\n    y += i\ny",
+        "for i in [1, 2, 3]:\n    y: Mut(Int) := 0\n    y += i\ny",
         "accumulator declaration inside a for-loop body is not",
     );
 }
 
-/// A `Mut[…]` annotation with the immutable `=` operator is contradictory —
+/// A `Mut(…)` annotation with the immutable `=` operator is contradictory —
 /// `Mut` introduces a mutable variable, which is `:=`'s job. Rejected at lowering, pointing
 /// at `:=`.
 #[test]
 fn mut_annotation_with_plain_equals_is_rejected() {
-    expect_compile_error("x: Mut[int] = 0\nx", "use `:=` instead");
+    expect_compile_error("x: Mut(Int) = 0\nx", "use `:=` instead");
 }
 
 /// A plain `=` to a mutable variable bound outside a loop is a mistaken accumulator: `=`
@@ -469,8 +469,8 @@ fn cross_channel_cycle_is_rejected() {
 }
 
 /// Rule 3: an unannotated copy of a mutable variable (`b = a`) aliases it — rejected, to
-/// force the author to disambiguate a value copy (`b: int = a`) from seeding a
-/// new mutable variable (`b: Mut[int] := a`).
+/// force the author to disambiguate a value copy (`b: Int = a`) from seeding a
+/// new mutable variable (`b: Mut(Int) := a`).
 #[test]
 fn rule3_unannotated_mut_alias_is_rejected() {
     expect_mut_discipline_error("a := 0\nb = a\nb", "not annotated `Mut`");
@@ -519,7 +519,7 @@ fn final_mutable_write_with_no_read_compiles_as_unit() {
         .unwrap_or_render("<final-mutable-write>", code);
 }
 
-/// I1(a): a `Mut[…]` accumulator loop as the program's *final* statement, with
+/// I1(a): a `Mut(…)` accumulator loop as the program's *final* statement, with
 /// no trailing read, is a valid mutation loop — `lower_final_stmt` now mirrors
 /// `lower_middle_stmt`'s mutation-loop dispatch (continuation `Unit`) instead
 /// of routing to the generator-for fallback, whose "must end in a yield/feed"
@@ -537,7 +537,7 @@ fn final_mutation_loop_with_no_read_compiles_as_unit() {
 #[test]
 fn mut_registry_does_not_leak_into_a_shadowing_param() {
     check_scalar(
-        "n: Mut[int] := 0\ndef h(n: int):\n    n = n + 1\n    n\nh(10)",
+        "n: Mut(Int) := 0\ndef h(n: Int):\n    n = n + 1\n    n\nh(10)",
         cambra::interpreter::Value::Int(11),
     );
 }
@@ -555,28 +555,28 @@ fn mut_collection_as_for_source_derefs() {
 #[test]
 fn multi_param_pass_by_ref_assign_works() {
     check_scalar(
-        "def add_to(c: Mut[int], amt: int):\n    c := c + amt\ncnt: Mut[int] := 0\nadd_to(cnt, 5)\ncnt",
+        "def add_to(c: Mut(Int), amt: Int):\n    c := c + amt\ncnt: Mut(Int) := 0\nadd_to(cnt, 5)\ncnt",
         cambra::interpreter::Value::Int(5),
     );
 }
 #[test]
 fn multi_param_pass_by_ref_augassign_works() {
     check_scalar(
-        "def f(c: Mut[int], d: int):\n    c += d\ncnt: Mut[int] := 0\nf(cnt, 7)\ncnt",
+        "def f(c: Mut(Int), d: Int):\n    c += d\ncnt: Mut(Int) := 0\nf(cnt, 7)\ncnt",
         cambra::interpreter::Value::Int(7),
     );
 }
 #[test]
 fn mut_arg_must_be_a_mutable_not_a_plain_value() {
     expect_mut_discipline_error(
-        "x = 7\ndef bump(c: Mut[int]):\n    c := c + 1\nbump(x)\nx",
+        "x = 7\ndef bump(c: Mut(Int)):\n    c := c + 1\nbump(x)\nx",
         "mutable variable",
     );
 }
 #[test]
 fn single_param_pass_by_ref_still_works() {
     check_scalar(
-        "cnt: Mut[int] := 0\ndef bump(c: Mut[int]):\n    c := c + 1\nbump(cnt)\ncnt",
+        "cnt: Mut(Int) := 0\ndef bump(c: Mut(Int)):\n    c := c + 1\nbump(cnt)\ncnt",
         cambra::interpreter::Value::Int(1),
     );
 }
@@ -589,14 +589,14 @@ fn single_param_pass_by_ref_still_works() {
 #[test]
 fn pass_by_ref_writer_with_intermediate_value_position() {
     check_scalar(
-        "def f(c: Mut[int]):\n    tmp = c + 1\n    c := tmp\ncnt: Mut[int] := 0\ny = f(cnt)\ncnt",
+        "def f(c: Mut(Int)):\n    tmp = c + 1\n    c := tmp\ncnt: Mut(Int) := 0\ny = f(cnt)\ncnt",
         cambra::interpreter::Value::Int(1),
     );
 }
 #[test]
 fn pass_by_ref_writer_with_intermediate_in_loop() {
     check_scalar(
-        "def f(c: Mut[int]):\n    tmp = c + 1\n    c := tmp\ncnt: Mut[int] := 0\nfor i in [1, 2, 3]:\n    y = f(cnt)\ncnt",
+        "def f(c: Mut(Int)):\n    tmp = c + 1\n    c := tmp\ncnt: Mut(Int) := 0\nfor i in [1, 2, 3]:\n    y = f(cnt)\ncnt",
         cambra::interpreter::Value::Int(3),
     );
 }
@@ -606,24 +606,24 @@ fn pass_by_ref_writer_with_intermediate_in_loop() {
 #[test]
 fn pass_by_ref_writer_with_intermediates_bare_statement_loop() {
     check_scalar(
-        "def f(c: Mut[int]):\n    a = c + 1\n    b = a + 10\n    c := b\ncnt: Mut[int] := 0\nfor i in [1, 2, 3]:\n    f(cnt)\ncnt",
+        "def f(c: Mut(Int)):\n    a = c + 1\n    b = a + 10\n    c := b\ncnt: Mut(Int) := 0\nfor i in [1, 2, 3]:\n    f(cnt)\ncnt",
         cambra::interpreter::Value::Int(33),
     );
 }
 #[test]
 fn wildcard_annotated_mut_alias_rejected() {
-    expect_mut_discipline_error("a: Mut[int] := 0\nb: _ = a\nb", "not annotated `Mut`");
+    expect_mut_discipline_error("a: Mut(Int) := 0\nb: _ = a\nb", "not annotated `Mut`");
 }
 #[test]
 fn typed_deref_copy_of_mut_still_works() {
     check_scalar(
-        "a: Mut[int] := 5\nb: int = a\nb",
+        "a: Mut(Int) := 5\nb: Int = a\nb",
         cambra::interpreter::Value::Int(5),
     );
 }
 
 /// A deref-copy is a **snapshot at its position**, not an alias of the mutable variable: a
-/// later write must not change the copied value. `x := 1; y: int = x; x += 4; y`
+/// later write must not change the copied value. `x := 1; y: Int = x; x += 4; y`
 /// is `1` (the value when `y` is bound), not `5`. Regression for the alias
 /// inliner substituting `y → x` past a `MutWrite` — which reads the mutable variable's
 /// post-write value — because the write is a `MutWrite`, not a `let` shadow the
@@ -633,7 +633,7 @@ fn typed_deref_copy_of_mut_still_works() {
 #[test]
 fn deref_copy_snapshots_the_value_at_its_position() {
     check_scalar(
-        "x: Mut[int] := 1\ny: int = x\nx += 4\ny",
+        "x: Mut(Int) := 1\ny: Int = x\nx += 4\ny",
         cambra::interpreter::Value::Int(1),
     );
 }
@@ -644,36 +644,36 @@ fn deref_copy_snapshots_the_value_at_its_position() {
 #[test]
 fn mutable_reads_are_positional() {
     check_scalar(
-        "x: Mut[int] := 1\nx += 4\ny: int = x\ny",
+        "x: Mut(Int) := 1\nx += 4\ny: Int = x\ny",
         cambra::interpreter::Value::Int(5),
     );
     check_scalar(
-        "x: Mut[int] := 1\ny: int = x\nx += 4\nx",
+        "x: Mut(Int) := 1\ny: Int = x\nx += 4\nx",
         cambra::interpreter::Value::Int(5),
     );
 }
 
 /// A deref-copy is a plain value, so copying it again is fine: `z = y` where
-/// `y: int = x` must compile (not trip the rule-3 "unannotated `Mut` alias"
+/// `y: Int = x` must compile (not trip the rule-3 "unannotated `Mut` alias"
 /// error). Regression for the deref-copy being bound at the mutable type, which
 /// made `y` a `Mut` alias in the type system and misfired the discipline on a
 /// binding the user declared `int`.
 #[test]
 fn deref_copy_is_a_value_not_a_mutable_alias() {
     check_scalar(
-        "x: Mut[int] := 1\ny: int = x\nz = y\nz",
+        "x: Mut(Int) := 1\ny: Int = x\nz = y\nz",
         cambra::interpreter::Value::Int(1),
     );
 }
 
-/// Writing a deref-copy is rejected — `y: int = x` is immutable, so `y += 1` is
+/// Writing a deref-copy is rejected — `y: Int = x` is immutable, so `y += 1` is
 /// the "not a mutable variable" error, never a silent mutable write. Regression for a
 /// write-site demand coalescing the `int`-declared `y`'s `.ty` to `Mut` and the
 /// write-target check trusting `.ty` over the annotation.
 #[test]
 fn write_to_deref_copy_rejected() {
     expect_mut_discipline_error(
-        "x: Mut[int] := 1\ny: int = x\ny += 1\ny",
+        "x: Mut(Int) := 1\ny: Int = x\ny += 1\ny",
         "not a mutable variable",
     );
 }
@@ -681,7 +681,7 @@ fn write_to_deref_copy_rejected() {
 #[test]
 fn genuine_mutable_still_accumulates() {
     check_scalar(
-        "x: Mut[int] := 0\nfor i in [1, 2, 3]:\n    x += i\nx",
+        "x: Mut(Int) := 0\nfor i in [1, 2, 3]:\n    x += i\nx",
         cambra::interpreter::Value::Int(6),
     );
 }
@@ -701,7 +701,7 @@ fn genuine_mutable_still_accumulates() {
 #[test]
 fn non_mut_redef_shadows_mut_param_fn_lowers_tupled() {
     check_scalar(
-        "def f(c: Mut[int]):\n    c += 1\ndef f(a, b):\n    a + b\nf(10, 20)",
+        "def f(c: Mut(Int)):\n    c += 1\ndef f(a, b):\n    a + b\nf(10, 20)",
         cambra::interpreter::Value::Int(30),
     );
 }
@@ -716,7 +716,7 @@ fn non_mut_redef_shadows_mut_param_fn_lowers_tupled() {
 #[test]
 fn nested_mut_param_fn_does_not_leak_to_outer_same_named_call() {
     check_scalar(
-        "def bump(a, b):\n    a + b\nr = bump(3, 4)\ndef outer(z):\n    def bump(c: Mut[int]):\n        c += 1\n    y: Mut[int] := 0\n    bump(y)\n    y + z\nr + outer(100)",
+        "def bump(a, b):\n    a + b\nr = bump(3, 4)\ndef outer(z):\n    def bump(c: Mut(Int)):\n        c += 1\n    y: Mut(Int) := 0\n    bump(y)\n    y + z\nr + outer(100)",
         cambra::interpreter::Value::Int(108),
     );
 }
@@ -727,7 +727,7 @@ fn nested_mut_param_fn_does_not_leak_to_outer_same_named_call() {
 /// fallback and rejected it with "must end in a yield/feed".
 #[test]
 fn trailing_hidden_writer_loop_compiles() {
-    let code = "def bump(c: Mut[int]):\n    c += 1\ncnt: Mut[int] := 0\nfor x in [1, 2, 3]:\n    bump(cnt)";
+    let code = "def bump(c: Mut(Int)):\n    c += 1\ncnt: Mut(Int) := 0\nfor x in [1, 2, 3]:\n    bump(cnt)";
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let result = compile_program(&mut ctx, code, consumer);

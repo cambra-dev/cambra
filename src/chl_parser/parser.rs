@@ -285,43 +285,74 @@ where
             )))
             .boxed();
 
-        // Dict or record literal: `{}`, `{ident: expr, ...}` (record),
-        // or `{expr: expr, ...}` (dict). We detect record-vs-dict by
-        // whether *every* key parses as a bare identifier followed by
-        // `:` — implemented by parsing an entry first as ident-or-expr.
-        let dict_entry = expr
+        // Brace literal `{ … }`. One production covers every brace form,
+        // classified after the fact by whether its items carry a `: value`:
+        //
+        //   - every item `key: value`  → record (all bare-ident keys) or dict
+        //   - no item has a value       → colon-free brace group `{T, U}`
+        //                                 (tuple-type syntax, `Expr::BraceGroup`)
+        //   - empty `{}`                → dict (preserves existing behaviour)
+        //   - mixed                     → a parse error
+        //
+        // Parsing items as `expr (":" expr)?` (rather than two competing
+        // `{`-starting alternatives) keeps a single committed brace parser, so
+        // classification is a total function of what was matched instead of
+        // relying on `choice` backtracking across a consumed `{`.
+        let brace_item = expr
             .clone()
-            .then_ignore(just(Token::Colon))
-            .then(expr.clone())
-            .map(|(k, v)| (k, v));
+            .then(just(Token::Colon).ignore_then(expr.clone()).or_not());
         let dict_or_record = just(Token::LBrace)
             .ignore_then(
-                dict_entry
+                brace_item
                     .separated_by(just(Token::Comma))
                     .allow_trailing()
                     .collect::<Vec<_>>(),
             )
             .then_ignore(just(Token::RBrace))
-            .map_with(|entries, e| {
+            .validate(|items, e, emitter| {
                 let span = e.span();
-                // If every key is a bare Name, produce a Record; else a Dict.
-                let all_idents = !entries.is_empty()
-                    && entries.iter().all(|(k, _)| matches!(k.node, Expr::Name(_)));
-                if all_idents {
-                    let fields = entries
-                        .into_iter()
-                        .map(|(k, v)| match k.node {
-                            Expr::Name(name) => RecordField {
-                                name,
-                                name_span: k.span,
-                                value: v,
-                            },
-                            _ => unreachable!(),
-                        })
-                        .collect();
-                    Spanned::new(span, Expr::Record(fields))
+                let with_value = items.iter().filter(|(_, v)| v.is_some()).count();
+                if items.is_empty() {
+                    // Empty `{}` stays a (rejected-at-lowering) dict, matching
+                    // the pre-existing behaviour; the empty-record/unit meaning
+                    // is a separate, unsettled question.
+                    return Spanned::new(span, Expr::Dict(Vec::new()));
+                }
+                if with_value == items.len() {
+                    // Every item has a value: record iff all keys are bare
+                    // identifiers, else dict.
+                    let all_idents = items.iter().all(|(k, _)| matches!(k.node, Expr::Name(_)));
+                    if all_idents {
+                        let fields = items
+                            .into_iter()
+                            .map(|(k, v)| match k.node {
+                                Expr::Name(name) => RecordField {
+                                    name,
+                                    name_span: k.span,
+                                    value: v.expect("all items have a value"),
+                                },
+                                _ => unreachable!("guarded by all_idents"),
+                            })
+                            .collect();
+                        Spanned::new(span, Expr::Record(fields))
+                    } else {
+                        let entries = items
+                            .into_iter()
+                            .map(|(k, v)| (k, v.expect("all items have a value")))
+                            .collect();
+                        Spanned::new(span, Expr::Dict(entries))
+                    }
+                } else if with_value == 0 {
+                    // No `: value` anywhere: a colon-free brace group.
+                    let elts = items.into_iter().map(|(k, _)| k).collect();
+                    Spanned::new(span, Expr::BraceGroup(elts))
                 } else {
-                    Spanned::new(span, Expr::Dict(entries))
+                    emitter.emit(Rich::custom(
+                        span,
+                        "brace items must be either all `key: value` (record or dict) \
+                         or all bare expressions (tuple type `{T, U}`), not a mix",
+                    ));
+                    Spanned::new(span, Expr::Error)
                 }
             })
             .boxed();
@@ -371,7 +402,7 @@ where
             .delimited_by(just(Token::LParen), just(Token::RParen))
             .map(PostfixOp::Call);
         // A subscript index is a comma-separated list: a single element is
-        // the index itself (`xs[0]`); several become a tuple (`Mut[int, Txn]`
+        // the index itself (`xs[0]`); several become a tuple (`Mut(Int, Txn)`
         // — the multi-argument type-annotation form), matching Python's
         // `a[i, j]` tuple-index convention.
         let subscript = expr
@@ -1064,7 +1095,7 @@ enum AssignTail {
     /// `:= value` — a bare mutable assignment (`MutAssign` with no annotation).
     MutPlain(Spanned<Expr>),
     /// `: ty := value` — an annotated mutable assignment (`MutAssign` carrying
-    /// the annotation, e.g. `Mut[V, Txn]`).
+    /// the annotation, e.g. `Mut(V, Txn)`).
     MutAnnotated(Spanned<Expr>, Spanned<Expr>),
     Aug(AugOp, Spanned<Expr>),
     Define(Spanned<Expr>),
@@ -1184,6 +1215,33 @@ mod tests {
             parse_e(r#"{"name": "alice"}"#).node,
             Expr::Dict(_)
         ));
+    }
+
+    #[test]
+    fn brace_group_is_colon_free() {
+        // A colon-free brace list is a `BraceGroup` (tuple-type syntax `{T, U}`),
+        // distinct from a record (`{x: 1}`) and a dict (`{"k": v}`).
+        let Expr::BraceGroup(elts) = parse_e("{Int, Bool}").node else {
+            panic!(
+                "expected a BraceGroup, got {:?}",
+                parse_e("{Int, Bool}").node
+            );
+        };
+        assert_eq!(elts.len(), 2);
+        // Single element, with and without a trailing comma.
+        assert!(matches!(parse_e("{Int}").node, Expr::BraceGroup(v) if v.len() == 1));
+        assert!(matches!(parse_e("{Int,}").node, Expr::BraceGroup(v) if v.len() == 1));
+    }
+
+    #[test]
+    fn mixed_brace_entries_are_an_error() {
+        // A brace literal mixing `key: value` entries with bare expressions is
+        // neither a record/dict nor a tuple type.
+        let result = parse_expression("{a: 1, b}");
+        assert!(
+            !result.errors.is_empty(),
+            "expected a parse error for a mixed brace literal"
+        );
     }
 
     #[test]
@@ -1323,10 +1381,10 @@ mod tests {
 
     #[test]
     fn mutable_assignment_annotated() {
-        // `x: Mut[int] := 0` — the annotation still rides `:=` (carrying the
+        // `x: Mut(Int) := 0` — the annotation still rides `:=` (carrying the
         // value type / domain), it's just no longer required to signal
-        // mutability. (Two-arg `Mut[int, Txn]` is a transactional/top-PR form.)
-        let m = parse_m("x: Mut[int] := 0\n");
+        // mutability. (Two-arg `Mut(Int, Txn)` is a transactional/top-PR form.)
+        let m = parse_m("x: Mut(Int) := 0\n");
         assert!(matches!(
             m.body[0].node,
             Stmt::MutAssign {

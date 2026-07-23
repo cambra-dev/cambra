@@ -116,9 +116,9 @@ Types (from `Display for Type` in `src/ccl/mod.rs`):
 - **Infer**: `?N` (where `N` is the variable id).
 - **DataSource**: `source(name)`.
 - **Union**: `T1 | T2`.
-- **Feed**: `Feed[T]` — a transient deferred-output type inference threads and `channelize` erases.
-- **Mut**: `Mut[value, domain]` — a transient mutable-variable type inference threads and the mutability-elimination phases (`mut_elim`) erase; the domain is an induction extent or `Txn`. Its `HistoryKind` is `Overwrite` (the last-write-wins merge law); the append-law sibling is `Feed`'s `Append` kind.
-- **Txn**: `Txn` — the (nullary) transaction-commit sequencing domain, the second slot of a `Mut[V, Txn]` register.
+- **Feed**: `Feed(T)` — a transient deferred-output type inference threads and `channelize` erases.
+- **Mut**: `Mut(value, domain)` — a transient mutable-variable type inference threads and the mutability-elimination phases (`mut_elim`) erase; the domain is an induction extent or `Txn`. Its `HistoryKind` is `Overwrite` (the last-write-wins merge law); the append-law sibling is `Feed`'s `Append` kind.
+- **Txn**: `Txn` — the (nullary) transaction-commit sequencing domain, the second slot of a `Mut(V, Txn)` register.
 
 Do **not** write `Apply { function: ..., argument: ... }`, `Apply(f, x)`, `Compose([f, g])`, or other constructor-style forms — those are AST node names, not the rendering. Do **not** fall back to source syntax when the point is what the *AST* looks like. Only deviate if explicitly asked (e.g. "show me the Debug form", "give me the source").
 

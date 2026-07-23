@@ -57,7 +57,7 @@ def repeat(n: Int, y: String) => String: # return type syntax is [Sketched]
   return z
 ```
 
-A `Mut[_]` parameter annotation gives pass-by-reference access to a caller's mutable variable, under a deliberately *second-class* discipline — mutables flow down into calls but are not returned or stored in data structures (see [src/ccl/design/mutability.md](../src/ccl/design/mutability.md)). Captures of ordinary bindings are read-only. Captures of transactional variables are **[Decided]** (§8 of the [spec](chl-spec.md)).
+A `Mut(_)` parameter annotation gives pass-by-reference access to a caller's mutable variable, under a deliberately *second-class* discipline — mutables flow down into calls but are not returned or stored in data structures (see [src/ccl/design/mutability.md](../src/ccl/design/mutability.md)). Captures of ordinary bindings are read-only. Captures of transactional variables are **[Decided]** (§8 of the [spec](chl-spec.md)).
 
 ### Collections are unordered
 
@@ -99,7 +99,7 @@ data to it using `d << data`. Generators (`yield`) are syntax sugar over feeds:
 a function with `yield`s has a hidden result-collection variable, and each
 `yield` translates exactly to a feed append into that collection — so the
 compiler query-plans generators and feeds uniformly.
-Today, a feed variable is introduced as `out = defer()` or arrives from a builtin like `http_serve`; a new syntactic form `out: Feed[_]` is designed but **not yet implemented**. 
+Today, a feed variable is introduced as `out = defer()` or arrives from a builtin like `http_serve`; a new syntactic form `out: Feed(_)` is designed but **not yet implemented**. 
 
 The APIs of library sources and sinks are **[Open]**.
 
@@ -115,11 +115,11 @@ The implemented surface:
 
 ```python
 cnt := 0                       # mutable by the introducing operator; := writes, += is shorthand
-cnt: Mut[Int] := 0             # optional annotation; value type inferred if omitted
-balance: Mut[Int, Txn] := 0    # transactional variable over the commit order — Txn is never inferred
+cnt: Mut(Int) := 0             # optional annotation; value type inferred if omitted
+balance: Mut(Int, Txn) := 0    # transactional variable over the commit order — Txn is never inferred
 ```
 
-`:=` is imperative assignment (in the Algol tradition); plain `=` is an immutable binding and never mutates. Transactions are `with begin():` blocks: writes to `Txn`-domain variables are legal only inside one, all writes in a block commit atomically on exit, and reads inside a block see one snapshot-consistent view. Sharing state across concurrent writers is a semantic commitment the program must spell (`Mut[V, Txn]`). It's never inferred.
+`:=` is imperative assignment (in the Algol tradition); plain `=` is an immutable binding and never mutates. Transactions are `with begin():` blocks: writes to `Txn`-domain variables are legal only inside one, all writes in a block commit atomically on exit, and reads inside a block see one snapshot-consistent view. Sharing state across concurrent writers is a semantic commitment the program must spell (`Mut(V, Txn)`). It's never inferred.
 
 Mutability is still being implemented. See the [not-yet-implemented list](../src/ccl/design/mutability.md#not-yet-implemented) for the authoritative list.
 
@@ -153,7 +153,7 @@ CHL source
   → inline           (ccl/inline.rs: inline UDF Let bindings with non-iterable domains; beta-reduce at
                       call sites. Runs *before* channelize so the letrec phase can route an in-loop
                       feed against inlined pass-by-ref writers; it therefore still sees Defer/Feed/Define)
-  → transact_phase   (ccl/transact_phase.rs: each `with begin():` block over Mut[V, Txn] variables folds into
+  → transact_phase   (ccl/transact_phase.rs: each `with begin():` block over Mut(V, Txn) variables folds into
                       a get_prev_txn-causal LetRec over the commit domain (per-key histories + per-site
                       commit records). 
                       See src/ccl/design/mutability.md)
@@ -213,10 +213,10 @@ The connections between the layers above and the capabilities Cambra claims:
 | Streaming sources and sinks (`stdin`, `http_serve`) | Implemented |
 | Generator functions | Implemented (single-`for` bodies; general shapes **[Planned]**) |
 | `:=` mutation and loop accumulators (induction histories) | Implemented |
-| Transactions: `with begin():` over `Mut[V, Txn]` variables | Implemented (single deny-guard conditionals only; handle form and `abort()` still landing) |
+| Transactions: `with begin():` over `Mut(V, Txn)` variables | Implemented (single deny-guard conditionals only; handle form and `abort()` still landing) |
 | Aggregates | `sum`, `max` implemented; `min`/`count`/`avg`/`len` **[Planned]** |
 | Refinement typing | Machinery implemented (internal); surface syntax **[Decided]** |
-| Feed channels | Via `defer()` / `http_serve` implemented; `Feed[_]` declarations designed, not yet |
+| Feed channels | Via `defer()` / `http_serve` implemented; `Feed(_)` declarations designed, not yet |
 | Contextual parameters (`requires` / `given` / `summon`) | **[Decided]** |
 | `rec` fixpoint bindings | **[Decided]** |
 | Collections-as-functions model | Organizing idea decided; encodings **[Sketched]** |

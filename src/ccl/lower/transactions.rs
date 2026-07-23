@@ -4,7 +4,7 @@
 //!
 //! A transaction is lowered exactly like an induction mutation loop
 //! (`ExprStmt(For{target, iter, block}, continuation)`); the *only* structural
-//! difference is that its `MutWrite`s target `Mut[V, Txn]` stores, which
+//! difference is that its `MutWrite`s target `Mut(V, Txn)` stores, which
 //! `transact_phase` recognizes (by the register's registered base name) and routes
 //! to the commit engine rather than the induction `Recurse`. A standalone
 //! transaction is one commit over a synthesized singleton source. Writes and
@@ -146,7 +146,7 @@ fn lower_tx_block(
         return Err(LoweringError::unsupported(
             span,
             "a `with begin():` block must do something: write a transactional \
-             (`Mut[_, Txn]`) variable, or feed a read (`out << …`)",
+             (`Mut(_, Txn)`) variable, or feed a read (`out << …`)",
         ));
     }
     Ok(block)
@@ -274,7 +274,7 @@ fn lower_tx_block_inner(
 /// A `:=` / `+=` write inside a transaction, emitted as a `MutWrite` marker (a
 /// name shadowed by an inner binder is a genuine local → a per-transaction
 /// `Let`). Mutability carries no lowering registry, so the target is *not*
-/// classified here: `transact_phase` reads the `Mut[…]` type and routes each
+/// classified here: `transact_phase` reads the `Mut(…)` type and routes each
 /// write — a transactional register joins the atomic commit decision; an
 /// induction accumulator is lifted onto the enclosing loop as its own recurrence
 /// (the two run on independent domains). A write to a genuine non-register surfaces

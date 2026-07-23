@@ -1,5 +1,5 @@
 # A scalar transactional register shared *live* across two endpoints: POST /set
-# overwrites `last` (a `Mut[str, Txn]` scalar store) and replies "ok"; GET /get
+# overwrites `last` (a `Mut(String, Txn)` scalar store) and replies "ok"; GET /get
 # reads the current value cross-endpoint inside a read-only `with begin():` block.
 #
 # The GET read is a **live cross-endpoint read**: a transactional register may be
@@ -27,7 +27,7 @@
 set_reqs, set_resps = http_serve("{PORT}", "POST", "/set")
 get_reqs, get_resps = http_serve("{PORT}", "GET", "/get")
 
-last: Mut[str, Txn] := "(none)"
+last: Mut(String, Txn) := "(none)"
 
 for msg in set_reqs:
     with begin():

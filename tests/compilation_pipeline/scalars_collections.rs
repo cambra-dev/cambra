@@ -22,15 +22,30 @@ fn test_literals(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
+// Type annotations use the capitalized primitive names and parenthesised type
+// application / brace-delimited structural types (see the CHL spec's
+// "Direction: term/type syntax split [Decided]").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// Capitalized primitive.
+#[case("x: Int = 5\nx", Value::Int(5))]
+// Record type `{name: T, …}`.
+#[case("p: {a: Int, b: Int} = {a: 1, b: 2}\np.a", Value::Int(1))]
+// Tuple type `{T, U}` (colon-free brace group).
+#[case("t: {Int, Bool} = (1, True)\nt[0]", Value::Int(1))]
+fn test_type_annotation_forms(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case("[]", Tile::SealedFunction { domain: ColumnValue::UInts(vec![]), codomain: Box::new(Tile::Scalar(ColumnValue::Units(0))), domain_predicate: Predicate::True, deleted: BitSet::new() })]
 #[case("[1, 2]", make_int_list(&[1, 2]))]
-// A `List[_]` annotation lowers the wildcard to a `Hole` element type
+// A `List(_)` annotation lowers the wildcard to a `Hole` element type
 // (inferred), so the annotation is accepted and unifies with the list literal.
-#[case("x: List[_] = [1, 2, 3]\nx", make_int_list(&[1, 2, 3]))]
-// The element type can also be spelled concretely: `List[int]`.
-#[case("x: List[int] = [1, 2, 3]\nx", make_int_list(&[1, 2, 3]))]
+#[case("x: List(_) = [1, 2, 3]\nx", make_int_list(&[1, 2, 3]))]
+// The element type can also be spelled concretely: `List(Int)`.
+#[case("x: List(Int) = [1, 2, 3]\nx", make_int_list(&[1, 2, 3]))]
 fn test_list_literals(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
@@ -174,7 +189,7 @@ fn test_let_bindings(#[case] code: &str, #[case] expected: Value) {
 // Chained augmented assignments accumulate correctly.
 #[case("x := 0\nx += 1\nx += 2\nx", Value::Int(3))]
 // Mix of an immutable `=` binding and a mutable `+=`: the plain local `y` is read
-// into the mutable-variable update. (A pre-mutation *snapshot* of the mutable variable — `y: int = x`
+// into the mutable-variable update. (A pre-mutation *snapshot* of the mutable variable — `y: Int = x`
 // before `x += 4` — is deliberately not tested here: a top-level mutable read
 // currently resolves to the mutable variable's final value, so point-in-time snapshots are
 // a separate concern from this write-lowering path.)

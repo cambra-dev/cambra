@@ -13,7 +13,7 @@ CHL source
   → uniquify          (ccl/uniquify.rs)                — α-uniquify binders           →  lowering.md
   → infer             (ccl/infer/ → ccl/infer/solver/) — type inference + refinements →  type-inference.md
   → inline            (ccl/inline.rs)                  — inline scalar/UDF lets       →  optimization.md
-  → transact_phase    (ccl/transact_phase.rs)          — with begin(): Mut[V,Txn] loops → get_prev_txn-guarded LetRec  →  mutability.md
+  → transact_phase    (ccl/transact_phase.rs)          — with begin(): Mut(V,Txn) loops → get_prev_txn-guarded LetRec  →  mutability.md
   → mut_elim      (ccl/mut_elim.rs)            — induction mutation loops → get_prev_seq-causal LetRec, then plan_loops → Transact  →  mutability.md
   → channelize        (ccl/channelize.rs)              — Defer/Feed/Define → channels; feed-routing step (channelize) of mutability elimination (after infer + the mutability phases; type-preserving)  →  mutability.md §4
   → lambda_elim       (ccl/lambda_elim.rs)             — λ → point-free combinators (runs simplify internally)  →  optimization.md

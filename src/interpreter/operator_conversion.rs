@@ -440,7 +440,7 @@ impl OpConversionContext {
             Type::UIntRange(n) => Ok(Extent::uint_range(*n)),
             // A `Txn` domain enumerates as UInt commit ticks (the prototype's
             // `CommitTime`); its positions are minted at runtime, like a data
-            // source's. `transact_phase` emits `Mut[V, Txn]` stores, so this is a
+            // source's. `transact_phase` emits `Mut(V, Txn)` stores, so this is a
             // live path — a transactional store's history domain converts here.
             Type::Txn => Ok(Extent::Base(BaseType::UInt)),
             other => Err(ConversionError::TypeError(format!(
@@ -1279,7 +1279,7 @@ fn build_commit_store(
     // via each `KeyReadInfo.value_extent` and store values are dynamically
     // tagged, so this is tiling metadata rather than an enforced cell type — but
     // it must still *describe* the column faithfully, so for a heterogeneous
-    // multi-key store (`Mut[str, Txn]` + `Mut[int, Txn]`) it is the union of the
+    // multi-key store (`Mut(String, Txn)` + `Mut(Int, Txn)`) it is the union of the
     // distinct per-key extents, not whichever key was iterated last. A
     // homogeneous store collapses the union to its single extent (the common
     // case, unchanged).

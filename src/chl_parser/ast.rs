@@ -181,7 +181,7 @@ pub enum Stmt {
     /// assignment as a store introduction (first `:=` to a name) or a store write
     /// (subsequent), so lowering never has to guess `MutWrite`-vs-`Let` from a
     /// name registry. The annotation is optional: bare `x := 0` is an induction
-    /// accumulator (domain inferred), `x: Mut[V, Txn] := 0` a transactional
+    /// accumulator (domain inferred), `x: Mut(V, Txn) := 0` a transactional
     /// register (the annotation carries the `Txn` domain, exactly as before).
     MutAssign {
         target: Spanned<AssignTarget>,
@@ -350,6 +350,16 @@ pub enum Expr {
 
     /// Dict literal with expression keys: `{"name": "alice", expr: value}`.
     Dict(Vec<(Spanned<Expr>, Spanned<Expr>)>),
+
+    /// A colon-free brace group: `{e0, e1, …}` (no `key: value` entries).
+    ///
+    /// Term-level braces are reserved for structural **type** syntax
+    /// (see `docs/chl-spec.md`):
+    /// a tuple type `{T, U}`. This variant captures that spelling so a type
+    /// annotation can name a tuple type; lowering interprets it as a
+    /// [`crate::ccl::Type::Tuple`] in annotation position and rejects it in
+    /// value position (there is no term-level brace-group value).
+    BraceGroup(Vec<Spanned<Expr>>),
 
     /// Subscript: `target[index]`.
     Subscript {

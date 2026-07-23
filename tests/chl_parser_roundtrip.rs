@@ -220,8 +220,8 @@ fn ternary_expression() {
 #[test]
 fn annotated_assignment_with_type() {
     must_parse_module(indoc! {"
-        x: int = 5
-        y: str = \"hi\"
+        x: Int = 5
+        y: String = \"hi\"
     "});
 }
 
@@ -564,21 +564,22 @@ fn with_begin_binds_handle() {
 }
 
 #[test]
-fn mut_txn_annotation_parses_as_tuple_subscript() {
-    // `Mut[V, Txn]` — the two-argument (value, domain) annotation form —
-    // parses as a subscript whose index is a 2-tuple.
-    let m = parse_module("store: Mut[int, Txn] = 0\nstore\n")
+fn mut_txn_annotation_parses_as_type_application() {
+    // `Mut(V, Txn)` — the two-argument (value, domain) annotation form —
+    // parses as type application: a call with a `Mut` head and two arguments.
+    let m = parse_module("store: Mut(Int, Txn) = 0\nstore\n")
         .value
         .expect("parses");
     let Stmt::AnnAssign { annotation, .. } = &m.body[0].node else {
         panic!("expected an AnnAssign, got {:?}", m.body[0].node);
     };
-    let Expr::Subscript { index, .. } = &annotation.node else {
-        panic!("expected a Subscript annotation, got {:?}", annotation.node);
+    let Expr::Call { func, args } = &annotation.node else {
+        panic!("expected a Call annotation, got {:?}", annotation.node);
     };
     assert!(
-        matches!(&index.node, Expr::Tuple(elts) if elts.len() == 2),
-        "Mut[int, Txn] index should be a 2-tuple, got {:?}",
-        index.node
+        matches!(&func.node, Expr::Name(n) if n == "Mut"),
+        "expected a `Mut` head, got {:?}",
+        func.node
     );
+    assert_eq!(args.len(), 2, "Mut(Int, Txn) should have two arguments");
 }

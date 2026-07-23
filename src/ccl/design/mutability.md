@@ -100,10 +100,10 @@ everything below is how that contract is met.
 Two surface facts are load-bearing for the realization and worth restating here:
 
 - **`:=` introduces and writes; `Txn` is never inferred.** A mutable variable is made by the `:=`
-  operator, not the annotation; a transactional register must be spelled `x: Mut[𝑉, Txn] := …`
-  (`Txn` never arises by inference). This document renders types in CCL symbolic form, so `Mut[𝑉, 𝐷]`
-  appears in **brackets** throughout — the CCL `Display` form — even though the surface language
-  converges to parenthesized type application (`Mut(𝑉, Txn)`); see the spec's spelling note.
+  operator, not the annotation; a transactional register must be spelled `x: Mut(𝑉, Txn) := …`
+  (`Txn` never arises by inference). Type application is parenthesised at both the surface and the
+  CCL `Display` level, so `Mut(𝑉, 𝐷)` renders the same way throughout this document and in the
+  language.
 - **A `Txn` register is read only inside a `with begin():` block, and a fed-out read is an as-of
   sample** (compiled to `AsOf`); the sole terminal register read is `await_final`, designed but not
   built. These two facts drive the
@@ -127,18 +127,18 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   [Mutability is the type](#mutability-is-the-type-no-lowering-registry)). Value `Unit`;
   `iter : 𝐼 ⇒ 𝑇`, `target : 𝑇` bound in `body`.
 - `MutWrite { name, value }` — one write to a variable. Value `Unit`. Its target **must** be
-  `Mut`-typed: inference peels the target's `Mut[𝑉, 𝐷]` and requires `value ⊑ 𝑉`; a write whose
+  `Mut`-typed: inference peels the target's `Mut(𝑉, 𝐷)` and requires `value ⊑ 𝑉`; a write whose
   target is *not* `Mut` is a **type error**, never a shadowing rebind (`x += e` on a plain `x` is
   rejected, not silently turned into `x = x + e`). `x += e` lowers to `MutWrite(x, x + e)`, the
   embedded read being the in-context read.
 - `Begin { body }` — one `with begin():` transaction block, made a *single* `Unit`-valued statement
   (`ExprStmt(Begin{block}, rest)`) so a loop body may freely mix a per-iteration transaction, sibling
   induction writes, and feeds. `body` is the per-transaction statement chain. The transaction phase
-  strips it: a block writing a `Mut[_, Txn]` register becomes a commit site (partitioned by register
+  strips it: a block writing a `Mut(_, Txn)` register becomes a commit site (partitioned by register
   domain — induction writes lifted onto the enclosing loop); a read-only block is unwrapped onto the
   loop spine. A standalone block lowers to a singleton `For` wrapping a `Begin`.
 - `Feed { name, value }` / `Defer` — a `<<` feed and its channel. These survive into inference (so
-  a defer binding is typed, at `Feed[𝑉]`) and are eliminated by mut_elim (feeds via channelize).
+  a defer binding is typed, at `Feed(𝑉)`) and are eliminated by mut_elim (feeds via channelize).
 
 `For`/`MutWrite`/`Begin`/`Feed`/`Defer` are **pre-phase surface-structure nodes**: pure placeholders
 no pass executes, eliminated wholesale by mut_elim + channelize. The purity invariant
@@ -148,7 +148,7 @@ residue, and planning/op-conversion never see them.
 ### Mutability is the type (no lowering registry)
 
 Whether a name denotes a mutable variable is carried **only** by the mutable-variable type
-`Type::History { kind: Overwrite }` (displayed `Mut[𝑉, 𝐷]`), and is therefore known
+`Type::History { kind: Overwrite }` (displayed `Mut(𝑉, 𝐷)`), and is therefore known
 only after inference. Lowering never tracks it — there is no lowering-side mutable-variable registry. This is
 what keeps lowering a pure representation change: it emits the markers above by *shape and scope
 alone*, and every decision that needs mutability happens later, keyed on the type.
@@ -156,7 +156,7 @@ alone*, and every decision that needs mutability happens later, keyed on the typ
 Lowering's two choices, both scope-only:
 
 - **Introduction vs. write.** `x := e` where `x` is *not* in scope is an introduction — a
-  `let x = e` whose binding is stamped `Mut[𝑉, 𝐷]` (`𝐷 = Txn` iff annotated `Mut[𝑉, Txn]`, else a
+  `let x = e` whose binding is stamped `Mut(𝑉, 𝐷)` (`𝐷 = Txn` iff annotated `Mut(𝑉, Txn)`, else a
   `Hole` the phase resolves). `x := e` / `x += e` where `x` *is* in scope is a write — a bare
   `MutWrite(x, e)`. The choice is membership in the ambient scope set (which lowering already
   threads for other reasons); it consults no mutability record.
@@ -168,7 +168,7 @@ Everything mutability-dependent is then a post-inference decision on the `Type::
 1. **Writes require a mutable** (`MutWrite` target must be `Mut`, above). A `+=` / `:=` to a plain
    binding is a type error, not a shadow. This is the single rule that makes "declare it with `:=`"
    a real discipline rather than a lowering-time heuristic.
-2. **Pass-by-reference requires the `Mut[…]` annotation.** The annotation is *what gives the
+2. **Pass-by-reference requires the `Mut(…)` annotation.** The annotation is *what gives the
    parameter a mutable `Type::History`*, so its body writes type-check (rule 1) and the phase can classify the
    writer; an unannotated parameter is non-`Mut`, so writing it is rejected by rule 1. Carrying the
    annotation means mutability is present in the type from the parameter inward through the whole
@@ -186,20 +186,20 @@ mutable variable is just a different binding with its own (non-`Mut`) type, hand
 
 ### `Mut` is a CCL type
 
-`Type::History { value: 𝑉, domain: 𝐷, kind: HistoryKind::Overwrite }` (displayed `Mut[𝑉, 𝐷]`) — a
+`Type::History { value: 𝑉, domain: 𝐷, kind: HistoryKind::Overwrite }` (displayed `Mut(𝑉, 𝐷)`) — a
 wrapper variant carried on the introduction's binding and on every reference to it. It shares the
 `Type::History` variant with a feed channel, distinguished by `kind`; a mutable variable is the
 `Overwrite` (last-write-wins) kind. Making mutability a real type buys two things:
 
 - **Pass-by-reference.** A function can take a mutable variable as a parameter
-  (`def bump(c: Mut[Int]): c += 1`) and write *the caller's* variable. Because mut_elim
+  (`def bump(c: Mut(Int)): c += 1`) and write *the caller's* variable. Because mut_elim
   runs after inlining, this needs no new machinery: beta-reduction substitutes the argument
   variable for the parameter, so the callee's `MutWrite`s land at the call site naming the actual
   mutable variable — the same route by which `Feed`-parameter UDFs work. The cross-function transactional
   writer falls out:
 
   ```python
-  def transfer(src: Mut[Int, Txn], dst: Mut[Int, Txn], amt: Int):
+  def transfer(src: Mut(Int, Txn), dst: Mut(Int, Txn), amt: Int):
       with begin():
           src -= amt
           dst += amt
@@ -209,13 +209,13 @@ wrapper variant carried on the introduction's binding and on every reference to 
 
 Typing:
 
-- **Reads are implicit derefs**: `Mut[𝑉, 𝐷]` coerces to `𝑉` wherever a non-`Mut` type is demanded
+- **Reads are implicit derefs**: `Mut(𝑉, 𝐷)` coerces to `𝑉` wherever a non-`Mut` type is demanded
   (a coercion arm in `constrain`, not structural subtyping). `cnt + 1`, `f(cnt)` for an `Int`
   parameter, and a trailing `cnt` all read; only a position that *expects* `Mut` (a `Mut`-annotated
   parameter) receives the handle. After inlining, no `Mut`-expecting positions remain, so the
   phase's rewrite is purely structural — every surviving `Mut`-typed occurrence is a write target
   or a read, decided by context.
-- A parameter `Mut[Int]` means `Mut[Int, _]`; the domain instantiates per call site through the
+- A parameter `Mut(Int)` means `Mut(Int, _)`; the domain instantiates per call site through the
   let-generalization of UDF bindings. Whether a write site requires `Txn` is the phase's structural
   check, post-inline — so one `bump` can serve an induction accumulator and a transactional
   register.
@@ -230,7 +230,7 @@ discipline:
    (so it is never a return type), `Feed` payloads, or another `Mut`.
 3. An **unannotated binding may not have `Mut` type**: `b = a` is an error, not an alias. To copy
    the current value, demand the deref (`b: Int = a`); to seed a *new* mutable variable from it, introduce one
-   with `:=` (`b: Mut[Int] := a`, the initializer being a read).
+   with `:=` (`b: Mut(Int) := a`, the initializer being a read).
 
 One structural check after inference enforces all three. The real fault line is the **merge law**,
 not `Feed`-vs-`Mut`. *Append-only* mutability merges commutatively — a feed by `++`, and (at
@@ -327,11 +327,11 @@ admits (pointwise maps and unions of causal streams change *what* is read per po
 
 ```
 CHL source
-  → parse              (annotations incl. _, Mut[…]/Feed[…]/Txn forms, with begin())
+  → parse              (annotations incl. _, Mut(…)/Feed(…)/Txn forms, with begin())
   → lower              (surface CCL: For / MutWrite / Begin / Feed / Defer; Mut/Feed types from annotations;
                         NO mutability classification — every loop is a `For`, intro-vs-write is scope-only)
   → uniquify
-  → infer + check      (on the surface-CCL tree; Feed[V] with a rigid ChanDom domain types the defers)
+  → infer + check      (on the surface-CCL tree; Feed(V) with a rigid ChanDom domain types the defers)
   → inline             (UDFs — incl. writers and defer-mediating lambdas — reach their call sites)
   → mut_elim           (overwrite-mutability elimination: collect mutable state + emit causal LetRec,
                         writer bodies decision-factored; eliminates For / MutWrite)
@@ -412,8 +412,8 @@ A transactional register and an induction counter shared across two HTTP endpoin
 incr_reqs, incr_resps = http_serve("8080", "POST", "/incr")
 get_reqs,  get_resps  = http_serve("8080", "GET",  "/get")
 
-balance: Mut[Int, Txn] := 0
-cnt: Mut[Int] := 0
+balance: Mut(Int, Txn) := 0
+cnt: Mut(Int) := 0
 
 for req in incr_reqs:
     with begin():
@@ -508,7 +508,7 @@ this section states how the letrec model *delivers* them.
   advances per request even though its write sits inside the block (a mix the current lowering
   rejects — see the caveat there); only `Txn`-domain variables participate in the atomic commit. A
   program that needs the counter transactionally consistent with the register declares it
-  `Mut[Int, Txn]`.
+  `Mut(Int, Txn)`.
 - **Liveness.** Induction domains are finite or stream-complete; `Txn` histories complete when all
   writer sources do. A fed-out `Txn` register read reads as-of its own position in the commit clock
   and does not wait for completeness. The one term that *does* wait for a register's completeness is
@@ -782,7 +782,7 @@ Designed — it binds `t` to the transaction's commit time (see the CHL spec,
 The **terminal read of a transactional register** — surface, semantics, and the unreferenceable-after
 rule are specified in the
 [CHL spec, "`await_final`"](../../../docs/chl-spec.md#86-await_final-decided): `await_final(𝑥)` reads a
-`Mut[𝑉, Txn]` register's last committed value once its whole commit history completes, and `𝑥` is
+`Mut(𝑉, Txn)` register's last committed value once its whole commit history completes, and `𝑥` is
 unreferenceable afterward so the completion event is well-defined. In the [ordering
 model](../../../docs/chl-spec.md#85-ordering-and-concurrency) it is the register-domain analog of loop
 completion — a **completeness** edge on the `Txn` domain. Designed, not built. This section is the

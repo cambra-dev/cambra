@@ -1,7 +1,7 @@
 //! A guestbook HTTP service: `POST /sign` appends an entry and the response is
 //! the whole guestbook so far — one endpoint that both *adds* data and
 //! *displays* it. State is carried across requests by an induction accumulator
-//! (`entries: Mut[_]`) whose running value the response feeds back on each
+//! (`entries: Mut(_)`) whose running value the response feeds back on each
 //! request, exercising a mutating for-loop with a per-request feed in *final*
 //! statement position. Plain-`String` requests and responses (`http_serve`
 //! yields the request body as a `String`; the reply is the accumulated text).

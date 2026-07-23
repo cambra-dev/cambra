@@ -1,5 +1,5 @@
 //! A scalar transactional register shared *live* across endpoints: `POST /set`
-//! overwrites `last` (`Mut[str, Txn]`, latest-write-wins); `GET /get` reads its
+//! overwrites `last` (`Mut(String, Txn)`, latest-write-wins); `GET /get` reads its
 //! current value cross-endpoint. The GET reads `last` inside a read-only `with
 //! begin():` block that feeds it out — a live as-of read (`Builtin::AsOf`)
 //! latched to the GET request loop (the outer index): each GET sees the store's
@@ -50,7 +50,7 @@ fn http_computed_live_read() {
     let source = format!(
         "set_reqs, set_resps = http_serve(\"{port}\", \"POST\", \"/set\")\n\
          get_reqs, get_resps = http_serve(\"{port}\", \"GET\", \"/get\")\n\
-         last: Mut[str, Txn] := \"(none)\"\n\
+         last: Mut(String, Txn) := \"(none)\"\n\
          for msg in set_reqs:\n    with begin():\n        last := msg\n    set_resps << \"ok\\n\"\n\
          for req in get_reqs:\n    with begin():\n        get_resps << last + \"!\"\n"
     );
@@ -81,8 +81,8 @@ fn http_multi_register_live_read() {
     let source = format!(
         "set_reqs, set_resps = http_serve(\"{port}\", \"POST\", \"/set\")\n\
          get_reqs, get_resps = http_serve(\"{port}\", \"GET\", \"/get\")\n\
-         a: Mut[str, Txn] := \"a0\"\n\
-         b: Mut[str, Txn] := \"b0\"\n\
+         a: Mut(String, Txn) := \"a0\"\n\
+         b: Mut(String, Txn) := \"b0\"\n\
          for msg in set_reqs:\n    with begin():\n        a := msg\n        b := msg\n    set_resps << \"ok\\n\"\n\
          for req in get_reqs:\n    with begin():\n        get_resps << a + b\n"
     );

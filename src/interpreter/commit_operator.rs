@@ -636,7 +636,7 @@ impl CommitOperator {
     /// Create a commit operator whose scalar keys' tick-0 values are produced by
     /// `init_ops` (each a scalar-valued, acyclic operator — it never reads the
     /// store), read once at subscribe. This is the op-conversion path for
-    /// `Mut[V, Txn]` keys; a literal init is just the trivial init
+    /// `Mut(V, Txn)` keys; a literal init is just the trivial init
     /// operator, and a collection key contributes no entry (its log starts
     /// empty). ([`Self::new`] is the concrete-map constructor used by
     /// engine-level tests.)
