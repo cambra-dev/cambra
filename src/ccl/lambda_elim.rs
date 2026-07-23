@@ -959,6 +959,219 @@ fn elim_lambda_impl(
             }
         }
 
+        // A **`VariantCtor` inside a lambda body** (`λ param → .Cᵢ(eᵢ(param))`):
+        // the point-free **constructor**, the dual of the scrutinee-`Case`'s
+        // `variant_project(i)`. Elaborate to `eᵢ ≫ variant_wrap(i)` — a
+        // composable morphism `param_ty ⇒ Union` that can sit as the RHS of a
+        // `≫`, so the value-`Case`-in-lambda fan-out
+        // `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)` accepts a variant-valued arm (the writer
+        // decision `if p: acc := .Commit(…) else: acc := .Abort(unit)`). A
+        // `VariantCtor` whose payload is *constant* in `param` never reaches here
+        // — the `const` arm above lifts the whole scalar variant value with
+        // `const(.Cᵢ(…))`, which op-conversion broadcasts.
+        TypedExprNode::VariantCtor { tag, payload } => {
+            // The node's own type is the full `Variant` (inference width-subtyped
+            // the singleton up to its consumer's tag set), giving the fixed arm
+            // position — the same index `variant_wrap`/`VariantProject` share.
+            let variants = match strip_refinements(&body_ty) {
+                Type::Variant(v) => v,
+                other => {
+                    return Err(LambdaElimError::Unsupported(format!(
+                        "VariantCtor with non-variant type {other}"
+                    )));
+                }
+            };
+            let tag_key = FieldKey::Name(tag.as_str().into());
+            let idx = variants
+                .iter()
+                .position(|(k, _)| *k == tag_key)
+                .ok_or_else(|| {
+                    LambdaElimError::Unsupported(format!(
+                        "VariantCtor tag `{tag}` absent from its variant type {body_ty}"
+                    ))
+                })?;
+            let payload_ty = payload.ty.clone();
+            // eᵢ  ⟹  point-free `param_ty ⇒ Pᵢ`.
+            let payload_pf = elim_lambda(ctx, param, param_ty, *payload)?;
+            // variant_wrap(i) : Pᵢ ⇒ Union (the tag injection).
+            let vw = Expr::builtin(Builtin::VariantWrap(idx))
+                .with_ty(Type::fun(payload_ty, body_ty.clone()));
+            Ok(typed_compose(vec![payload_pf, vw]).with_ty(result_ty))
+        }
+
+        // A **scrutinee-`Case`** over a variant inside a lambda body
+        // (`λ param → match scrut { Cᵢ(wᵢ) → eᵢ }`): the point-free **union of
+        // tag-restricts**. The branch tags *partition* the scrutinee's domain,
+        // so elimination is the same fan-out the value-`Case` above emits —
+        // keyed on **tag** rather than a boolean first-match gate:
+        //
+        //   ⧺ᵢ ( scrut ▷ variant_project(i) ▷ (λ wᵢ → eᵢ) )
+        //
+        // Each arm narrows the fed scrutinee stream to arm `i`'s tag-restricted
+        // sub-domain and reads that arm's inner payload (`variant_project(i)`
+        // fuses restrict+project — see the builtin docs), binds the payload
+        // `wᵢ`, then maps `eᵢ`. The flat `UnionOperator` re-totals the disjoint
+        // partitions; exhaustiveness (one arm per scrutinee tag, enforced by
+        // inference's width-subtyping) makes the union total, so no
+        // `final_or_default` scalar collapse is needed — this is the fan-out
+        // shape, not the C-form.
+        //
+        // **Outer-binder arms.** When `eᵢ` closes over the outer binder as well
+        // as its payload (`eᵢ(param, wᵢ)` — e.g. a per-key view
+        // `λ __c → match __c.decision { Commit(w) → {time: __c.time, write: w.i} }`
+        // reading both the record's sibling field and the Commit payload), the
+        // arm zips the outer element alongside the projected payload:
+        //
+        //   ⧺ᵢ ( ⟨id, scrut ▷ variant_project(i)⟩ ▷ zip ≫ (λ (param, wᵢ) → eᵢ) )
+        //
+        // `variant_project(i)` keeps the scrutinee's *real* domain keys (a union
+        // *stream* carries them explicitly), so the outer `id` arm (the full
+        // element) and the tag-restricted payload co-iterate by key under the
+        // `zip`/`FanIn`, which inner-joins on the shared keys — the outer arm
+        // need not be pre-restricted (the join drops the non-tag-`i` positions).
+        // The two binders merge into one pair (`param ↦ pair.0`, `wᵢ ↦ pair.1`),
+        // exactly as the nested-lambda rule does.
+        TypedExprNode::Case {
+            scrutinee: Some(scrut),
+            branches,
+        } if branches.iter().all(|b| b.pattern.is_some()) => {
+            let value_ty = body_ty.clone();
+            let scrut = *scrut;
+            let scrut_ty = scrut.ty.clone();
+            // Concrete `Variant` type behind the scrutinee, to map each branch
+            // tag → its 0-based arm position (the erased index `variant_project`
+            // and `VariantWrap` share).
+            let variants = match strip_refinements(&scrut_ty) {
+                Type::Variant(v) => v,
+                other => {
+                    return Err(LambdaElimError::Unsupported(format!(
+                        "scrutinee-Case over a non-variant type {other}"
+                    )));
+                }
+            };
+            // The scrutinee as a point-free morphism `param_ty ⇒ scrut_ty`. When
+            // the scrutinee is the bound parameter itself it collapses to `id`,
+            // which is dropped from the compose chain.
+            let scrut_pf = elim_lambda(ctx, param, param_ty, scrut)?;
+            let scrut_is_id = matches!(&scrut_pf.node, TypedExprNode::Builtin(Builtin::Id));
+
+            let mut arms: Vec<Expr> = Vec::with_capacity(branches.len());
+            // Each branch's tag position, collected to check exhaustiveness and
+            // one-arm-per-tag after the loop — load-bearing invariants inference's
+            // stamping guarantees but that are not type-enforced at this boundary.
+            let mut seen_idxs: Vec<usize> = Vec::with_capacity(branches.len());
+            for br in branches {
+                // A scrutinee-Case is a pattern match, not a guarded conditional:
+                // its branches carry the trivial `true` guard. Variant elimination
+                // dispatches on the tag and does not thread a secondary guard, so a
+                // non-trivial one would be silently dropped.
+                debug_assert!(
+                    matches!(&br.guard.node, TypedExprNode::Lit(Lit::Bool(true))),
+                    "scrutinee-Case branch carries a non-trivial guard; variant \
+                     elimination dispatches on the tag and does not thread guards"
+                );
+                let pat = br
+                    .pattern
+                    .expect("guarded: scrutinee-Case branches all bind a pattern");
+                let tag_key = FieldKey::Name(pat.tag.as_str().into());
+                let idx = variants
+                    .iter()
+                    .position(|(k, _)| *k == tag_key)
+                    .ok_or_else(|| {
+                        LambdaElimError::Unsupported(format!(
+                            "scrutinee-Case branch tag `{}` absent from scrutinee type {scrut_ty}",
+                            pat.tag
+                        ))
+                    })?;
+                seen_idxs.push(idx);
+                let payload_ty = pat.binding.ty.clone();
+                let payload_name = pat.binding.name.clone();
+                // variant_project(i) : scrut_ty ⇒ Pᵢ (the tag-restricting projection).
+                let vp = Expr::builtin(Builtin::VariantProject(idx))
+                    .with_ty(Type::fun(scrut_ty.clone(), payload_ty.clone()));
+                // Does `eᵢ` close over the outer binder as well as its payload?
+                // (Checked on the raw body — the payload binder `wᵢ` shadows
+                // nothing, so a free `param` is genuinely the outer element.)
+                let uses_outer = is_free(param, &br.body);
+
+                let arm = if !uses_outer {
+                    // Payload-only: scrut ≫ variant_project(i) ≫ (λ wᵢ → eᵢ).
+                    let arm_fn = elim_lambda(ctx, &payload_name, &payload_ty, br.body)?;
+                    let mut chain: Vec<Expr> = Vec::with_capacity(3);
+                    if !scrut_is_id {
+                        chain.push(scrut_pf.clone());
+                    }
+                    chain.push(vp);
+                    chain.push(arm_fn);
+                    typed_compose(chain).with_ty(Type::data_fun(param_ty.clone(), value_ty.clone()))
+                } else {
+                    // Outer-binder: zip the whole element alongside the projected
+                    // payload, then feed the pair to `eᵢ`. Merge `param` and `wᵢ`
+                    // into one pair binder (`param ↦ pair.0`, `wᵢ ↦ pair.1`) — the
+                    // same rewrite the nested-lambda rule uses.
+                    let pair = ctx.fresh_pair_name();
+                    let pair_ty = Type::Tuple(vec![param_ty.clone(), payload_ty.clone()]);
+                    let sub_x = Expr::apply(
+                        Expr::var(&pair).with_ty(pair_ty.clone()),
+                        Expr::proj_index(0).with_ty(Type::fun(pair_ty.clone(), param_ty.clone())),
+                    )
+                    .with_ty(param_ty.clone());
+                    let sub_w = Expr::apply(
+                        Expr::var(&pair).with_ty(pair_ty.clone()),
+                        Expr::proj_index(1).with_ty(Type::fun(pair_ty.clone(), payload_ty.clone())),
+                    )
+                    .with_ty(payload_ty.clone());
+                    let merged =
+                        substitute(substitute(br.body, &payload_name, &sub_w), param, &sub_x);
+                    // λ (param, wᵢ) → eᵢ  ⟹  point-free `(param_ty, Pᵢ) ⇒ V`.
+                    let arm_fn2 = elim_lambda(ctx, &pair, &pair_ty, merged)?;
+                    // Payload morphism `param_ty ⇒ Pᵢ` (scrut ≫ variant_project(i)).
+                    let payload_pf = if scrut_is_id {
+                        vp
+                    } else {
+                        typed_compose(vec![scrut_pf.clone(), vp])
+                    };
+                    // Outer morphism `param_ty ⇒ param_ty` — the full element; the
+                    // zip's `FanIn` restricts it to the tag-`i` keys by inner-join.
+                    let outer_pf = id().with_ty(Type::fun(param_ty.clone(), param_ty.clone()));
+                    // ⟨id, scrut ≫ variant_project(i)⟩ : param_ty ⇒ (param_ty, Pᵢ).
+                    let pair_stream = zip_pair(outer_pf, payload_pf);
+                    typed_compose(vec![pair_stream, arm_fn2])
+                        .with_ty(Type::data_fun(param_ty.clone(), value_ty.clone()))
+                };
+                arms.push(arm);
+            }
+            // One arm per tag, and every scrutinee variant covered: the tag
+            // positions are distinct and number exactly the scrutinee's variants.
+            // A duplicate tag would union two partitions onto the same domain
+            // positions (a monotonic-merge violation); a missing tag would leave
+            // that tag's positions in no arm, so the union re-totals to a domain
+            // with gaps. Both are guaranteed by inference's exhaustiveness stamping,
+            // not by any check here.
+            debug_assert!(
+                {
+                    let mut s = seen_idxs.clone();
+                    s.sort_unstable();
+                    s.dedup();
+                    s.len() == seen_idxs.len()
+                },
+                "scrutinee-Case has two branches for one tag (duplicate variant_project index)"
+            );
+            debug_assert_eq!(
+                seen_idxs.len(),
+                variants.len(),
+                "scrutinee-Case is non-exhaustive: {} branches for {} scrutinee variants",
+                seen_idxs.len(),
+                variants.len()
+            );
+            match arms.len() {
+                0 => unreachable!("a scrutinee-Case has at least one branch"),
+                1 => Ok(arms.pop().expect("len == 1")),
+                _ => Ok(Expr::collection_union(arms)
+                    .with_ty(Type::data_fun(param_ty.clone(), value_ty))),
+            }
+        }
+
         // Unsupported constructs.
         body => Err(LambdaElimError::Unsupported(format!(
             "unsupported body kind in lambda elimination for param '{param}' in body {body:?}"
