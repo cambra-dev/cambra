@@ -576,10 +576,12 @@ The pipeline passes downstream of inference treat function types structurally an
 ## 4.6 Data vs compute functions
 
 > **Status: implemented, minus Σ.** The `FunKind` marker, kind inference,
-> kind-aware subtyping (the `Compute <: Data` rejection) and the invariant data
+> kind-aware subtyping (the `Compute <: Data` rejection), the invariant data
+> domain, and the compilation of a value-selecting `Case` whose arms share one
 > domain are all live. What is missing is the type the model says a domain join
 > *produces* — the Σ — so a join over distinct domains is diagnosed rather than
-> typed. See the callout below.
+> typed. The heterogeneous-scalar union is separately deferred. See the callout
+> below.
 
 The unresolved domain-join corner of §4.5 (O1/O4 — two collections meeting at one
 join point) is resolved by making a missing distinction explicit. The distinction
@@ -705,6 +707,31 @@ one source (`[x for x in xs if x > 1]` vs `[x for x in xs if x < 3]`) are two
 distinct domains and reject like any other pair — refinement is not a special case
 here. Meeting them would claim one domain satisfying both filters; picking either
 would claim positions the other branch does not produce.
+
+> **Landed — value-`Case` compilation at one domain.** `lambda_elim` compiles a
+> value-selecting `Case` to a union of **gated restricts**: one leg per arm, each the
+> arm's domain refined by that arm's branch predicate `π̂ᵢ` (compiled from the
+> original `if`/`elif` conditions), assembled as
+> `Fun{Data, Variant([{𝐷ᵢ | π̂ᵢ}]), 𝑐}`. The gates are exclusive and exhaustive, so
+> exactly one leg is non-empty at runtime — an invariant `lambda_elim` asserts at the
+> fan-out boundary (a non-exhaustive value-`Case` would realize an empty collection
+> on the uncovered path, a silent miscompile) rather than the solver re-proving.
+>
+> Where every arm shares one domain 𝐷 — the case the domain-join rule admits, and
+> the one loop-carried accumulators produce (`if p: acc := x else: acc := y`) — the
+> arms' join is the plain data function `𝐷 ⤇ 𝑐`, and the compiled partition subtypes
+> *that* directly: `is_index_partition_of` recognizes a `Variant` whose every
+> payload is 𝐷 under a gate, and relates each leg `{𝐷 | π̂ᵢ} <: 𝐷` by refinement
+> width — *covariant*, since this is an introduction rather than the function-domain
+> contravariance. It is guarded on the legs refining the same *concrete* target, so a
+> genuine heterogeneous `++` flowing into a fresh-var domain still takes the ordinary
+> contravariant arm (its domain var resolves to the `Variant`, iterating every leg).
+>
+> Arms at *different* domains have no join to subtype against — see
+> [The domain join is a Σ](#the-domain-join-is-a-σ) — so the fan-out is built
+> and reconciled only at one domain. Reconciling it against the lossless join of
+> several domains is the same dependent sum that rejection is standing in for, and
+> lands with it.
 
 **`Case` arms join by the lattice.** `emit_case` constrains *every* arm into a
 fresh result variable (`require_sub`) instead of requiring equality. Homogeneous
