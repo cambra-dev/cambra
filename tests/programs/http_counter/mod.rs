@@ -40,10 +40,9 @@ fn http_counter() {
 /// A *computed* live cross-endpoint read: `GET /get` replies `last + "!"`, where
 /// `last` is overwritten by `POST /set`. This exercises the `as_of ≫ (λ x → x +
 /// "!")` shape at runtime — the map layer over the as-of latch — confirming it
-/// resolves rather than hanging. The hang is the failure mode the retired
-/// `check_live_reads_resolved` band-aid guarded against (a computed live read
-/// used to be rejected outright); the pre-lambda-elim rewrite makes it a real
-/// as-of read instead. (A `String` reply — the http sink only serializes
+/// resolves rather than hanging: the pre-lambda-elim rewrite makes the computed
+/// reply a real as-of read (a map over the latch), not a never-resolving
+/// terminal render. (A `String` reply — the http sink only serializes
 /// `Strings` — with a non-identity map, the point being the map, not the value.)
 #[test]
 fn http_computed_live_read() {

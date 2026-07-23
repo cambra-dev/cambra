@@ -398,51 +398,6 @@ impl Type {
         }
     }
 
-    /// Whether this type's positions can be statically enumerated — i.e. a
-    /// terminal reduction over a `Fun` of this domain converges. A live commit
-    /// history (`Txn`) has **no** enumerable extent: its positions are revealed
-    /// only as commits land, so a `final_or_default` over one never resolves.
-    /// `transact_phase::rewrite_live_reads` uses this to detect that a broadcast
-    /// read's register is a live commit log (`Txn`) and rewrite it to an as-of join
-    /// instead of broadcasting a never-resolving terminal render.
-    ///
-    /// The match is **exhaustive on purpose** (no `_` arm): the predicate is
-    /// load-bearing, so a new abstract domain whose elements live in a producer
-    /// must make an explicit decision here rather than silently defaulting to
-    /// enumerable. `DataSource` is enumerable-from-the-type (its extent resolves
-    /// from the registered source); only `Txn` is genuinely non-enumerable.
-    ///
-    /// A `Fun` defers to its **domain**: iterating a function converges iff its
-    /// domain does. This is what makes the predicate safe to call on a whole
-    /// history function (`Txn ⇒ V` → non-enumerable), not just an extracted
-    /// domain — a history is exactly a `Fun { domain: Txn, .. }`, so a
-    /// blanket `Fun ⇒ true` would have mis-answered the very case this exists to
-    /// detect.
-    pub fn has_enumerable_extent(&self) -> bool {
-        match self {
-            Type::Txn => false,
-            Type::Fun { domain, .. } => domain.has_enumerable_extent(),
-            Type::Tuple(ts) => ts.iter().all(Type::has_enumerable_extent),
-            Type::Record(fields) => fields.iter().all(|(_, t)| t.has_enumerable_extent()),
-            Type::Variant(tags) => tags.iter().all(|(_, t)| t.has_enumerable_extent()),
-            Type::Refinement(inner, _) => inner.has_enumerable_extent(),
-            // A history is erased by the unified phase
-            // (`mut_elim`/`transact_phase`) and a feed history by `channelize`,
-            // both before planning consults this predicate; observing one here is
-            // a compiler bug.
-            Type::History { .. } => unreachable!("Type::History survived its erasing phase"),
-            // Erased by `channelize` (before planning); a survivor here
-            // is a compiler bug, same as `History`.
-            Type::ChanDom(..) => unreachable!("Type::ChanDom survived channelize"),
-            // Concrete or type-resolvable domains: enumerable from the type alone.
-            Type::Base(_)
-            | Type::UIntRange(_)
-            | Type::DataSource(_)
-            | Type::Hole
-            | Type::Infer(_) => true,
-        }
-    }
-
     /// A structural copy with every Pi binder name erased (`Fun.name → None`).
     ///
     /// The binder is load-bearing only inside the type solver (it carries

@@ -85,11 +85,11 @@ pub enum CompileError {
     /// Operator-graph conversion failed.
     Conversion(ConversionError),
     /// A post-inference phase rejected the program for a semantic reason that
-    /// only becomes visible after inlining / type inference — a nested
-    /// transaction reaching a `with begin():` block via a function call, or a
-    /// live cross-endpoint read in a shape the as-of rewrite cannot stage. These
-    /// run on a lambda-free / inlined tree whose nodes carry no source span, so
-    /// they render as a plain `error: …` line rather than an ariadne report.
+    /// only becomes visible after inlining / type inference — e.g. a nested
+    /// transaction reaching a `with begin():` block via a function call, or an
+    /// induction-only / guarded-write transaction block. These run on a
+    /// lambda-free / inlined tree whose nodes carry no source span, so they
+    /// render as a plain `error: …` line rather than an ariadne report.
     Unsupported(String),
 }
 
@@ -652,12 +652,6 @@ pub fn compile_program(
     // reject. Uniform across the reading loop's domain. See
     // `transact_phase::rewrite_live_reads`.
     transact_phase::rewrite_live_reads(&mut desugared);
-    // A fed-out read whose *shape* the rewrite doesn't recognize would fall through
-    // to an `ExtractLast`; beside a never-terminating request stream that never goes
-    // terminal and hangs. Reject that case with a clear error rather than hang the
-    // endpoint — a hang-guard, not a semantic gate. See `check_live_reads_resolved`.
-    transact_phase::check_live_reads_resolved(&desugared)
-        .map_err(|msg| vec![CompileError::Unsupported(msg)])?;
     typecheck(&desugared).expect("live-read rewrite produced an ill-typed tree");
 
     let lambda_elim = lambda_elim::run(desugared).errs()?;
