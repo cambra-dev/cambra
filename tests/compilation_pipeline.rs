@@ -26,6 +26,8 @@ mod helpers;
 
 #[path = "compilation_pipeline/comprehensions.rs"]
 mod comprehensions;
+#[path = "compilation_pipeline/conditionals.rs"]
+mod conditionals;
 #[path = "compilation_pipeline/feeds_cases.rs"]
 mod feeds_cases;
 #[path = "compilation_pipeline/generators_udf_poly.rs"]

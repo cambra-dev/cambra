@@ -487,23 +487,62 @@ impl TileProducer for MapResultToConstProducer {
             _ => i_tiling.universal_guard(),
         };
         let input_tile = self.input.get(input_guard);
-        let constant_tile = self.constant.get(c_tiling.universal_guard());
-
-        // The broadcast value must be fully known before we can replicate it
-        // across the input's domain: `repeat` fabricates nothing, it copies a
-        // single present value. A constant that is still absent (e.g. a scalar
-        // read from a sibling induction loop that has not yet converged) yields
-        // an empty (non-terminal) output — the consumer re-pulls once it lands,
-        // rather than us inventing a value for the unknown positions.
-        //
-        // This is one half of a single invariant — "never fabricate a position
-        // from a not-yet-converged sibling read." The other half is the
-        // co-presence truncate in `binop::zip_arithmetic`/`zip_concat`: a binop
-        // over a lagging operand combines only the common prefix instead of
-        // returning the longer side's tail. Keep the two in step.
-        if !constant_tile.is_terminal() {
-            return self.tiling().empty_tile();
+        // **Laziness — do not evaluate an off-path arm.** In the scalar value-`Case`
+        // C-form a false first-match gate empties this arm's `Units(1)` driver — the
+        // `Restrict` marks the driver row *deleted* rather than dropping it. When
+        // every driver row is deleted, the arm contributes no live rows, so the
+        // constant's value is never observed. Crucially we must not *pull* it: the
+        // arm's value may be a partial expression (`//`, `%`, an index) the gate
+        // exists to guard, and pulling it would evaluate e.g. `x // 0` and panic.
+        // Return a terminal-empty tile carrying the input's decidedness, so the
+        // union / `final_or_default` sees this arm resolve to nothing rather than
+        // waiting forever. The data-collection fan-out is lazy the same way (an
+        // emptied restrict is never iterated); this brings the scalar form in line.
+        if let Tile::SealedFunction {
+            domain,
+            deleted,
+            domain_predicate,
+            ..
+        } = &input_tile
+            && (0..domain.len()).all(|i| deleted.contains(i))
+        {
+            let mut out = self.tiling().empty_tile();
+            if let Tile::SealedFunction {
+                domain_predicate: out_pred,
+                ..
+            } = &mut out
+            {
+                // Carry the input's decidedness so a decided (false-gate) arm reads
+                // terminal-empty — the union / `final_or_default` sees it resolve to
+                // nothing rather than waiting forever.
+                *out_pred = domain_predicate.clone();
+            } else {
+                // MapResultToConst's output is always a function tiling; a
+                // non-`SealedFunction` here would silently drop the decidedness
+                // carry-over and leave a decided arm reading non-terminal forever.
+                unreachable!("MapResultToConst output tiling is always SealedFunction");
+            }
+            return out;
         }
+        let constant_tile = {
+            // The broadcast value must be fully known before we can replicate it
+            // across the input's domain: `repeat` fabricates nothing, it copies a
+            // single present value. A constant that is still absent (e.g. a scalar
+            // read from a sibling induction loop that has not yet converged) yields
+            // an empty (non-terminal) output — the consumer re-pulls once it lands,
+            // rather than us inventing a value for the unknown positions.
+            //
+            // This is one half of a single invariant — "never fabricate a position
+            // from a not-yet-converged sibling read." The other half is the
+            // co-presence truncate in `binop::zip_arithmetic`/`zip_concat`: a binop
+            // over a lagging operand combines only the common prefix instead of
+            // returning the longer side's tail. Keep the two in step.
+            let ct = self.constant.get(c_tiling.universal_guard());
+            if !ct.is_terminal() {
+                return self.tiling().empty_tile();
+            }
+            ct
+        };
 
         let mode = self.mode;
         process_tile_result(self.tiling(), input_tile, move |codomain| {
