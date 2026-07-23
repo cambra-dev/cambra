@@ -898,6 +898,41 @@ fn elim_lambdas(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimErr
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || elim_lambdas_impl(ctx, expr))
 }
 
+/// Flip the outer arrow of an eliminated group-by source `const(cast(c)) :
+/// (k) ⇒ group` to `Data` — the runtime effect of `reify` (Compute→Data). The
+/// value is unchanged; only the kind on the outer `Fun` becomes `Data`, and the
+/// enclosing `const` combinator's codomain is re-stamped to match (kept
+/// consistent for the debug typecheck). The result type then equals the inferred
+/// keyed collection `{K | __elem ▷ keydom#id} ⤇ group`.
+fn reify_to_data(expr: Expr) -> Expr {
+    let data_ty = match &expr.ty {
+        Type::Fun {
+            name,
+            domain,
+            codomain,
+            ..
+        } => Type::Fun {
+            name: name.clone(),
+            kind: crate::ccl::ty::FunKind::Data,
+            domain: domain.clone(),
+            codomain: codomain.clone(),
+        },
+        other => other.clone(),
+    };
+    match expr.node {
+        // `const(cast) : body → (k) ⇒ group` — re-stamp const's codomain to the
+        // Data arrow so `Apply(cast, const)` stays internally consistent.
+        TypedExprNode::Apply { argument, function } => {
+            let new_fn_ty = match &function.ty {
+                Type::Fun { domain, .. } => Type::fun((**domain).clone(), data_ty.clone()),
+                other => other.clone(),
+            };
+            Expr::apply(*argument, (*function).with_ty(new_fn_ty)).with_ty(data_ty)
+        }
+        _ => expr.with_ty(data_ty),
+    }
+}
+
 fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaElimError> {
     log::trace!("elim_lambdas: eliminating {}", symbolic(&expr));
     debug_typecheck(&expr);
@@ -946,6 +981,23 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
                 result.ty
             );
             elim_lambdas(ctx, result)
+        }
+
+        // `reify(λ (k : {K | __elem ▷ keydom#id}) → cast(…))` — the keyed-collection realization
+        // of `groupby` (see `src/ccl/lower/exprs.rs`). Eliminate the inner
+        // cast-lambda to the point-free group-by source `const(cast(c)) :
+        // (k) ⇒ group`, then flip its outer arrow to `Data` (`reify`'s
+        // Compute→Data crossing) so the eliminated type matches the inferred keyed
+        // collection. The outer membership refinement rides the domain into
+        // planning, whose group-by recognizer strips it (`recognize_groupby_sites`);
+        // `reify` never survives to op-conversion.
+        TypedExprNode::Apply { argument, function }
+            if matches!(&function.node, TypedExprNode::Builtin(Builtin::Reify)) =>
+        {
+            let elim_arg = elim_lambdas(ctx, *argument)?;
+            let result = reify_to_data(elim_arg);
+            debug_typecheck(&result);
+            Ok(result)
         }
 
         // Filter pattern: Compose([..src.., Lambda(x, Case([guard→action, true→unit]))])

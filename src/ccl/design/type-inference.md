@@ -703,7 +703,7 @@ The expected binder is **always globally fresh** (proposal §5.2 verbatim; the �
 * **O2 (polymorphic case)** — `freshen_above` copy-and-freshens a refined value's predicate type slots through the shared cache (its `Refinement` arm), so a specialization's predicate is a proper freshen instance rather than a shared `Rc`. Immutable predicate terms are acyclic, so no refinement-cycle guard is needed.
 * **O4** — two *different* discharges of one refinement (`g(0)` vs `g(1)`) are distinguished once forced — `force_refinement` rewrites the predicate term and refinement equality is structural (§4) — and the constraint cache is σ-aware, so the two discharges record distinct edges rather than conflating. The residual domain-join corner is two *distinct non-invertible* morphisms meeting at one variable (O1/O4), guarded loudly by `bridge_holder_gap`'s panic tripwire rather than silently dropped.
 
-The pipeline passes downstream of inference treat function types structurally and compare modulo the Pi binder (`Type::without_pi_names`). **Refinement-predicate compilation is deferred out of lambda-elim** (proposal §6.3): predicates ride through inference and lambda-elim in their bare pointful form (a bare boolean over the implicit `REFINEMENT_BINDER`), and **planning** compiles them. Order matters: the group-by / hash-join recognizers run *first*, on the bare form — compiling first would destroy the pointful shapes they match (see the pointful-join-recognizers plan) — and `planning::compile_refinement_predicates` then runs the lambda-elim → simplify sub-pipeline on each remaining predicate (keyed by predicate `Rc` identity) before the generic `iterate`/`restrict` lowering consumes it. This is what lets a refined collection — including a group-by over a *filtered* source (`[sum(x) for x in groupby([y+10 for y in xs if y<6], key)]`) — compile to a runtime `Restrict`/`Filter` rather than reaching op-conversion as an un-compiled predicate. Single-key dependent lookups (`sum(groupby(xs, key)(k))`) and the nested filtered-source group-by both run end-to-end with correct values.
+The pipeline passes downstream of inference treat function types structurally and compare modulo the Pi binder (`Type::without_pi_names`). **Refinement-predicate compilation is deferred out of lambda-elim** (proposal §6.3): predicates ride through inference and lambda-elim in their bare pointful form (a bare boolean over the implicit `REFINEMENT_BINDER`), and **planning** compiles them. Order matters: the group-by / hash-join recognizers run *first*, on the bare form — compiling first would destroy the pointful shapes they match (see the pointful-join-recognizers plan) — and `planning::compile_refinement_predicates` then runs the lambda-elim → simplify sub-pipeline on each remaining predicate (keyed by predicate `Rc` identity) before the generic `iterate`/`restrict` lowering consumes it. This is what lets a refined collection — including a group-by over a *filtered* source (`[sum(x) for x in groupby([y+10 for y in xs if y<6], key)]`) — compile to a runtime `Restrict`/`Filter` rather than reaching op-conversion as an un-compiled predicate. The nested filtered-source group-by runs end-to-end with correct values. Single-key dependent lookups (`sum(groupby(xs, key)(k))`) **did too, and no longer type-check**: once `groupby` infers its honest keyed type (§4.6), a bare key cannot prove it lies in that collection's key domain, so the application is rejected and nine tests are `#[ignore]`d against the restore. Restoring them needs the discharge in `src/ccl/design/collections.md`, "Lookup: membership discharge" — the dependent-application machinery here is unchanged and still correct; what is missing is a membership proof for the argument.
 
 ## 4.6 Data vs compute functions and conditional-collection domain joins
 
@@ -1165,8 +1165,9 @@ correlation in a homogeneous-codomain data function (e.g. a conditionally-sized
 collection of in-bounds indices, `Σ 𝑛 ∈ Nat. {Int | __elem ∈ [0, 𝑛]} ⤇ …`),
 not per-branch element *types* — a third axis, neither this codomain join's nor
 the enumerated witness's. It is the same `Type::Sigma` machinery either way — only
-the witness *kind* differs — and is **implemented for `List`** (the collections
-work), pending for the keyed `Map`/`Set` case.
+the witness *kind* differs — and is **implemented for `List` and the keyed
+`Map`/`Set` case** (the collections work); the keyed *values* (constructors,
+`groupby`-as-`Map`) are the piece that remains.
 
 > **Direction — collections.** The general collection design
 > ([collections.md](collections.md)) is built on this section. Its first
@@ -1179,11 +1180,16 @@ work), pending for the keyed `Map`/`Set` case.
 >   term and a `Described` compact/coalesce domain. The keyed collection (`Map`/`Set`) is
 >   the same
 >   apparatus over a *membership*-refined element type (`{𝑘: 𝐾 | 𝑘 ∈ 𝐸}`, exactly
->   the `{Int | __elem ∈ 𝑛}` shape above), and is the remaining live use —
->   landing with the keyed collection types themselves (collections.md
->   "Status"). `groupby`'s already-refined result type
->   `{𝑖 | 𝑖 ▷ xs ▷ key == 𝑘} ⤇ 𝑉` *is* the `Map` type, and the two will unify
->   with no bridge.
+>   the `{Int | __elem ∈ 𝑛}` shape above) — **now wired too** (the `∈` atom
+>   [`Builtin::Member`], `Type::map_of`/`set_of`, and the keyed
+>   entry/consumption/width discharge). `groupby`'s result is a *concrete* keyed
+>   collection `{𝐾 | 𝑘 ∈ (c ≫ key)} ⤇ ({𝑖 | key(c(𝑖)) == 𝑘} ⤇ 𝐴)` and **injects
+>   into** `Map(𝐾, Collection(𝐴))` — the keyed discharge (`𝐸 := c ≫ key`) *is* the
+>   bridge, and [`Builtin::Reify`] supplies the `Compute → Data` crossing the
+>   outer lambda needs (a `cast` cannot: `Compute <: Data` is the forbidden
+>   direction). What remains on the value side is the `map` constructor and the
+>   keyed entry of a producer whose key domain is *not* written down by lowering
+>   (collections.md "Status").
 > - **Domain invariance** is already in force in both halves ([Data domains are
 >   invariant](#data-domains-are-invariant)), so the collection work inherits the
 >   arm rather than adding it. What changes is how much weight it carries: a
@@ -1192,9 +1198,11 @@ work), pending for the keyed `Map`/`Set` case.
 >   domains being ranges or fresh join vars — become pervasive the moment maps land
 >   (`{𝑘: 𝐾 | 𝑘 ∈ 𝐸}`, `{𝑘: 𝐾 | 𝑘 ∈ 𝐸 ∧ valid(𝑘)}`). The consequence to design
 >   against is that **neither** refinement edge is available: a keyed collection
->   cannot acquire a domain refinement by subsumption, so an entry needing one
->   is an explicit [`Cast`](ir.md#cast--explicit-refinement-acquisition), and a
->   filtered collection does not flow where its unfiltered domain is declared.
+>   cannot acquire a domain refinement by subsumption, so a refinement an entry term
+>   adds is named by an explicit
+>   [`Cast`](ir.md#cast--explicit-refinement-acquisition) rather than gained from
+>   one, and a filtered collection does not flow where its unfiltered domain is
+>   declared.
 
 ### Only a term builds a sum
 

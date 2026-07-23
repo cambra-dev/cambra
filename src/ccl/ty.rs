@@ -10,6 +10,23 @@ use smol_str::SmolStr;
 
 use crate::ccl::{BaseType, InferVar, Lit, ProjKey, TypedExpr, TypedExprNode, ccl_utils, symbolic};
 
+/// Identity of a [`Type::SharedHole`] — a linkage token, minted by whichever pass
+/// needs two annotation positions to denote one type.
+///
+/// Globally unique so two independently-lowered sites never collide; `Copy` so it
+/// rides inside a `Type` freely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HoleId(u32);
+
+static HOLE_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+impl HoleId {
+    /// Mint a fresh, globally-unique linkage token.
+    pub fn fresh() -> Self {
+        HoleId(HOLE_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// The introduction level riding a [`Type::ChanDom`] — deliberately
 /// **identity-transparent**: two channel domains denote the same channel iff
 /// their *names* match. The level is bookkeeping for `freshen_above`'s
@@ -334,6 +351,27 @@ pub enum Type {
     /// `UnresolvedHole` (treat as a compiler bug, not a user-facing error).
     /// Created exclusively by [`TypedExpr::new`] and [`crate::ccl::TypedBinding::new_unannotated`].
     Hole,
+    /// A [`Hole`](Self::Hole) with **identity**: every occurrence carrying the same
+    /// [`HoleId`] normalizes to the *same* inference variable.
+    ///
+    /// A plain `Hole` means "infer this, independently" — normalization mints one
+    /// fresh variable per occurrence, so two `Hole`s written in two annotations can
+    /// never be linked. A shared hole says the two positions denote the **same**
+    /// type. It is the type-level counterpart of a shared variable in a polymorphic
+    /// scheme, made available to *lowering*, which routinely knows which positions
+    /// must agree without knowing what they agree on.
+    ///
+    /// `groupby` is the motivating site: a keyed collection's key type is `key_fn`'s
+    /// codomain, and lowering holds both the key function and the key binder but
+    /// neither type. Writing one shared hole into both annotations states the
+    /// identity directly. The alternative — embedding the key-image *term* in the
+    /// key binder's refinement so a builtin's shared-variable scheme links them —
+    /// puts a whole term inside a type purely to carry its type.
+    ///
+    /// Same invariant as `Hole`: eliminated by the end of inference. Renders as `_`,
+    /// like `Hole` — the id is a lowering-time linkage, not part of the type, and
+    /// rendering it would make goldens depend on minting order.
+    SharedHole(HoleId),
     /// Unresolved type variable, identified by a unique [`crate::ccl::InferVarId`].
     ///
     /// Created during inference by the inference pass
@@ -864,13 +902,34 @@ impl TypeKind {
                 })
             }
             // A listed kind against the *keyed* description is the **entry** edge,
-            // and membership is not what decides it: a member is
-            // `{𝐾 | __elem ▷ keydom#id}`, so admitting one means *relating* the
-            // candidate's key to the kind's parameter. The concrete side is minted by
-            // lowering, so it arrives with the producers; until then nothing satisfies
-            // this and it rejects rather than accepting a domain that merely happens to
-            // be refined.
-            (Some(_), TypeKind::Keyed(_)) => None,
+            // and membership is not what decides it: a member is the key type refined by
+            // a *characteristic predicate over the element*, so admitting one means
+            // *relating* the candidate's key to the kind's parameter. `groupby` writes
+            // that refinement onto its key binder at lowering, so the **shape** is
+            // concrete here even when the key type itself is not — the shape decides
+            // containment and the key type rides out as an obligation, which is what pins
+            // an open key type from the annotation (without it `Set(String)` accepts an
+            // `Int`-keyed collection).
+            (Some(domains), keyed @ TypeKind::Keyed(key)) => {
+                let mut obligations = KindObligations::default();
+                for d in domains {
+                    match keyed_domain_key(d) {
+                        Some(base) => obligations.params.push((base.clone(), (**key).clone())),
+                        // No keyed shape. A bare variable has no shape *yet*, so the kind
+                        // becomes a constraint on it and its resolution decides — exactly
+                        // as for a `UIntRanges` candidate. Any other head is already
+                        // readable: a refinement whose predicate is not a key token does
+                        // not become one by resolving a type inside it.
+                        None => {
+                            let Type::Infer(v) = d else {
+                                return None;
+                            };
+                            obligations.kinds.push((Rc::clone(v), keyed.clone()));
+                        }
+                    }
+                }
+                Some(obligations)
+            }
             // A listed kind is contained in a *description* iff the description
             // [`admits`](Self::admits) every candidate — the one place membership and
             // kind subtyping meet. A *conjunction* of per-candidate questions, and a
@@ -1053,6 +1112,35 @@ pub mod witness_ctx {
     pub fn clear() {
         RANGES.with(|m| m.borrow_mut().clear());
     }
+}
+
+/// The **key type** of a concrete keyed domain — the base of `{𝐾 | __elem ▷ p}` — or
+/// `None` if `domain` is not keyed-shaped.
+///
+/// The concrete counterpart of [`TypeKind::Keyed`]: the kind is what an *annotation*
+/// ranges over, and this is what a *specific* keyed collection's domain looks like. The
+/// predicate's identity is what distinguishes two maps.
+///
+/// Returning the base rather than a yes/no is what lets the kind's key **parameter** be
+/// related to it ([`KindObligations`]): the shape decides containment, and the key type
+/// rides out as an obligation, so a still-open key type is pinned rather than silently
+/// ignored.
+fn keyed_domain_key(domain: &Type) -> Option<&Type> {
+    let Type::Refinement(base, r) = domain else {
+        return None;
+    };
+    // The ordinary bare-predicate shape `__elem ▷ p` with a key token as `p`. Note how
+    // narrow this is: *only* a `KeyDom` counts, so an ordinary refined domain
+    // (`{Int | __elem > 0}` — a filtered collection) is not mistaken for a keyed one.
+    let TypedExprNode::Apply { argument, function } = &r.predicate.node else {
+        return None;
+    };
+    let keyed = matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
+        && matches!(
+            &function.node,
+            TypedExprNode::Builtin(crate::ccl::Builtin::KeyDom(_))
+        );
+    keyed.then_some(base.as_ref())
 }
 
 impl SigmaType {
@@ -1445,7 +1533,10 @@ impl fmt::Display for Type {
                 Some(lit) => write!(f, "{}", symbolic::symbolic(lit)),
                 None => write!(f, "{{{t} | {}}}", symbolic::symbolic(&r.predicate)),
             },
-            Type::Hole => write!(f, "_"),
+            // The linkage id is deliberately not rendered: it is lowering-time
+            // plumbing, not part of the type, and rendering it would make goldens
+            // depend on minting order.
+            Type::Hole | Type::SharedHole(_) => write!(f, "_"),
             Type::Infer(var) => write!(f, "?{}", var.uid),
             Type::DataSource(name) => write!(f, "source({name})"),
             Type::ChanDom(name, _) => write!(f, "chan({name})"),
@@ -1631,9 +1722,11 @@ impl Type {
     /// *abstract* map: it ranges over every key domain over `𝐾` without naming one.
     ///
     /// The domain content therefore lives in the **kind**, not in a refinement on this
-    /// type — there is no `{𝑘 | 𝑘 ∈ 𝐸}` to discharge and no key-set value to witness.
-    /// A *concrete* keyed collection's domain names one specific key domain, and
-    /// injecting it here is plain kind containment. See
+    /// type — there is no key-set value to witness and no `{𝑘 | 𝑘 ∈ 𝐸}` to discharge.
+    /// A *concrete* map's domain names one specific key domain,
+    /// `{𝑘: 𝐾 | 𝑘 ▷ keydom#id}` ([`Builtin::KeyDom`](crate::ccl::Builtin::KeyDom)) —
+    /// which is what the kind ranges over, so injecting it here is plain kind
+    /// containment. See
     /// `src/ccl/design/collections.md`.
     pub fn map_of(key: Type, value: Type) -> Self {
         Self::keyed_collection(key, value)
@@ -1812,6 +1905,7 @@ impl Type {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -1847,6 +1941,7 @@ impl Type {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -1896,6 +1991,7 @@ impl Type {
             Type::Base(_)
             | Type::UIntRange(_)
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::Infer(_)
             | Type::DataSource(_)
             | Type::ChanDom(..)
@@ -2318,6 +2414,7 @@ fn subst_witness_ref(
         | Type::Infer(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)
+        | Type::SharedHole(_)
         | Type::Txn => ty.clone(),
     }
 }

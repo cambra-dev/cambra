@@ -302,7 +302,10 @@ fn stamp_kind_from(target: &mut Type, reference: &Type) {
 /// enclosing scope; this must run while those bindings are live (i.e.
 /// during `emit_node` of the annotated node). Each predicate is rebuilt in
 /// place ([`emit_bare_predicate`]) so the typed term lands on the annotation.
-fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), LocatedInferError> {
+pub(super) fn emit_annotation_predicates<C: Typing>(
+    ty: &mut Type,
+    ctx: &mut C,
+) -> Result<(), LocatedInferError> {
     match ty {
         Type::Refinement(inner, r) => {
             // The annotation's refinement is bare over REFINEMENT_BINDER, just
@@ -346,7 +349,7 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), L
                 emit_annotation_predicates(t, ctx)?;
             }
             // A witness introduces no *term* binder — it is a type, referenced by the
-            // nullary `Type::Witness` leaf — so the body is processed directly.
+            // nullary `Type::WitnessRef` leaf — so the body is processed directly.
             emit_annotation_predicates(&mut s.body, ctx)
         }
         Type::Base(_)
@@ -356,6 +359,7 @@ fn emit_annotation_predicates(ty: &mut Type, ctx: &mut InferCtx) -> Result<(), L
         | Type::WitnessRef(_)
         | Type::Txn
         | Type::Hole
+        | Type::SharedHole(_)
         | Type::Infer(_) => Ok(()),
     }
 }
@@ -478,13 +482,25 @@ pub(super) fn emit_lambda<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    // Param type: convert any explicit annotation/Hole/Infer into a
-    // the solver. A Hole turns into a fresh Var that will accumulate
-    // bounds from body usage and call sites. Link `param.ty` to that
-    // (shared) var so `coalesce_node` can resolve the binding slot in
-    // place. Domain refinements ride the type lattice (introduced by `cast`),
-    // not the lambda node, so the param binds under its bare type here.
-    let param_simple = ctx.normalize(&param.ty);
+    // Param type: convert any explicit type/Hole/Infer into a form for the solver. A
+    // Hole turns into a fresh Var that will accumulate bounds from body usage and
+    // call sites. Link `param.ty` to that (shared) var so `coalesce_node` can resolve
+    // the binding slot in place. Domain refinements ride the type lattice (introduced
+    // by `cast`), not the lambda node, so the param binds under its bare type here.
+    //
+    // `param.ty` and `param.user_annotation` are **not** the same channel, and the
+    // difference is load-bearing. `ty` is the param's type as whoever built the node
+    // knows it — a fresh variable for an ordinary lambda, or a type lowering asserts
+    // (`groupby`'s key binder). `user_annotation` is a *source-level* annotation,
+    // which is one **bound** on the param rather than a replacement for it.
+    let mut param_simple = ctx.normalize(&param.ty);
+    // Type any refinement predicate carried on the param type, in the *enclosing*
+    // scope (before the param binds), because its terms may reference outer
+    // bindings — `groupby`'s key binder `{K | __elem ▷ keydom#id}` closes over the
+    // collection. Emit-only (Check trusts resolved predicates and would mistype
+    // planning's function predicates): routed through the mode. A no-op for the
+    // ordinary unrefined/fresh-var param.
+    ctx.type_annotation_predicates(&mut param_simple)?;
     param.ty = param_simple.clone();
     // The param is bound in scope under the *unrefined* `param_simple`, so
     // `Var(param)` body references stay bare; restriction refinements decorate only
@@ -606,6 +622,20 @@ pub(super) fn emit_apply<C: Typing>(
     argument: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
+    // `reify` (the capability→collection coercion) is a **dependent kind-transformer**:
+    // it flips a compute function's kind to `Data` while *preserving its Pi
+    // binder*. A group-by's argument `λ (k : {K | __elem ▷ keydom#id}) → group(k)` is a
+    // dependent function whose codomain references `k`; a flat scheme
+    // `(δ ⇒ ν) → (δ ⤇ ν)` (or the generic `apply` discharge) would decompose the
+    // codomain `ν` out of `k`'s scope, tripping the §6.2 scope check. Typing it
+    // structurally here keeps the binder in place. See [`Builtin::Reify`].
+    if matches!(
+        &function.node,
+        TypedExprNode::Builtin(crate::ccl::Builtin::Reify)
+    ) {
+        let arg_ty = ctx.subexpr(argument)?;
+        return emit_reify(function, arg_ty, ctx);
+    }
     let arg_ty = ctx.subexpr(argument)?;
     let fn_ty = ctx.subexpr(function)?;
     // The application's type is the function's codomain with its Pi binder
@@ -617,6 +647,41 @@ pub(super) fn emit_apply<C: Typing>(
     // edges, is recovered structurally at coalesce
     // (`specialize_projection_domain` / `specialize_lambda_domain`).
     ctx.apply(&fn_ty, &arg_ty, argument, &|| "Apply".to_string())
+}
+
+/// Type `reify(𝑓) : (𝑘: 𝐷) ⤇ 𝐶` from `𝑓 : (𝑘: 𝐷) ⇒ 𝐶` — flip the argument
+/// function's kind to `Data`, preserving its (possibly dependent) Pi binder,
+/// domain, and codomain. This is the sanctioned `Compute → Data` crossing a
+/// `cast` cannot make; see [`Builtin::Reify`] and [`emit_apply`]'s reify arm for
+/// why it is typed structurally rather than via a flat scheme.
+///
+/// The `reify` builtin node itself is stamped `(𝐷 ⇒ 𝐶) → (𝐷 ⤇ 𝐶)` (the concrete
+/// instance at this site) so later passes read a consistent type off it.
+fn emit_reify<C: Typing>(
+    function: &mut Expr,
+    arg_ty: Type,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    let Type::Fun {
+        name,
+        domain,
+        codomain,
+        ..
+    } = peel_refinements_outer(&arg_ty)
+    else {
+        return Err(ctx.raise(InferError::ExpectedFunction {
+            found: arg_ty,
+            at: "reify argument".to_string(),
+        }));
+    };
+    let result = Type::Fun {
+        name: name.clone(),
+        kind: crate::ccl::ty::FunKind::Data,
+        domain: domain.clone(),
+        codomain: codomain.clone(),
+    };
+    function.ty = Type::fun(arg_ty, result.clone());
+    Ok(result)
 }
 
 pub(super) fn emit_binop<C: Typing>(

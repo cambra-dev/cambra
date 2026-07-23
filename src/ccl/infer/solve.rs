@@ -1366,6 +1366,7 @@ fn coalesce_type_predicates(ty: &mut Type, level: Level, ctx: &mut CoalesceCtx) 
         | Type::WitnessRef(_)
         | Type::Txn
         | Type::Hole
+        | Type::SharedHole(_)
         | Type::Infer(_) => {}
     }
 }

@@ -1750,7 +1750,7 @@ fn compact_go(
         }
         // A bare `Hole` shouldn't reach the solver (emission turns it into a
         // fresh var), but treat it as no contribution for exhaustiveness.
-        Type::Hole => CompactType::empty(),
+        Type::Hole | Type::SharedHole(_) => CompactType::empty(),
         Type::Fun {
             name,
             kind,

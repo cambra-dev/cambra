@@ -2,11 +2,13 @@
 //! operators, function calls (aggregates, `groupby`, sources, general
 //! application), unary ops, feeds, defines, and literal constants.
 
+use std::rc::Rc;
+
 use super::*;
 use crate::{
     ccl::{
-        AggregateKind, ArithmeticKind, BinOpKind, CompareKind, Expr, LogicKind, Name, Type,
-        TypedExprNode, UnaryOpKind,
+        AggregateKind, ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Expr, FunKind,
+        HoleId, KeyDomId, LogicKind, Name, Refinement, Type, TypedExprNode, UnaryOpKind,
         ccl_utils::{make_cast, refined_data_fun},
     },
     chl_parser::ast::{
@@ -53,15 +55,32 @@ pub(super) fn lower_call(
     };
 
     match name {
-        // groupby(c: I -> A, key_fn: A -> K) lowers to
-        //   λ k → cast({I | key_fn(c(__elem)) == k} ⇒ A, λ i → c(i))
+        // groupby(c: I ⤇ A, key: A → K) lowers to a **keyed collection** — a
+        // Map(K, group(k)) over this site's key domain:
         //
-        // The cast wraps the (unrefined) inner λ i → c(i) under a function
-        // type whose domain carries the partition predicate.  The predicate
-        // is a bare boolean expression whose element is the implicit
-        // REFINEMENT_BINDER and which captures `k` from the outer lambda's
-        // scope — surfacing this as the canonical "dependent refinement" site
-        // without a dedicated AST shape.
+        //   reify( λ (k : {K | __elem ▷ keydom#id}) →
+        //            cast(λ i → c(i), {I | key(c(__elem)) == k} ⇒ A) )
+        //
+        // Two layers realize the keyed Σ (see `src/ccl/design/collections.md`,
+        // "Lowering realization: `reify` over a present-key refinement"):
+        //
+        //   * **Inner group** — the cast wraps the unrefined `λ i → c(i)` under a
+        //     function type whose domain carries the partition predicate
+        //     `key(c(__elem)) == k` (element = the implicit REFINEMENT_BINDER,
+        //     capturing `k`). This is the dependent-refinement site, unchanged.
+        //   * **Outer binder** — `k`'s domain is refined by an **opaque per-site
+        //     token** ([`Builtin::KeyDom`], stamped `K ⇒ Bool`), which says "the keys
+        //     of *this* collection" and nothing more. Nothing inside an opaque
+        //     refinement can pin `K`, so the key type arrives from outside, via the
+        //     [`Type::SharedHole`] linking this domain to `key_fn`'s codomain. `reify`
+        //     then crosses `Compute → Data` (a `cast` cannot: `Compute <: Data` is
+        //     forbidden), so the result is a data collection injecting into
+        //     `Map(K, Collection(A))`.
+        //
+        // The whole `reify(λ (k : {K | __elem ▷ keydom#id}) → cast(…))` shape is
+        // recognized and rewritten to `Converse` at lambda elimination (the outer
+        // token refinement is stripped there — it exists only to make the inferred
+        // type honest), so neither `reify` nor the token reaches op-conversion.
         "groupby" => {
             if args.len() != 2 {
                 return Err(LoweringError::unsupported(
@@ -75,10 +94,16 @@ pub(super) fn lower_call(
             // `bare_pred` (and the `collection` clone inside it) lives in the
             // cast target's refinement predicate — a type slot outside the
             // `walk_children` domain — so its nodes are deliberately untagged.
+            // The key type is `key_fn`'s codomain, and lowering holds both terms but
+            // neither type — so it states the identity with a **shared hole** written
+            // into both annotations (see [`Type::SharedHole`]).
+            let key = Type::SharedHole(HoleId::fresh());
+
+            // Inner group: cast(λ i → c(i), {I | key(c(__elem)) == k} ⇒ A).
             let bare_pred = Expr::binop(
                 Expr::apply(
                     Expr::apply(Expr::var(Name::elem()), collection.clone()),
-                    key_fn,
+                    key_fn_producing(key_fn.clone(), key.clone()),
                 ),
                 BinOpKind::Compare(CompareKind::Equals),
                 Expr::var("__gb_k"),
@@ -87,20 +112,26 @@ pub(super) fn lower_call(
             // outer lambda is the call's image, tagged by `lower_expr`).
             let gb = "lower.groupby";
             let inner_var = ctx.tag_machinery(Expr::var("__gb_i"), func.span, gb);
-            let inner_body = ctx.tag_machinery(Expr::apply(inner_var, collection), func.span, gb);
+            let inner_body =
+                ctx.tag_machinery(Expr::apply(inner_var, collection.clone()), func.span, gb);
             let unrefined_inner = ctx.tag_machinery(
                 Expr::lambda("__gb_i", Type::Hole, inner_body),
                 func.span,
                 gb,
             );
             let target_ty = refined_data_fun(Type::Hole, bare_pred, Type::Hole);
-            let cast = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
-            // A group-by is a **data function** (a keyed collection): stamp its
-            // outer arrow `Data` by provenance (the `data_fun` annotation is a
-            // concrete-kind stamp — see `emit_node`), so its kind is data-by-
-            // construction rather than guessed from its (scalar key) domain.
-            Ok(Expr::lambda("__gb_k", Type::Hole, cast)
-                .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)))
+            let inner = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
+
+            // The key domain is presented by the shared hole, so the outer binder
+            // states the identity rather than guessing it; `Reify` is what turns the
+            // keyed function into the collection.
+            let outer_lambda = ctx.tag_machinery(
+                Expr::lambda("__gb_k", present_key_domain(key), inner),
+                func.span,
+                gb,
+            );
+            let reify = ctx.tag_machinery(Expr::builtin(Builtin::Reify), func.span, gb);
+            Ok(ctx.tag_machinery(Expr::apply(outer_lambda, reify), func.span, gb))
         }
         "sum" | "max" => {
             if args.len() != 1 {
@@ -134,11 +165,7 @@ pub(super) fn lower_call(
             // at the lowering boundary (`src/ccl/design/provenance.md`, "The recorder"),
             // which is how a type-level-only `box` passed every test while failing to
             // compile.
-            let op = ctx.tag_machinery(
-                Expr::builtin(crate::ccl::Builtin::Box),
-                func.span,
-                "lower.box",
-            );
+            let op = ctx.tag_machinery(Expr::builtin(Builtin::Box), func.span, "lower.box");
             Ok(Expr::apply(inner, op))
         }
         "defer" => Ok(Expr::new(TypedExprNode::Defer)),
@@ -196,6 +223,57 @@ pub(super) fn lower_call(
             Ok(Expr::apply(arg_tuple, callee))
         }
     }
+}
+
+/// The **present-key domain** of a re-keying: `{key | __elem ▷ keydom#id}`, where
+/// `key` is the caller's shared hole for the key type and `keydom#id` is a fresh
+/// [`Builtin::KeyDom`] token naming *this* creation site's key domain.
+///
+/// The token is opaque — it says "the keys of this collection" without saying which
+/// keys — so the domain carries an *identity* rather than a term. Two keyed
+/// collections' domains are the same iff they came from the same site, which is what
+/// keeps one map's membership proof from discharging against another's. It sits in the
+/// **function** position of the ordinary bare-predicate shape `__elem ▷ p`, so every
+/// existing predicate mechanism (`fn_of_bare_predicate`, point-free compilation)
+/// handles it with no special case.
+///
+/// Writing this domain down at *lowering* is what lets a keyed collection inject
+/// into a nominal `Map`/`Set`: the structural gate on entering it
+/// ([`keyed_domain_key`](crate::ccl::infer::solver)) runs at constraint-emission
+/// time, so a producer whose key domain only became concrete at coalesce could not
+/// discharge the keyed Σ witness. Every re-keying producer therefore stamps its own
+/// key binder with this (see `src/ccl/design/collections.md`, "Keyed entry needs
+/// the key domain written down at lowering").
+fn present_key_domain(key: Type) -> Type {
+    // The token's own type names the key: `keydom#id : 𝐾 ⇒ Bool`, the characteristic
+    // function of the domain. Sharing the caller's hole is what resolves it — an
+    // opaque token whose domain were an independent variable would leave the key type
+    // unresolved, since nothing inside an opaque refinement can pin it.
+    let token = Expr::builtin(Builtin::KeyDom(KeyDomId::fresh()))
+        .with_ty(Type::fun(key.clone(), Type::Base(BaseType::Bool)));
+    Type::Refinement(
+        Box::new(key),
+        Refinement {
+            predicate: Rc::new(Expr::apply(Expr::var(Name::elem()), token)),
+        },
+    )
+}
+
+/// Annotate `key_fn` as producing `key`: an assertion that the key function's
+/// **codomain** is the collection's key type. Paired with the same [`Type::SharedHole`]
+/// on the key binder's domain, this is what pins the key type — the type-level
+/// statement of "these two positions agree", written where lowering knows it.
+///
+/// The kind is left a fresh variable so the annotation does not *stamp* one: a key
+/// function is ordinarily `Compute`, but nothing here needs to decide that, and
+/// `stamp_kind_from` deliberately skips [`FunKind::Var`].
+fn key_fn_producing(key_fn: Expr, key: Type) -> Expr {
+    key_fn.with_user_annotation(Type::Fun {
+        name: None,
+        kind: FunKind::fresh_var(),
+        domain: Box::new(Type::Hole),
+        codomain: Box::new(key),
+    })
 }
 
 /// Lower a user-function call argument. A **bare variable** argument is the only
@@ -626,25 +704,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[rstest]
-    // Variable collection and inline key lambda
+    // Variable collection and inline key lambda. The outer binder is refined by
+    // membership in the key-image `xs ≫ key`, and the whole lambda is `reify`d
+    // (Compute → Data) — the keyed-collection realization of a group-by.
     #[case(
         "groupby(xs, \\x -> x)",
-        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+        "(λ __gb_k : {_ | __elem ▷ keydom} → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ reify"
     )]
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], \\x -> x // 2)",
-        "λ __gb_k → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
+        "(λ __gb_k : {_ | __elem ▷ keydom} → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])) ▷ reify"
     )]
     // Key is a variable reference (pre-defined function)
     #[case(
         "groupby(xs, key_fn)",
-        "λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+        "(λ __gb_k : {_ | __elem ▷ keydom} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ reify"
     )]
     // Keyed aggregation
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "λ __iter_record → __iter_record ▷ (λ __gb_k → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ (λ x → Sum(x))"
+        "λ __iter_record → __iter_record ▷ ((λ __gb_k : {_ | __elem ▷ keydom} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ reify) ▷ (λ x → Sum(x))"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

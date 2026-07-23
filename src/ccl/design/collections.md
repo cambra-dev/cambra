@@ -177,14 +177,14 @@ column names the branch that *will* land it.
 | `Collection(𝑇)` (`TypeKind::Any`): its own term, consumption, width-to-top from every *sum* kind (⊤ absorbs structurally; a bare `𝐷 ⤇ 𝑉` is not below it) | Implemented | `collection-constructors` |
 | `Map` / `Set` / `Dict` annotations as the `Keyed(𝐾)` witness **kind** | Implemented | `collection-constructors` |
 | kind **parameters** (a `Keyed` kind's key type) related invariantly through the solver, not tested by containment | Implemented | `collection-constructors` |
-| a **shared hole** ([`Type::SharedHole`]) — one annotation type var written at two lowering sites | Planned | `groupby-keyed-collection` |
-| the keyed **discharge** — keyed term / consumption / width, as kind containment | Planned | `groupby-keyed-collection` |
-| [`Builtin::Reify`]; `groupby` infers the keyed `Map` type; kind-based inlining | Planned | `groupby-keyed-collection` |
-| the *concrete* keyed domain `{𝐾 \| __elem ▷ keydom#id}` and its [`Builtin::KeyDom`] token; per-site key-domain identity | Planned | `groupby-keyed-collection` |
-| keyed entry into a nominal `Map`/`Set` (`groupby → Map`, `set(…) → Set`) | Planned | `groupby-keyed-collection` / `map-set-constructors` |
+| a **shared hole** ([`Type::SharedHole`]) — one annotation type var written at two lowering sites | Implemented | `groupby-keyed-collection` |
+| the keyed **discharge** — keyed term / consumption / width, as kind containment | Implemented | `groupby-keyed-collection` |
+| [`Builtin::Reify`]; `groupby` infers the keyed `Map` type; kind-based inlining | Implemented | `groupby-keyed-collection` |
+| the *concrete* keyed domain `{𝐾 \| __elem ▷ keydom#id}` and its [`Builtin::KeyDom`] token; per-site key-domain identity | Implemented | `groupby-keyed-collection` |
+| keyed entry into a nominal `Map`/`Set` (`groupby → Map`, `set(…) → Set`) | Implemented / Planned | `groupby-keyed-collection` / `map-set-constructors` |
 | `set(…)` values (group-by + [`AggregateKind::Drain`]) | Planned | `map-set-constructors` |
 | the general deferred keyed gate (a producer whose key domain is only concrete after coalesce) | Planned | — |
-| direct group-by key application `g(k)` | Works (via `groupby`'s imprecise total type) | — |
+| direct group-by key application `g(k)` | **Regressed** — 9 `#[ignore]`d tests; restored by roadmap step 2 | — |
 | how a collection *kind* (`Set` vs `Map`) is represented — decided as **provenance**, like `FunKind` | Planned | — |
 | driving a keyed collection as a *nested* comprehension source, and a bare `groupby` tail | Planned | — |
 | the operation layer: iteration element, `[]`/`[]?`, `in`, ordering, `keys`/`values`/`items` | Planned | — |

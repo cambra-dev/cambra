@@ -886,7 +886,7 @@ pub fn compile_program(
     // See `CompiledProgram::post_inference_ir`.
     let post_inference_ir = expr.clone();
 
-    expr = inline::inline_non_iterable_lambdas(expr);
+    expr = inline::inline_compute_lambdas(expr);
     debug!("UDFs inlined CCL:\n{}", symbolic(&expr));
     check_pre_desugar(&expr).map_err(|errs| {
         if errs
@@ -990,7 +990,7 @@ pub fn compile_program(
     // Recognition: lower each causal group — now in its point-free normal
     // form — onto the domain-parameterized `Transact` carrier (a
     // `get_prev_txn` transaction group → `Transact{Txn}`; a `get_prev_seq`
-    // induction group → `Transact{iteration extent}`) so planning stages the
+    // induction group → `Transact{iteration domain}`) so planning stages the
     // writer sources and operator conversion picks the engine on the domain.
     // Running post-elim is what keeps ONE letrec representation through
     // channelize and lambda_elim; the point-free guard matcher re-checks
@@ -1010,7 +1010,7 @@ pub fn compile_program(
     // Planning is the one pass that introduces `iterate` / `restrict` /
     // `Compose` staging, so re-checking its output catches a malformed tile
     // graph an adjacency that doesn't chain would otherwise hide. Planning
-    // surfaces each iterated / join-satisfying extent on its producer's
+    // surfaces each iterated / join-satisfying domain on its producer's
     // codomain (`refine_codomain` / `set_codomain`) and the strict checker
     // matches the fresh refinements it mints by structural predicate
     // equality, so the staging shapes now validate without re-blinding the
@@ -1023,6 +1023,11 @@ pub fn compile_program(
     // domain) is unsupported and must surface loudly, not miscompile.
     #[cfg(debug_assertions)]
     crate::ccl::ccl_utils::debug_assert_no_iteration_markers(&join_planned);
+    // Invariant (debug): no atom that op-conversion cannot lower survives in the
+    // term spine — a keyed collection's `member` atom lives in a domain refinement
+    // that `Converse` discharges, never as an operator to compile.
+    #[cfg(debug_assertions)]
+    crate::ccl::ccl_utils::debug_assert_no_unexecutable_atoms(&join_planned);
 
     // Compile to one operator per field of the trailing record.  Pure
     // programs (no sinks) end up at this point with a bare expression at the

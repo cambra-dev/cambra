@@ -1,22 +1,26 @@
-//! A single pre-lambda-elim inlining pass that substitutes `Let` bindings at
-//! their call sites for UDFs with non-iterable domains.
+//! A single pre-lambda-elim inlining pass that substitutes `Let` bindings for
+//! **compute functions** (capabilities) at their call sites.
 //!
-//! # [`inline_non_iterable_lambdas`] — inlines `Let` bindings for functions with non-iterable domains
+//! # [`inline_compute_lambdas`] — inlines `Let` bindings for compute functions
 //!
 //! Runs **before** [`crate::ccl::lambda_elim`].  Inlines any `Let` binding
-//! (selected by [`should_inline`]) whose domain is not natively iterable by the
-//! operator graph.  This covers:
+//! (selected by [`should_inline`]) that is a [`FunKind::Compute`] function — a
+//! *capability* the operator graph has no first-class value to emit.  Kind is a
+//! provenance property stamped at construction, so the decision reads what the
+//! bound value *is*, never guesses from its domain's shape.  This covers:
 //!
-//! - **Scalar UDFs**: `Fun(non_iterable_domain, codomain)`.  These have a
-//!   non-iterable (non-enumerable) domain.  Syntactic multi-arg Python lambdas
+//! - **Scalar UDFs**: `def f(x): x + 1`.  Syntactic multi-arg lambdas
 //!   (`\x, y -> …`) are uncurried at lowering to `Tuple([…]) → T`, so they
-//!   match this rule too.
+//!   match too.
+//! - **Curried / list-producing UDFs**: generator functions and list-returning
+//!   `def`s lowered to `λ user_arg → λ __iter_record → body`.
+//! - **Collection consumers**: `def f(c: Collection(Int)): sum(c)`.  Beta-reducing
+//!   at a concrete call site monomorphizes the abstract collection parameter to
+//!   the argument's concrete domain — the resolution op-conversion needs.
 //!
-//! - **List-producing UDFs**: `Fun(Fun(iterable_domain, _), _)`.  Functions
-//!   whose domain is itself a function type — generator functions and
-//!   list-returning `def`s lowered to `λ user_arg → λ __iter_record → body`.
-//!   A `Fun` domain has no iterable domain, so these are covered by the same
-//!   non-iterable-domain rule.
+//! A [`FunKind::Data`] binding is a *collection* (list, comprehension, source,
+//! `groupby`, keyed collection); op-conversion materializes it directly and it
+//! benefits from sharing, so it is left intact.
 //!
 //! After substituting the bound lambda at each call site, the resulting
 //! `Apply(arg, Lambda(x, body))` nodes are beta-reduced so that downstream
@@ -25,21 +29,23 @@
 //! references; those are folded by [`crate::ccl::simplify`]'s
 //! `try_literal_tuple_projection` rule, not here.
 //!
-//! # Why a single pre-lambda-elim pass works for both
+//! # Why a single pre-lambda-elim pass works
 //!
 //! Lambda-elim recurses into `Apply` nodes, so an `Apply(arg, Lambda)` produced
-//! by inlining a scalar UDF before lambda-elim is handled correctly — the
+//! by inlining a compute UDF before lambda-elim is handled correctly — the
 //! `Lambda` inside the `Apply` gets converted to a combinator by lambda-elim as
-//! usual.  Both scalar and list-producing UDFs benefit from the same
-//! per-call-site beta-reduction performed here, making a separate post-elim
-//! pass unnecessary.
+//! usual.  Per-call-site beta-reduction here makes a separate post-elim pass
+//! unnecessary.
 //!
 //! # Limitations
 //!
 //! - **Recursive UDFs** are not supported (already noted in operator conversion).
-//! - **Body duplication**: if a scalar UDF is called N times, its body appears N
+//! - **Body duplication**: if a compute UDF is called N times, its body appears N
 //!   times in the operator graph. Acceptable for now; caching is only needed for
-//!   collection-typed UDFs (iterable domain), which are not inlined.
+//!   data-function (collection) bindings, which are not inlined.
+//!
+//! [`FunKind::Compute`]: crate::ccl::ty::FunKind::Compute
+//! [`FunKind::Data`]: crate::ccl::ty::FunKind::Data
 //!
 //! # Alias inlining
 //!
@@ -74,22 +80,21 @@ use crate::ccl::{
 // Public entry points
 // ---------------------------------------------------------------------------
 
-/// Inline `Let` bindings for UDFs with non-iterable domains and beta-reduce
+/// Inline `Let` bindings for compute functions (capabilities) and beta-reduce
 /// their call sites.
 ///
 /// Runs **before** [`crate::ccl::lambda_elim`].  Walks the expression tree and
 /// substitutes each matching UDF at every free occurrence of its binding name
 /// in the body, beta-reducing at each call site, then drops the `Let` wrapper.
 ///
-/// Inlines any function whose domain is not natively iterable (see
-/// [`should_inline`]): scalar UDFs, list-producing UDFs, and curried functions
-/// all qualify.  Only bindings whose domain is natively iterable (`UIntRange`,
-/// `DataSource`) are left intact.
+/// Inlines any [`FunKind::Compute`](crate::ccl::ty::FunKind) binding (see
+/// [`should_inline`]): scalar UDFs, curried/list-producing UDFs, and collection
+/// consumers all qualify.  Data-function (collection) bindings are left intact.
 ///
 /// Literal tuple projections that arise from uncurried multi-arg call sites
 /// are *not* folded here — `crate::ccl::simplify` handles that rewrite as a
 /// general rule so it fires consistently throughout the tree.
-pub fn inline_non_iterable_lambdas(expr: Expr) -> Expr {
+pub fn inline_compute_lambdas(expr: Expr) -> Expr {
     let mut expr = inline_impl(expr);
     // Beta-reduction rebuilds predicates on `expr.ty` (immutable terms); keep
     // each `Cast`'s `target` slot in step so the post-pass typecheck matches.
@@ -98,100 +103,36 @@ pub fn inline_non_iterable_lambdas(expr: Expr) -> Expr {
 }
 
 // ---------------------------------------------------------------------------
-// Domain predicates
+// Inline decision
 // ---------------------------------------------------------------------------
-
-/// Returns `true` when `ty` has a finite, enumerable domain — i.e., when the
-/// operator graph can natively schedule a function over this domain as
-/// `IterateExtent` without inlining.
-///
-/// **This predicate is a type-shape hack and should be removed.** Dispatching
-/// the inline decision on the *shape* of a function's domain is the same
-/// anti-pattern as the retired `has_enumerable_extent`: it conflates "materialized
-/// collection to iterate" with "capability/consumer to beta-reduce" and gets edge
-/// cases wrong (a `Collection`/`List` parameter needs the `Sigma` arm below just
-/// to be classified correctly). The principled decision is the function's *kind*
-/// (`FunKind::Compute` → inline the capability; `FunKind::Data` → materialize the
-/// collection) — a provenance property, not a domain guess. That replacement is
-/// made on the branch that fixes `groupby` to its honest keyed type, because the
-/// looser `groupby` here still relies on inlining a `Data` partition function
-/// (`key ⤇ group`), which a clean kind-based rule would (correctly) stop doing.
-///
-/// | Type | Iterable? | Reason |
-/// |------|-----------|--------|
-/// | `Base(_)` | no | No finite enumeration of all integers / strings / bools |
-/// | `Tuple(ts)` | yes only if ALL `t` are iterable | A tuple can only be iterated if every component can |
-/// | `Record(fields)` | yes only if ALL fields are iterable | Same logic as tuples: a record with an unbounded field has no finite domain |
-/// | `Refinement(inner, _)` | same as `inner` | Refinement doesn't add iterability |
-/// | `UIntRange(_)` | yes | Finite, bounded range |
-/// | `DataSource(_)` | yes | Externally-backed finite collection |
-/// | `Fun(_, _)` as domain | no | Infinitely many possible functions; cannot enumerate |
-/// | anything else | yes | Conservative default: assume iterable so unknown types are not inlined |
-fn is_iterable_domain(ty: &Type) -> bool {
-    match ty {
-        Type::Base(_) => false,
-        // A tuple domain is iterable only if ALL components are iterable; you
-        // can't enumerate (UIntRange(3), Int) because Int is unbounded.
-        Type::Tuple(ts) => ts.iter().all(is_iterable_domain),
-        // Records are structurally equivalent to tuples for domain purposes.
-        Type::Record(fields) => fields.iter().all(|(_, t)| is_iterable_domain(t)),
-        // Refinement inherits the iterability of its base type.
-        Type::Refinement(inner, _) => is_iterable_domain(inner),
-        // Natively iterable types.
-        Type::UIntRange(_) | Type::DataSource(_) => true,
-        // There are infinitely many possible functions for any given function
-        // type, so function-typed domains cannot be enumerated.
-        Type::Fun { .. } => false,
-        // A dependent-sum (`Collection`/`List`/`Map`) parameter domain is a collection
-        // *value* consumed as a whole (`λ c → sum(c)`), not an enumerable index set —
-        // so its UDF is a capability to inline, like a `Fun`-domain one. Without this
-        // arm it falls through to `_ => true`, the UDF is wrongly left un-inlined, and
-        // the abstract Σ strands at op-conversion with no concrete domain to iterate.
-        //
-        // That stranding is the *shape* of the gap a runtime witness closes. **Two**
-        // separate mechanisms keep it from being reachable today, and they are easy to
-        // mistake for one: a `Collection(𝑇)` annotation is currently a *bound*, so the
-        // parameter's type monomorphizes to whatever was passed; and inlining
-        // beta-reduces the UDF, so the operator graph is monomorphic regardless of the
-        // type. Exact annotations retire the first and not the second — the type stays
-        // abstract while the graph stays concrete — so a Σ will start reaching
-        // op-conversion around a concrete producer. Whether that strands depends on the
-        // path (`src/ccl/design/collections.md`, "Future work").
-        Type::Sigma(_) => false,
-        // A history-typed domain has no enumerable domain — treat it
-        // non-iterable like a function so a history-param UDF is inlined; the
-        // `_ => true` fallthrough would otherwise strand it. Two cases reach
-        // here, both pre-erasure (inlining runs before `channelize` and the
-        // unified phase): a `Feed` defer-handle domain (a defer-mediating UDF
-        // `λ out → out << e` has domain `feed(ρ)`; its call sites beta-reduce,
-        // renaming the fed-to handle — see `Subst::handle_target`), and a
-        // `Overwrite` pass-by-ref param domain.
-        Type::History { .. } => false,
-        _ => true,
-    }
-}
 
 /// Returns `true` when a `Let` binding of type `bound_ty` should be inlined.
 ///
-/// Inlines `Let` bindings for functions whose domain is not iterable — i.e.,
-/// domains the operator graph cannot natively schedule as `IterateExtent`.
-/// This covers scalar UDFs (`Fun(Int, Int)`, `Fun(Tuple(Int,Int), Int)`, …),
-/// list-producing UDFs (`Fun(Fun(UIntRange,Int), Fun(UIntRange,Int))`, …), and
-/// curried functions (`Fun(Int, Fun(Int, Int))`, …): all of them have
-/// non-iterable domains and cannot be compiled as standalone operators by
-/// operator conversion.
+/// The decision is the function's **kind** — a provenance property stamped at
+/// construction (`emit_lambda` and friends), read here directly rather than
+/// guessed from the domain's shape.
 ///
-/// # What is NOT inlined
+/// A **compute** function ([`FunKind::Compute`](crate::ccl::ty::FunKind)) is a
+/// *capability*: a scalar or combinator UDF, a curried/list-producing `def`, or a
+/// *consumer* of a whole collection (`λ c → sum(c)`). The operator graph has no
+/// first-class function value to emit it as, so it must be beta-reduced away at
+/// its concrete call sites — which also monomorphizes any abstract collection
+/// parameter to the argument's concrete domain.
 ///
-/// Functions over natively iterable domains (`UIntRange`, `DataSource`) have a
-/// domain the operator graph can natively schedule and iterate.  They compile
-/// correctly as standalone `Let` bindings via `Memo + Splitter` and benefit
-/// from sharing, so they are left intact.
+/// A **data** function ([`FunKind::Data`](crate::ccl::ty::FunKind)) is a
+/// *collection* — a list literal, comprehension, registered source, `groupby`
+/// (a keyed collection), etc. — which op-conversion materializes directly and
+/// which benefits from sharing (`Memo + Splitter`), so it is left intact.
+///
+/// A non-function binding (or an alias) is handled by alias inlining, not here.
 fn should_inline(bound_ty: &Type) -> bool {
-    match bound_ty {
-        Type::Fun { domain, .. } => !is_iterable_domain(domain),
-        _ => false,
-    }
+    matches!(
+        bound_ty,
+        Type::Fun {
+            kind: crate::ccl::ty::FunKind::Compute,
+            ..
+        }
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -670,109 +611,6 @@ mod tests {
     use crate::ccl::{BaseType, Lit, Type, TypedExpr, TypedExprNode};
 
     // -----------------------------------------------------------------------
-    // is_iterable_domain predicate
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn non_iterable_domain_base_int() {
-        assert!(!is_iterable_domain(&Type::Base(BaseType::Int)));
-    }
-
-    #[test]
-    fn non_iterable_domain_base_string() {
-        assert!(!is_iterable_domain(&Type::Base(BaseType::String)));
-    }
-
-    #[test]
-    fn iterable_domain_uint_range() {
-        assert!(is_iterable_domain(&Type::UIntRange(3)));
-    }
-
-    #[test]
-    fn iterable_domain_datasource() {
-        assert!(is_iterable_domain(&Type::DataSource("s".to_string())));
-    }
-
-    #[test]
-    fn non_iterable_domain_tuple_all_non_iterable() {
-        let ty = Type::Tuple(vec![Type::Base(BaseType::Int), Type::Base(BaseType::Int)]);
-        assert!(!is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn non_iterable_domain_tuple_mixed() {
-        // Any non-iterable component makes the whole tuple non-iterable.
-        let ty = Type::Tuple(vec![Type::UIntRange(3), Type::Base(BaseType::Int)]);
-        assert!(!is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn iterable_domain_tuple_all_iterable() {
-        let ty = Type::Tuple(vec![Type::UIntRange(3), Type::UIntRange(3)]);
-        assert!(is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn non_iterable_domain_record_any_non_iterable() {
-        let ty = Type::Record(vec![
-            ("x".to_string(), Type::Base(BaseType::Int)),
-            ("n".to_string(), Type::UIntRange(3)),
-        ]);
-        assert!(!is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn iterable_domain_record_all_iterable() {
-        let ty = Type::Record(vec![
-            ("a".to_string(), Type::UIntRange(2)),
-            ("b".to_string(), Type::UIntRange(5)),
-        ]);
-        assert!(is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn non_iterable_domain_record_all_non_iterable() {
-        let ty = Type::Record(vec![
-            ("x".to_string(), Type::Base(BaseType::Int)),
-            ("y".to_string(), Type::Base(BaseType::String)),
-        ]);
-        assert!(!is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn non_iterable_domain_refinement_wraps_non_iterable() {
-        use crate::ccl::Refinement;
-        use std::rc::Rc;
-        let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
-        let refinement = Refinement::born(pred);
-        let ty = Type::Refinement(Box::new(Type::Base(BaseType::Int)), refinement);
-        assert!(!is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn iterable_domain_refinement_wraps_iterable() {
-        use crate::ccl::Refinement;
-        use std::rc::Rc;
-        let pred = Rc::new(TypedExpr::lit(Lit::Bool(true)));
-        let refinement = Refinement::born(pred);
-        let ty = Type::Refinement(Box::new(Type::UIntRange(3)), refinement);
-        assert!(is_iterable_domain(&ty));
-    }
-
-    #[test]
-    fn non_iterable_domain_fun() {
-        // There are infinitely many possible Int → Int functions, so Fun-as-domain
-        // has no finite, enumerable domain.
-        let ty = Type::Fun {
-            name: None,
-            kind: crate::ccl::ty::FunKind::Compute,
-            domain: Box::new(Type::Base(BaseType::Int)),
-            codomain: Box::new(Type::Base(BaseType::Int)),
-        };
-        assert!(!is_iterable_domain(&ty));
-    }
-
-    // -----------------------------------------------------------------------
     // should_inline predicate
     // -----------------------------------------------------------------------
 
@@ -830,11 +668,25 @@ mod tests {
     }
 
     #[test]
-    fn should_not_inline_iterable_domain() {
-        // UIntRange(3) → Int: iterable domain, don't inline.
+    fn should_inline_compute_over_iterable_domain() {
+        // A compute capability is inlined regardless of its domain shape — even
+        // an enumerable `UIntRange` domain. Kind, not domain, decides.
         let ty = Type::Fun {
             name: None,
             kind: crate::ccl::ty::FunKind::Compute,
+            domain: Box::new(Type::UIntRange(3)),
+            codomain: Box::new(Type::Base(BaseType::Int)),
+        };
+        assert!(should_inline(&ty));
+    }
+
+    #[test]
+    fn should_not_inline_data_function() {
+        // A data function *is* a collection (a list here: `[0, 3) ⤇ Int`).
+        // Op-conversion materializes it directly, so it is never inlined.
+        let ty = Type::Fun {
+            name: None,
+            kind: crate::ccl::ty::FunKind::Data,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
         };
@@ -925,7 +777,7 @@ mod tests {
     #[test]
     fn scalar_let_unchanged() {
         let expr = scalar_let();
-        let result = inline_non_iterable_lambdas(expr.clone());
+        let result = inline_compute_lambdas(expr.clone());
         assert_eq!(result, expr);
     }
 
@@ -940,7 +792,7 @@ mod tests {
         let id_expr = TypedExpr::var("id").with_ty(fun_ty.clone());
         let body = TypedExpr::var("f").with_ty(fun_ty.clone());
         let expr = TypedExpr::let_bind("f", id_expr.clone(), body);
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         // Alias `f → id` is substituted; result is just `id`.
         assert_eq!(result, id_expr);
     }
@@ -949,13 +801,13 @@ mod tests {
     fn curried_let_is_inlined() {
         // let f: Int → (Int → Int) = curry_add in f
         // Domain is Int (non-iterable), so the curried Let IS inlined.
-        // After inline_non_iterable_lambdas: the Let is dropped and the result is Var("curry_add").
+        // After inline_compute_lambdas: the Let is dropped and the result is Var("curry_add").
         let int = Type::Base(BaseType::Int);
         let curried_ty = Type::fun(int.clone(), Type::fun(int.clone(), int.clone()));
         let curry_expr = TypedExpr::var("curry_add").with_ty(curried_ty.clone());
         let body = TypedExpr::var("f").with_ty(curried_ty.clone());
         let expr = TypedExpr::let_bind("f", curry_expr.clone(), body);
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         assert_eq!(result, curry_expr);
     }
 
@@ -973,7 +825,7 @@ mod tests {
         .with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", id_expr.clone(), apply);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         // The Let wrapper should be gone; Var(f) replaced by id_expr.
         // Note: id_expr is Var("id"), not a Lambda, so Apply(Lit(3), id_expr)
@@ -1008,7 +860,7 @@ mod tests {
             .with_ty(Type::Tuple(vec![int.clone(), int.clone()]));
         let expr = TypedExpr::let_bind("f", id_expr.clone(), body);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         let expected_call3 = TypedExpr::new(TypedExprNode::Apply {
             argument: Box::new(TypedExpr::lit(Lit::Int(3)).with_ty(int.clone())),
@@ -1035,7 +887,7 @@ mod tests {
         let body = TypedExpr::lit(Lit::Int(42)).with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", id_expr, body);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         let expected = TypedExpr::lit(Lit::Int(42)).with_ty(int);
         assert_eq!(result, expected);
     }
@@ -1063,7 +915,7 @@ mod tests {
         let inner_let = TypedExpr::let_bind("g", id_g.clone(), outer_apply);
         let expr = TypedExpr::let_bind("f", id_f.clone(), inner_let);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         // Both f and g should be substituted with id.
         let expected_inner = TypedExpr::new(TypedExprNode::Apply {
@@ -1247,7 +1099,7 @@ mod tests {
             .with_ty(list.clone());
         let expr = TypedExpr::let_bind("rep", outer, call);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         let expected = TypedExpr::lambda("__iter_record", range, arg).with_ty(list);
         assert_eq!(result, expected);
@@ -1275,44 +1127,44 @@ mod tests {
         let call = TypedExpr::apply(arg, TypedExpr::var("f").with_ty(udf_ty)).with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", lambda, call);
 
-        let _ = inline_non_iterable_lambdas(expr);
+        let _ = inline_compute_lambdas(expr);
     }
 
-    // inline_non_iterable_lambdas — end-to-end pass behaviour
+    // inline_compute_lambdas — end-to-end pass behaviour
     // -----------------------------------------------------------------------
 
     #[test]
-    fn inline_non_iterable_lambdas_inlines_scalar_let() {
+    fn inline_compute_lambdas_inlines_scalar_let() {
         // Scalar UDF: `let f: Int → Int = id in Var("f")`.
-        // After inline_non_iterable_lambdas: the Let is dropped and the result is Var("id").
+        // After inline_compute_lambdas: the Let is dropped and the result is Var("id").
         let int = Type::Base(BaseType::Int);
         let ident = TypedExpr::var("id").with_ty(fn_ty(int.clone(), int.clone()));
         let body = TypedExpr::var("f").with_ty(fn_ty(int.clone(), int.clone()));
         let expr = TypedExpr::let_bind("f", ident.clone(), body);
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         assert_eq!(result, ident);
     }
 
     #[test]
-    fn inline_non_iterable_lambdas_inlines_user_curried_let() {
+    fn inline_compute_lambdas_inlines_user_curried_let() {
         // `let f: Int → (Int → Int) = g in f` — user-curried scalar.
         // Domain is Int (non-iterable), so `should_inline` returns true and
-        // the Let IS inlined. After inline_non_iterable_lambdas: the result is Var("g").
+        // the Let IS inlined. After inline_compute_lambdas: the result is Var("g").
         let int = Type::Base(BaseType::Int);
         let curried = fn_ty(int.clone(), fn_ty(int.clone(), int.clone()));
         let ident = TypedExpr::var("g").with_ty(curried.clone());
         let body = TypedExpr::var("f").with_ty(curried);
         let expr = TypedExpr::let_bind("f", ident.clone(), body);
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         assert_eq!(result, ident);
     }
 
     #[test]
-    fn inline_non_iterable_lambdas_inlines_and_beta_reduces_list_udf() {
+    fn inline_compute_lambdas_inlines_and_beta_reduces_list_udf() {
         // Mirror the simplest generator-function lowering:
         //   let doubles = λ xs → λ __iter_record → __iter_record ▷ xs ▷ (λ x → x)
         //   in [1, 2, 3] ▷ doubles
-        // After inline_non_iterable_lambdas: the outer `λ xs` is substituted and beta-reduced,
+        // After inline_compute_lambdas: the outer `λ xs` is substituted and beta-reduced,
         // leaving `λ __iter_record → __iter_record ▷ [1, 2, 3] ▷ (λ x → x)`.
         let int = Type::Base(BaseType::Int);
         let range = Type::UIntRange(3);
@@ -1348,7 +1200,7 @@ mod tests {
         .with_ty(list.clone());
         let expr = TypedExpr::let_bind("doubles", outer_lambda, call);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         // Expected: the top-level node is the inner Lambda (no more Let, no
         // more outer `λ xs`), with `xs` substituted by the concrete list.
@@ -1367,11 +1219,11 @@ mod tests {
     }
 
     #[test]
-    fn inline_non_iterable_lambdas_substitutes_arg_pair_into_multi_arg_body() {
+    fn inline_compute_lambdas_substitutes_arg_pair_into_multi_arg_body() {
         // Mirror the uncurried multi-arg shape:
         //   let f = λ __arg_pair → λ __iter_record → … __arg_pair.0 …
         //   in ([1, 2, 3], 10) ▷ f
-        // After inline_non_iterable_lambdas: the outer `λ __arg_pair` is
+        // After inline_compute_lambdas: the outer `λ __arg_pair` is
         // beta-reduced, leaving `Tuple([1,2,3], 10).0` in the body. The
         // literal-tuple-projection fold lives in `crate::ccl::simplify` and
         // is *not* applied here — this test asserts only the substitution +
@@ -1420,7 +1272,7 @@ mod tests {
             .with_ty(list.clone());
         let expr = TypedExpr::let_bind("f", outer_lambda, call);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         // Expected: outer Let / outer `λ __arg_pair` are gone; references to
         // `__arg_pair` are rewritten to the concrete tuple literal, so the
@@ -1441,9 +1293,9 @@ mod tests {
     }
 
     #[test]
-    fn inline_non_iterable_lambdas_beta_reduces_scalar_lambda_call() {
+    fn inline_compute_lambdas_beta_reduces_scalar_lambda_call() {
         // let f: Int → Int = λ x → Lit(42) in Apply(Lit(3), Var("f"))
-        // After inline_non_iterable_lambdas: Lit(42) (the constant lambda is beta-reduced,
+        // After inline_compute_lambdas: Lit(42) (the constant lambda is beta-reduced,
         // discarding the argument Lit(3)).
         let int = Type::Base(BaseType::Int);
         let lambda = TypedExpr::lambda(
@@ -1459,17 +1311,17 @@ mod tests {
         .with_ty(int.clone());
         let expr = TypedExpr::let_bind("f", lambda, call);
 
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
         let expected = TypedExpr::lit(Lit::Int(42)).with_ty(int);
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn inline_non_iterable_lambdas_substitutes_pair_into_multi_arg_scalar_body() {
+    fn inline_compute_lambdas_substitutes_pair_into_multi_arg_scalar_body() {
         // let add: Tuple(Int, Int) → Int = λ __pair → __pair.0 + __pair.1
         // in add(Tuple(Lit(1), Lit(2)))
         //
-        // After inline_non_iterable_lambdas: the body becomes
+        // After inline_compute_lambdas: the body becomes
         //   Tuple(1, 2).0 + Tuple(1, 2).1
         // — the literal-tuple projections survive here and are folded later
         // by `crate::ccl::simplify::try_literal_tuple_projection`.
@@ -1520,7 +1372,7 @@ mod tests {
         .with_ty(int.clone());
 
         let expr = TypedExpr::let_bind("add", lambda, call);
-        let result = inline_non_iterable_lambdas(expr);
+        let result = inline_compute_lambdas(expr);
 
         // Expected: Tuple(1,2).0 + Tuple(1,2).1 — projections unfolded here.
         let expected_left = TypedExpr::new(TypedExprNode::Apply {

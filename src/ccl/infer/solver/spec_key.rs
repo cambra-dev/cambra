@@ -376,7 +376,10 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // no `Hole` reaches a use's instantiation type in the first place. The
         // arm is for exhaustiveness, and "no information here" is the honest
         // reading if one ever did.
-        Type::Hole => KeyView::default(),
+        // A `SharedHole` joins the `Hole` arm, mirroring `compact_go`: its id is a
+        // lowering-time linkage and not part of the type, so there is nothing here to
+        // key on either.
+        Type::Hole | Type::SharedHole(_) => KeyView::default(),
         // A sum contributes its body and its candidates, each at this polarity — the
         // same no-flip `compact_go` uses on both, since neither is a domain.
         //

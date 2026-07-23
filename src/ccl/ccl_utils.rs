@@ -85,7 +85,7 @@ pub(crate) fn is_builtin(expr: &Expr, b: Builtin) -> bool {
 
 /// Whether `e` is a chain-head **iteration-source marker** `iterate(pred)` —
 /// `Apply(pred, Builtin::Iterate)`. Planning inserts these into the *term tree*
-/// ([`crate::ccl::planning::insert_iterate_markers`]) to mark an extent as an
+/// ([`crate::ccl::planning::insert_iterate_markers`]) to mark a domain as an
 /// iteration site; `iterate ≫ src` denotes exactly `src` (the marker is
 /// denotation-neutral).
 pub(crate) fn is_iterate_marker(e: &Expr) -> bool {
@@ -97,13 +97,14 @@ pub(crate) fn is_iterate_marker(e: &Expr) -> bool {
 ///
 /// Used when a term value is substituted **into a type** (a refinement
 /// predicate — e.g. the §6.2 move-site discharge of a `let`-bound collection
-/// into a refined domain like a join predicate `{d | __elem ▷ (.0 ≫ a) …}`). A
-/// refinement predicate is a *denotational* term; the `iterate` marker is a
-/// term-tree planning artifact with no meaning there, and leaving it in makes
-/// the predicate churn under `simplify` (nested-`Compose` vs `flatten_compose`)
-/// and diverge from inference's (pre-marker) copy at the post-planning
-/// typecheck. Since `iterate` is denotation-neutral, dropping it recovers the
-/// collection's value unchanged.
+/// into a refined domain like a join predicate `{d | __elem ▷ (.0 ≫ a) …}`, or
+/// into a keyed collection's `{k | k ∈ c ≫ key}`). A refinement predicate is a
+/// *denotational* term; the `iterate` marker is a term-tree planning artifact
+/// with no meaning there, and leaving it in makes the predicate churn under
+/// `simplify` (nested-`Compose` vs `flatten_compose`) and diverge from
+/// inference's (pre-marker) copy at the post-planning typecheck. Since
+/// `iterate` is denotation-neutral, dropping it recovers the collection's value
+/// unchanged.
 ///
 /// A `restrict`/`filter_values` marker is deliberately **not** stripped — it is
 /// a real filter and part of the denotation; a filtered source reaching a
@@ -178,6 +179,25 @@ pub(crate) fn debug_assert_no_iteration_markers(expr: &Expr) {
         debug_assert_no_iteration_markers_in_type(target);
     }
     expr.walk_children(debug_assert_no_iteration_markers);
+}
+
+/// Debug-only invariant: the **term spine** reaching op-conversion contains no
+/// atom that op-conversion has no lowering for. Today that is
+/// [`Builtin::KeyDom`]: a key-domain token exists only inside a keyed collection's
+/// *domain refinement*, which `Converse` discharges structurally, so it must never
+/// appear as a term the operator graph is asked to compile. Planning does compile
+/// surviving predicates to point-free form, so a `keydom` genuinely *can* end up in
+/// a type; what must not happen is a code path lowering one to a `Restrict`. This
+/// walk is what makes that a checked invariant instead of a coincidence — if a
+/// future membership *filter* (`x in s`) needs to run, it arrives here first.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_assert_no_unexecutable_atoms(expr: &Expr) {
+    debug_assert!(
+        !matches!(expr.node, TypedExprNode::Builtin(Builtin::KeyDom(_))),
+        "`keydom` reached op-conversion as a term: a key-domain token is a carried \
+         refinement discharged by `Converse`, not an executable operator"
+    );
+    expr.walk_children(debug_assert_no_unexecutable_atoms);
 }
 
 /// Builds an application of a primitive combinator, setting the types based on
@@ -395,10 +415,10 @@ pub fn make_restrict(predicate: Expr, upstream: Expr) -> Expr {
 /// `predicate` is trivially true).
 ///
 /// A hash join consumes its equi-join conditions structurally — into the
-/// key-lookup shape, with no residual `Restrict` — so the extent it produces
+/// key-lookup shape, with no residual `Restrict` — so the domain it produces
 /// reaches downstream consumers *bare* even though every element it yields
 /// satisfies the join condition. A `cast({C | predicate} ⇒ …)` that consumes
-/// the extent then sees `C ⊀ {C | predicate}` at the adjacency. Re-stamping
+/// the domain then sees `C ⊀ {C | predicate}` at the adjacency. Re-stamping
 /// the produced codomain with the join condition keeps both sides aligned —
 /// this is what a [`make_restrict`] residual does for the loop-join arm, made
 /// explicit for the equi-join case that has no residual to carry it.
@@ -413,7 +433,7 @@ pub fn refine_codomain(morphism: Expr, bare_predicate: &Expr) -> Expr {
         .codomain()
         .expect("join morphism must be a function type")
         .clone();
-    // `bare_predicate` is already the bare `Bool`-over-`__elem` form (the extent's
+    // `bare_predicate` is already the bare `Bool`-over-`__elem` form (the domain's
     // membership condition, the same predicate the body's `cast` demands), so it
     // is stored directly — *not* via `refine_with`, which wraps a predicate
     // *function*. Storing the identical bare term keeps the producer codomain
@@ -426,7 +446,7 @@ pub fn refine_codomain(morphism: Expr, bare_predicate: &Expr) -> Expr {
 }
 
 /// Re-stamp a morphism `D ⇒ _`'s codomain to `new_codomain`, yielding
-/// `D ⇒ new_codomain`. Used by join planning to surface the refined extent a
+/// `D ⇒ new_codomain`. Used by join planning to surface the refined domain a
 /// producer yields (see [`refine_codomain`], and `wrap_with_iterate`'s
 /// iteration source, whose codomain is its own refined domain).
 ///
@@ -483,22 +503,14 @@ fn restamp_spine_result(node: &mut Expr, new_result: Type) {
 /// Op-conversion treats `cast` as a no-op — see [`TypedExprNode::Cast`] — so
 /// this is purely a type-level coercion with no runtime cost.
 ///
-/// **Temporary shape contract:** `target_ty` must be
-/// `Fun(Refinement(_, _), _)` — a refinement on a function domain.  Inference
-/// no longer *requires* this (any `target` with `value_ty <: target` is a
-/// well-typed upcast), but it is the only shape lowering produces today and
-/// the one [`crate::ccl::lambda_elim`]'s groupby reconstruction reads a refinement
-/// off of, so this asserts the lowering contract: a non-conforming target is
-/// a construction-time bug, not a user error, so it panics rather than
-/// emitting a cast `lambda_elim` would mishandle.  See [`TypedExprNode::Cast`]
-/// for the migration plan toward a general `𝑈 ⇒ 𝑇` cast.
-/// TODO remove this constraint once we get rid of the special-casing correlated
-/// refinement code in lambda_elim.
+/// Any `target_ty` is accepted. One arm downstream *does* need a refined function
+/// domain — [`crate::ccl::lambda_elim`]'s cast-wrapped-**lambda** case, which reads
+/// the correlated binder off the domain refinement — and it asserts that itself, at
+/// the point where the shape is actually required. Asserting it here as well would
+/// be both a duplicate and a bound on what lowering may express: as refinements come
+/// to be produced by more than the group-by/for-filter lowerings, a cast whose target
+/// is not a refined function domain becomes ordinary. See [`TypedExprNode::Cast`].
 pub fn make_cast(value: Expr, target_ty: Type) -> Expr {
-    assert!(
-        matches!(&target_ty, Type::Fun { domain: d, .. } if matches!(d.as_ref(), Type::Refinement(..))),
-        "make_cast target_ty must be Fun(Refinement(_, _), _), got {target_ty}"
-    );
     Expr::cast(value, target_ty)
 }
 
@@ -605,6 +617,7 @@ pub(crate) fn strip_refinements(ty: &Type) -> Type {
         Type::Base(_)
         | Type::UIntRange(_)
         | Type::Hole
+        | Type::SharedHole(_)
         | Type::Infer(_)
         | Type::DataSource(_)
         | Type::ChanDom(..)

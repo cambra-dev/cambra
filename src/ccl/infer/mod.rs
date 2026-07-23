@@ -352,7 +352,7 @@ pub(crate) fn run(
     solver::clear_witness_ctx();
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
-        let pre = InferCtx::new(HashMap::new(), expr.node_id());
+        let mut pre = InferCtx::new(HashMap::new(), expr.node_id());
         let translated: HashMap<String, Type> = sources
             .iter()
             .map(|(k, v)| (k.clone(), pre.normalize_annotation(v)))

@@ -350,7 +350,13 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 #[case("sum([1,2,3])", "(iterate ≫ [1, 2, 3]) ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]
 #[case(
     "[sum(x) for x in groupby([1,2,3,4], \\y -> y // 2)]",
-    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:(Int ⇒ Int)",
+    // The final `sum`'s domain is the honest present-key domain — the key type refined
+    // by this group-by's key-domain **token** rather than the old imprecise total
+    // `Int` (see `src/ccl/design/collections.md`, "`groupby` is a `Map`"). The token
+    // rides this type annotation only; it is never executed (the group-by is realized
+    // as `converse`), and the compiled tile below is unchanged. Note what the token
+    // bought: the predicate no longer embeds the point-free-compiled key-image term.
+    "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:({Int | __elem ▷ keydom} ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Ints(vec![0, 1, 2]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 5, 4]))),

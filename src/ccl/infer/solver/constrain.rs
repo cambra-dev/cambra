@@ -1734,7 +1734,8 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Txn
-        | Type::Hole => ty.clone(),
+        | Type::Hole
+        | Type::SharedHole(_) => ty.clone(),
         Type::Fun {
             name,
             kind,
@@ -3249,6 +3250,37 @@ mod tests {
         );
     }
 
+    /// The key type is related through the **cross-form** width edge too. A `box`ed keyed
+    /// collection is an *unfactored* sum, so it reaches `Map(𝐾, 𝑉)` by the fibered
+    /// reading rather than by the same-form one — a different path to the same
+    /// obligation, and one that must not answer fewer of them.
+    #[test]
+    fn a_boxed_keyed_collection_still_checks_its_key_type() {
+        let int_ = prim(BaseType::Int);
+        let concrete = keyed_concrete(int_.clone(), int_.clone());
+        let boxed = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+            concrete,
+        ]))));
+        assert!(
+            constrain_subtype(
+                &boxed,
+                &Type::map_of(int_.clone(), int_.clone()),
+                &mut ConstrainCache::new()
+            )
+            .is_ok(),
+            "the matching key type still relates through a box"
+        );
+        assert!(
+            constrain_subtype(
+                &boxed,
+                &Type::map_of(prim(BaseType::String), int_),
+                &mut ConstrainCache::new()
+            )
+            .is_err(),
+            "an Int-keyed collection must not satisfy Map(String, _) through a box"
+        );
+    }
+
     /// A keyed kind's key type is a **parameter**, not a candidate: comparing two
     /// keyed kinds *relates* the two key types invariantly rather than testing them
     /// for equality. So a wrong key type is rejected in both directions, and an
@@ -3284,6 +3316,127 @@ mod tests {
              lower={:?} upper={:?}",
             bounds.lower,
             bounds.upper
+        );
+    }
+
+    // --- Keyed Sigma rules (Map/Set): entering one, consuming one, width ---
+
+    /// A concrete keyed collection `{𝐾 | __elem ▷ keydom#id} ⤇ value` — the shape a
+    /// `Map`/`Set` value realizes (`groupby`, an explicit map literal). The token is
+    /// freshly minted, as one would be at a creation site.
+    fn keyed_concrete(key: Type, value: Type) -> Type {
+        let token = TypedExpr::builtin(crate::ccl::Builtin::KeyDom(crate::ccl::KeyDomId::fresh()));
+        let pred = TypedExpr::apply(TypedExpr::var(Name::elem()), token);
+        Type::data_fun(
+            Type::Refinement(
+                Box::new(key),
+                Refinement {
+                    predicate: Rc::new(pred),
+                },
+            ),
+            value,
+        )
+    }
+
+    #[test]
+    fn keyed_collection_entry_consumption_and_width() {
+        let concrete = keyed_concrete(prim(BaseType::Int), prim(BaseType::Int));
+        let map = Type::map_of(prim(BaseType::Int), prim(BaseType::Int));
+        // Entering a sum is a term, so the *bare* concrete collection does not reach the
+        // annotation — the same rule that keeps a bare list literal out of `List(Int)`.
+        assert!(
+            constrain_subtype(&concrete, &map, &mut ConstrainCache::new()).is_err(),
+            "a bare keyed collection must not enter Map(Int, Int) by subsumption"
+        );
+        // `box`ed, it does, and by ordinary Σ-width: the one-candidate kind is contained
+        // in `Keyed(Int)` because the concrete key domain is one of those it ranges over,
+        // and the key types relate as its parameter.
+        let boxed = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+            concrete.clone(),
+        ]))));
+        assert!(constrain_subtype(&boxed, &map, &mut ConstrainCache::new()).is_ok());
+        // Elimination: consumed by a fresh-domain consumer (`sum` / comprehension).
+        let consumer = fun(fresh_var(0), prim(BaseType::Int));
+        assert!(constrain_subtype(&map, &consumer, &mut ConstrainCache::new()).is_ok());
+        // Width: `Map(Int, Int) <: Map(Int, Int)`; the codomain still flows, so
+        // `Map(Int, Int) ⊀ Map(Int, Bool)`.
+        assert!(constrain_subtype(&map, &map, &mut ConstrainCache::new()).is_ok());
+        let map_bool = Type::map_of(prim(BaseType::Int), prim(BaseType::Bool));
+        assert!(constrain_subtype(&map, &map_bool, &mut ConstrainCache::new()).is_err());
+    }
+
+    /// The keyed discharge is tied to the membership *predicate*, not merely to a
+    /// `Collection` witness: a length-refined (list-shaped) concrete domain must
+    /// not inject into a `Map`, and a keyed concrete must not inject into a `List`.
+    #[test]
+    fn entering_a_keyed_sum_requires_the_membership_refinement() {
+        let map = Type::map_of(prim(BaseType::Int), prim(BaseType::Int));
+        // A concrete list `[0, 3) ⤇ Int` carries no key token, so it must not inject
+        // into a `Map`.
+        let list_concrete = Type::data_fun(Type::UIntRange(3), prim(BaseType::Int));
+        assert!(
+            constrain_subtype(&list_concrete, &map, &mut ConstrainCache::new()).is_err(),
+            "a UIntRange domain must not realize a Map"
+        );
+        // Nor does a domain that merely *happens* to be refined: a filtered range is a
+        // `Refinement`, but its predicate is not a key token.
+        let filtered = Type::data_fun(
+            Type::Refinement(
+                Box::new(Type::UIntRange(3)),
+                Refinement {
+                    predicate: Rc::new(TypedExpr::binop(
+                        TypedExpr::var(Name::elem()),
+                        BinOpKind::Compare(CompareKind::Less),
+                        TypedExpr::lit(Lit::Int(2)),
+                    )),
+                },
+            ),
+            prim(BaseType::Int),
+        );
+        assert!(
+            constrain_subtype(&filtered, &map, &mut ConstrainCache::new()).is_err(),
+            "an ordinary refined domain is not a key domain"
+        );
+        // A keyed concrete must not inject into a `List`: the `UIntRanges` kind is
+        // membership in "is a dense prefix range", which a refinement is not.
+        let keyed = keyed_concrete(prim(BaseType::Int), prim(BaseType::Int));
+        let list = Type::list_of(prim(BaseType::Int));
+        assert!(
+            constrain_subtype(&keyed, &list, &mut ConstrainCache::new()).is_err(),
+            "a key domain must not realize a List"
+        );
+    }
+
+    /// **Per-creation-site key-domain identity.** Two keyed collections created
+    /// separately have *different* key domains, so one's key-membership proof cannot
+    /// discharge against the other's — the property that makes a later
+    /// membership-discharged lookup sound, and one that cannot be retrofitted onto
+    /// values already conflated.
+    ///
+    /// Before the key domain was a token this was true only *incidentally*, because
+    /// the domain embedded the producer's key-image term and two producers happened to
+    /// build different terms. It is now the token's `KeyDomId`, so identity is the
+    /// mechanism rather than a side effect of term inequality.
+    #[test]
+    fn key_domains_are_per_creation_site() {
+        let (int_, mut cache) = (prim(BaseType::Int), ConstrainCache::new());
+        let one = keyed_concrete(int_.clone(), int_.clone());
+        let other = keyed_concrete(int_.clone(), int_.clone());
+
+        // Both reach the *abstract* map once boxed — the kind ranges over every key
+        // domain, so either one-candidate sum is contained in it.
+        let map = Type::map_of(int_.clone(), int_);
+        for c in [&one, &other] {
+            let boxed = Type::Sigma(Box::new(SigmaType::of(TypeKind::Enumerated(vec![
+                c.clone(),
+            ]))));
+            constrain_subtype(&boxed, &map, &mut cache).expect("a key domain realizes Map(K, V)");
+        }
+        // But they are not each other: same key type, same codomain, different site.
+        assert_ne!(one, other, "two creation sites must not share a key domain");
+        assert!(
+            constrain_subtype(&one, &other, &mut ConstrainCache::new()).is_err(),
+            "one collection's key domain must not satisfy another's"
         );
     }
 

@@ -761,6 +761,7 @@ impl Subst {
             | Type::DataSource(_)
             | Type::Txn
             | Type::Hole
+            | Type::SharedHole(_)
             // A witness reference is a type-level binder occurrence, never a term
             // binder the substitution acts on.
             | Type::WitnessRef(_)
@@ -993,6 +994,7 @@ impl Subst {
             | Type::DataSource(_)
             | Type::Txn
             | Type::Hole
+            | Type::SharedHole(_)
             | Type::WitnessRef(_)
             | Type::Infer(_) => ty.clone(),
 
@@ -1113,7 +1115,8 @@ pub fn type_contains_infer(ty: &Type) -> bool {
         | Type::ChanDom(..)
         | Type::Txn
         | Type::WitnessRef(_)
-        | Type::Hole => false,
+        | Type::Hole
+        | Type::SharedHole(_) => false,
         Type::Infer(_) => true,
         Type::Fun {
             domain, codomain, ..
@@ -1164,6 +1167,7 @@ fn collect_type_fv(
         | Type::ChanDom(..)
         | Type::Txn
         | Type::Hole
+        | Type::SharedHole(_)
         // A witness reference is type-level, never a free term variable.
         | Type::WitnessRef(_)
         | Type::Infer(_) => {}

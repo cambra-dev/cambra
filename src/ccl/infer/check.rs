@@ -113,6 +113,13 @@ impl Typing for CheckCtx {
         ann.clone()
     }
 
+    fn type_annotation_predicates(&mut self, _ty: &mut Type) -> Result<(), LocatedInferError> {
+        // Check trusts already-resolved refinement predicates; re-emitting would
+        // duplicate work and mistype planning's *function* predicates (`D ⇒ Bool`)
+        // as bare `__elem`-Bool ones. See the trait method's doc.
+        Ok(())
+    }
+
     fn require_sub(
         &mut self,
         sub: &Type,

@@ -64,6 +64,16 @@ pub(super) trait Typing {
     /// [`InferCtx::normalize_annotation`](super::context::InferCtx::normalize_annotation).
     fn normalize(&mut self, ann: &Type) -> Type;
 
+    /// Emit constraints for any refinement predicate carried on a binder/param
+    /// annotation, so a **fresh bare** predicate (`{D | __elem …}` from lowering —
+    /// e.g. `groupby`'s `{K | __elem ∈ (c ≫ key)}`) gets its sub-terms typed in
+    /// the enclosing scope. **Emit** does the work; **Check** is a no-op — it
+    /// trusts the already-resolved predicate, and re-emitting would both duplicate
+    /// work and mistype planning-produced *function* predicates (`D ⇒ Bool`, from
+    /// `restrict`/`iterate`) as bare `__elem`-Bool ones. Mirrors the Emit-only
+    /// node-annotation predicate handling in [`emit_node`](super::emit::emit_node).
+    fn type_annotation_predicates(&mut self, ty: &mut Type) -> Result<(), LocatedInferError>;
+
     /// Require `sub <: sup`. `at` lazily produces an error-context label,
     /// invoked only on failure.
     fn require_sub(

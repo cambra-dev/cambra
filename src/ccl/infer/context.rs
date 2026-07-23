@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
-use crate::ccl::{Expr, Level, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode};
+use crate::ccl::{Expr, HoleId, Level, Lit, Name, Refinement, Type, TypedExpr, TypedExprNode};
 use crate::util::ScopeStack;
 
 use super::emit::emit_node;
@@ -112,6 +112,11 @@ pub(super) struct InferCtx {
     /// which is what lets `LocatedInferError` require a node instead of carrying
     /// an `Option` that every consumer must then interpret.
     current_node_id: NodeId,
+    /// Variables minted for [`Type::SharedHole`]s, so every occurrence of one id
+    /// normalizes to the *same* variable. Pass-scoped and never cleared: a linkage
+    /// id is globally unique, and its occurrences are spread across annotations
+    /// normalized at different times — which is exactly what it exists to relate.
+    shared_holes: HashMap<HoleId, Type>,
 }
 
 impl InferCtx {
@@ -127,6 +132,7 @@ impl InferCtx {
             pred_memo: Default::default(),
             lit_singletons: HashMap::new(),
             current_node_id: root,
+            shared_holes: HashMap::new(),
         }
     }
 
@@ -143,14 +149,28 @@ impl InferCtx {
 
     /// Normalize a user annotation / source type into a solver-ready
     /// `Type`: every `Hole` becomes a fresh inference variable at the
-    /// current level. Everything else — including existing `Infer` vars,
+    /// current level, and every [`Type::SharedHole`] the *one* variable its id
+    /// stands for. Everything else — including existing `Infer` vars,
     /// the structural variants the solver operates on, and `Refinement`
     /// wrappers (refinements ride the lattice as refinements) — is
     /// kept, recursing to normalize nested holes.
-    pub(super) fn normalize_annotation(&self, ty: &Type) -> Type {
+    pub(super) fn normalize_annotation(&mut self, ty: &Type) -> Type {
         match ty {
             // A `Hole` annotation means "infer this" → fresh variable.
             Type::Hole => fresh_var(self.level),
+            // A **shared** hole means "infer this, and the same as everywhere else
+            // this id appears" — so the variable is minted once and reused. The
+            // memo is keyed by id alone, deliberately not scoped: the whole point is
+            // to link positions that normalize at different times, in different
+            // annotations. Minted at the level of the *first* occurrence, which is
+            // the conservative choice — the sites a pass links are emitted within one
+            // subtree, so the levels coincide, and if they did not the variable would
+            // merely be less general, never wrongly generalized.
+            Type::SharedHole(id) => self
+                .shared_holes
+                .entry(*id)
+                .or_insert_with(|| fresh_var(self.level))
+                .clone(),
             // Refinements ride the lattice: keep the wrapper, normalize the
             // inner (so a `Refinement(Hole, r)` source annotation becomes
             // `Refinement(?fresh, r)` rather than losing the refinement).
@@ -253,6 +273,10 @@ impl Typing for InferCtx {
 
     fn normalize(&mut self, ann: &Type) -> Type {
         self.normalize_annotation(ann)
+    }
+
+    fn type_annotation_predicates(&mut self, ty: &mut Type) -> Result<(), LocatedInferError> {
+        crate::ccl::infer::emit::emit_annotation_predicates(ty, self)
     }
 
     fn require_sub(

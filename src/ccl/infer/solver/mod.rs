@@ -103,7 +103,12 @@ pub fn type_level(ty: &Type) -> Level {
             .unwrap_or(0)
             .max(type_level(&s.body)),
         Type::WitnessRef(_) => 0,
-        Type::Base(_) | Type::UIntRange(_) | Type::DataSource(_) | Type::Txn | Type::Hole => 0,
+        Type::Base(_)
+        | Type::UIntRange(_)
+        | Type::DataSource(_)
+        | Type::Txn
+        | Type::Hole
+        | Type::SharedHole(_) => 0,
     }
 }
 

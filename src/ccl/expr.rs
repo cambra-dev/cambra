@@ -164,12 +164,14 @@ pub enum TypedExprNode {
     /// Pure type-level assertion that re-views `value` under `target`.
     ///
     /// `cast(value, target)` does not change `value`'s runtime data — it
-    /// asserts that `value` may be viewed at `target`.  Today the only
-    /// `target` shape lowering emits is `Fun(Refinement(_, _), _)`: a
-    /// function type whose domain carries a refinement predicate, so the
-    /// cast attaches a refinement to a function's domain.  Lowering emits
-    /// it for list-comprehension filters, for-loop `if`-guards, and
-    /// `groupby` (see [`crate::ccl::ccl_utils::make_cast`]).
+    /// asserts that `value` may be viewed at `target`.  Every `target` lowering
+    /// emits today is `Fun(Refinement(_, _), _)`: a function type whose domain
+    /// carries a refinement predicate, so the cast attaches a refinement to a
+    /// function's domain.  Lowering emits it for list-comprehension filters,
+    /// for-loop `if`-guards, and `groupby` (see
+    /// [`crate::ccl::ccl_utils::make_cast`]).  That is a fact about today's
+    /// lowerings, not a contract: the one arm that *requires* the shape asserts
+    /// it where it needs it ([`crate::ccl::lambda_elim`]'s cast-wrapped lambda).
     ///
     /// `Cast` is an **upcast**: its whole typing rule is the single subtype
     /// obligation `value_ty <: target`.  For the domain refinement lowering
@@ -384,7 +386,7 @@ pub enum TypedExprNode {
         /// loop, whose footprint is all its accumulators).
         writers: Vec<WriterSite>,
         /// The carrier's **sequencing domain** — the index of every key's history
-        /// `Fun(domain, V)`. A concrete iteration extent for a `mut`
+        /// `Fun(domain, V)`. A concrete iteration domain for a `mut`
         /// accumulator (the loop's induction domain); [`Type::Txn`] for a
         /// transactional commit clock (later increment). Op-conversion
         /// dispatches the engine on it.
@@ -1187,8 +1189,8 @@ impl TypedExpr {
 
     /// Construct a [`TypedExprNode::Cast`] re-viewing `value` under `target`.
     ///
-    /// Prefer [`crate::ccl::ccl_utils::make_cast`], which enforces the
-    /// `target` shape contract; this is the bare constructor it builds on.
+    /// Lowering goes through [`crate::ccl::ccl_utils::make_cast`]; this is the
+    /// bare constructor it builds on.
     pub fn cast(value: TypedExpr, target: Type) -> Self {
         Self::new(TypedExprNode::Cast {
             value: Box::new(value),

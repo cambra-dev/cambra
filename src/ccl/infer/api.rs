@@ -900,7 +900,9 @@ fn collect_type_errors(
     seen_refinements: &mut HashSet<crate::ccl::PredicateId>,
 ) {
     match ty {
-        Type::Hole => errors.push(InferError::UnresolvedHole {
+        // A surviving shared hole is the same compiler bug as a plain one: the
+        // linkage was written but nothing normalized it.
+        Type::Hole | Type::SharedHole(_) => errors.push(InferError::UnresolvedHole {
             at: context_sym.to_string(),
         }),
         Type::Infer(var) => {
@@ -2095,6 +2097,55 @@ mod tests {
         );
     }
 
+    /// `reify(λ x → x + 1)` coerces a compute function `Int ⇒ Int` into the data
+    /// collection `Int ⤇ Int`: the scheme `∀δ ν. (δ ⇒ ν) → (δ ⤇ ν)` instantiates
+    /// at the lambda's domain/codomain and flips the kind to `Data`. This is the
+    /// crossing a plain `cast` cannot make (`Compute <: Data` is rejected).
+    #[test]
+    fn test_infer_reify_coerces_compute_to_data() {
+        use crate::ccl::Builtin;
+        use crate::ccl::ty::FunKind;
+        let mut ctx = TypeInferenceContext::new();
+        // λ x → x + 1 : Int ⇒ Int
+        let inc = Expr::lambda(
+            "x",
+            Type::Base(BaseType::Int),
+            Expr::binop(
+                Expr::var("x"),
+                BinOpKind::Arithmetic(ArithmeticKind::Add),
+                Expr::lit(Lit::Int(1)),
+            ),
+        );
+        let mut expr = Expr::apply(inc, Expr::builtin(Builtin::Reify));
+        let ty = infer(&mut expr, &mut ctx).expect("reify of a compute function type-checks");
+        let Type::Fun {
+            kind,
+            domain,
+            codomain,
+            ..
+        } = &ty
+        else {
+            panic!("expected a function type, got {ty}");
+        };
+        assert_eq!(*kind, FunKind::Data, "reify's result is a data collection");
+        assert_eq!(
+            domain.as_ref(),
+            &Type::Base(BaseType::Int),
+            "domain preserved"
+        );
+        assert_eq!(
+            codomain.as_ref(),
+            &Type::Base(BaseType::Int),
+            "codomain preserved"
+        );
+    }
+
+    /// `([1, 2, 3] : List(int))` on a *node* annotation exercises the paths a
+    /// `([1, 2, 3] : List(Int))` on a *node* annotation exercises the paths a
+    /// let-binding annotation skips: `emit_annotation_predicates` walking the
+    /// witness kind's type children, then the one-way entry of the concrete
+    /// `[0, 3) ⤇ Int` into `Σ (D: UIntRanges). D ⤇ Int`. A conflicting element type
+    /// is rejected.
     /// `([1, 2, 3] : List(Int))` on a *node* annotation is **rejected**: entering a
     /// collection type is `box`, not a subtyping edge, so the concrete `[0, 3) ⤇ Int`
     /// does not inject into `Σ 𝐷 ∈ UIntRanges. 𝐷 ⤇ Int`

@@ -1069,9 +1069,10 @@ fn lower_type_application(
             };
             Ok(Type::list_of(lower_type_annotation(elem)?))
         }
-        // `Map(K, V)` / `Dict(K, V)` = `Σ 𝐷 ∈ Keyed(K). 𝐷 ⤇ V`
-        // — a keyed collection over the key-set witness `𝐸` (`Type::map_of`,
-        // design/collections.md). `Dict` is the surface spelling of `Map`.
+        // `Map(K, V)` / `Dict(K, V)` = `Σ (𝐷: Keyed(K)). 𝐷 ⤇ V` — a sum over every key
+        // domain on `K`, with the keyed-ness in the witness *kind* rather than in a
+        // domain refinement (`Type::map_of`, design/collections.md). `Dict` is the
+        // surface spelling of `Map`.
         "Map" | "Dict" => {
             let [k, v] = args else {
                 return Err(arity_err("a key and a value type"));

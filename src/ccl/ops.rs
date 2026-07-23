@@ -3,8 +3,27 @@
 //! enum, projection keys, and the cross-phase [`TypeError`].
 
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::ccl::AggregateKind;
+
+/// Identity of a [`Builtin::KeyDom`] token — which key domain it is.
+///
+/// Minted per creation site, so two concrete keyed collections have the same key
+/// domain iff they were created by the same site. That is the whole content of
+/// keyed-collection identity: the token is opaque, so the id is all there is to
+/// compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KeyDomId(u32);
+
+static KEY_DOM_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+impl KeyDomId {
+    /// Mint a fresh, globally-unique key-domain identity.
+    pub fn fresh() -> Self {
+        KeyDomId(KEY_DOM_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 /// Primitive base types shared between the CCL type system and the interpreter.
 ///
@@ -457,21 +476,70 @@ pub enum Builtin {
     /// inside its tuple rather than prepending an `iterate`).
     AsOf,
 
-    /// `∈ : (𝐾, Collection(𝐾)) → Bool` — set **membership**, the predicate atom
-    /// of a keyed collection's domain: `Map(𝐾, 𝑉) = Σ (𝐸: Collection(𝐾)). {𝑘: 𝐾 |
-    /// 𝑘 ∈ 𝐸} ⤇ 𝑉`. Applied to a 2-tuple `Apply(Tuple([𝑘, 𝐸]), Builtin(Member))`,
-    /// the List `<`-analog: where `List`'s domain refinement is `𝑖 < 𝑛` over a
-    /// scalar length witness, a keyed collection's is `𝑘 ∈ 𝐸` over a
-    /// `Collection(𝐾)` key-set witness. Its type is **pre-stamped** at
-    /// construction (no [`crate::ccl::infer::OperatorSchemes`] scheme), so emit
-    /// reads `.ty` directly.
+    /// `keydom#id : 𝐾 ⇒ Bool` — the **characteristic function of one key domain**,
+    /// the predicate atom of a concrete keyed collection's domain
+    /// `{𝑘: 𝐾 | 𝑘 ▷ keydom#id}`. It is what [`TypeKind::Keyed`](crate::ccl::ty::TypeKind::Keyed) ranges over: the
+    /// kind is *every* key domain over 𝐾, and a token names one of them.
     ///
-    /// **Eval / op-conversion are deferred.** Membership is evaluated only at a
-    /// keyed *lookup* (`m[k]` totality) or a membership *filter* (`x in s`),
-    /// neither of which exists yet; until then the atom is a *carried* refinement
-    /// term that rides the type and is never executed. Both arms `unimplemented!`
-    /// with that explanation (see `src/ccl/design/collections.md`).
-    Member,
+    /// **Opaque, and that is the point.** The token says only "the keys of *this*
+    /// collection" — it does not say which keys, and nothing can look inside it. Its
+    /// [`KeyDomId`] is minted per creation site, so two collections' key domains are
+    /// the same iff they came from the same site. Type identity is therefore an
+    /// integer comparison rather than a structural comparison of an embedded
+    /// collection term, and a type stops carrying a term that exists only to be
+    /// compared. The key type is instead pinned at the *producer*, by a
+    /// [`Type::SharedHole`](crate::ccl::Type::SharedHole) linking this token's domain
+    /// to the key function's codomain.
+    ///
+    /// Its type is **pre-stamped** at construction (no
+    /// [`crate::ccl::infer::OperatorSchemes`] scheme), so emit reads `.ty` directly.
+    ///
+    /// **Never executed.** Key-domain membership would be evaluated only at a keyed
+    /// *lookup* (`m[k]` totality) or a membership *filter* (`x in s`), neither of
+    /// which exists yet. Until then the atom is a *carried* refinement term: planning
+    /// compiles it to point-free form along with every other surviving predicate, so
+    /// it does appear in post-planning types, but it is never lowered to a `Restrict`
+    /// — `Converse` discharges the present-key domain structurally. That makes "no
+    /// `KeyDom` reaches op-conversion" a real invariant rather than a coincidence, so
+    /// op-conversion **asserts** it (`debug_assert_no_unexecutable_atoms`) instead of
+    /// relying on no code path picking the predicate up. See
+    /// `src/ccl/design/collections.md`.
+    KeyDom(KeyDomId),
+
+    /// `reify : (𝐷 ⇒ 𝑉) → (𝐷 ⤇ 𝑉)` — the sanctioned **capability→collection**
+    /// coercion: force a compute function over a countable domain into a data
+    /// collection over that same domain. This is the one reverse of the
+    /// `Data <: Compute` subtyping direction: `Compute <: Data` is forbidden as a
+    /// silent subtype (it would let a capability stand where a lossless collection is
+    /// demanded), but `reify` makes the crossing *explicit* — the programmer (or a
+    /// lowering) asserts the domain is enumerable and asks for its materialization.
+    /// A plain [`cast`](crate::ccl::TypedExprNode::Cast) cannot express this: its
+    /// obligation is `value <: target`, and `(𝐷 ⇒ 𝑉) <: (𝐷 ⤇ 𝑉)` is exactly the
+    /// rejected direction.
+    ///
+    /// The gate is **countability**, not finiteness. Every Cambra type is
+    /// countable today, and unbounded programs are supported (reifying a function
+    /// over all naturals is a legitimate, if divergent-if-forced, request), so
+    /// there is no static finiteness obligation to discharge.
+    ///
+    /// **Eval / op-conversion are deferred.** `reify`'s sole current producer is
+    /// `groupby` lowering, and the atom is consumed in two stages, neither of them
+    /// op-conversion: **lambda elimination** eliminates the inner cast-lambda to the
+    /// point-free group-by source and flips that arrow's kind to `Data` (`reify`'s
+    /// only runtime-visible act), and **planning** is what recognizes the resulting
+    /// Pi-const source as [`Converse`](Self::Converse)
+    /// (`convert_groupby_pointful`). That ordering is forced: the group-by
+    /// recognizers must run on the *bare* pointful predicate form, before
+    /// `compile_refinement_predicates`. A standalone `reify` (e.g. user-forced
+    /// iteration over an unbounded domain) has no runtime yet, and reaching
+    /// op-conversion with one is an `Unsupported` conversion error, not a silent
+    /// miscompile (see `src/ccl/design/collections.md`). It is a **dependent kind-transformer**, so
+    /// inference types `reify(𝑓)` by a dedicated arm in
+    /// [`emit_apply`](crate::ccl::infer) that flips the argument function's kind to
+    /// `Data` while preserving its (possibly dependent) Pi binder — a flat scheme
+    /// `(𝐷 ⇒ 𝑉) → (𝐷 ⤇ 𝑉)` would decompose a group-by's dependent codomain out of
+    /// the key binder's scope.
+    Reify,
 }
 
 impl Builtin {
@@ -507,7 +575,10 @@ impl Builtin {
             Self::BeginTxn => "begin",
             Self::CollectionUnion => "collection_union",
             Self::AsOf => "as_of",
-            Self::Member => "member",
+            // The id is deliberately *not* rendered: it is a per-site identity, so
+            // printing it would make every type golden depend on minting order.
+            Self::KeyDom(_) => "keydom",
+            Self::Reify => "reify",
         }
     }
 
