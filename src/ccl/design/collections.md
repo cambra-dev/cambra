@@ -371,7 +371,8 @@ the producer is a keyed collection, the choice is the **η-expanded** form
 `producer ≫ consumer  ⤳  λ 𝑥 → consumer(producer(𝑥))`. Here `producer(𝑥)` is a
 dependent application: it substitutes `𝑥` for the key binder, so the group is
 `{𝑖 | key(𝑖) == 𝑥} ⤇ 𝑉` with `𝑥` bound by the fresh `λ 𝑥`, in scope for the consumer.
-A comprehension (`[… for key -> g in …]`) is already in this form. A **bare**
+A comprehension (`[… for key -> g in …]`) is already in this form; the `set`/`map`
+constructors emit it directly (`λ __iter → __iter ▷ keyed ▷ collapse`). A **bare**
 point-free `keyed ≫ collapse` is never emitted: its consumer's parameter would
 resolve to `{𝑖 | key(𝑖) == 𝑘} ⤇ 𝑉` with `𝑘` free — the scope escape inference rejects.
 
@@ -385,6 +386,16 @@ rides the compose's own Pi arrow — the dependent-morphism handling in `emit_co
 point-free chain input carrying a free binder. A `debug_assert` in `coalesce_node`'s
 `Compose` arm enforces the invariant: no `Compose` morphism's codomain may reference
 that morphism's own Pi binder.
+
+Because discharge introduces `𝑥` for its own sake, the group-collapse `collapse` need not
+itself *consume* the group **for scope-safety** — `keyed(𝑥)`'s type names `𝑥`, bound by
+`λ 𝑥`, whatever `collapse` does. It must nonetheless consume it for a different reason:
+**planning drives a source through its consumer.** Replacing `set`'s `Drain` with a
+group-ignoring `λ 𝑔 → unit` still type-checks (no scope violation — verified), but the
+group-by source is then never driven and the underlying list literal reaches op-conversion
+with no `iterate` before it. So the consuming collapse is load-bearing at *two* levels,
+neither of them the type checker: it deduplicates each key's group to the one `unit` a
+`Set` holds, and it is what makes the collection get materialized at all.
 
 The `Collection` Σ witness (the domain) still matters for *other* questions — e.g.
 rejecting an unsound `Σ <: Fun` consumption, which is what presenting the sum itself
@@ -673,6 +684,21 @@ function `𝐴 ⤇ 𝐵` as `𝐴 ⤇ (𝐴 ⤇ 𝐵)`: each key mapped to its s
 that yields entries from which both key and value project. `items` is **deferred**; value
 iteration is the near-term consumption path.
 
+The `map`/`set` constructors are `groupby` + a **codomain map** (the group collapse),
+which preserves the keyed domain:
+
+```
+set([e…])      = groupby(xs, id) ≫ (λ g → unit)            : Map(𝐾, unit) = Set(𝐾)
+map([(k,v)…])  = groupby(ps, .0) ≫ (λ g → g ▷ sole ▷ .1)   : Map(𝐾, 𝑉)
+```
+
+where `sole` is the pick-the-one-element (error if more than one) aggregate. The codomain
+map *conceptually* leaves the key domain untouched and rewrites only the codomain
+`𝑉 → 𝑊`, landing at `{𝐾 | 𝑘 ▷ (𝑚 ▷ collection_contains)} ⤇ 𝑊` — `Set(𝐾)` (`𝑊 = unit`) or
+`Map(𝐾, 𝑉)`. The collapse is lowered as the η-expanded discharge shape ([Consuming a keyed
+collection](#consuming-a-keyed-collection-discharge-not-point-free-compose)), which types
+and compiles end-to-end.
+
 #### The key type is pinned, not bounded
 
 [`Builtin::CollectionContains`]'s scheme `∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool)` shares `κ` between
@@ -707,6 +733,95 @@ domain — the resolution op-conversion needs. The inline decision is therefore 
 function's *kind* (`inline::should_inline`) and not the shape of its domain: a `groupby`
 is a `Data` arrow, which a shape test reads as a non-iterable domain and goes on inlining.
 
+### Constructor lowering: runtime `groupby` now, constant-folding later
+
+The re-keying constructors are the first surface (before the `[k -> v]` sugar and
+annotation-driven implicit insertion). Their **value construction is a runtime
+`groupby`** on the key projection ([chl-spec
+§3.11](../../../docs/chl-spec.md#311-list-tuple-record-literals)): `map([𝑘𝑣…])` groups the pairs by
+`.0` and collapses each group to its `.1`; `set([𝑒…])` groups by the element,
+codomain `unit`; `list([𝑒…])` keeps the positional domain (`Array` widened to
+`List`). The result is the keyed Σ (`Map`/`Set`) or `List`.
+
+Two consequences are **deferred to a future constant-folding pass**, recorded
+here so the shortcut is explicit:
+
+- **Compile-time construction.** A literal argument has statically-known keys, so
+  the ideal is to build the sealed keyed tile at compile time rather than run a
+  `groupby` over a constant. Cambra has no constant-folding today; when it lands,
+  folding a re-keying over a constant collection *is* the compile-time
+  construction, with no literal-detection special-case (the fold either succeeds
+  on constant inputs or falls through to the runtime operator).
+- **Duplicate-key error timing.** The spec makes a duplicate key in a map
+  *literal* a *compile-time* error
+  ([§3.11](../../../docs/chl-spec.md#311-list-tuple-record-literals)). At runtime, a duplicate produces a
+  non-singleton group, which `map`'s `sole` collapse **rejects at run time** (that
+  is its whole point) — so the error is *enforced*, just later than the spec wants.
+  Moving it to compile time needs the key *values*, which only a constant fold
+  has; so the compile-time-ness (not the enforcement) rides on constant-folding.
+  (`set` has no `sole`, so duplicates there are absorbed by the group — set
+  semantics — no error either way.)
+
+#### `sole` is an `Option`-accumulator aggregate
+
+`sole : (𝐷 ⤇ 𝐴) ⇒ 𝐴` is an ordinary [`AggregateKind`] (`Sole`) reusing the
+aggregation *framework* (per-key accumulator, fold, extract). Its accumulator is
+logically `Option(𝐴)`: identity `none`, and the merge law is the *partial* monoid
+where combining two `some` values is a **run-time error** (two elements for one
+key — the duplicate). `extract` errors on `none` (an empty group, which a
+`groupby`-produced group never is, so this arm is a defensive invariant rather
+than a reachable path for `map`). So the duplicate-key rejection is `some ⊕ some`
+and the collapse's well-formedness is the `none`-extract guard — both fall out of
+the accumulator law. (Contrast `Sum`/`Max`, whose accumulators are total
+monoids.)
+
+Two realization details distinguish `sole` from the scalar aggregates and are
+designed with `map` (not `set`, whose `unit` codomain needs no `sole`):
+
+- **Presence is out-of-band.** `Sum`/`Max` carry an in-band identity (`0`,
+  `MIN`); `sole` has none — any element is a valid value — so `none`/`some` is
+  tracked by accumulator *presence* (an empty vs. length-1 column), not a
+  sentinel value. A populated per-key accumulator is always length 1, so the
+  cross-tile merge path (`Tile::merge`) sees `some ⊕ some` and errors, as intended.
+- **`sole` folds a structured codomain.** In `map`, each group's codomain is the
+  pair `(𝐾, 𝑉)`, so `sole` picks the sole *row* of a record/tuple-valued group,
+  not a scalar column — a wider shape than the scalar `ColumnValue` fold `Sum`
+  uses.
+
+#### Runtime realization: nothing new for construction + value iteration
+
+A keyed collection is **already a first-class runtime tile**: `groupby`'s
+`λ 𝑘 → cast(…)` eliminates to a Pi-const source that planning recognizes as
+`Converse` (see [Lowering realization](#lowering-realization-the-key-binder-states-its-domain)),
+and `Converse` emits a `CurriedFunction` tile whose outer domain column *is* the
+present keys. The `map`/`set` codomain map runs over that
+`Converse` (as the group-consuming body of a comprehension-shaped iteration; see
+[Consuming a keyed
+collection](#consuming-a-keyed-collection-discharge-not-point-free-compose) for why
+it is not a bare `Compose`). So construction and **value-iteration** consumption (`for v in m`)
+reuse the existing operator set with **no new `Domain` and no hash store**. A keyed domain
+dispatching `extent_of` to a hash store is for *lookup* (`𝑚[𝑘]`), which arrives with that
+feature — not for immutable construction.
+
+`set([𝑒…])` lowers to the group-by on an identity key, collapsed by the terminal
+aggregate [`AggregateKind::Drain`] — `(𝐷 ⤇ 𝛾) ⇒ unit`, accumulator `Units(1)`,
+`accumulate` a no-op — folding each key's group (of ≥ 1 duplicate elements) to the
+one `unit` a `Set` holds. `set([1,2,2,3])` produces the sealed keyed tile over keys
+`{1, 2, 3}`. `map`/`sole` are the remaining constructor work.
+
+Where a keyed collection value is and is not **driven** is a planning property, not
+a constructor one, and the boundary is narrower than it looks. Planning inserts the
+driving `iterate` at a *chain head*, so a `set(…)` reaches the runtime when it is
+the program tail (`set([1,2,3])`) or is let-bound and then consumed
+(`s = set([…])` … `[k for k in s]`). What fails is a keyed collection **nested as
+the source of another comprehension** (`[1 for k in set([1,2,3])]`) and a **bare
+`groupby(…)`** — both surface as *"list literal reached op-conversion without an
+input"*, the underlying source never having been given an iteration site. Fixing
+that is one planning change covering both, and it is not part of the constructor surface.
+Neither shape has a test yet. Separately, a keyed collection cannot yet **yield its keys
+under iteration** — the deferred `items` view above, itself blocked on the
+[kind-representation question](#the-kind-is-declared-not-read-off-the-shape).
+
 ## Keyed entry needs the key domain written down at lowering
 
 An entry term runs a *membership predicate* on the entering side — is this domain a range,
@@ -718,6 +833,7 @@ it is a property of whether lowering wrote the domain down:
 ```
 x <: List(Int)   = box([y+1 for y in [1, 2, 3]])  # ✅ range domain ?N at emit; resolved at coalesce
 m <: Map(Int, _) = box(groupby(xs, key))          # ✅ key domain written onto `__gb_k` by lowering
+s <: Set(Int)    = box(set([1, 2, 3]))            # ✅ same, written onto the constructor's iteration binder
 ```
 
 The `box` is the entry itself and the bound is what leaves `m` its own type, so neither
@@ -745,8 +861,9 @@ comprehension, a keyed feed. No producer that exists today is in that position.
 
 ## Iterating a `Set`/`Map` binds the codomain, not the keys [Interim]
 
-`for g in groupby(xs, key)` binds `g` to the collection's **codomain** — each group, not
-each key. The *semantic* decision is made — the `Iterable` element is kind-directed
+`for k in set(xs)` binds `k` to the collection's **codomain** (`unit` for a `Set`), so
+`sum([k for k in set([1,2,3])])` fails (`Aggregate: expected Unit, found Int`); iterating
+a `groupby` binds each group rather than each key, the same way. The *semantic* decision is made — the `Iterable` element is kind-directed
 (`Set` → key, `Map` → `(𝐾, 𝑉)` entry, `Collection`/`List` → value;
 [chl-spec §4.6](../../../docs/chl-spec.md#46-for--iteration)) — and its realization is
 [Operations](#operations-how-the-trait-layer-is-realized-planned).

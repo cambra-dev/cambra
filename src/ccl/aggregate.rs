@@ -10,6 +10,15 @@ use crate::interpreter::{ColumnValue, Extent};
 pub enum AggregateKind {
     Sum,
     Max,
+    /// The terminal aggregate: consume a collection of any element type and
+    /// yield the single `unit` value. Its accumulator is `unit` (identity
+    /// `unit`, merge `unit ⊕ unit = unit`), so it collapses a group of any
+    /// multiplicity to one `unit`. The `set` constructor uses it to reduce each
+    /// key's group — which holds ≥ 1 duplicate elements — to the single `unit`
+    /// payload of `Set(K) = Map(K, unit)`, deduplicating in the process.
+    /// Consuming the group is *also* what abstracts its key-dependence — the sum is
+    /// consumed there (design/collections.md).
+    Drain,
 }
 
 impl AggregateKind {
@@ -17,6 +26,8 @@ impl AggregateKind {
         match (self, input_extent) {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => Some(Extent::Base(BaseType::Int)),
             (AggregateKind::Max, Extent::Base(b)) => Some(Extent::Base(b.clone())),
+            // `Drain` folds any element type to `unit`.
+            (AggregateKind::Drain, _) => Some(Extent::Base(BaseType::Unit)),
             _ => None,
         }
     }
@@ -33,6 +44,9 @@ impl AggregateKind {
             (AggregateKind::Max, Extent::Base(BaseType::String)) => {
                 ColumnValue::Strings(vec![SmolStr::default()])
             }
+            // The single `unit` a drained group collapses to; further elements
+            // fold in as no-ops (see `accumulate`).
+            (AggregateKind::Drain, Extent::Base(BaseType::Unit)) => ColumnValue::Units(1),
             _ => panic!("No identity for {self:?} over {accumulator_extent:?}"),
         }
     }
@@ -62,6 +76,10 @@ impl AggregateKind {
             (AggregateKind::Max, ColumnValue::Strings(acc), ColumnValue::Strings(vs)) => {
                 accumulate_max(acc, &vs[start..end]);
             }
+            // `Drain`: the accumulator already holds the single `unit` the group
+            // collapses to; folding in more elements is a no-op (any positive
+            // multiplicity yields one `unit`). The values column is ignored.
+            (AggregateKind::Drain, ColumnValue::Units(_), _) => {}
             _ => panic!("Invalid accumulate"),
         };
     }
@@ -73,7 +91,8 @@ impl AggregateKind {
             (AggregateKind::Sum, ColumnValue::Ints(_))
             | (AggregateKind::Max, ColumnValue::Ints(_))
             | (AggregateKind::Max, ColumnValue::UInts(_))
-            | (AggregateKind::Max, ColumnValue::Strings(_)) => accumulator,
+            | (AggregateKind::Max, ColumnValue::Strings(_))
+            | (AggregateKind::Drain, ColumnValue::Units(_)) => accumulator,
             _ => panic!("Invalid accumulate"),
         }
     }

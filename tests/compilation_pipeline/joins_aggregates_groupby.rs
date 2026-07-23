@@ -152,6 +152,72 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
 fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
+
+// `set([…])` is a deduplicating keyed-collection constructor: the distinct
+// elements become the present keys, each mapped to `unit` (the `Set(K) =
+// Map(K, unit)` payload). Duplicate elements collapse via the `Drain` aggregate.
+// See `src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby`
+// now, constant-folding later".
+//
+// The domain (key) order is hash-nondeterministic and the uniform `Units`
+// codomain isn't normalized by `sort_sealed_function_by_domain`, so compare the
+// sorted key column and assert the codomain is `n` units.
+fn check_set_keys(code: &str, sorted_keys: ColumnValue, n: usize) {
+    let Tile::SealedFunction {
+        domain, codomain, ..
+    } = run_pipeline(code)
+    else {
+        panic!("`set` must build a SealedFunction");
+    };
+    let got = match domain {
+        ColumnValue::Ints(mut v) => {
+            v.sort_unstable();
+            ColumnValue::Ints(v)
+        }
+        ColumnValue::Strings(mut v) => {
+            v.sort_unstable();
+            ColumnValue::Strings(v)
+        }
+        other => panic!("unexpected key column: {other:?}"),
+    };
+    // Sorted but **not** deduplicated: deduplication is what is under test, so
+    // normalizing it away here would leave the key column unasserted and only the
+    // `Units(n)` codomain catching a `set` that kept its duplicates.
+    assert_eq!(got, sorted_keys, "deduplicated keys");
+    assert_eq!(
+        *codomain,
+        Tile::Scalar(ColumnValue::Units(n)),
+        "unit payload"
+    );
+}
+
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case("set([1,2,2,3])", ColumnValue::Ints(vec![1, 2, 3]), 3)]
+#[case("set([3,1,2,1,3])", ColumnValue::Ints(vec![1, 2, 3]), 3)]
+#[case("set(['a','b','a'])", ColumnValue::strings(&["a", "b"]), 2)]
+fn test_set(#[case] code: &str, #[case] sorted_keys: ColumnValue, #[case] n: usize) {
+    check_set_keys(code, sorted_keys, n);
+}
+
+// A keyed collection **nested as another comprehension's source** is not driven:
+// planning inserts the iteration site at a chain head, so `set(…)` compiles as the
+// program tail (`test_set` above) and let-bound-then-consumed (`s = set(…)` …
+// `[k for k in s]`), but inlined into a comprehension source the underlying list
+// literal reaches op-conversion with no `iterate` before it. A bare `groupby(…)`
+// tail fails identically — same planning gap, and one fix covers both. Pins the
+// gap recorded in `src/ccl/design/collections.md`, "Runtime realization: nothing
+// new for construction + value iteration"; these are the acceptance tests for it.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[case("[1 for k in set([1,2,2,3])]")]
+#[case("groupby([1,2,3,4], \\y -> y // 2)")]
+#[ignore = "keyed collection as a nested comprehension source / bare tail is not driven by planning"]
+fn test_undriven_keyed_collection(#[case] code: &str) {
+    // Asserting only that compilation succeeds: the point is that planning gives
+    // the source an iteration site at all.
+    run_pipeline(code);
+}
 // 30s: among the heaviest compiles here; like `test_joins`, reaches ~9.5s wall on a slow CI VM.
 #[rstest]
 #[timeout(Duration::from_secs(30))]

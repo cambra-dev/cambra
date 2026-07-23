@@ -2219,6 +2219,68 @@ fn test_groupby_lookup_at_wrong_key_type_rejected() {
     );
 }
 
+/// `set(xs)` infers the keyed collection `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ unit` — this
+/// site's key domain, deduplicated, each key mapped to `unit` (the
+/// `Set(K) = Map(K, unit)` payload). The arrow is **Data** (`⤇`): a `set` *is* a
+/// data collection, so its
+/// outer lambda is stamped `Data` by provenance at lowering (like a
+/// comprehension), which is what lets it inject into a nominal `Set(K)`.
+#[test]
+fn set_infers_deduped_keyed_unit_collection() {
+    assert_eq!(
+        infer_program("set([1,2,3])").to_string(),
+        "({Int | __elem ▷ (([1, 2, 3] ≫ (λ __set_key : Int → __set_key)) ▷ collection_contains)} ⤇ Unit)"
+    );
+}
+
+/// A `Set(K)` is `Map(K, unit)`, so its checked lookup answers `Option(unit)` —
+/// membership as a value, which is what `k in s` will be built on. This is the set
+/// half of `checked_lookup_is_application_modulo_membership`, which pins the rule on
+/// the group-by producer that branch sits on.
+#[test]
+fn checked_lookup_on_a_set_is_membership_as_a_value() {
+    assert_eq!(
+        infer_program("s = set([1, 2, 3])\ns[1]?").to_string(),
+        "{`none | `some}"
+    );
+    assert!(
+        !infer_program_err("s = set([1, 2, 3])\ns[\"nope\"]?").is_empty(),
+        "a String key must not reach an Int-keyed set"
+    );
+}
+
+/// `box(set(xs))` reaching the nominal `Set(K)` annotation. A `Set(K)` is
+/// `Σ 𝐷 ∈ Keyed(K). 𝐷 ⤇ unit`, and entering a sum is a term — so the `box` is required
+/// and the annotation is then **kind containment**: this site's concrete key domain is
+/// one of the domains `Keyed(K)` ranges over. That works only because the constructor
+/// stamps its own iteration binder with the present-key domain at lowering
+/// (`present_key_domain`): containment reads the domain's *shape*, and it runs at
+/// constraint-emission time, so a key domain that only became concrete at coalesce would
+/// fall through to a mismatch. Regression guard for exactly that.
+#[test]
+fn set_injects_into_nominal_set_annotation() {
+    // The **bounded** form keeps the one-candidate sum the `box` built, in the
+    // unfactored spelling `box` builds it in — nothing consumes it, so nothing views it
+    // factored. An exact `x: Set(Int)` binds `x` at the annotation instead and gives
+    // back the abstract `Keyed` sum.
+    assert_eq!(
+        infer_program("x <: Set(Int) = box(set([1,2,3]))\nx").to_string(),
+        "Σ σ ∈ {({Int | __elem ▷ (([1, 2, 3] ≫ (λ __set_key : Int → __set_key)) ▷ collection_contains)} ⤇ Unit)}. σ"
+    );
+    // The **key type** flows too: it is a kind *parameter*, so the edge relates it
+    // rather than ignoring it — and it survives the `box`, which reaches the annotation
+    // by the cross-form width edge rather than the same-form one.
+    assert!(
+        !infer_program_err("x <: Set(String) = box(set([1,2,3]))\nx").is_empty(),
+        "an Int-keyed set must not satisfy Set(String)"
+    );
+    // The codomain still flows: a `Set(Int)` is not a `Map(Int, Int)`.
+    assert!(
+        !infer_program_err("x <: Map(Int, Int) = box(set([1,2,3]))\nx").is_empty(),
+        "a set's `unit` codomain must not satisfy Map(Int, Int)"
+    );
+}
+
 // Aggregating **one group** of a group-by, reached by key.
 //
 // As written this asserts the *proven* form `groups(1)`, and that will not come back:
