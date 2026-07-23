@@ -170,11 +170,12 @@ impl Tiling {
                 terminal: ColumnValue::Bools(BitVec::new()),
                 accumulator: ColumnValue::from_values(Vec::new(), accumulator),
             },
-            // An empty store: no change events yet, frontier undecided.
+            // An empty store: no change events yet, frontier undecided, live.
             Tiling::Store { domain, .. } => Tile::Store {
                 changes: ColumnValue::from_values(Vec::new(), domain),
                 deltas: ColumnValue::Variants(Vec::new()),
                 frontier: Predicate::False,
+                terminal: false,
             },
         }
     }

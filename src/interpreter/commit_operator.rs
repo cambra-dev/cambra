@@ -132,9 +132,57 @@ impl CommitEngine {
         }
     }
 
+    /// An empty engine for a **position-driven induction store**: no tick-0 init
+    /// seed (the accumulator's init is the reader's fold default, supplied by
+    /// `get_prev_seq`), driven by [`step`](Self::step) rather than
+    /// [`attempt`](Self::attempt). Undecided until the first `step`.
+    ///
+    /// Test-only: production `InductionStore`/commit engines seed tick 0 via
+    /// [`CommitEngine::new`]. This unseeded form models the pre-first-`step`
+    /// state directly for the `step`/carry unit tests.
+    #[cfg(test)]
+    pub fn for_induction() -> Self {
+        Self {
+            committed: BTreeMap::new(),
+            latest_write: HashMap::new(),
+            next_ts: 0,
+        }
+    }
+
+    /// The watermark frontier: all ticks `≤ watermark()` are decided. `None`
+    /// before anything is decided (an induction engine before its first
+    /// [`step`](Self::step); a commit engine always has its tick-0 init).
+    pub fn decided_watermark(&self) -> Option<CommitTs> {
+        self.next_ts.checked_sub(1)
+    }
+
     /// The watermark frontier: all ticks `≤ watermark()` are decided.
     pub fn watermark(&self) -> CommitTs {
         self.next_ts - 1
+    }
+
+    /// Position-driven induction step (the sequential, no-conflict dual of
+    /// [`attempt`](Self::attempt)): advance the decided frontier to `position`
+    /// **unconditionally** — every iteration position is decided — and record a
+    /// write at tick = `position` iff `writes` is `Some`. A `None` is a **carry**:
+    /// no change, the accumulator holds from the latest earlier write. Because the
+    /// tick *is* the position (not allocate-on-commit), the changelog is sparse in
+    /// position space while the frontier tracks the whole extent — so a store with
+    /// a trailing run of carries still reports the right decided region. There is
+    /// no conflict/retry: a single writer visits each position once in order.
+    pub fn step(&mut self, position: CommitTs, writes: Option<HashMap<Value, Value>>) {
+        debug_assert!(
+            self.decided_watermark().is_none_or(|w| position > w),
+            "induction positions advance strictly monotonically (got {position}, watermark {:?})",
+            self.decided_watermark()
+        );
+        self.next_ts = position + 1;
+        if let Some(w) = writes {
+            for k in w.keys() {
+                self.latest_write.insert(k.clone(), position);
+            }
+            self.committed.insert(position, w);
+        }
     }
 
     /// Validate and (if valid) commit one proposal. Allocate-on-commit: a valid
@@ -226,10 +274,21 @@ impl CommitEngine {
     pub fn render_full_store_tile(&self) -> Tile {
         let ticks: Vec<usize> = self.committed.keys().copied().collect();
         let deltas: Vec<Value> = self.committed.values().map(map_to_value).collect();
+        // The decided frontier is the watermark; an induction engine that has not
+        // stepped yet is undecided (`False`). The frontier is `LessThanEq(w)` even
+        // when the latest position(s) carried no write, so a trailing run of
+        // carries stays decided — the changelog is sparse but the frontier is not.
+        let frontier = match self.decided_watermark() {
+            Some(w) => Predicate::LessThanEq(Value::UInt(w)),
+            None => Predicate::False,
+        };
         Tile::Store {
             changes: ColumnValue::from_uints(ticks),
             deltas: ColumnValue::Variants(deltas),
-            frontier: Predicate::LessThanEq(Value::UInt(self.watermark())),
+            frontier,
+            // A rendered store is *live* by default; a producer that knows its
+            // writers are finished flips `terminal` (keeping the numeric frontier).
+            terminal: false,
         }
     }
 }
@@ -280,32 +339,17 @@ fn read_initial_scalar(producer: &mut dyn TileProducer) -> Result<Value, InitDra
 /// converging (the doc's "a couple of pulls" claim).
 const MAX_INIT_PULLS: usize = 8;
 
-/// The frontier of a store tile's change ticks + `frontier` predicate (the
-/// watermark decode behind [`store_frontier`]). `LessThanEq(w)` reads the
-/// watermark directly; the terminal `True` flip reconstructs it from the last
-/// (largest) change tick. `None` for an undecided/empty changelog.
+/// The watermark of a store tile's `frontier` predicate (the decode behind
+/// [`store_frontier`]). A store always carries its watermark as `LessThanEq(w)`
+/// — terminality is a separate flag, never a `True` frontier that would discard
+/// `w` — so the watermark reads directly and counts trailing carries. `None` for
+/// an undecided/empty changelog.
 fn frontier_from_domain(domain: &ColumnValue, domain_predicate: &Predicate) -> Option<CommitTs> {
     if domain.is_empty() {
         return None;
     }
     match domain_predicate {
         Predicate::LessThanEq(Value::UInt(f)) => Some(*f),
-        Predicate::True => {
-            debug_assert!(
-                (0..domain.len()).all(|i| {
-                    i == 0
-                        || matches!(
-                            (domain.index_at(i - 1), domain.index_at(i)),
-                            (Value::UInt(a), Value::UInt(b)) if a <= b
-                        )
-                }),
-                "store tile ticks are rendered in ascending order; the last is the watermark"
-            );
-            match domain.index_at(domain.len() - 1) {
-                Value::UInt(t) => Some(t),
-                _ => None,
-            }
-        }
         _ => None,
     }
 }
@@ -903,9 +947,10 @@ impl TileProducer for CommitProducer {
         // happen) — `all()` over the empty writer set is `true`, which is what we
         // want, so there is no `is_empty()` guard.
         if self.writer_terminal.iter().all(|&t| t)
-            && let Tile::Store { frontier, .. } = &mut store
+            && let Tile::Store { terminal, .. } = &mut store
         {
-            *frontier = Predicate::True;
+            // Close the frontier (no more commits), keeping its numeric watermark.
+            *terminal = true;
         }
         debug_assert!(
             store.check_from(&self.output_tiling),
@@ -966,6 +1011,258 @@ fn source_value_at(codomain: &Tile, i: usize) -> Value {
                 .collect(),
         ),
         other => panic!("cross-domain writer source column is not scalar/record: {other:?}"),
+    }
+}
+
+/// A **position-driven induction store** (a `mut` loop accumulator, plain or with
+/// a conditional write `if p: total += x`) built on the same [`CommitEngine`] +
+/// [`Tile::Store`] changelog machinery as the concurrent [`CommitOperator`], but
+/// driven by *iteration position* rather than by concurrent proposals.
+///
+/// There is exactly one writer, visiting each iteration position once in order:
+/// no proposals, no conflicts, no retries. The accumulator recurrence — position
+/// `i` reads `xᵢ₋₁` and decides `xᵢ` — is driven **sequentially inside the
+/// producer**: the driver holds the engine, folds the previous accumulator out of
+/// it ([`CommitEngine::read_as_of`], defaulting below the earliest change to the
+/// key's init), feeds the body `(prev…, item)` through a [`BodyInputBuffer`], reads
+/// the body's `{commit, writes}` decision, and [`step`](CommitEngine::step)s the
+/// engine — a `commit: true` position appends a change, a `commit: false` (a
+/// failed guard) is a **carry** (no change; the value inherits).
+///
+/// The key structural difference from the retired dense `Recurse` realization:
+/// the accumulator lives in the engine, not on a cyclic tile, so there is **no
+/// cyclic `FanOut`** — the previous value is always available before the body
+/// needs it, and a conditional write's carry positions simply produce no change
+/// rather than having to synthesize a same-value "write" on a complement leg.
+/// A plain (unconditional) `mut` loop is the degenerate `commit: true`-everywhere
+/// case (a dense changelog); a conditional write is sparse in position space
+/// while the frontier still tracks the whole extent.
+pub struct InductionStore {
+    /// Per accumulator key, its runtime key and the acyclic operator producing
+    /// its tick-0 fold default (the accumulator's init; read once at subscribe,
+    /// like [`CommitOperator::with_init_ops`]). Written in `write_keys` order.
+    init_ops: Vec<(Value, Box<dyn TileOperator>)>,
+    /// The writer body `λ (prev…, item) → {commit, writes(, to_<defer>…)}`,
+    /// compiled around a [`BodyInputSource`] over `buffer`.
+    body_op: Box<dyn TileOperator>,
+    /// The iteration source `Fun(D, item)` — the loop extent's items in order.
+    source_op: Box<dyn TileOperator>,
+    /// The body-input buffer the driver pushes `(prev…, item)` rows onto.
+    buffer: BodyInputBuffer,
+    /// Accumulator keys the body reads a snapshot of, in body-parameter order
+    /// (for an induction store these are exactly the accumulators it writes).
+    read_keys: Vec<Value>,
+    /// Keys written, in decision-`writes` order: the accumulator registers, then
+    /// any reply-tap (`to_<defer>`) keys.
+    write_keys: Vec<Value>,
+    /// Reply-tap decision fields, appended to each write set (see
+    /// [`body_decision_at`]). Empty for a store with no feed.
+    tap_fields: Vec<String>,
+    output_tiling: Tiling,
+}
+
+impl InductionStore {
+    /// Assemble an induction store. `init_ops`/`read_keys`/`write_keys` follow the
+    /// same conventions as the commit store's writer, with `read_keys ==` the
+    /// accumulator keys and `write_keys` the accumulators followed by tap keys.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        init_ops: Vec<(Value, Box<dyn TileOperator>)>,
+        body_op: Box<dyn TileOperator>,
+        source_op: Box<dyn TileOperator>,
+        buffer: BodyInputBuffer,
+        read_keys: Vec<Value>,
+        write_keys: Vec<Value>,
+        tap_fields: Vec<String>,
+        key_extent: Extent,
+        value_extent: Extent,
+    ) -> Self {
+        let output_tiling = full_store_tiling(&key_extent, &value_extent);
+        Self {
+            init_ops,
+            body_op,
+            source_op,
+            buffer,
+            read_keys,
+            write_keys,
+            tap_fields,
+            output_tiling,
+        }
+    }
+}
+
+impl TileOperator for InductionStore {
+    fn tiling(&self) -> &Tiling {
+        &self.output_tiling
+    }
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        mut consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        // Forward source/body progress to this store's consumer: an async loop
+        // source (a data source arriving over scheduler notifications) delivers
+        // its elements incrementally, and each arrival must wake a downstream
+        // reader so it re-pulls and the drive loop processes the new positions.
+        // Without this the store stalls at whatever prefix arrived by the first
+        // pull (a batch/list source is complete on the first pull, so it never
+        // needed the wiring — but an async source does). Kick once to start.
+        let consumer = Rc::new(RefCell::new(move || consumer.notify()));
+        consumer.borrow_mut().notify();
+        // Resolve each accumulator's tick-0 fold default. The init op is acyclic
+        // (it never reads the store), so a single drain to a scalar is sound —
+        // the same seeding path as `CommitOperator::with_init_ops`.
+        let mut inits: HashMap<Value, Value> = HashMap::with_capacity(self.init_ops.len());
+        for (key, mut op) in std::mem::take(&mut self.init_ops) {
+            let g = op.tiling().universal_guard();
+            let mut producer = op.subscribe(g, Box::new(|| {}), scheduler);
+            let value = read_initial_scalar(&mut *producer).unwrap_or_else(|e| match e {
+                InitDrainFailure::Empty => panic!(
+                    "InductionStore: init op for accumulator {key:?} produced an empty scalar \
+                     (no value to seed the accumulator)"
+                ),
+                InitDrainFailure::Diverged => panic!(
+                    "InductionStore: init op for accumulator {key:?} never settled to a scalar \
+                     within {MAX_INIT_PULLS} pulls (an acyclic init resolves on the first pull)"
+                ),
+            });
+            inits.insert(key, value);
+        }
+        let source_producer = {
+            let g = self.source_op.tiling().universal_guard();
+            self.source_op
+                .subscribe(g, Box::new(consumer.clone()), scheduler)
+        };
+        let body_producer = {
+            let g = self.body_op.tiling().universal_guard();
+            self.body_op
+                .subscribe(g, Box::new(consumer.clone()), scheduler)
+        };
+        Box::new(InductionStoreProducer {
+            base: ProducerBase::new(InductionStoreProducer::alloc_id(), &self.output_tiling),
+            // Seed tick 0 with the accumulators' inits, so the changelog is
+            // self-describing: `read_as_of`/`store_value_at` fold to the init below
+            // the first *iteration* change (a leading carry) without an external
+            // default. Iterations therefore occupy ticks 1.., a `+ 1` offset the
+            // drive loop and the dense read both apply.
+            engine: CommitEngine::new(inits),
+            body_producer,
+            source_producer,
+            buffer: self.buffer.clone(),
+            read_keys: self.read_keys.clone(),
+            write_keys: self.write_keys.clone(),
+            tap_fields: self.tap_fields.clone(),
+            output_tiling: self.output_tiling.clone(),
+            processed: 0,
+            source_complete: false,
+        })
+    }
+}
+
+struct InductionStoreProducer {
+    base: ProducerBase,
+    engine: CommitEngine,
+    body_producer: Box<dyn TileProducer>,
+    source_producer: Box<dyn TileProducer>,
+    buffer: BodyInputBuffer,
+    read_keys: Vec<Value>,
+    write_keys: Vec<Value>,
+    tap_fields: Vec<String>,
+    /// The full-store output tiling — for a debug-time shape check on the rendered
+    /// store tile.
+    output_tiling: Tiling,
+    /// Iteration positions already fed to the body and stepped into the engine.
+    /// Monotonic; the drive resumes here each pull as the source grows.
+    processed: usize,
+    /// Whether the iteration source is complete (its last pull was terminal). A
+    /// batch source (a list — the usual loop extent) is complete on the first pull.
+    source_complete: bool,
+}
+
+impl TileProducer for InductionStoreProducer {
+    impl_producer_base!();
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        let src = self
+            .source_producer
+            .get(self.source_producer.tiling().universal_guard());
+        self.source_complete = src.is_terminal();
+        let items = decode_source_items(&src);
+        // Drive each not-yet-processed position in order. Tick 0 is the seeded
+        // init, so iteration `pos` occupies tick `pos + 1`: it reads the previous
+        // accumulator as of tick `pos` (the init at `pos == 0`, else the latest
+        // change ≤ that tick — a leading carry inherits the seed), feeds the body,
+        // and steps tick `pos + 1`. The engine must be stepped through `pos` before
+        // we fold, hence the sequential push-body-step loop. The body's decision
+        // gates commit (append the change) vs carry (`step(_, None)` — the value
+        // inherits from tick 0 / the latest earlier change).
+        while self.processed < items.len() {
+            let pos = self.processed;
+            let snap_in: Vec<Value> = self
+                .read_keys
+                .iter()
+                .map(|k| {
+                    self.engine
+                        .read_as_of(pos, k)
+                        .expect("tick 0 seeds every accumulator, so a prev read always resolves")
+                })
+                .collect();
+            self.buffer
+                .borrow_mut()
+                .rows
+                .push((snap_in, items[pos].clone()));
+            let body_tile = self
+                .body_producer
+                .get(self.body_producer.tiling().universal_guard());
+            let Some((commit, writes)) = body_decision_at(&body_tile, pos, &self.tap_fields) else {
+                // The decision for a freshly-pushed row of a self-contained
+                // induction body is always ready on the pull. A `None` means the
+                // body has not converged at this position — for the loop shapes
+                // that reach here (no cross-loop broadcast in the body) this does
+                // not happen, so stop the drive and re-render; the harness re-pulls
+                // a non-terminal store to make progress.
+                break;
+            };
+            let write_set: Option<HashMap<Value, Value>> = if commit {
+                debug_assert_eq!(
+                    writes.len(),
+                    self.write_keys.len(),
+                    "the decision's write set aligns with the store's write keys"
+                );
+                Some(self.write_keys.iter().cloned().zip(writes).collect())
+            } else {
+                None // carry: the accumulator holds from tick 0 / the latest change
+            };
+            self.engine.step(pos + 1, write_set);
+            self.processed = pos + 1;
+        }
+        let mut store = self.engine.render_full_store_tile();
+        // Signal terminality once the source is complete and every position has
+        // been decided: the accumulator is final, so the frontier *closes*
+        // (`terminal`) and a downstream `ExtractLast`/`final_or_default` resolves.
+        // The frontier keeps its `LessThanEq(w)` watermark, which spans the whole
+        // extent including a trailing run of carries — so `len`/`store_frontier`
+        // no longer undercount to the last change tick when the tail is all carry.
+        if self.source_complete
+            && self.processed >= items.len()
+            && let Tile::Store { terminal, .. } = &mut store
+        {
+            *terminal = true;
+        }
+        debug_assert!(
+            store.check_from(&self.output_tiling),
+            "rendered induction store tile does not match the full-store tiling"
+        );
+        store
+    }
+
+    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
+        // The induction store is a finite batch driven to completion in one pull
+        // sweep; its whole changelog is retained for the accumulator-final read.
+        // Read-side commit-log GC (the long-lived-store bound) is a follow-up —
+        // tracked with the trailing-carry frontier gap in the pivot design notes.
     }
 }
 
@@ -1087,20 +1384,27 @@ impl TileProducer for StoreValueStreamProducer {
         // (consumer-driven; no producer-side drive-to-fixpoint). The store's writer
         // steps one commit per pull and re-arms itself on the wakeup queue, which
         // fans through the cyclic `FanOut` to re-pull this stream as commits land;
-        // terminality flows through the store's `frontier` predicate below.
+        // terminality flows through the store's `terminal` flag below.
         let sg = self.store_producer.tiling().universal_guard();
         let store = self.store_producer.get(sg);
-        // The store's watermark predicate (`frontier`) is carried through unchanged
-        // — terminality flows to this stream. Fold the changelog directly.
+        // Fold the changelog directly. Terminality flows to this stream: a closed
+        // store (`terminal`) yields a `True` output domain predicate so a
+        // downstream terminal read resolves; a live store carries its `LessThanEq`
+        // watermark through.
         let Tile::Store {
             changes,
             deltas,
             frontier,
+            terminal,
         } = &store
         else {
             return self.tiling().empty_tile();
         };
-        let domain_predicate = frontier.clone();
+        let domain_predicate = if *terminal {
+            Predicate::True
+        } else {
+            frontier.clone()
+        };
         // Project each change tick's delta map to `key`'s value. A register carries
         // the last written value forward across ticks that don't touch `key` (so a
         // read sees the latest write ≤ that tick — the step interpolation); a reply
@@ -1169,6 +1473,178 @@ impl TileProducer for StoreValueStreamProducer {
                     .release(TileGuard::Function(FunctionGuard::Domain(pred)));
             }
         }
+    }
+}
+
+/// A **dense** induction-accumulator read: `key`'s value at *every* position of
+/// the loop extent `D`, folded from the [`Tile::Store`] changelog —
+/// `Fun(D, V)` where position `p ↦ store_value_at(store, p, key)` (carry-forward,
+/// defaulting to `init` below the first change).
+///
+/// This is the induction counterpart of [`StoreValueStream`] (a commit
+/// register's per-tick stream). The difference is the domain: a register stream
+/// is indexed by *commit tick* (sparse change events), but an induction
+/// accumulator co-iterated into another store (e.g. `for r in …: cnt += 1; with
+/// begin(): store := store + cnt`) must present a *dense* function over the loop
+/// extent so it aligns (via `fan_in`) with the co-iterated `iter`. Because
+/// [`store_value_at`] folds by scanning changes `≤ p` — **independent of the
+/// store's frontier** — this reads every position correctly even across a
+/// trailing run of carries, so it needs neither the frontier watermark nor the
+/// extent recorded on the tile: the positions come from the `trigger`
+/// (`IterateExtent`-style enumeration of `D`), the values from the fold.
+///
+/// A scalar-final read (`total` after the loop) is `ExtractLast` over this dense
+/// stream; a co-iterated read is the stream itself — one reader serves both.
+pub struct StoreDenseRead {
+    /// Output tiling `SealedFunction { domain: D, codomain: Scalar(V) }`.
+    tiling: Tiling,
+    /// Enumerates the loop extent `D` (its positions drive the output domain, so
+    /// it aligns with any co-iterated source over the same `D`).
+    trigger: Box<dyn TileOperator>,
+    /// The induction store (a [`Tile::Store`] fan branch).
+    store_op: Box<dyn TileOperator>,
+    /// The accumulator key to project.
+    key: Value,
+    value_extent: Extent,
+}
+
+impl StoreDenseRead {
+    pub fn new(
+        trigger: Box<dyn TileOperator>,
+        store_op: Box<dyn TileOperator>,
+        key: Value,
+        value_extent: Extent,
+    ) -> Self {
+        let Tiling::SealedFunction { domain, .. } = trigger.tiling() else {
+            panic!(
+                "StoreDenseRead trigger must be a SealedFunction (the loop extent), got {}",
+                trigger.tiling()
+            );
+        };
+        debug_assert!(
+            matches!(store_op.tiling(), Tiling::Store { .. }),
+            "StoreDenseRead source must be a Store, got {}",
+            store_op.tiling()
+        );
+        let tiling = Tiling::SealedFunction {
+            domain: domain.clone(),
+            codomain: Box::new(Tiling::Scalar(value_extent.clone())),
+        };
+        Self {
+            tiling,
+            trigger,
+            store_op,
+            key,
+            value_extent,
+        }
+    }
+}
+
+impl TileOperator for StoreDenseRead {
+    fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        mut consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        // Wake the consumer on store progress (a new decided position) and on
+        // trigger progress. Route both through a shared notifier, and kick once.
+        let consumer = Rc::new(RefCell::new(move || consumer.notify()));
+        consumer.borrow_mut().notify();
+        let trigger_producer = {
+            let g = self.trigger.tiling().universal_guard();
+            self.trigger
+                .subscribe(g, Box::new(consumer.clone()), scheduler)
+        };
+        let store_producer = {
+            let g = self.store_op.tiling().universal_guard();
+            self.store_op
+                .subscribe(g, Box::new(consumer.clone()), scheduler)
+        };
+        Box::new(StoreDenseReadProducer {
+            base: ProducerBase::new(StoreDenseReadProducer::alloc_id(), &self.tiling),
+            trigger_producer,
+            store_producer,
+            key: self.key.clone(),
+            value_extent: self.value_extent.clone(),
+        })
+    }
+}
+
+struct StoreDenseReadProducer {
+    base: ProducerBase,
+    trigger_producer: Box<dyn TileProducer>,
+    store_producer: Box<dyn TileProducer>,
+    key: Value,
+    value_extent: Extent,
+}
+
+impl TileProducer for StoreDenseReadProducer {
+    impl_producer_base!();
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        // The loop-extent positions (the output domain) — the same positions a
+        // co-iterated `iter` presents, so the two `fan_in` cleanly.
+        let trigger = self
+            .trigger_producer
+            .get(self.trigger_producer.tiling().universal_guard());
+        let Tile::SealedFunction {
+            domain: positions,
+            domain_predicate: trigger_pred,
+            ..
+        } = trigger
+        else {
+            return self.tiling().empty_tile();
+        };
+        // Sample the induction store once (consumer-driven; no producer-side
+        // drive-to-fixpoint), then fold `key` at each position. The induction writer
+        // drives its whole loop per pull (every arrived position steps the engine in
+        // one `get_impl`), so a batch source converges in this single sample; an
+        // async source's later arrivals re-pull us through the store's
+        // source-forwarding consumer. Iterations occupy ticks 1.. (tick 0 is the
+        // seeded init), so loop position `p` reads tick `p + 1` — the accumulator
+        // *after* iteration `p`. `store_value_at` scans changes ≤ that tick, so a
+        // carry position inherits the latest earlier write, and a leading carry folds
+        // to the tick-0 init — no external default needed, and never `None` (tick 0
+        // is seeded). The `store.is_terminal()` gate below keeps this read
+        // non-terminal until the store is fully decided, so the consumer re-pulls.
+        let sg = self.store_producer.tiling().universal_guard();
+        let store = self.store_producer.get(sg);
+        let mut values: Vec<Value> = Vec::with_capacity(positions.len());
+        for i in 0..positions.len() {
+            let Value::UInt(p) = positions.index_at(i) else {
+                unreachable!("induction loop-extent positions are UInt");
+            };
+            values.push(
+                store_value_at(&store, p + 1, &self.key)
+                    .expect("tick 0 seeds every accumulator, so the fold always resolves"),
+            );
+        }
+        // The dense read is decided over `D` once the store is terminal (every
+        // position folded to its final value); until then it tracks the trigger's
+        // own completion but stays non-terminal so the consumer re-pulls.
+        let domain_predicate = if store.is_terminal() {
+            trigger_pred
+        } else {
+            Predicate::False
+        };
+        Tile::SealedFunction {
+            domain: positions,
+            codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
+                values,
+                &self.value_extent,
+            ))),
+            domain_predicate,
+            deleted: bit_set::BitSet::new(),
+        }
+    }
+
+    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
+        // A finite induction accumulator read is retained whole for its
+        // co-iterating consumer; prefix GC is the long-lived-store follow-up.
     }
 }
 
@@ -1481,10 +1957,7 @@ impl TileProducer for AsOfProducer {
             } => domain_predicate.clone(),
             _ => Predicate::False,
         };
-        let store_terminal = matches!(
-            &source_tile,
-            Tile::Store { frontier, .. } if *frontier == Predicate::True
-        );
+        let store_terminal = source_tile.is_terminal();
         // Latch timing distinguishes a **live** trigger from a **batch** one — the
         // consumer-driven replacement for the retired in-`get` drive-to-fixpoint:
         //
@@ -2400,6 +2873,7 @@ impl TileProducer for TransactWriterProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interpreter::tile_operators::{Constant, FanOut, IterateExtent};
     use crate::interpreter::validate_tile;
 
     fn int(n: i64) -> Value {
@@ -2413,6 +2887,354 @@ mod tests {
     /// Build a read/write set or initial state from `(account, balance)` pairs.
     fn balances(pairs: &[(&str, i64)]) -> HashMap<Value, Value> {
         pairs.iter().map(|(k, v)| (acct(k), int(*v))).collect()
+    }
+
+    /// Position-driven induction: `x := 0; for i in [1,2,3,4]: if i > 2: x += i`.
+    /// The guard (`i > 2`) fires at positions 2 and 3; positions 0 and 1 carry.
+    /// Modelled as sparse `step`s over the iteration extent — a change only where
+    /// the guard fires, a carry (`None`) elsewhere — the changelog stays sparse
+    /// while the frontier tracks the whole extent, and folded reads recover the
+    /// carry-forward accumulator `[0, 0, 3, 7]`.
+    #[test]
+    fn induction_conditional_write_folds_carry_forward() {
+        let acc = acct("acc");
+        let mut e = CommitEngine::for_induction();
+        // prev read defaults to init (0) below the earliest change; the write at a
+        // committing position is prev + item.
+        e.step(0, None); // i=1, guard false → carry (x_0 = 0)
+        e.step(1, None); // i=2, guard false → carry (x_1 = 0)
+        e.step(2, Some(balances(&[("acc", 3)]))); // i=3 → x_2 = 0 + 3
+        e.step(3, Some(balances(&[("acc", 7)]))); // i=4 → x_3 = 3 + 4
+
+        assert_eq!(
+            e.watermark(),
+            3,
+            "frontier reaches the last position, not the last write"
+        );
+        // Folded reads: carries inherit (None → the reader's init default), writes resolve.
+        assert_eq!(e.read_as_of(0, &acc), None); // carry → init 0
+        assert_eq!(e.read_as_of(1, &acc), None); // carry → init 0
+        assert_eq!(e.read_as_of(2, &acc), Some(int(3)));
+        assert_eq!(e.read_as_of(3, &acc), Some(int(7))); // final total
+
+        // The rendered store: a sparse changelog (2 change ticks) whose *length*
+        // is the decided frontier region (4 positions), not the change count.
+        let tile = e.render_full_store_tile();
+        assert!(validate_tile(&tile));
+        let Tile::Store {
+            changes, frontier, ..
+        } = &tile
+        else {
+            panic!("induction render is a Store");
+        };
+        assert_eq!(
+            changes.len(),
+            2,
+            "only the two committing positions are changes"
+        );
+        assert_eq!(*frontier, Predicate::LessThanEq(Value::UInt(3)));
+        assert_eq!(
+            tile.len(),
+            4,
+            "Store length is the decided region [0, 3], not changes.len()"
+        );
+    }
+
+    /// A test iteration source: one terminal `SealedFunction(pos → item)` tile
+    /// over a fixed item list (the loop extent), mirroring a lowered `cast(iter,
+    /// …)` loop source.
+    struct ItemSource {
+        tiling: Tiling,
+        tile: Tile,
+    }
+
+    impl ItemSource {
+        fn new(items: &[i64]) -> Self {
+            let tiling = Tiling::SealedFunction {
+                domain: Extent::Base(BaseType::UInt),
+                codomain: Box::new(Tiling::Scalar(value_extent())),
+            };
+            let tile = Tile::SealedFunction {
+                domain: ColumnValue::from_uints((0..items.len()).collect()),
+                codomain: Box::new(Tile::Scalar(ColumnValue::from_values(
+                    items.iter().map(|n| int(*n)).collect(),
+                    &value_extent(),
+                ))),
+                domain_predicate: Predicate::True,
+                deleted: bit_set::BitSet::new(),
+            };
+            Self { tiling, tile }
+        }
+    }
+
+    impl TileOperator for ItemSource {
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            Box::new(ProposalSourceProducer {
+                base: ProducerBase::new(ProposalSourceProducer::alloc_id(), &self.tiling),
+                tile: self.tile.clone(),
+            })
+        }
+    }
+
+    /// A single-accumulator induction-write decision body: over its `(prev, item)`
+    /// input (a `BodyInputSource`), emits `{commit: guard(item), writes: {_0: prev
+    /// + item}}` per row. A `commit: false` row is a carry (the accumulator holds).
+    /// Models the recognized body of `for i in xs: if guard(i): acc += i`.
+    struct AddIfBody {
+        input: Box<dyn TileOperator>,
+        tiling: Tiling,
+        /// The guard threshold: `commit` iff `item > threshold` (`i64::MIN` ⇒ an
+        /// unconditional loop, `commit` everywhere).
+        threshold: i64,
+    }
+
+    impl AddIfBody {
+        fn new(input: Box<dyn TileOperator>, threshold: i64) -> Self {
+            let tiling = Tiling::SealedFunction {
+                domain: Extent::Base(BaseType::UInt),
+                codomain: Box::new(Tiling::Record(HashMap::from([
+                    (
+                        F_COMMIT.to_string(),
+                        Tiling::Scalar(Extent::Base(BaseType::Bool)),
+                    ),
+                    (
+                        F_WRITES.to_string(),
+                        Tiling::Record(HashMap::from([(
+                            tuple_field(0),
+                            Tiling::Scalar(value_extent()),
+                        )])),
+                    ),
+                ]))),
+            };
+            Self {
+                input,
+                tiling,
+                threshold,
+            }
+        }
+    }
+
+    impl TileOperator for AddIfBody {
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            consumer: Box<dyn Consumer>,
+            scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            let input =
+                self.input
+                    .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+            Box::new(AddIfBodyProducer {
+                base: ProducerBase::new(AddIfBodyProducer::alloc_id(), &self.tiling),
+                input,
+                threshold: self.threshold,
+            })
+        }
+    }
+
+    struct AddIfBodyProducer {
+        base: ProducerBase,
+        input: Box<dyn TileProducer>,
+        threshold: i64,
+    }
+
+    impl TileProducer for AddIfBodyProducer {
+        impl_producer_base!();
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            let in_tile = self.input.get(self.input.tiling().universal_guard());
+            let Tile::SealedFunction {
+                domain, codomain, ..
+            } = in_tile
+            else {
+                panic!("AddIfBody input is a SealedFunction");
+            };
+            let Tile::Record(fields) = *codomain else {
+                panic!("AddIfBody input codomain is a Record {{_0: prev, _1: item}}");
+            };
+            let prev = record_field(&fields, &tuple_field(0));
+            let item = record_field(&fields, &tuple_field(1));
+            let mut commits = Vec::with_capacity(domain.len());
+            let mut news = Vec::with_capacity(domain.len());
+            for j in 0..domain.len() {
+                let (Value::Int(p), Value::Int(i)) = (prev.index_at(j), item.index_at(j)) else {
+                    panic!("AddIfBody prev/item are Ints");
+                };
+                commits.push(Value::Bool(i > self.threshold));
+                news.push(int(p + i));
+            }
+            Tile::SealedFunction {
+                domain,
+                codomain: Box::new(Tile::Record(HashMap::from([
+                    (
+                        F_COMMIT.to_string(),
+                        Tile::Scalar(ColumnValue::from_values(
+                            commits,
+                            &Extent::Base(BaseType::Bool),
+                        )),
+                    ),
+                    (
+                        F_WRITES.to_string(),
+                        Tile::Record(HashMap::from([(
+                            tuple_field(0),
+                            Tile::Scalar(ColumnValue::from_values(news, &value_extent())),
+                        )])),
+                    ),
+                ]))),
+                domain_predicate: Predicate::False,
+                deleted: bit_set::BitSet::new(),
+            }
+        }
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// Drive an `InductionStore` for a single-accumulator loop end-to-end through
+    /// the tile protocol and return the converged store tile.
+    fn drive_induction(items: &[i64], threshold: i64, init: i64) -> Tile {
+        let buffer: BodyInputBuffer = Rc::new(RefCell::new(WriterBuffer::default()));
+        let body_input = BodyInputSource::new(buffer.clone(), vec![value_extent()], value_extent());
+        let body = AddIfBody::new(Box::new(body_input), threshold);
+        let source = ItemSource::new(items);
+        let acc = acct("acc");
+        let mut op = InductionStore::new(
+            vec![(
+                acc.clone(),
+                Box::new(Constant::new(int(init), value_extent())),
+            )],
+            Box::new(body),
+            Box::new(source),
+            buffer,
+            vec![acc.clone()],
+            vec![acc],
+            Vec::new(),
+            key_extent(),
+            value_extent(),
+        );
+        let guard = op.tiling().universal_guard();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        producer.get(producer.tiling().universal_guard())
+    }
+
+    /// `acc := 0; for i in [1,2,3,4]: if i > 2: acc += i` driven through the whole
+    /// induction-store operator: the guard fires at positions 2,3 (items 3,4); the
+    /// changelog carries a sparse two-change history but the accumulator folds to
+    /// the carry-forward total `7`, and the frontier covers the full extent.
+    #[test]
+    fn induction_store_conditional_write_e2e() {
+        let tile = drive_induction(&[1, 2, 3, 4], 2, 0);
+        assert!(validate_tile(&tile));
+        assert!(
+            tile.is_terminal(),
+            "a complete batch source drives the store terminal"
+        );
+        let acc = acct("acc");
+        // Final accumulator value: 0 (carry) → 0 (carry) → 3 → 7.
+        assert_eq!(store_current(&tile, &acc).map(|(_, v)| v), Some(int(7)));
+        let Tile::Store { changes, .. } = &tile else {
+            panic!("induction store output is a Store");
+        };
+        assert_eq!(
+            changes.len(),
+            3,
+            "tick 0 (the init seed) plus the two firing positions (items 3, 4); the rest carry"
+        );
+    }
+
+    /// A plain (unconditional) `mut` loop is the degenerate `commit`-everywhere
+    /// case: `acc := 10; for i in [1,2,3]: acc += i` → 16, a dense changelog.
+    #[test]
+    fn induction_store_unconditional_write_e2e() {
+        let tile = drive_induction(&[1, 2, 3], i64::MIN, 10);
+        assert!(validate_tile(&tile));
+        assert!(tile.is_terminal());
+        assert_eq!(
+            store_current(&tile, &acct("acc")).map(|(_, v)| v),
+            Some(int(16))
+        );
+        let Tile::Store { changes, .. } = &tile else {
+            panic!("induction store output is a Store");
+        };
+        assert_eq!(
+            changes.len(),
+            4,
+            "tick 0 (the init seed) plus every committing position (a dense changelog)"
+        );
+    }
+
+    /// Build an `InductionStore` behind a fan and read `acc` densely over the loop
+    /// extent via `StoreDenseRead`; return the dense `Fun(D, V)` values in order.
+    fn dense_read(items: &[i64], threshold: i64, init: i64) -> Vec<i64> {
+        let buffer: BodyInputBuffer = Rc::new(RefCell::new(WriterBuffer::default()));
+        let body_input = BodyInputSource::new(buffer.clone(), vec![value_extent()], value_extent());
+        let body = AddIfBody::new(Box::new(body_input), threshold);
+        let source = ItemSource::new(items);
+        let acc = acct("acc");
+        let store = InductionStore::new(
+            vec![(
+                acc.clone(),
+                Box::new(Constant::new(int(init), value_extent())),
+            )],
+            Box::new(body),
+            Box::new(source),
+            buffer,
+            vec![acc.clone()],
+            vec![acc.clone()],
+            Vec::new(),
+            key_extent(),
+            value_extent(),
+        );
+        let fan = Rc::new(FanOut::new(Box::new(store)));
+        let trigger = IterateExtent::new(Extent::uint_range(items.len()));
+        let mut reader = StoreDenseRead::new(Box::new(trigger), fan.branch(), acc, value_extent());
+        let guard = reader.tiling().universal_guard();
+        let mut producer = reader.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let tile = producer.get(producer.tiling().universal_guard());
+        assert!(validate_tile(&tile));
+        assert!(
+            tile.is_terminal(),
+            "a complete batch drives the dense read terminal"
+        );
+        let Tile::SealedFunction { codomain, .. } = tile else {
+            panic!("dense read is a SealedFunction");
+        };
+        let Tile::Scalar(col) = *codomain else {
+            panic!("dense read codomain is a scalar column");
+        };
+        (0..col.len())
+            .map(|i| match col.index_at(i) {
+                Value::Int(v) => v,
+                other => panic!("dense read value is an Int, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The dense per-position read of a **conditional** accumulator: the guard
+    /// (`i > 2`) fires at positions 2, 3, so `acc` is `[0, 0, 3, 7]` — leading
+    /// carries fold to the `init` (0), then the running total. This is the shape a
+    /// co-iterated read (`zip(iter, acc)`) consumes, recovered from the sparse
+    /// two-change changelog by folding at every extent position.
+    #[test]
+    fn dense_read_conditional_accumulator_carries_forward() {
+        assert_eq!(dense_read(&[1, 2, 3, 4], 2, 0), vec![0, 0, 3, 7]);
+    }
+
+    /// The dense read of a plain (unconditional) accumulator: every position
+    /// writes, so `acc := 10; acc += i` over `[1,2,3]` reads `[11, 13, 16]` — a
+    /// dense function with no carries, exactly as the retired `.writes.(index)`
+    /// projection produced.
+    #[test]
+    fn dense_read_unconditional_accumulator() {
+        assert_eq!(dense_read(&[1, 2, 3], i64::MIN, 10), vec![11, 13, 16]);
     }
 
     /// Two writers touch the *same* key from the same snapshot: the first
@@ -2708,6 +3530,7 @@ mod tests {
             changes,
             deltas,
             frontier,
+            ..
         } = &tile
         else {
             panic!("expected Store");
@@ -2870,15 +3693,19 @@ mod tests {
         let tile = producer.get(producer.tiling().universal_guard());
         assert!(validate_tile(&tile));
         let Tile::Store {
-            changes, frontier, ..
+            changes,
+            frontier,
+            terminal,
+            ..
         } = &tile
         else {
             panic!("expected Store store tile");
         };
         // Tick 1 (A) committed; B's grant was stale → no tick consumed. The
-        // (materialized) writer is terminal, so the store is fully decided.
+        // (materialized) writer is terminal, so the store is closed at watermark 1.
         assert_eq!(changes, &ColumnValue::from_uints(vec![0, 1]));
-        assert_eq!(frontier, &Predicate::True);
+        assert_eq!(frontier, &Predicate::LessThanEq(Value::UInt(1)));
+        assert!(terminal);
         assert_eq!(store_at(&tile, &acct("pool")), Some((1, 30)));
     }
 
@@ -2893,14 +3720,20 @@ mod tests {
 
         let tile = producer.get(producer.tiling().universal_guard());
         let Tile::Store {
-            changes, frontier, ..
+            changes,
+            frontier,
+            terminal,
+            ..
         } = &tile
         else {
             panic!("expected Store store tile");
         };
         assert_eq!(changes, &ColumnValue::from_uints(vec![0, 1, 2]));
-        // Both proposals committed and the writer is terminal → store decided.
-        assert_eq!(frontier, &Predicate::True);
+        // Both proposals committed and the writer is terminal → store closed at
+        // watermark 2 (the frontier keeps its numeric watermark; terminality is
+        // the separate flag).
+        assert_eq!(frontier, &Predicate::LessThanEq(Value::UInt(2)));
+        assert!(terminal);
         assert_eq!(store_at(&tile, &acct("pool")), Some((2, 20)));
     }
 
@@ -2999,9 +3832,7 @@ mod tests {
     fn single_writer_cycle() {
         let commit = CommitOperator::new(balances(&[("n", 0)]), key_extent(), value_extent(), 1);
         let set_writer = commit.writer_input_setter(0);
-        let store_fan = Rc::new(crate::interpreter::tile_operators::FanOut::new_cyclic(
-            Box::new(commit),
-        ));
+        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         // The body reads a branch of the store (the operator's own output).
         let body = CounterBody::new(store_fan.branch(), acct("n"), 3);
         set_writer(Box::new(body));
@@ -3163,9 +3994,7 @@ mod tests {
             CommitOperator::new(balances(&[("pool", 100)]), key_extent(), value_extent(), 2);
         let set_a = commit.writer_input_setter(0);
         let set_b = commit.writer_input_setter(1);
-        let store_fan = Rc::new(crate::interpreter::tile_operators::FanOut::new_cyclic(
-            Box::new(commit),
-        ));
+        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         set_a(Box::new(TokenWriter::new(
             store_fan.branch(),
             acct("pool"),
@@ -3210,9 +4039,7 @@ mod tests {
             CommitOperator::new(balances(&[("pool", 100)]), key_extent(), value_extent(), 2);
         let set_a = commit.writer_input_setter(0);
         let set_b = commit.writer_input_setter(1);
-        let store_fan = Rc::new(crate::interpreter::tile_operators::FanOut::new_cyclic(
-            Box::new(commit),
-        ));
+        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         set_a(Box::new(TokenWriter::new(
             store_fan.branch(),
             acct("pool"),
@@ -3335,9 +4162,7 @@ mod tests {
     fn read_as_of_resolves_at_watermark() {
         let commit = CommitOperator::new(balances(&[("n", 0)]), key_extent(), value_extent(), 1);
         let set_writer = commit.writer_input_setter(0);
-        let store_fan = Rc::new(crate::interpreter::tile_operators::FanOut::new_cyclic(
-            Box::new(commit),
-        ));
+        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         set_writer(Box::new(CounterBody::new(store_fan.branch(), acct("n"), 3)));
 
         let mut reader = StoreReadAsOf::new(store_fan.branch(), acct("n"), 2);
@@ -3464,9 +4289,7 @@ mod tests {
         let commit = CommitOperator::new(init, key_extent(), value_extent(), 2);
         let set_a = commit.writer_input_setter(0);
         let set_b = commit.writer_input_setter(1);
-        let store_fan = Rc::new(crate::interpreter::tile_operators::FanOut::new_cyclic(
-            Box::new(commit),
-        ));
+        let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
         set_a(Box::new(BankWriter::new(store_fan.branch(), a)));
         set_b(Box::new(BankWriter::new(store_fan.branch(), b)));
 
@@ -3604,8 +4427,8 @@ mod tests {
 
         // Once the store is terminal, so is the stream — and `ExtractLast` over
         // it gives the final value 60 (the latest committed entry).
-        if let Tile::Store { frontier, .. } = &mut store_tile {
-            *frontier = Predicate::True;
+        if let Tile::Store { terminal, .. } = &mut store_tile {
+            *terminal = true;
         }
         let stream = StoreValueStream::new(
             Box::new(FixedSource {
@@ -3631,9 +4454,10 @@ mod tests {
 
     // --- Engine render → step-function fold ---------------------------------
 
-    /// A rendered [`Tile::Store`] folds consistently whether live (the `frontier`
-    /// predicate carries the watermark `≤ w`) or terminal (the predicate flips to
-    /// `True` and the frontier is reconstructed from the last change tick).
+    /// A rendered [`Tile::Store`] folds consistently whether live or terminal.
+    /// Terminality is a *separate* flag from the watermark: the numeric `frontier`
+    /// predicate `≤ w` is kept in both states, and setting the `terminal` flag
+    /// only signals "no more writes" — it does not rewrite the frontier.
     #[test]
     fn render_folds_consistently_live_and_terminal() {
         let mut e = CommitEngine::new(balances(&[("alice", 100), ("bob", 50)]));
@@ -3662,11 +4486,11 @@ mod tests {
             balances(&[("alice", 70), ("bob", 20)])
         );
 
-        // Terminal: flipping `frontier` to `True` must reconstruct the frontier
-        // from the last change tick, identically.
+        // Terminal: setting the separate `terminal` flag (the numeric frontier
+        // `≤ 2` is kept, not rewritten) must fold identically.
         let mut terminal = live.clone();
-        if let Tile::Store { frontier, .. } = &mut terminal {
-            *frontier = Predicate::True;
+        if let Tile::Store { terminal, .. } = &mut terminal {
+            *terminal = true;
         }
         assert_eq!(store_frontier(&terminal), Some(2));
         assert_eq!(store_current(&terminal, &acct("alice")), Some((2, int(70))));
@@ -3685,6 +4509,7 @@ mod tests {
             changes: ColumnValue::from_uints(vec![]),
             deltas: ColumnValue::Variants(vec![]),
             frontier: Predicate::LessThanEq(Value::UInt(0)),
+            terminal: false,
         };
         assert_eq!(store_frontier(&undecided), None);
     }
@@ -3755,6 +4580,7 @@ mod tests {
             changes,
             deltas,
             frontier,
+            terminal: false,
         };
         assert!(validate_tile(&tile), "store_tile built an invalid tile");
         tile
@@ -3777,13 +4603,21 @@ mod tests {
     fn store_frontier_reads_watermark_and_terminal() {
         let live = skew_store(2);
         assert_eq!(store_frontier(&live), Some(2));
-        // A fully-committed store flips `frontier` to `True`; the frontier is
-        // then the last (largest) change tick.
+        // A terminal store keeps its `LessThanEq(w)` watermark (terminality is the
+        // separate flag), so `store_frontier` reads `w` directly — even when the
+        // watermark is *past the last change tick* (trailing carries). Here the
+        // last change is at tick 3 but the decided watermark is 5: the frontier is
+        // 5, not 3 (the former `True`-reconstruction undercounted to the last
+        // change).
         let done = store_tile(
             &[(0, &[("alice", 100)]), (3, &[("alice", 70)])],
-            Predicate::True,
+            Predicate::LessThanEq(Value::UInt(5)),
         );
-        assert_eq!(store_frontier(&done), Some(3));
+        assert_eq!(store_frontier(&done), Some(5));
+        // `Tile::len` counts decided *positions* (watermark + 1), spanning the
+        // trailing carries at ticks 4 and 5 — not the 2 change ticks, nor the last
+        // change tick + 1 (4) the former `True`-reconstruction would have given.
+        assert_eq!(done.len(), 6);
         // Empty changelog and non-store tiles have no frontier.
         assert_eq!(store_frontier(&store_tile(&[], Predicate::False)), None);
         assert_eq!(
@@ -3879,6 +4713,7 @@ mod tests {
             changes: ColumnValue::from_uints(vec![0, 1]),
             deltas: ColumnValue::Variants(vec![map_to_value(&balances(&[("a", 1)]))]),
             frontier: Predicate::False,
+            terminal: false,
         }));
         // Non-ascending change ticks.
         assert!(!validate_tile(&Tile::Store {
@@ -3888,6 +4723,7 @@ mod tests {
                 map_to_value(&balances(&[("a", 2)])),
             ]),
             frontier: Predicate::False,
+            terminal: false,
         }));
     }
 }

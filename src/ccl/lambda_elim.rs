@@ -898,26 +898,65 @@ fn elim_lambda_impl(
         }
 
         // A value-selecting `Case` inside a bare lambda body (`λ x → Case{[gᵢ → eᵢ]}`),
-        // where the gate `gᵢ(x)` varies with the element. A *comprehension*
-        // element conditional (`[a if g(x) else b for x in xs]`) is fanned out at
+        // where the gate `gᵢ(x)` varies with the element. A *comprehension* element
+        // conditional (`[a if g(x) else b for x in xs]`) is fanned out at
         // comprehension lowering (`lower::comprehension::fan_out_element_case`) into
-        // `⧺ᵢ src|π̂ᵢ ≫ eᵢ`, so it never reaches here. This arm catches the residual
-        // shapes — a per-element conditional in a lambda whose *iteration source is
-        // not visible at lowering* (a UDF body, a comprehension with an extra
-        // `if`-filter alongside the element `Case`) — which need the same source
-        // fan-out but at a site without a source in hand. Deferred (a documented
-        // follow-up; see `design/mutability.md`
-        // "Value-selecting `Case` and conditional induction writes (partially implemented)").
+        // `⧺ᵢ src|π̂ᵢ ≫ eᵢ`, so it never reaches here. This arm handles the residual
+        // shapes — a per-element conditional in a lambda whose *iteration source is not
+        // visible at lowering* (a writer decision body: `if 𝑝: a := … else: b := …`, a
+        // per-key carry-forward merge, an `if/else`-both-write accumulator).
+        //
+        // It desugars to the same **union of domain-restricts** as every other
+        // value-`Case` — `⧺ᵢ (filter_values(π̂ᵢ) ≫ eᵢ)` — but over the *lambda
+        // parameter's* fed element stream (the writer body's runtime input) rather
+        // than a visible comprehension source or the `UIntRange(1)` C-form driver.
+        // Each arm filters the fed stream to the sub-domain its first-match gate
+        // `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ` admits (`filter_values` keeps the element value, unlike
+        // the position-domain `Restrict`), then maps by `eᵢ`. So a **partial op**
+        // (`//`, `%`) in `eᵢ` is evaluated only where its guard holds — never eagerly
+        // at a rejected position. The partition is exhaustive (a trailing `true` arm —
+        // the carry in a writer decision), so the arms reassemble the full
+        // `param_ty ⇒ V` column by position (op-conversion fans the fed input to each
+        // union operand).
         TypedExprNode::Case {
             scrutinee: None,
             branches,
         } if branches.iter().all(|b| b.pattern.is_none()) => {
-            Err(LambdaElimError::Unsupported(format!(
-                "per-element conditional (a value-selecting `Case` inside `λ {param} → …`) is \
-                 not compilable at a site with no visible iteration source. A comprehension \
-                 element conditional (`[a if g({param}) else b for {param} in xs]`), a top-level \
-                 ternary, a conditional collection, and a conditional feed all compile today."
-            )))
+            let value_ty = body_ty.clone();
+            let mut prior_guards: Vec<Expr> = Vec::new();
+            let mut arms: Vec<Expr> = Vec::with_capacity(branches.len());
+            for br in branches {
+                // First-match gate π̂ᵢ as a scalar bool in `param` (the nesting the
+                // old `select` encoded, made explicit), eliminated to the
+                // element-varying predicate morphism `param_ty ⇒ Bool`.
+                let pi_hat = synthesize_arm_predicate(&br.guard, &prior_guards);
+                prior_guards.push(br.guard);
+                let gate_fn = elim_lambda(ctx, param, param_ty, pi_hat)?;
+                let value_fn = elim_lambda(ctx, param, param_ty, br.body)?;
+                // `filter_values(π̂ᵢ) ≫ eᵢ`: filter the fed element stream to the gate
+                // (keeping the element value), then map by `eᵢ`. The filtered stream
+                // is typed by the plain `param` domain, **not** a `{param | π̂ᵢ}`
+                // refinement: the `filter_values` op *is* the runtime filter, and a
+                // refinement type would make planning inject its own (value-dropping,
+                // position-domain) `restrict` at this site. The arms' runtime domains
+                // are disjoint by first-match, so the `UnionOperator` merges them
+                // without overlap despite the identical static type.
+                let filter = apply_primitive(
+                    gate_fn,
+                    Builtin::FilterValues,
+                    Type::data_fun(param_ty.clone(), param_ty.clone()),
+                );
+                arms.push(
+                    typed_compose(vec![filter, value_fn])
+                        .with_ty(Type::data_fun(param_ty.clone(), value_ty.clone())),
+                );
+            }
+            match arms.len() {
+                0 => unreachable!("a value-selecting Case has at least one branch"),
+                1 => Ok(arms.pop().expect("len == 1")),
+                _ => Ok(Expr::collection_union(arms)
+                    .with_ty(Type::data_fun(param_ty.clone(), value_ty))),
+            }
         }
 
         // Unsupported constructs.

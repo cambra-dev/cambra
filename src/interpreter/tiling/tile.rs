@@ -102,10 +102,22 @@ pub enum Tile {
         /// [`crate::interpreter::commit_operator::map_to_value`]). A key absent
         /// from a tick's delta was not written at that tick (its value holds).
         deltas: ColumnValue,
-        /// The decided frontier: every tick at or below its bound is decided.
-        /// `Predicate::True` once the store is fully committed (no more writes),
-        /// which is the only condition under which a *terminal* read resolves.
+        /// The decided frontier: `LessThanEq(w)` means every tick `≤ w` is decided
+        /// — the watermark `w` counts trailing carries (positions past the last
+        /// *change*), because a store is a right-continuous step function over its
+        /// whole decided prefix, not a list of change events. `False` while
+        /// undecided (never stepped). **Not** `True`: terminality is the separate
+        /// `terminal` axis so the numeric watermark is never discarded (a terminal
+        /// store with trailing carries keeps `LessThanEq(w)`, so `len` and
+        /// `store_frontier` read `w` directly instead of undercounting to the last
+        /// change tick).
         frontier: Predicate,
+        /// Whether the frontier is *closed* — no further commits will ever land, so
+        /// a *terminal* read (`ExtractLast` / `final_or_default`) resolves. Distinct
+        /// from the decided *extent* (`frontier`): a live store decided up to `w`
+        /// has `terminal == false`; the same store, once its writers finish, flips
+        /// `terminal` to `true` while keeping `frontier = LessThanEq(w)`.
+        terminal: bool,
     },
 }
 
@@ -132,8 +144,21 @@ impl Tile {
                 domain2, deleted, ..
             } => domain2.len() - deleted.len(),
             Tile::Aggregation { accumulator, .. } => accumulator.len(),
-            // The number of change events in the changelog.
-            Tile::Store { changes, .. } => changes.len(),
+            // A `Store` is a right-continuous *step function* over its decided
+            // prefix, not a list of change events: a tick absent from `changes`
+            // but at or below the frontier is *decided* (its value inherits from
+            // the latest earlier change). So the length is the number of
+            // **decided domain positions** — the frontier watermark `+ 1` — not
+            // `changes.len()` (which counts only the ticks that carried a write).
+            //
+            // The watermark reads straight off `LessThanEq(w)`, which counts
+            // trailing carries (positions past the last change) because terminality
+            // rides the separate `terminal` flag, not a `True` frontier that would
+            // discard `w`. An undecided (`False`) frontier has no decided positions.
+            Tile::Store { frontier, .. } => match frontier {
+                Predicate::LessThanEq(Value::UInt(w)) => w + 1,
+                _ => 0,
+            },
         }
     }
 
@@ -189,10 +214,11 @@ impl Tile {
             Tile::Aggregation { terminal, .. } => {
                 terminal.as_single().map(|t| t.as_bool()).unwrap_or(false)
             }
-            // A store is terminal once its commit frontier is decided-forever
-            // (no more writes will commit) — the only state in which a *terminal*
-            // read of it resolves.
-            Tile::Store { frontier, .. } => frontier.as_bool().unwrap_or(false),
+            // A store is terminal once its commit frontier is closed (no more
+            // writes will commit) — the only state in which a *terminal* read of
+            // it resolves. Terminality is its own flag; the `frontier` predicate
+            // keeps the numeric watermark either way.
+            Tile::Store { terminal, .. } => *terminal,
         }
     }
 
@@ -290,25 +316,29 @@ impl Tile {
             // any already present (the changelog only grows forward in commit
             // time), so appending preserves the ascending order the fold relies
             // on. The frontier advances to the union — for the watermark
-            // `LessThanEq(w)` this is `LessThanEq(max(w_self, w_other))`, and
-            // `True` (fully committed) absorbs. Mirrors the `SealedFunction` arm
-            // sans `deleted`: a store releases by physically dropping a decided
-            // prefix (see `remove_guarded`), never by logical tombstoning.
+            // `LessThanEq(w)` this is `LessThanEq(max(w_self, w_other))`; the
+            // `terminal` flag ORs (either side declaring the frontier closed closes
+            // it). Mirrors the `SealedFunction` arm sans `deleted`: a store releases
+            // by physically dropping a decided prefix (see `remove_guarded`), never
+            // by logical tombstoning.
             (
                 Tile::Store {
                     changes: s_changes,
                     deltas: s_deltas,
                     frontier: s_frontier,
+                    terminal: s_terminal,
                 },
                 Tile::Store {
                     changes: o_changes,
                     deltas: o_deltas,
                     frontier: o_frontier,
+                    terminal: o_terminal,
                 },
             ) => {
                 s_changes.append(o_changes);
                 s_deltas.append(o_deltas);
                 *s_frontier = s_frontier.union(&o_frontier);
+                *s_terminal = *s_terminal || o_terminal;
             }
             (s, o) => panic!("Incompatible tiles {s:?} and {o:?}"),
         };
@@ -616,9 +646,12 @@ impl Tile {
             // The store's guard is over its commit-time domain (the change
             // ticks), like a `SealedFunction` — consumers release a prefix of it.
             Tile::Store {
-                changes, frontier, ..
+                changes,
+                frontier,
+                terminal,
+                ..
             } => {
-                if frontier.is_true() {
+                if *terminal {
                     TileGuard::Function(FunctionGuard::Domain(Predicate::True))
                 } else {
                     TileGuard::Function(FunctionGuard::Domain(
