@@ -125,7 +125,7 @@ for req in restock_reqs:
 # rollup is only defined once the order stream is exhausted — for a server,
 # never.
 for req in stats_reqs:
-    with begin() as txn:
+    with txn = begin():
         paid = orders.restrict(\o -> o.time < txn.current_time())
         revenue = [key -> sum([o.price for o in g]) for key -> g in groupby(paid, \o -> o.sku)]
     stats_resps[req.id] = revenue
