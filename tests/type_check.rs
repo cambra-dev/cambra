@@ -1013,6 +1013,50 @@ fn test_collection_union_heterogeneous_rejected() {
 // GroupBy + aggregate tests
 // ---------------------------------------------------------------------------
 
+/// `set(xs)` infers the keyed collection `{K | __elem ▷ keydom#id} ⤇ unit` — this
+/// site's key domain, deduplicated, each key mapped to `unit` (the
+/// `Set(K) = Map(K, unit)` payload). The arrow is **Data** (`⤇`): a `set` *is* a
+/// data collection, so its
+/// outer lambda is stamped `Data` by provenance at lowering (like a
+/// comprehension), which is what lets it inject into a nominal `Set(K)`.
+#[test]
+fn set_infers_deduped_keyed_unit_collection() {
+    assert_eq!(
+        infer_program("set([1,2,3])").to_string(),
+        "({Int | __elem ▷ keydom} ⤇ Unit)"
+    );
+}
+
+/// `box(set(xs))` reaching the nominal `Set(K)` annotation. A `Set(K)` is
+/// `Σ 𝐷 ∈ Keyed(K). 𝐷 ⤇ unit`, and entering a sum is a term — so the `box` is required
+/// and the annotation is then **kind containment**: this site's concrete key domain is
+/// one of the domains `Keyed(K)` ranges over. That works only because the constructor
+/// stamps its own iteration binder with the key-domain token at lowering
+/// (`present_key_domain`): containment reads the domain's *shape*, and it runs at
+/// constraint-emission time, so a key domain that only became concrete at coalesce would
+/// fall through to a mismatch. Regression guard for exactly that.
+#[test]
+fn set_injects_into_nominal_set_annotation() {
+    // A value ascription is one-way (`inferred <: ann`), so the program keeps the
+    // one-candidate sum the `box` built rather than the abstract `Keyed` one.
+    assert_eq!(
+        infer_program("x: Set(Int) = box(set([1,2,3]))\nx").to_string(),
+        "Σ σ ∈ {{Int | __elem ▷ keydom}}. (σ ⤇ Unit)"
+    );
+    // The **key type** flows too: it is a kind *parameter*, so the edge relates it
+    // rather than ignoring it — and it survives the `box`, which reaches the annotation
+    // by the cross-form width edge rather than the same-form one.
+    assert!(
+        !infer_program_err("x: Set(String) = box(set([1,2,3]))\nx").is_empty(),
+        "an Int-keyed set must not satisfy Set(String)"
+    );
+    // The codomain still flows: a `Set(Int)` is not a `Map(Int, Int)`.
+    assert!(
+        !infer_program_err("x: Map(Int, Int) = box(set([1,2,3]))\nx").is_empty(),
+        "a set's `unit` codomain must not satisfy Map(Int, Int)"
+    );
+}
+
 // NOTE: direct key lookup on a group-by (`g = groups(k)`) is deferred. `groupby`
 // infers the honest keyed type `{K | __elem ▷ keydom#id} ⤇ group` (see
 // `src/ccl/design/collections.md`, "`groupby` is a `Map`"), so applying it at a plain

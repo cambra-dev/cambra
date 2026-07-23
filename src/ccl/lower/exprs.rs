@@ -90,48 +90,98 @@ pub(super) fn lower_call(
             }
             let collection = lower_expr(&args[0], ctx)?;
             let key_fn = lower_expr(&args[1], ctx)?;
-
-            // `bare_pred` (and the `collection` clone inside it) lives in the
-            // cast target's refinement predicate — a type slot outside the
-            // `walk_children` domain — so its nodes are deliberately untagged.
-            // The key type is `key_fn`'s codomain, and lowering holds both terms but
-            // neither type — so it states the identity with a **shared hole** written
-            // into both annotations (see [`Type::SharedHole`]).
-            let key = Type::SharedHole(HoleId::fresh());
-
-            // Inner group: cast(λ i → c(i), {I | key(c(__elem)) == k} ⇒ A).
-            let bare_pred = Expr::binop(
-                Expr::apply(
-                    Expr::apply(Expr::var(Name::elem()), collection.clone()),
-                    key_fn_producing(key_fn.clone(), key.clone()),
-                ),
-                BinOpKind::Compare(CompareKind::Equals),
-                Expr::var("__gb_k"),
-            );
-            // Main-tree encoding plumbing of the groupby rule (the returned
-            // outer lambda is the call's image, tagged by `lower_expr`).
-            let gb = "lower.groupby";
-            let inner_var = ctx.tag_machinery(Expr::var("__gb_i"), func.span, gb);
-            let inner_body =
-                ctx.tag_machinery(Expr::apply(inner_var, collection.clone()), func.span, gb);
-            let unrefined_inner = ctx.tag_machinery(
-                Expr::lambda("__gb_i", Type::Hole, inner_body),
+            Ok(lower_groupby(
+                collection,
+                key_fn,
+                &KeyDomain::fresh(),
                 func.span,
-                gb,
-            );
-            let target_ty = refined_data_fun(Type::Hole, bare_pred, Type::Hole);
-            let inner = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), func.span, gb);
-
-            // The key domain is presented by the shared hole, so the outer binder
-            // states the identity rather than guessing it; `Reify` is what turns the
-            // keyed function into the collection.
-            let outer_lambda = ctx.tag_machinery(
-                Expr::lambda("__gb_k", present_key_domain(key), inner),
+                ctx,
+            ))
+        }
+        // set(xs) is a re-keying constructor (`src/ccl/design/collections.md`,
+        // "Constructor lowering: runtime `groupby` now, constant-folding later"): group
+        // the elements by identity — so this site's key domain *is* the distinct
+        // elements — then collapse every group to the trivial `unit` codomain via the
+        // `Drain` aggregate. The result is `{K | __elem ▷ keydom#id} ⤇ unit`, which
+        // injects into `Set(K)`.
+        //
+        // The collapse *consumes* each group (`Drain`, an aggregate) rather than
+        // ignoring it, and it must — but not for the type checker's sake.
+        // Substituting a group-ignoring `λ g → unit` still type-checks (scope
+        // safety comes from the η-expanded `__iter_record` shape below, not from
+        // consuming the group); what breaks is **planning**, which gives a source
+        // its driving `iterate` through its consumer. With nothing consuming the
+        // group the underlying list literal reaches op-conversion with no iteration
+        // site. So the consuming collapse carries two loads, neither of them
+        // typing: it folds each key's group of duplicates to the one `unit` a
+        // `Set(K) = Map(K, unit)` holds, and it is what gets the collection
+        // materialized at all.
+        "set" => {
+            if args.len() != 1 {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    "set requires exactly one argument",
+                ));
+            }
+            let elements = lower_expr(&args[0], ctx)?;
+            // One shared key for the whole constructor: the group-by's key binder and
+            // this lambda's iteration binder are the *same* key domain, so they must be
+            // the same type.
+            let kd = KeyDomain::fresh();
+            // Identity key as a λ rather than `Builtin::Id`, whose `∀α. α ⇒ α` would
+            // make the annotation `key_fn_producing` puts on it vacuous (α unifies with
+            // the shared key and nothing else pins it). A monomorphic lambda's
+            // parameter takes the element type from the collection.
+            let sc = "lower.set";
+            let key_var = ctx.tag_machinery(Expr::var("__set_key"), func.span, sc);
+            let id_key = ctx.tag_machinery(
+                Expr::lambda("__set_key", Type::Hole, key_var),
                 func.span,
-                gb,
+                sc,
             );
-            let reify = ctx.tag_machinery(Expr::builtin(Builtin::Reify), func.span, gb);
-            Ok(ctx.tag_machinery(Expr::apply(outer_lambda, reify), func.span, gb))
+            let keyed = lower_groupby(elements, id_key, &kd, func.span, ctx);
+            // Mirror the comprehension shape `λ __iter_record → __iter_record ▷
+            // keyed ▷ (λ g → drain(g))` rather than a bare `keyed ≫ (λ g → …)`
+            // compose. This η-expansion is what keeps the term scope-safe:
+            // `groupby`'s codomain is the *dependent* group `{i | c(i) == k} ⤇ A`,
+            // whose type names the outer key binder, so a bare compose would leave
+            // the collapse lambda's parameter pinned to a type with `k` free (a §6.2
+            // scope leak). Applying `keyed` to a fresh binder discharges the key to
+            // that binder instead — the same shape every comprehension over a
+            // `groupby` already takes (`src/ccl/design/collections.md`, "Consuming a
+            // keyed collection: discharge, not point-free compose").
+            let group_var = ctx.tag_machinery(Expr::var("__set_g"), func.span, sc);
+            let drained = ctx.tag_machinery(
+                Expr::aggregate(group_var, AggregateKind::Drain),
+                func.span,
+                sc,
+            );
+            let drain_group =
+                ctx.tag_machinery(Expr::lambda("__set_g", Type::Hole, drained), func.span, sc);
+            let idx_var = ctx.tag_machinery(Expr::var("__iter_record"), func.span, sc);
+            let read = ctx.tag_machinery(Expr::apply(idx_var, keyed), func.span, sc);
+            let iter_record = ctx.tag_machinery(Expr::apply(read, drain_group), func.span, sc);
+            // Two stamps on the outer iteration lambda, both needed for the result
+            // to inject into a nominal `Set(K)`:
+            //
+            //   * **kind** — a `set` *is* a data collection, so it carries the same
+            //     `data_fun` provenance annotation `emit_node` reads as a concrete
+            //     kind stamp that a comprehension does. This lambda is built in the
+            //     comprehension shape but directly (not via `comprehension.rs`), so
+            //     the stamp has to be applied here; without it a bare lambda is a
+            //     `Compute` capability and `Compute ⊀ Data`.
+            //   * **key domain** — the iteration binder *is* the key (it is applied
+            //     to `keyed`, whose domain is the key domain), so it takes a
+            //     present-key refinement over the *same* [`SharedKey`]. Without it the
+            //     result domain arrives from an application, is still an inference
+            //     variable at constraint-emission time, and the keyed Σ witness cannot
+            //     discharge — see [`present_key_domain`].
+            Ok(ctx.tag_machinery(
+                Expr::lambda("__iter_record", kd.domain, iter_record)
+                    .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
+                func.span,
+                sc,
+            ))
         }
         "sum" | "max" => {
             if args.len() != 1 {
@@ -225,8 +275,89 @@ pub(super) fn lower_call(
     }
 }
 
+/// The **key domain of one re-keying site** — everything lowering must write into
+/// every position that ranges over those keys.
+///
+/// Minted **once** per creation site, and that is load-bearing in both components:
+///
+/// - `domain` carries a per-site [`Builtin::KeyDom`] token, so two sites' key domains
+///   are different *types*. Positions that genuinely range over the *same* keys must
+///   therefore share this value, not each mint their own — `set`'s iteration binder
+///   and the group-by key binder underneath it are the same key domain, and giving
+///   them separate tokens makes the application between them a type error (which is
+///   the identity property working, not a bug in it).
+/// - `key` is the [`Type::SharedHole`] naming the key *type*, which the key function's
+///   codomain annotation shares. That is what pins it (see [`key_fn_producing`]).
+#[derive(Clone)]
+struct KeyDomain {
+    domain: Type,
+    key: Type,
+}
+
+impl KeyDomain {
+    fn fresh() -> Self {
+        let key = Type::SharedHole(HoleId::fresh());
+        KeyDomain {
+            domain: present_key_domain(key.clone()),
+            key,
+        }
+    }
+}
+
+/// Lower a group-by of `collection` by `key_fn` to the keyed-collection encoding
+///
+/// ```text
+/// reify( λ (k : {key | __elem ▷ keydom#id}) →
+///          cast(λ i → collection(i), {I | key_fn(collection(__elem)) == k} ⇒ A) )
+/// ```
+///
+/// `kd` is the caller's [`KeyDomain`]: its `domain` becomes the key binder's type and its
+/// `key` is written onto `key_fn`'s codomain, which together pin the key type. A caller
+/// that builds further positions over the same keys (`set`'s iteration binder) passes
+/// the *same* [`KeyDomain`] and reuses `kd.domain`.
+///
+/// See the `"groupby"` arm of [`lower_call`] for the two-layer rationale and
+/// `src/ccl/design/collections.md`, "Lowering realization: `reify` over a
+/// present-key refinement". Shared by the surface `groupby(c, key)` call and the
+/// `set`/`map` re-keying constructors, whose value construction is a group-by on
+/// the key projection followed by a codomain map.
+fn lower_groupby(
+    collection: Expr,
+    key_fn: Expr,
+    kd: &KeyDomain,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    // `bare_pred` (and the `collection` clone inside it) lives in the cast target's
+    // refinement predicate — a type slot outside the `walk_children` domain — so its
+    // nodes are deliberately untagged. Everything on the main tree below is recorded:
+    // an unrecorded lowering mint is a `Leak::Unexplained` at the boundary.
+    //
+    // Inner group: cast(λ i → c(i), {I | key(c(__elem)) == k} ⇒ A).
+    let bare_pred = Expr::binop(
+        Expr::apply(
+            Expr::apply(Expr::var(Name::elem()), collection.clone()),
+            key_fn_producing(key_fn, kd.key.clone()),
+        ),
+        BinOpKind::Compare(CompareKind::Equals),
+        Expr::var("__gb_k"),
+    );
+    let gb = "lower.groupby";
+    let inner_var = ctx.tag_machinery(Expr::var("__gb_i"), span, gb);
+    let inner_body = ctx.tag_machinery(Expr::apply(inner_var, collection.clone()), span, gb);
+    let unrefined_inner =
+        ctx.tag_machinery(Expr::lambda("__gb_i", Type::Hole, inner_body), span, gb);
+    let target_ty = refined_data_fun(Type::Hole, bare_pred, Type::Hole);
+    let inner = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), span, gb);
+
+    let outer_lambda =
+        ctx.tag_machinery(Expr::lambda("__gb_k", kd.domain.clone(), inner), span, gb);
+    let reify = ctx.tag_machinery(Expr::builtin(Builtin::Reify), span, gb);
+    ctx.tag_machinery(Expr::apply(outer_lambda, reify), span, gb)
+}
+
 /// The **present-key domain** of a re-keying: `{key | __elem ▷ keydom#id}`, where
-/// `key` is the caller's shared hole for the key type and `keydom#id` is a fresh
+/// `key` is the caller's [`SharedKey`] and `keydom#id` is a fresh
 /// [`Builtin::KeyDom`] token naming *this* creation site's key domain.
 ///
 /// The token is opaque — it says "the keys of this collection" without saying which
@@ -242,8 +373,9 @@ pub(super) fn lower_call(
 /// ([`keyed_domain_key`](crate::ccl::infer::solver)) runs at constraint-emission
 /// time, so a producer whose key domain only became concrete at coalesce could not
 /// discharge the keyed Σ witness. Every re-keying producer therefore stamps its own
-/// key binder with this (see `src/ccl/design/collections.md`, "Keyed entry needs
-/// the key domain written down at lowering").
+/// key binder with this — `groupby`'s `__gb_k` and `set`'s iteration binder alike (see
+/// `src/ccl/design/collections.md`, "Keyed entry needs the key domain written
+/// down at lowering").
 fn present_key_domain(key: Type) -> Type {
     // The token's own type names the key: `keydom#id : 𝐾 ⇒ Bool`, the characteristic
     // function of the domain. Sharing the caller's hole is what resolves it — an

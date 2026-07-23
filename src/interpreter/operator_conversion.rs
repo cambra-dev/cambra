@@ -1936,6 +1936,7 @@ fn builtin_to_aggregate(b: Builtin) -> Option<AggregateKind> {
     Some(match b {
         Builtin::Sum => AggregateKind::Sum,
         Builtin::Max => AggregateKind::Max,
+        Builtin::Drain => AggregateKind::Drain,
         _ => return None,
     })
 }

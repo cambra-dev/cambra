@@ -42,6 +42,10 @@ pub struct OperatorSchemes {
     /// to the input collection (function), folding its codomain γ to a
     /// result of the same type.
     aggregate_max: PolyScheme,
+    /// `∀α γ. (α → γ) → unit` — the terminal aggregate ([`AggregateKind::Drain`]):
+    /// consume a collection of any element type and yield `unit`. Used by the
+    /// `set` constructor's group collapse.
+    aggregate_drain: PolyScheme,
     /// `∀α β. ((α → β), β) → β` — extract the last value from a
     /// function-typed stream, falling back to the default scalar when the
     /// stream's domain is empty. Polymorphic in both the stream domain
@@ -144,6 +148,18 @@ impl OperatorSchemes {
             fun(Type::data_fun(alpha, gamma.clone()), gamma),
         );
 
+        // Drain: ∀α γ. (α ⤇ γ) → unit. Consumes a collection of any element
+        // type and yields the trivial `unit` — the terminal aggregate. `set`
+        // uses it to collapse each key's (duplicate-bearing) group to the single
+        // `unit` payload of `Set(K)`; consuming the group is also what abstracts its
+        // key-dependence, since that is where the sum is consumed.
+        let alpha = fresh_var(BODY_LEVEL);
+        let gamma = fresh_var(BODY_LEVEL);
+        let aggregate_drain = PolyScheme::poly(
+            SCHEME_LEVEL,
+            fun(Type::data_fun(alpha, gamma), prim(BaseType::Unit)),
+        );
+
         // FinalOrDefault: ∀α β. ((α ⤇ β), β) → β. The first field is a
         // collection stream. Inline-built (not via `normalize_annotation`) so
         // the codomain of the stream and the default share one variable `β`.
@@ -201,6 +217,7 @@ impl OperatorSchemes {
             not_op,
             aggregate_sum,
             aggregate_max,
+            aggregate_drain,
             final_or_default,
             get_prev_seq,
             get_prev_txn,
@@ -227,6 +244,7 @@ impl OperatorSchemes {
         match kind {
             AggregateKind::Sum => &self.aggregate_sum,
             AggregateKind::Max => &self.aggregate_max,
+            AggregateKind::Drain => &self.aggregate_drain,
         }
     }
 

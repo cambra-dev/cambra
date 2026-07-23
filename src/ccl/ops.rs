@@ -355,6 +355,10 @@ pub enum Builtin {
     Sum,
     /// `max`.
     Max,
+    /// `drain` — the terminal aggregate: consume a collection of any element
+    /// type and yield `unit` (see [`AggregateKind::Drain`]). Produced only by
+    /// the `set` constructor's group collapse.
+    Drain,
     /// `final_or_default : Tuple(Fun(D, T), T) → T` — extract the
     /// codomain value at the final position of an iteration stream, or
     /// fall back to the default scalar when the stream's domain is
@@ -569,6 +573,7 @@ impl Builtin {
             Self::FilterValues => "filter_values",
             Self::Sum => "sum",
             Self::Max => "max",
+            Self::Drain => "drain",
             Self::FinalOrDefault => "final_or_default",
             Self::GetPrevSeq => "get_prev_seq",
             Self::GetPrevTxn => "get_prev_txn",
@@ -595,6 +600,7 @@ impl Builtin {
         match kind {
             AggregateKind::Sum => Self::Sum,
             AggregateKind::Max => Self::Max,
+            AggregateKind::Drain => Self::Drain,
         }
     }
 
@@ -634,6 +640,7 @@ impl Builtin {
             self,
             Self::Sum
                 | Self::Max
+                | Self::Drain
                 | Self::Converse
                 | Self::MapDomain
                 | Self::Uncurry

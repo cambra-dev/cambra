@@ -181,8 +181,8 @@ column names the branch that *will* land it.
 | the keyed **discharge** — keyed term / consumption / width, as kind containment | Implemented | `groupby-keyed-collection` |
 | [`Builtin::Reify`]; `groupby` infers the keyed `Map` type; kind-based inlining | Implemented | `groupby-keyed-collection` |
 | the *concrete* keyed domain `{𝐾 \| __elem ▷ keydom#id}` and its [`Builtin::KeyDom`] token; per-site key-domain identity | Implemented | `groupby-keyed-collection` |
-| keyed entry into a nominal `Map`/`Set` (`groupby → Map`, `set(…) → Set`) | Implemented / Planned | `groupby-keyed-collection` / `map-set-constructors` |
-| `set(…)` values (group-by + [`AggregateKind::Drain`]) | Planned | `map-set-constructors` |
+| keyed entry into a nominal `Map`/`Set` (`groupby → Map`, `set(…) → Set`) | Implemented | `groupby-keyed-collection` / `map-set-constructors` |
+| `set(…)` values (group-by + [`AggregateKind::Drain`]) | Implemented | `map-set-constructors` |
 | the general deferred keyed gate (a producer whose key domain is only concrete after coalesce) | Planned | — |
 | direct group-by key application `g(k)` | **Regressed** — 9 `#[ignore]`d tests; restored by roadmap step 2 | — |
 | how a collection *kind* (`Set` vs `Map`) is represented — decided as **provenance**, like `FunKind` | Planned | — |
