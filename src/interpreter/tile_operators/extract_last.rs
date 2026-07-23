@@ -9,8 +9,9 @@ use crate::{
 // ExtractLast / ExtractLastProducer
 // ---------------------------------------------------------------------------
 
-/// Extracts the last value from a [`Recurse`] (or any `SealedFunction`) output,
-/// converting the accumulated `SealedFunction` tiling back to a `Scalar`.
+/// Extracts the last value from a changelog store's dense read (or any
+/// `SealedFunction`) output, converting the accumulated `SealedFunction` tiling
+/// back to a `Scalar` — the scalar-final read of a mutation loop's accumulator.
 ///
 /// When the source becomes terminal but emits no values (the empty-source
 /// case, e.g. `for i in []: x += 1`), the `default` operator's scalar value
@@ -149,6 +150,34 @@ impl TileProducer for ExtractLastProducer {
             // (always `Scalar`), so its extent gives us the value-space
             // directly without going through `Tiling::codomain` (which
             // would return `None` for a `Scalar`).
+            //
+            // Incremental release: we only ever need the *last* (highest-domain)
+            // value, so every position below the highest one seen so far is dead —
+            // release it. This is a promise never to re-request those positions;
+            // the source decides what upstream storage that frees (for a changelog
+            // dense read, the store prefix below the tail's carry source). Without
+            // it, a never-terminating loop would pin the whole changelog until a
+            // terminal that never comes.
+            if let Tile::SealedFunction {
+                domain, deleted, ..
+            } = &source_tile
+            {
+                let max_pos = (0..domain.len())
+                    .filter(|i| !deleted.contains(*i))
+                    .filter_map(|i| match domain.index_at(i) {
+                        Value::UInt(p) => Some(p),
+                        _ => None,
+                    })
+                    .max();
+                if let Some(max_pos) = max_pos
+                    && max_pos >= 1
+                {
+                    self.source
+                        .release(TileGuard::Function(FunctionGuard::Domain(
+                            Predicate::LessThanEq(Value::UInt(max_pos - 1)),
+                        )));
+                }
+            }
             return empty;
         }
         // Source is terminal — we've seen the final tile, so we'll
@@ -197,5 +226,98 @@ impl TileProducer for ExtractLastProducer {
             self.default
                 .release(self.default.tiling().universal_guard());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::interpreter::tile_operators::{FunctionGuard, Predicate};
+    use crate::interpreter::{BaseType, Extent};
+
+    /// A non-terminal `SealedFunction` source with domain `[0, 1, 2]`, recording
+    /// every domain-release watermark it receives. Never becomes terminal, so it
+    /// exercises `ExtractLast`'s incremental (pre-terminal) release path.
+    struct PartialSource {
+        tiling: Tiling,
+        releases: Rc<RefCell<Vec<usize>>>,
+    }
+
+    struct PartialSourceProducer {
+        base: ProducerBase,
+        releases: Rc<RefCell<Vec<usize>>>,
+    }
+
+    impl TileOperator for PartialSource {
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            _consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            Box::new(PartialSourceProducer {
+                base: ProducerBase::new(PartialSourceProducer::alloc_id(), &self.tiling),
+                releases: self.releases.clone(),
+            })
+        }
+    }
+
+    impl TileProducer for PartialSourceProducer {
+        impl_producer_base!();
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            Tile::SealedFunction {
+                domain: ColumnValue::from_uints(vec![0, 1, 2]),
+                codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
+                domain_predicate: Predicate::False, // never terminal
+                deleted: bit_set::BitSet::new(),
+            }
+        }
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            if let TileGuard::Function(FunctionGuard::Domain(Predicate::LessThanEq(Value::UInt(
+                w,
+            )))) = &obsolete_guard
+            {
+                self.releases.borrow_mut().push(*w);
+            }
+        }
+    }
+
+    /// On a non-terminal pull, `ExtractLast` needs only the highest-domain value,
+    /// so it releases everything below it — `[0, max)`. Over a source with domain
+    /// `[0, 1, 2]`, it forwards a release `≤ 1`, freeing the prefix that a
+    /// never-terminating scalar-final loop would otherwise pin.
+    #[test]
+    fn extract_last_releases_below_the_running_max() {
+        let value_tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let releases = Rc::new(RefCell::new(Vec::<usize>::new()));
+        let source = PartialSource {
+            tiling: Tiling::SealedFunction {
+                domain: Extent::Base(BaseType::UInt),
+                codomain: Box::new(value_tiling.clone()),
+            },
+            releases: releases.clone(),
+        };
+        let default = Constant::new(Value::Int(0), Extent::Base(BaseType::Int));
+        let mut op = ExtractLast::new(Box::new(source), Box::new(default));
+        let guard = op.tiling().universal_guard();
+        let mut producer = op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+
+        // Non-terminal source → ExtractLast emits empty but releases `[0, max)`.
+        let tile = producer.get(producer.tiling().universal_guard());
+        assert!(
+            !tile.is_terminal(),
+            "a non-terminal source stays non-terminal"
+        );
+        assert_eq!(
+            releases.borrow().last().copied(),
+            Some(1),
+            "ExtractLast must release below the running max (positions 0, 1), keeping position 2"
+        );
     }
 }

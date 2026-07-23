@@ -14,9 +14,9 @@ use crate::{
 /// none of the cyclic-mode overhead.
 ///
 /// A fan-out is "cyclic" iff one of its branches feeds (transitively)
-/// back into its own input.  In practice this is only the mutation-loop
-/// body fan-out: one branch is wired into `Recurse::recursive_input` and
-/// the body's `acc_var` reads close the cycle.  In that setup,
+/// back into its own input.  In practice this is the commit store's
+/// recurrence: one branch feeds back into the store's own input and the
+/// body's prior-value reads (`get_prev_txn`) close the cycle.  In that setup,
 /// subscribing or pulling one branch can synchronously trigger the same
 /// operation on a sibling branch — the re-entrancy state below catches
 /// that and serves from the cache instead of recursively re-entering the
@@ -124,8 +124,8 @@ impl FanOut {
     /// Construct a new `FanOut` wrapping `input`.  Use this for ordinary
     /// (non-cyclic) op graphs; the resulting fan-out doesn't pay any
     /// cyclic-mode overhead.  If a branch of this fan-out ends up
-    /// feeding back into its own input (e.g. via `Recurse::recursive_input`),
-    /// use [`FanOut::new_cyclic`] instead.
+    /// feeding back into its own input (e.g. a store recurrence closing
+    /// through the fan-out), use [`FanOut::new_cyclic`] instead.
     pub fn new(input: Box<dyn TileOperator>) -> Self {
         Self::new_with_reentrancy(input, None)
     }
