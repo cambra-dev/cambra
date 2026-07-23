@@ -23,8 +23,5 @@ use super::common::expect_compile_error;
 
 #[test]
 fn nonneg_inventory_currently_blocked_at_parsing() {
-    expect_compile_error(
-        include_str!("program.cambra"),
-        "found '>', expected expression",
-    );
+    expect_compile_error(include_str!("program.cambra"), "found '->'");
 }

@@ -152,7 +152,7 @@ pub enum Type {
     /// type is an *ambiguous-type* error, reported by `collect_type_errors`
     /// as `UnresolvedInfer`. `Infer` survivals are permitted only inside
     /// sub-expressions whose output type is not exercised (e.g. a top-level
-    /// `f = lambda x: x` that is never applied).
+    /// `f = \x -> x` that is never applied).
     ///
     /// Carries the mutable [`InferVar`] (id + level + bounds) that the
     /// solver constrains in place. A *coalesced* `Infer` (one

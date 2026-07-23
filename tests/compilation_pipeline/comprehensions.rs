@@ -111,7 +111,7 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_udf_used_inside_filter_predicate() {
-    let code = "f = lambda x: x > 1\n[x for x in [1, 2, 3] if f(x)]";
+    let code = "f = \\x -> x > 1\n[x for x in [1, 2, 3] if f(x)]";
     check_tile(
         code,
         Tile::SealedFunction {
@@ -130,7 +130,7 @@ fn test_udf_used_inside_filter_predicate() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_udf_containing_filter() {
-    let code = "f = lambda xs: [x for x in xs if x > 1]\nf([1, 2, 3])";
+    let code = "f = \\xs -> [x for x in xs if x > 1]\nf([1, 2, 3])";
     check_tile(
         code,
         Tile::SealedFunction {

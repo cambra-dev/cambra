@@ -9,7 +9,7 @@
 //!
 //! - **Scalar UDFs**: `Fun(non_iterable_domain, codomain)`.  These have a
 //!   non-iterable (non-enumerable) domain.  Syntactic multi-arg Python lambdas
-//!   (`lambda x, y: …`) are uncurried at lowering to `Tuple([…]) → T`, so they
+//!   (`\x, y -> …`) are uncurried at lowering to `Tuple([…]) → T`, so they
 //!   match this rule too.
 //!
 //! - **List-producing UDFs**: `Fun(Fun(iterable_domain, _), _)`.  Functions

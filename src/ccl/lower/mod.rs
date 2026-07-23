@@ -22,7 +22,7 @@
 //! | Assignment + expression blocks | nested [`TypedExprNode::Let`] |
 //! | Augmented assignment `x op= e` | desugared to [`TypedExprNode::Let`] via [`TypedExprNode::BinOp`] |
 //! | `sum(expr)` / `max(expr)` calls | [`TypedExprNode::Aggregate`] |
-//! | Lambda expressions `lambda x: body`, `lambda x, y: body` | single [`TypedExprNode::Lambda`] (tupled param when multi-arg) |
+//! | Lambda expressions `\x -> body`, `\x, y -> body` | single [`TypedExprNode::Lambda`] (tupled param when multi-arg) |
 //! | `groupby(collection, key)` calls | `Lambda`/`Apply` encoding with a refinement predicate |
 //! | Unary negation (`-x`) | [`TypedExprNode::UnaryOp`] with [`crate::ccl::UnaryOpKind::Neg`] |
 //! | Boolean negation (`not x`) | [`TypedExprNode::UnaryOp`] with [`crate::ccl::UnaryOpKind::Not`] |

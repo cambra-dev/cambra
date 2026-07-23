@@ -704,23 +704,22 @@ where
 
         // ---- Lambda / Yield (top-level expression forms) ------------
         //
-        // Lambda params do NOT allow `:` type annotations (the `:` is
-        // already taken to terminate the param list before the body), so
-        // we use a bare-ident-only param parser here. Function-def params
-        // (which use `(...)` to delimit) get the annotated form down in
-        // `statement()`.
+        // A lambda is `\params -> body`: `\` introduces the binders, `->`
+        // separates them from the body. Params are bare identifiers here;
+        // the `->` terminator (rather than `:`) leaves `:` free for a future
+        // per-param annotation (`\x: T -> body`), not yet parsed.
         let lambda_param = ident_only.map(|(name, name_span)| Param {
             name,
             name_span,
             annotation: None,
         });
-        let lambda = just(Token::Lambda)
+        let lambda = just(Token::Backslash)
             .ignore_then(
                 lambda_param
                     .separated_by(just(Token::Comma))
                     .collect::<Vec<_>>(),
             )
-            .then_ignore(just(Token::Colon))
+            .then_ignore(just(Token::Arrow))
             .then(expr.clone())
             .map_with(|(params, body), e| {
                 Spanned::new(
@@ -1275,7 +1274,9 @@ mod tests {
 
     #[test]
     fn lambda_and_ternary() {
-        let e = parse_e("lambda x: x + 1 if x > 0 else 0").node;
+        // The `->` body extends through the ternary, so the whole
+        // `x + 1 if x > 0 else 0` is the lambda body.
+        let e = parse_e("\\x -> x + 1 if x > 0 else 0").node;
         match e {
             Expr::Lambda { params, body } => {
                 assert_eq!(params.len(), 1);
@@ -1283,6 +1284,18 @@ mod tests {
             }
             other => panic!("expected Lambda, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lambda_multi_and_zero_param() {
+        assert!(matches!(
+            parse_e("\\x, y -> x + y").node,
+            Expr::Lambda { params, .. } if params.len() == 2
+        ));
+        assert!(matches!(
+            parse_e("\\ -> 1").node,
+            Expr::Lambda { params, .. } if params.is_empty()
+        ));
     }
 
     #[test]

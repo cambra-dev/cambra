@@ -36,7 +36,7 @@ fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_function_def_polymorphic_used_at_two_types() {
-    let code = "f = lambda x: x == x\nf(1) and f(\"foo\")";
+    let code = "f = \\x -> x == x\nf(1) and f(\"foo\")";
     check_scalar(code, Value::Bool(true));
 }
 
@@ -168,7 +168,7 @@ fn test_generator_polymorphic_over_element_type() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_calls_poly_at_two_types() {
-    let code = "f = lambda x: x == x\ng = lambda y: f(y)\ng(1) and g(\"foo\")";
+    let code = "f = \\x -> x == x\ng = \\y -> f(y)\ng(1) and g(\"foo\")";
     check_scalar(code, Value::Bool(true));
 }
 
@@ -179,7 +179,7 @@ fn test_poly_calls_poly_at_two_types() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_calls_poly_list_body() {
-    let code = "f = lambda x: [x, x]\ng = lambda y: f(y)\nsum(g(5))";
+    let code = "f = \\x -> [x, x]\ng = \\y -> f(y)\nsum(g(5))";
     check_scalar(code, Value::Int(10));
 }
 
@@ -188,7 +188,7 @@ fn test_poly_calls_poly_list_body() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_collection_udf_through_poly_wrapper() {
-    let code = "f = lambda xs: [x for x in xs]\ng = lambda ys: f(ys)\ng([1, 2, 3])";
+    let code = "f = \\xs -> [x for x in xs]\ng = \\ys -> f(ys)\ng([1, 2, 3])";
     check_tile(code, make_int_list(&[1, 2, 3]));
 }
 
@@ -197,7 +197,7 @@ fn test_collection_udf_through_poly_wrapper() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_collection_udf_through_poly_wrapper_two_element_types() {
-    let code = "f = lambda xs: [1 for x in xs]\ng = lambda ys: f(ys)\nsum(g([1, 2, 3])) + sum(g([\"a\", \"b\"]))";
+    let code = "f = \\xs -> [1 for x in xs]\ng = \\ys -> f(ys)\nsum(g([1, 2, 3])) + sum(g([\"a\", \"b\"]))";
     check_scalar(code, Value::Int(5));
 }
 
@@ -216,7 +216,7 @@ fn test_collection_udf_through_poly_wrapper_two_element_types() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_generator_def_through_poly_wrapper_two_element_types() {
-    let code = "def ones(xs):\n    for x in xs:\n        yield 1\nwrap = lambda ys: ones(ys)\nsum(wrap([1, 2, 3])) + sum(wrap([\"a\", \"b\"]))";
+    let code = "def ones(xs):\n    for x in xs:\n        yield 1\nwrap = \\ys -> ones(ys)\nsum(wrap([1, 2, 3])) + sum(wrap([\"a\", \"b\"]))";
     check_scalar(code, Value::Int(5));
 }
 
@@ -224,7 +224,8 @@ fn test_generator_def_through_poly_wrapper_two_element_types() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_triple_poly_chain_collection() {
-    let code = "f = lambda xs: [x for x in xs]\ng = lambda ys: f(ys)\nh = lambda zs: g(zs)\nsum(h([1, 2, 3]))";
+    let code =
+        "f = \\xs -> [x for x in xs]\ng = \\ys -> f(ys)\nh = \\zs -> g(zs)\nsum(h([1, 2, 3]))";
     check_scalar(code, Value::Int(6));
 }
 
@@ -232,7 +233,7 @@ fn test_triple_poly_chain_collection() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_triple_poly_chain_at_two_types() {
-    let code = "f = lambda x: x == x\ng = lambda y: f(y)\nh = lambda z: g(z)\nh(1) and h(\"foo\")";
+    let code = "f = \\x -> x == x\ng = \\y -> f(y)\nh = \\z -> g(z)\nh(1) and h(\"foo\")";
     check_scalar(code, Value::Bool(true));
 }
 
@@ -242,7 +243,7 @@ fn test_triple_poly_chain_at_two_types() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_diamond() {
-    let code = "f = lambda x: x == x\ng = lambda y: f(y)\nh = lambda z: f(z)\ng(1) and h(\"foo\")";
+    let code = "f = \\x -> x == x\ng = \\y -> f(y)\nh = \\z -> f(z)\ng(1) and h(\"foo\")";
     check_scalar(code, Value::Bool(true));
 }
 
@@ -251,7 +252,7 @@ fn test_poly_diamond() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_used_directly_and_through_wrapper() {
-    let code = "f = lambda x: x == x\ng = lambda y: f(y)\nf(1) and g(\"foo\")";
+    let code = "f = \\x -> x == x\ng = \\y -> f(y)\nf(1) and g(\"foo\")";
     check_scalar(code, Value::Bool(true));
 }
 
@@ -261,7 +262,7 @@ fn test_poly_used_directly_and_through_wrapper() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_fanout_inside_wrapper() {
-    let code = "f = lambda x: x == x\ng = lambda y: f(y) and f(\"z\")\ng(1) and g(\"foo\")";
+    let code = "f = \\x -> x == x\ng = \\y -> f(y) and f(\"z\")\ng(1) and g(\"foo\")";
     check_scalar(code, Value::Bool(true));
 }
 
@@ -272,7 +273,7 @@ fn test_poly_fanout_inside_wrapper() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_filter_udf_through_poly_wrapper() {
-    let code = "f = lambda xs: [x for x in xs if x > 1]\ng = lambda ys: f(ys)\ng([1, 2, 3])";
+    let code = "f = \\xs -> [x for x in xs if x > 1]\ng = \\ys -> f(ys)\ng([1, 2, 3])";
     check_tile(
         code,
         Tile::SealedFunction {
@@ -291,7 +292,7 @@ fn test_filter_udf_through_poly_wrapper() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_predicate_udf_used_inside_poly_wrapper_filter() {
-    let code = "p = lambda x: x > 1\ng = lambda ys: [y for y in ys if p(y)]\ng([1, 2, 3])";
+    let code = "p = \\x -> x > 1\ng = \\ys -> [y for y in ys if p(y)]\ng([1, 2, 3])";
     check_tile(
         code,
         Tile::SealedFunction {
@@ -308,7 +309,7 @@ fn test_predicate_udf_used_inside_poly_wrapper_filter() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn test_poly_chain_with_extra_param() {
-    let code = "f = lambda xs: [x for x in xs]\ng = lambda ys, n: sum(f(ys)) + n\ng([1, 2], 10)";
+    let code = "f = \\xs -> [x for x in xs]\ng = \\ys, n -> sum(f(ys)) + n\ng([1, 2], 10)";
     check_scalar(code, Value::Int(13));
 }
 
@@ -320,7 +321,7 @@ fn test_poly_chain_with_extra_param() {
 fn test_unexercised_generic_definition_is_an_error_not_a_panic() {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let result = compile_program(&mut ctx, "f = lambda x: [x, x]\nf", consumer);
+    let result = compile_program(&mut ctx, "f = \\x -> [x, x]\nf", consumer);
     assert!(
         result.is_err(),
         "ambiguous (never-exercised) generic must fail with a diagnostic"

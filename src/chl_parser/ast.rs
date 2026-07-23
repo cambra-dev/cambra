@@ -378,7 +378,7 @@ pub enum Expr {
         attr_span: Span,
     },
 
-    /// Lambda: `lambda params: body`.
+    /// Lambda: `\params -> body`.
     Lambda {
         params: Vec<Param>,
         body: Box<Spanned<Expr>>,

@@ -89,7 +89,7 @@ pub(super) fn validate_function_params(
 /// Substitution sidesteps that whole rewrite chain.
 ///
 /// Shared between [`lower_lambda`] and [`lower_function_body`] so that both
-/// `lambda x, y: …` and `def f(x, y): …` pair with [`lower_call`]'s
+/// `\x, y -> …` and `def f(x, y): …` pair with [`lower_call`]'s
 /// tupled-argument shape and never emit a curried `Expr::Lambda` chain that
 /// `lambda_elim` would fold into an unsupported `curry(body)` — the one
 /// exception being a pass-by-reference `Mut` parameter, which stays a *named*
@@ -192,7 +192,7 @@ pub(super) fn uncurry_params(
 /// [`uncurry_params`].
 ///
 /// Users who want genuine currying still write it explicitly
-/// (`lambda x: lambda y: ...` or an explicit `curry(f)` call); those nest
+/// (`\x -> \y -> ...` or an explicit `curry(f)` call); those nest
 /// through the general Lambda rule and remain unsupported past operator
 /// conversion — tracked as follow-up work.
 ///
@@ -226,7 +226,7 @@ pub(super) fn lower_lambda(
 /// engine's in-place mode ([`crate::ccl::subst::Subst::rewrite_expr`]), which
 /// traverses type slots too: a comprehension filter that references an
 /// enclosing multi-arg lambda's parameter — e.g.
-/// `lambda lo, hi: sum([x for x in data if x >= lo])` — lowers the filter
+/// `\lo, hi -> sum([x for x in data if x >= lo])` — lowers the filter
 /// into the comprehension's `Cast::target` predicate with `lo` free in it,
 /// and the engine rewrites it there along with the term spine.
 ///

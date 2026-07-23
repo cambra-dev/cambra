@@ -469,13 +469,13 @@ fn test_collection_union_heterogeneous_rejected() {
 
 #[test]
 fn test_groupby_aggregate() {
-    // groups = groupby([1, 2, 3], lambda x: x)
+    // groups = groupby([1, 2, 3], \x -> x)
     // g = groups(1)
     // sum(g)
     // Expected: Int (sum of a group of integers)
     let ty = infer_program(
         r#"
-groups = groupby([1, 2, 3], lambda x: x)
+groups = groupby([1, 2, 3], \x -> x)
 g = groups(1)
 sum(g)
 "#
@@ -497,7 +497,7 @@ fn test_groupby_dependent_application_discharges_key() {
     // longer reference the group-by key binder `__gb_k`.
     let ty = infer_program(
         r#"
-groups = groupby([1, 2, 3], lambda x: x)
+groups = groupby([1, 2, 3], \x -> x)
 groups(0)
 "#
         .trim(),
@@ -536,8 +536,8 @@ groups(0)
 fn test_higher_order_dependent_application_discharges_key() {
     let ty = infer_program(
         r#"
-groups = groupby([1, 2, 3], lambda x: x)
-apply0 = lambda g: g(0)
+groups = groupby([1, 2, 3], \x -> x)
+apply0 = \g -> g(0)
 apply0(groups)
 "#
         .trim(),
@@ -639,13 +639,13 @@ else:
 
 #[test]
 fn test_self_application_types() {
-    // `lambda x: x(x)` is the MLsub poster child `(α ∧ (α ⇒ β)) ⇒ β`. With
+    // `\x -> x(x)` is the MLsub poster child `(α ∧ (α ⇒ β)) ⇒ β`. With
     // both Apply edges one-way there is no var⇄var cycle, so it types
     // cleanly: the unconstrained `α` leg drops and the lambda infers as
     // `(?a ⇒ ?b) ⇒ ?c`, carrying unresolved `Infer` vars like any other
     // unapplied lambda. *Misusing* a self-applicator still errors — see
     // `self_application_rejected_without_panic` in `infer/solve.rs`.
-    let ty = infer_program("lambda x: x(x)");
+    let ty = infer_program("\\x -> x(x)");
     assert!(
         matches!(&ty, Type::Fun { domain: d, .. } if matches!(&**d, Type::Fun { .. })),
         "expected a function-domained function type, got {ty:?}"
@@ -655,14 +655,14 @@ fn test_self_application_types() {
 #[rstest]
 #[case::comparison(
     r"
-f = lambda x: x > 1
+f = \x -> x > 1
 f
 ",
     Type::Fun { name: None, domain: Box::new(int()), codomain: Box::new(bool_ty()) }
 )]
 #[case::arithmetic(
     r"
-f = lambda x: x + 1
+f = \x -> x + 1
 f
 ",
     Type::Fun { name: None, domain: Box::new(int()), codomain: Box::new(int()) }
@@ -673,9 +673,9 @@ fn test_lambda_unapplied(#[case] code: &str, #[case] expected: Type) {
 
 #[test]
 fn test_generic_identity() {
-    // f = lambda x: x; f -> Fun(?a, ?b)
+    // f = \x -> x; f -> Fun(?a, ?b)
     // inference allows unconstrained parameters to remain unresolved.
-    let ty = infer_program("f = lambda x: x\nf");
+    let ty = infer_program("f = \\x -> x\nf");
     if let Type::Fun {
         domain: dom,
         codomain: cod,
@@ -707,7 +707,7 @@ fn test_tuple_index_heterogeneous() {
 fn test_unconstrained_identity_applied_resolves() {
     // bind via Let so `f(5)` is a named call (lowering doesn't yet
     // support a lambda-literal in call position).
-    let ty = infer_program("f = lambda x: x\nf(5)");
+    let ty = infer_program("f = \\x -> x\nf(5)");
     assert_eq!(ty, int());
 }
 

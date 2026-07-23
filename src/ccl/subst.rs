@@ -378,7 +378,7 @@ impl Subst {
             // to a non-variable term has no Feed/Define shape to land in, so
             // the stale handle is kept for desugar's own
             // `UnboundDeferHandle` boundary to report (feeding a lambda
-            // parameter is user-reachable: `lambda d, v: d << v`).
+            // parameter is user-reachable: `\d, v -> d << v`).
             Feed { name, value } => {
                 let (name, value) = self.apply_handle_use(name, value);
                 Feed { name, value }

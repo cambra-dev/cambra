@@ -2,7 +2,7 @@
 //! the canonical "group by + per-group aggregate" shape.
 //!
 //! **Currently blocked.**  The natural form
-//! `[sum([s.amount for s in g]) for g in groupby(sales, lambda r: r.region)]`
+//! `[sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]`
 //! — i.e. groupby over records with a projecting inner comprehension —
 //! panics during operator conversion because the `curry` combinator isn't
 //! yet supported there.  Tracks completing `curry` combinator support in

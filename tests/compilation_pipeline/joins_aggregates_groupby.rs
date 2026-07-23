@@ -132,7 +132,7 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    "[sum(x) for x in groupby([2,3,4,5], lambda x: x // 2)]",
+    "[sum(x) for x in groupby([2,3,4,5], \\x -> x // 2)]",
     Tile::SealedFunction {
         domain: ColumnValue::Ints(vec![1, 2]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 9]))),
@@ -141,7 +141,7 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
     }
 )]
 #[case(
-    "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], lambda x: x // 2)]",
+    "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], \\x -> x // 2)]",
     Tile::SealedFunction {
         domain: ColumnValue::Ints(vec![6, 7]),
         codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![25, 29]))),
@@ -326,7 +326,7 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 )]
 #[case("sum([1,2,3])", "(iterate ≫ [1, 2, 3]) ▷ sum:Int", Tile::Scalar(ColumnValue::Ints(vec![6])))]
 #[case(
-    "[sum(x) for x in groupby([1,2,3,4], lambda y: y // 2)]",
+    "[sum(x) for x in groupby([1,2,3,4], \\y -> y // 2)]",
     "(iterate ≫ [1, 2, 3, 4] ≫ (id, 2 ▷ const) ▷ zip ≫ floor_div) ▷ converse ≫ [1, 2, 3, 4] ▷ map ≫ sum:(Int ⇒ Int)",
     Tile::SealedFunction {
         domain: ColumnValue::Ints(vec![0, 1, 2]),

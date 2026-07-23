@@ -9,15 +9,15 @@
 //! This isolates the storefront's revenue view: without the `restrict`, the
 //! aggregate is only defined when the feed closes — for a server, never.
 //!
-//! **Currently blocked at lexing.**  The `\` lambda in the restrict
-//! predicate isn't a lexable token yet (same first blocker as `txn_kv`).
-//! Behind it: the `Feed(...)` annotation, feed elements carrying
-//! transaction time, `restrict`/`sum` over a feed, and structured requests.
-//! This pins the lambda lex failure.
+//! **Currently blocked at parsing.**  The `\` lambda now lexes; the next
+//! unsupported construct is the `Feed(...)` annotation-only forward
+//! declaration (an annotation with no initialiser).  Behind it: feed elements
+//! carrying transaction time, `restrict`/`sum` over a feed, and structured
+//! requests.  This pins the `Feed(...)` forward-declaration parse failure.
 
 use super::common::expect_compile_error;
 
 #[test]
-fn ledger_balance_currently_blocked_at_lexing() {
-    expect_compile_error(include_str!("program.cambra"), "invalid token");
+fn ledger_balance_currently_blocked_at_parsing() {
+    expect_compile_error(include_str!("program.cambra"), "Feed({amount: Int})");
 }
