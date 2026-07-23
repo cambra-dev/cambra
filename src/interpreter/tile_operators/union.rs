@@ -76,18 +76,31 @@ impl UnionOperator {
             // Differing arms are alternative values at one row, so merging them
             // yields one *column* — which is also the only codomain shape
             // `UnionProducer` can build (it concatenates like columns, or
-            // materialises `Value` rows into a `Variants` column). Flattening a
-            // non-`Scalar` arm tiling through `Tiling::extent` here would declare a
-            // scalar column of *functions*: a tile the producer cannot emit and
-            // panics on at the first `get`. Reject it where the shape is already
-            // known instead.
+            // materialises `Value` rows into a `Variants` column). So an arm's
+            // tiling is admissible here exactly when its values fit in one column:
+            // a `Scalar`, or a `Record` of them — a compound register's arms are
+            // the latter, and disagree on *layout* rather than on type (a
+            // constructed tuple arrives as a record of columns, the carried
+            // snapshot as one column of record values), which is precisely what
+            // materialising into a single column reconciles.
+            //
+            // A function-tiled arm is the case that must not pass: flattening it
+            // through `Tiling::extent` would declare a scalar column of
+            // *functions*, a tile the producer cannot emit and panics on at the
+            // first `get`. Reject it here, where the shape is already known.
             let exts: Vec<Extent> = codomains
                 .iter()
                 .map(|t| match t {
                     Tiling::Scalar(e) => e.clone(),
+                    Tiling::Record(fields)
+                        if fields.values().all(|f| matches!(f, Tiling::Scalar(_))) =>
+                    {
+                        t.extent()
+                    }
                     other => panic!(
                         "UnionOperator: arms with differing codomains merge into one \
-                         column, so each must be Scalar; got {other}"
+                         column, so each must be a `Scalar` or a `Record` of them; \
+                         got {other}"
                     ),
                 })
                 .collect();
@@ -150,10 +163,12 @@ impl UnionOperator {
 /// key. Each arm is a filtered slice of the *same* fed element stream (a
 /// writer-body value-`Case` fan-out `⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`), so the arms'
 /// (`UInt`) positions are disjoint and reassemble the full column — which then
-/// co-iterates with the decision record's sibling `commit` field. Scalar codomain
-/// only (the value a decision field produces); the shared fed predicate is taken
-/// from the first arm (all arms carry it).
-fn flat_merge(tiles: Vec<Tile>, value_extent: &Extent) -> Tile {
+/// co-iterates with the decision record's sibling `commit` field. The codomain is
+/// a scalar decision-field value, or a boxed-compound `Tile::Record` for a
+/// tuple/record accumulator; the shared fed predicate is taken from the first arm
+/// (all arms carry it).
+fn flat_merge(tiles: Vec<Tile>, codomain_tiling: &Tiling) -> Tile {
+    let value_extent = codomain_tiling.extent();
     let mut pairs: Vec<(usize, Value)> = Vec::new();
     let mut domain_predicate = Predicate::False;
     for (i, tile) in tiles.into_iter().enumerate() {
@@ -169,11 +184,18 @@ fn flat_merge(tiles: Vec<Tile>, value_extent: &Extent) -> Tile {
         if i == 0 {
             domain_predicate = dp;
         }
-        let Tile::Scalar(values) = *codomain else {
-            panic!(
-                "flat_merge: writer-body value-Case arm has a Scalar codomain, got {codomain:?}"
-            );
-        };
+        // The decision field's value is usually a scalar, but a compound
+        // (tuple/record) accumulator carries a struct-of-arrays `Tile::Record`
+        // codomain; box it to a single record-valued column so each row extracts
+        // as one `Value`. `scalar_tile_to_column_value` is identity on a scalar.
+        // A function-valued codomain (a collection-valued register) is out of
+        // scope and would panic generically inside the helper — name the boundary.
+        debug_assert!(
+            matches!(codomain.as_ref(), Tile::Scalar(_) | Tile::Record(_)),
+            "flat_merge: a writer-body value-Case arm must have a scalar or \
+             boxed-compound codomain, got {codomain:?}"
+        );
+        let values = scalar_tile_to_column_value(*codomain);
         for row in 0..domain.len() {
             if deleted.contains(row) {
                 continue;
@@ -199,9 +221,13 @@ fn flat_merge(tiles: Vec<Tile>, value_extent: &Extent) -> Tile {
     pairs.sort_by_key(|(pos, _)| *pos);
     let positions: Vec<usize> = pairs.iter().map(|(pos, _)| *pos).collect();
     let values: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
+    // Build the codomain to match the operator's *declared* tiling shape: a
+    // scalar field stays `Tile::Scalar`, a compound (tuple/record) field unboxes
+    // the record-valued column back into a struct-of-arrays `Tile::Record`.
+    let cv = ColumnValue::from_values(values, &value_extent);
     Tile::SealedFunction {
         domain: ColumnValue::from_uints(positions),
-        codomain: Box::new(Tile::Scalar(ColumnValue::from_values(values, value_extent))),
+        codomain: Box::new(column_value_to_tile(cv, codomain_tiling)),
         domain_predicate,
         deleted: BitSet::new(),
     }
@@ -285,11 +311,11 @@ impl TileProducer for UnionProducer {
             .collect();
 
         if self.flat {
-            let value_extent = match self.tiling() {
-                Tiling::SealedFunction { codomain, .. } => codomain.extent(),
+            let codomain_tiling = match self.tiling() {
+                Tiling::SealedFunction { codomain, .. } => (**codomain).clone(),
                 other => panic!("flat union tiling is a SealedFunction, got {other}"),
             };
-            return flat_merge(tiles, &value_extent);
+            return flat_merge(tiles, &codomain_tiling);
         }
 
         let mut domains: Vec<ColumnValue> = Vec::new();

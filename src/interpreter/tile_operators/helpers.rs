@@ -91,7 +91,7 @@ pub(crate) fn apply_function_tile(
 ///
 /// - `Tiling::Scalar` → `Tile::Scalar(cv)`
 /// - `Tiling::Record` → `Tile::Record(fields)` where each field is rebuilt recursively
-fn column_value_to_tile(cv: ColumnValue, tiling: &Tiling) -> Tile {
+pub(crate) fn column_value_to_tile(cv: ColumnValue, tiling: &Tiling) -> Tile {
     match tiling {
         Tiling::Scalar(_) => Tile::Scalar(cv),
         Tiling::Record(fields) => {
