@@ -573,6 +573,40 @@ fn mut_arg_must_be_a_mutable_not_a_plain_value() {
         "mutable variable",
     );
 }
+// A mutable variable passed to a *non*-`Mut` parameter is read by value (its
+// current value is copied in) — the callee cannot write it back. The parameter
+// annotation is a plain checking-mode declaration here, so the register's value
+// type must match it.
+#[test]
+fn nonmut_param_reads_mut_arg_current_value() {
+    check_scalar(
+        "cnt: Mut[int] := 5\ndef g(a: int):\n    a + 1\ng(cnt)",
+        cambra::interpreter::Value::Int(6),
+    );
+}
+// The enforced annotation has force even when the argument is a mutable
+// variable: a `str` parameter rejects an `int` register's value. Before
+// parameter annotations were carried through lowering this compiled — the
+// annotation was silently dropped and `a` inferred `int` from the argument.
+#[test]
+fn nonmut_param_annotation_enforced_against_mut_arg() {
+    expect_compile_error(
+        "cnt: Mut[int] := 0\ndef g(a: str):\n    a\ng(cnt)",
+        "mismatch",
+    );
+}
+// Pass-by-reference sibling of the above: a `Mut[int]` register cannot bind a
+// `Mut[str]` parameter — the value types must agree across the `(Mut, Mut)`
+// edge. (This path is unchanged by parameter-annotation enforcement; the `Mut`
+// annotation always seeded the binder type. Pinned here because nothing else
+// covers a `Mut` value-type clash at a call site.)
+#[test]
+fn mut_param_value_type_must_match_mut_arg() {
+    expect_compile_error(
+        "cnt: Mut[int] := 0\ndef g(c: Mut[str]):\n    c := \"x\"\ng(cnt)\ncnt",
+        "mismatch",
+    );
+}
 #[test]
 fn single_param_pass_by_ref_still_works() {
     check_scalar(
