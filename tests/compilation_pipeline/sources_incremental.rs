@@ -557,6 +557,62 @@ x";
     );
 }
 
+/// A **feed riding an accumulator loop over an async source**: `cnt` increments
+/// per element and `o << cnt` streams the running count. The changelog
+/// `InductionStore` drives the source by *absolute position* (an async domain
+/// arrives unordered), so the feed's per-position stream is position-ordered —
+/// loop position `p` sees `cnt = p + 1`, not a value scrambled by arrival order
+/// (the dense `Recurse` path's bug this replaces). Source `[10, 20, 30]` → the
+/// feed maps `{0 ↦ 1, 1 ↦ 2, 2 ↦ 3}`.
+#[test_log::test]
+fn test_incremental_tap_loop() {
+    let code = "\
+o = defer()
+cnt := 0
+for i in source1():
+    cnt := cnt + 1
+    o << cnt
+o";
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    ctx.register_source(test_source.clone());
+    let mut compiled =
+        compile_program(&mut ctx, code, Box::new(|| {})).unwrap_or_render("<test>", code);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(10)),
+        (Value::UInt(1), Value::Int(20)),
+        (Value::UInt(2), Value::Int(30)),
+    ]);
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    ctx.scheduler().check_for_notifications();
+
+    let mut result = producer.get(producer.tiling().universal_guard());
+    for _ in 0..4 {
+        if !result.is_terminal() {
+            result = producer.get(producer.tiling().universal_guard());
+        }
+    }
+    // Compare as a function (position → value), independent of internal ordering.
+    assert_eq!(
+        sort_sealed_function_by_domain(result),
+        Tile::SealedFunction {
+            domain: ColumnValue::from_uints(vec![0, 1, 2]),
+            codomain: Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))),
+            domain_predicate: Predicate::True,
+            deleted: BitSet::new(),
+        },
+        "the tap stream must be position-ordered (cnt at position p is p+1)"
+    );
+}
+
 /// `MapAggregate`.  Verifies that `Recurse` correctly:
 /// - Re-reads its `domain` input as the source grows in batches.
 /// - Holds back the final emission until the source signals it's done.

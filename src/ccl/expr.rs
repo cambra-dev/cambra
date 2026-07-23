@@ -331,13 +331,13 @@ pub enum TypedExprNode {
     /// read is the record projection `__reg.key` (an `Apply` of `Proj(field)`
     /// to the `__reg` binder). Serialization and the register↔writer cycle are
     /// the *operator's* runtime behaviour (a cyclic `FanOut`), not the node's
-    /// denotation — exactly as `Recurse` realizes the recurrence.
+    /// denotation — exactly as the induction/commit store realizes the recurrence.
     ///
     /// Op-conversion dispatches on [`domain`](Self::Transact::domain): a
-    /// concrete iteration extent → the sequential `Recurse` (the induction case
-    /// — one always-commit writer, the degenerate no-conflict case of the
-    /// commit contract); [`Type::Txn`] → the concurrent commit operator
-    /// (multiple writers, serialize + retry).
+    /// concrete iteration domain → the position-driven `InductionStore` changelog
+    /// (the induction case — one carry-complete, commit-gated writer, the
+    /// no-conflict dual of the commit store); [`Type::Txn`] → the concurrent
+    /// commit operator (multiple writers, serialize + retry).
     Transact {
         /// The register keys — one per scalar register sharing this carrier's
         /// sequencing domain. Each carries its position-0 `init` (the seed,
